@@ -56,15 +56,6 @@ QByteArray encode(
     return term::encode_terminal_key_event(event, modes);
 }
 
-bool may_encode(
-    int                    key,
-    Qt::KeyboardModifiers  modifiers,
-    QString                text = {})
-{
-    QKeyEvent event(QEvent::KeyPress, key, modifiers, text);
-    return term::terminal_key_event_may_encode(event);
-}
-
 QByteArray sgr_mouse_report(int button_code, int row, int column, char final_byte)
 {
     QByteArray bytes = QByteArrayLiteral("\x1b[<");
@@ -89,6 +80,50 @@ bool test_control_and_altgr()
         encode(Qt::Key_Space, Qt::ControlModifier),
         bytes_from_hex("00"),
         "Ctrl+Space maps to NUL");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_2, Qt::ControlModifier),
+        bytes_from_hex("00"),
+        "Ctrl+2 maps to NUL");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_QuoteLeft, Qt::ControlModifier),
+        bytes_from_hex("00"),
+        "Ctrl+` maps to NUL");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_3, Qt::ControlModifier),
+        bytes_from_hex("1b"),
+        "Ctrl+3 maps to ESC");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_4, Qt::ControlModifier),
+        bytes_from_hex("1c"),
+        "Ctrl+4 maps to FS");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_5, Qt::ControlModifier),
+        bytes_from_hex("1d"),
+        "Ctrl+5 maps to GS");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_6, Qt::ControlModifier),
+        bytes_from_hex("1e"),
+        "Ctrl+6 maps to RS");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_7, Qt::ControlModifier),
+        bytes_from_hex("1f"),
+        "Ctrl+7 maps to US");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Minus, Qt::ControlModifier),
+        bytes_from_hex("1f"),
+        "Ctrl+- maps to US");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Slash, Qt::ControlModifier),
+        bytes_from_hex("1f"),
+        "Ctrl+/ maps to US");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_8, Qt::ControlModifier),
+        bytes_from_hex("7f"),
+        "Ctrl+8 maps to DEL");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Question, Qt::ControlModifier),
+        bytes_from_hex("7f"),
+        "Ctrl+? maps to DEL");
     ok &= check_bytes_equal(
         encode(Qt::Key_Backspace, Qt::ControlModifier),
         bytes_from_hex("08"),
@@ -137,12 +172,22 @@ bool test_cursor_and_navigation_modes()
         "plain Return writes CR");
     ok &= check_bytes_equal(
         encode(Qt::Key_Return, Qt::ShiftModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b31333b32383b31333b313b31363b315f"),
+        "Shift+Return writes Win32 key record on Windows");
+#else
         bytes_from_hex("0a"),
         "Shift+Return writes LF for multiline terminal prompts");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_Enter, Qt::ShiftModifier | Qt::KeypadModifier),
+#if defined(Q_OS_WIN)
+        bytes_from_hex("1b5b31333b32383b31333b313b31363b315f"),
+        "Shift+keypad Enter writes Win32 key record on Windows");
+#else
         bytes_from_hex("0a"),
         "Shift+keypad Enter writes LF for multiline terminal prompts");
+#endif
     ok &= check_bytes_equal(
         encode(Qt::Key_Return, Qt::AltModifier),
         bytes_from_hex("1b0d"),
@@ -223,24 +268,6 @@ bool test_keypad_policy()
             modes),
         bytes_from_hex("1b2b"),
         "modified keypad operator preserves Alt printable behavior");
-
-    return ok;
-}
-
-bool test_key_preclassification()
-{
-    bool ok = true;
-
-    ok &= check(!may_encode(Qt::Key_Shift, Qt::ShiftModifier),
-        "modifier-only key is classified as unencodable");
-    ok &= check(!may_encode(Qt::Key_unknown, Qt::NoModifier),
-        "unknown key without text is classified as unencodable");
-    ok &= check(may_encode(Qt::Key_unknown, Qt::NoModifier, QStringLiteral("x")),
-        "unknown key with text is classified as encodable");
-    ok &= check(may_encode(Qt::Key_Left, Qt::NoModifier),
-        "cursor key is classified as encodable");
-    ok &= check(may_encode(Qt::Key_5, Qt::KeypadModifier),
-        "keypad key can depend on live application keypad mode");
 
     return ok;
 }
@@ -790,7 +817,6 @@ int main(int argc, char** argv)
     ok &= test_control_and_altgr();
     ok &= test_cursor_and_navigation_modes();
     ok &= test_keypad_policy();
-    ok &= test_key_preclassification();
     ok &= test_paste_framing_policy();
     ok &= test_paste_sanitization();
     ok &= test_sgr_mouse_reporting();

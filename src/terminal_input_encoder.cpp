@@ -4,6 +4,7 @@
 #include <QKeyEvent>
 #include <Qt>
 #include <QtGlobal>
+#include <algorithm>
 #include <array>
 #include <utility>
 
@@ -18,6 +19,12 @@ constexpr ushort k_c0_control_max = 0x001fU;
 constexpr ushort k_del_control    = 0x007fU;
 constexpr ushort k_c1_control_min = 0x0080U;
 constexpr ushort k_c1_control_max = 0x009fU;
+
+#if defined(Q_OS_WIN)
+constexpr int k_win32_vk_return          = 13;
+constexpr int k_win32_scan_return        = 28;
+constexpr int k_win32_shift_pressed      = 0x0010;
+#endif
 
 QString sanitize_paste_text(QString text)
 {
@@ -95,6 +102,52 @@ QByteArray csi_tilde(int first_parameter, int modifier_parameter = 0)
     bytes.append('~');
     return bytes;
 }
+
+#if defined(Q_OS_WIN)
+QByteArray win32_input_key_event_bytes(
+    int  virtual_key,
+    int  scan_code,
+    int  unicode_character,
+    int  key_down,
+    int  control_key_state,
+    int  repeat_count)
+{
+    QByteArray bytes = QByteArrayLiteral("\x1b[");
+    bytes.append(QByteArray::number(virtual_key));
+    bytes.append(';');
+    bytes.append(QByteArray::number(scan_code));
+    bytes.append(';');
+    bytes.append(QByteArray::number(unicode_character));
+    bytes.append(';');
+    bytes.append(QByteArray::number(key_down));
+    bytes.append(';');
+    bytes.append(QByteArray::number(control_key_state));
+    bytes.append(';');
+    bytes.append(QByteArray::number(repeat_count));
+    bytes.append('_');
+    return bytes;
+}
+
+QByteArray win32_shift_enter_bytes(const QKeyEvent& event)
+{
+    const int virtual_key = event.nativeVirtualKey() != 0U
+        ? static_cast<int>(event.nativeVirtualKey())
+        : k_win32_vk_return;
+    const int scan_code = event.nativeScanCode() != 0U
+        ? static_cast<int>(event.nativeScanCode())
+        : k_win32_scan_return;
+    const int unicode_character = event.text().isEmpty()
+        ? '\r'
+        : event.text().front().unicode();
+    return win32_input_key_event_bytes(
+        virtual_key,
+        scan_code,
+        unicode_character,
+        1,
+        k_win32_shift_pressed,
+        std::max(1, event.count()));
+}
+#endif
 
 int mouse_modifier_bits(Qt::KeyboardModifiers modifiers)
 {
@@ -181,12 +234,23 @@ QByteArray control_key_bytes(const QKeyEvent& event)
 
     switch (key) {
         case Qt::Key_At:
+        case Qt::Key_2:
+        case Qt::Key_QuoteLeft:
         case Qt::Key_Space:        return QByteArray(1, '\0');
+        case Qt::Key_3:
         case Qt::Key_BracketLeft:  return QByteArray(1, '\x1b');
+        case Qt::Key_4:
         case Qt::Key_Backslash:    return QByteArray(1, '\x1c');
+        case Qt::Key_5:
         case Qt::Key_BracketRight: return QByteArray(1, '\x1d');
+        case Qt::Key_6:
         case Qt::Key_AsciiCircum:  return QByteArray(1, '\x1e');
+        case Qt::Key_7:
+        case Qt::Key_Minus:
+        case Qt::Key_Slash:
         case Qt::Key_Underscore:   return QByteArray(1, '\x1f');
+        case Qt::Key_8:
+        case Qt::Key_Question:     return QByteArray(1, '\x7f');
         default:                   return {};
     }
 }
@@ -197,7 +261,13 @@ QByteArray special_key_bytes(const QKeyEvent& event)
         case Qt::Key_Return:
         case Qt::Key_Enter:
             if (terminal_modifiers(event) == Qt::ShiftModifier) {
+#if defined(Q_OS_WIN)
+                // ConPTY consumers that use Win32 console input need the Shift
+                // modifier preserved as a KEY_EVENT_RECORD, not normalized to LF.
+                return win32_shift_enter_bytes(event);
+#else
                 return QByteArray(1, '\n');
+#endif
             }
             return alt_prefixed(QByteArray(1, '\r'), event);
         case Qt::Key_Tab:
@@ -441,18 +511,6 @@ QByteArray encode_terminal_key_event(
     }
 
     return printable_text_bytes(event);
-}
-
-bool terminal_key_event_may_encode(const QKeyEvent& event)
-{
-    if (!encode_terminal_key_event(event, {}).isEmpty()) {
-        return true;
-    }
-
-    return
-        (event.modifiers() & Qt::KeypadModifier) != Qt::NoModifier &&
-         terminal_modifiers(event) == Qt::NoModifier               &&
-         is_application_keypad_key(event.key());
 }
 
 QByteArray encode_terminal_mouse_event(
