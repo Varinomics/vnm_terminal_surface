@@ -1,6 +1,6 @@
 # vnm_terminal_surface
 
-[![CI Linux](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-linux.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-linux.yml) [![CI Windows](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-windows.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-windows.yml)
+[![CI Linux](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-linux.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-linux.yml) [![CI Windows](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-windows.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-windows.yml) [![CI macOS](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-macos.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-macos.yml)
 
 `vnm_terminal_surface` is the home of the Qt Quick terminal surface used to embed
 interactive PTY and ConPTY-backed command-line applications in Varinomics

@@ -1,6 +1,6 @@
 #include "vnm_terminal/internal/linux_pty_backend.h"
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 
 #include "native_backend_io_core.h"
 #include <QFile>
@@ -24,10 +24,15 @@
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
-#include <pty.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(__APPLE__)
+#include <util.h>
+#else
+#include <pty.h>
+#endif
 
 namespace vnm_terminal::internal {
 

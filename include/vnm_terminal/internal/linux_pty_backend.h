@@ -5,7 +5,7 @@
 
 namespace vnm_terminal::internal {
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__APPLE__)
 
 class Linux_pty_backend final : public Terminal_backend
 {

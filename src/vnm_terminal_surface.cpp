@@ -316,7 +316,7 @@ std::unique_ptr<term::Terminal_backend> make_native_backend()
 {
 #if defined(_WIN32)
     return term::make_windows_conpty_backend();
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
     return term::make_linux_pty_backend();
 #else
     return nullptr;
