@@ -361,7 +361,7 @@ bool test_mixed_unicode_row_geometry()
     return ok;
 }
 
-bool test_single_cell_unicode_text_is_clipped_to_cell()
+bool test_single_cell_unicode_text_is_not_clipped_to_cell()
 {
     bool ok = true;
     term::Terminal_render_snapshot snapshot = empty_snapshot({1, 4});
@@ -372,9 +372,9 @@ bool test_single_cell_unicode_text_is_clipped_to_cell()
     const term::Terminal_render_text_run* warning  = run_at(frame, 0, 0);
     const term::Terminal_render_text_run* sentinel = run_at(frame, 0, 1);
     ok &= check(warning != nullptr &&
-        warning->rect      == QRectF(0.0,  0.0, 10.0, 20.0) &&
-        warning->clip_rect == warning->rect,
-        "single-cell Unicode warning sign is clipped to its cell");
+        warning->rect == QRectF(0.0, 0.0, 10.0, 20.0) &&
+        !warning->clip_rect.isValid(),
+        "single-cell Unicode warning sign remains unclipped");
     ok &= check(sentinel != nullptr &&
         sentinel->text == QStringLiteral("H") &&
         sentinel->rect == QRectF(10.0, 0.0, 10.0, 20.0) &&
@@ -1395,7 +1395,7 @@ int main()
     ok &= test_rounded_box_corners_use_arc_primitives();
     ok &= test_block_cursor_over_graphic_has_overlay_rects();
     ok &= test_mixed_unicode_row_geometry();
-    ok &= test_single_cell_unicode_text_is_clipped_to_cell();
+    ok &= test_single_cell_unicode_text_is_not_clipped_to_cell();
     ok &= test_inverse_and_reverse_video_xor();
     ok &= test_default_and_reverse_full_grid_background();
     ok &= test_styled_blank_cells_emit_background_rects();
