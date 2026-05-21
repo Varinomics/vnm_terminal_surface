@@ -48,9 +48,6 @@ QByteArray encode_terminal_key_event(
     const QKeyEvent&               event,
     Terminal_input_mode_state      modes);
 
-bool terminal_key_event_may_encode(
-    const QKeyEvent&               event);
-
 QByteArray encode_terminal_mouse_event(
     Terminal_mouse_event           event,
     Terminal_input_mode_state      modes);

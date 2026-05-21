@@ -839,10 +839,6 @@ Terminal_session_result Terminal_session::write_user_bytes_locked(
 
 Terminal_key_event_result Terminal_session::write_key_event(const QKeyEvent& event)
 {
-    if (!terminal_key_event_may_encode(event)) {
-        return {};
-    }
-
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     drain_backend_callback_commands();
     process_pending_commands();

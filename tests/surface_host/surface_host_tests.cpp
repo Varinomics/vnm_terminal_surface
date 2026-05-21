@@ -1358,8 +1358,13 @@ bool test_keyboard_printable_controls_and_prompt_path(QGuiApplication& app)
         "Return writes carriage return");
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_Return, Qt::ShiftModifier,
+#if defined(Q_OS_WIN)
+        QStringLiteral("\r"), bytes_from_hex("1b5b31333b32383b31333b313b31363b315f"),
+        "Shift+Return writes Win32 key record on Windows");
+#else
         QStringLiteral("\r"), bytes_from_hex("0a"),
         "Shift+Return writes line feed");
+#endif
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_Tab, Qt::NoModifier,
         QStringLiteral("\t"), bytes_from_hex("09"),
@@ -1416,6 +1421,38 @@ bool test_keyboard_printable_controls_and_prompt_path(QGuiApplication& app)
         fixture.surface, *backend_ptr, Qt::Key_Space, Qt::ControlModifier,
         {}, bytes_from_hex("00"),
         "Ctrl+Space writes NUL");
+    ok &= send_key_and_expect_write(
+        fixture.surface, *backend_ptr, Qt::Key_2, Qt::ControlModifier,
+        {}, bytes_from_hex("00"),
+        "Ctrl+2 writes NUL");
+    ok &= send_key_and_expect_write(
+        fixture.surface, *backend_ptr, Qt::Key_3, Qt::ControlModifier,
+        {}, bytes_from_hex("1b"),
+        "Ctrl+3 writes ESC");
+    ok &= send_key_and_expect_write(
+        fixture.surface, *backend_ptr, Qt::Key_4, Qt::ControlModifier,
+        {}, bytes_from_hex("1c"),
+        "Ctrl+4 writes FS");
+    ok &= send_key_and_expect_write(
+        fixture.surface, *backend_ptr, Qt::Key_5, Qt::ControlModifier,
+        {}, bytes_from_hex("1d"),
+        "Ctrl+5 writes GS");
+    ok &= send_key_and_expect_write(
+        fixture.surface, *backend_ptr, Qt::Key_6, Qt::ControlModifier,
+        {}, bytes_from_hex("1e"),
+        "Ctrl+6 writes RS");
+    ok &= send_key_and_expect_write(
+        fixture.surface, *backend_ptr, Qt::Key_7, Qt::ControlModifier,
+        {}, bytes_from_hex("1f"),
+        "Ctrl+7 writes US");
+    ok &= send_key_and_expect_write(
+        fixture.surface, *backend_ptr, Qt::Key_Slash, Qt::ControlModifier,
+        {}, bytes_from_hex("1f"),
+        "Ctrl+/ writes US");
+    ok &= send_key_and_expect_write(
+        fixture.surface, *backend_ptr, Qt::Key_8, Qt::ControlModifier,
+        {}, bytes_from_hex("7f"),
+        "Ctrl+8 writes DEL");
     ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_X, Qt::AltModifier,
         QStringLiteral("x"), bytes_from_hex("1b78"),
