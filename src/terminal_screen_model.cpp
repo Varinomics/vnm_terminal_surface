@@ -24,6 +24,7 @@ constexpr ushort   k_printable_ascii_first = 0x20U;
 constexpr ushort   k_printable_ascii_last  = 0x7eU;
 constexpr std::size_t k_printable_ascii_count =
     k_printable_ascii_last - k_printable_ascii_first + 1U;
+constexpr int k_resize_repaint_clear_guard_action_budget = 64;
 
 template <typename T>
 constexpr bool k_unhandled_screen_mutation = false;
@@ -1852,6 +1853,7 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
             }
             clear_dirty();
             apply_action(action, result.actions, &publication);
+            advance_resize_repaint_clear_guard();
 
             if (m_modes.synchronized_output) {
                 collect_synchronized_changes();
@@ -1924,6 +1926,7 @@ void Terminal_screen_model::apply_action(const Parser_action& action)
 {
     std::vector<Parser_action> generated_actions;
     apply_action(action, generated_actions, nullptr);
+    advance_resize_repaint_clear_guard();
 }
 
 void Terminal_screen_model::apply_action(
@@ -1957,7 +1960,7 @@ void Terminal_screen_model::apply_action(
         const Parser_notification& notification =
             std::get<Parser_notification>(action.payload);
         if (notification.kind == Parser_notification_kind::TEXT_AREA_RESIZE_REQUESTED) {
-            apply_grid_resize({notification.rows, notification.columns});
+            apply_grid_resize({notification.rows, notification.columns}, false);
         }
         return;
     }
@@ -2456,7 +2459,7 @@ void Terminal_screen_model::apply_control_sequence(
                                     unsupported();
                                     return;
                                 }
-                                apply_grid_resize(grid_size);
+                                apply_grid_resize(grid_size, false);
                                 generated_actions.push_back(
                                     make_text_area_resize_notification_action(rows, columns));
                                 return;
@@ -3073,7 +3076,9 @@ void Terminal_screen_model::reset_grid()
     restore_buffer_state(m_primary_buffer);
 }
 
-bool Terminal_screen_model::apply_grid_resize(terminal_grid_size_t grid_size)
+bool Terminal_screen_model::apply_grid_resize(
+    terminal_grid_size_t grid_size,
+    bool                 guard_scrollback_clear)
 {
     if (!is_terminal_screen_model_grid_size_supported(grid_size)) {
         return false;
@@ -3093,6 +3098,12 @@ bool Terminal_screen_model::apply_grid_resize(terminal_grid_size_t grid_size)
     m_tab_stops = default_tab_stops(grid_size.columns);
     m_config.grid_size = grid_size;
     restore_buffer_state(active_stored_buffer());
+    if (guard_scrollback_clear) {
+        arm_resize_repaint_clear_guard();
+    }
+    else {
+        cancel_resize_repaint_clear_guard();
+    }
     mark_all_dirty();
     mark_viewport_changed();
 
@@ -3105,7 +3116,7 @@ Terminal_screen_model_result Terminal_screen_model::resize(terminal_grid_size_t 
     m_scrollback_evicted_rows = 0;
     clear_dirty();
 
-    const bool grid_resized = apply_grid_resize(grid_size);
+    const bool grid_resized = apply_grid_resize(grid_size, true);
     if (!grid_resized) {
         result.dirty_rows                    = dirty_rows();
         result.viewport_changed              = m_viewport_changed;
@@ -3201,6 +3212,10 @@ void Terminal_screen_model::put_scalar(QString text)
 
 void Terminal_screen_model::put_text(QString text)
 {
+    if (!text.isEmpty()) {
+        cancel_resize_repaint_clear_guard_before_visible_clear();
+    }
+
     for (qsizetype i = 0; i < text.size();) {
         const qsizetype ascii_begin = i;
         while (i < text.size() && is_printable_ascii(text[i])) {
@@ -3530,6 +3545,7 @@ void Terminal_screen_model::clear_screen_after_cursor()
 void Terminal_screen_model::erase_visible_screen()
 {
     cancel_primary_repaint_recovery_candidate();
+    note_resize_repaint_visible_clear();
     for (int row = 0; row < m_config.grid_size.rows; ++row) {
         fill_row_with_erased_cells(m_cells[row]);
     }
@@ -3553,6 +3569,9 @@ void Terminal_screen_model::erase_in_display(int mode)
         case 1:  clear_screen_before_cursor(); break;
         case 2:  erase_visible_screen();       break;
         case 3:
+            if (consume_resize_repaint_scrollback_clear_guard()) {
+                break;
+            }
             if (m_active_buffer_id == Terminal_buffer_id::PRIMARY && !m_scrollback.empty()) {
                 m_scrollback_evicted_rows += static_cast<int>(m_scrollback.size());
                 for (const scrollback_row_t& row : m_scrollback) {
@@ -4198,6 +4217,72 @@ void Terminal_screen_model::reverse_index()
     mark_cursor_dirty();
 }
 
+void Terminal_screen_model::arm_resize_repaint_clear_guard()
+{
+    if (!m_config.recover_scrollback_from_primary_repaints ||
+        m_active_buffer_id != Terminal_buffer_id::PRIMARY   ||
+        m_scrollback.empty())
+    {
+        cancel_resize_repaint_clear_guard();
+        return;
+    }
+
+    m_resize_repaint_clear_guard_remaining         =
+        k_resize_repaint_clear_guard_action_budget;
+    m_resize_repaint_clear_guard_saw_visible_clear = false;
+}
+
+void Terminal_screen_model::cancel_resize_repaint_clear_guard()
+{
+    m_resize_repaint_clear_guard_remaining         = 0;
+    m_resize_repaint_clear_guard_saw_visible_clear = false;
+}
+
+void Terminal_screen_model::cancel_resize_repaint_clear_guard_before_visible_clear()
+{
+    if (m_resize_repaint_clear_guard_saw_visible_clear) {
+        return;
+    }
+
+    cancel_resize_repaint_clear_guard();
+}
+
+void Terminal_screen_model::advance_resize_repaint_clear_guard()
+{
+    if (m_resize_repaint_clear_guard_remaining <= 0) {
+        return;
+    }
+
+    --m_resize_repaint_clear_guard_remaining;
+    if (m_resize_repaint_clear_guard_remaining <= 0) {
+        cancel_resize_repaint_clear_guard();
+    }
+}
+
+void Terminal_screen_model::note_resize_repaint_visible_clear()
+{
+    if (m_resize_repaint_clear_guard_remaining <= 0 ||
+        m_cursor.row                               != 0 ||
+        m_cursor.column                            != 0)
+    {
+        return;
+    }
+
+    m_resize_repaint_clear_guard_saw_visible_clear = true;
+}
+
+bool Terminal_screen_model::consume_resize_repaint_scrollback_clear_guard()
+{
+    if (m_resize_repaint_clear_guard_remaining <= 0 ||
+        !m_resize_repaint_clear_guard_saw_visible_clear)
+    {
+        return false;
+    }
+
+    cancel_resize_repaint_clear_guard();
+    return true;
+}
+
 void Terminal_screen_model::begin_primary_repaint_recovery_candidate()
 {
     if (!m_config.recover_scrollback_from_primary_repaints ||
@@ -4322,6 +4407,7 @@ bool Terminal_screen_model::row_has_visible_text(const std::vector<Cell>& row) c
 
 void Terminal_screen_model::carriage_return()
 {
+    cancel_resize_repaint_clear_guard_before_visible_clear();
     mark_cursor_dirty();
     m_cursor.column = 0;
     m_pending_wrap  = false;
@@ -4330,6 +4416,7 @@ void Terminal_screen_model::carriage_return()
 
 void Terminal_screen_model::line_feed()
 {
+    cancel_resize_repaint_clear_guard_before_visible_clear();
     mark_cursor_dirty();
     m_pending_wrap = false;
 

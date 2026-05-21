@@ -338,7 +338,8 @@ private:
         const Parser_control_sequence& sequence) const;
 
     bool apply_grid_resize(
-        terminal_grid_size_t           grid_size);
+        terminal_grid_size_t           grid_size,
+        bool                           guard_scrollback_clear);
 
     void reset_scroll_region();
     void reset_tab_stops();
@@ -483,6 +484,12 @@ private:
     void scroll_up_region(int top, int bottom, bool append_scrollback, int count = 1);
     void scroll_down_region(int top, int bottom, int count = 1);
     void reverse_index();
+    void arm_resize_repaint_clear_guard();
+    void cancel_resize_repaint_clear_guard();
+    void cancel_resize_repaint_clear_guard_before_visible_clear();
+    void advance_resize_repaint_clear_guard();
+    void note_resize_repaint_visible_clear();
+    bool consume_resize_repaint_scrollback_clear_guard();
     void begin_primary_repaint_recovery_candidate();
     void finish_primary_repaint_recovery_candidate(bool discard_if_no_match);
     void cancel_primary_repaint_recovery_candidate();
@@ -613,6 +620,8 @@ private:
     bool                            m_synchronized_mouse_reporting_mode_changed = false;
     bool                            m_synchronized_alternate_scroll_mode_changed = false;
     int                             m_scrollback_evicted_rows = 0;
+    int                             m_resize_repaint_clear_guard_remaining = 0;
+    bool                            m_resize_repaint_clear_guard_saw_visible_clear = false;
     primary_repaint_recovery_candidate_t
                                     m_primary_repaint_recovery_candidate;
 };

@@ -181,6 +181,24 @@ bool test_emoji_and_variation_width()
         term::Terminal_unicode_width_class::NARROW,
         "bare heart width class");
 
+    const term::Terminal_utf8_width_result bare_warning =
+        term::measure_utf8_width(bytes_from_hex("e29aa0"));
+    ok &= check(bare_warning.status == term::Terminal_unicode_width_status::OK,
+        "bare warning sign status");
+    ok &= check(bare_warning.cells == 1, "bare warning sign text width");
+    ok &= check(bare_warning.codepoints.front().width_class ==
+        term::Terminal_unicode_width_class::NARROW,
+        "bare warning sign width class");
+
+    const term::Terminal_utf8_width_result warning_emoji =
+        term::measure_utf8_width(bytes_from_hex("e29aa0efb88f"));
+    ok &= check(warning_emoji.status == term::Terminal_unicode_width_status::OK,
+        "warning sign VS16 status");
+    ok &= check(warning_emoji.cells == 2, "warning sign VS16 emoji width");
+    ok &= check(warning_emoji.codepoints.front().presentation ==
+        term::Terminal_unicode_presentation::EMOJI,
+        "warning sign VS16 presentation");
+
     const term::Terminal_utf8_width_result ascii_with_vs16 = term::measure_utf8_width(
         QByteArrayLiteral("A") +
         bytes_from_hex("efb88f"));

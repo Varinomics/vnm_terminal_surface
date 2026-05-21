@@ -2291,6 +2291,11 @@ bool is_printable_ascii_cell_text(const QString& text)
     return codepoint >= 0x20U && codepoint <= 0x7eU;
 }
 
+bool text_run_needs_cell_clip(const QString& text)
+{
+    return !text.isEmpty() && !is_printable_ascii_text(text);
+}
+
 QFont cell_stable_ascii_layout_font(const QFont& font)
 {
     QFont layout_font = font;
@@ -6164,6 +6169,9 @@ Terminal_render_frame build_terminal_render_frame(
             run.hyperlink_id    = cell.hyperlink_id;
             run.underline       = style.underline;
             run.strike          = style.strike;
+            if (text_run_needs_cell_clip(run.text)) {
+                run.clip_rect = rect;
+            }
             const bool packed_hard_graphic_covered =
                 !text_is_empty                                                          &&
                 classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY &&

@@ -1971,6 +1971,150 @@ bool test_viewport_scroll_public_session_path()
     return ok;
 }
 
+bool test_resize_preserves_primary_scrollback()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "resize scrollback session starts");
+    ok &= check(backend->emit_output(numbered_scroll_lines(80)),
+        "resize scrollback backend creates scrollback");
+
+    const std::optional<term::Terminal_render_snapshot> before_resize =
+        session->latest_render_snapshot();
+    ok &= check(before_resize.has_value() &&
+        before_resize->viewport.active_buffer    == term::Terminal_buffer_id::PRIMARY &&
+        before_resize->viewport.scrollback_rows  >  0                                &&
+        before_resize->viewport.offset_from_tail == 0,
+        "resize scrollback fixture starts at primary tail with scrollback");
+    const int previous_scrollback_rows = before_resize.has_value()
+        ? before_resize->viewport.scrollback_rows
+        : 0;
+
+    const term::Terminal_session_result resize_result =
+        session->resize(QSizeF(1000.0, 420.0), {20, 100});
+    ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
+        "resize with scrollback is accepted");
+    const std::optional<term::Terminal_render_snapshot> after_resize =
+        session->latest_render_snapshot();
+    ok &= check(after_resize.has_value() &&
+        after_resize->grid_size.rows            == 20                       &&
+        after_resize->grid_size.columns         == 100                      &&
+        after_resize->viewport.visible_rows     == 20                       &&
+        after_resize->viewport.scrollback_rows  == previous_scrollback_rows &&
+        after_resize->viewport.offset_from_tail == 0,
+        "resize preserves primary scrollback at tail");
+
+    const term::Terminal_viewport_scroll_result scroll_result =
+        session->scroll_viewport_lines(3);
+    const std::optional<term::Terminal_render_snapshot> scrolled =
+        session->latest_render_snapshot();
+    ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "resized primary scrollback remains scrollable");
+    ok &= check(scrolled.has_value() &&
+        scrolled->viewport.scrollback_rows  == previous_scrollback_rows &&
+        scrolled->viewport.offset_from_tail == 3,
+        "resized primary scrollback publishes detached viewport");
+
+    std::unique_ptr<term::Terminal_session> detached_session;
+    Scripted_backend* detached_backend = make_session(detached_session);
+    ok &= check(detached_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "detached resize scrollback session starts");
+    ok &= check(detached_backend->emit_output(numbered_scroll_lines(80)),
+        "detached resize scrollback backend creates scrollback");
+    ok &= check(detached_session->scroll_viewport_lines(4).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "detached resize fixture scrolls before resize");
+    const std::optional<term::Terminal_render_snapshot> detached_before_resize =
+        detached_session->latest_render_snapshot();
+    const int detached_scrollback_rows = detached_before_resize.has_value()
+        ? detached_before_resize->viewport.scrollback_rows
+        : 0;
+    ok &= check(detached_session->resize(QSizeF(900.0, 360.0), {18, 90}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "detached resize with scrollback is accepted");
+    const std::optional<term::Terminal_render_snapshot> detached_after_resize =
+        detached_session->latest_render_snapshot();
+    ok &= check(detached_after_resize.has_value() &&
+        detached_after_resize->viewport.scrollback_rows  == detached_scrollback_rows &&
+        detached_after_resize->viewport.offset_from_tail == 4,
+        "resize preserves detached primary scrollback offset");
+
+    return ok;
+}
+
+bool test_resize_repaint_clear_keeps_primary_scrollback_when_recovery_is_enabled()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.recover_scrollback_from_primary_repaints = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "resize repaint-clear session starts");
+    ok &= check(backend->emit_output(numbered_scroll_lines(80)),
+        "resize repaint-clear backend creates scrollback");
+
+    const std::optional<term::Terminal_render_snapshot> before_resize =
+        session->latest_render_snapshot();
+    const int previous_scrollback_rows = before_resize.has_value()
+        ? before_resize->viewport.scrollback_rows
+        : 0;
+    ok &= check(previous_scrollback_rows > 0,
+        "resize repaint-clear fixture starts with scrollback");
+
+    ok &= check(session->resize(QSizeF(1000.0, 420.0), {20, 100}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "resize repaint-clear resize is accepted");
+    ok &= check(backend->emit_output(QByteArrayLiteral(
+            "\x1b[?25l\x1b[H\x1b[?25h\x1b[2J\x1b[3Jredraw")),
+        "backend emits resize-triggered full repaint clear");
+
+    const std::optional<term::Terminal_render_snapshot> after_resize_repaint =
+        session->latest_render_snapshot();
+    ok &= check(after_resize_repaint.has_value() &&
+        after_resize_repaint->viewport.scrollback_rows == previous_scrollback_rows,
+        "resize-triggered repaint clear preserves primary scrollback");
+    ok &= check(session->scroll_viewport_lines(3).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "primary scrollback remains scrollable after resize repaint clear");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[H\x1b[2J\x1b[3J")),
+        "backend emits a later explicit scrollback clear");
+    const std::optional<term::Terminal_render_snapshot> after_later_clear =
+        session->latest_render_snapshot();
+    ok &= check(after_later_clear.has_value() &&
+        after_later_clear->viewport.scrollback_rows == 0,
+        "later explicit ED3 still clears primary scrollback");
+
+    std::unique_ptr<term::Terminal_session> echo_session;
+    Scripted_backend* echo_backend = make_session(echo_session, config);
+    ok &= check(echo_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "resize echo-clear session starts");
+    ok &= check(echo_backend->emit_output(numbered_scroll_lines(80)),
+        "resize echo-clear backend creates scrollback");
+    ok &= check(echo_session->resize(QSizeF(1000.0, 420.0), {20, 100}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "resize echo-clear resize is accepted");
+    ok &= check(echo_backend->emit_output(QByteArrayLiteral("clear\r\n\x1b[H\x1b[2J\x1b[3J")),
+        "backend emits echoed clear command after resize");
+    const std::optional<term::Terminal_render_snapshot> after_echo_clear =
+        echo_session->latest_render_snapshot();
+    ok &= check(after_echo_clear.has_value() &&
+        after_echo_clear->viewport.scrollback_rows == 0,
+        "visible output before ED3 treats clear as explicit after resize");
+
+    return ok;
+}
+
 bool test_parser_notifications_reach_session_notifications()
 {
     bool ok = true;
@@ -4831,6 +4975,8 @@ int main()
     ok &= test_output_activity_notifications_are_session_level();
     ok &= test_synchronized_output_defers_content_until_release();
     ok &= test_viewport_scroll_public_session_path();
+    ok &= test_resize_preserves_primary_scrollback();
+    ok &= test_resize_repaint_clear_keeps_primary_scrollback_when_recovery_is_enabled();
     ok &= test_parser_notifications_reach_session_notifications();
     ok &= test_bell_policy_coalesces_with_deterministic_clock();
     ok &= test_parser_state_crosses_backend_output_chunks();
