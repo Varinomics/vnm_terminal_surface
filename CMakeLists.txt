@@ -97,7 +97,7 @@ if(WIN32)
     )
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL Linux)
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     target_sources(vnm_terminal_surface PRIVATE
         src/linux_pty_backend.cpp
     )
@@ -122,11 +122,11 @@ if(MSVC)
     )
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL Linux)
-    find_library(VNM_TERMINAL_UTIL_LIBRARY util)
-    if(VNM_TERMINAL_UTIL_LIBRARY)
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    find_library(VNM_TERMINAL_PTY_UTIL_LIBRARY util)
+    if(VNM_TERMINAL_PTY_UTIL_LIBRARY)
         target_link_libraries(vnm_terminal_surface PRIVATE
-            ${VNM_TERMINAL_UTIL_LIBRARY}
+            ${VNM_TERMINAL_PTY_UTIL_LIBRARY}
         )
     endif()
 endif()

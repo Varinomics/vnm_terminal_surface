@@ -1,0 +1,60 @@
+name: CI macOS
+
+on:
+  push:
+    branches: [ master, main, dev ]
+  pull_request:
+    branches: [ master, main, dev ]
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CMAKE_BUILD_TYPE: Release
+
+jobs:
+  build-and-test:
+    name: Qt Quick Terminal Surface (macOS)
+    runs-on: macos-15-intel
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: '6.10.1'
+          arch: 'clang_64'
+          archives: 'qtbase qtdeclarative'
+          cache: 'true'
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+            -DVNM_TERMINAL_BUILD_BENCHMARKS=OFF \
+            -DVNM_TERMINAL_ENABLE_PROFILING=OFF \
+            -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel
+
+      - name: Run tests
+        working-directory: build
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --output-on-failure -E "^vnm_terminal_qsg_render$"
+
+      - name: Install package
+        run: cmake --install build --config ${CMAKE_BUILD_TYPE} --prefix "${GITHUB_WORKSPACE}/install"
+
+      - name: Configure package smoke
+        run: |
+          cmake -B package-smoke -S tests/package_smoke \
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+            -DCMAKE_PREFIX_PATH="${GITHUB_WORKSPACE}/install"
+
+      - name: Build package smoke
+        run: cmake --build package-smoke --config ${CMAKE_BUILD_TYPE} --parallel

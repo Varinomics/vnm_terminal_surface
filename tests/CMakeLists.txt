@@ -557,7 +557,7 @@ set_tests_properties(vnm_terminal_surface_behavior_smokes PROPERTIES
     TIMEOUT 60
 )
 
-if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL Linux)
+if(WIN32 OR CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     add_test(
         NAME vnm_terminal_native_surface_behavior_smokes
         COMMAND
@@ -575,7 +575,7 @@ if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL Linux)
     )
 endif()
 
-if(WIN32 OR CMAKE_SYSTEM_NAME STREQUAL Linux)
+if(WIN32 OR CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     add_executable(vnm_terminal_compat_smoke
         compat_smoke/compat_smoke_tests.cpp
     )
@@ -1085,7 +1085,7 @@ if(WIN32)
     )
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL Linux)
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     add_executable(vnm_terminal_linux_pty_backend
         linux_pty_backend/linux_pty_backend_tests.cpp
     )
@@ -1152,7 +1152,7 @@ if(WIN32)
     )
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL Linux)
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     list(APPEND vnm_terminal_test_process_targets
         vnm_terminal_linux_pty_backend
     )
