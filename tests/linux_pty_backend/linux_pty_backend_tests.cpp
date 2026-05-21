@@ -834,7 +834,7 @@ bool test_exit_drain_ignores_repause_and_delivers_buffered_output()
     const term::Terminal_backend_result pause_result = backend->set_output_paused(true);
     ok &= check(pause_result.code == term::Terminal_backend_result_code::ACCEPTED,
         "Linux PTY backend accepts pre-exit output pause");
-    ok &= check(backend->write(QByteArrayLiteral("go\n")).code ==
+    ok &= check(backend->write(QByteArrayLiteral("go\r")).code ==
         term::Terminal_backend_result_code::ACCEPTED,
         "paused exit-drain shell receives release input");
     ok &= check(capture.wait_for_output(marker),
