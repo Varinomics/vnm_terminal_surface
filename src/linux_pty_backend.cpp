@@ -475,6 +475,20 @@ void add_signal_target(Signal_targets& targets, pid_t process_group)
     }
 }
 
+pid_t process_group_for_child(pid_t child_pid)
+{
+    if (child_pid <= 0) {
+        return -1;
+    }
+
+    const pid_t process_group = ::getpgid(child_pid);
+    if (process_group > 0) {
+        return process_group;
+    }
+
+    return child_pid;
+}
+
 Signal_targets process_signal_targets(pid_t child_process_group, int master)
 {
     Signal_targets targets;
@@ -623,6 +637,7 @@ public:
 
         if (child_pid == 0) {
             startup_error_read.reset();
+            (void)::setpgid(0, 0);
             exec_child(*native_launch, startup_error_write.get());
         }
 
@@ -668,7 +683,7 @@ public:
             m_write_wake_read                    = std::move(write_wake_read);
             m_write_wake_write                   = std::move(write_wake_write);
             m_child_pid                          = child_pid;
-            m_child_process_group                = child_pid;
+            m_child_process_group                = process_group_for_child(child_pid);
             m_running                            = true;
             m_start_attempted                    = true;
             m_start_in_progress                  = false;
