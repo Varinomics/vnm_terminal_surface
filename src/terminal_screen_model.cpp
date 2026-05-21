@@ -3544,7 +3544,6 @@ void Terminal_screen_model::clear_screen_after_cursor()
 
 void Terminal_screen_model::erase_visible_screen()
 {
-    cancel_primary_repaint_recovery_candidate();
     note_resize_repaint_visible_clear();
     for (int row = 0; row < m_config.grid_size.rows; ++row) {
         fill_row_with_erased_cells(m_cells[row]);
@@ -3872,7 +3871,6 @@ void Terminal_screen_model::set_synchronized_output_mode(
     }
 
     if (enabled) {
-        cancel_primary_repaint_recovery_candidate();
         if (publication != nullptr) {
             publish_pending_changes(*publication);
         }
@@ -3884,6 +3882,7 @@ void Terminal_screen_model::set_synchronized_output_mode(
         return;
     }
 
+    finish_primary_repaint_recovery_candidate(false);
     if (publication != nullptr) {
         collect_synchronized_changes();
     }
@@ -4287,7 +4286,6 @@ void Terminal_screen_model::begin_primary_repaint_recovery_candidate()
 {
     if (!m_config.recover_scrollback_from_primary_repaints ||
         m_active_buffer_id != Terminal_buffer_id::PRIMARY  ||
-        m_modes.synchronized_output                        ||
         m_origin_mode                                      ||
         m_modes.cursor_visible                             ||
         m_scroll_top       != 0                            ||

@@ -841,7 +841,7 @@ bool test_primary_repaint_recovery_survives_split_repaint()
     return ok;
 }
 
-bool test_primary_repaint_recovery_ignores_synchronized_repaint()
+bool test_primary_repaint_recovery_handles_synchronized_repaint()
 {
     bool ok = true;
 
@@ -863,7 +863,7 @@ bool test_primary_repaint_recovery_ignores_synchronized_repaint()
         "synchronized repaint recovery setup has no diagnostics");
 
     result = model.ingest(
-        QByteArrayLiteral("\x1b[?2026h\x1b[H"
+        QByteArrayLiteral("\x1b[?2026h\x1b[?25l\x1b[H\x1b[2J"
             "top-two\x1b[K\r\n"
             "view\x1b[K\r\n"
             "HIST\x1b[K\r\n"
@@ -872,10 +872,17 @@ bool test_primary_repaint_recovery_ignores_synchronized_repaint()
 
     ok &= check(diagnostic_count(result) == 0,
         "synchronized home repaint has no diagnostics");
-    ok &= check(model.scrollback_size() == 0,
-        "synchronized home repaint does not synthesize scrollback");
+    ok &= check(model.scrollback_size() == 1,
+        "synchronized home repaint appends displaced top row");
+    ok &= check(result.viewport_changed,
+        "synchronized home repaint reports viewport change");
     ok &= check(model.row_text(0) == QStringLiteral("top-two"),
         "synchronized home repaint still updates the visible top row");
+    const term::Terminal_render_snapshot synchronized_scrollback_snapshot =
+        model.render_snapshot(request_for_model(model, 36U, 1));
+    ok &= check(snapshot_row_text(synchronized_scrollback_snapshot, 0) ==
+        QStringLiteral("top-one"),
+        "synchronized home repaint keeps old top row in scrollback");
 
     model   = term::Terminal_screen_model({
         term::terminal_grid_size_t{5, 20},
@@ -906,8 +913,8 @@ bool test_primary_repaint_recovery_ignores_synchronized_repaint()
 
     ok &= check(diagnostic_count(result) == 0,
         "pre-armed synchronized repaint has no diagnostics");
-    ok &= check(model.scrollback_size() == 0,
-        "entering synchronized output cancels pre-armed repaint recovery");
+    ok &= check(model.scrollback_size() == 1,
+        "pre-armed synchronized repaint appends displaced top row");
 
     return ok;
 }
@@ -1513,7 +1520,7 @@ int main()
     ok &= test_primary_repaint_recovery_ignores_plain_home_repaint();
     ok &= test_primary_repaint_recovery_ignores_clear_after_home();
     ok &= test_primary_repaint_recovery_survives_split_repaint();
-    ok &= test_primary_repaint_recovery_ignores_synchronized_repaint();
+    ok &= test_primary_repaint_recovery_handles_synchronized_repaint();
     ok &= test_scroll_region_zero_bottom_defaults_to_screen_bottom();
     ok &= test_scroll_up_down_sequences();
     ok &= test_blank_fill_operations_use_current_style();
