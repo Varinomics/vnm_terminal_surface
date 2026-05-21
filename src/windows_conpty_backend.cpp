@@ -16,6 +16,10 @@
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE 0x00020016
 #endif
 
+#if defined(__MINGW32__)
+DECLARE_HANDLE(HPCON);
+#endif
+
 #include <QProcessEnvironment>
 #include <QStringList>
 #include <algorithm>
@@ -53,6 +57,15 @@ DWORD wait_timeout_from_interval(std::chrono::milliseconds interval)
 bool process_exited_within(HANDLE process, std::chrono::milliseconds interval)
 {
     return WaitForSingleObject(process, wait_timeout_from_interval(interval)) == WAIT_OBJECT_0;
+}
+
+HANDLE thread_handle_for_cancel(std::thread& thread)
+{
+#if defined(__MINGW32__)
+    return reinterpret_cast<HANDLE>(thread.native_handle());
+#else
+    return thread.native_handle();
+#endif
 }
 
 class Unique_handle
@@ -1041,11 +1054,11 @@ private:
     void cancel_blocking_io()
     {
         if (m_reader_thread.joinable()) {
-            CancelSynchronousIo(m_reader_thread.native_handle());
+            CancelSynchronousIo(thread_handle_for_cancel(m_reader_thread));
         }
 
         if (m_writer_thread.joinable()) {
-            CancelSynchronousIo(m_writer_thread.native_handle());
+            CancelSynchronousIo(thread_handle_for_cancel(m_writer_thread));
         }
     }
 
