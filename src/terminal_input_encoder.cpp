@@ -196,6 +196,9 @@ QByteArray special_key_bytes(const QKeyEvent& event)
     switch (event.key()) {
         case Qt::Key_Return:
         case Qt::Key_Enter:
+            if (terminal_modifiers(event) == Qt::ShiftModifier) {
+                return QByteArray(1, '\n');
+            }
             return alt_prefixed(QByteArray(1, '\r'), event);
         case Qt::Key_Tab:
             if ((event.modifiers() & Qt::ShiftModifier) != Qt::NoModifier) {

@@ -1357,6 +1357,10 @@ bool test_keyboard_printable_controls_and_prompt_path(QGuiApplication& app)
         QStringLiteral("\r"), bytes_from_hex("0d"),
         "Return writes carriage return");
     ok &= send_key_and_expect_write(
+        fixture.surface, *backend_ptr, Qt::Key_Return, Qt::ShiftModifier,
+        QStringLiteral("\r"), bytes_from_hex("0a"),
+        "Shift+Return writes line feed");
+    ok &= send_key_and_expect_write(
         fixture.surface, *backend_ptr, Qt::Key_Tab, Qt::NoModifier,
         QStringLiteral("\t"), bytes_from_hex("09"),
         "Tab writes horizontal tab");
