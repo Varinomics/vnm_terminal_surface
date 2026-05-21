@@ -38,6 +38,7 @@ namespace {
 
 constexpr qreal       k_no_wrap_text_line_width             = 1024.0 * 1024.0;
 constexpr qreal       k_pi                                  = 3.14159265358979323846;
+constexpr qreal       k_faint_foreground_alpha_factor       = 0.5;
 constexpr qreal       k_graphic_antialias_feather           = 0.5;
 constexpr qreal       k_ascii_advance_tolerance_floor       = 0.000001;
 constexpr qreal       k_ascii_advance_tolerance_ratio       = 0.0000001;
@@ -291,6 +292,16 @@ QColor effective_background(
     return resolved_color(style.background, snapshot.color_state, false);
 }
 
+QColor faint_foreground_color(QColor color)
+{
+    color.setAlpha(std::clamp(
+        static_cast<int>(std::round(
+            static_cast<qreal>(color.alpha()) * k_faint_foreground_alpha_factor)),
+        0,
+        255));
+    return color;
+}
+
 QColor default_terminal_background(
     const Terminal_render_snapshot& snapshot)
 {
@@ -326,6 +337,9 @@ render_style_attributes_t render_style_attributes(
     QColor background = effective_background(style, snapshot);
     if (style_is_inverse(style, snapshot)) {
         std::swap(foreground, background);
+    }
+    if (terminal_style_has_attribute(style, Terminal_style_attribute::FAINT)) {
+        foreground = faint_foreground_color(foreground);
     }
     if (terminal_style_has_attribute(style, Terminal_style_attribute::INVISIBLE)) {
         foreground = background;

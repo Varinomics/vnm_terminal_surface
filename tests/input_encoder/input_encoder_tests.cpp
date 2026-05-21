@@ -131,6 +131,23 @@ bool test_cursor_and_navigation_modes()
 {
     bool ok = true;
 
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Return, Qt::NoModifier),
+        bytes_from_hex("0d"),
+        "plain Return writes CR");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Return, Qt::ShiftModifier),
+        bytes_from_hex("0a"),
+        "Shift+Return writes LF for multiline terminal prompts");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Enter, Qt::ShiftModifier | Qt::KeypadModifier),
+        bytes_from_hex("0a"),
+        "Shift+keypad Enter writes LF for multiline terminal prompts");
+    ok &= check_bytes_equal(
+        encode(Qt::Key_Return, Qt::AltModifier),
+        bytes_from_hex("1b0d"),
+        "Alt+Return keeps ESC-prefixed CR");
+
     term::Terminal_input_mode_state modes;
     ok &= check_bytes_equal(
         encode(Qt::Key_Home, Qt::NoModifier, {}, modes),

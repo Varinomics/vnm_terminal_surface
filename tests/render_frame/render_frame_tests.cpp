@@ -181,20 +181,28 @@ bool test_plain_text_color_inverse_and_wide_skip()
     term::set_terminal_style_attribute(inverse, term::Terminal_style_attribute::INVERSE);
     snapshot.styles.push_back(inverse);
 
+    term::Terminal_text_style faint = colored;
+    term::set_terminal_style_attribute(faint, term::Terminal_style_attribute::FAINT);
+    snapshot.styles.push_back(faint);
+
     snapshot.cells.push_back({{0, 0}, QStringLiteral("A"), 0U, 1, false, 1U});
     snapshot.cells.push_back({{0, 1}, QStringLiteral("B"), 0U, 1, false, 2U});
-    snapshot.cells.push_back({{0, 2}, QStringLiteral("\u754c"), 0U, 2, false, 1U});
-    snapshot.cells.push_back({{0, 3}, {}, 0U, 0, true, 1U});
+    snapshot.cells.push_back({{0, 2}, QStringLiteral("C"), 0U, 1, false, 3U});
+    snapshot.cells.push_back({{0, 3}, QStringLiteral("\u754c"), 0U, 2, false, 1U});
+    snapshot.cells.push_back({{0, 4}, {}, 0U, 0, true, 1U});
 
     const term::Terminal_render_frame frame = build(snapshot);
-    ok &= check(frame.text_runs.size() == 3U, "frame skips wide continuation text run");
+    ok &= check(frame.text_runs.size() == 4U, "frame skips wide continuation text run");
     ok &= check(frame.text_runs[0].foreground == QColor(204, 0, 0) &&
         frame.text_runs[0].background == QColor(0, 48, 204),
         "frame resolves explicit foreground/background");
     ok &= check(frame.text_runs[1].foreground == QColor(0, 48, 204) &&
         frame.text_runs[1].background == QColor(204, 0, 0),
         "frame applies inverse colors");
-    ok &= check(frame.text_runs[2].rect.width() == 20.0,
+    ok &= check(frame.text_runs[2].foreground == QColor(204, 0, 0, 128) &&
+        frame.text_runs[2].background == QColor(0, 48, 204),
+        "frame applies faint foreground");
+    ok &= check(frame.text_runs[3].rect.width() == 20.0,
         "wide base cell spans display width");
     return ok;
 }
