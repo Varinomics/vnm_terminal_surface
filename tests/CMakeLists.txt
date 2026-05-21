@@ -1085,7 +1085,7 @@ if(WIN32)
     )
 endif()
 
-if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+if(CMAKE_SYSTEM_NAME STREQUAL Linux)
     add_executable(vnm_terminal_linux_pty_backend
         linux_pty_backend/linux_pty_backend_tests.cpp
     )
@@ -1152,7 +1152,7 @@ if(WIN32)
     )
 endif()
 
-if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+if(CMAKE_SYSTEM_NAME STREQUAL Linux)
     list(APPEND vnm_terminal_test_process_targets
         vnm_terminal_linux_pty_backend
     )
