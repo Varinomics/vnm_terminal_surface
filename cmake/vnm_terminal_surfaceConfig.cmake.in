@@ -1,0 +1,9 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+find_dependency(Qt6 6.7 COMPONENTS Core Gui Quick)
+
+include("${CMAKE_CURRENT_LIST_DIR}/vnm_terminal_surfaceTargets.cmake")
+
+check_required_components(vnm_terminal_surface)

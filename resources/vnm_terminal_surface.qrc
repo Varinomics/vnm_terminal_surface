@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/vnm_terminal_surface">
+    <file alias="fonts/vnm_framework_monospace.ttf">fonts/vnm_framework_monospace.ttf</file>
+  </qresource>
+</RCC>
