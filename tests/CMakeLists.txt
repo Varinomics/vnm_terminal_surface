@@ -354,6 +354,33 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_render_frame>"
 )
 
+if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
+    add_executable(vnm_terminal_transcript
+        transcript/transcript_tests.cpp
+    )
+
+    add_dependencies(vnm_terminal_transcript
+        vnm_terminal_transcript_replay
+    )
+
+    target_link_libraries(vnm_terminal_transcript PRIVATE
+        vnm_terminal_surface::vnm_terminal_surface
+    )
+
+    set_target_properties(vnm_terminal_transcript PROPERTIES
+        AUTOMOC OFF
+    )
+
+    add_test(
+        NAME vnm_terminal_transcript
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_transcript>"
+            "$<TARGET_FILE:vnm_terminal_transcript_replay>"
+    )
+endif()
+
 add_executable(vnm_terminal_qsg_render
     qsg_render/qsg_render_tests.cpp
 )
@@ -463,6 +490,10 @@ add_executable(vnm_terminal_surface_host
 
 target_link_libraries(vnm_terminal_surface_host PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
+)
+
+target_compile_definitions(vnm_terminal_surface_host PRIVATE
+    VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY}>
 )
 
 set_target_properties(vnm_terminal_surface_host PROPERTIES
@@ -1146,6 +1177,12 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_backend_session
 )
 
+if(TARGET vnm_terminal_transcript)
+    list(APPEND vnm_terminal_test_process_targets
+        vnm_terminal_transcript
+    )
+endif()
+
 if(WIN32)
     list(APPEND vnm_terminal_test_process_targets
         vnm_terminal_windows_conpty_backend
@@ -1193,6 +1230,41 @@ if(TARGET vnm_terminal_parser_libfuzzer)
         vnm_terminal_parser_libfuzzer
     )
 endif()
+
+set(vnm_terminal_distribution_guard_configure_args
+    "-G" "${CMAKE_GENERATOR}"
+)
+
+if(NOT "${CMAKE_GENERATOR_PLATFORM}" STREQUAL "")
+    list(APPEND vnm_terminal_distribution_guard_configure_args
+        "-A" "${CMAKE_GENERATOR_PLATFORM}"
+    )
+endif()
+
+if(NOT "${CMAKE_GENERATOR_TOOLSET}" STREQUAL "")
+    list(APPEND vnm_terminal_distribution_guard_configure_args
+        "-T" "${CMAKE_GENERATOR_TOOLSET}"
+    )
+endif()
+
+add_test(
+    NAME vnm_terminal_surface_rejects_distribution_transcript_build
+    COMMAND
+        "${CMAKE_COMMAND}"
+        ${vnm_terminal_distribution_guard_configure_args}
+        -S "${PROJECT_SOURCE_DIR}"
+        -B "${CMAKE_CURRENT_BINARY_DIR}/vnm_terminal_surface_distribution_guard"
+        -DVNM_TERMINAL_DISTRIBUTION_BUILD=ON
+        -DVNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON
+        -DVNM_TERMINAL_SURFACE_BUILD_TESTING=OFF
+)
+
+set_tests_properties(vnm_terminal_surface_rejects_distribution_transcript_build PROPERTIES
+    PASS_REGULAR_EXPRESSION
+        "VNM_TERMINAL_DISTRIBUTION_BUILD=ON requires"
+    TIMEOUT 30
+    WILL_FAIL TRUE
+)
 
 
 

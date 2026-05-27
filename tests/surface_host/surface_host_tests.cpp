@@ -1,5 +1,6 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
+#include "vnm_terminal/internal/terminal_transcript.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
 
@@ -11,12 +12,14 @@
 #include <QHoverEvent>
 #include <QImage>
 #include <QInputMethodEvent>
+#include <QJsonObject>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QQuickItem>
 #include <QQuickWindow>
 #include <QThread>
+#include <QTemporaryDir>
 #include <QVariant>
 #include <QWheelEvent>
 #include <atomic>
@@ -87,6 +90,46 @@ bool check_write_chunks_equal(
     }
 
     return true;
+}
+
+std::optional<term::Terminal_transcript_event> first_transcript_event(
+    const std::vector<term::Terminal_transcript_event>& events,
+    const QString&                                      kind)
+{
+    for (const term::Terminal_transcript_event& event : events) {
+        if (event.kind == kind) {
+            return event;
+        }
+    }
+
+    return std::nullopt;
+}
+
+std::optional<term::Terminal_transcript_event> last_transcript_event(
+    const std::vector<term::Terminal_transcript_event>& events,
+    const QString&                                      kind)
+{
+    for (auto it = events.rbegin(); it != events.rend(); ++it) {
+        if (it->kind == kind) {
+            return *it;
+        }
+    }
+
+    return std::nullopt;
+}
+
+bool transcript_has_event_after(
+    const std::vector<term::Terminal_transcript_event>& events,
+    const QString&                                      kind,
+    const term::Terminal_transcript_event&              marker)
+{
+    for (const term::Terminal_transcript_event& event : events) {
+        if (event.kind == kind && event.event_index > marker.event_index) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 bool nearly_equal(qreal lhs, qreal rhs, qreal tolerance = 0.01)
@@ -366,6 +409,16 @@ QByteArray numbered_scroll_lines(int count)
     return bytes;
 }
 
+QByteArray repeated_scroll_lines(int count, const QByteArray& line)
+{
+    QByteArray bytes;
+    for (int i = 0; i < count; ++i) {
+        bytes += line;
+        bytes += QByteArrayLiteral("\r\n");
+    }
+    return bytes;
+}
+
 struct Scripted_backend_lifecycle_state
 {
     std::atomic<int> destructed_count{0};
@@ -428,6 +481,9 @@ public:
                 term::backend_reject(
                     term::Terminal_backend_error_code::WRITE_FAILED,
                     QStringLiteral("scripted write rejection"));
+        }
+        for (const QByteArray& output : outputs_during_write) {
+            m_callbacks.output_received(output);
         }
         return term::backend_accept();
     }
@@ -522,6 +578,7 @@ public:
     bool                       reject_writes          = false;
     bool                       output_paused          = false;
     std::vector<QByteArray>    outputs_during_start;
+    std::vector<QByteArray>    outputs_during_write;
     std::vector<term::Terminal_launch_config>
                                start_configs;
     std::vector<term::Terminal_backend_resize_request>
@@ -1627,8 +1684,80 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
             "Ctrl+C with empty active selection is accepted by copy policy");
         ok &= check(backend_ptr->writes.size() == empty_selection_write_count,
             "Ctrl+C with empty active selection writes no ETX");
-        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard).isEmpty(),
-            "Ctrl+C with empty active selection copies empty text");
+    ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard).isEmpty(),
+        "Ctrl+C with empty active selection copies empty text");
+    }
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("alpha\r\nbeta")};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "synchronized clear copy policy surface starts");
+
+        fixture.surface.set_copy_shortcut_policy(
+            VNM_TerminalSurface::Copy_shortcut_policy::COPY_SELECTION_OR_IGNORE);
+        const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 1);
+        const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            start_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "synchronized clear copy policy selection press is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            end_point,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "synchronized clear copy policy selection drag is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            end_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "synchronized clear copy policy selection release is accepted");
+        ok &= check(fixture.surface.selected_text() == QStringLiteral("lpha"),
+            "synchronized clear copy policy fixture has selected text");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hheld"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
+        fixture.surface.clear_selection();
+        ok &= check(fixture.surface.selected_text().isEmpty(),
+            "selected_text observes synchronized clear instead of stale visible spans");
+
+        QGuiApplication::clipboard()->setText(QStringLiteral("synchronized-clear-sentinel"),
+            QClipboard::Clipboard);
+        const std::size_t write_count = backend_ptr->writes.size();
+        ok &= send_key(
+            fixture.surface,
+            Qt::Key_C,
+            Qt::ControlModifier,
+            {},
+            "copy-or-ignore policy consumes Ctrl+C after synchronized clear");
+        ok &= check(backend_ptr->writes.size() == write_count,
+            "copy after synchronized clear writes no backend bytes");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral("synchronized-clear-sentinel"),
+            "copy after synchronized clear leaves clipboard unchanged");
     }
 
     {
@@ -1780,8 +1909,8 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
             ok &= check(!expected_text.isEmpty() && expected_text.contains(anchor_text),
                 "scrollback-spanning copy shortcut selected_text includes offscreen text");
             ok &= check(selection_snapshot != nullptr &&
-                !selection_snapshot->selection_spans.empty(),
-                "scrollback-spanning copy shortcut publishes visible selection spans");
+                selection_snapshot->selection_spans.empty(),
+                "scrollback-spanning copy shortcut suppresses spans without full visible proof");
             ok &= check(selection_snapshot != nullptr &&
                 !snapshot_contains_text(*selection_snapshot, anchor_text),
                 "scrollback-spanning copy shortcut anchor text is outside the visible snapshot");
@@ -2140,18 +2269,27 @@ bool test_control_wheel_font_zoom(QGuiApplication& app)
         Qt::ControlModifier,
         120,
         true,
-        "clamped Ctrl+wheel drains deferred backend output");
+        "clamped Ctrl+wheel does not drain deferred backend output");
     const std::shared_ptr<const term::Terminal_render_snapshot> post_zoom_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
     ok &= check(post_zoom_snapshot != nullptr &&
-        snapshot_contains_text(*post_zoom_snapshot, QStringLiteral("zoom-drain")),
-        "clamped Ctrl+wheel exposes deferred backend output immediately");
+        !snapshot_contains_text(*post_zoom_snapshot, QStringLiteral("zoom-drain")),
+        "clamped Ctrl+wheel leaves deferred backend output pending");
     ok &= check(fixture.surface.font_size() == 72.0,
         "clamped Ctrl+wheel leaves maximum font size unchanged");
+    ok &= check(backend_ptr->output_paused,
+        "clamped Ctrl+wheel leaves deferred backend output paused");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> drained_zoom_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(drained_zoom_snapshot != nullptr &&
+        snapshot_contains_text(*drained_zoom_snapshot, QStringLiteral("zoom-drain")),
+        "normal drain exposes deferred backend output after clamped Ctrl+wheel");
     ok &= check(!backend_ptr->output_paused,
-        "clamped Ctrl+wheel drain resumes backend output");
+        "normal drain after clamped Ctrl+wheel resumes backend output");
     ok &= check(!backpressure_states.empty() && !backpressure_states.back(),
-        "clamped Ctrl+wheel drain publishes final backpressure release");
+        "normal drain after clamped Ctrl+wheel publishes final backpressure release");
     const std::size_t post_zoom_write_count = backend_ptr->writes.size();
     ok &= send_key_and_expect_write(
         fixture.surface,
@@ -2830,6 +2968,72 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
 
     {
         Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "pending alternate-screen wheel surface starts");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> initial_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(initial_snapshot != nullptr &&
+            initial_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+            initial_snapshot->viewport.scrollback_rows > 0 &&
+            initial_snapshot->viewport.offset_from_tail == 0,
+            "pending alternate-screen fixture starts on primary scrollback tail");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?1049hpending-alternate"));
+        const std::size_t pending_alternate_wheel_index = backend_ptr->writes.size();
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            120,
+            true,
+            "pending alternate-screen transition does not drain before wheel routing");
+        const std::shared_ptr<const term::Terminal_render_snapshot> pending_wheel_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(pending_wheel_snapshot != nullptr &&
+            pending_wheel_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+            pending_wheel_snapshot->viewport.offset_from_tail > 0,
+            "pending alternate-screen wheel uses published primary scrollback");
+        ok &= check(backend_ptr->writes.size() == pending_alternate_wheel_index,
+            "pending alternate-screen wheel writes no terminal input");
+
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        const std::shared_ptr<const term::Terminal_render_snapshot> drained_alternate_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(drained_alternate_snapshot != nullptr &&
+            drained_alternate_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
+            "normal drain applies pending alternate-screen transition");
+
+        const std::size_t drained_alternate_wheel_index = backend_ptr->writes.size();
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            120,
+            true,
+            "drained alternate-screen transition affects future wheel routing");
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            drained_alternate_wheel_index,
+            {
+                QByteArrayLiteral("\x1b[A"),
+                QByteArrayLiteral("\x1b[A"),
+                QByteArrayLiteral("\x1b[A"),
+            },
+            "future alternate-screen wheel writes cursor-up input after normal drain");
+    }
+
+    {
+        Surface_fixture fixture;
         pump_events(app);
 
         auto backend = std::make_unique<Scripted_backend>();
@@ -2891,15 +3095,24 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             Qt::NoModifier,
             80,
             true,
-            "alternate-scroll toggle clears partial wheel fragment");
+            "pending alternate-scroll toggle is accepted conservatively");
         ok &= check(backend_ptr->writes.size() == partial_wheel_index,
-            "alternate-scroll toggle prevents stale fragment input");
+            "pending alternate-scroll toggle writes no stale fragment input");
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
         ok &= send_wheel_event(
             fixture.surface,
             Qt::NoModifier,
             40,
             true,
-            "post-toggle high-resolution wheel fragment completes a fresh step");
+            "first post-toggle high-resolution wheel fragment is retained");
+        ok &= check(backend_ptr->writes.size() == partial_wheel_index,
+            "first post-toggle high-resolution wheel fragment writes no input");
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            80,
+            true,
+            "second post-toggle high-resolution wheel fragment completes a fresh step");
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
             partial_wheel_index,
@@ -2934,16 +3147,27 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             Qt::NoModifier,
             120,
             true,
-            "alternate-screen wheel applies pending application-cursor mode before input");
+            "alternate-screen wheel with pending application-cursor mode is accepted");
+        ok &= check(backend_ptr->writes.size() == application_cursor_index,
+            "pending application-cursor mode prevents stale alternate-screen input");
+
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        const std::size_t drained_application_cursor_index = backend_ptr->writes.size();
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            120,
+            true,
+            "drained application-cursor mode affects future alternate-screen wheel");
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
-            application_cursor_index,
+            drained_application_cursor_index,
             {
                 QByteArrayLiteral("\x1bOA"),
                 QByteArrayLiteral("\x1bOA"),
                 QByteArrayLiteral("\x1bOA"),
             },
-            "alternate-screen wheel input honors application-cursor mode");
+            "future alternate-screen wheel input honors drained application-cursor mode");
 
         backend_ptr->emit_output(QByteArrayLiteral("\x1b[?1007l"));
         const std::size_t alternate_scroll_reset_index = backend_ptr->writes.size();
@@ -2952,16 +3176,27 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             Qt::NoModifier,
             120,
             true,
-            "plain wheel on alternate screen after DEC 1007 reset still uses fallback input");
+            "plain wheel with pending DEC 1007 reset is accepted conservatively");
+        ok &= check(backend_ptr->writes.size() == alternate_scroll_reset_index,
+            "pending DEC 1007 reset prevents stale alternate-screen input");
+
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        const std::size_t drained_alternate_scroll_reset_index = backend_ptr->writes.size();
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            120,
+            true,
+            "plain wheel after drained DEC 1007 reset still uses fallback input");
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
-            alternate_scroll_reset_index,
+            drained_alternate_scroll_reset_index,
             {
                 QByteArrayLiteral("\x1bOA"),
                 QByteArrayLiteral("\x1bOA"),
                 QByteArrayLiteral("\x1bOA"),
             },
-            "plain wheel after DEC 1007 reset writes application-cursor input");
+            "plain wheel after drained DEC 1007 reset writes application-cursor input");
 
         fixture.surface.set_wheel_event_policy(
             VNM_TerminalSurface::Wheel_event_policy::LOCAL_SCROLLBACK_ONLY);
@@ -3000,16 +3235,9 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             Qt::NoModifier,
             120,
             true,
-            "synchronized hidden alternate-scroll wheel is accepted");
-        ok &= check_write_chunks_equal(
-            backend_ptr->writes,
-            synchronized_wheel_index,
-            {
-                QByteArrayLiteral("\x1b[A"),
-                QByteArrayLiteral("\x1b[A"),
-                QByteArrayLiteral("\x1b[A"),
-            },
-            "alternate-scroll wheel uses live synchronized-output mode");
+            "synchronized hidden alternate-scroll wheel is accepted conservatively");
+        ok &= check(backend_ptr->writes.size() == synchronized_wheel_index,
+            "alternate-scroll wheel does not use hidden synchronized-output mode");
     }
 
     {
@@ -3486,10 +3714,14 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             0,
             120,
             true,
-            "mouse DECRST drains and clears partial wheel remainder");
+            "pending mouse DECRST is accepted conservatively");
         ok &= check(backend_ptr->writes.size() == mode_boundary_wheel_index,
-            "mouse DECRST after partial wheel writes no stale SGR report");
+            "pending mouse DECRST after partial wheel writes no stale SGR report");
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
         backend_ptr->emit_output(QByteArrayLiteral("\x1b[?1000;1006h"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
         ok &= send_wheel_event(
             fixture.surface,
             Qt::NoModifier,
@@ -3497,9 +3729,9 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             0,
             80,
             true,
-            "mouse DECSET starts a fresh wheel remainder after reset");
+            "drained mouse DECSET starts a fresh wheel remainder after reset");
         ok &= check(backend_ptr->writes.size() == mode_boundary_wheel_index,
-            "mouse DECSET after reset does not reuse stale wheel remainder");
+            "drained mouse DECSET after reset does not reuse stale wheel remainder");
         ok &= send_wheel_event(
             fixture.surface,
             Qt::NoModifier,
@@ -3533,9 +3765,21 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             0,
             80,
             true,
-            "collapsed mouse mode toggle starts a fresh wheel remainder");
+            "pending collapsed mouse mode toggle is accepted conservatively");
         ok &= check(backend_ptr->writes.size() == collapsed_boundary_wheel_index,
-            "collapsed mouse mode toggle does not reuse stale wheel remainder");
+            "pending collapsed mouse mode toggle writes no stale SGR report");
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            report_point,
+            0,
+            80,
+            true,
+            "drained collapsed mouse mode toggle starts a fresh wheel remainder");
+        ok &= check(backend_ptr->writes.size() == collapsed_boundary_wheel_index,
+            "drained collapsed mouse mode toggle does not reuse stale wheel remainder");
         ok &= send_wheel_event(
             fixture.surface,
             Qt::NoModifier,
@@ -3602,9 +3846,28 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             0,
             120,
             true,
-            "pending mouse DECRST is drained before wheel routing");
+            "pending mouse DECRST leaves current wheel terminal-owned");
         ok &= check(backend_ptr->writes.size() == pending_reset_wheel_index,
-            "pending mouse DECRST suppresses stale SGR wheel bytes");
+            "pending mouse DECRST suppresses stale SGR wheel bytes without draining");
+
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
+        const std::size_t drained_reset_wheel_index = backend_ptr->writes.size();
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            report_point,
+            0,
+            120,
+            true,
+            "drained mouse DECRST affects future wheel routing");
+        ok &= check(backend_ptr->writes.size() == drained_reset_wheel_index,
+            "future wheel after drained mouse DECRST writes no SGR bytes");
+        const std::shared_ptr<const term::Terminal_render_snapshot> drained_reset_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(drained_reset_snapshot != nullptr &&
+            drained_reset_snapshot->viewport.offset_from_tail > 0,
+            "future wheel after drained mouse DECRST scrolls published primary scrollback");
     }
 
     {
@@ -3641,12 +3904,31 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             0,
             120,
             true,
-            "pending mouse DECSET is drained before wheel routing");
+            "pending mouse DECSET does not drain before wheel routing");
+        ok &= check(backend_ptr->writes.size() == pending_set_wheel_index,
+            "pending mouse DECSET writes no SGR bytes on the current wheel");
+        const std::shared_ptr<const term::Terminal_render_snapshot> pending_set_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(pending_set_snapshot != nullptr &&
+            pending_set_snapshot->viewport.offset_from_tail > 0,
+            "pending mouse DECSET current wheel uses published local scrollback");
+
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
+        const std::size_t drained_set_wheel_index = backend_ptr->writes.size();
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            report_point,
+            0,
+            120,
+            true,
+            "drained mouse DECSET routes future wheel to SGR reporting");
         ok &= check_write_chunks_equal(
             backend_ptr->writes,
-            pending_set_wheel_index,
+            drained_set_wheel_index,
             { QByteArrayLiteral("\x1b[<64;1;1M") },
-            "pending mouse DECSET routes wheel to SGR reporting");
+            "future wheel after drained mouse DECSET writes SGR reporting");
     }
 
     {
@@ -3832,16 +4114,553 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
             fixture.surface,
             Qt::NoModifier,
             120,
-            true,
-            "synchronized hidden mouse-reporting wheel is accepted");
-        ok &= check_write_chunks_equal(
-            backend_ptr->writes,
-            wheel_index,
-            { sgr_mouse_report(64, 0, 1, 'M') },
-            "wheel reporting uses live synchronized-output mouse mode");
+            false,
+            "synchronized hidden mouse-reporting wheel is not consumed from stale state");
+        ok &= check(backend_ptr->writes.size() == wheel_index,
+            "wheel reporting does not use hidden synchronized-output mouse mode");
     }
 
     return ok;
+}
+
+bool test_local_first_wheel_scroll_keeps_callbacks_queued_without_backend_drain(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_scrollback_limit(200);
+    fixture.surface.set_wheel_event_policy(
+        VNM_TerminalSurface::Wheel_event_policy::LOCAL_SCROLLBACK_FIRST);
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "local-first post-barrier callback surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    bool post_barrier_output_queued = false;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::terminal_title_changed,
+        &fixture.surface,
+        [&] {
+            if (post_barrier_output_queued) {
+                return;
+            }
+
+            post_barrier_output_queued = true;
+            (void)backend_ptr->emit_output(QByteArrayLiteral("\x1b[?1049hpost-barrier-alt"));
+        });
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;post-barrier-title\a"));
+    ok &= send_wheel_event(
+        fixture.surface,
+        Qt::NoModifier,
+        120,
+        true,
+        "local-first wheel scroll with post-barrier callback is accepted");
+    ok &= check(!post_barrier_output_queued,
+        "local-first wheel leaves pre-existing backend callback queued");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> post_wheel_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(post_wheel_snapshot != nullptr &&
+        post_wheel_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY,
+        "local-first post-barrier callback stays queued until owner drain");
+    ok &= check(post_wheel_snapshot != nullptr &&
+        post_wheel_snapshot->viewport.offset_from_tail > 0,
+        "local-first wheel still applies primary scrollback movement");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    ok &= check(post_barrier_output_queued,
+        "normal drain processes pre-existing callback and queues follow-up output");
+    const std::shared_ptr<const term::Terminal_render_snapshot> first_drained_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(first_drained_snapshot != nullptr &&
+        first_drained_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY,
+        "follow-up output from notification callback waits for a later owner drain");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> second_drained_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(second_drained_snapshot != nullptr &&
+        second_drained_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
+        "local-first queued post-barrier callback is applied by the later drain");
+
+    return ok;
+}
+
+bool test_wheel_input_stops_after_post_barrier_callbacks_become_pending(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_alternate_screen_wheel_policy(
+        VNM_TerminalSurface::Alternate_screen_wheel_policy::PAGE_KEYS);
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1049halternate-ready"),
+    };
+    backend->outputs_during_write = {
+        QByteArrayLiteral("\x1b[?1049lpost-wheel-output\r\n"),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "wheel post-barrier callback surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> initial_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(initial_snapshot != nullptr &&
+        initial_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
+        "wheel post-barrier callback fixture starts on alternate screen");
+
+    const std::size_t wheel_write_index = backend_ptr->writes.size();
+    ok &= send_wheel_event(
+        fixture.surface,
+        Qt::NoModifier,
+        240,
+        true,
+        "alternate-screen page wheel accepts multi-step input");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        wheel_write_index,
+        { QByteArrayLiteral("\x1b[5~") },
+        "alternate-screen page wheel stops after callback becomes pending");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> post_wheel_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(post_wheel_snapshot != nullptr &&
+        post_wheel_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
+        "post-barrier backend callback stays queued until owner drain");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> drained_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(drained_snapshot != nullptr &&
+        drained_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY,
+        "queued post-barrier backend callback is applied by the next drain");
+
+    return ok;
+}
+
+bool test_wheel_mouse_reporting_stops_after_post_barrier_callbacks_become_pending(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1000;1006hmouse-ready"),
+    };
+    backend->outputs_during_write = {
+        QByteArrayLiteral("\x1b[?1049hpost-mouse-alt"),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "mouse wheel post-barrier callback surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    const int report_row       = 0;
+    const int report_column    = 0;
+    const QPointF report_point = point_in_grid_cell(fixture.surface, report_row, report_column);
+
+    const std::size_t wheel_write_index = backend_ptr->writes.size();
+    ok &= send_wheel_event(
+        fixture.surface,
+        Qt::NoModifier,
+        report_point,
+        0,
+        240,
+        true,
+        "mouse-reporting wheel accepts multi-step input");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        wheel_write_index,
+        { sgr_mouse_report(64, report_row, report_column, 'M') },
+        "mouse-reporting wheel stops after callback becomes pending");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> post_wheel_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(post_wheel_snapshot != nullptr &&
+        post_wheel_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY,
+        "mouse wheel post-barrier callback stays queued until owner drain");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> drained_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(drained_snapshot != nullptr &&
+        drained_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
+        "mouse wheel queued post-barrier callback is applied by the next drain");
+
+    return ok;
+}
+
+bool test_local_first_wheel_trace_records_ingress_before_route(QGuiApplication& app)
+{
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    bool ok = true;
+
+    QTemporaryDir transcript_dir;
+    ok &= check(transcript_dir.isValid(), "local-first wheel trace temp dir is valid");
+    if (!transcript_dir.isValid()) {
+        return ok;
+    }
+
+    const QString transcript_path =
+        transcript_dir.filePath(QStringLiteral("local_first_wheel.ndjson"));
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        fixture.surface.set_transcript_capture_path(transcript_path);
+        fixture.surface.set_wheel_trace_enabled(true);
+        fixture.surface.set_wheel_event_policy(
+            VNM_TerminalSurface::Wheel_event_policy::LOCAL_SCROLLBACK_FIRST);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        (void)start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "local-first no-drain wheel surface starts");
+        if (!started) {
+            return ok;
+        }
+
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            120,
+            true,
+            "local-first traced wheel scroll is accepted");
+    }
+
+    QString error;
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(transcript_path, &error);
+    ok &= check(events.has_value(), "local-first wheel trace transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return ok;
+    }
+
+    const std::optional<term::Terminal_transcript_event> wheel_trace =
+        first_transcript_event(*events, QStringLiteral("surface.wheel_trace"));
+    ok &= check(wheel_trace.has_value(), "local-first wheel trace is present");
+    const std::optional<term::Terminal_transcript_event> wheel_ingress =
+        first_transcript_event(*events, QStringLiteral("surface.wheel_ingress"));
+    ok &= check(wheel_ingress.has_value(), "local-first wheel ingress trace is present");
+    if (wheel_ingress.has_value() && wheel_trace.has_value()) {
+        ok &= check(wheel_ingress->event_index < wheel_trace->event_index,
+            "wheel ingress trace precedes routed wheel trace");
+    }
+    return ok;
+#else
+    (void)app;
+    return true;
+#endif
+}
+
+bool test_local_first_wheel_scroll_applies_during_synchronized_output_block(
+    QGuiApplication& app)
+{
+    bool ok = true;
+
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    QTemporaryDir transcript_dir;
+    ok &= check(transcript_dir.isValid(), "synchronized-output wheel trace temp dir is valid");
+    if (!transcript_dir.isValid()) {
+        return ok;
+    }
+
+    const QString transcript_path =
+        transcript_dir.filePath(QStringLiteral("synchronized_output_blocked_wheel.ndjson"));
+#endif
+
+    {
+        constexpr int k_detached_offset_from_tail = 6;
+        constexpr int k_blocked_wheel_event_count = 2;
+        constexpr int k_expected_wheel_delta =
+            k_blocked_wheel_event_count * 3;
+
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        fixture.surface.set_wheel_event_policy(
+            VNM_TerminalSurface::Wheel_event_policy::LOCAL_SCROLLBACK_FIRST);
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+        fixture.surface.set_transcript_capture_path(transcript_path);
+        fixture.surface.set_wheel_trace_enabled(true);
+#endif
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "synchronized-output blocked wheel surface starts");
+        if (!started) {
+            return ok;
+        }
+
+        ok &= check(fixture.surface.scroll_to_offset_from_tail(k_detached_offset_from_tail),
+            "synchronized-output blocked wheel setup detaches viewport from tail");
+        const std::shared_ptr<const term::Terminal_render_snapshot> detached_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(detached_snapshot != nullptr &&
+            !detached_snapshot->viewport.follow_tail &&
+            detached_snapshot->viewport.offset_from_tail == k_detached_offset_from_tail,
+            "synchronized-output blocked wheel setup publishes detached viewport");
+        const std::uint64_t blocked_sequence =
+            detached_snapshot != nullptr ? detached_snapshot->metadata.sequence : 0U;
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hblocked synchronized output"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> blocked_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(blocked_snapshot != nullptr &&
+            !blocked_snapshot->viewport.follow_tail &&
+            blocked_snapshot->viewport.offset_from_tail == k_detached_offset_from_tail,
+            "synchronized-output block leaves detached publication in place before wheel");
+        ok &= check(blocked_snapshot != nullptr &&
+            blocked_snapshot->metadata.sequence == blocked_sequence,
+            "synchronized-output block does not publish hidden output before wheel");
+
+        const std::size_t backend_write_count = backend_ptr->writes.size();
+        for (int i = 0; i < k_blocked_wheel_event_count; ++i) {
+            ok &= send_wheel_event(
+                fixture.surface,
+                Qt::NoModifier,
+                120,
+                true,
+                "local-first wheel during synchronized-output block is accepted");
+        }
+        ok &= check(backend_ptr->writes.size() == backend_write_count,
+            "local-first wheel during synchronized-output block writes no backend input");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> post_wheel_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(post_wheel_snapshot != nullptr &&
+            blocked_snapshot != nullptr &&
+            !post_wheel_snapshot->viewport.follow_tail &&
+            post_wheel_snapshot->viewport.offset_from_tail ==
+                blocked_snapshot->viewport.offset_from_tail,
+            "local-first wheel defers publication while synchronized output is hidden");
+        ok &= check(post_wheel_snapshot != nullptr &&
+            post_wheel_snapshot->metadata.sequence == blocked_sequence,
+            "local-first wheel does not publish a snapshot while synchronized output is hidden");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        const std::shared_ptr<const term::Terminal_render_snapshot> released_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(released_snapshot != nullptr &&
+            blocked_snapshot != nullptr &&
+            !released_snapshot->viewport.follow_tail &&
+            released_snapshot->viewport.offset_from_tail ==
+                blocked_snapshot->viewport.offset_from_tail + k_expected_wheel_delta,
+            "synchronized-output release publishes accumulated deferred local wheel scroll");
+    }
+
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    QString error;
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(transcript_path, &error);
+    ok &= check(events.has_value(), "synchronized-output blocked wheel transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return ok;
+    }
+
+    const std::optional<term::Terminal_transcript_event> wheel_ingress =
+        last_transcript_event(*events, QStringLiteral("surface.wheel_ingress"));
+    ok &= check(wheel_ingress.has_value(),
+        "synchronized-output blocked wheel ingress trace is present");
+
+    const std::optional<term::Terminal_transcript_event> wheel_trace =
+        last_transcript_event(*events, QStringLiteral("surface.wheel_trace"));
+    ok &= check(wheel_trace.has_value(),
+        "synchronized-output blocked wheel trace is present");
+
+    if (wheel_ingress.has_value() && wheel_trace.has_value()) {
+        ok &= check(wheel_ingress->event_index < wheel_trace->event_index,
+            "synchronized-output blocked wheel ingress precedes route trace");
+        ok &= check(
+            transcript_has_event_after(
+                *events,
+                QStringLiteral("surface.scroll"),
+                *wheel_ingress),
+            "synchronized-output blocked wheel records a surface.scroll event");
+    }
+
+    if (wheel_trace.has_value()) {
+        const QJsonObject& object = wheel_trace->object;
+        ok &= check(object.value(QStringLiteral("source")).toString() ==
+            QStringLiteral("surface.text_area"),
+            "synchronized-output blocked wheel trace records text-area source");
+        ok &= check(object.value(QStringLiteral("route")).toString() ==
+            QStringLiteral("local_scroll"),
+            "synchronized-output blocked wheel trace routes to local scroll");
+        ok &= check(object.value(QStringLiteral("render_publication_blocked")).toBool(),
+            "synchronized-output blocked wheel trace marks blocked render publication");
+        ok &= check(object.value(QStringLiteral("local_scroll_possible")).toBool(),
+            "synchronized-output blocked wheel trace marks local scroll possible");
+        ok &= check(object.value(QStringLiteral("local_scroll_applied")).toBool(),
+            "synchronized-output blocked wheel trace marks local scroll applied");
+        ok &= check(!object.value(QStringLiteral("visible_scroll_applied")).toBool(true),
+            "synchronized-output blocked wheel trace marks visible scroll deferred");
+        ok &= check(object.value(QStringLiteral("scroll_action")).toString() ==
+            QStringLiteral("viewport_moved"),
+            "synchronized-output blocked wheel trace records viewport movement");
+        ok &= check(object.value(QStringLiteral("local_scroll_block_reason")).toString() !=
+            QStringLiteral("synchronized_output_deferred"),
+            "synchronized-output blocked wheel trace does not block local scroll");
+        ok &= check(object.value(QStringLiteral("outcome")).toString() ==
+            QStringLiteral("local_scroll_publication_deferred"),
+            "synchronized-output blocked wheel trace reports deferred publication");
+        ok &= check(object.value(QStringLiteral("backend_drain_calls")).toInt(-1) == 0,
+            "synchronized-output blocked wheel trace records no backend drain");
+    }
+    const std::optional<term::Terminal_transcript_event> surface_scroll =
+        last_transcript_event(*events, QStringLiteral("surface.scroll"));
+    ok &= check(surface_scroll.has_value(),
+        "synchronized-output blocked wheel records surface scroll transcript");
+#endif
+
+    return ok;
+}
+
+bool test_transcript_timing_diagnostics_records_hot_paths()
+{
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    bool ok = true;
+
+    QTemporaryDir transcript_dir;
+    ok &= check(transcript_dir.isValid(), "transcript timing temp dir is valid");
+    if (!transcript_dir.isValid()) {
+        return ok;
+    }
+
+    const QByteArray hot_payload(8 * 1024 * 1024, 'x');
+    const QString disabled_path =
+        transcript_dir.filePath(QStringLiteral("timing_disabled.ndjson"));
+    {
+        QString error;
+        std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+            term::Terminal_transcript_recorder::create(disabled_path, false, false, &error);
+        ok &= check(recorder != nullptr, "disabled transcript timing recorder opens");
+        if (recorder != nullptr) {
+            ok &= check(
+                recorder->record_backend_output(1U, QByteArrayView(hot_payload)),
+                "disabled transcript timing recorder writes hot backend output");
+        }
+    }
+
+    QString error;
+    std::optional<std::vector<term::Terminal_transcript_event>> disabled_events =
+        term::read_terminal_transcript(disabled_path, &error);
+    ok &= check(disabled_events.has_value(), "disabled transcript timing transcript parses");
+    if (!disabled_events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return ok;
+    }
+    ok &= check(
+        !first_transcript_event(*disabled_events, QStringLiteral("transcript.timing")).has_value(),
+        "transcript timing records are absent when timing diagnostics are disabled");
+
+    const QString enabled_path =
+        transcript_dir.filePath(QStringLiteral("timing_enabled.ndjson"));
+    {
+        QString enabled_error;
+        std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+            term::Terminal_transcript_recorder::create(enabled_path, false, true, &enabled_error);
+        ok &= check(recorder != nullptr, "enabled transcript timing recorder opens");
+        if (recorder != nullptr) {
+            ok &= check(
+                recorder->record_backend_output(1U, QByteArrayView(hot_payload)),
+                "enabled transcript timing recorder writes hot backend output");
+        }
+    }
+
+    std::optional<std::vector<term::Terminal_transcript_event>> enabled_events =
+        term::read_terminal_transcript(enabled_path, &error);
+    ok &= check(enabled_events.has_value(), "enabled transcript timing transcript parses");
+    if (!enabled_events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return ok;
+    }
+
+    std::optional<term::Terminal_transcript_event> backend_timing;
+    for (const term::Terminal_transcript_event& event : *enabled_events) {
+        if (event.kind == QStringLiteral("transcript.timing") &&
+            event.object.value(QStringLiteral("record_kind")).toString() ==
+                QStringLiteral("backend.output"))
+        {
+            backend_timing = event;
+            break;
+        }
+    }
+
+    ok &= check(backend_timing.has_value(),
+        "enabled transcript timing records hot backend output");
+    if (backend_timing.has_value()) {
+        ok &= check(
+            static_cast<qint64>(
+                backend_timing->object.value(QStringLiteral("payload_byte_count")).toDouble(-1.0)) ==
+                hot_payload.size(),
+            "backend output timing records payload byte count");
+        ok &= check(
+            static_cast<qint64>(
+                backend_timing->object.value(QStringLiteral("ndjson_byte_count")).toDouble(0.0)) >
+                hot_payload.size(),
+            "backend output timing records serialized byte count");
+        ok &= check(
+            static_cast<qint64>(
+                backend_timing->object.value(QStringLiteral("total_elapsed_ns")).toDouble(0.0)) > 0,
+            "backend output timing records elapsed time");
+    }
+
+    return ok;
+#else
+    return true;
+#endif
 }
 
 bool test_selection_drag_and_selected_text(QGuiApplication& app)
@@ -4849,11 +5668,2261 @@ bool test_selection_drag_and_selected_text(QGuiApplication& app)
             "selected_text drain fixture starts with selected text");
 
         backend_ptr->emit_output(numbered_scroll_lines(80));
-        ok &= check(fixture.surface.selected_text().isEmpty(),
-            "selected_text drains queued output before reading evicted selection");
+        ok &= check(fixture.surface.selected_text() == QStringLiteral("lpha"),
+            "selected_text drains queued output while retaining evicted selection payload");
+        ok &= check(fixture.surface.selection_state() ==
+            VNM_TerminalSurface::Selection_state::ACTIVE,
+            "selected_text drain keeps public selection state after eviction");
+    }
+
+    return ok;
+}
+
+bool test_no_payload_copy_fallback_states(QGuiApplication& app)
+{
+    bool ok = true;
+    Clipboard_text_guard clipboard_guard;
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("alpha")};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "drag-armed copy fallback surface starts");
+        fixture.surface.set_copy_shortcut_policy(
+            VNM_TerminalSurface::Copy_shortcut_policy::COPY_SELECTION_OR_TERMINAL_INPUT);
+
+        const QPointF arm_point = point_in_grid_cell(fixture.surface, 0, 1);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            arm_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "drag-armed copy fallback press is accepted");
         ok &= check(fixture.surface.selection_state() ==
             VNM_TerminalSurface::Selection_state::NONE,
-            "selected_text drain updates public selection state after eviction");
+            "drag-armed copy fallback has no public copyable selection");
+        ok &= check(fixture.surface.selected_text().isEmpty(),
+            "drag-armed copy fallback exposes no selected text");
+
+        QGuiApplication::clipboard()->setText(QStringLiteral("drag-armed-sentinel"),
+            QClipboard::Clipboard);
+        ok &= send_key_and_expect_write(
+            fixture.surface, *backend_ptr, Qt::Key_C, Qt::ControlModifier,
+            {}, bytes_from_hex("03"),
+            "Ctrl+C while drag-armed falls through to terminal input");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral("drag-armed-sentinel"),
+            "Ctrl+C while drag-armed leaves clipboard unchanged");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            arm_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "drag-armed copy fallback release is accepted");
+    }
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("alpha")};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "cancelled replacement copy fallback surface starts");
+        fixture.surface.set_copy_shortcut_policy(
+            VNM_TerminalSurface::Copy_shortcut_policy::COPY_SELECTION_OR_TERMINAL_INPUT);
+
+        const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 1);
+        const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            start_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "cancelled replacement initial press is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            end_point,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "cancelled replacement initial drag is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            end_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "cancelled replacement initial release is accepted");
+        ok &= check(fixture.surface.selected_text() == QStringLiteral("lpha"),
+            "cancelled replacement fixture starts with a committed selection");
+
+        const QPointF replacement_point = point_in_grid_cell(fixture.surface, 0, 5);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            replacement_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "cancelled replacement arm press is accepted");
+        ok &= check(fixture.surface.selection_state() ==
+            VNM_TerminalSurface::Selection_state::NONE,
+            "cancelled replacement arm clears the prior copy payload");
+        ok &= check(fixture.surface.selected_text().isEmpty(),
+            "cancelled replacement arm exposes no selected text");
+
+        QGuiApplication::clipboard()->setText(QStringLiteral("cancelled-replacement-sentinel"),
+            QClipboard::Clipboard);
+        ok &= send_key_and_expect_write(
+            fixture.surface, *backend_ptr, Qt::Key_C, Qt::ControlModifier,
+            {}, bytes_from_hex("03"),
+            "Ctrl+C during cancelled replacement falls through to terminal input");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral("cancelled-replacement-sentinel"),
+            "Ctrl+C during cancelled replacement leaves clipboard unchanged");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            replacement_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "cancelled replacement release is accepted");
+        ok &= check(fixture.surface.selection_state() ==
+            VNM_TerminalSurface::Selection_state::NONE,
+            "cancelled replacement returns to no selection");
+        ok &= check(fixture.surface.selected_text().isEmpty(),
+            "cancelled replacement leaves no selected text");
+    }
+
+    return ok;
+}
+
+bool test_selection_visual_detach_after_row_mutation(QGuiApplication& app)
+{
+    bool ok = true;
+    Clipboard_text_guard clipboard_guard;
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("original\r\nstable")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface mutation-detach selection starts");
+
+    const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+    const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 7);
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        start_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "surface mutation-detach selection press is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        end_point,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "surface mutation-detach selection drag is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        end_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "surface mutation-detach selection release is accepted");
+    ok &= check(fixture.surface.selected_text() == QStringLiteral("original"),
+        "surface mutation-detach captures the original selected text");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[1;1Hmutated!"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> mutated_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(mutated_snapshot != nullptr &&
+        snapshot_row_text(*mutated_snapshot, 0) == QStringLiteral("mutated!"),
+        "surface mutation-detach snapshot contains replacement row text");
+    ok &= check(fixture.surface.selected_text() == QStringLiteral("original"),
+        "surface mutation-detach retains selected_text payload");
+    ok &= check(fixture.surface.selection_state() ==
+        VNM_TerminalSurface::Selection_state::ACTIVE,
+        "surface mutation-detach keeps public selection state active for retained payload");
+    ok &= check(mutated_snapshot != nullptr &&
+        mutated_snapshot->selection_spans.empty(),
+        "surface mutation-detach emits no stale highlight over replacement text");
+    backend_ptr->emit_output(QByteArrayLiteral("\r"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> followup_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(fixture.surface.selected_text() == QStringLiteral("original"),
+        "surface mutation-detach follow-up retains selected_text payload");
+    ok &= check(fixture.surface.selection_state() ==
+        VNM_TerminalSurface::Selection_state::ACTIVE,
+        "surface mutation-detach follow-up keeps public selection state active");
+    ok &= check(followup_snapshot != nullptr &&
+        followup_snapshot->selection_spans.empty(),
+        "surface mutation-detach cursor-only follow-up does not reattach stale spans");
+
+    QGuiApplication::clipboard()->setText(QStringLiteral("mutation-detach-sentinel"),
+        QClipboard::Clipboard);
+    const std::size_t write_count = backend_ptr->writes.size();
+    ok &= send_key(
+        fixture.surface,
+        Qt::Key_C,
+        Qt::ControlModifier,
+        {},
+        "surface mutation-detach Ctrl+C is accepted");
+    ok &= check(backend_ptr->writes.size() == write_count,
+        "surface mutation-detach Ctrl+C writes no ETX");
+    ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+        QStringLiteral("original"),
+        "surface mutation-detach Ctrl+C copies retained payload");
+
+    return ok;
+}
+
+bool test_selection_drag_survives_unrelated_row_backend_output(QGuiApplication& app)
+{
+    bool ok = true;
+
+    Surface_fixture fixture;
+    fixture.surface.set_scrollback_limit(0);
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("alpha\r\nbeta")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "backend-output interleaved drag surface starts");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> initial_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    const std::uint64_t initial_sequence =
+        initial_snapshot != nullptr ? initial_snapshot->metadata.sequence : 0U;
+    ok &= check(initial_snapshot != nullptr &&
+        snapshot_row_text(*initial_snapshot, 0) == QStringLiteral("alpha") &&
+        snapshot_row_text(*initial_snapshot, 1) == QStringLiteral("beta"),
+        "backend-output interleaved drag starts with stable visible content");
+
+    const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 1);
+    const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        start_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "backend-output interleaved drag press is accepted");
+    ok &= check(fixture.surface.selection_state() ==
+        VNM_TerminalSurface::Selection_state::NONE,
+        "backend-output interleaved drag press alone does not activate selection");
+
+    backend_ptr->emit_output(QByteArrayLiteral("!"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> interleaved_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(interleaved_snapshot != nullptr &&
+        interleaved_snapshot->metadata.sequence > initial_sequence &&
+        snapshot_row_text(*interleaved_snapshot, 0) == QStringLiteral("alpha") &&
+        snapshot_row_text(*interleaved_snapshot, 1) == QStringLiteral("beta!"),
+        "backend-output interleaved drag publishes unrelated backend output before first move");
+
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        end_point,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "backend-output interleaved drag move is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> moved_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(fixture.surface.selection_state() ==
+        VNM_TerminalSurface::Selection_state::ACTIVE,
+        "backend-output interleaved drag move keeps public selection state active");
+    ok &= check(moved_snapshot != nullptr &&
+        moved_snapshot->selection_spans.size() == 1U &&
+        snapshot_has_selection_span(*moved_snapshot, 0, 1, 4),
+        "backend-output interleaved drag move publishes a visible selection span");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        end_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "backend-output interleaved drag release is accepted");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(fixture.surface.selection_state() ==
+        VNM_TerminalSurface::Selection_state::ACTIVE,
+        "backend-output interleaved drag keeps public selection state active");
+    ok &= check(fixture.surface.selected_text() == QStringLiteral("lpha"),
+        "backend-output interleaved drag exposes selected text from the anchor row");
+    ok &= check(final_snapshot != nullptr &&
+        final_snapshot->selection_spans.size() == 1U &&
+        snapshot_has_selection_span(*final_snapshot, 0, 1, 4),
+        "backend-output interleaved drag publishes a visible selection span");
+
+    backend_ptr->emit_output(QByteArrayLiteral("?"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> post_release_output_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(fixture.surface.selection_state() ==
+        VNM_TerminalSurface::Selection_state::ACTIVE,
+        "post-release unrelated output keeps public selection state active");
+    ok &= check(fixture.surface.selected_text() == QStringLiteral("lpha"),
+        "post-release unrelated output keeps selected text from the anchor row");
+    ok &= check(post_release_output_snapshot != nullptr &&
+        snapshot_row_text(*post_release_output_snapshot, 1) == QStringLiteral("beta!?") &&
+        post_release_output_snapshot->selection_spans.size() == 1U &&
+        snapshot_has_selection_span(*post_release_output_snapshot, 0, 1, 4),
+        "post-release unrelated output keeps committed selection spans renderable");
+
+    return ok;
+}
+
+bool test_selection_drag_survives_worker_unrelated_row_backend_output(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("alpha\r\nbeta")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "worker unrelated-row selection surface starts");
+
+    const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 1);
+    const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        start_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "worker unrelated-row selection press is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        end_point,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "worker unrelated-row selection move is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        end_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "worker unrelated-row selection release is accepted");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> selected_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(selected_snapshot != nullptr &&
+        selected_snapshot->selection_spans.size() == 1U &&
+        snapshot_has_selection_span(*selected_snapshot, 0, 1, 4),
+        "worker unrelated-row selection publishes committed selection span");
+
+    backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b[2;5H!"));
+    backend_ptr->join_worker();
+    pump_events(app);
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> worker_output_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(worker_output_snapshot != nullptr &&
+        snapshot_row_text(*worker_output_snapshot, 1) == QStringLiteral("beta!") &&
+        worker_output_snapshot->selection_spans.size() == 1U &&
+        snapshot_has_selection_span(*worker_output_snapshot, 0, 1, 4),
+        "worker unrelated-row backend output keeps committed selection styling");
+
+    {
+        Surface_fixture release_fixture;
+        pump_events(app);
+
+        auto release_backend = std::make_unique<Scripted_backend>();
+        release_backend->outputs_during_start = {QByteArrayLiteral("alpha\r\nbeta")};
+
+        bool release_started = false;
+        Scripted_backend* release_backend_ptr = start_surface_with_backend(
+            release_fixture.surface,
+            std::move(release_backend),
+            { QStringLiteral("scripted-terminal") },
+            &release_started);
+        ok &= check(release_started, "worker release-drain selection surface starts");
+
+        const QPointF release_start_point = point_in_grid_cell(release_fixture.surface, 0, 1);
+        const QPointF release_end_point   = point_in_grid_cell(release_fixture.surface, 0, 4);
+        ok &= send_mouse_event(
+            release_fixture.surface,
+            QEvent::MouseButtonPress,
+            release_start_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "worker release-drain selection press is accepted");
+        ok &= send_mouse_event(
+            release_fixture.surface,
+            QEvent::MouseMove,
+            release_end_point,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "worker release-drain selection move is accepted");
+
+        release_backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b[2;5H!"));
+        release_backend_ptr->join_worker();
+        ok &= check(
+            term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
+                release_fixture.surface),
+            "worker release-drain queues backend output before mouse release");
+        const std::shared_ptr<const term::Terminal_render_snapshot> queued_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(release_fixture.surface);
+        ok &= check(queued_snapshot != nullptr &&
+            snapshot_row_text(*queued_snapshot, 1) == QStringLiteral("beta"),
+            "worker release-drain does not mutate snapshot before release");
+
+        ok &= send_mouse_event(
+            release_fixture.surface,
+            QEvent::MouseButtonRelease,
+            release_end_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "worker release-drain selection release is accepted");
+        const std::shared_ptr<const term::Terminal_render_snapshot> release_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(release_fixture.surface);
+        ok &= check(release_fixture.surface.selection_state() ==
+            VNM_TerminalSurface::Selection_state::ACTIVE,
+            "worker release-drain keeps public selection state active");
+        ok &= check(release_fixture.surface.selected_text() == QStringLiteral("lpha"),
+            "worker release-drain keeps selected text from anchor row");
+        ok &= check(release_snapshot != nullptr &&
+            snapshot_row_text(*release_snapshot, 1) == QStringLiteral("beta!") &&
+            release_snapshot->selection_spans.size() == 1U &&
+            snapshot_has_selection_span(*release_snapshot, 0, 1, 4),
+            "worker release-drain keeps committed selection styling after drain");
+    }
+
+    return ok;
+}
+
+bool test_selection_drag_survives_at_tail_streaming_output(QGuiApplication& app)
+{
+    bool ok = true;
+
+    Surface_fixture fixture;
+    fixture.surface.set_scrollback_limit(200);
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "at-tail streaming drag surface starts");
+
+    constexpr int move_cycle_count          = 4;
+    constexpr int emits_per_move            = 2;
+    constexpr int release_tail_append_count = 2;
+    constexpr int anchor_viewport_row =
+        move_cycle_count * emits_per_move + release_tail_append_count;
+    constexpr int release_viewport_row =
+        anchor_viewport_row - move_cycle_count * emits_per_move - release_tail_append_count;
+    const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    const bool usable_anchor_snapshot =
+        anchor_snapshot                            != nullptr             &&
+        anchor_snapshot->grid_size.rows            >  anchor_viewport_row &&
+        anchor_snapshot->viewport.offset_from_tail == 0                   &&
+        anchor_snapshot->viewport.scrollback_rows  >  0                   &&
+        release_viewport_row                       >= 0;
+    ok &= check(usable_anchor_snapshot,
+        "at-tail streaming drag fixture starts at tail with enough visible rows");
+
+    if (usable_anchor_snapshot) {
+        const QString expected_text =
+            snapshot_row_text(*anchor_snapshot, anchor_viewport_row);
+        const int line_last_column = expected_text.size() - 1;
+        ok &= check(!expected_text.isEmpty() &&
+            anchor_snapshot->grid_size.columns > line_last_column,
+            "at-tail streaming drag anchor row has selectable text");
+
+        const QPointF start_point =
+            point_in_grid_cell(fixture.surface, anchor_viewport_row, 0);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            start_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "at-tail streaming drag press is accepted");
+
+        for (int cycle = 0; cycle < move_cycle_count; ++cycle) {
+            for (int emit_index = 0; emit_index < emits_per_move; ++emit_index) {
+                backend_ptr->emit_output(
+                    QStringLiteral("stream-line-%1\r\n")
+                        .arg(
+                            80 + cycle * emits_per_move + emit_index,
+                            3,
+                            10,
+                            QLatin1Char('0'))
+                        .toUtf8());
+            }
+
+            const int current_viewport_row =
+                anchor_viewport_row - (cycle + 1) * emits_per_move;
+            const QPointF move_point =
+                point_in_grid_cell(fixture.surface, current_viewport_row, line_last_column);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                move_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "at-tail streaming drag move is accepted");
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> move_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(move_snapshot != nullptr &&
+                move_snapshot->viewport.scrollback_rows >
+                    anchor_snapshot->viewport.scrollback_rows &&
+                snapshot_row_text(*move_snapshot, current_viewport_row) == expected_text,
+                "at-tail streaming drag keeps the selected logical row visible");
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "at-tail streaming drag keeps public selection active after a move");
+            ok &= check(fixture.surface.selected_text() == expected_text,
+                "at-tail streaming drag keeps selected_text on the stable logical row");
+            ok &= check(move_snapshot != nullptr &&
+                move_snapshot->selection_spans.size() == 1U &&
+                snapshot_has_selection_span(
+                    *move_snapshot,
+                    current_viewport_row,
+                    0,
+                    line_last_column + 1),
+                "at-tail streaming drag publishes a moved selection span");
+        }
+
+        for (int emit_index = 0; emit_index < release_tail_append_count; ++emit_index) {
+            backend_ptr->emit_output(
+                QStringLiteral("stream-line-%1\r\n")
+                    .arg(
+                        80 + move_cycle_count * emits_per_move + emit_index,
+                        3,
+                        10,
+                        QLatin1Char('0'))
+                    .toUtf8());
+        }
+        const QPointF release_point =
+            point_in_grid_cell(fixture.surface, release_viewport_row, line_last_column);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            release_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "at-tail streaming drag release is accepted");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(fixture.surface.selection_state() ==
+            VNM_TerminalSurface::Selection_state::ACTIVE,
+            "at-tail streaming drag keeps public selection active after release");
+        ok &= check(fixture.surface.selected_text() == expected_text,
+            "at-tail streaming drag selects the stable logical row");
+        ok &= check(final_snapshot != nullptr &&
+            final_snapshot->selection_spans.size() == 1U &&
+            snapshot_has_selection_span(
+                *final_snapshot,
+                release_viewport_row,
+                0,
+                line_last_column + 1),
+            "at-tail streaming drag publishes the final shifted selection span");
+    }
+
+    return ok;
+}
+
+bool test_selection_drag_stationary_pointer_at_tail_streaming_contract(QGuiApplication& app)
+{
+    bool ok = true;
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "stationary streaming provable drag surface starts");
+
+        constexpr int anchor_viewport_row = 4;
+        const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_anchor_snapshot =
+            anchor_snapshot                            != nullptr                  &&
+            anchor_snapshot->grid_size.rows            >  anchor_viewport_row + 1 &&
+            anchor_snapshot->viewport.offset_from_tail == 0                        &&
+            anchor_snapshot->viewport.scrollback_rows  >  0;
+        ok &= check(usable_anchor_snapshot,
+            "stationary streaming provable drag fixture starts at tail with enough rows");
+
+        if (usable_anchor_snapshot) {
+            const QString expected_first =
+                snapshot_row_text(*anchor_snapshot, anchor_viewport_row);
+            const QString expected_second =
+                snapshot_row_text(*anchor_snapshot, anchor_viewport_row + 1);
+            const QString expected_text = expected_first + QLatin1Char('\n') + expected_second;
+            const int line_last_column  = expected_first.size() - 1;
+            ok &= check(!expected_first.isEmpty()             &&
+                expected_first.size() == expected_second.size() &&
+                anchor_snapshot->grid_size.columns > line_last_column,
+                "stationary streaming provable drag anchor rows have selectable text");
+
+            const QPointF start_point =
+                point_in_grid_cell(fixture.surface, anchor_viewport_row, 0);
+            const QPointF fixed_point =
+                point_in_grid_cell(fixture.surface, anchor_viewport_row, line_last_column);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "stationary streaming provable drag press is accepted");
+
+            backend_ptr->emit_output(QByteArrayLiteral("stationary-tail-000\r\n"));
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                fixed_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "stationary streaming provable drag move is accepted");
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> move_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(move_snapshot != nullptr &&
+                snapshot_row_text(*move_snapshot, anchor_viewport_row - 1) == expected_first &&
+                snapshot_row_text(*move_snapshot, anchor_viewport_row)     == expected_second,
+                "stationary streaming provable drag keeps selected logical rows visible");
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "stationary streaming provable drag keeps public selection active");
+            ok &= check(fixture.surface.selected_text() == expected_text,
+                "stationary streaming provable drag selects the proven logical range");
+            const int move_first_row_span_columns =
+                move_snapshot != nullptr ? move_snapshot->grid_size.columns : 0;
+            ok &= check(move_snapshot != nullptr &&
+                move_snapshot->selection_spans.size() == 2U &&
+                snapshot_has_selection_span(
+                    *move_snapshot,
+                    anchor_viewport_row - 1,
+                    0,
+                    move_first_row_span_columns) &&
+                snapshot_has_selection_span(
+                    *move_snapshot,
+                    anchor_viewport_row,
+                    0,
+                    line_last_column + 1),
+                "stationary streaming provable drag move publishes shifted selection spans");
+
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                fixed_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "stationary streaming provable drag release is accepted");
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "stationary streaming provable drag remains active after release");
+            ok &= check(fixture.surface.selected_text() == expected_text,
+                "stationary streaming provable drag keeps selected_text after release");
+            const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            const int final_first_row_span_columns =
+                final_snapshot != nullptr ? final_snapshot->grid_size.columns : 0;
+            ok &= check(final_snapshot != nullptr &&
+                final_snapshot->selection_spans.size() == 2U &&
+                snapshot_has_selection_span(
+                    *final_snapshot,
+                    anchor_viewport_row - 1,
+                    0,
+                    final_first_row_span_columns) &&
+                snapshot_has_selection_span(
+                    *final_snapshot,
+                    anchor_viewport_row,
+                    0,
+                    line_last_column + 1),
+                "stationary streaming provable drag release keeps shifted selection spans");
+        }
+    }
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "stationary streaming unmappable first-move drag surface starts");
+
+        constexpr int anchor_viewport_row = 4;
+        const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_anchor_snapshot =
+            anchor_snapshot                            != nullptr             &&
+            anchor_snapshot->grid_size.rows            >  anchor_viewport_row &&
+            anchor_snapshot->viewport.offset_from_tail == 0                   &&
+            anchor_snapshot->viewport.scrollback_rows  >  0;
+        ok &= check(usable_anchor_snapshot,
+            "stationary streaming unmappable first-move fixture starts at tail");
+
+        if (usable_anchor_snapshot) {
+            const QString expected_text =
+                snapshot_row_text(*anchor_snapshot, anchor_viewport_row);
+            const int line_last_column = expected_text.size() - 1;
+            ok &= check(!expected_text.isEmpty() &&
+                anchor_snapshot->grid_size.columns > line_last_column,
+                "stationary streaming unmappable first-move anchor row has selectable text");
+
+            const QPointF start_point =
+                point_in_grid_cell(fixture.surface, anchor_viewport_row, 0);
+            const QPointF fixed_point =
+                point_in_grid_cell(fixture.surface, anchor_viewport_row, line_last_column);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "stationary streaming unmappable first-move press is accepted");
+
+            backend_ptr->emit_output(numbered_scroll_lines(anchor_snapshot->grid_size.rows + 1));
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                fixed_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "stationary streaming unmappable first-move drag move is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                fixed_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "stationary streaming unmappable first-move drag release is accepted");
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::NONE,
+                "stationary streaming unmappable first move cancels without prior payload");
+            ok &= check(fixture.surface.selected_text().isEmpty(),
+                "stationary streaming unmappable first move exposes no selected_text");
+            ok &= check(final_snapshot != nullptr && final_snapshot->selection_spans.empty(),
+                "stationary streaming unmappable first move emits no selection spans");
+        }
+    }
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "stationary streaming unmappable payload drag surface starts");
+
+        constexpr int anchor_viewport_row = 4;
+        const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_anchor_snapshot =
+            anchor_snapshot                            != nullptr             &&
+            anchor_snapshot->grid_size.rows            >  anchor_viewport_row &&
+            anchor_snapshot->viewport.offset_from_tail == 0                   &&
+            anchor_snapshot->viewport.scrollback_rows  >  0;
+        ok &= check(usable_anchor_snapshot,
+            "stationary streaming unmappable payload fixture starts at tail");
+
+        if (usable_anchor_snapshot) {
+            const QString expected_text =
+                snapshot_row_text(*anchor_snapshot, anchor_viewport_row);
+            const int line_last_column = expected_text.size() - 1;
+            ok &= check(!expected_text.isEmpty() &&
+                anchor_snapshot->grid_size.columns > line_last_column,
+                "stationary streaming unmappable payload anchor row has selectable text");
+
+            const QPointF start_point =
+                point_in_grid_cell(fixture.surface, anchor_viewport_row, 0);
+            const QPointF fixed_point =
+                point_in_grid_cell(fixture.surface, anchor_viewport_row, line_last_column);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "stationary streaming unmappable payload press is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                fixed_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "stationary streaming unmappable payload initial move is accepted");
+            ok &= check(fixture.surface.selected_text() == expected_text,
+                "stationary streaming unmappable payload captures initial payload");
+
+            backend_ptr->emit_output(numbered_scroll_lines(anchor_snapshot->grid_size.rows + 1));
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                fixed_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "stationary streaming unmappable payload drift move is accepted");
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> detached_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "stationary streaming unmappable payload keeps public selection active");
+            ok &= check(fixture.surface.selected_text() == expected_text,
+                "stationary streaming unmappable payload preserves prior selected_text");
+            ok &= check(detached_snapshot != nullptr &&
+                detached_snapshot->selection_spans.empty(),
+                "stationary streaming unmappable payload emits no stale spans");
+
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                fixed_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "stationary streaming unmappable payload release is accepted");
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "stationary streaming unmappable payload remains active after release");
+            ok &= check(fixture.surface.selected_text() == expected_text,
+                "stationary streaming unmappable payload keeps selected_text after release");
+        }
+    }
+
+    return ok;
+}
+
+bool test_selection_drag_survives_stable_row_content_drift(QGuiApplication& app)
+{
+    bool ok = true;
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("alpha\r\nbeta\r\ngamma")};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "reverse drift drag surface starts");
+
+        const QPointF anchor_point = point_in_grid_cell(fixture.surface, 1, 2);
+        const QPointF extent_point = point_in_grid_cell(fixture.surface, 0, 1);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            anchor_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "reverse drift drag press is accepted");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[3;6H!"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
+        const std::shared_ptr<const term::Terminal_render_snapshot> drift_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(drift_snapshot != nullptr &&
+            snapshot_row_text(*drift_snapshot, 2) == QStringLiteral("gamma!"),
+            "reverse drift drag mutates only an unselected row");
+
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            extent_point,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "reverse drift drag move is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            extent_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "reverse drift drag release is accepted");
+        ok &= check(fixture.surface.selection_state() ==
+            VNM_TerminalSurface::Selection_state::ACTIVE,
+            "reverse drift drag keeps public selection state active");
+        ok &= check(fixture.surface.selected_text() == QStringLiteral("lpha\nbet"),
+            "reverse drift drag captures selected rows after unrelated row output");
+    }
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "detached append drift drag surface starts");
+
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            120,
+            true,
+            "detached append drift drag scrolls up");
+        const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const int line_last_column = QStringLiteral("scroll-line-000").size() - 1;
+        const bool usable_anchor_snapshot =
+            anchor_snapshot                         != nullptr          &&
+            anchor_snapshot->grid_size.rows         >  2                &&
+            anchor_snapshot->grid_size.columns      >  line_last_column &&
+            anchor_snapshot->viewport.scrollback_rows > 0               &&
+            anchor_snapshot->viewport.offset_from_tail > 0;
+        ok &= check(usable_anchor_snapshot,
+            "detached append drift drag fixture has detached scrollback");
+
+        if (usable_anchor_snapshot) {
+            const int first_visible_logical_row =
+                anchor_snapshot->viewport.scrollback_rows -
+                anchor_snapshot->viewport.offset_from_tail;
+            const QString expected_text =
+                QStringLiteral("scroll-line-%1")
+                    .arg(first_visible_logical_row + 1, 3, 10, QLatin1Char('0'));
+            ok &= check(snapshot_row_text(*anchor_snapshot, 1) == expected_text,
+                "detached append drift drag anchor row has expected text");
+
+            const QPointF start_point = point_in_grid_cell(fixture.surface, 1, 0);
+            const QPointF end_point   =
+                point_in_grid_cell(fixture.surface, 1, line_last_column);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "detached append drift drag press is accepted");
+
+            backend_ptr->emit_output(QByteArrayLiteral("scroll-line-080\r\n"));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            const std::shared_ptr<const term::Terminal_render_snapshot> append_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            const int append_first_visible_logical_row = append_snapshot != nullptr
+                ? append_snapshot->viewport.scrollback_rows -
+                    append_snapshot->viewport.offset_from_tail
+                : -1;
+            ok &= check(append_snapshot != nullptr &&
+                append_snapshot->viewport.scrollback_rows >
+                    anchor_snapshot->viewport.scrollback_rows &&
+                append_first_visible_logical_row == first_visible_logical_row &&
+                snapshot_row_text(*append_snapshot, 1) == expected_text,
+                "detached append drift preserves visible logical rows");
+
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "detached append drift drag move is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                end_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "detached append drift drag release is accepted");
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "detached append drift drag keeps public selection state active");
+            ok &= check(fixture.surface.selected_text() == expected_text,
+                "detached append drift drag selects stable detached scrollback row");
+        }
+    }
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(0);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            repeated_scroll_lines(fixture.surface.rows() + 2, QByteArrayLiteral("repeat")),
+        };
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "zero-scrollback reuse drag surface starts");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_anchor_snapshot =
+            anchor_snapshot != nullptr                         &&
+            anchor_snapshot->grid_size.columns > 5             &&
+            anchor_snapshot->viewport.scrollback_rows == 0     &&
+            snapshot_row_text(*anchor_snapshot, 0) == QStringLiteral("repeat");
+        ok &= check(usable_anchor_snapshot,
+            "zero-scrollback reuse drag starts with repeated visible row text");
+
+        if (usable_anchor_snapshot) {
+            const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+            const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 5);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "zero-scrollback reuse drag press is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "zero-scrollback reuse drag initial move is accepted");
+            const std::shared_ptr<const term::Terminal_render_snapshot> selected_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "zero-scrollback reuse drag captures payload before row reuse");
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("repeat"),
+                "zero-scrollback reuse drag captures repeated row payload");
+            ok &= check(selected_snapshot != nullptr &&
+                selected_snapshot->selection_spans.size() == 1U &&
+                snapshot_has_selection_span(*selected_snapshot, 0, 0, 6),
+                "zero-scrollback reuse drag initially publishes a selection span");
+
+            backend_ptr->emit_output(
+                repeated_scroll_lines(fixture.surface.rows() + 2, QByteArrayLiteral("repeat")));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            const std::shared_ptr<const term::Terminal_render_snapshot> reused_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(reused_snapshot != nullptr &&
+                reused_snapshot->viewport.scrollback_rows == 0 &&
+                snapshot_row_text(*reused_snapshot, 0) == QStringLiteral("repeat"),
+                "zero-scrollback reuse drag keeps repeated row text after discard");
+
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "zero-scrollback reuse drag reuse move is accepted");
+            const std::shared_ptr<const term::Terminal_render_snapshot> detached_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "zero-scrollback reuse drag preserves payload after row-origin ambiguity");
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("repeat"),
+                "zero-scrollback reuse drag keeps prior selected text after ambiguity");
+            ok &= check(detached_snapshot != nullptr &&
+                detached_snapshot->selection_spans.empty(),
+                "zero-scrollback reuse drag does not reattach stale spans");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                end_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "zero-scrollback reuse drag release is accepted");
+            const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("repeat"),
+                "zero-scrollback reuse drag keeps selected text after release");
+            ok &= check(final_snapshot != nullptr && final_snapshot->selection_spans.empty(),
+                "zero-scrollback reuse drag release keeps stale spans detached");
+        }
+    }
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(0);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            repeated_scroll_lines(fixture.surface.rows() + 2, QByteArrayLiteral("repeat")),
+        };
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "hidden synchronized zero-scrollback reuse surface starts");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_anchor_snapshot =
+            anchor_snapshot != nullptr                         &&
+            anchor_snapshot->grid_size.columns > 5             &&
+            anchor_snapshot->viewport.scrollback_rows == 0     &&
+            snapshot_row_text(*anchor_snapshot, 0) == QStringLiteral("repeat");
+        ok &= check(usable_anchor_snapshot,
+            "hidden synchronized zero-scrollback reuse starts with repeated visible row text");
+
+        if (usable_anchor_snapshot) {
+            const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+            const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 5);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "hidden synchronized zero-scrollback reuse press is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "hidden synchronized zero-scrollback reuse initial move is accepted");
+            const std::shared_ptr<const term::Terminal_render_snapshot> selected_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            const std::uint64_t selected_sequence =
+                selected_snapshot != nullptr ? selected_snapshot->metadata.sequence : 0U;
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "hidden synchronized zero-scrollback reuse captures payload before hold");
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("repeat"),
+                "hidden synchronized zero-scrollback reuse captures repeated row payload");
+            ok &= check(selected_snapshot != nullptr &&
+                selected_snapshot->selection_spans.size() == 1U &&
+                snapshot_has_selection_span(*selected_snapshot, 0, 0, 6),
+                "hidden synchronized zero-scrollback reuse initially publishes a selection span");
+
+            backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026h"));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            backend_ptr->emit_output(
+                repeated_scroll_lines(fixture.surface.rows() + 2, QByteArrayLiteral("repeat")));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            const std::shared_ptr<const term::Terminal_render_snapshot> held_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(held_snapshot != nullptr &&
+                held_snapshot->metadata.sequence == selected_sequence &&
+                held_snapshot->selection_spans.size() == 1U,
+                "hidden synchronized zero-scrollback reuse does not publish held reuse");
+
+            backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "hidden synchronized zero-scrollback reuse post-release move is accepted");
+            const std::shared_ptr<const term::Terminal_render_snapshot> detached_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "hidden synchronized zero-scrollback reuse preserves payload after ambiguity");
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("repeat"),
+                "hidden synchronized zero-scrollback reuse keeps prior selected text");
+            ok &= check(detached_snapshot != nullptr &&
+                detached_snapshot->selection_spans.empty(),
+                "hidden synchronized zero-scrollback reuse does not reattach stale spans");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                end_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "hidden synchronized zero-scrollback reuse release is accepted");
+        }
+    }
+
+    {
+        constexpr int scrollback_limit = 4;
+
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(scrollback_limit);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            repeated_scroll_lines(80, QByteArrayLiteral("repeat")),
+        };
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "eviction-ambiguous drag surface starts");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_anchor_snapshot =
+            anchor_snapshot != nullptr                              &&
+            anchor_snapshot->grid_size.columns > 5                  &&
+            anchor_snapshot->viewport.scrollback_rows == scrollback_limit;
+        ok &= check(usable_anchor_snapshot,
+            "eviction-ambiguous drag fixture fills scrollback limit");
+
+        if (usable_anchor_snapshot) {
+            const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+            const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 5);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "eviction-ambiguous drag press is accepted");
+
+            backend_ptr->emit_output(QByteArrayLiteral("repeat\r\n"));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            const std::shared_ptr<const term::Terminal_render_snapshot> eviction_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(eviction_snapshot != nullptr &&
+                eviction_snapshot->viewport.scrollback_rows == scrollback_limit &&
+                snapshot_row_text(*eviction_snapshot, 0) == QStringLiteral("repeat"),
+                "eviction-ambiguous drag keeps identical visible text after eviction");
+
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "eviction-ambiguous drag move is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                end_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "eviction-ambiguous drag release is accepted");
+            const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::NONE,
+                "eviction-ambiguous drag rejects repeated text at scrollback limit");
+            ok &= check(fixture.surface.selected_text().isEmpty(),
+                "eviction-ambiguous drag exposes no selected text");
+            ok &= check(final_snapshot != nullptr && final_snapshot->selection_spans.empty(),
+                "eviction-ambiguous drag emits no stale selection spans");
+        }
+    }
+
+    {
+        constexpr int scrollback_limit = 4;
+
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(scrollback_limit);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "eviction-boundary drag surface starts");
+
+        std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot;
+        const int max_fill_line_count = fixture.surface.rows() + scrollback_limit + 8;
+        for (int line = 0; line < max_fill_line_count; ++line) {
+            anchor_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            if (anchor_snapshot != nullptr &&
+                anchor_snapshot->viewport.scrollback_rows == scrollback_limit - 1)
+            {
+                break;
+            }
+
+            backend_ptr->emit_output(QByteArrayLiteral("repeat\r\n"));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+        }
+
+        const bool usable_anchor_snapshot =
+            anchor_snapshot != nullptr                                      &&
+            anchor_snapshot->grid_size.rows            >  4                 &&
+            anchor_snapshot->grid_size.columns         >  5                 &&
+            anchor_snapshot->viewport.offset_from_tail == 0                 &&
+            anchor_snapshot->viewport.scrollback_rows  == scrollback_limit - 1;
+        ok &= check(usable_anchor_snapshot,
+            "eviction-boundary drag fixture stops one row below scrollback limit");
+
+        if (usable_anchor_snapshot) {
+            const QPointF start_point = point_in_grid_cell(fixture.surface, 2, 0);
+            const QPointF end_point   = point_in_grid_cell(fixture.surface, 2, 5);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "eviction-boundary drag press is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "eviction-boundary drag initial move is accepted");
+            const std::shared_ptr<const term::Terminal_render_snapshot> selected_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "eviction-boundary drag captures payload before cap ambiguity");
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("repeat"),
+                "eviction-boundary drag captures selected text before cap ambiguity");
+            ok &= check(selected_snapshot != nullptr &&
+                selected_snapshot->selection_spans.size() == 1U &&
+                snapshot_has_selection_span(*selected_snapshot, 2, 0, 6),
+                "eviction-boundary drag initially publishes a selection span");
+
+            backend_ptr->emit_output(QByteArrayLiteral("repeat\r\nrepeat\r\n"));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            const std::shared_ptr<const term::Terminal_render_snapshot> eviction_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(eviction_snapshot != nullptr &&
+                eviction_snapshot->viewport.scrollback_rows == scrollback_limit &&
+                snapshot_row_text(*eviction_snapshot, 2) == QStringLiteral("repeat"),
+                "eviction-boundary drag reaches scrollback cap with repeated visible text");
+
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "eviction-boundary drag move is accepted");
+            const std::shared_ptr<const term::Terminal_render_snapshot> detached_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "eviction-boundary drag preserves payload after cap ambiguity");
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("repeat"),
+                "eviction-boundary drag keeps selected text after cap ambiguity");
+            ok &= check(detached_snapshot != nullptr &&
+                detached_snapshot->selection_spans.empty(),
+                "eviction-boundary drag detaches stale cap-ambiguous spans");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                end_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "eviction-boundary drag release is accepted");
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "eviction-boundary drag keeps payload active after release");
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("repeat"),
+                "eviction-boundary drag keeps selected text after release");
+            const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(final_snapshot != nullptr && final_snapshot->selection_spans.empty(),
+                "eviction-boundary drag release emits no stale selection spans");
+        }
+    }
+
+    return ok;
+}
+
+bool test_selection_drag_preserves_payload_after_mid_drag_drift(QGuiApplication& app)
+{
+    bool ok = true;
+    Clipboard_text_guard clipboard_guard;
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("alpha")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "mid-drag payload detach surface starts");
+
+    const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+    const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        start_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "mid-drag payload detach press is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        end_point,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "mid-drag payload detach initial move is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> selected_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(fixture.surface.selected_text() == QStringLiteral("alpha"),
+        "mid-drag payload detach captures the initial payload");
+    ok &= check(selected_snapshot != nullptr &&
+        selected_snapshot->selection_spans.size() == 1U &&
+        snapshot_has_selection_span(*selected_snapshot, 0, 0, 5),
+        "mid-drag payload detach initially publishes a visible span");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[1;1Hbravo"));
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        end_point,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "mid-drag payload detach drift move is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> detached_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(detached_snapshot != nullptr &&
+        snapshot_row_text(*detached_snapshot, 0) == QStringLiteral("bravo"),
+        "mid-drag payload detach publishes the mutated selected row");
+    ok &= check(fixture.surface.selection_state() ==
+        VNM_TerminalSurface::Selection_state::ACTIVE,
+        "mid-drag payload detach keeps public selection active");
+    ok &= check(fixture.surface.selected_text() == QStringLiteral("alpha"),
+        "mid-drag payload detach preserves the prior safe payload");
+    ok &= check(detached_snapshot != nullptr &&
+        detached_snapshot->selection_spans.empty(),
+        "mid-drag payload detach emits no stale span");
+
+    QGuiApplication::clipboard()->setText(QStringLiteral("mid-drag-detach-sentinel"),
+        QClipboard::Clipboard);
+    const std::size_t mid_drag_copy_write_count = backend_ptr->writes.size();
+    ok &= send_key(
+        fixture.surface,
+        Qt::Key_C,
+        Qt::ControlModifier,
+        {},
+        "mid-drag payload detach Ctrl+C is accepted");
+    ok &= check(backend_ptr->writes.size() == mid_drag_copy_write_count,
+        "mid-drag payload detach Ctrl+C writes no ETX");
+    ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+        QStringLiteral("alpha"),
+        "mid-drag payload detach Ctrl+C copies retained payload");
+
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        end_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "mid-drag payload detach release is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(fixture.surface.selection_state() ==
+        VNM_TerminalSurface::Selection_state::ACTIVE,
+        "mid-drag payload detach keeps public selection active after release");
+    ok &= check(fixture.surface.selected_text() == QStringLiteral("alpha"),
+        "mid-drag payload detach keeps the prior payload after release");
+    ok &= check(final_snapshot != nullptr &&
+        final_snapshot->selection_spans.empty(),
+        "mid-drag payload detach release emits no stale span");
+
+    QGuiApplication::clipboard()->setText(QStringLiteral("mid-drag-release-sentinel"),
+        QClipboard::Clipboard);
+    const std::size_t release_copy_write_count = backend_ptr->writes.size();
+    ok &= send_key(
+        fixture.surface,
+        Qt::Key_C,
+        Qt::ControlModifier,
+        {},
+        "mid-drag payload detach post-release Ctrl+C is accepted");
+    ok &= check(backend_ptr->writes.size() == release_copy_write_count,
+        "mid-drag payload detach post-release Ctrl+C writes no ETX");
+    ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+        QStringLiteral("alpha"),
+        "mid-drag payload detach post-release Ctrl+C copies retained payload");
+
+    return ok;
+}
+
+bool test_selection_drag_rejects_snapshot_change(QGuiApplication& app)
+{
+    bool ok = true;
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("alpha")};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "snapshot-changing drag selection starts");
+
+        const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+        const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            start_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "snapshot-changing drag press is accepted");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[1;1Hbravo"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
+        const std::shared_ptr<const term::Terminal_render_snapshot> changed_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(changed_snapshot != nullptr &&
+            snapshot_row_text(*changed_snapshot, 0) == QStringLiteral("bravo"),
+            "snapshot-changing drag publishes changed text before drag extent");
+
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            end_point,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "snapshot-changing drag move is accepted without mixing sources");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            end_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "snapshot-changing drag release is accepted");
+        const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(final_snapshot != nullptr,
+            "snapshot-changing drag has a final render snapshot");
+        ok &= check(fixture.surface.selection_state() ==
+            VNM_TerminalSurface::Selection_state::NONE,
+            "snapshot-changing drag does not create selection state from incompatible sources");
+        ok &= check(fixture.surface.selected_text().isEmpty(),
+            "snapshot-changing drag exposes no mixed-source selected text");
+        ok &= check(final_snapshot != nullptr && final_snapshot->selection_spans.empty(),
+            "snapshot-changing drag emits no mixed-source selection spans");
+    }
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("alpha")};
+
+        bool started = false;
+        (void)start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "resize-incompatible mid-drag surface starts");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> initial_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_initial_snapshot =
+            initial_snapshot != nullptr && initial_snapshot->grid_size.columns > 4;
+        ok &= check(usable_initial_snapshot,
+            "resize-incompatible mid-drag fixture has selectable initial grid");
+
+        if (usable_initial_snapshot) {
+            const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+            const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "resize-incompatible mid-drag press is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "resize-incompatible mid-drag initial move is accepted");
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "resize-incompatible mid-drag captures selection before resize");
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("alpha"),
+                "resize-incompatible mid-drag captures payload before resize");
+
+            const term::terminal_grid_size_t initial_grid_size = initial_snapshot->grid_size;
+            std::shared_ptr<const term::Terminal_render_snapshot> resized_snapshot;
+            const QSizeF resize_candidates[] = {
+                QSizeF(800.0, 360.0),
+                QSizeF(900.0, 420.0),
+                QSizeF(360.0, 180.0),
+            };
+            for (QSizeF size : resize_candidates) {
+                fixture.surface.setSize(size);
+                pump_events(app, 2);
+                resized_snapshot =
+                    term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+                if (resized_snapshot != nullptr &&
+                    resized_snapshot->grid_size.columns > 4 &&
+                    (resized_snapshot->grid_size.rows    != initial_grid_size.rows ||
+                        resized_snapshot->grid_size.columns != initial_grid_size.columns))
+                {
+                    break;
+                }
+            }
+
+            const bool usable_resized_snapshot =
+                resized_snapshot != nullptr                       &&
+                resized_snapshot->grid_size.columns > 4            &&
+                (resized_snapshot->grid_size.rows    != initial_grid_size.rows ||
+                    resized_snapshot->grid_size.columns != initial_grid_size.columns);
+            ok &= check(usable_resized_snapshot,
+                "resize-incompatible mid-drag fixture changes published grid size");
+
+            if (usable_resized_snapshot) {
+                const QPointF resized_point = point_in_grid_cell(fixture.surface, 0, 4);
+                ok &= send_mouse_event(
+                    fixture.surface,
+                    QEvent::MouseMove,
+                    resized_point,
+                    Qt::NoButton,
+                    Qt::LeftButton,
+                    Qt::NoModifier,
+                    true,
+                    "resize-incompatible mid-drag mismatch move is accepted");
+
+                const std::shared_ptr<const term::Terminal_render_snapshot> mismatch_snapshot =
+                    term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+                ok &= check(fixture.surface.selection_state() ==
+                    VNM_TerminalSurface::Selection_state::NONE,
+                    "resize-incompatible mid-drag clears selection state");
+                ok &= check(fixture.surface.selected_text().isEmpty(),
+                    "resize-incompatible mid-drag clears stale selected_text payload");
+                ok &= check(mismatch_snapshot != nullptr &&
+                    mismatch_snapshot->selection_spans.empty(),
+                    "resize-incompatible mid-drag emits no stale selection spans");
+
+                ok &= send_mouse_event(
+                    fixture.surface,
+                    QEvent::MouseButtonRelease,
+                    resized_point,
+                    Qt::LeftButton,
+                    Qt::NoButton,
+                    Qt::NoModifier,
+                    true,
+                    "resize-incompatible mid-drag release is accepted");
+                const std::shared_ptr<const term::Terminal_render_snapshot> release_snapshot =
+                    term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+                ok &= check(fixture.surface.selection_state() ==
+                    VNM_TerminalSurface::Selection_state::NONE,
+                    "resize-incompatible mid-drag remains cleared after release");
+                ok &= check(fixture.surface.selected_text().isEmpty(),
+                    "resize-incompatible mid-drag keeps selected_text empty after release");
+                ok &= check(release_snapshot != nullptr &&
+                    release_snapshot->selection_spans.empty(),
+                    "resize-incompatible mid-drag release emits no stale selection spans");
+            }
+        }
+    }
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("visible")};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "publication-blocked mid-drag surface starts");
+
+        const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+        const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 3);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            start_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "publication-blocked mid-drag press is accepted");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hheld"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
+        const std::shared_ptr<const term::Terminal_render_snapshot> hidden_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(hidden_snapshot != nullptr &&
+            snapshot_contains_text(*hidden_snapshot, QStringLiteral("visible")) &&
+            !snapshot_contains_text(*hidden_snapshot, QStringLiteral("held")),
+            "publication-blocked mid-drag keeps held output unpublished");
+
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            end_point,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "publication-blocked mid-drag move is accepted without selecting held output");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            end_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "publication-blocked mid-drag release is accepted");
+        const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(fixture.surface.selection_state() ==
+            VNM_TerminalSurface::Selection_state::NONE,
+            "publication-blocked mid-drag creates no local selection");
+        ok &= check(fixture.surface.selected_text().isEmpty(),
+            "publication-blocked mid-drag exposes no held selected text");
+        ok &= check(final_snapshot != nullptr && final_snapshot->selection_spans.empty(),
+            "publication-blocked mid-drag emits no selection spans");
+        ok &= check(final_snapshot != nullptr &&
+            snapshot_contains_text(*final_snapshot, QStringLiteral("visible")) &&
+            !snapshot_contains_text(*final_snapshot, QStringLiteral("held")),
+            "publication-blocked mid-drag keeps held output unpublished after release");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
+        const std::shared_ptr<const term::Terminal_render_snapshot> released_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(released_snapshot != nullptr &&
+            snapshot_contains_text(*released_snapshot, QStringLiteral("held")) &&
+            released_snapshot->selection_spans.empty(),
+            "publication-blocked mid-drag publishes held output only after explicit release");
+    }
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("visible")};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "publication-blocked retained-payload surface starts");
+
+        const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+        const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 3);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            start_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "publication-blocked retained-payload press is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            end_point,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "publication-blocked retained-payload initial move is accepted");
+        const std::shared_ptr<const term::Terminal_render_snapshot> selected_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(fixture.surface.selected_text() == QStringLiteral("visi"),
+            "publication-blocked retained-payload captures selected text");
+        ok &= check(selected_snapshot != nullptr &&
+            selected_snapshot->selection_spans.size() == 1U &&
+            snapshot_has_selection_span(*selected_snapshot, 0, 0, 4),
+            "publication-blocked retained-payload initially publishes a selection span");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hheld"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            end_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "publication-blocked retained-payload release is accepted");
+        ok &= check(fixture.surface.selection_state() ==
+            VNM_TerminalSurface::Selection_state::ACTIVE,
+            "publication-blocked retained-payload keeps payload active while blocked");
+        ok &= check(fixture.surface.selected_text() == QStringLiteral("visi"),
+            "publication-blocked retained-payload keeps selected text while blocked");
+        const std::shared_ptr<const term::Terminal_render_snapshot> blocked_payload_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(blocked_payload_snapshot != nullptr &&
+            snapshot_contains_text(*blocked_payload_snapshot, QStringLiteral("visible")) &&
+            !snapshot_contains_text(*blocked_payload_snapshot, QStringLiteral("held")) &&
+            blocked_payload_snapshot->selection_spans.empty(),
+            "publication-blocked retained-payload clears public spans while held output stays hidden");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            fixture.surface);
+        const std::shared_ptr<const term::Terminal_render_snapshot> released_payload_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(released_payload_snapshot != nullptr &&
+            snapshot_contains_text(*released_payload_snapshot, QStringLiteral("visible")) &&
+            snapshot_contains_text(*released_payload_snapshot, QStringLiteral("held")) &&
+            released_payload_snapshot->selection_spans.empty(),
+            "publication-blocked retained-payload releases without stale selection spans");
+        ok &= check(fixture.surface.selected_text() == QStringLiteral("visi"),
+            "publication-blocked retained-payload preserves selected text after release");
+    }
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(4);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("alpha")};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "dirty-scrollback selected-row surface starts");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_anchor_snapshot =
+            anchor_snapshot != nullptr                         &&
+            anchor_snapshot->grid_size.columns > 5             &&
+            anchor_snapshot->viewport.scrollback_rows == 0     &&
+            snapshot_row_text(*anchor_snapshot, 0) == QStringLiteral("alpha");
+        ok &= check(usable_anchor_snapshot,
+            "dirty-scrollback selected-row fixture starts with selected row on primary screen");
+
+        if (usable_anchor_snapshot) {
+            const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+            const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "dirty-scrollback selected-row press is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "dirty-scrollback selected-row move is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                end_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "dirty-scrollback selected-row release is accepted");
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> selected_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(selected_snapshot != nullptr &&
+                selected_snapshot->selection_spans.size() == 1U &&
+                snapshot_has_selection_span(*selected_snapshot, 0, 0, 5),
+                "dirty-scrollback selected-row initially publishes committed selection span");
+
+            QByteArray dirty_then_scroll = QByteArrayLiteral("\x1b[1;1Hbravo\x1b[");
+            dirty_then_scroll += QByteArray::number(fixture.surface.rows());
+            dirty_then_scroll += QByteArrayLiteral(";1H\r\n");
+            backend_ptr->emit_output(std::move(dirty_then_scroll));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> tail_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(tail_snapshot != nullptr &&
+                tail_snapshot->viewport.scrollback_rows == 1,
+                "dirty-scrollback selected-row output grows scrollback in one result");
+            ok &= check(fixture.surface.scroll_to_offset_from_tail(1),
+                "dirty-scrollback selected-row scrolls viewport back to mutated scrollback row");
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> scrolled_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(scrolled_snapshot != nullptr &&
+                scrolled_snapshot->viewport.offset_from_tail == 1 &&
+                snapshot_row_text(*scrolled_snapshot, 0) == QStringLiteral("bravo") &&
+                scrolled_snapshot->selection_spans.empty(),
+                "dirty-scrollback selected-row does not preserve stale selection styling");
+        }
+    }
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(4);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("alpha")};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "synchronized dirty-scrollback selected-row surface starts");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_anchor_snapshot =
+            anchor_snapshot != nullptr                         &&
+            anchor_snapshot->grid_size.columns > 5             &&
+            anchor_snapshot->viewport.scrollback_rows == 0     &&
+            fixture.surface.rows() > 1                         &&
+            snapshot_row_text(*anchor_snapshot, 0) == QStringLiteral("alpha");
+        ok &= check(usable_anchor_snapshot,
+            "synchronized dirty-scrollback fixture starts with selected row on primary screen");
+
+        if (usable_anchor_snapshot) {
+            const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+            const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "synchronized dirty-scrollback selected-row press is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "synchronized dirty-scrollback selected-row move is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                end_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "synchronized dirty-scrollback selected-row release is accepted");
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> selected_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            const std::uint64_t selected_sequence =
+                selected_snapshot != nullptr ? selected_snapshot->metadata.sequence : 0U;
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("alpha"),
+                "synchronized dirty-scrollback captures selected-row payload");
+            ok &= check(selected_snapshot != nullptr &&
+                selected_snapshot->selection_spans.size() == 1U &&
+                snapshot_has_selection_span(*selected_snapshot, 0, 0, 5),
+                "synchronized dirty-scrollback initially publishes committed selection span");
+
+            backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026h\x1b[1;1Hbravo"));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            const std::shared_ptr<const term::Terminal_render_snapshot> hidden_dirty_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(hidden_dirty_snapshot != nullptr &&
+                hidden_dirty_snapshot->metadata.sequence == selected_sequence &&
+                snapshot_row_text(*hidden_dirty_snapshot, 0) == QStringLiteral("alpha") &&
+                hidden_dirty_snapshot->selection_spans.size() == 1U,
+                "synchronized dirty-scrollback keeps selected-row rewrite hidden");
+
+            QByteArray hidden_scroll = QByteArrayLiteral("\x1b[");
+            hidden_scroll += QByteArray::number(fixture.surface.rows());
+            hidden_scroll += QByteArrayLiteral(";1H\r\n");
+            backend_ptr->emit_output(std::move(hidden_scroll));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            const std::shared_ptr<const term::Terminal_render_snapshot> hidden_scroll_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(hidden_scroll_snapshot != nullptr &&
+                hidden_scroll_snapshot->metadata.sequence == selected_sequence &&
+                snapshot_row_text(*hidden_scroll_snapshot, 0) == QStringLiteral("alpha"),
+                "synchronized dirty-scrollback keeps hidden scrollback unpublished");
+
+            backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            const std::shared_ptr<const term::Terminal_render_snapshot> released_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(released_snapshot != nullptr &&
+                released_snapshot->viewport.scrollback_rows == 1,
+                "synchronized dirty-scrollback release publishes hidden scrollback growth");
+            ok &= check(fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+                "synchronized dirty-scrollback keeps retained payload active");
+            ok &= check(fixture.surface.selected_text() == QStringLiteral("alpha"),
+                "synchronized dirty-scrollback keeps retained selected-row payload");
+            ok &= check(fixture.surface.scroll_to_offset_from_tail(1),
+                "synchronized dirty-scrollback scrolls viewport back to rewritten row");
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> scrolled_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(scrolled_snapshot != nullptr &&
+                scrolled_snapshot->viewport.offset_from_tail == 1 &&
+                snapshot_row_text(*scrolled_snapshot, 0) == QStringLiteral("bravo") &&
+                scrolled_snapshot->selection_spans.empty(),
+                "synchronized dirty-scrollback release does not preserve stale selection styling");
+        }
     }
 
     return ok;
@@ -4950,6 +8019,60 @@ bool test_stale_synchronized_output_recovery(QGuiApplication& app)
             snapshot_contains_text(*snapshot, QStringLiteral("held")),
             "explicit synchronized-output release does not publish again after stale timeout");
     }
+
+    return ok;
+}
+
+bool test_stale_synchronized_output_recovery_force_releases_after_budgeted_catchup(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "budgeted stale recovery surface starts");
+
+    QByteArray output = QByteArrayLiteral("\x1b[?2026h");
+    for (int i = 0; i < 180; ++i) {
+        output += QByteArrayLiteral("\r\nsurface-repaint-fill");
+    }
+    output += QByteArrayLiteral("\x1b[Hsurface-held");
+    for (int i = 0; i < 500; ++i) {
+        output += QByteArrayLiteral("\r\nsurface-tail-fill");
+    }
+    output += QByteArrayLiteral("\r\nsurface-tail-after-timeout");
+
+    backend_ptr->emit_output(output);
+    term::VNM_TerminalSurface_render_bridge::handle_synchronized_output_recovery_timeout(
+        fixture.surface,
+        std::chrono::steady_clock::duration::zero());
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> released_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(released_snapshot != nullptr &&
+        snapshot_contains_text(*released_snapshot, QStringLiteral("surface-held")),
+        "budgeted stale recovery force-releases held synchronized output after one catch-up slice");
+    ok &= check(released_snapshot != nullptr &&
+        !snapshot_contains_text(*released_snapshot, QStringLiteral("surface-tail-after-timeout")),
+        "budgeted stale recovery does not drain the full backend output during timeout");
+    ok &= check(term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
+        fixture.surface),
+        "budgeted stale recovery reposts remaining backend output");
+
+    ok &= check(pump_until(app, [&] {
+        const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        return snapshot != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("surface-tail-after-timeout"));
+    }),
+        "budgeted stale recovery drains remaining output through posted GUI work");
 
     return ok;
 }
@@ -7337,6 +10460,7 @@ int main(int argc, char** argv)
     ok &= test_osc52_clipboard_allow_writes_clipboard(app);
     ok &= test_keyboard_printable_controls_and_prompt_path(app);
     ok &= test_copy_shortcut_policy(app);
+    ok &= test_no_payload_copy_fallback_states(app);
     ok &= test_control_wheel_font_zoom(app);
     ok &= test_plain_wheel_scrolls_primary_scrollback(app);
     ok &= test_public_viewport_scroll_api(app);
@@ -7345,9 +10469,24 @@ int main(int argc, char** argv)
     ok &= test_page_keys_scroll_primary_scrollback(app);
     ok &= test_page_keys_fall_through_on_alternate_screen(app);
     ok &= test_plain_wheel_boundaries_and_alternate_input(app);
+    ok &= test_local_first_wheel_scroll_keeps_callbacks_queued_without_backend_drain(app);
+    ok &= test_wheel_input_stops_after_post_barrier_callbacks_become_pending(app);
+    ok &= test_wheel_mouse_reporting_stops_after_post_barrier_callbacks_become_pending(app);
+    ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
+    ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);
+    ok &= test_transcript_timing_diagnostics_records_hot_paths();
     ok &= test_mouse_reporting_surface_events(app);
     ok &= test_selection_drag_and_selected_text(app);
+    ok &= test_selection_visual_detach_after_row_mutation(app);
+    ok &= test_selection_drag_survives_unrelated_row_backend_output(app);
+    ok &= test_selection_drag_survives_worker_unrelated_row_backend_output(app);
+    ok &= test_selection_drag_survives_at_tail_streaming_output(app);
+    ok &= test_selection_drag_stationary_pointer_at_tail_streaming_contract(app);
+    ok &= test_selection_drag_survives_stable_row_content_drift(app);
+    ok &= test_selection_drag_preserves_payload_after_mid_drag_drift(app);
+    ok &= test_selection_drag_rejects_snapshot_change(app);
     ok &= test_stale_synchronized_output_recovery(app);
+    ok &= test_stale_synchronized_output_recovery_force_releases_after_budgeted_catchup(app);
     ok &= test_paste_text_public_method_and_policy(app);
     ok &= test_right_click_paste_and_mouse_reporting_precedence(app);
     ok &= test_focus_reporting_writes_mode_bytes_and_preserves_ime_cancel(app);

@@ -8,6 +8,7 @@
 #include <QByteArray>
 #include <QSizeF>
 #include <QString>
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -51,11 +52,31 @@ public:
 
     Terminal_session_result write_user_bytes(
         QByteArray                 bytes);
+    // Writes already-encoded user input without draining backend callbacks.
+    // Callers must choose bytes from already-published state and must avoid
+    // this route when pending backend callbacks make protocol state unsafe.
+    Terminal_session_result write_user_bytes_without_backend_drain(
+        QByteArray                 bytes);
+    // Writes already-encoded user input without draining backend callbacks
+    // only when no backend callback events are queued or active under the
+    // session lock. Returns std::nullopt without writing when callback ingress
+    // could make the published protocol state stale.
+    std::optional<Terminal_session_result>
+        try_write_user_bytes_without_backend_drain_if_callbacks_empty(
+            QByteArray             bytes);
 
     Terminal_key_event_result write_key_event(
         const QKeyEvent&           event);
+    // Caller must have just drained backend callbacks and processed pending
+    // commands. Post-barrier callbacks stay queued for the next owner drain.
+    Terminal_key_event_result write_key_event_from_drained_state(
+        const QKeyEvent&           event);
 
     Terminal_mouse_event_result write_mouse_event(
+        Terminal_mouse_event       event);
+    // Caller must have just drained backend callbacks and processed pending
+    // commands. Post-barrier callbacks stay queued for the next owner drain.
+    Terminal_mouse_event_result write_mouse_event_from_drained_state(
         Terminal_mouse_event       event);
 
     Terminal_ime_commit_result write_ime_commit(
@@ -83,6 +104,14 @@ public:
 
     Terminal_viewport_scroll_result scroll_viewport_lines(
         int                        line_delta);
+    // Caller must have just drained backend callbacks and processed pending
+    // commands. Post-barrier callbacks stay queued for the next owner drain.
+    Terminal_viewport_scroll_result scroll_viewport_lines_from_drained_state(
+        int                        line_delta);
+
+    Terminal_viewport_scroll_result scroll_viewport_lines_from_published_state(
+        int                        line_delta,
+        Terminal_viewport_state    published_viewport);
 
     Terminal_viewport_scroll_result scroll_published_viewport_lines(
         int                        line_delta);
@@ -92,18 +121,36 @@ public:
 
     void set_selection_range(
         Terminal_selection_range   range);
+    void set_selection_range_from_published_source(
+        Terminal_selection_range   range,
+        terminal_selection_source_identity_t source);
+    // Caller must have just drained backend callbacks and pending commands, then
+    // pass the current published source from that same drain. This variant skips
+    // a second drain so a GUI-event selection proof stays coherent.
+    void set_selection_range_from_drained_published_source(
+        Terminal_selection_range   range,
+        terminal_selection_source_identity_t source);
+    // Detaches public visual selection state while preserving any cached payload.
+    // During synchronized output, this publishes a selection-only snapshot from
+    // the last public content so held output remains unpublished.
+    void detach_selection_visual_attachment();
 
     void clear_selection();
     void set_scrollback_limit(int limit);
     Terminal_session_result interrupt();
     Terminal_session_result terminate();
     Terminal_session_result force_release_synchronized_output();
+    // Releases held synchronized output without draining queued backend callbacks.
+    // Timeout recovery uses this after a bounded catch-up so sustained output
+    // cannot postpone stale-frame publication indefinitely.
+    Terminal_session_result force_release_synchronized_output_without_backend_drain();
 
     Terminal_process_state process_state() const;
     bool backend_ready() const;
     bool backend_geometry_in_sync() const;
     bool output_backpressure_active() const;
     bool render_publication_blocked() const;
+    bool has_pending_backend_callback_events() const;
     bool mouse_reporting_active() const;
     bool alternate_scroll_active() const;
     std::uint64_t alternate_scroll_mode_generation() const;
@@ -112,6 +159,8 @@ public:
     std::uint64_t last_processed_sequence() const;
     bool has_selection() const;
     Terminal_selection_result selected_text() const;
+    std::optional<terminal_selection_visual_lease_t> selection_visual_lease() const;
+    std::optional<terminal_selection_source_identity_t> published_selection_source_identity() const;
 
     std::vector<Terminal_session_command> processed_commands() const;
     std::vector<Terminal_session_notification> notifications() const;
@@ -148,6 +197,8 @@ public:
      * path calls this method inline, preserving the synchronous test/backend contract.
      */
     void process_backend_callback_events();
+    bool process_backend_callback_events_for(
+        std::chrono::steady_clock::duration     budget);
 
 private:
     enum class Queue_category
@@ -163,13 +214,25 @@ private:
         PRESERVE_VIEWPORT,
     };
 
+    enum class Backend_callback_drain_policy
+    {
+        DRAIN_CALLBACKS,
+        KEEP_CALLBACKS_QUEUED,
+    };
+
     Terminal_session_result enqueue_command(
         Terminal_session_command   command);
 
     Terminal_session_result enqueue_and_process_synchronous_command(
-        Terminal_session_command   command);
+        Terminal_session_command           command,
+        Backend_callback_drain_policy      drain_policy =
+            Backend_callback_drain_policy::DRAIN_CALLBACKS);
 
-    void process_pending_commands();
+    bool process_pending_commands(
+        Backend_callback_drain_policy      drain_policy =
+            Backend_callback_drain_policy::DRAIN_CALLBACKS,
+        std::optional<std::chrono::steady_clock::time_point>
+                                            deadline = std::nullopt);
 
     Terminal_session_result process_command(
         Terminal_session_command   command);
@@ -191,6 +254,8 @@ private:
 
     Terminal_session_result process_force_release_synchronized_output_command(
         const Terminal_session_command&        command);
+    Terminal_session_result force_release_synchronized_output_locked(
+        std::uint64_t                          sequence);
 
     Terminal_session_result process_backend_output_command(
         const Terminal_session_command&        command);
@@ -202,8 +267,21 @@ private:
         const Terminal_session_command&        command);
 
     Terminal_session_result write_user_bytes_locked(
-        QByteArray                 bytes,
-        User_write_viewport_policy viewport_policy);
+        QByteArray                         bytes,
+        User_write_viewport_policy         viewport_policy,
+        Backend_callback_drain_policy      drain_policy =
+            Backend_callback_drain_policy::DRAIN_CALLBACKS);
+
+    Terminal_key_event_result write_key_event_locked(
+        const QKeyEvent&                   event,
+        Backend_callback_drain_policy      drain_policy);
+
+    Terminal_mouse_event_result write_mouse_event_locked(
+        Terminal_mouse_event               event,
+        Backend_callback_drain_policy      drain_policy);
+
+    Terminal_viewport_scroll_result scroll_viewport_lines_locked(
+        int                                line_delta);
 
     Terminal_backend_callbacks make_backend_callbacks();
     void drain_backend_callback_commands();
@@ -264,7 +342,34 @@ private:
 
     void publish_selection_snapshot(
         std::uint64_t              sequence,
-        QString                    message);
+        QString                    message,
+        bool                       allow_blocked_selection_only_snapshot = false);
+
+    void advance_selection_content_basis_for_model_result(
+        const Terminal_screen_model_result&    result,
+        const Terminal_viewport_state&         previous_viewport,
+        terminal_grid_size_t                   previous_grid_size);
+
+    void record_blocked_synchronized_row_origin_change(
+        const Terminal_screen_model_result&    result);
+
+    Terminal_screen_model_result model_result_with_deferred_synchronized_row_origins(
+        Terminal_screen_model_result           result);
+
+    std::optional<terminal_selection_source_identity_t>
+        published_selection_source_identity_unlocked() const;
+
+    void set_selection_range_from_published_source_locked(
+        Terminal_selection_range               range,
+        std::optional<terminal_selection_source_identity_t>
+                                            expected_source);
+
+    terminal_selection_visual_lease_t make_selection_visual_lease(
+        Terminal_selection_range               range) const;
+
+    terminal_selection_visual_lease_t make_selection_visual_lease(
+        Terminal_selection_range               range,
+        const terminal_selection_source_identity_t& source) const;
 
     Terminal_render_snapshot_request make_render_snapshot_request(
         std::uint64_t              sequence) const;
@@ -320,7 +425,8 @@ private:
 
     void remove_from_queue_state(
         Queue_category             category,
-        std::size_t                byte_count);
+        std::size_t                byte_count,
+        std::size_t                command_count = 1U);
 
     bool queue_high_water_reached(
         Queue_category             category) const;
@@ -369,10 +475,14 @@ private:
     std::uint64_t                                          m_next_sequence = 1U;
     std::uint64_t                                          m_next_resize_id = 1U;
     std::uint64_t                                          m_last_processed_sequence = 0U;
+    std::uint64_t                                          m_budgeted_backend_output_sequence = 0U;
     std::uint64_t                                          m_render_snapshot_generation = 0U;
     std::uint64_t                                          m_render_snapshot_synced_generation = 0U;
     std::uint64_t                                          m_ime_preedit_generation = 0U;
     std::uint64_t                                          m_alternate_scroll_mode_generation = 0U;
+    std::uint64_t                                          m_row_origin_generation = 0U;
+    int                                                    m_deferred_synchronized_evicted_scrollback_rows = 0;
+    std::uint64_t                                          m_selection_session_epoch = 0U;
     bool                                                   m_backend_ready = false;
     bool                                                   m_backend_geometry_in_sync = false;
     bool                                                   m_output_backpressure_active = false;
@@ -385,6 +495,7 @@ private:
     Terminal_viewport_controller                           m_viewport_controller;
     Terminal_bell_state                                    m_bell_state;
     Selection_contract_controller                          m_selection;
+    terminal_selection_content_basis_t                     m_selection_content_basis;
     Terminal_buffer_id                         m_selection_buffer_id =
         Terminal_buffer_id::PRIMARY;
     bool                                                   m_deferred_viewport_changed = false;

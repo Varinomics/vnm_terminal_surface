@@ -5,6 +5,7 @@
 #include <QString>
 #include <QStringList>
 #include <QVariant>
+#include <chrono>
 #include <memory>
 
 class QQuickWindow;
@@ -177,6 +178,21 @@ public:
     };
     Q_ENUM(Clipboard_response_decision)
 
+    struct wheel_scroll_diagnostic_result_t
+    {
+        QString no_op_cause;
+        QString scroll_action;
+        qint64  backend_drain_elapsed_ns      = 0;
+        int     backend_drain_calls           = 0;
+        int     applied_line_delta            = 0;
+        bool    session_present               = false;
+        bool    render_publication_blocked    = false;
+        bool    published_synchronized_output = false;
+        bool    alternate_screen              = false;
+        bool    local_scroll_intent_recorded  = false;
+        bool    local_scroll_applied          = false;
+    };
+
     enum class Selection_state
     {
         NONE,
@@ -207,6 +223,34 @@ public:
 
     QString backend_output_capture_path() const;
     void set_backend_output_capture_path(const QString& path);
+
+    QString transcript_capture_path() const;
+    void set_transcript_capture_path(const QString& path);
+
+    bool transcript_snapshot_diagnostics() const;
+    void set_transcript_snapshot_diagnostics(bool enabled);
+
+    bool transcript_timing_diagnostics() const;
+    void set_transcript_timing_diagnostics(bool enabled);
+
+    bool wheel_trace_enabled() const;
+    void set_wheel_trace_enabled(bool enabled);
+    void record_wheel_trace_event(
+        const QString& source,
+        const QWheelEvent& event,
+        const QString& route,
+        const QString& outcome,
+        bool           accepted,
+        int            wheel_steps = 0,
+        int            effective_line_delta = 0,
+        qreal          angle_remainder = 0.0,
+        qreal          pixel_remainder = 0.0,
+        int            backend_drain_calls = 0,
+        qint64         backend_drain_elapsed_ns = 0,
+        bool           local_scroll_intent_recorded = false,
+        const QString& local_scroll_block_reason = {},
+        const QString& scroll_action = {},
+        int            applied_line_delta = 0);
 
     int synchronized_output_stale_timeout_ms() const;
     void set_synchronized_output_stale_timeout_ms(int timeout_ms);
@@ -257,6 +301,8 @@ public:
     // deltas/offsets, non-primary buffers, hidden synchronized output, and
     // boundary-clamped scrolls.
     Q_INVOKABLE bool scroll_viewport_lines(int line_delta);
+    wheel_scroll_diagnostic_result_t scroll_viewport_lines_with_diagnostics(
+        int                    line_delta);
     Q_INVOKABLE bool scroll_to_offset_from_tail(int offset_from_tail);
     Q_INVOKABLE bool start_process(QStringList argv, QString working_directory = {});
     Q_INVOKABLE bool interrupt_process();
@@ -355,10 +401,15 @@ private:
         QString                working_directory);
 
     void drain_backend_callback_events();
+    void drain_backend_callback_events(bool budgeted);
+    void drain_backend_callback_events_for_posted_work();
+    void queue_backend_callback_drain();
     void refresh_active_session_geometry();
     void sync_from_session();
     void sync_synchronized_output_recovery_timer();
     void handle_synchronized_output_recovery_timeout();
+    void handle_synchronized_output_recovery_timeout(
+        std::chrono::steady_clock::duration     budget);
 
     void replay_session_notification(
         const vnm_terminal::internal::Terminal_session_notification&
@@ -384,6 +435,11 @@ private:
     bool                     m_cursor_blink_enabled                 = true;
     int                      m_scrollback_limit                     = 10000;
     QString                  m_backend_output_capture_path;
+    QString                  m_transcript_capture_path;
+    bool                     m_transcript_snapshot_diagnostics      = false;
+    bool                     m_transcript_timing_diagnostics        = false;
+    bool                     m_wheel_trace_enabled                  = false;
+    bool                     m_selection_trace_enabled              = false;
     int                      m_synchronized_output_stale_timeout_ms = 1000;
     Mouse_reporting_policy   m_mouse_reporting_policy =
         Mouse_reporting_policy::APPLICATION_CONTROLLED;

@@ -1756,6 +1756,8 @@ QString render_snapshot_status_name(term::Terminal_render_snapshot_status status
             return QStringLiteral("INVALID_DIRTY_ROW_RANGE");
         case term::Terminal_render_snapshot_status::INVALID_SELECTION_SPAN:
             return QStringLiteral("INVALID_SELECTION_SPAN");
+        case term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE:
+            return QStringLiteral("INVALID_LINE_PROVENANCE");
         case term::Terminal_render_snapshot_status::INVALID_HYPERLINK_METADATA:
             return QStringLiteral("INVALID_HYPERLINK_METADATA");
     }

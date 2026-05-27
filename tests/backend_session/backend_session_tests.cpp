@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstddef>
 #include <functional>
 #include <iostream>
@@ -437,6 +438,54 @@ bool snapshot_has_selection_span(
     }
 
     return false;
+}
+
+std::vector<term::terminal_selection_line_lease_t> expected_line_leases_from_snapshot(
+    const term::Terminal_render_snapshot&  snapshot,
+    const term::Terminal_selection_range&  range)
+{
+    std::vector<term::terminal_selection_line_lease_t> lines;
+    if (!term::render_snapshot_visible_line_provenance_is_valid(snapshot)) {
+        return lines;
+    }
+
+    const term::terminal_grid_position_t start = term::normalized_selection_start(range);
+    const term::terminal_grid_position_t end   = term::normalized_selection_end(range);
+    const int first_visible_logical_row =
+        term::render_snapshot_first_visible_logical_row(snapshot);
+    const int last_visible_logical_row =
+        first_visible_logical_row + snapshot.grid_size.rows - 1;
+    if (start.row < first_visible_logical_row || end.row > last_visible_logical_row) {
+        return lines;
+    }
+
+    lines.reserve(static_cast<std::size_t>(end.row - start.row + 1));
+    for (int logical_row = start.row; logical_row <= end.row; ++logical_row) {
+        const int viewport_row = logical_row - first_visible_logical_row;
+        const term::Terminal_render_line_provenance& provenance =
+            snapshot.visible_line_provenance[static_cast<std::size_t>(viewport_row)];
+        lines.push_back({
+            logical_row - start.row,
+            provenance.retained_line_id,
+            provenance.content_generation,
+        });
+    }
+    return lines;
+}
+
+bool snapshot_cells_fit_grid(const term::Terminal_render_snapshot& snapshot)
+{
+    for (const term::Terminal_render_cell& cell : snapshot.cells) {
+        if (cell.position.row    <  0                          ||
+            cell.position.row    >= snapshot.grid_size.rows     ||
+            cell.position.column <  0                          ||
+            cell.position.column >= snapshot.grid_size.columns)
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 QByteArray numbered_scroll_lines(int count)
@@ -925,6 +974,25 @@ bool test_selection_snapshot_and_visible_text()
     ok &= check(selected_text.code == term::Terminal_selection_result_code::OK &&
         selected_text.text == QStringLiteral("lpha\nbe"),
         "session extracts selected visible text in row order");
+
+    std::unique_ptr<term::Terminal_session> partial_space_session;
+    Scripted_backend* partial_space_backend = make_session(partial_space_session);
+    ok &= check(partial_space_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 4 bounded-space selection session starts");
+    ok &= check(partial_space_backend->emit_output(QByteArrayLiteral("A B")),
+        "Phase 4 bounded-space backend emits visible text");
+    partial_space_session->set_selection_range({
+        { 0, 0 },
+        { 0, 2 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result partial_space_payload =
+        partial_space_session->selected_text();
+    ok &= check(partial_space_payload.code == term::Terminal_selection_result_code::OK &&
+        partial_space_payload.text == QStringLiteral("A "),
+        "Phase 4 snapshot payload preserves bounded trailing space");
+
     const std::uint64_t selected_generation = session->render_snapshot_generation();
     session->set_selection_range({
         { 0, 1 },
@@ -933,6 +1001,65 @@ bool test_selection_snapshot_and_visible_text()
     });
     ok &= check(session->render_snapshot_generation() == selected_generation,
         "setting the same selection range does not publish a redundant snapshot");
+
+    std::unique_ptr<term::Terminal_session> payload_session;
+    Scripted_backend* payload_backend = make_session(payload_session);
+    ok &= check(payload_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "payload selection session starts");
+    ok &= check(payload_backend->emit_output(QByteArrayLiteral("original")),
+        "payload backend emits original row text");
+    payload_session->set_selection_range({
+        { 0, 0 },
+        { 0, 8 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result original_payload =
+        payload_session->selected_text();
+    ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+        original_payload.text == QStringLiteral("original"),
+        "finalized selection captures the original payload");
+    ok &= check(payload_backend->emit_output(QByteArrayLiteral("\rmutated!")),
+        "payload backend rewrites selected row text");
+    const term::Terminal_selection_result retained_payload =
+        payload_session->selected_text();
+    ok &= check(retained_payload.code == term::Terminal_selection_result_code::OK &&
+        retained_payload.text == QStringLiteral("original"),
+        "selected_text keeps finalized payload after backing row mutates");
+    payload_session->clear_selection();
+    ok &= check(payload_session->selected_text().code ==
+        term::Terminal_selection_result_code::NO_SELECTION,
+        "clear_selection clears the finalized payload");
+    payload_session->set_selection_range({
+        { 0, 0 },
+        { 0, 8 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result refreshed_payload =
+        payload_session->selected_text();
+    ok &= check(refreshed_payload.code == term::Terminal_selection_result_code::OK &&
+        refreshed_payload.text == QStringLiteral("mutated!"),
+        "new selection captures replacement payload");
+
+    std::unique_ptr<term::Terminal_session> sync_payload_session;
+    Scripted_backend* sync_payload_backend = make_session(sync_payload_session);
+    ok &= check(sync_payload_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "synchronized payload selection session starts");
+    ok &= check(sync_payload_backend->emit_output(QByteArrayLiteral("original")),
+        "synchronized payload backend emits original row text");
+    sync_payload_session->set_selection_range({
+        { 0, 0 },
+        { 0, 8 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    ok &= check(sync_payload_backend->emit_output(QByteArrayLiteral("\x1b[?2026h\rmutated!")),
+        "synchronized payload backend mutates selected row while held");
+    const term::Terminal_selection_result held_payload =
+        sync_payload_session->selected_text();
+    ok &= check(held_payload.code == term::Terminal_selection_result_code::OK &&
+        held_payload.text == QStringLiteral("original"),
+        "selected_text keeps session payload while synchronized output is held");
 
     session->clear_selection();
     const std::optional<term::Terminal_render_snapshot> cleared_snapshot =
@@ -1097,15 +1224,17 @@ bool test_selection_snapshot_and_visible_text()
         "alternate selection backend enters alternate buffer");
     const std::optional<term::Terminal_render_snapshot> alternate_snapshot =
         alternate_session->latest_render_snapshot();
-    ok &= check(!alternate_session->has_selection(),
-        "active buffer transition clears primary selection");
+    const term::Terminal_selection_result alternate_retained_text =
+        alternate_session->selected_text();
+    ok &= check(alternate_session->has_selection(),
+        "active buffer transition retains primary finalized selection payload");
     ok &= check(alternate_snapshot.has_value() &&
         alternate_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE &&
         alternate_snapshot->selection_spans.empty(),
         "alternate buffer snapshot does not project primary selection spans");
-    ok &= check(alternate_session->selected_text().code ==
-        term::Terminal_selection_result_code::NO_SELECTION,
-        "selected_text reports no selection after active buffer transition");
+    ok &= check(alternate_retained_text.code == term::Terminal_selection_result_code::OK &&
+        alternate_retained_text.text == QStringLiteral("prim"),
+        "selected_text reports retained payload after active buffer transition");
 
     std::unique_ptr<term::Terminal_session> alternate_eviction_session;
     Scripted_backend* alternate_eviction_backend = make_session(alternate_eviction_session);
@@ -1135,13 +1264,18 @@ bool test_selection_snapshot_and_visible_text()
         "alternate eviction backend leaves alternate buffer");
     const std::optional<term::Terminal_render_snapshot> leave_alternate_snapshot =
         alternate_eviction_session->latest_render_snapshot();
-    ok &= check(!alternate_eviction_session->has_selection(),
-        "alternate-to-primary transition clears alternate-buffer selection");
+    const term::Terminal_selection_result leave_alternate_text =
+        alternate_eviction_session->selected_text();
+    ok &= check(alternate_eviction_session->has_selection(),
+        "alternate-to-primary transition retains alternate-buffer payload");
     ok &= check(leave_alternate_snapshot.has_value() &&
         leave_alternate_snapshot->viewport.active_buffer ==
             term::Terminal_buffer_id::PRIMARY &&
         leave_alternate_snapshot->selection_spans.empty(),
         "primary snapshot does not project alternate-buffer selection spans");
+    ok &= check(leave_alternate_text.code == term::Terminal_selection_result_code::OK &&
+        leave_alternate_text.text == QStringLiteral("alternate"),
+        "selected_text reports retained alternate-buffer payload");
 
     std::unique_ptr<term::Terminal_session> eviction_session;
     Scripted_backend* eviction_backend = make_session(eviction_session);
@@ -1150,6 +1284,22 @@ bool test_selection_snapshot_and_visible_text()
         "eviction selection session starts");
     ok &= check(eviction_backend->emit_output(numbered_scroll_lines(80)),
         "eviction selection backend creates scrollback");
+    const std::optional<term::terminal_selection_source_identity_t> eviction_source =
+        eviction_session->published_selection_source_identity();
+    ok &= check(eviction_source.has_value(),
+        "Phase 4 offscreen scrollback selection has a published source identity");
+    eviction_session->set_selection_range_from_published_source({
+        { 0, 0 },
+        { 2, 15 },
+        term::Terminal_selection_mode::NORMAL,
+    }, eviction_source.value_or(term::terminal_selection_source_identity_t{}));
+    const term::Terminal_selection_result offscreen_scrollback_payload =
+        eviction_session->selected_text();
+    ok &= check(offscreen_scrollback_payload.code == term::Terminal_selection_result_code::OK &&
+        offscreen_scrollback_payload.text ==
+            QStringLiteral("scroll-line-000\nscroll-line-001\nscroll-line-002"),
+        "Phase 4 offscreen scrollback payload is complete instead of visible-snapshot-truncated");
+    eviction_session->clear_selection();
     eviction_session->set_selection_range({
         { 0, 0 },
         { 0, 5 },
@@ -1157,13 +1307,25 @@ bool test_selection_snapshot_and_visible_text()
     });
     ok &= check(eviction_session->has_selection(),
         "eviction selection session records scrollback selection");
+    const term::Terminal_selection_result eviction_original_payload =
+        eviction_session->selected_text();
+    ok &= check(eviction_original_payload.code == term::Terminal_selection_result_code::OK &&
+        eviction_original_payload.text == QStringLiteral("scrol"),
+        "eviction selection captures exact finalized offscreen payload before eviction");
     eviction_session->set_scrollback_limit(2);
     const std::optional<term::Terminal_render_snapshot> eviction_snapshot =
         eviction_session->latest_render_snapshot();
-    ok &= check(!eviction_session->has_selection(),
-        "scrollback eviction clears evicted selection");
+    const term::Terminal_selection_result eviction_payload =
+        eviction_session->selected_text();
+    ok &= check(eviction_session->has_selection(),
+        "scrollback eviction retains finalized selection payload");
+    ok &= check(eviction_payload.code == term::Terminal_selection_result_code::OK &&
+        eviction_payload.text == eviction_original_payload.text,
+        "scrollback eviction preserves finalized selected text");
     ok &= check(eviction_snapshot.has_value() && eviction_snapshot->selection_spans.empty(),
         "scrollback eviction publishes snapshot without stale selection spans");
+    ok &= check(!eviction_session->selection_visual_lease().has_value(),
+        "scrollback eviction clears retained-line visual proof");
 
     term::Terminal_session_config zero_scrollback_config;
     zero_scrollback_config.scrollback_limit = 0;
@@ -1182,15 +1344,27 @@ bool test_selection_snapshot_and_visible_text()
     });
     ok &= check(zero_scrollback_session->has_selection(),
         "zero-scrollback session records a visible selection");
+    const term::Terminal_selection_result zero_scrollback_original_payload =
+        zero_scrollback_session->selected_text();
+    ok &= check(zero_scrollback_original_payload.code ==
+        term::Terminal_selection_result_code::OK,
+        "zero-scrollback session captures finalized payload before live scroll");
     ok &= check(zero_scrollback_backend->emit_output(QByteArrayLiteral("extra\r\n")),
         "zero-scrollback backend scrolls without retaining scrollback");
     const std::optional<term::Terminal_render_snapshot> zero_scrollback_snapshot =
         zero_scrollback_session->latest_render_snapshot();
-    ok &= check(!zero_scrollback_session->has_selection(),
-        "zero-scrollback live scroll clears the evicted selection");
+    const term::Terminal_selection_result zero_scrollback_payload =
+        zero_scrollback_session->selected_text();
+    ok &= check(zero_scrollback_session->has_selection(),
+        "zero-scrollback live scroll retains finalized selection payload");
+    ok &= check(zero_scrollback_payload.code == term::Terminal_selection_result_code::OK &&
+        zero_scrollback_payload.text == zero_scrollback_original_payload.text,
+        "zero-scrollback live scroll preserves finalized selected text");
     ok &= check(zero_scrollback_snapshot.has_value() &&
         zero_scrollback_snapshot->selection_spans.empty(),
         "zero-scrollback live scroll publishes no stale selection spans");
+    ok &= check(!zero_scrollback_session->selection_visual_lease().has_value(),
+        "zero-scrollback live scroll clears retained-line visual proof");
 
     std::unique_ptr<term::Terminal_session> sync_session;
     Scripted_backend* sync_backend = make_session(sync_session);
@@ -1246,6 +1420,2085 @@ bool test_selection_snapshot_and_visible_text()
     ok &= check(sync_set_snapshot.has_value() &&
         snapshot_has_selection_span(*sync_set_snapshot, 0, 1, 3),
         "synchronized selection set releases with the deferred selection span");
+
+    std::unique_ptr<term::Terminal_session> sync_source_session;
+    Scripted_backend* sync_source_backend = make_session(sync_source_session);
+    ok &= check(sync_source_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 4 synchronized payload-source session starts");
+    ok &= check(sync_source_backend->emit_output(QByteArrayLiteral("alpha")),
+        "Phase 4 synchronized payload-source backend emits visible text");
+    const std::optional<term::terminal_selection_source_identity_t> visible_source =
+        sync_source_session->published_selection_source_identity();
+    ok &= check(visible_source.has_value(),
+        "Phase 4 visible published source identity is available");
+    ok &= check(sync_source_backend->emit_output(QByteArrayLiteral("\x1b[?2026h\rbravo")),
+        "Phase 4 synchronized payload-source backend mutates hidden text");
+    sync_source_session->set_selection_range_from_published_source({
+        { 0, 0 },
+        { 0, 5 },
+        term::Terminal_selection_mode::NORMAL,
+    }, visible_source.value_or(term::terminal_selection_source_identity_t{}));
+    const term::Terminal_selection_result hidden_source_payload =
+        sync_source_session->selected_text();
+    ok &= check(hidden_source_payload.code == term::Terminal_selection_result_code::OK &&
+        hidden_source_payload.text == QStringLiteral("alpha"),
+        "Phase 4 selection payload is extracted from the published source, not hidden synchronized state");
+    ok &= check(sync_source_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "Phase 4 synchronized payload-source backend releases hidden text");
+    const std::optional<term::Terminal_render_snapshot> released_source_snapshot =
+        sync_source_session->latest_render_snapshot();
+    const term::Terminal_selection_result released_source_payload =
+        sync_source_session->selected_text();
+    ok &= check(released_source_snapshot.has_value() &&
+        snapshot_row_text(*released_source_snapshot, 0) == QStringLiteral("bravo"),
+        "Phase 4 synchronized payload-source release publishes hidden replacement text");
+    ok &= check(released_source_payload.code == term::Terminal_selection_result_code::OK &&
+        released_source_payload.text == QStringLiteral("alpha"),
+        "Phase 4 synchronized payload-source release retains the published-source payload");
+
+    std::unique_ptr<term::Terminal_session> hidden_offscreen_session;
+    Scripted_backend* hidden_offscreen_backend = make_session(hidden_offscreen_session);
+    ok &= check(hidden_offscreen_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 4 hidden offscreen selection session starts");
+    ok &= check(hidden_offscreen_backend->emit_output(numbered_scroll_lines(80)),
+        "Phase 4 hidden offscreen backend creates scrollback");
+    ok &= check(hidden_offscreen_backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
+        "Phase 4 hidden offscreen backend enters synchronized output with hidden text");
+    hidden_offscreen_session->set_selection_range({
+        { 0, 0 },
+        { 0, 5 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result hidden_offscreen_payload =
+        hidden_offscreen_session->selected_text();
+    ok &= check(hidden_offscreen_payload.code == term::Terminal_selection_result_code::NO_SELECTION,
+        "Phase 4 hidden synchronized output blocks offscreen model fallback");
+
+    return ok;
+}
+
+bool test_selection_snapshot_during_blocked_publication()
+{
+    bool ok = true;
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "blocked detach session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("visible")),
+            "blocked detach backend emits visible text");
+        session->set_selection_range({
+            { 0, 0 },
+            { 0, 4 },
+            term::Terminal_selection_mode::NORMAL,
+        });
+        const std::uint64_t selected_generation =
+            session->render_snapshot_generation();
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
+            "blocked detach backend holds synchronized output");
+        ok &= check(session->render_snapshot_generation() == selected_generation,
+            "blocked detach held output does not publish content");
+
+        session->detach_selection_visual_attachment();
+        const std::optional<term::Terminal_render_snapshot> detached_snapshot =
+            session->latest_render_snapshot();
+        const term::Terminal_selection_result detached_payload =
+            session->selected_text();
+        ok &= check(session->render_snapshot_generation() == selected_generation + 1U,
+            "blocked detach publishes a selection-only snapshot");
+        ok &= check(detached_snapshot.has_value() &&
+            snapshot_contains_text(*detached_snapshot, QStringLiteral("visible")) &&
+            !snapshot_contains_text(*detached_snapshot, QStringLiteral("held")) &&
+            detached_snapshot->selection_spans.empty(),
+            "blocked detach clears public spans without publishing held content");
+        ok &= check(detached_payload.code == term::Terminal_selection_result_code::OK &&
+            detached_payload.text == QStringLiteral("visi"),
+            "blocked detach preserves selected payload");
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "blocked clear session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("alpha")),
+            "blocked clear backend emits visible text");
+        session->set_selection_range({
+            { 0, 0 },
+            { 0, 5 },
+            term::Terminal_selection_mode::NORMAL,
+        });
+        const std::uint64_t selected_generation =
+            session->render_snapshot_generation();
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
+            "blocked clear backend holds synchronized output");
+        session->clear_selection();
+        ok &= check(session->render_snapshot_generation() == selected_generation,
+            "blocked clear defers snapshot publication");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "blocked clear backend releases synchronized output");
+        const std::optional<term::Terminal_render_snapshot> released_snapshot =
+            session->latest_render_snapshot();
+        ok &= check(!session->has_selection(),
+            "blocked clear updates internal selection state");
+        ok &= check(released_snapshot.has_value() &&
+            snapshot_contains_text(*released_snapshot, QStringLiteral("held")) &&
+            released_snapshot->selection_spans.empty(),
+            "blocked clear publishes deferred clear on release");
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "blocked set session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("alpha")),
+            "blocked set backend emits visible text");
+        const std::uint64_t visible_generation =
+            session->render_snapshot_generation();
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+            "blocked set backend holds synchronized output");
+        session->set_selection_range({
+            { 0, 1 },
+            { 0, 4 },
+            term::Terminal_selection_mode::NORMAL,
+        });
+        ok &= check(session->render_snapshot_generation() == visible_generation,
+            "blocked set defers snapshot publication");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "blocked set backend releases synchronized output");
+        const std::optional<term::Terminal_render_snapshot> released_snapshot =
+            session->latest_render_snapshot();
+        ok &= check(released_snapshot.has_value() &&
+            snapshot_has_selection_span(*released_snapshot, 0, 1, 3),
+            "blocked set publishes deferred selection on release");
+    }
+
+    return ok;
+}
+
+bool test_blocked_detach_resize_snapshot_metadata_coherence()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.scrollback_limit = 0;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {3, 10};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "blocked detach resize metadata session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("visible")),
+        "blocked detach resize backend emits visible text");
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+        session->latest_render_snapshot();
+    const std::uint64_t selected_generation =
+        session->render_snapshot_generation();
+
+    QByteArray held_output = QByteArrayLiteral("\x1b[?2026h");
+    held_output += numbered_scroll_lines(8);
+    ok &= check(backend->emit_output(std::move(held_output)),
+        "blocked detach resize backend emits held scrollback churn");
+    ok &= check(session->render_snapshot_generation() == selected_generation,
+        "held scrollback churn stays unpublished before resize");
+
+    const term::Terminal_session_result resize_result =
+        session->resize(QSizeF(120.0, 80.0), {4, 12});
+    const std::optional<term::Terminal_render_snapshot> resize_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
+        "blocked detach resize is accepted");
+    ok &= check(resize_snapshot.has_value()             &&
+        resize_snapshot->grid_size.rows    == 4         &&
+        resize_snapshot->grid_size.columns == 12        &&
+        snapshot_cells_fit_grid(*resize_snapshot),
+        "synchronized resize snapshot publishes current geometry");
+    ok &= check(selected_snapshot.has_value() && resize_snapshot.has_value() &&
+        resize_snapshot->metadata.row_origin_generation >
+            selected_snapshot->metadata.row_origin_generation,
+        "synchronized resize snapshot includes deferred row-origin churn");
+
+    session->detach_selection_visual_attachment();
+    const std::optional<term::Terminal_render_snapshot> detached_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(detached_snapshot.has_value()             &&
+        detached_snapshot->grid_size.rows    == 4         &&
+        detached_snapshot->grid_size.columns == 12        &&
+        snapshot_cells_fit_grid(*detached_snapshot)       &&
+        detached_snapshot->selection_spans.empty()        &&
+        !snapshot_contains_text(*detached_snapshot, QStringLiteral("scroll-line")),
+        "blocked detach after synchronized resize preserves current public geometry only");
+    ok &= check(resize_snapshot.has_value() && detached_snapshot.has_value() &&
+        detached_snapshot->metadata.row_origin_generation ==
+            resize_snapshot->metadata.row_origin_generation,
+        "blocked detach after synchronized resize stamps current row-origin metadata");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "blocked detach resize backend releases synchronized output");
+    const std::optional<term::Terminal_render_snapshot> released_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(detached_snapshot.has_value() && released_snapshot.has_value() &&
+        released_snapshot->metadata.row_origin_generation ==
+            detached_snapshot->metadata.row_origin_generation,
+        "synchronized release does not reapply row-origin churn consumed by resize");
+
+    return ok;
+}
+
+term::terminal_selection_visual_lease_t make_phase2_selection_lease(
+    term::Terminal_selection_range range)
+{
+    term::terminal_selection_visual_lease_t lease;
+    lease.source_content_basis = {7U, 3U};
+    lease.session_epoch        = 11U;
+    lease.buffer_id            = term::Terminal_buffer_id::PRIMARY;
+    lease.grid_reflow_basis    = 3U;
+    lease.grid_size            = {24, 80};
+    lease.viewport_mapping     = {
+        term::Terminal_buffer_id::PRIMARY,
+        6,
+        24,
+        2,
+        false,
+        term::Terminal_alternate_screen_scroll_policy::KEEP_AT_TAIL,
+    };
+    lease.selected_range = range;
+    lease.anchor         = range.start;
+    lease.extent         = range.end;
+    lease.selected_lines = {{
+        0,
+        101U,
+        13U,
+    }};
+    return lease;
+}
+
+bool test_selection_phase2_internal_state_and_lease()
+{
+    bool ok = true;
+
+    term::Selection_contract_controller selection;
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::NONE &&
+        !selection.has_selection(),
+        "Phase 2 selection starts with internal NONE state");
+
+    selection.begin({1, 2});
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::DRAG_ARMED &&
+        !selection.has_selection() &&
+        selection.has_internal_selection() &&
+        selection.provisional_payload_identity() != 0U &&
+        selection.durable_payload_identity() == 0U,
+        "Phase 2 drag begin arms a non-copyable provisional selection and clears durable payload");
+
+    selection.extend({1, 6});
+    const std::vector<QString> rows = {
+        QStringLiteral("zero"),
+        QStringLiteral("abcdefgh"),
+    };
+    const term::Terminal_selection_result preview_text =
+        selection.selected_text(std::span<const QString>(rows));
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::DRAG_PREVIEW &&
+        preview_text.code == term::Terminal_selection_result_code::OK &&
+        preview_text.text == QStringLiteral("cdef"),
+        "Phase 2 drag extend records DRAG_PREVIEW without durable payload storage");
+
+    const term::Terminal_selection_range range = {
+        {1, 2},
+        {1, 6},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    selection.set_range(range, QStringLiteral("cdef"), make_phase2_selection_lease(range));
+    const std::uint64_t durable_identity = selection.durable_payload_identity();
+    const term::Terminal_selection_result durable_text = selection.selected_text();
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::ATTACHED_VISIBLE &&
+        durable_identity != 0U &&
+        selection.provisional_payload_identity() == 0U &&
+        durable_text.code == term::Terminal_selection_result_code::OK &&
+        durable_text.text == QStringLiteral("cdef"),
+        "Phase 2 finalize stores durable payload separately from provisional drag state");
+
+    const std::optional<term::terminal_selection_visual_lease_t>& lease =
+        selection.visual_lease();
+    ok &= check(lease.has_value() &&
+        lease->source_content_basis == term::terminal_selection_content_basis_t{7U, 3U} &&
+        lease->session_epoch == 11U &&
+        lease->buffer_id == term::Terminal_buffer_id::PRIMARY &&
+        lease->grid_reflow_basis == 3U &&
+        lease->grid_size.rows == 24 &&
+        lease->grid_size.columns == 80 &&
+        lease->viewport_mapping.offset_from_tail == 2 &&
+        lease->selected_range == range &&
+        lease->anchor == range.start &&
+        lease->extent == range.end &&
+        lease->selected_lines == make_phase2_selection_lease(range).selected_lines &&
+        lease->durable_payload_identity == durable_identity,
+        "Phase 2 visual lease records content basis, grid, viewport, endpoints, and payload identity");
+
+    selection.hide_visual_attachment();
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::ATTACHED_HIDDEN &&
+        selection.visual_lease().has_value() &&
+        selection.selected_text().text == QStringLiteral("cdef"),
+        "Phase 2 hidden attachment keeps the lease and durable payload");
+
+    selection.detach_visual_attachment();
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::PAYLOAD_ONLY &&
+        !selection.visual_lease().has_value() &&
+        selection.has_selection() &&
+        selection.selected_text().text == QStringLiteral("cdef"),
+        "Phase 2 visual detach keeps copyability as PAYLOAD_ONLY");
+
+    selection.clear();
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::NONE &&
+        !selection.has_selection() &&
+        selection.selected_text().code == term::Terminal_selection_result_code::NO_SELECTION,
+        "Phase 2 clear removes payload and visual lease data");
+
+    return ok;
+}
+
+bool test_selection_phase2_replacement_empty_cancel_and_eviction()
+{
+    bool ok = true;
+
+    term::Selection_contract_controller selection;
+    const term::Terminal_selection_range original_range = {
+        {2, 0},
+        {2, 5},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    selection.set_range(
+        original_range,
+        QStringLiteral("alpha"),
+        make_phase2_selection_lease(original_range));
+    const std::uint64_t original_identity = selection.durable_payload_identity();
+
+    selection.begin({3, 1});
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::DRAG_ARMED &&
+        !selection.has_selection() &&
+        selection.has_internal_selection() &&
+        selection.durable_payload_identity() == 0U &&
+        selection.selected_text().code == term::Terminal_selection_result_code::INVALID_RANGE,
+        "Phase 2 replacement mouse-down clears the old durable payload immediately");
+
+    selection.clear();
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::NONE &&
+        selection.selected_text().code == term::Terminal_selection_result_code::NO_SELECTION,
+        "Phase 2 cancelled replacement returns to NONE without restoring old payload");
+
+    const term::Terminal_selection_range empty_range = {
+        {4, 6},
+        {4, 6},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    selection.set_range(empty_range, QString(), make_phase2_selection_lease(empty_range));
+    const std::uint64_t empty_identity = selection.durable_payload_identity();
+    const term::Terminal_selection_result empty_text = selection.selected_text();
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::ATTACHED_VISIBLE &&
+        selection.has_selection() &&
+        empty_text.code == term::Terminal_selection_result_code::OK &&
+        empty_text.text.isEmpty(),
+        "Phase 2 committed empty selection remains an active durable payload");
+
+    const term::Terminal_selection_range replacement_range = {
+        {5, 0},
+        {5, 4},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    selection.set_range(
+        replacement_range,
+        QStringLiteral("beta"),
+        make_phase2_selection_lease(replacement_range));
+    ok &= check(selection.durable_payload_identity() != original_identity &&
+        selection.durable_payload_identity() != empty_identity &&
+        selection.selected_text().text == QStringLiteral("beta"),
+        "Phase 2 non-empty replacement creates a new durable payload identity");
+
+    ok &= check(selection.apply_scrollback_eviction(6),
+        "Phase 2 scrollback eviction applies to the active selection");
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::PAYLOAD_ONLY &&
+        !selection.visual_lease().has_value() &&
+        selection.selected_text().code == term::Terminal_selection_result_code::OK &&
+        selection.selected_text().text == QStringLiteral("beta"),
+        "Phase 2 scrollback eviction detaches visuals while preserving payload");
+
+    return ok;
+}
+
+bool test_selection_phase2_model_semantic_flags()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model_config config;
+    config.grid_size = {3, 10};
+    term::Terminal_screen_model model(config);
+
+    const term::Terminal_screen_model_result text_result =
+        model.ingest(QByteArrayLiteral("abc"));
+    ok &= check(text_result.terminal_content_changed &&
+        !text_result.active_buffer_changed &&
+        !text_result.grid_reflow_changed,
+        "Phase 2 model marks printable output as semantic content change");
+
+    const term::Terminal_screen_model_result cursor_result =
+        model.ingest(QByteArrayLiteral("\r"));
+    ok &= check(!cursor_result.dirty_rows.empty() &&
+        !cursor_result.terminal_content_changed &&
+        !cursor_result.active_buffer_changed &&
+        !cursor_result.grid_reflow_changed,
+        "Phase 2 model does not treat cursor-only dirty rows as semantic content identity");
+
+    const term::Terminal_screen_model_result resize_result =
+        model.resize({4, 10});
+    ok &= check(!resize_result.terminal_content_changed &&
+        !resize_result.active_buffer_changed &&
+        resize_result.grid_reflow_changed,
+        "Phase 2 model reports resize/reflow through an explicit grid flag");
+
+    const term::Terminal_screen_model_result alternate_result =
+        model.ingest(QByteArrayLiteral("\x1b[?1049h"));
+    ok &= check(alternate_result.active_buffer_changed,
+        "Phase 2 model reports alternate-buffer transitions through an explicit buffer flag");
+
+    return ok;
+}
+
+bool test_selection_phase2_session_lease_basis_advances()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 2 lease-basis session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("alpha")),
+        "Phase 2 lease-basis backend publishes initial content");
+
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 5 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::terminal_selection_visual_lease_t> initial_lease =
+        session->selection_visual_lease();
+    ok &= check(initial_lease.has_value() &&
+        initial_lease->source_content_basis.content_generation > 0U,
+        "Phase 2 initial lease captures advanced content basis after published text");
+
+    session->clear_selection();
+    ok &= check(backend->emit_output(QByteArrayLiteral("\ralpha!")),
+        "Phase 2 lease-basis backend publishes content mutation");
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 6 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::terminal_selection_visual_lease_t> mutated_lease =
+        session->selection_visual_lease();
+    ok &= check(initial_lease.has_value() &&
+        mutated_lease.has_value() &&
+        mutated_lease->source_content_basis.content_generation >
+            initial_lease->source_content_basis.content_generation,
+        "Phase 2 lease captures later content-generation advancement");
+
+    session->clear_selection();
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1049h")),
+        "Phase 2 lease-basis backend enters alternate buffer");
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 0 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::terminal_selection_visual_lease_t> alternate_lease =
+        session->selection_visual_lease();
+    ok &= check(mutated_lease.has_value() &&
+        alternate_lease.has_value() &&
+        alternate_lease->buffer_id == term::Terminal_buffer_id::ALTERNATE &&
+        alternate_lease->source_content_basis.content_generation >
+            mutated_lease->source_content_basis.content_generation,
+        "Phase 2 lease captures active-buffer content-basis advancement");
+
+    session->clear_selection();
+    const term::Terminal_session_result resize_result =
+        session->resize(QSizeF(400.0, 120.0), {12, 40});
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 0 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::terminal_selection_visual_lease_t> resized_lease =
+        session->selection_visual_lease();
+    ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
+        "Phase 2 lease-basis resize is accepted");
+    ok &= check(alternate_lease.has_value() &&
+        resized_lease.has_value() &&
+        resized_lease->source_content_basis.grid_reflow_generation >
+            alternate_lease->source_content_basis.grid_reflow_generation,
+        "Phase 2 lease captures grid-reflow basis advancement");
+
+    std::unique_ptr<term::Terminal_session> synchronized_resize_session;
+    Scripted_backend* synchronized_resize_backend =
+        make_session(synchronized_resize_session);
+    ok &= check(synchronized_resize_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 2 synchronized resize lease-basis session starts");
+    ok &= check(synchronized_resize_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+        "Phase 2 synchronized resize enters synchronized output");
+    const term::Terminal_session_result synchronized_resize_result =
+        synchronized_resize_session->resize(QSizeF(640.0, 300.0), {15, 64});
+    const std::optional<term::Terminal_render_snapshot> synchronized_resize_snapshot =
+        synchronized_resize_session->latest_render_snapshot();
+    ok &= check(synchronized_resize_result.code == term::Terminal_session_result_code::ACCEPTED,
+        "Phase 2 synchronized resize is accepted");
+    ok &= check(synchronized_resize_snapshot.has_value() &&
+        synchronized_resize_snapshot->grid_size.rows    == 15 &&
+        synchronized_resize_snapshot->grid_size.columns == 64,
+        "Phase 2 synchronized resize publishes a geometry snapshot");
+    synchronized_resize_session->set_selection_range({
+        { 0, 0 },
+        { 0, 0 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::terminal_selection_visual_lease_t>
+        synchronized_resize_lease =
+            synchronized_resize_session->selection_visual_lease();
+    ok &= check(synchronized_resize_lease.has_value() &&
+        synchronized_resize_lease->source_content_basis.grid_reflow_generation > 0U,
+        "Phase 2 lease captures synchronized resize grid-reflow basis advancement");
+
+    return ok;
+}
+
+bool test_selection_phase3_line_lease_provenance_capture()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {4, 20};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 3 line lease session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma")),
+        "Phase 3 line lease backend emits selectable rows");
+    const std::optional<term::Terminal_render_snapshot> source_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_source_identity_t> source =
+        session->published_selection_source_identity();
+
+    const term::Terminal_selection_range range = {
+        {0, 1},
+        {2, 3},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    session->set_selection_range_from_published_source(
+        range,
+        source.value_or(term::terminal_selection_source_identity_t{}));
+    const term::Terminal_selection_result payload = session->selected_text();
+    const std::optional<term::terminal_selection_visual_lease_t> lease =
+        session->selection_visual_lease();
+    ok &= check(payload.code == term::Terminal_selection_result_code::OK &&
+        payload.text == QStringLiteral("lpha\nbeta\ngam"),
+        "Phase 3 line lease payload is extracted from the selected source rows");
+    ok &= check(source_snapshot.has_value() && source.has_value() && lease.has_value() &&
+        lease->selected_lines ==
+            expected_line_leases_from_snapshot(*source_snapshot, range),
+        "Phase 3 line lease descriptors match the source snapshot provenance");
+    ok &= check(lease.has_value() && lease->selected_lines.size() == 3U,
+        "Phase 3 multi-row selection stores one descriptor per selected logical row");
+    if (lease.has_value() && lease->selected_lines.size() == 3U) {
+        ok &= check(lease->selected_lines[0].row_offset == 0 &&
+            lease->selected_lines[1].row_offset == 1 &&
+            lease->selected_lines[2].row_offset == 2,
+            "Phase 3 multi-row line lease row offsets are normalized from the selected start row");
+    }
+    if (source_snapshot.has_value() &&
+        lease.has_value()          &&
+        lease->selected_lines.size() == 3U &&
+        source_snapshot->visible_line_provenance.size() >= 3U)
+    {
+        const std::vector<term::Terminal_render_line_provenance>& provenance =
+            source_snapshot->visible_line_provenance;
+        ok &= check(provenance[0].logical_row == 0 &&
+            provenance[1].logical_row == 1 &&
+            provenance[2].logical_row == 2,
+            "Phase 3 source snapshot independently exposes the selected logical rows");
+        ok &= check(lease->selected_lines[0].retained_line_id ==
+                provenance[0].retained_line_id &&
+            lease->selected_lines[0].content_generation ==
+                provenance[0].content_generation &&
+            lease->selected_lines[1].retained_line_id ==
+                provenance[1].retained_line_id &&
+            lease->selected_lines[1].content_generation ==
+                provenance[1].content_generation &&
+            lease->selected_lines[2].retained_line_id ==
+                provenance[2].retained_line_id &&
+            lease->selected_lines[2].content_generation ==
+                provenance[2].content_generation,
+            "Phase 3 line lease descriptor values match snapshot provenance fields directly");
+    }
+
+    term::Terminal_session_config drained_config;
+    drained_config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> drained_session;
+    Scripted_backend* drained_backend = make_session(drained_session, drained_config);
+    term::Terminal_launch_config drained_launch_config = valid_launch_config();
+    drained_launch_config.initial_grid_size = {3, 20};
+    ok &= check(drained_session->start(drained_launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 3 drained line lease session starts");
+    ok &= check(drained_backend->emit_output(QByteArrayLiteral("drained\r\nsource")),
+        "Phase 3 drained line lease backend queues selectable rows");
+    ok &= check(drained_session->output_chunks().empty(),
+        "Phase 3 drained line lease fixture holds queued output before owner drain");
+    drained_session->process_backend_callback_events();
+    const std::optional<term::Terminal_render_snapshot> drained_snapshot =
+        drained_session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_source_identity_t> drained_source =
+        drained_session->published_selection_source_identity();
+    const term::Terminal_selection_range drained_range = {
+        {1, 0},
+        {1, 6},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    ok &= check(drained_snapshot.has_value() &&
+        drained_source.has_value() &&
+        snapshot_row_text(*drained_snapshot, 0) == QStringLiteral("drained") &&
+        snapshot_row_text(*drained_snapshot, 1) == QStringLiteral("source"),
+        "Phase 3 owner drain publishes queued source rows before selection");
+    if (drained_snapshot.has_value() && drained_source.has_value()) {
+        drained_session->set_selection_range_from_drained_published_source(
+            drained_range,
+            *drained_source);
+        const term::Terminal_selection_result drained_payload =
+            drained_session->selected_text();
+        const std::optional<term::terminal_selection_visual_lease_t> drained_lease =
+            drained_session->selection_visual_lease();
+        ok &= check(drained_payload.code == term::Terminal_selection_result_code::OK &&
+            drained_payload.text == QStringLiteral("source"),
+            "Phase 3 drained published source payload comes from queued output");
+        ok &= check(drained_lease.has_value() &&
+            drained_lease->selected_lines.size() == 1U,
+            "Phase 3 drained published source captures one retained-line descriptor");
+        if (drained_lease.has_value() &&
+            drained_lease->selected_lines.size() == 1U &&
+            drained_snapshot->visible_line_provenance.size() >= 2U)
+        {
+            const term::Terminal_render_line_provenance& provenance =
+                drained_snapshot->visible_line_provenance[1];
+            const term::terminal_selection_line_lease_t& selected_line =
+                drained_lease->selected_lines[0];
+            ok &= check(provenance.logical_row == 1 &&
+                selected_line.row_offset == 0 &&
+                selected_line.retained_line_id == provenance.retained_line_id &&
+                selected_line.content_generation == provenance.content_generation,
+                "Phase 3 drained descriptor fields match drained snapshot provenance directly");
+        }
+        else {
+            ok &= check(false,
+                "Phase 3 drained published source fixture exposes selected row provenance");
+        }
+    }
+
+    return ok;
+}
+
+bool test_selection_phase3_line_lease_negative_source_paths()
+{
+    bool ok = true;
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = {4, 20};
+        ok &= check(session->start(launch_config).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "Phase 3 reversed line lease session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma")),
+            "Phase 3 reversed line lease backend emits selectable rows");
+        const std::optional<term::Terminal_render_snapshot> source_snapshot =
+            session->latest_render_snapshot();
+        const std::optional<term::terminal_selection_source_identity_t> source =
+            session->published_selection_source_identity();
+
+        const term::Terminal_selection_range reversed_range = {
+            {2, 3},
+            {0, 1},
+            term::Terminal_selection_mode::NORMAL,
+        };
+        session->set_selection_range_from_published_source(
+            reversed_range,
+            source.value_or(term::terminal_selection_source_identity_t{}));
+        const term::Terminal_selection_result payload = session->selected_text();
+        const std::optional<term::terminal_selection_visual_lease_t> lease =
+            session->selection_visual_lease();
+        ok &= check(payload.code == term::Terminal_selection_result_code::OK &&
+            payload.text == QStringLiteral("lpha\nbeta\ngam"),
+            "Phase 3 reversed multi-row selection normalizes payload row order");
+        ok &= check(source_snapshot.has_value() && source.has_value() && lease.has_value() &&
+            lease->selected_range == reversed_range &&
+            lease->anchor == reversed_range.start &&
+            lease->extent == reversed_range.end,
+            "Phase 3 reversed visual lease preserves caller endpoints");
+        if (source_snapshot.has_value() &&
+            lease.has_value()          &&
+            lease->selected_lines.size() == 3U &&
+            source_snapshot->visible_line_provenance.size() >= 3U)
+        {
+            const std::vector<term::Terminal_render_line_provenance>& provenance =
+                source_snapshot->visible_line_provenance;
+            ok &= check(lease->selected_lines[0].row_offset == 0 &&
+                lease->selected_lines[0].retained_line_id ==
+                    provenance[0].retained_line_id &&
+                lease->selected_lines[0].content_generation ==
+                    provenance[0].content_generation &&
+                lease->selected_lines[1].row_offset == 1 &&
+                lease->selected_lines[1].retained_line_id ==
+                    provenance[1].retained_line_id &&
+                lease->selected_lines[1].content_generation ==
+                    provenance[1].content_generation &&
+                lease->selected_lines[2].row_offset == 2 &&
+                lease->selected_lines[2].retained_line_id ==
+                    provenance[2].retained_line_id &&
+                lease->selected_lines[2].content_generation ==
+                    provenance[2].content_generation,
+                "Phase 3 reversed multi-row descriptor fields normalize to source row order");
+        }
+        else {
+            ok &= check(false,
+                "Phase 3 reversed multi-row fixture exposes three source descriptors");
+        }
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "Phase 3 stale source session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("alpha")),
+            "Phase 3 stale source backend emits original content");
+        const std::optional<term::terminal_selection_source_identity_t> stale_source =
+            session->published_selection_source_identity();
+        ok &= check(stale_source.has_value(),
+            "Phase 3 stale source fixture publishes a real source before mutation");
+
+        if (stale_source.has_value()) {
+            ok &= check(backend->emit_output(QByteArrayLiteral("\ralpha!")),
+                "Phase 3 stale source backend mutates published content");
+
+            session->set_selection_range_from_published_source(
+                {{0, 0}, {0, 5}, term::Terminal_selection_mode::NORMAL},
+                *stale_source);
+            ok &= check(!session->has_selection() &&
+                !session->selection_visual_lease().has_value(),
+                "Phase 3 stale source selection attempt captures no visual lease descriptors");
+        }
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "Phase 3 stale-source clear session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("alpha")),
+            "Phase 3 stale-source clear backend emits original content");
+        const std::optional<term::terminal_selection_source_identity_t> stale_source =
+            session->published_selection_source_identity();
+        const term::Terminal_selection_range range = {
+            {0, 0},
+            {0, 5},
+            term::Terminal_selection_mode::NORMAL,
+        };
+        ok &= check(stale_source.has_value(),
+            "Phase 3 stale-source clear fixture publishes a real source before mutation");
+
+        if (stale_source.has_value()) {
+            session->set_selection_range_from_published_source(range, *stale_source);
+            const term::Terminal_selection_result initial_payload =
+                session->selected_text();
+            ok &= check(session->has_selection() &&
+                initial_payload.code == term::Terminal_selection_result_code::OK &&
+                initial_payload.text == QStringLiteral("alpha"),
+                "Phase 3 stale-source clear fixture creates an initial selection");
+
+            ok &= check(backend->emit_output(QByteArrayLiteral("\ralpha!")),
+                "Phase 3 stale-source clear backend mutates selected content");
+            const bool had_selection_before_stale_attempt = session->has_selection();
+            ok &= check(had_selection_before_stale_attempt,
+                "Phase 3 stale-source clear fixture retains a selection before stale replacement");
+
+            session->set_selection_range_from_published_source(range, *stale_source);
+            ok &= check(had_selection_before_stale_attempt &&
+                !session->has_selection() &&
+                !session->selection_visual_lease().has_value(),
+                "Phase 3 stale source attempt clears an existing selection");
+        }
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = {3, 20};
+        ok &= check(session->start(launch_config).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "Phase 3 mismatched source session starts");
+        ok &= check(backend->emit_output(numbered_scroll_lines(6)),
+            "Phase 3 mismatched source backend creates scrollback");
+        const std::optional<term::Terminal_render_snapshot> source_snapshot =
+            session->latest_render_snapshot();
+        const std::optional<term::terminal_selection_source_identity_t> source =
+            session->published_selection_source_identity();
+
+        if (source_snapshot.has_value() && source.has_value()) {
+            term::terminal_selection_source_identity_t mismatched_source = *source;
+            ++mismatched_source.viewport_mapping.offset_from_tail;
+            const int first_visible_logical_row =
+                term::render_snapshot_first_visible_logical_row(*source_snapshot);
+            const term::Terminal_selection_range range = {
+                {first_visible_logical_row, 0},
+                {first_visible_logical_row, 15},
+                term::Terminal_selection_mode::NORMAL,
+            };
+            session->set_selection_range_from_published_source(range, mismatched_source);
+            const term::Terminal_selection_result payload = session->selected_text();
+            const std::optional<term::terminal_selection_visual_lease_t> lease =
+                session->selection_visual_lease();
+            ok &= check(payload.code == term::Terminal_selection_result_code::OK &&
+                payload.text == QStringLiteral("scroll-line-%1")
+                    .arg(first_visible_logical_row, 3, 10, QLatin1Char('0')),
+                "Phase 3 mismatched viewport source still uses active-model selection fallback");
+            ok &= check(session->has_selection(),
+                "Phase 3 mismatched viewport source may create a fallback selection");
+            ok &= check(lease.has_value() && lease->selected_lines.empty(),
+                "Phase 3 mismatched snapshot identity captures no retained-line descriptors");
+        }
+        else {
+            ok &= check(false,
+                "Phase 3 mismatched source fixture publishes a selectable source");
+        }
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = {3, 20};
+        ok &= check(session->start(launch_config).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "Phase 3 offscreen source session starts");
+        ok &= check(backend->emit_output(numbered_scroll_lines(6)),
+            "Phase 3 offscreen source backend creates scrollback");
+        const std::optional<term::Terminal_render_snapshot> source_snapshot =
+            session->latest_render_snapshot();
+        const std::optional<term::terminal_selection_source_identity_t> source =
+            session->published_selection_source_identity();
+
+        if (source_snapshot.has_value() && source.has_value()) {
+            const int offscreen_logical_row =
+                term::render_snapshot_first_visible_logical_row(*source_snapshot) - 1;
+            const term::Terminal_selection_range range = {
+                {offscreen_logical_row, 0},
+                {offscreen_logical_row, 15},
+                term::Terminal_selection_mode::NORMAL,
+            };
+            session->set_selection_range_from_published_source(range, *source);
+            const term::Terminal_selection_result payload = session->selected_text();
+            const std::optional<term::terminal_selection_visual_lease_t> lease =
+                session->selection_visual_lease();
+            const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+                session->latest_render_snapshot();
+            ok &= check(offscreen_logical_row >= 0 &&
+                payload.code == term::Terminal_selection_result_code::OK &&
+                payload.text == QStringLiteral("scroll-line-%1")
+                    .arg(offscreen_logical_row, 3, 10, QLatin1Char('0')),
+                "Phase 3 offscreen range keeps selection payload through active-model fallback");
+            ok &= check(lease.has_value() && lease->selected_lines.empty(),
+                "Phase 3 offscreen visible-line provenance captures no descriptors");
+            ok &= check(selected_snapshot.has_value() &&
+                selected_snapshot->selection_spans.empty(),
+                "Phase 3 offscreen selection emits no visible spans");
+        }
+        else {
+            ok &= check(false,
+                "Phase 3 offscreen source fixture publishes a selectable source");
+        }
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = {3, 12};
+        ok &= check(session->start(launch_config).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "Phase 3 missing provenance session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("visible")),
+            "Phase 3 missing provenance backend emits base content");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
+            "Phase 3 missing provenance backend holds synchronized output");
+        const term::Terminal_session_result resize_result =
+            session->resize(QSizeF(120.0, 80.0), {4, 12});
+        const std::optional<term::Terminal_render_snapshot> geometry_snapshot =
+            session->latest_render_snapshot();
+        const std::optional<term::terminal_selection_source_identity_t> geometry_source =
+            session->published_selection_source_identity();
+        ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
+            "Phase 3 missing provenance synchronized resize is accepted");
+        ok &= check(geometry_snapshot.has_value() &&
+            geometry_snapshot->visible_line_provenance.empty(),
+            "Phase 3 missing provenance fixture publishes geometry without line descriptors");
+
+        session->set_selection_range_from_published_source(
+            {{0, 0}, {0, 4}, term::Terminal_selection_mode::NORMAL},
+            geometry_source.value_or(term::terminal_selection_source_identity_t{}));
+        const term::Terminal_selection_result payload = session->selected_text();
+        const std::optional<term::terminal_selection_visual_lease_t> lease =
+            session->selection_visual_lease();
+        const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+            session->latest_render_snapshot();
+        ok &= check(payload.code == term::Terminal_selection_result_code::OK &&
+            payload.text == QStringLiteral("visi"),
+            "Phase 3 missing provenance path keeps selection payload behavior");
+        ok &= check(lease.has_value() && lease->selected_lines.empty(),
+            "Phase 3 missing provenance path captures no retained-line descriptors");
+        ok &= check(selected_snapshot.has_value() &&
+            selected_snapshot->selection_spans.empty(),
+            "Phase 3 missing provenance path suppresses visible spans fail-closed");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "Phase 5 missing retained-line proof backend releases synchronized output");
+        const std::optional<term::Terminal_render_snapshot> released_snapshot =
+            session->latest_render_snapshot();
+        ok &= check(!session->selection_visual_lease().has_value(),
+            "Phase 5 missing retained-line proof detaches the visual lease fail-closed");
+        ok &= check(released_snapshot.has_value() &&
+            released_snapshot->selection_spans.empty(),
+            "Phase 5 missing retained-line proof suppresses spans after release");
+    }
+
+    return ok;
+}
+
+bool test_selection_phase5_visual_lease_span_compatibility()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 5 compatible visual lease session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta")),
+        "Phase 5 compatible visual lease backend emits visible rows");
+
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 5 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_visual_lease_t> selected_lease =
+        session->selection_visual_lease();
+    const term::terminal_selection_content_basis_t selected_basis =
+        selected_lease.has_value()
+            ? selected_lease->source_content_basis
+            : term::terminal_selection_content_basis_t{};
+    ok &= check(selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*selected_snapshot, 0, 0, 5),
+        "Phase 5 attached visible lease initially emits selection spans");
+    ok &= check(selected_lease.has_value(),
+        "Phase 5 attached visible selection records a visual lease");
+    const std::vector<term::terminal_selection_line_lease_t> selected_lines =
+        selected_lease.has_value()
+            ? selected_lease->selected_lines
+            : std::vector<term::terminal_selection_line_lease_t>{};
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r")),
+        "Phase 5 cursor-only backend output is accepted");
+    const std::optional<term::Terminal_render_snapshot> cursor_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_visual_lease_t> cursor_lease =
+        session->selection_visual_lease();
+    ok &= check(cursor_snapshot.has_value() &&
+        snapshot_has_selection_span(*cursor_snapshot, 0, 0, 5),
+        "Phase 5 cursor-only snapshot preserves compatible selection spans");
+    ok &= check(cursor_lease.has_value() &&
+        cursor_lease->source_content_basis == selected_basis,
+        "Phase 5 cursor-only snapshot preserves the visual lease basis");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?25l")),
+        "Phase 5 paint-only cursor-visibility update is accepted");
+    const std::optional<term::Terminal_render_snapshot> paint_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_visual_lease_t> paint_lease =
+        session->selection_visual_lease();
+    ok &= check(paint_snapshot.has_value()                         &&
+        !paint_snapshot->modes.cursor_visible                      &&
+        snapshot_has_selection_span(*paint_snapshot, 0, 0, 5),
+        "Phase 5 paint-only cursor-visibility snapshot preserves compatible selection spans");
+    ok &= check(paint_lease.has_value() &&
+        paint_lease->source_content_basis == selected_basis,
+        "Phase 5 paint-only cursor-visibility snapshot preserves the visual lease basis");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[2;1Hunrelated")),
+        "Phase 5 unrelated row backend output is accepted");
+    const std::optional<term::Terminal_render_snapshot> unrelated_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_visual_lease_t> unrelated_lease =
+        session->selection_visual_lease();
+    ok &= check(unrelated_snapshot.has_value() &&
+        snapshot_row_text(*unrelated_snapshot, 1) == QStringLiteral("unrelated") &&
+        snapshot_has_selection_span(*unrelated_snapshot, 0, 0, 5),
+        "Phase 5 unrelated row output keeps committed selection spans renderable");
+    ok &= check(unrelated_lease.has_value() &&
+        unrelated_lease->source_content_basis.content_generation >
+            selected_basis.content_generation,
+        "Phase 5 unrelated row output advances the visual lease by retained-line proof");
+    ok &= check(unrelated_lease.has_value() &&
+        unrelated_lease->selected_lines == selected_lines,
+        "Phase 5 unrelated row output keeps retained-line descriptors stable");
+
+    std::unique_ptr<term::Terminal_session> boundary_session;
+    Scripted_backend* boundary_backend = make_session(boundary_session);
+    ok &= check(boundary_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 4b boundary viewport-scroll lease session starts");
+    ok &= check(boundary_backend->emit_output(numbered_scroll_lines(80)),
+        "Phase 4b boundary viewport-scroll backend creates scrollback");
+    ok &= check(boundary_session->scroll_viewport_lines(5).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "Phase 4b boundary viewport-scroll fixture scrolls into scrollback");
+    const std::optional<term::Terminal_render_snapshot> boundary_anchor_snapshot =
+        boundary_session->latest_render_snapshot();
+    if (!boundary_anchor_snapshot.has_value()) {
+        return false;
+    }
+
+    const int boundary_first_visible_logical_row =
+        boundary_anchor_snapshot->viewport.scrollback_rows -
+        boundary_anchor_snapshot->viewport.offset_from_tail;
+    const int boundary_selection_row = boundary_first_visible_logical_row;
+    const QString boundary_payload_text =
+        QStringLiteral("scroll-line-%1")
+            .arg(boundary_selection_row, 3, 10, QLatin1Char('0'));
+    boundary_session->set_selection_range({
+        { boundary_selection_row, 0 },
+        { boundary_selection_row, 15 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result boundary_payload =
+        boundary_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> boundary_selected_snapshot =
+        boundary_session->latest_render_snapshot();
+    ok &= check(boundary_payload.code == term::Terminal_selection_result_code::OK &&
+        boundary_payload.text == boundary_payload_text,
+        "Phase 4b boundary viewport-scroll selection captures durable payload");
+    ok &= check(boundary_selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*boundary_selected_snapshot, 0, 0, 15),
+        "Phase 4b boundary viewport-scroll selection emits spans while visible");
+
+    ok &= check(boundary_session->scroll_viewport_lines(-5).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "Phase 4b boundary viewport-scroll fixture returns to tail");
+    ok &= check(boundary_session->scroll_viewport_lines(6).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "Phase 4b boundary viewport-scroll fixture makes selection visible through a new mapping");
+    const std::optional<term::Terminal_render_snapshot> boundary_remapped_snapshot =
+        boundary_session->latest_render_snapshot();
+    ok &= check(boundary_remapped_snapshot.has_value() &&
+        boundary_remapped_snapshot->selection_spans.empty(),
+        "Phase 4b boundary viewport remap does not project spans before Phase 5 opt-in");
+    ok &= check(boundary_session->selection_visual_lease().has_value() &&
+        boundary_session->selected_text().text == boundary_payload.text,
+        "Phase 4b boundary viewport remap keeps lease and payload available");
+
+    std::unique_ptr<term::Terminal_session> scroll_session;
+    term::Terminal_session_config phase5_projection_config;
+    phase5_projection_config.selection_viewport_projection_enabled = true;
+    Scripted_backend* scroll_backend =
+        make_session(scroll_session, phase5_projection_config);
+    ok &= check(scroll_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 5 viewport-projection lease session starts");
+    ok &= check(scroll_backend->emit_output(numbered_scroll_lines(80)),
+        "Phase 5 viewport-projection backend creates scrollback");
+    ok &= check(scroll_session->scroll_viewport_lines(5).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "Phase 5 viewport-projection fixture scrolls into scrollback");
+    const std::optional<term::Terminal_render_snapshot> scroll_anchor_snapshot =
+        scroll_session->latest_render_snapshot();
+    if (!scroll_anchor_snapshot.has_value()) {
+        return false;
+    }
+
+    const int first_visible_logical_row =
+        scroll_anchor_snapshot->viewport.scrollback_rows -
+        scroll_anchor_snapshot->viewport.offset_from_tail;
+    const int selection_row = first_visible_logical_row;
+    scroll_session->set_selection_range({
+        { selection_row, 0 },
+        { selection_row, 15 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result scroll_payload =
+        scroll_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> scroll_selected_snapshot =
+        scroll_session->latest_render_snapshot();
+    ok &= check(scroll_payload.code == term::Terminal_selection_result_code::OK &&
+        scroll_payload.text == QStringLiteral("scroll-line-%1")
+            .arg(selection_row, 3, 10, QLatin1Char('0')),
+        "Phase 5 viewport-projection selection captures durable payload");
+    ok &= check(scroll_selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*scroll_selected_snapshot, 0, 0, 15),
+        "Phase 5 viewport-projection selection emits spans while visible");
+
+    ok &= check(scroll_session->scroll_viewport_lines(-5).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "Phase 5 viewport-projection fixture returns to tail");
+    const std::optional<term::Terminal_render_snapshot> scroll_hidden_snapshot =
+        scroll_session->latest_render_snapshot();
+    ok &= check(scroll_hidden_snapshot.has_value() &&
+        scroll_hidden_snapshot->selection_spans.empty(),
+        "Phase 5 compatible viewport scroll hides offscreen spans");
+    ok &= check(scroll_session->selection_visual_lease().has_value() &&
+        scroll_session->selected_text().text == scroll_payload.text,
+        "Phase 5 compatible viewport scroll keeps lease and payload while hidden");
+
+    ok &= check(scroll_session->scroll_viewport_lines(6).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "Phase 5 viewport-projection fixture makes selected rows visible through a new mapping");
+    const std::optional<term::Terminal_render_snapshot> scroll_shown_snapshot =
+        scroll_session->latest_render_snapshot();
+    ok &= check(scroll_shown_snapshot.has_value() &&
+        snapshot_has_selection_span(*scroll_shown_snapshot, 1, 0, 15),
+        "Phase 5 compatible viewport projection re-emits spans when visible again");
+
+    return ok;
+}
+
+bool test_selection_spans_preserve_after_same_viewport_idempotent_selected_row_rewrite()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "same-viewport idempotent rewrite selection session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta")),
+        "same-viewport idempotent rewrite backend emits visible rows");
+
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 5 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result original_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_visual_lease_t> selected_lease =
+        session->selection_visual_lease();
+    const term::terminal_selection_content_basis_t selected_basis =
+        selected_lease.has_value()
+            ? selected_lease->source_content_basis
+            : term::terminal_selection_content_basis_t{};
+    const std::vector<term::terminal_selection_line_lease_t> selected_lines =
+        selected_lease.has_value()
+            ? selected_lease->selected_lines
+            : std::vector<term::terminal_selection_line_lease_t>{};
+    ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+        original_payload.text == QStringLiteral("alpha"),
+        "same-viewport idempotent rewrite captures the selected payload");
+    ok &= check(selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*selected_snapshot, 0, 0, 5),
+        "same-viewport idempotent rewrite initially emits selection spans");
+    ok &= check(selected_lease.has_value() && selected_lease->selected_lines.size() == 1U,
+        "same-viewport idempotent rewrite starts with retained-line proof");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[1;1Halpha")),
+        "same-viewport idempotent rewrite rewrites the selected row with identical text");
+    const term::Terminal_selection_result retained_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> rewritten_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_visual_lease_t> rewritten_lease =
+        session->selection_visual_lease();
+    ok &= check(retained_payload.code == term::Terminal_selection_result_code::OK &&
+        retained_payload.text == original_payload.text,
+        "same-viewport idempotent rewrite keeps the finalized copy payload");
+    ok &= check(rewritten_lease.has_value() &&
+        rewritten_lease->source_content_basis.content_generation >
+            selected_basis.content_generation,
+        "same-viewport idempotent rewrite advances the visual lease basis");
+    ok &= check(rewritten_lease.has_value() &&
+        rewritten_lease->selected_lines == selected_lines,
+        "same-viewport idempotent rewrite keeps the retained-line proof");
+    ok &= check(rewritten_snapshot.has_value() &&
+        snapshot_row_text(*rewritten_snapshot, 0) == QStringLiteral("alpha") &&
+        snapshot_has_selection_span(*rewritten_snapshot, 0, 0, 5),
+        "same-viewport idempotent rewrite preserves visible selection spans");
+
+    return ok;
+}
+
+bool test_selection_spans_preserve_during_scrollback_growth_with_retained_lines()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {4, 20};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 4a scrollback-growth selection session starts");
+    ok &= check(backend->emit_output(numbered_scroll_lines(32)),
+        "Phase 4a scrollback-growth backend creates retained scrollback");
+    ok &= check(session->scroll_viewport_lines(4).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "Phase 4a scrollback-growth fixture detaches viewport from tail");
+
+    const std::optional<term::Terminal_render_snapshot> anchor_snapshot =
+        session->latest_render_snapshot();
+    if (!anchor_snapshot.has_value()) {
+        return check(false, "Phase 4a scrollback-growth anchor snapshot is available");
+    }
+
+    const int first_visible_logical_row =
+        term::render_snapshot_first_visible_logical_row(*anchor_snapshot);
+    const int selection_row = first_visible_logical_row + 1;
+    const QString expected_payload =
+        QStringLiteral("scroll-line-%1").arg(selection_row, 3, 10, QLatin1Char('0'));
+    session->set_selection_range({
+        {selection_row, 0},
+        {selection_row, 15},
+        term::Terminal_selection_mode::NORMAL,
+    });
+
+    const term::Terminal_selection_result selected_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_visual_lease_t> selected_lease =
+        session->selection_visual_lease();
+    ok &= check(selected_payload.code == term::Terminal_selection_result_code::OK &&
+        selected_payload.text == expected_payload,
+        "Phase 4a scrollback-growth selection captures the retained row payload");
+    ok &= check(selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*selected_snapshot, 1, 0, 15),
+        "Phase 4a scrollback-growth selection initially emits a visible span");
+    ok &= check(selected_lease.has_value() && selected_lease->selected_lines.size() == 1U,
+        "Phase 4a scrollback-growth selection starts with complete retained-line proof");
+
+    ok &= check(backend->emit_output(numbered_scroll_lines(3)),
+        "Phase 4a scrollback-growth backend appends unrelated tail output");
+    const term::Terminal_selection_result preserved_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> grown_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_visual_lease_t> grown_lease =
+        session->selection_visual_lease();
+    ok &= check(preserved_payload.code == term::Terminal_selection_result_code::OK &&
+        preserved_payload.text == expected_payload,
+        "Phase 4a scrollback-growth preserves the finalized copy payload");
+    ok &= check(grown_snapshot.has_value() &&
+        term::render_snapshot_first_visible_logical_row(*grown_snapshot) ==
+            first_visible_logical_row,
+        "Phase 4a scrollback-growth keeps the detached viewport on the selected content");
+    ok &= check(grown_lease.has_value(),
+        "Phase 4a scrollback-growth preserves the visual lease by retained-line proof");
+    ok &= check(grown_snapshot.has_value() &&
+        snapshot_has_selection_span(*grown_snapshot, 1, 0, 15),
+        "Phase 4a scrollback-growth preserves visible selection spans");
+
+    return ok;
+}
+
+bool test_selection_spans_detach_when_selected_row_mutates()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "mutating selection session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("original\r\nstable")),
+        "mutating selection backend emits visible rows");
+
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 8 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result original_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+        original_payload.text == QStringLiteral("original"),
+        "mutating selection captures the original payload");
+    ok &= check(selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*selected_snapshot, 0, 0, 8),
+        "mutating selection initially publishes a visible span");
+    const std::optional<term::terminal_selection_visual_lease_t> selected_lease =
+        session->selection_visual_lease();
+    ok &= check(selected_snapshot.has_value() && selected_lease.has_value() &&
+        !selected_lease->selected_lines.empty(),
+        "Phase 3 selected-row mutation fixture starts with captured descriptors");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[1;1Hmutated!")),
+        "mutating selection backend rewrites the selected row");
+    const term::Terminal_selection_result retained_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> mutated_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(retained_payload.code == term::Terminal_selection_result_code::OK &&
+        retained_payload.text == QStringLiteral("original"),
+        "mutating selection keeps the finalized copy payload");
+    ok &= check(session->has_selection(),
+        "mutating selection keeps public copyability active after visual detach");
+    ok &= check(!session->selection_visual_lease().has_value(),
+        "mutating selection detaches the stale visual lease");
+    ok &= check(mutated_snapshot.has_value() &&
+        snapshot_row_text(*mutated_snapshot, 0) == QStringLiteral("mutated!"),
+        "mutating selection snapshot contains replacement row text");
+
+    ok &= check(mutated_snapshot.has_value() &&
+        mutated_snapshot->selection_spans.empty(),
+        "mutating selection detaches spans instead of highlighting replacement text");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r")),
+        "mutating selection cursor-only follow-up output is accepted");
+    const term::Terminal_selection_result followup_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> followup_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(session->has_selection() &&
+        followup_payload.code == term::Terminal_selection_result_code::OK &&
+        followup_payload.text == QStringLiteral("original"),
+        "mutating selection follow-up keeps durable copyability and payload");
+    ok &= check(!session->selection_visual_lease().has_value(),
+        "mutating selection follow-up keeps the stale visual lease detached");
+    ok &= check(followup_snapshot.has_value() &&
+        followup_snapshot->selection_spans.empty(),
+        "mutating selection cursor-only follow-up does not reattach stale spans");
+
+    return ok;
+}
+
+bool test_selection_spans_detach_when_retained_row_moves()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "retained-row movement selection session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma")),
+        "retained-row movement backend emits visible rows");
+
+    session->set_selection_range({
+        { 1, 0 },
+        { 1, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result original_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+        original_payload.text == QStringLiteral("beta"),
+        "retained-row movement selection captures the original payload");
+    ok &= check(selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*selected_snapshot, 1, 0, 4),
+        "retained-row movement initially publishes a visible span");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[1;1H\x1b[L")),
+        "retained-row movement backend inserts a line above the selection");
+    const term::Terminal_selection_result retained_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> moved_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(retained_payload.code == term::Terminal_selection_result_code::OK &&
+        retained_payload.text == QStringLiteral("beta"),
+        "retained-row movement keeps the finalized copy payload");
+    ok &= check(moved_snapshot.has_value() &&
+        snapshot_row_text(*moved_snapshot, 2) == QStringLiteral("beta"),
+        "retained-row movement snapshot keeps the retained text at its moved row");
+    ok &= check(!session->selection_visual_lease().has_value(),
+        "retained-row movement detaches the stale visual lease");
+    ok &= check(moved_snapshot.has_value() &&
+        moved_snapshot->selection_spans.empty(),
+        "retained-row movement suppresses spans after row-layout mismatch");
+
+    std::unique_ptr<term::Terminal_session> delete_session;
+    Scripted_backend* delete_backend = make_session(delete_session);
+    ok &= check(delete_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "retained-row delete movement selection session starts");
+    ok &= check(delete_backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma")),
+        "retained-row delete movement backend emits visible rows");
+
+    delete_session->set_selection_range({
+        { 2, 0 },
+        { 2, 5 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result delete_original_payload =
+        delete_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> delete_selected_snapshot =
+        delete_session->latest_render_snapshot();
+    ok &= check(delete_original_payload.code == term::Terminal_selection_result_code::OK &&
+        delete_original_payload.text == QStringLiteral("gamma"),
+        "retained-row delete movement selection captures the original payload");
+    ok &= check(delete_selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*delete_selected_snapshot, 2, 0, 5),
+        "retained-row delete movement initially publishes a visible span");
+
+    ok &= check(delete_backend->emit_output(QByteArrayLiteral("\x1b[2;1H\x1b[M")),
+        "retained-row delete movement backend deletes a line above the selection");
+    const term::Terminal_selection_result delete_retained_payload =
+        delete_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> delete_moved_snapshot =
+        delete_session->latest_render_snapshot();
+    ok &= check(delete_retained_payload.code == term::Terminal_selection_result_code::OK &&
+        delete_retained_payload.text == QStringLiteral("gamma"),
+        "retained-row delete movement keeps the finalized copy payload");
+    ok &= check(delete_moved_snapshot.has_value() &&
+        snapshot_row_text(*delete_moved_snapshot, 1) == QStringLiteral("gamma"),
+        "retained-row delete movement snapshot keeps the retained text at its moved row");
+    ok &= check(!delete_session->selection_visual_lease().has_value(),
+        "retained-row delete movement detaches the stale visual lease");
+    ok &= check(delete_moved_snapshot.has_value() &&
+        delete_moved_snapshot->selection_spans.empty(),
+        "retained-row delete movement suppresses spans after row-layout mismatch");
+
+    return ok;
+}
+
+bool test_selection_spans_preserve_after_unchanged_synchronized_output_release()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "unchanged sync-release selection session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("original\r\nstable")),
+        "unchanged sync-release backend emits visible rows");
+
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 8 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result original_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+        original_payload.text == QStringLiteral("original"),
+        "unchanged sync-release selection captures the original payload");
+    ok &= check(selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*selected_snapshot, 0, 0, 8),
+        "unchanged sync-release selection initially publishes a visible span");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h\x1b[2;1Hchanged")),
+        "unchanged sync-release backend mutates an unselected row while unpublished");
+    const term::Terminal_selection_result held_payload =
+        session->selected_text();
+    ok &= check(held_payload.code == term::Terminal_selection_result_code::OK &&
+        held_payload.text == QStringLiteral("original"),
+        "unchanged sync-release selection retains payload while output is hidden");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "unchanged sync-release backend publishes held mutation");
+    const term::Terminal_selection_result retained_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> released_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(retained_payload.code == term::Terminal_selection_result_code::OK &&
+        retained_payload.text == QStringLiteral("original"),
+        "unchanged sync-release selection retains payload after publication");
+    ok &= check(session->has_selection(),
+        "unchanged sync-release selection keeps public copyability active");
+    ok &= check(session->selection_visual_lease().has_value(),
+        "unchanged sync-release selection preserves the visual lease");
+    ok &= check(released_snapshot.has_value() &&
+        snapshot_row_text(*released_snapshot, 0) == QStringLiteral("original") &&
+        snapshot_row_text(*released_snapshot, 1) == QStringLiteral("changed"),
+        "unchanged sync-release snapshot contains the unchanged selection and mutation");
+
+    ok &= check(released_snapshot.has_value() &&
+        snapshot_has_selection_span(*released_snapshot, 0, 0, 8),
+        "unchanged sync-release preserves spans by retained-line proof");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r")),
+        "unchanged sync-release cursor-only follow-up output is accepted");
+    const term::Terminal_selection_result followup_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> followup_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(session->has_selection() &&
+        followup_payload.code == term::Terminal_selection_result_code::OK &&
+        followup_payload.text == QStringLiteral("original"),
+        "unchanged sync-release follow-up keeps durable copyability and payload");
+    ok &= check(session->selection_visual_lease().has_value(),
+        "unchanged sync-release follow-up keeps the visual lease attached");
+    ok &= check(followup_snapshot.has_value() &&
+        snapshot_has_selection_span(*followup_snapshot, 0, 0, 8),
+        "unchanged sync-release cursor-only follow-up keeps visible spans");
+
+    return ok;
+}
+
+bool test_selection_spans_detach_when_synchronized_release_mutates_selected_row()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "mutating sync-release selection session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("original\r\nstable")),
+        "mutating sync-release backend emits visible rows");
+
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 8 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result original_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+        original_payload.text == QStringLiteral("original"),
+        "mutating sync-release selection captures the original payload");
+    ok &= check(selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*selected_snapshot, 0, 0, 8),
+        "mutating sync-release selection initially publishes a visible span");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h\x1b[1;1Hmutated!")),
+        "mutating sync-release backend rewrites the selected row while unpublished");
+    const term::Terminal_selection_result held_payload =
+        session->selected_text();
+    ok &= check(held_payload.code == term::Terminal_selection_result_code::OK &&
+        held_payload.text == QStringLiteral("original"),
+        "mutating sync-release selection retains payload while output is hidden");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "mutating sync-release backend publishes held selected-row mutation");
+    const term::Terminal_selection_result retained_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> released_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(retained_payload.code == term::Terminal_selection_result_code::OK &&
+        retained_payload.text == QStringLiteral("original"),
+        "mutating sync-release keeps the finalized copy payload");
+    ok &= check(!session->selection_visual_lease().has_value(),
+        "mutating sync-release detaches the stale visual lease");
+    ok &= check(released_snapshot.has_value() &&
+        snapshot_row_text(*released_snapshot, 0) == QStringLiteral("mutated!"),
+        "mutating sync-release snapshot contains replacement selected-row text");
+    ok &= check(released_snapshot.has_value() &&
+        released_snapshot->selection_spans.empty(),
+        "mutating sync-release suppresses stale spans");
+
+    return ok;
+}
+
+bool test_selection_spans_detach_when_synchronized_release_moves_retained_row()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> insert_session;
+    Scripted_backend* insert_backend = make_session(insert_session);
+    ok &= check(insert_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "insert sync-release movement selection session starts");
+    ok &= check(insert_backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma")),
+        "insert sync-release movement backend emits visible rows");
+
+    insert_session->set_selection_range({
+        { 1, 0 },
+        { 1, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result insert_original_payload =
+        insert_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> insert_selected_snapshot =
+        insert_session->latest_render_snapshot();
+    ok &= check(insert_original_payload.code == term::Terminal_selection_result_code::OK &&
+        insert_original_payload.text == QStringLiteral("beta"),
+        "insert sync-release movement selection captures the original payload");
+    ok &= check(insert_selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*insert_selected_snapshot, 1, 0, 4),
+        "insert sync-release movement initially publishes a visible span");
+
+    ok &= check(insert_backend->emit_output(QByteArrayLiteral("\x1b[?2026h\x1b[1;1H\x1b[L")),
+        "insert sync-release movement inserts a line above the selection while unpublished");
+    ok &= check(insert_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "insert sync-release movement publishes the held row insertion");
+    const term::Terminal_selection_result insert_retained_payload =
+        insert_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> insert_moved_snapshot =
+        insert_session->latest_render_snapshot();
+    ok &= check(insert_retained_payload.code == term::Terminal_selection_result_code::OK &&
+        insert_retained_payload.text == QStringLiteral("beta"),
+        "insert sync-release movement keeps the finalized copy payload");
+    ok &= check(insert_moved_snapshot.has_value() &&
+        snapshot_row_text(*insert_moved_snapshot, 2) == QStringLiteral("beta"),
+        "insert sync-release movement snapshot keeps the retained text at its moved row");
+    ok &= check(!insert_session->selection_visual_lease().has_value(),
+        "insert sync-release movement detaches the stale visual lease");
+    ok &= check(insert_moved_snapshot.has_value() &&
+        insert_moved_snapshot->selection_spans.empty(),
+        "insert sync-release movement suppresses stale spans");
+
+    std::unique_ptr<term::Terminal_session> delete_session;
+    Scripted_backend* delete_backend = make_session(delete_session);
+    ok &= check(delete_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "delete sync-release movement selection session starts");
+    ok &= check(delete_backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma")),
+        "delete sync-release movement backend emits visible rows");
+
+    delete_session->set_selection_range({
+        { 2, 0 },
+        { 2, 5 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result delete_original_payload =
+        delete_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> delete_selected_snapshot =
+        delete_session->latest_render_snapshot();
+    ok &= check(delete_original_payload.code == term::Terminal_selection_result_code::OK &&
+        delete_original_payload.text == QStringLiteral("gamma"),
+        "delete sync-release movement selection captures the original payload");
+    ok &= check(delete_selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*delete_selected_snapshot, 2, 0, 5),
+        "delete sync-release movement initially publishes a visible span");
+
+    ok &= check(delete_backend->emit_output(QByteArrayLiteral("\x1b[?2026h\x1b[2;1H\x1b[M")),
+        "delete sync-release movement deletes a line above the selection while unpublished");
+    ok &= check(delete_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "delete sync-release movement publishes the held row deletion");
+    const term::Terminal_selection_result delete_retained_payload =
+        delete_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> delete_moved_snapshot =
+        delete_session->latest_render_snapshot();
+    ok &= check(delete_retained_payload.code == term::Terminal_selection_result_code::OK &&
+        delete_retained_payload.text == QStringLiteral("gamma"),
+        "delete sync-release movement keeps the finalized copy payload");
+    ok &= check(delete_moved_snapshot.has_value() &&
+        snapshot_row_text(*delete_moved_snapshot, 1) == QStringLiteral("gamma"),
+        "delete sync-release movement snapshot keeps the retained text at its moved row");
+    ok &= check(!delete_session->selection_visual_lease().has_value(),
+        "delete sync-release movement detaches the stale visual lease");
+    ok &= check(delete_moved_snapshot.has_value() &&
+        delete_moved_snapshot->selection_spans.empty(),
+        "delete sync-release movement suppresses stale spans");
+
+    return ok;
+}
+
+bool test_selection_spans_fail_closed_at_phase4c_boundaries()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> alternate_session;
+    Scripted_backend* alternate_backend = make_session(alternate_session);
+    ok &= check(alternate_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 4c active-buffer boundary session starts");
+    ok &= check(alternate_backend->emit_output(QByteArrayLiteral("primary")),
+        "Phase 4c active-buffer boundary backend emits primary text");
+
+    alternate_session->set_selection_range({
+        { 0, 0 },
+        { 0, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result alternate_original_payload =
+        alternate_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> alternate_selected_snapshot =
+        alternate_session->latest_render_snapshot();
+    ok &= check(alternate_original_payload.code == term::Terminal_selection_result_code::OK &&
+        alternate_original_payload.text == QStringLiteral("prim"),
+        "Phase 4c active-buffer boundary captures the primary payload");
+    ok &= check(alternate_selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*alternate_selected_snapshot, 0, 0, 4),
+        "Phase 4c active-buffer boundary initially publishes a primary span");
+
+    ok &= check(alternate_backend->emit_output(QByteArrayLiteral("\x1b[?1049halternate")),
+        "Phase 4c active-buffer boundary enters alternate screen");
+    const term::Terminal_selection_result alternate_hidden_payload =
+        alternate_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> alternate_snapshot =
+        alternate_session->latest_render_snapshot();
+    ok &= check(alternate_hidden_payload.code == term::Terminal_selection_result_code::OK &&
+        alternate_hidden_payload.text == QStringLiteral("prim"),
+        "Phase 4c active-buffer boundary keeps the finalized primary payload in alternate");
+    ok &= check(!alternate_session->selection_visual_lease().has_value(),
+        "Phase 4c active-buffer boundary detaches the visual lease on alternate entry");
+    ok &= check(alternate_snapshot.has_value() &&
+        alternate_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE &&
+        alternate_snapshot->selection_spans.empty(),
+        "Phase 4c active-buffer boundary emits no primary spans in alternate");
+
+    ok &= check(alternate_backend->emit_output(QByteArrayLiteral("\x1b[?1049l")),
+        "Phase 4c active-buffer boundary returns to primary screen");
+    const term::Terminal_selection_result alternate_return_payload =
+        alternate_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> alternate_return_snapshot =
+        alternate_session->latest_render_snapshot();
+    ok &= check(alternate_return_payload.code == term::Terminal_selection_result_code::OK &&
+        alternate_return_payload.text == QStringLiteral("prim"),
+        "Phase 4c active-buffer boundary keeps the finalized payload after return");
+    ok &= check(!alternate_session->selection_visual_lease().has_value(),
+        "Phase 4c active-buffer boundary does not reattach after returning to primary");
+    ok &= check(alternate_return_snapshot.has_value() &&
+        alternate_return_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        alternate_return_snapshot->selection_spans.empty(),
+        "Phase 4c active-buffer boundary emits no stale spans after return");
+
+    std::unique_ptr<term::Terminal_session> reverse_alternate_session;
+    Scripted_backend* reverse_alternate_backend =
+        make_session(reverse_alternate_session);
+    ok &= check(reverse_alternate_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 4c reverse active-buffer boundary session starts");
+    ok &= check(reverse_alternate_backend->emit_output(QByteArrayLiteral("primary")),
+        "Phase 4c reverse active-buffer boundary emits primary text");
+    ok &= check(reverse_alternate_backend->emit_output(QByteArrayLiteral("\x1b[?1049halternate")),
+        "Phase 4c reverse active-buffer boundary enters alternate screen");
+
+    reverse_alternate_session->set_selection_range({
+        { 0, 0 },
+        { 0, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result reverse_alternate_payload =
+        reverse_alternate_session->selected_text();
+    const std::optional<term::terminal_selection_visual_lease_t>
+        reverse_alternate_attached_lease =
+            reverse_alternate_session->selection_visual_lease();
+    const std::optional<term::Terminal_render_snapshot> reverse_alternate_snapshot =
+        reverse_alternate_session->latest_render_snapshot();
+    ok &= check(reverse_alternate_payload.code == term::Terminal_selection_result_code::OK &&
+        reverse_alternate_payload.text == QStringLiteral("alte"),
+        "Phase 4c reverse active-buffer boundary captures the alternate payload");
+    ok &= check(reverse_alternate_attached_lease.has_value() &&
+        reverse_alternate_attached_lease->buffer_id == term::Terminal_buffer_id::ALTERNATE,
+        "Phase 4c reverse active-buffer boundary attaches an alternate visual lease");
+    ok &= check(reverse_alternate_snapshot.has_value() &&
+        reverse_alternate_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE &&
+        snapshot_has_selection_span(*reverse_alternate_snapshot, 0, 0, 4),
+        "Phase 4c reverse active-buffer boundary initially publishes an alternate span");
+
+    ok &= check(reverse_alternate_backend->emit_output(QByteArrayLiteral("\x1b[?1049l")),
+        "Phase 4c reverse active-buffer boundary returns to primary screen");
+    const term::Terminal_selection_result reverse_alternate_return_payload =
+        reverse_alternate_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> reverse_alternate_return_snapshot =
+        reverse_alternate_session->latest_render_snapshot();
+    ok &= check(reverse_alternate_return_payload.code ==
+            term::Terminal_selection_result_code::OK &&
+        reverse_alternate_return_payload.text == QStringLiteral("alte"),
+        "Phase 4c reverse active-buffer boundary keeps the finalized alternate payload");
+    ok &= check(!reverse_alternate_session->selection_visual_lease().has_value(),
+        "Phase 4c reverse active-buffer boundary clears the alternate visual lease");
+    ok &= check(reverse_alternate_return_snapshot.has_value() &&
+        reverse_alternate_return_snapshot->viewport.active_buffer ==
+            term::Terminal_buffer_id::PRIMARY &&
+        reverse_alternate_return_snapshot->selection_spans.empty(),
+        "Phase 4c reverse active-buffer boundary emits no stale primary spans after return");
+
+    std::unique_ptr<term::Terminal_session> synchronized_alternate_session;
+    Scripted_backend* synchronized_alternate_backend =
+        make_session(synchronized_alternate_session);
+    ok &= check(synchronized_alternate_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 4c synchronized active-buffer boundary session starts");
+    ok &= check(synchronized_alternate_backend->emit_output(QByteArrayLiteral("primary")),
+        "Phase 4c synchronized active-buffer boundary emits primary text");
+
+    synchronized_alternate_session->set_selection_range({
+        { 0, 0 },
+        { 0, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::terminal_selection_visual_lease_t>
+        synchronized_alternate_attached_lease =
+            synchronized_alternate_session->selection_visual_lease();
+    ok &= check(synchronized_alternate_attached_lease.has_value() &&
+        synchronized_alternate_attached_lease->buffer_id == term::Terminal_buffer_id::PRIMARY,
+        "Phase 4c synchronized active-buffer boundary starts with an attached visual lease");
+    ok &= check(synchronized_alternate_backend->emit_output(
+            QByteArrayLiteral("\x1b[?2026h\x1b[?1049halternate\x1b[?1049l\x1b[?2026l")),
+        "Phase 4c synchronized active-buffer boundary releases an alternate round trip");
+    const term::Terminal_selection_result synchronized_alternate_payload =
+        synchronized_alternate_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> synchronized_alternate_snapshot =
+        synchronized_alternate_session->latest_render_snapshot();
+    ok &= check(synchronized_alternate_payload.code == term::Terminal_selection_result_code::OK &&
+        synchronized_alternate_payload.text == QStringLiteral("prim"),
+        "Phase 4c synchronized active-buffer boundary keeps the finalized payload");
+    ok &= check(!synchronized_alternate_session->selection_visual_lease().has_value(),
+        "Phase 4c synchronized active-buffer boundary detaches despite matching primary provenance");
+    ok &= check(synchronized_alternate_snapshot.has_value() &&
+        synchronized_alternate_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        synchronized_alternate_snapshot->selection_spans.empty(),
+        "Phase 4c synchronized active-buffer boundary emits no stale returned primary spans");
+
+    std::unique_ptr<term::Terminal_session> region_session;
+    Scripted_backend* region_backend = make_session(region_session);
+    ok &= check(region_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 4c partial-region discard session starts");
+    ok &= check(region_backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma\r\ndelta")),
+        "Phase 4c partial-region discard backend emits visible rows");
+
+    region_session->set_selection_range({
+        { 1, 0 },
+        { 1, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result region_original_payload =
+        region_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> region_selected_snapshot =
+        region_session->latest_render_snapshot();
+    ok &= check(region_original_payload.code == term::Terminal_selection_result_code::OK &&
+        region_original_payload.text == QStringLiteral("beta"),
+        "Phase 4c partial-region discard captures the selected row payload");
+    ok &= check(region_selected_snapshot.has_value() &&
+        snapshot_has_selection_span(*region_selected_snapshot, 1, 0, 4),
+        "Phase 4c partial-region discard initially publishes a visible span");
+
+    ok &= check(region_backend->emit_output(
+            QByteArrayLiteral("\x1b[2;3r\x1b[3;1H\x1b" "D\x1b[r")),
+        "Phase 4c partial-region discard scrolls the selected row out of the region");
+    const term::Terminal_selection_result region_retained_payload =
+        region_session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> region_discard_snapshot =
+        region_session->latest_render_snapshot();
+    ok &= check(region_retained_payload.code == term::Terminal_selection_result_code::OK &&
+        region_retained_payload.text == QStringLiteral("beta"),
+        "Phase 4c partial-region discard keeps the finalized copy payload");
+    ok &= check(!region_session->selection_visual_lease().has_value(),
+        "Phase 4c partial-region discard detaches the stale visual lease");
+    ok &= check(region_discard_snapshot.has_value() &&
+        snapshot_row_text(*region_discard_snapshot, 1) == QStringLiteral("gamma"),
+        "Phase 4c partial-region discard moves replacement content into the selected row");
+    ok &= check(region_discard_snapshot.has_value() &&
+        region_discard_snapshot->selection_spans.empty(),
+        "Phase 4c partial-region discard suppresses stale spans");
+
+    std::unique_ptr<term::Terminal_session> clear_scrollback_session;
+    Scripted_backend* clear_scrollback_backend = make_session(clear_scrollback_session);
+    ok &= check(clear_scrollback_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 4c clear-scrollback boundary session starts");
+    ok &= check(clear_scrollback_backend->emit_output(numbered_scroll_lines(80)),
+        "Phase 4c clear-scrollback boundary backend creates scrollback");
+    ok &= check(clear_scrollback_session->scroll_viewport_lines(3).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "Phase 4c clear-scrollback boundary exposes scrollback rows");
+
+    const std::optional<term::Terminal_render_snapshot> clear_scrollback_source_snapshot =
+        clear_scrollback_session->latest_render_snapshot();
+    if (clear_scrollback_source_snapshot.has_value()) {
+        const int first_visible_logical_row =
+            clear_scrollback_source_snapshot->viewport.scrollback_rows -
+            clear_scrollback_source_snapshot->viewport.offset_from_tail;
+        const int selection_row = first_visible_logical_row + 1;
+        const QString expected_text =
+            QStringLiteral("scroll-line-%1")
+                .arg(selection_row, 3, 10, QLatin1Char('0'));
+        clear_scrollback_session->set_selection_range({
+            { selection_row, 0 },
+            { selection_row, 15 },
+            term::Terminal_selection_mode::NORMAL,
+        });
+        const term::Terminal_selection_result clear_scrollback_original_payload =
+            clear_scrollback_session->selected_text();
+        const std::optional<term::Terminal_render_snapshot> clear_scrollback_selected_snapshot =
+            clear_scrollback_session->latest_render_snapshot();
+        ok &= check(clear_scrollback_original_payload.code ==
+                term::Terminal_selection_result_code::OK &&
+            clear_scrollback_original_payload.text == expected_text,
+            "Phase 4c clear-scrollback boundary captures the scrollback payload");
+        ok &= check(clear_scrollback_selected_snapshot.has_value() &&
+            snapshot_has_selection_span(*clear_scrollback_selected_snapshot, 1, 0, 15),
+            "Phase 4c clear-scrollback boundary initially publishes a scrollback span");
+
+        ok &= check(clear_scrollback_backend->emit_output(QByteArrayLiteral("\x1b[3J")),
+            "Phase 4c clear-scrollback boundary clears retained scrollback");
+        const term::Terminal_selection_result clear_scrollback_retained_payload =
+            clear_scrollback_session->selected_text();
+        const std::optional<term::Terminal_render_snapshot> clear_scrollback_cleared_snapshot =
+            clear_scrollback_session->latest_render_snapshot();
+        ok &= check(clear_scrollback_retained_payload.code ==
+                term::Terminal_selection_result_code::OK &&
+            clear_scrollback_retained_payload.text == expected_text,
+            "Phase 4c clear-scrollback boundary keeps the finalized copy payload");
+        ok &= check(!clear_scrollback_session->selection_visual_lease().has_value(),
+            "Phase 4c clear-scrollback boundary detaches the purged retained-line proof");
+        ok &= check(clear_scrollback_cleared_snapshot.has_value() &&
+            clear_scrollback_cleared_snapshot->selection_spans.empty(),
+            "Phase 4c clear-scrollback boundary suppresses purged scrollback spans");
+    }
+    else {
+        ok &= check(false, "Phase 4c clear-scrollback boundary source snapshot is available");
+    }
+
+    return ok;
+}
+
+bool test_selection_spans_detach_when_resize_invalidates_selected_columns()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "resize-invalidated selection session starts");
+    ok &= check(backend->emit_output(
+        QByteArrayLiteral("0123456789012345678901234567890123456789"
+                          "012345678901234567890123456789")),
+        "resize-invalidated backend emits selectable text beyond the resized grid");
+
+    session->set_selection_range({
+        { 0, 50 },
+        { 0, 70 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result original_payload =
+        session->selected_text();
+    ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+        original_payload.text == QStringLiteral("01234567890123456789"),
+        "resize-invalidated selection captures original payload");
+
+    const term::Terminal_session_result resize_result =
+        session->resize(QSizeF(400.0, 240.0), {24, 40});
+    const term::Terminal_selection_result retained_payload =
+        session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> resized_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
+        "resize-invalidated incompatible column resize is accepted");
+    ok &= check(retained_payload.code == term::Terminal_selection_result_code::OK &&
+        retained_payload.text == QStringLiteral("01234567890123456789"),
+        "resize-invalidated incompatible resize retains copy payload");
+    ok &= check(resized_snapshot.has_value() &&
+        resized_snapshot->grid_size.columns == 40,
+        "resize-invalidated snapshot records resized grid");
+    ok &= check(resized_snapshot.has_value() &&
+        resized_snapshot->selection_spans.empty(),
+        "resize-invalidated columns emit no stale spans");
+    ok &= check(!session->selection_visual_lease().has_value(),
+        "resize-invalidated columns clear retained-line visual proof");
+
+    return ok;
+}
+
+bool test_selection_unicode_cluster_payloads()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> wide_continuation_session;
+    Scripted_backend* wide_continuation_backend =
+        make_session(wide_continuation_session);
+    ok &= check(wide_continuation_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "wide-continuation selection session starts");
+    ok &= check(wide_continuation_backend->emit_output(
+        QByteArrayLiteral("A") + QStringLiteral("\u754c").toUtf8() +
+        QByteArrayLiteral("B")),
+        "wide-continuation backend emits wide glyph text");
+    wide_continuation_session->set_selection_range({
+        { 0, 2 },
+        { 0, 3 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result trailing_wide_text =
+        wide_continuation_session->selected_text();
+    ok &= check(trailing_wide_text.code == term::Terminal_selection_result_code::OK &&
+        trailing_wide_text.text.isEmpty(),
+        "trailing wide continuation cell is not copied as independent text");
+
+    std::unique_ptr<term::Terminal_session> combining_session;
+    Scripted_backend* combining_backend = make_session(combining_session);
+    ok &= check(combining_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "combining-mark selection session starts");
+    ok &= check(combining_backend->emit_output(
+        QStringLiteral("e\u0301x").toUtf8()),
+        "combining-mark backend emits composed cell text");
+    combining_session->set_selection_range({
+        { 0, 0 },
+        { 0, 1 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result combining_text =
+        combining_session->selected_text();
+    ok &= check(combining_text.code == term::Terminal_selection_result_code::OK &&
+        combining_text.text == QStringLiteral("e\u0301"),
+        "combining mark remains attached to the selected base cell");
+
+    std::unique_ptr<term::Terminal_session> variation_session;
+    Scripted_backend* variation_backend = make_session(variation_session);
+    ok &= check(variation_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "variation selection session starts");
+    ok &= check(variation_backend->emit_output(
+        QStringLiteral("\u2764\ufe0fx").toUtf8()),
+        "variation backend emits variation-sequence text");
+    variation_session->set_selection_range({
+        { 0, 0 },
+        { 0, 2 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result variation_text =
+        variation_session->selected_text();
+    ok &= check(variation_text.code == term::Terminal_selection_result_code::OK &&
+        variation_text.text == QStringLiteral("\u2764\ufe0f"),
+        "variation selector remains attached to the selected base cell");
 
     return ok;
 }
@@ -1896,6 +4149,11 @@ bool test_viewport_scroll_public_session_path()
         "synchronized viewport-scroll session starts");
     ok &= check(synchronized_backend->emit_output(numbered_scroll_lines(80)),
         "synchronized viewport-scroll backend creates scrollback");
+    const std::optional<term::Terminal_render_snapshot> synchronized_tail_snapshot =
+        synchronized_session->latest_render_snapshot();
+    ok &= check(synchronized_tail_snapshot.has_value() &&
+        synchronized_tail_snapshot->viewport.offset_from_tail == 0,
+        "synchronized viewport-scroll setup publishes tail viewport");
     const std::uint64_t synchronized_tail_generation =
         synchronized_session->render_snapshot_generation();
     ok &= check(synchronized_backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
@@ -1904,14 +4162,25 @@ bool test_viewport_scroll_public_session_path()
         synchronized_tail_generation,
         "synchronized output entry suppresses publication before scroll");
 
+    // This is the no-drain wheel/session path. It must accept viewport movement
+    // from the published baseline while synchronized output defers publication.
     const term::Terminal_viewport_scroll_result held_scroll_result =
-        synchronized_session->scroll_viewport_lines(1);
+        synchronized_tail_snapshot.has_value()
+            ? synchronized_session->scroll_viewport_lines_from_published_state(
+                1,
+                synchronized_tail_snapshot->viewport)
+            : term::Terminal_viewport_scroll_result{};
     ok &= check(held_scroll_result.action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "viewport scroll during synchronized output still updates viewport state");
+        "published-state viewport scroll during synchronized output still updates viewport state");
     ok &= check(synchronized_session->render_snapshot_generation() ==
         synchronized_tail_generation,
-        "viewport scroll during synchronized output does not publish hidden state");
+        "published-state viewport scroll during synchronized output does not publish hidden state");
+    const std::optional<term::Terminal_render_snapshot> hidden_scroll_snapshot =
+        synchronized_session->latest_render_snapshot();
+    ok &= check(hidden_scroll_snapshot.has_value() &&
+        hidden_scroll_snapshot->viewport.offset_from_tail == 0,
+        "published-state viewport scroll keeps hidden synchronized output unpublished");
 
     ok &= check(synchronized_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
         "synchronized viewport-scroll backend releases synchronized output");
@@ -1928,6 +4197,60 @@ bool test_viewport_scroll_public_session_path()
         released_snapshot->dirty_row_ranges.front().row_count ==
             released_snapshot->grid_size.rows,
         "synchronized output release preserves deferred viewport damage metadata");
+
+    std::unique_ptr<term::Terminal_session> no_payload_sync_session;
+    Scripted_backend* no_payload_sync_backend = make_session(no_payload_sync_session);
+    ok &= check(no_payload_sync_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "no-payload synchronized viewport-scroll session starts");
+    ok &= check(no_payload_sync_backend->emit_output(numbered_scroll_lines(80)),
+        "no-payload synchronized viewport-scroll backend creates scrollback");
+    const std::optional<term::Terminal_render_snapshot> no_payload_tail_snapshot =
+        no_payload_sync_session->latest_render_snapshot();
+    ok &= check(no_payload_tail_snapshot.has_value() &&
+        no_payload_tail_snapshot->viewport.offset_from_tail == 0,
+        "no-payload synchronized viewport-scroll setup publishes tail viewport");
+    const std::uint64_t no_payload_tail_generation =
+        no_payload_sync_session->render_snapshot_generation();
+    ok &= check(no_payload_sync_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+        "no-payload synchronized viewport-scroll backend enters synchronized output");
+    ok &= check(no_payload_sync_session->render_snapshot_generation() ==
+        no_payload_tail_generation,
+        "no-payload synchronized output entry suppresses publication before scroll");
+
+    const term::Terminal_viewport_scroll_result no_payload_scroll_result =
+        no_payload_tail_snapshot.has_value()
+            ? no_payload_sync_session->scroll_viewport_lines_from_published_state(
+                2,
+                no_payload_tail_snapshot->viewport)
+            : term::Terminal_viewport_scroll_result{};
+    ok &= check(no_payload_scroll_result.action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "no-payload published-state viewport scroll during synchronized output updates viewport state");
+    ok &= check(no_payload_sync_session->render_snapshot_generation() ==
+        no_payload_tail_generation,
+        "no-payload published-state viewport scroll during synchronized output does not publish");
+    const std::optional<term::Terminal_render_snapshot> no_payload_held_snapshot =
+        no_payload_sync_session->latest_render_snapshot();
+    ok &= check(no_payload_held_snapshot.has_value() &&
+        no_payload_held_snapshot->viewport.offset_from_tail == 0,
+        "no-payload published-state viewport scroll keeps synchronized output unpublished");
+
+    ok &= check(no_payload_sync_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "no-payload synchronized viewport-scroll backend releases synchronized output");
+    const std::optional<term::Terminal_render_snapshot> no_payload_released_snapshot =
+        no_payload_sync_session->latest_render_snapshot();
+    ok &= check(no_payload_released_snapshot.has_value() &&
+        no_payload_released_snapshot->viewport.offset_from_tail == 2 &&
+        no_payload_sync_session->render_snapshot_generation() ==
+            no_payload_tail_generation + 1U,
+        "no-payload synchronized output release publishes exact deferred viewport offset");
+    ok &= check(no_payload_released_snapshot.has_value() &&
+        no_payload_released_snapshot->dirty_row_ranges.size() == 1U &&
+        no_payload_released_snapshot->dirty_row_ranges.front().first_row == 0 &&
+        no_payload_released_snapshot->dirty_row_ranges.front().row_count ==
+            no_payload_released_snapshot->grid_size.rows,
+        "no-payload synchronized output release preserves deferred viewport dirty metadata");
 
     term::Terminal_session_config negative_scrollback_config;
     negative_scrollback_config.scrollback_limit = -5;
@@ -2111,6 +4434,115 @@ bool test_resize_repaint_clear_keeps_primary_scrollback_when_recovery_is_enabled
     ok &= check(after_echo_clear.has_value() &&
         after_echo_clear->viewport.scrollback_rows == 0,
         "visible output before ED3 treats clear as explicit after resize");
+
+    return ok;
+}
+
+bool test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.recover_scrollback_from_primary_repaints = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "line-repaint recovery session starts");
+    ok &= check(session->resize(QSizeF(80.0, 24.0), {3, 8}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "line-repaint recovery grid is compact");
+    ok &= check(backend->emit_output(QByteArrayLiteral("aaa\r\nbbb\r\nccc")),
+        "line-repaint recovery fixture fills the primary screen");
+
+    const std::optional<term::Terminal_render_snapshot> before_repaint =
+        session->latest_render_snapshot();
+    ok &= check(before_repaint.has_value() &&
+        before_repaint->viewport.scrollback_rows == 0,
+        "line-repaint recovery fixture starts without scrollback");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral(
+            "\x1b[?2026h"
+            "\x1b[?25l"
+            "\x1b[H\x1b[K" "bbb"
+            "\x1b[2;1H\x1b[K" "ccc"
+            "\x1b[3;1H\x1b[K" "ddd"
+            "\x1b[?25h"
+            "\x1b[?2026l")),
+        "backend emits synchronized cursor-home line repaint");
+
+    const std::optional<term::Terminal_render_snapshot> after_repaint =
+        session->latest_render_snapshot();
+    ok &= check(after_repaint.has_value() &&
+        after_repaint->viewport.scrollback_rows == 0,
+        "cursor-home EL line repaint does not synthesize primary scrollback");
+    ok &= check(after_repaint.has_value() &&
+        snapshot_row_text(*after_repaint, 0) == QStringLiteral("bbb") &&
+        snapshot_row_text(*after_repaint, 1) == QStringLiteral("ccc") &&
+        snapshot_row_text(*after_repaint, 2) == QStringLiteral("ddd"),
+        "cursor-home EL line repaint updates visible rows");
+    ok &= check(session->scroll_viewport_lines(1).action ==
+        term::Terminal_viewport_scroll_action::AT_BOUNDARY,
+        "cursor-home EL line repaint leaves primary viewport at scrollback boundary");
+    return ok;
+}
+
+bool test_cursor_home_text_then_el_repaint_synthesizes_primary_scrollback()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.recover_scrollback_from_primary_repaints = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "text-then-EL recovery session starts");
+    ok &= check(session->resize(QSizeF(80.0, 24.0), {3, 8}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "text-then-EL recovery grid is compact");
+    ok &= check(backend->emit_output(QByteArrayLiteral("aaa\r\nbbb\r\nccc")),
+        "text-then-EL recovery fixture fills the primary screen");
+
+    const std::optional<term::Terminal_render_snapshot> before_repaint =
+        session->latest_render_snapshot();
+    ok &= check(before_repaint.has_value() &&
+        before_repaint->viewport.scrollback_rows == 0,
+        "text-then-EL recovery fixture starts without scrollback");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral(
+            "\x1b[?2026h"
+            "\x1b[?25l"
+            "\x1b[H" "bbb\x1b[K\r\n"
+            "ccc\x1b[K\r\n"
+            "ddd\x1b[K"
+            "\x1b[?25h"
+            "\x1b[?2026l")),
+        "backend emits synchronized cursor-home text-then-EL repaint");
+
+    const std::optional<term::Terminal_render_snapshot> after_repaint =
+        session->latest_render_snapshot();
+    ok &= check(after_repaint.has_value() &&
+        after_repaint->viewport.scrollback_rows  == 1 &&
+        after_repaint->viewport.offset_from_tail == 0,
+        "cursor-home text-then-EL repaint synthesizes primary scrollback");
+    ok &= check(after_repaint.has_value() &&
+        snapshot_row_text(*after_repaint, 0) == QStringLiteral("bbb") &&
+        snapshot_row_text(*after_repaint, 1) == QStringLiteral("ccc") &&
+        snapshot_row_text(*after_repaint, 2) == QStringLiteral("ddd"),
+        "cursor-home text-then-EL repaint updates visible rows");
+
+    const term::Terminal_viewport_scroll_result scroll_result =
+        session->scroll_viewport_lines(1);
+    const std::optional<term::Terminal_render_snapshot> scrolled_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "cursor-home text-then-EL recovered scrollback is scrollable");
+    ok &= check(scrolled_snapshot.has_value() &&
+        snapshot_row_text(*scrolled_snapshot, 0) == QStringLiteral("aaa"),
+        "cursor-home text-then-EL repaint keeps displaced row in scrollback");
 
     return ok;
 }
@@ -3134,6 +5566,115 @@ bool test_deferred_callback_ingress_merges_adjacent_output()
         session->notifications(),
         term::Terminal_backend_error_code::OUTPUT_OVERFLOW),
         "deferred-ingress merge avoids command-count overflow");
+
+    return ok;
+}
+
+bool test_budgeted_backend_callback_drain_yields_inside_coalesced_output()
+{
+    bool ok = true;
+
+    constexpr qsizetype expected_budgeted_slice_bytes = 4096;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "budgeted backend drain session starts");
+
+    QByteArray output;
+    for (int i = 0; i < 900; ++i) {
+        output += QByteArrayLiteral("budget-fill\r\n");
+    }
+    output += QByteArrayLiteral("budget-tail");
+
+    ok &= check(backend->emit_output(output),
+        "budgeted backend drain queues large coalesced output");
+    backend->emit_exit({term::Terminal_exit_reason::TERMINATED, 0});
+
+    const bool first_drain_complete = session->process_backend_callback_events_for(
+        std::chrono::steady_clock::duration::zero());
+    const std::vector<QByteArray> first_chunks = session->output_chunks();
+    ok &= check(!first_drain_complete,
+        "budgeted backend drain yields before draining all queued callback work");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "budgeted backend drain leaves ordered continuation work pending");
+    ok &= check(!session->exit_status().has_value(),
+        "budgeted backend drain keeps later callback commands behind output remainder");
+    ok &= check(first_chunks.size() == 1U &&
+        first_chunks.front().size() == expected_budgeted_slice_bytes,
+        "budgeted backend drain processes exactly one bounded output slice first");
+
+    bool complete = first_drain_complete;
+    for (int i = 0; !complete && i < 16; ++i) {
+        complete = session->process_backend_callback_events_for(
+            std::chrono::steady_clock::duration::zero());
+    }
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(complete && !session->has_pending_backend_callback_events(),
+        "budgeted backend drain finishes after repeated owner drains");
+    ok &= check(session->exit_status().has_value() &&
+        session->exit_status()->reason == term::Terminal_exit_reason::TERMINATED,
+        "budgeted backend drain preserves output-before-exit callback ordering");
+    ok &= check(snapshot.has_value() &&
+        snapshot_contains_text(*snapshot, QStringLiteral("budget-tail")),
+        "budgeted backend drain eventually publishes the final output tail");
+    ok &= check_processed_sequences_are_monotonic(
+        *session,
+        "budgeted backend drain command trace stays monotonic");
+
+    return ok;
+}
+
+bool test_budgeted_backend_callback_drain_holds_output_command_backpressure()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier                  = [] {};
+    config.output_queue_limits.high_water_bytes    = 1024U * 1024U;
+    config.output_queue_limits.hard_limit_bytes    = 1024U * 1024U;
+    config.output_queue_limits.high_water_commands = 1U;
+    config.output_queue_limits.hard_limit_commands = 2U;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "budgeted backpressure session starts");
+
+    QByteArray output;
+    for (int i = 0; i < 500; ++i) {
+        output += QByteArrayLiteral("backpressure-fill\r\n");
+    }
+
+    ok &= check(backend->emit_output(output),
+        "budgeted backpressure queues large output command");
+    ok &= check(backend->output_paused && session->output_backpressure_active(),
+        "budgeted backpressure starts while one output command is queued");
+
+    const bool first_drain_complete = session->process_backend_callback_events_for(
+        std::chrono::steady_clock::duration::zero());
+    ok &= check(!first_drain_complete,
+        "budgeted backpressure first owner drain yields with a sliced remainder");
+    ok &= check(backend->output_paused && session->output_backpressure_active(),
+        "budgeted backpressure remains active until the sliced command finishes");
+
+    bool complete = first_drain_complete;
+    for (int i = 0; !complete && i < 8; ++i) {
+        complete = session->process_backend_callback_events_for(
+            std::chrono::steady_clock::duration::zero());
+    }
+
+    ok &= check(complete && !session->has_pending_backend_callback_events(),
+        "budgeted backpressure finishes after repeated owner drains");
+    ok &= check(!backend->output_paused && !session->output_backpressure_active(),
+        "budgeted backpressure releases only after the final continuation");
 
     return ok;
 }
@@ -4972,11 +7513,32 @@ int main()
     ok &= test_backend_output_capture_records_callback_overflow_bytes();
     ok &= test_backend_output_updates_latest_render_snapshot();
     ok &= test_selection_snapshot_and_visible_text();
+    ok &= test_selection_snapshot_during_blocked_publication();
+    ok &= test_blocked_detach_resize_snapshot_metadata_coherence();
+    ok &= test_selection_phase2_internal_state_and_lease();
+    ok &= test_selection_phase2_replacement_empty_cancel_and_eviction();
+    ok &= test_selection_phase2_model_semantic_flags();
+    ok &= test_selection_phase2_session_lease_basis_advances();
+    ok &= test_selection_phase3_line_lease_provenance_capture();
+    ok &= test_selection_phase3_line_lease_negative_source_paths();
+    ok &= test_selection_phase5_visual_lease_span_compatibility();
+    ok &= test_selection_spans_preserve_after_same_viewport_idempotent_selected_row_rewrite();
+    ok &= test_selection_spans_preserve_during_scrollback_growth_with_retained_lines();
+    ok &= test_selection_spans_detach_when_selected_row_mutates();
+    ok &= test_selection_spans_detach_when_retained_row_moves();
+    ok &= test_selection_spans_preserve_after_unchanged_synchronized_output_release();
+    ok &= test_selection_spans_detach_when_synchronized_release_mutates_selected_row();
+    ok &= test_selection_spans_detach_when_synchronized_release_moves_retained_row();
+    ok &= test_selection_spans_fail_closed_at_phase4c_boundaries();
+    ok &= test_selection_spans_detach_when_resize_invalidates_selected_columns();
+    ok &= test_selection_unicode_cluster_payloads();
     ok &= test_output_activity_notifications_are_session_level();
     ok &= test_synchronized_output_defers_content_until_release();
     ok &= test_viewport_scroll_public_session_path();
     ok &= test_resize_preserves_primary_scrollback();
     ok &= test_resize_repaint_clear_keeps_primary_scrollback_when_recovery_is_enabled();
+    ok &= test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback();
+    ok &= test_cursor_home_text_then_el_repaint_synthesizes_primary_scrollback();
     ok &= test_parser_notifications_reach_session_notifications();
     ok &= test_bell_policy_coalesces_with_deterministic_clock();
     ok &= test_parser_state_crosses_backend_output_chunks();
@@ -4991,6 +7553,8 @@ int main()
     ok &= test_destructor_ignores_late_backend_callbacks();
     ok &= test_worker_thread_callback_is_delivered();
     ok &= test_deferred_callback_ingress_merges_adjacent_output();
+    ok &= test_budgeted_backend_callback_drain_yields_inside_coalesced_output();
+    ok &= test_budgeted_backend_callback_drain_holds_output_command_backpressure();
     ok &= test_deferred_callback_ingress_pauses_backend_at_high_water();
     ok &= test_deferred_callback_ingress_overflow_is_bounded();
     ok &= test_deferred_callback_ingress_error_count_is_bounded();

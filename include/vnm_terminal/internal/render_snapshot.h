@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <set>
 #include <vector>
+#include <cstddef>
 #include <cstdint>
 
 namespace vnm_terminal::internal {
@@ -59,6 +60,7 @@ enum class Terminal_render_snapshot_status
     INVALID_VIEWPORT,
     INVALID_DIRTY_ROW_RANGE,
     INVALID_SELECTION_SPAN,
+    INVALID_LINE_PROVENANCE,
     INVALID_HYPERLINK_METADATA,
 };
 
@@ -94,6 +96,29 @@ struct Terminal_render_selection_span
     int                        column_count = 0;
 };
 
+struct Terminal_render_line_provenance
+{
+    std::int64_t               logical_row        = 0;
+    std::uint64_t              retained_line_id   = 0U;
+    std::uint64_t              content_generation = 0U;
+};
+
+struct Terminal_render_selection_request
+{
+    Terminal_selection_range                         range;
+    std::vector<terminal_selection_line_lease_t>     expected_lines;
+};
+
+inline bool operator==(
+    const Terminal_render_line_provenance& left,
+    const Terminal_render_line_provenance& right)
+{
+    return
+        left.logical_row        == right.logical_row        &&
+        left.retained_line_id   == right.retained_line_id   &&
+        left.content_generation == right.content_generation;
+}
+
 struct Terminal_render_hyperlink_metadata
 {
     std::uint64_t              hyperlink_id                 = 0U;
@@ -104,6 +129,7 @@ struct Terminal_render_hyperlink_metadata
 struct Terminal_render_metadata
 {
     std::uint64_t              sequence                     = 0U;
+    std::uint64_t              row_origin_generation         = 0U;
     bool                       backend_geometry_in_sync     = true;
     bool                       visual_bell_active           = false;
     bool                       mouse_reporting_mode_changed = false;
@@ -112,13 +138,14 @@ struct Terminal_render_metadata
 struct Terminal_render_snapshot_request
 {
     std::uint64_t                         sequence = 0U;
+    std::uint64_t                         row_origin_generation = 0U;
     Terminal_viewport_state               viewport;
     std::vector<int>                      dirty_rows;
     bool                                  viewport_changed = false;
     Terminal_cursor_shape                 cursor_shape = Terminal_cursor_shape::BLOCK;
     bool                                  cursor_blink_enabled = true;
     Ime_preedit_state                     ime_preedit;
-    std::vector<Terminal_selection_range> selections;
+    std::vector<Terminal_render_selection_request> selections;
     bool                                  backend_geometry_in_sync = true;
     bool                                  visual_bell_active = false;
     bool                                  mouse_reporting_mode_changed = false;
@@ -131,6 +158,7 @@ struct Terminal_render_snapshot
     Terminal_color_state                               color_state;
     std::vector<Terminal_text_style>                   styles;
     std::vector<Terminal_render_cell>                  cells;
+    std::vector<Terminal_render_line_provenance>       visible_line_provenance;
     std::vector<Terminal_render_dirty_row_range>       dirty_row_ranges;
     std::vector<Terminal_render_hyperlink_metadata>    hyperlinks;
     Terminal_render_cursor                             cursor;
@@ -194,6 +222,218 @@ inline std::vector<Terminal_render_dirty_row_range> compact_dirty_row_ranges(
     return ranges;
 }
 
+inline terminal_grid_position_t normalized_selection_start(
+    const Terminal_selection_range& range)
+{
+    if (range.start.row < range.end.row) {
+        return range.start;
+    }
+
+    if (range.start.row > range.end.row) {
+        return range.end;
+    }
+
+    return range.start.column <= range.end.column ? range.start : range.end;
+}
+
+inline terminal_grid_position_t normalized_selection_end(
+    const Terminal_selection_range& range)
+{
+    if (range.start.row < range.end.row) {
+        return range.end;
+    }
+
+    if (range.start.row > range.end.row) {
+        return range.start;
+    }
+
+    return range.start.column <= range.end.column ? range.end : range.start;
+}
+
+inline std::size_t normalized_selection_row_count(
+    const Terminal_selection_range& range)
+{
+    const terminal_grid_position_t start = normalized_selection_start(range);
+    const terminal_grid_position_t end   = normalized_selection_end(range);
+    const std::int64_t row_count =
+        static_cast<std::int64_t>(end.row) - static_cast<std::int64_t>(start.row) + 1;
+    return row_count > 0 ? static_cast<std::size_t>(row_count) : 0U;
+}
+
+inline int render_snapshot_first_visible_logical_row(
+    const Terminal_render_snapshot& snapshot)
+{
+    return snapshot.viewport.active_buffer == Terminal_buffer_id::ALTERNATE
+        ? 0
+        : snapshot.viewport.scrollback_rows - snapshot.viewport.offset_from_tail;
+}
+
+inline bool render_snapshot_visible_line_provenance_is_valid(
+    const Terminal_render_snapshot& snapshot)
+{
+    if (snapshot.grid_size.rows <= 0) {
+        return false;
+    }
+
+    if (snapshot.visible_line_provenance.size() !=
+        static_cast<std::size_t>(snapshot.grid_size.rows))
+    {
+        return false;
+    }
+
+    const std::int64_t first_visible_logical_row =
+        render_snapshot_first_visible_logical_row(snapshot);
+    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
+        const Terminal_render_line_provenance& provenance =
+            snapshot.visible_line_provenance[static_cast<std::size_t>(row)];
+        const std::int64_t expected_logical_row =
+            first_visible_logical_row + static_cast<std::int64_t>(row);
+        if (provenance.logical_row != expected_logical_row ||
+            provenance.retained_line_id == 0U)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+inline void suppress_selection_spans_without_valid_line_provenance(
+    Terminal_render_snapshot& snapshot)
+{
+    if (!snapshot.selection_spans.empty() &&
+        !render_snapshot_visible_line_provenance_is_valid(snapshot))
+    {
+        snapshot.selection_spans.clear();
+    }
+}
+
+inline std::vector<const Terminal_render_cell*> render_snapshot_cells_by_position(
+    const Terminal_render_snapshot& snapshot)
+{
+    std::vector<const Terminal_render_cell*> cells_by_position(
+        static_cast<std::size_t>(snapshot.grid_size.rows) *
+            static_cast<std::size_t>(snapshot.grid_size.columns),
+        nullptr);
+    for (const Terminal_render_cell& cell : snapshot.cells) {
+        if (cell.position.row    <  0                          ||
+            cell.position.row    >= snapshot.grid_size.rows     ||
+            cell.position.column <  0                          ||
+            cell.position.column >= snapshot.grid_size.columns)
+        {
+            continue;
+        }
+
+        const std::size_t index =
+            static_cast<std::size_t>(cell.position.row) *
+                static_cast<std::size_t>(snapshot.grid_size.columns) +
+            static_cast<std::size_t>(cell.position.column);
+        cells_by_position[index] = &cell;
+    }
+    return cells_by_position;
+}
+
+inline const Terminal_render_cell* render_snapshot_cell_at(
+    const std::vector<const Terminal_render_cell*>& cells_by_position,
+    terminal_grid_size_t                            grid_size,
+    int                                             row,
+    int                                             column)
+{
+    const std::size_t index =
+        static_cast<std::size_t>(row) *
+            static_cast<std::size_t>(grid_size.columns) +
+        static_cast<std::size_t>(column);
+    return cells_by_position[index];
+}
+
+inline QString selected_text_from_render_snapshot_row(
+    const Terminal_render_snapshot& snapshot,
+    const std::vector<const Terminal_render_cell*>&
+                                    cells_by_position,
+    int                             viewport_row,
+    int                             first_column,
+    int                             end_column,
+    bool                            trim_trailing_spaces)
+{
+    QString text;
+    for (int column = first_column; column < end_column; ++column) {
+        const Terminal_render_cell* cell =
+            render_snapshot_cell_at(
+                cells_by_position,
+                snapshot.grid_size,
+                viewport_row,
+                column);
+        if (cell == nullptr) {
+            text += QLatin1Char(' ');
+            continue;
+        }
+
+        if (cell->wide_continuation) {
+            continue;
+        }
+
+        text += cell->text;
+    }
+
+    if (trim_trailing_spaces) {
+        while (text.endsWith(QLatin1Char(' '))) {
+            text.chop(1);
+        }
+    }
+    return text;
+}
+
+inline Terminal_selection_result selected_text_from_render_snapshot(
+    const Terminal_render_snapshot& snapshot,
+    const Terminal_selection_range& selection)
+{
+    if (snapshot.grid_size.rows <= 0 || snapshot.grid_size.columns <= 0 ||
+        selection.mode == Terminal_selection_mode::NONE)
+    {
+        return {Terminal_selection_result_code::INVALID_RANGE, {}};
+    }
+
+    const terminal_grid_position_t start = normalized_selection_start(selection);
+    const terminal_grid_position_t end   = normalized_selection_end(selection);
+    const int first_visible_logical_row  = render_snapshot_first_visible_logical_row(snapshot);
+
+    if (start.row    < first_visible_logical_row                            ||
+        end.row      >= first_visible_logical_row + snapshot.grid_size.rows ||
+        start.column < 0                                                    ||
+        start.column > snapshot.grid_size.columns                           ||
+        end.column   < 0                                                    ||
+        end.column   > snapshot.grid_size.columns)
+    {
+        return {Terminal_selection_result_code::INVALID_RANGE, {}};
+    }
+
+    const std::vector<const Terminal_render_cell*> cells_by_position =
+        render_snapshot_cells_by_position(snapshot);
+    QString text;
+    for (int logical_row = start.row; logical_row <= end.row; ++logical_row) {
+        const int first_column = logical_row == start.row ? start.column : 0;
+        const int end_column =
+            logical_row == end.row ? end.column : snapshot.grid_size.columns;
+        if (end_column < first_column) {
+            return {Terminal_selection_result_code::INVALID_RANGE, {}};
+        }
+
+        if (logical_row > start.row) {
+            text += QLatin1Char('\n');
+        }
+
+        text += selected_text_from_render_snapshot_row(
+            snapshot,
+            cells_by_position,
+            logical_row - first_visible_logical_row,
+            first_column,
+            end_column,
+            end_column == snapshot.grid_size.columns);
+    }
+
+    return {Terminal_selection_result_code::OK, text};
+}
+
 inline Terminal_render_snapshot_validation validate_render_snapshot(
     const Terminal_render_snapshot& snapshot)
 {
@@ -219,6 +459,16 @@ inline Terminal_render_snapshot_validation validate_render_snapshot(
                 snapshot.viewport.offset_from_tail != 0)))
     {
         return {Terminal_render_snapshot_status::INVALID_VIEWPORT};
+    }
+
+    if (!snapshot.visible_line_provenance.empty() &&
+        !render_snapshot_visible_line_provenance_is_valid(snapshot))
+    {
+        return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};
+    }
+
+    if (snapshot.visible_line_provenance.empty() && !snapshot.selection_spans.empty()) {
+        return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};
     }
 
     int next_dirty_row = 0;

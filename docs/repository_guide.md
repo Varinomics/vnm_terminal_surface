@@ -49,6 +49,12 @@ Quick.
 - `VNM_TERMINAL_ENABLE_PROFILING` is `OFF` by default. Turning it on compiles
   profile-scope instrumentation into the library and enables profile-output
   validation paths.
+- `VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY` is `OFF` by default. Turning
+  it on compiles the sensitive diagnostic transcript recorder, the
+  `vnm_terminal_transcript_replay` tool, and the transcript-specific tests.
+- `VNM_TERMINAL_DISTRIBUTION_BUILD` is `OFF` by default. Distribution
+  packaging sets it to `ON`; configure fails if transcript capture/replay is
+  also enabled.
 - `VNM_TERMINAL_QT_LICENSE_ROUTE` is `lgpl_dynamic` by default and also accepts
   `commercial`. The LGPL route requires shared Qt libraries.
 
@@ -59,6 +65,7 @@ cmake -S . -B build -DBUILD_TESTING=ON
 cmake -S . -B build -DVNM_TERMINAL_BUILD_BENCHMARKS=ON -DBUILD_TESTING=ON
 cmake -S . -B build -DVNM_TERMINAL_BUILD_REQUIRED_READINESS=ON -DBUILD_TESTING=ON
 cmake -S . -B build-profile -DVNM_TERMINAL_BUILD_BENCHMARKS=ON -DVNM_TERMINAL_ENABLE_PROFILING=ON -DBUILD_TESTING=ON
+cmake -S . -B build-transcript -DVNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON -DBUILD_TESTING=ON
 ```
 
 ## Supported Platforms
@@ -81,6 +88,8 @@ The root CMake project builds:
   `vnm_terminal_surface::vnm_terminal_surface`;
 - `vnm_terminal_canvas_fixture`, the scripted child process used by backend,
   surface, and conformance tests;
+- `vnm_terminal_transcript_replay`, only when
+  `VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON`;
 - `vnm_terminal_embedded_benchmark`, when benchmarks are enabled;
 - test executables named after their CTest entries when `BUILD_TESTING` is on;
 - optional conformance targets created by CMake cache variables under
@@ -126,6 +135,8 @@ CTest names are the stable way to find a test. The main families are:
 - `vnm_terminal_resource_lifecycle`, `vnm_terminal_profiler`,
   `vnm_terminal_qt_posture`, and `vnm_terminal_canvas_fixture_contract`:
   lifecycle, profiling, Qt posture, and fixture protocol tests.
+- `vnm_terminal_transcript`: sensitive diagnostic transcript capture/replay
+  coverage, only when `VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON`.
 - `vnm_terminal_*_conformance`, `vnm_terminal_parser_fuzz_smoke`, and
   `vnm_terminal_libvterm_differential`: optional conformance and differential
   tests controlled by CMake cache variables.

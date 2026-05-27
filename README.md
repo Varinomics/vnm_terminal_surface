@@ -32,6 +32,12 @@ Configure once:
 cmake -S . -B build -DBUILD_TESTING=ON
 ```
 
+Diagnostic transcript capture/replay is compiled out by default. Enable it only
+for local diagnostic builds with
+`-DVNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON`; distribution builds must
+use `-DVNM_TERMINAL_DISTRIBUTION_BUILD=ON` and leave transcript capture/replay
+disabled.
+
 Build from an x64 MSVC Developer Command Prompt or another shell where the
 Visual Studio C++ environment has already been initialized:
 

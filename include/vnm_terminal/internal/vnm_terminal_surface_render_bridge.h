@@ -7,6 +7,7 @@
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include <QString>
 #include <QStringList>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 
@@ -54,6 +55,10 @@ public:
         VNM_TerminalSurface&       surface,
         bool                       enabled);
 
+    static void set_selection_trace_enabled(
+        VNM_TerminalSurface&       surface,
+        bool                       enabled);
+
     static Terminal_screen_model_dirty_row_stats dirty_row_stats(
         const VNM_TerminalSurface& surface);
 
@@ -75,6 +80,10 @@ public:
 
     static void drain_backend_callback_events(
         VNM_TerminalSurface&       surface);
+
+    static void handle_synchronized_output_recovery_timeout(
+        VNM_TerminalSurface&                    surface,
+        std::chrono::steady_clock::duration     budget);
 
     static std::shared_ptr<const Terminal_render_snapshot> render_snapshot(
         const VNM_TerminalSurface& surface);
