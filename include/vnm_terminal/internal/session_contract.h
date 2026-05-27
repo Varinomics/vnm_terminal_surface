@@ -8,11 +8,14 @@
 #include <QString>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <cstddef>
 #include <cstdint>
 
 namespace vnm_terminal::internal {
+
+class Terminal_transcript_recorder;
 
 enum class Terminal_session_command_kind
 {
@@ -174,6 +177,9 @@ struct Terminal_session_config
     bool                            capture_last_model_ingest_result         = false;
     bool                            capture_dirty_row_stats                  = false;
     bool                            recover_scrollback_from_primary_repaints = false;
+    bool                            selection_trace_enabled                  = false;
+    bool                            selection_viewport_projection_enabled    = false;
+    std::shared_ptr<Terminal_transcript_recorder> transcript_recorder;
 };
 
 class Bounded_terminal_command_queue

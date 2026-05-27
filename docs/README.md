@@ -45,6 +45,11 @@ the repository without reading every implementation detail.
   public API, and Scene Graph constraints.
 - [Repository guide](repository_guide.md) records supported platforms, build
   options, fixture formats, generated artifacts, and operational entry points.
+- [Selection row provenance plan](selection_row_provenance_plan.md) records the
+  implemented retained-line provenance architecture and phase outcomes for
+  selection visual lease preservation.
+- [Selection row provenance manual validation](selection_row_provenance_manual_validation.md)
+  records the manual Codex active-output checklist and trace hints.
 
 ## Maintenance Rule
 

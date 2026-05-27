@@ -5,6 +5,7 @@
 #include <QByteArray>
 #include <QSizeF>
 #include <QString>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -83,6 +84,38 @@ const term::Terminal_render_hyperlink_metadata* hyperlink_by_id(
     }
 
     return nullptr;
+}
+
+bool check_visible_line_provenance_matches_model(
+    const term::Terminal_screen_model&     model,
+    const term::Terminal_render_snapshot&  snapshot,
+    const char*                            label)
+{
+    bool ok = true;
+    ok &= check(snapshot.visible_line_provenance.size() ==
+        static_cast<std::size_t>(snapshot.grid_size.rows),
+        label);
+    if (snapshot.visible_line_provenance.size() !=
+        static_cast<std::size_t>(snapshot.grid_size.rows))
+    {
+        return false;
+    }
+
+    const int first_visible_logical_row =
+        term::render_snapshot_first_visible_logical_row(snapshot);
+    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
+        const int logical_row = first_visible_logical_row + row;
+        const term::Terminal_retained_line_provenance expected =
+            model.retained_line_provenance_for_testing(
+                snapshot.viewport.active_buffer,
+                logical_row);
+        const term::Terminal_render_line_provenance& actual =
+            snapshot.visible_line_provenance[static_cast<std::size_t>(row)];
+        ok &= check(actual.logical_row == static_cast<std::int64_t>(logical_row), label);
+        ok &= check(actual.retained_line_id == expected.retained_line_id, label);
+        ok &= check(actual.content_generation == expected.content_generation, label);
+    }
+    return ok;
 }
 
 term::Terminal_launch_config launch_config(term::terminal_grid_size_t grid_size)
@@ -306,7 +339,17 @@ bool test_request_metadata_damage_selection_and_ime()
     request.ime_preedit.text            = QStringLiteral("ime");
     request.ime_preedit.cursor_position = 2;
     request.ime_preedit.active          = true;
-    request.selections.push_back({{0, 1}, {1, 4}, term::Terminal_selection_mode::NORMAL});
+    const term::Terminal_retained_line_provenance first_line =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const term::Terminal_retained_line_provenance second_line =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    request.selections.push_back({
+        {{0, 1}, {1, 4}, term::Terminal_selection_mode::NORMAL},
+        {
+            {0, first_line.retained_line_id,  first_line.content_generation},
+            {1, second_line.retained_line_id, second_line.content_generation},
+        },
+    });
 
     const term::Terminal_render_snapshot snapshot = model.render_snapshot(request);
     ok &= check(snapshot.dirty_row_ranges.size() == 2U &&
@@ -329,6 +372,42 @@ bool test_request_metadata_damage_selection_and_ime()
         snapshot.selection_spans[1].row == 1,
         "selection range is converted to grid-relative spans");
 
+    term::Terminal_render_snapshot_request empty_line_request =
+        request_for_model(model, 31U);
+    empty_line_request.selections.push_back({
+        {{0, 1}, {1, 4}, term::Terminal_selection_mode::NORMAL},
+        {},
+    });
+    const term::Terminal_render_snapshot empty_line_snapshot =
+        model.render_snapshot(empty_line_request);
+    ok &= check(empty_line_snapshot.selection_spans.empty(),
+        "selection request with empty retained-line proof emits no spans");
+
+    term::Terminal_render_snapshot_request incomplete_line_request =
+        request_for_model(model, 32U);
+    incomplete_line_request.selections.push_back({
+        {{0, 1}, {1, 4}, term::Terminal_selection_mode::NORMAL},
+        {{0, first_line.retained_line_id, first_line.content_generation}},
+    });
+    const term::Terminal_render_snapshot incomplete_line_snapshot =
+        model.render_snapshot(incomplete_line_request);
+    ok &= check(incomplete_line_snapshot.selection_spans.empty(),
+        "selection request with incomplete retained-line proof emits no spans");
+
+    term::Terminal_render_snapshot_request stale_line_request =
+        request_for_model(model, 33U);
+    stale_line_request.selections.push_back({
+        {{0, 1}, {1, 4}, term::Terminal_selection_mode::NORMAL},
+        {
+            {0, first_line.retained_line_id,  first_line.content_generation + 1U},
+            {1, second_line.retained_line_id, second_line.content_generation},
+        },
+    });
+    const term::Terminal_render_snapshot stale_line_snapshot =
+        model.render_snapshot(stale_line_request);
+    ok &= check(stale_line_snapshot.selection_spans.empty(),
+        "selection request with stale retained-line proof emits no spans");
+
     request.viewport_changed = true;
     const term::Terminal_render_snapshot full_repaint = model.render_snapshot(request);
     ok &= check(full_repaint.dirty_row_ranges.size() == 1U &&
@@ -338,6 +417,37 @@ bool test_request_metadata_damage_selection_and_ime()
     ok &= check(term::validate_render_snapshot(full_repaint).status ==
         term::Terminal_render_snapshot_status::OK,
         "context-rich snapshot validates");
+    return ok;
+}
+
+bool test_selection_request_rejects_retained_line_row_reorder()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({4, 12});
+    model.ingest(QByteArrayLiteral("alpha\r\nbeta\r\ngamma"));
+
+    const term::Terminal_retained_line_provenance beta_line =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    term::Terminal_render_snapshot_request request = request_for_model(model, 40U);
+    request.selections.push_back({
+        {{1, 0}, {1, 4}, term::Terminal_selection_mode::NORMAL},
+        {{0, beta_line.retained_line_id, beta_line.content_generation}},
+    });
+
+    const term::Terminal_render_snapshot selected_snapshot =
+        model.render_snapshot(request);
+    ok &= check(selected_snapshot.selection_spans.size() == 1U &&
+        selected_snapshot.selection_spans.front().row == 1,
+        "selection request emits a span before row movement");
+
+    model.ingest(QByteArrayLiteral("\x1b[1;1H\x1b[L"));
+    const term::Terminal_render_snapshot moved_snapshot =
+        model.render_snapshot(request);
+    ok &= check(row_text(moved_snapshot, 2) == QStringLiteral("beta"),
+        "insert-line fixture moves the retained selected text without mutating it");
+    ok &= check(moved_snapshot.selection_spans.empty(),
+        "selection request rejects retained-line descriptors after row movement");
+
     return ok;
 }
 
@@ -356,6 +466,113 @@ bool test_dirty_rows_are_viewport_relative()
         snapshot.dirty_row_ranges.front().first_row == 1 &&
         snapshot.dirty_row_ranges.front().row_count == 1,
         "screen dirty row is translated to viewport-relative damage");
+    return ok;
+}
+
+bool test_model_snapshots_publish_visible_line_provenance()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model scroll_model = make_model({3, 8});
+    scroll_model.ingest(QByteArrayLiteral("one\r\ntwo\r\nthree\r\nfour"));
+
+    ok &= check(scroll_model.scrollback_size() > 0,
+        "line provenance scrollback fixture has retained history");
+    const term::Terminal_render_snapshot tail_snapshot =
+        scroll_model.render_snapshot(request_for_model(scroll_model, 60U));
+    ok &= check(term::validate_render_snapshot(tail_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "tail line provenance snapshot validates");
+    ok &= check_visible_line_provenance_matches_model(
+        scroll_model,
+        tail_snapshot,
+        "tail line provenance descriptors match visible logical rows");
+
+    const term::Terminal_render_snapshot scrollback_snapshot =
+        scroll_model.render_snapshot(request_for_model(scroll_model, 61U, 1));
+    ok &= check(term::validate_render_snapshot(scrollback_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "scrollback line provenance snapshot validates");
+    ok &= check_visible_line_provenance_matches_model(
+        scroll_model,
+        scrollback_snapshot,
+        "scrollback line provenance descriptors match visible logical rows");
+
+    term::Terminal_screen_model model = make_model({3, 8});
+    model.ingest(QByteArrayLiteral("alpha\r\nbeta"));
+    const term::Terminal_render_snapshot before_cursor =
+        model.render_snapshot(request_for_model(model, 70U));
+
+    model.ingest(QByteArrayLiteral("\x1b[2;3H"));
+    const term::Terminal_render_snapshot cursor_only =
+        model.render_snapshot(request_for_model(model, 71U));
+    ok &= check(cursor_only.visible_line_provenance ==
+        before_cursor.visible_line_provenance,
+        "cursor-only snapshot preserves visible line provenance");
+
+    model.ingest(QByteArrayLiteral("\x1b[1;1HZ"));
+    const term::Terminal_render_snapshot mutated =
+        model.render_snapshot(request_for_model(model, 72U));
+    ok &= check(
+        mutated.visible_line_provenance[0].retained_line_id ==
+            before_cursor.visible_line_provenance[0].retained_line_id &&
+        mutated.visible_line_provenance[0].content_generation >
+            before_cursor.visible_line_provenance[0].content_generation,
+        "content mutation preserves retained line id and advances row generation");
+    ok &= check(
+        mutated.visible_line_provenance[1] == before_cursor.visible_line_provenance[1] &&
+        mutated.visible_line_provenance[2] == before_cursor.visible_line_provenance[2],
+        "unmodified visible rows keep line provenance descriptors");
+    return ok;
+}
+
+bool test_visible_line_provenance_validation()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model({2, 8});
+    model.ingest(QByteArrayLiteral("A"));
+    const term::Terminal_render_snapshot valid =
+        model.render_snapshot(request_for_model(model, 80U));
+    ok &= check(term::validate_render_snapshot(valid).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "line provenance validation accepts model snapshot");
+
+    term::Terminal_render_snapshot missing_row = valid;
+    missing_row.visible_line_provenance.pop_back();
+    ok &= check(term::validate_render_snapshot(missing_row).status ==
+        term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE,
+        "line provenance validation rejects missing visible row descriptor");
+
+    term::Terminal_render_snapshot zero_id = valid;
+    zero_id.visible_line_provenance[0].retained_line_id = 0U;
+    ok &= check(term::validate_render_snapshot(zero_id).status ==
+        term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE,
+        "line provenance validation rejects zero retained line id");
+
+    term::Terminal_render_snapshot wrong_logical_row = valid;
+    ++wrong_logical_row.visible_line_provenance[1].logical_row;
+    ok &= check(term::validate_render_snapshot(wrong_logical_row).status ==
+        term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE,
+        "line provenance validation rejects mismatched logical row");
+
+    term::Terminal_render_snapshot empty_without_spans =
+        term::make_empty_render_snapshot({2, 8}, tail_viewport(model), 81U);
+    ok &= check(empty_without_spans.visible_line_provenance.empty() &&
+        term::validate_render_snapshot(empty_without_spans).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "empty snapshot may omit line provenance when it emits no spans");
+
+    term::Terminal_render_snapshot empty_with_span = empty_without_spans;
+    empty_with_span.selection_spans.push_back({
+        {{0, 0}, {0, 1}, term::Terminal_selection_mode::NORMAL},
+        0,
+        0,
+        1,
+    });
+    ok &= check(term::validate_render_snapshot(empty_with_span).status ==
+        term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE,
+        "snapshot without line provenance cannot publish selection spans");
     return ok;
 }
 
@@ -566,6 +783,105 @@ bool test_resize_metadata_publication_respects_synchronized_output()
     return ok;
 }
 
+bool test_synthetic_snapshots_preserve_or_suppress_line_provenance()
+{
+    bool ok = true;
+
+    Recording_backend* backend = nullptr;
+    std::unique_ptr<term::Terminal_session> session = make_session(backend);
+    ok &= check(session->start(launch_config({3, 12})).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "synthetic provenance geometry session starts");
+    ok &= check(backend != nullptr &&
+        backend->emit_output(QByteArrayLiteral("base")),
+        "synthetic provenance geometry session publishes base content");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> base =
+        session->latest_render_snapshot_handle();
+    ok &= check(base != nullptr &&
+        term::render_snapshot_visible_line_provenance_is_valid(*base),
+        "base content snapshot has valid line provenance");
+    const std::vector<term::Terminal_render_line_provenance> base_provenance =
+        base != nullptr ? base->visible_line_provenance :
+            std::vector<term::Terminal_render_line_provenance>{};
+    const std::uint64_t base_generation = session->render_snapshot_generation();
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
+        "synthetic provenance geometry session enters synchronized output");
+    ok &= check(session->render_snapshot_generation() == base_generation,
+        "synchronized output entry publishes no hidden content snapshot");
+
+    ok &= check(session->resize(QSizeF(120.0, 80.0), {3, 12}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "same-grid geometry snapshot is accepted during synchronized output");
+    const std::shared_ptr<const term::Terminal_render_snapshot> same_grid =
+        session->latest_render_snapshot_handle();
+    ok &= check(same_grid != nullptr &&
+        same_grid->visible_line_provenance == base_provenance &&
+        same_grid->selection_spans.empty() &&
+        cell_with_text(*same_grid, QStringLiteral("h")) == nullptr,
+        "same-grid geometry snapshot preserves provenance without exposing hidden content");
+    ok &= check(same_grid != nullptr &&
+        term::validate_render_snapshot(*same_grid).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "same-grid geometry snapshot validates");
+
+    ok &= check(session->resize(QSizeF(120.0, 100.0), {4, 12}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "changed-grid geometry snapshot is accepted during synchronized output");
+    const std::shared_ptr<const term::Terminal_render_snapshot> changed_grid =
+        session->latest_render_snapshot_handle();
+    ok &= check(changed_grid != nullptr &&
+        changed_grid->visible_line_provenance.empty() &&
+        changed_grid->selection_spans.empty(),
+        "changed-grid geometry snapshot suppresses unproven provenance and spans");
+    ok &= check(changed_grid != nullptr &&
+        term::validate_render_snapshot(*changed_grid).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "changed-grid geometry snapshot validates without provenance");
+
+    Recording_backend* selection_backend = nullptr;
+    std::unique_ptr<term::Terminal_session> selection_session =
+        make_session(selection_backend);
+    ok &= check(selection_session->start(launch_config({3, 12})).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "selection-only provenance session starts");
+    ok &= check(selection_backend != nullptr &&
+        selection_backend->emit_output(QByteArrayLiteral("select")),
+        "selection-only provenance session publishes selectable content");
+    selection_session->set_selection_range({
+        {0, 0},
+        {0, 6},
+        term::Terminal_selection_mode::NORMAL,
+    });
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> selected =
+        selection_session->latest_render_snapshot_handle();
+    ok &= check(selected != nullptr &&
+        !selected->selection_spans.empty() &&
+        term::render_snapshot_visible_line_provenance_is_valid(*selected),
+        "selected snapshot has spans and valid line provenance");
+    const std::vector<term::Terminal_render_line_provenance> selected_provenance =
+        selected != nullptr ? selected->visible_line_provenance :
+            std::vector<term::Terminal_render_line_provenance>{};
+
+    ok &= check(selection_backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
+        "selection-only provenance session enters synchronized output");
+    selection_session->detach_selection_visual_attachment();
+    const std::shared_ptr<const term::Terminal_render_snapshot> detached =
+        selection_session->latest_render_snapshot_handle();
+    ok &= check(detached != nullptr &&
+        detached->selection_spans.empty() &&
+        detached->visible_line_provenance == selected_provenance &&
+        cell_with_text(*detached, QStringLiteral("h")) == nullptr,
+        "selection-only snapshot preserves previous provenance and suppresses spans");
+    ok &= check(detached != nullptr &&
+        term::validate_render_snapshot(*detached).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "selection-only snapshot validates");
+    return ok;
+}
+
 }
 
 int main()
@@ -575,10 +891,14 @@ int main()
     ok &= test_scrollback_wide_rows_are_repaired_on_resize();
     ok &= test_alternate_screen_hides_primary_scrollback();
     ok &= test_request_metadata_damage_selection_and_ime();
+    ok &= test_selection_request_rejects_retained_line_row_reorder();
     ok &= test_dirty_rows_are_viewport_relative();
+    ok &= test_model_snapshots_publish_visible_line_provenance();
+    ok &= test_visible_line_provenance_validation();
     ok &= test_session_snapshot_handles_and_synchronized_release();
     ok &= test_session_ime_overlay_does_not_clone_render_snapshot();
     ok &= test_backend_sync_metadata_publishes_after_same_grid_retry();
     ok &= test_resize_metadata_publication_respects_synchronized_output();
+    ok &= test_synthetic_snapshots_preserve_or_suppress_line_provenance();
     return ok ? 0 : 1;
 }

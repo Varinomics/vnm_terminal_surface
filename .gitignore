@@ -1,6 +1,8 @@
 build/
+build_codex*/
 out/
 more_tests/
+manual_validation_runs/
 CMakeUserPresets.json
 *.user
 *.user.*

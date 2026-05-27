@@ -3,6 +3,7 @@
 
 #include <QByteArray>
 #include <QString>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -26,11 +27,14 @@ QByteArray bytes_from_hex(const char* hex)
     return QByteArray::fromHex(QByteArray(hex));
 }
 
-term::Terminal_screen_model make_model(int rows = 4, int columns = 8)
+term::Terminal_screen_model make_model(
+    int    rows = 4,
+    int    columns = 8,
+    int    scrollback_limit = 8)
 {
     return term::Terminal_screen_model({
         term::terminal_grid_size_t{rows, columns},
-        8,
+        scrollback_limit,
         4,
     });
 }
@@ -131,6 +135,113 @@ QString snapshot_row_text(
         text.chop(1);
     }
     return text;
+}
+
+bool contains_id(
+    const std::vector<std::uint64_t>& ids,
+    std::uint64_t                     target)
+{
+    for (std::uint64_t id : ids) {
+        if (id == target) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::uint64_t max_retained_line_id(const std::vector<std::uint64_t>& ids)
+{
+    std::uint64_t max_id = 0U;
+    for (std::uint64_t id : ids) {
+        max_id = std::max(max_id, id);
+    }
+    return max_id;
+}
+
+term::Terminal_retained_line_provenance primary_retained_line_provenance(
+    const term::Terminal_screen_model& model,
+    int                                logical_row)
+{
+    return model.retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        logical_row);
+}
+
+term::Terminal_retained_line_provenance alternate_retained_line_provenance(
+    const term::Terminal_screen_model& model,
+    int                                logical_row)
+{
+    return model.retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::ALTERNATE,
+        logical_row);
+}
+
+std::uint64_t primary_retained_line_id(
+    const term::Terminal_screen_model& model,
+    int                                logical_row)
+{
+    return primary_retained_line_provenance(model, logical_row).retained_line_id;
+}
+
+std::uint64_t alternate_retained_line_id(
+    const term::Terminal_screen_model& model,
+    int                                logical_row)
+{
+    return alternate_retained_line_provenance(model, logical_row).retained_line_id;
+}
+
+std::uint64_t primary_retained_line_generation(
+    const term::Terminal_screen_model& model,
+    int                                logical_row)
+{
+    return primary_retained_line_provenance(model, logical_row).content_generation;
+}
+
+std::vector<std::uint64_t> primary_retained_line_ids(
+    const term::Terminal_screen_model& model)
+{
+    std::vector<std::uint64_t> ids;
+    const int retained_row_count = model.scrollback_size() + model.grid_size().rows;
+    ids.reserve(static_cast<std::size_t>(retained_row_count));
+    for (int logical_row = 0; logical_row < retained_row_count; ++logical_row) {
+        ids.push_back(primary_retained_line_id(model, logical_row));
+    }
+    return ids;
+}
+
+bool check_primary_retained_line_ids_unique(
+    const term::Terminal_screen_model& model,
+    const char*                        label)
+{
+    bool ok = true;
+    std::vector<std::uint64_t> ids;
+    const int retained_row_count = model.scrollback_size() + model.grid_size().rows;
+    ids.reserve(static_cast<std::size_t>(retained_row_count));
+    for (int logical_row = 0; logical_row < retained_row_count; ++logical_row) {
+        const term::Terminal_retained_line_provenance provenance =
+            primary_retained_line_provenance(model, logical_row);
+        ok &= check(provenance.retained_line_id != 0U, label);
+        ok &= check(!contains_id(ids, provenance.retained_line_id), label);
+        ids.push_back(provenance.retained_line_id);
+    }
+    return ok;
+}
+
+bool check_alternate_screen_retained_line_ids_unique(
+    const term::Terminal_screen_model& model,
+    const char*                        label)
+{
+    bool ok = true;
+    std::vector<std::uint64_t> ids;
+    ids.reserve(static_cast<std::size_t>(model.grid_size().rows));
+    for (int logical_row = 0; logical_row < model.grid_size().rows; ++logical_row) {
+        const term::Terminal_retained_line_provenance provenance =
+            alternate_retained_line_provenance(model, logical_row);
+        ok &= check(provenance.retained_line_id != 0U, label);
+        ok &= check(!contains_id(ids, provenance.retained_line_id), label);
+        ids.push_back(provenance.retained_line_id);
+    }
+    return ok;
 }
 
 std::vector<term::Terminal_reply> replies_in(
@@ -686,6 +797,8 @@ bool test_conpty_primary_repaint_recovery_preserves_scrollback()
             "below\x1b[?25h"));
     ok &= check(diagnostic_count(result) == 0,
         "ConPTY repaint recovery prefill has no diagnostics");
+    const std::vector<std::uint64_t> pre_repaint_ids =
+        primary_retained_line_ids(model);
 
     result = model.ingest(
         QByteArrayLiteral("\x1b[?25l\x1b[H"
@@ -707,6 +820,15 @@ bool test_conpty_primary_repaint_recovery_preserves_scrollback()
         "ConPTY repaint recovery keeps old top row in scrollback");
     ok &= check(snapshot_row_text(scrollback_snapshot, 1) == QStringLiteral("top-two"),
         "ConPTY repaint recovery keeps current top row at tail");
+    const std::vector<std::uint64_t> post_repaint_ids =
+        primary_retained_line_ids(model);
+    for (std::uint64_t pre_repaint_id : pre_repaint_ids) {
+        ok &= check(!contains_id(post_repaint_ids, pre_repaint_id),
+            "ConPTY repaint recovery replaces unproven retained line ids");
+    }
+    ok &= check_primary_retained_line_ids_unique(
+        model,
+        "ConPTY repaint recovery retained line ids stay unique");
 
     return ok;
 }
@@ -772,6 +894,8 @@ bool test_primary_repaint_recovery_ignores_clear_after_home()
             "below"));
     ok &= check(diagnostic_count(result) == 0,
         "clear-after-home repaint setup has no diagnostics");
+    const std::vector<std::uint64_t> pre_clear_ids =
+        primary_retained_line_ids(model);
 
     result = model.ingest(
         QByteArrayLiteral("\x1b[?25l\x1b[H\x1b[J"
@@ -789,6 +913,118 @@ bool test_primary_repaint_recovery_ignores_clear_after_home()
         "clear-after-home repaint does not report viewport changed");
     ok &= check(model.row_text(0) == QStringLiteral("top-two"),
         "clear-after-home repaint still updates top row");
+    const std::vector<std::uint64_t> post_clear_ids =
+        primary_retained_line_ids(model);
+    for (std::uint64_t pre_clear_id : pre_clear_ids) {
+        ok &= check(!contains_id(post_clear_ids, pre_clear_id),
+            "clear-after-home repaint replaces visible retained line ids");
+    }
+    ok &= check_primary_retained_line_ids_unique(
+        model,
+        "clear-after-home repaint retained line ids stay unique");
+
+    return ok;
+}
+
+bool test_primary_repaint_recovery_cancel_refreshes_ambiguous_ids_on_alternate_entry()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model(
+        {
+            term::terminal_grid_size_t{5, 20},
+            8,
+            4,
+            true,
+            });
+    term::Terminal_screen_model_result result = model.ingest(
+        QByteArrayLiteral("\x1b[?25l\x1b[H"
+            "alpha\r\n"
+            "bravo\r\n"
+            "charlie\r\n"
+            "delta\r\n"
+            "echo"));
+    ok &= check(diagnostic_count(result) == 0,
+        "alternate-entry repaint cancel setup has no diagnostics");
+    const std::vector<std::uint64_t> pre_cancel_ids =
+        primary_retained_line_ids(model);
+
+    result = model.ingest(
+        QByteArrayLiteral("\x1b[Homega\x1b[K\x1b[?47h"));
+
+    ok &= check(diagnostic_count(result) == 0,
+        "alternate-entry repaint cancel has no diagnostics");
+    ok &= check(model.active_buffer_id() == term::Terminal_buffer_id::ALTERNATE,
+        "alternate-entry repaint cancel enters alternate screen");
+    const std::vector<std::uint64_t> post_cancel_ids =
+        primary_retained_line_ids(model);
+    for (std::uint64_t pre_cancel_id : pre_cancel_ids) {
+        ok &= check(!contains_id(post_cancel_ids, pre_cancel_id),
+            "alternate-entry repaint cancel refreshes ambiguous visible primary retained line ids");
+    }
+    ok &= check_primary_retained_line_ids_unique(
+        model,
+        "alternate-entry repaint cancel primary retained line ids stay unique");
+
+    result = model.ingest(QByteArrayLiteral("\x1b[?47l"));
+    ok &= check(diagnostic_count(result) == 0,
+        "alternate-entry repaint cancel restore has no diagnostics");
+    ok &= check(model.row_text(0) == QStringLiteral("omega"),
+        "alternate-entry repaint cancel keeps mutated primary content");
+
+    return ok;
+}
+
+bool test_primary_repaint_recovery_replaces_ids_after_hidden_home_no_match()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model(
+        {
+            term::terminal_grid_size_t{5, 20},
+            8,
+            4,
+            true,
+            });
+    term::Terminal_screen_model_result result = model.ingest(
+        QByteArrayLiteral("\x1b[?25l\x1b[H"
+            "alpha\r\n"
+            "bravo\r\n"
+            "charlie\r\n"
+            "delta\r\n"
+            "echo"));
+    ok &= check(diagnostic_count(result) == 0,
+        "hidden home no-match repaint setup has no diagnostics");
+    const std::vector<std::uint64_t> pre_repaint_ids =
+        primary_retained_line_ids(model);
+
+    result = model.ingest(
+        QByteArrayLiteral("\x1b[?25l\x1b[H"
+            "xray\x1b[K\r\n"
+            "yankee\x1b[K\r\n"
+            "zulu\x1b[K\r\n"
+            "omega\x1b[K\r\n"
+            "sigma\x1b[K\r\x1b[?25h"));
+
+    ok &= check(diagnostic_count(result) == 0,
+        "hidden home no-match repaint has no diagnostics");
+    ok &= check(model.scrollback_size() == 0,
+        "hidden home no-match repaint does not synthesize scrollback");
+    ok &= check(!result.viewport_changed,
+        "hidden home no-match repaint does not report viewport changed");
+    ok &= check(model.row_text(0) == QStringLiteral("xray"),
+        "hidden home no-match repaint updates top row");
+    ok &= check(model.row_text(4) == QStringLiteral("sigma"),
+        "hidden home no-match repaint updates bottom row");
+    const std::vector<std::uint64_t> post_repaint_ids =
+        primary_retained_line_ids(model);
+    for (std::uint64_t pre_repaint_id : pre_repaint_ids) {
+        ok &= check(!contains_id(post_repaint_ids, pre_repaint_id),
+            "hidden home no-match repaint replaces visible retained line ids");
+    }
+    ok &= check_primary_retained_line_ids_unique(
+        model,
+        "hidden home no-match repaint retained line ids stay unique");
 
     return ok;
 }
@@ -915,6 +1151,95 @@ bool test_primary_repaint_recovery_handles_synchronized_repaint()
         "pre-armed synchronized repaint has no diagnostics");
     ok &= check(model.scrollback_size() == 1,
         "pre-armed synchronized repaint appends displaced top row");
+
+    return ok;
+}
+
+bool test_primary_repaint_recovery_handles_sequential_el_before_text_repaint()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model(
+        {
+            term::terminal_grid_size_t{3, 8},
+            4,
+            4,
+            true,
+            });
+    term::Terminal_screen_model_result result = model.ingest(
+        QByteArrayLiteral("\x1b[?25l\x1b[Haaa\r\nbbb\r\nccc"));
+    ok &= check(diagnostic_count(result) == 0,
+        "sequential EL-before-text setup has no diagnostics");
+
+    const QByteArray repaint = QByteArrayLiteral(
+        "\x1b[?25l\x1b[H"
+        "\x1b[Kbbb\r\n"
+        "\x1b[Kccc\r\n"
+        "\x1b[Kddd\x1b[?25h");
+    result = model.ingest(repaint);
+
+    ok &= check(diagnostic_count(result) == 0,
+        "sequential EL-before-text repaint has no diagnostics");
+    ok &= check(model.scrollback_size() == 1,
+        "sequential EL-before-text repaint appends displaced row");
+    ok &= check(result.viewport_changed,
+        "sequential EL-before-text repaint reports viewport change");
+    ok &= check(model.row_text(0) == QStringLiteral("bbb") &&
+        model.row_text(1) == QStringLiteral("ccc") &&
+        model.row_text(2) == QStringLiteral("ddd"),
+        "sequential EL-before-text repaint updates visible rows");
+    const term::Terminal_render_snapshot scrollback_snapshot =
+        model.render_snapshot(request_for_model(model, 37U, 1));
+    ok &= check(snapshot_row_text(scrollback_snapshot, 0) == QStringLiteral("aaa"),
+        "sequential EL-before-text repaint keeps displaced row in scrollback");
+
+    result = model.ingest(repaint);
+
+    ok &= check(diagnostic_count(result) == 0,
+        "repeated sequential EL-before-text repaint has no diagnostics");
+    ok &= check(model.scrollback_size() == 1,
+        "repeated sequential EL-before-text repaint does not append duplicate row");
+    const term::Terminal_render_snapshot repeated_scrollback_snapshot =
+        model.render_snapshot(request_for_model(model, 38U, 1));
+    ok &= check(snapshot_row_text(repeated_scrollback_snapshot, 0) == QStringLiteral("aaa"),
+        "repeated sequential EL-before-text repaint keeps original scrollback row");
+
+    term::Terminal_screen_model cursor_restore_model(
+        {
+            term::terminal_grid_size_t{3, 8},
+            4,
+            4,
+            true,
+            });
+    result = cursor_restore_model.ingest(
+        QByteArrayLiteral("\x1b[?25l\x1b[Haaa\r\nbbb\r\nccc"));
+    ok &= check(diagnostic_count(result) == 0,
+        "sequential EL-before-text cursor-restore setup has no diagnostics");
+
+    const QByteArray repaint_with_cursor_restore = QByteArrayLiteral(
+        "\x1b[?25l\x1b[H"
+        "\x1b[Kbbb\r\n"
+        "\x1b[Kccc\r\n"
+        "\x1b[Kddd\x1b[2;3H\x1b[?25h");
+    result = cursor_restore_model.ingest(repaint_with_cursor_restore);
+
+    ok &= check(diagnostic_count(result) == 0,
+        "sequential EL-before-text cursor-restore repaint has no diagnostics");
+    ok &= check(cursor_restore_model.scrollback_size() == 1,
+        "sequential EL-before-text cursor-restore repaint appends displaced row");
+    ok &= check(result.viewport_changed,
+        "sequential EL-before-text cursor-restore repaint reports viewport change");
+    ok &= check(cursor_restore_model.row_text(0) == QStringLiteral("bbb") &&
+        cursor_restore_model.row_text(1) == QStringLiteral("ccc") &&
+        cursor_restore_model.row_text(2) == QStringLiteral("ddd"),
+        "sequential EL-before-text cursor-restore repaint updates visible rows");
+    ok &= check(cursor_restore_model.cursor_position().row == 1 &&
+        cursor_restore_model.cursor_position().column == 2,
+        "sequential EL-before-text cursor-restore repaint keeps restored cursor");
+    const term::Terminal_render_snapshot cursor_restore_scrollback_snapshot =
+        cursor_restore_model.render_snapshot(request_for_model(cursor_restore_model, 39U, 1));
+    ok &= check(snapshot_row_text(cursor_restore_scrollback_snapshot, 0) == QStringLiteral("aaa"),
+        "sequential EL-before-text cursor-restore repaint keeps displaced row in scrollback");
 
     return ok;
 }
@@ -1313,6 +1638,390 @@ bool test_insert_delete_lines_cells_and_tabs()
     return ok;
 }
 
+bool test_retained_line_provenance_lifecycle()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(3, 4, 4);
+    ok &= check_primary_retained_line_ids_unique(
+        model,
+        "initial retained line ids are allocated and unique");
+    for (int logical_row = 0; logical_row < model.grid_size().rows; ++logical_row) {
+        ok &= check(primary_retained_line_generation(model, logical_row) == 0U,
+            "initial retained line generations are zero");
+    }
+
+    model.ingest(QByteArrayLiteral("111\r\n222\r\n333"));
+    const std::vector<std::uint64_t> scroll_source_ids = primary_retained_line_ids(model);
+    model.ingest(QByteArrayLiteral("\r\n444"));
+    ok &= check(model.scrollback_size() == 1, "primary scroll creates one scrollback row");
+    ok &= check(primary_retained_line_id(model, 0) == scroll_source_ids[0],
+        "scrollback row keeps the scrolled screen row id");
+    ok &= check(primary_retained_line_id(model, 1) == scroll_source_ids[1],
+        "primary scroll moves retained row ids upward");
+    ok &= check(primary_retained_line_id(model, 2) == scroll_source_ids[2],
+        "primary scroll preserves the second moved row id");
+    ok &= check(!contains_id(scroll_source_ids, primary_retained_line_id(model, 3)),
+        "primary scroll allocates a fresh id for the new bottom row");
+    ok &= check_primary_retained_line_ids_unique(
+        model,
+        "primary scroll retained line ids stay unique");
+
+    term::Terminal_screen_model resize_model = make_model(2, 4, 4);
+    resize_model.ingest(QByteArrayLiteral("aa\r\nbb"));
+    const std::vector<std::uint64_t> pre_resize_ids =
+        primary_retained_line_ids(resize_model);
+    resize_model.resize({4, 6});
+    ok &= check(primary_retained_line_id(resize_model, 0) == pre_resize_ids[0],
+        "resize preserves existing top retained row id");
+    ok &= check(primary_retained_line_id(resize_model, 1) == pre_resize_ids[1],
+        "resize preserves existing second retained row id");
+    ok &= check(primary_retained_line_id(resize_model, 2) > max_retained_line_id(pre_resize_ids) &&
+        primary_retained_line_id(resize_model, 3) > primary_retained_line_id(resize_model, 2),
+        "resize allocates monotonically fresh retained row ids for new rows");
+    ok &= check_primary_retained_line_ids_unique(
+        resize_model,
+        "resize retained line ids stay unique");
+
+    term::Terminal_screen_model streaming_eviction_model = make_model(2, 4, 1);
+    streaming_eviction_model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc"));
+    const std::uint64_t streaming_evicted_id =
+        primary_retained_line_id(streaming_eviction_model, 0);
+    streaming_eviction_model.ingest(QByteArrayLiteral("\r\ndd"));
+    ok &= check(streaming_eviction_model.scrollback_size() == 1,
+        "streaming eviction keeps the scrollback cap");
+    ok &= check(
+        !contains_id(primary_retained_line_ids(streaming_eviction_model), streaming_evicted_id),
+        "streaming scrollback eviction retires the evicted id");
+    ok &= check_primary_retained_line_ids_unique(
+        streaming_eviction_model,
+        "streaming eviction retained line ids stay unique");
+
+    term::Terminal_screen_model manual_eviction_model = make_model(2, 4, 4);
+    manual_eviction_model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc\r\ndd\r\nee"));
+    const std::uint64_t manually_evicted_id =
+        primary_retained_line_id(manual_eviction_model, 0);
+    manual_eviction_model.set_scrollback_limit(1);
+    ok &= check(manual_eviction_model.scrollback_size() == 1,
+        "manual scrollback limit applies eviction");
+    ok &= check(
+        !contains_id(primary_retained_line_ids(manual_eviction_model), manually_evicted_id),
+        "manual scrollback eviction retires the evicted id");
+    ok &= check_primary_retained_line_ids_unique(
+        manual_eviction_model,
+        "manual eviction retained line ids stay unique");
+
+    term::Terminal_screen_model zero_scrollback_model = make_model(2, 4, 0);
+    zero_scrollback_model.ingest(QByteArrayLiteral("aa\r\nbb"));
+    const std::uint64_t zero_discarded_id = primary_retained_line_id(zero_scrollback_model, 0);
+    const std::uint64_t zero_moved_id     = primary_retained_line_id(zero_scrollback_model, 1);
+    zero_scrollback_model.ingest(QByteArrayLiteral("\r\ncc"));
+    ok &= check(zero_scrollback_model.scrollback_size() == 0,
+        "zero scrollback retains no discarded rows");
+    ok &= check(primary_retained_line_id(zero_scrollback_model, 0) == zero_moved_id,
+        "zero scrollback preserves the row moved up");
+    ok &= check(primary_retained_line_id(zero_scrollback_model, 1) != zero_discarded_id &&
+        primary_retained_line_id(zero_scrollback_model, 1) != zero_moved_id,
+        "zero scrollback reused storage receives a fresh id");
+    ok &= check_primary_retained_line_ids_unique(
+        zero_scrollback_model,
+        "zero scrollback retained line ids stay unique");
+
+    term::Terminal_screen_model reverse_index_model = make_model(3, 4, 4);
+    reverse_index_model.ingest(
+        QByteArrayLiteral("\x1b[1;1H111\x1b[2;1H222\x1b[3;1H333"));
+    const std::vector<std::uint64_t> reverse_index_ids =
+        primary_retained_line_ids(reverse_index_model);
+    reverse_index_model.ingest(QByteArrayLiteral("\x1b[1;1H\x1b" "M"));
+    ok &= check(primary_retained_line_id(reverse_index_model, 0) >
+            max_retained_line_id(reverse_index_ids),
+        "reverse index allocates a fresh id for the exposed top row");
+    ok &= check(primary_retained_line_id(reverse_index_model, 1) == reverse_index_ids[0],
+        "reverse index moves the previous top row id down");
+    ok &= check(primary_retained_line_id(reverse_index_model, 2) == reverse_index_ids[1],
+        "reverse index moves retained row ids downward");
+    ok &= check(!contains_id(primary_retained_line_ids(reverse_index_model), reverse_index_ids[2]),
+        "reverse index retires the displaced bottom row id");
+    ok &= check_primary_retained_line_ids_unique(
+        reverse_index_model,
+        "reverse index retained line ids stay unique");
+
+    term::Terminal_screen_model scroll_down_model = make_model(3, 4, 4);
+    scroll_down_model.ingest(
+        QByteArrayLiteral("\x1b[1;1H111\x1b[2;1H222\x1b[3;1H333"));
+    const std::vector<std::uint64_t> scroll_down_ids =
+        primary_retained_line_ids(scroll_down_model);
+    scroll_down_model.ingest(QByteArrayLiteral("\x1b[T"));
+    ok &= check(primary_retained_line_id(scroll_down_model, 0) >
+            max_retained_line_id(scroll_down_ids),
+        "SD/T allocates a fresh id for the exposed top row");
+    ok &= check(primary_retained_line_id(scroll_down_model, 1) == scroll_down_ids[0],
+        "SD/T moves the previous top row id down");
+    ok &= check(primary_retained_line_id(scroll_down_model, 2) == scroll_down_ids[1],
+        "SD/T moves retained row ids downward");
+    ok &= check(!contains_id(primary_retained_line_ids(scroll_down_model), scroll_down_ids[2]),
+        "SD/T retires the displaced bottom row id");
+    ok &= check_primary_retained_line_ids_unique(
+        scroll_down_model,
+        "SD/T retained line ids stay unique");
+
+    term::Terminal_screen_model region_model = make_model(4, 4, 4);
+    region_model.ingest(
+        QByteArrayLiteral("\x1b[1;1H111\x1b[2;1H222\x1b[3;1H333\x1b[4;1H444"));
+    const std::vector<std::uint64_t> region_ids = primary_retained_line_ids(region_model);
+    region_model.ingest(QByteArrayLiteral("\x1b[2;3r\x1b[3;1H\n"));
+    ok &= check(region_model.scrollback_size() == 0,
+        "partial scroll region does not append scrollback");
+    ok &= check(primary_retained_line_id(region_model, 0) == region_ids[0],
+        "partial scroll region preserves the row above the region");
+    ok &= check(primary_retained_line_id(region_model, 1) == region_ids[2],
+        "partial scroll region preserves moved retained content");
+    ok &= check(primary_retained_line_id(region_model, 2) != region_ids[1] &&
+        primary_retained_line_id(region_model, 2) != region_ids[2],
+        "partial scroll region replaces the exposed blank row id");
+    ok &= check(primary_retained_line_id(region_model, 3) == region_ids[3],
+        "partial scroll region preserves the row below the region");
+    ok &= check(!contains_id(primary_retained_line_ids(region_model), region_ids[1]),
+        "partial scroll region retires the displaced row id");
+    ok &= check_primary_retained_line_ids_unique(
+        region_model,
+        "partial scroll region retained line ids stay unique");
+
+    term::Terminal_screen_model insert_delete_lines_model = make_model(4, 4, 4);
+    insert_delete_lines_model.ingest(
+        QByteArrayLiteral("\x1b[1;1H111\x1b[2;1H222\x1b[3;1H333\x1b[4;1H444"
+            "\x1b[2;4r\x1b[2;1H"));
+    const std::vector<std::uint64_t> pre_insert_line_ids =
+        primary_retained_line_ids(insert_delete_lines_model);
+    insert_delete_lines_model.ingest(QByteArrayLiteral("\x1b[L"));
+    const std::vector<std::uint64_t> post_insert_line_ids =
+        primary_retained_line_ids(insert_delete_lines_model);
+    ok &= check(post_insert_line_ids[0] == pre_insert_line_ids[0],
+        "IL preserves the row above the scroll region");
+    ok &= check(post_insert_line_ids[1] > max_retained_line_id(pre_insert_line_ids),
+        "IL allocates a fresh id for the inserted row");
+    ok &= check(post_insert_line_ids[2] == pre_insert_line_ids[1],
+        "IL moves retained row ids down within the region");
+    ok &= check(post_insert_line_ids[3] == pre_insert_line_ids[2],
+        "IL preserves the second shifted retained row id");
+    ok &= check(!contains_id(post_insert_line_ids, pre_insert_line_ids[3]),
+        "IL retires the displaced bottom row id");
+
+    insert_delete_lines_model.ingest(QByteArrayLiteral("\x1b[2;1H\x1b[M"));
+    const std::vector<std::uint64_t> post_delete_line_ids =
+        primary_retained_line_ids(insert_delete_lines_model);
+    ok &= check(post_delete_line_ids[0] == post_insert_line_ids[0],
+        "DL preserves the row above the scroll region");
+    ok &= check(post_delete_line_ids[1] == post_insert_line_ids[2],
+        "DL moves retained row ids up within the region");
+    ok &= check(post_delete_line_ids[2] == post_insert_line_ids[3],
+        "DL preserves the second shifted retained row id");
+    ok &= check(post_delete_line_ids[3] > max_retained_line_id(post_insert_line_ids),
+        "DL allocates a fresh id for the exposed bottom row");
+    ok &= check(!contains_id(post_delete_line_ids, post_insert_line_ids[1]),
+        "DL retires the deleted row id");
+    ok &= check_primary_retained_line_ids_unique(
+        insert_delete_lines_model,
+        "IL/DL retained line ids stay unique");
+
+    term::Terminal_screen_model clear_scrollback_model = make_model(2, 4, 4);
+    clear_scrollback_model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc\r\ndd"));
+    std::vector<std::uint64_t> purged_ids;
+    for (int logical_row = 0; logical_row < clear_scrollback_model.scrollback_size();
+        ++logical_row)
+    {
+        purged_ids.push_back(primary_retained_line_id(clear_scrollback_model, logical_row));
+    }
+    clear_scrollback_model.ingest(QByteArrayLiteral("\x1b[3J"));
+    ok &= check(clear_scrollback_model.scrollback_size() == 0,
+        "ED3 clears primary scrollback");
+    for (std::uint64_t purged_id : purged_ids) {
+        ok &= check(!contains_id(primary_retained_line_ids(clear_scrollback_model), purged_id),
+            "clear scrollback retires purged ids");
+    }
+    ok &= check_primary_retained_line_ids_unique(
+        clear_scrollback_model,
+        "clear scrollback retained line ids stay unique");
+
+    term::Terminal_screen_model_config recovery_config;
+    recovery_config.grid_size = {3, 4};
+    recovery_config.scrollback_limit = 4;
+    recovery_config.tab_width = 4;
+    recovery_config.recover_scrollback_from_primary_repaints = true;
+    term::Terminal_screen_model recovery_model(recovery_config);
+    recovery_model.ingest(QByteArrayLiteral("aaa\r\nbbb\r\nccc\x1b[?25l"));
+    const std::vector<std::uint64_t> pre_recovery_ids =
+        primary_retained_line_ids(recovery_model);
+    recovery_model.ingest(QByteArrayLiteral("\x1b[H\x1b[2Jbbb\r\nccc\r\nddd\x1b[?25h"));
+    ok &= check(recovery_model.scrollback_size() == 1,
+        "primary repaint recovery infers one scrolled row");
+    for (std::uint64_t pre_recovery_id : pre_recovery_ids) {
+        ok &= check(!contains_id(primary_retained_line_ids(recovery_model), pre_recovery_id),
+            "primary repaint recovery replaces unproven retained line ids");
+    }
+    ok &= check_primary_retained_line_ids_unique(
+        recovery_model,
+        "primary repaint recovery retained line ids stay unique");
+
+    term::Terminal_screen_model_config eviction_recovery_config;
+    eviction_recovery_config.grid_size = {3, 4};
+    eviction_recovery_config.scrollback_limit = 3;
+    eviction_recovery_config.tab_width = 4;
+    eviction_recovery_config.recover_scrollback_from_primary_repaints = true;
+    term::Terminal_screen_model eviction_recovery_model(eviction_recovery_config);
+    term::Terminal_screen_model_result result = eviction_recovery_model.ingest(
+        QByteArrayLiteral("old\r\none\r\ntwo\r\ntri\x1b[?25l"));
+    ok &= check(diagnostic_count(result) == 0,
+        "eviction repaint cancel setup has no diagnostics");
+    ok &= check(eviction_recovery_model.scrollback_size() == 1,
+        "eviction repaint cancel setup has scrollback to evict");
+    const std::vector<std::uint64_t> pre_eviction_visible_ids = {
+        primary_retained_line_id(eviction_recovery_model, 1),
+        primary_retained_line_id(eviction_recovery_model, 2),
+        primary_retained_line_id(eviction_recovery_model, 3),
+    };
+    result = eviction_recovery_model.ingest(QByteArrayLiteral("\x1b[H"));
+    ok &= check(diagnostic_count(result) == 0,
+        "eviction repaint cancel arms recovery candidate");
+    const term::Terminal_screen_model_result eviction_result =
+        eviction_recovery_model.set_scrollback_limit(0);
+    ok &= check(diagnostic_count(eviction_result) == 0,
+        "eviction repaint cancel limit change has no diagnostics");
+    ok &= check(eviction_recovery_model.scrollback_size() == 0,
+        "eviction repaint cancel limit change evicts scrollback");
+    result = eviction_recovery_model.ingest(QByteArrayLiteral("\x1b[?1049h\x1b[?1049l"));
+    ok &= check(diagnostic_count(result) == 0,
+        "eviction repaint cancel alternate round trip has no diagnostics");
+    ok &= check(eviction_recovery_model.row_text(0) == QStringLiteral("one"),
+        "eviction repaint cancel preserves first visible row text");
+    ok &= check(eviction_recovery_model.row_text(1) == QStringLiteral("two"),
+        "eviction repaint cancel preserves second visible row text");
+    ok &= check(eviction_recovery_model.row_text(2) == QStringLiteral("tri"),
+        "eviction repaint cancel preserves third visible row text");
+    for (std::uint64_t pre_eviction_visible_id : pre_eviction_visible_ids) {
+        ok &= check(!contains_id(primary_retained_line_ids(eviction_recovery_model),
+            pre_eviction_visible_id),
+            "eviction repaint cancel refreshes ambiguous visible retained line ids");
+    }
+    ok &= check_primary_retained_line_ids_unique(
+        eviction_recovery_model,
+        "eviction repaint cancel retained line ids stay unique");
+
+    term::Terminal_screen_model alternate_model = make_model(2, 4, 4);
+    alternate_model.ingest(QByteArrayLiteral("P"));
+    const std::uint64_t primary_top_id    = primary_retained_line_id(alternate_model, 0);
+    const std::uint64_t primary_bottom_id = primary_retained_line_id(alternate_model, 1);
+    alternate_model.ingest(QByteArrayLiteral("\x1b[?47h"));
+    const std::uint64_t alternate_top_id    = alternate_retained_line_id(alternate_model, 0);
+    const std::uint64_t alternate_bottom_id = alternate_retained_line_id(alternate_model, 1);
+    ok &= check(alternate_top_id != primary_top_id && alternate_top_id != primary_bottom_id,
+        "alternate retained line ids do not collide with primary ids");
+    alternate_model.ingest(QByteArrayLiteral("ALT"));
+    ok &= check(alternate_retained_line_id(alternate_model, 0) == alternate_top_id,
+        "alternate writes preserve the active alternate row id");
+    alternate_model.ingest(QByteArrayLiteral("\x1b[?47l"));
+    ok &= check(primary_retained_line_id(alternate_model, 0) == primary_top_id &&
+        primary_retained_line_id(alternate_model, 1) == primary_bottom_id,
+        "leaving alternate restores saved primary provenance");
+    alternate_model.ingest(QByteArrayLiteral("\x1b[?47h"));
+    ok &= check(alternate_retained_line_id(alternate_model, 0) == alternate_top_id &&
+        alternate_retained_line_id(alternate_model, 1) == alternate_bottom_id,
+        "re-entering alternate restores saved alternate provenance");
+    alternate_model.ingest(QByteArrayLiteral("\x1b[?47l\x1b[?1047h"));
+    ok &= check(alternate_retained_line_id(alternate_model, 0) != alternate_top_id &&
+        alternate_retained_line_id(alternate_model, 1) != alternate_bottom_id,
+        "clearing alternate replaces alternate retained line ids");
+    ok &= check_primary_retained_line_ids_unique(
+        alternate_model,
+        "alternate round trip primary retained line ids stay unique");
+    ok &= check_alternate_screen_retained_line_ids_unique(
+        alternate_model,
+        "alternate round trip alternate retained line ids stay unique");
+
+    return ok;
+}
+
+bool test_retained_line_content_generation_mutations()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(1, 8);
+    const std::uint64_t retained_line_id = primary_retained_line_id(model, 0);
+    const std::uint64_t initial_generation =
+        primary_retained_line_generation(model, 0);
+    model.ingest(QByteArrayLiteral("ABC"));
+    ok &= check(primary_retained_line_id(model, 0) == retained_line_id,
+        "content writes preserve retained line id");
+    ok &= check(primary_retained_line_generation(model, 0) == initial_generation + 1U,
+        "printable span increments generation once when row content changes");
+
+    const std::uint64_t after_write_generation =
+        primary_retained_line_generation(model, 0);
+    model.ingest(QByteArrayLiteral("\rABC"));
+    ok &= check(primary_retained_line_generation(model, 0) == after_write_generation,
+        "idempotent printable write does not increment generation");
+
+    model.ingest(QByteArrayLiteral("\x1b[1;5H"));
+    ok &= check(primary_retained_line_generation(model, 0) == after_write_generation,
+        "cursor-only update does not increment generation");
+
+    term::Terminal_screen_model shift_model = make_model(1, 8);
+    shift_model.ingest(QByteArrayLiteral("ABCD"));
+    std::uint64_t generation = primary_retained_line_generation(shift_model, 0);
+    shift_model.ingest(QByteArrayLiteral("\x1b[1;2H\x1b[@"));
+    ok &= check(primary_retained_line_generation(shift_model, 0) == generation + 1U,
+        "insert-cell content shift increments generation");
+    generation = primary_retained_line_generation(shift_model, 0);
+    shift_model.ingest(QByteArrayLiteral("\x1b[P"));
+    ok &= check(primary_retained_line_generation(shift_model, 0) == generation + 1U,
+        "delete-cell content shift increments generation");
+
+    term::Terminal_screen_model erase_model = make_model(1, 4);
+    generation = primary_retained_line_generation(erase_model, 0);
+    erase_model.ingest(QByteArrayLiteral("\x1b[X"));
+    ok &= check(primary_retained_line_generation(erase_model, 0) == generation,
+        "erase-character on already blank content does not increment generation");
+    erase_model.ingest(QByteArrayLiteral("AB"));
+    generation = primary_retained_line_generation(erase_model, 0);
+    erase_model.ingest(QByteArrayLiteral("\x1b[1;1H\x1b[X"));
+    ok &= check(primary_retained_line_generation(erase_model, 0) == generation + 1U,
+        "erase-character changing content increments generation");
+    generation = primary_retained_line_generation(erase_model, 0);
+    erase_model.ingest(QByteArrayLiteral("\x1b[1;1H\x1b[X"));
+    ok &= check(primary_retained_line_generation(erase_model, 0) == generation,
+        "idempotent erase-character does not increment generation");
+
+    term::Terminal_screen_model wide_model = make_model(1, 4);
+    wide_model.ingest(bytes_from_hex("e4b880"));
+    generation = primary_retained_line_generation(wide_model, 0);
+    wide_model.ingest(QByteArrayLiteral("\rA"));
+    ok &= check(primary_retained_line_generation(wide_model, 0) == generation + 1U,
+        "wide-cell occupancy change increments generation");
+
+    term::Terminal_screen_model combining_model = make_model(1, 4);
+    combining_model.ingest(QByteArrayLiteral("e"));
+    generation = primary_retained_line_generation(combining_model, 0);
+    combining_model.ingest(bytes_from_hex("cc81"));
+    ok &= check(primary_retained_line_generation(combining_model, 0) == generation + 1U,
+        "combining sequence change increments generation");
+
+    term::Terminal_screen_model variation_model = make_model(1, 4);
+    variation_model.ingest(bytes_from_hex("e29da4"));
+    generation = primary_retained_line_generation(variation_model, 0);
+    variation_model.ingest(bytes_from_hex("efb88f"));
+    ok &= check(primary_retained_line_generation(variation_model, 0) == generation + 1U,
+        "variation sequence change increments generation");
+
+    term::Terminal_screen_model style_model = make_model(1, 4);
+    style_model.ingest(QByteArrayLiteral("A"));
+    generation = primary_retained_line_generation(style_model, 0);
+    style_model.ingest(QByteArrayLiteral("\r\x1b[31mA"));
+    ok &= check(primary_retained_line_generation(style_model, 0) == generation,
+        "style-only rewrite of identical text does not increment generation");
+
+    return ok;
+}
+
 bool test_replies_and_cursor_save_restore()
 {
     bool ok = true;
@@ -1519,12 +2228,17 @@ int main()
     ok &= test_conpty_primary_repaint_recovery_preserves_scrollback();
     ok &= test_primary_repaint_recovery_ignores_plain_home_repaint();
     ok &= test_primary_repaint_recovery_ignores_clear_after_home();
+    ok &= test_primary_repaint_recovery_cancel_refreshes_ambiguous_ids_on_alternate_entry();
+    ok &= test_primary_repaint_recovery_replaces_ids_after_hidden_home_no_match();
     ok &= test_primary_repaint_recovery_survives_split_repaint();
     ok &= test_primary_repaint_recovery_handles_synchronized_repaint();
+    ok &= test_primary_repaint_recovery_handles_sequential_el_before_text_repaint();
     ok &= test_scroll_region_zero_bottom_defaults_to_screen_bottom();
     ok &= test_scroll_up_down_sequences();
     ok &= test_blank_fill_operations_use_current_style();
     ok &= test_insert_delete_lines_cells_and_tabs();
+    ok &= test_retained_line_provenance_lifecycle();
+    ok &= test_retained_line_content_generation_mutations();
     ok &= test_replies_and_cursor_save_restore();
     return ok ? 0 : 1;
 }

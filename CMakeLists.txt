@@ -19,6 +19,18 @@ option(VNM_TERMINAL_SURFACE_BUILD_TESTING
 option(VNM_TERMINAL_BUILD_REQUIRED_READINESS "Build vnm_terminal_surface readiness validation gates" OFF)
 option(VNM_TERMINAL_BUILD_BENCHMARKS "Build vnm_terminal_surface benchmark executables" OFF)
 option(VNM_TERMINAL_ENABLE_PROFILING "Compile vnm_terminal_surface profile scope instrumentation" OFF)
+option(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY
+    "Build diagnostic transcript capture/replay recorder, replay tool, and transcript tests"
+    OFF)
+option(VNM_TERMINAL_DISTRIBUTION_BUILD
+    "Configure a distribution build; diagnostic transcript capture/replay must stay disabled"
+    OFF)
+
+if(VNM_TERMINAL_DISTRIBUTION_BUILD AND VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
+    message(FATAL_ERROR
+        "VNM_TERMINAL_DISTRIBUTION_BUILD=ON requires "
+        "VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=OFF")
+endif()
 
 if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_BUILD_BENCHMARKS)
     set(VNM_TERMINAL_BUILD_BENCHMARKS ON)
@@ -57,6 +69,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/terminal_resize_controller.h
     include/vnm_terminal/internal/terminal_screen_model.h
     include/vnm_terminal/internal/terminal_session.h
+    include/vnm_terminal/internal/terminal_transcript.h
     include/vnm_terminal/internal/terminal_style.h
     include/vnm_terminal/internal/utf8_scan.h
     include/vnm_terminal/internal/unicode_width.h
@@ -91,6 +104,16 @@ target_sources(vnm_terminal_surface PRIVATE
     ${vnm_terminal_surface_resource_sources}
 )
 
+if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
+    target_sources(vnm_terminal_surface PRIVATE
+        src/terminal_transcript.cpp
+    )
+else()
+    target_sources(vnm_terminal_surface PRIVATE
+        src/terminal_transcript_disabled.cpp
+    )
+endif()
+
 if(WIN32)
     target_sources(vnm_terminal_surface PRIVATE
         src/windows_conpty_backend.cpp
@@ -114,6 +137,10 @@ target_link_libraries(vnm_terminal_surface PUBLIC
 
 target_compile_definitions(vnm_terminal_surface PUBLIC
     VNM_TERMINAL_PROFILING_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_PROFILING}>
+)
+
+target_compile_definitions(vnm_terminal_surface PRIVATE
+    VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY}>
 )
 
 if(MSVC)
@@ -181,6 +208,29 @@ set_target_properties(vnm_terminal_canvas_fixture PROPERTIES
 target_include_directories(vnm_terminal_canvas_fixture PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
+
+if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
+    add_executable(vnm_terminal_transcript_replay
+        tools/transcript_replay/terminal_transcript_replay.cpp
+    )
+
+    target_link_libraries(vnm_terminal_transcript_replay PRIVATE
+        vnm_terminal_surface::vnm_terminal_surface
+    )
+
+    set_target_properties(vnm_terminal_transcript_replay PROPERTIES
+        AUTOMOC OFF
+    )
+
+    if(WIN32)
+        add_custom_command(TARGET vnm_terminal_transcript_replay POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:vnm_terminal_transcript_replay>
+                $<TARGET_FILE_DIR:vnm_terminal_transcript_replay>
+            COMMAND_EXPAND_LISTS
+        )
+    endif()
+endif()
 
 if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_SURFACE_BUILD_TESTING)
     message(FATAL_ERROR

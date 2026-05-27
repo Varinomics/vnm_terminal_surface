@@ -1005,8 +1005,10 @@ private:
 
 struct row_cache_identity_t
 {
-    Terminal_buffer_id active_buffer = Terminal_buffer_id::PRIMARY;
-    int                logical_row   = 0;
+    Terminal_buffer_id active_buffer      = Terminal_buffer_id::PRIMARY;
+    int                logical_row        = 0;
+    std::uint64_t      retained_line_id   = 0U;
+    std::uint64_t      content_generation = 0U;
 };
 
 bool operator==(
@@ -1014,8 +1016,10 @@ bool operator==(
     const row_cache_identity_t& right)
 {
     return
-        left.active_buffer == right.active_buffer &&
-        left.logical_row   == right.logical_row;
+        left.active_buffer      == right.active_buffer      &&
+        left.logical_row        == right.logical_row        &&
+        left.retained_line_id   == right.retained_line_id   &&
+        left.content_generation == right.content_generation;
 }
 
 bool operator<(
@@ -1026,7 +1030,21 @@ bool operator<(
         return left.active_buffer < right.active_buffer;
     }
 
-    return left.logical_row < right.logical_row;
+    if (left.logical_row != right.logical_row) {
+        return left.logical_row < right.logical_row;
+    }
+
+    if (left.retained_line_id != right.retained_line_id) {
+        return left.retained_line_id < right.retained_line_id;
+    }
+
+    return left.content_generation < right.content_generation;
+}
+
+bool row_cache_identity_has_valid_retained_provenance(
+    const row_cache_identity_t& identity)
+{
+    return identity.retained_line_id != 0U;
 }
 
 struct row_text_group_t
@@ -3234,6 +3252,8 @@ std::vector<row_text_group_t> text_run_groups_by_viewport_row(
         const row_cache_identity_t identity{
             frame.viewport.active_buffer,
             run.logical_row,
+            run.retained_line_id,
+            run.content_generation,
         };
         std::optional<row_text_group_t>& slot = groups_by_row[row_index];
         if (!slot.has_value()) {
@@ -3325,8 +3345,10 @@ bool text_resource_descriptor_run_is_eligible(
     const row_text_group_t&            group)
 {
     return
-        run.row == group.viewport_row                 &&
-        run.logical_row == group.identity.logical_row &&
+        run.row == group.viewport_row                               &&
+        run.logical_row        == group.identity.logical_row        &&
+        run.retained_line_id   == group.identity.retained_line_id   &&
+        run.content_generation == group.identity.content_generation &&
         !run.clip_rect.isValid();
 }
 
@@ -3505,6 +3527,7 @@ void sync_text_resource_nodes(
             group);
         if (!dirty_group &&
             clean_row_cache_skip_available &&
+            row_cache_identity_has_valid_retained_provenance(group.identity) &&
             old_slot.has_value() &&
             text_resource_descriptor.has_value() &&
             old_slot->text_resource_descriptor.has_value())
@@ -4938,6 +4961,22 @@ int logical_row_for_viewport_row(
     return viewport.scrollback_rows - viewport.offset_from_tail + row;
 }
 
+Terminal_render_line_provenance line_provenance_for_viewport_row(
+    const Terminal_render_snapshot&    snapshot,
+    int                                row,
+    bool                               use_visible_line_provenance)
+{
+    if (!use_visible_line_provenance) {
+        return {
+            logical_row_for_viewport_row(snapshot.viewport, row),
+            0U,
+            0U,
+        };
+    }
+
+    return snapshot.visible_line_provenance[static_cast<std::size_t>(row)];
+}
+
 }
 
 #if VNM_TERMINAL_PROFILING_ENABLED
@@ -6001,6 +6040,8 @@ Terminal_render_frame build_terminal_render_frame(
     const bool cursor_visible =
         cursor_in_grid && snapshot->cursor.visible &&
         (!cursor_blink_enabled || cursor_blink_visible);
+    const bool use_visible_line_provenance =
+        render_snapshot_visible_line_provenance_is_valid(*snapshot);
     const Terminal_cursor_shape cursor_shape =
         options.cursor_shape_override.value_or(snapshot->cursor.shape);
     const bool block_cursor_visible =
@@ -6119,6 +6160,11 @@ Terminal_render_frame build_terminal_render_frame(
                 frame.background_rects.push_back({rect, background});
             }
 
+            const Terminal_render_line_provenance line_provenance =
+                line_provenance_for_viewport_row(
+                    *snapshot,
+                    cell.position.row,
+                    use_visible_line_provenance);
             const bool text_is_empty = cell.text.isEmpty();
             if (text_is_empty) {
                 ++frame.stats.text_cells_empty;
@@ -6152,18 +6198,20 @@ Terminal_render_frame build_terminal_render_frame(
             }
 
             Terminal_render_text_run run;
-            run.row             = cell.position.row;
-            run.logical_row     = logical_row_for_viewport_row(snapshot->viewport, cell.position.row);
-            run.column          = cell.position.column;
-            run.rect            = rect;
-            run.baseline_origin = QPointF(rect.left(), rect.top() + cell_metrics.ascent);
-            run.text            = cell.text;
-            run.foreground      = foreground;
-            run.background      = background;
-            run.style_id        = cell.style_id;
-            run.hyperlink_id    = cell.hyperlink_id;
-            run.underline       = style.underline;
-            run.strike          = style.strike;
+            run.row                = cell.position.row;
+            run.logical_row        = static_cast<int>(line_provenance.logical_row);
+            run.retained_line_id   = line_provenance.retained_line_id;
+            run.content_generation = line_provenance.content_generation;
+            run.column             = cell.position.column;
+            run.rect               = rect;
+            run.baseline_origin    = QPointF(rect.left(), rect.top() + cell_metrics.ascent);
+            run.text               = cell.text;
+            run.foreground         = foreground;
+            run.background         = background;
+            run.style_id           = cell.style_id;
+            run.hyperlink_id       = cell.hyperlink_id;
+            run.underline          = style.underline;
+            run.strike             = style.strike;
             const bool packed_hard_graphic_covered =
                 !text_is_empty                                                          &&
                 classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY &&
@@ -6327,15 +6375,22 @@ Terminal_render_frame build_terminal_render_frame(
             const QRectF rect = cell_rect(row, column, column_count, cell_metrics);
             frame.selection_rects.push_back({rect, options.preedit_background});
 
+            const Terminal_render_line_provenance line_provenance =
+                line_provenance_for_viewport_row(
+                    *snapshot,
+                    row,
+                    use_visible_line_provenance);
             Terminal_render_text_run run;
-            run.row             = row;
-            run.logical_row     = logical_row_for_viewport_row(snapshot->viewport, row);
-            run.column          = column;
-            run.rect            = rect;
-            run.baseline_origin = QPointF(rect.left(), rect.top() + cell_metrics.ascent);
-            run.text            = ime_preedit.text;
-            run.foreground      = options.default_foreground;
-            run.background      = options.preedit_background;
+            run.row                = row;
+            run.logical_row        = static_cast<int>(line_provenance.logical_row);
+            run.retained_line_id   = line_provenance.retained_line_id;
+            run.content_generation = line_provenance.content_generation;
+            run.column             = column;
+            run.rect               = rect;
+            run.baseline_origin    = QPointF(rect.left(), rect.top() + cell_metrics.ascent);
+            run.text               = ime_preedit.text;
+            run.foreground         = options.default_foreground;
+            run.background         = options.preedit_background;
             frame.text_runs.push_back(run);
 
             const int caret_column = std::clamp(

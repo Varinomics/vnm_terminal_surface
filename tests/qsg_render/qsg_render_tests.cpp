@@ -1466,6 +1466,8 @@ term::Terminal_render_frame make_direct_hyperlink_text_resource_frame(
         frame.text_runs.push_back({
             0,
             0,
+            0U,
+            0U,
             column,
             rect,
             QRectF(),
@@ -1523,6 +1525,8 @@ term::Terminal_render_frame make_direct_text_metadata_decoration_frame(
         frame.text_runs.push_back({
             0,
             0,
+            0U,
+            0U,
             column,
             rect,
             QRectF(),
@@ -3061,7 +3065,7 @@ bool test_qsg_snapshot_rendering(QGuiApplication& app)
             dirty_stats.text_groups_considered == 3 &&
             dirty_stats.text_groups_dirty == 1 &&
             dirty_stats.text_groups_clean == 2 &&
-            dirty_stats.text_clean_reuse_skips == 1 &&
+            dirty_stats.text_clean_reuse_skips == 0 &&
             dirty_stats.text_key_builds == 4 &&
             dirty_stats.text_dirty_row_ranges == 1 &&
             dirty_stats.text_dirty_rows == 1 &&
@@ -3082,7 +3086,7 @@ bool test_qsg_snapshot_rendering(QGuiApplication& app)
             << '\n';
     }
     ok &= check(dirty_key_stats_ok,
-        "single dirty content change skips clean text row key rebuild work");
+        "single dirty content change avoids clean-skip without retained provenance");
     ok &= check_no_text_content_failures(dirty_stats,
         "single dirty content change has no text content failures");
     ok &= check(dirty_stats.route_fast_text_cells == 0 &&
@@ -8414,6 +8418,247 @@ bool test_qsg_viewport_scroll_reuses_text_resources(QGuiApplication& app)
     return ok;
 }
 
+bool test_qsg_text_row_slot_retained_line_provenance_pixels(QGuiApplication& app)
+{
+    constexpr int visible_rows      = 3;
+    constexpr int column_count      = 18;
+    constexpr int first_logical_row = 10;
+    constexpr int scrollback_rows   = 20;
+
+    bool ok = true;
+    QQuickWindow window;
+    window.setColor(QColor(180, 16, 16));
+    window.resize(340, 120);
+
+    const auto make_snapshot = [](
+        std::uint64_t                                      sequence,
+        const QStringList&                                 row_texts,
+        const std::vector<int>&                            row_color_ids,
+        const std::vector<std::uint64_t>&                  retained_line_ids,
+        const std::vector<std::uint64_t>&                  content_generations,
+        std::vector<term::Terminal_render_dirty_row_range> dirty_row_ranges) {
+        term::Terminal_viewport_state viewport;
+        viewport.visible_rows     = visible_rows;
+        viewport.scrollback_rows  = scrollback_rows;
+        viewport.offset_from_tail = scrollback_rows - first_logical_row;
+        viewport.follow_tail      = false;
+
+        term::Terminal_render_snapshot snapshot =
+            term::make_empty_render_snapshot({visible_rows, column_count}, viewport, sequence);
+        snapshot.color_state      = color_state();
+        snapshot.cursor.visible   = false;
+        snapshot.dirty_row_ranges = std::move(dirty_row_ranges);
+
+        for (int row = 0; row < visible_rows; ++row) {
+            term::Terminal_text_style style = term::make_default_terminal_text_style();
+            style.foreground = term::make_rgb_terminal_color_ref(
+                viewport_scroll_foreground_rgba(row_color_ids[static_cast<std::size_t>(row)]));
+            snapshot.styles.push_back(style);
+            snapshot.visible_line_provenance.push_back({
+                first_logical_row + row,
+                retained_line_ids[static_cast<std::size_t>(row)],
+                content_generations[static_cast<std::size_t>(row)],
+            });
+
+            const QString row_text = row_texts.at(row);
+            for (int column = 0; column < column_count; ++column) {
+                snapshot.cells.push_back({
+                    { row, column },
+                    row_text,
+                    0U,
+                    1,
+                    false,
+                    static_cast<term::Terminal_style_id>(row + 1),
+                });
+            }
+        }
+
+        return std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot));
+    };
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(300.0, 90.0));
+    configure_test_font(surface);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        make_snapshot(
+            922U,
+            {QStringLiteral("B"), QStringLiteral("D"), QStringLiteral("C")},
+            {1, 3, 2},
+            {101U, 102U, 103U},
+            {0U, 0U, 0U},
+            {{0, visible_rows}}));
+    window.show();
+
+    ok &= check(wait_rendered_sequence_with_text_rebuilds(app, window, surface, 922U, visible_rows),
+        "retained-line provenance visual baseline renders every row");
+    ok &= check_surface_no_text_content_failures(surface,
+        "retained-line provenance visual baseline has no text content failures");
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        make_snapshot(
+            923U,
+            {QStringLiteral("A"), QStringLiteral("B"), QStringLiteral("C")},
+            {0, 1, 2},
+            {201U, 102U, 103U},
+            {1U, 1U, 0U},
+            {{1, 1}}));
+    const QImage image = render_window_until(app, window, [&](const QImage&) {
+        const term::Terminal_surface_render_invalidation_stats_t invalidation_stats =
+            term::VNM_TerminalSurface_render_bridge::invalidation_stats(surface);
+        const term::terminal_renderer_stats_t render_stats =
+            term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+        return
+            invalidation_stats.last_rendered_snapshot_sequence == 923U &&
+            !invalidation_stats.pending_update                         &&
+            render_stats.paint_completed                               &&
+            render_stats.text_content_failures == 0;
+    });
+
+    const term::terminal_cell_metrics_t metrics = test_metrics();
+    ok &= check(!image.isNull(),
+        "retained-line provenance visual update renders an image");
+    ok &= check(count_matching_pixels(
+        image,
+        cell_area(0, 0, column_count, metrics),
+        [](QColor color) {
+            return is_viewport_scroll_row_color(color, 0);
+        }) > 10,
+        "retained-line provenance visual update renders fresh row-zero text");
+    ok &= check(count_matching_pixels(
+        image,
+        cell_area(1, 0, column_count, metrics),
+        [](QColor color) {
+            return is_viewport_scroll_row_color(color, 1);
+        }) > 10,
+        "retained-line provenance visual update keeps row one unique");
+    ok &= check(count_matching_pixels(
+        image,
+        cell_area(2, 0, column_count, metrics),
+        [](QColor color) {
+            return is_viewport_scroll_row_color(color, 2);
+        }) > 10,
+        "retained-line provenance visual update keeps row two unique");
+    return ok;
+}
+
+bool test_qsg_text_row_slot_invalid_provenance_rebuilds_skipped_dirty_pixels(QGuiApplication& app)
+{
+    constexpr int visible_rows      = 3;
+    constexpr int column_count      = 18;
+    constexpr int first_logical_row = 10;
+    constexpr int scrollback_rows   = 20;
+
+    bool ok = true;
+    QQuickWindow window;
+    window.setColor(QColor(180, 16, 16));
+    window.resize(340, 120);
+
+    const auto make_snapshot = [](
+        std::uint64_t                                      sequence,
+        const QStringList&                                 row_texts,
+        const std::vector<int>&                            row_color_ids,
+        std::vector<term::Terminal_render_dirty_row_range> dirty_row_ranges) {
+        term::Terminal_viewport_state viewport;
+        viewport.visible_rows     = visible_rows;
+        viewport.scrollback_rows  = scrollback_rows;
+        viewport.offset_from_tail = scrollback_rows - first_logical_row;
+        viewport.follow_tail      = false;
+
+        term::Terminal_render_snapshot snapshot =
+            term::make_empty_render_snapshot({visible_rows, column_count}, viewport, sequence);
+        snapshot.color_state      = color_state();
+        snapshot.cursor.visible   = false;
+        snapshot.dirty_row_ranges = std::move(dirty_row_ranges);
+        snapshot.visible_line_provenance.clear();
+
+        for (int row = 0; row < visible_rows; ++row) {
+            term::Terminal_text_style style = term::make_default_terminal_text_style();
+            style.foreground = term::make_rgb_terminal_color_ref(
+                viewport_scroll_foreground_rgba(row_color_ids[static_cast<std::size_t>(row)]));
+            snapshot.styles.push_back(style);
+
+            const QString row_text = row_texts.at(row);
+            for (int column = 0; column < column_count; ++column) {
+                snapshot.cells.push_back({
+                    { row, column },
+                    row_text,
+                    0U,
+                    1,
+                    false,
+                    static_cast<term::Terminal_style_id>(row + 1),
+                });
+            }
+        }
+
+        return std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot));
+    };
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(300.0, 90.0));
+    configure_test_font(surface);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        make_snapshot(
+            924U,
+            {QStringLiteral("B"), QStringLiteral("D"), QStringLiteral("C")},
+            {1, 3, 2},
+            {{0, visible_rows}}));
+    window.show();
+
+    ok &= check(wait_rendered_sequence_with_text_rebuilds(app, window, surface, 924U, visible_rows),
+        "invalid-provenance text clean-skip baseline renders every row");
+    ok &= check_surface_no_text_content_failures(surface,
+        "invalid-provenance text clean-skip baseline has no text content failures");
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        make_snapshot(
+            925U,
+            {QStringLiteral("A"), QStringLiteral("D"), QStringLiteral("C")},
+            {0, 3, 2},
+            {{1, 1}}));
+    const QImage image = render_window_until(app, window, [&](const QImage&) {
+        const term::Terminal_surface_render_invalidation_stats_t invalidation_stats =
+            term::VNM_TerminalSurface_render_bridge::invalidation_stats(surface);
+        const term::terminal_renderer_stats_t render_stats =
+            term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+        return
+            invalidation_stats.last_rendered_snapshot_sequence == 925U &&
+            !invalidation_stats.pending_update                         &&
+            render_stats.paint_completed                               &&
+            render_stats.text_content_failures == 0;
+    });
+
+    const term::terminal_renderer_stats_t stats =
+        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+    const term::terminal_cell_metrics_t metrics = test_metrics();
+    ok &= check(!image.isNull(),
+        "invalid-provenance text clean-skip update renders an image");
+    ok &= check(count_matching_pixels(
+        image,
+        cell_area(0, 0, column_count, metrics),
+        [](QColor color) {
+            return is_viewport_scroll_row_color(color, 0);
+        }) > 10,
+        "invalid-provenance text clean-skip update renders fresh row-zero pixels");
+    ok &= check(count_matching_pixels(
+        image,
+        cell_area(0, 0, column_count, metrics),
+        [](QColor color) {
+            return is_viewport_scroll_row_color(color, 1);
+        }) <= 10,
+        "invalid-provenance text clean-skip update does not stale-reuse old row-zero pixels");
+    ok &= check(stats.text_content_rebuilds == 1 &&
+        stats.text_resource_descriptor_reuses == 2 &&
+        stats.text_clean_reuse_skips == 0,
+        "invalid-provenance text clean-skip update compares descriptors before reuse");
+    return ok;
+}
+
 bool test_qsg_text_resource_descriptor_dirty_reuse(QGuiApplication& app)
 {
     bool ok = true;
@@ -9163,10 +9408,13 @@ bool test_qsg_text_row_slot_dirty_clean_skip_safety(QGuiApplication& app)
     const QFont font = term::vnm_terminal_font(QString(), 16.0);
     const term::terminal_cell_metrics_t metrics = test_metrics();
     const auto make_runs = [&](QString row_zero_text, QString row_one_text) {
-        return std::vector<term::Terminal_render_text_run>{
-            make_direct_text_run_for_row(0, 0, 0, 1, row_zero_text, metrics),
-            make_direct_text_run_for_row(1, 1, 0, 1, row_one_text, metrics),
-        };
+        term::Terminal_render_text_run row_zero =
+            make_direct_text_run_for_row(0, 0, 0, 1, row_zero_text, metrics);
+        term::Terminal_render_text_run row_one =
+            make_direct_text_run_for_row(1, 1, 0, 1, row_one_text, metrics);
+        row_zero.retained_line_id = 101U;
+        row_one.retained_line_id  = 102U;
+        return std::vector<term::Terminal_render_text_run>{row_zero, row_one};
     };
 
     term::Qsg_terminal_renderer renderer;
@@ -11074,6 +11322,8 @@ int main(int argc, char** argv)
     ok &= test_qsg_clipped_text_run_transition_clears_pixels(app);
     ok &= test_qsg_text_resource_removal_clears_pixels_across_frames(app);
     ok &= test_qsg_viewport_scroll_reuses_text_resources(app);
+    ok &= test_qsg_text_row_slot_retained_line_provenance_pixels(app);
+    ok &= test_qsg_text_row_slot_invalid_provenance_rebuilds_skipped_dirty_pixels(app);
     ok &= test_qsg_text_resource_descriptor_dirty_reuse(app);
     ok &= test_qsg_text_resource_descriptor_styled_ascii_reuse(app);
     ok &= test_qsg_text_resource_descriptor_complex_transitions(app);

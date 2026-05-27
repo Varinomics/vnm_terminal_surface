@@ -64,6 +64,8 @@ struct Terminal_render_text_run
 {
     int                        row          = 0;
     int                        logical_row  = 0;
+    std::uint64_t              retained_line_id   = 0U;
+    std::uint64_t              content_generation = 0U;
     int                        column       = 0;
     QRectF                     rect;
     QRectF                     clip_rect;

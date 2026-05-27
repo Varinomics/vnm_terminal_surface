@@ -17,6 +17,7 @@
 #include <deque>
 #include <map>
 #include <set>
+#include <span>
 #include <vector>
 
 namespace vnm_terminal::internal {
@@ -62,10 +63,20 @@ enum class Terminal_screen_model_config_status
 Terminal_screen_model_config_status validate_terminal_screen_model_config(
     const Terminal_screen_model_config&    config);
 
+struct Terminal_retained_line_provenance
+{
+    std::uint64_t retained_line_id   = 0U;
+    std::uint64_t content_generation = 0U;
+};
+
 struct Terminal_screen_model_result
 {
     std::vector<Parser_action> actions;
     std::vector<int>           dirty_rows;
+    bool                       dirty_rows_have_stable_mutation_identity = true;
+    bool                       terminal_content_changed     = false;
+    bool                       active_buffer_changed        = false;
+    bool                       grid_reflow_changed          = false;
     bool                       viewport_changed              = false;
     bool                       mode_state_changed            = false;
     bool                       mouse_reporting_mode_changed  = false;
@@ -238,6 +249,14 @@ public:
     const QString& title() const;
     const QString& icon_name() const;
     int scrollback_size() const;
+    bool retained_line_descriptors_match(
+        Terminal_buffer_id             buffer_id,
+        const Terminal_selection_range& range,
+        std::span<const terminal_selection_line_lease_t>
+                                       descriptors) const;
+    Terminal_retained_line_provenance retained_line_provenance_for_testing(
+        Terminal_buffer_id             buffer_id,
+        int                            logical_row) const;
     void set_dirty_row_stats_enabled(bool enabled);
     Terminal_screen_model_dirty_row_stats dirty_row_stats() const;
     Terminal_screen_model_dirty_row_timeline dirty_row_timeline() const;
@@ -253,9 +272,15 @@ private:
         std::uint64_t                  hyperlink_id      = 0U;
     };
 
+    struct Terminal_screen_row
+    {
+        std::vector<Cell>                  cells;
+        Terminal_retained_line_provenance  retained_line_provenance;
+    };
+
     struct scrollback_row_t
     {
-        std::vector<Cell>                       cells;
+        Terminal_screen_row                    row;
         std::map<std::uint64_t, QByteArray>     hyperlink_identity_keys;
     };
 
@@ -271,7 +296,7 @@ private:
 
     struct screen_buffer_state_t
     {
-        std::vector<std::vector<Cell>> cells;
+        std::vector<Terminal_screen_row> rows;
         saved_cursor_state_t           saved_cursor;
         terminal_grid_position_t       cursor;
         int                            scroll_top     = 0;
@@ -283,6 +308,10 @@ private:
     struct ingest_publication_t
     {
         std::set<int>                  dirty_rows;
+        bool                           dirty_rows_have_stable_mutation_identity = true;
+        bool                           terminal_content_changed     = false;
+        bool                           active_buffer_changed        = false;
+        bool                           grid_reflow_changed          = false;
         bool                           viewport_changed              = false;
         bool                           mode_state_changed            = false;
         bool                           mouse_reporting_mode_changed  = false;
@@ -291,20 +320,41 @@ private:
 
     struct primary_repaint_recovery_candidate_t
     {
-        std::vector<std::vector<Cell>> rows;
-        int                            scrollback_rows         = 0;
-        int                            unmatched_finish_budget = 0;
-        bool                           active                  = false;
+        std::vector<Terminal_screen_row> rows;
+        int                              scrollback_rows                 = 0;
+        int                              unmatched_finish_budget         = 0;
+        int                              pending_non_home_addressed_row  = -1;
+        bool                             line_start_clear_before_text    = false;
+        bool                             explicit_non_home_repaint_address = false;
+        bool                             visible_row_identity_ambiguous = false;
+        bool                             active                          = false;
     };
 
-    screen_buffer_state_t make_empty_buffer_state() const;
+    screen_buffer_state_t make_empty_buffer_state();
     screen_buffer_state_t capture_current_buffer_state() const;
     void restore_buffer_state(const screen_buffer_state_t& state);
     void save_active_buffer_state();
     screen_buffer_state_t& active_stored_buffer();
     const screen_buffer_state_t& active_stored_buffer() const;
-    void resize_buffer_state(screen_buffer_state_t& state, terminal_grid_size_t grid_size) const;
-    void resize_cells(std::vector<std::vector<Cell>>& cells, terminal_grid_size_t grid_size) const;
+    void resize_buffer_state(screen_buffer_state_t& state, terminal_grid_size_t grid_size);
+    void resize_rows(std::vector<Terminal_screen_row>& rows, terminal_grid_size_t grid_size);
+    std::uint64_t next_retained_line_id();
+    void replace_retained_line_id(Terminal_screen_row& row);
+    void replace_visible_retained_line_ids();
+    void replace_row_with_erased_retained_line(Terminal_screen_row& row);
+
+    bool cells_have_same_selection_content(
+        const Cell&                    left,
+        const Cell&                    right) const;
+
+    bool rows_have_same_selection_content(
+        const std::vector<Cell>&       left,
+        const std::vector<Cell>&       right) const;
+
+    void advance_row_content_generation_if_changed(
+        Terminal_screen_row&           row,
+        const std::vector<Cell>&       before_cells);
+
     std::vector<bool> default_tab_stops(int column_count) const;
     void reset_grid();
 
@@ -358,7 +408,16 @@ private:
         int                            first_column,
         QStringView                    text);
 
+    void write_printable_ascii_span_content(
+        int                            row,
+        int                            first_column,
+        QStringView                    text);
+
     void write_printable_ascii_cell(
+        terminal_grid_position_t       position,
+        QChar                          text);
+
+    void write_printable_ascii_cell_content(
         terminal_grid_position_t       position,
         QChar                          text);
 
@@ -480,7 +539,7 @@ private:
     void restore_cursor();
     void clear_current_tab_stop();
     void clear_all_tab_stops();
-    void append_scrollback_row(const std::vector<Cell>& cells);
+    void append_scrollback_row(const Terminal_screen_row& row);
     void scroll_up_region(int top, int bottom, bool append_scrollback, int count = 1);
     void scroll_down_region(int top, int bottom, int count = 1);
     void reverse_index();
@@ -498,11 +557,11 @@ private:
         const primary_repaint_recovery_candidate_t&    candidate) const;
 
     bool rows_have_matching_text(
-        const std::vector<Cell>&       left,
-        const std::vector<Cell>&       right) const;
+        const Terminal_screen_row&     left,
+        const Terminal_screen_row&     right) const;
 
     bool row_has_visible_text(
-        const std::vector<Cell>&       row) const;
+        const Terminal_screen_row&     row) const;
 
     void carriage_return();
     void line_feed();
@@ -510,6 +569,9 @@ private:
     void horizontal_tab();
     void mark_cursor_dirty();
     void mark_dirty(int row);
+    void mark_terminal_content_changed();
+    void mark_active_buffer_changed();
+    void mark_grid_reflow_changed();
     void mark_viewport_changed();
     void mark_mode_state_changed();
     void mark_mouse_reporting_mode_changed();
@@ -529,7 +591,7 @@ private:
     void retain_referenced_hyperlink_ids();
 
     scrollback_row_t make_scrollback_row(
-        const std::vector<Cell>&       cells) const;
+        const Terminal_screen_row&     screen_row) const;
 
     void add_scrollback_hyperlink_refs(
         const scrollback_row_t&        row);
@@ -565,6 +627,20 @@ private:
         const Terminal_viewport_state& viewport,
         int                            viewport_row) const;
 
+    const Terminal_retained_line_provenance* viewport_row_provenance(
+        const Terminal_viewport_state& viewport,
+        int                            viewport_row) const;
+
+    bool retained_line_descriptor_logical_row(
+        Terminal_buffer_id             buffer_id,
+        terminal_selection_line_lease_t descriptor,
+        int&                           logical_row) const;
+
+    bool render_selection_request_logical_rows(
+        const Terminal_render_selection_request& request,
+        Terminal_buffer_id             buffer_id,
+        std::vector<int>&              logical_rows) const;
+
     std::vector<Terminal_render_hyperlink_metadata> hyperlink_metadata_for_cells(
         const std::vector<Terminal_render_cell>&       cells) const;
 
@@ -577,7 +653,8 @@ private:
                                     m_styles;
     screen_buffer_state_t           m_primary_buffer;
     screen_buffer_state_t           m_alternate_buffer;
-    std::vector<std::vector<Cell>>  m_cells;
+    std::vector<Terminal_screen_row>
+                                    m_rows;
     std::deque<scrollback_row_t>    m_scrollback;
     std::set<int>                   m_dirty_rows;
     int                             m_last_dirty_row = -1;
@@ -594,6 +671,7 @@ private:
     int                             m_active_alternate_mode = 0;
     std::uint64_t                   m_current_hyperlink_id = 0U;
     std::uint64_t                   m_next_hyperlink_id = 1U;
+    std::uint64_t                   m_next_retained_line_id = 1U;
     std::map<QByteArray, std::uint64_t>
                                     m_hyperlink_ids;
     std::map<std::uint64_t, QByteArray>
@@ -605,6 +683,9 @@ private:
     bool                            m_dec_1049_saved_primary_cursor = false;
     bool                            m_pending_wrap = false;
     bool                            m_viewport_changed = false;
+    bool                            m_terminal_content_changed = false;
+    bool                            m_active_buffer_changed = false;
+    bool                            m_grid_reflow_changed = false;
     bool                            m_mode_state_changed = false;
     bool                            m_mouse_reporting_mode_changed = false;
     bool                            m_alternate_scroll_mode_changed = false;
@@ -616,6 +697,9 @@ private:
     mutable std::chrono::steady_clock::time_point
                                     m_dirty_row_stats_start_time;
     bool                            m_synchronized_viewport_changed = false;
+    bool                            m_synchronized_terminal_content_changed = false;
+    bool                            m_synchronized_active_buffer_changed = false;
+    bool                            m_synchronized_grid_reflow_changed = false;
     bool                            m_synchronized_mode_state_changed = false;
     bool                            m_synchronized_mouse_reporting_mode_changed = false;
     bool                            m_synchronized_alternate_scroll_mode_changed = false;
