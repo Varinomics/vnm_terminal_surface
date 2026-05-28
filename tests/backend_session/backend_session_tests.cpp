@@ -7563,6 +7563,359 @@ bool test_public_projection_phase1_default_deferred_path_is_runtime_inert()
     return ok;
 }
 
+struct crlf_append_snapshot_state_t
+{
+    term::Terminal_viewport_state                      viewport;
+    std::vector<QString>                               rows;
+    std::vector<term::Terminal_render_line_provenance> provenance;
+};
+
+struct crlf_append_capture_t
+{
+    crlf_append_snapshot_state_t tail;
+    crlf_append_snapshot_state_t oldest;
+};
+
+term::Terminal_launch_config crlf_append_launch_config()
+{
+    term::Terminal_launch_config config = valid_launch_config();
+    config.initial_grid_size = term::terminal_grid_size_t{2, 8};
+    return config;
+}
+
+crlf_append_snapshot_state_t crlf_append_snapshot_state(
+    const term::Terminal_render_snapshot& snapshot)
+{
+    crlf_append_snapshot_state_t state;
+    state.viewport   = snapshot.viewport;
+    state.provenance = snapshot.visible_line_provenance;
+    state.rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
+    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
+        state.rows.push_back(snapshot_row_text(snapshot, row));
+    }
+    return state;
+}
+
+std::optional<crlf_append_capture_t> capture_crlf_append_state(
+    term::Terminal_session& session)
+{
+    const std::optional<term::Terminal_render_snapshot> tail_snapshot =
+        session.latest_render_snapshot();
+    if (!check(tail_snapshot.has_value(), "CRLF append tail snapshot exists")) {
+        return std::nullopt;
+    }
+
+    session.scroll_viewport_lines(100);
+    const std::optional<term::Terminal_render_snapshot> oldest_snapshot =
+        session.latest_render_snapshot();
+    if (!check(oldest_snapshot.has_value(), "CRLF append scrolled snapshot exists")) {
+        return std::nullopt;
+    }
+
+    return crlf_append_capture_t{
+        crlf_append_snapshot_state(*tail_snapshot),
+        crlf_append_snapshot_state(*oldest_snapshot),
+    };
+}
+
+std::optional<crlf_append_capture_t> capture_crlf_append_stream(
+    const std::vector<QByteArray>&       chunks,
+    term::Terminal_session_config        config = {})
+{
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, std::move(config));
+    if (!check(session->start(crlf_append_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "CRLF append session starts"))
+    {
+        return std::nullopt;
+    }
+
+    for (const QByteArray& chunk : chunks) {
+        if (!check(backend->emit_output(chunk), "CRLF append backend emits chunk")) {
+            return std::nullopt;
+        }
+    }
+
+    return capture_crlf_append_state(*session);
+}
+
+bool crlf_append_snapshot_states_equal(
+    const crlf_append_snapshot_state_t& left,
+    const crlf_append_snapshot_state_t& right)
+{
+    return
+        viewport_states_equal(left.viewport, right.viewport) &&
+        left.rows       == right.rows                       &&
+        left.provenance == right.provenance;
+}
+
+bool crlf_append_captures_equal(
+    const crlf_append_capture_t& left,
+    const crlf_append_capture_t& right)
+{
+    return
+        crlf_append_snapshot_states_equal(left.tail,   right.tail) &&
+        crlf_append_snapshot_states_equal(left.oldest, right.oldest);
+}
+
+QByteArray codex_blank_row_redraw_sequence(
+    bool synchronized_output,
+    bool clear_blank_row)
+{
+    QByteArray bytes;
+    if (synchronized_output) {
+        bytes += QByteArrayLiteral("\x1b[?2026h");
+    }
+
+    bytes += QByteArrayLiteral("\x1b[Hone\x1b[K\r\n");
+    if (clear_blank_row) {
+        bytes += QByteArrayLiteral("\x1b[K");
+    }
+    bytes += QByteArrayLiteral("\r\ntwo\x1b[K\r\n");
+
+    if (synchronized_output) {
+        bytes += QByteArrayLiteral("\x1b[?2026l");
+    }
+    return bytes;
+}
+
+bool check_codex_blank_row_capture(
+    const crlf_append_capture_t& capture,
+    const char*                  rows_message,
+    const char*                  provenance_message)
+{
+    bool ok = true;
+
+    ok &= check(capture.oldest.viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        capture.oldest.viewport.scrollback_rows  == 2 &&
+        capture.oldest.viewport.offset_from_tail == 2,
+        "Codex-style blank-row capture scrolls to retained primary rows");
+    ok &= check(capture.oldest.rows.size() == 2U &&
+        capture.oldest.rows[0] == QStringLiteral("one") &&
+        capture.oldest.rows[1].isEmpty()                 &&
+        capture.tail.rows.size() == 2U                   &&
+        capture.tail.rows[0] == QStringLiteral("two")    &&
+        capture.tail.rows[1].isEmpty(),
+        rows_message);
+    ok &= check(capture.oldest.provenance.size() == 2U &&
+        capture.tail.provenance.size() == 2U &&
+        capture.oldest.provenance[0].logical_row + 1 ==
+            capture.oldest.provenance[1].logical_row &&
+        capture.oldest.provenance[1].logical_row + 1 ==
+            capture.tail.provenance[0].logical_row &&
+        capture.oldest.provenance[0].retained_line_id != 0U &&
+        capture.oldest.provenance[1].retained_line_id != 0U &&
+        capture.tail.provenance[0].retained_line_id    != 0U &&
+        capture.oldest.provenance[0].retained_line_id !=
+            capture.oldest.provenance[1].retained_line_id &&
+        capture.oldest.provenance[1].retained_line_id !=
+            capture.tail.provenance[0].retained_line_id,
+        provenance_message);
+
+    return ok;
+}
+
+bool test_primary_crlf_blank_rows_are_retained_in_scrollback()
+{
+    bool ok = true;
+
+    const std::optional<crlf_append_capture_t> capture =
+        capture_crlf_append_stream({QByteArrayLiteral("A\r\n\r\nB\r\n")});
+    ok &= check(capture.has_value(), "plain CRLF append capture succeeds");
+    if (!capture.has_value()) {
+        return false;
+    }
+
+    const crlf_append_snapshot_state_t& oldest = capture->oldest;
+    ok &= check(oldest.viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        oldest.viewport.scrollback_rows  == 2 &&
+        oldest.viewport.offset_from_tail == 2,
+        "plain CRLF append scrolls to the retained primary rows");
+    ok &= check(oldest.rows.size() == 2U &&
+        oldest.rows[0] == QStringLiteral("A") &&
+        oldest.rows[1].isEmpty(),
+        "plain CRLF append preserves a real blank row in scrollback");
+    ok &= check(oldest.provenance.size() == 2U &&
+        oldest.provenance[0].logical_row      == 0 &&
+        oldest.provenance[1].logical_row      == 1 &&
+        oldest.provenance[0].retained_line_id != 0U &&
+        oldest.provenance[1].retained_line_id != 0U &&
+        oldest.provenance[0].retained_line_id != oldest.provenance[1].retained_line_id,
+        "plain CRLF blank scrollback row has independent retained-line provenance");
+
+    const crlf_append_snapshot_state_t& tail = capture->tail;
+    ok &= check(tail.rows.size() == 2U &&
+        tail.rows[0] == QStringLiteral("B") &&
+        tail.rows[1].isEmpty(),
+        "plain CRLF append keeps following text after the retained blank row");
+
+    return ok;
+}
+
+bool test_codex_synchronized_el_blank_row_is_retained_after_release()
+{
+    bool ok = true;
+
+    const std::optional<crlf_append_capture_t> capture =
+        capture_crlf_append_stream({
+            codex_blank_row_redraw_sequence(true, true),
+        });
+    ok &= check(capture.has_value(), "Codex synchronized EL blank-row capture succeeds");
+    if (!capture.has_value()) {
+        return false;
+    }
+
+    ok &= check_codex_blank_row_capture(
+        *capture,
+        "Codex synchronized EL redraw preserves an empty row between one and two",
+        "Codex synchronized EL blank row keeps retained-line provenance between one and two");
+
+    return ok;
+}
+
+bool test_codex_unsynchronized_el_blank_row_is_retained_after_publication()
+{
+    bool ok = true;
+
+    const std::optional<crlf_append_capture_t> capture =
+        capture_crlf_append_stream({
+            codex_blank_row_redraw_sequence(false, true),
+        });
+    ok &= check(capture.has_value(), "Codex unsynchronized EL blank-row capture succeeds");
+    if (!capture.has_value()) {
+        return false;
+    }
+
+    ok &= check_codex_blank_row_capture(
+        *capture,
+        "Codex unsynchronized EL redraw preserves an empty row between one and two",
+        "Codex unsynchronized EL blank row keeps retained-line provenance between one and two");
+
+    return ok;
+}
+
+bool test_codex_synchronized_crlf_control_blank_row_is_retained_after_release()
+{
+    bool ok = true;
+
+    const std::optional<crlf_append_capture_t> capture =
+        capture_crlf_append_stream({
+            codex_blank_row_redraw_sequence(true, false),
+        });
+    ok &= check(capture.has_value(), "Codex synchronized CRLF-control blank-row capture succeeds");
+    if (!capture.has_value()) {
+        return false;
+    }
+
+    ok &= check_codex_blank_row_capture(
+        *capture,
+        "Codex synchronized CRLF-control redraw preserves an empty row between one and two",
+        "Codex synchronized CRLF-control blank row keeps retained-line provenance between one and two");
+
+    return ok;
+}
+
+bool test_primary_crlf_blank_rows_are_chunk_boundary_invariant()
+{
+    bool ok = true;
+
+    const std::optional<crlf_append_capture_t> combined =
+        capture_crlf_append_stream({QByteArrayLiteral("A\r\n\r\nB\r\n")});
+    const std::optional<crlf_append_capture_t> split =
+        capture_crlf_append_stream({
+            QByteArrayLiteral("A\r\n"),
+            QByteArrayLiteral("\r\n"),
+            QByteArrayLiteral("B\r\n"),
+        });
+    ok &= check(combined.has_value() && split.has_value(),
+        "combined and split CRLF append captures succeed");
+    if (!combined.has_value() || !split.has_value()) {
+        return false;
+    }
+
+    ok &= check(crlf_append_captures_equal(*combined, *split),
+        "combined and split CRLF append chunks produce identical rows and provenance");
+
+    return ok;
+}
+
+bool test_empty_backend_output_chunk_does_not_synthesize_blank_line()
+{
+    bool ok = true;
+
+    const std::optional<crlf_append_capture_t> with_empty_chunk =
+        capture_crlf_append_stream({
+            QByteArrayLiteral("A\r\n"),
+            QByteArray(),
+            QByteArrayLiteral("B\r\n"),
+        });
+    const std::optional<crlf_append_capture_t> without_empty_chunk =
+        capture_crlf_append_stream({
+            QByteArrayLiteral("A\r\n"),
+            QByteArrayLiteral("B\r\n"),
+        });
+    ok &= check(with_empty_chunk.has_value() && without_empty_chunk.has_value(),
+        "empty-chunk boundary captures succeed");
+    if (!with_empty_chunk.has_value() || !without_empty_chunk.has_value()) {
+        return false;
+    }
+
+    ok &= check(crlf_append_captures_equal(*with_empty_chunk, *without_empty_chunk),
+        "empty backend output chunks are ignored at CRLF boundaries");
+    ok &= check(with_empty_chunk->oldest.rows.size() == 2U &&
+        with_empty_chunk->oldest.rows[0] == QStringLiteral("A") &&
+        with_empty_chunk->oldest.rows[1] == QStringLiteral("B") &&
+        with_empty_chunk->oldest.viewport.scrollback_rows == 1,
+        "empty backend output chunks do not synthesize blank lines");
+
+    return ok;
+}
+
+bool test_immediate_public_synchronized_release_preserves_held_crlf_blank_rows()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(crlf_append_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "immediate-public synchronized CRLF session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+        "immediate-public synchronized CRLF hold starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("A\r\n\r\nB\r\n")),
+        "immediate-public synchronized CRLF hold receives blank-row payload");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "immediate-public synchronized CRLF hold releases");
+
+    const std::optional<crlf_append_capture_t> capture = capture_crlf_append_state(*session);
+    ok &= check(capture.has_value(), "immediate-public synchronized CRLF capture succeeds");
+    if (!capture.has_value()) {
+        return false;
+    }
+
+    ok &= check(capture->oldest.viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        capture->oldest.viewport.scrollback_rows  == 2 &&
+        capture->oldest.viewport.offset_from_tail == 2,
+        "immediate-public synchronized release scrolls to retained primary rows");
+    ok &= check(capture->oldest.rows.size() == 2U &&
+        capture->oldest.rows[0] == QStringLiteral("A") &&
+        capture->oldest.rows[1].isEmpty(),
+        "immediate-public synchronized release preserves held CRLF blank row");
+    ok &= check(capture->oldest.provenance.size() == 2U &&
+        capture->oldest.provenance[0].retained_line_id != 0U &&
+        capture->oldest.provenance[1].retained_line_id != 0U &&
+        capture->oldest.provenance[0].retained_line_id !=
+            capture->oldest.provenance[1].retained_line_id,
+        "immediate-public synchronized blank row keeps retained-line provenance");
+
+    return ok;
+}
+
 bool test_synchronized_output_defers_content_until_release()
 {
     bool ok = true;
@@ -8408,97 +8761,28 @@ bool test_resize_preserves_primary_scrollback()
     return ok;
 }
 
-bool test_resize_repaint_clear_keeps_primary_scrollback_when_recovery_is_enabled()
-{
-    bool ok = true;
-
-    term::Terminal_session_config config;
-    config.recover_scrollback_from_primary_repaints = true;
-
-    std::unique_ptr<term::Terminal_session> session;
-    Scripted_backend* backend = make_session(session, config);
-    ok &= check(session->start(valid_launch_config()).code ==
-        term::Terminal_session_result_code::ACCEPTED,
-        "resize repaint-clear session starts");
-    ok &= check(backend->emit_output(numbered_scroll_lines(80)),
-        "resize repaint-clear backend creates scrollback");
-
-    const std::optional<term::Terminal_render_snapshot> before_resize =
-        session->latest_render_snapshot();
-    const int previous_scrollback_rows = before_resize.has_value()
-        ? before_resize->viewport.scrollback_rows
-        : 0;
-    ok &= check(previous_scrollback_rows > 0,
-        "resize repaint-clear fixture starts with scrollback");
-
-    ok &= check(session->resize(QSizeF(1000.0, 420.0), {20, 100}).code ==
-        term::Terminal_session_result_code::ACCEPTED,
-        "resize repaint-clear resize is accepted");
-    ok &= check(backend->emit_output(QByteArrayLiteral(
-            "\x1b[?25l\x1b[H\x1b[?25h\x1b[2J\x1b[3Jredraw")),
-        "backend emits resize-triggered full repaint clear");
-
-    const std::optional<term::Terminal_render_snapshot> after_resize_repaint =
-        session->latest_render_snapshot();
-    ok &= check(after_resize_repaint.has_value() &&
-        after_resize_repaint->viewport.scrollback_rows == previous_scrollback_rows,
-        "resize-triggered repaint clear preserves primary scrollback");
-    ok &= check(session->scroll_viewport_lines(3).action ==
-        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "primary scrollback remains scrollable after resize repaint clear");
-
-    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[H\x1b[2J\x1b[3J")),
-        "backend emits a later explicit scrollback clear");
-    const std::optional<term::Terminal_render_snapshot> after_later_clear =
-        session->latest_render_snapshot();
-    ok &= check(after_later_clear.has_value() &&
-        after_later_clear->viewport.scrollback_rows == 0,
-        "later explicit ED3 still clears primary scrollback");
-
-    std::unique_ptr<term::Terminal_session> echo_session;
-    Scripted_backend* echo_backend = make_session(echo_session, config);
-    ok &= check(echo_session->start(valid_launch_config()).code ==
-        term::Terminal_session_result_code::ACCEPTED,
-        "resize echo-clear session starts");
-    ok &= check(echo_backend->emit_output(numbered_scroll_lines(80)),
-        "resize echo-clear backend creates scrollback");
-    ok &= check(echo_session->resize(QSizeF(1000.0, 420.0), {20, 100}).code ==
-        term::Terminal_session_result_code::ACCEPTED,
-        "resize echo-clear resize is accepted");
-    ok &= check(echo_backend->emit_output(QByteArrayLiteral("clear\r\n\x1b[H\x1b[2J\x1b[3J")),
-        "backend emits echoed clear command after resize");
-    const std::optional<term::Terminal_render_snapshot> after_echo_clear =
-        echo_session->latest_render_snapshot();
-    ok &= check(after_echo_clear.has_value() &&
-        after_echo_clear->viewport.scrollback_rows == 0,
-        "visible output before ED3 treats clear as explicit after resize");
-
-    return ok;
-}
-
 bool test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback()
 {
     bool ok = true;
 
     term::Terminal_session_config config;
-    config.recover_scrollback_from_primary_repaints = true;
 
     std::unique_ptr<term::Terminal_session> session;
     Scripted_backend* backend = make_session(session, config);
     ok &= check(session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "line-repaint recovery session starts");
+        "line-default repaint non-synthesis session starts");
     ok &= check(session->resize(QSizeF(80.0, 24.0), {3, 8}).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "line-repaint recovery grid is compact");
+        "line-default repaint non-synthesis grid is compact");
     ok &= check(backend->emit_output(QByteArrayLiteral("aaa\r\nbbb\r\nccc")),
-        "line-repaint recovery fixture fills the primary screen");
+        "line-default repaint non-synthesis fixture fills the primary screen");
 
     const std::optional<term::Terminal_render_snapshot> before_repaint =
         session->latest_render_snapshot();
     ok &= check(before_repaint.has_value() &&
         before_repaint->viewport.scrollback_rows == 0,
-        "line-repaint recovery fixture starts without scrollback");
+        "line-default repaint non-synthesis fixture starts without scrollback");
 
     ok &= check(backend->emit_output(QByteArrayLiteral(
             "\x1b[?2026h"
@@ -8526,64 +8810,55 @@ bool test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback()
     return ok;
 }
 
-bool test_cursor_home_text_then_el_repaint_synthesizes_primary_scrollback()
+bool test_cursor_home_blank_row_partial_repaint_does_not_synthesize_primary_scrollback()
 {
     bool ok = true;
 
     term::Terminal_session_config config;
-    config.recover_scrollback_from_primary_repaints = true;
 
     std::unique_ptr<term::Terminal_session> session;
     Scripted_backend* backend = make_session(session, config);
     ok &= check(session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "text-then-EL recovery session starts");
+        "blank-row partial default repaint non-synthesis session starts");
     ok &= check(session->resize(QSizeF(80.0, 24.0), {3, 8}).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "text-then-EL recovery grid is compact");
-    ok &= check(backend->emit_output(QByteArrayLiteral("aaa\r\nbbb\r\nccc")),
-        "text-then-EL recovery fixture fills the primary screen");
+        "blank-row partial default repaint non-synthesis grid is compact");
+    ok &= check(backend->emit_output(QByteArrayLiteral("aaa\r\n\r\nccc")),
+        "blank-row partial repaint fixture includes a visible blank row");
 
     const std::optional<term::Terminal_render_snapshot> before_repaint =
         session->latest_render_snapshot();
     ok &= check(before_repaint.has_value() &&
         before_repaint->viewport.scrollback_rows == 0,
-        "text-then-EL recovery fixture starts without scrollback");
+        "blank-row partial repaint fixture starts without scrollback");
 
     ok &= check(backend->emit_output(QByteArrayLiteral(
             "\x1b[?2026h"
             "\x1b[?25l"
-            "\x1b[H" "bbb\x1b[K\r\n"
-            "ccc\x1b[K\r\n"
-            "ddd\x1b[K"
+            "\x1b[H\x1b[K\r\n"
+            "ccc"
             "\x1b[?25h"
             "\x1b[?2026l")),
-        "backend emits synchronized cursor-home text-then-EL repaint");
+        "backend emits synchronized cursor-home blank-row partial repaint");
 
     const std::optional<term::Terminal_render_snapshot> after_repaint =
         session->latest_render_snapshot();
     ok &= check(after_repaint.has_value() &&
-        after_repaint->viewport.scrollback_rows  == 1 &&
-        after_repaint->viewport.offset_from_tail == 0,
-        "cursor-home text-then-EL repaint synthesizes primary scrollback");
+        after_repaint->viewport.scrollback_rows == 0,
+        "cursor-home blank-row partial repaint does not synthesize primary scrollback");
     ok &= check(after_repaint.has_value() &&
-        snapshot_row_text(*after_repaint, 0) == QStringLiteral("bbb") &&
+        snapshot_row_text(*after_repaint, 0).isEmpty() &&
         snapshot_row_text(*after_repaint, 1) == QStringLiteral("ccc") &&
-        snapshot_row_text(*after_repaint, 2) == QStringLiteral("ddd"),
-        "cursor-home text-then-EL repaint updates visible rows");
-
-    const term::Terminal_viewport_scroll_result scroll_result =
-        session->scroll_viewport_lines(1);
-    const std::optional<term::Terminal_render_snapshot> scrolled_snapshot =
-        session->latest_render_snapshot();
-    ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "cursor-home text-then-EL recovered scrollback is scrollable");
-    ok &= check(scrolled_snapshot.has_value() &&
-        snapshot_row_text(*scrolled_snapshot, 0) == QStringLiteral("aaa"),
-        "cursor-home text-then-EL repaint keeps displaced row in scrollback");
-
+        snapshot_row_text(*after_repaint, 2) == QStringLiteral("ccc"),
+        "cursor-home blank-row partial repaint keeps unchanged bottom row visible");
+    ok &= check(session->scroll_viewport_lines(1).action ==
+        term::Terminal_viewport_scroll_action::AT_BOUNDARY,
+        "cursor-home blank-row partial repaint leaves primary viewport at scrollback boundary");
     return ok;
 }
+
+
 
 bool test_parser_notifications_reach_session_notifications()
 {
@@ -11604,12 +11879,18 @@ int main()
     ok &= test_public_projection_phase4_alternate_safe_basis_disables_projection();
     ok &= test_public_projection_phase4_default_text_area_scroll_remains_deferred();
     ok &= test_public_projection_phase1_default_deferred_path_is_runtime_inert();
+    ok &= test_primary_crlf_blank_rows_are_retained_in_scrollback();
+    ok &= test_codex_synchronized_el_blank_row_is_retained_after_release();
+    ok &= test_codex_unsynchronized_el_blank_row_is_retained_after_publication();
+    ok &= test_codex_synchronized_crlf_control_blank_row_is_retained_after_release();
+    ok &= test_primary_crlf_blank_rows_are_chunk_boundary_invariant();
+    ok &= test_empty_backend_output_chunk_does_not_synthesize_blank_line();
+    ok &= test_immediate_public_synchronized_release_preserves_held_crlf_blank_rows();
     ok &= test_synchronized_output_defers_content_until_release();
     ok &= test_viewport_scroll_public_session_path();
     ok &= test_resize_preserves_primary_scrollback();
-    ok &= test_resize_repaint_clear_keeps_primary_scrollback_when_recovery_is_enabled();
     ok &= test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback();
-    ok &= test_cursor_home_text_then_el_repaint_synthesizes_primary_scrollback();
+    ok &= test_cursor_home_blank_row_partial_repaint_does_not_synthesize_primary_scrollback();
     ok &= test_parser_notifications_reach_session_notifications();
     ok &= test_bell_policy_coalesces_with_deterministic_clock();
     ok &= test_parser_state_crosses_backend_output_chunks();

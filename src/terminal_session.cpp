@@ -4149,8 +4149,6 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     screen_config.grid_size                 = grid_size;
     screen_config.scrollback_limit          = m_config.scrollback_limit;
     screen_config.retain_structural_actions = m_config.capture_last_model_ingest_result;
-    screen_config.recover_scrollback_from_primary_repaints =
-        m_config.recover_scrollback_from_primary_repaints;
     m_screen_model.emplace(screen_config);
     m_screen_model->set_dirty_row_stats_enabled(m_config.capture_dirty_row_stats);
     m_viewport_controller = Terminal_viewport_controller{};

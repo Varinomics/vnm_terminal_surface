@@ -296,16 +296,12 @@ provenance for affected rows and detach visual spans.
 
 ### Primary repaint recovery
 
-Primary repaint recovery must not silently copy cell rows without provenance.
+The heuristic primary repaint recovery path was rejected and removed. Default
+repaint handling must not synthesize primary scrollback rows or retained-line
+provenance from repaint-shaped output.
 
-V1 rule: rows reconstructed or inferred by primary repaint recovery receive fresh
-provenance unless the implementation has an explicit proof that the captured row
-object and content state are unchanged. This is fail-closed and may detach
-visual spans.
-
-If future work wants preservation through recovery, the recovery candidate must
-capture provenance together with cells and prove that it still describes the same
-retained content.
+If future work wants preservation through recovery, it must capture provenance
+together with cells and prove that it still describes the same retained content.
 
 ### Alternate buffer
 
@@ -563,7 +559,7 @@ Implementation touch points:
 - extend `scrollback_row_t` in place or wrap it equivalently; do not create a
   separate parallel provenance container
 - saved buffer state
-- primary repaint recovery state
+- default repaint non-synthesis paths
 - grid resize / cell resize paths that rebuild row storage
 - any helper or adapter that currently assumes a raw `std::vector<Cell>` row
 
@@ -573,7 +569,7 @@ Tests are coverage/invariant tests, not proof of behavior fix:
 - row wrapper moves preserve cell content
 - scrollback rows preserve cell content
 - saved buffer state preserves/restores cell content
-- primary repaint recovery remains fail-closed or behavior-equivalent
+- default repaint non-synthesis behavior remains unchanged
 
 Rollback:
 
@@ -602,7 +598,7 @@ Implementation touch points:
 - clear-scrollback paths
 - alternate-buffer save/restore
 - zero-scrollback discard/reuse
-- primary repaint recovery
+- default repaint non-synthesis paths
 
 Tests are coverage/invariant tests, not proof of behavior fix:
 
@@ -613,7 +609,8 @@ Tests are coverage/invariant tests, not proof of behavior fix:
 - zero scrollback reuses storage with fresh IDs
 - partial scroll regions retire displaced rows and preserve moved rows
 - clear scrollback retires purged IDs
-- primary repaint recovery is fail-closed with fresh IDs unless explicitly proven
+- heuristic primary repaint recovery remains absent and repaint paths do not
+  synthesize retained IDs
 - alternate buffer provenance is saved/restored consistently but not visually
   reattached
 
@@ -916,8 +913,8 @@ During implementation:
    integer descriptors are acceptable compared with text comparison.
 8. Session-only proof is not enough; model-side validation is the final stale
    span guard.
-9. Primary repaint recovery can reconstruct rows that look identical but lack
-   proven identity.
+9. Reintroducing primary repaint recovery could reconstruct rows that look
+   identical but lack proven identity.
 10. Dirty rows are still useful render damage metadata but must not remain the
     semantic source of selection truth.
 11. Manual app validation is still required for the original Codex streaming
