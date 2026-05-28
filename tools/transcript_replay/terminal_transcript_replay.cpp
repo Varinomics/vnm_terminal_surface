@@ -617,8 +617,6 @@ term::Terminal_session_config replay_session_config(
             session_config.contains(QStringLiteral("effective_scrollback_limit"))
                 ? session_config.value(QStringLiteral("effective_scrollback_limit")).toInt()
                 : session_config.value(QStringLiteral("scrollback_limit")).toInt();
-        config.recover_scrollback_from_primary_repaints =
-            session_config.value(QStringLiteral("recover_scrollback_from_primary_repaints")).toBool();
         config.selection_viewport_projection_enabled =
             session_config.value(QStringLiteral("selection_viewport_projection_enabled")).toBool();
         const QJsonValue explicit_scroll_policy =
@@ -639,7 +637,6 @@ term::Terminal_session_config replay_session_config(
     const int recorded_scrollback_rows = max_recorded_scrollback_rows(events);
     config.scrollback_limit =
         recorded_scrollback_rows > 0 ? recorded_scrollback_rows : k_surface_default_scrollback_limit;
-    config.recover_scrollback_from_primary_repaints = true;
     if (transcript_uses_immediate_public_projection(events)) {
         config.synchronized_output_scroll_policy =
             term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;

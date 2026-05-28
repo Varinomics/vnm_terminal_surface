@@ -6,3 +6,6 @@ manual_validation_runs/
 CMakeUserPresets.json
 *.user
 *.user.*
+build_phase*/
+Testing/
+*.obj

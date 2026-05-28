@@ -24,7 +24,6 @@ constexpr ushort   k_printable_ascii_first = 0x20U;
 constexpr ushort   k_printable_ascii_last  = 0x7eU;
 constexpr std::size_t k_printable_ascii_count =
     k_printable_ascii_last - k_printable_ascii_first + 1U;
-constexpr int k_resize_repaint_clear_guard_action_budget = 64;
 
 template <typename T>
 constexpr bool k_unhandled_screen_mutation = false;
@@ -1853,7 +1852,6 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
             }
             clear_dirty();
             apply_action(action, result.actions, &publication);
-            advance_resize_repaint_clear_guard();
 
             if (m_modes.synchronized_output) {
                 collect_synchronized_changes();
@@ -1865,16 +1863,6 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
         }
     }
 
-    if (m_primary_repaint_recovery_candidate.active && m_modes.cursor_visible) {
-        clear_dirty();
-        finish_primary_repaint_recovery_candidate(false);
-        if (m_modes.synchronized_output) {
-            collect_synchronized_changes();
-        }
-        else {
-            publish_pending_changes(publication);
-        }
-    }
 
     m_dirty_rows                    = std::move(publication.dirty_rows);
     m_terminal_content_changed      = publication.terminal_content_changed;
@@ -1942,7 +1930,6 @@ void Terminal_screen_model::apply_action(const Parser_action& action)
 {
     std::vector<Parser_action> generated_actions;
     apply_action(action, generated_actions, nullptr);
-    advance_resize_repaint_clear_guard();
 }
 
 void Terminal_screen_model::apply_action(
@@ -1976,7 +1963,7 @@ void Terminal_screen_model::apply_action(
         const Parser_notification& notification =
             std::get<Parser_notification>(action.payload);
         if (notification.kind == Parser_notification_kind::TEXT_AREA_RESIZE_REQUESTED) {
-            apply_grid_resize({notification.rows, notification.columns}, false);
+            apply_grid_resize({notification.rows, notification.columns});
         }
         return;
     }
@@ -2206,10 +2193,7 @@ void Terminal_screen_model::apply_control_sequence(
                                 return;
                             }
 
-                            if (row == 1 && column == 1) {
-                                begin_primary_repaint_recovery_candidate();
-                            }
-                            set_cursor_address(row, column);
+                                                    set_cursor_address(row, column);
                             return;
         }
         case 'G':
@@ -2475,7 +2459,7 @@ void Terminal_screen_model::apply_control_sequence(
                                     unsupported();
                                     return;
                                 }
-                                apply_grid_resize(grid_size, false);
+                                apply_grid_resize(grid_size);
                                 generated_actions.push_back(
                                     make_text_area_resize_notification_action(rows, columns));
                                 return;
@@ -3484,7 +3468,6 @@ std::vector<bool> Terminal_screen_model::default_tab_stops(int column_count) con
 
 void Terminal_screen_model::reset_grid()
 {
-    cancel_primary_repaint_recovery_candidate();
     m_primary_buffer                = make_empty_buffer_state();
     m_alternate_buffer              = make_empty_buffer_state();
     m_active_buffer_id              = Terminal_buffer_id::PRIMARY;
@@ -3495,8 +3478,7 @@ void Terminal_screen_model::reset_grid()
 }
 
 bool Terminal_screen_model::apply_grid_resize(
-    terminal_grid_size_t grid_size,
-    bool                 guard_scrollback_clear)
+    terminal_grid_size_t grid_size)
 {
     if (!is_terminal_screen_model_grid_size_supported(grid_size)) {
         return false;
@@ -3507,8 +3489,6 @@ bool Terminal_screen_model::apply_grid_resize(
     {
         return false;
     }
-
-    cancel_primary_repaint_recovery_candidate();
     save_active_buffer_state();
     resize_buffer_state(m_primary_buffer,   grid_size);
     resize_buffer_state(m_alternate_buffer, grid_size);
@@ -3516,14 +3496,7 @@ bool Terminal_screen_model::apply_grid_resize(
     m_tab_stops = default_tab_stops(grid_size.columns);
     m_config.grid_size = grid_size;
     restore_buffer_state(active_stored_buffer());
-    mark_grid_reflow_changed();
-    if (guard_scrollback_clear) {
-        arm_resize_repaint_clear_guard();
-    }
-    else {
-        cancel_resize_repaint_clear_guard();
-    }
-    mark_all_dirty();
+    mark_grid_reflow_changed();    mark_all_dirty();
     mark_viewport_changed();
 
     return true;
@@ -3535,7 +3508,7 @@ Terminal_screen_model_result Terminal_screen_model::resize(terminal_grid_size_t 
     m_scrollback_evicted_rows = 0;
     clear_dirty();
 
-    const bool grid_resized = apply_grid_resize(grid_size, true);
+    const bool grid_resized = apply_grid_resize(grid_size);
     const bool resize_terminal_content_changed = m_terminal_content_changed;
     const bool resize_active_buffer_changed    = m_active_buffer_changed;
     const bool resize_grid_reflow_changed      = m_grid_reflow_changed;
@@ -3653,7 +3626,6 @@ void Terminal_screen_model::put_scalar(QString text)
 void Terminal_screen_model::put_text(QString text)
 {
     if (!text.isEmpty()) {
-        cancel_resize_repaint_clear_guard_before_visible_clear();
     }
 
     for (qsizetype i = 0; i < text.size();) {
@@ -4026,22 +3998,14 @@ void Terminal_screen_model::clear_screen_after_cursor()
 
 void Terminal_screen_model::erase_visible_screen()
 {
-    note_resize_repaint_visible_clear();
     mark_terminal_content_changed();
-    const bool primary_repaint_rebuild =
-        m_primary_repaint_recovery_candidate.active;
     for (int row = 0; row < m_config.grid_size.rows; ++row) {
         Terminal_screen_row& screen_row = m_rows[static_cast<std::size_t>(row)];
-        if (primary_repaint_rebuild) {
-            replace_row_with_erased_retained_line(screen_row);
-        }
-        else {
-            const std::vector<Cell> before_cells = screen_row.cells;
-            fill_row_with_erased_cells(screen_row.cells);
-            advance_row_content_generation_if_changed(screen_row, before_cells);
-        }
+        const std::vector<Cell> before_cells = screen_row.cells;
+        fill_row_with_erased_cells(screen_row.cells);
+        advance_row_content_generation_if_changed(screen_row, before_cells);
+        mark_dirty(row);
     }
-    mark_all_dirty();
 }
 
 void Terminal_screen_model::erase_in_display(int mode)
@@ -4050,22 +4014,11 @@ void Terminal_screen_model::erase_in_display(int mode)
 
     switch (mode) {
         case 0:
-            if (m_primary_repaint_recovery_candidate.active &&
-                m_cursor.row    == 0 &&
-                m_cursor.column == 0)
-            {
-                replace_visible_retained_line_ids();
-                m_primary_repaint_recovery_candidate.visible_row_identity_ambiguous = false;
-                cancel_primary_repaint_recovery_candidate();
-            }
-            clear_screen_after_cursor();
+                    clear_screen_after_cursor();
             break;
         case 1:  clear_screen_before_cursor(); break;
         case 2:  erase_visible_screen();       break;
         case 3:
-            if (consume_resize_repaint_scrollback_clear_guard()) {
-                break;
-            }
             if (m_active_buffer_id == Terminal_buffer_id::PRIMARY && !m_scrollback.empty()) {
                 m_scrollback_evicted_rows += static_cast<int>(m_scrollback.size());
                 for (const scrollback_row_t& row : m_scrollback) {
@@ -4084,22 +4037,6 @@ void Terminal_screen_model::erase_in_line(int mode)
 {
     // EL must not consume delayed autowrap: a following printable still wraps,
     // while CR or cursor movement can cancel the pending wrap first.
-    if (m_primary_repaint_recovery_candidate.active &&
-        mode            == 0 &&
-        m_cursor.column == 0)
-    {
-        const Terminal_screen_row& candidate_row =
-            m_primary_repaint_recovery_candidate.rows[static_cast<std::size_t>(m_cursor.row)];
-        m_primary_repaint_recovery_candidate.line_start_clear_before_text =
-            m_primary_repaint_recovery_candidate.line_start_clear_before_text ||
-            row_has_visible_text(candidate_row);
-        m_primary_repaint_recovery_candidate.explicit_non_home_repaint_address =
-            m_primary_repaint_recovery_candidate.explicit_non_home_repaint_address ||
-            (m_primary_repaint_recovery_candidate.pending_non_home_addressed_row ==
-                m_cursor.row &&
-                row_has_visible_text(candidate_row));
-        m_primary_repaint_recovery_candidate.pending_non_home_addressed_row = -1;
-    }
 
     switch (mode) {
         case 0:  erase_row_range(m_cursor.row, m_cursor.column, m_config.grid_size.columns - 1); break;
@@ -4302,10 +4239,6 @@ void Terminal_screen_model::set_cursor_address(int row_parameter, int column_par
         target_row = std::clamp(target_row, 0, m_config.grid_size.rows - 1);
     }
 
-    if (m_primary_repaint_recovery_candidate.active) {
-        m_primary_repaint_recovery_candidate.pending_non_home_addressed_row =
-            (requested_row != 0 || requested_column != 0) ? target_row : -1;
-    }
 
     set_cursor_position(target_row, requested_column);
 }
@@ -4409,8 +4342,6 @@ void Terminal_screen_model::set_synchronized_output_mode(
         }
         return;
     }
-
-    finish_primary_repaint_recovery_candidate(false);
     if (publication != nullptr) {
         collect_synchronized_changes();
     }
@@ -4578,7 +4509,6 @@ int Terminal_screen_model::dec_private_mode_status(int mode) const
 
 void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int active_mode)
 {
-    cancel_primary_repaint_recovery_candidate();
     if (m_active_buffer_id == Terminal_buffer_id::PRIMARY) {
         save_active_buffer_state();
         if (clear_alternate) {
@@ -4606,7 +4536,6 @@ void Terminal_screen_model::enter_alternate_screen(bool clear_alternate, int act
 
 bool Terminal_screen_model::leave_alternate_screen(bool clear_alternate)
 {
-    cancel_primary_repaint_recovery_candidate();
     if (m_active_buffer_id != Terminal_buffer_id::ALTERNATE) {
         m_active_alternate_mode = 0;
         return false;
@@ -4750,276 +4679,15 @@ void Terminal_screen_model::reverse_index()
     mark_cursor_dirty();
 }
 
-void Terminal_screen_model::arm_resize_repaint_clear_guard()
-{
-    if (!m_config.recover_scrollback_from_primary_repaints ||
-        m_active_buffer_id != Terminal_buffer_id::PRIMARY   ||
-        m_scrollback.empty())
-    {
-        cancel_resize_repaint_clear_guard();
-        return;
-    }
 
-    m_resize_repaint_clear_guard_remaining         =
-        k_resize_repaint_clear_guard_action_budget;
-    m_resize_repaint_clear_guard_saw_visible_clear = false;
-}
 
-void Terminal_screen_model::cancel_resize_repaint_clear_guard()
-{
-    m_resize_repaint_clear_guard_remaining         = 0;
-    m_resize_repaint_clear_guard_saw_visible_clear = false;
-}
 
-void Terminal_screen_model::cancel_resize_repaint_clear_guard_before_visible_clear()
-{
-    if (m_resize_repaint_clear_guard_saw_visible_clear) {
-        return;
-    }
 
-    cancel_resize_repaint_clear_guard();
-}
 
-void Terminal_screen_model::advance_resize_repaint_clear_guard()
-{
-    if (m_resize_repaint_clear_guard_remaining <= 0) {
-        return;
-    }
 
-    --m_resize_repaint_clear_guard_remaining;
-    if (m_resize_repaint_clear_guard_remaining <= 0) {
-        cancel_resize_repaint_clear_guard();
-    }
-}
-
-void Terminal_screen_model::note_resize_repaint_visible_clear()
-{
-    if (m_resize_repaint_clear_guard_remaining <= 0 ||
-        m_cursor.row                               != 0 ||
-        m_cursor.column                            != 0)
-    {
-        return;
-    }
-
-    m_resize_repaint_clear_guard_saw_visible_clear = true;
-}
-
-bool Terminal_screen_model::consume_resize_repaint_scrollback_clear_guard()
-{
-    if (m_resize_repaint_clear_guard_remaining <= 0 ||
-        !m_resize_repaint_clear_guard_saw_visible_clear)
-    {
-        return false;
-    }
-
-    cancel_resize_repaint_clear_guard();
-    return true;
-}
-
-void Terminal_screen_model::begin_primary_repaint_recovery_candidate()
-{
-    if (!m_config.recover_scrollback_from_primary_repaints ||
-        m_active_buffer_id != Terminal_buffer_id::PRIMARY  ||
-        m_origin_mode                                      ||
-        m_modes.cursor_visible                             ||
-        m_scroll_top       != 0                            ||
-        m_scroll_bottom    != m_config.grid_size.rows - 1)
-    {
-        cancel_primary_repaint_recovery_candidate();
-        return;
-    }
-
-    if (m_primary_repaint_recovery_candidate.active) {
-        finish_primary_repaint_recovery_candidate(true);
-    }
-
-    bool has_visible_row = false;
-    for (const Terminal_screen_row& row : m_rows) {
-        has_visible_row = has_visible_row || row_has_visible_text(row);
-    }
-    if (!has_visible_row) {
-        cancel_primary_repaint_recovery_candidate();
-        return;
-    }
-
-    m_primary_repaint_recovery_candidate.rows                         = m_rows;
-    m_primary_repaint_recovery_candidate.scrollback_rows              = scrollback_size();
-    m_primary_repaint_recovery_candidate.unmatched_finish_budget      = 1;
-    m_primary_repaint_recovery_candidate.pending_non_home_addressed_row = -1;
-    m_primary_repaint_recovery_candidate.line_start_clear_before_text = false;
-    m_primary_repaint_recovery_candidate.explicit_non_home_repaint_address =
-        false;
-    m_primary_repaint_recovery_candidate.visible_row_identity_ambiguous =
-        false;
-    m_primary_repaint_recovery_candidate.active                       = true;
-}
-
-void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
-    bool discard_if_no_match)
-{
-    if (!m_primary_repaint_recovery_candidate.active) {
-        return;
-    }
-
-    primary_repaint_recovery_candidate_t candidate =
-        std::move(m_primary_repaint_recovery_candidate);
-    m_primary_repaint_recovery_candidate = {};
-
-    if (candidate.visible_row_identity_ambiguous) {
-        for (Terminal_screen_row& row : candidate.rows) {
-            replace_retained_line_id(row);
-        }
-    }
-
-    const int scrolled_rows = inferred_primary_repaint_scroll_rows(candidate);
-    if (scrolled_rows <= 0) {
-        if (candidate.visible_row_identity_ambiguous) {
-            replace_visible_retained_line_ids();
-            mark_all_dirty();
-            candidate.visible_row_identity_ambiguous = false;
-        }
-        if (!discard_if_no_match && candidate.unmatched_finish_budget > 0) {
-            --candidate.unmatched_finish_budget;
-            m_primary_repaint_recovery_candidate = std::move(candidate);
-        }
-        return;
-    }
-
-    for (int row = 0; row < scrolled_rows; ++row) {
-        Terminal_screen_row recovered_row = candidate.rows[static_cast<std::size_t>(row)];
-        replace_retained_line_id(recovered_row);
-        append_scrollback_row(recovered_row);
-    }
-    for (Terminal_screen_row& row : m_rows) {
-        replace_retained_line_id(row);
-    }
-    mark_all_dirty();
-}
-
-void Terminal_screen_model::cancel_primary_repaint_recovery_candidate()
-{
-    if (m_primary_repaint_recovery_candidate.active &&
-        m_primary_repaint_recovery_candidate.visible_row_identity_ambiguous)
-    {
-        replace_visible_retained_line_ids();
-        mark_all_dirty();
-    }
-    m_primary_repaint_recovery_candidate = {};
-}
-
-int Terminal_screen_model::inferred_primary_repaint_scroll_rows(
-    const primary_repaint_recovery_candidate_t& candidate) const
-{
-    if (!candidate.active ||
-        m_active_buffer_id        != Terminal_buffer_id::PRIMARY ||
-        candidate.scrollback_rows != scrollback_size()           ||
-        candidate.rows.size()     != m_rows.size())
-    {
-        return 0;
-    }
-
-    if (candidate.line_start_clear_before_text &&
-        candidate.explicit_non_home_repaint_address)
-    {
-        return 0;
-    }
-
-    constexpr int k_min_meaningful_matches       = 2;
-    constexpr int k_preferred_meaningful_matches = 3;
-
-    const int row_count =
-        std::min(static_cast<int>(candidate.rows.size()), m_config.grid_size.rows);
-    int best_shift              = 0;
-    int best_meaningful_matches = 0;
-    int best_matched_prefix     = 0;
-
-    for (int shift = 1; shift < row_count; ++shift) {
-        bool displaced_visible = false;
-        for (int row = 0; row < shift; ++row) {
-            displaced_visible = displaced_visible ||
-                row_has_visible_text(candidate.rows[static_cast<std::size_t>(row)]);
-        }
-        if (!displaced_visible) {
-            continue;
-        }
-
-        int available_meaningful_matches = 0;
-        for (int row = 0; row + shift < row_count; ++row) {
-            if (row_has_visible_text(candidate.rows[static_cast<std::size_t>(row + shift)])) {
-                ++available_meaningful_matches;
-            }
-        }
-        const int required_meaningful_matches = std::min(
-            k_preferred_meaningful_matches,
-            available_meaningful_matches);
-        if (required_meaningful_matches < k_min_meaningful_matches) {
-            continue;
-        }
-
-        int                  matched_prefix     = 0;
-        int                  meaningful_matches = 0;
-        std::vector<QString> distinct_matched_texts;
-        while (matched_prefix + shift < row_count) {
-            const Terminal_screen_row& current_row =
-                m_rows[static_cast<std::size_t>(matched_prefix)];
-            const Terminal_screen_row& candidate_row =
-                candidate.rows[static_cast<std::size_t>(matched_prefix + shift)];
-            const QString current_text =
-                row_text_from_cells(current_row.cells, 0, m_config.grid_size.columns);
-            const QString candidate_text =
-                row_text_from_cells(candidate_row.cells, 0, m_config.grid_size.columns);
-            if (current_text != candidate_text) {
-                break;
-            }
-
-            if (!candidate_text.isEmpty()) {
-                ++meaningful_matches;
-                if (std::find(
-                        distinct_matched_texts.begin(),
-                        distinct_matched_texts.end(),
-                        candidate_text) == distinct_matched_texts.end())
-                {
-                    distinct_matched_texts.push_back(candidate_text);
-                }
-            }
-            ++matched_prefix;
-        }
-
-        if (meaningful_matches < required_meaningful_matches ||
-            static_cast<int>(distinct_matched_texts.size()) < k_min_meaningful_matches)
-        {
-            continue;
-        }
-
-        if (meaningful_matches > best_meaningful_matches ||
-            (meaningful_matches == best_meaningful_matches &&
-                matched_prefix > best_matched_prefix))
-        {
-            best_meaningful_matches = meaningful_matches;
-            best_matched_prefix     = matched_prefix;
-            best_shift              = shift;
-        }
-    }
-
-    return best_shift;
-}
-
-bool Terminal_screen_model::rows_have_matching_text(
-    const Terminal_screen_row& left,
-    const Terminal_screen_row& right) const
-{
-    return row_text_from_cells(left.cells, 0, m_config.grid_size.columns) ==
-        row_text_from_cells(right.cells, 0, m_config.grid_size.columns);
-}
-
-bool Terminal_screen_model::row_has_visible_text(const Terminal_screen_row& row) const
-{
-    return !row_text_from_cells(row.cells, 0, m_config.grid_size.columns).isEmpty();
-}
 
 void Terminal_screen_model::carriage_return()
 {
-    cancel_resize_repaint_clear_guard_before_visible_clear();
     mark_cursor_dirty();
     m_cursor.column = 0;
     m_pending_wrap  = false;
@@ -5028,7 +4696,6 @@ void Terminal_screen_model::carriage_return()
 
 void Terminal_screen_model::line_feed()
 {
-    cancel_resize_repaint_clear_guard_before_visible_clear();
     mark_cursor_dirty();
     m_pending_wrap = false;
 
@@ -5131,11 +4798,6 @@ void Terminal_screen_model::mark_dirty(int row)
 
 void Terminal_screen_model::mark_terminal_content_changed()
 {
-    if (m_primary_repaint_recovery_candidate.active &&
-        m_active_buffer_id == Terminal_buffer_id::PRIMARY)
-    {
-        m_primary_repaint_recovery_candidate.visible_row_identity_ambiguous = true;
-    }
     m_terminal_content_changed = true;
 }
 

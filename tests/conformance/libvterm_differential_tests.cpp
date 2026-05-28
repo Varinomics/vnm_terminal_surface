@@ -211,7 +211,6 @@ term::Terminal_color_state default_vnm_color_state(Grid_size grid_size)
     config.grid_size                                = term::terminal_grid_size_t{grid_size.rows, grid_size.columns};
     config.scrollback_limit                         = 10000;
     config.tab_width                                = 8;
-    config.recover_scrollback_from_primary_repaints = true;
     return term::Terminal_screen_model(config).render_snapshot(0U).color_state;
 }
 
@@ -319,7 +318,6 @@ std::vector<std::string> vnm_rows_for_bytes(const QByteArray& bytes, Grid_size g
     config.grid_size                                = term::terminal_grid_size_t{grid_size.rows, grid_size.columns};
     config.scrollback_limit                         = 10000;
     config.tab_width                                = 8;
-    config.recover_scrollback_from_primary_repaints = true;
 
     term::Terminal_screen_model model(config);
 
@@ -341,7 +339,6 @@ std::vector<std::vector<Cell_attributes>> vnm_attributes_for_bytes(
     config.grid_size                                = term::terminal_grid_size_t{grid_size.rows, grid_size.columns};
     config.scrollback_limit                         = 10000;
     config.tab_width                                = 8;
-    config.recover_scrollback_from_primary_repaints = true;
 
     term::Terminal_screen_model model(config);
     model.ingest(bytes);

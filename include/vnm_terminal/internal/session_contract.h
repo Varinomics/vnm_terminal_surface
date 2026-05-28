@@ -177,7 +177,6 @@ struct Terminal_session_config
     int                             scrollback_limit                         = 1000;
     bool                            capture_last_model_ingest_result         = false;
     bool                            capture_dirty_row_stats                  = false;
-    bool                            recover_scrollback_from_primary_repaints = false;
     bool                            selection_trace_enabled                  = false;
     bool                            selection_viewport_projection_enabled    = false;
     Terminal_synchronized_output_scroll_policy synchronized_output_scroll_policy =

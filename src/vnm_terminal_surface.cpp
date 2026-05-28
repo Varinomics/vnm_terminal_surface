@@ -4807,7 +4807,6 @@ bool VNM_TerminalSurface::start_process_with_backend(
     session_config.synchronized_output_scroll_policy =
         terminal_synchronized_output_scroll_policy(m_synchronized_output_scroll_policy);
 #if defined(Q_OS_WIN)
-    session_config.recover_scrollback_from_primary_repaints = true;
 #endif
     session_config.bell_policy.audible_enabled =
         m_audible_bell_policy == Bell_policy::ENABLED;
