@@ -18,12 +18,18 @@ namespace vnm_terminal::internal {
 void insert_wheel_trace_scroll_publication_fields(
     QJsonObject& object,
     bool         local_scroll_applied,
-    bool         render_publication_blocked)
+    bool         render_publication_blocked,
+    std::optional<bool> visible_scroll_applied,
+    bool         deferred_intent_recorded)
 {
     object.insert(QStringLiteral("local_scroll_applied"), local_scroll_applied);
+    object.insert(QStringLiteral("deferred_intent_recorded"), deferred_intent_recorded);
+    // The default is the Phase 3 deferred-publication trace value. Public
+    // projection scroll publication must pass an explicit visible result.
     object.insert(
         QStringLiteral("visible_scroll_applied"),
-        local_scroll_applied && !render_publication_blocked);
+        visible_scroll_applied.value_or(
+            local_scroll_applied && !render_publication_blocked));
 }
 
 namespace {
@@ -34,6 +40,27 @@ constexpr qint64 k_transcript_timing_record_threshold_ns = 250000;
 void insert_u64(QJsonObject& object, const QString& name, std::uint64_t value)
 {
     object.insert(name, static_cast<qint64>(value));
+}
+
+void insert_u64_if_missing(QJsonObject& object, const QString& name, std::uint64_t value)
+{
+    if (!object.contains(name)) {
+        insert_u64(object, name, value);
+    }
+}
+
+void insert_string_if_missing(QJsonObject& object, const QString& name, const QString& value)
+{
+    if (!object.contains(name)) {
+        object.insert(name, value);
+    }
+}
+
+void insert_bool_if_missing(QJsonObject& object, const QString& name, bool value)
+{
+    if (!object.contains(name)) {
+        object.insert(name, value);
+    }
 }
 
 QString u64_string(std::uint64_t value)
@@ -253,6 +280,194 @@ QJsonObject viewport_object(const Terminal_viewport_state& viewport)
     };
 }
 
+Terminal_viewport_state valid_transcript_viewport_or_fallback(
+    Terminal_viewport_state viewport,
+    Terminal_viewport_state fallback)
+{
+    const Terminal_viewport_state default_viewport;
+    return
+        viewport.active_buffer == default_viewport.active_buffer &&
+        viewport.scrollback_rows == default_viewport.scrollback_rows &&
+        viewport.visible_rows == default_viewport.visible_rows &&
+        viewport.offset_from_tail == default_viewport.offset_from_tail &&
+        viewport.follow_tail == default_viewport.follow_tail &&
+        viewport.alternate_screen_scroll_policy ==
+            default_viewport.alternate_screen_scroll_policy
+            ? fallback
+            : viewport;
+}
+
+void insert_public_scroll_policy_defaults(QJsonObject& object)
+{
+    insert_string_if_missing(
+        object,
+        QStringLiteral("effective_synchronized_output_scroll_policy"),
+        synchronized_output_scroll_policy_name(
+            Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION));
+    insert_string_if_missing(
+        object,
+        QStringLiteral("synchronized_output_scroll_policy_change_event"),
+        synchronized_output_policy_change_event_name(
+            Terminal_synchronized_output_policy_change_event::NONE));
+    insert_string_if_missing(
+        object,
+        QStringLiteral("diagnostic_reason"),
+        public_scroll_diagnostic_reason_name(
+            Terminal_public_scroll_diagnostic_reason::NONE));
+}
+
+QString legacy_snapshot_purpose_name(const QJsonObject& object)
+{
+    const QString reason = object.value(QStringLiteral("reason")).toString();
+
+    // Compatibility for snapshot records written before snapshot_purpose
+    // existed is limited to producer-owned reason strings. Free-form reason
+    // text remains CONTENT even when it happens to mention selection or
+    // geometry.
+    if (reason == QStringLiteral("selection changed")          ||
+        reason == QStringLiteral("selection cleared")          ||
+        reason == QStringLiteral("selection visual detached"))
+    {
+        return render_snapshot_purpose_name(
+            Terminal_render_snapshot_purpose::SELECTION_DERIVED);
+    }
+
+    if (reason == QStringLiteral("resize geometry snapshot ready")) {
+        return render_snapshot_purpose_name(
+            Terminal_render_snapshot_purpose::GEOMETRY_DERIVED);
+    }
+
+    return render_snapshot_purpose_name(Terminal_render_snapshot_purpose::CONTENT);
+}
+
+void insert_snapshot_public_scroll_fields(
+    QJsonObject&                    object,
+    const Terminal_render_snapshot& snapshot)
+{
+    const Terminal_public_scroll_diagnostics& diagnostics =
+        snapshot.public_scroll_diagnostics;
+    const Terminal_viewport_state public_viewport_before =
+        valid_transcript_viewport_or_fallback(
+            diagnostics.public_viewport_before,
+            snapshot.viewport);
+    const Terminal_viewport_state public_viewport_after =
+        valid_transcript_viewport_or_fallback(
+            diagnostics.public_viewport_after,
+            snapshot.viewport);
+    const Terminal_viewport_state live_viewport_before_on_release =
+        valid_transcript_viewport_or_fallback(
+            diagnostics.live_viewport_before_on_release,
+            snapshot.viewport);
+    const Terminal_viewport_state live_viewport_after_on_release =
+        valid_transcript_viewport_or_fallback(
+            diagnostics.live_viewport_after_on_release,
+            snapshot.viewport);
+
+    object.insert(QStringLiteral("snapshot_basis"), render_snapshot_basis_name(snapshot.basis));
+    object.insert(QStringLiteral("snapshot_purpose"), render_snapshot_purpose_name(snapshot.purpose));
+    object.insert(
+        QStringLiteral("effective_synchronized_output_scroll_policy"),
+        synchronized_output_scroll_policy_name(diagnostics.effective_policy));
+    object.insert(
+        QStringLiteral("synchronized_output_scroll_policy_change_event"),
+        synchronized_output_policy_change_event_name(diagnostics.policy_change_event));
+    object.insert(
+        QStringLiteral("diagnostic_reason"),
+        public_scroll_diagnostic_reason_name(diagnostics.diagnostic_reason));
+    insert_u64(
+        object,
+        QStringLiteral("public_projection_generation"),
+        diagnostics.public_projection_generation);
+    object.insert(
+        QStringLiteral("public_viewport_before"),
+        viewport_object(public_viewport_before));
+    object.insert(
+        QStringLiteral("public_viewport_after"),
+        viewport_object(public_viewport_after));
+    object.insert(
+        QStringLiteral("live_viewport_before_on_release"),
+        viewport_object(live_viewport_before_on_release));
+    object.insert(
+        QStringLiteral("live_viewport_after_on_release"),
+        viewport_object(live_viewport_after_on_release));
+    object.insert(QStringLiteral("visible_scroll_applied"), diagnostics.visible_scroll_applied);
+    object.insert(
+        QStringLiteral("live_content_publication_blocked"),
+        diagnostics.live_content_publication_blocked);
+    object.insert(
+        QStringLiteral("release_reconciliation_result"),
+        release_reconciliation_result_name(diagnostics.release_reconciliation_result));
+    object.insert(
+        QStringLiteral("hidden_row_eligibility"),
+        hidden_row_eligibility_name(diagnostics.hidden_row_eligibility));
+    object.insert(
+        QStringLiteral("hidden_row_clamp_reason"),
+        hidden_row_clamp_reason_name(diagnostics.hidden_row_clamp_reason));
+    object.insert(
+        QStringLiteral("public_projection_disable_reason"),
+        public_projection_disable_reason_name(diagnostics.public_projection_disable_reason));
+}
+
+void apply_snapshot_schema_compatibility_defaults(QJsonObject& object)
+{
+    insert_string_if_missing(
+        object,
+        QStringLiteral("snapshot_basis"),
+        render_snapshot_basis_name(Terminal_render_snapshot_basis::LIVE_CONTENT));
+    insert_string_if_missing(
+        object,
+        QStringLiteral("snapshot_purpose"),
+        legacy_snapshot_purpose_name(object));
+    insert_public_scroll_policy_defaults(object);
+    insert_u64_if_missing(object, QStringLiteral("public_projection_generation"), 0U);
+    insert_bool_if_missing(object, QStringLiteral("visible_scroll_applied"), false);
+    insert_bool_if_missing(object, QStringLiteral("live_content_publication_blocked"), false);
+    insert_string_if_missing(
+        object,
+        QStringLiteral("release_reconciliation_result"),
+        release_reconciliation_result_name(Terminal_release_reconciliation_result::NONE));
+    insert_string_if_missing(
+        object,
+        QStringLiteral("hidden_row_eligibility"),
+        hidden_row_eligibility_name(Terminal_hidden_row_eligibility::NOT_EVALUATED));
+    insert_string_if_missing(
+        object,
+        QStringLiteral("hidden_row_clamp_reason"),
+        hidden_row_clamp_reason_name(Terminal_hidden_row_clamp_reason::NONE));
+    insert_string_if_missing(
+        object,
+        QStringLiteral("public_projection_disable_reason"),
+        public_projection_disable_reason_name(Terminal_public_projection_disable_reason::NONE));
+
+    const QJsonObject viewport = object.value(QStringLiteral("viewport")).toObject();
+    if (!viewport.isEmpty()) {
+        if (!object.contains(QStringLiteral("public_viewport_before"))) {
+            object.insert(QStringLiteral("public_viewport_before"), viewport);
+        }
+        if (!object.contains(QStringLiteral("public_viewport_after"))) {
+            object.insert(QStringLiteral("public_viewport_after"), viewport);
+        }
+        if (!object.contains(QStringLiteral("live_viewport_before_on_release"))) {
+            object.insert(QStringLiteral("live_viewport_before_on_release"), viewport);
+        }
+        if (!object.contains(QStringLiteral("live_viewport_after_on_release"))) {
+            object.insert(QStringLiteral("live_viewport_after_on_release"), viewport);
+        }
+    }
+}
+
+void apply_transcript_compatibility_defaults(QJsonObject& object, const QString& kind)
+{
+    if (kind == QStringLiteral("snapshot")) {
+        apply_snapshot_schema_compatibility_defaults(object);
+        return;
+    }
+
+    if (kind == QStringLiteral("surface.wheel_trace")) {
+        insert_public_scroll_policy_defaults(object);
+    }
+}
+
 QString model_resize_result_name(Terminal_model_resize_result result)
 {
     switch (result) {
@@ -332,6 +547,8 @@ QString viewport_scroll_action_name(Terminal_viewport_scroll_action action)
             return QStringLiteral("viewport_moved");
         case Terminal_viewport_scroll_action::AT_BOUNDARY:
             return QStringLiteral("at_boundary");
+        case Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED:
+            return QStringLiteral("deferred_intent_recorded");
         case Terminal_viewport_scroll_action::TERMINAL_INPUT:
             return QStringLiteral("terminal_input");
     }
@@ -371,8 +588,12 @@ QJsonObject session_config_object(const Terminal_session_config& config)
     return {
         {QStringLiteral("recover_scrollback_from_primary_repaints"),
             config.recover_scrollback_from_primary_repaints},
+        {QStringLiteral("selection_viewport_projection_enabled"),
+            config.selection_viewport_projection_enabled},
         {QStringLiteral("scrollback_limit"),           effective_scrollback_limit},
         {QStringLiteral("effective_scrollback_limit"), effective_scrollback_limit},
+        {QStringLiteral("synchronized_output_scroll_policy"),
+            synchronized_output_scroll_policy_name(config.synchronized_output_scroll_policy)},
     };
 }
 
@@ -549,6 +770,25 @@ bool require_string_enum_field(
             .arg(line_number)
             .arg(value)
             .arg(field_name));
+}
+
+bool validate_optional_string_enum_field(
+    const QJsonObject&             object,
+    const QString&                 field_name,
+    std::initializer_list<QString> allowed_values,
+    int                            line_number,
+    QString*                       out_error)
+{
+    if (!object.contains(field_name)) {
+        return true;
+    }
+
+    return require_string_enum_field(
+        object,
+        field_name,
+        allowed_values,
+        line_number,
+        out_error);
 }
 
 bool require_object_field(
@@ -767,6 +1007,19 @@ bool validate_viewport_object(
     return true;
 }
 
+bool validate_optional_viewport_object(
+    const QJsonObject& object,
+    const QString&     field_name,
+    int                line_number,
+    QString*           out_error)
+{
+    if (!object.contains(field_name)) {
+        return true;
+    }
+
+    return validate_viewport_object(object, field_name, line_number, out_error);
+}
+
 bool validate_optional_session_config_object(
     const QJsonObject& object,
     int                line_number,
@@ -784,6 +1037,12 @@ bool validate_optional_session_config_object(
             QStringLiteral("recover_scrollback_from_primary_repaints"),
             line_number,
             out_error) &&
+        (!config.contains(QStringLiteral("selection_viewport_projection_enabled")) ||
+            require_bool_field(
+                config,
+                QStringLiteral("selection_viewport_projection_enabled"),
+                line_number,
+                out_error)) &&
         require_nonnegative_int_field(
             config,
             QStringLiteral("scrollback_limit"),
@@ -794,7 +1053,16 @@ bool validate_optional_session_config_object(
                 config,
                 QStringLiteral("effective_scrollback_limit"),
                 line_number,
-                out_error));
+                out_error)) &&
+        validate_optional_string_enum_field(
+            config,
+            QStringLiteral("synchronized_output_scroll_policy"),
+            {
+                QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION"),
+                QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"),
+            },
+            line_number,
+            out_error);
 }
 
 bool validate_base64_payload(
@@ -1088,6 +1356,191 @@ bool validate_selected_text_object(
     return true;
 }
 
+bool validate_optional_public_scroll_policy_fields(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        validate_optional_string_enum_field(
+            object,
+            QStringLiteral("effective_synchronized_output_scroll_policy"),
+            {
+                QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION"),
+                QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"),
+            },
+            line_number,
+            out_error) &&
+        validate_optional_string_enum_field(
+            object,
+            QStringLiteral("synchronized_output_scroll_policy_change_event"),
+            {
+                QStringLiteral("none"),
+                QStringLiteral("changed_mid_hold"),
+            },
+            line_number,
+            out_error) &&
+        validate_optional_string_enum_field(
+            object,
+            QStringLiteral("diagnostic_reason"),
+            {
+                QStringLiteral("none"),
+                QStringLiteral("synchronized_output_scroll_policy_changed_mid_hold"),
+                QStringLiteral("public_projection_geometry_invalidated"),
+                QStringLiteral("public_projection_memory_pressure_invalidated"),
+                QStringLiteral("public_projection_invalidated_deferred_intent"),
+                QStringLiteral("public_projection_scroll_publication_failed"),
+                QStringLiteral("detached_anchor_content_generation_changed"),
+                QStringLiteral("detached_anchor_geometry_changed"),
+                QStringLiteral("detached_anchor_not_retained"),
+                QStringLiteral("selection_public_projection_unsupported"),
+                QStringLiteral("screen_buffer_epoch_changed"),
+                QStringLiteral("buffer_transition_released"),
+            },
+            line_number,
+            out_error);
+}
+
+bool validate_optional_snapshot_public_scroll_fields(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        validate_optional_string_enum_field(
+            object,
+            QStringLiteral("snapshot_basis"),
+            {
+                QStringLiteral("LIVE_CONTENT"),
+                QStringLiteral("PUBLIC_PROJECTION"),
+            },
+            line_number,
+            out_error) &&
+        validate_optional_string_enum_field(
+            object,
+            QStringLiteral("snapshot_purpose"),
+            {
+                QStringLiteral("CONTENT"),
+                QStringLiteral("SELECTION_DERIVED"),
+                QStringLiteral("GEOMETRY_DERIVED"),
+                QStringLiteral("SCROLL"),
+            },
+            line_number,
+            out_error) &&
+        validate_optional_public_scroll_policy_fields(object, line_number, out_error) &&
+        (!object.contains(QStringLiteral("public_projection_generation")) ||
+            require_nonnegative_integral_field(
+                object,
+                QStringLiteral("public_projection_generation"),
+                line_number,
+                out_error)) &&
+        validate_optional_viewport_object(
+            object,
+            QStringLiteral("public_viewport_before"),
+            line_number,
+            out_error) &&
+        validate_optional_viewport_object(
+            object,
+            QStringLiteral("public_viewport_after"),
+            line_number,
+            out_error) &&
+        validate_optional_viewport_object(
+            object,
+            QStringLiteral("live_viewport_before_on_release"),
+            line_number,
+            out_error) &&
+        validate_optional_viewport_object(
+            object,
+            QStringLiteral("live_viewport_after_on_release"),
+            line_number,
+            out_error) &&
+        (!object.contains(QStringLiteral("visible_scroll_applied")) ||
+            require_bool_field(
+                object,
+                QStringLiteral("visible_scroll_applied"),
+                line_number,
+                out_error)) &&
+        (!object.contains(QStringLiteral("live_content_publication_blocked")) ||
+            require_bool_field(
+                object,
+                QStringLiteral("live_content_publication_blocked"),
+                line_number,
+                out_error)) &&
+        validate_optional_string_enum_field(
+            object,
+            QStringLiteral("release_reconciliation_result"),
+            {
+                QStringLiteral("none"),
+                QStringLiteral("sticky_tail"),
+                QStringLiteral("exact_anchor"),
+                QStringLiteral("retained_id_best_effort"),
+                QStringLiteral("nearest_successor"),
+                QStringLiteral("nearest_predecessor"),
+                QStringLiteral("oldest_available_live"),
+                QStringLiteral("deferred_offset"),
+                QStringLiteral("incompatible_buffer"),
+            },
+            line_number,
+            out_error) &&
+        validate_optional_string_enum_field(
+            object,
+            QStringLiteral("hidden_row_eligibility"),
+            {
+                QStringLiteral("not_evaluated"),
+                QStringLiteral("eligible"),
+                QStringLiteral("ineligible"),
+            },
+            line_number,
+            out_error) &&
+        validate_optional_string_enum_field(
+            object,
+            QStringLiteral("hidden_row_clamp_reason"),
+            {
+                QStringLiteral("none"),
+                QStringLiteral("public_viewport_boundary"),
+                QStringLiteral("live_viewport_boundary"),
+            },
+            line_number,
+            out_error) &&
+        validate_optional_string_enum_field(
+            object,
+            QStringLiteral("public_projection_disable_reason"),
+            {
+                QStringLiteral("none"),
+                QStringLiteral("geometry_invalidated"),
+                QStringLiteral("memory_pressure"),
+                QStringLiteral("projection_invalidated"),
+                QStringLiteral("unsupported_buffer"),
+            },
+            line_number,
+            out_error);
+}
+
+bool validate_snapshot_basis_purpose_biconditional(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    const QString basis = object.value(QStringLiteral("snapshot_basis")).toString(
+        render_snapshot_basis_name(Terminal_render_snapshot_basis::LIVE_CONTENT));
+    const QString purpose = object.value(QStringLiteral("snapshot_purpose")).toString(
+        legacy_snapshot_purpose_name(object));
+
+    const bool public_projection_basis = basis == QStringLiteral("PUBLIC_PROJECTION");
+    const bool scroll_purpose          = purpose == QStringLiteral("SCROLL");
+    if (public_projection_basis != scroll_purpose) {
+        return fail_read(
+            out_error,
+            QStringLiteral(
+                "transcript line %1 has incompatible snapshot_basis %2 and snapshot_purpose %3")
+                .arg(line_number)
+                .arg(basis)
+                .arg(purpose));
+    }
+
+    return true;
+}
+
 bool validate_event_object(
     const QJsonObject& object,
     const QString&     kind,
@@ -1331,7 +1784,8 @@ bool validate_event_object(
                     object,
                     QStringLiteral("requested_offset_from_tail"),
                     line_number,
-                    out_error));
+                    out_error)) &&
+            validate_optional_public_scroll_policy_fields(object, line_number, out_error);
     }
 
     if (kind == QStringLiteral("surface.scroll")) {
@@ -1353,6 +1807,7 @@ bool validate_event_object(
                 {
                     QStringLiteral("viewport_moved"),
                     QStringLiteral("at_boundary"),
+                    QStringLiteral("deferred_intent_recorded"),
                     QStringLiteral("terminal_input"),
                 },
                 line_number,
@@ -1378,7 +1833,8 @@ bool validate_event_object(
                     object,
                     QStringLiteral("viewport"),
                     line_number,
-                    out_error));
+                    out_error)) &&
+            validate_optional_public_scroll_policy_fields(object, line_number, out_error);
     }
 
     if (kind == QStringLiteral("surface.wheel_trace")) {
@@ -1470,6 +1926,7 @@ bool validate_event_object(
                     {
                         QStringLiteral("viewport_moved"),
                         QStringLiteral("at_boundary"),
+                        QStringLiteral("deferred_intent_recorded"),
                         QStringLiteral("terminal_input"),
                     },
                     line_number,
@@ -1503,7 +1960,8 @@ bool validate_event_object(
                     object,
                     QStringLiteral("viewport_after"),
                     line_number,
-                    out_error));
+                    out_error)) &&
+            validate_optional_public_scroll_policy_fields(object, line_number, out_error);
     }
 
     if (kind == QStringLiteral("surface.wheel_ingress")) {
@@ -1704,6 +2162,8 @@ bool validate_event_object(
                     QStringLiteral("row_origin_generation"),
                     line_number,
                     out_error)) &&
+            validate_optional_snapshot_public_scroll_fields(object, line_number, out_error) &&
+            validate_snapshot_basis_purpose_biconditional(object, line_number, out_error) &&
             validate_visible_rows_array(object, line_number, out_error) &&
             validate_row_provenance_array(object, line_number, out_error) &&
             validate_dirty_row_ranges_array(object, line_number, out_error) &&
@@ -2109,6 +2569,7 @@ bool Terminal_transcript_recorder::record_surface_scroll_intent(
 bool Terminal_transcript_recorder::record_surface_wheel_trace(QJsonObject object)
 {
     object.insert(QStringLiteral("kind"), QStringLiteral("surface.wheel_trace"));
+    insert_public_scroll_policy_defaults(object);
     return write_event(std::move(object));
 }
 
@@ -2164,6 +2625,7 @@ bool Terminal_transcript_recorder::record_snapshot(
     object.insert(QStringLiteral("grid_size"), grid_size_object(snapshot.grid_size));
     object.insert(QStringLiteral("viewport"), viewport_object(snapshot.viewport));
     object.insert(QStringLiteral("cursor"), cursor);
+    insert_snapshot_public_scroll_fields(object, snapshot);
     insert_u64(object, QStringLiteral("snapshot_sequence"), snapshot.metadata.sequence);
     insert_u64(object, QStringLiteral("row_origin_generation"), snapshot.metadata.row_origin_generation);
     object.insert(QStringLiteral("cell_count"), static_cast<int>(snapshot.cells.size()));
@@ -2393,7 +2855,7 @@ std::optional<std::vector<Terminal_transcript_event>> read_terminal_transcript(
             return std::nullopt;
         }
 
-        const QJsonObject object = document.object();
+        QJsonObject object = document.object();
         const QString kind = object.value(QStringLiteral("kind")).toString();
         std::uint64_t event_index = 0U;
         if (kind.isEmpty() || !read_event_index(object, &event_index)) {
@@ -2433,6 +2895,7 @@ std::optional<std::vector<Terminal_transcript_event>> read_terminal_transcript(
             return std::nullopt;
         }
 
+        apply_transcript_compatibility_defaults(object, kind);
         ++expected_event_index;
         events.push_back({event_index, kind, object});
     }

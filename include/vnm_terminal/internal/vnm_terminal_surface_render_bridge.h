@@ -114,6 +114,10 @@ public:
 
     static void simulate_stale_scene_graph_invalidated(
         VNM_TerminalSurface&       surface);
+
+    static void invalidate_public_projection_for_testing(
+        VNM_TerminalSurface&                       surface,
+        Terminal_public_projection_disable_reason  reason);
 };
 
 }

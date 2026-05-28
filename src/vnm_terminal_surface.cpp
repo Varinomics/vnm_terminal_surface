@@ -1155,6 +1155,39 @@ QString mouse_reporting_policy_name(VNM_TerminalSurface::Mouse_reporting_policy 
     return QStringLiteral("unknown");
 }
 
+term::Terminal_synchronized_output_scroll_policy terminal_synchronized_output_scroll_policy(
+    VNM_TerminalSurface::Synchronized_output_scroll_policy policy)
+{
+    switch (policy) {
+        case VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                DEFER_UNTIL_CONTENT_PUBLICATION:
+            return term::Terminal_synchronized_output_scroll_policy::
+                DEFER_UNTIL_CONTENT_PUBLICATION;
+        case VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                IMMEDIATE_PUBLIC_PROJECTION:
+            return term::Terminal_synchronized_output_scroll_policy::
+                IMMEDIATE_PUBLIC_PROJECTION;
+    }
+
+    return term::Terminal_synchronized_output_scroll_policy::
+        DEFER_UNTIL_CONTENT_PUBLICATION;
+}
+
+QString surface_synchronized_output_scroll_policy_name(
+    VNM_TerminalSurface::Synchronized_output_scroll_policy policy)
+{
+    switch (policy) {
+        case VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                DEFER_UNTIL_CONTENT_PUBLICATION:
+            return QStringLiteral("defer_until_content_publication");
+        case VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                IMMEDIATE_PUBLIC_PROJECTION:
+            return QStringLiteral("immediate_public_projection");
+    }
+
+    return QStringLiteral("unknown");
+}
+
 QString wheel_trace_scroll_action_name(term::Terminal_viewport_scroll_action action)
 {
     switch (action) {
@@ -1162,6 +1195,8 @@ QString wheel_trace_scroll_action_name(term::Terminal_viewport_scroll_action act
             return QStringLiteral("viewport_moved");
         case term::Terminal_viewport_scroll_action::AT_BOUNDARY:
             return QStringLiteral("at_boundary");
+        case term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED:
+            return QStringLiteral("deferred_intent_recorded");
         case term::Terminal_viewport_scroll_action::TERMINAL_INPUT:
             return QStringLiteral("terminal_input");
     }
@@ -1320,9 +1355,10 @@ void record_surface_scroll_transcript(
     const term::Terminal_viewport_state&                       viewport_after)
 {
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
-    if (recorder == nullptr ||
-        result.action != term::Terminal_viewport_scroll_action::VIEWPORT_MOVED)
-    {
+    const bool should_record =
+        result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED ||
+        result.action == term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED;
+    if (recorder == nullptr || !should_record) {
         return;
     }
 
@@ -2000,7 +2036,8 @@ void VNM_TerminalSurface::record_wheel_trace_event(
     bool               local_scroll_intent_recorded,
     const QString&     local_scroll_block_reason,
     const QString&     scroll_action,
-    int                applied_line_delta)
+    int                applied_line_delta,
+    bool               deferred_intent_recorded)
 {
     if (!m_wheel_trace_enabled) {
         return;
@@ -2068,10 +2105,24 @@ void VNM_TerminalSurface::record_wheel_trace_event(
         QStringLiteral("local_scroll_intent_recorded"),
         local_scroll_intent_recorded);
     const bool local_scroll_applied = applied_line_delta != 0;
+    std::optional<bool> visible_scroll_applied;
+    if (local_scroll_applied &&
+        render_publication_blocked &&
+        m_private->render_snapshot != nullptr &&
+        m_private->render_snapshot->basis ==
+            term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+        m_private->render_snapshot->purpose ==
+            term::Terminal_render_snapshot_purpose::SCROLL)
+    {
+        visible_scroll_applied =
+            m_private->render_snapshot->public_scroll_diagnostics.visible_scroll_applied;
+    }
     term::insert_wheel_trace_scroll_publication_fields(
         object,
         local_scroll_applied,
-        render_publication_blocked);
+        render_publication_blocked,
+        visible_scroll_applied,
+        deferred_intent_recorded);
     object.insert(QStringLiteral("live_sgr_mouse_reporting"), live_sgr_mouse_reporting);
     object.insert(QStringLiteral("published_sgr_mouse_reporting"), published_sgr_mouse_reporting);
     object.insert(QStringLiteral("published_mouse_tracking"), published_mouse_tracking);
@@ -2084,6 +2135,10 @@ void VNM_TerminalSurface::record_wheel_trace_event(
         object.insert(QStringLiteral("scroll_action"), scroll_action);
         object.insert(QStringLiteral("applied_line_delta"), applied_line_delta);
     }
+    object.insert(
+        QStringLiteral("synchronized_output_scroll_policy"),
+        surface_synchronized_output_scroll_policy_name(
+            m_synchronized_output_scroll_policy));
 
     record_surface_wheel_trace_transcript(
         m_private->transcript_recorder,
@@ -2107,6 +2162,27 @@ void VNM_TerminalSurface::set_synchronized_output_stale_timeout_ms(int timeout_m
     m_synchronized_output_stale_timeout_ms = bounded_timeout_ms;
     emit synchronized_output_stale_timeout_ms_changed();
     sync_synchronized_output_recovery_timer();
+}
+
+VNM_TerminalSurface::Synchronized_output_scroll_policy
+VNM_TerminalSurface::synchronized_output_scroll_policy() const
+{
+    return m_synchronized_output_scroll_policy;
+}
+
+void VNM_TerminalSurface::set_synchronized_output_scroll_policy(
+    Synchronized_output_scroll_policy policy)
+{
+    if (m_synchronized_output_scroll_policy == policy) {
+        return;
+    }
+
+    m_synchronized_output_scroll_policy = policy;
+    if (m_private->session != nullptr) {
+        m_private->session->set_synchronized_output_scroll_policy(
+            terminal_synchronized_output_scroll_policy(policy));
+    }
+    emit synchronized_output_scroll_policy_changed();
 }
 
 VNM_TerminalSurface::Mouse_reporting_policy VNM_TerminalSurface::mouse_reporting_policy() const
@@ -2425,21 +2501,31 @@ bool VNM_TerminalSurface::paste_text(QString text)
 
 bool VNM_TerminalSurface::scroll_viewport_lines(int line_delta)
 {
-    return scroll_viewport_lines_with_diagnostics(line_delta).local_scroll_applied;
+    return scroll_viewport_lines_with_diagnostics(line_delta).event_accepted;
 }
 
 VNM_TerminalSurface::wheel_scroll_diagnostic_result_t
 VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(int line_delta)
 {
+    return scroll_viewport_lines_with_diagnostics(
+        line_delta,
+        QStringLiteral("api.lines"));
+}
+
+VNM_TerminalSurface::wheel_scroll_diagnostic_result_t
+VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(
+    int     line_delta,
+    QString source)
+{
     Q_ASSERT(thread() == QThread::currentThread());
 
     wheel_scroll_diagnostic_result_t diagnostic;
+    diagnostic.session_present = m_private->session != nullptr;
     if (line_delta == 0) {
         diagnostic.no_op_cause = QStringLiteral("zero_line_delta");
         return diagnostic;
     }
 
-    diagnostic.session_present = m_private->session != nullptr;
     if (!diagnostic.session_present) {
         diagnostic.no_op_cause = QStringLiteral("no_session");
         return diagnostic;
@@ -2450,20 +2536,19 @@ VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(int line_delta)
     diagnostic.published_synchronized_output =
         m_private->render_snapshot != nullptr &&
         m_private->render_snapshot->modes.synchronized_output;
-    if (m_private->render_snapshot != nullptr) {
-        diagnostic.alternate_screen =
-            m_private->render_snapshot->viewport.active_buffer ==
-            term::Terminal_buffer_id::ALTERNATE;
-    }
 
     const term::Terminal_viewport_state viewport_before =
-        m_private->session->viewport_state();
+        m_private->render_snapshot != nullptr
+            ? m_private->render_snapshot->viewport
+            : m_private->session->viewport_state();
     diagnostic.alternate_screen =
-        diagnostic.alternate_screen ||
         viewport_before.active_buffer == term::Terminal_buffer_id::ALTERNATE;
+    if (source.isEmpty()) {
+        source = QStringLiteral("api.lines");
+    }
     record_surface_scroll_intent_transcript(
         m_private->transcript_recorder,
-        QStringLiteral("api.lines"),
+        source,
         line_delta,
         std::nullopt,
         viewport_before);
@@ -2474,16 +2559,41 @@ VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(int line_delta)
         wheel_trace_scroll_action_name(scroll_result.action);
     diagnostic.applied_line_delta = scroll_result.applied_line_delta;
     sync_from_session();
-    if (scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED) {
+    diagnostic.local_scroll_applied =
+        scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED;
+    diagnostic.deferred_intent_recorded =
+        scroll_result.action ==
+            term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED;
+    diagnostic.event_accepted =
+        diagnostic.local_scroll_applied || diagnostic.deferred_intent_recorded;
+
+    if (diagnostic.event_accepted)
+    {
+        const term::Terminal_viewport_state viewport_after =
+            m_private->render_snapshot != nullptr
+                ? m_private->render_snapshot->viewport
+                : m_private->session->viewport_state();
+        const bool render_publication_blocked_after_scroll =
+            m_private->session->render_publication_blocked();
+        const bool public_projection_scroll_visible =
+            render_publication_blocked_after_scroll &&
+            m_private->render_snapshot != nullptr &&
+            m_private->render_snapshot->basis ==
+                term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+            m_private->render_snapshot->purpose ==
+                term::Terminal_render_snapshot_purpose::SCROLL &&
+            m_private->render_snapshot->public_scroll_diagnostics.visible_scroll_applied;
+        diagnostic.visible_scroll_applied =
+            diagnostic.local_scroll_applied &&
+            (!render_publication_blocked_after_scroll || public_projection_scroll_visible);
         record_surface_scroll_transcript(
             m_private->transcript_recorder,
-            QStringLiteral("api.lines"),
+            source,
             line_delta,
             std::nullopt,
             scroll_result,
             viewport_before,
-            m_private->session->viewport_state());
-        diagnostic.local_scroll_applied = true;
+            viewport_after);
         return diagnostic;
     }
 
@@ -2511,34 +2621,129 @@ VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(int line_delta)
 
 bool VNM_TerminalSurface::scroll_to_offset_from_tail(int offset_from_tail)
 {
+    return scroll_to_offset_from_tail_with_diagnostics(
+        offset_from_tail,
+        QStringLiteral("api.offset")).event_accepted;
+}
+
+VNM_TerminalSurface::wheel_scroll_diagnostic_result_t
+VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(int offset_from_tail)
+{
+    return scroll_to_offset_from_tail_with_diagnostics(
+        offset_from_tail,
+        QStringLiteral("api.offset"));
+}
+
+VNM_TerminalSurface::wheel_scroll_diagnostic_result_t
+VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
+    int     offset_from_tail,
+    QString source)
+{
     Q_ASSERT(thread() == QThread::currentThread());
 
+    wheel_scroll_diagnostic_result_t diagnostic;
+    diagnostic.session_present = m_private->session != nullptr;
     if (m_private->session == nullptr) {
-        return false;
+        diagnostic.no_op_cause = QStringLiteral("no_session");
+        return diagnostic;
     }
 
+    diagnostic.render_publication_blocked =
+        m_private->session->render_publication_blocked();
+    diagnostic.published_synchronized_output =
+        m_private->render_snapshot != nullptr &&
+        m_private->render_snapshot->modes.synchronized_output;
     const term::Terminal_viewport_state viewport_before =
-        m_private->session->viewport_state();
+        m_private->render_snapshot != nullptr
+            ? m_private->render_snapshot->viewport
+            : m_private->session->viewport_state();
+    diagnostic.alternate_screen =
+        viewport_before.active_buffer == term::Terminal_buffer_id::ALTERNATE;
+    if (source.isEmpty()) {
+        source = QStringLiteral("api.offset");
+    }
+    const int requested_line_delta =
+        offset_from_tail - viewport_before.offset_from_tail;
     record_surface_scroll_intent_transcript(
         m_private->transcript_recorder,
-        QStringLiteral("api.offset"),
-        offset_from_tail - viewport_before.offset_from_tail,
+        source,
+        requested_line_delta,
         offset_from_tail,
         viewport_before);
+    diagnostic.local_scroll_intent_recorded = true;
     const term::Terminal_viewport_scroll_result scroll_result =
         m_private->session->scroll_published_viewport_to_offset_from_tail(offset_from_tail);
+    diagnostic.scroll_action =
+        wheel_trace_scroll_action_name(scroll_result.action);
+    diagnostic.applied_line_delta = scroll_result.applied_line_delta;
     sync_from_session();
-    if (scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED) {
+    diagnostic.local_scroll_applied =
+        scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED;
+    diagnostic.deferred_intent_recorded =
+        scroll_result.action ==
+            term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED;
+    diagnostic.event_accepted =
+        scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED ||
+        scroll_result.action ==
+            term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED;
+    if (diagnostic.event_accepted) {
+        const term::Terminal_viewport_state viewport_after =
+            m_private->render_snapshot != nullptr
+                ? m_private->render_snapshot->viewport
+                : m_private->session->viewport_state();
+        const bool render_publication_blocked_after_scroll =
+            m_private->session->render_publication_blocked();
+        const bool public_projection_scroll_visible =
+            render_publication_blocked_after_scroll &&
+            m_private->render_snapshot != nullptr &&
+            m_private->render_snapshot->basis ==
+                term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+            m_private->render_snapshot->purpose ==
+                term::Terminal_render_snapshot_purpose::SCROLL &&
+            m_private->render_snapshot->public_scroll_diagnostics.visible_scroll_applied;
+        diagnostic.visible_scroll_applied =
+            diagnostic.local_scroll_applied &&
+            (!render_publication_blocked_after_scroll || public_projection_scroll_visible);
         record_surface_scroll_transcript(
             m_private->transcript_recorder,
-            QStringLiteral("api.offset"),
-            scroll_result.applied_line_delta,
+            source,
+            requested_line_delta,
             offset_from_tail,
             scroll_result,
             viewport_before,
-            m_private->session->viewport_state());
+            viewport_after);
+        return diagnostic;
     }
-    return scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED;
+
+    if (diagnostic.render_publication_blocked) {
+        diagnostic.no_op_cause = QStringLiteral("synchronized_output_deferred");
+    }
+    else
+    if (diagnostic.published_synchronized_output) {
+        diagnostic.no_op_cause = QStringLiteral("synchronized_output_published");
+    }
+    else
+    if (diagnostic.alternate_screen) {
+        diagnostic.no_op_cause = QStringLiteral("alternate_screen");
+    }
+    else
+    if (scroll_result.action == term::Terminal_viewport_scroll_action::AT_BOUNDARY) {
+        diagnostic.no_op_cause = QStringLiteral("boundary_or_clamp");
+    }
+    else {
+        diagnostic.no_op_cause = QStringLiteral("no_publication");
+    }
+
+    return diagnostic;
+}
+
+bool VNM_TerminalSurface::scroll_to_offset_from_tail_from_source(
+    int     offset_from_tail,
+    QString source)
+{
+    return scroll_to_offset_from_tail_with_diagnostics(
+        offset_from_tail,
+        std::move(source)).event_accepted;
 }
 
 bool VNM_TerminalSurface::start_process(QStringList argv, QString working_directory)
@@ -2731,39 +2936,17 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             }
 
             const int direction = event->key() == Qt::Key_PageUp ? 1 : -1;
-            const term::Terminal_viewport_state viewport =
-                m_private->session->viewport_state();
-            if (viewport.active_buffer   == term::Terminal_buffer_id::PRIMARY &&
-                viewport.scrollback_rows >  0)
+            const std::shared_ptr<const term::Terminal_render_snapshot> published_snapshot =
+                m_private->render_snapshot;
+            if (published_snapshot != nullptr &&
+                published_snapshot->viewport.active_buffer   == term::Terminal_buffer_id::PRIMARY &&
+                published_snapshot->viewport.scrollback_rows >  0)
             {
                 const int visible_rows =
-                    std::max(1, viewport.visible_rows);
-                const term::Terminal_viewport_state viewport_before =
-                    m_private->session->viewport_state();
-                record_surface_scroll_intent_transcript(
-                    m_private->transcript_recorder,
-                    QStringLiteral("page_key"),
+                    std::max(1, published_snapshot->viewport.visible_rows);
+                (void)scroll_viewport_lines_with_diagnostics(
                     direction * visible_rows,
-                    std::nullopt,
-                    viewport_before);
-                const term::Terminal_viewport_scroll_result scroll_result =
-                    m_private->session->scroll_viewport_lines(direction * visible_rows);
-                if (scroll_result.action ==
-                    term::Terminal_viewport_scroll_action::VIEWPORT_MOVED)
-                {
-                    sync_from_session();
-                    record_surface_scroll_transcript(
-                        m_private->transcript_recorder,
-                        QStringLiteral("page_key"),
-                        direction * visible_rows,
-                        std::nullopt,
-                        scroll_result,
-                        viewport_before,
-                        m_private->session->viewport_state());
-                    event->accept();
-                    return;
-                }
-
+                    QStringLiteral("key.page"));
                 event->accept();
                 return;
             }
@@ -3642,7 +3825,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
     if (m_wheel_trace_enabled) {
         record_surface_wheel_ingress_transcript(
             m_private->transcript_recorder,
-            QStringLiteral("surface.text_area"),
+            QStringLiteral("surface.text_area.wheel"),
             *event);
     }
 
@@ -3663,6 +3846,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
     bool   local_scroll_possible        = false;
     bool   local_scroll_intent_recorded = false;
     bool   local_scroll_applied         = false;
+    bool   deferred_intent_recorded     = false;
     bool   application_route_attempted  = false;
     bool   alternate_screen             = false;
     bool   live_sgr_mouse_reporting     = false;
@@ -3681,6 +3865,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
     term::Terminal_viewport_scroll_result trace_scroll_result;
     term::Terminal_viewport_state         trace_viewport_before;
     term::Terminal_viewport_state         trace_viewport_after;
+    std::optional<bool>                   trace_visible_scroll_applied;
 
     const auto finish_trace =
         [&](const QString& route, const QString& outcome, bool accepted) {
@@ -3690,7 +3875,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
             trace_written = true;
 
             QJsonObject object =
-                wheel_trace_event_object(QStringLiteral("surface.text_area"), *event);
+                wheel_trace_event_object(QStringLiteral("surface.text_area.wheel"), *event);
             object.insert(QStringLiteral("route"), route);
             object.insert(QStringLiteral("outcome"), outcome);
             object.insert(QStringLiteral("accepted"), accepted);
@@ -3750,7 +3935,9 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
             term::insert_wheel_trace_scroll_publication_fields(
                 object,
                 local_scroll_applied,
-                render_publication_blocked);
+                render_publication_blocked,
+                trace_visible_scroll_applied,
+                deferred_intent_recorded);
             object.insert(
                 QStringLiteral("application_route_attempted"),
                 application_route_attempted);
@@ -4113,7 +4300,14 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 
         const term::Terminal_viewport_state viewport = wheel_snapshot->viewport;
         const int scroll_direction = vertical_wheel_direction(*event);
-        local_scroll_possible = viewport_state_can_scroll_locally(viewport, scroll_direction);
+        const bool immediate_projection_hold =
+            viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+            m_private->session->effective_synchronized_output_scroll_policy() ==
+                term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION &&
+            m_private->session->render_publication_blocked();
+        local_scroll_possible =
+            viewport_state_can_scroll_locally(viewport, scroll_direction) ||
+            immediate_projection_hold;
         if (!local_scroll_possible) {
             event->ignore();
             local_scroll_block_reason =
@@ -4153,7 +4347,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
         has_viewport_before   = true;
         record_surface_scroll_intent_transcript(
             m_private->transcript_recorder,
-            QStringLiteral("wheel"),
+            QStringLiteral("surface.text_area.wheel"),
             effective_line_delta,
             std::nullopt,
             viewport_before);
@@ -4164,27 +4358,54 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
                 viewport_before);
         trace_scroll_result = scroll_result;
         has_scroll_result   = true;
-        if (scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED) {
+        deferred_intent_recorded =
+            scroll_result.action ==
+                term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED;
+        if (scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED ||
+            deferred_intent_recorded)
+        {
             sync_from_session();
-            trace_viewport_after = m_private->session->viewport_state();
+            trace_viewport_after =
+                m_private->render_snapshot != nullptr
+                    ? m_private->render_snapshot->viewport
+                    : m_private->session->viewport_state();
             has_viewport_after   = true;
-            local_scroll_applied = true;
+            local_scroll_applied =
+                scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED;
             record_surface_scroll_transcript(
                 m_private->transcript_recorder,
-                QStringLiteral("wheel"),
+                QStringLiteral("surface.text_area.wheel"),
                 effective_line_delta,
                 std::nullopt,
                 scroll_result,
                 viewport_before,
                 trace_viewport_after);
             event->accept();
+            const bool render_publication_blocked_after_scroll =
+                m_private->session->render_publication_blocked();
+            const bool public_projection_scroll_visible =
+                render_publication_blocked_after_scroll &&
+                m_private->render_snapshot != nullptr &&
+                m_private->render_snapshot->basis ==
+                    term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+                m_private->render_snapshot->purpose ==
+                    term::Terminal_render_snapshot_purpose::SCROLL &&
+                m_private->render_snapshot->public_scroll_diagnostics.visible_scroll_applied;
             const bool visible_scroll_applied =
-                !m_private->session->render_publication_blocked();
+                local_scroll_applied &&
+                (!render_publication_blocked_after_scroll || public_projection_scroll_visible);
+            trace_visible_scroll_applied = visible_scroll_applied;
+            const QString outcome =
+                deferred_intent_recorded
+                    ? QStringLiteral("public_projection_deferred_intent_recorded")
+                    : public_projection_scroll_visible
+                    ? QStringLiteral("public_projection_scroll_visible")
+                    : visible_scroll_applied
+                    ? QStringLiteral("local_scroll_applied")
+                    : QStringLiteral("local_scroll_publication_deferred");
             finish_trace(
                 QStringLiteral("local_scroll"),
-                visible_scroll_applied
-                    ? QStringLiteral("local_scroll_applied")
-                    : QStringLiteral("local_scroll_publication_deferred"),
+                outcome,
                 true);
             return true;
         }
@@ -4576,12 +4797,15 @@ bool VNM_TerminalSurface::start_process_with_backend(
 #endif
 
     term::Terminal_session_config session_config;
-    session_config.trace_notification_limit    = k_surface_notification_trace_limit;
-    session_config.scrollback_limit            = m_scrollback_limit;
-    session_config.backend_output_capture_path = m_backend_output_capture_path;
-    session_config.capture_dirty_row_stats     = m_private->dirty_row_stats_enabled;
-    session_config.selection_trace_enabled     = m_selection_trace_enabled;
-    session_config.transcript_recorder         = m_private->transcript_recorder;
+    session_config.trace_notification_limit              = k_surface_notification_trace_limit;
+    session_config.scrollback_limit                      = m_scrollback_limit;
+    session_config.backend_output_capture_path           = m_backend_output_capture_path;
+    session_config.capture_dirty_row_stats               = m_private->dirty_row_stats_enabled;
+    session_config.selection_trace_enabled               = m_selection_trace_enabled;
+    session_config.transcript_recorder                   = m_private->transcript_recorder;
+    session_config.selection_viewport_projection_enabled = true;
+    session_config.synchronized_output_scroll_policy =
+        terminal_synchronized_output_scroll_policy(m_synchronized_output_scroll_policy);
 #if defined(Q_OS_WIN)
     session_config.recover_scrollback_from_primary_repaints = true;
 #endif
@@ -5311,4 +5535,17 @@ void term::VNM_TerminalSurface_render_bridge::simulate_stale_scene_graph_invalid
         generation == 0U
             ? ~std::uint64_t{0U}
             : generation - 1U);
+}
+
+void term::VNM_TerminalSurface_render_bridge::invalidate_public_projection_for_testing(
+    VNM_TerminalSurface&                       surface,
+    Terminal_public_projection_disable_reason  reason)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    if (surface.m_private->session == nullptr) {
+        return;
+    }
+
+    surface.m_private->session->invalidate_public_projection_for_testing(reason);
+    surface.sync_from_session();
 }

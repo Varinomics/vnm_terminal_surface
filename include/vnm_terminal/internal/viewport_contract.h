@@ -24,6 +24,7 @@ enum class Terminal_viewport_scroll_action
 {
     VIEWPORT_MOVED,
     AT_BOUNDARY,
+    DEFERRED_INTENT_RECORDED,
     TERMINAL_INPUT,
 };
 

@@ -51,7 +51,9 @@ struct Terminal_transcript_surface_selection_drag_event
 void insert_wheel_trace_scroll_publication_fields(
     QJsonObject& object,
     bool         local_scroll_applied,
-    bool         render_publication_blocked);
+    bool         render_publication_blocked,
+    std::optional<bool> visible_scroll_applied = std::nullopt,
+    bool         deferred_intent_recorded = false);
 
 class Terminal_transcript_recorder
 {

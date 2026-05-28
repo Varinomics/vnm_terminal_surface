@@ -40,6 +40,13 @@ QString buffer_name(term::Terminal_buffer_id buffer)
     return QStringLiteral("unknown");
 }
 
+term::Terminal_buffer_id buffer_from_name(const QString& buffer)
+{
+    return buffer == QStringLiteral("alternate")
+        ? term::Terminal_buffer_id::ALTERNATE
+        : term::Terminal_buffer_id::PRIMARY;
+}
+
 QString selection_mode_name(term::Terminal_selection_mode mode)
 {
     switch (mode) {
@@ -66,6 +73,14 @@ QString alternate_policy_name(term::Terminal_alternate_screen_scroll_policy poli
     }
 
     return QStringLiteral("unknown");
+}
+
+term::Terminal_alternate_screen_scroll_policy alternate_policy_from_name(
+    const QString& policy)
+{
+    return policy == QStringLiteral("wheel_to_terminal_input")
+        ? term::Terminal_alternate_screen_scroll_policy::WHEEL_TO_TERMINAL_INPUT
+        : term::Terminal_alternate_screen_scroll_policy::KEEP_AT_TAIL;
 }
 
 QString escaped_text(QString text)
@@ -248,6 +263,42 @@ QJsonObject viewport_object(const term::Terminal_viewport_state& viewport)
     };
 }
 
+term::Terminal_viewport_state viewport_from_object(const QJsonObject& object)
+{
+    term::Terminal_viewport_state viewport;
+    viewport.active_buffer =
+        buffer_from_name(object.value(QStringLiteral("active_buffer")).toString());
+    viewport.scrollback_rows =
+        object.value(QStringLiteral("scrollback_rows")).toInt();
+    viewport.visible_rows =
+        object.value(QStringLiteral("visible_rows")).toInt();
+    viewport.offset_from_tail =
+        object.value(QStringLiteral("offset_from_tail")).toInt();
+    viewport.follow_tail =
+        object.value(QStringLiteral("follow_tail")).toBool();
+    viewport.alternate_screen_scroll_policy =
+        alternate_policy_from_name(
+            object.value(QStringLiteral("alternate_screen_scroll_policy")).toString());
+    return viewport;
+}
+
+term::Terminal_viewport_state valid_transcript_viewport_or_fallback(
+    term::Terminal_viewport_state viewport,
+    term::Terminal_viewport_state fallback)
+{
+    const term::Terminal_viewport_state default_viewport;
+    return
+        viewport.active_buffer == default_viewport.active_buffer &&
+        viewport.scrollback_rows == default_viewport.scrollback_rows &&
+        viewport.visible_rows == default_viewport.visible_rows &&
+        viewport.offset_from_tail == default_viewport.offset_from_tail &&
+        viewport.follow_tail == default_viewport.follow_tail &&
+        viewport.alternate_screen_scroll_policy ==
+            default_viewport.alternate_screen_scroll_policy
+            ? fallback
+            : viewport;
+}
+
 QString scroll_action_name(term::Terminal_viewport_scroll_action action)
 {
     switch (action) {
@@ -255,6 +306,8 @@ QString scroll_action_name(term::Terminal_viewport_scroll_action action)
             return QStringLiteral("viewport_moved");
         case term::Terminal_viewport_scroll_action::AT_BOUNDARY:
             return QStringLiteral("at_boundary");
+        case term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED:
+            return QStringLiteral("deferred_intent_recorded");
         case term::Terminal_viewport_scroll_action::TERMINAL_INPUT:
             return QStringLiteral("terminal_input");
     }
@@ -361,6 +414,69 @@ QJsonObject snapshot_diagnostics_object(const term::Terminal_render_snapshot& sn
     object.insert(QStringLiteral("grid_size"), grid_size_object(snapshot.grid_size));
     object.insert(QStringLiteral("viewport"), viewport_object(snapshot.viewport));
     object.insert(QStringLiteral("cursor"), cursor);
+    object.insert(QStringLiteral("snapshot_basis"), term::render_snapshot_basis_name(snapshot.basis));
+    object.insert(QStringLiteral("snapshot_purpose"), term::render_snapshot_purpose_name(snapshot.purpose));
+    object.insert(
+        QStringLiteral("effective_synchronized_output_scroll_policy"),
+        term::synchronized_output_scroll_policy_name(
+            snapshot.public_scroll_diagnostics.effective_policy));
+    object.insert(
+        QStringLiteral("synchronized_output_scroll_policy_change_event"),
+        term::synchronized_output_policy_change_event_name(
+            snapshot.public_scroll_diagnostics.policy_change_event));
+    object.insert(
+        QStringLiteral("diagnostic_reason"),
+        term::public_scroll_diagnostic_reason_name(
+            snapshot.public_scroll_diagnostics.diagnostic_reason));
+    object.insert(
+        QStringLiteral("public_projection_generation"),
+        static_cast<qint64>(snapshot.public_scroll_diagnostics.public_projection_generation));
+    object.insert(
+        QStringLiteral("public_viewport_before"),
+        viewport_object(
+            valid_transcript_viewport_or_fallback(
+                snapshot.public_scroll_diagnostics.public_viewport_before,
+                snapshot.viewport)));
+    object.insert(
+        QStringLiteral("public_viewport_after"),
+        viewport_object(
+            valid_transcript_viewport_or_fallback(
+                snapshot.public_scroll_diagnostics.public_viewport_after,
+                snapshot.viewport)));
+    object.insert(
+        QStringLiteral("live_viewport_before_on_release"),
+        viewport_object(
+            valid_transcript_viewport_or_fallback(
+                snapshot.public_scroll_diagnostics.live_viewport_before_on_release,
+                snapshot.viewport)));
+    object.insert(
+        QStringLiteral("live_viewport_after_on_release"),
+        viewport_object(
+            valid_transcript_viewport_or_fallback(
+                snapshot.public_scroll_diagnostics.live_viewport_after_on_release,
+                snapshot.viewport)));
+    object.insert(
+        QStringLiteral("visible_scroll_applied"),
+        snapshot.public_scroll_diagnostics.visible_scroll_applied);
+    object.insert(
+        QStringLiteral("live_content_publication_blocked"),
+        snapshot.public_scroll_diagnostics.live_content_publication_blocked);
+    object.insert(
+        QStringLiteral("release_reconciliation_result"),
+        term::release_reconciliation_result_name(
+            snapshot.public_scroll_diagnostics.release_reconciliation_result));
+    object.insert(
+        QStringLiteral("hidden_row_eligibility"),
+        term::hidden_row_eligibility_name(
+            snapshot.public_scroll_diagnostics.hidden_row_eligibility));
+    object.insert(
+        QStringLiteral("hidden_row_clamp_reason"),
+        term::hidden_row_clamp_reason_name(
+            snapshot.public_scroll_diagnostics.hidden_row_clamp_reason));
+    object.insert(
+        QStringLiteral("public_projection_disable_reason"),
+        term::public_projection_disable_reason_name(
+            snapshot.public_scroll_diagnostics.public_projection_disable_reason));
     object.insert(QStringLiteral("snapshot_sequence"), static_cast<qint64>(snapshot.metadata.sequence));
     object.insert(
         QStringLiteral("row_origin_generation"),
@@ -432,6 +548,16 @@ bool viewport_offset_matches_recorded_after(
         viewport_after.value(QStringLiteral("offset_from_tail")).toInt();
 }
 
+bool visible_viewport_offset_matches_recorded_after(
+    const term::Terminal_session&          session,
+    const term::Terminal_transcript_event& event)
+{
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session.latest_render_snapshot();
+    return snapshot.has_value() &&
+        viewport_offset_matches_recorded_after(snapshot->viewport, event);
+}
+
 int max_recorded_scrollback_rows(const std::vector<term::Terminal_transcript_event>& events)
 {
     int max_scrollback_rows = 0;
@@ -456,6 +582,23 @@ bool is_replay_transparent_diagnostic_event(const QString& kind)
         kind == QStringLiteral("surface.wheel_trace");
 }
 
+bool transcript_uses_immediate_public_projection(
+    const std::vector<term::Terminal_transcript_event>& events)
+{
+    for (const term::Terminal_transcript_event& event : events) {
+        if (event.object.value(QStringLiteral("snapshot_basis")).toString() ==
+                QStringLiteral("PUBLIC_PROJECTION") ||
+            event.object.value(
+                QStringLiteral("effective_synchronized_output_scroll_policy")).toString() ==
+                QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 term::Terminal_session_config replay_session_config(
     const std::vector<term::Terminal_transcript_event>& events)
 {
@@ -476,6 +619,20 @@ term::Terminal_session_config replay_session_config(
                 : session_config.value(QStringLiteral("scrollback_limit")).toInt();
         config.recover_scrollback_from_primary_repaints =
             session_config.value(QStringLiteral("recover_scrollback_from_primary_repaints")).toBool();
+        config.selection_viewport_projection_enabled =
+            session_config.value(QStringLiteral("selection_viewport_projection_enabled")).toBool();
+        const QJsonValue explicit_scroll_policy =
+            session_config.value(QStringLiteral("synchronized_output_scroll_policy"));
+        if (explicit_scroll_policy.toString() == QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"))
+        {
+            config.synchronized_output_scroll_policy =
+                term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+        }
+        else
+        if (!explicit_scroll_policy.isString() && transcript_uses_immediate_public_projection(events)) {
+            config.synchronized_output_scroll_policy =
+                term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+        }
         return config;
     }
 
@@ -483,6 +640,10 @@ term::Terminal_session_config replay_session_config(
     config.scrollback_limit =
         recorded_scrollback_rows > 0 ? recorded_scrollback_rows : k_surface_default_scrollback_limit;
     config.recover_scrollback_from_primary_repaints = true;
+    if (transcript_uses_immediate_public_projection(events)) {
+        config.synchronized_output_scroll_policy =
+            term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+    }
     return config;
 }
 
@@ -598,6 +759,7 @@ struct Replay_result
     int matching_snapshot_events           = 0;
     int divergent_snapshot_events          = 0;
     int dirty_mismatch_snapshot_events     = 0;
+    int public_projection_scroll_snapshot_events = 0;
     int semantic_selection_events          = 0;
     int surface_scroll_intents             = 0;
     std::optional<std::uint64_t> first_divergent_event_index;
@@ -667,6 +829,11 @@ void compare_recorded_snapshot(
 {
     const std::optional<term::Terminal_render_snapshot> snapshot =
         session.latest_render_snapshot();
+    const bool recorded_public_projection_scroll =
+        event.object.value(QStringLiteral("snapshot_basis")).toString() ==
+            QStringLiteral("PUBLIC_PROJECTION") &&
+        event.object.value(QStringLiteral("snapshot_purpose")).toString() ==
+            QStringLiteral("SCROLL");
     if (!snapshot.has_value()) {
         ++replay.divergent_snapshot_events;
         record_first_snapshot_divergence(replay, event, std::nullopt);
@@ -674,6 +841,15 @@ void compare_recorded_snapshot(
     }
 
     const QJsonObject replayed_object = snapshot_diagnostics_object(*snapshot);
+    if (recorded_public_projection_scroll &&
+        (snapshot->basis   != term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION ||
+            snapshot->purpose != term::Terminal_render_snapshot_purpose::SCROLL))
+    {
+        ++replay.divergent_snapshot_events;
+        record_first_snapshot_divergence(replay, event, replayed_object);
+        return;
+    }
+
     if (dirty_snapshot_fields_differ(event.object, replayed_object)) {
         ++replay.dirty_mismatch_snapshot_events;
         record_first_dirty_mismatch(replay, event, replayed_object);
@@ -682,6 +858,9 @@ void compare_recorded_snapshot(
     const QByteArray recorded = canonical_model_json(event.object);
     const QByteArray replayed = canonical_model_json(replayed_object);
     if (recorded == replayed) {
+        if (recorded_public_projection_scroll) {
+            ++replay.public_projection_scroll_snapshot_events;
+        }
         ++replay.matching_snapshot_events;
         return;
     }
@@ -742,6 +921,15 @@ bool scroll_event_matches_pending_intent(
     return true;
 }
 
+bool scroll_event_uses_published_state_source(
+    const term::Terminal_transcript_event& event)
+{
+    return
+        event.object.value(QStringLiteral("source")).toString() ==
+            QStringLiteral("surface.text_area.wheel") &&
+        event.object.contains(QStringLiteral("viewport_before"));
+}
+
 bool apply_scroll_event(
     term::Terminal_session&                session,
     const term::Terminal_transcript_event& event,
@@ -752,6 +940,12 @@ bool apply_scroll_event(
     if (event.object.contains(QStringLiteral("requested_offset_from_tail"))) {
         result = session.scroll_published_viewport_to_offset_from_tail(
             event.object.value(QStringLiteral("requested_offset_from_tail")).toInt());
+    }
+    else
+    if (scroll_event_uses_published_state_source(event)) {
+        result = session.scroll_viewport_lines_from_published_state(
+            event.object.value(QStringLiteral("requested_line_delta")).toInt(),
+            viewport_from_object(event.object.value(QStringLiteral("viewport_before")).toObject()));
     }
     else {
         result = session.scroll_published_viewport_lines(
@@ -910,7 +1104,10 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
                 return replay;
             }
             pending_scroll_intent.reset();
-            if (result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED) {
+            if (result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED ||
+                result.action ==
+                    term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED)
+            {
                 pending_scroll_intent = pending_scroll_intent_from_event(event, result);
             }
             ++replay.surface_scroll_intents;
@@ -920,7 +1117,10 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
             const bool pending_result_already_applied =
                 pending_scroll_intent.has_value() &&
                 scroll_event_matches_pending_intent(event, *pending_scroll_intent) &&
-                viewport_offset_matches_recorded_after(session.viewport_state(), event);
+                (pending_scroll_intent->result.action ==
+                    term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED ||
+                    viewport_offset_matches_recorded_after(session.viewport_state(), event) ||
+                    visible_viewport_offset_matches_recorded_after(session, event));
             pending_scroll_intent.reset();
             if (!pending_result_already_applied) {
                 term::Terminal_viewport_scroll_result result;
@@ -967,6 +1167,9 @@ void print_snapshot_diagnostics(const term::Terminal_render_snapshot& snapshot)
         << "snapshot.sequence=" << static_cast<unsigned long long>(snapshot.metadata.sequence)
         << " row_origin_generation="
         << static_cast<unsigned long long>(snapshot.metadata.row_origin_generation) << '\n'
+        << "snapshot.basis=" << term::render_snapshot_basis_name(snapshot.basis).toStdString()
+        << " snapshot.purpose=" << term::render_snapshot_purpose_name(snapshot.purpose).toStdString()
+        << '\n'
         << "cell_count=" << snapshot.cells.size()
         << " dirty_row_range_count=" << snapshot.dirty_row_ranges.size()
         << " selection_span_count=" << snapshot.selection_spans.size() << '\n';
@@ -1040,6 +1243,8 @@ int main(int argc, char** argv)
         << " matching_snapshot_events=" << replay.matching_snapshot_events
         << " divergent_snapshot_events=" << replay.divergent_snapshot_events << '\n'
         << "dirty_mismatch_snapshot_events=" << replay.dirty_mismatch_snapshot_events << '\n'
+        << "public_projection_scroll_snapshot_events="
+        << replay.public_projection_scroll_snapshot_events << '\n'
         << "terminal_reply_host_writes_skipped="
         << replay.terminal_reply_host_writes_skipped << '\n'
         << "backend_error_events=" << replay.backend_error_events

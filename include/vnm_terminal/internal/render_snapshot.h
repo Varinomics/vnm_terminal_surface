@@ -62,7 +62,252 @@ enum class Terminal_render_snapshot_status
     INVALID_SELECTION_SPAN,
     INVALID_LINE_PROVENANCE,
     INVALID_HYPERLINK_METADATA,
+    INVALID_SNAPSHOT_BASIS_PURPOSE,
 };
+
+enum class Terminal_render_snapshot_basis
+{
+    LIVE_CONTENT,
+    PUBLIC_PROJECTION,
+};
+
+enum class Terminal_render_snapshot_purpose
+{
+    CONTENT,
+    SELECTION_DERIVED,
+    GEOMETRY_DERIVED,
+    SCROLL,
+};
+
+enum class Terminal_synchronized_output_scroll_policy
+{
+    DEFER_UNTIL_CONTENT_PUBLICATION,
+    IMMEDIATE_PUBLIC_PROJECTION,
+};
+
+enum class Terminal_synchronized_output_policy_change_event
+{
+    NONE,
+    CHANGED_MID_HOLD,
+};
+
+enum class Terminal_public_scroll_diagnostic_reason
+{
+    NONE,
+    SYNCHRONIZED_OUTPUT_SCROLL_POLICY_CHANGED_MID_HOLD,
+    PUBLIC_PROJECTION_GEOMETRY_INVALIDATED,
+    PUBLIC_PROJECTION_MEMORY_PRESSURE_INVALIDATED,
+    PUBLIC_PROJECTION_INVALIDATED_DEFERRED_INTENT,
+    PUBLIC_PROJECTION_SCROLL_PUBLICATION_FAILED,
+    DETACHED_ANCHOR_CONTENT_GENERATION_CHANGED,
+    DETACHED_ANCHOR_GEOMETRY_CHANGED,
+    DETACHED_ANCHOR_NOT_RETAINED,
+    SELECTION_PUBLIC_PROJECTION_UNSUPPORTED,
+    SCREEN_BUFFER_EPOCH_CHANGED,
+    BUFFER_TRANSITION_RELEASED,
+};
+
+enum class Terminal_release_reconciliation_result
+{
+    NONE,
+    STICKY_TAIL,
+    EXACT_ANCHOR,
+    RETAINED_ID_BEST_EFFORT,
+    NEAREST_SUCCESSOR,
+    NEAREST_PREDECESSOR,
+    OLDEST_AVAILABLE_LIVE,
+    DEFERRED_OFFSET,
+    INCOMPATIBLE_BUFFER,
+};
+
+enum class Terminal_hidden_row_eligibility
+{
+    NOT_EVALUATED,
+    ELIGIBLE,
+    INELIGIBLE,
+};
+
+enum class Terminal_hidden_row_clamp_reason
+{
+    NONE,
+    PUBLIC_VIEWPORT_BOUNDARY,
+    LIVE_VIEWPORT_BOUNDARY,
+};
+
+enum class Terminal_public_projection_disable_reason
+{
+    NONE,
+    GEOMETRY_INVALIDATED,
+    MEMORY_PRESSURE,
+    PROJECTION_INVALIDATED,
+    UNSUPPORTED_BUFFER,
+};
+
+inline QString render_snapshot_basis_name(Terminal_render_snapshot_basis basis)
+{
+    switch (basis) {
+        case Terminal_render_snapshot_basis::LIVE_CONTENT:
+            return QStringLiteral("LIVE_CONTENT");
+        case Terminal_render_snapshot_basis::PUBLIC_PROJECTION:
+            return QStringLiteral("PUBLIC_PROJECTION");
+    }
+
+    return QStringLiteral("UNKNOWN");
+}
+
+inline QString render_snapshot_purpose_name(Terminal_render_snapshot_purpose purpose)
+{
+    switch (purpose) {
+        case Terminal_render_snapshot_purpose::CONTENT:
+            return QStringLiteral("CONTENT");
+        case Terminal_render_snapshot_purpose::SELECTION_DERIVED:
+            return QStringLiteral("SELECTION_DERIVED");
+        case Terminal_render_snapshot_purpose::GEOMETRY_DERIVED:
+            return QStringLiteral("GEOMETRY_DERIVED");
+        case Terminal_render_snapshot_purpose::SCROLL:
+            return QStringLiteral("SCROLL");
+    }
+
+    return QStringLiteral("UNKNOWN");
+}
+
+inline QString synchronized_output_scroll_policy_name(
+    Terminal_synchronized_output_scroll_policy policy)
+{
+    switch (policy) {
+        case Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION:
+            return QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION");
+        case Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION:
+            return QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION");
+    }
+
+    return QStringLiteral("UNKNOWN");
+}
+
+inline QString synchronized_output_policy_change_event_name(
+    Terminal_synchronized_output_policy_change_event event)
+{
+    switch (event) {
+        case Terminal_synchronized_output_policy_change_event::NONE:
+            return QStringLiteral("none");
+        case Terminal_synchronized_output_policy_change_event::CHANGED_MID_HOLD:
+            return QStringLiteral("changed_mid_hold");
+    }
+
+    return QStringLiteral("unknown");
+}
+
+inline QString public_scroll_diagnostic_reason_name(
+    Terminal_public_scroll_diagnostic_reason reason)
+{
+    switch (reason) {
+        case Terminal_public_scroll_diagnostic_reason::NONE:
+            return QStringLiteral("none");
+        case Terminal_public_scroll_diagnostic_reason::
+            SYNCHRONIZED_OUTPUT_SCROLL_POLICY_CHANGED_MID_HOLD:
+            return QStringLiteral("synchronized_output_scroll_policy_changed_mid_hold");
+        case Terminal_public_scroll_diagnostic_reason::PUBLIC_PROJECTION_GEOMETRY_INVALIDATED:
+            return QStringLiteral("public_projection_geometry_invalidated");
+        case Terminal_public_scroll_diagnostic_reason::
+            PUBLIC_PROJECTION_MEMORY_PRESSURE_INVALIDATED:
+            return QStringLiteral("public_projection_memory_pressure_invalidated");
+        case Terminal_public_scroll_diagnostic_reason::
+            PUBLIC_PROJECTION_INVALIDATED_DEFERRED_INTENT:
+            return QStringLiteral("public_projection_invalidated_deferred_intent");
+        case Terminal_public_scroll_diagnostic_reason::
+            PUBLIC_PROJECTION_SCROLL_PUBLICATION_FAILED:
+            return QStringLiteral("public_projection_scroll_publication_failed");
+        case Terminal_public_scroll_diagnostic_reason::
+            DETACHED_ANCHOR_CONTENT_GENERATION_CHANGED:
+            return QStringLiteral("detached_anchor_content_generation_changed");
+        case Terminal_public_scroll_diagnostic_reason::DETACHED_ANCHOR_GEOMETRY_CHANGED:
+            return QStringLiteral("detached_anchor_geometry_changed");
+        case Terminal_public_scroll_diagnostic_reason::DETACHED_ANCHOR_NOT_RETAINED:
+            return QStringLiteral("detached_anchor_not_retained");
+        case Terminal_public_scroll_diagnostic_reason::SELECTION_PUBLIC_PROJECTION_UNSUPPORTED:
+            return QStringLiteral("selection_public_projection_unsupported");
+        case Terminal_public_scroll_diagnostic_reason::SCREEN_BUFFER_EPOCH_CHANGED:
+            return QStringLiteral("screen_buffer_epoch_changed");
+        case Terminal_public_scroll_diagnostic_reason::BUFFER_TRANSITION_RELEASED:
+            return QStringLiteral("buffer_transition_released");
+    }
+
+    return QStringLiteral("unknown");
+}
+
+inline QString release_reconciliation_result_name(
+    Terminal_release_reconciliation_result result)
+{
+    switch (result) {
+        case Terminal_release_reconciliation_result::NONE:
+            return QStringLiteral("none");
+        case Terminal_release_reconciliation_result::STICKY_TAIL:
+            return QStringLiteral("sticky_tail");
+        case Terminal_release_reconciliation_result::EXACT_ANCHOR:
+            return QStringLiteral("exact_anchor");
+        case Terminal_release_reconciliation_result::RETAINED_ID_BEST_EFFORT:
+            return QStringLiteral("retained_id_best_effort");
+        case Terminal_release_reconciliation_result::NEAREST_SUCCESSOR:
+            return QStringLiteral("nearest_successor");
+        case Terminal_release_reconciliation_result::NEAREST_PREDECESSOR:
+            return QStringLiteral("nearest_predecessor");
+        case Terminal_release_reconciliation_result::OLDEST_AVAILABLE_LIVE:
+            return QStringLiteral("oldest_available_live");
+        case Terminal_release_reconciliation_result::DEFERRED_OFFSET:
+            return QStringLiteral("deferred_offset");
+        case Terminal_release_reconciliation_result::INCOMPATIBLE_BUFFER:
+            return QStringLiteral("incompatible_buffer");
+    }
+
+    return QStringLiteral("unknown");
+}
+
+inline QString hidden_row_eligibility_name(Terminal_hidden_row_eligibility eligibility)
+{
+    switch (eligibility) {
+        case Terminal_hidden_row_eligibility::NOT_EVALUATED:
+            return QStringLiteral("not_evaluated");
+        case Terminal_hidden_row_eligibility::ELIGIBLE:
+            return QStringLiteral("eligible");
+        case Terminal_hidden_row_eligibility::INELIGIBLE:
+            return QStringLiteral("ineligible");
+    }
+
+    return QStringLiteral("unknown");
+}
+
+inline QString hidden_row_clamp_reason_name(Terminal_hidden_row_clamp_reason reason)
+{
+    switch (reason) {
+        case Terminal_hidden_row_clamp_reason::NONE:
+            return QStringLiteral("none");
+        case Terminal_hidden_row_clamp_reason::PUBLIC_VIEWPORT_BOUNDARY:
+            return QStringLiteral("public_viewport_boundary");
+        case Terminal_hidden_row_clamp_reason::LIVE_VIEWPORT_BOUNDARY:
+            return QStringLiteral("live_viewport_boundary");
+    }
+
+    return QStringLiteral("unknown");
+}
+
+inline QString public_projection_disable_reason_name(
+    Terminal_public_projection_disable_reason reason)
+{
+    switch (reason) {
+        case Terminal_public_projection_disable_reason::NONE:
+            return QStringLiteral("none");
+        case Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED:
+            return QStringLiteral("geometry_invalidated");
+        case Terminal_public_projection_disable_reason::MEMORY_PRESSURE:
+            return QStringLiteral("memory_pressure");
+        case Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED:
+            return QStringLiteral("projection_invalidated");
+        case Terminal_public_projection_disable_reason::UNSUPPORTED_BUFFER:
+            return QStringLiteral("unsupported_buffer");
+    }
+
+    return QStringLiteral("unknown");
+}
 
 struct Terminal_render_cell
 {
@@ -135,10 +380,38 @@ struct Terminal_render_metadata
     bool                       mouse_reporting_mode_changed = false;
 };
 
+struct Terminal_public_scroll_diagnostics
+{
+    Terminal_synchronized_output_scroll_policy effective_policy =
+        Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION;
+    Terminal_synchronized_output_policy_change_event policy_change_event =
+        Terminal_synchronized_output_policy_change_event::NONE;
+    Terminal_public_scroll_diagnostic_reason diagnostic_reason =
+        Terminal_public_scroll_diagnostic_reason::NONE;
+    std::uint64_t public_projection_generation = 0U;
+    Terminal_viewport_state public_viewport_before;
+    Terminal_viewport_state public_viewport_after;
+    Terminal_viewport_state live_viewport_before_on_release;
+    Terminal_viewport_state live_viewport_after_on_release;
+    bool visible_scroll_applied = false;
+    bool live_content_publication_blocked = false;
+    Terminal_release_reconciliation_result release_reconciliation_result =
+        Terminal_release_reconciliation_result::NONE;
+    Terminal_hidden_row_eligibility hidden_row_eligibility =
+        Terminal_hidden_row_eligibility::NOT_EVALUATED;
+    Terminal_hidden_row_clamp_reason hidden_row_clamp_reason =
+        Terminal_hidden_row_clamp_reason::NONE;
+    Terminal_public_projection_disable_reason public_projection_disable_reason =
+        Terminal_public_projection_disable_reason::NONE;
+};
+
 struct Terminal_render_snapshot_request
 {
     std::uint64_t                         sequence = 0U;
     std::uint64_t                         row_origin_generation = 0U;
+    Terminal_render_snapshot_basis        basis = Terminal_render_snapshot_basis::LIVE_CONTENT;
+    Terminal_render_snapshot_purpose      purpose = Terminal_render_snapshot_purpose::CONTENT;
+    Terminal_public_scroll_diagnostics    public_scroll_diagnostics;
     Terminal_viewport_state               viewport;
     std::vector<int>                      dirty_rows;
     bool                                  viewport_changed = false;
@@ -153,6 +426,9 @@ struct Terminal_render_snapshot_request
 
 struct Terminal_render_snapshot
 {
+    Terminal_render_snapshot_basis                     basis = Terminal_render_snapshot_basis::LIVE_CONTENT;
+    Terminal_render_snapshot_purpose                   purpose = Terminal_render_snapshot_purpose::CONTENT;
+    Terminal_public_scroll_diagnostics                 public_scroll_diagnostics;
     terminal_grid_size_t                               grid_size;
     Terminal_viewport_state                            viewport;
     Terminal_color_state                               color_state;
@@ -459,6 +735,26 @@ inline Terminal_render_snapshot_validation validate_render_snapshot(
                 snapshot.viewport.offset_from_tail != 0)))
     {
         return {Terminal_render_snapshot_status::INVALID_VIEWPORT};
+    }
+
+    const bool public_projection_basis =
+        snapshot.basis == Terminal_render_snapshot_basis::PUBLIC_PROJECTION;
+    const bool scroll_purpose =
+        snapshot.purpose == Terminal_render_snapshot_purpose::SCROLL;
+    if (public_projection_basis != scroll_purpose) {
+        return {Terminal_render_snapshot_status::INVALID_SNAPSHOT_BASIS_PURPOSE};
+    }
+    if (public_projection_basis &&
+        snapshot.viewport.active_buffer != Terminal_buffer_id::PRIMARY)
+    {
+        return {Terminal_render_snapshot_status::INVALID_VIEWPORT};
+    }
+    if (public_projection_basis &&
+        (snapshot.dirty_row_ranges.size() != 1U ||
+            snapshot.dirty_row_ranges.front().first_row != 0 ||
+            snapshot.dirty_row_ranges.front().row_count != snapshot.grid_size.rows))
+    {
+        return {Terminal_render_snapshot_status::INVALID_DIRTY_ROW_RANGE};
     }
 
     if (!snapshot.visible_line_provenance.empty() &&
