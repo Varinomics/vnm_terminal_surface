@@ -239,6 +239,9 @@ bool test_owned_styled_wide_hyperlink_scrollback_snapshot()
     request.viewport_changed = true;
     const term::Terminal_render_snapshot snapshot = model.render_snapshot(request);
 
+    ok &= check(snapshot.basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        snapshot.purpose == term::Terminal_render_snapshot_purpose::CONTENT,
+        "styled scrollback snapshot records live content basis and content purpose");
     ok &= check(term::validate_render_snapshot(snapshot).status ==
         term::Terminal_render_snapshot_status::OK,
         "styled scrollback snapshot validates");
@@ -576,6 +579,94 @@ bool test_visible_line_provenance_validation()
     return ok;
 }
 
+bool test_public_projection_scroll_snapshot_structural_validation()
+{
+    bool ok = true;
+
+    // The render snapshot validator enforces structural snapshot invariants. It
+    // intentionally does not interpret public-scroll diagnostic semantics; those
+    // fields are covered by transcript and replay contract tests.
+    term::Terminal_viewport_state viewport;
+    viewport.active_buffer    = term::Terminal_buffer_id::PRIMARY;
+    viewport.scrollback_rows  = 3;
+    viewport.visible_rows     = 2;
+    viewport.offset_from_tail = 1;
+    viewport.follow_tail      = false;
+
+    term::Terminal_render_snapshot valid =
+        term::make_empty_render_snapshot({2, 8}, viewport, 90U);
+    valid.basis   = term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION;
+    valid.purpose = term::Terminal_render_snapshot_purpose::SCROLL;
+    valid.public_scroll_diagnostics.effective_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+    valid.public_scroll_diagnostics.public_projection_generation = 7U;
+    valid.public_scroll_diagnostics.public_viewport_before = viewport;
+    valid.public_scroll_diagnostics.public_viewport_after  = viewport;
+    valid.public_scroll_diagnostics.visible_scroll_applied = true;
+    valid.public_scroll_diagnostics.live_content_publication_blocked = true;
+    valid.visible_line_provenance = {
+        {2, 700U, 1U},
+        {3, 701U, 1U},
+    };
+    valid.dirty_row_ranges = {{0, 2}};
+    valid.cells.push_back({{0, 0}, QStringLiteral("A")});
+    valid.cells.push_back({{1, 0}, QStringLiteral("B")});
+
+    ok &= check(term::validate_render_snapshot(valid).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "public projection scroll snapshot validates");
+
+    term::Terminal_render_snapshot malformed = valid;
+    malformed.visible_line_provenance[1].logical_row = 9;
+    ok &= check(term::validate_render_snapshot(malformed).status ==
+        term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE,
+        "public projection scroll snapshot rejects malformed line provenance");
+
+    term::Terminal_render_snapshot invalid_cell = valid;
+    invalid_cell.cells.front().position.column = valid.grid_size.columns;
+    ok &= check(term::validate_render_snapshot(invalid_cell).status ==
+        term::Terminal_render_snapshot_status::INVALID_CELL_POSITION,
+        "public projection scroll snapshot rejects malformed cell position");
+
+    term::Terminal_render_snapshot partial_dirty = valid;
+    partial_dirty.dirty_row_ranges = {{1, 1}};
+    ok &= check(term::validate_render_snapshot(partial_dirty).status ==
+        term::Terminal_render_snapshot_status::INVALID_DIRTY_ROW_RANGE,
+        "public projection scroll snapshot rejects partial dirty ranges");
+
+    term::Terminal_render_snapshot missing_dirty = valid;
+    missing_dirty.dirty_row_ranges.clear();
+    ok &= check(term::validate_render_snapshot(missing_dirty).status ==
+        term::Terminal_render_snapshot_status::INVALID_DIRTY_ROW_RANGE,
+        "public projection scroll snapshot requires a full visible-viewport dirty range");
+
+    term::Terminal_render_snapshot public_content = valid;
+    public_content.purpose = term::Terminal_render_snapshot_purpose::CONTENT;
+    ok &= check(term::validate_render_snapshot(public_content).status ==
+        term::Terminal_render_snapshot_status::INVALID_SNAPSHOT_BASIS_PURPOSE,
+        "public projection snapshot rejects non-scroll purpose");
+
+    term::Terminal_render_snapshot live_scroll = valid;
+    live_scroll.basis = term::Terminal_render_snapshot_basis::LIVE_CONTENT;
+    ok &= check(term::validate_render_snapshot(live_scroll).status ==
+        term::Terminal_render_snapshot_status::INVALID_SNAPSHOT_BASIS_PURPOSE,
+        "live-content snapshot rejects scroll purpose");
+
+    term::Terminal_render_snapshot alternate_public_scroll = valid;
+    alternate_public_scroll.viewport.active_buffer = term::Terminal_buffer_id::ALTERNATE;
+    alternate_public_scroll.viewport.scrollback_rows  = 0;
+    alternate_public_scroll.viewport.offset_from_tail = 0;
+    alternate_public_scroll.visible_line_provenance = {
+        {0, 700U, 1U},
+        {1, 701U, 1U},
+    };
+    ok &= check(term::validate_render_snapshot(alternate_public_scroll).status ==
+        term::Terminal_render_snapshot_status::INVALID_VIEWPORT,
+        "public projection scroll snapshot remains primary-buffer only");
+
+    return ok;
+}
+
 bool test_session_snapshot_handles_and_synchronized_release()
 {
     bool                                    ok      = true;
@@ -741,10 +832,12 @@ bool test_resize_metadata_publication_respects_synchronized_output()
     ok &= check(failed != nullptr &&
         failed->grid_size.rows == 4 &&
         failed->grid_size.columns == 2 &&
+        failed->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        failed->purpose == term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
         !failed->metadata.backend_geometry_in_sync &&
         row_text(*failed, 0) == QStringLiteral("ba") &&
         cell_with_text(*failed, QStringLiteral("H")) == nullptr,
-        "held resize failure publishes clipped public geometry without hidden content");
+        "held resize failure publishes clipped live-content geometry without hidden content");
     ok &= check(failed != nullptr &&
         term::validate_render_snapshot(*failed).status ==
             term::Terminal_render_snapshot_status::OK,
@@ -760,10 +853,12 @@ bool test_resize_metadata_publication_respects_synchronized_output()
     ok &= check(recovered != nullptr &&
         recovered->grid_size.rows == 4 &&
         recovered->grid_size.columns == 12 &&
+        recovered->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        recovered->purpose == term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
         recovered->metadata.backend_geometry_in_sync &&
         row_text(*recovered, 0) == QStringLiteral("base") &&
         cell_with_text(*recovered, QStringLiteral("H")) == nullptr,
-        "held resize recovery restores public baseline without hidden content");
+        "held resize recovery restores safe public content baseline without hidden content");
     ok &= check(recovered != nullptr &&
         term::validate_render_snapshot(*recovered).status ==
             term::Terminal_render_snapshot_status::OK,
@@ -833,6 +928,8 @@ bool test_synthetic_snapshots_preserve_or_suppress_line_provenance()
         session->latest_render_snapshot_handle();
     ok &= check(changed_grid != nullptr &&
         changed_grid->visible_line_provenance.empty() &&
+        changed_grid->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        changed_grid->purpose == term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
         changed_grid->selection_spans.empty(),
         "changed-grid geometry snapshot suppresses unproven provenance and spans");
     ok &= check(changed_grid != nullptr &&
@@ -871,6 +968,8 @@ bool test_synthetic_snapshots_preserve_or_suppress_line_provenance()
     const std::shared_ptr<const term::Terminal_render_snapshot> detached =
         selection_session->latest_render_snapshot_handle();
     ok &= check(detached != nullptr &&
+        detached->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        detached->purpose == term::Terminal_render_snapshot_purpose::SELECTION_DERIVED &&
         detached->selection_spans.empty() &&
         detached->visible_line_provenance == selected_provenance &&
         cell_with_text(*detached, QStringLiteral("h")) == nullptr,
@@ -895,6 +994,7 @@ int main()
     ok &= test_dirty_rows_are_viewport_relative();
     ok &= test_model_snapshots_publish_visible_line_provenance();
     ok &= test_visible_line_provenance_validation();
+    ok &= test_public_projection_scroll_snapshot_structural_validation();
     ok &= test_session_snapshot_handles_and_synchronized_release();
     ok &= test_session_ime_overlay_does_not_clone_render_snapshot();
     ok &= test_backend_sync_metadata_publishes_after_same_grid_retry();

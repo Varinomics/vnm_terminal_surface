@@ -14,6 +14,7 @@
 #include <QInputMethodEvent>
 #include <QJsonObject>
 #include <QKeyEvent>
+#include <QMetaProperty>
 #include <QMouseEvent>
 #include <QPointer>
 #include <QQuickItem>
@@ -130,6 +131,83 @@ bool transcript_has_event_after(
     }
 
     return false;
+}
+
+bool transcript_has_source_event(
+    const std::vector<term::Terminal_transcript_event>& events,
+    const QString&                                      kind,
+    const QString&                                      source)
+{
+    for (const term::Terminal_transcript_event& event : events) {
+        if (event.kind == kind &&
+            event.object.value(QStringLiteral("source")).toString() == source)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool check_route(
+    bool             condition,
+    const QString&   route,
+    const QByteArray& suffix)
+{
+    const QByteArray message = route.toUtf8() + suffix;
+    return check(condition, message.constData());
+}
+
+struct Frozen_public_viewport_state
+{
+    int  scrollback_rows       = 0;
+    int  visible_rows          = 0;
+    int  offset_from_tail      = 0;
+    bool at_tail               = true;
+    int  viewport_change_count = 0;
+};
+
+Frozen_public_viewport_state frozen_public_viewport_state(
+    const VNM_TerminalSurface& surface,
+    int                        viewport_change_count)
+{
+    return {
+        surface.scrollback_rows(),
+        surface.viewport_visible_rows(),
+        surface.viewport_offset_from_tail(),
+        surface.viewport_at_tail(),
+        viewport_change_count,
+    };
+}
+
+bool check_public_viewport_frozen(
+    const VNM_TerminalSurface&          surface,
+    const Frozen_public_viewport_state& frozen,
+    int                                 viewport_change_count,
+    const QString&                      route)
+{
+    bool ok = true;
+    ok &= check_route(
+        surface.scrollback_rows() == frozen.scrollback_rows,
+        route,
+        " keeps public scrollback frozen");
+    ok &= check_route(
+        surface.viewport_visible_rows() == frozen.visible_rows,
+        route,
+        " keeps public visible rows frozen");
+    ok &= check_route(
+        surface.viewport_offset_from_tail() == frozen.offset_from_tail,
+        route,
+        " keeps public offset frozen");
+    ok &= check_route(
+        surface.viewport_at_tail() == frozen.at_tail,
+        route,
+        " keeps public at-tail flag frozen");
+    ok &= check_route(
+        viewport_change_count == frozen.viewport_change_count,
+        route,
+        " emits no viewport_changed while public projection is invalidated");
+    return ok;
 }
 
 bool nearly_equal(qreal lhs, qreal rhs, qreal tolerance = 0.01)
@@ -396,6 +474,73 @@ bool snapshot_has_selection_span(
     }
 
     return false;
+}
+
+int first_visible_logical_row_for_snapshot(const term::Terminal_render_snapshot& snapshot)
+{
+    return snapshot.viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE
+        ? 0
+        : snapshot.viewport.scrollback_rows - snapshot.viewport.offset_from_tail;
+}
+
+bool surface_scrolls_to_first_visible_row(
+    VNM_TerminalSurface&   surface,
+    int                    first_visible_row)
+{
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(surface);
+    if (snapshot == nullptr) {
+        return false;
+    }
+
+    const int target_offset = snapshot->viewport.scrollback_rows - first_visible_row;
+    if (target_offset < 0 || target_offset > snapshot->viewport.scrollback_rows) {
+        return false;
+    }
+
+    if (target_offset == snapshot->viewport.offset_from_tail) {
+        return true;
+    }
+
+    return surface.scroll_to_offset_from_tail(target_offset);
+}
+
+bool surface_public_prefix_selection_is_highlighted(
+    const term::Terminal_render_snapshot& snapshot,
+    int                                   first_visible_row)
+{
+    constexpr int         k_first_selected_row = 36;
+    constexpr int         k_last_selected_row  = 42;
+    constexpr int         k_tail_column_count  = 17;
+    constexpr std::size_t k_selected_row_count =
+        static_cast<std::size_t>(k_last_selected_row - k_first_selected_row + 1);
+
+    if (first_visible_logical_row_for_snapshot(snapshot) != first_visible_row ||
+        snapshot.selection_spans.size()             != k_selected_row_count   ||
+        snapshot.grid_size.columns                  <  k_tail_column_count)
+    {
+        return false;
+    }
+
+    for (int public_row = k_first_selected_row;
+         public_row <= k_last_selected_row;
+         ++public_row)
+    {
+        const int snapshot_row = public_row - first_visible_row;
+        if (snapshot_row < 0 || snapshot_row >= snapshot.grid_size.rows) {
+            return false;
+        }
+
+        const int expected_column_count =
+            public_row == k_last_selected_row
+                ? k_tail_column_count
+                : snapshot.grid_size.columns;
+        if (!snapshot_has_selection_span(snapshot, snapshot_row, 0, expected_column_count)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 QByteArray numbered_scroll_lines(int count)
@@ -2612,6 +2757,632 @@ bool test_public_viewport_scroll_api(QGuiApplication& app)
     return ok;
 }
 
+bool test_immediate_public_projection_public_scroll_api(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_scrollback_limit(200);
+    fixture.surface.set_synchronized_output_scroll_policy(
+        VNM_TerminalSurface::Synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION);
+    pump_events(app);
+
+    ok &= check(
+        fixture.surface.synchronized_output_scroll_policy() ==
+            VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                IMMEDIATE_PUBLIC_PROJECTION,
+        "immediate public projection policy is publicly readable");
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "immediate public projection API surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> safe_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(safe_snapshot != nullptr &&
+        safe_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        safe_snapshot->viewport.offset_from_tail == 0,
+        "immediate public projection API starts from live content tail");
+    if (safe_snapshot == nullptr) {
+        return ok;
+    }
+    const int safe_scrollback_rows = fixture.surface.scrollback_rows();
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hhidden"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    ok &= check_int_equal(
+        fixture.surface.scrollback_rows(),
+        safe_scrollback_rows,
+        "immediate public projection hides held scrollback growth before public scroll");
+
+    ok &= check(fixture.surface.scroll_viewport_lines(2),
+        "immediate public projection public line scroll is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> public_scroll =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(public_scroll != nullptr &&
+        public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+        public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
+        public_scroll->viewport.offset_from_tail == 2 &&
+        fixture.surface.viewport_offset_from_tail() == 2 &&
+        fixture.surface.scrollback_rows() == public_scroll->viewport.scrollback_rows,
+        "immediate public projection line scroll publishes visible public projection state");
+    if (public_scroll == nullptr) {
+        return ok;
+    }
+
+    const int public_scrollback_rows = fixture.surface.scrollback_rows();
+    const std::uint64_t public_scroll_sequence = public_scroll->metadata.sequence;
+    backend_ptr->emit_output(numbered_scroll_lines(5));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> after_hidden_growth =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(after_hidden_growth != nullptr &&
+        after_hidden_growth->metadata.sequence == public_scroll_sequence &&
+        fixture.surface.scrollback_rows() == public_scrollback_rows &&
+        fixture.surface.viewport_offset_from_tail() == 2,
+        "immediate public projection hidden live growth does not move scrollbar-visible state");
+
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(0),
+        "immediate public projection public offset scroll is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> public_tail_scroll =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(public_tail_scroll != nullptr &&
+        public_tail_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+        public_tail_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
+        fixture.surface.viewport_at_tail() &&
+        fixture.surface.viewport_offset_from_tail() == 0,
+        "immediate public projection offset scroll publishes public tail state");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> release =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(release != nullptr &&
+        release->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        fixture.surface.scrollback_rows() == release->viewport.scrollback_rows &&
+        fixture.surface.scrollback_rows() > public_scrollback_rows,
+        "immediate public projection release updates public state from reconciled live content");
+
+    return ok;
+}
+
+bool test_public_viewport_scroll_source_labels(QGuiApplication& app)
+{
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    bool ok = true;
+
+    QTemporaryDir transcript_dir;
+    ok &= check(transcript_dir.isValid(), "public source-label temp dir is valid");
+    if (!transcript_dir.isValid()) {
+        return ok;
+    }
+
+    const QString transcript_path =
+        transcript_dir.filePath(QStringLiteral("public_source_labels.ndjson"));
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        fixture.surface.set_transcript_capture_path(transcript_path);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        (void)start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "public source-label surface starts");
+        if (!started) {
+            return ok;
+        }
+
+        const VNM_TerminalSurface::wheel_scroll_diagnostic_result_t api_lines =
+            fixture.surface.scroll_viewport_lines_with_diagnostics(
+                1,
+                QStringLiteral("api.lines"));
+        ok &= check(api_lines.event_accepted,
+            "public source-label api.lines scroll is accepted");
+        ok &= check(fixture.surface.scroll_to_offset_from_tail_from_source(
+            3,
+            QStringLiteral("api.offset")),
+            "public source-label api.offset scroll is accepted");
+        ok &= check(fixture.surface.scroll_viewport_lines_with_diagnostics(
+            -1,
+            QStringLiteral("app.scrollbar.wheel")).event_accepted,
+            "public source-label app wheel scroll is accepted");
+        ok &= check(fixture.surface.scroll_to_offset_from_tail_from_source(
+            5,
+            QStringLiteral("app.scrollbar.track")),
+            "public source-label app track scroll is accepted");
+        ok &= check(fixture.surface.scroll_viewport_lines_with_diagnostics(
+            1,
+            QStringLiteral("app.scrollbar.page")).event_accepted,
+            "public source-label app page scroll is accepted");
+        ok &= check(fixture.surface.scroll_to_offset_from_tail_from_source(
+            0,
+            QStringLiteral("app.scrollbar.thumb")),
+            "public source-label app thumb scroll is accepted");
+    }
+
+    QString error;
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(transcript_path, &error);
+    ok &= check(events.has_value(), "public source-label transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return ok;
+    }
+
+    const QStringList sources = {
+        QStringLiteral("api.lines"),
+        QStringLiteral("api.offset"),
+        QStringLiteral("app.scrollbar.wheel"),
+        QStringLiteral("app.scrollbar.track"),
+        QStringLiteral("app.scrollbar.page"),
+        QStringLiteral("app.scrollbar.thumb"),
+    };
+    for (const QString& source : sources) {
+        ok &= check(transcript_has_source_event(
+            *events,
+            QStringLiteral("surface.scroll_intent"),
+            source),
+            "public source-label intent source is recorded");
+        ok &= check(transcript_has_source_event(
+            *events,
+            QStringLiteral("surface.scroll"),
+            source),
+            "public source-label scroll source is recorded");
+    }
+
+    return ok;
+#else
+    (void)app;
+    return true;
+#endif
+}
+
+bool test_immediate_public_projection_page_keys(QGuiApplication& app)
+{
+    bool ok = true;
+
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    QTemporaryDir transcript_dir;
+    ok &= check(transcript_dir.isValid(), "immediate page-key transcript temp dir is valid");
+    if (!transcript_dir.isValid()) {
+        return ok;
+    }
+    const QString transcript_path =
+        transcript_dir.filePath(QStringLiteral("immediate_page_keys.ndjson"));
+#endif
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        fixture.surface.set_synchronized_output_scroll_policy(
+            VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                IMMEDIATE_PUBLIC_PROJECTION);
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+        fixture.surface.set_transcript_capture_path(transcript_path);
+#endif
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "immediate page-key surface starts");
+        if (!started || backend_ptr == nullptr) {
+            return ok;
+        }
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hheld"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        const std::size_t write_count = backend_ptr->writes.size();
+        const int expected_page_offset = std::min(
+            fixture.surface.viewport_visible_rows(),
+            fixture.surface.scrollback_rows());
+
+        ok &= send_key(
+            fixture.surface,
+            Qt::Key_PageUp,
+            Qt::NoModifier,
+            {},
+            "immediate PageUp is accepted by public projection path");
+        ok &= check(backend_ptr->writes.size() == write_count,
+            "immediate PageUp writes no backend bytes");
+        const std::shared_ptr<const term::Terminal_render_snapshot> page_up_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(page_up_snapshot != nullptr &&
+            page_up_snapshot->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+            page_up_snapshot->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
+            page_up_snapshot->public_scroll_diagnostics.visible_scroll_applied &&
+            page_up_snapshot->viewport.offset_from_tail == expected_page_offset,
+            "immediate PageUp publishes visible public projection scroll");
+
+        ok &= send_key(
+            fixture.surface,
+            Qt::Key_PageDown,
+            Qt::NoModifier,
+            {},
+            "immediate PageDown is accepted by public projection path");
+        ok &= check(backend_ptr->writes.size() == write_count,
+            "immediate PageDown writes no backend bytes");
+        const std::shared_ptr<const term::Terminal_render_snapshot> page_down_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(page_down_snapshot != nullptr &&
+            page_down_snapshot->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+            page_down_snapshot->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
+            page_down_snapshot->public_scroll_diagnostics.visible_scroll_applied &&
+            page_down_snapshot->viewport.offset_from_tail == 0,
+            "immediate PageDown publishes visible public projection scroll");
+    }
+
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    QString error;
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(transcript_path, &error);
+    ok &= check(events.has_value(), "immediate page-key transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return ok;
+    }
+    ok &= check(transcript_has_source_event(
+        *events,
+        QStringLiteral("surface.scroll_intent"),
+        QStringLiteral("key.page")),
+        "immediate page-key transcript records key.page intent source");
+    ok &= check(transcript_has_source_event(
+        *events,
+        QStringLiteral("surface.scroll"),
+        QStringLiteral("key.page")),
+        "immediate page-key transcript records key.page scroll source");
+#endif
+
+    return ok;
+}
+
+bool test_public_scroll_api_records_deferred_after_projection_invalidation(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_scrollback_limit(200);
+    fixture.surface.set_synchronized_output_scroll_policy(
+        VNM_TerminalSurface::Synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION);
+    pump_events(app);
+
+    int viewport_change_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::viewport_changed,
+        &fixture.surface,
+        [&viewport_change_count] {
+            ++viewport_change_count;
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "public invalidation API surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hheld"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    ok &= check(fixture.surface.scroll_viewport_lines(2),
+        "public invalidation API initial public scroll is accepted");
+
+    const int frozen_change_count = viewport_change_count;
+    const int frozen_scrollback_rows = fixture.surface.scrollback_rows();
+    const int frozen_visible_rows = fixture.surface.viewport_visible_rows();
+    const int frozen_offset = fixture.surface.viewport_offset_from_tail();
+    const bool frozen_at_tail = fixture.surface.viewport_at_tail();
+
+    term::VNM_TerminalSurface_render_bridge::invalidate_public_projection_for_testing(
+        fixture.surface,
+        term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED);
+    const VNM_TerminalSurface::wheel_scroll_diagnostic_result_t deferred_diagnostic =
+        fixture.surface.scroll_viewport_lines_with_diagnostics(
+            1,
+            QStringLiteral("api.lines"));
+    ok &= check(deferred_diagnostic.event_accepted,
+        "public invalidation diagnostics accepts deferred line intent");
+    ok &= check(deferred_diagnostic.deferred_intent_recorded,
+        "public invalidation diagnostics records deferred intent");
+    ok &= check(!deferred_diagnostic.local_scroll_applied,
+        "public invalidation diagnostics does not claim local scroll");
+    ok &= check(!deferred_diagnostic.visible_scroll_applied,
+        "public invalidation diagnostics does not claim visible scroll");
+    ok &= check(fixture.surface.scroll_viewport_lines(1),
+        "public invalidation API line scroll records deferred intent");
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(frozen_offset + 1),
+        "public invalidation API offset scroll records deferred intent");
+    ok &= check_int_equal(
+        fixture.surface.scrollback_rows(),
+        frozen_scrollback_rows,
+        "public invalidation API keeps public scrollback frozen");
+    ok &= check_int_equal(
+        fixture.surface.viewport_visible_rows(),
+        frozen_visible_rows,
+        "public invalidation API keeps public visible rows frozen");
+    ok &= check_int_equal(
+        fixture.surface.viewport_offset_from_tail(),
+        frozen_offset,
+        "public invalidation API keeps public offset frozen");
+    ok &= check(fixture.surface.viewport_at_tail() == frozen_at_tail,
+        "public invalidation API keeps public at-tail flag frozen");
+    ok &= check(viewport_change_count == frozen_change_count,
+        "public invalidation API emits no viewport_changed before release");
+
+    backend_ptr->emit_output(numbered_scroll_lines(5));
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> release =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(release != nullptr &&
+        release->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        release->public_scroll_diagnostics.release_reconciliation_result ==
+            term::Terminal_release_reconciliation_result::DEFERRED_OFFSET,
+        "public invalidation API release reconciles the deferred offset");
+    ok &= check(viewport_change_count > frozen_change_count,
+        "public invalidation API release emits viewport_changed");
+
+    return ok;
+}
+
+bool test_app_route_boundaries_record_deferred_after_projection_invalidation(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_scrollback_limit(200);
+    fixture.surface.set_synchronized_output_scroll_policy(
+        VNM_TerminalSurface::Synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION);
+    pump_events(app);
+
+    int viewport_change_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::viewport_changed,
+        &fixture.surface,
+        [&viewport_change_count] {
+            ++viewport_change_count;
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "app route invalidation boundary surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hheld"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(fixture.surface.scrollback_rows()),
+        "app route invalidation boundary setup reaches top boundary");
+
+    const Frozen_public_viewport_state frozen =
+        frozen_public_viewport_state(fixture.surface, viewport_change_count);
+    ok &= check(frozen.offset_from_tail == frozen.scrollback_rows,
+        "app route invalidation boundary setup captures top boundary");
+
+    term::VNM_TerminalSurface_render_bridge::invalidate_public_projection_for_testing(
+        fixture.surface,
+        term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED);
+
+    struct Route_case
+    {
+        QString source;
+        bool    offset_route = false;
+    };
+
+    const Route_case routes[] = {
+        {QStringLiteral("app.scrollbar.wheel"), false},
+        {QStringLiteral("app.scrollbar.page"),  false},
+        {QStringLiteral("app.scrollbar.track"), true},
+        {QStringLiteral("app.scrollbar.thumb"), true},
+    };
+
+    for (const Route_case& route : routes) {
+        const VNM_TerminalSurface::wheel_scroll_diagnostic_result_t diagnostic =
+            route.offset_route
+                ? fixture.surface.scroll_to_offset_from_tail_with_diagnostics(
+                    frozen.offset_from_tail + 1,
+                    route.source)
+                : fixture.surface.scroll_viewport_lines_with_diagnostics(
+                    1,
+                    route.source);
+        ok &= check_route(
+            diagnostic.event_accepted,
+            route.source,
+            " accepts invalidated boundary deferred intent");
+        ok &= check_route(
+            diagnostic.deferred_intent_recorded,
+            route.source,
+            " records invalidated boundary deferred intent");
+        ok &= check_route(
+            !diagnostic.local_scroll_applied,
+            route.source,
+            " does not claim local scroll after invalidation");
+        ok &= check_route(
+            !diagnostic.visible_scroll_applied,
+            route.source,
+            " does not claim visible scroll after invalidation");
+        ok &= check_public_viewport_frozen(
+            fixture.surface,
+            frozen,
+            viewport_change_count,
+            route.source);
+    }
+
+    backend_ptr->emit_output(numbered_scroll_lines(5));
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> release =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(release != nullptr &&
+        release->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        release->public_scroll_diagnostics.release_reconciliation_result ==
+            term::Terminal_release_reconciliation_result::DEFERRED_OFFSET,
+        "app route invalidation boundary release reconciles deferred offset");
+    ok &= check(viewport_change_count > frozen.viewport_change_count,
+        "app route invalidation boundary release emits viewport_changed");
+
+    return ok;
+}
+
+bool test_mid_hold_policy_flip_keeps_text_area_wheel_boundary_input(
+    QGuiApplication& app)
+{
+    bool ok = true;
+
+    struct Test_case
+    {
+        int         start_offset_from_tail;
+        int         wheel_delta;
+        const char* label;
+    };
+
+    const Test_case cases[] = {
+        {0, -120, "tail-down"},
+        {-1, 120, "top-up"},
+    };
+
+    for (const Test_case& test_case : cases) {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        fixture.surface.set_wheel_event_policy(
+            VNM_TerminalSurface::Wheel_event_policy::LOCAL_SCROLLBACK_FIRST);
+        fixture.surface.set_synchronized_output_scroll_policy(
+            VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                IMMEDIATE_PUBLIC_PROJECTION);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "mid-hold policy flip surface starts");
+        if (!started || backend_ptr == nullptr) {
+            continue;
+        }
+
+        if (test_case.start_offset_from_tail < 0) {
+            ok &= check(fixture.surface.scroll_to_offset_from_tail(
+                fixture.surface.scrollback_rows()),
+                "mid-hold policy flip scrolls to top boundary");
+        }
+        else {
+            ok &= check(fixture.surface.viewport_offset_from_tail() == 0,
+                "mid-hold policy flip starts at tail boundary");
+        }
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hheld"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        fixture.surface.set_synchronized_output_scroll_policy(
+            VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                DEFER_UNTIL_CONTENT_PUBLICATION);
+        term::VNM_TerminalSurface_render_bridge::simulate_scene_graph_invalidated(fixture.surface);
+
+        const std::size_t write_count = backend_ptr->writes.size();
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            test_case.wheel_delta,
+            false,
+            test_case.label);
+        ok &= check(backend_ptr->writes.size() == write_count,
+            "mid-hold policy flip boundary wheel writes no backend bytes");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        const std::shared_ptr<const term::Terminal_render_snapshot> first_release =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(first_release != nullptr &&
+            first_release->public_scroll_diagnostics.effective_policy ==
+                term::Terminal_synchronized_output_scroll_policy::
+                    IMMEDIATE_PUBLIC_PROJECTION &&
+            first_release->public_scroll_diagnostics.policy_change_event ==
+                term::Terminal_synchronized_output_policy_change_event::CHANGED_MID_HOLD,
+            "mid-hold policy flip keeps immediate policy latched through release");
+
+        ok &= check(fixture.surface.scroll_to_offset_from_tail(1),
+            "mid-hold policy flip primes second hold with scrollable public viewport");
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hnext-held"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        const std::shared_ptr<const term::Terminal_render_snapshot> second_hold_before =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(second_hold_before != nullptr,
+            "mid-hold policy flip second hold keeps a public snapshot");
+        const std::uint64_t second_hold_sequence =
+            second_hold_before != nullptr
+                ? second_hold_before->metadata.sequence
+                : 0U;
+        ok &= send_wheel_event(
+            fixture.surface,
+            Qt::NoModifier,
+            120,
+            true,
+            "mid-hold policy flip second hold accepts scroll under deferred policy");
+        const std::shared_ptr<const term::Terminal_render_snapshot> second_hold_after =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(second_hold_after != nullptr &&
+            second_hold_after->metadata.sequence == second_hold_sequence &&
+            second_hold_after->basis != term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION,
+            "mid-hold policy flip second hold does not publish immediate projection scroll");
+
+        backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        const std::shared_ptr<const term::Terminal_render_snapshot> second_release =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(second_release != nullptr &&
+            second_release->public_scroll_diagnostics.effective_policy ==
+                term::Terminal_synchronized_output_scroll_policy::
+                    DEFER_UNTIL_CONTENT_PUBLICATION &&
+            second_release->public_scroll_diagnostics.policy_change_event ==
+                term::Terminal_synchronized_output_policy_change_event::NONE,
+            "mid-hold policy flip next hold uses configured deferred policy");
+    }
+
+    return ok;
+}
+
 bool test_plain_wheel_scrolls_scroll_region_primary_scrollback(QGuiApplication& app)
 {
     bool ok = true;
@@ -4533,7 +5304,7 @@ bool test_local_first_wheel_scroll_applies_during_synchronized_output_block(
     if (wheel_trace.has_value()) {
         const QJsonObject& object = wheel_trace->object;
         ok &= check(object.value(QStringLiteral("source")).toString() ==
-            QStringLiteral("surface.text_area"),
+            QStringLiteral("surface.text_area.wheel"),
             "synchronized-output blocked wheel trace records text-area source");
         ok &= check(object.value(QStringLiteral("route")).toString() ==
             QStringLiteral("local_scroll"),
@@ -5678,6 +6449,65 @@ bool test_selection_drag_and_selected_text(QGuiApplication& app)
     return ok;
 }
 
+bool test_synchronized_output_scroll_policy_property(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    const QMetaObject* meta_object = fixture.surface.metaObject();
+    const int property_index =
+        meta_object->indexOfProperty("synchronizedOutputScrollPolicy");
+    ok &= check(property_index >= 0,
+        "synchronizedOutputScrollPolicy property is registered");
+    if (property_index < 0) {
+        return ok;
+    }
+
+    const QMetaProperty property = meta_object->property(property_index);
+    int changed_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::synchronized_output_scroll_policy_changed,
+        &fixture.surface,
+        [&changed_count] {
+            ++changed_count;
+        });
+
+    ok &= check(property.read(&fixture.surface).toInt() ==
+        static_cast<int>(
+            VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                DEFER_UNTIL_CONTENT_PUBLICATION),
+        "synchronizedOutputScrollPolicy property reads the default policy");
+    ok &= check(property.write(
+            &fixture.surface,
+            QVariant::fromValue(static_cast<int>(
+                VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                    IMMEDIATE_PUBLIC_PROJECTION))),
+        "synchronizedOutputScrollPolicy property writes immediate policy");
+    ok &= check(fixture.surface.synchronized_output_scroll_policy() ==
+        VNM_TerminalSurface::Synchronized_output_scroll_policy::
+            IMMEDIATE_PUBLIC_PROJECTION,
+        "synchronizedOutputScrollPolicy property updates the public getter");
+    ok &= check(property.read(&fixture.surface).toInt() ==
+        static_cast<int>(
+            VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                IMMEDIATE_PUBLIC_PROJECTION),
+        "synchronizedOutputScrollPolicy property rereads immediate policy");
+    ok &= check(changed_count == 1,
+        "synchronizedOutputScrollPolicy property write emits notify once");
+    ok &= check(property.write(
+            &fixture.surface,
+            QVariant::fromValue(static_cast<int>(
+                VNM_TerminalSurface::Synchronized_output_scroll_policy::
+                    IMMEDIATE_PUBLIC_PROJECTION))),
+        "synchronizedOutputScrollPolicy property accepts idempotent write");
+    ok &= check(changed_count == 1,
+        "synchronizedOutputScrollPolicy idempotent write emits no notify");
+
+    return ok;
+}
+
 bool test_no_payload_copy_fallback_states(QGuiApplication& app)
 {
     bool ok = true;
@@ -5924,6 +6754,113 @@ bool test_selection_visual_detach_after_row_mutation(QGuiApplication& app)
     ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
         QStringLiteral("original"),
         "surface mutation-detach Ctrl+C copies retained payload");
+
+    return ok;
+}
+
+bool test_selection_drag_remaps_live_scrollback_viewport_spans(QGuiApplication& app)
+{
+    bool ok = true;
+
+    Surface_fixture fixture;
+    fixture.window.resize(640, 680);
+    fixture.surface.setSize(QSizeF(520.0, 600.0));
+    fixture.surface.set_scrollback_limit(96);
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {numbered_scroll_lines(90)};
+
+    bool started = false;
+    (void)start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface live-scroll selection remap starts");
+    ok &= check(surface_scrolls_to_first_visible_row(fixture.surface, 18),
+        "surface live-scroll selection remap scrolls to top row 018");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> top_018 =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(top_018 != nullptr &&
+        top_018->grid_size.rows    > 24 &&
+        top_018->grid_size.columns > 16,
+        "surface live-scroll selection remap fixture exposes the selected row range");
+    if (top_018 == nullptr || top_018->grid_size.rows <= 24 || top_018->grid_size.columns <= 16) {
+        return ok;
+    }
+
+    const QPointF start_point = point_in_grid_cell(fixture.surface, 18, 0);
+    const QPointF end_point   = point_in_grid_cell(fixture.surface, 24, 16);
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        start_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "surface live-scroll selection remap press is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        end_point,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "surface live-scroll selection remap drag is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        end_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "surface live-scroll selection remap release is accepted");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> selected =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(fixture.surface.selection_state() ==
+        VNM_TerminalSurface::Selection_state::ACTIVE,
+        "surface live-scroll selection remap activates public selection state");
+    ok &= check(selected != nullptr &&
+        surface_public_prefix_selection_is_highlighted(*selected, 18),
+        "surface live-scroll selection remap highlights selected rows at top row 018");
+
+    ok &= check(surface_scrolls_to_first_visible_row(fixture.surface, 21),
+        "surface live-scroll selection remap scrolls to top row 021");
+    const std::shared_ptr<const term::Terminal_render_snapshot> top_021 =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(top_021 != nullptr &&
+        surface_public_prefix_selection_is_highlighted(*top_021, 21),
+        "surface live-scroll selection remap keeps spans at top row 021");
+
+    ok &= check(surface_scrolls_to_first_visible_row(fixture.surface, 18),
+        "surface live-scroll selection remap returns to top row 018");
+    const std::shared_ptr<const term::Terminal_render_snapshot> returned_from_021 =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(returned_from_021 != nullptr &&
+        surface_public_prefix_selection_is_highlighted(*returned_from_021, 18),
+        "surface live-scroll selection remap restores spans after top row 021");
+
+    ok &= check(surface_scrolls_to_first_visible_row(fixture.surface, 15),
+        "surface live-scroll selection remap scrolls to top row 015");
+    const std::shared_ptr<const term::Terminal_render_snapshot> top_015 =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(top_015 != nullptr &&
+        surface_public_prefix_selection_is_highlighted(*top_015, 15),
+        "surface live-scroll selection remap keeps spans at top row 015");
+
+    ok &= check(surface_scrolls_to_first_visible_row(fixture.surface, 18),
+        "surface live-scroll selection remap returns to top row 018 again");
+    const std::shared_ptr<const term::Terminal_render_snapshot> returned_from_015 =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(returned_from_015 != nullptr &&
+        surface_public_prefix_selection_is_highlighted(*returned_from_015, 18),
+        "surface live-scroll selection remap restores spans after top row 015");
 
     return ok;
 }
@@ -10460,10 +11397,16 @@ int main(int argc, char** argv)
     ok &= test_osc52_clipboard_allow_writes_clipboard(app);
     ok &= test_keyboard_printable_controls_and_prompt_path(app);
     ok &= test_copy_shortcut_policy(app);
+    ok &= test_synchronized_output_scroll_policy_property(app);
     ok &= test_no_payload_copy_fallback_states(app);
     ok &= test_control_wheel_font_zoom(app);
     ok &= test_plain_wheel_scrolls_primary_scrollback(app);
     ok &= test_public_viewport_scroll_api(app);
+    ok &= test_immediate_public_projection_public_scroll_api(app);
+    ok &= test_public_viewport_scroll_source_labels(app);
+    ok &= test_immediate_public_projection_page_keys(app);
+    ok &= test_public_scroll_api_records_deferred_after_projection_invalidation(app);
+    ok &= test_app_route_boundaries_record_deferred_after_projection_invalidation(app);
     ok &= test_plain_wheel_scrolls_scroll_region_primary_scrollback(app);
     ok &= test_plain_wheel_scrolls_csi_scroll_up_primary_scrollback(app);
     ok &= test_page_keys_scroll_primary_scrollback(app);
@@ -10474,10 +11417,12 @@ int main(int argc, char** argv)
     ok &= test_wheel_mouse_reporting_stops_after_post_barrier_callbacks_become_pending(app);
     ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
     ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);
+    ok &= test_mid_hold_policy_flip_keeps_text_area_wheel_boundary_input(app);
     ok &= test_transcript_timing_diagnostics_records_hot_paths();
     ok &= test_mouse_reporting_surface_events(app);
     ok &= test_selection_drag_and_selected_text(app);
     ok &= test_selection_visual_detach_after_row_mutation(app);
+    ok &= test_selection_drag_remaps_live_scrollback_viewport_spans(app);
     ok &= test_selection_drag_survives_unrelated_row_backend_output(app);
     ok &= test_selection_drag_survives_worker_unrelated_row_backend_output(app);
     ok &= test_selection_drag_survives_at_tail_streaming_output(app);

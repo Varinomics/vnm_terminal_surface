@@ -45,6 +45,10 @@ class VNM_TerminalSurface : public QQuickItem
         READ synchronized_output_stale_timeout_ms
         WRITE set_synchronized_output_stale_timeout_ms
         NOTIFY synchronized_output_stale_timeout_ms_changed)
+    Q_PROPERTY(Synchronized_output_scroll_policy synchronizedOutputScrollPolicy
+        READ synchronized_output_scroll_policy
+        WRITE set_synchronized_output_scroll_policy
+        NOTIFY synchronized_output_scroll_policy_changed)
     Q_PROPERTY(Mouse_reporting_policy mouseReportingPolicy
         READ mouse_reporting_policy WRITE set_mouse_reporting_policy
         NOTIFY mouse_reporting_policy_changed)
@@ -112,6 +116,13 @@ public:
         LOCAL_SCROLLBACK_ONLY,
     };
     Q_ENUM(Wheel_event_policy)
+
+    enum class Synchronized_output_scroll_policy
+    {
+        DEFER_UNTIL_CONTENT_PUBLICATION,
+        IMMEDIATE_PUBLIC_PROJECTION,
+    };
+    Q_ENUM(Synchronized_output_scroll_policy)
 
     enum class Alternate_screen_wheel_policy
     {
@@ -191,6 +202,9 @@ public:
         bool    alternate_screen              = false;
         bool    local_scroll_intent_recorded  = false;
         bool    local_scroll_applied          = false;
+        bool    visible_scroll_applied        = false;
+        bool    deferred_intent_recorded      = false;
+        bool    event_accepted                = false;
     };
 
     enum class Selection_state
@@ -250,10 +264,15 @@ public:
         bool           local_scroll_intent_recorded = false,
         const QString& local_scroll_block_reason = {},
         const QString& scroll_action = {},
-        int            applied_line_delta = 0);
+        int            applied_line_delta = 0,
+        bool           deferred_intent_recorded = false);
 
     int synchronized_output_stale_timeout_ms() const;
     void set_synchronized_output_stale_timeout_ms(int timeout_ms);
+
+    Synchronized_output_scroll_policy synchronized_output_scroll_policy() const;
+    void set_synchronized_output_scroll_policy(
+        Synchronized_output_scroll_policy policy);
 
     Mouse_reporting_policy mouse_reporting_policy() const;
     void set_mouse_reporting_policy(Mouse_reporting_policy policy);
@@ -296,14 +315,27 @@ public:
     Q_INVOKABLE QString selected_text();
     Q_INVOKABLE void    clear_selection();
     Q_INVOKABLE bool    paste_text(QString text);
-    // Scrolls only when the published viewport is primary-screen scrollback
-    // and can be updated immediately. Returns false for no session, no-op
-    // deltas/offsets, non-primary buffers, hidden synchronized output, and
-    // boundary-clamped scrolls.
+    // Scrolls only when the published public viewport is primary-screen
+    // scrollback and can be updated immediately. Under the default synchronized
+    // output policy, hidden synchronized output remains deferred and returns
+    // false. Under IMMEDIATE_PUBLIC_PROJECTION, a valid hold publishes a public
+    // projection scroll snapshot, while an invalidated hold accepts a deferred
+    // release intent without consulting hidden live bounds.
     Q_INVOKABLE bool scroll_viewport_lines(int line_delta);
     wheel_scroll_diagnostic_result_t scroll_viewport_lines_with_diagnostics(
         int                    line_delta);
+    wheel_scroll_diagnostic_result_t scroll_viewport_lines_with_diagnostics(
+        int                    line_delta,
+        QString                source);
     Q_INVOKABLE bool scroll_to_offset_from_tail(int offset_from_tail);
+    wheel_scroll_diagnostic_result_t scroll_to_offset_from_tail_with_diagnostics(
+        int                    offset_from_tail);
+    wheel_scroll_diagnostic_result_t scroll_to_offset_from_tail_with_diagnostics(
+        int                    offset_from_tail,
+        QString                source);
+    bool scroll_to_offset_from_tail_from_source(
+        int                    offset_from_tail,
+        QString                source);
     Q_INVOKABLE bool start_process(QStringList argv, QString working_directory = {});
     Q_INVOKABLE bool interrupt_process();
     Q_INVOKABLE bool terminate_process();
@@ -319,6 +351,7 @@ signals:
     void cursor_blink_enabled_changed();
     void scrollback_limit_changed();
     void synchronized_output_stale_timeout_ms_changed();
+    void synchronized_output_scroll_policy_changed();
     void mouse_reporting_policy_changed();
     void copy_shortcut_policy_changed();
     void wheel_event_policy_changed();
@@ -441,6 +474,8 @@ private:
     bool                     m_wheel_trace_enabled                  = false;
     bool                     m_selection_trace_enabled              = false;
     int                      m_synchronized_output_stale_timeout_ms = 1000;
+    Synchronized_output_scroll_policy m_synchronized_output_scroll_policy =
+        Synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION;
     Mouse_reporting_policy   m_mouse_reporting_policy =
         Mouse_reporting_policy::APPLICATION_CONTROLLED;
     Copy_shortcut_policy     m_copy_shortcut_policy =

@@ -1,1 +1,2 @@
 add_subdirectory(embedded_terminal)
+add_subdirectory(phase7_public_scroll)

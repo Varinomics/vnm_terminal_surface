@@ -44,6 +44,14 @@ Writable Qt properties:
 - `synchronizedOutputStaleTimeoutMs` clamps to at least one millisecond and is
   used to release synchronized-output mode if the application leaves output
   hidden.
+- `synchronizedOutputScrollPolicy` controls scroll behavior while DEC
+  synchronized output is hiding live content. The default is
+  `DEFER_UNTIL_CONTENT_PUBLICATION`; public scroll APIs and app chrome remain
+  visually deferred until content is published. `IMMEDIATE_PUBLIC_PROJECTION`
+  is opt-in and scrolls a copied public projection without exposing hidden live
+  rows. Policy changes during an active hold are latched: the current hold keeps
+  its entry policy, a diagnostic is recorded, and the next hold uses the new
+  policy.
 - `mouseReportingPolicy` is `APPLICATION_CONTROLLED` or `DISABLED`. With the
   application-controlled policy, mouse-reporting terminal modes receive mouse
   input. Holding Shift forces local selection when no terminal mouse grab is
@@ -85,7 +93,11 @@ Read-only Qt properties expose the host-visible state:
 - `rows` and `columns` are the grid size derived from item geometry and font
   metrics.
 - `scrollbackRows`, `viewportVisibleRows`, `viewportOffsetFromTail`, and
-  `viewportAtTail` describe the published primary-screen viewport.
+  `viewportAtTail` describe the published primary-screen viewport. During an
+  opt-in immediate synchronized-output hold, these properties describe only the
+  public projection. If that projection is invalidated before release, the
+  values freeze at the last visible public state until live content is
+  published. Hidden live scrollback growth does not change these properties.
 - `selectionState` is `NONE` or `ACTIVE`.
 
 Every property has a matching notify signal. Grid size changes emit
@@ -113,6 +125,12 @@ ratio. Hosts should size the item before launch. Later geometry, font, screen,
 or device-pixel-ratio changes refresh the grid and send ordered resize requests
 through the session.
 
+Surface-owned product sessions opt into viewport-stable selection visuals for
+live primary scrollback: visible selection spans remap as the published viewport
+moves. The lower-level backend/session contract keeps that projection disabled
+by default, so direct session owners must enable it explicitly when they want
+the same visual behavior.
+
 `interrupt_process()` and `terminate_process()` forward lifecycle requests to
 the active session. They return `false` and emit a backend error if there is no
 active session or if the backend rejects the request. Destroying a surface with a
@@ -137,11 +155,45 @@ Invokable methods:
 - `respond_clipboard_write(quint64 request_id, Clipboard_response_decision
   decision)` answers a pending OSC 52 write request.
 
-Viewport operations return `true` only when the visible viewport actually moves.
-They return `false` for no session, zero or no-op movement, alternate-screen
-state, hidden synchronized output, or an already-boundary request. Large offset
-requests may clamp to the available scrollback and still return `true` if the
-viewport moved.
+Viewport operations return `true` when the visible viewport moves, or when an
+invalidated immediate public projection accepts a deferred release intent. They
+return `false` for no session, zero or no-op movement, alternate-screen state,
+hidden synchronized output under the default deferred policy, or an
+already-boundary request with no accepted deferred intent. Large offset requests
+may clamp to the available scrollback and still return `true` if the viewport
+moved.
+
+Under `IMMEDIATE_PUBLIC_PROJECTION`, valid synchronized-output holds are an
+exception to the default hidden-output behavior: `scroll_viewport_lines()` and
+`scroll_to_offset_from_tail()` publish visible
+`basis=PUBLIC_PROJECTION, purpose=SCROLL` snapshots and return `true` when the
+public projection moves. Clamping uses public projection bounds only. After
+projection invalidation, these methods still record a deferred release intent
+without consulting hidden live bounds; that accepted deferred intent returns
+`true` even though visible properties remain frozen. If neither visible
+movement nor deferred intent is possible, the methods return `false`.
+
+The C++ diagnostic/source overloads used by application chrome attach transcript
+source labels such as `api.lines`, `api.offset`, `key.page`,
+`surface.text_area.wheel`, `app.scrollbar.wheel`, `app.scrollbar.page`,
+`app.scrollbar.track`, and `app.scrollbar.thumb`. In the app scrollbar,
+`app.scrollbar.page` is the plain track-page route and `app.scrollbar.track` is
+the Ctrl-track absolute-position route. The labels distinguish replay routes
+only; they do not change scrolling semantics. `surface.text_area.wheel` replays
+through the same published-state wheel path used by direct text-area wheel
+handling. `key.page`, `app.scrollbar.wheel`, and `app.scrollbar.page` replay
+through the public line-scroll path, while `api.offset`, `app.scrollbar.track`,
+and `app.scrollbar.thumb` replay through the public offset path. Wheel trace
+events use the same `source` taxonomy, but their `route` field describes how
+that wheel event was handled, such as local scroll, mouse tracking, alternate
+screen keys, or control zoom. Diagnostics report visible scroll, deferred
+intent, and event acceptance separately; an accepted deferred intent is not a
+visible/local scroll application.
+
+The diagnostic strings emitted in transcript and snapshot diagnostics, including
+invalidated-projection fallback names, are diagnostic schema values rather than
+stable public API enum names. Hosts should branch on the documented surface
+policy and method return values, not on diagnostic string spelling.
 
 ## Clipboard Policy
 

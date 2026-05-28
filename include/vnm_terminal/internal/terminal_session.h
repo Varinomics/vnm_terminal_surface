@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/session_contract.h"
 #include "vnm_terminal/internal/selection_contract.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
+#include "vnm_terminal/internal/terminal_public_projection.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/utf8_scan.h"
 #include <QByteArray>
@@ -150,6 +151,7 @@ public:
     bool backend_geometry_in_sync() const;
     bool output_backpressure_active() const;
     bool render_publication_blocked() const;
+    Terminal_synchronized_output_scroll_policy effective_synchronized_output_scroll_policy() const;
     bool has_pending_backend_callback_events() const;
     bool mouse_reporting_active() const;
     bool alternate_scroll_active() const;
@@ -177,6 +179,25 @@ public:
     std::vector<QByteArray> output_chunks() const;
     std::optional<Terminal_render_snapshot> latest_render_snapshot() const;
     std::shared_ptr<const Terminal_render_snapshot> latest_render_snapshot_handle() const;
+    std::optional<Terminal_render_snapshot> latest_content_render_snapshot_for_testing() const;
+    std::optional<Terminal_public_projection> capture_public_projection_for_testing();
+    std::optional<Terminal_public_projection> public_projection_for_testing() const;
+    void install_public_projection_for_testing(Terminal_public_projection projection);
+    std::optional<Terminal_viewport_state> public_viewport_for_testing() const;
+    std::optional<Terminal_public_release_intent> public_release_intent_for_testing() const;
+    Terminal_public_viewport_scroll_result scroll_public_projection_viewport_lines_for_testing(
+        int                        line_delta);
+    Terminal_public_viewport_scroll_result
+        scroll_public_projection_viewport_to_offset_from_tail_for_testing(
+            int                    offset_from_tail);
+    Terminal_public_viewport_scroll_result
+        scroll_public_projection_viewport_to_tail_for_testing();
+    void invalidate_public_projection_for_testing(
+        Terminal_public_projection_disable_reason reason);
+    void set_synchronized_output_scroll_policy(
+        Terminal_synchronized_output_scroll_policy policy);
+    void set_synchronized_output_scroll_policy_for_testing(
+        Terminal_synchronized_output_scroll_policy policy);
     std::uint64_t render_snapshot_generation() const;
     void mark_render_snapshot_synced(std::uint64_t generation);
     Ime_preedit_state ime_preedit_state() const;
@@ -372,11 +393,27 @@ private:
         const terminal_selection_source_identity_t& source) const;
 
     Terminal_render_snapshot_request make_render_snapshot_request(
-        std::uint64_t              sequence) const;
+        std::uint64_t                      sequence,
+        Terminal_render_snapshot_purpose   purpose,
+        Terminal_public_scroll_diagnostics public_scroll_diagnostics = {}) const;
 
     void publish_render_snapshot(
         std::uint64_t              sequence,
-        QString                    message);
+        QString                    message,
+        Terminal_render_snapshot_purpose
+                                   purpose = Terminal_render_snapshot_purpose::CONTENT,
+        Terminal_public_scroll_diagnostics public_scroll_diagnostics = {});
+
+    bool publish_public_projection_scroll_snapshot(
+        std::uint64_t                  sequence,
+        QString                        message,
+        const Terminal_viewport_state& public_viewport_before,
+        const Terminal_viewport_state& public_viewport_after);
+    Terminal_viewport_scroll_result finish_public_projection_scroll(
+        Terminal_public_viewport_scroll_result scroll_result,
+        Terminal_public_viewport_controller    public_viewport_controller_before,
+        Terminal_viewport_state                public_viewport_before,
+        QString                                message);
 
     void publish_synchronized_resize_snapshot(
         std::uint64_t              sequence,
@@ -384,6 +421,24 @@ private:
 
     bool selection_range_is_valid_for_active_model(
         const Terminal_selection_range&        range) const;
+
+    bool public_projection_hold_active() const;
+    Terminal_synchronized_output_policy_change_event
+        synchronized_output_policy_change_event() const;
+    bool immediate_public_projection_policy_enabled() const;
+    void latch_synchronized_output_scroll_policy_for_new_hold();
+    void reset_synchronized_output_policy_lifecycle();
+    bool capture_public_projection_from_latest_content_basis();
+    std::optional<Terminal_public_scroll_diagnostics> reconcile_public_projection_release(
+        const Terminal_public_release_intent& release_intent,
+        Terminal_viewport_state               live_viewport_before_on_release);
+    std::optional<Terminal_public_scroll_diagnostics>
+        synchronized_output_policy_change_diagnostics() const;
+    void reset_public_projection_lifecycle();
+    void invalidate_public_projection(
+        Terminal_public_projection_disable_reason reason,
+        Terminal_public_scroll_diagnostic_reason  diagnostic_reason =
+            Terminal_public_scroll_diagnostic_reason::NONE);
 
     void advance_ime_preedit_generation();
 
@@ -465,6 +520,9 @@ private:
     std::optional<Terminal_screen_model>                   m_screen_model;
     std::shared_ptr<const Terminal_render_snapshot>        m_latest_render_snapshot;
     std::shared_ptr<const Terminal_render_snapshot>        m_latest_content_render_snapshot;
+    terminal_selection_content_basis_t                     m_latest_content_render_snapshot_content_basis;
+    std::optional<Terminal_public_projection>              m_public_projection;
+    Terminal_public_viewport_controller                    m_public_viewport_controller;
     std::optional<Terminal_screen_model_result>            m_last_model_ingest_result;
     std::optional<Terminal_screen_model_result>            m_render_snapshot_model_result;
     std::optional<Terminal_backend_exit>                   m_exit_status;
@@ -478,8 +536,14 @@ private:
     std::uint64_t                                          m_budgeted_backend_output_sequence = 0U;
     std::uint64_t                                          m_render_snapshot_generation = 0U;
     std::uint64_t                                          m_render_snapshot_synced_generation = 0U;
+    std::uint64_t                                          m_next_public_projection_generation = 1U;
+    std::optional<Terminal_synchronized_output_scroll_policy>
+                                                           m_synchronized_output_hold_policy;
+    Terminal_synchronized_output_policy_change_event       m_synchronized_output_policy_change_event =
+        Terminal_synchronized_output_policy_change_event::NONE;
     std::uint64_t                                          m_ime_preedit_generation = 0U;
     std::uint64_t                                          m_alternate_scroll_mode_generation = 0U;
+    std::uint64_t                                          m_active_buffer_epoch = 0U;
     std::uint64_t                                          m_row_origin_generation = 0U;
     int                                                    m_deferred_synchronized_evicted_scrollback_rows = 0;
     std::uint64_t                                          m_selection_session_epoch = 0U;

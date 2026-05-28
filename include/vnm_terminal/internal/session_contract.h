@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/parser_action.h"
+#include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/viewport_contract.h"
 #include <QByteArray>
 #include <QSizeF>
@@ -179,6 +180,8 @@ struct Terminal_session_config
     bool                            recover_scrollback_from_primary_repaints = false;
     bool                            selection_trace_enabled                  = false;
     bool                            selection_viewport_projection_enabled    = false;
+    Terminal_synchronized_output_scroll_policy synchronized_output_scroll_policy =
+        Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION;
     std::shared_ptr<Terminal_transcript_recorder> transcript_recorder;
 };
 

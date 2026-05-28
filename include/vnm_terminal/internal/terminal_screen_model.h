@@ -69,6 +69,18 @@ struct Terminal_retained_line_provenance
     std::uint64_t content_generation = 0U;
 };
 
+struct Terminal_retained_line_lookup_result
+{
+    bool exact_match = false;
+    int  exact_logical_row = 0;
+    bool nearest_successor = false;
+    int  nearest_successor_logical_row = 0;
+    bool nearest_predecessor = false;
+    int  nearest_predecessor_logical_row = 0;
+    bool retained_line_id_found = false;
+    bool retained_line_content_generation_mismatch = false;
+};
+
 struct Terminal_screen_model_result
 {
     std::vector<Parser_action> actions;
@@ -254,6 +266,10 @@ public:
         const Terminal_selection_range& range,
         std::span<const terminal_selection_line_lease_t>
                                        descriptors) const;
+    Terminal_retained_line_lookup_result retained_line_lookup(
+        Terminal_buffer_id             buffer_id,
+        std::uint64_t                  retained_line_id,
+        std::uint64_t                  content_generation) const;
     Terminal_retained_line_provenance retained_line_provenance_for_testing(
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;

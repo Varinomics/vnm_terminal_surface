@@ -2712,6 +2712,9 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
 
     Terminal_render_snapshot snapshot =
         make_empty_render_snapshot(m_config.grid_size, viewport, request.sequence);
+    snapshot.basis                     = request.basis;
+    snapshot.purpose                   = request.purpose;
+    snapshot.public_scroll_diagnostics = request.public_scroll_diagnostics;
     {
         VNM_TERMINAL_PROFILE_SCOPE(
             "Terminal_screen_model::render_snapshot::metadata");
@@ -3040,6 +3043,92 @@ bool Terminal_screen_model::retained_line_descriptors_match(
         }
     }
     return true;
+}
+
+Terminal_retained_line_lookup_result Terminal_screen_model::retained_line_lookup(
+    Terminal_buffer_id    buffer_id,
+    std::uint64_t         retained_line_id,
+    std::uint64_t         content_generation) const
+{
+    Terminal_retained_line_lookup_result result;
+    if (retained_line_id == 0U) {
+        return result;
+    }
+
+    std::uint64_t nearest_successor_id = 0U;
+    std::uint64_t nearest_predecessor_id = 0U;
+    const auto inspect_row = [&](
+        const Terminal_screen_row& row,
+        int                        logical_row)
+    {
+        const Terminal_retained_line_provenance& provenance =
+            row.retained_line_provenance;
+        if (provenance.retained_line_id == 0U) {
+            return;
+        }
+
+        if (provenance.retained_line_id == retained_line_id) {
+            result.retained_line_id_found = true;
+            if (provenance.content_generation == content_generation &&
+                !result.exact_match)
+            {
+                result.exact_match       = true;
+                result.exact_logical_row = logical_row;
+            }
+            else
+            if (provenance.content_generation != content_generation) {
+                result.retained_line_content_generation_mismatch = true;
+            }
+            return;
+        }
+
+        if (provenance.retained_line_id > retained_line_id &&
+            (!result.nearest_successor ||
+                provenance.retained_line_id < nearest_successor_id))
+        {
+            result.nearest_successor = true;
+            nearest_successor_id = provenance.retained_line_id;
+            result.nearest_successor_logical_row = logical_row;
+            return;
+        }
+
+        if (provenance.retained_line_id < retained_line_id &&
+            (!result.nearest_predecessor ||
+                provenance.retained_line_id > nearest_predecessor_id))
+        {
+            result.nearest_predecessor = true;
+            nearest_predecessor_id = provenance.retained_line_id;
+            result.nearest_predecessor_logical_row = logical_row;
+        }
+    };
+
+    if (buffer_id == Terminal_buffer_id::PRIMARY) {
+        for (std::size_t index = 0U; index < m_scrollback.size(); ++index) {
+            inspect_row(
+                m_scrollback[index].row,
+                static_cast<int>(index));
+        }
+
+        const std::vector<Terminal_screen_row>& rows =
+            m_active_buffer_id == Terminal_buffer_id::PRIMARY
+                ? m_rows
+                : m_primary_buffer.rows;
+        for (std::size_t index = 0U; index < rows.size(); ++index) {
+            inspect_row(
+                rows[index],
+                static_cast<int>(m_scrollback.size() + index));
+        }
+        return result;
+    }
+
+    const std::vector<Terminal_screen_row>& rows =
+        m_active_buffer_id == Terminal_buffer_id::ALTERNATE
+            ? m_rows
+            : m_alternate_buffer.rows;
+    for (std::size_t index = 0U; index < rows.size(); ++index) {
+        inspect_row(rows[index], static_cast<int>(index));
+    }
+    return result;
 }
 
 Terminal_retained_line_provenance Terminal_screen_model::retained_line_provenance_for_testing(

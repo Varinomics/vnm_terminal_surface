@@ -7,12 +7,18 @@ namespace vnm_terminal::internal {
 void insert_wheel_trace_scroll_publication_fields(
     QJsonObject& object,
     bool         local_scroll_applied,
-    bool         render_publication_blocked)
+    bool         render_publication_blocked,
+    std::optional<bool> visible_scroll_applied,
+    bool         deferred_intent_recorded)
 {
     object.insert(QStringLiteral("local_scroll_applied"), local_scroll_applied);
+    // The default is the Phase 3 deferred-publication trace value. Public
+    // projection scroll publication must pass an explicit visible result.
     object.insert(
         QStringLiteral("visible_scroll_applied"),
-        local_scroll_applied && !render_publication_blocked);
+        visible_scroll_applied.value_or(
+            local_scroll_applied && !render_publication_blocked));
+    object.insert(QStringLiteral("deferred_intent_recorded"), deferred_intent_recorded);
 }
 
 namespace {

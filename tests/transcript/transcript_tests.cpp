@@ -14,6 +14,7 @@
 #include <QStringList>
 #include <QTemporaryDir>
 #include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -44,6 +45,31 @@ void insert_u64(QJsonObject& object, const QString& name, std::uint64_t value)
 QByteArray json_line(QJsonObject object)
 {
     return QJsonDocument(object).toJson(QJsonDocument::Compact) + QByteArrayLiteral("\n");
+}
+
+QString hex_u64(std::uint64_t value)
+{
+    return QStringLiteral("%1").arg(
+        static_cast<qulonglong>(value),
+        16,
+        16,
+        QLatin1Char('0'));
+}
+
+std::uint64_t fnv1a64(QByteArrayView bytes)
+{
+    std::uint64_t hash = 14695981039346656037ULL;
+    for (char byte : bytes) {
+        hash ^= static_cast<unsigned char>(byte);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+QString text_hash64(const QString& text)
+{
+    const QByteArray bytes = text.toUtf8();
+    return hex_u64(fnv1a64(QByteArrayView(bytes)));
 }
 
 QJsonObject valid_header_object(std::uint64_t event_index = 0U)
@@ -141,6 +167,27 @@ QJsonObject valid_compact_snapshot_object(std::uint64_t event_index)
     return object;
 }
 
+term::Terminal_public_projection_row public_projection_row_from_text(
+    std::int64_t    public_row,
+    const QString&  text)
+{
+    term::Terminal_public_projection_row row;
+    row.public_row = public_row;
+    row.provenance = {
+        public_row,
+        static_cast<std::uint64_t>(9000 + public_row),
+        1U,
+    };
+
+    for (int column = 0; column < text.size(); ++column) {
+        term::Terminal_render_cell cell;
+        cell.position = {0, column};
+        cell.text     = text.mid(column, 1);
+        row.cells.push_back(std::move(cell));
+    }
+    return row;
+}
+
 QByteArray event_bytes(const term::Terminal_transcript_event& event)
 {
     const QByteArray::FromBase64Result decoded = QByteArray::fromBase64Encoding(
@@ -171,6 +218,23 @@ std::optional<term::Terminal_transcript_event> first_event(
             return event.kind == kind;
         });
     if (it == events.end()) {
+        return std::nullopt;
+    }
+
+    return *it;
+}
+
+std::optional<term::Terminal_transcript_event> last_event(
+    const std::vector<term::Terminal_transcript_event>& events,
+    const QString&                                      kind)
+{
+    const auto it = std::find_if(
+        events.rbegin(),
+        events.rend(),
+        [&kind](const term::Terminal_transcript_event& event) {
+            return event.kind == kind;
+        });
+    if (it == events.rend()) {
         return std::nullopt;
     }
 
@@ -249,6 +313,40 @@ bool write_transcript_lines(
     return true;
 }
 
+QJsonObject valid_wheel_trace_object(std::uint64_t event_index)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("kind"), QStringLiteral("surface.wheel_trace"));
+    insert_u64(object, QStringLiteral("event_index"), event_index);
+    object.insert(QStringLiteral("source"), QStringLiteral("surface.text_area.wheel"));
+    object.insert(QStringLiteral("route"), QStringLiteral("local_scroll"));
+    object.insert(QStringLiteral("outcome"), QStringLiteral("local_scroll_publication_deferred"));
+    object.insert(QStringLiteral("accepted"), true);
+    object.insert(QStringLiteral("angle_delta_x"), 0);
+    object.insert(QStringLiteral("angle_delta_y"), 120);
+    object.insert(QStringLiteral("pixel_delta_x"), 0);
+    object.insert(QStringLiteral("pixel_delta_y"), 0);
+    object.insert(QStringLiteral("modifiers"), 0);
+    object.insert(QStringLiteral("wheel_steps"), 1);
+    object.insert(QStringLiteral("effective_line_delta"), 3);
+    object.insert(QStringLiteral("angle_remainder"), 0.0);
+    object.insert(QStringLiteral("pixel_remainder"), 0.0);
+    object.insert(QStringLiteral("session_present"), true);
+    object.insert(QStringLiteral("render_publication_blocked"), true);
+    object.insert(QStringLiteral("published_synchronized_output"), false);
+    object.insert(QStringLiteral("alternate_screen"), false);
+    object.insert(QStringLiteral("local_scroll_attempted"), true);
+    object.insert(QStringLiteral("local_scroll_intent_recorded"), true);
+    object.insert(QStringLiteral("local_scroll_applied"), true);
+    object.insert(QStringLiteral("visible_scroll_applied"), false);
+    object.insert(QStringLiteral("live_sgr_mouse_reporting"), false);
+    object.insert(QStringLiteral("published_sgr_mouse_reporting"), false);
+    object.insert(QStringLiteral("published_mouse_tracking"), false);
+    object.insert(QStringLiteral("backend_drain_calls"), 1);
+    object.insert(QStringLiteral("backend_drain_elapsed_ns"), 0);
+    return object;
+}
+
 struct Replay_tool_process_result
 {
     bool                 finished    = false;
@@ -282,6 +380,50 @@ void print_replay_tool_output(const Replay_tool_process_result& result)
     std::cerr << result.stdout_text.constData() << result.stderr_text.constData();
 }
 
+std::optional<int> replay_stdout_metric(
+    const QByteArray& stdout_text,
+    const QByteArray& metric_name)
+{
+    const QByteArray prefix = metric_name + QByteArrayLiteral("=");
+    const QList<QByteArray> lines = stdout_text.split('\n');
+    for (const QByteArray& line : lines) {
+        const QList<QByteArray> tokens = line.split(' ');
+        for (const QByteArray& token : tokens) {
+            if (!token.startsWith(prefix)) {
+                continue;
+            }
+
+            bool ok = false;
+            const int value = token.mid(prefix.size()).toInt(&ok);
+            if (ok) {
+                return value;
+            }
+        }
+    }
+
+    return std::nullopt;
+}
+
+QStringList transcript_event_sources(
+    const std::vector<term::Terminal_transcript_event>& events,
+    const QString&                                      kind)
+{
+    QStringList sources;
+    for (const term::Terminal_transcript_event& event : events) {
+        if (event.kind != kind) {
+            continue;
+        }
+
+        const QString source = event.object.value(QStringLiteral("source")).toString();
+        if (!source.isEmpty() && !sources.contains(source)) {
+            sources.push_back(source);
+        }
+    }
+
+    sources.sort();
+    return sources;
+}
+
 bool rewrite_first_snapshot_dirty_ranges(const QString& path)
 {
     QFile file(path);
@@ -310,6 +452,135 @@ bool rewrite_first_snapshot_dirty_ranges(const QString& path)
                     {QStringLiteral("row_count"), 1},
                 },
             });
+            rewritten = true;
+        }
+        lines.push_back(json_line(object));
+    }
+    file.close();
+
+    return rewritten && write_transcript_lines(path, lines);
+}
+
+bool rewrite_first_snapshot_reason(const QString& path, const QString& reason)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+
+    bool rewritten = false;
+    std::vector<QByteArray> lines;
+    while (!file.atEnd()) {
+        const QByteArray line = file.readLine();
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
+            return false;
+        }
+
+        QJsonObject object = document.object();
+        if (!rewritten && object.value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("snapshot"))
+        {
+            object.insert(QStringLiteral("reason"), reason);
+            rewritten = true;
+        }
+        lines.push_back(json_line(object));
+    }
+    file.close();
+
+    return rewritten && write_transcript_lines(path, lines);
+}
+
+bool remove_snapshot_public_scroll_schema_fields(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+
+    const QStringList schema_fields = {
+        QStringLiteral("snapshot_basis"),
+        QStringLiteral("snapshot_purpose"),
+        QStringLiteral("effective_synchronized_output_scroll_policy"),
+        QStringLiteral("synchronized_output_scroll_policy_change_event"),
+        QStringLiteral("diagnostic_reason"),
+        QStringLiteral("public_projection_generation"),
+        QStringLiteral("public_viewport_before"),
+        QStringLiteral("public_viewport_after"),
+        QStringLiteral("live_viewport_before_on_release"),
+        QStringLiteral("live_viewport_after_on_release"),
+        QStringLiteral("visible_scroll_applied"),
+        QStringLiteral("live_content_publication_blocked"),
+        QStringLiteral("release_reconciliation_result"),
+        QStringLiteral("hidden_row_eligibility"),
+        QStringLiteral("hidden_row_clamp_reason"),
+        QStringLiteral("public_projection_disable_reason"),
+    };
+
+    bool rewritten = false;
+    std::vector<QByteArray> lines;
+    while (!file.atEnd()) {
+        const QByteArray line = file.readLine();
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
+            return false;
+        }
+
+        QJsonObject object = document.object();
+        if (object.value(QStringLiteral("kind")).toString() == QStringLiteral("snapshot")) {
+            for (const QString& field : schema_fields) {
+                object.remove(field);
+            }
+            rewritten = true;
+        }
+        lines.push_back(json_line(object));
+    }
+    file.close();
+
+    return rewritten && write_transcript_lines(path, lines);
+}
+
+bool corrupt_first_public_projection_scroll_snapshot_to_self_consistent_wrong_content(
+    const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+
+    bool rewritten = false;
+    std::vector<QByteArray> lines;
+    while (!file.atEnd()) {
+        const QByteArray line = file.readLine();
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
+            return false;
+        }
+
+        QJsonObject object = document.object();
+        if (!rewritten &&
+            object.value(QStringLiteral("kind")).toString() == QStringLiteral("snapshot") &&
+            object.value(QStringLiteral("snapshot_basis")).toString() ==
+                QStringLiteral("PUBLIC_PROJECTION") &&
+            object.value(QStringLiteral("snapshot_purpose")).toString() == QStringLiteral("SCROLL"))
+        {
+            QJsonArray visible_rows = object.value(QStringLiteral("visible_rows")).toArray();
+            if (!visible_rows.isEmpty()) {
+                const QString corrupted_text =
+                    QStringLiteral("corrupted-public-row");
+                QJsonObject first_row = visible_rows.first().toObject();
+                first_row.insert(QStringLiteral("text"), corrupted_text);
+                first_row.insert(QStringLiteral("hash64"), text_hash64(corrupted_text));
+                visible_rows.replace(0, first_row);
+                object.insert(QStringLiteral("visible_rows"), visible_rows);
+            }
+
+            object.insert(
+                QStringLiteral("public_viewport_after"),
+                object.value(QStringLiteral("viewport")).toObject());
             rewritten = true;
         }
         lines.push_back(json_line(object));
@@ -400,6 +671,12 @@ bool insert_replay_transparent_diagnostics_around_first_snapshot(const QString& 
             first_row.insert(QStringLiteral("hash64"), QStringLiteral("intermediate-diagnostic-hash"));
             visible_rows.replace(0, first_row);
             intermediate.insert(QStringLiteral("visible_rows"), visible_rows);
+            intermediate.insert(
+                QStringLiteral("diagnostic_reason"),
+                QStringLiteral("public_projection_memory_pressure_invalidated"));
+            intermediate.insert(
+                QStringLiteral("public_projection_disable_reason"),
+                QStringLiteral("memory_pressure"));
             objects.push_back(std::move(intermediate));
             objects.push_back(transcript_timing_diagnostic_object(
                 QStringLiteral("snapshot"),
@@ -529,6 +806,8 @@ QString scroll_action_name(term::Terminal_viewport_scroll_action action)
             return QStringLiteral("viewport_moved");
         case term::Terminal_viewport_scroll_action::AT_BOUNDARY:
             return QStringLiteral("at_boundary");
+        case term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED:
+            return QStringLiteral("deferred_intent_recorded");
         case term::Terminal_viewport_scroll_action::TERMINAL_INPUT:
             return QStringLiteral("terminal_input");
     }
@@ -662,6 +941,23 @@ int max_recorded_scrollback_rows(const std::vector<term::Terminal_transcript_eve
     return max_scrollback_rows;
 }
 
+bool transcript_uses_immediate_public_projection(
+    const std::vector<term::Terminal_transcript_event>& events)
+{
+    for (const term::Terminal_transcript_event& event : events) {
+        if (event.object.value(QStringLiteral("snapshot_basis")).toString() ==
+                QStringLiteral("PUBLIC_PROJECTION") ||
+            event.object.value(
+                QStringLiteral("effective_synchronized_output_scroll_policy")).toString() ==
+                QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 term::Terminal_session_config replay_session_config(
     const std::vector<term::Terminal_transcript_event>& events)
 {
@@ -682,6 +978,20 @@ term::Terminal_session_config replay_session_config(
                 : session_config.value(QStringLiteral("scrollback_limit")).toInt();
         config.recover_scrollback_from_primary_repaints =
             session_config.value(QStringLiteral("recover_scrollback_from_primary_repaints")).toBool();
+        config.selection_viewport_projection_enabled =
+            session_config.value(QStringLiteral("selection_viewport_projection_enabled")).toBool();
+        const QJsonValue explicit_scroll_policy =
+            session_config.value(QStringLiteral("synchronized_output_scroll_policy"));
+        if (explicit_scroll_policy.toString() == QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"))
+        {
+            config.synchronized_output_scroll_policy =
+                term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+        }
+        else
+        if (!explicit_scroll_policy.isString() && transcript_uses_immediate_public_projection(events)) {
+            config.synchronized_output_scroll_policy =
+                term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+        }
         return config;
     }
 
@@ -689,6 +999,10 @@ term::Terminal_session_config replay_session_config(
     config.scrollback_limit =
         recorded_scrollback_rows > 0 ? recorded_scrollback_rows : k_surface_default_scrollback_limit;
     config.recover_scrollback_from_primary_repaints = true;
+    if (transcript_uses_immediate_public_projection(events)) {
+        config.synchronized_output_scroll_policy =
+            term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+    }
     return config;
 }
 
@@ -744,6 +1058,40 @@ bool scroll_event_matches_pending_intent(
     return true;
 }
 
+term::Terminal_buffer_id buffer_from_name(const QString& buffer)
+{
+    return buffer == QStringLiteral("alternate")
+        ? term::Terminal_buffer_id::ALTERNATE
+        : term::Terminal_buffer_id::PRIMARY;
+}
+
+term::Terminal_alternate_screen_scroll_policy alternate_policy_from_name(
+    const QString& policy)
+{
+    return policy == QStringLiteral("wheel_to_terminal_input")
+        ? term::Terminal_alternate_screen_scroll_policy::WHEEL_TO_TERMINAL_INPUT
+        : term::Terminal_alternate_screen_scroll_policy::KEEP_AT_TAIL;
+}
+
+term::Terminal_viewport_state viewport_from_object(const QJsonObject& object)
+{
+    term::Terminal_viewport_state viewport;
+    viewport.active_buffer =
+        buffer_from_name(object.value(QStringLiteral("active_buffer")).toString());
+    viewport.scrollback_rows =
+        object.value(QStringLiteral("scrollback_rows")).toInt();
+    viewport.visible_rows =
+        object.value(QStringLiteral("visible_rows")).toInt();
+    viewport.offset_from_tail =
+        object.value(QStringLiteral("offset_from_tail")).toInt();
+    viewport.follow_tail =
+        object.value(QStringLiteral("follow_tail")).toBool();
+    viewport.alternate_screen_scroll_policy =
+        alternate_policy_from_name(
+            object.value(QStringLiteral("alternate_screen_scroll_policy")).toString());
+    return viewport;
+}
+
 bool viewport_offset_matches_recorded_after(
     const term::Terminal_viewport_state&   viewport,
     const term::Terminal_transcript_event& event)
@@ -752,6 +1100,25 @@ bool viewport_offset_matches_recorded_after(
         event.object.value(QStringLiteral("viewport_after")).toObject();
     return viewport.offset_from_tail ==
         viewport_after.value(QStringLiteral("offset_from_tail")).toInt();
+}
+
+bool visible_viewport_offset_matches_recorded_after(
+    const term::Terminal_session&          session,
+    const term::Terminal_transcript_event& event)
+{
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session.latest_render_snapshot();
+    return snapshot.has_value() &&
+        viewport_offset_matches_recorded_after(snapshot->viewport, event);
+}
+
+bool scroll_event_uses_published_state_source(
+    const term::Terminal_transcript_event& event)
+{
+    return
+        event.object.value(QStringLiteral("source")).toString() ==
+            QStringLiteral("surface.text_area.wheel") &&
+        event.object.contains(QStringLiteral("viewport_before"));
 }
 
 bool apply_replay_scroll_event(
@@ -764,6 +1131,12 @@ bool apply_replay_scroll_event(
     if (event.object.contains(QStringLiteral("requested_offset_from_tail"))) {
         result = session.scroll_published_viewport_to_offset_from_tail(
             event.object.value(QStringLiteral("requested_offset_from_tail")).toInt());
+    }
+    else
+    if (scroll_event_uses_published_state_source(event)) {
+        result = session.scroll_viewport_lines_from_published_state(
+            event.object.value(QStringLiteral("requested_line_delta")).toInt(),
+            viewport_from_object(event.object.value(QStringLiteral("viewport_before")).toObject()));
     }
     else {
         result = session.scroll_published_viewport_lines(
@@ -867,7 +1240,10 @@ Replay_harness replay_events(const std::vector<term::Terminal_transcript_event>&
                 return replay;
             }
             pending_scroll_intent.reset();
-            if (result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED) {
+            if (result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED ||
+                result.action ==
+                    term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED)
+            {
                 pending_scroll_intent = pending_scroll_intent_from_event(event, result);
             }
         }
@@ -876,7 +1252,10 @@ Replay_harness replay_events(const std::vector<term::Terminal_transcript_event>&
             const bool pending_result_already_applied =
                 pending_scroll_intent.has_value() &&
                 scroll_event_matches_pending_intent(event, *pending_scroll_intent) &&
-                viewport_offset_matches_recorded_after(session.viewport_state(), event);
+                (pending_scroll_intent->result.action ==
+                    term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED ||
+                    viewport_offset_matches_recorded_after(session.viewport_state(), event) ||
+                    visible_viewport_offset_matches_recorded_after(session, event));
             pending_scroll_intent.reset();
             if (!pending_result_already_applied) {
                 term::Terminal_viewport_scroll_result result;
@@ -1005,9 +1384,18 @@ bool test_writer_reader_schema_roundtrip()
     ok &= check(
         visible_scroll_fields.value(QStringLiteral("visible_scroll_applied")).toBool(),
         "wheel trace publication fields mark visible local scroll");
+    QJsonObject explicit_visible_scroll_fields;
+    term::insert_wheel_trace_scroll_publication_fields(
+        explicit_visible_scroll_fields,
+        true,
+        true,
+        true);
+    ok &= check(
+        explicit_visible_scroll_fields.value(QStringLiteral("visible_scroll_applied")).toBool(),
+        "wheel trace publication fields allow explicit visible public scroll while content is blocked");
 
     QJsonObject wheel_trace;
-    wheel_trace.insert(QStringLiteral("source"), QStringLiteral("surface.text_area"));
+    wheel_trace.insert(QStringLiteral("source"), QStringLiteral("surface.text_area.wheel"));
     wheel_trace.insert(QStringLiteral("route"), QStringLiteral("local_scroll"));
     wheel_trace.insert(QStringLiteral("outcome"), QStringLiteral("local_scroll_publication_deferred"));
     wheel_trace.insert(QStringLiteral("accepted"), true);
@@ -1023,6 +1411,15 @@ bool test_writer_reader_schema_roundtrip()
     wheel_trace.insert(QStringLiteral("session_present"), true);
     wheel_trace.insert(QStringLiteral("render_publication_blocked"), true);
     wheel_trace.insert(QStringLiteral("published_synchronized_output"), false);
+    wheel_trace.insert(
+        QStringLiteral("effective_synchronized_output_scroll_policy"),
+        QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"));
+    wheel_trace.insert(
+        QStringLiteral("synchronized_output_scroll_policy_change_event"),
+        QStringLiteral("changed_mid_hold"));
+    wheel_trace.insert(
+        QStringLiteral("diagnostic_reason"),
+        QStringLiteral("synchronized_output_scroll_policy_changed_mid_hold"));
     wheel_trace.insert(QStringLiteral("alternate_screen"), false);
     wheel_trace.insert(QStringLiteral("local_scroll_attempted"), true);
     wheel_trace.insert(QStringLiteral("local_scroll_intent_recorded"), true);
@@ -1037,8 +1434,20 @@ bool test_writer_reader_schema_roundtrip()
     wheel_trace.insert(QStringLiteral("backend_drain_elapsed_ns"), 0);
     wheel_trace.insert(QStringLiteral("scroll_action"), QStringLiteral("viewport_moved"));
     wheel_trace.insert(QStringLiteral("applied_line_delta"), 3);
+    QJsonObject explicit_blocked_wheel_trace = wheel_trace;
+    explicit_blocked_wheel_trace.insert(
+        QStringLiteral("outcome"),
+        QStringLiteral("public_projection_scroll_visible"));
+    term::insert_wheel_trace_scroll_publication_fields(
+        explicit_blocked_wheel_trace,
+        true,
+        true,
+        true);
     ok &= check(recorder->record_surface_wheel_trace(std::move(wheel_trace)),
         "surface.wheel_trace writes");
+    ok &= check(
+        recorder->record_surface_wheel_trace(std::move(explicit_blocked_wheel_trace)),
+        "explicit visible surface.wheel_trace writes while publication is blocked");
 
     term::Terminal_selection_range range;
     range.start = {1, 2};
@@ -1064,8 +1473,66 @@ bool test_writer_reader_schema_roundtrip()
 
     term::Terminal_render_snapshot snapshot =
         term::make_empty_render_snapshot({4, 12}, viewport_after, 8U);
+    snapshot.basis   = term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION;
+    snapshot.purpose = term::Terminal_render_snapshot_purpose::SCROLL;
+    snapshot.public_scroll_diagnostics.effective_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+    snapshot.public_scroll_diagnostics.policy_change_event =
+        term::Terminal_synchronized_output_policy_change_event::CHANGED_MID_HOLD;
+    snapshot.public_scroll_diagnostics.diagnostic_reason =
+        term::Terminal_public_scroll_diagnostic_reason::
+            PUBLIC_PROJECTION_MEMORY_PRESSURE_INVALIDATED;
+    snapshot.public_scroll_diagnostics.public_projection_generation = 42U;
+    snapshot.public_scroll_diagnostics.public_viewport_before = viewport_before;
+    snapshot.public_scroll_diagnostics.public_viewport_after  = viewport_after;
+    snapshot.public_scroll_diagnostics.live_viewport_before_on_release = viewport_after;
+    snapshot.public_scroll_diagnostics.live_viewport_after_on_release  = viewport_before;
+    snapshot.public_scroll_diagnostics.visible_scroll_applied = true;
+    snapshot.public_scroll_diagnostics.live_content_publication_blocked = true;
+    snapshot.public_scroll_diagnostics.release_reconciliation_result =
+        term::Terminal_release_reconciliation_result::EXACT_ANCHOR;
+    snapshot.public_scroll_diagnostics.hidden_row_eligibility =
+        term::Terminal_hidden_row_eligibility::ELIGIBLE;
+    snapshot.public_scroll_diagnostics.hidden_row_clamp_reason =
+        term::Terminal_hidden_row_clamp_reason::LIVE_VIEWPORT_BOUNDARY;
+    snapshot.public_scroll_diagnostics.public_projection_disable_reason =
+        term::Terminal_public_projection_disable_reason::MEMORY_PRESSURE;
     ok &= check(recorder->record_snapshot(8U, QStringLiteral("test snapshot"), snapshot),
         "compact snapshot writes when enabled");
+
+    constexpr int k_public_projection_disable_reason_case_count = 5;
+    const term::Terminal_public_projection_disable_reason disable_reason_cases[
+        k_public_projection_disable_reason_case_count] = {
+        term::Terminal_public_projection_disable_reason::NONE,
+        term::Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED,
+        term::Terminal_public_projection_disable_reason::MEMORY_PRESSURE,
+        term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED,
+        term::Terminal_public_projection_disable_reason::UNSUPPORTED_BUFFER,
+    };
+    for (int i = 0; i < k_public_projection_disable_reason_case_count; ++i) {
+        term::Terminal_render_snapshot disable_reason_snapshot =
+            term::make_empty_render_snapshot(
+                {4, 12},
+                viewport_after,
+                20U + static_cast<std::uint64_t>(i));
+        disable_reason_snapshot.public_scroll_diagnostics.public_projection_disable_reason =
+            disable_reason_cases[i];
+        ok &= check(
+            recorder->record_snapshot(
+                20U + static_cast<std::uint64_t>(i),
+                QStringLiteral("disable reason snapshot"),
+                disable_reason_snapshot),
+            "compact snapshot public projection disable reason writes");
+    }
+
+    term::Terminal_render_snapshot default_snapshot =
+        term::make_empty_render_snapshot({4, 12}, viewport_after, 9U);
+    ok &= check(
+        recorder->record_snapshot(
+            9U,
+            QStringLiteral("default diagnostics snapshot"),
+            default_snapshot),
+        "default compact snapshot writes when enabled");
 
     recorder.reset();
 
@@ -1129,9 +1596,37 @@ bool test_writer_reader_schema_roundtrip()
         ok &= check(
             wheel_trace_event->object.value(QStringLiteral("backend_drain_calls")).toInt() == 1,
             "surface.wheel_trace records backend drain call count");
+        ok &= check(
+            wheel_trace_event->object.value(
+                QStringLiteral("effective_synchronized_output_scroll_policy")).toString() ==
+                QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"),
+            "surface.wheel_trace records effective synchronized-output scroll policy");
+        ok &= check(
+            wheel_trace_event->object.value(
+                QStringLiteral("synchronized_output_scroll_policy_change_event")).toString() ==
+                QStringLiteral("changed_mid_hold"),
+            "surface.wheel_trace records mid-hold policy-change event");
+        ok &= check(
+            wheel_trace_event->object.value(QStringLiteral("diagnostic_reason")).toString() ==
+                QStringLiteral("synchronized_output_scroll_policy_changed_mid_hold"),
+            "surface.wheel_trace records mid-hold policy-change diagnostic reason");
+    }
+    const std::optional<term::Terminal_transcript_event> explicit_wheel_trace_event =
+        last_event(*events, QStringLiteral("surface.wheel_trace"));
+    ok &= check(explicit_wheel_trace_event.has_value(),
+        "explicit visible surface.wheel_trace event is present");
+    if (explicit_wheel_trace_event.has_value()) {
+        ok &= check(
+            explicit_wheel_trace_event->object.value(QStringLiteral("render_publication_blocked")).toBool() &&
+            explicit_wheel_trace_event->object.value(QStringLiteral("visible_scroll_applied")).toBool(),
+            "explicit surface.wheel_trace round-trips visible scroll while publication is blocked");
     }
     ok &= check(first_event(*events, QStringLiteral("snapshot")).has_value(),
         "snapshot compact event is present");
+    ok &= check(
+        event_count(*events, QStringLiteral("snapshot")) ==
+            2 + k_public_projection_disable_reason_case_count,
+        "snapshot compact events include explicit, disable-reason, and default diagnostics");
     const std::optional<term::Terminal_transcript_event> snapshot_event =
         first_event(*events, QStringLiteral("snapshot"));
     if (snapshot_event.has_value()) {
@@ -1143,6 +1638,112 @@ bool test_writer_reader_schema_roundtrip()
             "snapshot diagnostics include dirty row ranges");
         ok &= check(snapshot_event->object.contains(QStringLiteral("selection_spans")),
             "snapshot diagnostics include selection spans");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("snapshot_basis")).toString() ==
+                QStringLiteral("PUBLIC_PROJECTION") &&
+            snapshot_event->object.value(QStringLiteral("snapshot_purpose")).toString() ==
+                QStringLiteral("SCROLL"),
+            "snapshot diagnostics include public projection basis and scroll purpose");
+        ok &= check(
+            snapshot_event->object.value(
+                QStringLiteral("effective_synchronized_output_scroll_policy")).toString() ==
+                QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"),
+            "snapshot diagnostics round-trip effective synchronized-output scroll policy");
+        ok &= check(
+            snapshot_event->object.value(
+                QStringLiteral("synchronized_output_scroll_policy_change_event")).toString() ==
+                QStringLiteral("changed_mid_hold"),
+            "snapshot diagnostics round-trip policy-change event");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("diagnostic_reason")).toString() ==
+                QStringLiteral("public_projection_memory_pressure_invalidated"),
+            "snapshot diagnostics round-trip memory-pressure diagnostic reason");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("live_content_publication_blocked")).toBool(),
+            "snapshot diagnostics round-trip live content publication blocking field");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("public_projection_generation")).toInt() == 42,
+            "snapshot diagnostics round-trip public projection generation");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("public_viewport_before")).toObject()
+                .value(QStringLiteral("offset_from_tail")).toInt() == 0,
+            "snapshot diagnostics round-trip public viewport before");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("public_viewport_after")).toObject()
+                .value(QStringLiteral("offset_from_tail")).toInt() == 3,
+            "snapshot diagnostics round-trip public viewport after");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("visible_scroll_applied")).toBool(),
+            "snapshot diagnostics round-trip visible scroll application field");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("release_reconciliation_result")).toString() ==
+                QStringLiteral("exact_anchor"),
+            "snapshot diagnostics round-trip release reconciliation result");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("hidden_row_eligibility")).toString() ==
+                QStringLiteral("eligible"),
+            "snapshot diagnostics round-trip hidden-row eligibility");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("hidden_row_clamp_reason")).toString() ==
+                QStringLiteral("live_viewport_boundary"),
+            "snapshot diagnostics round-trip hidden-row clamp reason");
+        ok &= check(
+            snapshot_event->object.value(QStringLiteral("public_projection_disable_reason")).toString() ==
+                QStringLiteral("memory_pressure"),
+            "snapshot diagnostics round-trip memory-pressure public projection disable reason");
+    }
+    for (term::Terminal_public_projection_disable_reason disable_reason :
+         disable_reason_cases)
+    {
+        const QString reason_name =
+            term::public_projection_disable_reason_name(disable_reason);
+        bool found = false;
+        for (const term::Terminal_transcript_event& event : *events) {
+            if (event.kind == QStringLiteral("snapshot") &&
+                event.object.value(QStringLiteral("public_projection_disable_reason")).toString() ==
+                    reason_name)
+            {
+                found = true;
+                break;
+            }
+        }
+        ok &= check(found,
+            "snapshot diagnostics round-trip every public projection disable reason");
+    }
+    const std::optional<term::Terminal_transcript_event> default_snapshot_event =
+        last_event(*events, QStringLiteral("snapshot"));
+    if (default_snapshot_event.has_value()) {
+        ok &= check(
+            default_snapshot_event->object.value(QStringLiteral("snapshot_basis")).toString() ==
+                QStringLiteral("LIVE_CONTENT") &&
+            default_snapshot_event->object.value(QStringLiteral("snapshot_purpose")).toString() ==
+                QStringLiteral("CONTENT"),
+            "default snapshot diagnostics round-trip live content basis and content purpose");
+        ok &= check(
+            default_snapshot_event->object.value(
+                QStringLiteral("effective_synchronized_output_scroll_policy")).toString() ==
+                QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION") &&
+            default_snapshot_event->object.value(
+                QStringLiteral("synchronized_output_scroll_policy_change_event")).toString() ==
+                QStringLiteral("none") &&
+            default_snapshot_event->object.value(QStringLiteral("diagnostic_reason")).toString() ==
+                QStringLiteral("none"),
+            "default snapshot diagnostics round-trip policy defaults");
+        ok &= check(
+            default_snapshot_event->object.value(QStringLiteral("public_projection_generation")).toInt() == 0 &&
+            !default_snapshot_event->object.value(QStringLiteral("visible_scroll_applied")).toBool() &&
+            !default_snapshot_event->object.value(QStringLiteral("live_content_publication_blocked")).toBool(),
+            "default snapshot diagnostics round-trip public scroll flags");
+        ok &= check(
+            default_snapshot_event->object.value(QStringLiteral("release_reconciliation_result")).toString() ==
+                QStringLiteral("none") &&
+            default_snapshot_event->object.value(QStringLiteral("hidden_row_eligibility")).toString() ==
+                QStringLiteral("not_evaluated") &&
+            default_snapshot_event->object.value(QStringLiteral("hidden_row_clamp_reason")).toString() ==
+                QStringLiteral("none") &&
+            default_snapshot_event->object.value(QStringLiteral("public_projection_disable_reason")).toString() ==
+                QStringLiteral("none"),
+            "default snapshot diagnostics round-trip reconciliation defaults");
     }
     return ok;
 }
@@ -1397,6 +1998,220 @@ bool test_reader_rejects_compact_snapshots_missing_required_diagnostics()
             {json_line(valid_header_object()), json_line(snapshot)},
             field);
     }
+    return ok;
+}
+
+bool test_reader_rejects_invalid_snapshot_public_scroll_enum_values()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary invalid snapshot enum directory is valid")) {
+        return false;
+    }
+
+    struct Invalid_enum_case
+    {
+        QString field_name;
+        QString invalid_value;
+    };
+
+    const Invalid_enum_case cases[] = {
+        {QStringLiteral("snapshot_basis"), QStringLiteral("NOT_A_BASIS")},
+        {QStringLiteral("snapshot_purpose"), QStringLiteral("NOT_A_PURPOSE")},
+        {
+            QStringLiteral("effective_synchronized_output_scroll_policy"),
+            QStringLiteral("NOT_A_POLICY"),
+        },
+        {
+            QStringLiteral("synchronized_output_scroll_policy_change_event"),
+            QStringLiteral("not_a_change_event"),
+        },
+        {QStringLiteral("diagnostic_reason"), QStringLiteral("not_a_reason")},
+        {
+            QStringLiteral("release_reconciliation_result"),
+            QStringLiteral("not_a_release_result"),
+        },
+        {
+            QStringLiteral("hidden_row_eligibility"),
+            QStringLiteral("not_a_hidden_row_eligibility"),
+        },
+        {
+            QStringLiteral("hidden_row_clamp_reason"),
+            QStringLiteral("not_a_hidden_row_clamp_reason"),
+        },
+        {
+            QStringLiteral("public_projection_disable_reason"),
+            QStringLiteral("not_a_projection_disable_reason"),
+        },
+    };
+
+    bool ok = true;
+    for (const Invalid_enum_case& enum_case : cases) {
+        QJsonObject snapshot = valid_compact_snapshot_object(1U);
+        snapshot.insert(enum_case.field_name, enum_case.invalid_value);
+        ok &= expect_reader_failure(
+            temp_dir,
+            QStringLiteral("compact-snapshot-invalid-%1.ndjson").arg(enum_case.field_name),
+            {json_line(valid_header_object()), json_line(snapshot)},
+            enum_case.field_name);
+    }
+    return ok;
+}
+
+bool test_reader_rejects_snapshot_basis_purpose_mismatches()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary snapshot basis-purpose mismatch directory is valid")) {
+        return false;
+    }
+
+    struct Mismatch_case
+    {
+        QString basis;
+        QString purpose;
+        QString filename;
+    };
+
+    const Mismatch_case cases[] = {
+        {
+            QStringLiteral("PUBLIC_PROJECTION"),
+            QStringLiteral("CONTENT"),
+            QStringLiteral("public-content.ndjson"),
+        },
+        {
+            QStringLiteral("LIVE_CONTENT"),
+            QStringLiteral("SCROLL"),
+            QStringLiteral("live-scroll.ndjson"),
+        },
+    };
+
+    bool ok = true;
+    for (const Mismatch_case& mismatch : cases) {
+        QJsonObject snapshot = valid_compact_snapshot_object(1U);
+        snapshot.insert(QStringLiteral("snapshot_basis"), mismatch.basis);
+        snapshot.insert(QStringLiteral("snapshot_purpose"), mismatch.purpose);
+        ok &= expect_reader_failure(
+            temp_dir,
+            mismatch.filename,
+            {json_line(valid_header_object()), json_line(snapshot)},
+            QStringLiteral("incompatible snapshot_basis"));
+    }
+    return ok;
+}
+
+bool test_reader_accepts_selection_projection_diagnostic_reason()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary selection projection diagnostic directory is valid")) {
+        return false;
+    }
+
+    QJsonObject snapshot = valid_compact_snapshot_object(1U);
+    snapshot.insert(
+        QStringLiteral("diagnostic_reason"),
+        QStringLiteral("selection_public_projection_unsupported"));
+
+    const QString path = temp_dir.filePath(QStringLiteral("selection-projection-diagnostic.ndjson"));
+    bool ok = true;
+    ok &= check(
+        write_transcript_lines(path, {json_line(valid_header_object()), json_line(snapshot)}),
+        "selection projection diagnostic fixture writes");
+
+    QString error;
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "selection projection diagnostic transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    const std::optional<term::Terminal_transcript_event> event =
+        first_event(*events, QStringLiteral("snapshot"));
+    ok &= check(
+        event.has_value() &&
+            event->object.value(QStringLiteral("diagnostic_reason")).toString() ==
+                QStringLiteral("selection_public_projection_unsupported"),
+        "selection projection diagnostic reason is accepted");
+    return ok;
+}
+
+bool test_reader_defaults_detached_selection_legacy_reason_to_selection_purpose()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary detached selection legacy directory is valid")) {
+        return false;
+    }
+
+    QJsonObject snapshot = valid_compact_snapshot_object(1U);
+    snapshot.insert(QStringLiteral("reason"), QStringLiteral("selection visual detached"));
+
+    const QString path = temp_dir.filePath(QStringLiteral("detached-selection-legacy.ndjson"));
+    bool ok = true;
+    ok &= check(
+        write_transcript_lines(path, {json_line(valid_header_object()), json_line(snapshot)}),
+        "detached selection legacy fixture writes");
+
+    QString error;
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "detached selection legacy transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    const std::optional<term::Terminal_transcript_event> event =
+        first_event(*events, QStringLiteral("snapshot"));
+    ok &= check(
+        event.has_value() &&
+            event->object.value(QStringLiteral("snapshot_basis")).toString() ==
+                QStringLiteral("LIVE_CONTENT") &&
+            event->object.value(QStringLiteral("snapshot_purpose")).toString() ==
+                QStringLiteral("SELECTION_DERIVED"),
+        "detached selection legacy reason defaults missing purpose to selection-derived");
+    return ok;
+}
+
+bool test_reader_defaults_old_wheel_trace_policy_fields()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary old wheel-trace directory is valid")) {
+        return false;
+    }
+
+    QJsonObject wheel_trace = valid_wheel_trace_object(1U);
+    wheel_trace.remove(QStringLiteral("effective_synchronized_output_scroll_policy"));
+    wheel_trace.remove(QStringLiteral("synchronized_output_scroll_policy_change_event"));
+    wheel_trace.remove(QStringLiteral("diagnostic_reason"));
+
+    const QString path = temp_dir.filePath(QStringLiteral("old-wheel-trace.ndjson"));
+    bool ok = true;
+    ok &= check(
+        write_transcript_lines(path, {json_line(valid_header_object()), json_line(wheel_trace)}),
+        "old wheel-trace fixture writes");
+
+    QString error;
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "old wheel-trace transcript parses with policy defaults");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    const std::optional<term::Terminal_transcript_event> event =
+        first_event(*events, QStringLiteral("surface.wheel_trace"));
+    ok &= check(
+        event.has_value() &&
+            event->object.value(
+                QStringLiteral("effective_synchronized_output_scroll_policy")).toString() ==
+                QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION") &&
+            event->object.value(
+                QStringLiteral("synchronized_output_scroll_policy_change_event")).toString() ==
+                QStringLiteral("none") &&
+            event->object.value(QStringLiteral("diagnostic_reason")).toString() ==
+                QStringLiteral("none"),
+        "old wheel-trace policy fields default to deferred/no-change diagnostics");
     return ok;
 }
 
@@ -1876,6 +2691,7 @@ bool test_replay_honors_primary_repaint_recovery_session_config()
     config.transcript_recorder = recorder;
     config.scrollback_limit = 1;
     config.recover_scrollback_from_primary_repaints = true;
+    config.selection_viewport_projection_enabled = true;
     term::Terminal_session session(std::move(backend), config);
 
     term::Terminal_launch_config launch_config = valid_launch_config();
@@ -1907,6 +2723,14 @@ bool test_replay_honors_primary_repaint_recovery_session_config()
         recorded_config.value(QStringLiteral("scrollback_limit")).toInt() == 1 &&
             recorded_config.value(QStringLiteral("effective_scrollback_limit")).toInt() == 1,
         "session.start records effective scrollback limit");
+    ok &= check(
+        recorded_config.value(QStringLiteral("selection_viewport_projection_enabled")).toBool(),
+        "session.start records selection viewport projection config");
+
+    const term::Terminal_session_config replay_config = replay_session_config(*events);
+    ok &= check(
+        replay_config.selection_viewport_projection_enabled,
+        "replay config preserves selection viewport projection config");
 
     const Replay_harness replay = replay_events(*events);
     ok &= check(replay.error.isEmpty(), "repaint recovery replay succeeds with recorded config");
@@ -1980,6 +2804,329 @@ bool test_replay_tool_treats_dirty_only_snapshot_mismatch_as_diagnostic(
         "dirty-only replay has no model divergence");
     ok &= check(replay.stdout_text.contains("dirty_mismatch_snapshot_events=1"),
         "dirty-only replay reports dirty mismatch diagnostically");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
+bool test_replay_tool_accepts_old_snapshot_schema_defaults(const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "old-schema replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary old-schema replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("old-snapshot-schema.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "old-schema replay transcript recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 12};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "old-schema replay captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("alpha"));
+    ok &= check(session.latest_render_snapshot().has_value(),
+        "old-schema replay captured session publishes output");
+    recorder.reset();
+
+    ok &= check(remove_snapshot_public_scroll_schema_fields(path),
+        "old-schema replay fixture removes Phase 0 snapshot fields");
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "old-schema replay transcript parses with defaults");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    const std::optional<term::Terminal_transcript_event> snapshot =
+        first_event(*events, QStringLiteral("snapshot"));
+    ok &= check(
+        snapshot.has_value() &&
+            snapshot->object.value(QStringLiteral("snapshot_basis")).toString() ==
+                QStringLiteral("LIVE_CONTENT") &&
+            snapshot->object.value(QStringLiteral("snapshot_purpose")).toString() ==
+                QStringLiteral("CONTENT"),
+        "old-schema replay defaults missing snapshot basis and purpose");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "old-schema replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "old-schema replay tool exits successfully");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "old-schema replay has no model divergence");
+    ok &= check(replay.stdout_text.contains("snapshot.basis=LIVE_CONTENT snapshot.purpose=CONTENT"),
+        "old-schema replay prints compatibility basis and purpose");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
+bool test_replay_tool_accepts_old_selection_snapshot_schema_defaults(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "old selection-schema replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary old selection-schema replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("old-selection-snapshot-schema.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "old selection-schema transcript recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 12};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "old selection-schema replay captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("alpha"));
+
+    term::Terminal_selection_range selection;
+    selection.start = {0, 0};
+    selection.end   = {0, 5};
+    ok &= check(
+        recorder->record_surface_selection_drag({
+            QStringLiteral("finish"),
+            selection.start,
+            selection.end,
+            selection,
+            true,
+        }),
+        "old selection-schema replay selection drag writes");
+    session.set_selection_range(selection);
+    recorder.reset();
+
+    ok &= check(remove_snapshot_public_scroll_schema_fields(path),
+        "old selection-schema replay fixture removes Phase 0 snapshot fields");
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "old selection-schema transcript parses with defaults");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    const std::optional<term::Terminal_transcript_event> snapshot =
+        last_event(*events, QStringLiteral("snapshot"));
+    ok &= check(
+        snapshot.has_value() &&
+            snapshot->object.value(QStringLiteral("snapshot_basis")).toString() ==
+                QStringLiteral("LIVE_CONTENT") &&
+            snapshot->object.value(QStringLiteral("snapshot_purpose")).toString() ==
+                QStringLiteral("SELECTION_DERIVED"),
+        "old selection-schema replay infers missing selection-derived purpose");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "old selection-schema replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "old selection-schema replay tool exits successfully");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "old selection-schema replay has no model divergence");
+    ok &= check(
+        replay.stdout_text.contains(
+            "snapshot.basis=LIVE_CONTENT snapshot.purpose=SELECTION_DERIVED"),
+        "old selection-schema replay prints inferred selection-derived purpose");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
+bool test_replay_tool_defaults_incidental_legacy_reason_words_to_content(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "incidental legacy reason replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary incidental legacy reason replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("incidental-legacy-reason.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "incidental legacy reason transcript recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 12};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "incidental legacy reason replay captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("alpha"));
+    ok &= check(session.latest_render_snapshot().has_value(),
+        "incidental legacy reason replay captured session publishes output");
+    recorder.reset();
+
+    ok &= check(remove_snapshot_public_scroll_schema_fields(path),
+        "incidental legacy reason replay fixture removes Phase 0 snapshot fields");
+    ok &= check(
+        rewrite_first_snapshot_reason(
+            path,
+            QStringLiteral("content snapshot mentions selection and geometry words")),
+        "incidental legacy reason replay fixture rewrites snapshot reason");
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "incidental legacy reason transcript parses with defaults");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    const std::optional<term::Terminal_transcript_event> snapshot =
+        first_event(*events, QStringLiteral("snapshot"));
+    ok &= check(
+        snapshot.has_value() &&
+            snapshot->object.value(QStringLiteral("snapshot_basis")).toString() ==
+                QStringLiteral("LIVE_CONTENT") &&
+            snapshot->object.value(QStringLiteral("snapshot_purpose")).toString() ==
+                QStringLiteral("CONTENT"),
+        "incidental legacy reason defaults missing purpose to content");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "incidental legacy reason replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "incidental legacy reason replay tool exits successfully");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "incidental legacy reason replay has no model divergence");
+    ok &= check(
+        replay.stdout_text.contains("snapshot.basis=LIVE_CONTENT snapshot.purpose=CONTENT"),
+        "incidental legacy reason replay prints content purpose");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
+bool test_replay_tool_accepts_old_geometry_snapshot_schema_defaults(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "old geometry-schema replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary old geometry-schema replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("old-geometry-snapshot-schema.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "old geometry-schema transcript recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 12};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "old geometry-schema replay captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("base"));
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026h\r\nH"));
+    ok &= check(session.resize(QSizeF(20.0, 80.0), {4, 2}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "old geometry-schema replay fixture publishes synchronized geometry snapshot");
+    recorder.reset();
+
+    ok &= check(remove_snapshot_public_scroll_schema_fields(path),
+        "old geometry-schema replay fixture removes Phase 0 snapshot fields");
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "old geometry-schema transcript parses with defaults");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    const std::optional<term::Terminal_transcript_event> snapshot =
+        last_event(*events, QStringLiteral("snapshot"));
+    ok &= check(
+        snapshot.has_value() &&
+            snapshot->object.value(QStringLiteral("snapshot_basis")).toString() ==
+                QStringLiteral("LIVE_CONTENT") &&
+            snapshot->object.value(QStringLiteral("snapshot_purpose")).toString() ==
+                QStringLiteral("GEOMETRY_DERIVED"),
+        "old geometry-schema replay infers missing geometry-derived purpose");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "old geometry-schema replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "old geometry-schema replay tool exits successfully");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "old geometry-schema replay has no model divergence");
+    ok &= check(
+        replay.stdout_text.contains(
+            "snapshot.basis=LIVE_CONTENT snapshot.purpose=GEOMETRY_DERIVED"),
+        "old geometry-schema replay prints inferred geometry-derived purpose");
     if (!ok) {
         print_replay_tool_output(replay);
     }
@@ -2077,6 +3224,450 @@ bool test_replay_tool_applies_post_tail_scroll_snapshots(const QString& replay_t
     return ok;
 }
 
+bool test_replay_config_keeps_explicit_deferred_public_scroll_policy()
+{
+    QJsonObject session_config;
+    session_config.insert(QStringLiteral("scrollback_limit"), 8);
+    session_config.insert(QStringLiteral("effective_scrollback_limit"), 8);
+    session_config.insert(QStringLiteral("recover_scrollback_from_primary_repaints"), true);
+    session_config.insert(
+        QStringLiteral("synchronized_output_scroll_policy"),
+        QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION"));
+
+    QJsonObject start = valid_session_start_object(1U);
+    start.insert(QStringLiteral("session_config"), session_config);
+
+    QJsonObject public_scroll = valid_compact_snapshot_object(2U);
+    public_scroll.insert(QStringLiteral("snapshot_basis"), QStringLiteral("PUBLIC_PROJECTION"));
+    public_scroll.insert(QStringLiteral("snapshot_purpose"), QStringLiteral("SCROLL"));
+    public_scroll.insert(
+        QStringLiteral("effective_synchronized_output_scroll_policy"),
+        QStringLiteral("IMMEDIATE_PUBLIC_PROJECTION"));
+
+    const term::Terminal_session_config config = replay_session_config({
+        {0U, QStringLiteral("header"), valid_header_object()},
+        {1U, QStringLiteral("session.start"), start},
+        {2U, QStringLiteral("snapshot"), public_scroll},
+    });
+
+    return check(
+        config.synchronized_output_scroll_policy ==
+            term::Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION,
+        "replay config keeps explicit deferred public scroll policy despite public projection events");
+}
+
+bool test_replay_config_defaults_missing_selection_viewport_projection_to_disabled()
+{
+    QJsonObject session_config;
+    session_config.insert(QStringLiteral("scrollback_limit"), 8);
+    session_config.insert(QStringLiteral("effective_scrollback_limit"), 8);
+    session_config.insert(QStringLiteral("recover_scrollback_from_primary_repaints"), true);
+    session_config.insert(
+        QStringLiteral("synchronized_output_scroll_policy"),
+        QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION"));
+
+    QJsonObject start = valid_session_start_object(1U);
+    start.insert(QStringLiteral("session_config"), session_config);
+
+    const term::Terminal_session_config config = replay_session_config({
+        {0U, QStringLiteral("header"), valid_header_object()},
+        {1U, QStringLiteral("session.start"), start},
+    });
+
+    return check(
+        !config.selection_viewport_projection_enabled,
+        "replay config defaults missing selection viewport projection to disabled");
+}
+
+bool test_replay_tool_accepts_natural_public_projection_scroll_snapshot(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "natural public projection replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "natural public projection replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("natural-public-projection.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "natural public projection recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    config.scrollback_limit = 8;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 20};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "natural public projection replay captured session starts");
+    backend_ptr->emit_output(
+        QByteArrayLiteral("row-0\r\nrow-1\r\nrow-2\r\nrow-3\r\nrow-4\r\nrow-5\r\nrow-6\r\nrow-7"));
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hheld-output"));
+
+    const auto visible_viewport = [&]() {
+        const std::optional<term::Terminal_render_snapshot> snapshot =
+            session.latest_render_snapshot();
+        return snapshot.has_value() ? snapshot->viewport : session.viewport_state();
+    };
+    const auto record_scroll_result = [&](
+        const QString&                               source,
+        int                                          requested_line_delta,
+        std::optional<int>                           requested_offset_from_tail,
+        const term::Terminal_viewport_scroll_result& result,
+        const term::Terminal_viewport_state&         viewport_before)
+    {
+        return recorder->record_surface_scroll({
+            source,
+            requested_line_delta,
+            requested_offset_from_tail,
+            result,
+            viewport_before,
+            visible_viewport(),
+        });
+    };
+    const auto record_line_scroll = [&](const QString& source, int line_delta) {
+        const term::Terminal_viewport_state viewport_before = visible_viewport();
+        ok &= check(
+            recorder->record_surface_scroll_intent({
+                source,
+                line_delta,
+                std::nullopt,
+                viewport_before,
+            }),
+            "natural public projection records line scroll intent");
+        const term::Terminal_viewport_scroll_result result =
+            source == QStringLiteral("surface.text_area.wheel")
+                ? session.scroll_viewport_lines_from_published_state(
+                    line_delta,
+                    viewport_before)
+                : session.scroll_published_viewport_lines(line_delta);
+        ok &= check(
+            record_scroll_result(source, line_delta, std::nullopt, result, viewport_before),
+            "natural public projection records line scroll result");
+        return result;
+    };
+    const auto record_offset_scroll = [&](const QString& source, int offset_from_tail) {
+        const term::Terminal_viewport_state viewport_before = visible_viewport();
+        const int requested_line_delta = offset_from_tail - viewport_before.offset_from_tail;
+        ok &= check(
+            recorder->record_surface_scroll_intent({
+                source,
+                requested_line_delta,
+                offset_from_tail,
+                viewport_before,
+            }),
+            "natural public projection records offset scroll intent");
+        const term::Terminal_viewport_scroll_result result =
+            session.scroll_published_viewport_to_offset_from_tail(offset_from_tail);
+        ok &= check(
+            record_scroll_result(
+                source,
+                requested_line_delta,
+                offset_from_tail,
+                result,
+                viewport_before),
+            "natural public projection records offset scroll result");
+        return result;
+    };
+
+    ok &= check(
+        record_line_scroll(QStringLiteral("api.lines"), 1).action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "natural public projection records public scroll_viewport_lines move");
+    ok &= check(
+        record_offset_scroll(QStringLiteral("api.offset"), 3).action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "natural public projection records public scroll_to_offset move");
+    ok &= check(
+        record_line_scroll(QStringLiteral("surface.text_area.wheel"), -1).action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "natural public projection records text-area wheel move");
+    ok &= check(
+        record_line_scroll(QStringLiteral("key.page"), 1).action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "natural public projection records page-key move");
+    ok &= check(
+        record_line_scroll(QStringLiteral("app.scrollbar.wheel"), 1).action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "natural public projection records app scrollbar wheel move");
+    ok &= check(
+        record_offset_scroll(QStringLiteral("app.scrollbar.track"), 2).action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "natural public projection records app scrollbar track move");
+    ok &= check(
+        record_line_scroll(QStringLiteral("app.scrollbar.page"), 1).action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "natural public projection records app scrollbar page move");
+    ok &= check(
+        record_offset_scroll(QStringLiteral("app.scrollbar.thumb"), 0).action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "natural public projection records app scrollbar thumb move");
+
+    ok &= check(
+        session.resize(QSizeF(640.0, 160.0), term::terminal_grid_size_t{4, 20}).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "natural public projection resize invalidates projection");
+    ok &= check(
+        record_offset_scroll(QStringLiteral("app.scrollbar.thumb"), 1).action ==
+            term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED,
+        "natural public projection records invalidated deferred app scrollbar intent");
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+    recorder.reset();
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "natural public projection transcript parses");
+    if (events.has_value()) {
+        bool has_deferred_scroll = false;
+        bool has_invalidated_release = false;
+        for (const term::Terminal_transcript_event& event : *events) {
+            if (event.kind == QStringLiteral("surface.scroll") &&
+                event.object.value(QStringLiteral("action")).toString() ==
+                    QStringLiteral("deferred_intent_recorded"))
+            {
+                has_deferred_scroll = true;
+            }
+            if (event.kind == QStringLiteral("snapshot") &&
+                event.object.value(QStringLiteral("diagnostic_reason")).toString() ==
+                    QStringLiteral("public_projection_invalidated_deferred_intent") &&
+                event.object.value(QStringLiteral("release_reconciliation_result")).toString() ==
+                    QStringLiteral("deferred_offset"))
+            {
+                has_invalidated_release = true;
+            }
+        }
+        ok &= check(has_deferred_scroll,
+            "natural public projection transcript includes deferred scroll result");
+        ok &= check(has_invalidated_release,
+            "natural public projection transcript includes invalidated deferred release");
+
+        QStringList expected_sources = {
+            QStringLiteral("api.lines"),
+            QStringLiteral("api.offset"),
+            QStringLiteral("key.page"),
+            QStringLiteral("surface.text_area.wheel"),
+            QStringLiteral("app.scrollbar.wheel"),
+            QStringLiteral("app.scrollbar.track"),
+            QStringLiteral("app.scrollbar.page"),
+            QStringLiteral("app.scrollbar.thumb"),
+        };
+        expected_sources.sort();
+        ok &= check(
+            transcript_event_sources(*events, QStringLiteral("surface.scroll_intent")) ==
+                expected_sources,
+            "natural public projection records expected scroll intent source set");
+        ok &= check(
+            transcript_event_sources(*events, QStringLiteral("surface.scroll")) ==
+                expected_sources,
+            "natural public projection records expected scroll source set");
+    }
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "natural public projection replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "natural public projection replay tool exits successfully");
+    const std::optional<int> public_projection_scroll_snapshot_events =
+        replay_stdout_metric(
+            replay.stdout_text,
+            QByteArrayLiteral("public_projection_scroll_snapshot_events"));
+    ok &= check(public_projection_scroll_snapshot_events.has_value() &&
+        *public_projection_scroll_snapshot_events == 8,
+        "natural public projection replay accepts eight public scroll snapshots");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "natural public projection replay has no divergence");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
+bool test_replay_tool_rejects_unmatched_public_projection_scroll_snapshot_before_release(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "public projection scroll replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary public projection scroll replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("public-projection-scroll.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "public projection scroll replay transcript recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    config.scrollback_limit = 2;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 20};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "public projection scroll replay captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("row-0\r\nrow-1\r\nrow-2\r\nrow-3"));
+
+    const term::Terminal_viewport_state detach_before = session.viewport_state();
+    ok &= check(
+        recorder->record_surface_scroll_intent({
+            QStringLiteral("scrollbar"),
+            0,
+            1,
+            detach_before,
+        }),
+        "public projection scroll replay records pre-hold detach intent");
+    const term::Terminal_viewport_scroll_result detach_result =
+        session.scroll_published_viewport_to_offset_from_tail(1);
+    ok &= check(detach_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "public projection scroll replay detaches viewport before hold");
+
+    const std::optional<term::Terminal_render_snapshot> safe_content =
+        session.latest_content_render_snapshot_for_testing();
+    ok &= check(safe_content.has_value(),
+        "public projection scroll replay fixture has safe content basis");
+    if (!safe_content.has_value()) {
+        return ok;
+    }
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hhidden-live"));
+    const std::optional<term::Terminal_public_projection> captured_projection =
+        session.public_projection_for_testing();
+    ok &= check(captured_projection.has_value(),
+        "public projection scroll replay fixture captures projection");
+    if (!captured_projection.has_value()) {
+        return ok;
+    }
+
+    // This installed projection seam drives replay rejection of a public scroll
+    // snapshot that natural production capture cannot reproduce.
+    std::vector<term::Terminal_public_projection_row> copied_rows =
+        captured_projection->rows();
+    bool copied_tail_installed = false;
+    for (term::Terminal_public_projection_row& row : copied_rows) {
+        if (row.public_row == 3) {
+            row = public_projection_row_from_text(3, QStringLiteral("copied-tail"));
+            copied_tail_installed = true;
+            break;
+        }
+    }
+    if (!copied_tail_installed) {
+        copied_rows.push_back(
+            public_projection_row_from_text(3, QStringLiteral("copied-tail")));
+    }
+    session.install_public_projection_for_testing(
+        term::Terminal_public_projection::with_copied_rows_for_testing(
+            *captured_projection,
+            captured_projection->first_copied_public_row(),
+            std::move(copied_rows)));
+
+    ok &= check(
+        recorder->record_surface_scroll_intent({
+            QStringLiteral("surface.text_area.wheel"),
+            -1,
+            std::nullopt,
+            safe_content->viewport,
+        }),
+        "public projection scroll replay records public scroll intent");
+    const std::optional<term::Terminal_render_snapshot> content_basis_before_public_scroll =
+        session.latest_content_render_snapshot_for_testing();
+    const term::Terminal_viewport_scroll_result public_scroll_result =
+        session.scroll_viewport_lines_from_published_state(-1, safe_content->viewport);
+    const std::optional<term::Terminal_render_snapshot> public_scroll =
+        session.latest_render_snapshot();
+    const std::optional<term::Terminal_render_snapshot> content_basis_after_public_scroll =
+        session.latest_content_render_snapshot_for_testing();
+    ok &= check(public_scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "public projection scroll replay fixture applies real public scroll");
+    ok &= check(public_scroll.has_value() &&
+        public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+        public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL,
+        "public projection scroll replay fixture records a session-produced public scroll snapshot");
+    ok &= check(content_basis_before_public_scroll.has_value() &&
+        content_basis_after_public_scroll.has_value() &&
+        content_basis_after_public_scroll->metadata.sequence ==
+            content_basis_before_public_scroll->metadata.sequence &&
+        content_basis_after_public_scroll->basis ==
+            term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        content_basis_after_public_scroll->purpose ==
+            term::Terminal_render_snapshot_purpose::CONTENT,
+        "recorded public projection scroll does not advance the safe live-content basis");
+
+    recorder.reset();
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "public projection scroll replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code != 0,
+        "public projection scroll replay tool rejects unmatched installed public snapshot");
+    ok &= check(replay.stdout_text.contains("recorded_snapshot_events=3"),
+        "public projection scroll replay sees pre-release public and live snapshots");
+    const std::optional<int> replay_public_scroll_snapshot_events =
+        replay_stdout_metric(
+            replay.stdout_text,
+            QByteArrayLiteral("public_projection_scroll_snapshot_events"));
+    ok &= check(replay_public_scroll_snapshot_events.has_value() &&
+        *replay_public_scroll_snapshot_events == 0,
+        "public projection scroll replay does not self-accept unmatched public scroll snapshots");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=1"),
+        "public projection scroll replay reports unmatched public snapshot divergence");
+    ok &= check(replay.stdout_text.contains(
+            "snapshot.basis=PUBLIC_PROJECTION snapshot.purpose=SCROLL"),
+        "public projection scroll replay reports the unmatched public scroll snapshot");
+
+    ok &= check(corrupt_first_public_projection_scroll_snapshot_to_self_consistent_wrong_content(path),
+        "public projection scroll replay corruption fixture rewrites recorded public snapshot");
+    const Replay_tool_process_result corrupted_replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(corrupted_replay.finished,
+        "corrupted public projection scroll replay tool finishes");
+    ok &= check(
+        corrupted_replay.exit_status == QProcess::NormalExit && corrupted_replay.exit_code != 0,
+        "corrupted public projection scroll replay tool reports divergence");
+    const std::optional<int> corrupted_public_scroll_snapshot_events =
+        replay_stdout_metric(
+            corrupted_replay.stdout_text,
+            QByteArrayLiteral("public_projection_scroll_snapshot_events"));
+    ok &= check(corrupted_public_scroll_snapshot_events.has_value() &&
+        *corrupted_public_scroll_snapshot_events == 0,
+        "corrupted public projection scroll replay does not self-accept wrong visible-row content");
+    ok &= check(corrupted_replay.stdout_text.contains("divergent_snapshot_events=1"),
+        "corrupted public projection scroll replay counts self-consistent wrong-content divergence");
+    if (!ok) {
+        print_replay_tool_output(replay);
+        print_replay_tool_output(corrupted_replay);
+    }
+    return ok;
+}
+
 bool test_replay_tool_compares_only_final_snapshot_in_contiguous_run(
     const QString& replay_tool_path)
 {
@@ -2120,6 +3711,21 @@ bool test_replay_tool_compares_only_final_snapshot_in_contiguous_run(
 
     ok &= check(insert_replay_transparent_diagnostics_around_first_snapshot(path),
         "snapshot-run replay fixture inserts replay-transparent diagnostics");
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> memory_events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(memory_events.has_value(),
+        "snapshot-run memory-pressure diagnostic transcript parses");
+    const std::optional<term::Terminal_transcript_event> memory_snapshot =
+        memory_events.has_value()
+            ? first_event(*memory_events, QStringLiteral("snapshot"))
+            : std::nullopt;
+    ok &= check(memory_snapshot.has_value() &&
+        memory_snapshot->object.value(QStringLiteral("diagnostic_reason")).toString() ==
+            QStringLiteral("public_projection_memory_pressure_invalidated") &&
+        memory_snapshot->object.value(QStringLiteral("public_projection_disable_reason")).toString() ==
+            QStringLiteral("memory_pressure"),
+        "snapshot-run memory-pressure diagnostic values round-trip through reader");
 
     const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
     ok &= check(replay.finished, "snapshot-run replay tool finishes");
@@ -2198,6 +3804,10 @@ bool test_replay_tool_prints_diagnostics(const QString& replay_tool_path)
     ok &= check(replay.stdout_text.contains("visible_row[0]"), "replay tool prints visible rows");
     ok &= check(replay.stdout_text.contains("selected_text=\"alpha\""),
         "replay tool prints selected text diagnostics");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "replay tool replays new snapshot schema fields without divergence");
+    ok &= check(replay.stdout_text.contains("snapshot.basis=LIVE_CONTENT snapshot.purpose=SELECTION_DERIVED"),
+        "replay tool prints live-content selection snapshot basis and purpose");
     ok &= check(
         replay.stdout_text.contains("selection_replay=semantic_range_from_surface_selection_drag"),
         "replay tool labels semantic selection replay");
@@ -2217,6 +3827,11 @@ int main(int argc, char** argv)
     ok &= test_snapshot_timing_diagnostics_include_snapshot_metadata();
     ok &= test_reader_rejects_malformed_transcripts();
     ok &= test_reader_rejects_compact_snapshots_missing_required_diagnostics();
+    ok &= test_reader_rejects_invalid_snapshot_public_scroll_enum_values();
+    ok &= test_reader_rejects_snapshot_basis_purpose_mismatches();
+    ok &= test_reader_accepts_selection_projection_diagnostic_reason();
+    ok &= test_reader_defaults_detached_selection_legacy_reason_to_selection_purpose();
+    ok &= test_reader_defaults_old_wheel_trace_policy_fields();
     ok &= test_transcript_orders_host_and_resize_requests_before_synchronous_output();
     ok &= test_text_area_resize_requests_record_from_session();
     ok &= test_terminal_reply_replay_does_not_duplicate_host_write();
@@ -2224,10 +3839,19 @@ int main(int argc, char** argv)
     ok &= test_replay_noop_scroll_intent_does_not_consume_next_scroll();
     ok &= test_replay_drives_terminal_state();
     ok &= test_replay_honors_primary_repaint_recovery_session_config();
+    ok &= test_replay_config_keeps_explicit_deferred_public_scroll_policy();
+    ok &= test_replay_config_defaults_missing_selection_viewport_projection_to_disabled();
     const QString replay_tool_path =
         argc >= 2 ? QString::fromLocal8Bit(argv[1]) : QString();
     ok &= test_replay_tool_treats_dirty_only_snapshot_mismatch_as_diagnostic(replay_tool_path);
+    ok &= test_replay_tool_accepts_old_snapshot_schema_defaults(replay_tool_path);
+    ok &= test_replay_tool_accepts_old_selection_snapshot_schema_defaults(replay_tool_path);
+    ok &= test_replay_tool_defaults_incidental_legacy_reason_words_to_content(replay_tool_path);
+    ok &= test_replay_tool_accepts_old_geometry_snapshot_schema_defaults(replay_tool_path);
     ok &= test_replay_tool_applies_post_tail_scroll_snapshots(replay_tool_path);
+    ok &= test_replay_tool_accepts_natural_public_projection_scroll_snapshot(replay_tool_path);
+    ok &= test_replay_tool_rejects_unmatched_public_projection_scroll_snapshot_before_release(
+        replay_tool_path);
     ok &= test_replay_tool_compares_only_final_snapshot_in_contiguous_run(replay_tool_path);
     ok &= test_replay_tool_prints_diagnostics(replay_tool_path);
     return ok ? 0 : 1;

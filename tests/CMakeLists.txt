@@ -73,6 +73,8 @@ set(VNM_TERMINAL_GRAPHICS_CAPTURE_REPLAY_DIR "" CACHE PATH
     "Directory of graphics-protocol captures for replay conformance.")
 set(VNM_TERMINAL_FUZZ_SMOKE_CORPUS_DIR "${vnm_terminal_default_capture_replay_dir}" CACHE PATH
     "Directory of seed files for parser fuzz-smoke replay.")
+set(VNM_TERMINAL_TRANSCRIPT_REPLAY_CORPUS_DIR "" CACHE PATH
+    "Optional directory of .ndjson transcript files replayed by vnm_terminal_transcript_replay.")
 set(VNM_TERMINAL_BUILD_LIBFUZZER OFF CACHE BOOL
     "Build the parser libFuzzer harness target when the compiler supports it.")
 set(VNM_TERMINAL_LIBVTERM_DIFF_COMMAND "" CACHE STRING
@@ -379,6 +381,28 @@ if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
             "$<TARGET_FILE:vnm_terminal_transcript>"
             "$<TARGET_FILE:vnm_terminal_transcript_replay>"
     )
+
+    if(NOT VNM_TERMINAL_TRANSCRIPT_REPLAY_CORPUS_DIR STREQUAL "")
+        if(NOT IS_DIRECTORY "${VNM_TERMINAL_TRANSCRIPT_REPLAY_CORPUS_DIR}")
+            message(FATAL_ERROR
+                "VNM_TERMINAL_TRANSCRIPT_REPLAY_CORPUS_DIR is not a directory: "
+                "${VNM_TERMINAL_TRANSCRIPT_REPLAY_CORPUS_DIR}")
+        endif()
+
+        add_test(
+            NAME vnm_terminal_transcript_replay_corpus
+            COMMAND
+                "${CMAKE_COMMAND}"
+                "-Dreplay_executable=$<TARGET_FILE:vnm_terminal_transcript_replay>"
+                "-Dcorpus_dir=${VNM_TERMINAL_TRANSCRIPT_REPLAY_CORPUS_DIR}"
+                -P "${CMAKE_SOURCE_DIR}/tools/transcript_replay/run_transcript_corpus.cmake"
+        )
+
+        set_tests_properties(vnm_terminal_transcript_replay_corpus PROPERTIES
+            LABELS "transcript;replay;corpus"
+            TIMEOUT 300
+        )
+    endif()
 endif()
 
 add_executable(vnm_terminal_qsg_render
