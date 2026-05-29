@@ -586,6 +586,8 @@ QJsonObject session_config_object(const Terminal_session_config& config)
 {
     const int effective_scrollback_limit = std::max(0, config.scrollback_limit);
     return {
+        {QStringLiteral("recover_scrollback_from_primary_repaints"),
+            config.recover_scrollback_from_primary_repaints},
         {QStringLiteral("selection_viewport_projection_enabled"),
             config.selection_viewport_projection_enabled},
         {QStringLiteral("scrollback_limit"),           effective_scrollback_limit},
@@ -1030,6 +1032,12 @@ bool validate_optional_session_config_object(
     QJsonObject config;
     return
         require_object_field(object, QStringLiteral("session_config"), line_number, out_error, &config) &&
+        (!config.contains(QStringLiteral("recover_scrollback_from_primary_repaints")) ||
+            require_bool_field(
+                config,
+                QStringLiteral("recover_scrollback_from_primary_repaints"),
+                line_number,
+                out_error)) &&
         (!config.contains(QStringLiteral("selection_viewport_projection_enabled")) ||
             require_bool_field(
                 config,

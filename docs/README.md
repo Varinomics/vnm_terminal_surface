@@ -50,6 +50,9 @@ the repository without reading every implementation detail.
   selection visual lease preservation.
 - [Selection row provenance manual validation](selection_row_provenance_manual_validation.md)
   records the manual Codex active-output checklist and trace hints.
+- [Primary backing redesign plans](primary_backing_redesign_plans/README.md)
+  records the current primary backing implementation phases and recovery-policy
+  ownership.
 
 ## Maintenance Rule
 

@@ -1,4 +1,5 @@
 #include "helpers/decode_hex.h"
+#include "helpers/primary_backing_test_config.h"
 #include "helpers/test_check.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 #include "vnm_terminal/internal/terminal_resize_controller.h"
@@ -38,6 +39,7 @@ namespace {
 
 using vnm_terminal::test_helpers::check;
 using vnm_terminal::test_helpers::decode_hex;
+using vnm_terminal::test_helpers::recovery_disabled_primary_backing_session_config;
 
 term::Terminal_launch_config valid_launch_config()
 {
@@ -302,9 +304,11 @@ Scripted_backend* make_session(
 {
     auto              backend     = std::make_unique<Scripted_backend>();
     Scripted_backend* backend_ptr = backend.get();
+    term::Terminal_session_config test_config =
+        recovery_disabled_primary_backing_session_config(config);
     session = std::make_unique<term::Terminal_session>(
         std::move(backend),
-        enable_test_traces(config));
+        enable_test_traces(test_config));
     return backend_ptr;
 }
 
@@ -2070,6 +2074,8 @@ term::terminal_selection_visual_lease_t make_phase2_selection_lease(
 {
     term::terminal_selection_visual_lease_t lease;
     lease.source_content_basis = {7U, 3U};
+    lease.anchor_domain        =
+        term::Terminal_selection_anchor_domain::PRIMARY_BACKING;
     lease.session_epoch        = 11U;
     lease.buffer_id            = term::Terminal_buffer_id::PRIMARY;
     lease.grid_reflow_basis    = 3U;
@@ -2100,12 +2106,16 @@ bool test_selection_phase2_internal_state_and_lease()
     term::Selection_contract_controller selection;
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::NONE &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::NONE &&
         !selection.has_selection(),
         "Phase 2 selection starts with internal NONE state");
 
     selection.begin({1, 2});
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::DRAG_ARMED &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::UNRESOLVED_ACTIVE_GRID &&
         !selection.has_selection() &&
         selection.has_internal_selection() &&
         selection.provisional_payload_identity() != 0U &&
@@ -2135,6 +2145,8 @@ bool test_selection_phase2_internal_state_and_lease()
     const term::Terminal_selection_result durable_text = selection.selected_text();
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::ATTACHED_VISIBLE &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         durable_identity != 0U &&
         selection.provisional_payload_identity() == 0U &&
         durable_text.code == term::Terminal_selection_result_code::OK &&
@@ -2145,6 +2157,7 @@ bool test_selection_phase2_internal_state_and_lease()
         selection.visual_lease();
     ok &= check(lease.has_value() &&
         lease->source_content_basis == term::terminal_selection_content_basis_t{7U, 3U} &&
+        lease->anchor_domain == term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         lease->session_epoch == 11U &&
         lease->buffer_id == term::Terminal_buffer_id::PRIMARY &&
         lease->grid_reflow_basis == 3U &&
@@ -2161,6 +2174,8 @@ bool test_selection_phase2_internal_state_and_lease()
     selection.hide_visual_attachment();
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::ATTACHED_HIDDEN &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         selection.visual_lease().has_value() &&
         selection.selected_text().text == QStringLiteral("cdef"),
         "Phase 2 hidden attachment keeps the lease and durable payload");
@@ -2168,6 +2183,8 @@ bool test_selection_phase2_internal_state_and_lease()
     selection.detach_visual_attachment();
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::PAYLOAD_ONLY &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
         !selection.visual_lease().has_value() &&
         selection.has_selection() &&
         selection.selected_text().text == QStringLiteral("cdef"),
@@ -2176,6 +2193,8 @@ bool test_selection_phase2_internal_state_and_lease()
     selection.clear();
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::NONE &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::NONE &&
         !selection.has_selection() &&
         selection.selected_text().code == term::Terminal_selection_result_code::NO_SELECTION,
         "Phase 2 clear removes payload and visual lease data");
@@ -2202,6 +2221,8 @@ bool test_selection_phase2_replacement_empty_cancel_and_eviction()
     selection.begin({3, 1});
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::DRAG_ARMED &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::UNRESOLVED_ACTIVE_GRID &&
         !selection.has_selection() &&
         selection.has_internal_selection() &&
         selection.durable_payload_identity() == 0U &&
@@ -2211,6 +2232,8 @@ bool test_selection_phase2_replacement_empty_cancel_and_eviction()
     selection.clear();
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::NONE &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::NONE &&
         selection.selected_text().code == term::Terminal_selection_result_code::NO_SELECTION,
         "Phase 2 cancelled replacement returns to NONE without restoring old payload");
 
@@ -2224,6 +2247,8 @@ bool test_selection_phase2_replacement_empty_cancel_and_eviction()
     const term::Terminal_selection_result empty_text = selection.selected_text();
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::ATTACHED_VISIBLE &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         selection.has_selection() &&
         empty_text.code == term::Terminal_selection_result_code::OK &&
         empty_text.text.isEmpty(),
@@ -2234,6 +2259,15 @@ bool test_selection_phase2_replacement_empty_cancel_and_eviction()
         {5, 4},
         term::Terminal_selection_mode::NORMAL,
     };
+    selection.set_range(replacement_range, QStringLiteral("beta"));
+    ok &= check(selection.internal_state() ==
+            term::Terminal_selection_internal_state::PAYLOAD_ONLY &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
+        !selection.visual_lease().has_value() &&
+        selection.selected_text().text == QStringLiteral("beta"),
+        "Phase 7C controller payload without visual proof is explicitly payload-only");
+
     selection.set_range(
         replacement_range,
         QStringLiteral("beta"),
@@ -2243,10 +2277,15 @@ bool test_selection_phase2_replacement_empty_cancel_and_eviction()
         selection.selected_text().text == QStringLiteral("beta"),
         "Phase 2 non-empty replacement creates a new durable payload identity");
 
-    ok &= check(selection.apply_scrollback_eviction(6),
-        "Phase 2 scrollback eviction applies to the active selection");
+    ok &= check(selection.apply_backing_event({
+            term::Terminal_selection_backing_event_kind::PRIMARY_SCROLLBACK_EVICTION,
+            6,
+        }),
+        "Phase 10A named scrollback eviction event applies to the active selection");
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::PAYLOAD_ONLY &&
+        selection.anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
         !selection.visual_lease().has_value() &&
         selection.selected_text().code == term::Terminal_selection_result_code::OK &&
         selection.selected_text().text == QStringLiteral("beta"),
@@ -2313,8 +2352,12 @@ bool test_selection_phase2_session_lease_basis_advances()
     const std::optional<term::terminal_selection_visual_lease_t> initial_lease =
         session->selection_visual_lease();
     ok &= check(initial_lease.has_value() &&
+        initial_lease->anchor_domain ==
+            term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
+        session->selection_anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         initial_lease->source_content_basis.content_generation > 0U,
-        "Phase 2 initial lease captures advanced content basis after published text");
+        "Phase 2 initial lease captures primary backing domain and advanced content basis");
 
     session->clear_selection();
     ok &= check(backend->emit_output(QByteArrayLiteral("\ralpha!")),
@@ -2328,9 +2371,11 @@ bool test_selection_phase2_session_lease_basis_advances()
         session->selection_visual_lease();
     ok &= check(initial_lease.has_value() &&
         mutated_lease.has_value() &&
+        mutated_lease->anchor_domain ==
+            term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         mutated_lease->source_content_basis.content_generation >
             initial_lease->source_content_basis.content_generation,
-        "Phase 2 lease captures later content-generation advancement");
+        "Phase 2 lease keeps primary backing domain across content-generation advancement");
 
     session->clear_selection();
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1049h")),
@@ -2344,10 +2389,14 @@ bool test_selection_phase2_session_lease_basis_advances()
         session->selection_visual_lease();
     ok &= check(mutated_lease.has_value() &&
         alternate_lease.has_value() &&
+        alternate_lease->anchor_domain ==
+            term::Terminal_selection_anchor_domain::ALTERNATE_ACTIVE_GRID &&
+        session->selection_anchor_domain() ==
+            term::Terminal_selection_anchor_domain::ALTERNATE_ACTIVE_GRID &&
         alternate_lease->buffer_id == term::Terminal_buffer_id::ALTERNATE &&
         alternate_lease->source_content_basis.content_generation >
             mutated_lease->source_content_basis.content_generation,
-        "Phase 2 lease captures active-buffer content-basis advancement");
+        "Phase 2 lease captures alternate-grid domain and content-basis advancement");
 
     session->clear_selection();
     const term::Terminal_session_result resize_result =
@@ -3844,6 +3893,152 @@ bool test_selection_spans_detach_when_resize_invalidates_selected_columns()
         "resize-invalidated columns emit no stale spans");
     ok &= check(!session->selection_visual_lease().has_value(),
         "resize-invalidated columns clear retained-line visual proof");
+    ok &= check(session->selection_anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PAYLOAD_ONLY,
+        "Phase 7C resize-invalidated columns mark the preserved payload as payload-only");
+
+    return ok;
+}
+
+bool test_selection_phase7c_anchor_domains_and_invalidation_events()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> domain_session;
+    Scripted_backend* domain_backend = make_session(domain_session);
+    ok &= check(domain_session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 7C domain session starts");
+    ok &= check(domain_backend->emit_output(QByteArrayLiteral("primary")),
+        "Phase 7C domain session emits primary content");
+
+    const std::optional<term::terminal_selection_source_identity_t> primary_source =
+        domain_session->published_selection_source_identity();
+    ok &= check(primary_source.has_value() &&
+        primary_source->anchor_domain ==
+            term::Terminal_selection_anchor_domain::PRIMARY_BACKING,
+        "Phase 7C published primary source states the primary backing domain");
+    domain_session->set_selection_range({
+        { 0, 0 },
+        { 0, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::terminal_selection_visual_lease_t> primary_lease =
+        domain_session->selection_visual_lease();
+    ok &= check(domain_session->selection_anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
+        primary_lease.has_value() &&
+        primary_lease->anchor_domain ==
+            term::Terminal_selection_anchor_domain::PRIMARY_BACKING,
+        "Phase 7C committed primary selection exposes the primary backing domain");
+
+    ok &= check(domain_backend->emit_output(QByteArrayLiteral("\x1b[?1049halternate")),
+        "Phase 7C domain session enters alternate content");
+    domain_session->set_selection_range({
+        { 0, 0 },
+        { 0, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::terminal_selection_visual_lease_t> alternate_lease =
+        domain_session->selection_visual_lease();
+    ok &= check(domain_session->selection_anchor_domain() ==
+            term::Terminal_selection_anchor_domain::ALTERNATE_ACTIVE_GRID &&
+        alternate_lease.has_value() &&
+        alternate_lease->anchor_domain ==
+            term::Terminal_selection_anchor_domain::ALTERNATE_ACTIVE_GRID,
+        "Phase 7C committed alternate selection exposes the alternate active-grid domain");
+
+    ok &= check(domain_backend->emit_output(QByteArrayLiteral("\x1b[?1049l")),
+        "Phase 7C domain session leaves alternate content");
+    const term::Terminal_selection_result alternate_payload =
+        domain_session->selected_text();
+    ok &= check(alternate_payload.code == term::Terminal_selection_result_code::OK &&
+        alternate_payload.text == QStringLiteral("alte") &&
+        domain_session->selection_anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
+        !domain_session->selection_visual_lease().has_value(),
+        "Phase 7C alternate transition detaches to explicit payload-only domain");
+
+    domain_session->clear_selection();
+    ok &= check(domain_session->selection_anchor_domain() ==
+            term::Terminal_selection_anchor_domain::NONE &&
+        !domain_session->has_selection(),
+        "Phase 7C clear selection resets the anchor domain");
+
+    std::unique_ptr<term::Terminal_session> eviction_session;
+    Scripted_backend* eviction_backend = make_session(eviction_session);
+    term::Terminal_launch_config eviction_launch_config = valid_launch_config();
+    eviction_launch_config.initial_grid_size = {4, 20};
+    ok &= check(eviction_session->start(eviction_launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 7C surviving-eviction session starts");
+    ok &= check(eviction_backend->emit_output(numbered_scroll_lines(10)),
+        "Phase 7C surviving-eviction backend creates scrollback");
+    const std::optional<term::Terminal_render_snapshot> eviction_snapshot =
+        eviction_session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_source_identity_t> eviction_source =
+        eviction_session->published_selection_source_identity();
+    ok &= check(eviction_snapshot.has_value() &&
+        eviction_snapshot->viewport.scrollback_rows > 1,
+        "Phase 7C surviving-eviction fixture has multiple scrollback rows");
+    if (eviction_snapshot.has_value() && eviction_source.has_value()) {
+        const int scrollback_before =
+            eviction_snapshot->viewport.scrollback_rows;
+        eviction_session->set_selection_range_from_published_source({
+            { 1, 0 },
+            { 1, 15 },
+            term::Terminal_selection_mode::NORMAL,
+        }, *eviction_source);
+        const term::Terminal_selection_result original_payload =
+            eviction_session->selected_text();
+        ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+            original_payload.text == QStringLiteral("scroll-line-001") &&
+            eviction_session->selection_anchor_domain() ==
+                term::Terminal_selection_anchor_domain::PRIMARY_BACKING,
+            "Phase 7C surviving-eviction selection starts in primary backing domain");
+
+        eviction_session->set_scrollback_limit(scrollback_before - 1);
+        const term::Terminal_selection_result retained_payload =
+            eviction_session->selected_text();
+        ok &= check(retained_payload.code == term::Terminal_selection_result_code::OK &&
+            retained_payload.text == original_payload.text &&
+            eviction_session->selection_anchor_domain() ==
+                term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
+            !eviction_session->selection_visual_lease().has_value(),
+            "Phase 7C oldest-row eviction preserves payload and detaches domain");
+    }
+
+    std::unique_ptr<term::Terminal_session> clear_session;
+    Scripted_backend* clear_backend = make_session(clear_session);
+    term::Terminal_launch_config clear_launch_config = valid_launch_config();
+    clear_launch_config.initial_grid_size = {4, 20};
+    ok &= check(clear_session->start(clear_launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 7C clear-scrollback session starts");
+    ok &= check(clear_backend->emit_output(numbered_scroll_lines(10)),
+        "Phase 7C clear-scrollback backend creates scrollback");
+    const std::optional<term::terminal_selection_source_identity_t> clear_source =
+        clear_session->published_selection_source_identity();
+    if (clear_source.has_value()) {
+        clear_session->set_selection_range_from_published_source({
+            { 0, 0 },
+            { 0, 15 },
+            term::Terminal_selection_mode::NORMAL,
+        }, *clear_source);
+        const term::Terminal_selection_result original_payload =
+            clear_session->selected_text();
+        ok &= check(clear_backend->emit_output(QByteArrayLiteral("\x1b[3J")),
+            "Phase 7C clear-scrollback backend clears retained history");
+        const term::Terminal_selection_result retained_payload =
+            clear_session->selected_text();
+        ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+            retained_payload.code == term::Terminal_selection_result_code::OK &&
+            retained_payload.text == original_payload.text &&
+            clear_session->selection_anchor_domain() ==
+                term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
+            !clear_session->selection_visual_lease().has_value(),
+            "Phase 7C clear-scrollback preserves payload and marks payload-only domain");
+    }
 
     return ok;
 }
@@ -6922,6 +7117,387 @@ bool test_public_projection_phase5_public_scroll_apis_and_deferred_intent()
     return ok;
 }
 
+bool test_public_projection_phase7b_scroll_bounds_ignore_hidden_live_growth()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.scrollback_limit = 6;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {3, 20};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 7B public bounds session starts");
+    ok &= check(backend->emit_output(numbered_scroll_lines(8)),
+        "Phase 7B public bounds fixture publishes public scrollback");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
+        "Phase 7B public bounds fixture enters immediate hold");
+
+    const std::optional<term::Terminal_public_projection> projection =
+        session->public_projection_for_testing();
+    ok &= check(projection.has_value() &&
+        projection->viewport().scrollback_rows > 0 &&
+        projection->viewport().offset_from_tail == 0,
+        "Phase 7B public bounds fixture captures tail public projection");
+    if (!projection.has_value()) {
+        return ok;
+    }
+
+    const term::Terminal_viewport_state public_tail_viewport =
+        projection->viewport();
+    const term::Terminal_viewport_scroll_result scroll_to_public_top =
+        session->scroll_viewport_lines_from_published_state(
+            public_tail_viewport.scrollback_rows + 20,
+            public_tail_viewport);
+    const std::optional<term::Terminal_render_snapshot> public_top_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(scroll_to_public_top.action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
+        scroll_to_public_top.applied_line_delta ==
+            public_tail_viewport.scrollback_rows,
+        "Phase 7B public bounds scroll clamps at public projection top");
+    ok &= check(public_top_snapshot.has_value() &&
+        public_top_snapshot->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+        public_top_snapshot->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
+        public_top_snapshot->viewport.scrollback_rows ==
+            public_tail_viewport.scrollback_rows &&
+        public_top_snapshot->viewport.offset_from_tail ==
+            public_tail_viewport.scrollback_rows,
+        "Phase 7B public bounds publishes the public top viewport");
+    if (!public_top_snapshot.has_value()) {
+        return ok;
+    }
+
+    ok &= check(backend->emit_output(numbered_scroll_lines(20)),
+        "Phase 7B public bounds grows hidden live scrollback");
+    const std::optional<term::Terminal_render_snapshot> after_hidden_growth =
+        session->latest_render_snapshot();
+    ok &= check(after_hidden_growth.has_value() &&
+        after_hidden_growth->viewport.scrollback_rows ==
+            public_tail_viewport.scrollback_rows &&
+        after_hidden_growth->viewport.offset_from_tail ==
+            public_tail_viewport.scrollback_rows,
+        "Phase 7B public bounds keeps the frozen public top after hidden growth");
+    if (!after_hidden_growth.has_value()) {
+        return ok;
+    }
+
+    const std::uint64_t sequence_before_boundary =
+        after_hidden_growth->metadata.sequence;
+    const term::Terminal_viewport_scroll_result boundary_scroll =
+        session->scroll_viewport_lines_from_published_state(
+            1,
+            after_hidden_growth->viewport);
+    const std::optional<term::Terminal_render_snapshot> after_boundary_scroll =
+        session->latest_render_snapshot();
+    ok &= check(boundary_scroll.action ==
+            term::Terminal_viewport_scroll_action::AT_BOUNDARY &&
+        boundary_scroll.applied_line_delta == 0,
+        "Phase 7B public bounds do not scroll into hidden live rows");
+    ok &= check(after_boundary_scroll.has_value() &&
+        after_boundary_scroll->metadata.sequence == sequence_before_boundary,
+        "Phase 7B public bounds boundary scroll does not publish a new snapshot");
+
+    session->invalidate_public_projection_for_testing(
+        term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED);
+    const term::Terminal_viewport_scroll_result deferred_boundary_scroll =
+        session->scroll_published_viewport_lines(3);
+    const std::optional<term::Terminal_public_release_intent> release_intent =
+        session->public_release_intent_for_testing();
+    ok &= check(deferred_boundary_scroll.action ==
+            term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED &&
+        release_intent.has_value() &&
+        release_intent->deferred_offset_from_tail.has_value() &&
+        *release_intent->deferred_offset_from_tail ==
+            public_tail_viewport.scrollback_rows,
+        "Phase 7B invalidated public bounds defer at the public top");
+
+    return ok;
+}
+
+bool test_public_projection_phase7b_default_hold_bounds_to_published_viewport()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.scrollback_limit = 20;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {3, 20};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 7B default hold bounds session starts");
+    ok &= check(backend->emit_output(numbered_scroll_lines(8)),
+        "Phase 7B default hold bounds publishes public scrollback");
+
+    const std::optional<term::Terminal_render_snapshot> safe_content =
+        session->latest_content_render_snapshot_for_testing();
+    ok &= check(safe_content.has_value() &&
+        safe_content->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        safe_content->viewport.scrollback_rows > 0 &&
+        safe_content->viewport.offset_from_tail == 0,
+        "Phase 7B default hold bounds fixture starts at published tail");
+    if (!safe_content.has_value()) {
+        return ok;
+    }
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
+        "Phase 7B default hold bounds enters synchronized output");
+    ok &= check(backend->emit_output(numbered_scroll_lines(25)),
+        "Phase 7B default hold bounds grows hidden live scrollback");
+
+    const term::Terminal_viewport_scroll_result scroll_to_published_top =
+        session->scroll_viewport_lines_from_published_state(
+            safe_content->viewport.scrollback_rows + 20,
+            safe_content->viewport);
+    ok &= check(scroll_to_published_top.action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
+        scroll_to_published_top.applied_line_delta ==
+            safe_content->viewport.scrollback_rows,
+        "Phase 7B default hold bounds clamps movement at the published top");
+
+    const term::Terminal_viewport_scroll_result boundary_scroll =
+        session->scroll_viewport_lines_from_published_state(
+            1,
+            safe_content->viewport);
+    ok &= check(boundary_scroll.action ==
+            term::Terminal_viewport_scroll_action::AT_BOUNDARY &&
+        boundary_scroll.applied_line_delta == 0,
+        "Phase 7B default hold bounds reject hidden-only movement");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "Phase 7B default hold bounds releases synchronized output");
+    const std::optional<term::Terminal_render_snapshot> release =
+        session->latest_render_snapshot();
+    ok &= check(release.has_value() &&
+        release->viewport.scrollback_rows > safe_content->viewport.scrollback_rows,
+        "Phase 7B default hold bounds exposes live scrollback after release");
+
+    return ok;
+}
+
+bool test_public_projection_phase8_combined_hold_scroll_and_release()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.scrollback_limit = 16;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {4, 24};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 8 combined publication session starts");
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("safe-0\r\nsafe-1\r\nsafe-2\r\nsafe-3\r\nsafe-4")),
+        "Phase 8 combined publication fixture publishes public scrollback");
+
+    const std::optional<term::Terminal_render_snapshot> safe_content =
+        session->latest_content_render_snapshot_for_testing();
+    const std::uint64_t generation_before_hold =
+        session->render_snapshot_generation();
+    ok &= check(safe_content.has_value() &&
+        safe_content->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        safe_content->viewport.scrollback_rows > 0 &&
+        safe_content->viewport.offset_from_tail == 0,
+        "Phase 8 combined publication fixture starts at a public tail basis");
+    if (!safe_content.has_value()) {
+        return ok;
+    }
+
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("\x1b[?2026h")
+            + QByteArrayLiteral("\x1b[1;1HHIDDEN-REWRITE")
+            + numbered_scroll_lines(8)
+            + QByteArrayLiteral("\x1b[4;1HHIDDEN-TAIL")),
+        "Phase 8 combined publication mutates hidden rows during synchronized output");
+    const std::optional<term::Terminal_render_snapshot> held_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::Terminal_render_snapshot> held_content_basis =
+        session->latest_content_render_snapshot_for_testing();
+    ok &= check(session->render_snapshot_generation() == generation_before_hold &&
+        held_snapshot.has_value() &&
+        held_snapshot->metadata.sequence == safe_content->metadata.sequence &&
+        held_content_basis.has_value() &&
+        held_content_basis->metadata.sequence == safe_content->metadata.sequence &&
+        !snapshot_contains_text(*held_snapshot, QStringLiteral("HIDDEN")) &&
+        !snapshot_contains_text(*held_content_basis, QStringLiteral("HIDDEN")),
+        "Phase 8 combined publication keeps hidden live mutations unpublished before public scroll");
+
+    const term::Terminal_viewport_scroll_result public_scroll_result =
+        session->scroll_viewport_lines_from_published_state(1, safe_content->viewport);
+    const std::optional<term::Terminal_render_snapshot> public_scroll =
+        session->latest_render_snapshot();
+    const std::optional<term::Terminal_render_snapshot> content_after_public_scroll =
+        session->latest_content_render_snapshot_for_testing();
+    ok &= check(public_scroll_result.action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
+        session->render_snapshot_generation() == generation_before_hold + 1U,
+        "Phase 8 combined publication publishes one public scroll snapshot during hold");
+    ok &= check(public_scroll.has_value() &&
+        public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+        public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
+        public_scroll->viewport.offset_from_tail == 1 &&
+        !snapshot_contains_text(*public_scroll, QStringLiteral("HIDDEN")),
+        "Phase 8 combined publication public scroll uses only public projection rows");
+    ok &= check(content_after_public_scroll.has_value() &&
+        content_after_public_scroll->metadata.sequence == safe_content->metadata.sequence &&
+        content_after_public_scroll->viewport.offset_from_tail == 0 &&
+        !snapshot_contains_text(*content_after_public_scroll, QStringLiteral("HIDDEN")),
+        "Phase 8 combined publication public scroll does not advance the live-content basis");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[4;1HHIDDEN-TAIL")),
+        "Phase 8 combined publication keeps final hidden content pending before release");
+    const std::uint64_t generation_before_release =
+        session->render_snapshot_generation();
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "Phase 8 combined publication releases synchronized output");
+    const std::optional<term::Terminal_render_snapshot> release =
+        session->latest_render_snapshot();
+    const std::optional<term::Terminal_render_snapshot> content_after_release =
+        session->latest_content_render_snapshot_for_testing();
+    ok &= check(session->render_snapshot_generation() == generation_before_release + 1U &&
+        release.has_value() &&
+        release->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        release->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+        snapshot_contains_text(*release, QStringLiteral("HIDDEN-REWRITE")) &&
+        release->public_scroll_diagnostics.release_reconciliation_result !=
+            term::Terminal_release_reconciliation_result::NONE,
+        "Phase 8 combined publication releases hidden live content exactly once");
+    ok &= check(content_after_release.has_value() &&
+        release.has_value() &&
+        content_after_release->metadata.sequence == release->metadata.sequence &&
+        snapshot_contains_text(*content_after_release, QStringLiteral("HIDDEN-REWRITE")) &&
+        !session->public_projection_for_testing().has_value() &&
+        !session->public_release_intent_for_testing().has_value(),
+        "Phase 8 combined publication advances live content and clears public projection lifecycle on release");
+
+    return ok;
+}
+
+bool test_public_projection_phase8_public_scroll_uses_safe_projection_fields()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.scrollback_limit = 4;
+    config.selection_viewport_projection_enabled = true;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {3, 24};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "Phase 8 safe-field projection session starts");
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("row-0\r\n")
+            + QByteArrayLiteral("\x1b]8;id=safe;https://safe.example\x1b\\")
+            + QByteArrayLiteral("\x1b[31mSAFE\x1b[0m")
+            + QByteArrayLiteral("\x1b]8;;\x1b\\\r\nrow-2\r\nrow-3")),
+        "Phase 8 safe-field fixture publishes styled public rows");
+
+    session->set_selection_range({
+        { 1, 0 },
+        { 1, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::Terminal_render_snapshot> selected_public_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::Terminal_render_snapshot> safe_content =
+        session->latest_content_render_snapshot_for_testing();
+    ok &= check(selected_public_snapshot.has_value() &&
+        safe_content.has_value() &&
+        snapshot_has_selection_span(*selected_public_snapshot, 0, 0, 4),
+        "Phase 8 safe-field fixture has a safe selected public row");
+    if (!selected_public_snapshot.has_value() || !safe_content.has_value()) {
+        return ok;
+    }
+
+    const term::Terminal_render_cursor safe_cursor = safe_content->cursor;
+    const term::Terminal_mode_state    safe_modes  = safe_content->modes;
+
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("\x1b[?2026h")
+            + QByteArrayLiteral("\x1b[?25l\x1b[?7l\x1b[2;12H")
+            + QByteArrayLiteral("\x1b]8;id=hidden;https://hidden.example\x1b\\")
+            + QByteArrayLiteral("\x1b[32mhidden-live\x1b[0m")
+            + QByteArrayLiteral("\x1b]8;;\x1b\\")),
+        "Phase 8 safe-field fixture mutates hidden live fields");
+
+    const term::Terminal_viewport_scroll_result scroll_result =
+        session->scroll_viewport_lines_from_published_state(1, safe_content->viewport);
+    const std::optional<term::Terminal_render_snapshot> public_scroll =
+        session->latest_render_snapshot();
+    ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
+        public_scroll.has_value() &&
+        public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+        public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL,
+        "Phase 8 safe-field fixture publishes a public projection scroll snapshot");
+    if (!public_scroll.has_value()) {
+        return ok;
+    }
+
+    const term::Terminal_render_cell* public_safe_cell =
+        snapshot_cell_with_text(*public_scroll, QStringLiteral("S"));
+    const bool public_safe_cell_style_resolves =
+        public_safe_cell != nullptr &&
+        static_cast<std::size_t>(public_safe_cell->style_id) < public_scroll->styles.size();
+    const term::Terminal_text_style public_safe_cell_style =
+        public_safe_cell_style_resolves
+            ? public_scroll->styles[static_cast<std::size_t>(public_safe_cell->style_id)]
+            : term::Terminal_text_style{};
+    const bool public_safe_cell_uses_safe_red =
+        public_safe_cell_style.foreground.kind == term::Terminal_color_ref_kind::PALETTE_INDEX &&
+        public_safe_cell_style.foreground.palette_index == 1U;
+    const bool public_safe_cell_uses_hidden_green =
+        public_safe_cell_style.foreground.kind == term::Terminal_color_ref_kind::PALETTE_INDEX &&
+        public_safe_cell_style.foreground.palette_index == 2U;
+    const int expected_public_cursor_row =
+        safe_cursor.position.row +
+        first_public_row_for_viewport(safe_content->viewport) -
+        first_public_row_for_viewport(public_scroll->viewport);
+
+    ok &= check(snapshot_row_text(*public_scroll, 0) == QStringLiteral("row-0") &&
+        snapshot_row_text(*public_scroll, 1) == QStringLiteral("SAFE") &&
+        !snapshot_contains_text(*public_scroll, QStringLiteral("hidden-live")) &&
+        snapshot_has_selection_span(*public_scroll, 1, 0, 4),
+        "Phase 8 safe-field public scroll uses safe text and selection spans");
+    ok &= check(public_safe_cell != nullptr &&
+        public_safe_cell->style_id     != term::k_default_terminal_style_id &&
+        public_safe_cell->hyperlink_id != 0U &&
+        public_safe_cell_uses_safe_red &&
+        !public_safe_cell_uses_hidden_green &&
+        snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://safe.example")) &&
+        !snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://hidden.example")),
+        "Phase 8 safe-field public scroll uses copied safe style and hyperlink metadata");
+    ok &= check(!public_scroll->cursor.visible &&
+        public_scroll->cursor.position.row            == expected_public_cursor_row &&
+        public_scroll->cursor.position.column         == safe_cursor.position.column &&
+        public_scroll->cursor.shape                   == safe_cursor.shape &&
+        public_scroll->cursor.blink_enabled           == safe_cursor.blink_enabled &&
+        public_scroll->modes.autowrap                 == safe_modes.autowrap &&
+        public_scroll->modes.cursor_visible           == safe_modes.cursor_visible &&
+        public_scroll->metadata.row_origin_generation ==
+            selected_public_snapshot->metadata.row_origin_generation,
+        "Phase 8 safe-field public scroll uses safe cursor, mode, and row-origin metadata");
+
+    return ok;
+}
+
 bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
 {
     bool ok = true;
@@ -8678,9 +9254,9 @@ bool test_viewport_scroll_public_session_path()
         live_limit_session->latest_render_snapshot();
     ok &= check(live_limit_snapshot.has_value() &&
         live_limit_snapshot->viewport.scrollback_rows == 2 &&
-        live_limit_snapshot->viewport.offset_from_tail <= 2 &&
+        live_limit_snapshot->viewport.offset_from_tail == 2 &&
         live_limit_session->render_snapshot_generation() == live_limit_generation + 1U,
-        "live scrollback-limit shrink clamps detached viewport and publishes");
+        "Phase 9 live scrollback-limit shrink preserves the detached viewport at the new top");
 
     return ok;
 }
@@ -8855,6 +9431,60 @@ bool test_cursor_home_blank_row_partial_repaint_does_not_synthesize_primary_scro
     ok &= check(session->scroll_viewport_lines(1).action ==
         term::Terminal_viewport_scroll_action::AT_BOUNDARY,
         "cursor-home blank-row partial repaint leaves primary viewport at scrollback boundary");
+    return ok;
+}
+
+bool test_primary_repaint_recovery_toggle_propagates_to_model()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> enabled_session;
+    Scripted_backend* enabled_backend = make_session(enabled_session);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 8};
+    ok &= check(enabled_session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "primary recovery toggle-enabled session starts");
+    ok &= check(enabled_backend->emit_output(QByteArrayLiteral(
+            "\x1b[1;1H" "aa" "\x1b[K"
+            "\x1b[2;1H" "bb" "\x1b[K"
+            "\x1b[3;1H" "cc" "\x1b[K")),
+        "primary recovery toggle-enabled fixture fills the primary screen");
+    enabled_session->set_primary_repaint_recovery_enabled(true);
+    ok &= check(enabled_backend->emit_output(QByteArrayLiteral(
+            "\x1b[?25l"
+            "\x1b[H" "bb" "\x1b[K"
+            "\x1b[2;1H" "cc" "\x1b[K"
+            "\x1b[3;1H" "dd" "\x1b[K"
+            "\x1b[?25h")),
+        "primary recovery toggle-enabled backend emits shifted repaint");
+
+    ok &= check(enabled_session->viewport_state().scrollback_rows == 1,
+        "primary recovery toggle on reaches model");
+
+    std::unique_ptr<term::Terminal_session> disabled_session;
+    Scripted_backend* disabled_backend = make_session(disabled_session);
+    ok &= check(disabled_session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "primary recovery toggle-disabled session starts");
+    ok &= check(disabled_backend->emit_output(QByteArrayLiteral(
+            "\x1b[1;1H" "aa" "\x1b[K"
+            "\x1b[2;1H" "bb" "\x1b[K"
+            "\x1b[3;1H" "cc" "\x1b[K")),
+        "primary recovery toggle-disabled fixture fills the primary screen");
+    disabled_session->set_primary_repaint_recovery_enabled(true);
+    disabled_session->set_primary_repaint_recovery_enabled(false);
+    ok &= check(disabled_backend->emit_output(QByteArrayLiteral(
+            "\x1b[?25l"
+            "\x1b[H" "bb" "\x1b[K"
+            "\x1b[2;1H" "cc" "\x1b[K"
+            "\x1b[3;1H" "dd" "\x1b[K"
+            "\x1b[?25h")),
+        "primary recovery toggle-disabled backend emits shifted repaint");
+
+    ok &= check(disabled_session->viewport_state().scrollback_rows == 0,
+        "primary recovery toggle off reaches model");
+
     return ok;
 }
 
@@ -11844,6 +12474,7 @@ int main()
     ok &= test_selection_spans_detach_when_synchronized_release_moves_retained_row();
     ok &= test_selection_spans_fail_closed_at_phase4c_boundaries();
     ok &= test_selection_spans_detach_when_resize_invalidates_selected_columns();
+    ok &= test_selection_phase7c_anchor_domains_and_invalidation_events();
     ok &= test_selection_unicode_cluster_payloads();
     ok &= test_output_activity_notifications_are_session_level();
     ok &= test_public_projection_phase1_copies_public_rows_and_metadata();
@@ -11873,6 +12504,10 @@ int main()
     ok &= test_selection_clear_overrides_public_projection_safe_basis_spans();
     ok &= test_public_projection_phase4_policy_latch_ignores_mid_hold_change();
     ok &= test_public_projection_phase5_public_scroll_apis_and_deferred_intent();
+    ok &= test_public_projection_phase7b_scroll_bounds_ignore_hidden_live_growth();
+    ok &= test_public_projection_phase7b_default_hold_bounds_to_published_viewport();
+    ok &= test_public_projection_phase8_combined_hold_scroll_and_release();
+    ok &= test_public_projection_phase8_public_scroll_uses_safe_projection_fields();
     ok &= test_public_projection_phase4_installed_projection_seam_publishes_scroll();
     ok &= test_public_projection_phase4_failed_scroll_publication_rolls_back();
     ok &= test_public_projection_phase4_installed_projection_seam_off_copied_scroll_stays_deferred();
@@ -11891,6 +12526,7 @@ int main()
     ok &= test_resize_preserves_primary_scrollback();
     ok &= test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback();
     ok &= test_cursor_home_blank_row_partial_repaint_does_not_synthesize_primary_scrollback();
+    ok &= test_primary_repaint_recovery_toggle_propagates_to_model();
     ok &= test_parser_notifications_reach_session_notifications();
     ok &= test_bell_policy_coalesces_with_deterministic_clock();
     ok &= test_parser_state_crosses_backend_output_chunks();

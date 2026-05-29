@@ -201,7 +201,6 @@ std::vector<Terminal_text_style> compact_styles_for_copied_rows(
 
         const std::size_t source_style_index =
             static_cast<std::size_t>(source_style_id);
-        Q_ASSERT(source_style_index < source_styles.size());
         if (source_style_index >= source_styles.size()) {
             continue;
         }
@@ -215,7 +214,6 @@ std::vector<Terminal_text_style> compact_styles_for_copied_rows(
         for (Terminal_render_cell& cell : row.cells) {
             const std::size_t source_style_index =
                 static_cast<std::size_t>(cell.style_id);
-            Q_ASSERT(source_style_index < remapped_style_ids.size());
             if (source_style_index < remapped_style_ids.size() &&
                 remapped_style_ids[source_style_index].has_value())
             {

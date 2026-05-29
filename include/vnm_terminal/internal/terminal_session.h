@@ -138,6 +138,7 @@ public:
 
     void clear_selection();
     void set_scrollback_limit(int limit);
+    void set_primary_repaint_recovery_enabled(bool enabled);
     Terminal_session_result interrupt();
     Terminal_session_result terminate();
     Terminal_session_result force_release_synchronized_output();
@@ -161,6 +162,7 @@ public:
     std::uint64_t last_processed_sequence() const;
     bool has_selection() const;
     Terminal_selection_result selected_text() const;
+    Terminal_selection_anchor_domain selection_anchor_domain() const;
     std::optional<terminal_selection_visual_lease_t> selection_visual_lease() const;
     std::optional<terminal_selection_source_identity_t> published_selection_source_identity() const;
 

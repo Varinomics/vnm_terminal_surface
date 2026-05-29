@@ -1,4 +1,7 @@
 #include "vnm_terminal/internal/terminal_screen_model.h"
+#include "vnm_terminal/internal/terminal_repaint_recovery.h"
+#include "helpers/primary_backing_observation.h"
+#include "helpers/primary_backing_test_config.h"
 #include "helpers/test_check.h"
 
 #include <QByteArray>
@@ -6,6 +9,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <iostream>
 #include <variant>
 #include <vector>
@@ -15,6 +19,12 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 using vnm_terminal::test_helpers::check;
+using vnm_terminal::test_helpers::Primary_backing_observation_classification;
+using vnm_terminal::test_helpers::Primary_backing_boundary;
+using vnm_terminal::test_helpers::Scrollback_delta_observer;
+using vnm_terminal::test_helpers::Scrollback_delta_operation_annotation;
+using vnm_terminal::test_helpers::recovery_disabled_primary_backing_screen_model_config;
+using vnm_terminal::test_helpers::scrollback_rows_delta;
 
 [[noreturn]] void fail_required_value(const char* message)
 {
@@ -37,6 +47,57 @@ term::Terminal_screen_model make_model(
         scrollback_limit,
         4,
     });
+}
+
+term::Terminal_screen_model make_recovery_disabled_primary_backing_model(
+    int    rows,
+    int    columns,
+    int    scrollback_limit)
+{
+    term::Terminal_screen_model_config config;
+    config.grid_size        = term::terminal_grid_size_t{rows, columns};
+    config.scrollback_limit = scrollback_limit;
+    config.tab_width        = 4;
+    return term::Terminal_screen_model(
+        recovery_disabled_primary_backing_screen_model_config(config));
+}
+
+term::Terminal_screen_model make_recovery_enabled_primary_repaint_model(
+    int    rows,
+    int    columns,
+    int    scrollback_limit)
+{
+    term::Terminal_screen_model_config config;
+    config.grid_size                                = term::terminal_grid_size_t{rows, columns};
+    config.scrollback_limit                         = scrollback_limit;
+    config.tab_width                                = 4;
+    config.recover_scrollback_from_primary_repaints = true;
+    return term::Terminal_screen_model(config);
+}
+
+QByteArray visible_row_write_stream(
+    std::initializer_list<QByteArray>  rows,
+    bool                               cursor_hidden)
+{
+    QByteArray stream;
+    if (cursor_hidden) {
+        stream += QByteArrayLiteral("\x1b[?25l");
+    }
+
+    int row_number = 1;
+    for (const QByteArray& row : rows) {
+        stream += QByteArrayLiteral("\x1b[");
+        stream += QByteArray::number(row_number);
+        stream += QByteArrayLiteral(";1H");
+        stream += row;
+        stream += QByteArrayLiteral("\x1b[K");
+        ++row_number;
+    }
+
+    if (cursor_hidden) {
+        stream += QByteArrayLiteral("\x1b[?25h");
+    }
+    return stream;
 }
 
 int diagnostic_count(const term::Terminal_screen_model_result& result)
@@ -76,6 +137,128 @@ bool dirty_rows_equal(
     const char*                                label)
 {
     return check(result.dirty_rows == rows, label);
+}
+
+bool primary_backing_delta_matches(
+    const term::terminal_backing_delta_t& delta,
+    term::Terminal_backing_delta_kind     kind,
+    int                                   scrollback_rows_before,
+    int                                   scrollback_rows_after,
+    int                                   appended_scrollback_rows,
+    int                                   evicted_scrollback_rows,
+    int                                   discarded_scrollback_rows = 0)
+{
+    return delta.kind                     == kind                       &&
+        delta.buffer_id                   == term::Terminal_buffer_id::PRIMARY &&
+        delta.scrollback_rows_before      == scrollback_rows_before     &&
+        delta.scrollback_rows_after       == scrollback_rows_after      &&
+        delta.appended_scrollback_rows    == appended_scrollback_rows   &&
+        delta.evicted_scrollback_rows     == evicted_scrollback_rows    &&
+        delta.discarded_scrollback_rows   == discarded_scrollback_rows;
+}
+
+bool single_primary_backing_delta_equal(
+    const std::vector<term::terminal_backing_delta_t>& deltas,
+    term::Terminal_backing_delta_kind                  kind,
+    int                                                scrollback_rows_before,
+    int                                                scrollback_rows_after,
+    int                                                appended_scrollback_rows,
+    int                                                evicted_scrollback_rows,
+    const char*                                        label)
+{
+    return check(deltas.size() == 1U &&
+            primary_backing_delta_matches(
+                deltas.front(),
+                kind,
+                scrollback_rows_before,
+                scrollback_rows_after,
+                appended_scrollback_rows,
+                evicted_scrollback_rows),
+        label);
+}
+
+bool grid_size_equal(
+    term::terminal_grid_size_t left,
+    term::terminal_grid_size_t right)
+{
+    return left.rows == right.rows && left.columns == right.columns;
+}
+
+bool single_active_grid_backing_delta_equal(
+    const std::vector<term::terminal_backing_delta_t>& deltas,
+    term::Terminal_backing_delta_kind                  kind,
+    term::terminal_grid_size_t                         grid_size_before,
+    term::terminal_grid_size_t                         grid_size_after,
+    const char*                                        label)
+{
+    return check(deltas.size() == 1U                        &&
+            deltas.front().kind == kind                      &&
+            deltas.front().buffer_id == term::Terminal_buffer_id::PRIMARY &&
+            deltas.front().active_buffer_before ==
+                term::Terminal_buffer_id::PRIMARY           &&
+            deltas.front().active_buffer_after ==
+                term::Terminal_buffer_id::PRIMARY           &&
+            grid_size_equal(deltas.front().grid_size_before, grid_size_before) &&
+            grid_size_equal(deltas.front().grid_size_after,  grid_size_after),
+        label);
+}
+
+bool active_grid_backing_delta_matches(
+    const term::terminal_backing_delta_t& delta,
+    term::Terminal_backing_delta_kind     kind,
+    term::Terminal_buffer_id              active_buffer,
+    term::terminal_grid_size_t            grid_size_before,
+    term::terminal_grid_size_t            grid_size_after)
+{
+    return delta.kind                 == kind          &&
+        delta.buffer_id               == active_buffer &&
+        delta.active_buffer_before    == active_buffer &&
+        delta.active_buffer_after     == active_buffer &&
+        grid_size_equal(delta.grid_size_before, grid_size_before) &&
+        grid_size_equal(delta.grid_size_after,  grid_size_after);
+}
+
+bool single_mode_transition_backing_delta_equal(
+    const std::vector<term::terminal_backing_delta_t>& deltas,
+    term::Terminal_buffer_id                           active_buffer_before,
+    term::Terminal_buffer_id                           active_buffer_after,
+    const char*                                        label)
+{
+    return check(deltas.size() == 1U &&
+            deltas.front().kind == term::Terminal_backing_delta_kind::MODE_TRANSITIONED &&
+            deltas.front().active_buffer_before == active_buffer_before &&
+            deltas.front().active_buffer_after  == active_buffer_after,
+        label);
+}
+
+int appended_scrollback_rows_in_backing_deltas(
+    const std::vector<term::terminal_backing_delta_t>& deltas)
+{
+    int rows = 0;
+    for (const term::terminal_backing_delta_t& delta : deltas) {
+        rows += delta.appended_scrollback_rows;
+    }
+    return rows;
+}
+
+int evicted_scrollback_rows_in_backing_deltas(
+    const std::vector<term::terminal_backing_delta_t>& deltas)
+{
+    int rows = 0;
+    for (const term::terminal_backing_delta_t& delta : deltas) {
+        rows += delta.evicted_scrollback_rows;
+    }
+    return rows;
+}
+
+int discarded_scrollback_rows_in_backing_deltas(
+    const std::vector<term::terminal_backing_delta_t>& deltas)
+{
+    int rows = 0;
+    for (const term::terminal_backing_delta_t& delta : deltas) {
+        rows += delta.discarded_scrollback_rows;
+    }
+    return rows;
 }
 
 std::vector<int> row_range(int row_count)
@@ -207,6 +390,47 @@ std::vector<std::uint64_t> primary_retained_line_ids(
         ids.push_back(primary_retained_line_id(model, logical_row));
     }
     return ids;
+}
+
+struct primary_backing_model_summary_t
+{
+    term::terminal_grid_size_t      grid_size;
+    term::terminal_grid_position_t  cursor;
+    term::Terminal_buffer_id        active_buffer = term::Terminal_buffer_id::PRIMARY;
+    int                             scrollback_rows = 0;
+    std::vector<QString>            visible_rows;
+    std::vector<std::uint64_t>      primary_retained_line_ids;
+};
+
+primary_backing_model_summary_t primary_backing_model_summary(
+    const term::Terminal_screen_model& model)
+{
+    primary_backing_model_summary_t summary;
+    summary.grid_size                 = model.grid_size();
+    summary.cursor                    = model.cursor_position();
+    summary.active_buffer             = model.active_buffer_id();
+    summary.scrollback_rows           = model.scrollback_size();
+    summary.primary_retained_line_ids = primary_retained_line_ids(model);
+    summary.visible_rows.reserve(static_cast<std::size_t>(summary.grid_size.rows));
+    for (int row = 0; row < summary.grid_size.rows; ++row) {
+        summary.visible_rows.push_back(model.row_text(row));
+    }
+    return summary;
+}
+
+bool primary_backing_model_summaries_equal(
+    const primary_backing_model_summary_t& left,
+    const primary_backing_model_summary_t& right)
+{
+    return
+        left.grid_size.rows             == right.grid_size.rows             &&
+        left.grid_size.columns          == right.grid_size.columns          &&
+        left.cursor.row                 == right.cursor.row                 &&
+        left.cursor.column              == right.cursor.column              &&
+        left.active_buffer              == right.active_buffer              &&
+        left.scrollback_rows            == right.scrollback_rows            &&
+        left.visible_rows               == right.visible_rows               &&
+        left.primary_retained_line_ids  == right.primary_retained_line_ids;
 }
 
 bool check_primary_retained_line_ids_unique(
@@ -441,6 +665,487 @@ bool test_cursor_addressing_and_split_csi()
     ok     &= check(c0_model.row_text(1) == QStringLiteral(" B"),
         "CSI C0 executes line feed while collecting CSI");
     ok     &= check(snapshot_valid(c0_model, 12U), "CSI C0 snapshot validates");
+
+    return ok;
+}
+
+bool test_scrollback_growth_observer_seam()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_disabled_primary_backing_model(2, 4, 4);
+    Scrollback_delta_observer observer(false);
+
+    term::Terminal_screen_model helper_contract_model = make_model(2, 4, 4);
+    helper_contract_model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc"));
+    Scrollback_delta_observer recovery_observer(true);
+    const auto helper_contract = recovery_observer.observe(
+        helper_contract_model,
+        Primary_backing_boundary::SCROLLBACK_CLEAR,
+        Scrollback_delta_operation_annotation::CLEAR_SCROLLBACK,
+        [&] {
+            return helper_contract_model.ingest(QByteArrayLiteral("\x1b[3J"));
+        });
+    ok &= check(helper_contract.boundary_annotation == Primary_backing_boundary::SCROLLBACK_CLEAR &&
+        helper_contract.operation_annotation ==
+            Scrollback_delta_operation_annotation::CLEAR_SCROLLBACK &&
+        helper_contract.classification_annotation ==
+            Primary_backing_observation_classification::TEST_ONLY &&
+        helper_contract.recovery_enabled_annotation,
+        "observer seam preserves caller-supplied helper annotations");
+
+    auto check_allowed_growth_source = [&](const QByteArray& bytes,
+        int expected_cursor_column,
+        const char* label) {
+        bool source_ok = true;
+
+        term::Terminal_screen_model source_model =
+            make_recovery_disabled_primary_backing_model(2, 4, 4);
+        Scrollback_delta_observer source_observer(false);
+
+        source_model.ingest(QByteArrayLiteral("aa\r\nbb"));
+        const std::vector<std::uint64_t> pre_source_ids =
+            primary_retained_line_ids(source_model);
+        const std::uint64_t pre_max_line_id = max_retained_line_id(pre_source_ids);
+
+        source_ok &= check(source_model.scrollback_size() == 0, label);
+        source_ok &= check(pre_source_ids.size() == 2U, label);
+
+        const auto observation = source_observer.observe(
+            source_model,
+            Primary_backing_boundary::INGEST,
+            Scrollback_delta_operation_annotation::TERMINAL_SCROLL,
+            [&] {
+                return source_model.ingest(bytes);
+            });
+        const std::vector<std::uint64_t> post_source_ids =
+            primary_retained_line_ids(source_model);
+
+        source_ok &= check(scrollback_rows_delta(observation) == 1, label);
+        source_ok &= check(observation.result_scrollback_rows == observation.scrollback_rows_after,
+            label);
+        source_ok &= single_primary_backing_delta_equal(
+            observation.backing_deltas,
+            term::Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
+            0,
+            1,
+            1,
+            0,
+            label);
+        source_ok &= check(!observation.recovery_enabled_annotation, label);
+        source_ok &= check(source_model.scrollback_size() == 1, label);
+        source_ok &= check(source_model.row_text(0) == QStringLiteral("bb"), label);
+        source_ok &= check(source_model.row_text(1).isEmpty(), label);
+        source_ok &= check(source_model.cursor_position().row == 1 &&
+            source_model.cursor_position().column == expected_cursor_column,
+            label);
+        source_ok &= check(post_source_ids.size() == pre_source_ids.size() + 1U, label);
+        if (pre_source_ids.size() == 2U && post_source_ids.size() == 3U) {
+            source_ok &= check(post_source_ids[0] == pre_source_ids[0], label);
+            source_ok &= check(post_source_ids[1] == pre_source_ids[1], label);
+            source_ok &= check(post_source_ids[2] > pre_max_line_id, label);
+        }
+        source_ok &= check_primary_retained_line_ids_unique(source_model, label);
+
+        return source_ok;
+    };
+
+    ok &= check_allowed_growth_source(
+        QByteArrayLiteral("\n"),
+        2,
+        "LF is an allowed retained-history growth source");
+    ok &= check_allowed_growth_source(
+        QByteArrayLiteral("\x1b" "D"),
+        2,
+        "IND is an allowed retained-history growth source");
+    ok &= check_allowed_growth_source(
+        QByteArrayLiteral("\x1b" "E"),
+        0,
+        "NEL is an allowed retained-history growth source");
+    ok &= check_allowed_growth_source(
+        QByteArrayLiteral("\r\n"),
+        0,
+        "CRLF overflow is an allowed retained-history growth source");
+
+    const auto terminal_scroll = observer.observe(
+        model,
+        Primary_backing_boundary::INGEST,
+        Scrollback_delta_operation_annotation::TERMINAL_SCROLL,
+        [&] {
+            return model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc"));
+        });
+    ok &= check(scrollback_rows_delta(terminal_scroll) == 1,
+        "terminal scroll observation records retained-history growth");
+    ok &= check(terminal_scroll.result_scrollback_rows == terminal_scroll.scrollback_rows_after,
+        "terminal scroll observation records the model result row count");
+    ok &= single_primary_backing_delta_equal(
+        terminal_scroll.backing_deltas,
+        term::Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
+        0,
+        1,
+        1,
+        0,
+        "terminal scroll observation records the backing append delta");
+    ok &= check(terminal_scroll.active_buffer_before == term::Terminal_buffer_id::PRIMARY &&
+        terminal_scroll.active_buffer_after == term::Terminal_buffer_id::PRIMARY,
+        "terminal scroll observation records primary buffer ownership");
+    ok &= check(model.row_text(0) == QStringLiteral("bb"),
+        "terminal scroll leaves the first visible row");
+    ok &= check(model.row_text(1) == QStringLiteral("cc"),
+        "terminal scroll leaves the second visible row");
+
+    const auto repaint = observer.observe(
+        model,
+        Primary_backing_boundary::INGEST,
+        Scrollback_delta_operation_annotation::REPAINT,
+        [&] {
+            return model.ingest(QByteArrayLiteral("\x1b[1;1Hdd\x1b[K\x1b[2;1Hee\x1b[K"));
+        });
+    ok &= check(scrollback_rows_delta(repaint) == 0,
+        "repaint-shaped observation does not record retained-history growth");
+    ok &= check(repaint.result_scrollback_rows == terminal_scroll.scrollback_rows_after,
+        "repaint-shaped observation preserves retained-history count");
+    ok &= check(repaint.backing_deltas.empty(),
+        "repaint-shaped observation has no backing storage delta");
+    ok &= check(model.row_text(0) == QStringLiteral("dd"),
+        "repaint-shaped observation rewrites the first visible row");
+    ok &= check(model.row_text(1) == QStringLiteral("ee"),
+        "repaint-shaped observation rewrites the second visible row");
+
+    const auto clear = observer.observe(
+        model,
+        Primary_backing_boundary::SCROLLBACK_CLEAR,
+        Scrollback_delta_operation_annotation::CLEAR_SCROLLBACK,
+        [&] {
+            return model.ingest(QByteArrayLiteral("\x1b[3J"));
+        });
+    ok &= check(scrollback_rows_delta(clear) == -1,
+        "scrollback clear observation records retained-history removal");
+    ok &= check(clear.scrollback_rows_after == 0,
+        "scrollback clear observation records the cleared retained-history count");
+    ok &= check(clear.evicted_scrollback_rows == clear.scrollback_rows_before,
+        "scrollback clear observation records evicted retained-history rows");
+    ok &= single_primary_backing_delta_equal(
+        clear.backing_deltas,
+        term::Terminal_backing_delta_kind::PRIMARY_HISTORY_CLEARED,
+        clear.scrollback_rows_before,
+        0,
+        0,
+        clear.scrollback_rows_before,
+        "scrollback clear observation records the backing clear delta");
+
+    const auto empty_clear = observer.observe(
+        model,
+        Primary_backing_boundary::SCROLLBACK_CLEAR,
+        Scrollback_delta_operation_annotation::CLEAR_SCROLLBACK,
+        [&] {
+            return model.ingest(QByteArrayLiteral("\x1b[3J"));
+        });
+    ok &= single_primary_backing_delta_equal(
+        empty_clear.backing_deltas,
+        term::Terminal_backing_delta_kind::BACKING_UNCHANGED,
+        0,
+        0,
+        0,
+        0,
+        "empty scrollback clear records an explicit backing no-op delta");
+
+    const term::Terminal_screen_model_result erase_visible_result =
+        model.ingest(QByteArrayLiteral("\x1b[2J"));
+    ok &= check(erase_visible_result.backing_deltas.empty(),
+        "ED2 visible clear has no backing storage delta");
+
+    const term::Terminal_screen_model_result resize_result =
+        model.resize(term::terminal_grid_size_t{3, 4});
+    ok &= single_active_grid_backing_delta_equal(
+        resize_result.backing_deltas,
+        term::Terminal_backing_delta_kind::ACTIVE_GRID_RESIZED,
+        term::terminal_grid_size_t{2, 4},
+        term::terminal_grid_size_t{3, 4},
+        "row-count resize records an active-grid backing delta");
+
+    const term::Terminal_screen_model_result reflow_result =
+        model.resize(term::terminal_grid_size_t{3, 6});
+    ok &= single_active_grid_backing_delta_equal(
+        reflow_result.backing_deltas,
+        term::Terminal_backing_delta_kind::COLUMN_REFLOWED,
+        term::terminal_grid_size_t{3, 4},
+        term::terminal_grid_size_t{3, 6},
+        "column-count resize records a column-reflow backing delta");
+
+    const term::Terminal_screen_model_result alternate_enter =
+        model.ingest(QByteArrayLiteral("\x1b[?47h"));
+    ok &= single_mode_transition_backing_delta_equal(
+        alternate_enter.backing_deltas,
+        term::Terminal_buffer_id::PRIMARY,
+        term::Terminal_buffer_id::ALTERNATE,
+        "alternate-screen enter records a mode-transition backing delta");
+
+    const term::Terminal_screen_model_result alternate_leave =
+        model.ingest(QByteArrayLiteral("\x1b[?47l"));
+    ok &= single_mode_transition_backing_delta_equal(
+        alternate_leave.backing_deltas,
+        term::Terminal_buffer_id::ALTERNATE,
+        term::Terminal_buffer_id::PRIMARY,
+        "alternate-screen leave records a mode-transition backing delta");
+
+    return ok;
+}
+
+bool test_phase_r_primary_repaint_recovery_accepts_distinct_shift()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+
+    const term::Terminal_screen_model_result result =
+        model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("ee"),
+        }, true));
+
+    ok &= check(model.scrollback_size() == 1,
+        "Phase R recovery accepts one provable shifted repaint row");
+    ok &= check(result.scrollback_rows == 1,
+        "Phase R recovery result reports recovered retained row");
+    ok &= check(result.backing_deltas.size() == 1U &&
+            primary_backing_delta_matches(
+                result.backing_deltas[0],
+                term::Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
+                0,
+                1,
+                1,
+                0),
+        "Phase R recovery emits a primary-history append delta");
+    ok &= check(result.recovery_proposals.size() == 1U &&
+            result.recovery_proposals[0].reason ==
+                term::Terminal_recovery_proposal_reason::PRIMARY_REPAINT_SHIFTED_VISIBLE_ROWS &&
+            result.recovery_proposals[0].status ==
+                term::Terminal_recovery_proposal_status::ACCEPTED &&
+            result.recovery_proposals[0].provenance_source ==
+                term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT &&
+            result.recovery_proposals[0].candidate_visible_rows == 4 &&
+            result.recovery_proposals[0].recovered_row_count == 1 &&
+            result.recovery_proposals[0].visible_row_identity_ambiguous,
+        "Phase R recovery records accepted proposal metadata");
+    ok &= check(model.row_text(0) == QStringLiteral("bb") &&
+            model.row_text(1) == QStringLiteral("cc") &&
+            model.row_text(2) == QStringLiteral("dd") &&
+            model.row_text(3) == QStringLiteral("ee"),
+        "Phase R recovery keeps the repainted active grid");
+    ok &= check(primary_retained_line_provenance(model, 0).source ==
+            term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
+        "Phase R recovery stamps recovered retained-row provenance");
+    ok &= check(primary_retained_line_provenance(model, 1).source ==
+            term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        "Phase R recovery keeps repainted active rows on terminal-storage provenance");
+
+    const term::Terminal_render_snapshot scrollback_snapshot =
+        model.render_snapshot(request_for_model(model, 80U, 1));
+    ok &= check(snapshot_row_text(scrollback_snapshot, 0) == QStringLiteral("aa") &&
+            snapshot_row_text(scrollback_snapshot, 1) == QStringLiteral("bb") &&
+            snapshot_row_text(scrollback_snapshot, 2) == QStringLiteral("cc") &&
+            snapshot_row_text(scrollback_snapshot, 3) == QStringLiteral("dd"),
+        "Phase R recovery exposes the recovered row through primary backing");
+
+    const term::Terminal_screen_model_result non_recovery_result =
+        model.ingest(QByteArrayLiteral("z"));
+    ok &= check(non_recovery_result.recovery_proposals.empty(),
+        "Phase R recovery proposal metadata clears on later non-recovery ingest");
+
+    return ok;
+}
+
+bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
+{
+    bool ok = true;
+
+    term::terminal_repaint_recovery_shift_input_t input;
+    input.candidate_active          = true;
+    input.primary_buffer_active     = true;
+    input.scrollback_rows_unchanged = true;
+    input.candidate_rows = {
+        QStringLiteral("aa"),
+        QStringLiteral("bb"),
+        QStringLiteral("cc"),
+        QStringLiteral("dd"),
+    };
+    input.current_rows = {
+        QStringLiteral("bb"),
+        QStringLiteral("cc"),
+        QStringLiteral("dd"),
+        QStringLiteral("ee"),
+    };
+    ok &= check(term::primary_repaint_recovery_shift_rows(input) == 1,
+        "Phase R recovery helper accepts distinct shifted repaint");
+
+    input.candidate_rows = {
+        QStringLiteral("aa"),
+        QStringLiteral("aa"),
+        QStringLiteral("aa"),
+        QStringLiteral("aa"),
+    };
+    input.current_rows = {
+        QStringLiteral("aa"),
+        QStringLiteral("aa"),
+        QStringLiteral("aa"),
+        QStringLiteral("zz"),
+    };
+    ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
+        "Phase R recovery helper suppresses repeated-row ambiguous repaint");
+
+    input.candidate_rows = {
+        QString(),
+        QStringLiteral("bb"),
+        QStringLiteral("cc"),
+        QStringLiteral("dd"),
+    };
+    input.current_rows = {
+        QStringLiteral("bb"),
+        QStringLiteral("cc"),
+        QStringLiteral("dd"),
+        QStringLiteral("ee"),
+    };
+    ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
+        "Phase R recovery helper suppresses blank-only displaced repaint");
+
+    input.line_start_clear_before_text     = true;
+    input.explicit_non_home_repaint_address = true;
+    input.candidate_rows = {
+        QStringLiteral("aa"),
+        QStringLiteral("bb"),
+        QStringLiteral("cc"),
+        QStringLiteral("dd"),
+    };
+    ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
+        "Phase R recovery helper suppresses explicit non-home repaint");
+
+    return ok;
+}
+
+bool test_phase_r_primary_repaint_recovery_suppresses_false_positives()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model repeated_model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    repeated_model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("aa"),
+    }, false));
+    const term::Terminal_screen_model_result repeated_result =
+        repeated_model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("aa"),
+            QByteArrayLiteral("aa"),
+            QByteArrayLiteral("aa"),
+            QByteArrayLiteral("zz"),
+        }, true));
+    ok &= check(repeated_model.scrollback_size() == 0 &&
+            repeated_result.backing_deltas.empty() &&
+            repeated_result.recovery_proposals.empty(),
+        "Phase R recovery suppresses repeated-row ambiguous repaint shifts");
+
+    term::Terminal_screen_model blank_model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    blank_model.ingest(visible_row_write_stream({
+        QByteArray(),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+    const term::Terminal_screen_model_result blank_result =
+        blank_model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("ee"),
+        }, true));
+    ok &= check(blank_model.scrollback_size() == 0 &&
+            blank_result.backing_deltas.empty() &&
+            blank_result.recovery_proposals.empty(),
+        "Phase R recovery suppresses blank-only displaced repaint shifts");
+
+    term::Terminal_screen_model resize_model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    resize_model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+    resize_model.resize(term::terminal_grid_size_t{5, 8});
+    const term::Terminal_screen_model_result resize_result =
+        resize_model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("ee"),
+            QByteArrayLiteral("ff"),
+        }, true));
+    ok &= check(resize_model.scrollback_size() == 0 &&
+            resize_result.backing_deltas.empty() &&
+            resize_result.recovery_proposals.empty(),
+        "Phase R recovery suppresses resize-adjacent repaint shifts");
+
+    return ok;
+}
+
+bool test_phase_r_primary_repaint_recovery_toggle_cancels_candidate()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+
+    model.ingest(QByteArrayLiteral("\x1b[?25l\x1b[1;1H\x1b[Kbb"));
+    model.set_primary_repaint_recovery_enabled(false);
+
+    const term::Terminal_screen_model_result result =
+        model.ingest(QByteArrayLiteral(
+            "\x1b[2;1H\x1b[K" "cc"
+            "\x1b[3;1H\x1b[K" "dd"
+            "\x1b[4;1H\x1b[K" "ee"
+            "\x1b[?25h"));
+
+    ok &= check(model.scrollback_size() == 0,
+        "Phase R recovery toggle off cancels in-flight candidate");
+    ok &= check(result.recovery_proposals.empty(),
+        "Phase R recovery toggle off leaves no accepted proposal");
+    ok &= check(result.backing_deltas.empty(),
+        "Phase R recovery toggle off emits no recovered history delta");
+    ok &= check(model.row_text(0) == QStringLiteral("bb") &&
+            model.row_text(1) == QStringLiteral("cc") &&
+            model.row_text(2) == QStringLiteral("dd") &&
+            model.row_text(3) == QStringLiteral("ee"),
+        "Phase R recovery toggle off keeps the repainted active grid");
+
+    model.set_primary_repaint_recovery_enabled(true);
+    model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+        QByteArrayLiteral("ff"),
+    }, true));
+    ok &= check(model.scrollback_size() == 1,
+        "Phase R recovery toggle on re-enables later recovery");
 
     return ok;
 }
@@ -1369,15 +2074,18 @@ bool test_retained_line_provenance_lifecycle()
 
     term::Terminal_screen_model clear_scrollback_model = make_model(2, 4, 4);
     clear_scrollback_model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc\r\ndd"));
+    const int purged_scrollback_rows = clear_scrollback_model.scrollback_size();
     std::vector<std::uint64_t> purged_ids;
-    for (int logical_row = 0; logical_row < clear_scrollback_model.scrollback_size();
-        ++logical_row)
-    {
+    purged_ids.reserve(static_cast<std::size_t>(purged_scrollback_rows));
+    for (int logical_row = 0; logical_row < purged_scrollback_rows; ++logical_row) {
         purged_ids.push_back(primary_retained_line_id(clear_scrollback_model, logical_row));
     }
-    clear_scrollback_model.ingest(QByteArrayLiteral("\x1b[3J"));
+    const term::Terminal_screen_model_result clear_scrollback_result =
+        clear_scrollback_model.ingest(QByteArrayLiteral("\x1b[3J"));
     ok &= check(clear_scrollback_model.scrollback_size() == 0,
         "ED3 clears primary scrollback");
+    ok &= check(clear_scrollback_result.evicted_scrollback_rows == purged_scrollback_rows,
+        "ED3 reports evicted primary scrollback rows");
     for (std::uint64_t purged_id : purged_ids) {
         ok &= check(!contains_id(primary_retained_line_ids(clear_scrollback_model), purged_id),
             "clear scrollback retires purged ids");
@@ -1416,6 +2124,495 @@ bool test_retained_line_provenance_lifecycle()
     ok &= check_alternate_screen_retained_line_ids_unique(
         alternate_model,
         "alternate round trip alternate retained line ids stay unique");
+
+    return ok;
+}
+
+bool test_recovery_disabled_non_scroll_sources_do_not_grow_retained_history()
+{
+    bool ok = true;
+
+    Scrollback_delta_observer observer(false);
+    auto check_observed_boundary_no_retained_history_growth = [&](
+        term::Terminal_screen_model&          model,
+        Primary_backing_boundary              boundary_annotation,
+        Scrollback_delta_operation_annotation operation_annotation,
+        term::Terminal_buffer_id              expected_active_buffer_before,
+        term::Terminal_buffer_id              expected_active_buffer_after,
+        const char*                           label,
+        bool                                  expect_no_backing_deltas,
+        const auto&                           operation) {
+        bool source_ok = true;
+
+        const std::size_t pre_retained_line_count = primary_retained_line_ids(model).size();
+        const auto observation = observer.observe(
+            model,
+            boundary_annotation,
+            operation_annotation,
+            operation);
+        const std::size_t post_retained_line_count = primary_retained_line_ids(model).size();
+
+        source_ok &= check(
+            observation.boundary_annotation == boundary_annotation,
+            label);
+        source_ok &= check(
+            observation.operation_annotation == operation_annotation,
+            label);
+        source_ok &= check(
+            observation.active_buffer_before == expected_active_buffer_before &&
+                observation.active_buffer_after == expected_active_buffer_after,
+            label);
+        source_ok &= check(!observation.recovery_enabled_annotation, label);
+        source_ok &= check(scrollback_rows_delta(observation) == 0, label);
+        source_ok &= check(observation.evicted_scrollback_rows == 0, label);
+        if (expect_no_backing_deltas) {
+            source_ok &= check(observation.backing_deltas.empty(), label);
+        }
+        source_ok &= check(post_retained_line_count == pre_retained_line_count, label);
+        return source_ok;
+    };
+
+    auto check_observed_no_retained_history_growth = [&](
+        term::Terminal_screen_model&          model,
+        Scrollback_delta_operation_annotation operation_annotation,
+        const char*                           label,
+        const auto&                           operation) {
+        return check_observed_boundary_no_retained_history_growth(
+            model,
+            Primary_backing_boundary::INGEST,
+            operation_annotation,
+            term::Terminal_buffer_id::PRIMARY,
+            term::Terminal_buffer_id::PRIMARY,
+            label,
+            true,
+            operation);
+    };
+
+    term::Terminal_screen_model resize_model =
+        make_recovery_disabled_primary_backing_model(3, 5, 5);
+    resize_model.ingest(QByteArrayLiteral("abc"));
+    ok &= check_observed_boundary_no_retained_history_growth(
+        resize_model,
+        Primary_backing_boundary::RESIZE,
+        Scrollback_delta_operation_annotation::RESIZE,
+        term::Terminal_buffer_id::PRIMARY,
+        term::Terminal_buffer_id::PRIMARY,
+        "same-row resize does not grow retained history",
+        false,
+        [&] {
+            return resize_model.resize(term::terminal_grid_size_t{3, 7});
+        });
+    ok &= check(resize_model.grid_size().rows == 3 &&
+        resize_model.grid_size().columns == 7,
+        "same-row resize applies requested grid");
+
+    term::Terminal_screen_model alternate_boundary_model =
+        make_recovery_disabled_primary_backing_model(2, 4, 4);
+    alternate_boundary_model.ingest(QByteArrayLiteral("P"));
+    ok &= check_observed_boundary_no_retained_history_growth(
+        alternate_boundary_model,
+        Primary_backing_boundary::ALTERNATE_ENTER,
+        Scrollback_delta_operation_annotation::ALTERNATE_ENTER_LEAVE,
+        term::Terminal_buffer_id::PRIMARY,
+        term::Terminal_buffer_id::ALTERNATE,
+        "alternate enter does not grow retained history",
+        false,
+        [&] {
+            return alternate_boundary_model.ingest(QByteArrayLiteral("\x1b[?47h"));
+        });
+    ok &= check(alternate_boundary_model.active_buffer_id() ==
+        term::Terminal_buffer_id::ALTERNATE,
+        "alternate enter switches to alternate buffer");
+    ok &= check_observed_boundary_no_retained_history_growth(
+        alternate_boundary_model,
+        Primary_backing_boundary::ALTERNATE_LEAVE,
+        Scrollback_delta_operation_annotation::ALTERNATE_ENTER_LEAVE,
+        term::Terminal_buffer_id::ALTERNATE,
+        term::Terminal_buffer_id::PRIMARY,
+        "alternate leave does not grow retained history",
+        false,
+        [&] {
+            return alternate_boundary_model.ingest(QByteArrayLiteral("\x1b[?47l"));
+        });
+    ok &= check(alternate_boundary_model.active_buffer_id() ==
+        term::Terminal_buffer_id::PRIMARY,
+        "alternate leave returns to primary buffer");
+
+    term::Terminal_screen_model cursor_model =
+        make_recovery_disabled_primary_backing_model(3, 5, 5);
+    cursor_model.ingest(QByteArrayLiteral("abc"));
+    ok &= check_observed_no_retained_history_growth(
+        cursor_model,
+        Scrollback_delta_operation_annotation::REPAINT,
+        "cursor movement repaint does not grow retained history",
+        [&] {
+            return cursor_model.ingest(QByteArrayLiteral("\x1b[3;4H"));
+        });
+    ok &= check(cursor_model.cursor_position().row == 2 &&
+        cursor_model.cursor_position().column == 3,
+        "cursor movement repaint moves the cursor");
+
+    term::Terminal_screen_model erase_line_model =
+        make_recovery_disabled_primary_backing_model(3, 6, 5);
+    erase_line_model.ingest(QByteArrayLiteral("abcdef"));
+    ok &= check_observed_no_retained_history_growth(
+        erase_line_model,
+        Scrollback_delta_operation_annotation::REPAINT,
+        "EL visible clear does not grow retained history",
+        [&] {
+            return erase_line_model.ingest(QByteArrayLiteral("\x1b[1;3H\x1b[K"));
+        });
+    ok &= check(erase_line_model.row_text(0) == QStringLiteral("ab"),
+        "EL visible clear erases from the cursor to end of row");
+
+    term::Terminal_screen_model erase_display_model =
+        make_recovery_disabled_primary_backing_model(3, 6, 5);
+    erase_display_model.ingest(
+        QByteArrayLiteral("abcd\x1b[2;1Hefgh\x1b[3;1Hijkl"));
+    ok &= check_observed_no_retained_history_growth(
+        erase_display_model,
+        Scrollback_delta_operation_annotation::REPAINT,
+        "ED visible clear does not grow retained history",
+        [&] {
+            return erase_display_model.ingest(QByteArrayLiteral("\x1b[2;3H\x1b[J"));
+        });
+    ok &= check(erase_display_model.row_text(0) == QStringLiteral("abcd"),
+        "ED visible clear preserves rows before the cursor");
+    ok &= check(erase_display_model.row_text(1) == QStringLiteral("ef"),
+        "ED visible clear erases the current row from the cursor");
+    ok &= check(erase_display_model.row_text(2).isEmpty(),
+        "ED visible clear erases following rows");
+
+    term::Terminal_screen_model overwrite_model =
+        make_recovery_disabled_primary_backing_model(2, 5, 5);
+    overwrite_model.ingest(QByteArrayLiteral("abcde"));
+    ok &= check_observed_no_retained_history_growth(
+        overwrite_model,
+        Scrollback_delta_operation_annotation::REPAINT,
+        "text overwrite does not grow retained history",
+        [&] {
+            return overwrite_model.ingest(QByteArrayLiteral("\x1b[1;3HX"));
+        });
+    ok &= check(overwrite_model.row_text(0) == QStringLiteral("abXde"),
+        "text overwrite changes an existing visible cell");
+
+    term::Terminal_screen_model non_top_region_model =
+        make_recovery_disabled_primary_backing_model(4, 5, 5);
+    non_top_region_model.ingest(
+        QByteArrayLiteral("\x1b[2;3r\x1b[1;1Htop\x1b[2;1Hone\x1b[3;1Htwo\x1b[4;1Hbot"));
+    ok &= check_observed_no_retained_history_growth(
+        non_top_region_model,
+        Scrollback_delta_operation_annotation::SCROLL_REGION_WITHOUT_HISTORY_APPEND,
+        "non-top scroll region does not grow retained history",
+        [&] {
+            return non_top_region_model.ingest(QByteArrayLiteral("\x1b[3;1H\n"));
+        });
+    ok &= check(non_top_region_model.row_text(0) == QStringLiteral("top"),
+        "non-top scroll region preserves rows above the region");
+    ok &= check(non_top_region_model.row_text(1) == QStringLiteral("two"),
+        "non-top scroll region scrolls region content upward");
+    ok &= check(non_top_region_model.row_text(2).isEmpty(),
+        "non-top scroll region blanks the exposed bottom margin");
+    ok &= check(non_top_region_model.row_text(3) == QStringLiteral("bot"),
+        "non-top scroll region preserves rows below the region");
+
+    return ok;
+}
+
+bool test_recovery_disabled_chunk_split_invariance_for_non_scroll_sources()
+{
+    bool ok = true;
+
+    auto run_non_scroll_fixture = [&](const std::vector<QByteArray>& chunks,
+        bool resize_before_chunks,
+        const char* label) {
+        term::Terminal_screen_model model =
+            make_recovery_disabled_primary_backing_model(3, 8, 8);
+        term::Terminal_screen_model_result result =
+            model.ingest(QByteArrayLiteral("aaa\r\nbbb\r\nccc"));
+        ok &= check(diagnostic_count(result) == 0, label);
+        ok &= check(model.scrollback_size() == 0, label);
+        if (resize_before_chunks) {
+            result = model.resize(term::terminal_grid_size_t{3, 10});
+            ok &= check(result.scrollback_rows == 0, label);
+            ok &= check(model.scrollback_size() == 0, label);
+        }
+
+        for (const QByteArray& chunk : chunks) {
+            result = model.ingest(chunk);
+            ok &= check(diagnostic_count(result) == 0, label);
+        }
+        ok &= check(model.scrollback_size() == 0, label);
+        return primary_backing_model_summary(model);
+    };
+
+    auto check_chunk_split = [&](
+        const std::vector<QByteArray>& combined_chunks,
+        const std::vector<QByteArray>& split_chunks,
+        bool                           resize_before_chunks,
+        const char*                    label)
+    {
+        const primary_backing_model_summary_t combined =
+            run_non_scroll_fixture(combined_chunks, resize_before_chunks, label);
+        const primary_backing_model_summary_t split =
+            run_non_scroll_fixture(split_chunks, resize_before_chunks, label);
+        ok &= check(primary_backing_model_summaries_equal(combined, split), label);
+    };
+
+    check_chunk_split(
+        {
+            QByteArrayLiteral("\x1b[Hxxx\x1b[K\r\nyyy\x1b[K\r\nzzz\x1b[K"),
+        },
+        {
+            QByteArrayLiteral("\x1b[Hxxx"),
+            QByteArrayLiteral("\x1b[K\r\n"),
+            QByteArrayLiteral("yyy\x1b[K\r\nzzz"),
+            QByteArrayLiteral("\x1b[K"),
+        },
+        false,
+        "cursor-home repaint chunk split is invariant with recovery disabled");
+
+    check_chunk_split(
+        {
+            QByteArrayLiteral("\x1b[Hwide\x1b[K\r\nresize\x1b[K"),
+        },
+        {
+            QByteArrayLiteral("\x1b[H"),
+            QByteArrayLiteral("wide\x1b[K\r\n"),
+            QByteArrayLiteral("resize"),
+            QByteArrayLiteral("\x1b[K"),
+        },
+        true,
+        "resize-adjacent repaint chunk split is invariant with recovery disabled");
+
+    check_chunk_split(
+        {
+            QByteArrayLiteral("\x1b[?2026h\x1b[Hheld\x1b[K\r\npublic\x1b[K\x1b[?2026l"),
+        },
+        {
+            QByteArrayLiteral("\x1b[?2026h\x1b[H"),
+            QByteArrayLiteral("held\x1b[K"),
+            QByteArrayLiteral("\r\npublic\x1b[K"),
+            QByteArrayLiteral("\x1b[?2026l"),
+        },
+        false,
+        "synchronized-output repaint chunk split is invariant with recovery disabled");
+
+    return ok;
+}
+
+bool test_recovery_disabled_scrollback_limit_changes_do_not_grow_retained_history()
+{
+    bool ok = true;
+
+    Scrollback_delta_observer observer(false);
+
+    term::Terminal_screen_model discard_model =
+        make_recovery_disabled_primary_backing_model(2, 4, 0);
+    const term::Terminal_screen_model_result discard_result =
+        discard_model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc"));
+    ok &= check(discard_result.evicted_scrollback_rows == 1 &&
+        discard_model.scrollback_size() == 0,
+        "zero scrollback limit preserves scalar discarded-row compatibility");
+    ok &= check(discard_result.backing_deltas.size() == 1U &&
+            primary_backing_delta_matches(
+                discard_result.backing_deltas.front(),
+                term::Terminal_backing_delta_kind::PRIMARY_HISTORY_DISCARDED,
+                0,
+                0,
+                0,
+                0,
+                1),
+        "zero scrollback limit records discarded rows separately from eviction");
+    ok &= check(evicted_scrollback_rows_in_backing_deltas(
+            discard_result.backing_deltas) == 0 &&
+        discarded_scrollback_rows_in_backing_deltas(
+            discard_result.backing_deltas) == 1,
+        "zero scrollback limit does not mislabel discarded rows as stored-history eviction");
+
+    term::Terminal_screen_model increased_limit_model =
+        make_recovery_disabled_primary_backing_model(2, 4, 2);
+    increased_limit_model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc\r\ndd"));
+    const int increased_limit_rows_before = increased_limit_model.scrollback_size();
+    const std::vector<std::uint64_t> increased_limit_ids_before =
+        primary_retained_line_ids(increased_limit_model);
+
+    ok &= check(increased_limit_rows_before == 2,
+        "scrollback limit increase fixture starts at the original limit");
+
+    const auto increased_limit = observer.observe(
+        increased_limit_model,
+        Primary_backing_boundary::SCROLLBACK_LIMIT_CHANGE,
+        Scrollback_delta_operation_annotation::RESIZE,
+        [&] {
+            return increased_limit_model.set_scrollback_limit(4);
+        });
+    ok &= check(increased_limit.boundary_annotation ==
+            Primary_backing_boundary::SCROLLBACK_LIMIT_CHANGE &&
+        increased_limit.classification_annotation ==
+            Primary_backing_observation_classification::TEST_ONLY &&
+        !increased_limit.recovery_enabled_annotation,
+        "scrollback limit increase is observed as a recovery-disabled test-only boundary");
+    ok &= check(increased_limit.active_buffer_before == term::Terminal_buffer_id::PRIMARY &&
+        increased_limit.active_buffer_after == term::Terminal_buffer_id::PRIMARY,
+        "scrollback limit increase stays on the primary buffer");
+    ok &= check(scrollback_rows_delta(increased_limit) == 0,
+        "scrollback limit increase does not grow retained history");
+    ok &= check(increased_limit.evicted_scrollback_rows == 0,
+        "scrollback limit increase does not evict retained history");
+    ok &= single_primary_backing_delta_equal(
+        increased_limit.backing_deltas,
+        term::Terminal_backing_delta_kind::BACKING_UNCHANGED,
+        increased_limit_rows_before,
+        increased_limit_rows_before,
+        0,
+        0,
+        "scrollback limit increase records an explicit storage no-op delta");
+    ok &= check(increased_limit.result_scrollback_rows == increased_limit_rows_before &&
+        increased_limit_model.scrollback_size() == increased_limit_rows_before,
+        "scrollback limit increase reports unchanged retained history rows");
+    ok &= check(primary_retained_line_ids(increased_limit_model) ==
+        increased_limit_ids_before,
+        "scrollback limit increase preserves retained line identities");
+
+    const term::Terminal_screen_model_result equal_limit =
+        increased_limit_model.set_scrollback_limit(4);
+    ok &= single_primary_backing_delta_equal(
+        equal_limit.backing_deltas,
+        term::Terminal_backing_delta_kind::BACKING_UNCHANGED,
+        increased_limit_rows_before,
+        increased_limit_rows_before,
+        0,
+        0,
+        "unchanged scrollback limit records an explicit storage no-op delta");
+
+    constexpr int expected_increased_scrollback_rows = 4;
+
+    const term::Terminal_screen_model_result append_after_increase =
+        increased_limit_model.ingest(QByteArrayLiteral("\r\nee"));
+    ok &= check(append_after_increase.evicted_scrollback_rows == 0 &&
+        increased_limit_model.scrollback_size() == increased_limit_rows_before + 1,
+        "increased scrollback limit accepts a later terminal-scroll append");
+    ok &= single_primary_backing_delta_equal(
+        append_after_increase.backing_deltas,
+        term::Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
+        increased_limit_rows_before,
+        increased_limit_rows_before + 1,
+        1,
+        0,
+        "append after limit increase records the backing append delta");
+
+    const term::Terminal_screen_model_result append_to_increased_limit =
+        increased_limit_model.ingest(QByteArrayLiteral("\r\nff"));
+    ok &= check(append_to_increased_limit.evicted_scrollback_rows == 0 &&
+        increased_limit_model.scrollback_size() == expected_increased_scrollback_rows,
+        "later terminal-scroll append reaches the increased scrollback limit");
+    ok &= single_primary_backing_delta_equal(
+        append_to_increased_limit.backing_deltas,
+        term::Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
+        increased_limit_rows_before + 1,
+        expected_increased_scrollback_rows,
+        1,
+        0,
+        "append to increased limit records the backing append delta");
+
+    const term::Terminal_screen_model_result append_past_increased_limit =
+        increased_limit_model.ingest(QByteArrayLiteral("\r\ngg"));
+    ok &= check(append_past_increased_limit.evicted_scrollback_rows == 1 &&
+        increased_limit_model.scrollback_size() == expected_increased_scrollback_rows,
+        "later terminal-scroll append keeps the increased scrollback limit capped");
+    ok &= check(append_past_increased_limit.backing_deltas.size() == 2U &&
+            primary_backing_delta_matches(
+                append_past_increased_limit.backing_deltas[0],
+                term::Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
+                expected_increased_scrollback_rows,
+                expected_increased_scrollback_rows + 1,
+                1,
+                0) &&
+            primary_backing_delta_matches(
+                append_past_increased_limit.backing_deltas[1],
+                term::Terminal_backing_delta_kind::PRIMARY_HISTORY_EVICTED,
+                expected_increased_scrollback_rows + 1,
+                expected_increased_scrollback_rows,
+                0,
+                1),
+        "append past increased limit records append and eviction backing deltas");
+
+    term::Terminal_screen_model shrunk_limit_model =
+        make_recovery_disabled_primary_backing_model(2, 4, 4);
+    shrunk_limit_model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc\r\ndd\r\nee"));
+    const int shrunk_limit_rows_before = shrunk_limit_model.scrollback_size();
+    const std::vector<std::uint64_t> shrunk_limit_ids_before =
+        primary_retained_line_ids(shrunk_limit_model);
+
+    constexpr int expected_shrunk_scrollback_rows = 1;
+    ok &= check(shrunk_limit_rows_before == 3,
+        "scrollback limit shrink fixture starts above the smaller limit");
+
+    const auto shrunk_limit = observer.observe(
+        shrunk_limit_model,
+        Primary_backing_boundary::SCROLLBACK_LIMIT_CHANGE,
+        Scrollback_delta_operation_annotation::RESIZE,
+        [&] {
+            return shrunk_limit_model.set_scrollback_limit(
+                expected_shrunk_scrollback_rows);
+        });
+    const int expected_evicted_scrollback_rows =
+        shrunk_limit_rows_before - expected_shrunk_scrollback_rows;
+    ok &= check(shrunk_limit.boundary_annotation ==
+            Primary_backing_boundary::SCROLLBACK_LIMIT_CHANGE &&
+        shrunk_limit.classification_annotation ==
+            Primary_backing_observation_classification::TEST_ONLY &&
+        !shrunk_limit.recovery_enabled_annotation,
+        "scrollback limit shrink is observed as a recovery-disabled test-only boundary");
+    ok &= check(shrunk_limit.active_buffer_before == term::Terminal_buffer_id::PRIMARY &&
+        shrunk_limit.active_buffer_after == term::Terminal_buffer_id::PRIMARY,
+        "scrollback limit shrink stays on the primary buffer");
+    ok &= check(scrollback_rows_delta(shrunk_limit) ==
+            -expected_evicted_scrollback_rows &&
+        shrunk_limit.result_scrollback_rows == expected_shrunk_scrollback_rows &&
+        shrunk_limit_model.scrollback_size() == expected_shrunk_scrollback_rows,
+        "scrollback limit shrink applies the smaller retention limit");
+    ok &= check(shrunk_limit.evicted_scrollback_rows ==
+        expected_evicted_scrollback_rows,
+        "scrollback limit shrink reports evicted history separately");
+    ok &= check(appended_scrollback_rows_in_backing_deltas(
+            shrunk_limit.backing_deltas) == 0 &&
+        evicted_scrollback_rows_in_backing_deltas(shrunk_limit.backing_deltas) ==
+            expected_evicted_scrollback_rows,
+        "scrollback limit shrink records eviction-only backing deltas");
+
+    const std::vector<std::uint64_t> shrunk_limit_ids_after =
+        primary_retained_line_ids(shrunk_limit_model);
+    const std::vector<std::uint64_t> expected_shrunk_limit_ids_after(
+        shrunk_limit_ids_before.begin() + expected_evicted_scrollback_rows,
+        shrunk_limit_ids_before.end());
+    ok &= check(shrunk_limit_ids_after == expected_shrunk_limit_ids_after,
+        "scrollback limit shrink evicts the oldest retained history rows");
+    ok &= check(scrollback_rows_delta(shrunk_limit) <= 0,
+        "scrollback limit shrink is not retained-history growth");
+
+    const term::Terminal_screen_model_result first_append_after_shrink =
+        shrunk_limit_model.ingest(QByteArrayLiteral("\r\nff"));
+    ok &= check(first_append_after_shrink.evicted_scrollback_rows == 1 &&
+        shrunk_limit_model.scrollback_size() == expected_shrunk_scrollback_rows,
+        "shrunk scrollback limit evicts on a later terminal-scroll append");
+    ok &= check(appended_scrollback_rows_in_backing_deltas(
+            first_append_after_shrink.backing_deltas) == 1 &&
+        evicted_scrollback_rows_in_backing_deltas(
+            first_append_after_shrink.backing_deltas) == 1,
+        "first append after shrink records append and eviction backing deltas");
+
+    const term::Terminal_screen_model_result second_append_after_shrink =
+        shrunk_limit_model.ingest(QByteArrayLiteral("\r\ngg"));
+    ok &= check(second_append_after_shrink.evicted_scrollback_rows == 1 &&
+        shrunk_limit_model.scrollback_size() == expected_shrunk_scrollback_rows,
+        "shrunk scrollback limit remains enforced after later terminal-scroll appends");
+    ok &= check(appended_scrollback_rows_in_backing_deltas(
+            second_append_after_shrink.backing_deltas) == 1 &&
+        evicted_scrollback_rows_in_backing_deltas(
+            second_append_after_shrink.backing_deltas) == 1,
+        "second append after shrink records append and eviction backing deltas");
 
     return ok;
 }
@@ -1589,6 +2786,20 @@ bool test_replies_and_cursor_save_restore()
         "text-area resize request applies requested grid");
     ok &= dirty_rows_equal(result, row_range(5),
         "text-area resize request dirties resized visible rows");
+    ok &= check(result.backing_deltas.size() == 2U &&
+            active_grid_backing_delta_matches(
+                result.backing_deltas[0],
+                term::Terminal_backing_delta_kind::ACTIVE_GRID_RESIZED,
+                term::Terminal_buffer_id::PRIMARY,
+                term::terminal_grid_size_t{7, 13},
+                term::terminal_grid_size_t{5, 9}) &&
+            active_grid_backing_delta_matches(
+                result.backing_deltas[1],
+                term::Terminal_backing_delta_kind::COLUMN_REFLOWED,
+                term::Terminal_buffer_id::PRIMARY,
+                term::terminal_grid_size_t{7, 13},
+                term::terminal_grid_size_t{5, 9}),
+        "text-area resize request records active-grid resize and column-reflow deltas");
 
     result  = model.ingest(QByteArrayLiteral("\x1b[8;4097;9t"));
     ok     &= check(diagnostic_count(result) == 1,
@@ -1609,6 +2820,20 @@ bool test_replies_and_cursor_save_restore()
         "inline text-area resize updates grid before following output");
     ok     &= check(model.row_text(2) == QStringLiteral("    Z"),
         "inline text-area resize interprets following cursor address in resized grid");
+    ok     &= check(result.backing_deltas.size() == 2U &&
+            active_grid_backing_delta_matches(
+                result.backing_deltas[0],
+                term::Terminal_backing_delta_kind::ACTIVE_GRID_RESIZED,
+                term::Terminal_buffer_id::PRIMARY,
+                term::terminal_grid_size_t{2, 4},
+                term::terminal_grid_size_t{3, 5}) &&
+            active_grid_backing_delta_matches(
+                result.backing_deltas[1],
+                term::Terminal_backing_delta_kind::COLUMN_REFLOWED,
+                term::Terminal_buffer_id::PRIMARY,
+                term::terminal_grid_size_t{2, 4},
+                term::terminal_grid_size_t{3, 5}),
+        "inline text-area resize records active-grid resize and column-reflow deltas");
     ok     &= check(snapshot_valid(model, 44U),
         "inline text-area resize snapshot validates");
 
@@ -1698,6 +2923,11 @@ int main()
 {
     bool ok = true;
     ok &= test_cursor_addressing_and_split_csi();
+    ok &= test_scrollback_growth_observer_seam();
+    ok &= test_phase_r_repaint_recovery_shift_helper_matches_policy();
+    ok &= test_phase_r_primary_repaint_recovery_accepts_distinct_shift();
+    ok &= test_phase_r_primary_repaint_recovery_suppresses_false_positives();
+    ok &= test_phase_r_primary_repaint_recovery_toggle_cancels_candidate();
     ok &= test_erase_operations_and_wide_damage();
     ok &= test_scroll_region_and_origin_mode();
     ok &= test_top_anchored_scroll_region_appends_scrollback();
@@ -1709,6 +2939,9 @@ int main()
     ok &= test_blank_fill_operations_use_current_style();
     ok &= test_insert_delete_lines_cells_and_tabs();
     ok &= test_retained_line_provenance_lifecycle();
+    ok &= test_recovery_disabled_non_scroll_sources_do_not_grow_retained_history();
+    ok &= test_recovery_disabled_chunk_split_invariance_for_non_scroll_sources();
+    ok &= test_recovery_disabled_scrollback_limit_changes_do_not_grow_retained_history();
     ok &= test_retained_line_content_generation_mutations();
     ok &= test_replies_and_cursor_save_restore();
     return ok ? 0 : 1;

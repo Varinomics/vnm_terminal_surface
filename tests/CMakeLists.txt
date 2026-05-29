@@ -57,6 +57,19 @@ set(vnm_terminal_qt_scaled_environment
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+add_test(
+    NAME vnm_terminal_primary_backing_phase_0b_guard
+    COMMAND
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/tools/primary_backing_phase_0b_guard.py"
+        --repo-root
+        "${CMAKE_SOURCE_DIR}"
+)
+
+set_tests_properties(vnm_terminal_primary_backing_phase_0b_guard PROPERTIES
+    LABELS "primary-backing;static"
+)
+
 set(vnm_terminal_default_capture_replay_dir "")
 if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/conformance/captures")
     set(vnm_terminal_default_capture_replay_dir

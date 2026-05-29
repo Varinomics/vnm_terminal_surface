@@ -1174,13 +1174,13 @@ bool test_scroll_region_scrollback_survives_conpty(const QString& fixture_path)
         exit->exit_code == 0,
         "scroll-region scrollback fixture reports clean exit");
 
-    term::Terminal_screen_model model(
-        {
-            term::terminal_grid_size_t{5, 20},
-            32,
-            8,
-            true,
-            });
+    term::Terminal_screen_model_config recovery_model_config;
+    recovery_model_config.grid_size                                = {5, 20};
+    recovery_model_config.scrollback_limit                         = 32;
+    recovery_model_config.tab_width                                = 8;
+    recovery_model_config.recover_scrollback_from_primary_repaints = true;
+    recovery_model_config.retain_structural_actions                = true;
+    term::Terminal_screen_model model(recovery_model_config);
     const term::Terminal_screen_model_result result =
         model.ingest(capture.output_snapshot());
     ok &= check(diagnostic_count(result) == 0,

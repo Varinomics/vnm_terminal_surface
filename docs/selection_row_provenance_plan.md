@@ -296,12 +296,14 @@ provenance for affected rows and detach visual spans.
 
 ### Primary repaint recovery
 
-The heuristic primary repaint recovery path was rejected and removed. Default
-repaint handling must not synthesize primary scrollback rows or retained-line
-provenance from repaint-shaped output.
+Primary repaint recovery is valid only as Phase R policy when explicitly
+enabled. It must not serve as storage evidence for the base backing model, and
+default repaint handling must not synthesize primary scrollback rows or
+retained-line provenance from repaint-shaped output.
 
-If future work wants preservation through recovery, it must capture provenance
-together with cells and prove that it still describes the same retained content.
+Accepted Phase R recovery captures provenance together with cells. Recovered
+rows use `RECOVERED_PRIMARY_REPAINT` retained-row provenance and enter the
+canonical primary-history path through normal backing APIs.
 
 ### Alternate buffer
 
@@ -609,8 +611,8 @@ Tests are coverage/invariant tests, not proof of behavior fix:
 - zero scrollback reuses storage with fresh IDs
 - partial scroll regions retire displaced rows and preserve moved rows
 - clear scrollback retires purged IDs
-- heuristic primary repaint recovery remains absent and repaint paths do not
-  synthesize retained IDs
+- primary repaint recovery remains Phase R-owned and repaint paths do not
+  synthesize retained IDs outside that policy
 - alternate buffer provenance is saved/restored consistently but not visually
   reattached
 
@@ -913,8 +915,9 @@ During implementation:
    integer descriptors are acceptable compared with text comparison.
 8. Session-only proof is not enough; model-side validation is the final stale
    span guard.
-9. Reintroducing primary repaint recovery could reconstruct rows that look
-   identical but lack proven identity.
+9. Primary repaint recovery can reconstruct rows that look identical but lack
+   proven identity unless Phase R remains the only owner and records recovered
+   provenance explicitly.
 10. Dirty rows are still useful render damage metadata but must not remain the
     semantic source of selection truth.
 11. Manual app validation is still required for the original Codex streaming
@@ -984,4 +987,3 @@ The plan is successful when:
    behavior-changing phases.
 8. Phase 6 documentation identifies the implemented architecture, final phase
    outcomes, manual validation checklist, and residual manual-test expectations.
-
