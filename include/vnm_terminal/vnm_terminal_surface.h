@@ -41,6 +41,9 @@ class VNM_TerminalSurface : public QQuickItem
         NOTIFY cursor_blink_enabled_changed)
     Q_PROPERTY(int scrollbackLimit
         READ scrollback_limit WRITE set_scrollback_limit NOTIFY scrollback_limit_changed)
+    Q_PROPERTY(bool primaryRepaintRecoveryEnabled
+        READ primary_repaint_recovery_enabled WRITE set_primary_repaint_recovery_enabled
+        NOTIFY primary_repaint_recovery_enabled_changed)
     Q_PROPERTY(int synchronizedOutputStaleTimeoutMs
         READ synchronized_output_stale_timeout_ms
         WRITE set_synchronized_output_stale_timeout_ms
@@ -235,6 +238,9 @@ public:
     int scrollback_limit() const;
     void set_scrollback_limit(int limit);
 
+    bool primary_repaint_recovery_enabled() const;
+    void set_primary_repaint_recovery_enabled(bool enabled);
+
     QString backend_output_capture_path() const;
     void set_backend_output_capture_path(const QString& path);
 
@@ -350,6 +356,7 @@ signals:
     void cursor_style_changed();
     void cursor_blink_enabled_changed();
     void scrollback_limit_changed();
+    void primary_repaint_recovery_enabled_changed();
     void synchronized_output_stale_timeout_ms_changed();
     void synchronized_output_scroll_policy_changed();
     void mouse_reporting_policy_changed();
@@ -467,6 +474,11 @@ private:
     Cursor_style             m_cursor_style                         = Cursor_style::BLOCK;
     bool                     m_cursor_blink_enabled                 = true;
     int                      m_scrollback_limit                     = 10000;
+#if defined(Q_OS_WIN)
+    bool                     m_primary_repaint_recovery_enabled     = true;
+#else
+    bool                     m_primary_repaint_recovery_enabled     = false;
+#endif
     QString                  m_backend_output_capture_path;
     QString                  m_transcript_capture_path;
     bool                     m_transcript_snapshot_diagnostics      = false;

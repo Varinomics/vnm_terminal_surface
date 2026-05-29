@@ -1971,6 +1971,24 @@ void VNM_TerminalSurface::set_scrollback_limit(int limit)
     }
 }
 
+bool VNM_TerminalSurface::primary_repaint_recovery_enabled() const
+{
+    return m_primary_repaint_recovery_enabled;
+}
+
+void VNM_TerminalSurface::set_primary_repaint_recovery_enabled(bool enabled)
+{
+    if (m_primary_repaint_recovery_enabled == enabled) {
+        return;
+    }
+
+    m_primary_repaint_recovery_enabled = enabled;
+    emit primary_repaint_recovery_enabled_changed();
+    if (m_private->session != nullptr) {
+        m_private->session->set_primary_repaint_recovery_enabled(enabled);
+    }
+}
+
 QString VNM_TerminalSurface::backend_output_capture_path() const
 {
     return m_backend_output_capture_path;
@@ -4806,8 +4824,8 @@ bool VNM_TerminalSurface::start_process_with_backend(
     session_config.selection_viewport_projection_enabled = true;
     session_config.synchronized_output_scroll_policy =
         terminal_synchronized_output_scroll_policy(m_synchronized_output_scroll_policy);
-#if defined(Q_OS_WIN)
-#endif
+    session_config.recover_scrollback_from_primary_repaints =
+        m_primary_repaint_recovery_enabled;
     session_config.bell_policy.audible_enabled =
         m_audible_bell_policy == Bell_policy::ENABLED;
     session_config.bell_policy.visual_enabled =

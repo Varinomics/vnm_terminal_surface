@@ -201,12 +201,13 @@ int diagnostic_count(const term::Terminal_screen_model_result& result)
 
 term::Terminal_screen_model make_model()
 {
-    return term::Terminal_screen_model({
-        term::terminal_grid_size_t{24, 80},
-        10000,
-        8,
-        true,
-    });
+    term::Terminal_screen_model_config config;
+    config.grid_size        = term::terminal_grid_size_t{24, 80};
+    config.scrollback_limit = 10000;
+    config.tab_width        = 8;
+    config.recover_scrollback_from_primary_repaints = false;
+    config.retain_structural_actions                = true;
+    return term::Terminal_screen_model(config);
 }
 
 std::vector<int> deterministic_chunks(int byte_count)

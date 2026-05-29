@@ -28,13 +28,13 @@ void exercise_parser(const std::uint8_t* data, std::size_t size)
             size,
             static_cast<std::size_t>(std::numeric_limits<int>::max()))));
 
-    term::Terminal_screen_model model(
-        {
-            term::terminal_grid_size_t{24, 80},
-            1000,
-            8,
-            true,
-            });
+    term::Terminal_screen_model_config config;
+    config.grid_size                                = {24, 80};
+    config.scrollback_limit                         = 1000;
+    config.tab_width                                = 8;
+    config.recover_scrollback_from_primary_repaints = false;
+    config.retain_structural_actions                = true;
+    term::Terminal_screen_model model(config);
 
     std::size_t offset = 0U;
     while (offset < size) {

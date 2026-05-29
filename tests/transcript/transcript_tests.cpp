@@ -976,6 +976,8 @@ term::Terminal_session_config replay_session_config(
             session_config.contains(QStringLiteral("effective_scrollback_limit"))
                 ? session_config.value(QStringLiteral("effective_scrollback_limit")).toInt()
                 : session_config.value(QStringLiteral("scrollback_limit")).toInt();
+        config.recover_scrollback_from_primary_repaints =
+            session_config.value(QStringLiteral("recover_scrollback_from_primary_repaints")).toBool();
         config.selection_viewport_projection_enabled =
             session_config.value(QStringLiteral("selection_viewport_projection_enabled")).toBool();
         const QJsonValue explicit_scroll_policy =
@@ -996,6 +998,7 @@ term::Terminal_session_config replay_session_config(
     const int recorded_scrollback_rows = max_recorded_scrollback_rows(events);
     config.scrollback_limit =
         recorded_scrollback_rows > 0 ? recorded_scrollback_rows : k_surface_default_scrollback_limit;
+    config.recover_scrollback_from_primary_repaints = false;
     if (transcript_uses_immediate_public_projection(events)) {
         config.synchronized_output_scroll_policy =
             term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
@@ -1744,6 +1747,67 @@ bool test_writer_reader_schema_roundtrip()
     return ok;
 }
 
+bool test_writer_records_recovery_flag_values()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary recovery flag directory is valid")) {
+        return false;
+    }
+
+    bool ok = true;
+    auto check_recorded_recovery_flag = [&](bool recovery_enabled, const char* label) {
+        const QString path = temp_dir.filePath(
+            recovery_enabled
+                ? QStringLiteral("recovery-enabled.ndjson")
+                : QStringLiteral("recovery-disabled.ndjson"));
+
+        QString error;
+        std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+            term::Terminal_transcript_recorder::create(path, true, &error);
+        ok &= check(recorder != nullptr, label);
+        if (recorder == nullptr) {
+            std::cerr << error.toStdString() << '\n';
+            return;
+        }
+
+        term::Terminal_session_config session_config;
+        session_config.recover_scrollback_from_primary_repaints = recovery_enabled;
+        ok &= check(
+            recorder->record_session_start(1U, valid_launch_config(), session_config),
+            label);
+        recorder.reset();
+
+        const std::optional<std::vector<term::Terminal_transcript_event>> events =
+            term::read_terminal_transcript(path, &error);
+        ok &= check(events.has_value(), label);
+        if (!events.has_value()) {
+            std::cerr << error.toStdString() << '\n';
+            return;
+        }
+
+        const std::optional<term::Terminal_transcript_event> start =
+            first_event(*events, QStringLiteral("session.start"));
+        ok &= check(start.has_value(), label);
+        if (!start.has_value()) {
+            return;
+        }
+
+        const QJsonObject session_config_object =
+            start->object.value(QStringLiteral("session_config")).toObject();
+        ok &= check(
+            session_config_object.contains(
+                QStringLiteral("recover_scrollback_from_primary_repaints")) &&
+                session_config_object.value(
+                    QStringLiteral("recover_scrollback_from_primary_repaints")).toBool() ==
+                    recovery_enabled,
+            label);
+    };
+
+    check_recorded_recovery_flag(true,  "writer records enabled recovery flag");
+    check_recorded_recovery_flag(false, "writer records disabled recovery flag");
+    return ok;
+}
+
 bool test_snapshot_diagnostics_flag_controls_snapshot_event()
 {
     QTemporaryDir temp_dir;
@@ -1966,6 +2030,40 @@ bool test_reader_rejects_malformed_transcripts()
         {json_line(valid_header_object()), json_line(invalid_range)},
         QStringLiteral("selection range cannot use mode none"));
 
+    return ok;
+}
+
+bool test_reader_accepts_session_config_without_recovery_flag()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary legacy session-config directory is valid")) {
+        return false;
+    }
+
+    QJsonObject session_config;
+    session_config.insert(QStringLiteral("scrollback_limit"), 8);
+    session_config.insert(QStringLiteral("effective_scrollback_limit"), 8);
+    session_config.insert(
+        QStringLiteral("synchronized_output_scroll_policy"),
+        QStringLiteral("DEFER_UNTIL_CONTENT_PUBLICATION"));
+
+    QJsonObject start = valid_session_start_object(1U);
+    start.insert(QStringLiteral("session_config"), session_config);
+
+    const QString path = temp_dir.filePath(QStringLiteral("legacy-session-config.ndjson"));
+    bool ok = true;
+    ok &= check(
+        write_transcript_lines(path, {json_line(valid_header_object()), json_line(start)}),
+        "legacy session-config transcript writes");
+
+    QString error;
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(),
+        "reader accepts session_config without restored recovery flag");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+    }
     return ok;
 }
 
@@ -2710,9 +2808,121 @@ bool test_replay_config_defaults_missing_selection_viewport_projection_to_disabl
         {1U, QStringLiteral("session.start"), start},
     });
 
-    return check(
+    bool ok = true;
+    ok &= check(
         !config.selection_viewport_projection_enabled,
         "replay config defaults missing selection viewport projection to disabled");
+    ok &= check(
+        !config.recover_scrollback_from_primary_repaints,
+        "replay config defaults missing recorded recovery flag to disabled");
+    return ok;
+}
+
+bool test_replay_config_preserves_recorded_recovery_flag()
+{
+    auto replay_recovery_flag = [](bool recorded_recovery_flag) {
+        QJsonObject session_config;
+        session_config.insert(QStringLiteral("scrollback_limit"), 8);
+        session_config.insert(QStringLiteral("effective_scrollback_limit"), 8);
+        session_config.insert(
+            QStringLiteral("recover_scrollback_from_primary_repaints"),
+            recorded_recovery_flag);
+
+        QJsonObject start = valid_session_start_object(1U);
+        start.insert(QStringLiteral("session_config"), session_config);
+
+        return replay_session_config({
+            {0U, QStringLiteral("header"), valid_header_object()},
+            {1U, QStringLiteral("session.start"), start},
+        }).recover_scrollback_from_primary_repaints;
+    };
+
+    bool ok = true;
+    ok &= check(
+        replay_recovery_flag(true),
+        "replay config preserves recorded enabled recovery flag");
+    ok &= check(
+        !replay_recovery_flag(false),
+        "replay config preserves recorded disabled recovery flag");
+    return ok;
+}
+
+bool test_replay_config_defaults_inferred_recovery_to_disabled()
+{
+    const term::Terminal_session_config config = replay_session_config({
+        {0U, QStringLiteral("header"), valid_header_object()},
+        {1U, QStringLiteral("snapshot"), valid_compact_snapshot_object(1U)},
+    });
+
+    return check(
+        !config.recover_scrollback_from_primary_repaints,
+        "replay config defaults inferred recovery to disabled");
+}
+
+bool test_replay_tool_preserves_recorded_disabled_recovery_flag(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "recovery flag replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "recovery flag replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("recovery-disabled-replay.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "recovery flag replay recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    config.scrollback_limit = 8;
+    config.recover_scrollback_from_primary_repaints = false;
+
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 8};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "recovery flag replay captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("aaa\r\nbbb\r\nccc"));
+    backend_ptr->emit_output(QByteArrayLiteral(
+        "\x1b[?2026h"
+        "\x1b[?25l"
+        "\x1b[Hbbb\x1b[K\r\n"
+        "ccc\x1b[K\r\n"
+        "ddd\x1b[K"
+        "\x1b[?25h"
+        "\x1b[?2026l"));
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session.latest_render_snapshot();
+    ok &= check(snapshot.has_value() && snapshot->viewport.scrollback_rows == 0,
+        "recorded disabled recovery does not synthesize scrollback");
+    recorder.reset();
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "recovery flag replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "recovery flag replay tool exits successfully");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "recovery flag replay has no divergence");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
 }
 
 bool test_replay_tool_accepts_natural_public_projection_scroll_snapshot(
@@ -3259,9 +3469,11 @@ int main(int argc, char** argv)
 {
     bool ok = true;
     ok &= test_writer_reader_schema_roundtrip();
+    ok &= test_writer_records_recovery_flag_values();
     ok &= test_snapshot_diagnostics_flag_controls_snapshot_event();
     ok &= test_snapshot_timing_diagnostics_include_snapshot_metadata();
     ok &= test_reader_rejects_malformed_transcripts();
+    ok &= test_reader_accepts_session_config_without_recovery_flag();
     ok &= test_reader_rejects_compact_snapshots_missing_required_diagnostics();
     ok &= test_reader_rejects_invalid_snapshot_public_scroll_enum_values();
     ok &= test_reader_rejects_snapshot_basis_purpose_mismatches();
@@ -3276,8 +3488,11 @@ int main(int argc, char** argv)
     ok &= test_replay_drives_terminal_state();
     ok &= test_replay_config_keeps_explicit_deferred_public_scroll_policy();
     ok &= test_replay_config_defaults_missing_selection_viewport_projection_to_disabled();
+    ok &= test_replay_config_preserves_recorded_recovery_flag();
+    ok &= test_replay_config_defaults_inferred_recovery_to_disabled();
     const QString replay_tool_path =
         argc >= 2 ? QString::fromLocal8Bit(argv[1]) : QString();
+    ok &= test_replay_tool_preserves_recorded_disabled_recovery_flag(replay_tool_path);
     ok &= test_replay_tool_accepts_natural_public_projection_scroll_snapshot(replay_tool_path);
     ok &= test_replay_tool_rejects_unmatched_public_projection_scroll_snapshot_before_release(
         replay_tool_path);

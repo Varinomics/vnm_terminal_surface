@@ -50,6 +50,21 @@ enum class Terminal_selection_internal_state
     PAYLOAD_ONLY,
 };
 
+enum class Terminal_selection_anchor_domain
+{
+    NONE,
+    UNRESOLVED_ACTIVE_GRID,
+    PRIMARY_BACKING,
+    ALTERNATE_ACTIVE_GRID,
+    PAYLOAD_ONLY,
+};
+
+enum class Terminal_selection_backing_event_kind
+{
+    NONE,
+    PRIMARY_SCROLLBACK_EVICTION,
+};
+
 struct terminal_grid_position_t
 {
     int                        row    = 0;
@@ -72,6 +87,7 @@ struct terminal_selection_content_basis_t
 struct terminal_selection_source_identity_t
 {
     terminal_selection_content_basis_t source_content_basis;
+    Terminal_selection_anchor_domain   anchor_domain = Terminal_selection_anchor_domain::NONE;
     std::uint64_t                      session_epoch     = 0U;
     Terminal_buffer_id                 buffer_id         = Terminal_buffer_id::PRIMARY;
     std::uint64_t                      grid_reflow_basis = 0U;
@@ -87,9 +103,17 @@ struct terminal_selection_line_lease_t
     std::uint64_t                      content_generation = 0U;
 };
 
+struct terminal_selection_backing_event_t
+{
+    Terminal_selection_backing_event_kind kind =
+        Terminal_selection_backing_event_kind::NONE;
+    int                                    evicted_rows = 0;
+};
+
 struct terminal_selection_visual_lease_t
 {
     terminal_selection_content_basis_t source_content_basis;
+    Terminal_selection_anchor_domain   anchor_domain = Terminal_selection_anchor_domain::NONE;
     std::uint64_t                      session_epoch = 0U;
     Terminal_buffer_id                 buffer_id     = Terminal_buffer_id::PRIMARY;
     std::uint64_t                      grid_reflow_basis = 0U;
@@ -200,6 +224,7 @@ public:
     bool                            has_cached_selected_text() const { return m_selected_text.has_value(); }
     const Terminal_selection_range& range()                    const { return m_range;                    }
     Terminal_selection_internal_state internal_state()          const { return m_internal_state;           }
+    Terminal_selection_anchor_domain anchor_domain()            const { return m_anchor_domain;            }
     std::uint64_t durable_payload_identity()                    const { return m_durable_payload_identity; }
     std::uint64_t provisional_payload_identity()                const { return m_provisional_payload_identity; }
     const std::optional<terminal_selection_visual_lease_t>& visual_lease() const
@@ -224,7 +249,7 @@ public:
         std::uint64_t                      row_origin_generation,
         terminal_grid_size_t               grid_size,
         const Terminal_viewport_state&     viewport_mapping);
-    bool apply_scrollback_eviction(int evicted_rows);
+    bool apply_backing_event(terminal_selection_backing_event_t event);
 
     Terminal_selection_result selected_text() const;
     Terminal_selection_result selected_text(std::span<const QString> logical_rows) const;
@@ -236,6 +261,8 @@ private:
     void record_visual_lease(terminal_selection_visual_lease_t visual_lease);
 
     Terminal_selection_internal_state m_internal_state = Terminal_selection_internal_state::NONE;
+    Terminal_selection_anchor_domain
+                               m_anchor_domain = Terminal_selection_anchor_domain::NONE;
     bool                       m_has_selection = false;
     Terminal_selection_range   m_range;
     std::optional<QString>     m_selected_text;

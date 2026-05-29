@@ -1,6 +1,7 @@
 #include "vnm_terminal/internal/terminal_session.h"
 
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/terminal_backing_delta_viewport_sync.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include <QFile>
@@ -336,12 +337,21 @@ bool selection_snapshot_matches_safe_content_basis(
             safe_content.visible_line_provenance;
 }
 
+Terminal_selection_anchor_domain selection_anchor_domain_for_buffer(
+    Terminal_buffer_id buffer_id)
+{
+    return buffer_id == Terminal_buffer_id::ALTERNATE
+        ? Terminal_selection_anchor_domain::ALTERNATE_ACTIVE_GRID
+        : Terminal_selection_anchor_domain::PRIMARY_BACKING;
+}
+
 bool selection_source_identities_match(
     const terminal_selection_source_identity_t& left,
     const terminal_selection_source_identity_t& right)
 {
     return
         left.source_content_basis == right.source_content_basis      &&
+        left.anchor_domain        == right.anchor_domain             &&
         left.session_epoch        == right.session_epoch             &&
         left.buffer_id            == right.buffer_id                 &&
         left.grid_reflow_basis    == right.grid_reflow_basis         &&
@@ -356,6 +366,7 @@ bool selection_sources_have_compatible_content(
 {
     return
         left.source_content_basis == right.source_content_basis &&
+        left.anchor_domain        == right.anchor_domain        &&
         left.session_epoch        == right.session_epoch        &&
         left.buffer_id            == right.buffer_id            &&
         left.grid_reflow_basis    == right.grid_reflow_basis    &&
@@ -369,6 +380,7 @@ bool selection_lease_matches_source(
 {
     return
         lease.source_content_basis == source.source_content_basis &&
+        lease.anchor_domain        == source.anchor_domain        &&
         lease.session_epoch        == source.session_epoch        &&
         lease.buffer_id            == source.buffer_id            &&
         lease.grid_reflow_basis    == source.grid_reflow_basis    &&
@@ -384,6 +396,7 @@ bool selection_lease_has_compatible_visual_source(
 {
     return
         lease.source_content_basis == source.source_content_basis &&
+        lease.anchor_domain        == source.anchor_domain        &&
         lease.session_epoch        == source.session_epoch        &&
         lease.buffer_id            == source.buffer_id            &&
         lease.grid_reflow_basis    == source.grid_reflow_basis    &&
@@ -493,6 +506,11 @@ QString selection_trace_content_basis(terminal_selection_content_basis_t content
         .arg(static_cast<qulonglong>(content_basis.grid_reflow_generation));
 }
 
+QString selection_trace_anchor_domain(Terminal_selection_anchor_domain domain)
+{
+    return QString::number(static_cast<int>(domain));
+}
+
 QString selection_trace_viewport(const Terminal_viewport_state& viewport)
 {
     return QStringLiteral("buffer=%1,visible=%2,scrollback=%3,offset=%4")
@@ -506,9 +524,10 @@ QString selection_trace_source_identity(
     const terminal_selection_source_identity_t& source)
 {
     return QStringLiteral(
-        "source{basis={%1},epoch=%2,buffer=%3,grid_reflow=%4,row_origin=%5,"
-        "grid=%6,viewport={%7}}")
+        "source{basis={%1},domain=%2,epoch=%3,buffer=%4,grid_reflow=%5,"
+        "row_origin=%6,grid=%7,viewport={%8}}")
         .arg(selection_trace_content_basis(source.source_content_basis))
+        .arg(selection_trace_anchor_domain(source.anchor_domain))
         .arg(static_cast<qulonglong>(source.session_epoch))
         .arg(static_cast<int>(source.buffer_id))
         .arg(static_cast<qulonglong>(source.grid_reflow_basis))
@@ -529,10 +548,11 @@ QString selection_trace_visual_lease(
     const terminal_selection_visual_lease_t& lease)
 {
     return QStringLiteral(
-        "lease{basis={%1},epoch=%2,buffer=%3,grid_reflow=%4,row_origin=%5,"
-        "grid=%6,viewport={%7},range=%8,anchor=%9,extent=%10,durable=%11,"
-        "provisional=%12,line_leases=%13}")
+        "lease{basis={%1},domain=%2,epoch=%3,buffer=%4,grid_reflow=%5,"
+        "row_origin=%6,grid=%7,viewport={%8},range=%9,anchor=%10,extent=%11,"
+        "durable=%12,provisional=%13,line_leases=%14}")
         .arg(selection_trace_content_basis(lease.source_content_basis))
+        .arg(selection_trace_anchor_domain(lease.anchor_domain))
         .arg(static_cast<qulonglong>(lease.session_epoch))
         .arg(static_cast<int>(lease.buffer_id))
         .arg(static_cast<qulonglong>(lease.grid_reflow_basis))
@@ -570,6 +590,9 @@ QString selection_trace_source_mismatch_reason(
     QString reasons;
     if (left.source_content_basis != right.source_content_basis) {
         append_selection_trace_reason(reasons, QStringLiteral("content-basis"));
+    }
+    if (left.anchor_domain != right.anchor_domain) {
+        append_selection_trace_reason(reasons, QStringLiteral("anchor-domain"));
     }
     if (left.session_epoch != right.session_epoch) {
         append_selection_trace_reason(reasons, QStringLiteral("epoch"));
@@ -820,6 +843,8 @@ bool active_model_matches_published_selection_source(
     return
         model_allows_render_snapshot(model)                         &&
         source.source_content_basis == content_basis                 &&
+        source.anchor_domain == selection_anchor_domain_for_buffer(
+            model.active_buffer_id())                                &&
         source.session_epoch        == session_epoch                 &&
         source.buffer_id            == model.active_buffer_id()      &&
         source.grid_reflow_basis    == content_basis.grid_reflow_generation  &&
@@ -2067,8 +2092,34 @@ Terminal_viewport_scroll_result Terminal_session::scroll_viewport_lines_from_pub
         }
     }
 
-    const Terminal_viewport_scroll_result scroll_result =
-        m_viewport_controller.scroll_lines(line_delta);
+    Terminal_viewport_scroll_result scroll_result;
+    if (render_publication_blocked) {
+        const Terminal_viewport_state live_viewport = m_viewport_controller.state();
+        if (live_viewport.active_buffer != Terminal_buffer_id::PRIMARY) {
+            return {};
+        }
+
+        const int bounded_public_max_offset =
+            std::max(0, published_viewport.scrollback_rows);
+        const long long requested_offset =
+            static_cast<long long>(live_viewport.offset_from_tail) +
+            static_cast<long long>(line_delta);
+        const int target_offset = static_cast<int>(
+            std::clamp(
+                requested_offset,
+                0LL,
+                static_cast<long long>(bounded_public_max_offset)));
+        const int bounded_line_delta =
+            target_offset - live_viewport.offset_from_tail;
+        if (bounded_line_delta == 0) {
+            return {Terminal_viewport_scroll_action::AT_BOUNDARY, 0};
+        }
+
+        scroll_result = m_viewport_controller.scroll_lines(bounded_line_delta);
+    }
+    else {
+        scroll_result = m_viewport_controller.scroll_lines(line_delta);
+    }
     if (scroll_result.action != Terminal_viewport_scroll_action::VIEWPORT_MOVED) {
         return scroll_result;
     }
@@ -2388,6 +2439,22 @@ void Terminal_session::set_scrollback_limit(int limit)
     }
 }
 
+void Terminal_session::set_primary_repaint_recovery_enabled(bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    drain_backend_callback_commands();
+    process_pending_commands();
+
+    if (m_config.recover_scrollback_from_primary_repaints == enabled) {
+        return;
+    }
+
+    m_config.recover_scrollback_from_primary_repaints = enabled;
+    if (m_screen_model.has_value()) {
+        m_screen_model->set_primary_repaint_recovery_enabled(enabled);
+    }
+}
+
 Terminal_session_result Terminal_session::interrupt()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -2570,6 +2637,13 @@ std::optional<terminal_selection_visual_lease_t> Terminal_session::selection_vis
     return m_selection.visual_lease();
 }
 
+Terminal_selection_anchor_domain Terminal_session::selection_anchor_domain() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_selection.anchor_domain();
+}
+
 std::optional<terminal_selection_source_identity_t>
 Terminal_session::published_selection_source_identity() const
 {
@@ -2587,6 +2661,8 @@ Terminal_session::published_selection_source_identity_unlocked() const
 
     terminal_selection_source_identity_t source;
     source.source_content_basis = m_selection_content_basis;
+    source.anchor_domain        =
+        selection_anchor_domain_for_buffer(m_latest_render_snapshot->viewport.active_buffer);
     source.session_epoch        = m_selection_session_epoch;
     source.buffer_id            = m_latest_render_snapshot->viewport.active_buffer;
     source.grid_reflow_basis    = m_selection_content_basis.grid_reflow_generation;
@@ -4149,6 +4225,8 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     screen_config.grid_size                 = grid_size;
     screen_config.scrollback_limit          = m_config.scrollback_limit;
     screen_config.retain_structural_actions = m_config.capture_last_model_ingest_result;
+    screen_config.recover_scrollback_from_primary_repaints =
+        m_config.recover_scrollback_from_primary_repaints;
     m_screen_model.emplace(screen_config);
     m_screen_model->set_dirty_row_stats_enabled(m_config.capture_dirty_row_stats);
     m_viewport_controller = Terminal_viewport_controller{};
@@ -4480,10 +4558,13 @@ void Terminal_session::sync_viewport_from_model_result(
         return;
     }
 
+    const terminal_backing_delta_viewport_sync_t viewport_sync =
+        viewport_sync_from_backing_deltas(result);
+
     if (result.alternate_scroll_mode_changed) {
         ++m_alternate_scroll_mode_generation;
     }
-    if (result.active_buffer_changed) {
+    if (viewport_sync.active_buffer_changed) {
         ++m_active_buffer_epoch;
         if (m_active_buffer_epoch == 0U) {
             m_active_buffer_epoch = 1U;
@@ -4492,14 +4573,19 @@ void Terminal_session::sync_viewport_from_model_result(
 
     m_viewport_controller.set_visible_rows(m_screen_model->grid_size().rows);
     m_viewport_controller.sync_scrollback_rows(
-        result.scrollback_rows,
-        result.evicted_scrollback_rows);
+        viewport_sync.scrollback_rows,
+        viewport_sync.evicted_scrollback_rows);
     if (m_selection.has_selection() &&
         m_selection_buffer_id == Terminal_buffer_id::PRIMARY)
     {
-        m_selection.apply_scrollback_eviction(result.evicted_scrollback_rows);
+        m_selection.apply_backing_event({
+            Terminal_selection_backing_event_kind::PRIMARY_SCROLLBACK_EVICTION,
+            viewport_sync.evicted_scrollback_rows,
+        });
     }
-    const Terminal_buffer_id active_buffer = m_screen_model->active_buffer_id();
+    const Terminal_buffer_id active_buffer =
+        viewport_sync.active_buffer_after.value_or(
+            m_screen_model->active_buffer_id());
     if (!m_selection.has_selection())                   { m_selection_buffer_id = active_buffer;          }
     if (active_buffer == Terminal_buffer_id::ALTERNATE) { m_viewport_controller.enter_alternate_screen(); }
     else {
@@ -4986,6 +5072,8 @@ terminal_selection_visual_lease_t Terminal_session::make_selection_visual_lease(
 {
     terminal_selection_visual_lease_t lease;
     lease.source_content_basis = m_selection_content_basis;
+    lease.anchor_domain        =
+        selection_anchor_domain_for_buffer(m_screen_model->active_buffer_id());
     lease.session_epoch        = m_selection_session_epoch;
     lease.buffer_id            = m_screen_model->active_buffer_id();
     lease.grid_reflow_basis    = m_selection_content_basis.grid_reflow_generation;
@@ -5004,6 +5092,7 @@ terminal_selection_visual_lease_t Terminal_session::make_selection_visual_lease(
 {
     terminal_selection_visual_lease_t lease;
     lease.source_content_basis = source.source_content_basis;
+    lease.anchor_domain        = source.anchor_domain;
     lease.session_epoch        = source.session_epoch;
     lease.buffer_id            = source.buffer_id;
     lease.grid_reflow_basis    = source.grid_reflow_basis;
@@ -5054,6 +5143,8 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
     {
         terminal_selection_source_identity_t source;
         source.source_content_basis = m_selection_content_basis;
+        source.anchor_domain        =
+            selection_anchor_domain_for_buffer(m_screen_model->active_buffer_id());
         source.session_epoch        = m_selection_session_epoch;
         source.buffer_id            = m_screen_model->active_buffer_id();
         source.grid_reflow_basis    = m_selection_content_basis.grid_reflow_generation;
@@ -5102,6 +5193,8 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
         if (has_internal_selection && visual_lease.has_value()) {
             terminal_selection_source_identity_t source;
             source.source_content_basis = m_selection_content_basis;
+            source.anchor_domain        =
+                selection_anchor_domain_for_buffer(m_screen_model->active_buffer_id());
             source.session_epoch        = m_selection_session_epoch;
             source.buffer_id            = m_screen_model->active_buffer_id();
             source.grid_reflow_basis    = m_selection_content_basis.grid_reflow_generation;
