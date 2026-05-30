@@ -1,2 +1,3 @@
 add_subdirectory(embedded_terminal)
 add_subdirectory(phase7_public_scroll)
+add_subdirectory(surface_stress)
