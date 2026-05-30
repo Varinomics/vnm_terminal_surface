@@ -229,6 +229,86 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_unicode_width_tables>"
 )
 
+add_executable(vnm_terminal_history_ring
+    history_ring/history_ring_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_history_ring PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_history_ring PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_history_ring
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_history_ring>"
+)
+
+add_executable(vnm_terminal_history_row_record_codec
+    history_row_record_codec/history_row_record_codec_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_history_row_record_codec PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_history_row_record_codec PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_history_row_record_codec
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_history_row_record_codec>"
+)
+
+add_executable(vnm_terminal_history_row_traversal
+    history_row_record_codec/history_row_traversal_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_history_row_traversal PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_history_row_traversal PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_history_row_traversal
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_history_row_traversal>"
+)
+
+add_executable(vnm_terminal_history_phase8_benchmark
+    history_row_record_codec/history_row_record_phase8_benchmark.cpp
+)
+
+target_link_libraries(vnm_terminal_history_phase8_benchmark PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_history_phase8_benchmark PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_history_phase8_benchmark
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_history_phase8_benchmark>"
+)
+
 add_executable(vnm_terminal_sequence_matrix
     sequence_matrix/sequence_matrix_tests.cpp
 )
@@ -1190,6 +1270,10 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_parser_ir
     vnm_terminal_unicode_width
     vnm_terminal_unicode_width_tables
+    vnm_terminal_history_ring
+    vnm_terminal_history_row_record_codec
+    vnm_terminal_history_row_traversal
+    vnm_terminal_history_phase8_benchmark
     vnm_terminal_sequence_matrix
     vnm_terminal_canvas_fixture_contract
     vnm_terminal_qt_render_smoke

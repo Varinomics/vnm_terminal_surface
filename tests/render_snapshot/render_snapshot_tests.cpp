@@ -279,8 +279,16 @@ bool test_owned_styled_wide_hyperlink_scrollback_snapshot()
     const term::Terminal_render_cell* retained_link_cell =
         cell_with_text(retained_snapshot, QStringLiteral("L"));
     ok &= check(retained_link_cell != nullptr &&
-        hyperlink_by_id(retained_snapshot, retained_link_cell->hyperlink_id) != nullptr,
-        "scrollback hyperlink metadata resolves after active model mutation");
+        term::validate_render_snapshot(retained_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "scrollback hyperlink snapshot validates after active model mutation");
+    if (retained_link_cell != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* retained_hyperlink =
+            hyperlink_by_id(retained_snapshot, retained_link_cell->hyperlink_id);
+        ok &= check(retained_hyperlink != nullptr &&
+            retained_hyperlink->uri == QByteArrayLiteral("https://example.test"),
+            "scrollback hyperlink metadata resolves from retained row after active model mutation");
+    }
     return ok;
 }
 
@@ -349,8 +357,10 @@ bool test_request_metadata_damage_selection_and_ime()
     request.selections.push_back({
         {{0, 1}, {1, 4}, term::Terminal_selection_mode::NORMAL},
         {
-            {0, first_line.retained_line_id,  first_line.content_generation},
-            {1, second_line.retained_line_id, second_line.content_generation},
+            term::terminal_selection_line_lease_from_retained_identity(
+                0, first_line.retained_line_id, first_line.content_generation),
+            term::terminal_selection_line_lease_from_retained_identity(
+                1, second_line.retained_line_id, second_line.content_generation),
         },
     });
 
@@ -390,7 +400,10 @@ bool test_request_metadata_damage_selection_and_ime()
         request_for_model(model, 32U);
     incomplete_line_request.selections.push_back({
         {{0, 1}, {1, 4}, term::Terminal_selection_mode::NORMAL},
-        {{0, first_line.retained_line_id, first_line.content_generation}},
+        {
+            term::terminal_selection_line_lease_from_retained_identity(
+                0, first_line.retained_line_id, first_line.content_generation),
+        },
     });
     const term::Terminal_render_snapshot incomplete_line_snapshot =
         model.render_snapshot(incomplete_line_request);
@@ -402,8 +415,10 @@ bool test_request_metadata_damage_selection_and_ime()
     stale_line_request.selections.push_back({
         {{0, 1}, {1, 4}, term::Terminal_selection_mode::NORMAL},
         {
-            {0, first_line.retained_line_id,  first_line.content_generation + 1U},
-            {1, second_line.retained_line_id, second_line.content_generation},
+            term::terminal_selection_line_lease_from_retained_identity(
+                0, first_line.retained_line_id, first_line.content_generation + 1U),
+            term::terminal_selection_line_lease_from_retained_identity(
+                1, second_line.retained_line_id, second_line.content_generation),
         },
     });
     const term::Terminal_render_snapshot stale_line_snapshot =
@@ -434,7 +449,10 @@ bool test_selection_request_rejects_retained_line_row_reorder()
     term::Terminal_render_snapshot_request request = request_for_model(model, 40U);
     request.selections.push_back({
         {{1, 0}, {1, 4}, term::Terminal_selection_mode::NORMAL},
-        {{0, beta_line.retained_line_id, beta_line.content_generation}},
+        {
+            term::terminal_selection_line_lease_from_retained_identity(
+                0, beta_line.retained_line_id, beta_line.content_generation),
+        },
     });
 
     const term::Terminal_render_snapshot selected_snapshot =

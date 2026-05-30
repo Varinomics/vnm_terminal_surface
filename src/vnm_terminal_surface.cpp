@@ -5427,6 +5427,26 @@ term::VNM_TerminalSurface_render_bridge::dirty_row_timeline(
         : term::Terminal_screen_model_dirty_row_timeline{};
 }
 
+term::Terminal_screen_model_profile_stats
+term::VNM_TerminalSurface_render_bridge::model_profile_stats(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->session != nullptr
+        ? surface.m_private->session->model_profile_stats()
+        : term::Terminal_screen_model_profile_stats{};
+}
+
+term::Terminal_session_profile_stats
+term::VNM_TerminalSurface_render_bridge::session_profile_stats(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->session != nullptr
+        ? surface.m_private->session->profile_stats()
+        : term::Terminal_session_profile_stats{};
+}
+
 void term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(
     VNM_TerminalSurface&               surface,
     bool                               visible)

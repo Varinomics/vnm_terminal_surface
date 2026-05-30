@@ -4,6 +4,7 @@
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/render_snapshot.h"
+#include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include <QString>
 #include <QStringList>
@@ -63,6 +64,12 @@ public:
         const VNM_TerminalSurface& surface);
 
     static Terminal_screen_model_dirty_row_timeline dirty_row_timeline(
+        const VNM_TerminalSurface& surface);
+
+    static Terminal_screen_model_profile_stats model_profile_stats(
+        const VNM_TerminalSurface& surface);
+
+    static Terminal_session_profile_stats session_profile_stats(
         const VNM_TerminalSurface& surface);
 
     static void set_cursor_blink_visible(

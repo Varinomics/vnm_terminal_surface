@@ -64,7 +64,9 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/selection_contract.h
     include/vnm_terminal/internal/session_contract.h
     include/vnm_terminal/internal/terminal_canvas_fixture_contract.h
-    include/vnm_terminal/internal/terminal_backing_delta_viewport_sync.h
+    include/vnm_terminal/internal/terminal_history_ring.h
+    include/vnm_terminal/internal/terminal_history_row_record_codec.h
+    include/vnm_terminal/internal/terminal_history_row_traversal.h
     include/vnm_terminal/internal/terminal_input_mode.h
     include/vnm_terminal/internal/terminal_input_encoder.h
     include/vnm_terminal/internal/terminal_public_projection.h
@@ -83,8 +85,10 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/linux_pty_backend.h
     include/vnm_terminal/internal/windows_conpty_backend.h
     include/vnm_terminal/vnm_terminal_surface.h
+    src/terminal_history_ring.cpp
+    src/terminal_history_row_record_codec.cpp
+    src/terminal_history_row_traversal.cpp
     src/terminal_input_encoder.cpp
-    src/terminal_backing_delta_viewport_sync.cpp
     src/terminal_public_projection.cpp
     src/terminal_repaint_recovery.cpp
     src/terminal_resize_controller.cpp

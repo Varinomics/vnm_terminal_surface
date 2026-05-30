@@ -35,32 +35,6 @@ void apply_scrollback_rows(Terminal_viewport_state& state, int rows)
     clamp_state_offset(state);
 }
 
-void apply_scrollback_sync(
-    Terminal_viewport_state&   state,
-    int                        rows,
-    int                        evicted_rows)
-{
-    const int old_first_visible_row =
-        state.scrollback_rows - state.offset_from_tail;
-
-    state.scrollback_rows = std::max(0, rows);
-
-    if (state.follow_tail) {
-        state.offset_from_tail = 0;
-        clamp_state_offset(state);
-        return;
-    }
-
-    const int bounded_evicted_rows = std::max(0, evicted_rows);
-    const int preserved_first_row =
-        old_first_visible_row < bounded_evicted_rows
-            ? 0
-            : old_first_visible_row - bounded_evicted_rows;
-
-    state.offset_from_tail = state.scrollback_rows - preserved_first_row;
-    clamp_state_offset(state);
-}
-
 }
 
 Terminal_viewport_result Terminal_viewport_controller::set_visible_rows(int rows)
@@ -84,16 +58,6 @@ void Terminal_viewport_controller::set_scrollback_rows(int rows)
     }
 
     apply_scrollback_rows(m_state, rows);
-}
-
-void Terminal_viewport_controller::sync_scrollback_rows(int rows, int evicted_rows)
-{
-    if (m_state.active_buffer == Terminal_buffer_id::ALTERNATE) {
-        apply_scrollback_sync(m_primary_state, rows, evicted_rows);
-        return;
-    }
-
-    apply_scrollback_sync(m_state, rows, evicted_rows);
 }
 
 Terminal_viewport_scroll_result Terminal_viewport_controller::scroll_lines(int line_delta)

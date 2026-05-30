@@ -16,6 +16,7 @@ struct Terminal_public_projection_row
     // identity is carried by public_row.
     std::int64_t                         public_row = 0;
     Terminal_render_line_provenance      provenance;
+    terminal_history_handle_t            history_handle;
     // Duplicate visual fragment ordinal within the retained line identified by
     // provenance.
     int                                  visual_fragment_index = 0;
@@ -28,6 +29,7 @@ struct Terminal_public_projection_row
 struct Terminal_public_projection_row_metadata
 {
     Terminal_render_line_provenance      provenance;
+    terminal_history_handle_t            history_handle;
     // Duplicate visual fragment ordinal within the retained line identified by
     // provenance.
     int                                  visual_fragment_index = 0;
@@ -40,8 +42,7 @@ struct Terminal_public_viewport_anchor
     Terminal_buffer_id active_buffer = Terminal_buffer_id::PRIMARY;
     std::uint64_t      active_buffer_epoch = 0U;
     std::uint64_t      geometry_generation = 0U;
-    std::uint64_t      retained_line_id = 0U;
-    std::uint64_t      retained_line_content_generation = 0U;
+    terminal_history_handle_t history_handle;
     // Duplicate visual fragment ordinal within the retained line.
     int                visual_fragment_index = 0;
     bool               visual_fragment_index_is_exact = false;

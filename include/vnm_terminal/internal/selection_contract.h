@@ -59,11 +59,50 @@ enum class Terminal_selection_anchor_domain
     PAYLOAD_ONLY,
 };
 
-enum class Terminal_selection_backing_event_kind
+enum class Terminal_history_resolution_status
 {
-    NONE,
-    PRIMARY_SCROLLBACK_EVICTION,
+    OK,
+    INVALID_HANDLE,
+    STALE_EPOCH,
+    STALE_BYTE_SEQUENCE,
+    STALE_ROW_SEQUENCE,
+    RECORD_SIZE_MISMATCH,
+    CONTENT_GENERATION_MISMATCH,
 };
+
+constexpr std::uint64_t k_terminal_history_retained_identity_epoch = 1U;
+constexpr std::uint32_t k_terminal_history_retained_identity_record_bytes = 0U;
+
+struct terminal_history_handle_t
+{
+    std::uint64_t              epoch              = 0U;
+    std::uint64_t              byte_sequence      = 0U;
+    std::uint64_t              row_sequence       = 0U;
+    std::uint32_t              record_bytes       = 0U;
+    std::uint64_t              content_generation = 0U;
+};
+
+inline terminal_history_handle_t terminal_history_handle_from_retained_identity(
+    std::uint64_t retained_line_id,
+    std::uint64_t content_generation)
+{
+    if (retained_line_id == 0U) {
+        return {};
+    }
+
+    return {
+        k_terminal_history_retained_identity_epoch,
+        retained_line_id,
+        retained_line_id,
+        k_terminal_history_retained_identity_record_bytes,
+        content_generation,
+    };
+}
+
+inline bool terminal_history_handle_has_identity(terminal_history_handle_t handle)
+{
+    return handle.epoch != 0U && handle.row_sequence != 0U;
+}
 
 struct terminal_grid_position_t
 {
@@ -99,15 +138,7 @@ struct terminal_selection_source_identity_t
 struct terminal_selection_line_lease_t
 {
     int                                row_offset         = 0;
-    std::uint64_t                      retained_line_id   = 0U;
-    std::uint64_t                      content_generation = 0U;
-};
-
-struct terminal_selection_backing_event_t
-{
-    Terminal_selection_backing_event_kind kind =
-        Terminal_selection_backing_event_kind::NONE;
-    int                                    evicted_rows = 0;
+    terminal_history_handle_t          history_handle;
 };
 
 struct terminal_selection_visual_lease_t
@@ -174,13 +205,42 @@ inline bool operator!=(
 }
 
 inline bool operator==(
+    terminal_history_handle_t lhs,
+    terminal_history_handle_t rhs)
+{
+    return
+        lhs.epoch              == rhs.epoch              &&
+        lhs.byte_sequence      == rhs.byte_sequence      &&
+        lhs.row_sequence       == rhs.row_sequence       &&
+        lhs.record_bytes       == rhs.record_bytes       &&
+        lhs.content_generation == rhs.content_generation;
+}
+
+inline bool operator!=(
+    terminal_history_handle_t lhs,
+    terminal_history_handle_t rhs)
+{
+    return !(lhs == rhs);
+}
+
+inline terminal_selection_line_lease_t terminal_selection_line_lease_from_retained_identity(
+    int           row_offset,
+    std::uint64_t retained_line_id,
+    std::uint64_t content_generation)
+{
+    return {
+        row_offset,
+        terminal_history_handle_from_retained_identity(retained_line_id, content_generation),
+    };
+}
+
+inline bool operator==(
     terminal_selection_line_lease_t lhs,
     terminal_selection_line_lease_t rhs)
 {
     return
-        lhs.row_offset         == rhs.row_offset         &&
-        lhs.retained_line_id   == rhs.retained_line_id   &&
-        lhs.content_generation == rhs.content_generation;
+        lhs.row_offset     == rhs.row_offset     &&
+        lhs.history_handle == rhs.history_handle;
 }
 
 inline bool operator!=(
@@ -249,7 +309,6 @@ public:
         std::uint64_t                      row_origin_generation,
         terminal_grid_size_t               grid_size,
         const Terminal_viewport_state&     viewport_mapping);
-    bool apply_backing_event(terminal_selection_backing_event_t event);
 
     Terminal_selection_result selected_text() const;
     Terminal_selection_result selected_text(std::span<const QString> logical_rows) const;

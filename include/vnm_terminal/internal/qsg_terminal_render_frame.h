@@ -258,6 +258,12 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
 struct terminal_render_frame_stats_t
 {
     terminal_simple_content_stats_t                simple_content;
+    int                                            visible_rows                     = 0;
+    int                                            dirty_rows                       = 0;
+    int                                            full_dirty_rows                  = 0;
+    int                                            cell_pass_input_cells            = 0;
+    int                                            packed_pass_input_cells          = 0;
+    int                                            dirty_row_lookup_count           = 0;
     int                                            cells_considered                = 0;
     int                                            cells_skipped_invalid           = 0;
     int                                            cells_skipped_wide_continuation = 0;
@@ -297,6 +303,12 @@ struct terminal_render_frame_stats_t
 struct terminal_render_frame_cumulative_stats_t
 {
     terminal_simple_content_cumulative_stats_t     simple_content;
+    std::uint64_t                                  visible_rows                     = 0U;
+    std::uint64_t                                  dirty_rows                       = 0U;
+    std::uint64_t                                  full_dirty_rows                  = 0U;
+    std::uint64_t                                  cell_pass_input_cells            = 0U;
+    std::uint64_t                                  packed_pass_input_cells          = 0U;
+    std::uint64_t                                  dirty_row_lookup_count           = 0U;
     std::uint64_t                                  cells_considered                = 0U;
     std::uint64_t                                  cells_skipped_invalid           = 0U;
     std::uint64_t                                  cells_skipped_wide_continuation = 0U;

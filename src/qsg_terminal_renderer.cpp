@@ -3553,6 +3553,9 @@ void sync_text_resource_nodes(
             set_row_text_clip_rect(*old_slot, row_clip_rect);
             ++stats.text_content_reused;
             ++stats.text_resource_descriptor_reuses;
+            if (dirty_group) {
+                ++stats.text_dirty_descriptor_identical_rows;
+            }
             new_slots.push_back(std::move(*old_slot));
             continue;
         }
@@ -3578,9 +3581,17 @@ void sync_text_resource_nodes(
 
         stats.text_resource_runs_before_coalescing +=
             static_cast<int>(local_runs.size());
-        stats.text_resource_runs_after_coalescing += use_coalesced_resource_runs
+        const int runs_after_coalescing = use_coalesced_resource_runs
             ? static_cast<int>(coalesced_resource_runs.size())
             : static_cast<int>(local_runs.size());
+        stats.text_resource_runs_after_coalescing += runs_after_coalescing;
+        if (runs_after_coalescing > 0) {
+            ++stats.text_resource_rows_with_runs;
+            stats.text_resource_max_runs_after_coalescing_per_row =
+                std::max(
+                    stats.text_resource_max_runs_after_coalescing_per_row,
+                    runs_after_coalescing);
+        }
         QByteArray key = use_coalesced_resource_runs
             ? text_resource_key(coalesced_resource_runs, text_font_key, frame.logical_size)
             : text_resource_key(local_runs, text_font_key, frame.logical_size);
@@ -3594,6 +3605,7 @@ void sync_text_resource_nodes(
             set_row_text_clip_rect(*old_slot, row_clip_rect);
             old_slot->text_resource_descriptor = std::move(text_resource_descriptor);
             ++stats.text_content_reused;
+            ++stats.text_key_match_reuses;
             new_slots.push_back(std::move(*old_slot));
             continue;
         }
@@ -3662,6 +3674,12 @@ void sync_text_resource_nodes(
                 ++stats.text_cache_entries_created;
             }
             ++stats.text_content_rebuilds;
+            if (dirty_group) {
+                ++stats.text_dirty_rows_rebuilt;
+            }
+            else {
+                ++stats.text_clean_rows_rebuilt;
+            }
             stats.text_leaf_nodes_created += text_leaf_nodes_created;
         }
         else {
@@ -5064,6 +5082,12 @@ void accumulate_frame_stats(
     const terminal_render_frame_stats_t&           stats)
 {
     accumulate_simple_content_stats(total.simple_content, stats.simple_content);
+    total.visible_rows          += static_cast<std::uint64_t>(stats.visible_rows);
+    total.dirty_rows            += static_cast<std::uint64_t>(stats.dirty_rows);
+    total.full_dirty_rows       += static_cast<std::uint64_t>(stats.full_dirty_rows);
+    total.cell_pass_input_cells += static_cast<std::uint64_t>(stats.cell_pass_input_cells);
+    total.packed_pass_input_cells += static_cast<std::uint64_t>(stats.packed_pass_input_cells);
+    total.dirty_row_lookup_count += static_cast<std::uint64_t>(stats.dirty_row_lookup_count);
     total.cells_considered      += static_cast<std::uint64_t>(stats.cells_considered);
     total.cells_skipped_invalid += static_cast<std::uint64_t>(stats.cells_skipped_invalid);
     total.cells_skipped_wide_continuation +=
@@ -5176,10 +5200,23 @@ void accumulate_renderer_stats(
         static_cast<std::uint64_t>(stats.text_coalescing_candidate_groups);
     total.text_coalescing_enabled_groups   +=
         static_cast<std::uint64_t>(stats.text_coalescing_enabled_groups);
+    total.text_resource_rows_with_runs +=
+        static_cast<std::uint64_t>(stats.text_resource_rows_with_runs);
+    total.text_resource_max_runs_after_coalescing_per_row = std::max(
+        total.text_resource_max_runs_after_coalescing_per_row,
+        static_cast<std::uint64_t>(stats.text_resource_max_runs_after_coalescing_per_row));
     total.text_resource_runs_before_coalescing += static_cast<std::uint64_t>(
         stats.text_resource_runs_before_coalescing);
     total.text_resource_runs_after_coalescing +=
         static_cast<std::uint64_t>(stats.text_resource_runs_after_coalescing);
+    total.text_dirty_descriptor_identical_rows +=
+        static_cast<std::uint64_t>(stats.text_dirty_descriptor_identical_rows);
+    total.text_key_match_reuses +=
+        static_cast<std::uint64_t>(stats.text_key_match_reuses);
+    total.text_dirty_rows_rebuilt +=
+        static_cast<std::uint64_t>(stats.text_dirty_rows_rebuilt);
+    total.text_clean_rows_rebuilt +=
+        static_cast<std::uint64_t>(stats.text_clean_rows_rebuilt);
     total.rect_resource_rects_before_coalescing  += static_cast<std::uint64_t>(
         stats.rect_resource_rects_before_coalescing);
     total.rect_resource_rects_after_coalescing   += static_cast<std::uint64_t>(
@@ -5929,6 +5966,8 @@ void build_terminal_render_frame_packed_data(
 {
     VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data");
 
+    frame.stats.packed_pass_input_cells = static_cast<int>(snapshot.cells.size());
+    frame.stats.dirty_row_lookup_count += static_cast<int>(snapshot.cells.size());
     if (snapshot.grid_size.rows <= 0 || snapshot.grid_size.columns <= 0) {
         return;
     }
@@ -6030,6 +6069,15 @@ Terminal_render_frame build_terminal_render_frame(
     frame.grid_size        = snapshot->grid_size;
     frame.viewport         = snapshot->viewport;
     frame.dirty_row_ranges = snapshot->dirty_row_ranges;
+    frame.stats.visible_rows          = snapshot->grid_size.rows;
+    frame.stats.cell_pass_input_cells = static_cast<int>(snapshot->cells.size());
+    frame.stats.dirty_row_lookup_count += static_cast<int>(snapshot->cells.size());
+    for (const Terminal_render_dirty_row_range& range : snapshot->dirty_row_ranges) {
+        frame.stats.dirty_rows += range.row_count;
+    }
+    if (frame.stats.dirty_rows == snapshot->grid_size.rows) {
+        frame.stats.full_dirty_rows = frame.stats.dirty_rows;
+    }
     const bool valid_grid = snapshot->grid_size.rows > 0 && snapshot->grid_size.columns > 0;
     const Ime_preedit_state& ime_preedit =
         ime_preedit_override != nullptr ? *ime_preedit_override : snapshot->ime_preedit;

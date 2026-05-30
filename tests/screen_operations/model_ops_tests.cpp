@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <iostream>
+#include <optional>
+#include <span>
 #include <variant>
 #include <vector>
 
@@ -98,6 +100,21 @@ QByteArray visible_row_write_stream(
         stream += QByteArrayLiteral("\x1b[?25h");
     }
     return stream;
+}
+
+QByteArray styled_hyperlink_row_bytes(
+    const QByteArray& text,
+    const QByteArray& uri)
+{
+    QByteArray row;
+    row += QByteArrayLiteral("\x1b[43m");
+    row += QByteArrayLiteral("\x1b]8;id=phase3;");
+    row += uri;
+    row += QByteArrayLiteral("\x1b\\");
+    row += text;
+    row += QByteArrayLiteral("\x1b]8;;\x1b\\");
+    row += QByteArrayLiteral("\x1b[0m");
+    return row;
 }
 
 int diagnostic_count(const term::Terminal_screen_model_result& result)
@@ -318,6 +335,31 @@ QString snapshot_row_text(
         text.chop(1);
     }
     return text;
+}
+
+bool snapshot_has_hyperlink_uri(
+    const term::Terminal_render_snapshot& snapshot,
+    const QByteArray&                     uri)
+{
+    return std::any_of(
+        snapshot.hyperlinks.begin(),
+        snapshot.hyperlinks.end(),
+        [&](const term::Terminal_render_hyperlink_metadata& hyperlink) {
+            return hyperlink.uri == uri;
+        });
+}
+
+std::size_t snapshot_hyperlink_uri_count(
+    const term::Terminal_render_snapshot& snapshot,
+    std::span<const QByteArray>           uris)
+{
+    std::size_t count = 0U;
+    for (const QByteArray& uri : uris) {
+        if (snapshot_has_hyperlink_uri(snapshot, uri)) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 bool contains_id(
@@ -962,6 +1004,446 @@ bool test_phase_r_primary_repaint_recovery_accepts_distinct_shift()
         model.ingest(QByteArrayLiteral("z"));
     ok &= check(non_recovery_result.recovery_proposals.empty(),
         "Phase R recovery proposal metadata clears on later non-recovery ingest");
+
+    return ok;
+}
+
+bool test_flat_ring_phase3_retained_record_producer_contract()
+{
+    bool ok = true;
+
+    const QByteArray uri =
+        QByteArrayLiteral("https://phase3.varinomics.example/retained");
+    const QByteArray styled_row =
+        styled_hyperlink_row_bytes(QByteArrayLiteral("aa"), uri);
+
+    term::Terminal_screen_model normal_model =
+        make_recovery_disabled_primary_backing_model(4, 8, 8);
+    normal_model.ingest(visible_row_write_stream({
+        styled_row,
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+    const term::Terminal_screen_model_result normal_result =
+        normal_model.ingest(QByteArrayLiteral("\r\nee"));
+
+    term::Terminal_screen_model recovered_model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    recovered_model.ingest(visible_row_write_stream({
+        styled_row,
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+    const term::Terminal_screen_model_result recovered_result =
+        recovered_model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("ee"),
+        }, true));
+
+    ok &= check(normal_model.scrollback_size() == 1 &&
+            normal_result.recovery_proposals.empty(),
+        "flat-ring Phase 3 normal scrollout seals one retained row without recovery");
+    ok &= check(recovered_model.scrollback_size() == 1 &&
+            recovered_result.recovery_proposals.size() == 1U,
+        "flat-ring Phase 3 accepted recovery seals one retained row");
+
+    const term::Terminal_render_snapshot normal_snapshot =
+        normal_model.render_snapshot(request_for_model(normal_model, 90U, 1));
+    const term::Terminal_render_snapshot recovered_snapshot =
+        recovered_model.render_snapshot(request_for_model(recovered_model, 91U, 1));
+    ok &= check(snapshot_row_text(normal_snapshot, 0) == QStringLiteral("aa") &&
+            snapshot_row_text(recovered_snapshot, 0) == QStringLiteral("aa"),
+        "flat-ring Phase 3 normal and recovered retained records carry canonical content");
+    ok &= check(snapshot_has_hyperlink_uri(normal_snapshot, uri) &&
+            snapshot_has_hyperlink_uri(recovered_snapshot, uri),
+        "flat-ring Phase 3 normal and recovered retained records materialize row-local hyperlinks");
+    ok &= check_cell_background_palette(
+        normal_snapshot,
+        0,
+        0,
+        3U,
+        "flat-ring Phase 3 normal retained record keeps session style id");
+    ok &= check_cell_background_palette(
+        recovered_snapshot,
+        0,
+        0,
+        3U,
+        "flat-ring Phase 3 recovered retained record keeps session style id");
+
+    const term::Terminal_retained_line_provenance normal_provenance =
+        normal_model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const term::Terminal_retained_line_provenance recovered_provenance =
+        recovered_model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(normal_provenance.retained_line_id != 0U &&
+            normal_provenance.source ==
+                term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        "flat-ring Phase 3 normal retained record keeps terminal-storage provenance");
+    ok &= check(recovered_provenance.retained_line_id != 0U &&
+            recovered_provenance.source ==
+                term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
+        "flat-ring Phase 3 recovered retained record keeps recovered provenance");
+
+    const std::optional<term::terminal_retained_row_record_metadata_t> normal_metadata =
+        normal_model.retained_row_record_metadata_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    const std::optional<term::terminal_retained_row_record_metadata_t> recovered_metadata =
+        recovered_model.retained_row_record_metadata_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    ok &= check(normal_metadata.has_value() &&
+            recovered_metadata.has_value() &&
+            normal_metadata->source_width == 8 &&
+            recovered_metadata->source_width == 8,
+        "flat-ring Phase 3 producer records retained source width");
+    ok &= check(normal_metadata.has_value() &&
+            recovered_metadata.has_value() &&
+            normal_metadata->style_lifetime ==
+                term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID &&
+            recovered_metadata->style_lifetime ==
+                term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID,
+        "flat-ring Phase 3 producer records session-lifetime style policy");
+    ok &= check(normal_metadata.has_value() &&
+            recovered_metadata.has_value() &&
+            normal_metadata->wrap_state ==
+                term::Terminal_retained_row_wrap_state::HARD_BOUNDARY &&
+            recovered_metadata->wrap_state ==
+                term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
+        "flat-ring Phase 3 producer records current hard-boundary wrap metadata");
+
+    return ok;
+}
+
+bool test_flat_ring_phase7_recovery_shared_producer_boundary()
+{
+    bool ok = true;
+
+    const QByteArray uri =
+        QByteArrayLiteral("https://phase7.varinomics.example/recovered-ring");
+    const QByteArray styled_row =
+        styled_hyperlink_row_bytes(QByteArrayLiteral("aa"), uri);
+
+    term::Terminal_screen_model recovered_model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    recovered_model.ingest(visible_row_write_stream({
+        styled_row,
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+    const term::Terminal_screen_model_result recovered_result =
+        recovered_model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("ee"),
+        }, true));
+
+    ok &= check(recovered_model.scrollback_size() == 1 &&
+            recovered_result.backing_deltas.size() == 1U &&
+            primary_backing_delta_matches(
+                recovered_result.backing_deltas[0],
+                term::Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
+                0,
+                1,
+                1,
+                0) &&
+            recovered_result.recovery_proposals.size() == 1U &&
+            recovered_result.recovery_proposals[0].provenance_source ==
+                term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
+        "flat-ring Phase 7 recovery appends one retained row through the primary-history delta path");
+
+    const std::optional<term::terminal_history_handle_t> recovered_handle =
+        recovered_model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    const term::Terminal_retained_line_lookup_result recovered_lookup =
+        recovered_handle.has_value()
+            ? recovered_model.retained_line_lookup(
+                  term::Terminal_buffer_id::PRIMARY,
+                  *recovered_handle)
+            : term::Terminal_retained_line_lookup_result{};
+    ok &= check(recovered_handle.has_value() &&
+            recovered_handle->record_bytes != 0U &&
+            recovered_lookup.resolution_status ==
+                term::Terminal_history_resolution_status::OK &&
+            recovered_lookup.exact_match &&
+            recovered_lookup.exact_logical_row == 0,
+        "flat-ring Phase 7 recovered row resolves through an authoritative ring handle");
+
+    const term::Terminal_retained_line_provenance recovered_provenance =
+        primary_retained_line_provenance(recovered_model, 0);
+    ok &= check(recovered_provenance.retained_line_id != 0U &&
+            recovered_provenance.source ==
+                term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
+        "flat-ring Phase 7 recovered ring materialization carries recovered provenance");
+
+    const std::optional<term::terminal_retained_row_record_metadata_t> recovered_metadata =
+        recovered_model.retained_row_record_metadata_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    ok &= check(recovered_metadata.has_value() &&
+            recovered_metadata->source_width == 8 &&
+            recovered_metadata->style_lifetime ==
+                term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID &&
+            recovered_metadata->wrap_state ==
+                term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
+        "flat-ring Phase 7 recovered row carries shared-producer metadata in ring storage");
+
+    const term::Terminal_render_snapshot recovered_snapshot =
+        recovered_model.render_snapshot(request_for_model(recovered_model, 92U, 1));
+    ok &= check(snapshot_row_text(recovered_snapshot, 0) == QStringLiteral("aa") &&
+            snapshot_has_hyperlink_uri(recovered_snapshot, uri),
+        "flat-ring Phase 7 recovered row materializes shared-producer content and hyperlinks");
+    ok &= check_cell_background_palette(
+        recovered_snapshot,
+        0,
+        0,
+        3U,
+        "flat-ring Phase 7 recovered row materializes shared-producer style ids");
+
+    term::Terminal_screen_model disabled_model =
+        make_recovery_disabled_primary_backing_model(4, 8, 8);
+    disabled_model.ingest(visible_row_write_stream({
+        styled_row,
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+    const term::Terminal_screen_model_result disabled_result =
+        disabled_model.ingest(QByteArrayLiteral("\r\nee"));
+
+    ok &= check(disabled_model.scrollback_size() == 1 &&
+            disabled_result.recovery_proposals.empty() &&
+            disabled_result.backing_deltas.size() == 1U &&
+            primary_backing_delta_matches(
+                disabled_result.backing_deltas[0],
+                term::Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
+                0,
+                1,
+                1,
+                0),
+        "flat-ring Phase 7 recovery-disabled normal scrollout appends through normal history");
+
+    const std::optional<term::terminal_history_handle_t> disabled_handle =
+        disabled_model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    const term::Terminal_retained_line_lookup_result disabled_lookup =
+        disabled_handle.has_value()
+            ? disabled_model.retained_line_lookup(
+                  term::Terminal_buffer_id::PRIMARY,
+                  *disabled_handle)
+            : term::Terminal_retained_line_lookup_result{};
+    const term::Terminal_retained_line_provenance disabled_provenance =
+        primary_retained_line_provenance(disabled_model, 0);
+    const std::optional<term::terminal_retained_row_record_metadata_t> disabled_metadata =
+        disabled_model.retained_row_record_metadata_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    ok &= check(disabled_handle.has_value() &&
+            disabled_handle->record_bytes != 0U &&
+            disabled_lookup.resolution_status ==
+                term::Terminal_history_resolution_status::OK &&
+            disabled_lookup.exact_match &&
+            disabled_lookup.exact_logical_row == 0 &&
+            disabled_provenance.retained_line_id != 0U &&
+            disabled_provenance.source ==
+                term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE &&
+            disabled_metadata.has_value() &&
+            disabled_metadata->source_width == 8,
+        "flat-ring Phase 7 recovery-disabled normal scrollout remains terminal-storage ring history");
+
+    return ok;
+}
+
+bool test_flat_ring_phase5a_resize_projects_retained_history_without_mutation()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_disabled_primary_backing_model(2, 8, 8);
+    model.ingest(
+        QByteArrayLiteral("\x1b[1;1H123456") +
+        bytes_from_hex("e7958c") +
+        QByteArrayLiteral("\x1b[2;1Htail"));
+    const term::Terminal_screen_model_result scroll_result =
+        model.ingest(QByteArrayLiteral("\r\nnext"));
+    ok &= check(model.scrollback_size() == 1 &&
+            scroll_result.viewport_changed,
+        "flat-ring Phase 5A fixture creates one retained row");
+
+    const term::Terminal_retained_line_provenance before_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const std::optional<term::terminal_retained_row_record_metadata_t> before_metadata =
+        model.retained_row_record_metadata_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const term::Terminal_selection_range prefix_range = {
+        {0, 0},
+        {0, 6},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    const std::vector<term::terminal_selection_line_lease_t> prefix_leases =
+        model.selection_line_leases(term::Terminal_buffer_id::PRIMARY, prefix_range);
+    ok &= check(before_provenance.retained_line_id != 0U &&
+            before_metadata.has_value() &&
+            before_metadata->source_width == 8 &&
+            prefix_leases.size() == 1U,
+        "flat-ring Phase 5A fixture captures source-width retained row and lease");
+    if (!before_metadata.has_value()) {
+        return ok;
+    }
+
+    const term::Terminal_screen_model_result narrow_resize = model.resize({3, 7});
+    const term::Terminal_retained_line_provenance narrow_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const std::optional<term::terminal_retained_row_record_metadata_t> narrow_metadata =
+        model.retained_row_record_metadata_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const term::Terminal_render_snapshot narrow_snapshot =
+        model.render_snapshot(request_for_model(model, 92U, model.scrollback_size()));
+    const term::Terminal_selection_result prefix_after_resize =
+        model.selected_text(
+            term::Terminal_buffer_id::PRIMARY,
+            prefix_range,
+            std::span<const term::terminal_selection_line_lease_t>(
+                prefix_leases.data(),
+                prefix_leases.size()));
+    ok &= check(narrow_resize.grid_reflow_changed &&
+            !narrow_resize.terminal_content_changed,
+        "flat-ring Phase 5A resize advances geometry without reporting content mutation");
+    ok &= check(narrow_metadata.has_value() &&
+            narrow_provenance.content_generation ==
+                before_provenance.content_generation &&
+            narrow_metadata->source_width == before_metadata->source_width,
+        "flat-ring Phase 5A narrow resize leaves retained record content immutable");
+    ok &= check(term::validate_render_snapshot(narrow_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK &&
+            narrow_snapshot.grid_size.rows == 3 &&
+            narrow_snapshot.grid_size.columns == 7 &&
+            snapshot_row_text(narrow_snapshot, 0) == QStringLiteral("123456"),
+        "flat-ring Phase 5A narrow projection repairs wide cell geometry at the edge");
+    ok &= check(prefix_after_resize.code == term::Terminal_selection_result_code::OK &&
+            prefix_after_resize.text == QStringLiteral("123456"),
+        "flat-ring Phase 5A retained selection lease resolves after geometry-only resize");
+
+    const term::Terminal_screen_model_result wide_resize = model.resize({2, 10});
+    const term::Terminal_retained_line_provenance wide_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const std::optional<term::terminal_retained_row_record_metadata_t> wide_metadata =
+        model.retained_row_record_metadata_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const term::Terminal_render_snapshot wide_snapshot =
+        model.render_snapshot(request_for_model(model, 93U, model.scrollback_size()));
+    const term::Terminal_selection_range trailing_blank_range = {
+        {0, 8},
+        {0, 9},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    const std::vector<term::terminal_selection_line_lease_t> trailing_blank_leases =
+        model.selection_line_leases(
+            term::Terminal_buffer_id::PRIMARY,
+            trailing_blank_range);
+    const term::Terminal_selection_result trailing_blank =
+        model.selected_text(
+            term::Terminal_buffer_id::PRIMARY,
+            trailing_blank_range,
+            std::span<const term::terminal_selection_line_lease_t>(
+                trailing_blank_leases.data(),
+                trailing_blank_leases.size()));
+    ok &= check(wide_resize.grid_reflow_changed &&
+            !wide_resize.terminal_content_changed,
+        "flat-ring Phase 5A width growth remains geometry-only");
+    ok &= check(wide_metadata.has_value() &&
+            wide_provenance.content_generation ==
+                before_provenance.content_generation &&
+            wide_metadata->source_width == before_metadata->source_width,
+        "flat-ring Phase 5A width growth leaves retained record content immutable");
+    ok &= check(term::validate_render_snapshot(wide_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK &&
+            wide_snapshot.grid_size.rows == 2 &&
+            wide_snapshot.grid_size.columns == 10 &&
+            snapshot_row_text(wide_snapshot, 0) == QStringLiteral("123456") +
+                QString::fromUtf8(bytes_from_hex("e7958c")),
+        "flat-ring Phase 5A width growth projects retained content into wider geometry");
+    ok &= check(trailing_blank.code == term::Terminal_selection_result_code::OK &&
+            trailing_blank.text == QStringLiteral(" "),
+        "flat-ring Phase 5A selection projection exposes widened trailing blanks");
+
+    return ok;
+}
+
+bool test_flat_ring_phase5b_retained_hyperlink_metadata_authority()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_disabled_primary_backing_model(3, 16, 8);
+    std::vector<QByteArray> retained_uris;
+    for (int index = 0; index < 7; ++index) {
+        const QByteArray uri =
+            QByteArrayLiteral("https://phase5b.varinomics.example/retained/") +
+            QByteArray::number(index);
+        const QByteArray label = QByteArrayLiteral("L") + QByteArray::number(index);
+        retained_uris.push_back(uri);
+        model.ingest(styled_hyperlink_row_bytes(label, uri) + QByteArrayLiteral("\r\n"));
+    }
+
+    const int scrollback_before_active_clear = model.scrollback_size();
+    ok &= check(scrollback_before_active_clear >= 4,
+        "flat-ring Phase 5B fixture creates hyperlink-heavy retained history");
+
+    const term::Terminal_render_snapshot retained_snapshot =
+        model.render_snapshot(
+            request_for_model(model, 94U, scrollback_before_active_clear));
+    const int visible_retained_rows =
+        std::min(scrollback_before_active_clear, model.grid_size().rows);
+    ok &= check(term::validate_render_snapshot(retained_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK &&
+            snapshot_hyperlink_uri_count(
+                retained_snapshot,
+                std::span<const QByteArray>(
+                    retained_uris.data(),
+                    static_cast<std::size_t>(visible_retained_rows))) ==
+                static_cast<std::size_t>(visible_retained_rows),
+        "flat-ring Phase 5B hyperlink-heavy retained snapshot materializes row-local metadata");
+
+    model.ingest(QByteArrayLiteral("\x1b]8;;\x1b\\\x1b[2Jplain"));
+    const term::Terminal_render_snapshot after_active_clear_snapshot =
+        model.render_snapshot(
+            request_for_model(model, 95U, model.scrollback_size()));
+    ok &= check(term::validate_render_snapshot(after_active_clear_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK &&
+            snapshot_has_hyperlink_uri(after_active_clear_snapshot, retained_uris.front()),
+        "flat-ring Phase 5B retained hyperlinks survive after active hyperlinks are gone");
+
+    model.set_scrollback_limit(2);
+    const int first_surviving_uri =
+        scrollback_before_active_clear - model.scrollback_size();
+    const term::Terminal_render_snapshot after_eviction_snapshot =
+        model.render_snapshot(request_for_model(model, 96U, model.scrollback_size()));
+    ok &= check(model.scrollback_size() == 2 &&
+            term::validate_render_snapshot(after_eviction_snapshot).status ==
+                term::Terminal_render_snapshot_status::OK &&
+            snapshot_hyperlink_uri_count(
+                after_eviction_snapshot,
+                std::span<const QByteArray>(
+                    retained_uris.data() + first_surviving_uri,
+                    static_cast<std::size_t>(model.scrollback_size()))) ==
+                static_cast<std::size_t>(model.scrollback_size()),
+        "flat-ring Phase 5B eviction leaves surviving retained hyperlinks self-contained");
+
+    model.ingest(QByteArrayLiteral("\x1b[3J"));
+    const term::Terminal_render_snapshot after_clear_snapshot =
+        model.render_snapshot(request_for_model(model, 97U));
+    ok &= check(model.scrollback_size() == 0 &&
+            term::validate_render_snapshot(after_clear_snapshot).status ==
+                term::Terminal_render_snapshot_status::OK &&
+            snapshot_has_hyperlink_uri(
+                after_eviction_snapshot,
+                retained_uris[static_cast<std::size_t>(first_surviving_uri)]),
+        "flat-ring Phase 5B clear needs no retained hyperlink pre-reclaim cleanup for correctness");
 
     return ok;
 }
@@ -2674,6 +3156,78 @@ bool test_retained_line_content_generation_mutations()
     ok &= check(primary_retained_line_generation(wide_model, 0) == generation + 1U,
         "wide-cell occupancy change increments generation");
 
+    const QByteArray wide_scalar      = bytes_from_hex("e4b880");
+    const QByteArray other_wide_scalar = bytes_from_hex("e7958c");
+    term::Terminal_screen_model non_ascii_model = make_model(1, 4);
+    non_ascii_model.ingest(wide_scalar);
+    generation = primary_retained_line_generation(non_ascii_model, 0);
+    non_ascii_model.ingest(QByteArrayLiteral("\r") + wide_scalar);
+    ok &= check(primary_retained_line_generation(non_ascii_model, 0) == generation,
+        "idempotent non-ASCII scalar rewrite does not increment generation");
+    non_ascii_model.ingest(QByteArrayLiteral("\r") + other_wide_scalar);
+    ok &= check(primary_retained_line_generation(non_ascii_model, 0) == generation + 1U,
+        "changed non-ASCII scalar rewrite increments generation");
+
+    term::Terminal_screen_model non_ascii_style_model = make_model(1, 4);
+    non_ascii_style_model.ingest(wide_scalar);
+    generation = primary_retained_line_generation(non_ascii_style_model, 0);
+    non_ascii_style_model.ingest(QByteArrayLiteral("\r\x1b[31m") + wide_scalar);
+    ok &= check(primary_retained_line_generation(non_ascii_style_model, 0) == generation,
+        "style-only non-ASCII scalar rewrite does not increment generation");
+
+    term::Terminal_screen_model non_ascii_hyperlink_model = make_model(1, 4);
+    non_ascii_hyperlink_model.ingest(
+        QByteArrayLiteral("\x1b]8;;https://one.example\x1b\\") +
+        wide_scalar +
+        QByteArrayLiteral("\x1b]8;;\x1b\\"));
+    generation = primary_retained_line_generation(non_ascii_hyperlink_model, 0);
+    non_ascii_hyperlink_model.ingest(
+        QByteArrayLiteral("\r\x1b]8;;https://two.example\x1b\\") +
+        wide_scalar +
+        QByteArrayLiteral("\x1b]8;;\x1b\\"));
+    ok &= check(primary_retained_line_generation(non_ascii_hyperlink_model, 0) == generation,
+        "hyperlink-only non-ASCII scalar rewrite does not increment generation");
+
+    term::Terminal_screen_model wide_base_model = make_model(1, 4);
+    wide_base_model.ingest(wide_scalar);
+    generation = primary_retained_line_generation(wide_base_model, 0);
+    wide_base_model.ingest(QByteArrayLiteral("\r") + other_wide_scalar);
+    ok &= check(primary_retained_line_generation(wide_base_model, 0) == generation + 1U &&
+            wide_base_model.row_text(0) == QString::fromUtf8(other_wide_scalar),
+        "non-ASCII overwrite of wide base updates text and generation");
+
+    term::Terminal_screen_model wide_continuation_model = make_model(1, 4);
+    wide_continuation_model.ingest(bytes_from_hex("e4b880"));
+    generation = primary_retained_line_generation(wide_continuation_model, 0);
+    wide_continuation_model.ingest(QByteArrayLiteral("\x1b[1;2HA"));
+    ok &= check(
+        primary_retained_line_generation(wide_continuation_model, 0) == generation + 1U,
+        "ASCII overwrite of wide-continuation column increments generation");
+
+    term::Terminal_screen_model non_ascii_wide_continuation_model = make_model(1, 4);
+    non_ascii_wide_continuation_model.ingest(wide_scalar);
+    generation = primary_retained_line_generation(non_ascii_wide_continuation_model, 0);
+    non_ascii_wide_continuation_model.ingest(
+        QByteArrayLiteral("\x1b[1;2H") + other_wide_scalar);
+    ok &= check(
+        primary_retained_line_generation(non_ascii_wide_continuation_model, 0) ==
+            generation + 1U,
+        "non-ASCII overwrite of wide-continuation column increments generation");
+    ok &= check(
+        non_ascii_wide_continuation_model.row_text(0) ==
+            QStringLiteral(" ") + QString::fromUtf8(other_wide_scalar),
+        "non-ASCII overwrite of wide-continuation column updates text and generation");
+
+    term::Terminal_screen_model no_autowrap_model = make_model(1, 4);
+    no_autowrap_model.ingest(QByteArrayLiteral("\x1b[?7lABCDE"));
+    generation = primary_retained_line_generation(no_autowrap_model, 0);
+    no_autowrap_model.ingest(QByteArrayLiteral("\rABCDE"));
+    ok &= check(primary_retained_line_generation(no_autowrap_model, 0) == generation,
+        "no-autowrap clipped identical row rewrite does not increment generation");
+    no_autowrap_model.ingest(QByteArrayLiteral("\rABCDX"));
+    ok &= check(primary_retained_line_generation(no_autowrap_model, 0) == generation + 1U,
+        "no-autowrap clipped last-cell change increments generation");
+
     term::Terminal_screen_model combining_model = make_model(1, 4);
     combining_model.ingest(QByteArrayLiteral("e"));
     generation = primary_retained_line_generation(combining_model, 0);
@@ -2688,12 +3242,38 @@ bool test_retained_line_content_generation_mutations()
     ok &= check(primary_retained_line_generation(variation_model, 0) == generation + 1U,
         "variation sequence change increments generation");
 
+    term::Terminal_screen_model overflow_combining_model = make_model(2, 4);
+    overflow_combining_model.ingest(QByteArrayLiteral("abc") + bytes_from_hex("e29da4"));
+    const std::uint64_t overflow_source_generation =
+        primary_retained_line_generation(overflow_combining_model, 0);
+    const std::uint64_t overflow_destination_generation =
+        primary_retained_line_generation(overflow_combining_model, 1);
+    overflow_combining_model.ingest(bytes_from_hex("efb88f"));
+    ok &= check(
+        primary_retained_line_generation(overflow_combining_model, 0) ==
+            overflow_source_generation + 1U &&
+            primary_retained_line_generation(overflow_combining_model, 1) ==
+                overflow_destination_generation + 1U &&
+            overflow_combining_model.row_text(0) == QStringLiteral("abc") &&
+            overflow_combining_model.row_text(1) ==
+                QString::fromUtf8(bytes_from_hex("e29da4efb88f")),
+        "combining autowrap overflow clears source row and installs destination row");
+
     term::Terminal_screen_model style_model = make_model(1, 4);
     style_model.ingest(QByteArrayLiteral("A"));
     generation = primary_retained_line_generation(style_model, 0);
     style_model.ingest(QByteArrayLiteral("\r\x1b[31mA"));
     ok &= check(primary_retained_line_generation(style_model, 0) == generation,
         "style-only rewrite of identical text does not increment generation");
+
+    term::Terminal_screen_model hyperlink_model = make_model(1, 4);
+    hyperlink_model.ingest(
+        QByteArrayLiteral("\x1b]8;;https://one.example\x1b\\A\x1b]8;;\x1b\\"));
+    generation = primary_retained_line_generation(hyperlink_model, 0);
+    hyperlink_model.ingest(
+        QByteArrayLiteral("\r\x1b]8;;https://two.example\x1b\\A\x1b]8;;\x1b\\"));
+    ok &= check(primary_retained_line_generation(hyperlink_model, 0) == generation,
+        "hyperlink-only rewrite of identical text does not increment generation");
 
     return ok;
 }
@@ -2926,6 +3506,10 @@ int main()
     ok &= test_scrollback_growth_observer_seam();
     ok &= test_phase_r_repaint_recovery_shift_helper_matches_policy();
     ok &= test_phase_r_primary_repaint_recovery_accepts_distinct_shift();
+    ok &= test_flat_ring_phase3_retained_record_producer_contract();
+    ok &= test_flat_ring_phase7_recovery_shared_producer_boundary();
+    ok &= test_flat_ring_phase5a_resize_projects_retained_history_without_mutation();
+    ok &= test_flat_ring_phase5b_retained_hyperlink_metadata_authority();
     ok &= test_phase_r_primary_repaint_recovery_suppresses_false_positives();
     ok &= test_phase_r_primary_repaint_recovery_toggle_cancels_candidate();
     ok &= test_erase_operations_and_wide_damage();

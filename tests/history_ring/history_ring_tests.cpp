@@ -1,0 +1,295 @@
+#include "vnm_terminal/internal/terminal_history_ring.h"
+#include "helpers/test_check.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace term = vnm_terminal::internal;
+
+namespace {
+
+using vnm_terminal::test_helpers::check;
+
+std::vector<std::byte> bytes_from_text(std::string_view text)
+{
+    std::vector<std::byte> bytes;
+    bytes.reserve(text.size());
+    for (char ch : text) {
+        bytes.push_back(static_cast<std::byte>(ch));
+    }
+    return bytes;
+}
+
+void fill_payload(
+    term::Terminal_history_ring_record_reservation& reservation,
+    std::string_view                                text)
+{
+    const std::vector<std::byte> bytes = bytes_from_text(text);
+    std::span<std::byte> payload = reservation.payload();
+    std::copy(bytes.begin(), bytes.end(), payload.begin());
+}
+
+bool payload_equal(
+    const term::Terminal_history_ring_read_scope& scope,
+    std::string_view                              text)
+{
+    const std::vector<std::byte> expected = bytes_from_text(text);
+    const std::span<const std::byte> payload = scope.payload();
+    return payload.size() == expected.size() &&
+        std::equal(payload.begin(), payload.end(), expected.begin(), expected.end());
+}
+
+term::terminal_history_ring_commit_result_t append_record(
+    term::Terminal_history_ring& ring,
+    std::string_view             text)
+{
+    term::Terminal_history_ring_record_reservation reservation =
+        ring.reserve_record(text.size());
+    fill_payload(reservation, text);
+    return ring.commit(std::move(reservation));
+}
+
+bool test_capacity_alignment_and_one_octile_limit()
+{
+    bool ok = true;
+
+    const std::size_t aligned_capacity =
+        term::terminal_history_ring_aligned_capacity(513U, 256U);
+    ok &= check(aligned_capacity == 768U,
+        "Phase 4A ring capacity aligns to the configured page/octet boundary");
+
+    term::Terminal_history_ring ring({513U, 256U});
+    ok &= check(ring.status() == term::Terminal_history_ring_status::OK,
+        "Phase 4A aligned ring initializes");
+    ok &= check(ring.capacity_bytes() == aligned_capacity,
+        "Phase 4A ring stores the aligned capacity");
+    ok &= check(ring.max_record_bytes() == aligned_capacity / 8U,
+        "Phase 4A ring maps Sintra-lineage one-octile commit limit");
+
+    const std::size_t max_payload = ring.max_payload_bytes();
+    term::Terminal_history_ring_record_reservation max_reservation =
+        ring.reserve_record(max_payload);
+    ok &= check(max_reservation.status() == term::Terminal_history_ring_status::OK,
+        "Phase 4A one-octile boundary payload reserves");
+    const term::terminal_history_ring_commit_result_t max_commit =
+        ring.commit(std::move(max_reservation));
+    ok &= check(max_commit.status == term::Terminal_history_ring_status::OK,
+        "Phase 4A one-octile boundary payload commits");
+    ok &= check(max_commit.record_bytes == ring.max_record_bytes(),
+        "Phase 4A maximum payload consumes exactly one octile");
+
+    const std::uint64_t head_before_oversize = ring.head_byte_sequence();
+    term::Terminal_history_ring_record_reservation oversize =
+        ring.reserve_record(max_payload + 1U);
+    ok &= check(oversize.status() == term::Terminal_history_ring_status::OVERSIZE_RECORD,
+        "Phase 4A oversize payload hard-fails explicitly");
+    ok &= check(ring.head_byte_sequence() == head_before_oversize,
+        "Phase 4A oversize failure does not publish bytes");
+
+    return ok;
+}
+
+bool test_partial_records_are_invisible()
+{
+    bool ok = true;
+
+    term::Terminal_history_ring ring({512U, 512U});
+    ok &= check(ring.status() == term::Terminal_history_ring_status::OK,
+        "Phase 4A partial-write test ring initializes");
+
+    {
+        term::Terminal_history_ring_record_reservation reservation =
+            ring.reserve_record(7U);
+        ok &= check(reservation.status() == term::Terminal_history_ring_status::OK,
+            "Phase 4A pending reservation succeeds");
+        fill_payload(reservation, "pending");
+        ok &= check(ring.head_byte_sequence() == 0U,
+            "Phase 4A pending reservation does not advance published head");
+        ok &= check(ring.read_record(reservation.byte_sequence()).status() ==
+                term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE,
+            "Phase 4A uncommitted record is invisible to readers");
+    }
+
+    term::Terminal_history_ring_record_reservation replacement =
+        ring.reserve_record(9U);
+    ok &= check(replacement.status() == term::Terminal_history_ring_status::OK,
+        "Phase 4A released pending reservation allows a later reservation");
+    ok &= check(replacement.byte_sequence() == 0U,
+        "Phase 4A cancelled reservation leaves the absolute byte sequence unpublished");
+    fill_payload(replacement, "committed");
+
+    const term::terminal_history_ring_commit_result_t commit =
+        ring.commit(std::move(replacement));
+    ok &= check(commit.status == term::Terminal_history_ring_status::OK,
+        "Phase 4A replacement reservation commits");
+
+    const term::Terminal_history_ring_read_scope read =
+        ring.read_record(commit.byte_sequence);
+    ok &= check(read.status() == term::Terminal_history_ring_status::OK &&
+            payload_equal(read, "committed"),
+        "Phase 4A committed replacement payload becomes visible");
+
+    return ok;
+}
+
+bool test_wrap_traversal_tail_boundaries_and_rebuild()
+{
+    bool ok = true;
+
+    term::Terminal_history_ring ring({512U, 512U});
+    ok &= check(ring.status() == term::Terminal_history_ring_status::OK,
+        "Phase 4A wrap traversal test ring initializes");
+
+    std::vector<term::terminal_history_ring_commit_result_t> commits;
+    commits.reserve(10U);
+    commits.push_back(append_record(ring, "record-00-abcdef"));
+    commits.push_back(append_record(ring, "record-01-abcdef"));
+    commits.push_back(append_record(ring, "record-02-abcdef"));
+    commits.push_back(append_record(ring, "record-03-abcdef"));
+    commits.push_back(append_record(ring, "record-04-abcdef"));
+    commits.push_back(append_record(ring, "record-05-abcdef"));
+    commits.push_back(append_record(ring, "record-06-abcdef"));
+    commits.push_back(append_record(ring, "record-07-abcdef"));
+    commits.push_back(append_record(ring, "record-08-abcdef"));
+    commits.push_back(append_record(ring, "record-09-abcdef"));
+
+    for (const term::terminal_history_ring_commit_result_t& commit : commits) {
+        ok &= check(commit.status == term::Terminal_history_ring_status::OK,
+            "Phase 4A wrap traversal fixture commit succeeds");
+    }
+
+    const term::terminal_history_ring_commit_result_t& wrap_commit = commits.back();
+    ok &= check(
+        wrap_commit.byte_sequence % ring.capacity_bytes() + wrap_commit.record_bytes >
+            ring.capacity_bytes(),
+        "Phase 4A fixture commits a record that physically wraps");
+    ok &= check(wrap_commit.tail_advanced,
+        "Phase 4A wrapped commit advances tail when live bytes exceed capacity");
+    ok &= check(
+        ring.oldest_live_byte_sequence() ==
+            commits.front().byte_sequence + commits.front().record_bytes,
+        "Phase 4A tail advances to the next committed record boundary");
+
+    ok &= check(ring.read_record(commits.front().byte_sequence).status() ==
+            term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE,
+        "Phase 4A evicted record falls outside live byte bounds");
+
+    const term::Terminal_history_ring_read_scope wrapped_read =
+        ring.read_record(wrap_commit.byte_sequence);
+    ok &= check(wrapped_read.status() == term::Terminal_history_ring_status::OK &&
+            payload_equal(wrapped_read, "record-09-abcdef"),
+        "Phase 4A two-span read reconstructs a physically wrapped record");
+
+    const term::Terminal_history_ring_record_index_result before_drop =
+        ring.live_record_descriptors();
+    ok &= check(before_drop.status == term::Terminal_history_ring_status::OK &&
+            before_drop.records.size() == 9U,
+        "Phase 4A live record descriptors cover only live records before cache drop");
+
+    ring.discard_record_index_cache();
+    ok &= check(ring.rebuild_record_index() == term::Terminal_history_ring_status::OK,
+        "Phase 4A record-boundary cache rebuilds from the live byte range");
+    const term::Terminal_history_ring_record_index_result after_rebuild =
+        ring.live_record_descriptors();
+    ok &= check(after_rebuild.status == term::Terminal_history_ring_status::OK &&
+            after_rebuild.records.size() == before_drop.records.size(),
+        "Phase 4A rebuilt record-boundary cache preserves live record count");
+    ok &= check(after_rebuild.records.front().byte_sequence ==
+            ring.oldest_live_byte_sequence(),
+        "Phase 4A rebuilt cache starts at the oldest live byte sequence");
+
+    const term::Terminal_history_ring_read_scope rebuilt_wrapped_read =
+        ring.read_record(wrap_commit.byte_sequence);
+    ok &= check(rebuilt_wrapped_read.status() == term::Terminal_history_ring_status::OK &&
+            payload_equal(rebuilt_wrapped_read, "record-09-abcdef"),
+        "Phase 4A wrapped record remains readable after cache rebuild");
+
+    return ok;
+}
+
+bool test_read_scope_failure_translation()
+{
+    bool ok = true;
+
+    ok &= check(term::terminal_history_ring_status_from_backend_snapshot(
+            term::Terminal_history_ring_backend_snapshot_status::OK) ==
+            term::Terminal_history_ring_status::OK,
+        "Phase 4A backend snapshot OK maps to terminal-local OK");
+    ok &= check(term::terminal_history_ring_status_from_backend_snapshot(
+            term::Terminal_history_ring_backend_snapshot_status::STALE) ==
+            term::Terminal_history_ring_status::SNAPSHOT_STALE,
+        "Phase 4A backend stale snapshot maps to terminal-local stale status");
+    ok &= check(term::terminal_history_ring_status_from_backend_snapshot(
+            term::Terminal_history_ring_backend_snapshot_status::RETRY) ==
+            term::Terminal_history_ring_status::SNAPSHOT_RETRY,
+        "Phase 4A backend retry snapshot maps to terminal-local retry status");
+
+    term::Terminal_history_ring ring({512U, 512U});
+    const term::terminal_history_ring_commit_result_t commit =
+        append_record(ring, "scope");
+    ok &= check(commit.status == term::Terminal_history_ring_status::OK,
+        "Phase 4A read-scope fixture commit succeeds");
+    ok &= check(ring.read_record(commit.byte_sequence + 1U).status() ==
+            term::Terminal_history_ring_status::NOT_RECORD_BOUNDARY,
+        "Phase 4A read scope rejects live byte positions that are not record boundaries");
+    ok &= check(ring.read_record(commit.head_byte_sequence).status() ==
+            term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE,
+        "Phase 4A read scope treats the published head as outside the live range");
+
+    return ok;
+}
+
+bool test_explicit_discard_advances_live_bounds()
+{
+    bool ok = true;
+
+    term::Terminal_history_ring ring({512U, 512U});
+    const term::terminal_history_ring_commit_result_t first =
+        append_record(ring, "first");
+    const term::terminal_history_ring_commit_result_t second =
+        append_record(ring, "second");
+    const term::terminal_history_ring_commit_result_t third =
+        append_record(ring, "third");
+    ok &= check(first.status  == term::Terminal_history_ring_status::OK &&
+            second.status == term::Terminal_history_ring_status::OK &&
+            third.status  == term::Terminal_history_ring_status::OK,
+        "Phase 6B discard fixture commits three records");
+
+    const term::terminal_history_ring_discard_result_t discard =
+        ring.discard_oldest_records(2U);
+    ok &= check(discard.status == term::Terminal_history_ring_status::OK &&
+            discard.discarded_records == 2U &&
+            discard.oldest_live_byte_sequence == third.byte_sequence,
+        "Phase 6B explicit discard advances the live byte lower bound");
+    ok &= check(ring.read_record(first.byte_sequence).status() ==
+            term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE &&
+            ring.read_record(second.byte_sequence).status() ==
+                term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE,
+        "Phase 6B explicitly discarded records fail live-range validation");
+
+    const term::Terminal_history_ring_read_scope live_read =
+        ring.read_record(third.byte_sequence);
+    ok &= check(live_read.status() == term::Terminal_history_ring_status::OK &&
+            payload_equal(live_read, "third"),
+        "Phase 6B surviving record remains readable after explicit discard");
+
+    return ok;
+}
+
+}
+
+int main()
+{
+    bool ok = true;
+    ok &= test_capacity_alignment_and_one_octile_limit();
+    ok &= test_partial_records_are_invisible();
+    ok &= test_wrap_traversal_tail_boundaries_and_rebuild();
+    ok &= test_read_scope_failure_translation();
+    ok &= test_explicit_discard_advances_live_bounds();
+    return ok ? 0 : 1;
+}
