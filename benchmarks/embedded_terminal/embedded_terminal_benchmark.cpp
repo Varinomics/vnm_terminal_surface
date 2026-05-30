@@ -242,6 +242,9 @@ struct renderer_totals_t
     qint64                 frame_cursor_graphic_arcs                            = 0;
     qint64                 frame_overlay_rects                                  = 0;
     qint64                 frame_dirty_row_ranges                               = 0;
+    qint64                 frame_dirty_row_lookup_count                         = 0;
+    qint64                 frame_dirty_row_range_lookup_count                   = 0;
+    qint64                 frame_dirty_row_range_scan_steps                     = 0;
     qint64                 frame_packed_rows                                    = 0;
     qint64                 frame_packed_text_spans                              = 0;
     qint64                 frame_packed_text_cells                              = 0;
@@ -1986,6 +1989,9 @@ void add_renderer_stats(
 {
     totals.paint_completed = totals.paint_completed && stats.paint_completed;
     add_simple_content_stats(totals.frame.simple_content, stats.frame.simple_content);
+    totals.frame.dirty_row_lookup_count += stats.frame.dirty_row_lookup_count;
+    totals.frame.dirty_row_range_lookup_count += stats.frame.dirty_row_range_lookup_count;
+    totals.frame.dirty_row_range_scan_steps += stats.frame.dirty_row_range_scan_steps;
     totals.text_content_rebuilds   += stats.text_content_rebuilds;
     totals.text_content_reused     += stats.text_content_reused;
     totals.text_content_removed    += stats.text_content_removed;
@@ -2561,6 +2567,9 @@ void add_renderer_stats(
     totals.frame_cursor_graphic_arcs      += stats.frame_cursor_graphic_arcs;
     totals.frame_overlay_rects            += stats.frame_overlay_rects;
     totals.frame_dirty_row_ranges         += stats.frame_dirty_row_ranges;
+    totals.frame_dirty_row_lookup_count   += stats.frame.dirty_row_lookup_count;
+    totals.frame_dirty_row_range_lookup_count += stats.frame.dirty_row_range_lookup_count;
+    totals.frame_dirty_row_range_scan_steps += stats.frame.dirty_row_range_scan_steps;
     totals.frame_packed_rows              += stats.frame_packed_rows;
     totals.frame_packed_text_spans        += stats.frame_packed_text_spans;
     totals.frame_packed_text_cells        += stats.frame_packed_text_cells;
@@ -4379,6 +4388,15 @@ QJsonObject scenario_json(const Scenario_result& result)
         QStringLiteral("frame_dirty_row_ranges"),
         result.renderer_totals.frame_dirty_row_ranges);
     object.insert(
+        QStringLiteral("frame_dirty_row_lookup_count"),
+        result.renderer_totals.frame_dirty_row_lookup_count);
+    object.insert(
+        QStringLiteral("frame_dirty_row_range_lookup_count"),
+        result.renderer_totals.frame_dirty_row_range_lookup_count);
+    object.insert(
+        QStringLiteral("frame_dirty_row_range_scan_steps"),
+        result.renderer_totals.frame_dirty_row_range_scan_steps);
+    object.insert(
         QStringLiteral("frame_packed_rows"),
         result.renderer_totals.frame_packed_rows);
     object.insert(
@@ -4932,6 +4950,9 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
         QStringLiteral("frame_cursor_graphic_arcs"),
         QStringLiteral("frame_overlay_rects"),
         QStringLiteral("frame_dirty_row_ranges"),
+        QStringLiteral("frame_dirty_row_lookup_count"),
+        QStringLiteral("frame_dirty_row_range_lookup_count"),
+        QStringLiteral("frame_dirty_row_range_scan_steps"),
         QStringLiteral("frame_packed_rows"),
         QStringLiteral("frame_packed_text_spans"),
         QStringLiteral("frame_packed_text_cells"),
@@ -6109,6 +6130,9 @@ bool validate_scenario_json(
         QStringLiteral("frame_cursor_graphic_arcs"),
         QStringLiteral("frame_overlay_rects"),
         QStringLiteral("frame_dirty_row_ranges"),
+        QStringLiteral("frame_dirty_row_lookup_count"),
+        QStringLiteral("frame_dirty_row_range_lookup_count"),
+        QStringLiteral("frame_dirty_row_range_scan_steps"),
         QStringLiteral("frame_packed_rows"),
         QStringLiteral("frame_packed_text_spans"),
         QStringLiteral("frame_packed_text_cells"),

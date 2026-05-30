@@ -275,6 +275,10 @@ struct terminal_render_frame_stats_t
     int                                            packed_inline_fallbacks          = 0;
     int                                            packed_cells_appended            = 0;
     int                                            dirty_row_lookup_count           = 0;
+    // Equals dirty_row_lookup_count until row dirtiness queries are cached.
+    // It is kept separate so cache misses remain visible when that lands.
+    int                                            dirty_row_range_lookup_count     = 0;
+    int                                            dirty_row_range_scan_steps       = 0;
     int                                            cells_considered                = 0;
     int                                            cells_skipped_invalid           = 0;
     int                                            cells_skipped_wide_continuation = 0;
@@ -329,6 +333,10 @@ struct terminal_render_frame_cumulative_stats_t
     std::uint64_t                                  packed_inline_fallbacks          = 0U;
     std::uint64_t                                  packed_cells_appended            = 0U;
     std::uint64_t                                  dirty_row_lookup_count           = 0U;
+    // Equals dirty_row_lookup_count until row dirtiness queries are cached.
+    // It is kept separate so cache misses remain visible when that lands.
+    std::uint64_t                                  dirty_row_range_lookup_count     = 0U;
+    std::uint64_t                                  dirty_row_range_scan_steps       = 0U;
     std::uint64_t                                  cells_considered                = 0U;
     std::uint64_t                                  cells_skipped_invalid           = 0U;
     std::uint64_t                                  cells_skipped_wide_continuation = 0U;

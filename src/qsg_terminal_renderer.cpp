@@ -5228,6 +5228,10 @@ void accumulate_frame_stats(
     total.packed_cells_appended +=
         static_cast<std::uint64_t>(stats.packed_cells_appended);
     total.dirty_row_lookup_count += static_cast<std::uint64_t>(stats.dirty_row_lookup_count);
+    total.dirty_row_range_lookup_count +=
+        static_cast<std::uint64_t>(stats.dirty_row_range_lookup_count);
+    total.dirty_row_range_scan_steps +=
+        static_cast<std::uint64_t>(stats.dirty_row_range_scan_steps);
     total.cells_considered      += static_cast<std::uint64_t>(stats.cells_considered);
     total.cells_skipped_invalid += static_cast<std::uint64_t>(stats.cells_skipped_invalid);
     total.cells_skipped_wide_continuation +=
@@ -5948,9 +5952,13 @@ bool ime_preedit_covers_cell(
 
 bool snapshot_row_is_dirty(
     const Terminal_render_snapshot&    snapshot,
-    int                                row)
+    int                                row,
+    terminal_render_frame_stats_t&     stats)
 {
+    ++stats.dirty_row_lookup_count;
+    ++stats.dirty_row_range_lookup_count;
     for (const Terminal_render_dirty_row_range& range : snapshot.dirty_row_ranges) {
+        ++stats.dirty_row_range_scan_steps;
         if (row >= range.first_row && row < range.first_row + range.row_count) { return true;  }
         if (row <  range.first_row)                                            { return false; }
     }
@@ -6244,8 +6252,10 @@ void build_terminal_render_frame_packed_data(
             if (graphic_candidate) {
                 ++frame.stats.packed_graphic_candidates_classified;
             }
-            ++frame.stats.dirty_row_lookup_count;
-            const bool dirty_row = snapshot_row_is_dirty(snapshot, cell->position.row);
+            const bool dirty_row = snapshot_row_is_dirty(
+                snapshot,
+                cell->position.row,
+                frame.stats);
             const bool has_decoration = cell_text_decoration_enabled(
                 *cell,
                 snapshot.styles.size(),
@@ -6318,7 +6328,6 @@ Terminal_render_frame build_terminal_render_frame(
     frame.text_style_key   = text_style_cache_key(*snapshot, options);
     frame.stats.visible_rows          = snapshot->grid_size.rows;
     frame.stats.cell_pass_input_cells = static_cast<int>(snapshot->cells.size());
-    frame.stats.dirty_row_lookup_count += static_cast<int>(snapshot->cells.size());
     for (const Terminal_render_dirty_row_range& range : snapshot->dirty_row_ranges) {
         frame.stats.dirty_rows += range.row_count;
     }
@@ -6409,7 +6418,7 @@ Terminal_render_frame build_terminal_render_frame(
                 snapshot->grid_size,
                 snapshot->styles.size(),
                 classification_has_decoration,
-                snapshot_row_is_dirty(*snapshot, cell.position.row));
+                snapshot_row_is_dirty(*snapshot, cell.position.row, frame.stats));
             const bool block_cursor_cell =
                 block_cursor_covers_cell(cell, snapshot->cursor, block_cursor_visible);
             const bool ime_preedit_cell = ime_preedit_covers_cell(
