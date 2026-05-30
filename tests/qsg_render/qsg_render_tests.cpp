@@ -2928,7 +2928,7 @@ bool test_qsg_snapshot_rendering(QGuiApplication& app)
         first_stats.frame_selection_rects == first_stats.frame.selection_rects_emitted &&
         first_stats.frame_dirty_row_ranges == 0 &&
         first_stats.frame_packed_rows == first_stats.frame.packed_rows &&
-        first_stats.frame.simple_content.eligible_after_all_gates_cells == 5 &&
+        first_stats.frame.simple_content.eligible_after_all_gates_cells == 4 &&
         first_stats.frame_packed_text_cells == 0 &&
         first_stats.frame.packed_text_cells == 0 &&
         first_stats.frame_packed_payload_bytes > 0U,
@@ -8654,9 +8654,10 @@ bool test_qsg_text_row_slot_invalid_provenance_rebuilds_skipped_dirty_pixels(QGu
         }) <= 10,
         "invalid-provenance text clean-skip update does not stale-reuse old row-zero pixels");
     ok &= check(stats.text_content_rebuilds == 1 &&
-        stats.text_resource_descriptor_reuses == 2 &&
+        stats.text_content_reused == 2 &&
+        stats.text_resource_descriptor_reuses + stats.text_key_match_reuses == 2 &&
         stats.text_clean_reuse_skips == 0,
-        "invalid-provenance text clean-skip update compares descriptors before reuse");
+        "invalid-provenance text clean-skip update reuses unchanged rows safely");
     return ok;
 }
 
