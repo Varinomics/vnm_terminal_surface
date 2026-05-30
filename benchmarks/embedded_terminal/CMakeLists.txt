@@ -107,6 +107,36 @@ if(BUILD_TESTING AND TARGET vnm_terminal_embedded_benchmark)
         TIMEOUT 180
     )
 
+    add_test(
+        NAME vnm_terminal_embedded_benchmark_renderer_gate
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_benchmark_qt_offscreen_environment}
+            "QT_SCALE_FACTOR=1"
+            "QT_SCREEN_SCALE_FACTORS="
+            "QT_AUTO_SCREEN_SCALE_FACTOR=0"
+            "QT_DEVICE_PIXEL_RATIO="
+            "QT_SCALE_FACTOR_ROUNDING_POLICY=PassThrough"
+            "${vnm_terminal_benchmark_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_embedded_benchmark>"
+            "--software-renderer"
+            "--iterations" "3"
+            "--warmup" "1"
+            "--scenario" "dense_repaint"
+            "--scenario" "ascii_full_dirty_reuse_only"
+            "--scenario" "scroll_burst"
+            "--scenario" "cursor_repaint_toggle"
+            "--scenario" "single_row_geometry_update"
+            "--output" "${CMAKE_CURRENT_BINARY_DIR}/renderer_gate_output.json"
+            "--quiet"
+            "--validate-json"
+    )
+
+    set_tests_properties(vnm_terminal_embedded_benchmark_renderer_gate PROPERTIES
+        LABELS "readiness;benchmark;renderer"
+        TIMEOUT 90
+    )
+
     if(VNM_TERMINAL_ENABLE_PROFILING)
         add_test(
             NAME vnm_terminal_embedded_benchmark_profile_validate

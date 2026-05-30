@@ -1701,6 +1701,20 @@ make_single_row_geometry_update_snapshot(
         selection_start,
         selection_width,
     });
+    // make_base_snapshot uses a primary-buffer viewport whose first visible
+    // logical row is zero. The row index is therefore the logical row here.
+    // Only the updated row changes generation across phases; unchanged rows
+    // retain stable provenance identity.
+    snapshot.visible_line_provenance.reserve(static_cast<std::size_t>(grid.rows));
+    for (int provenance_row = 0; provenance_row < grid.rows; ++provenance_row) {
+        snapshot.visible_line_provenance.push_back({
+            provenance_row,
+            static_cast<std::uint64_t>(provenance_row) + 1U,
+            provenance_row == row
+                ? static_cast<std::uint64_t>(phase + 1)
+                : 1U,
+        });
+    }
 
     const int decoration_column = free_column_near(phase * 5 + 7);
     if (decoration_column >= 0) {
@@ -5132,21 +5146,21 @@ bool validate_renderer_counter_invariants(
         json_counter(object, QStringLiteral("frame_packed_text_spans"));
     const qint64 frame_packed_graphic_spans =
         json_counter(object, QStringLiteral("frame_packed_graphic_spans"));
-    if (frame_packed_text_cells !=
-        json_counter(
-            object,
-            QStringLiteral("simple_content_eligible_after_all_gates_cells")) ||
-        frame_packed_graphic_cells > simple_content_graphic_route_cells      ||
-        frame_packed_text_spans    > frame_packed_text_cells                 ||
+    if (frame_packed_text_cells != 0 ||
+        frame_packed_text_spans != 0)
+    {
+        *out_error = QStringLiteral("packed text sidecars unexpectedly emitted");
+        return false;
+    }
+
+    if (frame_packed_graphic_cells > simple_content_graphic_route_cells      ||
         frame_packed_graphic_spans > frame_packed_graphic_cells)
     {
         *out_error = QStringLiteral("packed span counters are inconsistent");
         return false;
     }
 
-    if ((frame_packed_text_cells   > 0 ||
-        frame_packed_graphic_cells > 0 ||
-        frame_packed_text_spans    > 0 ||
+    if ((frame_packed_graphic_cells > 0 ||
         frame_packed_graphic_spans > 0)
         &&
         json_counter(object, QStringLiteral("frame_packed_payload_bytes")) <= 0)
@@ -7175,6 +7189,7 @@ int main(int argc, char** argv)
     if (options.software_renderer) {
         QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
     }
+    const bool software_renderer_requested = options.software_renderer;
 
     QGuiApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("vnm_terminal_embedded_benchmark"));
@@ -7208,14 +7223,26 @@ int main(int argc, char** argv)
     Benchmark_context context{app, window, surface, 1000U, surface.scrollback_limit()};
     if (!initialize_surface(context)) {
         options.software_renderer = window_uses_software_scene_graph(window);
+        const QString initialization_error =
+            software_renderer_requested && !options.software_renderer
+                ? QStringLiteral("software renderer request was not honored")
+                : QStringLiteral("initial render did not complete");
         const QJsonObject root = make_root_json(
             options,
             {},
             false,
-            QStringLiteral("initial render did not complete"));
+            initialization_error);
         return emit_json_and_status(options, root, {}, false);
     }
     options.software_renderer = window_uses_software_scene_graph(window);
+    if (software_renderer_requested && !options.software_renderer) {
+        const QJsonObject root = make_root_json(
+            options,
+            {},
+            false,
+            QStringLiteral("software renderer request was not honored"));
+        return emit_json_and_status(options, root, {}, false);
+    }
 
     QJsonArray scenario_array;
     std::vector<Scenario_result> scenario_results;
