@@ -630,6 +630,9 @@ term::Terminal_public_projection_row public_projection_row_from_text(
         static_cast<std::uint64_t>(9000 + public_row),
         static_cast<std::uint64_t>(19000 + public_row),
     };
+    row.history_handle = term::terminal_history_handle_from_retained_identity(
+        row.provenance.retained_line_id,
+        row.provenance.content_generation);
 
     for (int column = 0; column < text.size(); ++column) {
         row.cells.push_back({
@@ -657,6 +660,9 @@ std::vector<term::Terminal_public_projection_row_metadata> public_row_metadata_r
                 static_cast<std::uint64_t>(1000 + first_public_row + row),
                 static_cast<std::uint64_t>(2000 + first_public_row + row),
             },
+            term::terminal_history_handle_from_retained_identity(
+                static_cast<std::uint64_t>(1000 + first_public_row + row),
+                static_cast<std::uint64_t>(2000 + first_public_row + row)),
             0,
             true,
         });
@@ -706,11 +712,10 @@ std::vector<term::terminal_selection_line_lease_t> expected_line_leases_from_sna
         const int viewport_row = logical_row - first_visible_logical_row;
         const term::Terminal_render_line_provenance& provenance =
             snapshot.visible_line_provenance[static_cast<std::size_t>(viewport_row)];
-        lines.push_back({
+        lines.push_back(term::terminal_selection_line_lease_from_retained_identity(
             logical_row - start.row,
             provenance.retained_line_id,
-            provenance.content_generation,
-        });
+            provenance.content_generation));
     }
     return lines;
 }
@@ -2091,11 +2096,9 @@ term::terminal_selection_visual_lease_t make_phase2_selection_lease(
     lease.selected_range = range;
     lease.anchor         = range.start;
     lease.extent         = range.end;
-    lease.selected_lines = {{
-        0,
-        101U,
-        13U,
-    }};
+    lease.selected_lines = {
+        term::terminal_selection_line_lease_from_retained_identity(0, 101U, 13U),
+    };
     return lease;
 }
 
@@ -2202,7 +2205,7 @@ bool test_selection_phase2_internal_state_and_lease()
     return ok;
 }
 
-bool test_selection_phase2_replacement_empty_cancel_and_eviction()
+bool test_selection_phase2_replacement_empty_cancel_and_payload_detach()
 {
     bool ok = true;
 
@@ -2277,11 +2280,7 @@ bool test_selection_phase2_replacement_empty_cancel_and_eviction()
         selection.selected_text().text == QStringLiteral("beta"),
         "Phase 2 non-empty replacement creates a new durable payload identity");
 
-    ok &= check(selection.apply_backing_event({
-            term::Terminal_selection_backing_event_kind::PRIMARY_SCROLLBACK_EVICTION,
-            6,
-        }),
-        "Phase 10A named scrollback eviction event applies to the active selection");
+    selection.detach_visual_attachment();
     ok &= check(selection.internal_state() ==
             term::Terminal_selection_internal_state::PAYLOAD_ONLY &&
         selection.anchor_domain() ==
@@ -2289,7 +2288,7 @@ bool test_selection_phase2_replacement_empty_cancel_and_eviction()
         !selection.visual_lease().has_value() &&
         selection.selected_text().code == term::Terminal_selection_result_code::OK &&
         selection.selected_text().text == QStringLiteral("beta"),
-        "Phase 2 scrollback eviction detaches visuals while preserving payload");
+        "Phase 2A stale-policy detach preserves payload as payload-only");
 
     return ok;
 }
@@ -2504,19 +2503,19 @@ bool test_selection_phase3_line_lease_provenance_capture()
             provenance[1].logical_row == 1 &&
             provenance[2].logical_row == 2,
             "Phase 3 source snapshot independently exposes the selected logical rows");
-        ok &= check(lease->selected_lines[0].retained_line_id ==
-                provenance[0].retained_line_id &&
-            lease->selected_lines[0].content_generation ==
-                provenance[0].content_generation &&
-            lease->selected_lines[1].retained_line_id ==
-                provenance[1].retained_line_id &&
-            lease->selected_lines[1].content_generation ==
-                provenance[1].content_generation &&
-            lease->selected_lines[2].retained_line_id ==
-                provenance[2].retained_line_id &&
-            lease->selected_lines[2].content_generation ==
-                provenance[2].content_generation,
-            "Phase 3 line lease descriptor values match snapshot provenance fields directly");
+        ok &= check(lease->selected_lines[0].history_handle ==
+                term::terminal_history_handle_from_retained_identity(
+                    provenance[0].retained_line_id,
+                    provenance[0].content_generation) &&
+            lease->selected_lines[1].history_handle ==
+                term::terminal_history_handle_from_retained_identity(
+                    provenance[1].retained_line_id,
+                    provenance[1].content_generation) &&
+            lease->selected_lines[2].history_handle ==
+                term::terminal_history_handle_from_retained_identity(
+                    provenance[2].retained_line_id,
+                    provenance[2].content_generation),
+            "Phase 3 line lease handles match snapshot provenance fields directly");
     }
 
     term::Terminal_session_config drained_config;
@@ -2571,9 +2570,11 @@ bool test_selection_phase3_line_lease_provenance_capture()
                 drained_lease->selected_lines[0];
             ok &= check(provenance.logical_row == 1 &&
                 selected_line.row_offset == 0 &&
-                selected_line.retained_line_id == provenance.retained_line_id &&
-                selected_line.content_generation == provenance.content_generation,
-                "Phase 3 drained descriptor fields match drained snapshot provenance directly");
+                selected_line.history_handle ==
+                    term::terminal_history_handle_from_retained_identity(
+                        provenance.retained_line_id,
+                        provenance.content_generation),
+                "Phase 3 drained descriptor handle matches drained snapshot provenance directly");
         }
         else {
             ok &= check(false,
@@ -2630,21 +2631,21 @@ bool test_selection_phase3_line_lease_negative_source_paths()
             const std::vector<term::Terminal_render_line_provenance>& provenance =
                 source_snapshot->visible_line_provenance;
             ok &= check(lease->selected_lines[0].row_offset == 0 &&
-                lease->selected_lines[0].retained_line_id ==
-                    provenance[0].retained_line_id &&
-                lease->selected_lines[0].content_generation ==
-                    provenance[0].content_generation &&
+                lease->selected_lines[0].history_handle ==
+                    term::terminal_history_handle_from_retained_identity(
+                        provenance[0].retained_line_id,
+                        provenance[0].content_generation) &&
                 lease->selected_lines[1].row_offset == 1 &&
-                lease->selected_lines[1].retained_line_id ==
-                    provenance[1].retained_line_id &&
-                lease->selected_lines[1].content_generation ==
-                    provenance[1].content_generation &&
+                lease->selected_lines[1].history_handle ==
+                    term::terminal_history_handle_from_retained_identity(
+                        provenance[1].retained_line_id,
+                        provenance[1].content_generation) &&
                 lease->selected_lines[2].row_offset == 2 &&
-                lease->selected_lines[2].retained_line_id ==
-                    provenance[2].retained_line_id &&
-                lease->selected_lines[2].content_generation ==
-                    provenance[2].content_generation,
-                "Phase 3 reversed multi-row descriptor fields normalize to source row order");
+                lease->selected_lines[2].history_handle ==
+                    term::terminal_history_handle_from_retained_identity(
+                        provenance[2].retained_line_id,
+                        provenance[2].content_generation),
+                "Phase 3 reversed multi-row descriptor handles normalize to source row order");
         }
         else {
             ok &= check(false,
@@ -2754,8 +2755,8 @@ bool test_selection_phase3_line_lease_negative_source_paths()
                 "Phase 3 mismatched viewport source still uses active-model selection fallback");
             ok &= check(session->has_selection(),
                 "Phase 3 mismatched viewport source may create a fallback selection");
-            ok &= check(lease.has_value() && lease->selected_lines.empty(),
-                "Phase 3 mismatched snapshot identity captures no retained-line descriptors");
+            ok &= check(lease.has_value() && !lease->selected_lines.empty(),
+                "Phase 2A mismatched snapshot identity resolves retained-line descriptors through handles");
         }
         else {
             ok &= check(false,
@@ -2797,8 +2798,8 @@ bool test_selection_phase3_line_lease_negative_source_paths()
                 payload.text == QStringLiteral("scroll-line-%1")
                     .arg(offscreen_logical_row, 3, 10, QLatin1Char('0')),
                 "Phase 3 offscreen range keeps selection payload through active-model fallback");
-            ok &= check(lease.has_value() && lease->selected_lines.empty(),
-                "Phase 3 offscreen visible-line provenance captures no descriptors");
+            ok &= check(lease.has_value() && !lease->selected_lines.empty(),
+                "Phase 2A offscreen range resolves retained-line descriptors through handles");
             ok &= check(selected_snapshot.has_value() &&
                 selected_snapshot->selection_spans.empty(),
                 "Phase 3 offscreen selection emits no visible spans");
@@ -4728,6 +4729,10 @@ bool test_public_projection_phase2_controller_diagnostic_precedence()
         copied_metadata[i].provenance.retained_line_id =
             2000U + static_cast<std::uint64_t>(i);
         copied_metadata[i].provenance.content_generation = 1U;
+        copied_metadata[i].history_handle =
+            term::terminal_history_handle_from_retained_identity(
+                copied_metadata[i].provenance.retained_line_id,
+                copied_metadata[i].provenance.content_generation);
         copied_metadata[i].visual_fragment_index_is_exact = true;
     }
 
@@ -4805,7 +4810,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         controller.release_intent().public_projection_valid &&
         !controller.release_intent().sticky_tail &&
         controller.release_intent().detached_anchor.has_value() &&
-        controller.release_intent().detached_anchor->retained_line_id == 1002U,
+        controller.release_intent().detached_anchor->history_handle.row_sequence == 1002U,
         "Phase 2 public viewport initializes detached release intent from copied rows");
 
     const term::Terminal_public_viewport_scroll_result detached_scroll =
@@ -4816,7 +4821,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         controller.viewport().offset_from_tail == 3 &&
         !controller.release_intent().sticky_tail &&
         controller.release_intent().detached_anchor.has_value() &&
-        controller.release_intent().detached_anchor->retained_line_id == 1001U,
+        controller.release_intent().detached_anchor->history_handle.row_sequence == 1001U,
         "Phase 2 public viewport scroll refreshes detached first-visible-row anchor");
 
     const term::Terminal_public_viewport_scroll_result clamped_tail_scroll =
@@ -4827,7 +4832,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         controller.viewport().follow_tail &&
         !controller.release_intent().sticky_tail &&
         controller.release_intent().detached_anchor.has_value() &&
-        controller.release_intent().detached_anchor->retained_line_id == 1004U,
+        controller.release_intent().detached_anchor->history_handle.row_sequence == 1004U,
         "Phase 2 public viewport clamp to offset zero does not create sticky-tail intent");
 
     term::Terminal_public_viewport_controller negative_offset_controller;
@@ -4846,7 +4851,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         negative_offset_controller.viewport().follow_tail &&
         !negative_offset_controller.release_intent().sticky_tail &&
         negative_offset_controller.release_intent().detached_anchor.has_value() &&
-        negative_offset_controller.release_intent().detached_anchor->retained_line_id == 1004U,
+        negative_offset_controller.release_intent().detached_anchor->history_handle.row_sequence == 1004U,
         "Phase 2 explicit negative offset clamps to tail without sticky-tail intent");
 
     const term::Terminal_public_viewport_scroll_result explicit_tail =
@@ -4865,7 +4870,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         controller.viewport().offset_from_tail == 2 &&
         !controller.release_intent().sticky_tail &&
         controller.release_intent().detached_anchor.has_value() &&
-        controller.release_intent().detached_anchor->retained_line_id == 1002U,
+        controller.release_intent().detached_anchor->history_handle.row_sequence == 1002U,
         "Phase 2 explicit non-tail public offset restores detached release anchoring");
 
     const term::Terminal_public_viewport_scroll_result off_copied_scroll =
@@ -4921,12 +4926,27 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         25U,
         1,
         {
-            {{1, 900U, 17U}, 0, true},
-            {{2, 900U, 17U}, 1, true},
-            {{3, 901U, 18U}, 0, true},
+            {
+                {1, 900U, 17U},
+                term::terminal_history_handle_from_retained_identity(900U, 17U),
+                0,
+                true,
+            },
+            {
+                {2, 900U, 17U},
+                term::terminal_history_handle_from_retained_identity(900U, 17U),
+                1,
+                true,
+            },
+            {
+                {3, 901U, 18U},
+                term::terminal_history_handle_from_retained_identity(901U, 18U),
+                0,
+                true,
+            },
         });
     ok &= check(fragment_controller.release_intent().detached_anchor.has_value() &&
-        fragment_controller.release_intent().detached_anchor->retained_line_id == 900U &&
+        fragment_controller.release_intent().detached_anchor->history_handle.row_sequence == 900U &&
         fragment_controller.release_intent().detached_anchor->visual_fragment_index == 1,
         "Phase 2 detached anchor preserves retained-line visual fragment index");
 
@@ -5151,8 +5171,8 @@ bool test_public_projection_phase2_resize_and_memory_invalidation()
         !after_memory->deferred_intent_recorded &&
         after_memory->detached_anchor.has_value() &&
         before_memory->detached_anchor.has_value() &&
-        after_memory->detached_anchor->retained_line_id ==
-            before_memory->detached_anchor->retained_line_id &&
+        after_memory->detached_anchor->history_handle ==
+            before_memory->detached_anchor->history_handle &&
         after_memory->public_projection_disable_reason ==
             term::Terminal_public_projection_disable_reason::MEMORY_PRESSURE &&
         after_memory->diagnostic_reason ==
@@ -6184,15 +6204,21 @@ bool test_public_projection_phase4_wrapped_fragment_release_reconciles_fragment_
     }
     const term::Terminal_render_line_provenance retained_line_provenance =
         copied_rows[0].provenance;
+    const term::terminal_history_handle_t retained_line_handle =
+        term::terminal_history_handle_from_retained_identity(
+            retained_line_provenance.retained_line_id,
+            retained_line_provenance.content_generation);
     copied_rows[0] =
         public_projection_row_from_text(0, QStringLiteral("fragment-zero"));
     copied_rows[0].provenance = retained_line_provenance;
+    copied_rows[0].history_handle = retained_line_handle;
     copied_rows[0].visual_fragment_index = 0;
     copied_rows[0].visual_fragment_index_is_exact = true;
     copied_rows[1] =
         public_projection_row_from_text(1, QStringLiteral("fragment-one"));
     copied_rows[1].provenance = retained_line_provenance;
     copied_rows[1].provenance.logical_row = 1;
+    copied_rows[1].history_handle = retained_line_handle;
     copied_rows[1].visual_fragment_index = 1;
     copied_rows[1].visual_fragment_index_is_exact = true;
     session->install_public_projection_for_testing(
@@ -6284,10 +6310,15 @@ bool test_public_projection_phase4_viewport_only_fragment_release_avoids_false_e
 
     const term::Terminal_render_line_provenance retained_line_provenance =
         captured_projection->rows()[0].provenance;
+    const term::terminal_history_handle_t retained_line_handle =
+        term::terminal_history_handle_from_retained_identity(
+            retained_line_provenance.retained_line_id,
+            retained_line_provenance.content_generation);
     copied_rows[0] =
         public_projection_row_from_text(1, QStringLiteral("fragment-one"));
     copied_rows[0].provenance = retained_line_provenance;
     copied_rows[0].provenance.logical_row = 1;
+    copied_rows[0].history_handle = retained_line_handle;
     copied_rows[0].visual_fragment_index = 0;
     copied_rows[0].visual_fragment_index_is_exact = false;
     session->install_public_projection_for_testing(
@@ -12282,6 +12313,715 @@ bool test_metrics_driven_resize_interleaves_with_output()
     return ok;
 }
 
+// Phase 0 evidence shim ownership: Phase 4D owns promotion/reuse if these
+// helpers become parity-harness helpers; Phase 6B owns deletion/replacement if
+// cutover tests supersede them.
+bool flat_ring_phase0_snapshot_has_hyperlink_uri(
+    const term::Terminal_render_snapshot& snapshot,
+    const QByteArray&                     uri)
+{
+    return std::any_of(
+        snapshot.hyperlinks.begin(),
+        snapshot.hyperlinks.end(),
+        [&](const term::Terminal_render_hyperlink_metadata& hyperlink) {
+            return hyperlink.uri == uri;
+        });
+}
+
+bool flat_ring_phase0_projection_has_hyperlink_uri(
+    const term::Terminal_public_projection& projection,
+    const QByteArray&                       uri)
+{
+    return std::any_of(
+        projection.hyperlinks().begin(),
+        projection.hyperlinks().end(),
+        [&](const term::Terminal_render_hyperlink_metadata& hyperlink) {
+            return hyperlink.uri == uri;
+        });
+}
+
+bool test_flat_ring_phase0_retained_history_contract_baseline()
+{
+    bool ok = true;
+
+    const QByteArray retained_uri =
+        QByteArrayLiteral("https://phase0.varinomics.example/retained-link");
+
+    std::unique_ptr<Scripted_backend> backend_owner = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend                       = backend_owner.get();
+    term::Terminal_session session(std::move(backend_owner), enable_test_traces());
+
+    term::Terminal_launch_config launch = valid_launch_config();
+    launch.initial_grid_size = {4, 12};
+    ok &= check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
+        "flat-ring Phase 0 retained-history baseline session starts");
+
+    QByteArray output;
+    output += QByteArrayLiteral("\x1b]8;id=phase0;");
+    output += retained_uri;
+    output += QByteArrayLiteral("\x1b\\LINK\x1b]8;;\x1b\\\r\nROW2\r\nROW3\r\nROW4\r\nTAIL");
+    ok &= check(backend->emit_output(output),
+        "flat-ring Phase 0 scrollout fixture is accepted");
+
+    const std::optional<term::Terminal_render_snapshot> tail_snapshot =
+        session.latest_render_snapshot();
+    ok &= check(tail_snapshot.has_value() &&
+        tail_snapshot->viewport.scrollback_rows == 1 &&
+        snapshot_row_text(*tail_snapshot, 0) == QStringLiteral("ROW2"),
+        "flat-ring Phase 0 scrollout baseline appends one retained row at tail");
+
+    const term::Terminal_viewport_scroll_result retained_scroll =
+        session.scroll_published_viewport_to_offset_from_tail(1);
+    ok &= check(retained_scroll.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "flat-ring Phase 0 retained-row viewport scroll detaches from tail");
+
+    const std::optional<term::Terminal_render_snapshot> retained_snapshot =
+        session.latest_render_snapshot();
+    const bool retained_snapshot_has_first_provenance =
+        retained_snapshot.has_value() &&
+        !retained_snapshot->visible_line_provenance.empty() &&
+        retained_snapshot->visible_line_provenance.front().retained_line_id != 0U;
+    const term::Terminal_render_line_provenance retained_row_provenance =
+        retained_snapshot_has_first_provenance
+            ? retained_snapshot->visible_line_provenance.front()
+            : term::Terminal_render_line_provenance{};
+    ok &= check(retained_snapshot.has_value() &&
+        snapshot_row_text(*retained_snapshot, 0) == QStringLiteral("LINK") &&
+        retained_snapshot_has_first_provenance,
+        "flat-ring Phase 0 scrollout baseline exposes retained row provenance");
+    ok &= check(retained_snapshot.has_value() &&
+        flat_ring_phase0_snapshot_has_hyperlink_uri(*retained_snapshot, retained_uri),
+        "flat-ring Phase 0 retained hyperlink baseline materializes from retained history");
+
+    session.set_selection_range({{0, 0}, {0, 4}, term::Terminal_selection_mode::NORMAL});
+    const term::Terminal_selection_result retained_selection = session.selected_text();
+    const std::optional<term::terminal_selection_visual_lease_t> retained_selection_lease =
+        session.selection_visual_lease();
+    ok &= check(retained_selection.code == term::Terminal_selection_result_code::OK &&
+        retained_selection.text == QStringLiteral("LINK"),
+        "flat-ring Phase 0 selection baseline extracts retained row payload");
+    ok &= check(retained_selection_lease.has_value() &&
+        retained_selection_lease->anchor_domain ==
+            term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
+        !retained_selection_lease->selected_lines.empty() &&
+        retained_selection_lease->selected_lines.front().history_handle ==
+            term::terminal_history_handle_from_retained_identity(
+                retained_row_provenance.retained_line_id,
+                retained_row_provenance.content_generation),
+        "flat-ring Phase 0 selection baseline records retained-row lease handle");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r\nNEXT")),
+        "flat-ring Phase 0 detached viewport append fixture is accepted");
+    const std::optional<term::Terminal_render_snapshot> after_append_snapshot =
+        session.latest_render_snapshot();
+    ok &= check(after_append_snapshot.has_value() &&
+        after_append_snapshot->viewport.scrollback_rows == 2 &&
+        after_append_snapshot->viewport.offset_from_tail == 2 &&
+        snapshot_row_text(*after_append_snapshot, 0) == QStringLiteral("LINK"),
+        "flat-ring Phase 0 viewport baseline keeps detached anchor stable across append");
+
+    const term::Terminal_session_result resize_result =
+        session.resize(QSizeF(160.0, 80.0), {4, 16});
+    ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
+        "flat-ring Phase 0 resize baseline accepts retained-history resize");
+    const std::optional<term::Terminal_render_snapshot> after_resize_snapshot =
+        session.latest_render_snapshot();
+    ok &= check(after_resize_snapshot.has_value() &&
+        snapshot_row_text(*after_resize_snapshot, 0) == QStringLiteral("LINK") &&
+        flat_ring_phase0_snapshot_has_hyperlink_uri(*after_resize_snapshot, retained_uri),
+        "flat-ring Phase 0 resize baseline preserves retained text and hyperlink projection");
+
+    const std::optional<term::Terminal_public_projection> projection =
+        session.capture_public_projection_for_testing();
+    ok &= check(projection.has_value() &&
+        projection->stored_row_count() > 0U &&
+        !projection->rows().empty() &&
+        projection->rows().front().provenance.retained_line_id ==
+            retained_row_provenance.retained_line_id &&
+        flat_ring_phase0_projection_has_hyperlink_uri(*projection, retained_uri),
+        "flat-ring Phase 0 public projection baseline copies retained row identity and hyperlink metadata");
+
+    session.set_scrollback_limit(1);
+    const std::optional<term::Terminal_render_snapshot> after_eviction_snapshot =
+        session.latest_render_snapshot();
+    ok &= check(after_eviction_snapshot.has_value() &&
+        after_eviction_snapshot->viewport.scrollback_rows == 1 &&
+        after_eviction_snapshot->viewport.offset_from_tail <= 1,
+        "flat-ring Phase 0 eviction baseline clamps detached viewport to live retained bounds");
+    const term::Terminal_selection_result evicted_selection = session.selected_text();
+    ok &= check(evicted_selection.code == term::Terminal_selection_result_code::OK &&
+        evicted_selection.text == QStringLiteral("LINK") &&
+        session.selection_anchor_domain() ==
+            term::Terminal_selection_anchor_domain::PAYLOAD_ONLY,
+        "flat-ring Phase 0 selection baseline keeps payload after retained row eviction");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[3J")),
+        "flat-ring Phase 0 clear-history fixture is accepted");
+    const std::optional<term::Terminal_render_snapshot> after_clear_snapshot =
+        session.latest_render_snapshot();
+    ok &= check(after_clear_snapshot.has_value() &&
+        after_clear_snapshot->viewport.scrollback_rows == 0 &&
+        after_clear_snapshot->viewport.offset_from_tail == 0,
+        "flat-ring Phase 0 clear baseline clears live retained history and clamps viewport");
+    ok &= check(projection.has_value() &&
+        flat_ring_phase0_projection_has_hyperlink_uri(*projection, retained_uri),
+        "flat-ring Phase 0 copied public projection baseline survives live eviction and clear");
+
+    return ok;
+}
+
+bool test_flat_ring_phase0_recovered_provenance_baseline()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model_config config;
+    config.grid_size = {4, 12};
+    config.recover_scrollback_from_primary_repaints = true;
+
+    term::Terminal_screen_model model(config);
+    const term::Terminal_screen_model_result initial_result =
+        model.ingest(QByteArrayLiteral("ROW1\r\nROW2\r\nROW3\r\nROW4"));
+    ok &= check(model.scrollback_size() == 0 &&
+        initial_result.recovery_proposals.empty(),
+        "flat-ring Phase 0 recovery baseline starts without recovered history");
+
+    const term::Terminal_screen_model_result recovery_result =
+        model.ingest(QByteArrayLiteral("\x1b[?25l\x1b[HROW2\r\nROW3\r\nROW4\r\nROW5\x1b[?25h"));
+    ok &= check(recovery_result.recovery_proposals.size() == 1U &&
+        recovery_result.recovery_proposals.front().status ==
+            term::Terminal_recovery_proposal_status::ACCEPTED &&
+        recovery_result.recovery_proposals.front().provenance_source ==
+            term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT &&
+        recovery_result.recovery_proposals.front().recovered_row_count == 1,
+        "flat-ring Phase 0 recovery baseline records accepted recovered provenance");
+    ok &= check(model.scrollback_size() == 1,
+        "flat-ring Phase 0 recovery baseline appends recovered row to retained history");
+
+    const term::Terminal_retained_line_provenance recovered_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(recovered_provenance.retained_line_id != 0U &&
+        recovered_provenance.source ==
+            term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
+        "flat-ring Phase 0 recovery baseline stores recovered provenance on retained row");
+
+    const term::Terminal_retained_line_lookup_result recovered_lookup =
+        model.retained_line_lookup(
+            term::Terminal_buffer_id::PRIMARY,
+            term::terminal_history_handle_from_retained_identity(
+                recovered_provenance.retained_line_id,
+                recovered_provenance.content_generation));
+    ok &= check(recovered_lookup.exact_match &&
+        recovered_lookup.resolution_status == term::Terminal_history_resolution_status::OK &&
+        recovered_lookup.exact_logical_row == 0,
+        "flat-ring Phase 0 recovered provenance resolves through retained lookup seam");
+
+    return ok;
+}
+
+bool test_flat_ring_phase1_history_handle_resolution_statuses()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model_config config;
+    config.grid_size        = {3, 12};
+    config.scrollback_limit = 4;
+
+    term::Terminal_screen_model model(config);
+    model.ingest(QByteArrayLiteral("ROW1\r\nROW2\r\nROW3\r\nROW4"));
+    ok &= check(model.scrollback_size() == 1,
+        "flat-ring Phase 1 handle fixture creates retained history");
+
+    const term::Terminal_retained_line_provenance provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const term::terminal_history_handle_t handle =
+        term::terminal_history_handle_from_retained_identity(
+            provenance.retained_line_id,
+            provenance.content_generation);
+
+    const term::Terminal_retained_line_lookup_result exact_lookup =
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, handle);
+    ok &= check(exact_lookup.resolution_status == term::Terminal_history_resolution_status::OK &&
+        exact_lookup.exact_match &&
+        exact_lookup.exact_logical_row == 0,
+        "flat-ring Phase 1 exact retained-history handle resolves");
+
+    term::terminal_history_handle_t generation_mismatch = handle;
+    ++generation_mismatch.content_generation;
+    const term::Terminal_retained_line_lookup_result generation_lookup =
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, generation_mismatch);
+    ok &= check(generation_lookup.resolution_status ==
+            term::Terminal_history_resolution_status::CONTENT_GENERATION_MISMATCH &&
+        generation_lookup.retained_line_id_found &&
+        generation_lookup.retained_line_content_generation_mismatch &&
+        !generation_lookup.exact_match,
+        "flat-ring Phase 1 retained-history handle reports content generation mismatch");
+
+    term::terminal_history_handle_t byte_mismatch = handle;
+    ++byte_mismatch.byte_sequence;
+    const term::Terminal_retained_line_lookup_result byte_lookup =
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, byte_mismatch);
+    ok &= check(byte_lookup.resolution_status ==
+            term::Terminal_history_resolution_status::STALE_BYTE_SEQUENCE &&
+        byte_lookup.retained_line_id_found &&
+        !byte_lookup.exact_match,
+        "flat-ring Phase 1 retained-history handle reports byte sequence mismatch");
+
+    term::terminal_history_handle_t record_mismatch = handle;
+    record_mismatch.record_bytes = 1U;
+    const term::Terminal_retained_line_lookup_result record_lookup =
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, record_mismatch);
+    ok &= check(record_lookup.resolution_status ==
+            term::Terminal_history_resolution_status::RECORD_SIZE_MISMATCH &&
+        record_lookup.retained_line_id_found &&
+        !record_lookup.exact_match,
+        "flat-ring Phase 1 retained-history handle reports record size mismatch");
+
+    term::terminal_history_handle_t epoch_mismatch = handle;
+    ++epoch_mismatch.epoch;
+    const term::Terminal_retained_line_lookup_result epoch_lookup =
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, epoch_mismatch);
+    ok &= check(epoch_lookup.resolution_status ==
+            term::Terminal_history_resolution_status::STALE_EPOCH &&
+        !epoch_lookup.retained_line_id_found &&
+        !epoch_lookup.exact_match,
+        "flat-ring Phase 1 retained-history handle reports epoch mismatch");
+
+    const term::Terminal_retained_line_lookup_result invalid_lookup =
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, {});
+    ok &= check(invalid_lookup.resolution_status ==
+            term::Terminal_history_resolution_status::INVALID_HANDLE &&
+        !invalid_lookup.retained_line_id_found &&
+        !invalid_lookup.exact_match,
+        "flat-ring Phase 1 retained-history handle rejects an empty handle");
+
+    model.set_scrollback_limit(0);
+    const term::Terminal_retained_line_lookup_result stale_lookup =
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, handle);
+    ok &= check(stale_lookup.resolution_status ==
+            term::Terminal_history_resolution_status::STALE_ROW_SEQUENCE &&
+        !stale_lookup.retained_line_id_found &&
+        !stale_lookup.exact_match,
+        "flat-ring Phase 1 retained-history handle reports evicted row sequence stale");
+
+    return ok;
+}
+
+bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model_config config;
+    config.grid_size        = {3, 20};
+    config.scrollback_limit = 6;
+
+    term::Terminal_screen_model model(config);
+    model.ingest(numbered_scroll_lines(8));
+    ok &= check(model.scrollback_size() >= 3,
+        "flat-ring Phase 5C lookup-cache fixture creates retained rows");
+    if (model.scrollback_size() < 3) {
+        return ok;
+    }
+
+    const term::Terminal_retained_line_provenance first_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const term::Terminal_retained_line_provenance middle_provenance =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+    const term::terminal_history_handle_t first_handle =
+        term::terminal_history_handle_from_retained_identity(
+            first_provenance.retained_line_id,
+            first_provenance.content_generation);
+    const term::terminal_history_handle_t middle_handle =
+        term::terminal_history_handle_from_retained_identity(
+            middle_provenance.retained_line_id,
+            middle_provenance.content_generation);
+
+    const term::Terminal_retained_line_lookup_result exact_lookup =
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, middle_handle);
+    ok &= check(exact_lookup.resolution_status ==
+            term::Terminal_history_resolution_status::OK &&
+        exact_lookup.exact_match &&
+        exact_lookup.exact_logical_row == 1 &&
+        exact_lookup.retained_line_id_match_count == 1,
+        "flat-ring Phase 5C exact retained-line lookup resolves from cache");
+
+    const std::optional<term::terminal_history_handle_t> ordinal_handle =
+        model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, 1);
+    ok &= check(ordinal_handle.has_value() &&
+            ordinal_handle->row_sequence == middle_handle.row_sequence &&
+            ordinal_handle->content_generation == middle_handle.content_generation &&
+            ordinal_handle->record_bytes >
+                term::k_terminal_history_retained_identity_record_bytes,
+        "flat-ring Phase 6B ordinal lookup resolves to an authoritative ring handle");
+
+    term::terminal_history_handle_t generation_mismatch = middle_handle;
+    ++generation_mismatch.content_generation;
+    const term::Terminal_retained_line_lookup_result generation_lookup =
+        model.retained_line_lookup(
+            term::Terminal_buffer_id::PRIMARY,
+            generation_mismatch);
+    ok &= check(generation_lookup.resolution_status ==
+            term::Terminal_history_resolution_status::CONTENT_GENERATION_MISMATCH &&
+        generation_lookup.retained_line_id_found &&
+        generation_lookup.retained_line_content_generation_mismatch &&
+        !generation_lookup.exact_match,
+        "flat-ring Phase 5C cache hit validates retained-line generation mismatch");
+
+    model.discard_retained_lookup_cache_for_testing();
+    const term::Terminal_retained_line_lookup_result rebuilt_lookup =
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, middle_handle);
+    const std::optional<term::terminal_history_handle_t> rebuilt_ordinal_handle =
+        model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, 1);
+    ok &= check(rebuilt_lookup.exact_match &&
+        rebuilt_lookup.exact_logical_row == 1 &&
+        rebuilt_ordinal_handle.has_value() &&
+        rebuilt_ordinal_handle->row_sequence == middle_handle.row_sequence &&
+        rebuilt_ordinal_handle->content_generation == middle_handle.content_generation &&
+        rebuilt_ordinal_handle->record_bytes >
+            term::k_terminal_history_retained_identity_record_bytes,
+        "flat-ring Phase 5C dropped lookup caches rebuild without losing retained rows");
+
+    const int scrollback_before_evict = model.scrollback_size();
+    model.set_scrollback_limit(scrollback_before_evict - 1);
+    const term::Terminal_retained_line_lookup_result stale_first_lookup =
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, first_handle);
+    ok &= check(stale_first_lookup.resolution_status ==
+            term::Terminal_history_resolution_status::STALE_ROW_SEQUENCE &&
+        !stale_first_lookup.retained_line_id_found &&
+        !stale_first_lookup.exact_match &&
+        stale_first_lookup.nearest_successor &&
+        stale_first_lookup.nearest_successor_logical_row == 0,
+        "flat-ring Phase 5C stale retained handle reconciles to nearest successor");
+
+    const int latest_logical_row =
+        model.scrollback_size() + config.grid_size.rows - 1;
+    const std::optional<term::terminal_history_handle_t> latest_handle =
+        model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            latest_logical_row);
+    ok &= check(latest_handle.has_value(),
+        "flat-ring Phase 5C predecessor fixture captures latest live handle");
+    if (latest_handle.has_value()) {
+        term::terminal_history_handle_t future_handle = *latest_handle;
+        future_handle.byte_sequence += 100U;
+        future_handle.row_sequence  += 100U;
+
+        const term::Terminal_retained_line_lookup_result future_lookup =
+            model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, future_handle);
+        ok &= check(future_lookup.resolution_status ==
+                term::Terminal_history_resolution_status::STALE_ROW_SEQUENCE &&
+            !future_lookup.retained_line_id_found &&
+            !future_lookup.exact_match &&
+            future_lookup.nearest_predecessor &&
+            future_lookup.nearest_predecessor_logical_row == latest_logical_row,
+            "flat-ring Phase 5C missing retained handle reconciles to nearest predecessor");
+    }
+
+    return ok;
+}
+
+bool test_flat_ring_phase2a_selection_handle_resolution_policy()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {4, 20};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "flat-ring Phase 2A selection-handle session starts");
+    ok &= check(backend->emit_output(numbered_scroll_lines(10)),
+        "flat-ring Phase 2A fixture creates retained scrollback");
+
+    const std::optional<term::Terminal_render_snapshot> source_snapshot =
+        session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_source_identity_t> source =
+        session->published_selection_source_identity();
+    ok &= check(source_snapshot.has_value() &&
+        source_snapshot->viewport.scrollback_rows > 1 &&
+        source.has_value(),
+        "flat-ring Phase 2A fixture publishes a retained source with evictable rows");
+
+    if (source_snapshot.has_value() && source.has_value()) {
+        const int scrollback_before = source_snapshot->viewport.scrollback_rows;
+        session->set_selection_range_from_published_source({
+            {0, 0},
+            {0, 15},
+            term::Terminal_selection_mode::NORMAL,
+        }, *source);
+
+        const term::Terminal_selection_result original_payload =
+            session->selected_text();
+        const std::optional<term::terminal_selection_visual_lease_t> original_lease =
+            session->selection_visual_lease();
+        ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+            original_payload.text == QStringLiteral("scroll-line-000"),
+            "flat-ring Phase 2A selection extracts retained payload through handle proof");
+        ok &= check(original_lease.has_value() &&
+            original_lease->selected_lines.size() == 1U &&
+            term::terminal_history_handle_has_identity(
+                original_lease->selected_lines.front().history_handle),
+            "flat-ring Phase 2A selection stores a retained history handle");
+
+        session->set_scrollback_limit(scrollback_before - 1);
+        const term::Terminal_selection_result stale_payload =
+            session->selected_text();
+        const std::optional<term::Terminal_render_snapshot> stale_snapshot =
+            session->latest_render_snapshot();
+        ok &= check(stale_payload.code == term::Terminal_selection_result_code::OK &&
+            stale_payload.text == original_payload.text &&
+            session->selection_anchor_domain() ==
+                term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
+            !session->selection_visual_lease().has_value(),
+            "flat-ring Phase 2A stale retained handle preserves finalized payload only");
+        ok &= check(stale_snapshot.has_value() &&
+            stale_snapshot->selection_spans.empty(),
+            "flat-ring Phase 2A stale retained handle emits no visual selection proof");
+    }
+
+    return ok;
+}
+
+bool test_flat_ring_phase2b_viewport_handle_resolution_policy()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {4, 20};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "flat-ring Phase 2B viewport-handle session starts");
+    ok &= check(backend->emit_output(numbered_scroll_lines(10)),
+        "flat-ring Phase 2B fixture creates retained scrollback");
+
+    const std::optional<term::Terminal_render_snapshot> tail_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(tail_snapshot.has_value() &&
+        tail_snapshot->viewport.follow_tail &&
+        tail_snapshot->viewport.offset_from_tail == 0,
+        "flat-ring Phase 2B tail-following starts unchanged");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r\nphase2b-tail")),
+        "flat-ring Phase 2B tail-follow append is accepted");
+    const std::optional<term::Terminal_render_snapshot> followed_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(followed_snapshot.has_value() &&
+        followed_snapshot->viewport.follow_tail &&
+        followed_snapshot->viewport.offset_from_tail == 0,
+        "flat-ring Phase 2B tail-following stays at tail after append");
+
+    if (!followed_snapshot.has_value() ||
+        followed_snapshot->viewport.scrollback_rows <= 2)
+    {
+        ok &= check(false, "flat-ring Phase 2B fixture has evictable retained rows");
+        return ok;
+    }
+
+    const term::Terminal_viewport_scroll_result detach_result =
+        session->scroll_published_viewport_to_offset_from_tail(
+            followed_snapshot->viewport.scrollback_rows);
+    ok &= check(detach_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "flat-ring Phase 2B viewport detaches to oldest retained row");
+    const std::optional<term::Terminal_render_snapshot> detached_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(detached_snapshot.has_value() &&
+        detached_snapshot->viewport.offset_from_tail ==
+            detached_snapshot->viewport.scrollback_rows &&
+        snapshot_row_text(*detached_snapshot, 0) == QStringLiteral("scroll-line-000"),
+        "flat-ring Phase 2B detached viewport captures retained top-row handle");
+
+    const int scrollback_before_detached_append =
+        detached_snapshot.has_value()
+            ? detached_snapshot->viewport.scrollback_rows
+            : 0;
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r\nphase2b-detached")),
+        "flat-ring Phase 2B detached append is accepted");
+    const std::optional<term::Terminal_render_snapshot> after_append_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(after_append_snapshot.has_value() &&
+        after_append_snapshot->viewport.scrollback_rows > scrollback_before_detached_append &&
+        after_append_snapshot->viewport.offset_from_tail ==
+            after_append_snapshot->viewport.scrollback_rows &&
+        snapshot_row_text(*after_append_snapshot, 0) == QStringLiteral("scroll-line-000"),
+        "flat-ring Phase 2B exact viewport handle preserves detached anchor across append");
+
+    ok &= check(session->resize(QSizeF(240.0, 80.0), {4, 24}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "flat-ring Phase 2B resize is accepted");
+    const std::optional<term::Terminal_render_snapshot> after_resize_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(after_resize_snapshot.has_value() &&
+        after_resize_snapshot->viewport.offset_from_tail ==
+            after_resize_snapshot->viewport.scrollback_rows &&
+        snapshot_row_text(*after_resize_snapshot, 0) == QStringLiteral("scroll-line-000"),
+        "flat-ring Phase 2B resize keeps detached viewport baseline without projection migration");
+
+    if (!after_resize_snapshot.has_value() ||
+        after_resize_snapshot->viewport.scrollback_rows <= 1)
+    {
+        ok &= check(false, "flat-ring Phase 2B shrink fixture has evictable scrollback");
+        return ok;
+    }
+
+    session->set_scrollback_limit(after_resize_snapshot->viewport.scrollback_rows - 1);
+    const std::optional<term::Terminal_render_snapshot> after_shrink_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(after_shrink_snapshot.has_value() &&
+        after_shrink_snapshot->viewport.scrollback_rows ==
+            after_resize_snapshot->viewport.scrollback_rows - 1 &&
+        after_shrink_snapshot->viewport.offset_from_tail ==
+            after_shrink_snapshot->viewport.scrollback_rows &&
+        snapshot_row_text(*after_shrink_snapshot, 0) == QStringLiteral("scroll-line-001"),
+        "flat-ring Phase 2B stale viewport handle clamps to oldest live retained row");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[3J")),
+        "flat-ring Phase 2B clear-history fixture is accepted");
+    const std::optional<term::Terminal_render_snapshot> after_clear_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(after_clear_snapshot.has_value() &&
+        after_clear_snapshot->viewport.scrollback_rows == 0 &&
+        after_clear_snapshot->viewport.offset_from_tail == 0 &&
+        after_clear_snapshot->viewport.follow_tail,
+        "flat-ring Phase 2B clear clamps stale detached viewport to tail");
+
+    return ok;
+}
+
+bool test_flat_ring_phase2c_public_projection_handle_resolution_policy()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.scrollback_limit = 20;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {4, 20};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "flat-ring Phase 2C public projection handle session starts");
+    ok &= check(backend->emit_output(numbered_scroll_lines(8)),
+        "flat-ring Phase 2C fixture creates public scrollback");
+
+    const std::optional<term::Terminal_render_snapshot> safe_content =
+        session->latest_content_render_snapshot_for_testing();
+    ok &= check(safe_content.has_value() &&
+        safe_content->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        safe_content->viewport.scrollback_rows > 0,
+        "flat-ring Phase 2C fixture publishes a primary public basis");
+    if (!safe_content.has_value()) {
+        return ok;
+    }
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld-hidden")),
+        "flat-ring Phase 2C fixture enters synchronized-output hold");
+    const std::optional<term::Terminal_public_projection> projection =
+        session->public_projection_for_testing();
+    bool projection_rows_have_handles = projection.has_value() && !projection->rows().empty();
+    if (projection.has_value()) {
+        for (const term::Terminal_public_projection_row& row : projection->rows()) {
+            projection_rows_have_handles =
+                projection_rows_have_handles &&
+                term::terminal_history_handle_has_identity(row.history_handle);
+        }
+    }
+    ok &= check(projection_rows_have_handles,
+        "flat-ring Phase 2C projection capture stores retained-history handles");
+
+    const term::Terminal_viewport_scroll_result public_scroll_result =
+        session->scroll_published_viewport_lines(1);
+    const std::optional<term::Terminal_render_snapshot> public_scroll =
+        session->latest_render_snapshot();
+    const std::optional<term::Terminal_public_release_intent> release_intent =
+        session->public_release_intent_for_testing();
+    ok &= check(public_scroll_result.action ==
+            term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
+        public_scroll.has_value() &&
+        public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+        public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
+        !snapshot_contains_text(*public_scroll, QStringLiteral("held-hidden")),
+        "flat-ring Phase 2C public scroll during hold uses copied projection payload only");
+    ok &= check(release_intent.has_value() &&
+        release_intent->detached_anchor.has_value() &&
+        term::terminal_history_handle_has_identity(
+            release_intent->detached_anchor->history_handle),
+        "flat-ring Phase 2C public release intent stores a retained-history anchor handle");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r\nhidden-live-growth")),
+        "flat-ring Phase 2C fixture grows hidden live scrollback");
+    const std::optional<term::Terminal_render_snapshot> after_hidden_growth =
+        session->latest_render_snapshot();
+    ok &= check(after_hidden_growth.has_value() &&
+        public_scroll.has_value() &&
+        after_hidden_growth->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+        after_hidden_growth->viewport.scrollback_rows == public_scroll->viewport.scrollback_rows &&
+        after_hidden_growth->viewport.offset_from_tail == public_scroll->viewport.offset_from_tail &&
+        !snapshot_contains_text(*after_hidden_growth, QStringLiteral("hidden-live-growth")),
+        "flat-ring Phase 2C hidden live growth stays isolated from the public projection");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "flat-ring Phase 2C fixture releases synchronized output");
+    const std::optional<term::Terminal_render_snapshot> release =
+        session->latest_render_snapshot();
+    ok &= check(release.has_value() &&
+        release->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        release->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+        release->public_scroll_diagnostics.release_reconciliation_result ==
+            term::Terminal_release_reconciliation_result::EXACT_ANCHOR,
+        "flat-ring Phase 2C exact public anchor resolves by retained-history handle");
+
+    term::Terminal_session_config stale_config = config;
+    stale_config.scrollback_limit = 6;
+
+    std::unique_ptr<term::Terminal_session> stale_session;
+    Scripted_backend* stale_backend = make_session(stale_session, stale_config);
+    ok &= check(stale_session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "flat-ring Phase 2C stale public anchor session starts");
+    ok &= check(stale_backend->emit_output(numbered_scroll_lines(12)),
+        "flat-ring Phase 2C stale fixture fills bounded scrollback");
+    ok &= check(stale_session->scroll_published_viewport_to_offset_from_tail(5).action ==
+        term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "flat-ring Phase 2C stale fixture detaches public viewport");
+    const std::optional<term::Terminal_render_snapshot> stale_anchor =
+        stale_session->latest_render_snapshot();
+    const QString expected_successor =
+        stale_anchor.has_value()
+            ? snapshot_row_text(*stale_anchor, 1)
+            : QString{};
+
+    ok &= check(stale_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+        "flat-ring Phase 2C stale fixture enters synchronized-output hold");
+    const std::optional<term::Terminal_public_release_intent> stale_intent =
+        stale_session->public_release_intent_for_testing();
+    ok &= check(stale_intent.has_value() &&
+        stale_intent->detached_anchor.has_value() &&
+        term::terminal_history_handle_has_identity(
+            stale_intent->detached_anchor->history_handle),
+        "flat-ring Phase 2C stale fixture stores a public anchor handle before eviction");
+
+    ok &= check(stale_backend->emit_output(
+            QByteArrayLiteral("\r\nphase2c-new-a\r\nphase2c-new-b\x1b[?2026l")),
+        "flat-ring Phase 2C stale fixture evicts the public anchor and releases");
+    const std::optional<term::Terminal_render_snapshot> stale_release =
+        stale_session->latest_render_snapshot();
+    ok &= check(stale_release.has_value() &&
+        !expected_successor.isEmpty() &&
+        snapshot_row_text(*stale_release, 0) == expected_successor &&
+        stale_release->public_scroll_diagnostics.diagnostic_reason ==
+            term::Terminal_public_scroll_diagnostic_reason::DETACHED_ANCHOR_NOT_RETAINED &&
+        stale_release->public_scroll_diagnostics.release_reconciliation_result ==
+            term::Terminal_release_reconciliation_result::NEAREST_SUCCESSOR,
+        "flat-ring Phase 2C stale public anchor reconciles to nearest surviving live row");
+
+    return ok;
+}
+
 bool test_exit_failed_start_and_double_stop()
 {
     bool ok = true;
@@ -12459,7 +13199,7 @@ int main()
     ok &= test_selection_snapshot_during_blocked_publication();
     ok &= test_blocked_detach_resize_snapshot_metadata_coherence();
     ok &= test_selection_phase2_internal_state_and_lease();
-    ok &= test_selection_phase2_replacement_empty_cancel_and_eviction();
+    ok &= test_selection_phase2_replacement_empty_cancel_and_payload_detach();
     ok &= test_selection_phase2_model_semantic_flags();
     ok &= test_selection_phase2_session_lease_basis_advances();
     ok &= test_selection_phase3_line_lease_provenance_capture();
@@ -12527,6 +13267,13 @@ int main()
     ok &= test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback();
     ok &= test_cursor_home_blank_row_partial_repaint_does_not_synthesize_primary_scrollback();
     ok &= test_primary_repaint_recovery_toggle_propagates_to_model();
+    ok &= test_flat_ring_phase0_retained_history_contract_baseline();
+    ok &= test_flat_ring_phase0_recovered_provenance_baseline();
+    ok &= test_flat_ring_phase1_history_handle_resolution_statuses();
+    ok &= test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation();
+    ok &= test_flat_ring_phase2a_selection_handle_resolution_policy();
+    ok &= test_flat_ring_phase2b_viewport_handle_resolution_policy();
+    ok &= test_flat_ring_phase2c_public_projection_handle_resolution_policy();
     ok &= test_parser_notifications_reach_session_notifications();
     ok &= test_bell_policy_coalesces_with_deterministic_clock();
     ok &= test_parser_state_crosses_backend_output_chunks();

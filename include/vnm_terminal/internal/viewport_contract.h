@@ -70,7 +70,6 @@ public:
     Terminal_viewport_result set_visible_rows(int rows);
 
     void set_scrollback_rows(int rows);
-    void sync_scrollback_rows(int rows, int evicted_rows);
 
     Terminal_viewport_scroll_result scroll_lines(int line_delta);
     Terminal_viewport_scroll_result scroll_pages(int page_delta);

@@ -51,6 +51,14 @@ bool provenance_describes_same_retained_fragment_source(
         left.content_generation == right.content_generation;
 }
 
+terminal_history_handle_t projection_history_handle_from_provenance(
+    const Terminal_render_line_provenance& provenance)
+{
+    return terminal_history_handle_from_retained_identity(
+        provenance.retained_line_id,
+        provenance.content_generation);
+}
+
 bool grid_sizes_match(terminal_grid_size_t left, terminal_grid_size_t right)
 {
     return left.rows == right.rows && left.columns == right.columns;
@@ -155,6 +163,8 @@ Terminal_public_projection_row copied_projection_row(
     row.public_row            = public_row;
     row.provenance            =
         snapshot.visible_line_provenance[static_cast<std::size_t>(snapshot_row)];
+    row.history_handle        =
+        projection_history_handle_from_provenance(row.provenance);
     row.visual_fragment_index = visual_fragment_index;
     row.visual_fragment_index_is_exact = visual_fragment_index_is_exact;
 
@@ -360,8 +370,20 @@ std::vector<Terminal_public_projection_row> copied_primary_projection_rows(
                 continue;
             }
 
-            copied_by_public_row[static_cast<std::size_t>(public_row)] =
+            Terminal_public_projection_row copied_row =
                 copied_projection_row(row_snapshot, snapshot_row, public_row, 0, false);
+            const std::optional<terminal_history_handle_t> history_handle =
+                safe_model.retained_history_handle_at_logical_row(
+                    Terminal_buffer_id::PRIMARY,
+                    public_row);
+            if (!history_handle.has_value()) {
+                safe_basis_matches_entry_boundary = false;
+                return {};
+            }
+
+            copied_row.history_handle = *history_handle;
+            copied_by_public_row[static_cast<std::size_t>(public_row)] =
+                std::move(copied_row);
             copied_public_rows[static_cast<std::size_t>(public_row)] = true;
         }
 
@@ -554,6 +576,7 @@ void Terminal_public_viewport_controller::initialize_from_projection(
     for (const Terminal_public_projection_row& row : projection.rows()) {
         copied_row_metadata.push_back({
             row.provenance,
+            row.history_handle,
             row.visual_fragment_index,
             row.visual_fragment_index_is_exact,
         });
@@ -760,15 +783,13 @@ void Terminal_public_viewport_controller::refresh_detached_anchor()
         static_cast<std::size_t>(first_public_row - m_first_copied_public_row);
     const Terminal_public_projection_row_metadata& metadata =
         m_copied_row_metadata[copied_index];
-    const Terminal_render_line_provenance& provenance = metadata.provenance;
 
     Terminal_public_viewport_anchor anchor;
     anchor.public_projection_generation = m_release_intent.public_projection_generation;
     anchor.active_buffer                 = m_release_intent.public_viewport.active_buffer;
     anchor.active_buffer_epoch           = m_active_buffer_epoch;
     anchor.geometry_generation           = m_content_basis.grid_reflow_generation;
-    anchor.retained_line_id              = provenance.retained_line_id;
-    anchor.retained_line_content_generation = provenance.content_generation;
+    anchor.history_handle                = metadata.history_handle;
     anchor.visual_fragment_index = metadata.visual_fragment_index;
     anchor.visual_fragment_index_is_exact =
         metadata.visual_fragment_index_is_exact;

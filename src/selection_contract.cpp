@@ -174,50 +174,6 @@ void Selection_contract_controller::update_visual_lease_source(
     m_visual_lease->viewport_mapping      = viewport_mapping;
 }
 
-bool Selection_contract_controller::apply_backing_event(
-    terminal_selection_backing_event_t event)
-{
-    if (event.kind == Terminal_selection_backing_event_kind::NONE) {
-        return false;
-    }
-
-    if (event.kind !=
-        Terminal_selection_backing_event_kind::PRIMARY_SCROLLBACK_EVICTION)
-    {
-        return false;
-    }
-
-    if (!m_has_selection || event.evicted_rows <= 0) {
-        return false;
-    }
-
-    if (first_selected_row(m_range) < event.evicted_rows) {
-        m_range.mode = Terminal_selection_mode::NONE;
-        clear_visual_lease();
-        m_internal_state =
-            m_selected_text.has_value()
-                ? Terminal_selection_internal_state::PAYLOAD_ONLY
-                : Terminal_selection_internal_state::NONE;
-        if (m_internal_state == Terminal_selection_internal_state::NONE) {
-            m_has_selection = false;
-            m_anchor_domain = Terminal_selection_anchor_domain::NONE;
-        }
-        else {
-            m_anchor_domain = Terminal_selection_anchor_domain::PAYLOAD_ONLY;
-        }
-        return true;
-    }
-
-    m_range.start.row -= event.evicted_rows;
-    m_range.end.row   -= event.evicted_rows;
-    if (m_visual_lease.has_value()) {
-        m_visual_lease->selected_range = m_range;
-        m_visual_lease->anchor         = m_range.start;
-        m_visual_lease->extent         = m_range.end;
-    }
-    return true;
-}
-
 Terminal_selection_result Selection_contract_controller::selected_text() const
 {
     if (!m_has_selection) {
