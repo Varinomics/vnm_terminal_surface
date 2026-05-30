@@ -33,6 +33,9 @@ struct Benchmark_totals
     std::uint64_t snapshot_cells = 0U;
     std::uint64_t snapshot_dirty_rows_visible = 0U;
     std::uint64_t frame_cell_pass_input_cells = 0U;
+    std::uint64_t frame_dirty_row_lookup_count = 0U;
+    std::uint64_t frame_dirty_row_range_lookup_count = 0U;
+    std::uint64_t frame_dirty_row_range_scan_steps = 0U;
     std::uint64_t frame_packed_pass_cells_scanned = 0U;
     std::uint64_t frame_packed_data_passes_skipped = 0U;
     std::uint64_t frame_packed_inline_fallbacks = 0U;
@@ -272,6 +275,12 @@ void accumulate_frame_stats(
 
     totals.frame_cell_pass_input_cells +=
         static_cast<std::uint64_t>(frame.stats.cell_pass_input_cells);
+    totals.frame_dirty_row_lookup_count +=
+        static_cast<std::uint64_t>(frame.stats.dirty_row_lookup_count);
+    totals.frame_dirty_row_range_lookup_count +=
+        static_cast<std::uint64_t>(frame.stats.dirty_row_range_lookup_count);
+    totals.frame_dirty_row_range_scan_steps +=
+        static_cast<std::uint64_t>(frame.stats.dirty_row_range_scan_steps);
     totals.frame_packed_pass_cells_scanned +=
         static_cast<std::uint64_t>(frame.stats.packed_pass_cells_scanned);
     totals.frame_packed_data_passes_skipped +=
@@ -392,6 +401,13 @@ int main(int argc, char** argv)
         "snapshot_dirty_rows_visible_per_frame",
         static_cast<double>(totals.snapshot_dirty_rows_visible) / frames);
     print_metric("frame_cell_pass_input_cells", totals.frame_cell_pass_input_cells);
+    print_metric("frame_dirty_row_lookup_count", totals.frame_dirty_row_lookup_count);
+    print_metric(
+        "frame_dirty_row_range_lookup_count",
+        totals.frame_dirty_row_range_lookup_count);
+    print_metric(
+        "frame_dirty_row_range_scan_steps",
+        totals.frame_dirty_row_range_scan_steps);
     print_metric("frame_packed_pass_cells_scanned", totals.frame_packed_pass_cells_scanned);
     print_metric("frame_packed_data_passes_skipped", totals.frame_packed_data_passes_skipped);
     print_metric("frame_packed_inline_fallbacks", totals.frame_packed_inline_fallbacks);
