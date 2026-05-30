@@ -3471,6 +3471,51 @@ Text_dirty_rebuild_reason text_dirty_rebuild_reason(
     return Text_dirty_rebuild_reason::KEY_MISMATCH;
 }
 
+void record_text_descriptor_mismatch_attribution(
+    terminal_renderer_stats_t&             stats,
+    const Text_resource_row_descriptor&    old_descriptor,
+    const Text_resource_row_descriptor&    current_descriptor)
+{
+    // These counters are non-exclusive row-event attribution. A single row
+    // descriptor mismatch can increment multiple categories, but each category
+    // increments at most once for that row.
+    if (old_descriptor.runs.size() != current_descriptor.runs.size()) {
+        ++stats.text_descriptor_mismatch_run_count;
+    }
+
+    bool text_mismatch       = false;
+    bool foreground_mismatch = false;
+    bool geometry_mismatch   = false;
+    bool baseline_mismatch   = false;
+
+    const std::size_t comparable_run_count =
+        std::min(old_descriptor.runs.size(), current_descriptor.runs.size());
+    for (std::size_t index = 0U; index < comparable_run_count; ++index) {
+        const Text_resource_row_run_descriptor& old_run     = old_descriptor.runs[index];
+        const Text_resource_row_run_descriptor& current_run = current_descriptor.runs[index];
+
+        text_mismatch       = text_mismatch       || old_run.text            != current_run.text;
+        foreground_mismatch = foreground_mismatch || old_run.foreground_rgba != current_run.foreground_rgba;
+        geometry_mismatch   = geometry_mismatch   || old_run.column          != current_run.column ||
+                              old_run.rect        != current_run.rect;
+        baseline_mismatch   = baseline_mismatch   || old_run.baseline_x      != current_run.baseline_x ||
+                              old_run.baseline_y  != current_run.baseline_y;
+    }
+
+    if (text_mismatch) {
+        ++stats.text_descriptor_mismatch_text;
+    }
+    if (foreground_mismatch) {
+        ++stats.text_descriptor_mismatch_foreground;
+    }
+    if (geometry_mismatch) {
+        ++stats.text_descriptor_mismatch_geometry;
+    }
+    if (baseline_mismatch) {
+        ++stats.text_descriptor_mismatch_baseline;
+    }
+}
+
 void record_text_dirty_rebuild_reason(
     terminal_renderer_stats_t& stats,
     Text_dirty_rebuild_reason  reason)
@@ -3757,6 +3802,15 @@ void sync_text_resource_nodes(
                 failed,
                 text_leaf_nodes_created);
         if (node != nullptr) {
+            if (dirty_group &&
+                dirty_rebuild_reason == Text_dirty_rebuild_reason::DESCRIPTOR_MISMATCH)
+            {
+                record_text_descriptor_mismatch_attribution(
+                    stats,
+                    *old_slot->text_resource_descriptor,
+                    *text_resource_descriptor);
+            }
+
             if (old_slot.has_value()) {
                 VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::replace_cache_entry");
 
@@ -5375,6 +5429,16 @@ void accumulate_renderer_stats(
         static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_old_descriptor_missing);
     total.text_dirty_rebuilds_with_descriptor_mismatch +=
         static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_descriptor_mismatch);
+    total.text_descriptor_mismatch_run_count +=
+        static_cast<std::uint64_t>(stats.text_descriptor_mismatch_run_count);
+    total.text_descriptor_mismatch_text +=
+        static_cast<std::uint64_t>(stats.text_descriptor_mismatch_text);
+    total.text_descriptor_mismatch_foreground +=
+        static_cast<std::uint64_t>(stats.text_descriptor_mismatch_foreground);
+    total.text_descriptor_mismatch_geometry +=
+        static_cast<std::uint64_t>(stats.text_descriptor_mismatch_geometry);
+    total.text_descriptor_mismatch_baseline +=
+        static_cast<std::uint64_t>(stats.text_descriptor_mismatch_baseline);
     total.text_dirty_rebuilds_with_key_mismatch +=
         static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_key_mismatch);
     total.rect_resource_rects_before_coalescing  += static_cast<std::uint64_t>(

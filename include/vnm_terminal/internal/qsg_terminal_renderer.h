@@ -139,6 +139,11 @@ struct terminal_renderer_stats_t
     int            text_dirty_rebuilds_with_descriptor_ineligible       = 0;
     int            text_dirty_rebuilds_with_old_descriptor_missing      = 0;
     int            text_dirty_rebuilds_with_descriptor_mismatch         = 0;
+    int            text_descriptor_mismatch_run_count                   = 0;
+    int            text_descriptor_mismatch_text                        = 0;
+    int            text_descriptor_mismatch_foreground                  = 0;
+    int            text_descriptor_mismatch_geometry                    = 0;
+    int            text_descriptor_mismatch_baseline                    = 0;
     int            text_dirty_rebuilds_with_key_mismatch                = 0;
     int            rect_resource_rects_before_coalescing                = 0;
     int            rect_resource_rects_after_coalescing                 = 0;
@@ -269,6 +274,11 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_dirty_rebuilds_with_descriptor_ineligible       = 0U;
     std::uint64_t  text_dirty_rebuilds_with_old_descriptor_missing      = 0U;
     std::uint64_t  text_dirty_rebuilds_with_descriptor_mismatch         = 0U;
+    std::uint64_t  text_descriptor_mismatch_run_count                   = 0U;
+    std::uint64_t  text_descriptor_mismatch_text                        = 0U;
+    std::uint64_t  text_descriptor_mismatch_foreground                  = 0U;
+    std::uint64_t  text_descriptor_mismatch_geometry                    = 0U;
+    std::uint64_t  text_descriptor_mismatch_baseline                    = 0U;
     std::uint64_t  text_dirty_rebuilds_with_key_mismatch                = 0U;
     std::uint64_t  rect_resource_rects_before_coalescing                = 0U;
     std::uint64_t  rect_resource_rects_after_coalescing                 = 0U;
