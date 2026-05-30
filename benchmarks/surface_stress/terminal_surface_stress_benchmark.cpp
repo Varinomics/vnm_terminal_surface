@@ -45,6 +45,33 @@ struct Benchmark_totals
 
 using Clock = std::chrono::steady_clock;
 
+template <typename Stats>
+int packed_data_passes_skipped(const Stats& stats)
+{
+    if constexpr (requires { stats.packed_data_passes_skipped; }) {
+        return stats.packed_data_passes_skipped;
+    }
+    return 0;
+}
+
+template <typename Stats>
+int packed_inline_fallbacks(const Stats& stats)
+{
+    if constexpr (requires { stats.packed_inline_fallbacks; }) {
+        return stats.packed_inline_fallbacks;
+    }
+    return 0;
+}
+
+template <typename Stats>
+int packed_graphic_cells_inlined(const Stats& stats)
+{
+    if constexpr (requires { stats.packed_graphic_cells_inlined; }) {
+        return stats.packed_graphic_cells_inlined;
+    }
+    return 0;
+}
+
 double elapsed_ms(Clock::time_point begin, Clock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -248,11 +275,11 @@ void accumulate_frame_stats(
     totals.frame_packed_pass_cells_scanned +=
         static_cast<std::uint64_t>(frame.stats.packed_pass_cells_scanned);
     totals.frame_packed_data_passes_skipped +=
-        static_cast<std::uint64_t>(frame.stats.packed_data_passes_skipped);
+        static_cast<std::uint64_t>(packed_data_passes_skipped(frame.stats));
     totals.frame_packed_inline_fallbacks +=
-        static_cast<std::uint64_t>(frame.stats.packed_inline_fallbacks);
+        static_cast<std::uint64_t>(packed_inline_fallbacks(frame.stats));
     totals.frame_packed_graphic_cells_inlined +=
-        static_cast<std::uint64_t>(frame.stats.packed_graphic_cells_inlined);
+        static_cast<std::uint64_t>(packed_graphic_cells_inlined(frame.stats));
     totals.frame_text_runs_emitted +=
         static_cast<std::uint64_t>(frame.stats.text_runs_emitted);
     totals.frame_graphic_rects_emitted +=
