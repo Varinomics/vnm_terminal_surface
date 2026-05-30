@@ -113,6 +113,8 @@ struct terminal_renderer_stats_t
     int            text_groups_clean                                    = 0;
     int            text_clean_reuse_skips                               = 0;
     int            text_resource_descriptor_reuses                      = 0;
+    int            text_resource_descriptor_builds                      = 0;
+    int            text_resource_descriptor_clean_reuse_skips           = 0;
     int            text_key_builds                                      = 0;
     std::uint64_t  text_key_bytes                                       = 0U;
     int            rect_key_builds                                      = 0;
@@ -132,6 +134,12 @@ struct terminal_renderer_stats_t
     int            text_key_match_reuses                                = 0;
     int            text_dirty_rows_rebuilt                              = 0;
     int            text_clean_rows_rebuilt                              = 0;
+    int            text_dirty_rebuilds_without_old_slot                 = 0;
+    int            text_dirty_rebuilds_with_frame_key_mismatch          = 0;
+    int            text_dirty_rebuilds_with_descriptor_ineligible       = 0;
+    int            text_dirty_rebuilds_with_old_descriptor_missing      = 0;
+    int            text_dirty_rebuilds_with_descriptor_mismatch         = 0;
+    int            text_dirty_rebuilds_with_key_mismatch                = 0;
     int            rect_resource_rects_before_coalescing                = 0;
     int            rect_resource_rects_after_coalescing                 = 0;
     int            background_row_rects_before_coalescing               = 0;
@@ -235,6 +243,8 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_groups_clean                                    = 0U;
     std::uint64_t  text_clean_reuse_skips                               = 0U;
     std::uint64_t  text_resource_descriptor_reuses                      = 0U;
+    std::uint64_t  text_resource_descriptor_builds                      = 0U;
+    std::uint64_t  text_resource_descriptor_clean_reuse_skips           = 0U;
     std::uint64_t  text_key_builds                                      = 0U;
     std::uint64_t  text_key_bytes                                       = 0U;
     std::uint64_t  rect_key_builds                                      = 0U;
@@ -254,6 +264,12 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_key_match_reuses                                = 0U;
     std::uint64_t  text_dirty_rows_rebuilt                              = 0U;
     std::uint64_t  text_clean_rows_rebuilt                              = 0U;
+    std::uint64_t  text_dirty_rebuilds_without_old_slot                 = 0U;
+    std::uint64_t  text_dirty_rebuilds_with_frame_key_mismatch          = 0U;
+    std::uint64_t  text_dirty_rebuilds_with_descriptor_ineligible       = 0U;
+    std::uint64_t  text_dirty_rebuilds_with_old_descriptor_missing      = 0U;
+    std::uint64_t  text_dirty_rebuilds_with_descriptor_mismatch         = 0U;
+    std::uint64_t  text_dirty_rebuilds_with_key_mismatch                = 0U;
     std::uint64_t  rect_resource_rects_before_coalescing                = 0U;
     std::uint64_t  rect_resource_rects_after_coalescing                 = 0U;
     std::uint64_t  background_row_rects_before_coalescing               = 0U;

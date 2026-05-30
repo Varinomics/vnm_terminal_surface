@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/cell_stable_shaping.h"
 #include "vnm_terminal/internal/render_snapshot.h"
+#include <QByteArray>
 #include <QColor>
 #include <QPointF>
 #include <QRectF>
@@ -364,6 +365,7 @@ struct Terminal_render_frame
     terminal_grid_size_t                           grid_size;
     Terminal_viewport_state                        viewport;
     terminal_cell_metrics_t                        cell_metrics;
+    QByteArray                                      text_style_key;
     std::vector<Terminal_render_rect>              background_rects;
     std::vector<Terminal_render_rect>              selection_rects;
     std::vector<Terminal_render_rect>              graphic_rects;

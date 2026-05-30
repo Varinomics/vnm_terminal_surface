@@ -1956,6 +1956,12 @@ void append_cache_key_string(QByteArray& key, const QString& field)
     }
 }
 
+void append_cache_key_byte_array(QByteArray& key, const QByteArray& field)
+{
+    append_cache_key_value(key, static_cast<std::uint64_t>(field.size()));
+    key.append(field);
+}
+
 void append_cache_key_size(QByteArray& key, std::size_t value)
 {
     append_cache_key_value(key, static_cast<std::uint64_t>(value));
@@ -3093,6 +3099,35 @@ QString font_cache_key(const QFont& font)
     return font.toString();
 }
 
+QByteArray text_style_cache_key(
+    const Terminal_render_snapshot&    snapshot,
+    const Terminal_render_options&     options)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("text_style_cache_key");
+
+    QByteArray key;
+    key.reserve(
+        static_cast<qsizetype>(
+            sizeof(std::uint64_t) +
+            sizeof(char)          +
+            snapshot.styles.size() * (2U * sizeof(std::uint32_t) + 2U * sizeof(char))));
+    append_cache_key_bool(key, options.underline_hyperlinks);
+    append_cache_key_size(key, snapshot.styles.size());
+    for (const Terminal_text_style& style : snapshot.styles) {
+        const render_style_attributes_t attributes =
+            render_style_attributes(style, snapshot);
+        append_cache_key_value(
+            key,
+            static_cast<std::uint32_t>(attributes.foreground.rgba()));
+        append_cache_key_value(
+            key,
+            static_cast<std::uint32_t>(attributes.background.rgba()));
+        append_cache_key_bool(key, attributes.underline);
+        append_cache_key_bool(key, attributes.strike);
+    }
+    return key;
+}
+
 QByteArray text_frame_cache_key(
     const Terminal_render_frame&   frame,
     const QString&                 font_key)
@@ -3117,6 +3152,7 @@ QByteArray text_frame_cache_key(
     append_cache_key_value(key, frame.grid_size.rows);
     append_cache_key_value(key, frame.grid_size.columns);
     append_cache_key_value(key, static_cast<int>(frame.viewport.active_buffer));
+    append_cache_key_byte_array(key, frame.text_style_key);
     return key;
 }
 
@@ -3352,26 +3388,37 @@ bool text_resource_descriptor_run_is_eligible(
         !run.clip_rect.isValid();
 }
 
-std::optional<Text_resource_row_descriptor> text_resource_row_descriptor(
+bool text_resource_descriptor_is_eligible(
     const Terminal_render_frame&       frame,
     const row_text_group_t&            group)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("text_resource_row_descriptor");
+    VNM_TERMINAL_PROFILE_SCOPE("text_resource_descriptor_eligibility");
 
     if (row_has_cursor_text_run(frame, group.viewport_row) ||
         row_has_preedit_caret(frame, group.viewport_row))
     {
-        return std::nullopt;
+        return false;
     }
+
+    for (const Terminal_render_text_run* run_ptr : group.runs) {
+        const Terminal_render_text_run& run = *run_ptr;
+        if (!text_resource_descriptor_run_is_eligible(run, group)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+Text_resource_row_descriptor text_resource_row_descriptor(
+    const row_text_group_t&    group)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("text_resource_row_descriptor");
 
     Text_resource_row_descriptor descriptor;
     descriptor.runs.reserve(group.runs.size());
     for (const Terminal_render_text_run* run_ptr : group.runs) {
         const Terminal_render_text_run& run = *run_ptr;
-        if (!text_resource_descriptor_run_is_eligible(run, group)) {
-            return std::nullopt;
-        }
-
         const QRectF local_rect = row_local_rect(run.rect, group.row_top);
         descriptor.runs.push_back({
             run.column,
@@ -3384,6 +3431,70 @@ std::optional<Text_resource_row_descriptor> text_resource_row_descriptor(
     }
 
     return descriptor;
+}
+
+enum class Text_dirty_rebuild_reason
+{
+    WITHOUT_OLD_SLOT,
+    FRAME_KEY_MISMATCH,
+    DESCRIPTOR_INELIGIBLE,
+    OLD_DESCRIPTOR_MISSING,
+    DESCRIPTOR_MISMATCH,
+    KEY_MISMATCH,
+};
+
+Text_dirty_rebuild_reason text_dirty_rebuild_reason(
+    const std::optional<Terminal_scene_node::Text_resource_cache_slot>& old_slot,
+    bool                                                               same_text_frame_key,
+    const std::optional<Text_resource_row_descriptor>&                  descriptor)
+{
+    if (!old_slot.has_value()) {
+        return Text_dirty_rebuild_reason::WITHOUT_OLD_SLOT;
+    }
+
+    if (!same_text_frame_key) {
+        return Text_dirty_rebuild_reason::FRAME_KEY_MISMATCH;
+    }
+
+    if (!descriptor.has_value()) {
+        return Text_dirty_rebuild_reason::DESCRIPTOR_INELIGIBLE;
+    }
+
+    if (!old_slot->text_resource_descriptor.has_value()) {
+        return Text_dirty_rebuild_reason::OLD_DESCRIPTOR_MISSING;
+    }
+
+    if (old_slot->text_resource_descriptor != descriptor) {
+        return Text_dirty_rebuild_reason::DESCRIPTOR_MISMATCH;
+    }
+
+    return Text_dirty_rebuild_reason::KEY_MISMATCH;
+}
+
+void record_text_dirty_rebuild_reason(
+    terminal_renderer_stats_t& stats,
+    Text_dirty_rebuild_reason  reason)
+{
+    switch (reason) {
+    case Text_dirty_rebuild_reason::WITHOUT_OLD_SLOT:
+        ++stats.text_dirty_rebuilds_without_old_slot;
+        break;
+    case Text_dirty_rebuild_reason::FRAME_KEY_MISMATCH:
+        ++stats.text_dirty_rebuilds_with_frame_key_mismatch;
+        break;
+    case Text_dirty_rebuild_reason::DESCRIPTOR_INELIGIBLE:
+        ++stats.text_dirty_rebuilds_with_descriptor_ineligible;
+        break;
+    case Text_dirty_rebuild_reason::OLD_DESCRIPTOR_MISSING:
+        ++stats.text_dirty_rebuilds_with_old_descriptor_missing;
+        break;
+    case Text_dirty_rebuild_reason::DESCRIPTOR_MISMATCH:
+        ++stats.text_dirty_rebuilds_with_descriptor_mismatch;
+        break;
+    case Text_dirty_rebuild_reason::KEY_MISMATCH:
+        ++stats.text_dirty_rebuilds_with_key_mismatch;
+        break;
+    }
 }
 
 bool text_row_slot_order_changed(
@@ -3522,15 +3633,14 @@ void sync_text_resource_nodes(
             }
         }
 
-        std::optional<Text_resource_row_descriptor> text_resource_descriptor = text_resource_row_descriptor(
-            frame,
-            group);
+        const bool text_resource_descriptor_eligible =
+            text_resource_descriptor_is_eligible(frame, group);
         if (!dirty_group &&
             clean_row_cache_skip_available &&
             row_cache_identity_has_valid_retained_provenance(group.identity) &&
             old_slot.has_value() &&
-            text_resource_descriptor.has_value() &&
-            old_slot->text_resource_descriptor.has_value())
+            old_slot->text_resource_descriptor.has_value() &&
+            text_resource_descriptor_eligible)
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::clean_cache_skip");
 
@@ -3538,8 +3648,15 @@ void sync_text_resource_nodes(
             set_row_text_clip_rect(*old_slot, row_clip_rect);
             ++stats.text_content_reused;
             ++stats.text_clean_reuse_skips;
+            ++stats.text_resource_descriptor_clean_reuse_skips;
             new_slots.push_back(std::move(*old_slot));
             continue;
+        }
+
+        std::optional<Text_resource_row_descriptor> text_resource_descriptor;
+        if (text_resource_descriptor_eligible) {
+            ++stats.text_resource_descriptor_builds;
+            text_resource_descriptor = text_resource_row_descriptor(group);
         }
 
         if (same_text_frame_key &&
@@ -3560,6 +3677,10 @@ void sync_text_resource_nodes(
             continue;
         }
 
+        const Text_dirty_rebuild_reason dirty_rebuild_reason = text_dirty_rebuild_reason(
+            old_slot,
+            same_text_frame_key,
+            text_resource_descriptor);
         assign_row_local_text_runs(group.runs, group.row_top, local_runs);
         const Ascii_text_coalescing_context* coalescing_context = nullptr;
         bool use_coalesced_resource_runs = false;
@@ -3676,6 +3797,7 @@ void sync_text_resource_nodes(
             ++stats.text_content_rebuilds;
             if (dirty_group) {
                 ++stats.text_dirty_rows_rebuilt;
+                record_text_dirty_rebuild_reason(stats, dirty_rebuild_reason);
             }
             else {
                 ++stats.text_clean_rows_rebuilt;
@@ -5199,6 +5321,10 @@ void accumulate_renderer_stats(
     total.text_clean_reuse_skips += static_cast<std::uint64_t>(stats.text_clean_reuse_skips);
     total.text_resource_descriptor_reuses +=
         static_cast<std::uint64_t>(stats.text_resource_descriptor_reuses);
+    total.text_resource_descriptor_builds +=
+        static_cast<std::uint64_t>(stats.text_resource_descriptor_builds);
+    total.text_resource_descriptor_clean_reuse_skips +=
+        static_cast<std::uint64_t>(stats.text_resource_descriptor_clean_reuse_skips);
     total.text_key_builds       += static_cast<std::uint64_t>(stats.text_key_builds);
     total.text_key_bytes        += stats.text_key_bytes;
     total.rect_key_builds       += static_cast<std::uint64_t>(stats.rect_key_builds);
@@ -5229,6 +5355,18 @@ void accumulate_renderer_stats(
         static_cast<std::uint64_t>(stats.text_dirty_rows_rebuilt);
     total.text_clean_rows_rebuilt +=
         static_cast<std::uint64_t>(stats.text_clean_rows_rebuilt);
+    total.text_dirty_rebuilds_without_old_slot +=
+        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_without_old_slot);
+    total.text_dirty_rebuilds_with_frame_key_mismatch +=
+        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_frame_key_mismatch);
+    total.text_dirty_rebuilds_with_descriptor_ineligible +=
+        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_descriptor_ineligible);
+    total.text_dirty_rebuilds_with_old_descriptor_missing +=
+        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_old_descriptor_missing);
+    total.text_dirty_rebuilds_with_descriptor_mismatch +=
+        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_descriptor_mismatch);
+    total.text_dirty_rebuilds_with_key_mismatch +=
+        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_key_mismatch);
     total.rect_resource_rects_before_coalescing  += static_cast<std::uint64_t>(
         stats.rect_resource_rects_before_coalescing);
     total.rect_resource_rects_after_coalescing   += static_cast<std::uint64_t>(
@@ -6104,6 +6242,7 @@ Terminal_render_frame build_terminal_render_frame(
     frame.grid_size        = snapshot->grid_size;
     frame.viewport         = snapshot->viewport;
     frame.dirty_row_ranges = snapshot->dirty_row_ranges;
+    frame.text_style_key   = text_style_cache_key(*snapshot, options);
     frame.stats.visible_rows          = snapshot->grid_size.rows;
     frame.stats.cell_pass_input_cells = static_cast<int>(snapshot->cells.size());
     frame.stats.dirty_row_lookup_count += static_cast<int>(snapshot->cells.size());
