@@ -270,6 +270,9 @@ struct terminal_render_frame_stats_t
     int                                            packed_text_sidecars_disabled    = 0;
     int                                            packed_text_disabled_cells_skipped = 0;
     int                                            packed_graphic_candidates_classified = 0;
+    int                                            packed_graphic_cells_inlined     = 0;
+    int                                            packed_data_passes_skipped       = 0;
+    int                                            packed_inline_fallbacks          = 0;
     int                                            packed_cells_appended            = 0;
     int                                            dirty_row_lookup_count           = 0;
     int                                            cells_considered                = 0;
@@ -321,6 +324,9 @@ struct terminal_render_frame_cumulative_stats_t
     std::uint64_t                                  packed_text_sidecars_disabled    = 0U;
     std::uint64_t                                  packed_text_disabled_cells_skipped = 0U;
     std::uint64_t                                  packed_graphic_candidates_classified = 0U;
+    std::uint64_t                                  packed_graphic_cells_inlined     = 0U;
+    std::uint64_t                                  packed_data_passes_skipped       = 0U;
+    std::uint64_t                                  packed_inline_fallbacks          = 0U;
     std::uint64_t                                  packed_cells_appended            = 0U;
     std::uint64_t                                  dirty_row_lookup_count           = 0U;
     std::uint64_t                                  cells_considered                = 0U;
