@@ -2928,10 +2928,11 @@ bool test_qsg_snapshot_rendering(QGuiApplication& app)
         first_stats.frame_selection_rects == first_stats.frame.selection_rects_emitted &&
         first_stats.frame_dirty_row_ranges == 0 &&
         first_stats.frame_packed_rows == first_stats.frame.packed_rows &&
-        first_stats.frame_packed_text_cells ==
-            first_stats.frame.simple_content.eligible_after_all_gates_cells &&
+        first_stats.frame.simple_content.eligible_after_all_gates_cells == 5 &&
+        first_stats.frame_packed_text_cells == 0 &&
+        first_stats.frame.packed_text_cells == 0 &&
         first_stats.frame_packed_payload_bytes > 0U,
-        "first render reports frame vector sizes with packed sidecar payloads");
+        "first render reports frame vector sizes with QSG packed text sidecars disabled");
     ok &= check(first_stats.background_layer_rebuilt &&
         first_stats.selection_layer_rebuilt &&
         first_stats.graphic_layer_rebuilt &&
@@ -9774,7 +9775,7 @@ bool test_qsg_block_cursor_text_overlay_paths(QGuiApplication& app)
     const term::terminal_renderer_stats_t ascii_stats = term::VNM_TerminalSurface_render_bridge::last_renderer_stats(
         surface);
     ok &= check(ascii_stats.frame_cursor_text_runs == 1 &&
-        ascii_stats.frame_packed_text_cells == 3 &&
+        ascii_stats.frame_packed_text_cells == 0 &&
         ascii_stats.cursor_text_layer_rebuilt &&
         ascii_stats.route_fast_text_cells == 0,
         "ASCII block cursor text stays on the cursor overlay and canonical text routes");
@@ -9797,7 +9798,7 @@ bool test_qsg_block_cursor_text_overlay_paths(QGuiApplication& app)
     const term::terminal_renderer_stats_t complex_stats = term::VNM_TerminalSurface_render_bridge::last_renderer_stats(
         surface);
     ok &= check(complex_stats.frame_cursor_text_runs == 1 &&
-        complex_stats.frame_packed_text_cells == 2 &&
+        complex_stats.frame_packed_text_cells == 0 &&
         complex_stats.route_qt_text_layout_runs > 0 &&
         complex_stats.route_fast_text_cells == 0,
         "complex block cursor text uses the existing Qt text layout route");

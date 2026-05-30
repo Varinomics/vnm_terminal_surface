@@ -5087,6 +5087,18 @@ void accumulate_frame_stats(
     total.full_dirty_rows       += static_cast<std::uint64_t>(stats.full_dirty_rows);
     total.cell_pass_input_cells += static_cast<std::uint64_t>(stats.cell_pass_input_cells);
     total.packed_pass_input_cells += static_cast<std::uint64_t>(stats.packed_pass_input_cells);
+    total.packed_pass_cells_scanned +=
+        static_cast<std::uint64_t>(stats.packed_pass_cells_scanned);
+    total.packed_text_sidecars_enabled +=
+        static_cast<std::uint64_t>(stats.packed_text_sidecars_enabled);
+    total.packed_text_sidecars_disabled +=
+        static_cast<std::uint64_t>(stats.packed_text_sidecars_disabled);
+    total.packed_text_disabled_cells_skipped +=
+        static_cast<std::uint64_t>(stats.packed_text_disabled_cells_skipped);
+    total.packed_graphic_candidates_classified +=
+        static_cast<std::uint64_t>(stats.packed_graphic_candidates_classified);
+    total.packed_cells_appended +=
+        static_cast<std::uint64_t>(stats.packed_cells_appended);
     total.dirty_row_lookup_count += static_cast<std::uint64_t>(stats.dirty_row_lookup_count);
     total.cells_considered      += static_cast<std::uint64_t>(stats.cells_considered);
     total.cells_skipped_invalid += static_cast<std::uint64_t>(stats.cells_skipped_invalid);
@@ -5867,6 +5879,7 @@ void append_packed_text_cell(
             span.column_count += cell.display_width;
             append_packed_text_bytes(frame, span, cell.text);
             ++frame.stats.packed_text_cells;
+            ++frame.stats.packed_cells_appended;
             return;
         }
     }
@@ -5887,6 +5900,7 @@ void append_packed_text_cell(
     frame.packed_text_spans.push_back(span);
     ++row.text_span_count;
     ++frame.stats.packed_text_cells;
+    ++frame.stats.packed_cells_appended;
 }
 
 void append_packed_graphic_cell(
@@ -5911,6 +5925,7 @@ void append_packed_graphic_cell(
             frame.packed_graphic_codepoints.push_back(
                 static_cast<std::uint32_t>(cell.text.at(0).unicode()));
             ++frame.stats.packed_graphic_cells;
+            ++frame.stats.packed_cells_appended;
             return;
         }
     }
@@ -5934,6 +5949,7 @@ void append_packed_graphic_cell(
     frame.packed_graphic_spans.push_back(span);
     ++row.graphic_span_count;
     ++frame.stats.packed_graphic_cells;
+    ++frame.stats.packed_cells_appended;
 }
 
 std::uint64_t packed_payload_byte_count(const Terminal_render_frame& frame)
@@ -5962,12 +5978,16 @@ void build_terminal_render_frame_packed_data(
     bool                               ime_preedit_visible,
     int                                ime_preedit_row,
     int                                ime_preedit_column,
-    int                                ime_preedit_columns)
+    int                                ime_preedit_columns,
+    bool                               packed_text_sidecars_enabled)
 {
     VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data");
 
     frame.stats.packed_pass_input_cells = static_cast<int>(snapshot.cells.size());
-    frame.stats.dirty_row_lookup_count += static_cast<int>(snapshot.cells.size());
+    frame.stats.packed_text_sidecars_enabled =
+        packed_text_sidecars_enabled ? 1 : 0;
+    frame.stats.packed_text_sidecars_disabled =
+        packed_text_sidecars_enabled ? 0 : 1;
     if (snapshot.grid_size.rows <= 0 || snapshot.grid_size.columns <= 0) {
         return;
     }
@@ -5975,8 +5995,10 @@ void build_terminal_render_frame_packed_data(
     const std::vector<std::vector<const Terminal_render_cell*>> row_table =
         build_explicit_snapshot_row_table(snapshot);
     frame.packed_rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
-    frame.packed_text_spans.reserve(snapshot.cells.size() / 2U);
-    frame.packed_text_bytes.reserve(snapshot.cells.size());
+    if (packed_text_sidecars_enabled) {
+        frame.packed_text_spans.reserve(snapshot.cells.size() / 2U);
+        frame.packed_text_bytes.reserve(snapshot.cells.size());
+    }
     frame.packed_graphic_spans.reserve(snapshot.cells.size() / 8U);
     frame.packed_graphic_codepoints.reserve(snapshot.cells.size() / 8U);
 
@@ -5993,6 +6015,26 @@ void build_terminal_render_frame_packed_data(
 
         terminal_packed_render_row_t& packed_row = frame.packed_rows.back();
         for (const Terminal_render_cell* cell : row_table[static_cast<std::size_t>(row_index)]) {
+            ++frame.stats.packed_pass_cells_scanned;
+            const bool graphic_candidate = is_terminal_graphic_text(cell->text);
+            if (!packed_text_sidecars_enabled && !graphic_candidate) {
+                ++frame.stats.packed_text_disabled_cells_skipped;
+                continue;
+            }
+
+            if (block_cursor_covers_cell(*cell, snapshot.cursor, block_cursor_visible) ||
+                ime_preedit_covers_cell(
+                    *cell, ime_preedit_visible, ime_preedit_row,
+                    ime_preedit_column, ime_preedit_columns))
+            {
+                continue;
+            }
+
+            if (graphic_candidate) {
+                ++frame.stats.packed_graphic_candidates_classified;
+            }
+            ++frame.stats.dirty_row_lookup_count;
+            const bool dirty_row = snapshot_row_is_dirty(snapshot, cell->position.row);
             const bool has_decoration = cell_text_decoration_enabled(
                 *cell,
                 snapshot.styles.size(),
@@ -6002,14 +6044,7 @@ void build_terminal_render_frame_packed_data(
                 snapshot.grid_size,
                 snapshot.styles.size(),
                 has_decoration,
-                snapshot_row_is_dirty(snapshot, cell->position.row));
-            if (block_cursor_covers_cell(*cell, snapshot.cursor, block_cursor_visible) ||
-                ime_preedit_covers_cell(
-                    *cell, ime_preedit_visible, ime_preedit_row,
-                    ime_preedit_column, ime_preedit_columns))
-            {
-                continue;
-            }
+                dirty_row);
 
             if (classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY) {
                 append_packed_graphic_cell(
@@ -6020,7 +6055,7 @@ void build_terminal_render_frame_packed_data(
                 continue;
             }
 
-            if (!classification.fast_text_eligible) {
+            if (!packed_text_sidecars_enabled || !classification.fast_text_eligible) {
                 continue;
             }
 
@@ -6348,7 +6383,8 @@ Terminal_render_frame build_terminal_render_frame(
         ime_preedit_visible,
         ime_preedit_row,
         ime_preedit_column,
-        ime_preedit_columns);
+        ime_preedit_columns,
+        options.packed_text_sidecars_enabled);
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::selection");

@@ -1011,6 +1011,7 @@ term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurfa
     options.cursor_blink_enabled_override = surface.cursor_blink_enabled();
     options.visual_bell_enabled =
         surface.visual_bell_policy() == VNM_TerminalSurface::Bell_policy::ENABLED;
+    options.packed_text_sidecars_enabled = false;
     return options;
 }
 
