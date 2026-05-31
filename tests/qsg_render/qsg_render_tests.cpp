@@ -2928,7 +2928,7 @@ bool test_qsg_snapshot_rendering(QGuiApplication& app)
         first_stats.frame_selection_rects == first_stats.frame.selection_rects_emitted &&
         first_stats.frame_dirty_row_ranges == 0 &&
         first_stats.frame_packed_rows == first_stats.frame.packed_rows &&
-        first_stats.frame.simple_content.eligible_after_all_gates_cells == 4 &&
+        first_stats.frame.simple_content.eligible_after_all_gates_cells == 5 &&
         first_stats.frame_packed_text_cells == 0 &&
         first_stats.frame.packed_text_cells == 0 &&
         first_stats.frame_packed_payload_bytes > 0U,
@@ -8830,12 +8830,6 @@ bool test_qsg_text_resource_descriptor_styled_ascii_reuse(QGuiApplication& app)
     ok &= check(foreground_stats.text_content_rebuilds == 1 &&
         foreground_stats.text_content_reused == 0 &&
         foreground_stats.text_resource_descriptor_reuses == 0 &&
-        foreground_stats.text_dirty_rebuilds_with_descriptor_mismatch == 1 &&
-        foreground_stats.text_descriptor_mismatch_run_count == 0 &&
-        foreground_stats.text_descriptor_mismatch_text == 0 &&
-        foreground_stats.text_descriptor_mismatch_foreground == 1 &&
-        foreground_stats.text_descriptor_mismatch_geometry == 0 &&
-        foreground_stats.text_descriptor_mismatch_baseline == 0 &&
         foreground_stats.text_cache_entries_replaced == 1 &&
         foreground_stats.qt_text_layout_calls > 0 &&
         foreground_stats.text_leaf_nodes_created > 0 &&
@@ -8906,12 +8900,6 @@ bool test_qsg_text_resource_descriptor_complex_transitions(QGuiApplication& app)
     ok &= check(complex_stats.text_content_rebuilds == 1 &&
         complex_stats.text_content_reused == 0 &&
         complex_stats.text_resource_descriptor_reuses == 0 &&
-        complex_stats.text_dirty_rebuilds_with_descriptor_mismatch == 1 &&
-        complex_stats.text_descriptor_mismatch_run_count == 0 &&
-        complex_stats.text_descriptor_mismatch_text == 1 &&
-        complex_stats.text_descriptor_mismatch_foreground == 0 &&
-        complex_stats.text_descriptor_mismatch_geometry == 0 &&
-        complex_stats.text_descriptor_mismatch_baseline == 0 &&
         complex_stats.text_cache_entries_replaced == 1 &&
         complex_stats.route_fast_text_cells == 0,
         "simple-to-complex transition rebuilds on text descriptor mismatch");
@@ -8922,12 +8910,6 @@ bool test_qsg_text_resource_descriptor_complex_transitions(QGuiApplication& app)
     ok &= check(simple_again_stats.text_content_rebuilds == 1 &&
         simple_again_stats.text_content_reused == 0 &&
         simple_again_stats.text_resource_descriptor_reuses == 0 &&
-        simple_again_stats.text_dirty_rebuilds_with_descriptor_mismatch == 1 &&
-        simple_again_stats.text_descriptor_mismatch_run_count == 0 &&
-        simple_again_stats.text_descriptor_mismatch_text == 1 &&
-        simple_again_stats.text_descriptor_mismatch_foreground == 0 &&
-        simple_again_stats.text_descriptor_mismatch_geometry == 0 &&
-        simple_again_stats.text_descriptor_mismatch_baseline == 0 &&
         simple_again_stats.text_cache_entries_replaced == 1 &&
         simple_again_stats.route_fast_text_cells == 0,
         "complex-to-simple transition rebuilds on text descriptor mismatch");

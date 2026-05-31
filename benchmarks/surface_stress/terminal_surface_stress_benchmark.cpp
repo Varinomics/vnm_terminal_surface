@@ -75,6 +75,24 @@ int packed_graphic_cells_inlined(const Stats& stats)
     return 0;
 }
 
+template <typename Stats>
+int dirty_row_range_lookup_count(const Stats& stats)
+{
+    if constexpr (requires { stats.dirty_row_range_lookup_count; }) {
+        return stats.dirty_row_range_lookup_count;
+    }
+    return 0;
+}
+
+template <typename Stats>
+int dirty_row_range_scan_steps(const Stats& stats)
+{
+    if constexpr (requires { stats.dirty_row_range_scan_steps; }) {
+        return stats.dirty_row_range_scan_steps;
+    }
+    return 0;
+}
+
 double elapsed_ms(Clock::time_point begin, Clock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - begin).count();
@@ -278,9 +296,9 @@ void accumulate_frame_stats(
     totals.frame_dirty_row_lookup_count +=
         static_cast<std::uint64_t>(frame.stats.dirty_row_lookup_count);
     totals.frame_dirty_row_range_lookup_count +=
-        static_cast<std::uint64_t>(frame.stats.dirty_row_range_lookup_count);
+        static_cast<std::uint64_t>(dirty_row_range_lookup_count(frame.stats));
     totals.frame_dirty_row_range_scan_steps +=
-        static_cast<std::uint64_t>(frame.stats.dirty_row_range_scan_steps);
+        static_cast<std::uint64_t>(dirty_row_range_scan_steps(frame.stats));
     totals.frame_packed_pass_cells_scanned +=
         static_cast<std::uint64_t>(frame.stats.packed_pass_cells_scanned);
     totals.frame_packed_data_passes_skipped +=
