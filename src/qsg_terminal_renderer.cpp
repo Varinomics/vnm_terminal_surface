@@ -5838,15 +5838,81 @@ bool ime_preedit_covers_cell(
         cell_intersects_grid_columns(cell, ime_preedit_column, ime_preedit_columns);
 }
 
+struct Snapshot_dirty_row_flags
+{
+    int                        row_count = 0;
+    bool                       all_rows_dirty = false;
+    std::vector<unsigned char> row_flags;
+};
+
+Snapshot_dirty_row_flags build_snapshot_dirty_row_flags(
+    const std::vector<Terminal_render_dirty_row_range>& dirty_row_ranges,
+    int                                                row_count)
+{
+    if (row_count <= 0) {
+        return {};
+    }
+
+    if (dirty_row_ranges.size() == 1U) {
+        const Terminal_render_dirty_row_range& range = dirty_row_ranges.front();
+        const std::int64_t range_first_row =
+            static_cast<std::int64_t>(range.first_row);
+        const std::int64_t range_end_row =
+            range_first_row + static_cast<std::int64_t>(range.row_count);
+        if (range.row_count > 0 &&
+            range_first_row <= 0 &&
+            range_end_row >= static_cast<std::int64_t>(row_count))
+        {
+            return {row_count, true, {}};
+        }
+    }
+
+    Snapshot_dirty_row_flags dirty_row_flags;
+    dirty_row_flags.row_count = row_count;
+    dirty_row_flags.row_flags.resize(static_cast<std::size_t>(row_count), 0U);
+    for (const Terminal_render_dirty_row_range& range : dirty_row_ranges) {
+        if (range.row_count <= 0) {
+            continue;
+        }
+
+        const std::int64_t first_row_value =
+            std::max<std::int64_t>(static_cast<std::int64_t>(range.first_row), 0);
+        const std::int64_t end_row_value =
+            std::min<std::int64_t>(
+                static_cast<std::int64_t>(range.first_row) +
+                    static_cast<std::int64_t>(range.row_count),
+                static_cast<std::int64_t>(row_count));
+        if (end_row_value <= first_row_value) {
+            continue;
+        }
+
+        const int first_row = static_cast<int>(first_row_value);
+        const int end_row = static_cast<int>(end_row_value);
+        for (int row = first_row; row < end_row; ++row) {
+            dirty_row_flags.row_flags[static_cast<std::size_t>(row)] = 1U;
+        }
+    }
+    return dirty_row_flags;
+}
+
 bool snapshot_row_is_dirty(
-    const Terminal_render_snapshot&    snapshot,
+    const Snapshot_dirty_row_flags&    dirty_row_flags,
     int                                row)
 {
-    for (const Terminal_render_dirty_row_range& range : snapshot.dirty_row_ranges) {
-        if (row >= range.first_row && row < range.first_row + range.row_count) { return true;  }
-        if (row <  range.first_row)                                            { return false; }
+    if (row < 0) {
+        return false;
     }
-    return false;
+
+    const std::size_t row_index = static_cast<std::size_t>(row);
+    if (row_index >= static_cast<std::size_t>(dirty_row_flags.row_count)) {
+        return false;
+    }
+    if (dirty_row_flags.all_rows_dirty) {
+        return true;
+    }
+
+    return row_index < dirty_row_flags.row_flags.size() &&
+        dirty_row_flags.row_flags[row_index] != 0U;
 }
 
 std::vector<std::vector<const Terminal_render_cell*>> build_explicit_snapshot_row_table(
@@ -6009,6 +6075,7 @@ void finalize_packed_render_frame_stats(Terminal_render_frame& frame)
 void build_terminal_render_frame_packed_data(
     Terminal_render_frame&             frame,
     const Terminal_render_snapshot&    snapshot,
+    const Snapshot_dirty_row_flags&    dirty_row_flags,
     Render_style_attribute_cache&      style_attributes,
     bool                               block_cursor_visible,
     bool                               ime_preedit_visible,
@@ -6073,7 +6140,9 @@ void build_terminal_render_frame_packed_data(
                 ++frame.stats.packed_graphic_candidates_classified;
             }
             ++frame.stats.dirty_row_lookup_count;
-            const bool dirty_row = snapshot_row_is_dirty(snapshot, cell->position.row);
+            const bool dirty_row = snapshot_row_is_dirty(
+                dirty_row_flags,
+                cell->position.row);
             const bool has_decoration = cell_text_decoration_enabled(
                 *cell,
                 snapshot.styles.size(),
@@ -6154,6 +6223,11 @@ Terminal_render_frame build_terminal_render_frame(
         frame.stats.full_dirty_rows = frame.stats.dirty_rows;
     }
     const bool valid_grid = snapshot->grid_size.rows > 0 && snapshot->grid_size.columns > 0;
+    const Snapshot_dirty_row_flags dirty_row_flags = valid_grid
+        ? build_snapshot_dirty_row_flags(
+            snapshot->dirty_row_ranges,
+            snapshot->grid_size.rows)
+        : Snapshot_dirty_row_flags{};
     const Ime_preedit_state& ime_preedit =
         ime_preedit_override != nullptr ? *ime_preedit_override : snapshot->ime_preedit;
     const bool cursor_in_grid = valid_grid &&
@@ -6219,7 +6293,7 @@ Terminal_render_frame build_terminal_render_frame(
                 snapshot->grid_size,
                 snapshot->styles.size(),
                 classification_has_decoration,
-                snapshot_row_is_dirty(*snapshot, cell.position.row));
+                snapshot_row_is_dirty(dirty_row_flags, cell.position.row));
             const bool block_cursor_cell =
                 block_cursor_covers_cell(cell, snapshot->cursor, block_cursor_visible);
             const bool ime_preedit_cell = ime_preedit_covers_cell(
@@ -6419,6 +6493,7 @@ Terminal_render_frame build_terminal_render_frame(
     build_terminal_render_frame_packed_data(
         frame,
         *snapshot,
+        dirty_row_flags,
         style_attributes,
         block_cursor_visible,
         ime_preedit_visible,

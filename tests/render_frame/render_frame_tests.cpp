@@ -1084,6 +1084,43 @@ bool test_simple_content_classifier_and_stats()
     return ok;
 }
 
+bool test_fragmented_dirty_ranges_drive_simple_content_membership()
+{
+    bool ok = true;
+
+    term::Terminal_render_snapshot snapshot = empty_snapshot({4, 4});
+    snapshot.cursor.visible     = false;
+    snapshot.dirty_row_ranges   = {{0, 1}, {2, 1}};
+    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
+    snapshot.cells.push_back({.position = {1, 0}, .text = QStringLiteral("B")});
+    snapshot.cells.push_back({.position = {2, 0}, .text = QStringLiteral("C")});
+    snapshot.cells.push_back({.position = {3, 0}, .text = QStringLiteral("D")});
+
+    term::Terminal_render_options render_options = options();
+    render_options.packed_text_sidecars_enabled = true;
+    const term::Terminal_render_frame frame = build(snapshot, render_options);
+    const term::terminal_simple_content_stats_t& simple_stats =
+        frame.stats.simple_content;
+
+    ok &= check(frame.dirty_row_ranges.size() == 2U &&
+        frame.dirty_row_ranges[0].first_row == 0 &&
+        frame.dirty_row_ranges[0].row_count == 1 &&
+        frame.dirty_row_ranges[1].first_row == 2 &&
+        frame.dirty_row_ranges[1].row_count == 1,
+        "fragmented dirty ranges are preserved on the render frame");
+    ok &= check(simple_stats.eligible_cells == 4 &&
+        simple_stats.eligible_after_all_gates_cells == 4 &&
+        simple_stats.dirty_eligible_cells == 2 &&
+        simple_stats.clean_eligible_cells == 2,
+        "fragmented dirty ranges classify selected rows dirty and gaps clean");
+    ok &= check(frame.stats.dirty_row_lookup_count == 8,
+        "fragmented dirty row membership preserves logical lookup probe count");
+    ok &= check(frame.stats.packed_text_cells == 4,
+        "fragmented dirty row membership also feeds packed text sidecar classification");
+
+    return ok;
+}
+
 bool test_packed_text_rows_spans_and_order()
 {
     bool ok = true;
@@ -1405,6 +1442,7 @@ int main()
     ok &= test_preedit_override_takes_precedence_over_snapshot();
     ok &= test_frame_stats_classify_rendered_cells();
     ok &= test_simple_content_classifier_and_stats();
+    ok &= test_fragmented_dirty_ranges_drive_simple_content_membership();
     ok &= test_packed_text_rows_spans_and_order();
     ok &= test_packed_graphic_source_codepoint_spans();
     ok &= test_packed_graphics_exclude_unrepresented_cells();
