@@ -1204,6 +1204,13 @@ std::uint64_t ascii_text_coalescing_context_call_count(const VNM_TerminalSurface
     return profile_call_count(profile.root, "ascii_text_coalescing_context");
 }
 
+std::uint64_t row_local_text_runs_call_count(const VNM_TerminalSurface& surface)
+{
+    const term::Render_profile_snapshot_t profile = term::VNM_TerminalSurface_render_bridge::render_profiler_snapshot(
+        surface);
+    return profile_call_count(profile.root, "row_local_text_runs");
+}
+
 term::terminal_cell_metrics_t cell_metrics_for_font(const QFont& font)
 {
     const QFontMetricsF metrics(font);
@@ -3330,7 +3337,12 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
             "dense same-color row coalesces to one prepare_text_layout call");
         ok &= check(ascii_text_coalescing_context_call_count(surface) == 1U,
             "dense same-color row computes the ASCII coalescing font gate once");
+        ok &= check(row_local_text_runs_call_count(surface) == 0U,
+            "dense same-color row fuses row-localization into ASCII coalescing");
     }
+    ok &= check(stats.text_resource_runs_before_coalescing == 20 &&
+        stats.text_resource_runs_after_coalescing == 1,
+        "dense same-color row preserves text resource coalescing counters");
     ok &= check(stats.text_leaf_nodes_created == 1,
         "dense same-color row batches populated cells into one QSGTextNode leaf");
     ok &= check(stats.text_leaf_nodes_created < 20 / 4,
@@ -3575,6 +3587,8 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
             "multi-row dense render coalesces each row to one text layout");
         ok &= check(ascii_text_coalescing_context_call_count(surface) <= 1U,
             "multi-row dense render computes or reuses the ASCII coalescing font gate");
+        ok &= check(row_local_text_runs_call_count(surface) == 0U,
+            "multi-row dense render keeps every row on the fused ASCII coalescing path");
     }
 
     render_profiler->reset();
@@ -3593,6 +3607,8 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
             "single-cell row keeps one prepare_text_layout call");
         ok &= check(ascii_text_coalescing_context_call_count(surface) == 0U,
             "single-cell row skips the ASCII coalescing font gate");
+        ok &= check(row_local_text_runs_call_count(surface) == 1U,
+            "single-cell row falls back to row-local materialization");
     }
     return ok;
 }
@@ -3937,6 +3953,8 @@ bool test_qsg_text_coalescing_rejects_cell_width_drift(QGuiApplication& app)
             profiler.root_snapshot(),
             "ascii_text_coalescing_context") == 1U,
             "cell-width-drift direct QSG render evaluates the ASCII coalescing font gate once");
+        ok &= check(profile_call_count(profiler.root_snapshot(), "row_local_text_runs") == 1U,
+            "cell-width-drift direct QSG render falls back to row-local materialization");
     }
 
     term::terminal_renderer_stats_t cleanup_stats;
