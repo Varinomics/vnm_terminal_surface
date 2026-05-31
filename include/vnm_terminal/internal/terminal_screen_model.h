@@ -972,12 +972,6 @@ private:
         const std::vector<Cell>&       row,
         std::vector<Cell>&             visual_projection) const;
 
-    bool append_snapshot_viewport_row(
-        Terminal_render_snapshot&      snapshot,
-        const Terminal_viewport_state& viewport,
-        viewport_row_t                 viewport_row,
-        snapshot_row_t                 snapshot_row) const;
-
     void append_snapshot_cells_from_row(
         Terminal_render_snapshot&      snapshot,
         const std::vector<Cell>&       row,
@@ -991,6 +985,19 @@ private:
     std::optional<std::vector<Cell>> logical_row_cells(
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
+
+    std::optional<std::vector<Cell>> viewport_row_cells(
+        const Terminal_viewport_state& viewport,
+        int                            viewport_row) const;
+
+    std::optional<Terminal_retained_line_provenance> viewport_row_provenance(
+        const Terminal_viewport_state& viewport,
+        int                            viewport_row) const;
+
+    std::optional<std::map<std::uint64_t, QByteArray>>
+        viewport_row_retained_hyperlink_identity_keys(
+            const Terminal_viewport_state& viewport,
+            int                            viewport_row) const;
 
     bool retained_line_descriptor_logical_row(
         Terminal_buffer_id             buffer_id,

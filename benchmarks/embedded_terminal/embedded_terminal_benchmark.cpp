@@ -726,6 +726,24 @@ bool parse_nonnegative_int(
     return true;
 }
 
+template <typename Stats>
+qint64 dirty_row_range_lookup_count(const Stats& stats)
+{
+    if constexpr (requires { stats.dirty_row_range_lookup_count; }) {
+        return stats.dirty_row_range_lookup_count;
+    }
+    return 0;
+}
+
+template <typename Stats>
+qint64 dirty_row_range_scan_steps(const Stats& stats)
+{
+    if constexpr (requires { stats.dirty_row_range_scan_steps; }) {
+        return stats.dirty_row_range_scan_steps;
+    }
+    return 0;
+}
+
 QString normalized_output_path_key(const QString& path)
 {
     QString key = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
@@ -1990,8 +2008,6 @@ void add_renderer_stats(
     totals.paint_completed = totals.paint_completed && stats.paint_completed;
     add_simple_content_stats(totals.frame.simple_content, stats.frame.simple_content);
     totals.frame.dirty_row_lookup_count += stats.frame.dirty_row_lookup_count;
-    totals.frame.dirty_row_range_lookup_count += stats.frame.dirty_row_range_lookup_count;
-    totals.frame.dirty_row_range_scan_steps += stats.frame.dirty_row_range_scan_steps;
     totals.text_content_rebuilds   += stats.text_content_rebuilds;
     totals.text_content_reused     += stats.text_content_reused;
     totals.text_content_removed    += stats.text_content_removed;
@@ -2568,8 +2584,10 @@ void add_renderer_stats(
     totals.frame_overlay_rects            += stats.frame_overlay_rects;
     totals.frame_dirty_row_ranges         += stats.frame_dirty_row_ranges;
     totals.frame_dirty_row_lookup_count   += stats.frame.dirty_row_lookup_count;
-    totals.frame_dirty_row_range_lookup_count += stats.frame.dirty_row_range_lookup_count;
-    totals.frame_dirty_row_range_scan_steps += stats.frame.dirty_row_range_scan_steps;
+    totals.frame_dirty_row_range_lookup_count +=
+        dirty_row_range_lookup_count(stats.frame);
+    totals.frame_dirty_row_range_scan_steps +=
+        dirty_row_range_scan_steps(stats.frame);
     totals.frame_packed_rows              += stats.frame_packed_rows;
     totals.frame_packed_text_spans        += stats.frame_packed_text_spans;
     totals.frame_packed_text_cells        += stats.frame_packed_text_cells;

@@ -2888,15 +2888,39 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
 #endif
             const viewport_row_t viewport_row{row};
             const snapshot_row_t snapshot_row = snapshot_row_from_viewport(viewport_row);
-            const bool row_appended =
-                append_snapshot_viewport_row(snapshot, viewport, viewport_row, snapshot_row);
+            const std::optional<std::vector<Cell>> row_cells =
+                viewport_row_cells(viewport, row);
+            const std::size_t first_row_cell = snapshot.cells.size();
+            if (row_cells.has_value()) {
 #if VNM_TERMINAL_PROFILING_ENABLED
-            if (row_appended) {
                 ++rows_materialized;
-            }
-#else
-            (void)row_appended;
 #endif
+                append_snapshot_cells_from_row(snapshot, *row_cells, snapshot_row.value);
+            }
+            const std::optional<std::map<std::uint64_t, QByteArray>>
+                row_local_hyperlink_identity_keys =
+                    viewport_row_retained_hyperlink_identity_keys(viewport, row);
+            append_hyperlink_metadata_for_cells(
+                snapshot.hyperlinks,
+                snapshot.cells,
+                first_row_cell,
+                row_local_hyperlink_identity_keys.has_value()
+                    ? &*row_local_hyperlink_identity_keys
+                    : nullptr);
+
+            const std::optional<Terminal_retained_line_provenance> provenance =
+                viewport_row_provenance(viewport, row);
+            if (provenance.has_value()) {
+                const std::optional<primary_backing_row_t> backing_row =
+                    primary_backing_row_from_viewport(viewport, viewport_row);
+                const int logical_row =
+                    backing_row.has_value() ? backing_row->value : row;
+                snapshot.visible_line_provenance.push_back({
+                    static_cast<std::int64_t>(logical_row),
+                    provenance->retained_line_id,
+                    provenance->content_generation,
+                });
+            }
         }
 #if VNM_TERMINAL_PROFILING_ENABLED
         if (m_profile_stats.enabled) {
@@ -2999,6 +3023,66 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
     }
 
     return snapshot;
+}
+
+std::optional<Terminal_retained_line_provenance>
+Terminal_screen_model::viewport_row_provenance(
+    const Terminal_viewport_state& viewport,
+    int                            viewport_row) const
+{
+    const viewport_row_t row{viewport_row};
+    if (!viewport_row_is_valid(row)) {
+        return std::nullopt;
+    }
+
+    if (viewport.active_buffer == Terminal_buffer_id::ALTERNATE) {
+        const Terminal_screen_row* active_row =
+            alternate_active_row(active_grid_row_t{row.value});
+        return active_row != nullptr
+            ? std::optional<Terminal_retained_line_provenance>(
+                active_row->retained_line_provenance)
+            : std::nullopt;
+    }
+
+    const std::optional<primary_backing_row_t> backing_row =
+        primary_backing_row_from_viewport(viewport, row);
+    if (!backing_row.has_value()) {
+        return std::nullopt;
+    }
+
+    const std::optional<Terminal_screen_row> backing = primary_backing_row(*backing_row);
+    return backing.has_value()
+        ? std::optional<Terminal_retained_line_provenance>(
+            backing->retained_line_provenance)
+        : std::nullopt;
+}
+
+std::optional<std::map<std::uint64_t, QByteArray>>
+Terminal_screen_model::viewport_row_retained_hyperlink_identity_keys(
+    const Terminal_viewport_state& viewport,
+    int                            viewport_row) const
+{
+    const viewport_row_t row{viewport_row};
+    if (viewport.active_buffer != Terminal_buffer_id::PRIMARY ||
+        !viewport_row_is_valid(row))
+    {
+        return std::nullopt;
+    }
+
+    const std::optional<primary_backing_row_t> backing_row =
+        primary_backing_row_from_viewport(viewport, row);
+    if (!backing_row.has_value() || backing_row->value >= scrollback_size()) {
+        return std::nullopt;
+    }
+
+    const std::optional<retained_row_record_t> retained_record =
+        m_primary_backing.materialize_retained_history_record(
+            static_cast<std::size_t>(backing_row->value));
+    if (!retained_record.has_value()) {
+        return std::nullopt;
+    }
+
+    return retained_record->hyperlink_identity_keys;
 }
 
 Terminal_selection_result Terminal_screen_model::selected_text(
@@ -6989,79 +7073,6 @@ Terminal_screen_model::row_cells_for_current_geometry(
     return visual_projection;
 }
 
-bool Terminal_screen_model::append_snapshot_viewport_row(
-    Terminal_render_snapshot&      snapshot,
-    const Terminal_viewport_state& viewport,
-    viewport_row_t                 viewport_row,
-    snapshot_row_t                 snapshot_row) const
-{
-    if (!viewport_row_is_valid(viewport_row)) {
-        return false;
-    }
-
-    const std::size_t first_row_cell = snapshot.cells.size();
-    const auto append_materialized_row =
-        [&](const Terminal_screen_row& row,
-            int logical_row,
-            const std::map<std::uint64_t, QByteArray>* row_local_identity_keys) {
-            append_snapshot_cells_from_row(snapshot, row.cells, snapshot_row.value);
-            append_hyperlink_metadata_for_cells(
-                snapshot.hyperlinks,
-                snapshot.cells,
-                first_row_cell,
-                row_local_identity_keys);
-            snapshot.visible_line_provenance.push_back({
-                static_cast<std::int64_t>(logical_row),
-                row.retained_line_provenance.retained_line_id,
-                row.retained_line_provenance.content_generation,
-            });
-        };
-
-    if (viewport.active_buffer == Terminal_buffer_id::ALTERNATE) {
-        const Terminal_screen_row* active_row =
-            alternate_active_row(active_grid_row_t{viewport_row.value});
-        if (active_row == nullptr) {
-            return false;
-        }
-
-        append_materialized_row(*active_row, viewport_row.value, nullptr);
-        return true;
-    }
-
-    const std::optional<primary_backing_row_t> backing_row =
-        primary_backing_row_from_viewport(viewport, viewport_row);
-    if (!backing_row.has_value()) {
-        return false;
-    }
-
-    if (backing_row->value < scrollback_size()) {
-        const std::optional<retained_row_record_t> retained_record =
-            m_primary_backing.materialize_retained_history_record(
-                static_cast<std::size_t>(backing_row->value));
-        if (!retained_record.has_value()) {
-            return false;
-        }
-
-        append_materialized_row(
-            retained_record->row,
-            backing_row->value,
-            &retained_record->hyperlink_identity_keys);
-        return true;
-    }
-
-    const std::optional<active_grid_row_t> active_row =
-        active_grid_row_from_primary_backing(*backing_row);
-    if (!active_row.has_value()) {
-        return false;
-    }
-
-    append_materialized_row(
-        primary_active_grid_rows()[static_cast<std::size_t>(active_row->value)],
-        backing_row->value,
-        nullptr);
-    return true;
-}
-
 void Terminal_screen_model::append_snapshot_cells_from_row(
     Terminal_render_snapshot&  snapshot,
     const std::vector<Cell>&   row,
@@ -7139,6 +7150,36 @@ Terminal_screen_model::logical_row_cells(
         primary_backing_row(primary_backing_row_t{logical_row});
     return row.has_value()
         ? std::optional<std::vector<Cell>>(row->cells)
+        : std::nullopt;
+}
+
+std::optional<std::vector<Terminal_screen_model::Cell>>
+Terminal_screen_model::viewport_row_cells(
+    const Terminal_viewport_state& viewport,
+    int                            viewport_row) const
+{
+    const viewport_row_t row{viewport_row};
+    if (!viewport_row_is_valid(row)) {
+        return std::nullopt;
+    }
+
+    if (viewport.active_buffer == Terminal_buffer_id::ALTERNATE) {
+        const Terminal_screen_row* active_row =
+            alternate_active_row(active_grid_row_t{row.value});
+        return active_row != nullptr
+            ? std::optional<std::vector<Cell>>(active_row->cells)
+            : std::nullopt;
+    }
+
+    const std::optional<primary_backing_row_t> backing_row =
+        primary_backing_row_from_viewport(viewport, row);
+    if (!backing_row.has_value()) {
+        return std::nullopt;
+    }
+
+    const std::optional<Terminal_screen_row> backing = primary_backing_row(*backing_row);
+    return backing.has_value()
+        ? std::optional<std::vector<Cell>>(backing->cells)
         : std::nullopt;
 }
 

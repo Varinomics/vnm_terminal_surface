@@ -3388,37 +3388,26 @@ bool text_resource_descriptor_run_is_eligible(
         !run.clip_rect.isValid();
 }
 
-bool text_resource_descriptor_is_eligible(
+std::optional<Text_resource_row_descriptor> text_resource_row_descriptor(
     const Terminal_render_frame&       frame,
     const row_text_group_t&            group)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("text_resource_descriptor_eligibility");
+    VNM_TERMINAL_PROFILE_SCOPE("text_resource_row_descriptor");
 
     if (row_has_cursor_text_run(frame, group.viewport_row) ||
         row_has_preedit_caret(frame, group.viewport_row))
     {
-        return false;
+        return std::nullopt;
     }
-
-    for (const Terminal_render_text_run* run_ptr : group.runs) {
-        const Terminal_render_text_run& run = *run_ptr;
-        if (!text_resource_descriptor_run_is_eligible(run, group)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-Text_resource_row_descriptor text_resource_row_descriptor(
-    const row_text_group_t&    group)
-{
-    VNM_TERMINAL_PROFILE_SCOPE("text_resource_row_descriptor");
 
     Text_resource_row_descriptor descriptor;
     descriptor.runs.reserve(group.runs.size());
     for (const Terminal_render_text_run* run_ptr : group.runs) {
         const Terminal_render_text_run& run = *run_ptr;
+        if (!text_resource_descriptor_run_is_eligible(run, group)) {
+            return std::nullopt;
+        }
+
         const QRectF local_rect = row_local_rect(run.rect, group.row_top);
         descriptor.runs.push_back({
             run.column,
@@ -3431,115 +3420,6 @@ Text_resource_row_descriptor text_resource_row_descriptor(
     }
 
     return descriptor;
-}
-
-enum class Text_dirty_rebuild_reason
-{
-    WITHOUT_OLD_SLOT,
-    FRAME_KEY_MISMATCH,
-    DESCRIPTOR_INELIGIBLE,
-    OLD_DESCRIPTOR_MISSING,
-    DESCRIPTOR_MISMATCH,
-    KEY_MISMATCH,
-};
-
-Text_dirty_rebuild_reason text_dirty_rebuild_reason(
-    const std::optional<Terminal_scene_node::Text_resource_cache_slot>& old_slot,
-    bool                                                               same_text_frame_key,
-    const std::optional<Text_resource_row_descriptor>&                  descriptor)
-{
-    if (!old_slot.has_value()) {
-        return Text_dirty_rebuild_reason::WITHOUT_OLD_SLOT;
-    }
-
-    if (!same_text_frame_key) {
-        return Text_dirty_rebuild_reason::FRAME_KEY_MISMATCH;
-    }
-
-    if (!descriptor.has_value()) {
-        return Text_dirty_rebuild_reason::DESCRIPTOR_INELIGIBLE;
-    }
-
-    if (!old_slot->text_resource_descriptor.has_value()) {
-        return Text_dirty_rebuild_reason::OLD_DESCRIPTOR_MISSING;
-    }
-
-    if (old_slot->text_resource_descriptor != descriptor) {
-        return Text_dirty_rebuild_reason::DESCRIPTOR_MISMATCH;
-    }
-
-    return Text_dirty_rebuild_reason::KEY_MISMATCH;
-}
-
-void record_text_descriptor_mismatch_attribution(
-    terminal_renderer_stats_t&             stats,
-    const Text_resource_row_descriptor&    old_descriptor,
-    const Text_resource_row_descriptor&    current_descriptor)
-{
-    // These counters are non-exclusive row-event attribution. A single row
-    // descriptor mismatch can increment multiple categories, but each category
-    // increments at most once for that row.
-    if (old_descriptor.runs.size() != current_descriptor.runs.size()) {
-        ++stats.text_descriptor_mismatch_run_count;
-    }
-
-    bool text_mismatch       = false;
-    bool foreground_mismatch = false;
-    bool geometry_mismatch   = false;
-    bool baseline_mismatch   = false;
-
-    const std::size_t comparable_run_count =
-        std::min(old_descriptor.runs.size(), current_descriptor.runs.size());
-    for (std::size_t index = 0U; index < comparable_run_count; ++index) {
-        const Text_resource_row_run_descriptor& old_run     = old_descriptor.runs[index];
-        const Text_resource_row_run_descriptor& current_run = current_descriptor.runs[index];
-
-        text_mismatch       = text_mismatch       || old_run.text            != current_run.text;
-        foreground_mismatch = foreground_mismatch || old_run.foreground_rgba != current_run.foreground_rgba;
-        geometry_mismatch   = geometry_mismatch   || old_run.column          != current_run.column ||
-                              old_run.rect        != current_run.rect;
-        baseline_mismatch   = baseline_mismatch   || old_run.baseline_x      != current_run.baseline_x ||
-                              old_run.baseline_y  != current_run.baseline_y;
-    }
-
-    if (text_mismatch) {
-        ++stats.text_descriptor_mismatch_text;
-    }
-    if (foreground_mismatch) {
-        ++stats.text_descriptor_mismatch_foreground;
-    }
-    if (geometry_mismatch) {
-        ++stats.text_descriptor_mismatch_geometry;
-    }
-    if (baseline_mismatch) {
-        ++stats.text_descriptor_mismatch_baseline;
-    }
-}
-
-void record_text_dirty_rebuild_reason(
-    terminal_renderer_stats_t& stats,
-    Text_dirty_rebuild_reason  reason)
-{
-    switch (reason) {
-    case Text_dirty_rebuild_reason::WITHOUT_OLD_SLOT:
-        ++stats.text_dirty_rebuilds_without_old_slot;
-        break;
-    case Text_dirty_rebuild_reason::FRAME_KEY_MISMATCH:
-        ++stats.text_dirty_rebuilds_with_frame_key_mismatch;
-        break;
-    case Text_dirty_rebuild_reason::DESCRIPTOR_INELIGIBLE:
-        ++stats.text_dirty_rebuilds_with_descriptor_ineligible;
-        break;
-    case Text_dirty_rebuild_reason::OLD_DESCRIPTOR_MISSING:
-        ++stats.text_dirty_rebuilds_with_old_descriptor_missing;
-        break;
-    case Text_dirty_rebuild_reason::DESCRIPTOR_MISMATCH:
-        ++stats.text_dirty_rebuilds_with_descriptor_mismatch;
-        break;
-    case Text_dirty_rebuild_reason::KEY_MISMATCH:
-        ++stats.text_dirty_rebuilds_with_key_mismatch;
-        break;
-    }
 }
 
 bool text_row_slot_order_changed(
@@ -3678,14 +3558,15 @@ void sync_text_resource_nodes(
             }
         }
 
-        const bool text_resource_descriptor_eligible =
-            text_resource_descriptor_is_eligible(frame, group);
+        std::optional<Text_resource_row_descriptor> text_resource_descriptor = text_resource_row_descriptor(
+            frame,
+            group);
         if (!dirty_group &&
             clean_row_cache_skip_available &&
             row_cache_identity_has_valid_retained_provenance(group.identity) &&
             old_slot.has_value() &&
-            old_slot->text_resource_descriptor.has_value() &&
-            text_resource_descriptor_eligible)
+            text_resource_descriptor.has_value() &&
+            old_slot->text_resource_descriptor.has_value())
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::clean_cache_skip");
 
@@ -3693,15 +3574,8 @@ void sync_text_resource_nodes(
             set_row_text_clip_rect(*old_slot, row_clip_rect);
             ++stats.text_content_reused;
             ++stats.text_clean_reuse_skips;
-            ++stats.text_resource_descriptor_clean_reuse_skips;
             new_slots.push_back(std::move(*old_slot));
             continue;
-        }
-
-        std::optional<Text_resource_row_descriptor> text_resource_descriptor;
-        if (text_resource_descriptor_eligible) {
-            ++stats.text_resource_descriptor_builds;
-            text_resource_descriptor = text_resource_row_descriptor(group);
         }
 
         if (same_text_frame_key &&
@@ -3722,10 +3596,6 @@ void sync_text_resource_nodes(
             continue;
         }
 
-        const Text_dirty_rebuild_reason dirty_rebuild_reason = text_dirty_rebuild_reason(
-            old_slot,
-            same_text_frame_key,
-            text_resource_descriptor);
         assign_row_local_text_runs(group.runs, group.row_top, local_runs);
         const Ascii_text_coalescing_context* coalescing_context = nullptr;
         bool use_coalesced_resource_runs = false;
@@ -3802,15 +3672,6 @@ void sync_text_resource_nodes(
                 failed,
                 text_leaf_nodes_created);
         if (node != nullptr) {
-            if (dirty_group &&
-                dirty_rebuild_reason == Text_dirty_rebuild_reason::DESCRIPTOR_MISMATCH)
-            {
-                record_text_descriptor_mismatch_attribution(
-                    stats,
-                    *old_slot->text_resource_descriptor,
-                    *text_resource_descriptor);
-            }
-
             if (old_slot.has_value()) {
                 VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::replace_cache_entry");
 
@@ -3851,7 +3712,6 @@ void sync_text_resource_nodes(
             ++stats.text_content_rebuilds;
             if (dirty_group) {
                 ++stats.text_dirty_rows_rebuilt;
-                record_text_dirty_rebuild_reason(stats, dirty_rebuild_reason);
             }
             else {
                 ++stats.text_clean_rows_rebuilt;
@@ -5273,19 +5133,9 @@ void accumulate_frame_stats(
         static_cast<std::uint64_t>(stats.packed_text_disabled_cells_skipped);
     total.packed_graphic_candidates_classified +=
         static_cast<std::uint64_t>(stats.packed_graphic_candidates_classified);
-    total.packed_graphic_cells_inlined +=
-        static_cast<std::uint64_t>(stats.packed_graphic_cells_inlined);
-    total.packed_data_passes_skipped +=
-        static_cast<std::uint64_t>(stats.packed_data_passes_skipped);
-    total.packed_inline_fallbacks +=
-        static_cast<std::uint64_t>(stats.packed_inline_fallbacks);
     total.packed_cells_appended +=
         static_cast<std::uint64_t>(stats.packed_cells_appended);
     total.dirty_row_lookup_count += static_cast<std::uint64_t>(stats.dirty_row_lookup_count);
-    total.dirty_row_range_lookup_count +=
-        static_cast<std::uint64_t>(stats.dirty_row_range_lookup_count);
-    total.dirty_row_range_scan_steps +=
-        static_cast<std::uint64_t>(stats.dirty_row_range_scan_steps);
     total.cells_considered      += static_cast<std::uint64_t>(stats.cells_considered);
     total.cells_skipped_invalid += static_cast<std::uint64_t>(stats.cells_skipped_invalid);
     total.cells_skipped_wide_continuation +=
@@ -5385,10 +5235,6 @@ void accumulate_renderer_stats(
     total.text_clean_reuse_skips += static_cast<std::uint64_t>(stats.text_clean_reuse_skips);
     total.text_resource_descriptor_reuses +=
         static_cast<std::uint64_t>(stats.text_resource_descriptor_reuses);
-    total.text_resource_descriptor_builds +=
-        static_cast<std::uint64_t>(stats.text_resource_descriptor_builds);
-    total.text_resource_descriptor_clean_reuse_skips +=
-        static_cast<std::uint64_t>(stats.text_resource_descriptor_clean_reuse_skips);
     total.text_key_builds       += static_cast<std::uint64_t>(stats.text_key_builds);
     total.text_key_bytes        += stats.text_key_bytes;
     total.rect_key_builds       += static_cast<std::uint64_t>(stats.rect_key_builds);
@@ -5419,28 +5265,6 @@ void accumulate_renderer_stats(
         static_cast<std::uint64_t>(stats.text_dirty_rows_rebuilt);
     total.text_clean_rows_rebuilt +=
         static_cast<std::uint64_t>(stats.text_clean_rows_rebuilt);
-    total.text_dirty_rebuilds_without_old_slot +=
-        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_without_old_slot);
-    total.text_dirty_rebuilds_with_frame_key_mismatch +=
-        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_frame_key_mismatch);
-    total.text_dirty_rebuilds_with_descriptor_ineligible +=
-        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_descriptor_ineligible);
-    total.text_dirty_rebuilds_with_old_descriptor_missing +=
-        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_old_descriptor_missing);
-    total.text_dirty_rebuilds_with_descriptor_mismatch +=
-        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_descriptor_mismatch);
-    total.text_descriptor_mismatch_run_count +=
-        static_cast<std::uint64_t>(stats.text_descriptor_mismatch_run_count);
-    total.text_descriptor_mismatch_text +=
-        static_cast<std::uint64_t>(stats.text_descriptor_mismatch_text);
-    total.text_descriptor_mismatch_foreground +=
-        static_cast<std::uint64_t>(stats.text_descriptor_mismatch_foreground);
-    total.text_descriptor_mismatch_geometry +=
-        static_cast<std::uint64_t>(stats.text_descriptor_mismatch_geometry);
-    total.text_descriptor_mismatch_baseline +=
-        static_cast<std::uint64_t>(stats.text_descriptor_mismatch_baseline);
-    total.text_dirty_rebuilds_with_key_mismatch +=
-        static_cast<std::uint64_t>(stats.text_dirty_rebuilds_with_key_mismatch);
     total.rect_resource_rects_before_coalescing  += static_cast<std::uint64_t>(
         stats.rect_resource_rects_before_coalescing);
     total.rect_resource_rects_after_coalescing   += static_cast<std::uint64_t>(
@@ -6014,73 +5838,16 @@ bool ime_preedit_covers_cell(
         cell_intersects_grid_columns(cell, ime_preedit_column, ime_preedit_columns);
 }
 
-enum class Dirty_row_cache_state
+bool snapshot_row_is_dirty(
+    const Terminal_render_snapshot&    snapshot,
+    int                                row)
 {
-    UNKNOWN,
-    CLEAN,
-    DIRTY,
-};
-
-class Snapshot_dirty_row_cache
-{
-public:
-    explicit Snapshot_dirty_row_cache(const Terminal_render_snapshot& snapshot)
-    :
-        m_snapshot(snapshot)
-    {
-        if (snapshot.grid_size.rows > 0) {
-            m_row_states.resize(
-                static_cast<std::size_t>(snapshot.grid_size.rows),
-                Dirty_row_cache_state::UNKNOWN);
-        }
+    for (const Terminal_render_dirty_row_range& range : snapshot.dirty_row_ranges) {
+        if (row >= range.first_row && row < range.first_row + range.row_count) { return true;  }
+        if (row <  range.first_row)                                            { return false; }
     }
-
-    bool row_is_dirty(
-        int                            row,
-        terminal_render_frame_stats_t& stats)
-    {
-        ++stats.dirty_row_lookup_count;
-        if (row >= 0 && row < static_cast<int>(m_row_states.size())) {
-            Dirty_row_cache_state& state = m_row_states[static_cast<std::size_t>(row)];
-            if (state != Dirty_row_cache_state::UNKNOWN) {
-                return state == Dirty_row_cache_state::DIRTY;
-            }
-
-            const bool dirty = lookup_row_is_dirty(row, stats);
-            state = dirty
-                ? Dirty_row_cache_state::DIRTY
-                : Dirty_row_cache_state::CLEAN;
-            return dirty;
-        }
-
-        const auto found = m_out_of_grid_rows.find(row);
-        if (found != m_out_of_grid_rows.end()) {
-            return found->second;
-        }
-
-        const bool dirty = lookup_row_is_dirty(row, stats);
-        m_out_of_grid_rows.emplace(row, dirty);
-        return dirty;
-    }
-
-private:
-    bool lookup_row_is_dirty(
-        int                            row,
-        terminal_render_frame_stats_t& stats) const
-    {
-        ++stats.dirty_row_range_lookup_count;
-        for (const Terminal_render_dirty_row_range& range : m_snapshot.dirty_row_ranges) {
-            ++stats.dirty_row_range_scan_steps;
-            if (row >= range.first_row && row < range.first_row + range.row_count) { return true;  }
-            if (row <  range.first_row)                                            { return false; }
-        }
-        return false;
-    }
-
-    const Terminal_render_snapshot&         m_snapshot;
-    std::vector<Dirty_row_cache_state>      m_row_states;
-    std::map<int, bool>                     m_out_of_grid_rows;
-};
+    return false;
+}
 
 std::vector<std::vector<const Terminal_render_cell*>> build_explicit_snapshot_row_table(
     const Terminal_render_snapshot& snapshot)
@@ -6221,82 +5988,6 @@ void append_packed_graphic_cell(
     ++frame.stats.packed_cells_appended;
 }
 
-void initialize_packed_render_rows(
-    Terminal_render_frame&             frame,
-    const Terminal_render_snapshot&    snapshot)
-{
-    frame.packed_rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
-    for (int row_index = 0; row_index < snapshot.grid_size.rows; ++row_index) {
-        terminal_packed_render_row_t row;
-        row.active_buffer = snapshot.viewport.active_buffer;
-        row.viewport_row  = row_index;
-        row.logical_row   = logical_row_for_viewport_row(snapshot.viewport, row_index);
-        row.first_text_span =
-            static_cast<std::uint32_t>(frame.packed_text_spans.size());
-        row.first_graphic_span =
-            static_cast<std::uint32_t>(frame.packed_graphic_spans.size());
-        frame.packed_rows.push_back(row);
-    }
-}
-
-void clear_packed_render_payload(Terminal_render_frame& frame)
-{
-    frame.packed_rows.clear();
-    frame.packed_text_spans.clear();
-    frame.packed_text_bytes.clear();
-    frame.packed_graphic_spans.clear();
-    frame.packed_graphic_codepoints.clear();
-
-    frame.stats.packed_rows                 = 0;
-    frame.stats.packed_text_spans           = 0;
-    frame.stats.packed_text_cells           = 0;
-    frame.stats.packed_graphic_spans        = 0;
-    frame.stats.packed_graphic_cells        = 0;
-    frame.stats.packed_payload_bytes        = 0U;
-    frame.stats.packed_graphic_candidates_classified = 0;
-    frame.stats.packed_graphic_cells_inlined = 0;
-    frame.stats.packed_data_passes_skipped  = 0;
-    frame.stats.packed_cells_appended       = 0;
-}
-
-bool append_inline_packed_graphic_cell(
-    Terminal_render_frame&             frame,
-    const Terminal_render_cell&        cell,
-    const render_style_attributes_t&   style,
-    int&                               current_row,
-    std::vector<bool>&                 closed_rows,
-    std::vector<int>&                  last_row_columns)
-{
-    const int row = cell.position.row;
-    if (row < 0 || row >= static_cast<int>(frame.packed_rows.size())) {
-        return false;
-    }
-
-    const std::size_t row_index = static_cast<std::size_t>(row);
-    if (row != current_row) {
-        if (current_row >= 0) {
-            closed_rows[static_cast<std::size_t>(current_row)] = true;
-        }
-        if (closed_rows[row_index]) {
-            return false;
-        }
-        current_row = row;
-    }
-
-    if (cell.position.column < last_row_columns[row_index]) {
-        return false;
-    }
-    last_row_columns[row_index] = cell.position.column + cell.display_width;
-
-    append_packed_graphic_cell(
-        frame,
-        frame.packed_rows[row_index],
-        cell,
-        style);
-    ++frame.stats.packed_graphic_cells_inlined;
-    return true;
-}
-
 std::uint64_t packed_payload_byte_count(const Terminal_render_frame& frame)
 {
     return
@@ -6319,7 +6010,6 @@ void build_terminal_render_frame_packed_data(
     Terminal_render_frame&             frame,
     const Terminal_render_snapshot&    snapshot,
     Render_style_attribute_cache&      style_attributes,
-    Snapshot_dirty_row_cache&          dirty_row_cache,
     bool                               block_cursor_visible,
     bool                               ime_preedit_visible,
     int                                ime_preedit_row,
@@ -6340,7 +6030,7 @@ void build_terminal_render_frame_packed_data(
 
     const std::vector<std::vector<const Terminal_render_cell*>> row_table =
         build_explicit_snapshot_row_table(snapshot);
-    initialize_packed_render_rows(frame, snapshot);
+    frame.packed_rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
     if (packed_text_sidecars_enabled) {
         frame.packed_text_spans.reserve(snapshot.cells.size() / 2U);
         frame.packed_text_bytes.reserve(snapshot.cells.size());
@@ -6349,8 +6039,17 @@ void build_terminal_render_frame_packed_data(
     frame.packed_graphic_codepoints.reserve(snapshot.cells.size() / 8U);
 
     for (int row_index = 0; row_index < snapshot.grid_size.rows; ++row_index) {
-        terminal_packed_render_row_t& packed_row =
-            frame.packed_rows[static_cast<std::size_t>(row_index)];
+        terminal_packed_render_row_t row;
+        row.active_buffer = snapshot.viewport.active_buffer;
+        row.viewport_row  = row_index;
+        row.logical_row   = logical_row_for_viewport_row(snapshot.viewport, row_index);
+        row.first_text_span =
+            static_cast<std::uint32_t>(frame.packed_text_spans.size());
+        row.first_graphic_span =
+            static_cast<std::uint32_t>(frame.packed_graphic_spans.size());
+        frame.packed_rows.push_back(row);
+
+        terminal_packed_render_row_t& packed_row = frame.packed_rows.back();
         for (const Terminal_render_cell* cell : row_table[static_cast<std::size_t>(row_index)]) {
             ++frame.stats.packed_pass_cells_scanned;
             const bool graphic_candidate = is_terminal_graphic_text(cell->text);
@@ -6370,7 +6069,8 @@ void build_terminal_render_frame_packed_data(
             if (graphic_candidate) {
                 ++frame.stats.packed_graphic_candidates_classified;
             }
-            const bool dirty_row = dirty_row_cache.row_is_dirty(cell->position.row, frame.stats);
+            ++frame.stats.dirty_row_lookup_count;
+            const bool dirty_row = snapshot_row_is_dirty(snapshot, cell->position.row);
             const bool has_decoration = cell_text_decoration_enabled(
                 *cell,
                 snapshot.styles.size(),
@@ -6443,6 +6143,7 @@ Terminal_render_frame build_terminal_render_frame(
     frame.text_style_key   = text_style_cache_key(*snapshot, options);
     frame.stats.visible_rows          = snapshot->grid_size.rows;
     frame.stats.cell_pass_input_cells = static_cast<int>(snapshot->cells.size());
+    frame.stats.dirty_row_lookup_count += static_cast<int>(snapshot->cells.size());
     for (const Terminal_render_dirty_row_range& range : snapshot->dirty_row_ranges) {
         frame.stats.dirty_rows += range.row_count;
     }
@@ -6452,7 +6153,6 @@ Terminal_render_frame build_terminal_render_frame(
     const bool valid_grid = snapshot->grid_size.rows > 0 && snapshot->grid_size.columns > 0;
     const Ime_preedit_state& ime_preedit =
         ime_preedit_override != nullptr ? *ime_preedit_override : snapshot->ime_preedit;
-    Snapshot_dirty_row_cache dirty_row_cache(*snapshot);
     const bool cursor_in_grid = valid_grid &&
         position_inside_grid(snapshot->cursor.position, snapshot->grid_size);
     const bool cursor_blink_enabled =
@@ -6496,25 +6196,6 @@ Terminal_render_frame build_terminal_render_frame(
     frame.cursor_graphic_arcs.reserve(2U);
     frame.overlay_rects.reserve(1U);
 
-    const bool inline_packed_graphics =
-        valid_grid && !options.packed_text_sidecars_enabled;
-    bool inline_packed_graphics_safe = true;
-    int inline_packed_current_row    = -1;
-    std::vector<bool> inline_packed_closed_rows;
-    std::vector<int>  inline_packed_last_row_columns;
-    if (inline_packed_graphics) {
-        frame.stats.packed_text_sidecars_disabled = 1;
-        initialize_packed_render_rows(frame, *snapshot);
-        frame.packed_graphic_spans.reserve(cell_count / 8U);
-        frame.packed_graphic_codepoints.reserve(cell_count / 8U);
-        inline_packed_closed_rows.resize(
-            static_cast<std::size_t>(snapshot->grid_size.rows),
-            false);
-        inline_packed_last_row_columns.resize(
-            static_cast<std::size_t>(snapshot->grid_size.rows),
-            0);
-    }
-
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::cells");
 
@@ -6534,7 +6215,7 @@ Terminal_render_frame build_terminal_render_frame(
                 snapshot->grid_size,
                 snapshot->styles.size(),
                 classification_has_decoration,
-                dirty_row_cache.row_is_dirty(cell.position.row, frame.stats));
+                snapshot_row_is_dirty(*snapshot, cell.position.row));
             const bool block_cursor_cell =
                 block_cursor_covers_cell(cell, snapshot->cursor, block_cursor_visible);
             const bool ime_preedit_cell = ime_preedit_covers_cell(
@@ -6657,22 +6338,6 @@ Terminal_render_frame build_terminal_render_frame(
                 terminal_hard_block_graphic_text_is_supported(cell.text)                &&
                 !block_cursor_cell                                                      &&
                 !ime_preedit_cell;
-            if (inline_packed_graphics &&
-                inline_packed_graphics_safe &&
-                !text_is_empty &&
-                classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY &&
-                !block_cursor_cell &&
-                !ime_preedit_cell)
-            {
-                ++frame.stats.packed_graphic_candidates_classified;
-                inline_packed_graphics_safe = append_inline_packed_graphic_cell(
-                    frame,
-                    cell,
-                    style,
-                    inline_packed_current_row,
-                    inline_packed_closed_rows,
-                    inline_packed_last_row_columns);
-            }
             const bool rendered_as_graphic = packed_hard_graphic_covered ||
                 (!text_is_empty &&
                     append_terminal_graphic_rects(
@@ -6747,31 +6412,16 @@ Terminal_render_frame build_terminal_render_frame(
             simple_eligible_styles);
     }
 
-    bool packed_data_pass_required = true;
-    if (inline_packed_graphics) {
-        if (inline_packed_graphics_safe) {
-            finalize_packed_render_frame_stats(frame);
-            frame.stats.packed_data_passes_skipped = 1;
-            packed_data_pass_required = false;
-        }
-        else {
-            clear_packed_render_payload(frame);
-            frame.stats.packed_inline_fallbacks = 1;
-        }
-    }
-    if (packed_data_pass_required) {
-        build_terminal_render_frame_packed_data(
-            frame,
-            *snapshot,
-            style_attributes,
-            dirty_row_cache,
-            block_cursor_visible,
-            ime_preedit_visible,
-            ime_preedit_row,
-            ime_preedit_column,
-            ime_preedit_columns,
-            options.packed_text_sidecars_enabled);
-    }
+    build_terminal_render_frame_packed_data(
+        frame,
+        *snapshot,
+        style_attributes,
+        block_cursor_visible,
+        ime_preedit_visible,
+        ime_preedit_row,
+        ime_preedit_column,
+        ime_preedit_columns,
+        options.packed_text_sidecars_enabled);
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::selection");
