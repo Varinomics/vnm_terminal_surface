@@ -2893,28 +2893,43 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
 #endif
             const viewport_row_t viewport_row{row};
             const std::size_t first_row_cell = snapshot.cells.size();
+            const snapshot_row_t snapshot_row = [&]() {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "Terminal_screen_model::render_snapshot::append_rows::snapshot_row");
+
+                return snapshot_row_from_viewport(viewport_row);
+            }();
+
+            std::optional<std::vector<Cell>> row_cells;
             {
                 VNM_TERMINAL_PROFILE_SCOPE(
-                    "Terminal_screen_model::render_snapshot::append_rows::row_cells");
+                    "Terminal_screen_model::render_snapshot::append_rows::viewport_row_cells");
 
-                const snapshot_row_t snapshot_row = snapshot_row_from_viewport(viewport_row);
-                const std::optional<std::vector<Cell>> row_cells =
-                    viewport_row_cells(viewport, row);
-                if (row_cells.has_value()) {
+                row_cells = viewport_row_cells(viewport, row);
+            }
+            if (row_cells.has_value()) {
 #if VNM_TERMINAL_PROFILING_ENABLED
-                    ++rows_materialized;
+                ++rows_materialized;
 #endif
-                    append_snapshot_cells_from_row(snapshot, *row_cells, snapshot_row.value);
-                }
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "Terminal_screen_model::render_snapshot::append_rows::append_cells");
+
+                append_snapshot_cells_from_row(snapshot, *row_cells, snapshot_row.value);
             }
 
+            std::optional<std::map<std::uint64_t, QByteArray>>
+                row_local_hyperlink_identity_keys;
             {
                 VNM_TERMINAL_PROFILE_SCOPE(
-                    "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata");
+                    "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata::lookup");
 
-                const std::optional<std::map<std::uint64_t, QByteArray>>
-                    row_local_hyperlink_identity_keys =
-                        viewport_row_retained_hyperlink_identity_keys(viewport, row);
+                row_local_hyperlink_identity_keys =
+                    viewport_row_retained_hyperlink_identity_keys(viewport, row);
+            }
+            {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata::append");
+
                 append_hyperlink_metadata_for_cells(
                     snapshot.hyperlinks,
                     snapshot.cells,
@@ -2924,15 +2939,25 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                         : nullptr);
             }
 
+            std::optional<Terminal_retained_line_provenance> provenance;
             {
                 VNM_TERMINAL_PROFILE_SCOPE(
-                    "Terminal_screen_model::render_snapshot::append_rows::provenance");
+                    "Terminal_screen_model::render_snapshot::append_rows::provenance::lookup");
 
-                const std::optional<Terminal_retained_line_provenance> provenance =
-                    viewport_row_provenance(viewport, row);
-                if (provenance.has_value()) {
-                    const std::optional<primary_backing_row_t> backing_row =
-                        primary_backing_row_from_viewport(viewport, viewport_row);
+                provenance = viewport_row_provenance(viewport, row);
+            }
+            if (provenance.has_value()) {
+                std::optional<primary_backing_row_t> backing_row;
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "Terminal_screen_model::render_snapshot::append_rows::provenance::backing_row");
+
+                    backing_row = primary_backing_row_from_viewport(viewport, viewport_row);
+                }
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "Terminal_screen_model::render_snapshot::append_rows::provenance::append");
+
                     const int logical_row =
                         backing_row.has_value() ? backing_row->value : row;
                     snapshot.visible_line_provenance.push_back({
@@ -7099,24 +7124,37 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
     const std::vector<Cell>&   row,
     int                        snapshot_row) const
 {
-    std::vector<Cell> visual_projection;
-    const std::vector<Cell>& visual_row =
-        row_cells_for_current_geometry(row, visual_projection);
-    const int column_count = m_config.grid_size.columns;
-    for (int column = 0; column < column_count; ++column) {
-        const Cell& cell = visual_row[static_cast<std::size_t>(column)];
-        if (!cell.occupied) {
-            continue;
-        }
+    VNM_TERMINAL_PROFILE_SCOPE(
+        "Terminal_screen_model::append_snapshot_cells_from_row");
 
-        snapshot.cells.push_back({
-            { snapshot_row, column },
-            cell.text,
-            cell.hyperlink_id,
-            cell.display_width,
-            cell.wide_continuation,
-            cell.style_id,
-        });
+    std::vector<Cell> visual_projection;
+    const std::vector<Cell>& visual_row = [&]() -> const std::vector<Cell>& {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "Terminal_screen_model::append_snapshot_cells_from_row::geometry_projection");
+
+        return row_cells_for_current_geometry(row, visual_projection);
+    }();
+
+    const int column_count = m_config.grid_size.columns;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "Terminal_screen_model::append_snapshot_cells_from_row::scan_cells");
+
+        for (int column = 0; column < column_count; ++column) {
+            const Cell& cell = visual_row[static_cast<std::size_t>(column)];
+            if (!cell.occupied) {
+                continue;
+            }
+
+            snapshot.cells.push_back({
+                { snapshot_row, column },
+                cell.text,
+                cell.hyperlink_id,
+                cell.display_width,
+                cell.wide_continuation,
+                cell.style_id,
+            });
+        }
     }
 }
 

@@ -2493,21 +2493,36 @@ bool prepare_text_layout(QTextLayout& layout, qreal& out_line_ascent)
     const auto started_at = std::chrono::steady_clock::now();
 #endif
 
-    QTextOption option;
-    option.setWrapMode(QTextOption::NoWrap);
-    layout.setTextOption(option);
-    layout.setCacheEnabled(false);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("prepare_text_layout::layout_option_cache_setup");
 
-    layout.beginLayout();
-    QTextLine line          = layout.createLine();
+        QTextOption option;
+        option.setWrapMode(QTextOption::NoWrap);
+        layout.setTextOption(option);
+        layout.setCacheEnabled(false);
+    }
+
+    QTextLine line;
     bool      line_has_text = false;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("prepare_text_layout::begin_createLine");
+
+        layout.beginLayout();
+        line = layout.createLine();
+    }
     if (line.isValid()) {
+        VNM_TERMINAL_PROFILE_SCOPE("prepare_text_layout::line_setup_metrics");
+
         line.setLineWidth(k_no_wrap_text_line_width);
         line.setPosition(QPointF(0.0, 0.0));
         out_line_ascent = line.ascent();
         line_has_text = line.textLength() > 0;
     }
-    layout.endLayout();
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("prepare_text_layout::endLayout");
+
+        layout.endLayout();
+    }
 
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (active_slow_text_layout_recorder            != nullptr &&
@@ -2516,6 +2531,9 @@ bool prepare_text_layout(QTextLayout& layout, qreal& out_line_ascent)
         active_text_layout_diagnostic_context->run  != nullptr)
     {
         const auto finished_at = std::chrono::steady_clock::now();
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "prepare_text_layout::slow_layout_diagnostic_recording");
+
         const std::uint64_t duration_ns = static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(finished_at - started_at).count());
         active_slow_text_layout_recorder->record_layout(
@@ -2597,9 +2615,13 @@ void add_text_run_layout(
 {
     VNM_TERMINAL_PROFILE_SCOPE("add_text_run_layout");
 
-    text_node.addTextLayout(
-        QPointF(run.baseline_origin.x(), run.baseline_origin.y() - line_ascent),
-        &layout);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("add_text_run_layout::addTextLayout_call");
+
+        text_node.addTextLayout(
+            QPointF(run.baseline_origin.x(), run.baseline_origin.y() - line_ascent),
+            &layout);
+    }
 }
 
 bool append_clipped_text_run_node(
@@ -2625,10 +2647,15 @@ bool append_clipped_text_run_node(
         return true;
     }
 
-    QSGTextNode* text_node = make_text_leaf_node(
-        window,
-        text_node_foreground(run, force_blended_order),
-        frame_viewport);
+    QSGTextNode* text_node = nullptr;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("append_clipped_text_run_node::create_text_node");
+
+        text_node = make_text_leaf_node(
+            window,
+            text_node_foreground(run, force_blended_order),
+            frame_viewport);
+    }
     if (text_node == nullptr) {
         return false;
     }
@@ -2637,13 +2664,17 @@ bool append_clipped_text_run_node(
 
     add_text_run_layout(*text_node, layout, run, line_ascent);
 
-    auto* clip_node = new QSGClipNode();
-    clip_node->setFlag(QSGNode::OwnedByParent, true);
-    clip_node->setIsRectangular(true);
-    clip_node->setClipRect(run.clip_rect);
-    clip_node->appendChildNode(text_node);
-    parent.appendChildNode(clip_node);
-    ++stats.qsg_nodes_created;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("append_clipped_text_run_node::append_child");
+
+        auto* clip_node = new QSGClipNode();
+        clip_node->setFlag(QSGNode::OwnedByParent, true);
+        clip_node->setIsRectangular(true);
+        clip_node->setClipRect(run.clip_rect);
+        clip_node->appendChildNode(text_node);
+        parent.appendChildNode(clip_node);
+        ++stats.qsg_nodes_created;
+    }
     return true;
 }
 
@@ -2676,12 +2707,22 @@ bool append_unclipped_text_run_layout(
     if (active_text_node       == nullptr ||
         active_foreground_rgba != foreground.rgba())
     {
-        active_text_node = make_text_leaf_node(window, foreground, frame_viewport);
+        {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "append_unclipped_text_run_layout::create_text_node");
+
+            active_text_node = make_text_leaf_node(window, foreground, frame_viewport);
+        }
         if (active_text_node == nullptr) {
             return false;
         }
 
-        parent.appendChildNode(active_text_node);
+        {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "append_unclipped_text_run_layout::append_child");
+
+            parent.appendChildNode(active_text_node);
+        }
         active_foreground_rgba = foreground.rgba();
         ++out_text_leaf_nodes_created;
         ++stats.qsg_nodes_created;
@@ -3420,30 +3461,42 @@ std::optional<Text_resource_row_descriptor> text_resource_source_row_descriptor(
 {
     VNM_TERMINAL_PROFILE_SCOPE("text_resource_source_row_descriptor");
 
-    if (row_has_cursor_text_run(frame, group.viewport_row) ||
-        row_has_preedit_caret(frame, group.viewport_row))
     {
-        return std::nullopt;
+        VNM_TERMINAL_PROFILE_SCOPE("text_resource_source_row_descriptor::row_gates");
+
+        if (row_has_cursor_text_run(frame, group.viewport_row) ||
+            row_has_preedit_caret(frame, group.viewport_row))
+        {
+            return std::nullopt;
+        }
     }
 
     Text_resource_row_descriptor descriptor;
-    descriptor.runs.reserve(group.runs.size());
-    for (const Terminal_render_text_run* run_ptr : group.runs) {
-        const Terminal_render_text_run& run = *run_ptr;
-        if (!text_resource_descriptor_run_is_eligible(run, group)) {
-            return std::nullopt;
-        }
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("text_resource_source_row_descriptor::reserve");
 
-        const QRectF local_rect = row_local_rect(run.rect, group.row_top);
-        descriptor.runs.push_back({
-            run.column,
-            make_text_resource_rect_descriptor(local_rect),
-            run.baseline_origin.x(),
-            run.baseline_origin.y() - group.row_top,
-            run.foreground.rgba(),
-            false,
-            run.text,
-        });
+        descriptor.runs.reserve(group.runs.size());
+    }
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("text_resource_source_row_descriptor::runs");
+
+        for (const Terminal_render_text_run* run_ptr : group.runs) {
+            const Terminal_render_text_run& run = *run_ptr;
+            if (!text_resource_descriptor_run_is_eligible(run, group)) {
+                return std::nullopt;
+            }
+
+            const QRectF local_rect = row_local_rect(run.rect, group.row_top);
+            descriptor.runs.push_back({
+                run.column,
+                make_text_resource_rect_descriptor(local_rect),
+                run.baseline_origin.x(),
+                run.baseline_origin.y() - group.row_top,
+                run.foreground.rgba(),
+                false,
+                run.text,
+            });
+        }
     }
 
     return descriptor;
@@ -3456,18 +3509,26 @@ Text_resource_row_descriptor text_resource_row_descriptor_for_runs(
     VNM_TERMINAL_PROFILE_SCOPE("text_resource_row_descriptor_for_runs");
 
     Text_resource_row_descriptor descriptor;
-    descriptor.runs.reserve(runs.size());
-    for (const auto& resource_run : runs) {
-        const Terminal_render_text_run& run = text_resource_key_run(resource_run);
-        descriptor.runs.push_back({
-            run.column,
-            make_text_resource_rect_descriptor(run.rect),
-            run.baseline_origin.x(),
-            run.baseline_origin.y(),
-            run.foreground.rgba(),
-            text_resource_key_uses_ascii_layout_font(resource_run),
-            run.text,
-        });
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("text_resource_row_descriptor_for_runs::reserve");
+
+        descriptor.runs.reserve(runs.size());
+    }
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("text_resource_row_descriptor_for_runs::runs");
+
+        for (const auto& resource_run : runs) {
+            const Terminal_render_text_run& run = text_resource_key_run(resource_run);
+            descriptor.runs.push_back({
+                run.column,
+                make_text_resource_rect_descriptor(run.rect),
+                run.baseline_origin.x(),
+                run.baseline_origin.y(),
+                run.foreground.rgba(),
+                text_resource_key_uses_ascii_layout_font(resource_run),
+                run.text,
+            });
+        }
     }
 
     return descriptor;
@@ -3624,18 +3685,32 @@ void sync_text_resource_nodes(
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::group_bookkeeping");
 
-            ++stats.text_groups_considered;
+            row_dirty_probe_result_t dirty_probe;
+            {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "sync_text_resource_nodes::group_bookkeeping::old_slot");
 
-            old_slot = take_text_row_slot(old_slots, group.identity);
-            const row_dirty_probe_result_t dirty_probe =
-                row_dirty_probe(frame, group.viewport_row);
-            dirty_group = dirty_probe.dirty;
-            stats.text_resource_dirty_row_probes += dirty_probe.probes;
-            if (dirty_group) {
-                ++stats.text_groups_dirty;
+                old_slot = take_text_row_slot(old_slots, group.identity);
             }
-            else {
-                ++stats.text_groups_clean;
+            {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "sync_text_resource_nodes::group_bookkeeping::dirty_probe");
+
+                dirty_probe = row_dirty_probe(frame, group.viewport_row);
+            }
+            {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "sync_text_resource_nodes::group_bookkeeping::stats");
+
+                ++stats.text_groups_considered;
+                dirty_group = dirty_probe.dirty;
+                stats.text_resource_dirty_row_probes += dirty_probe.probes;
+                if (dirty_group) {
+                    ++stats.text_groups_dirty;
+                }
+                else {
+                    ++stats.text_groups_clean;
+                }
             }
         }
 
@@ -3670,8 +3745,13 @@ void sync_text_resource_nodes(
         bool use_coalesced_resource_runs = false;
         auto select_coalesced_resource_runs_if_enabled = [&]() {
             ++stats.text_coalescing_candidate_groups;
-            coalescing_context =
-                &coalescing_context_cache.context(font, frame.cell_metrics.width);
+            {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "sync_text_resource_nodes::coalescing::context");
+
+                coalescing_context =
+                    &coalescing_context_cache.context(font, frame.cell_metrics.width);
+            }
             if (coalescing_context->enabled) {
                 ++stats.text_coalescing_enabled_groups;
                 use_coalesced_resource_runs = true;
@@ -3680,18 +3760,34 @@ void sync_text_resource_nodes(
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::coalescing");
 
-            if (try_make_row_local_coalesced_ascii_text_resource_runs(
-                    group.runs, group.row_top, frame.cell_metrics.width, coalesced_resource_runs))
+            bool row_local_ascii = false;
+            {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "sync_text_resource_nodes::coalescing::try_ascii");
+
+                row_local_ascii = try_make_row_local_coalesced_ascii_text_resource_runs(
+                    group.runs,
+                    group.row_top,
+                    frame.cell_metrics.width,
+                    coalesced_resource_runs);
+            }
+            if (row_local_ascii)
             {
                 select_coalesced_resource_runs_if_enabled();
             }
             else {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "sync_text_resource_nodes::coalescing::row_local_fallback");
+
                 assign_row_local_text_runs(group.runs, group.row_top, local_runs);
                 local_runs_assigned = true;
             }
         }
 
         if (!use_coalesced_resource_runs && !local_runs_assigned) {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "sync_text_resource_nodes::coalescing_disabled_row_local_fallback");
+
             assign_row_local_text_runs(group.runs, group.row_top, local_runs);
             local_runs_assigned = true;
         }
@@ -3793,38 +3889,65 @@ void sync_text_resource_nodes(
             if (old_slot.has_value()) {
                 VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::replace_cache_entry");
 
-                record_text_cache_entry_nodes_cleared(stats, *old_slot, true);
-                ++stats.qsg_nodes_replaced;
-                stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*old_slot->node);
-                old_slot->clip->removeChildNode(old_slot->node);
-                delete old_slot->node;
-                old_slot->node                     = node;
-                old_slot->key                      = std::move(key);
-                old_slot->text_resource_descriptor = std::move(text_resource_descriptor);
-                sync_text_wrapper_row_top(*old_slot, group.row_top);
-                set_row_text_clip_rect(*old_slot, row_clip_rect);
-                old_slot->clip->appendChildNode(node);
-                new_slots.push_back(std::move(*old_slot));
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "sync_text_resource_nodes::replace_cache_entry::clear_old");
+
+                    record_text_cache_entry_nodes_cleared(stats, *old_slot, true);
+                    ++stats.qsg_nodes_replaced;
+                    stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*old_slot->node);
+                    old_slot->clip->removeChildNode(old_slot->node);
+                    delete old_slot->node;
+                }
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "sync_text_resource_nodes::replace_cache_entry::resync_slot");
+
+                    old_slot->node                     = node;
+                    old_slot->key                      = std::move(key);
+                    old_slot->text_resource_descriptor = std::move(text_resource_descriptor);
+                    sync_text_wrapper_row_top(*old_slot, group.row_top);
+                    set_row_text_clip_rect(*old_slot, row_clip_rect);
+                    old_slot->clip->appendChildNode(node);
+                }
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "sync_text_resource_nodes::replace_cache_entry::append_slot");
+
+                    new_slots.push_back(std::move(*old_slot));
+                }
                 ++stats.text_cache_entries_replaced;
             }
             else {
                 VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::create_cache_entry");
 
-                QSGTransformNode* wrapper = make_text_wrapper_node(group.row_top);
-                QSGClipNode*      clip    = make_row_text_clip_node(row_clip_rect);
-                clip->appendChildNode(node);
-                wrapper->appendChildNode(clip);
-                stats.qsg_nodes_created += 2;
-                new_slots.push_back({
-                    .identity  = group.identity,
-                    .wrapper   = wrapper,
-                    .clip      = clip,
-                    .node      = node,
-                    .clip_rect = row_clip_rect,
-                    .key       = std::move(key),
-                    .text_resource_descriptor = std::move(text_resource_descriptor),
-                    .row_top   = group.row_top,
-                });
+                QSGTransformNode* wrapper = nullptr;
+                QSGClipNode*      clip    = nullptr;
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "sync_text_resource_nodes::create_cache_entry::nodes");
+
+                    wrapper = make_text_wrapper_node(group.row_top);
+                    clip    = make_row_text_clip_node(row_clip_rect);
+                    clip->appendChildNode(node);
+                    wrapper->appendChildNode(clip);
+                    stats.qsg_nodes_created += 2;
+                }
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "sync_text_resource_nodes::create_cache_entry::append_slot");
+
+                    new_slots.push_back({
+                        .identity  = group.identity,
+                        .wrapper   = wrapper,
+                        .clip      = clip,
+                        .node      = node,
+                        .clip_rect = row_clip_rect,
+                        .key       = std::move(key),
+                        .text_resource_descriptor = std::move(text_resource_descriptor),
+                        .row_top   = group.row_top,
+                    });
+                }
                 ++stats.text_cache_entries_created;
             }
             ++stats.text_content_rebuilds;
