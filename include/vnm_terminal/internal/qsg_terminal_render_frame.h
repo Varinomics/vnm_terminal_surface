@@ -263,9 +263,13 @@ struct terminal_render_frame_stats_t
     int                                            visible_rows                     = 0;
     int                                            dirty_rows                       = 0;
     int                                            full_dirty_rows                  = 0;
+    // These mirror current input/scanned counts until Phase 4 reuses cell-pass
+    // intermediates and the packed pass stops reclassifying every scanned cell.
     int                                            cell_pass_input_cells            = 0;
+    int                                            cell_pass_classification_calls   = 0;
     int                                            packed_pass_input_cells          = 0;
     int                                            packed_pass_cells_scanned        = 0;
+    int                                            packed_pass_classification_calls = 0;
     int                                            packed_text_sidecars_enabled     = 0;
     int                                            packed_text_sidecars_disabled    = 0;
     int                                            packed_text_disabled_cells_skipped = 0;
@@ -315,8 +319,10 @@ struct terminal_render_frame_cumulative_stats_t
     std::uint64_t                                  dirty_rows                       = 0U;
     std::uint64_t                                  full_dirty_rows                  = 0U;
     std::uint64_t                                  cell_pass_input_cells            = 0U;
+    std::uint64_t                                  cell_pass_classification_calls   = 0U;
     std::uint64_t                                  packed_pass_input_cells          = 0U;
     std::uint64_t                                  packed_pass_cells_scanned        = 0U;
+    std::uint64_t                                  packed_pass_classification_calls = 0U;
     std::uint64_t                                  packed_text_sidecars_enabled     = 0U;
     std::uint64_t                                  packed_text_sidecars_disabled    = 0U;
     std::uint64_t                                  packed_text_disabled_cells_skipped = 0U;

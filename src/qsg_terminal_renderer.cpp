@@ -1110,6 +1110,7 @@ struct Text_resource_row_run_descriptor
     qreal                         baseline_x      = 0.0;
     qreal                         baseline_y      = 0.0;
     QRgb                          foreground_rgba = 0U;
+    bool                          uses_ascii_layout_font = false;
     QString                       text;
 
     bool operator==(const Text_resource_row_run_descriptor&) const = default;
@@ -3335,15 +3336,28 @@ int dirty_row_count(const Terminal_render_frame& frame)
     return rows;
 }
 
-bool row_is_dirty(
+struct row_dirty_probe_result_t
+{
+    bool dirty  = false;
+    int  probes = 0;
+};
+
+row_dirty_probe_result_t row_dirty_probe(
     const Terminal_render_frame&   frame,
     int                            row)
 {
+    row_dirty_probe_result_t result;
     for (const Terminal_render_dirty_row_range& range : frame.dirty_row_ranges) {
-        if (row >= range.first_row && row < range.first_row + range.row_count) { return true;  }
-        if (row <  range.first_row)                                            { return false; }
+        ++result.probes;
+        if (row >= range.first_row && row < range.first_row + range.row_count) {
+            result.dirty = true;
+            return result;
+        }
+        if (row < range.first_row) {
+            return result;
+        }
     }
-    return false;
+    return result;
 }
 
 bool row_has_cursor_text_run(
@@ -3398,11 +3412,11 @@ bool text_resource_descriptor_run_is_eligible(
         !run.clip_rect.isValid();
 }
 
-std::optional<Text_resource_row_descriptor> text_resource_row_descriptor(
+std::optional<Text_resource_row_descriptor> text_resource_source_row_descriptor(
     const Terminal_render_frame&       frame,
     const row_text_group_t&            group)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("text_resource_row_descriptor");
+    VNM_TERMINAL_PROFILE_SCOPE("text_resource_source_row_descriptor");
 
     if (row_has_cursor_text_run(frame, group.viewport_row) ||
         row_has_preedit_caret(frame, group.viewport_row))
@@ -3425,6 +3439,31 @@ std::optional<Text_resource_row_descriptor> text_resource_row_descriptor(
             run.baseline_origin.x(),
             run.baseline_origin.y() - group.row_top,
             run.foreground.rgba(),
+            false,
+            run.text,
+        });
+    }
+
+    return descriptor;
+}
+
+template <typename Text_runs>
+Text_resource_row_descriptor text_resource_row_descriptor_for_runs(
+    const Text_runs& runs)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("text_resource_row_descriptor_for_runs");
+
+    Text_resource_row_descriptor descriptor;
+    descriptor.runs.reserve(runs.size());
+    for (const auto& resource_run : runs) {
+        const Terminal_render_text_run& run = text_resource_key_run(resource_run);
+        descriptor.runs.push_back({
+            run.column,
+            make_text_resource_rect_descriptor(run.rect),
+            run.baseline_origin.x(),
+            run.baseline_origin.y(),
+            run.foreground.rgba(),
+            text_resource_key_uses_ascii_layout_font(resource_run),
             run.text,
         });
     }
@@ -3559,7 +3598,10 @@ void sync_text_resource_nodes(
             ++stats.text_groups_considered;
 
             old_slot = take_text_row_slot(old_slots, group.identity);
-            dirty_group = row_is_dirty(frame, group.viewport_row);
+            const row_dirty_probe_result_t dirty_probe =
+                row_dirty_probe(frame, group.viewport_row);
+            dirty_group = dirty_probe.dirty;
+            stats.text_resource_dirty_row_probes += dirty_probe.probes;
             if (dirty_group) {
                 ++stats.text_groups_dirty;
             }
@@ -3568,14 +3610,15 @@ void sync_text_resource_nodes(
             }
         }
 
-        std::optional<Text_resource_row_descriptor> text_resource_descriptor = text_resource_row_descriptor(
-            frame,
-            group);
+        std::optional<Text_resource_row_descriptor> source_text_resource_descriptor =
+            text_resource_source_row_descriptor(
+                frame,
+                group);
         if (!dirty_group &&
             clean_row_cache_skip_available &&
             row_cache_identity_has_valid_retained_provenance(group.identity) &&
             old_slot.has_value() &&
-            text_resource_descriptor.has_value() &&
+            source_text_resource_descriptor.has_value() &&
             old_slot->text_resource_descriptor.has_value())
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::clean_cache_skip");
@@ -3584,24 +3627,6 @@ void sync_text_resource_nodes(
             set_row_text_clip_rect(*old_slot, row_clip_rect);
             ++stats.text_content_reused;
             ++stats.text_clean_reuse_skips;
-            new_slots.push_back(std::move(*old_slot));
-            continue;
-        }
-
-        if (same_text_frame_key &&
-            old_slot.has_value() &&
-            text_resource_descriptor.has_value() &&
-            old_slot->text_resource_descriptor == text_resource_descriptor)
-        {
-            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::text_resource_descriptor_reuse");
-
-            sync_text_wrapper_row_top(*old_slot, group.row_top);
-            set_row_text_clip_rect(*old_slot, row_clip_rect);
-            ++stats.text_content_reused;
-            ++stats.text_resource_descriptor_reuses;
-            if (dirty_group) {
-                ++stats.text_dirty_descriptor_identical_rows;
-            }
             new_slots.push_back(std::move(*old_slot));
             continue;
         }
@@ -3632,6 +3657,36 @@ void sync_text_resource_nodes(
             }
         }
 
+        if (!use_coalesced_resource_runs && !local_runs_assigned) {
+            assign_row_local_text_runs(group.runs, group.row_top, local_runs);
+            local_runs_assigned = true;
+        }
+
+        std::optional<Text_resource_row_descriptor> text_resource_descriptor;
+        if (source_text_resource_descriptor.has_value()) {
+            text_resource_descriptor = use_coalesced_resource_runs
+                ? text_resource_row_descriptor_for_runs(coalesced_resource_runs)
+                : text_resource_row_descriptor_for_runs(local_runs);
+        }
+
+        if (same_text_frame_key &&
+            old_slot.has_value() &&
+            text_resource_descriptor.has_value() &&
+            old_slot->text_resource_descriptor == text_resource_descriptor)
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::text_resource_descriptor_reuse");
+
+            sync_text_wrapper_row_top(*old_slot, group.row_top);
+            set_row_text_clip_rect(*old_slot, row_clip_rect);
+            ++stats.text_content_reused;
+            ++stats.text_resource_descriptor_reuses;
+            if (dirty_group) {
+                ++stats.text_dirty_descriptor_identical_rows;
+            }
+            new_slots.push_back(std::move(*old_slot));
+            continue;
+        }
+
         stats.text_resource_runs_before_coalescing +=
             static_cast<int>(group.runs.size());
         const int runs_after_coalescing = use_coalesced_resource_runs
@@ -3644,10 +3699,6 @@ void sync_text_resource_nodes(
                 std::max(
                     stats.text_resource_max_runs_after_coalescing_per_row,
                     runs_after_coalescing);
-        }
-        if (!use_coalesced_resource_runs && !local_runs_assigned) {
-            assign_row_local_text_runs(group.runs, group.row_top, local_runs);
-            local_runs_assigned = true;
         }
         QByteArray key = use_coalesced_resource_runs
             ? text_resource_key(coalesced_resource_runs, text_font_key, frame.logical_size)
@@ -5143,9 +5194,13 @@ void accumulate_frame_stats(
     total.dirty_rows            += static_cast<std::uint64_t>(stats.dirty_rows);
     total.full_dirty_rows       += static_cast<std::uint64_t>(stats.full_dirty_rows);
     total.cell_pass_input_cells += static_cast<std::uint64_t>(stats.cell_pass_input_cells);
+    total.cell_pass_classification_calls +=
+        static_cast<std::uint64_t>(stats.cell_pass_classification_calls);
     total.packed_pass_input_cells += static_cast<std::uint64_t>(stats.packed_pass_input_cells);
     total.packed_pass_cells_scanned +=
         static_cast<std::uint64_t>(stats.packed_pass_cells_scanned);
+    total.packed_pass_classification_calls +=
+        static_cast<std::uint64_t>(stats.packed_pass_classification_calls);
     total.packed_text_sidecars_enabled +=
         static_cast<std::uint64_t>(stats.packed_text_sidecars_enabled);
     total.packed_text_sidecars_disabled +=
@@ -5264,6 +5319,8 @@ void accumulate_renderer_stats(
     total.cache_key_bytes       += stats.cache_key_bytes;
     total.text_dirty_row_ranges += static_cast<std::uint64_t>(stats.text_dirty_row_ranges);
     total.text_dirty_rows       += static_cast<std::uint64_t>(stats.text_dirty_rows);
+    total.text_resource_dirty_row_probes +=
+        static_cast<std::uint64_t>(stats.text_resource_dirty_row_probes);
     total.text_runs_considered  += static_cast<std::uint64_t>(stats.text_runs_considered);
     total.text_coalescing_candidate_groups +=
         static_cast<std::uint64_t>(stats.text_coalescing_candidate_groups);
@@ -5456,6 +5513,18 @@ Terminal_simple_content_rejection_reason unrepresented_simple_cell_semantics_rej
     return Terminal_simple_content_rejection_reason::NONE;
 }
 
+bool strict_printable_ascii_classifier_bypass_eligible(
+    const Terminal_render_cell&    cell,
+    bool                           has_decoration)
+{
+    return
+        is_printable_ascii_cell_text(cell.text) &&
+        cell.display_width == 1                 &&
+        !cell.wide_continuation                 &&
+        cell.hyperlink_id == 0U                 &&
+        !has_decoration;
+}
+
 } // namespace
 
 terminal_simple_content_classification_t classify_terminal_simple_content_cell(
@@ -5520,6 +5589,14 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
         return reject(
             Terminal_simple_content_route::NONE,
             Terminal_simple_content_rejection_reason::EMPTY_TEXT);
+    }
+
+    if (strict_printable_ascii_classifier_bypass_eligible(cell, has_decoration)) {
+        classification.route = Terminal_simple_content_route::FAST_TEXT;
+        classification.rejection_reason =
+            Terminal_simple_content_rejection_reason::NONE;
+        classification.fast_text_eligible = true;
+        return classification;
     }
 
     Terminal_cell_shaping_input shaping_input;
@@ -6168,6 +6245,7 @@ void build_terminal_render_frame_packed_data(
                 *cell,
                 snapshot.styles.size(),
                 style_attributes);
+            ++frame.stats.packed_pass_classification_calls;
             const terminal_simple_content_classification_t classification =
                 classify_terminal_simple_content_cell(
                     *cell,
@@ -6324,6 +6402,7 @@ Terminal_render_frame build_terminal_render_frame(
                 style_or_null != nullptr &&
                 (style_or_null->underline || style_or_null->strike);
             ++frame.stats.dirty_row_lookup_count;
+            ++frame.stats.cell_pass_classification_calls;
             const terminal_simple_content_classification_t classification = classify_terminal_simple_content_cell(
                 cell,
                 snapshot->grid_size,

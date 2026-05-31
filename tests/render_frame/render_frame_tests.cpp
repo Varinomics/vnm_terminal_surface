@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
+#include <vector>
 
 namespace term = vnm_terminal::internal;
 
@@ -115,6 +116,25 @@ bool has_graphic_rect(
     }
 
     return false;
+}
+
+bool snapshot_cells_are_row_major_column_sorted(
+    const term::Terminal_render_snapshot& snapshot)
+{
+    for (std::size_t index = 1U; index < snapshot.cells.size(); ++index) {
+        const term::Terminal_render_cell& previous = snapshot.cells[index - 1U];
+        const term::Terminal_render_cell& current  = snapshot.cells[index];
+        if (current.position.row < previous.position.row) {
+            return false;
+        }
+        if (current.position.row    == previous.position.row &&
+            current.position.column <  previous.position.column)
+        {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool has_background_rect(
@@ -1084,6 +1104,337 @@ bool test_simple_content_classifier_and_stats()
     return ok;
 }
 
+bool test_classify_terminal_simple_content_cell_unicode_property()
+{
+    bool ok = true;
+    const term::terminal_grid_size_t grid_size{3, 8};
+
+    term::Terminal_render_cell ascii_cell;
+    ascii_cell.position = {0, 0};
+    ascii_cell.text     = QStringLiteral("A");
+    const std::vector<QString> strict_ascii_fast_texts = {
+        QString(QChar(0x0020)),
+        QStringLiteral("A"),
+        QString(QChar(0x007e)),
+    };
+    const bool dirty_row_inputs[] = {false, true};
+    for (const QString& text : strict_ascii_fast_texts) {
+        for (const bool dirty_row : dirty_row_inputs) {
+            term::Terminal_render_cell strict_ascii_cell = ascii_cell;
+            strict_ascii_cell.position = {2, 4};
+            strict_ascii_cell.text     = text;
+            strict_ascii_cell.style_id = 1U;
+            const term::terminal_simple_content_classification_t ascii_classification =
+                term::classify_terminal_simple_content_cell(
+                    strict_ascii_cell,
+                    grid_size,
+                    2U,
+                    false,
+                    dirty_row);
+            ok &= check(ascii_classification.fast_text_eligible &&
+                ascii_classification.route == term::Terminal_simple_content_route::FAST_TEXT &&
+                ascii_classification.rejection_reason ==
+                    term::Terminal_simple_content_rejection_reason::NONE &&
+                ascii_classification.text_category ==
+                    term::Terminal_simple_content_text_category::PRINTABLE_ASCII &&
+                ascii_classification.valid_terminal_cell &&
+                ascii_classification.row == strict_ascii_cell.position.row &&
+                ascii_classification.style_id == strict_ascii_cell.style_id &&
+                ascii_classification.dirty_row == dirty_row,
+                "strict single-code-unit printable ASCII remains the only fast-text corpus case");
+        }
+    }
+
+    const auto check_strict_ascii_gate_ordering = [&](
+        const term::Terminal_render_cell&                 cell,
+        term::terminal_grid_size_t                        case_grid_size,
+        std::size_t                                       style_count,
+        term::Terminal_simple_content_route               expected_route,
+        term::Terminal_simple_content_rejection_reason    expected_reason,
+        const char*                                       message) {
+        const term::terminal_simple_content_classification_t classification =
+            term::classify_terminal_simple_content_cell(
+                cell,
+                case_grid_size,
+                style_count,
+                false,
+                false);
+        return check(!classification.fast_text_eligible &&
+            classification.route == expected_route &&
+            classification.rejection_reason == expected_reason &&
+            classification.text_category ==
+                term::Terminal_simple_content_text_category::PRINTABLE_ASCII,
+            message);
+    };
+
+    term::Terminal_render_cell invalid_grid_cell = ascii_cell;
+    invalid_grid_cell.text = QStringLiteral("A");
+    ok &= check_strict_ascii_gate_ordering(
+        invalid_grid_cell,
+        {0, 8},
+        1U,
+        term::Terminal_simple_content_route::FALLBACK,
+        term::Terminal_simple_content_rejection_reason::INVALID_GRID,
+        "strict ASCII bypass keeps invalid-grid rejection ahead of fast text");
+
+    term::Terminal_render_cell invalid_position_cell = ascii_cell;
+    invalid_position_cell.text     = QStringLiteral("A");
+    invalid_position_cell.position = {3, 0};
+    ok &= check_strict_ascii_gate_ordering(
+        invalid_position_cell,
+        grid_size,
+        1U,
+        term::Terminal_simple_content_route::FALLBACK,
+        term::Terminal_simple_content_rejection_reason::INVALID_POSITION,
+        "strict ASCII bypass keeps invalid-position rejection ahead of fast text");
+
+    term::Terminal_render_cell invalid_style_cell = ascii_cell;
+    invalid_style_cell.text     = QStringLiteral("A");
+    invalid_style_cell.style_id = 1U;
+    ok &= check_strict_ascii_gate_ordering(
+        invalid_style_cell,
+        grid_size,
+        1U,
+        term::Terminal_simple_content_route::FALLBACK,
+        term::Terminal_simple_content_rejection_reason::INVALID_STYLE_ID,
+        "strict ASCII bypass keeps invalid-style rejection ahead of fast text");
+
+    term::Terminal_render_cell continuation_cell = ascii_cell;
+    continuation_cell.text              = QStringLiteral("A");
+    continuation_cell.wide_continuation = true;
+    ok &= check_strict_ascii_gate_ordering(
+        continuation_cell,
+        grid_size,
+        1U,
+        term::Terminal_simple_content_route::NONE,
+        term::Terminal_simple_content_rejection_reason::WIDE_CONTINUATION,
+        "strict ASCII bypass keeps wide-continuation rejection ahead of fast text");
+
+    term::Terminal_render_cell invalid_display_width_cell = ascii_cell;
+    invalid_display_width_cell.text          = QStringLiteral("A");
+    invalid_display_width_cell.display_width = 0;
+    ok &= check_strict_ascii_gate_ordering(
+        invalid_display_width_cell,
+        grid_size,
+        1U,
+        term::Terminal_simple_content_route::FALLBACK,
+        term::Terminal_simple_content_rejection_reason::INVALID_DISPLAY_WIDTH,
+        "strict ASCII bypass keeps invalid-display-width rejection ahead of fast text");
+
+    term::Terminal_render_cell out_of_row_width_cell = ascii_cell;
+    out_of_row_width_cell.text          = QStringLiteral("A");
+    out_of_row_width_cell.position      = {0, 7};
+    out_of_row_width_cell.display_width = 2;
+    ok &= check_strict_ascii_gate_ordering(
+        out_of_row_width_cell,
+        grid_size,
+        1U,
+        term::Terminal_simple_content_route::FALLBACK,
+        term::Terminal_simple_content_rejection_reason::INVALID_DISPLAY_WIDTH,
+        "strict ASCII bypass keeps out-of-row width rejection ahead of fast text");
+
+    struct rejection_case_t
+    {
+        const char*       message       = "";
+        QString           text;
+        int               display_width = 1;
+        std::uint64_t     hyperlink_id  = 0U;
+        bool              has_decoration = false;
+        bool              check_reason   = false;
+        term::Terminal_simple_content_rejection_reason
+                          expected_reason =
+                              term::Terminal_simple_content_rejection_reason::NONE;
+    };
+
+    const std::vector<rejection_case_t> cases = {
+        {
+            "tab rejects fast text",
+            QString(QChar(0x0009)),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
+        },
+        {
+            "newline rejects fast text",
+            QString(QChar(0x000a)),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
+        },
+        {
+            "U+001F rejects fast text below printable ASCII",
+            QString(QChar(0x001f)),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
+        },
+        {
+            "DEL rejects fast text",
+            QString(QChar(0x007f)),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
+        },
+        {
+            "U+0080 rejects fast text just above ASCII",
+            QString(QChar(0x0080)),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
+        },
+        {
+            "multi-code-unit ASCII rejects fast text",
+            QStringLiteral("AB"),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
+        },
+        {
+            "multi-cell ASCII rejects fast text",
+            QStringLiteral("AB"),
+            2,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::MULTI_CELL_TEXT,
+        },
+        {
+            "Omega rejects fast text",
+            QStringLiteral("\u03a9"),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::NON_ASCII_TEXT,
+        },
+        {
+            "CJK text rejects fast text",
+            QStringLiteral("\u754c"),
+            2,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::MULTI_CELL_TEXT,
+        },
+        {
+            "combining mark rejects fast text",
+            QStringLiteral("e\u0301"),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::NON_ASCII_TEXT,
+        },
+        {
+            "variation selector rejects fast text",
+            QString::fromUcs4(U"\u2764\ufe0e"),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::NON_ASCII_TEXT,
+        },
+        {
+            "emoji rejects fast text",
+            QString::fromUcs4(U"\U0001f600"),
+            2,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::MULTI_CELL_TEXT,
+        },
+        {
+            "ZWJ emoji rejects fast text",
+            QString::fromUcs4(U"\U0001f469\u200d\U0001f4bb"),
+            2,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING,
+        },
+        {
+            "invalid surrogate rejects fast text",
+            QString(QChar(0xd800)),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING,
+        },
+        {
+            "bidi control rejects fast text",
+            QString(QChar(0x202e)),
+            1,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
+        },
+        {
+            "hyperlink rejects fast text",
+            QStringLiteral("A"),
+            1,
+            17U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::HYPERLINK,
+        },
+        {
+            "decoration rejects fast text",
+            QStringLiteral("A"),
+            1,
+            0U,
+            true,
+            true,
+            term::Terminal_simple_content_rejection_reason::DECORATION,
+        },
+        {
+            "width mismatch rejects fast text",
+            QStringLiteral("A"),
+            2,
+            0U,
+            false,
+            true,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
+        },
+    };
+
+    for (const rejection_case_t& entry : cases) {
+        term::Terminal_render_cell cell = ascii_cell;
+        cell.text          = entry.text;
+        cell.display_width = entry.display_width;
+        cell.hyperlink_id  = entry.hyperlink_id;
+        const term::terminal_simple_content_classification_t classification =
+            term::classify_terminal_simple_content_cell(
+                cell,
+                grid_size,
+                1U,
+                entry.has_decoration,
+                false);
+        ok &= check(!classification.fast_text_eligible &&
+            classification.route != term::Terminal_simple_content_route::FAST_TEXT,
+            entry.message);
+        if (entry.check_reason) {
+            ok &= check(classification.rejection_reason == entry.expected_reason,
+                entry.message);
+        }
+    }
+
+    return ok;
+}
+
 bool test_fragmented_dirty_ranges_drive_simple_content_membership()
 {
     bool ok = true;
@@ -1115,8 +1466,308 @@ bool test_fragmented_dirty_ranges_drive_simple_content_membership()
         "fragmented dirty ranges classify selected rows dirty and gaps clean");
     ok &= check(frame.stats.dirty_row_lookup_count == 8,
         "fragmented dirty row membership preserves logical lookup probe count");
+    ok &= check(frame.stats.cell_pass_classification_calls == 4 &&
+        frame.stats.packed_pass_classification_calls == 4,
+        "fragmented dirty row membership exposes cell-pass and packed-pass classification calls");
     ok &= check(frame.stats.packed_text_cells == 4,
         "fragmented dirty row membership also feeds packed text sidecar classification");
+
+    return ok;
+}
+
+bool test_cell_pass_and_packed_pass_classification_agree()
+{
+    bool ok = true;
+
+    enum class decoration_t
+    {
+        NONE,
+        UNDERLINE,
+        STRIKE,
+    };
+
+    struct agreement_case_t
+    {
+        const char*    message               = "";
+        QString        text;
+        decoration_t   decoration           = decoration_t::NONE;
+        std::uint64_t  hyperlink_id          = 0U;
+        bool           dirty_row             = true;
+        term::Terminal_simple_content_route
+                       expected_route        = term::Terminal_simple_content_route::FAST_TEXT;
+        term::Terminal_simple_content_rejection_reason
+                       expected_reason       =
+                           term::Terminal_simple_content_rejection_reason::NONE;
+        QString        expected_packed_text;
+        std::uint32_t  expected_graphic      = 0U;
+        int            expected_dirty_fast   = 0;
+        int            expected_clean_fast   = 0;
+    };
+
+    const std::vector<agreement_case_t> cases = {
+        {
+            "dirty ASCII fast-text cell agrees across passes",
+            QStringLiteral("A"),
+            decoration_t::NONE,
+            0U,
+            true,
+            term::Terminal_simple_content_route::FAST_TEXT,
+            term::Terminal_simple_content_rejection_reason::NONE,
+            QStringLiteral("A"),
+            0U,
+            1,
+            0,
+        },
+        {
+            "clean ASCII fast-text cell agrees across passes",
+            QStringLiteral("B"),
+            decoration_t::NONE,
+            0U,
+            false,
+            term::Terminal_simple_content_route::FAST_TEXT,
+            term::Terminal_simple_content_rejection_reason::NONE,
+            QStringLiteral("B"),
+            0U,
+            0,
+            1,
+        },
+        {
+            "non-ASCII text cell stays off packed fast text",
+            QStringLiteral("\u03c0"),
+            decoration_t::NONE,
+            0U,
+            true,
+            term::Terminal_simple_content_route::QT_TEXT_LAYOUT,
+            term::Terminal_simple_content_rejection_reason::NON_ASCII_TEXT,
+        },
+        {
+            "terminal graphic cell agrees on packed graphic route",
+            QStringLiteral("\u2588"),
+            decoration_t::NONE,
+            0U,
+            true,
+            term::Terminal_simple_content_route::GRAPHIC_GEOMETRY,
+            term::Terminal_simple_content_rejection_reason::TERMINAL_GRAPHIC,
+            {},
+            0x2588U,
+        },
+        {
+            "underlined ASCII cell stays off packed fast text",
+            QStringLiteral("D"),
+            decoration_t::UNDERLINE,
+            0U,
+            true,
+            term::Terminal_simple_content_route::QT_TEXT_LAYOUT,
+            term::Terminal_simple_content_rejection_reason::DECORATION,
+        },
+        {
+            "strike-only ASCII cell stays off packed fast text",
+            QStringLiteral("E"),
+            decoration_t::STRIKE,
+            0U,
+            true,
+            term::Terminal_simple_content_route::QT_TEXT_LAYOUT,
+            term::Terminal_simple_content_rejection_reason::DECORATION,
+        },
+        {
+            "hyperlink ASCII cell stays off packed fast text",
+            QStringLiteral("F"),
+            decoration_t::NONE,
+            17U,
+            true,
+            term::Terminal_simple_content_route::QT_TEXT_LAYOUT,
+            term::Terminal_simple_content_rejection_reason::HYPERLINK,
+        },
+    };
+
+    const auto route_count = [](
+        const term::terminal_simple_content_stats_t& stats,
+        term::Terminal_simple_content_route route) {
+        switch (route) {
+            case term::Terminal_simple_content_route::NONE:
+                return stats.route_none_cells;
+            case term::Terminal_simple_content_route::FAST_TEXT:
+                return stats.route_fast_text_cells;
+            case term::Terminal_simple_content_route::QT_TEXT_LAYOUT:
+                return stats.route_qt_text_layout_cells;
+            case term::Terminal_simple_content_route::GRAPHIC_GEOMETRY:
+                return stats.route_graphic_geometry_cells;
+            case term::Terminal_simple_content_route::FALLBACK:
+                return stats.route_fallback_cells;
+        }
+        return 0;
+    };
+    const auto route_total = [](
+        const term::terminal_simple_content_stats_t& stats) {
+        return
+            stats.route_none_cells             +
+            stats.route_fast_text_cells        +
+            stats.route_qt_text_layout_cells   +
+            stats.route_graphic_geometry_cells +
+            stats.route_fallback_cells;
+    };
+    const auto rejection_count = [](
+        const term::terminal_simple_content_stats_t& stats,
+        term::Terminal_simple_content_rejection_reason reason) {
+        switch (reason) {
+            case term::Terminal_simple_content_rejection_reason::NONE:
+                return stats.rejection_none_cells;
+            case term::Terminal_simple_content_rejection_reason::EMPTY_TEXT:
+                return stats.rejection_empty_text_cells;
+            case term::Terminal_simple_content_rejection_reason::INVALID_GRID:
+                return stats.rejection_invalid_grid_cells;
+            case term::Terminal_simple_content_rejection_reason::INVALID_POSITION:
+                return stats.rejection_invalid_position_cells;
+            case term::Terminal_simple_content_rejection_reason::INVALID_STYLE_ID:
+                return stats.rejection_invalid_style_id_cells;
+            case term::Terminal_simple_content_rejection_reason::WIDE_CONTINUATION:
+                return stats.rejection_wide_continuation_cells;
+            case term::Terminal_simple_content_rejection_reason::INVALID_DISPLAY_WIDTH:
+                return stats.rejection_invalid_display_width_cells;
+            case term::Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING:
+                return stats.rejection_invalid_text_encoding_cells;
+            case term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH:
+                return stats.rejection_invalid_text_width_cells;
+            case term::Terminal_simple_content_rejection_reason::MULTI_CELL_TEXT:
+                return stats.rejection_multi_cell_text_cells;
+            case term::Terminal_simple_content_rejection_reason::NON_PRINTABLE_ASCII:
+                return stats.rejection_non_printable_ascii_cells;
+            case term::Terminal_simple_content_rejection_reason::NON_ASCII_TEXT:
+                return stats.rejection_non_ascii_text_cells;
+            case term::Terminal_simple_content_rejection_reason::DECORATION:
+                return stats.rejection_decoration_cells;
+            case term::Terminal_simple_content_rejection_reason::HYPERLINK:
+                return stats.rejection_hyperlink_cells;
+            case term::Terminal_simple_content_rejection_reason::TERMINAL_GRAPHIC:
+                return stats.rejection_terminal_graphic_cells;
+        }
+        return 0;
+    };
+    const auto rejection_total = [](
+        const term::terminal_simple_content_stats_t& stats) {
+        return
+            stats.rejection_none_cells                  +
+            stats.rejection_empty_text_cells            +
+            stats.rejection_invalid_grid_cells          +
+            stats.rejection_invalid_position_cells      +
+            stats.rejection_invalid_style_id_cells      +
+            stats.rejection_wide_continuation_cells     +
+            stats.rejection_invalid_display_width_cells +
+            stats.rejection_invalid_text_encoding_cells +
+            stats.rejection_invalid_text_width_cells    +
+            stats.rejection_multi_cell_text_cells       +
+            stats.rejection_non_printable_ascii_cells   +
+            stats.rejection_non_ascii_text_cells        +
+            stats.rejection_decoration_cells            +
+            stats.rejection_hyperlink_cells             +
+            stats.rejection_terminal_graphic_cells;
+    };
+
+    for (const agreement_case_t& entry : cases) {
+        term::Terminal_render_snapshot snapshot = empty_snapshot({1, 8});
+        snapshot.cursor.visible                 = false;
+        snapshot.dirty_row_ranges               = entry.dirty_row
+            ? std::vector<term::Terminal_render_dirty_row_range>{{0, 1}}
+            : std::vector<term::Terminal_render_dirty_row_range>{};
+
+        if (entry.decoration != decoration_t::NONE) {
+            term::Terminal_text_style style = term::make_default_terminal_text_style();
+            const term::Terminal_style_attribute attribute =
+                entry.decoration == decoration_t::UNDERLINE
+                    ? term::Terminal_style_attribute::UNDERLINE
+                    : term::Terminal_style_attribute::STRIKE;
+            term::set_terminal_style_attribute(style, attribute);
+            snapshot.styles.push_back(style);
+        }
+
+        term::Terminal_render_cell cell;
+        cell.position     = {0, 0};
+        cell.text         = entry.text;
+        cell.hyperlink_id = entry.hyperlink_id;
+        cell.style_id     = entry.decoration == decoration_t::NONE ? 0U : 1U;
+        snapshot.cells.push_back(cell);
+
+        const bool has_decoration = entry.decoration != decoration_t::NONE;
+        const term::terminal_simple_content_classification_t classification =
+            term::classify_terminal_simple_content_cell(
+                cell,
+                snapshot.grid_size,
+                snapshot.styles.size(),
+                has_decoration,
+                entry.dirty_row);
+        const term::Terminal_render_frame frame = build(snapshot);
+        const term::terminal_simple_content_stats_t& simple_stats =
+            frame.stats.simple_content;
+
+        ok &= check(classification.route == entry.expected_route &&
+            classification.rejection_reason == entry.expected_reason &&
+            classification.dirty_row == entry.dirty_row,
+            entry.message);
+        ok &= check(frame.stats.cell_pass_classification_calls == 1 &&
+            frame.stats.packed_pass_classification_calls == 1,
+            "single-cell agreement case classifies once in each pass");
+        ok &= check(simple_stats.cells_considered == 1 &&
+            route_total(simple_stats) == 1 &&
+            route_count(simple_stats, classification.route) == 1 &&
+            rejection_total(simple_stats) == 1 &&
+            rejection_count(simple_stats, classification.rejection_reason) == 1,
+            "single-cell agreement case records the direct route and rejection");
+        ok &= check(simple_stats.dirty_eligible_cells == entry.expected_dirty_fast &&
+            simple_stats.clean_eligible_cells == entry.expected_clean_fast,
+            "single-cell agreement case preserves dirty-row eligibility");
+
+        if (entry.expected_route == term::Terminal_simple_content_route::FAST_TEXT) {
+            ok &= check(frame.stats.packed_text_cells == 1 &&
+                frame.stats.packed_graphic_cells == 0 &&
+                packed_text_payload(frame) == entry.expected_packed_text,
+                "packed text output agrees with the fast-text classification");
+        }
+        else
+        if (entry.expected_route == term::Terminal_simple_content_route::GRAPHIC_GEOMETRY) {
+            ok &= check(frame.stats.packed_text_cells == 0 &&
+                frame.stats.packed_graphic_cells == 1 &&
+                has_packed_graphic_codepoint(frame, entry.expected_graphic),
+                "packed graphic output agrees with the graphic classification");
+        }
+        else {
+            ok &= check(frame.stats.packed_text_cells == 0 &&
+                frame.stats.packed_graphic_cells == 0,
+                "packed output excludes cells rejected from packed fast routes");
+        }
+    }
+
+    return ok;
+}
+
+bool test_snapshot_cells_are_row_major_column_sorted()
+{
+    bool ok = true;
+
+    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 8});
+    snapshot.cursor.visible = false;
+    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
+    snapshot.cells.push_back({.position = {0, 3}, .text = QStringLiteral("D")});
+    snapshot.cells.push_back({.position = {1, 0}, .text = QStringLiteral("B")});
+    snapshot.cells.push_back({.position = {2, 2}, .text = QStringLiteral("C")});
+
+    ok &= check(snapshot_cells_are_row_major_column_sorted(snapshot),
+        "snapshot cell fixture is row-major and column sorted");
+
+    const term::Terminal_render_frame frame = build(snapshot);
+    ok &= check(frame.text_runs.size() == 4U &&
+        frame.text_runs[0].row == 0 && frame.text_runs[0].column == 0 &&
+        frame.text_runs[1].row == 0 && frame.text_runs[1].column == 3 &&
+        frame.text_runs[2].row == 1 && frame.text_runs[2].column == 0 &&
+        frame.text_runs[3].row == 2 && frame.text_runs[3].column == 2,
+        "cell pass observes the row-major snapshot ordering invariant");
+    ok &= check(frame.stats.packed_text_cells == 4 &&
+        packed_text_payload(frame) == QStringLiteral("ADBC"),
+        "packed pass output matches row-major column order for sorted snapshots");
+
+    term::Terminal_render_snapshot unsorted_snapshot = snapshot;
+    std::swap(unsorted_snapshot.cells[0], unsorted_snapshot.cells[1]);
+    ok &= check(!snapshot_cells_are_row_major_column_sorted(unsorted_snapshot),
+        "snapshot cell order fixture detects unsorted columns");
 
     return ok;
 }
@@ -1327,9 +1978,13 @@ bool test_packed_text_excludes_cursor_and_ime_cells()
     const term::Terminal_render_frame cursor_frame = build(cursor_snapshot);
     ok &= check(cursor_frame.stats.simple_content.eligible_cells == 3 &&
         cursor_frame.stats.simple_content.eligible_after_all_gates_cells == 2 &&
+        cursor_frame.stats.simple_content.route_fast_text_cells == 3 &&
         cursor_frame.stats.packed_text_cells == 2 &&
         packed_text_payload(cursor_frame) == QStringLiteral("AC"),
-        "packed text excludes block-cursor-covered simple text");
+        "packed text excludes one otherwise-strict ASCII cell covered by block cursor");
+    ok &= check(cursor_frame.stats.cell_pass_classification_calls == 3 &&
+        cursor_frame.stats.packed_pass_classification_calls == 2,
+        "block cursor coverage is visible as a packed-pass classification skip");
     ok &= check(cursor_frame.cursor_text_runs.size() == 1U &&
         cursor_frame.cursor_text_runs.front().text == QStringLiteral("B"),
         "block cursor inverse text still comes from visual text runs");
@@ -1347,9 +2002,13 @@ bool test_packed_text_excludes_cursor_and_ime_cells()
     const term::Terminal_render_frame ime_frame = build(ime_snapshot);
     ok &= check(ime_frame.stats.simple_content.eligible_cells == 4 &&
         ime_frame.stats.simple_content.eligible_after_all_gates_cells == 2 &&
+        ime_frame.stats.simple_content.route_fast_text_cells == 4 &&
         ime_frame.stats.packed_text_cells == 2 &&
         packed_text_payload(ime_frame) == QStringLiteral("AD"),
-        "packed text excludes IME-covered simple text");
+        "packed text excludes otherwise-strict ASCII cells covered by IME preedit");
+    ok &= check(ime_frame.stats.cell_pass_classification_calls == 4 &&
+        ime_frame.stats.packed_pass_classification_calls == 2,
+        "IME coverage is visible as packed-pass classification skips");
     ok &= check(!ime_frame.text_runs.empty() &&
         ime_frame.text_runs.back().text == QStringLiteral("xy"),
         "IME visual text still uses the existing text-run route");
@@ -1367,9 +2026,13 @@ bool test_packed_text_excludes_cursor_and_ime_cells()
     const term::Terminal_render_frame cjk_ime_frame = build(cjk_ime_snapshot);
     ok &= check(cjk_ime_frame.stats.simple_content.eligible_cells == 4 &&
         cjk_ime_frame.stats.simple_content.eligible_after_all_gates_cells == 2 &&
+        cjk_ime_frame.stats.simple_content.route_fast_text_cells == 4 &&
         cjk_ime_frame.stats.packed_text_cells == 2 &&
         packed_text_payload(cjk_ime_frame) == QStringLiteral("AD"),
         "packed text excludes cells covered by CJK preedit over ASCII content");
+    ok &= check(cjk_ime_frame.stats.cell_pass_classification_calls == 4 &&
+        cjk_ime_frame.stats.packed_pass_classification_calls == 2,
+        "CJK IME coverage is visible as packed-pass classification skips");
     ok &= check(!cjk_ime_frame.text_runs.empty() &&
         cjk_ime_frame.text_runs.back().text == QStringLiteral("\u754c") &&
         cjk_ime_frame.text_runs.back().rect.width() == metrics().width * 2.0,
@@ -1442,7 +2105,10 @@ int main()
     ok &= test_preedit_override_takes_precedence_over_snapshot();
     ok &= test_frame_stats_classify_rendered_cells();
     ok &= test_simple_content_classifier_and_stats();
+    ok &= test_classify_terminal_simple_content_cell_unicode_property();
     ok &= test_fragmented_dirty_ranges_drive_simple_content_membership();
+    ok &= test_cell_pass_and_packed_pass_classification_agree();
+    ok &= test_snapshot_cells_are_row_major_column_sorted();
     ok &= test_packed_text_rows_spans_and_order();
     ok &= test_packed_graphic_source_codepoint_spans();
     ok &= test_packed_graphics_exclude_unrepresented_cells();

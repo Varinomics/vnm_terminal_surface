@@ -4034,6 +4034,104 @@ bool test_qsg_text_resource_key_separates_coalesced_ascii_from_original_runs(
     return ok;
 }
 
+bool test_ascii_coalescing_context_enable_disable_descriptor_identity(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    QQuickWindow window;
+    window.setColor(QColor(180, 16, 16));
+    window.resize(380, 120);
+    window.show();
+    pump_events(app, 2);
+
+    const QFont font = term::vnm_terminal_font(QString(), 16.0);
+    const term::terminal_cell_metrics_t metrics = cell_metrics_for_font(font);
+    const term::Terminal_render_frame coalesced_frame = make_direct_text_frame(
+        {
+            make_direct_text_run(0, 1, QStringLiteral("A"), metrics),
+            make_direct_text_run(1, 1, QStringLiteral("B"), metrics),
+        },
+        metrics);
+    const term::Terminal_render_frame original_frame = make_direct_text_frame(
+        {
+            make_direct_text_run(0, 2, QStringLiteral("AB"), metrics),
+        },
+        metrics);
+
+    term::Qsg_terminal_renderer renderer;
+    QSGNode* node = nullptr;
+    auto update = [&](
+        const term::Terminal_render_frame& frame,
+        term::terminal_renderer_stats_t& stats) {
+        node = renderer.update_node(
+            node,
+            &window,
+            frame,
+            font,
+            1.0,
+            {},
+            stats);
+        return
+            node != nullptr       &&
+            stats.paint_completed &&
+            stats.text_content_failures == 0;
+    };
+
+    term::terminal_renderer_stats_t enabled_stats;
+    ok &= check(update(coalesced_frame, enabled_stats),
+        "ASCII coalescing descriptor-identity baseline renders");
+    ok &= check(enabled_stats.text_content_rebuilds == 1 &&
+        enabled_stats.text_coalescing_candidate_groups == 1 &&
+        enabled_stats.text_coalescing_enabled_groups == 1 &&
+        enabled_stats.text_resource_runs_before_coalescing == 2 &&
+        enabled_stats.text_resource_runs_after_coalescing == 1,
+        "ASCII coalescing baseline uses the coalesced text-resource route");
+
+    term::terminal_renderer_stats_t disabled_stats;
+    ok &= check(update(original_frame, disabled_stats),
+        "ASCII coalescing original-route transition renders");
+    ok &= check(disabled_stats.text_content_rebuilds == 1 &&
+        disabled_stats.text_cache_entries_replaced == 1 &&
+        disabled_stats.text_content_reused == 0 &&
+        disabled_stats.text_resource_descriptor_reuses == 0 &&
+        disabled_stats.text_key_match_reuses == 0 &&
+        disabled_stats.text_coalescing_candidate_groups == 0 &&
+        disabled_stats.text_coalescing_enabled_groups == 0 &&
+        disabled_stats.text_resource_runs_before_coalescing == 1 &&
+        disabled_stats.text_resource_runs_after_coalescing == 1,
+        "original ASCII route rebuilds instead of reusing the coalesced descriptor");
+
+    term::terminal_renderer_stats_t reenabled_stats;
+    ok &= check(update(coalesced_frame, reenabled_stats),
+        "ASCII coalescing re-enabled descriptor route transition renders");
+    ok &= check(reenabled_stats.text_content_rebuilds == 1 &&
+        reenabled_stats.text_cache_entries_replaced == 1 &&
+        reenabled_stats.text_content_reused == 0 &&
+        reenabled_stats.text_resource_descriptor_reuses == 0 &&
+        reenabled_stats.text_key_match_reuses == 0 &&
+        reenabled_stats.text_coalescing_candidate_groups == 1 &&
+        reenabled_stats.text_coalescing_enabled_groups == 1 &&
+        reenabled_stats.text_resource_runs_before_coalescing == 2 &&
+        reenabled_stats.text_resource_runs_after_coalescing == 1,
+        "coalesced ASCII route rebuilds instead of reusing the original descriptor");
+
+    term::terminal_renderer_stats_t reuse_stats;
+    ok &= check(update(coalesced_frame, reuse_stats),
+        "ASCII coalescing repeated route renders");
+    ok &= check(reuse_stats.text_content_rebuilds == 0 &&
+        reuse_stats.text_cache_entries_replaced == 0 &&
+        reuse_stats.text_content_reused == 1 &&
+        reuse_stats.text_resource_descriptor_reuses == 1 &&
+        reuse_stats.text_key_match_reuses == 0 &&
+        reuse_stats.text_coalescing_candidate_groups == 1 &&
+        reuse_stats.text_coalescing_enabled_groups == 1,
+        "repeated coalesced ASCII route reuses the matching descriptor");
+
+    term::terminal_renderer_stats_t cleanup_stats;
+    renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
+    return ok;
+}
+
 bool test_qsg_background_selection_row_cache(QGuiApplication& app)
 {
     bool ok = true;
@@ -9538,6 +9636,85 @@ bool test_qsg_text_row_slot_dirty_clean_skip_safety(QGuiApplication& app)
     return ok;
 }
 
+bool test_qsg_text_sync_dirty_probe_counts_fragmented_ranges(QGuiApplication& app)
+{
+    bool ok = true;
+    QQuickWindow window;
+    window.setColor(QColor(180, 16, 16));
+    window.resize(260, 140);
+    window.show();
+    pump_events(app, 2);
+
+    const QFont font = term::vnm_terminal_font(QString(), 16.0);
+    const term::terminal_cell_metrics_t metrics = test_metrics();
+
+    term::Qsg_terminal_renderer renderer;
+    QSGNode* node = nullptr;
+    auto update = [&](
+        const term::Terminal_render_frame& frame,
+        term::terminal_renderer_stats_t& stats) {
+        node = renderer.update_node(
+            node,
+            &window,
+            frame,
+            font,
+            1.0,
+            {},
+            stats);
+        return
+            node != nullptr       &&
+            stats.paint_completed &&
+            stats.text_content_failures == 0;
+    };
+
+    const term::Terminal_render_frame baseline_frame =
+        make_direct_text_slot_rows_frame(
+            term::Terminal_buffer_id::PRIMARY,
+            0,
+            5,
+            metrics,
+            {{0, 5}});
+    term::terminal_renderer_stats_t baseline_stats;
+    ok &= check(update(baseline_frame, baseline_stats),
+        "fragmented dirty probe baseline renders");
+    ok &= check(baseline_stats.text_content_rebuilds == 5 &&
+        baseline_stats.text_groups_considered == 5 &&
+        baseline_stats.text_groups_dirty == 5 &&
+        baseline_stats.text_groups_clean == 0 &&
+        baseline_stats.text_resource_dirty_row_probes == 5,
+        "contiguous dirty row range exposes one text-resource probe per row");
+
+    const term::Terminal_render_frame fragmented_frame =
+        make_direct_text_slot_rows_frame(
+            term::Terminal_buffer_id::PRIMARY,
+            0,
+            5,
+            metrics,
+            {{0, 1}, {2, 1}, {4, 1}});
+    term::terminal_renderer_stats_t fragmented_stats;
+    ok &= check(update(fragmented_frame, fragmented_stats),
+        "fragmented dirty probe update renders");
+    // Phase 3 commit "move dirty membership to QSG row state" flips the exact
+    // probe count from 11 to one O(1) check per considered row.
+    ok &= check(fragmented_stats.text_groups_considered == 5 &&
+        fragmented_stats.text_groups_dirty == 3 &&
+        fragmented_stats.text_groups_clean == 2 &&
+        fragmented_stats.text_dirty_row_ranges == 3 &&
+        fragmented_stats.text_dirty_rows == 3 &&
+        fragmented_stats.text_resource_dirty_row_probes == 11,
+        "fragmented dirty row ranges expose current linear probe behavior");
+    ok &= check(fragmented_stats.text_content_rebuilds == 0 &&
+        fragmented_stats.text_content_reused == 5 &&
+        fragmented_stats.text_resource_descriptor_reuses == 5 &&
+        fragmented_stats.text_dirty_descriptor_identical_rows == 3 &&
+        fragmented_stats.text_content_failures == 0,
+        "fragmented dirty probe update reuses unchanged text resources");
+
+    term::terminal_renderer_stats_t cleanup_stats;
+    renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
+    return ok;
+}
+
 bool test_qsg_text_row_slot_exact_content_descriptors(QGuiApplication& app)
 {
     bool ok = true;
@@ -9750,6 +9927,88 @@ bool test_qsg_text_row_slot_exact_content_descriptors(QGuiApplication& app)
     return ok;
 }
 
+bool test_qsg_text_frame_cache_key_logical_size_resize_breaks_reuse(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    QQuickWindow window;
+    window.setColor(QColor(180, 16, 16));
+    window.resize(260, 100);
+    window.show();
+    pump_events(app, 2);
+
+    const QFont font = term::vnm_terminal_font(QString(), 16.0);
+    const term::terminal_cell_metrics_t metrics = test_metrics();
+    const term::Terminal_render_frame base_frame = make_direct_text_slot_frame(
+        term::Terminal_buffer_id::PRIMARY,
+        0,
+        1,
+        {make_direct_text_run_for_row(
+            0,
+            0,
+            0,
+            1,
+            QStringLiteral("A"),
+            metrics)},
+        metrics,
+        {{0, 1}});
+
+    term::Qsg_terminal_renderer renderer;
+    QSGNode* node = nullptr;
+    auto update = [&](
+        const term::Terminal_render_frame& frame,
+        term::terminal_renderer_stats_t& stats) {
+        node = renderer.update_node(
+            node,
+            &window,
+            frame,
+            font,
+            1.0,
+            {},
+            stats);
+        return
+            node != nullptr       &&
+            stats.paint_completed &&
+            stats.text_content_failures == 0;
+    };
+
+    term::terminal_renderer_stats_t first_stats;
+    ok &= check(update(base_frame, first_stats),
+        "logical-size cache churn baseline renders");
+    ok &= check(first_stats.text_content_rebuilds == 1,
+        "logical-size cache churn baseline builds one text row");
+
+    term::terminal_renderer_stats_t reuse_stats;
+    ok &= check(update(base_frame, reuse_stats),
+        "logical-size cache churn unchanged base rerenders");
+    ok &= check(reuse_stats.text_content_rebuilds == 0 &&
+        reuse_stats.text_content_reused == 1 &&
+        reuse_stats.text_resource_descriptor_reuses == 1,
+        "unchanged logical size reuses the text row");
+
+    term::Terminal_render_frame resized_frame = base_frame;
+    resized_frame.logical_size.rwidth() += 1.0;
+    term::terminal_renderer_stats_t resized_stats;
+    ok &= check(update(resized_frame, resized_stats),
+        "logical-size-only one-pixel resize renders");
+    // Phase 2 commit "drop logical_size from text descriptor reuse key" flips
+    // current churn to reuse, with text_key_builds 2 -> 1.
+    ok &= check(resized_stats.text_content_rebuilds == 1 &&
+        resized_stats.text_cache_entries_replaced == 1 &&
+        resized_stats.text_content_reused == 0 &&
+        resized_stats.text_resource_descriptor_reuses == 0 &&
+        resized_stats.text_key_match_reuses == 0 &&
+        resized_stats.text_key_builds == 2 &&
+        resized_stats.cache_key_builds ==
+            resized_stats.text_key_builds + resized_stats.rect_key_builds &&
+        resized_stats.text_content_failures == 0,
+        "logical-size-only one-pixel resize currently breaks text resource reuse");
+
+    term::terminal_renderer_stats_t cleanup_stats;
+    renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
+    return ok;
+}
+
 bool test_qsg_block_cursor_text_overlay_paths(QGuiApplication& app)
 {
     bool ok = true;
@@ -9860,6 +10119,86 @@ bool test_qsg_block_cursor_text_overlay_paths(QGuiApplication& app)
     ok                        &= check(!moved_image.isNull() &&
         new_cursor_white > old_cursor_white + 20,
         "cursor movement clears old block pixels and paints the new cursor cell");
+    return ok;
+}
+
+bool test_cursor_walk_across_coalesced_ascii_row(QGuiApplication& app)
+{
+    bool ok = true;
+    QQuickWindow window;
+    window.setColor(QColor(180, 16, 16));
+    window.resize(300, 120);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(240.0, 80.0));
+    configure_test_font(surface);
+    window.show();
+
+    const term::terminal_cell_metrics_t metrics = test_metrics();
+    const auto white_cursor_pixels = [&](const QImage& image, int column) {
+        return count_matching_pixels(
+            image,
+            cell_area(0, column, 1, metrics),
+            [](QColor color) {
+                return color.red() > 180 && color.green() > 180 && color.blue() > 180;
+            });
+    };
+    const auto dark_cursor_glyph_pixels = [&](const QImage& image, int column) {
+        return count_matching_pixels(
+            image,
+            cell_area(0, column, 1, metrics),
+            [](QColor color) {
+                return color.red() + color.green() + color.blue() < 650;
+            });
+    };
+
+    for (int column = 0; column < 4; ++column) {
+        const std::uint64_t sequence = 1340U + static_cast<std::uint64_t>(column);
+        const std::vector<term::Terminal_render_dirty_row_range> dirty_rows =
+            column == 0
+                ? std::vector<term::Terminal_render_dirty_row_range>{{0, 1}}
+                : std::vector<term::Terminal_render_dirty_row_range>{};
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            surface,
+            make_block_cursor_text_snapshot(sequence, column, dirty_rows));
+
+        ok &= check(wait_rendered_sequence_with_text_rebuilds(
+            app,
+            window,
+            surface,
+            sequence,
+            column == 0 ? 1 : 0),
+            "cursor walk over coalesced ASCII row renders the expected frame");
+
+        const QImage image = window.grabWindow();
+        const term::terminal_renderer_stats_t stats =
+            term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+        const int current_white = white_cursor_pixels(image, column);
+        ok &= check(!image.isNull() &&
+            current_white > 20 &&
+            dark_cursor_glyph_pixels(image, column) > 1,
+            "cursor walk paints the current block cursor and inverse glyph");
+        if (column > 0) {
+            ok &= check(white_cursor_pixels(image, column - 1) < current_white - 15,
+                "cursor walk clears the previous block cursor cell");
+        }
+
+        ok &= check(stats.frame_cursor_text_runs == 1 &&
+            stats.cursor_layer_rebuilt &&
+            stats.cursor_text_layer_rebuilt &&
+            stats.text_coalescing_candidate_groups == 1 &&
+            stats.text_coalescing_enabled_groups == 1 &&
+            stats.text_resource_runs_before_coalescing == 4 &&
+            stats.text_resource_runs_after_coalescing == 1,
+            "cursor walk keeps the main ASCII row on the coalesced text-resource route");
+        if (column > 0) {
+            ok &= check(stats.text_content_rebuilds == 0 &&
+                stats.text_key_match_reuses == 1,
+                "cursor walk reuses coalesced main text while cursor overlays move");
+        }
+    }
+
     return ok;
 }
 
@@ -11312,6 +11651,7 @@ int main(int argc, char** argv)
     ok &= test_qsg_packed_sidecars_do_not_affect_visual_output(app);
     ok &= test_qsg_text_coalescing_rejects_cell_width_drift(app);
     ok &= test_qsg_text_resource_key_separates_coalesced_ascii_from_original_runs(app);
+    ok &= test_ascii_coalescing_context_enable_disable_descriptor_identity(app);
     ok &= test_qsg_background_selection_row_cache(app);
     ok &= test_qsg_background_row_cache_uses_batched_geometry(app, false);
     ok &= test_qsg_selection_row_cache_uses_batched_geometry(app, false);
@@ -11353,8 +11693,11 @@ int main(int argc, char** argv)
     ok &= test_qsg_text_row_slot_active_buffer_roundtrip_pixels(app);
     ok &= test_qsg_text_row_slot_viewport_order_and_resize_cleanup(app);
     ok &= test_qsg_text_row_slot_dirty_clean_skip_safety(app);
+    ok &= test_qsg_text_sync_dirty_probe_counts_fragmented_ranges(app);
     ok &= test_qsg_text_row_slot_exact_content_descriptors(app);
+    ok &= test_qsg_text_frame_cache_key_logical_size_resize_breaks_reuse(app);
     ok &= test_qsg_block_cursor_text_overlay_paths(app);
+    ok &= test_cursor_walk_across_coalesced_ascii_row(app);
     ok &= test_qsg_wide_block_cursor_overlay(app);
     ok &= test_qsg_active_preedit_snapshot_rendering(app);
     ok &= test_qsg_block_cursor_over_terminal_graphic(app);

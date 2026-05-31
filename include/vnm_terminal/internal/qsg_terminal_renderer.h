@@ -121,6 +121,7 @@ struct terminal_renderer_stats_t
     std::uint64_t  cache_key_bytes                                      = 0U;
     int            text_dirty_row_ranges                                = 0;
     int            text_dirty_rows                                      = 0;
+    int            text_resource_dirty_row_probes                       = 0;
     int            text_runs_considered                                 = 0;
     int            text_coalescing_candidate_groups                     = 0;
     int            text_coalescing_enabled_groups                       = 0;
@@ -243,6 +244,7 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  cache_key_bytes                                      = 0U;
     std::uint64_t  text_dirty_row_ranges                                = 0U;
     std::uint64_t  text_dirty_rows                                      = 0U;
+    std::uint64_t  text_resource_dirty_row_probes                       = 0U;
     std::uint64_t  text_runs_considered                                 = 0U;
     std::uint64_t  text_coalescing_candidate_groups                     = 0U;
     std::uint64_t  text_coalescing_enabled_groups                       = 0U;
