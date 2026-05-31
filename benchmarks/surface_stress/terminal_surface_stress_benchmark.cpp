@@ -23,6 +23,7 @@ struct Benchmark_options
     int rows           = 235;
     int columns        = 873;
     int dirty_rows     = 235;
+    int dirty_row_stride = 1;
     int graphics_every = 11;
     int style_period   = 8;
     bool packed_text_sidecars_enabled = false;
@@ -99,6 +100,7 @@ Benchmark_options parse_options(int argc, char** argv)
             parse_int_arg(argc, argv, index, "--rows", options.rows) ||
             parse_int_arg(argc, argv, index, "--cols", options.columns) ||
             parse_int_arg(argc, argv, index, "--dirty-rows", options.dirty_rows) ||
+            parse_int_arg(argc, argv, index, "--dirty-row-stride", options.dirty_row_stride) ||
             parse_int_arg(argc, argv, index, "--graphics-every", options.graphics_every) ||
             parse_int_arg(argc, argv, index, "--style-period", options.style_period))
         {
@@ -119,6 +121,7 @@ Benchmark_options parse_options(int argc, char** argv)
                 << "  --rows <n>                   grid rows, default 235\n"
                 << "  --cols <n>                   grid columns, default 873\n"
                 << "  --dirty-rows <n>             rows rewritten per frame, default all rows\n"
+                << "  --dirty-row-stride <n>       strided dirty row walk; fragmentation requires --dirty-rows < --rows, default 1\n"
                 << "  --graphics-every <n>         emit U+2588 every N cells, 0 disables\n"
                 << "  --style-period <n>           ANSI color variation period, 0 disables\n"
                 << "  --packed-text-sidecars       enable packed text sidecars\n";
@@ -134,6 +137,7 @@ Benchmark_options parse_options(int argc, char** argv)
     options.rows          = std::max(1, options.rows);
     options.columns       = std::max(1, options.columns);
     options.dirty_rows    = std::clamp(options.dirty_rows, 1, options.rows);
+    options.dirty_row_stride = std::clamp(options.dirty_row_stride, 1, options.rows);
     options.graphics_every = std::max(0, options.graphics_every);
     options.style_period   = std::max(0, options.style_period);
     return options;
@@ -152,9 +156,24 @@ std::vector<int> dirty_rows_for_frame(const Benchmark_options& options, int fram
     std::vector<bool> used(static_cast<std::size_t>(options.rows), false);
     std::vector<int> rows;
     rows.reserve(static_cast<std::size_t>(options.dirty_rows));
-    int probe = frame_index * 37;
+    std::int64_t probe = static_cast<std::int64_t>(frame_index) * 37;
     while (static_cast<int>(rows.size()) < options.dirty_rows) {
-        const int row = ((probe * 17) + (frame_index * 13)) % options.rows;
+        const std::int64_t frame_offset = static_cast<std::int64_t>(frame_index) * 13;
+        const int candidate = options.dirty_row_stride > 1
+            ? static_cast<int>(
+                ((probe * options.dirty_row_stride) + frame_offset) %
+                    options.rows)
+            : static_cast<int>(((probe * 17) + frame_offset) % options.rows);
+        int row = candidate;
+        if (options.dirty_row_stride > 1 && used[static_cast<std::size_t>(row)]) {
+            for (int offset = 1; offset < options.rows; ++offset) {
+                const int fallback_row = (candidate + offset) % options.rows;
+                if (!used[static_cast<std::size_t>(fallback_row)]) {
+                    row = fallback_row;
+                    break;
+                }
+            }
+        }
         if (!used[static_cast<std::size_t>(row)]) {
             used[static_cast<std::size_t>(row)] = true;
             rows.push_back(row);
@@ -366,6 +385,7 @@ int main(int argc, char** argv)
     print_metric("rows", static_cast<std::uint64_t>(options.rows));
     print_metric("columns", static_cast<std::uint64_t>(options.columns));
     print_metric("dirty_rows_requested", static_cast<std::uint64_t>(options.dirty_rows));
+    print_metric("dirty_row_stride", static_cast<std::uint64_t>(options.dirty_row_stride));
     print_metric("graphics_every", static_cast<std::uint64_t>(options.graphics_every));
     print_metric("style_period", static_cast<std::uint64_t>(options.style_period));
     std::cout << "packed_text_sidecars_enabled="
