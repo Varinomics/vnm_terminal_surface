@@ -2880,46 +2880,67 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
         std::uint64_t rows_visited                     = 0U;
         std::uint64_t rows_materialized                = 0U;
 #endif
-        snapshot.visible_line_provenance.reserve(
-            static_cast<std::size_t>(m_config.grid_size.rows));
+        {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "Terminal_screen_model::render_snapshot::append_rows::reserve");
+
+            snapshot.visible_line_provenance.reserve(
+                static_cast<std::size_t>(m_config.grid_size.rows));
+        }
         for (int row = 0; row < m_config.grid_size.rows; ++row) {
 #if VNM_TERMINAL_PROFILING_ENABLED
             ++rows_visited;
 #endif
             const viewport_row_t viewport_row{row};
-            const snapshot_row_t snapshot_row = snapshot_row_from_viewport(viewport_row);
-            const std::optional<std::vector<Cell>> row_cells =
-                viewport_row_cells(viewport, row);
             const std::size_t first_row_cell = snapshot.cells.size();
-            if (row_cells.has_value()) {
-#if VNM_TERMINAL_PROFILING_ENABLED
-                ++rows_materialized;
-#endif
-                append_snapshot_cells_from_row(snapshot, *row_cells, snapshot_row.value);
-            }
-            const std::optional<std::map<std::uint64_t, QByteArray>>
-                row_local_hyperlink_identity_keys =
-                    viewport_row_retained_hyperlink_identity_keys(viewport, row);
-            append_hyperlink_metadata_for_cells(
-                snapshot.hyperlinks,
-                snapshot.cells,
-                first_row_cell,
-                row_local_hyperlink_identity_keys.has_value()
-                    ? &*row_local_hyperlink_identity_keys
-                    : nullptr);
+            {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "Terminal_screen_model::render_snapshot::append_rows::row_cells");
 
-            const std::optional<Terminal_retained_line_provenance> provenance =
-                viewport_row_provenance(viewport, row);
-            if (provenance.has_value()) {
-                const std::optional<primary_backing_row_t> backing_row =
-                    primary_backing_row_from_viewport(viewport, viewport_row);
-                const int logical_row =
-                    backing_row.has_value() ? backing_row->value : row;
-                snapshot.visible_line_provenance.push_back({
-                    static_cast<std::int64_t>(logical_row),
-                    provenance->retained_line_id,
-                    provenance->content_generation,
-                });
+                const snapshot_row_t snapshot_row = snapshot_row_from_viewport(viewport_row);
+                const std::optional<std::vector<Cell>> row_cells =
+                    viewport_row_cells(viewport, row);
+                if (row_cells.has_value()) {
+#if VNM_TERMINAL_PROFILING_ENABLED
+                    ++rows_materialized;
+#endif
+                    append_snapshot_cells_from_row(snapshot, *row_cells, snapshot_row.value);
+                }
+            }
+
+            {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata");
+
+                const std::optional<std::map<std::uint64_t, QByteArray>>
+                    row_local_hyperlink_identity_keys =
+                        viewport_row_retained_hyperlink_identity_keys(viewport, row);
+                append_hyperlink_metadata_for_cells(
+                    snapshot.hyperlinks,
+                    snapshot.cells,
+                    first_row_cell,
+                    row_local_hyperlink_identity_keys.has_value()
+                        ? &*row_local_hyperlink_identity_keys
+                        : nullptr);
+            }
+
+            {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "Terminal_screen_model::render_snapshot::append_rows::provenance");
+
+                const std::optional<Terminal_retained_line_provenance> provenance =
+                    viewport_row_provenance(viewport, row);
+                if (provenance.has_value()) {
+                    const std::optional<primary_backing_row_t> backing_row =
+                        primary_backing_row_from_viewport(viewport, viewport_row);
+                    const int logical_row =
+                        backing_row.has_value() ? backing_row->value : row;
+                    snapshot.visible_line_provenance.push_back({
+                        static_cast<std::int64_t>(logical_row),
+                        provenance->retained_line_id,
+                        provenance->content_generation,
+                    });
+                }
             }
         }
 #if VNM_TERMINAL_PROFILING_ENABLED

@@ -360,6 +360,8 @@ public:
     :
         m_snapshot(snapshot)
     {
+        VNM_TERMINAL_PROFILE_SCOPE("Render_style_attribute_cache::build");
+
         if (snapshot.styles.size() > k_eager_render_style_attribute_limit) {
             return;
         }
@@ -3570,22 +3572,49 @@ void sync_text_resource_nodes(
 {
     VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes");
 
-    const QRectF frame_viewport(QPointF(0.0, 0.0), frame.logical_size);
-    const QRectF     row_clip_rect          = row_text_clip_rect(frame);
-    const QString    text_font_key          = font_cache_key(font);
-    const QByteArray current_text_frame_key = text_frame_cache_key(frame, text_font_key);
-    record_text_cache_key_build(stats, current_text_frame_key);
-    const bool same_text_frame_key = root.text_frame_key == current_text_frame_key;
-    const bool clean_row_cache_skip_available =
-        !frame.dirty_row_ranges.empty() &&
-        same_text_frame_key;
-    stats.text_dirty_row_ranges = static_cast<int>(frame.dirty_row_ranges.size());
-    stats.text_dirty_rows       = dirty_row_count(frame);
-    stats.text_runs_considered  = static_cast<int>(frame.text_runs.size());
-    const std::vector<row_text_group_t> groups    = text_run_groups_by_viewport_row(frame);
-    Text_row_slot_transfer              old_slots = take_text_row_slots(root.text_row_slots);
+    QRectF     frame_viewport;
+    QRectF     row_clip_rect;
+    QString    text_font_key;
+    QByteArray current_text_frame_key;
+    bool       same_text_frame_key             = false;
+    bool       clean_row_cache_skip_available  = false;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::initial_setup");
+
+        frame_viewport         = QRectF(QPointF(0.0, 0.0), frame.logical_size);
+        row_clip_rect          = row_text_clip_rect(frame);
+        text_font_key          = font_cache_key(font);
+        current_text_frame_key = text_frame_cache_key(frame, text_font_key);
+        record_text_cache_key_build(stats, current_text_frame_key);
+        same_text_frame_key            = root.text_frame_key == current_text_frame_key;
+        clean_row_cache_skip_available =
+            !frame.dirty_row_ranges.empty() &&
+            same_text_frame_key;
+        stats.text_dirty_row_ranges = static_cast<int>(frame.dirty_row_ranges.size());
+        stats.text_dirty_rows       = dirty_row_count(frame);
+        stats.text_runs_considered  = static_cast<int>(frame.text_runs.size());
+    }
+
+    std::vector<row_text_group_t> groups;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::build_groups");
+
+        groups = text_run_groups_by_viewport_row(frame);
+    }
+
+    Text_row_slot_transfer old_slots;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::take_old_slots");
+
+        old_slots = take_text_row_slots(root.text_row_slots);
+    }
+
     std::vector<Terminal_scene_node::Text_resource_cache_slot> new_slots;
-    new_slots.reserve(groups.size());
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::reserve_slots");
+
+        new_slots.reserve(groups.size());
+    }
     // Scratch storage is live only while use_coalesced_resource_runs selects it.
     std::vector<Terminal_render_text_run> local_runs;
     std::vector<text_resource_run_t> coalesced_resource_runs;
@@ -3610,10 +3639,15 @@ void sync_text_resource_nodes(
             }
         }
 
-        std::optional<Text_resource_row_descriptor> source_text_resource_descriptor =
-            text_resource_source_row_descriptor(
-                frame,
-                group);
+        std::optional<Text_resource_row_descriptor> source_text_resource_descriptor;
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::source_descriptor");
+
+            source_text_resource_descriptor =
+                text_resource_source_row_descriptor(
+                    frame,
+                    group);
+        }
         if (!dirty_group &&
             clean_row_cache_skip_available &&
             row_cache_identity_has_valid_retained_provenance(group.identity) &&
@@ -3664,6 +3698,8 @@ void sync_text_resource_nodes(
 
         std::optional<Text_resource_row_descriptor> text_resource_descriptor;
         if (source_text_resource_descriptor.has_value()) {
+            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::resource_descriptor");
+
             text_resource_descriptor = use_coalesced_resource_runs
                 ? text_resource_row_descriptor_for_runs(coalesced_resource_runs)
                 : text_resource_row_descriptor_for_runs(local_runs);
@@ -3700,10 +3736,15 @@ void sync_text_resource_nodes(
                     stats.text_resource_max_runs_after_coalescing_per_row,
                     runs_after_coalescing);
         }
-        QByteArray key = use_coalesced_resource_runs
-            ? text_resource_key(coalesced_resource_runs, text_font_key, frame.logical_size)
-            : text_resource_key(local_runs, text_font_key, frame.logical_size);
-        record_text_cache_key_build(stats, key);
+        QByteArray key;
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::resource_key");
+
+            key = use_coalesced_resource_runs
+                ? text_resource_key(coalesced_resource_runs, text_font_key, frame.logical_size)
+                : text_resource_key(local_runs, text_font_key, frame.logical_size);
+            record_text_cache_key_build(stats, key);
+        }
         if (old_slot.has_value() &&
             old_slot->key == key)
         {
@@ -3720,29 +3761,34 @@ void sync_text_resource_nodes(
 
         bool failed                  = false;
         int  text_leaf_nodes_created = 0;
-        Terminal_text_resource_node* node = use_coalesced_resource_runs
-            ? make_text_resource_node(
-                window,
-                coalesced_resource_runs,
-                font,
-                frame_viewport,
-                frame.cell_metrics.width,
-                coalescing_context,
-                lifecycle_recorder,
-                false,
-                stats,
-                failed,
-                text_leaf_nodes_created)
-            : make_text_resource_node(
-                window,
-                local_runs,
-                font,
-                frame_viewport,
-                lifecycle_recorder,
-                false,
-                stats,
-                failed,
-                text_leaf_nodes_created);
+        Terminal_text_resource_node* node = nullptr;
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::make_resource_node");
+
+            node = use_coalesced_resource_runs
+                ? make_text_resource_node(
+                    window,
+                    coalesced_resource_runs,
+                    font,
+                    frame_viewport,
+                    frame.cell_metrics.width,
+                    coalescing_context,
+                    lifecycle_recorder,
+                    false,
+                    stats,
+                    failed,
+                    text_leaf_nodes_created)
+                : make_text_resource_node(
+                    window,
+                    local_runs,
+                    font,
+                    frame_viewport,
+                    lifecycle_recorder,
+                    false,
+                    stats,
+                    failed,
+                    text_leaf_nodes_created);
+        }
         if (node != nullptr) {
             if (old_slot.has_value()) {
                 VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::replace_cache_entry");
@@ -6193,89 +6239,106 @@ void build_terminal_render_frame_packed_data(
         return;
     }
 
-    const std::vector<std::vector<const Terminal_render_cell*>> row_table =
-        build_explicit_snapshot_row_table(snapshot);
-    frame.packed_rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
-    if (packed_text_sidecars_enabled) {
-        frame.packed_text_spans.reserve(snapshot.cells.size() / 2U);
-        frame.packed_text_bytes.reserve(snapshot.cells.size());
+    std::vector<std::vector<const Terminal_render_cell*>> row_table;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::row_table");
+
+        row_table = build_explicit_snapshot_row_table(snapshot);
     }
-    frame.packed_graphic_spans.reserve(snapshot.cells.size() / 8U);
-    frame.packed_graphic_codepoints.reserve(snapshot.cells.size() / 8U);
 
-    for (int row_index = 0; row_index < snapshot.grid_size.rows; ++row_index) {
-        terminal_packed_render_row_t row;
-        row.active_buffer = snapshot.viewport.active_buffer;
-        row.viewport_row  = row_index;
-        row.logical_row   = logical_row_for_viewport_row(snapshot.viewport, row_index);
-        row.first_text_span =
-            static_cast<std::uint32_t>(frame.packed_text_spans.size());
-        row.first_graphic_span =
-            static_cast<std::uint32_t>(frame.packed_graphic_spans.size());
-        frame.packed_rows.push_back(row);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::reserve");
 
-        terminal_packed_render_row_t& packed_row = frame.packed_rows.back();
-        for (const Terminal_render_cell* cell : row_table[static_cast<std::size_t>(row_index)]) {
-            ++frame.stats.packed_pass_cells_scanned;
-            const bool graphic_candidate = is_terminal_graphic_text(cell->text);
-            if (!packed_text_sidecars_enabled && !graphic_candidate) {
-                ++frame.stats.packed_text_disabled_cells_skipped;
-                continue;
-            }
+        frame.packed_rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
+        if (packed_text_sidecars_enabled) {
+            frame.packed_text_spans.reserve(snapshot.cells.size() / 2U);
+            frame.packed_text_bytes.reserve(snapshot.cells.size());
+        }
+        frame.packed_graphic_spans.reserve(snapshot.cells.size() / 8U);
+        frame.packed_graphic_codepoints.reserve(snapshot.cells.size() / 8U);
+    }
 
-            if (block_cursor_covers_cell(*cell, snapshot.cursor, block_cursor_visible) ||
-                ime_preedit_covers_cell(
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::scan");
+
+        for (int row_index = 0; row_index < snapshot.grid_size.rows; ++row_index) {
+            terminal_packed_render_row_t row;
+            row.active_buffer = snapshot.viewport.active_buffer;
+            row.viewport_row  = row_index;
+            row.logical_row   = logical_row_for_viewport_row(snapshot.viewport, row_index);
+            row.first_text_span =
+                static_cast<std::uint32_t>(frame.packed_text_spans.size());
+            row.first_graphic_span =
+                static_cast<std::uint32_t>(frame.packed_graphic_spans.size());
+            frame.packed_rows.push_back(row);
+
+            terminal_packed_render_row_t& packed_row = frame.packed_rows.back();
+            for (const Terminal_render_cell* cell : row_table[static_cast<std::size_t>(row_index)]) {
+                ++frame.stats.packed_pass_cells_scanned;
+                const bool graphic_candidate = is_terminal_graphic_text(cell->text);
+                if (!packed_text_sidecars_enabled && !graphic_candidate) {
+                    ++frame.stats.packed_text_disabled_cells_skipped;
+                    continue;
+                }
+
+                if (block_cursor_covers_cell(*cell, snapshot.cursor, block_cursor_visible) ||
+                    ime_preedit_covers_cell(
+                        *cell,
+                        ime_preedit_visible,
+                        ime_preedit_row,
+                        ime_preedit_column,
+                        ime_preedit_columns))
+                {
+                    continue;
+                }
+
+                if (graphic_candidate) {
+                    ++frame.stats.packed_graphic_candidates_classified;
+                }
+                ++frame.stats.dirty_row_lookup_count;
+                const bool dirty_row = snapshot_row_is_dirty(
+                    dirty_row_flags,
+                    cell->position.row);
+                const bool has_decoration = cell_text_decoration_enabled(
                     *cell,
-                    ime_preedit_visible,
-                    ime_preedit_row,
-                    ime_preedit_column,
-                    ime_preedit_columns))
-            {
-                continue;
-            }
-
-            if (graphic_candidate) {
-                ++frame.stats.packed_graphic_candidates_classified;
-            }
-            ++frame.stats.dirty_row_lookup_count;
-            const bool dirty_row = snapshot_row_is_dirty(
-                dirty_row_flags,
-                cell->position.row);
-            const bool has_decoration = cell_text_decoration_enabled(
-                *cell,
-                snapshot.styles.size(),
-                style_attributes);
-            ++frame.stats.packed_pass_classification_calls;
-            const terminal_simple_content_classification_t classification =
-                classify_terminal_simple_content_cell(
-                    *cell,
-                    snapshot.grid_size,
                     snapshot.styles.size(),
-                    has_decoration,
-                    dirty_row);
+                    style_attributes);
+                ++frame.stats.packed_pass_classification_calls;
+                const terminal_simple_content_classification_t classification =
+                    classify_terminal_simple_content_cell(
+                        *cell,
+                        snapshot.grid_size,
+                        snapshot.styles.size(),
+                        has_decoration,
+                        dirty_row);
 
-            if (classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY) {
-                append_packed_graphic_cell(
+                if (classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY) {
+                    append_packed_graphic_cell(
+                        frame,
+                        packed_row,
+                        *cell,
+                        style_attributes.attributes(cell->style_id));
+                    continue;
+                }
+
+                if (!packed_text_sidecars_enabled || !classification.fast_text_eligible) {
+                    continue;
+                }
+
+                append_packed_text_cell(
                     frame,
                     packed_row,
                     *cell,
                     style_attributes.attributes(cell->style_id));
-                continue;
             }
-
-            if (!packed_text_sidecars_enabled || !classification.fast_text_eligible) {
-                continue;
-            }
-
-            append_packed_text_cell(
-                frame,
-                packed_row,
-                *cell,
-                style_attributes.attributes(cell->style_id));
         }
     }
 
-    finalize_packed_render_frame_stats(frame);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::finalize");
+
+        finalize_packed_render_frame_stats(frame);
+    }
 }
 
 } // namespace
@@ -6292,41 +6355,55 @@ Terminal_render_frame build_terminal_render_frame(
 
     const bool metrics_valid = is_valid_cell_metrics(cell_metrics);
     Terminal_render_frame frame;
-    frame.logical_size = logical_size;
-    frame.cell_metrics = cell_metrics;
-    frame.background_rects.reserve(
-        snapshot != nullptr && metrics_valid ? snapshot->cells.size() + 1U : 1U);
-    frame.background_rects.push_back({
-        QRectF(QPointF(0.0, 0.0), logical_size),
-        options.default_background,
-    });
-    frame.stats.background_rects_emitted =
-        static_cast<int>(frame.background_rects.size());
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::base_frame");
+
+        frame.logical_size = logical_size;
+        frame.cell_metrics = cell_metrics;
+        frame.background_rects.reserve(
+            snapshot != nullptr && metrics_valid ? snapshot->cells.size() + 1U : 1U);
+        frame.background_rects.push_back({
+            QRectF(QPointF(0.0, 0.0), logical_size),
+            options.default_background,
+        });
+        frame.stats.background_rects_emitted =
+            static_cast<int>(frame.background_rects.size());
+    }
 
     if (snapshot == nullptr || !metrics_valid) {
         return frame;
     }
 
-    const QColor grid_background = default_terminal_background(*snapshot);
-    frame.background_rects.front().color = grid_background;
-    frame.grid_size        = snapshot->grid_size;
-    frame.viewport         = snapshot->viewport;
-    frame.dirty_row_ranges = snapshot->dirty_row_ranges;
-    frame.text_style_key   = text_style_cache_key(*snapshot, options);
-    frame.stats.visible_rows          = snapshot->grid_size.rows;
-    frame.stats.cell_pass_input_cells = static_cast<int>(snapshot->cells.size());
-    for (const Terminal_render_dirty_row_range& range : snapshot->dirty_row_ranges) {
-        frame.stats.dirty_rows += range.row_count;
-    }
-    if (frame.stats.dirty_rows == snapshot->grid_size.rows) {
-        frame.stats.full_dirty_rows = frame.stats.dirty_rows;
+    QColor grid_background;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::snapshot_setup");
+
+        grid_background = default_terminal_background(*snapshot);
+        frame.background_rects.front().color = grid_background;
+        frame.grid_size        = snapshot->grid_size;
+        frame.viewport         = snapshot->viewport;
+        frame.dirty_row_ranges = snapshot->dirty_row_ranges;
+        frame.text_style_key   = text_style_cache_key(*snapshot, options);
+        frame.stats.visible_rows          = snapshot->grid_size.rows;
+        frame.stats.cell_pass_input_cells = static_cast<int>(snapshot->cells.size());
+        for (const Terminal_render_dirty_row_range& range : snapshot->dirty_row_ranges) {
+            frame.stats.dirty_rows += range.row_count;
+        }
+        if (frame.stats.dirty_rows == snapshot->grid_size.rows) {
+            frame.stats.full_dirty_rows = frame.stats.dirty_rows;
+        }
     }
     const bool valid_grid = snapshot->grid_size.rows > 0 && snapshot->grid_size.columns > 0;
-    const Snapshot_dirty_row_flags dirty_row_flags = valid_grid
-        ? build_snapshot_dirty_row_flags(
-            snapshot->dirty_row_ranges,
-            snapshot->grid_size.rows)
-        : Snapshot_dirty_row_flags{};
+    Snapshot_dirty_row_flags dirty_row_flags;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::dirty_row_flags");
+
+        if (valid_grid) {
+            dirty_row_flags = build_snapshot_dirty_row_flags(
+                snapshot->dirty_row_ranges,
+                snapshot->grid_size.rows);
+        }
+    }
     const Ime_preedit_state& ime_preedit =
         ime_preedit_override != nullptr ? *ime_preedit_override : snapshot->ime_preedit;
     const bool cursor_in_grid = valid_grid &&
@@ -6361,16 +6438,20 @@ Terminal_render_frame build_terminal_render_frame(
         : 0;
     Render_style_attribute_cache style_attributes(*snapshot);
 
-    const std::size_t cell_count = snapshot->cells.size();
-    frame.selection_rects.reserve(snapshot->selection_spans.size() + 1U);
-    frame.graphic_rects.reserve(cell_count / 8U);
-    frame.graphic_arcs.reserve(cell_count / 16U);
-    frame.text_runs.reserve(cell_count);
-    frame.decorations.reserve(cell_count / 8U);
-    frame.cursors.reserve(2U);
-    frame.cursor_graphic_rects.reserve(4U);
-    frame.cursor_graphic_arcs.reserve(2U);
-    frame.overlay_rects.reserve(1U);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::reserve_outputs");
+
+        const std::size_t cell_count = snapshot->cells.size();
+        frame.selection_rects.reserve(snapshot->selection_spans.size() + 1U);
+        frame.graphic_rects.reserve(cell_count / 8U);
+        frame.graphic_arcs.reserve(cell_count / 16U);
+        frame.text_runs.reserve(cell_count);
+        frame.decorations.reserve(cell_count / 8U);
+        frame.cursors.reserve(2U);
+        frame.cursor_graphic_rects.reserve(4U);
+        frame.cursor_graphic_arcs.reserve(2U);
+        frame.overlay_rects.reserve(1U);
+    }
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::cells");

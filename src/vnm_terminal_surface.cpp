@@ -4991,76 +4991,102 @@ void VNM_TerminalSurface::sync_from_session()
         return;
     }
 
-    set_process_state(surface_process_state(m_private->session->process_state()));
-    set_backend_ready(m_private->session->backend_ready());
-    set_backend_geometry_in_sync(m_private->session->backend_geometry_in_sync());
-    set_selection_state(
-        m_private->session->has_selection()
-            ? Selection_state::ACTIVE
-            : Selection_state::NONE);
-
-    const term::terminal_grid_size_t grid_size = m_private->session->grid_size();
-    set_grid_size(grid_size.rows, grid_size.columns);
-
-    const bool live_mouse_reporting_active = m_private->session->mouse_reporting_active();
-    if (live_mouse_reporting_active != m_private->last_sgr_mouse_reporting_active) {
-        m_private->clear_mouse_wheel_remainders();
-    }
-    m_private->last_sgr_mouse_reporting_active = live_mouse_reporting_active;
-
-    const bool live_alternate_scroll_active = m_private->session->alternate_scroll_active();
-    const std::uint64_t alternate_scroll_mode_generation =
-        m_private->session->alternate_scroll_mode_generation();
-    if (alternate_scroll_mode_generation !=
-        m_private->last_alternate_scroll_mode_generation)
     {
-        m_private->clear_mouse_wheel_remainders();
-    }
-    m_private->last_alternate_scroll_mode_generation = alternate_scroll_mode_generation;
+        VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::session_state");
 
-    if (live_alternate_scroll_active != m_private->last_alternate_scroll_active) {
-        m_private->clear_mouse_wheel_remainders();
+        set_process_state(surface_process_state(m_private->session->process_state()));
+        set_backend_ready(m_private->session->backend_ready());
+        set_backend_geometry_in_sync(m_private->session->backend_geometry_in_sync());
+        set_selection_state(
+            m_private->session->has_selection()
+                ? Selection_state::ACTIVE
+                : Selection_state::NONE);
     }
-    m_private->last_alternate_scroll_active = live_alternate_scroll_active;
 
-    const std::uint64_t snapshot_generation =
-        m_private->session->render_snapshot_generation();
-    if (snapshot_generation != m_private->last_render_snapshot_generation) {
-        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-            *this,
-            m_private->session->latest_render_snapshot_handle());
-        m_private->session->mark_render_snapshot_synced(snapshot_generation);
-        m_private->last_render_snapshot_generation = snapshot_generation;
-        if (m_private->render_snapshot != nullptr) {
-            set_viewport_state(m_private->render_snapshot->viewport);
+    bool live_mouse_reporting_active  = false;
+    bool live_alternate_scroll_active = false;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::grid_and_modes");
+
+        const term::terminal_grid_size_t grid_size = m_private->session->grid_size();
+        set_grid_size(grid_size.rows, grid_size.columns);
+
+        live_mouse_reporting_active = m_private->session->mouse_reporting_active();
+        if (live_mouse_reporting_active != m_private->last_sgr_mouse_reporting_active) {
+            m_private->clear_mouse_wheel_remainders();
         }
+        m_private->last_sgr_mouse_reporting_active = live_mouse_reporting_active;
 
-        const bool sgr_mouse_reporting_active =
-            snapshot_has_sgr_mouse_reporting(m_private->render_snapshot);
-        const bool mouse_reporting_mode_changed =
-            m_private->render_snapshot != nullptr &&
-            m_private->render_snapshot->metadata.mouse_reporting_mode_changed;
-        if (mouse_reporting_mode_changed ||
-            sgr_mouse_reporting_active != live_mouse_reporting_active)
+        live_alternate_scroll_active = m_private->session->alternate_scroll_active();
+        const std::uint64_t alternate_scroll_mode_generation =
+            m_private->session->alternate_scroll_mode_generation();
+        if (alternate_scroll_mode_generation !=
+            m_private->last_alternate_scroll_mode_generation)
         {
             m_private->clear_mouse_wheel_remainders();
         }
+        m_private->last_alternate_scroll_mode_generation = alternate_scroll_mode_generation;
+
+        if (live_alternate_scroll_active != m_private->last_alternate_scroll_active) {
+            m_private->clear_mouse_wheel_remainders();
+        }
+        m_private->last_alternate_scroll_active = live_alternate_scroll_active;
     }
 
-    const std::uint64_t ime_preedit_generation =
-        m_private->session->ime_preedit_generation();
-    if (ime_preedit_generation != m_private->last_ime_preedit_generation) {
-        m_private->set_ime_preedit_state(*this, m_private->session->ime_preedit_state());
-        m_private->last_ime_preedit_generation = ime_preedit_generation;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::render_snapshot");
+
+        const std::uint64_t snapshot_generation =
+            m_private->session->render_snapshot_generation();
+        if (snapshot_generation != m_private->last_render_snapshot_generation) {
+            term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+                *this,
+                m_private->session->latest_render_snapshot_handle());
+            m_private->session->mark_render_snapshot_synced(snapshot_generation);
+            m_private->last_render_snapshot_generation = snapshot_generation;
+            if (m_private->render_snapshot != nullptr) {
+                set_viewport_state(m_private->render_snapshot->viewport);
+            }
+
+            const bool sgr_mouse_reporting_active =
+                snapshot_has_sgr_mouse_reporting(m_private->render_snapshot);
+            const bool mouse_reporting_mode_changed =
+                m_private->render_snapshot != nullptr &&
+                m_private->render_snapshot->metadata.mouse_reporting_mode_changed;
+            if (mouse_reporting_mode_changed ||
+                sgr_mouse_reporting_active != live_mouse_reporting_active)
+            {
+                m_private->clear_mouse_wheel_remainders();
+            }
+        }
     }
 
-    const std::vector<term::Terminal_session_notification> notifications =
-        m_private->session->take_pending_notifications();
-    for (const term::Terminal_session_notification& notification : notifications) {
-        replay_session_notification(notification);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::ime_preedit");
+
+        const std::uint64_t ime_preedit_generation =
+            m_private->session->ime_preedit_generation();
+        if (ime_preedit_generation != m_private->last_ime_preedit_generation) {
+            m_private->set_ime_preedit_state(*this, m_private->session->ime_preedit_state());
+            m_private->last_ime_preedit_generation = ime_preedit_generation;
+        }
     }
 
-    sync_synchronized_output_recovery_timer();
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::notifications");
+
+        const std::vector<term::Terminal_session_notification> notifications =
+            m_private->session->take_pending_notifications();
+        for (const term::Terminal_session_notification& notification : notifications) {
+            replay_session_notification(notification);
+        }
+    }
+
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::recovery_timer");
+
+        sync_synchronized_output_recovery_timer();
+    }
 }
 
 void VNM_TerminalSurface::sync_synchronized_output_recovery_timer()
