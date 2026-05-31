@@ -2482,34 +2482,6 @@ bool text_runs_have_matching_paint(
     return left.foreground.rgba() == right.foreground.rgba();
 }
 
-bool has_adjacent_coalescing_geometry(
-    const Terminal_render_text_run&    left,
-    const Terminal_render_text_run&    right,
-    qreal                              cell_width)
-{
-    return
-        left.row == right.row                                                          &&
-        left.logical_row == right.logical_row                                          &&
-        right.column == left.column + 1                                                &&
-        nearly_same_text_geometry(left.rect.top(), right.rect.top())                   &&
-        nearly_same_text_geometry(left.rect.height(), right.rect.height())             &&
-        nearly_same_text_geometry(left.rect.left() + cell_width, right.rect.left())    &&
-        nearly_same_text_geometry(left.baseline_origin.y(), right.baseline_origin.y()) &&
-        nearly_same_text_geometry(left.baseline_origin.x() + cell_width, right.baseline_origin.x());
-}
-
-bool can_coalesce_adjacent_text_runs(
-    const Terminal_render_text_run&    left,
-    const Terminal_render_text_run&    right,
-    qreal                              cell_width)
-{
-    return
-        is_one_cell_unclipped_printable_ascii_run(left, cell_width)  &&
-        is_one_cell_unclipped_printable_ascii_run(right, cell_width) &&
-        text_runs_have_matching_paint(left, right)                   &&
-        has_adjacent_coalescing_geometry(left, right, cell_width);
-}
-
 bool prepare_text_layout(QTextLayout& layout, qreal& out_line_ascent)
 {
     VNM_TERMINAL_PROFILE_SCOPE("prepare_text_layout");
@@ -2714,86 +2686,6 @@ bool append_unclipped_text_run_layout(
 
     add_text_run_layout(*active_text_node, layout, run, line_ascent);
     return true;
-}
-
-Terminal_render_text_run coalesced_ascii_text_run(
-    const std::vector<Terminal_render_text_run>&   runs,
-    std::size_t                                    first_index,
-    std::size_t                                    past_last_index)
-{
-    Terminal_render_text_run coalesced_run = runs[first_index];
-    coalesced_run.text.reserve(static_cast<qsizetype>(past_last_index - first_index));
-    for (std::size_t index = first_index + 1U; index < past_last_index; ++index) {
-        const Terminal_render_text_run& run = runs[index];
-        coalesced_run.text += run.text;
-    }
-    const Terminal_render_text_run& last_run = runs[past_last_index - 1U];
-    coalesced_run.rect.setWidth(
-        last_run.rect.left() + last_run.rect.width() - coalesced_run.rect.left());
-    return coalesced_run;
-}
-
-std::size_t past_last_coalescible_ascii_text_run(
-    const std::vector<Terminal_render_text_run>&   runs,
-    std::size_t                                    first_index,
-    qreal                                          cell_width)
-{
-    std::size_t past_last_index = first_index + 1U;
-    while (past_last_index            < runs.size()                           &&
-        past_last_index - first_index < k_max_coalesced_ascii_text_run_length &&
-        can_coalesce_adjacent_text_runs(
-            runs[past_last_index - 1U], runs[past_last_index], cell_width))
-    {
-        ++past_last_index;
-    }
-
-    return past_last_index;
-}
-
-bool try_coalesce_ascii_text_resource_runs(
-    const std::vector<Terminal_render_text_run>&   runs,
-    qreal                                          cell_width,
-    std::vector<text_resource_run_t>&              out_runs)
-{
-    out_runs.clear();
-    if (runs.size() <  2U          ||
-        !std::isfinite(cell_width) ||
-        cell_width  <= 0.0)
-    {
-        return false;
-    }
-
-    bool coalesced = false;
-    for (std::size_t index = 0U; index < runs.size();) {
-        const std::size_t past_last_index =
-            past_last_coalescible_ascii_text_run(runs, index, cell_width);
-        if (past_last_index > index + 1U) {
-            if (!coalesced) {
-                out_runs.reserve(runs.size());
-                for (std::size_t prefix_index = 0U; prefix_index < index; ++prefix_index) {
-                    out_runs.push_back({runs[prefix_index], false});
-                }
-                coalesced = true;
-            }
-
-            out_runs.push_back({
-                coalesced_ascii_text_run(runs, index, past_last_index),
-                true,
-            });
-            index = past_last_index;
-            continue;
-        }
-
-        if (coalesced) {
-            out_runs.push_back({runs[index], false});
-        }
-        ++index;
-    }
-
-    if (!coalesced) {
-        out_runs.clear();
-    }
-    return coalesced;
 }
 
 bool append_batched_text_run_nodes(
@@ -3030,6 +2922,124 @@ void assign_row_local_text_runs(
     for (const Terminal_render_text_run* run : runs) {
         out_runs.push_back(row_local_text_run(*run, row_top));
     }
+}
+
+bool has_adjacent_row_local_coalescing_source_geometry(
+    const Terminal_render_text_run&    left,
+    const Terminal_render_text_run&    right,
+    qreal                              cell_width)
+{
+    // The established coalescing path applies the same row-top translation to
+    // both adjacent runs, preserving Y equality. Row/logical_row are normalized
+    // in localized output, but source input must still match the row-group invariant.
+    return
+        left.row == right.row                                                          &&
+        left.logical_row == right.logical_row                                          &&
+        right.column == left.column + 1                                                &&
+        nearly_same_text_geometry(left.rect.top(), right.rect.top())                   &&
+        nearly_same_text_geometry(left.rect.height(), right.rect.height())             &&
+        nearly_same_text_geometry(left.rect.left() + cell_width, right.rect.left())    &&
+        nearly_same_text_geometry(left.baseline_origin.y(), right.baseline_origin.y()) &&
+        nearly_same_text_geometry(left.baseline_origin.x() + cell_width, right.baseline_origin.x());
+}
+
+bool can_coalesce_adjacent_row_local_source_text_runs(
+    const Terminal_render_text_run&    left,
+    const Terminal_render_text_run&    right,
+    qreal                              cell_width)
+{
+    return
+        is_one_cell_unclipped_printable_ascii_run(left, cell_width)  &&
+        is_one_cell_unclipped_printable_ascii_run(right, cell_width) &&
+        text_runs_have_matching_paint(left, right)                   &&
+        has_adjacent_row_local_coalescing_source_geometry(left, right, cell_width);
+}
+
+std::size_t past_last_coalescible_ascii_source_text_run(
+    const std::vector<const Terminal_render_text_run*>&    runs,
+    std::size_t                                            first_index,
+    qreal                                                  cell_width)
+{
+    std::size_t past_last_index = first_index + 1U;
+    while (past_last_index            < runs.size()                           &&
+        past_last_index - first_index < k_max_coalesced_ascii_text_run_length &&
+        can_coalesce_adjacent_row_local_source_text_runs(
+            *runs[past_last_index - 1U], *runs[past_last_index], cell_width))
+    {
+        ++past_last_index;
+    }
+
+    return past_last_index;
+}
+
+text_resource_run_t row_local_coalesced_ascii_text_resource_run(
+    const std::vector<const Terminal_render_text_run*>&    runs,
+    qreal                                                  row_top,
+    std::size_t                                            first_index,
+    std::size_t                                            past_last_index)
+{
+    Terminal_render_text_run coalesced_run = row_local_text_run(*runs[first_index], row_top);
+    coalesced_run.text.reserve(static_cast<qsizetype>(past_last_index - first_index));
+    for (std::size_t index = first_index + 1U; index < past_last_index; ++index) {
+        coalesced_run.text += runs[index]->text;
+    }
+
+    const Terminal_render_text_run& last_run = *runs[past_last_index - 1U];
+    coalesced_run.rect.setWidth(
+        last_run.rect.left() + last_run.rect.width() - coalesced_run.rect.left());
+
+    return {
+        std::move(coalesced_run),
+        true,
+    };
+}
+
+bool try_make_row_local_coalesced_ascii_text_resource_runs(
+    const std::vector<const Terminal_render_text_run*>&    runs,
+    qreal                                                  row_top,
+    qreal                                                  cell_width,
+    std::vector<text_resource_run_t>&                      out_runs)
+{
+    out_runs.clear();
+    if (runs.size() <  2U          ||
+        !std::isfinite(cell_width) ||
+        cell_width  <= 0.0)
+    {
+        return false;
+    }
+
+    bool coalesced = false;
+    for (std::size_t index = 0U; index < runs.size();) {
+        const std::size_t past_last_index =
+            past_last_coalescible_ascii_source_text_run(runs, index, cell_width);
+        if (past_last_index > index + 1U) {
+            if (!coalesced) {
+                out_runs.reserve(runs.size());
+                for (std::size_t prefix_index = 0U; prefix_index < index; ++prefix_index) {
+                    out_runs.push_back({row_local_text_run(*runs[prefix_index], row_top), false});
+                }
+                coalesced = true;
+            }
+
+            out_runs.push_back(row_local_coalesced_ascii_text_resource_run(
+                runs,
+                row_top,
+                index,
+                past_last_index));
+            index = past_last_index;
+            continue;
+        }
+
+        if (coalesced) {
+            out_runs.push_back({row_local_text_run(*runs[index], row_top), false});
+        }
+        ++index;
+    }
+
+    if (!coalesced) {
+        out_runs.clear();
+    }
+    return coalesced;
 }
 
 void set_text_wrapper_row_top(QSGTransformNode& wrapper, qreal row_top)
@@ -3596,30 +3606,37 @@ void sync_text_resource_nodes(
             continue;
         }
 
-        assign_row_local_text_runs(group.runs, group.row_top, local_runs);
         const Ascii_text_coalescing_context* coalescing_context = nullptr;
+        bool local_runs_assigned = false;
         bool use_coalesced_resource_runs = false;
+        auto select_coalesced_resource_runs_if_enabled = [&]() {
+            ++stats.text_coalescing_candidate_groups;
+            coalescing_context =
+                &coalescing_context_cache.context(font, frame.cell_metrics.width);
+            if (coalescing_context->enabled) {
+                ++stats.text_coalescing_enabled_groups;
+                use_coalesced_resource_runs = true;
+            }
+        };
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::coalescing");
 
-            if (try_coalesce_ascii_text_resource_runs(
-                    local_runs, frame.cell_metrics.width, coalesced_resource_runs))
+            if (try_make_row_local_coalesced_ascii_text_resource_runs(
+                    group.runs, group.row_top, frame.cell_metrics.width, coalesced_resource_runs))
             {
-                ++stats.text_coalescing_candidate_groups;
-                coalescing_context =
-                    &coalescing_context_cache.context(font, frame.cell_metrics.width);
-                if (coalescing_context->enabled) {
-                    ++stats.text_coalescing_enabled_groups;
-                    use_coalesced_resource_runs = true;
-                }
+                select_coalesced_resource_runs_if_enabled();
+            }
+            else {
+                assign_row_local_text_runs(group.runs, group.row_top, local_runs);
+                local_runs_assigned = true;
             }
         }
 
         stats.text_resource_runs_before_coalescing +=
-            static_cast<int>(local_runs.size());
+            static_cast<int>(group.runs.size());
         const int runs_after_coalescing = use_coalesced_resource_runs
             ? static_cast<int>(coalesced_resource_runs.size())
-            : static_cast<int>(local_runs.size());
+            : static_cast<int>(group.runs.size());
         stats.text_resource_runs_after_coalescing += runs_after_coalescing;
         if (runs_after_coalescing > 0) {
             ++stats.text_resource_rows_with_runs;
@@ -3627,6 +3644,10 @@ void sync_text_resource_nodes(
                 std::max(
                     stats.text_resource_max_runs_after_coalescing_per_row,
                     runs_after_coalescing);
+        }
+        if (!use_coalesced_resource_runs && !local_runs_assigned) {
+            assign_row_local_text_runs(group.runs, group.row_top, local_runs);
+            local_runs_assigned = true;
         }
         QByteArray key = use_coalesced_resource_runs
             ? text_resource_key(coalesced_resource_runs, text_font_key, frame.logical_size)
