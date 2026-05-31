@@ -37,9 +37,6 @@ struct Benchmark_totals
     std::uint64_t frame_dirty_row_range_lookup_count = 0U;
     std::uint64_t frame_dirty_row_range_scan_steps = 0U;
     std::uint64_t frame_packed_pass_cells_scanned = 0U;
-    std::uint64_t frame_packed_data_passes_skipped = 0U;
-    std::uint64_t frame_packed_inline_fallbacks = 0U;
-    std::uint64_t frame_packed_graphic_cells_inlined = 0U;
     std::uint64_t frame_text_runs_emitted = 0U;
     std::uint64_t frame_graphic_rects_emitted = 0U;
     std::uint64_t frame_packed_graphic_cells = 0U;
@@ -47,33 +44,6 @@ struct Benchmark_totals
 };
 
 using Clock = std::chrono::steady_clock;
-
-template <typename Stats>
-int packed_data_passes_skipped(const Stats& stats)
-{
-    if constexpr (requires { stats.packed_data_passes_skipped; }) {
-        return stats.packed_data_passes_skipped;
-    }
-    return 0;
-}
-
-template <typename Stats>
-int packed_inline_fallbacks(const Stats& stats)
-{
-    if constexpr (requires { stats.packed_inline_fallbacks; }) {
-        return stats.packed_inline_fallbacks;
-    }
-    return 0;
-}
-
-template <typename Stats>
-int packed_graphic_cells_inlined(const Stats& stats)
-{
-    if constexpr (requires { stats.packed_graphic_cells_inlined; }) {
-        return stats.packed_graphic_cells_inlined;
-    }
-    return 0;
-}
 
 template <typename Stats>
 int dirty_row_range_lookup_count(const Stats& stats)
@@ -301,12 +271,6 @@ void accumulate_frame_stats(
         static_cast<std::uint64_t>(dirty_row_range_scan_steps(frame.stats));
     totals.frame_packed_pass_cells_scanned +=
         static_cast<std::uint64_t>(frame.stats.packed_pass_cells_scanned);
-    totals.frame_packed_data_passes_skipped +=
-        static_cast<std::uint64_t>(packed_data_passes_skipped(frame.stats));
-    totals.frame_packed_inline_fallbacks +=
-        static_cast<std::uint64_t>(packed_inline_fallbacks(frame.stats));
-    totals.frame_packed_graphic_cells_inlined +=
-        static_cast<std::uint64_t>(packed_graphic_cells_inlined(frame.stats));
     totals.frame_text_runs_emitted +=
         static_cast<std::uint64_t>(frame.stats.text_runs_emitted);
     totals.frame_graphic_rects_emitted +=
@@ -427,11 +391,6 @@ int main(int argc, char** argv)
         "frame_dirty_row_range_scan_steps",
         totals.frame_dirty_row_range_scan_steps);
     print_metric("frame_packed_pass_cells_scanned", totals.frame_packed_pass_cells_scanned);
-    print_metric("frame_packed_data_passes_skipped", totals.frame_packed_data_passes_skipped);
-    print_metric("frame_packed_inline_fallbacks", totals.frame_packed_inline_fallbacks);
-    print_metric(
-        "frame_packed_graphic_cells_inlined",
-        totals.frame_packed_graphic_cells_inlined);
     print_metric("frame_text_runs_emitted", totals.frame_text_runs_emitted);
     print_metric("frame_graphic_rects_emitted", totals.frame_graphic_rects_emitted);
     print_metric("frame_packed_graphic_cells", totals.frame_packed_graphic_cells);
