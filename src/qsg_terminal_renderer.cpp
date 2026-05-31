@@ -6060,8 +6060,11 @@ void build_terminal_render_frame_packed_data(
 
             if (block_cursor_covers_cell(*cell, snapshot.cursor, block_cursor_visible) ||
                 ime_preedit_covers_cell(
-                    *cell, ime_preedit_visible, ime_preedit_row,
-                    ime_preedit_column, ime_preedit_columns))
+                    *cell,
+                    ime_preedit_visible,
+                    ime_preedit_row,
+                    ime_preedit_column,
+                    ime_preedit_columns))
             {
                 continue;
             }
@@ -6075,12 +6078,13 @@ void build_terminal_render_frame_packed_data(
                 *cell,
                 snapshot.styles.size(),
                 style_attributes);
-            const terminal_simple_content_classification_t classification = classify_terminal_simple_content_cell(
-                *cell,
-                snapshot.grid_size,
-                snapshot.styles.size(),
-                has_decoration,
-                dirty_row);
+            const terminal_simple_content_classification_t classification =
+                classify_terminal_simple_content_cell(
+                    *cell,
+                    snapshot.grid_size,
+                    snapshot.styles.size(),
+                    has_decoration,
+                    dirty_row);
 
             if (classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY) {
                 append_packed_graphic_cell(
@@ -6143,7 +6147,6 @@ Terminal_render_frame build_terminal_render_frame(
     frame.text_style_key   = text_style_cache_key(*snapshot, options);
     frame.stats.visible_rows          = snapshot->grid_size.rows;
     frame.stats.cell_pass_input_cells = static_cast<int>(snapshot->cells.size());
-    frame.stats.dirty_row_lookup_count += static_cast<int>(snapshot->cells.size());
     for (const Terminal_render_dirty_row_range& range : snapshot->dirty_row_ranges) {
         frame.stats.dirty_rows += range.row_count;
     }
@@ -6210,6 +6213,7 @@ Terminal_render_frame build_terminal_render_frame(
                 cell,
                 snapshot->styles.size(),
                 style_attributes);
+            ++frame.stats.dirty_row_lookup_count;
             const terminal_simple_content_classification_t classification = classify_terminal_simple_content_cell(
                 cell,
                 snapshot->grid_size,

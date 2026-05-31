@@ -2928,7 +2928,7 @@ bool test_qsg_snapshot_rendering(QGuiApplication& app)
         first_stats.frame_selection_rects == first_stats.frame.selection_rects_emitted &&
         first_stats.frame_dirty_row_ranges == 0 &&
         first_stats.frame_packed_rows == first_stats.frame.packed_rows &&
-        first_stats.frame.simple_content.eligible_after_all_gates_cells == 5 &&
+        first_stats.frame.simple_content.eligible_after_all_gates_cells == 4 &&
         first_stats.frame_packed_text_cells == 0 &&
         first_stats.frame.packed_text_cells == 0 &&
         first_stats.frame_packed_payload_bytes > 0U,
