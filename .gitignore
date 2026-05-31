@@ -1,5 +1,6 @@
 build/
 build_*/
+artifacts/
 out/
 more_tests/
 manual_validation_runs/
