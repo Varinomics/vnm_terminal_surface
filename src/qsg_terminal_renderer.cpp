@@ -6304,10 +6304,25 @@ Terminal_render_frame build_terminal_render_frame(
         std::set<Terminal_style_id> simple_eligible_styles;
         for (const Terminal_render_cell& cell : snapshot->cells) {
             ++frame.stats.cells_considered;
-            const bool classification_has_decoration = cell_text_decoration_enabled(
-                cell,
-                snapshot->styles.size(),
-                style_attributes);
+            const bool valid_style_id =
+                static_cast<std::size_t>(cell.style_id) < snapshot->styles.size();
+            const bool valid_render_cell =
+                !cell.wide_continuation                                                  &&
+                valid_grid                                                                &&
+                cell.position.row                       >= 0                              &&
+                cell.position.row                       <  snapshot->grid_size.rows       &&
+                cell.position.column                    >= 0                              &&
+                cell.position.column                    <  snapshot->grid_size.columns    &&
+                cell.display_width                      >  0                              &&
+                cell.display_width                      <= snapshot->grid_size.columns -
+                                                           cell.position.column            &&
+                valid_style_id;
+            const render_style_attributes_t* style_or_null = valid_render_cell
+                ? &style_attributes.attributes(cell.style_id)
+                : nullptr;
+            const bool classification_has_decoration =
+                style_or_null != nullptr &&
+                (style_or_null->underline || style_or_null->strike);
             ++frame.stats.dirty_row_lookup_count;
             const terminal_simple_content_classification_t classification = classify_terminal_simple_content_cell(
                 cell,
@@ -6339,15 +6354,7 @@ Terminal_render_frame build_terminal_render_frame(
                 continue;
             }
 
-            if (!valid_grid ||
-                cell.position.row                       <  0                                                  ||
-                cell.position.row                       >= snapshot->grid_size.rows                           ||
-                cell.position.column                    <  0                                                  ||
-                cell.position.column                    >= snapshot->grid_size.columns                        ||
-                cell.display_width                      <= 0                                                  ||
-                cell.display_width                      >  snapshot->grid_size.columns - cell.position.column ||
-                static_cast<std::size_t>(cell.style_id) >= snapshot->styles.size())
-            {
+            if (!valid_render_cell) {
                 ++frame.stats.cells_skipped_invalid;
                 continue;
             }
@@ -6365,8 +6372,7 @@ Terminal_render_frame build_terminal_render_frame(
                 ++frame.stats.text_distinct_styles;
             }
 
-            const render_style_attributes_t& style =
-                style_attributes.attributes(cell.style_id);
+            const render_style_attributes_t& style = *style_or_null;
             const QColor foreground = style.foreground;
             const QColor background = style.background;
 
@@ -6396,15 +6402,18 @@ Terminal_render_frame build_terminal_render_frame(
                     ++frame.stats.text_cells_multi_width;
                 }
 
-                const bool printable_ascii = is_printable_ascii_text(cell.text);
-                if (printable_ascii) {
+                if (classification.text_category ==
+                    Terminal_simple_content_text_category::PRINTABLE_ASCII)
+                {
                     ++frame.stats.text_cells_printable_ascii;
                     if (cell.display_width == 1) {
                         ++frame.stats.text_cells_simple_ascii;
                     }
                 }
                 else
-                if (contains_non_ascii_text(cell.text)) {
+                if (classification.text_category ==
+                    Terminal_simple_content_text_category::NON_ASCII)
+                {
                     ++frame.stats.text_cells_non_ascii;
                 }
                 else {
