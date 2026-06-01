@@ -6,6 +6,7 @@
 #include "vnm_terminal/internal/terminal_repaint_recovery.h"
 #include "vnm_terminal/internal/unicode_width.h"
 
+#include <QByteArray>
 #include <QChar>
 #include <QLatin1StringView>
 #include <QStringList>
@@ -14,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <type_traits>
@@ -31,6 +33,40 @@ constexpr std::size_t k_printable_ascii_count =
     k_printable_ascii_last - k_printable_ascii_first + 1U;
 constexpr int k_resize_repaint_clear_guard_action_budget = 64;
 constexpr std::size_t k_retained_history_ring_capacity_bytes = 64U * 1024U * 1024U;
+
+// Stage 4.2 isolation switches are benchmark toggles. Values are cached on
+// first use, so A/B comparisons must use separate benchmark processes.
+bool stage42_feature_enabled(const char* name)
+{
+    const QByteArray value = qgetenv(name).trimmed().toLower();
+    return
+        value.isEmpty()       ||
+        (value != "0"         &&
+         value != "false"     &&
+         value != "off"       &&
+         value != "no");
+}
+
+bool stage42_model_ascii_direct_print_enabled()
+{
+    static const bool enabled =
+        stage42_feature_enabled("VNM_TERMINAL_STAGE42_MODEL_ASCII_DIRECT_PRINT");
+    return enabled;
+}
+
+bool stage42_model_ascii_skip_simple_cell_clear_enabled()
+{
+    static const bool enabled =
+        stage42_feature_enabled("VNM_TERMINAL_STAGE42_MODEL_ASCII_SKIP_SIMPLE_CELL_CLEAR");
+    return enabled;
+}
+
+bool stage42_snapshot_inline_hyperlink_ids_enabled()
+{
+    static const bool enabled =
+        stage42_feature_enabled("VNM_TERMINAL_STAGE42_SNAPSHOT_INLINE_HYPERLINK_IDS");
+    return enabled;
+}
 
 template <typename T>
 constexpr bool k_unhandled_screen_mutation = false;
@@ -2125,7 +2161,9 @@ void Terminal_screen_model::apply_action(
             if constexpr (std::is_same_v<mutation_t, Screen_print_text_mutation>) {
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "Terminal_screen_model::apply_action::print_text");
-                if (mutation.printable_ascii_only) {
+                if (mutation.printable_ascii_only &&
+                    stage42_model_ascii_direct_print_enabled())
+                {
 #if VNM_TERMINAL_PROFILING_ENABLED
                     if (m_profile_stats.enabled) {
                         ++m_profile_stats.print_text_calls;
@@ -2924,12 +2962,14 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
             snapshot.visible_line_provenance.reserve(
                 static_cast<std::size_t>(m_config.grid_size.rows));
         }
+        const bool collect_inline_hyperlink_ids = stage42_snapshot_inline_hyperlink_ids_enabled();
         std::vector<std::uint64_t> row_referenced_hyperlink_ids;
         for (int row = 0; row < m_config.grid_size.rows; ++row) {
 #if VNM_TERMINAL_PROFILING_ENABLED
             ++rows_visited;
 #endif
             row_referenced_hyperlink_ids.clear();
+            const std::size_t first_row_cell = snapshot.cells.size();
             const viewport_row_t viewport_row{row};
             const snapshot_row_t snapshot_row = [&]() {
                 VNM_TERMINAL_PROFILE_SCOPE(
@@ -2962,11 +3002,12 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                     snapshot,
                     row_cells->cells(),
                     snapshot_row.value,
-                    row_referenced_hyperlink_ids);
+                    row_referenced_hyperlink_ids,
+                    collect_inline_hyperlink_ids);
             }
 
-            if (row_cells.has_value() && !row_referenced_hyperlink_ids.empty()) {
-                {
+            if (collect_inline_hyperlink_ids) {
+                if (row_cells.has_value() && !row_referenced_hyperlink_ids.empty()) {
                     VNM_TERMINAL_PROFILE_SCOPE(
                         "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata::append");
 
@@ -2974,6 +3015,29 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                         snapshot.hyperlinks,
                         row_referenced_hyperlink_ids,
                         row_cells->hyperlink_identity_keys());
+                }
+            }
+            else {
+                std::optional<std::map<std::uint64_t, QByteArray>>
+                    row_local_hyperlink_identity_keys;
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata::lookup");
+
+                    row_local_hyperlink_identity_keys =
+                        viewport_row_retained_hyperlink_identity_keys(viewport, row);
+                }
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata::append");
+
+                    append_hyperlink_metadata_for_cells(
+                        snapshot.hyperlinks,
+                        snapshot.cells,
+                        first_row_cell,
+                        row_local_hyperlink_identity_keys.has_value()
+                            ? &*row_local_hyperlink_identity_keys
+                            : nullptr);
                 }
             }
 
@@ -3152,6 +3216,34 @@ Terminal_screen_model::viewport_row_provenance(
     const Terminal_screen_row& active =
         primary_active_grid_rows()[static_cast<std::size_t>(active_row.value)];
     return active.retained_line_provenance;
+}
+
+std::optional<std::map<std::uint64_t, QByteArray>>
+Terminal_screen_model::viewport_row_retained_hyperlink_identity_keys(
+    const Terminal_viewport_state& viewport,
+    int                            viewport_row) const
+{
+    const viewport_row_t row{viewport_row};
+    if (viewport.active_buffer != Terminal_buffer_id::PRIMARY ||
+        !viewport_row_is_valid(row))
+    {
+        return std::nullopt;
+    }
+
+    const std::optional<primary_backing_row_t> backing_row =
+        primary_backing_row_from_viewport(viewport, row);
+    if (!backing_row.has_value() || backing_row->value >= scrollback_size()) {
+        return std::nullopt;
+    }
+
+    const std::optional<retained_row_record_t> retained_record =
+        m_primary_backing.materialize_retained_history_record(
+            static_cast<std::size_t>(backing_row->value));
+    if (!retained_record.has_value()) {
+        return std::nullopt;
+    }
+
+    return retained_record->hyperlink_identity_keys;
 }
 
 Terminal_selection_result Terminal_screen_model::selected_text(
@@ -4908,7 +5000,10 @@ void Terminal_screen_model::write_printable_ascii_cell_content(
     QChar                      text)
 {
     Cell& cell = row.cells[static_cast<std::size_t>(column)];
-    if (cell.wide_continuation || cell.display_width != 1) {
+    if (!stage42_model_ascii_skip_simple_cell_clear_enabled() ||
+        cell.wide_continuation                               ||
+        cell.display_width != 1)
+    {
         clear_cell_at_content(row, column);
     }
 
@@ -7190,7 +7285,8 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
     Terminal_render_snapshot&  snapshot,
     const std::vector<Cell>&   row,
     int                        snapshot_row,
-    std::vector<std::uint64_t>& row_referenced_hyperlink_ids) const
+    std::vector<std::uint64_t>& row_referenced_hyperlink_ids,
+    bool                       collect_hyperlink_ids) const
 {
     VNM_TERMINAL_PROFILE_SCOPE(
         "Terminal_screen_model::append_snapshot_cells_from_row");
@@ -7214,7 +7310,7 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
                 continue;
             }
 
-            if (cell.hyperlink_id != 0U) {
+            if (collect_hyperlink_ids && cell.hyperlink_id != 0U) {
                 const auto insert_position = std::lower_bound(
                     row_referenced_hyperlink_ids.begin(),
                     row_referenced_hyperlink_ids.end(),
@@ -7341,6 +7437,56 @@ Terminal_screen_model::viewport_row_cells(
     const Terminal_screen_row& active =
         primary_active_grid_rows()[static_cast<std::size_t>(active_row.value)];
     return Viewport_row_cells{&active.cells};
+}
+
+void Terminal_screen_model::append_hyperlink_metadata_for_cells(
+    std::vector<Terminal_render_hyperlink_metadata>& metadata,
+    const std::vector<Terminal_render_cell>&         cells,
+    std::size_t                                      first_cell,
+    const std::map<std::uint64_t, QByteArray>*       row_local_identity_keys) const
+{
+    if (first_cell >= cells.size()) {
+        return;
+    }
+
+    std::set<std::uint64_t> referenced_ids;
+    for (std::size_t index = first_cell; index < cells.size(); ++index) {
+        const Terminal_render_cell& cell = cells[index];
+        if (cell.hyperlink_id != 0U) {
+            referenced_ids.insert(cell.hyperlink_id);
+        }
+    }
+
+    for (std::uint64_t hyperlink_id : referenced_ids) {
+        const bool already_materialized = std::any_of(
+            metadata.begin(),
+            metadata.end(),
+            [hyperlink_id](const Terminal_render_hyperlink_metadata& candidate) {
+                return candidate.hyperlink_id == hyperlink_id;
+            });
+        if (already_materialized) {
+            continue;
+        }
+
+        const QByteArray* identity_key = nullptr;
+        if (row_local_identity_keys != nullptr) {
+            const auto row_local_found = row_local_identity_keys->find(hyperlink_id);
+            if (row_local_found != row_local_identity_keys->end()) {
+                identity_key = &row_local_found->second;
+            }
+        }
+        else {
+            identity_key = active_hyperlink_identity_key(hyperlink_id);
+        }
+
+        if (identity_key != nullptr) {
+            metadata.push_back({
+                hyperlink_id,
+                *identity_key,
+                uri_from_hyperlink_identity_key(*identity_key),
+            });
+        }
+    }
 }
 
 void Terminal_screen_model::append_hyperlink_metadata_for_ids(
