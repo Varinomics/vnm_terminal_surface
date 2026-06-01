@@ -1449,7 +1449,8 @@ term::Terminal_render_frame make_direct_decoration_cache_frame(
 
 term::Terminal_render_frame make_direct_hyperlink_text_resource_frame(
     bool                           hyperlink,
-    term::terminal_cell_metrics_t  metrics)
+    term::terminal_cell_metrics_t  metrics,
+    int                            hyperlink_column = -1)
 {
     term::Terminal_render_frame frame;
     frame.logical_size          = QSizeF(metrics.width * 20.0, metrics.height * 3.0);
@@ -1465,6 +1466,8 @@ term::Terminal_render_frame make_direct_hyperlink_text_resource_frame(
     const QColor foreground(196, 230, 201);
     const QColor background(9, 12, 16);
     for (int column = 0; column < 20; ++column) {
+        const bool cell_hyperlink =
+            hyperlink && (hyperlink_column < 0 || column == hyperlink_column);
         const QRectF rect(
             static_cast<qreal>(column) * metrics.width,
             0.0,
@@ -1483,7 +1486,7 @@ term::Terminal_render_frame make_direct_hyperlink_text_resource_frame(
             foreground,
             background,
             term::k_default_terminal_style_id,
-            hyperlink ? 77U : 0U,
+            cell_hyperlink ? 77U : 0U,
             false,
             false,
         });
@@ -1491,12 +1494,18 @@ term::Terminal_render_frame make_direct_hyperlink_text_resource_frame(
 
     if (hyperlink) {
         const qreal thickness = std::max<qreal>(1.0, std::floor(metrics.height * 0.08));
+        const qreal left = hyperlink_column >= 0
+            ? static_cast<qreal>(hyperlink_column) * metrics.width
+            : 0.0;
+        const qreal width = hyperlink_column >= 0
+            ? metrics.width
+            : metrics.width * 20.0;
         frame.decorations.push_back({
             term::Terminal_render_decoration_kind::HYPERLINK_UNDERLINE,
             QRectF(
-                0.0,
+                left,
                 metrics.ascent + thickness,
-                metrics.width * 20.0,
+                width,
                 thickness),
             foreground,
         });
@@ -1508,7 +1517,8 @@ term::Terminal_render_frame make_direct_hyperlink_text_resource_frame(
 term::Terminal_render_frame make_direct_text_metadata_decoration_frame(
     bool                           underline,
     bool                           strike,
-    term::terminal_cell_metrics_t  metrics)
+    term::terminal_cell_metrics_t  metrics,
+    int                            decorated_column = -1)
 {
     term::Terminal_render_frame frame;
     frame.logical_size          = QSizeF(metrics.width * 20.0, metrics.height * 3.0);
@@ -1524,6 +1534,9 @@ term::Terminal_render_frame make_direct_text_metadata_decoration_frame(
     const QColor foreground(196, 230, 201);
     const QColor background(9, 12, 16);
     for (int column = 0; column < 20; ++column) {
+        const bool cell_decorated =
+            (underline || strike) &&
+            (decorated_column < 0 || column == decorated_column);
         const QRectF rect(
             static_cast<qreal>(column) * metrics.width,
             0.0,
@@ -1538,24 +1551,32 @@ term::Terminal_render_frame make_direct_text_metadata_decoration_frame(
             rect,
             QRectF(),
             QPointF(rect.left(), rect.top() + metrics.ascent),
-            QString(QChar(static_cast<char16_t>(u'P' + column % 8))),
+            // Keep this pool descender-free; underline pixel checks sample the
+            // lower glyph band and should not count text descenders as lines.
+            QString(QChar(static_cast<char16_t>(u'A' + column % 8))),
             foreground,
             background,
-            underline || strike ? 1U : term::k_default_terminal_style_id,
+            cell_decorated ? 1U : term::k_default_terminal_style_id,
             0U,
-            underline,
-            strike,
+            cell_decorated && underline,
+            cell_decorated && strike,
         });
     }
 
     const qreal thickness = std::max<qreal>(1.0, std::floor(metrics.height * 0.08));
+    const qreal decoration_left = decorated_column >= 0
+        ? static_cast<qreal>(decorated_column) * metrics.width
+        : 0.0;
+    const qreal decoration_width = decorated_column >= 0
+        ? metrics.width
+        : metrics.width * 20.0;
     if (underline) {
         frame.decorations.push_back({
             term::Terminal_render_decoration_kind::UNDERLINE,
             QRectF(
-                0.0,
+                decoration_left,
                 metrics.ascent + thickness,
-                metrics.width * 20.0,
+                decoration_width,
                 thickness),
             foreground,
         });
@@ -1564,9 +1585,9 @@ term::Terminal_render_frame make_direct_text_metadata_decoration_frame(
         frame.decorations.push_back({
             term::Terminal_render_decoration_kind::STRIKE,
             QRectF(
-                0.0,
+                decoration_left,
                 metrics.ascent * 0.55,
-                metrics.width * 20.0,
+                decoration_width,
                 thickness),
             foreground,
         });
@@ -3348,7 +3369,9 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     }
     ok &= check(stats.qt_text_layout_calls == 0 &&
         stats.text_ascii_replacement_runs_eligible == 1 &&
+        stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
         stats.text_ascii_replacement_runs_succeeded == 1 &&
+        stats.text_ascii_replacement_code_units_trusted_fast_path == 20U &&
         stats.text_ascii_replacement_runs_fallback == 0,
         "dense same-color row renders through the ASCII replacement path");
     ok &= check(stats.text_resource_runs_before_coalescing == 20 &&
@@ -3392,7 +3415,9 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     ok &= check(style_stats.qt_text_layout_calls == 0 &&
         style_stats.text_ascii_replacement_runs_eligible == 3 &&
+        style_stats.text_ascii_replacement_runs_trusted_fast_path == 3 &&
         style_stats.text_ascii_replacement_runs_succeeded == 3 &&
+        style_stats.text_ascii_replacement_code_units_trusted_fast_path == 20U &&
         style_stats.text_ascii_replacement_runs_fallback == 0,
         "style boundary row keeps foreground boundaries while replacing all ASCII runs");
     const QImage style_image = window.grabWindow();
@@ -3414,8 +3439,8 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         1),
         "same-foreground style boundary row renders as one rebuilt text resource row");
     if (profile_scopes_available()) {
-        ok &= check(prepare_text_layout_call_count(surface) == 0U,
-            "same-foreground style boundary row bypasses prepare_text_layout after coalescing");
+        ok &= check(prepare_text_layout_call_count(surface) == 1U,
+            "same-foreground style boundary keeps decorated cells on QTextLayout");
         ok &= check(ascii_text_coalescing_context_call_count(surface) <= 1U,
             "same-foreground style boundary row computes or reuses the ASCII coalescing font gate");
     }
@@ -3424,10 +3449,12 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     ok &= check(same_foreground_stats.background_layer_rebuilt &&
         same_foreground_stats.decoration_layer_rebuilt,
         "same-foreground style boundary still updates background and decoration layers");
-    ok &= check(same_foreground_stats.qt_text_layout_calls == 0 &&
-        same_foreground_stats.text_ascii_replacement_runs_eligible == 1 &&
-        same_foreground_stats.text_ascii_replacement_runs_succeeded == 1,
-        "same-foreground style boundary replaces the coalesced ASCII text run");
+    ok &= check(same_foreground_stats.qt_text_layout_calls == 1 &&
+        same_foreground_stats.text_resource_runs_after_coalescing == 1 &&
+        same_foreground_stats.text_ascii_replacement_runs_trusted_fast_path == 0 &&
+        same_foreground_stats.text_ascii_replacement_runs_fallback == 1 &&
+        same_foreground_stats.text_ascii_replacement_runs_rejected_decoration == 1,
+        "same-foreground style boundary preserves coalescing and falls back for decoration");
     const QImage same_foreground_image = window.grabWindow();
     ok &= check(!same_foreground_image.isNull() &&
         cell_is_nonblank(same_foreground_image, 0, 0, metrics) &&
@@ -3564,7 +3591,9 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     const term::terminal_renderer_stats_t wide_stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     ok &= check(wide_stats.qt_text_layout_calls == 1 &&
+        wide_stats.text_ascii_replacement_runs_trusted_fast_path == 2 &&
         wide_stats.text_ascii_replacement_runs_succeeded == 2 &&
+        wide_stats.text_ascii_replacement_code_units_trusted_fast_path == 18U &&
         wide_stats.text_ascii_replacement_runs_rejected_non_ascii == 1,
         "wide boundary row replaces ASCII runs and falls back for the wide run");
     const QImage wide_image = window.grabWindow();
@@ -3596,6 +3625,9 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     const term::terminal_renderer_stats_t long_stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     ok &= check(long_stats.qt_text_layout_calls == 0 &&
+        long_stats.text_ascii_replacement_runs_trusted_fast_path == 2 &&
+        long_stats.text_ascii_replacement_code_units_trusted_fast_path ==
+            static_cast<std::uint64_t>(k_long_dense_column_count) &&
         long_stats.text_ascii_replacement_runs_succeeded == 2,
         "long dense row uses replacement for both bounded chunks");
     const QImage long_image = window.grabWindow();
@@ -3626,6 +3658,8 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     const term::terminal_renderer_stats_t multirow_stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     ok &= check(multirow_stats.qt_text_layout_calls == 0 &&
+        multirow_stats.text_ascii_replacement_runs_trusted_fast_path == 3 &&
+        multirow_stats.text_ascii_replacement_code_units_trusted_fast_path == 60U &&
         multirow_stats.text_ascii_replacement_runs_succeeded == 3,
         "multi-row dense render replaces every coalesced ASCII row");
 
@@ -3651,6 +3685,8 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     const term::terminal_renderer_stats_t single_cell_stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     ok &= check(single_cell_stats.qt_text_layout_calls == 0 &&
+        single_cell_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        single_cell_stats.text_ascii_replacement_code_units_trusted_fast_path == 1U &&
         single_cell_stats.text_ascii_replacement_runs_succeeded == 1,
         "single-cell row uses the broad ASCII replacement path");
     return ok;
@@ -3681,6 +3717,35 @@ bool test_qsg_text_resource_key_ignores_hyperlink_metadata(QGuiApplication& app)
         "hyperlink text-resource baseline renders an image");
     ok &= check(count_underline_pixels(baseline_image, 0, 0, 20, metrics) <= 4,
         "hyperlink text-resource baseline has no hyperlink underline pixels");
+
+    item.set_frame(make_direct_hyperlink_text_resource_frame(true, metrics, 10));
+    const QImage partial_hyperlink_image = render_window_until(app, window, [&](const QImage&) {
+        const term::terminal_renderer_stats_t stats = item.last_stats();
+        return
+            stats.root_reused                          &&
+            stats.paint_completed                      &&
+            stats.text_content_failures == 0           &&
+            stats.text_content_rebuilds == 0           &&
+            stats.text_content_reused == 1             &&
+            stats.text_resource_descriptor_reuses == 1 &&
+            stats.text_key_builds == 1                 &&
+            stats.decoration_layer_rebuilt             &&
+            stats.decoration_rows_rebuilt == 1;
+    });
+    const term::terminal_renderer_stats_t partial_hyperlink_stats = item.last_stats();
+    const int partial_hyperlink_before_pixels =
+        count_underline_pixels(partial_hyperlink_image, 0, 0, 10, metrics);
+    const int partial_hyperlink_pixels =
+        count_underline_pixels(partial_hyperlink_image, 0, 10, 1, metrics);
+    const int partial_hyperlink_after_pixels =
+        count_underline_pixels(partial_hyperlink_image, 0, 11, 9, metrics);
+    ok &= check(!partial_hyperlink_image.isNull() &&
+        partial_hyperlink_stats.text_resource_descriptor_reuses == 1,
+        "partial hyperlink metadata transition reuses the cached text resource row");
+    ok &= check(partial_hyperlink_pixels > 2 &&
+        partial_hyperlink_before_pixels <= 4 &&
+        partial_hyperlink_after_pixels  <= 4,
+        "partial hyperlink metadata transition paints only the linked column");
 
     item.set_frame(make_direct_hyperlink_text_resource_frame(true, metrics));
     const QImage hyperlink_image = render_window_until(app, window, [&](const QImage&) {
@@ -3772,6 +3837,35 @@ bool test_qsg_text_resource_descriptor_ignores_decoration_metadata(QGuiApplicati
         count_strike_pixels(baseline_image, 0, 0, 20, metrics);
     ok &= check(count_underline_pixels(baseline_image, 0, 0, 20, metrics) <= 4,
         "decoration metadata baseline has no underline pixels");
+
+    item.set_frame(make_direct_text_metadata_decoration_frame(true, false, metrics, 10));
+    const QImage partial_decorated_image = render_window_until(app, window, [&](const QImage&) {
+        const term::terminal_renderer_stats_t stats = item.last_stats();
+        return
+            stats.root_reused                          &&
+            stats.paint_completed                      &&
+            stats.text_content_failures == 0           &&
+            stats.text_content_rebuilds == 0           &&
+            stats.text_content_reused == 1             &&
+            stats.text_resource_descriptor_reuses == 1 &&
+            stats.text_key_builds == 1                 &&
+            stats.decoration_layer_rebuilt             &&
+            stats.decoration_rows_rebuilt == 1;
+    });
+    const term::terminal_renderer_stats_t partial_decorated_stats = item.last_stats();
+    const int partial_decorated_before_pixels =
+        count_underline_pixels(partial_decorated_image, 0, 0, 10, metrics);
+    const int partial_decorated_pixels =
+        count_underline_pixels(partial_decorated_image, 0, 10, 1, metrics);
+    const int partial_decorated_after_pixels =
+        count_underline_pixels(partial_decorated_image, 0, 11, 9, metrics);
+    ok &= check(!partial_decorated_image.isNull() &&
+        partial_decorated_stats.text_resource_descriptor_reuses == 1,
+        "partial decoration metadata transition reuses the cached text resource row");
+    ok &= check(partial_decorated_pixels > 2 &&
+        partial_decorated_before_pixels <= 4 &&
+        partial_decorated_after_pixels  <= 4,
+        "partial decoration metadata transition paints only the decorated column");
 
     item.set_frame(make_direct_text_metadata_decoration_frame(true, true, metrics));
     const QImage decorated_image = render_window_until(app, window, [&](const QImage&) {
@@ -4005,6 +4099,370 @@ bool test_qsg_text_coalescing_rejects_cell_width_drift(QGuiApplication& app)
     return ok;
 }
 
+bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
+{
+    bool ok = true;
+    QQuickWindow window;
+    window.setColor(QColor(180, 16, 16));
+    window.resize(380, 120);
+    window.show();
+    pump_events(app, 2);
+
+    const QFont font = term::vnm_terminal_font(QString(), 16.0);
+    const term::terminal_cell_metrics_t metrics = cell_metrics_for_font(font);
+    auto render_once = [&](
+        const term::Terminal_render_frame& frame,
+        term::terminal_renderer_stats_t&   stats,
+        term::Hierarchical_profiler&       profiler) {
+        term::Qsg_terminal_renderer renderer;
+        QSGNode* node = nullptr;
+        {
+            term::Active_profiler_binding binding(&profiler);
+            node = renderer.update_node(nullptr, &window, frame, font, 1.0, {}, stats);
+        }
+
+        const bool rendered =
+            node != nullptr       &&
+            stats.paint_completed &&
+            stats.text_content_failures == 0;
+
+        term::terminal_renderer_stats_t cleanup_stats;
+        renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
+        return rendered;
+    };
+
+    const term::Terminal_render_frame trusted_frame = make_direct_text_frame(
+        {
+            make_direct_text_run(0, 1, QStringLiteral("A"), metrics),
+            make_direct_text_run(1, 1, QStringLiteral("B"), metrics),
+        },
+        metrics);
+
+    term::terminal_renderer_stats_t trusted_stats;
+    term::Hierarchical_profiler trusted_profiler;
+    ok &= check(render_once(trusted_frame, trusted_stats, trusted_profiler),
+        "trusted ASCII replacement fast-path baseline renders");
+    ok &= check(trusted_stats.text_resource_runs_before_coalescing == 2 &&
+        trusted_stats.text_resource_runs_after_coalescing == 1,
+        "trusted ASCII replacement fast-path test uses one coalesced resource run");
+    ok &= check(trusted_stats.qt_text_layout_calls == 0 &&
+        trusted_stats.text_ascii_replacement_runs_screened == 1 &&
+        trusted_stats.text_ascii_replacement_runs_eligible == 1 &&
+        trusted_stats.text_ascii_replacement_runs_attempted == 1 &&
+        trusted_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        trusted_stats.text_ascii_replacement_runs_succeeded == 1 &&
+        trusted_stats.text_ascii_replacement_runs_fallback == 0 &&
+        trusted_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U,
+        "trusted ASCII replacement fast path preserves replacement counters");
+    if (profile_scopes_available()) {
+        ok &= check(profile_call_count(
+                trusted_profiler.root_snapshot(),
+                "try_append_ascii_replacement_text_run") == 0U,
+            "trusted ASCII replacement fast path bypasses the generic replacement scope");
+        ok &= check(profile_call_count(
+                trusted_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run") == 1U,
+            "trusted ASCII replacement fast path records its focused scope");
+    }
+
+    const term::Terminal_render_frame space_frame = make_direct_text_frame(
+        {
+            make_direct_text_run(0, 1, QStringLiteral(" "), metrics),
+            make_direct_text_run(1, 1, QStringLiteral(" "), metrics),
+        },
+        metrics);
+
+    term::terminal_renderer_stats_t space_stats;
+    term::Hierarchical_profiler space_profiler;
+    ok &= check(render_once(space_frame, space_stats, space_profiler),
+        "trusted all-space ASCII replacement frame renders");
+    ok &= check(space_stats.qt_text_layout_calls == 0 &&
+        space_stats.text_ascii_replacement_runs_screened == 1 &&
+        space_stats.text_ascii_replacement_runs_eligible == 1 &&
+        space_stats.text_ascii_replacement_runs_attempted == 1 &&
+        space_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        space_stats.text_ascii_replacement_runs_succeeded == 1 &&
+        space_stats.text_ascii_replacement_runs_all_space_succeeded == 1 &&
+        space_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U &&
+        space_stats.text_ascii_replacement_code_units_succeeded == 2U &&
+        space_stats.text_ascii_replacement_runs_fallback == 0 &&
+        space_stats.text_leaf_nodes_created == 0,
+        "trusted all-space ASCII replacement keeps all-space counters and skips text leaves");
+
+    const term::Terminal_render_frame mixed_space_frame = make_direct_text_frame(
+        {
+            make_direct_text_run(0, 1, QStringLiteral(" "), metrics),
+            make_direct_text_run(1, 1, QStringLiteral("A"), metrics),
+        },
+        metrics);
+
+    term::terminal_renderer_stats_t mixed_space_stats;
+    term::Hierarchical_profiler mixed_space_profiler;
+    ok &= check(render_once(mixed_space_frame, mixed_space_stats, mixed_space_profiler),
+        "trusted mixed-space ASCII replacement frame renders");
+    ok &= check(mixed_space_stats.qt_text_layout_calls == 0 &&
+        mixed_space_stats.text_ascii_replacement_runs_screened == 1 &&
+        mixed_space_stats.text_ascii_replacement_runs_eligible == 1 &&
+        mixed_space_stats.text_ascii_replacement_runs_attempted == 1 &&
+        mixed_space_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        mixed_space_stats.text_ascii_replacement_runs_succeeded == 1 &&
+        mixed_space_stats.text_ascii_replacement_runs_all_space_succeeded == 0 &&
+        mixed_space_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U &&
+        mixed_space_stats.text_ascii_replacement_runs_fallback == 0,
+        "trusted mixed-space ASCII replacement uses glyph fast path, not all-space skip");
+    if (profile_scopes_available()) {
+        ok &= check(profile_call_count(
+                mixed_space_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run") == 1U,
+            "trusted mixed-space ASCII replacement records the trusted scope");
+    }
+
+    const term::Terminal_render_frame single_run_frame = make_direct_text_frame(
+        {
+            make_direct_text_run(0, 2, QStringLiteral("AB"), metrics),
+        },
+        metrics);
+
+    term::terminal_renderer_stats_t single_run_stats;
+    term::Hierarchical_profiler single_run_profiler;
+    ok &= check(render_once(single_run_frame, single_run_stats, single_run_profiler),
+        "single-run trusted ASCII replacement frame renders");
+    ok &= check(single_run_stats.text_resource_runs_before_coalescing == 1 &&
+        single_run_stats.text_resource_runs_after_coalescing == 1 &&
+        single_run_stats.qt_text_layout_calls == 0 &&
+        single_run_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        single_run_stats.text_ascii_replacement_runs_succeeded == 1 &&
+        single_run_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U,
+        "single-run trusted ASCII replacement uses the non-coalesced trusted branch");
+    if (profile_scopes_available()) {
+        ok &= check(profile_call_count(
+                single_run_profiler.root_snapshot(),
+                "try_append_ascii_replacement_text_run") == 0U,
+            "single-run trusted ASCII replacement bypasses the generic replacement scope");
+    }
+
+    const term::Terminal_render_frame single_space_run_frame = make_direct_text_frame(
+        {
+            make_direct_text_run(0, 2, QStringLiteral("  "), metrics),
+        },
+        metrics);
+
+    term::terminal_renderer_stats_t single_space_run_stats;
+    term::Hierarchical_profiler single_space_run_profiler;
+    ok &= check(render_once(
+            single_space_run_frame,
+            single_space_run_stats,
+            single_space_run_profiler),
+        "single-run all-space trusted ASCII replacement frame renders");
+    ok &= check(single_space_run_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        single_space_run_stats.text_ascii_replacement_runs_screened == 1 &&
+        single_space_run_stats.text_ascii_replacement_runs_all_space_succeeded == 1 &&
+        single_space_run_stats.text_ascii_replacement_code_units_screened == 2U &&
+        single_space_run_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U &&
+        single_space_run_stats.text_leaf_nodes_created == 0,
+        "single-run all-space trusted ASCII replacement preserves all-space fast path");
+
+    term::Terminal_render_text_run decorated_first =
+        make_direct_text_run(0, 1, QStringLiteral("A"), metrics);
+    term::Terminal_render_text_run decorated_second =
+        make_direct_text_run(1, 1, QStringLiteral("B"), metrics);
+    decorated_first.underline  = true;
+    decorated_second.underline = true;
+    const term::Terminal_render_frame decorated_frame = make_direct_text_frame(
+        { decorated_first, decorated_second },
+        metrics);
+
+    term::terminal_renderer_stats_t decorated_stats;
+    term::Hierarchical_profiler decorated_profiler;
+    ok &= check(render_once(decorated_frame, decorated_stats, decorated_profiler),
+        "decorated ASCII replacement fallback frame renders");
+    ok &= check(decorated_stats.text_resource_runs_before_coalescing == 2 &&
+        decorated_stats.text_resource_runs_after_coalescing == 1,
+        "decorated ASCII replacement fallback still uses the coalesced resource route");
+    ok &= check(decorated_stats.text_ascii_replacement_runs_trusted_fast_path == 0 &&
+        decorated_stats.text_ascii_replacement_runs_screened == 1 &&
+        decorated_stats.text_ascii_replacement_code_units_screened == 2U &&
+        decorated_stats.text_ascii_replacement_runs_fallback == 1 &&
+        decorated_stats.text_ascii_replacement_runs_rejected_decoration == 1 &&
+        decorated_stats.qt_text_layout_calls == 1,
+        "decorated ASCII replacement stays on the generic fallback path");
+    if (profile_scopes_available()) {
+        ok &= check(profile_call_count(
+                decorated_profiler.root_snapshot(),
+                "try_append_ascii_replacement_text_run") == 1U,
+            "decorated ASCII replacement fallback keeps the generic replacement scope");
+        ok &= check(profile_call_count(
+                decorated_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run") == 0U,
+            "decorated ASCII replacement fallback does not use the trusted fast path");
+    }
+
+    term::Terminal_render_text_run mixed_plain =
+        make_direct_text_run(0, 1, QStringLiteral("A"), metrics);
+    term::Terminal_render_text_run mixed_decorated =
+        make_direct_text_run(1, 1, QStringLiteral("B"), metrics);
+    mixed_decorated.underline = true;
+    const term::Terminal_render_frame mixed_decorated_frame = make_direct_text_frame(
+        { mixed_plain, mixed_decorated },
+        metrics);
+
+    term::terminal_renderer_stats_t mixed_decorated_stats;
+    term::Hierarchical_profiler mixed_decorated_profiler;
+    ok &= check(render_once(
+            mixed_decorated_frame,
+            mixed_decorated_stats,
+            mixed_decorated_profiler),
+        "mixed decorated ASCII replacement frame renders");
+    ok &= check(mixed_decorated_stats.text_resource_runs_before_coalescing == 2 &&
+        mixed_decorated_stats.text_resource_runs_after_coalescing == 1 &&
+        mixed_decorated_stats.text_ascii_replacement_runs_trusted_fast_path == 0 &&
+        mixed_decorated_stats.text_ascii_replacement_runs_screened == 1 &&
+        mixed_decorated_stats.text_ascii_replacement_code_units_screened == 2U &&
+        mixed_decorated_stats.text_ascii_replacement_runs_succeeded == 0 &&
+        mixed_decorated_stats.text_ascii_replacement_runs_fallback == 1 &&
+        mixed_decorated_stats.text_ascii_replacement_runs_rejected_decoration == 1 &&
+        mixed_decorated_stats.text_layout_runs_with_decoration == 1 &&
+        mixed_decorated_stats.qt_text_layout_calls == 1,
+        "mixed decorated ASCII replacement coalesces but keeps fallback metadata");
+    if (profile_scopes_available()) {
+        ok &= check(profile_call_count(
+                mixed_decorated_profiler.root_snapshot(),
+                "try_append_ascii_replacement_text_run") == 1U,
+            "mixed decorated ASCII replacement fallback keeps the generic replacement scope");
+        ok &= check(profile_call_count(
+                mixed_decorated_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run") == 0U,
+            "mixed decorated ASCII replacement fallback does not use the trusted fast path");
+    }
+
+    term::Terminal_render_text_run leading_decorated =
+        make_direct_text_run(0, 1, QStringLiteral("A"), metrics);
+    term::Terminal_render_text_run trailing_plain =
+        make_direct_text_run(1, 1, QStringLiteral("B"), metrics);
+    leading_decorated.underline = true;
+    const term::Terminal_render_frame leading_decorated_frame = make_direct_text_frame(
+        { leading_decorated, trailing_plain },
+        metrics);
+
+    term::terminal_renderer_stats_t leading_decorated_stats;
+    term::Hierarchical_profiler leading_decorated_profiler;
+    ok &= check(render_once(
+            leading_decorated_frame,
+            leading_decorated_stats,
+            leading_decorated_profiler),
+        "leading decorated ASCII replacement frame renders");
+    ok &= check(leading_decorated_stats.text_resource_runs_before_coalescing == 2 &&
+        leading_decorated_stats.text_resource_runs_after_coalescing == 1 &&
+        leading_decorated_stats.text_ascii_replacement_runs_trusted_fast_path == 0 &&
+        leading_decorated_stats.text_ascii_replacement_runs_screened == 1 &&
+        leading_decorated_stats.text_ascii_replacement_code_units_screened == 2U &&
+        leading_decorated_stats.text_ascii_replacement_runs_succeeded == 0 &&
+        leading_decorated_stats.text_ascii_replacement_runs_fallback == 1 &&
+        leading_decorated_stats.text_ascii_replacement_runs_rejected_decoration == 1 &&
+        leading_decorated_stats.text_layout_runs_with_decoration == 1 &&
+        leading_decorated_stats.qt_text_layout_calls == 1,
+        "leading decorated ASCII replacement coalesces but keeps fallback metadata");
+    if (profile_scopes_available()) {
+        ok &= check(profile_call_count(
+                leading_decorated_profiler.root_snapshot(),
+                "try_append_ascii_replacement_text_run") == 1U,
+            "leading decorated ASCII replacement fallback keeps the generic replacement scope");
+        ok &= check(profile_call_count(
+                leading_decorated_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run") == 0U,
+            "leading decorated ASCII replacement fallback does not use the trusted fast path");
+    }
+
+    term::Terminal_render_text_run mixed_hyperlink =
+        make_direct_text_run(1, 1, QStringLiteral("B"), metrics);
+    mixed_hyperlink.hyperlink_id = 77U;
+    const term::Terminal_render_frame mixed_hyperlink_frame = make_direct_text_frame(
+        { mixed_plain, mixed_hyperlink },
+        metrics);
+
+    term::terminal_renderer_stats_t mixed_hyperlink_stats;
+    term::Hierarchical_profiler mixed_hyperlink_profiler;
+    ok &= check(render_once(
+            mixed_hyperlink_frame,
+            mixed_hyperlink_stats,
+            mixed_hyperlink_profiler),
+        "mixed hyperlink ASCII replacement frame renders");
+    ok &= check(mixed_hyperlink_stats.text_resource_runs_before_coalescing == 2 &&
+        mixed_hyperlink_stats.text_resource_runs_after_coalescing == 1 &&
+        mixed_hyperlink_stats.text_ascii_replacement_runs_trusted_fast_path == 0 &&
+        mixed_hyperlink_stats.text_ascii_replacement_runs_screened == 1 &&
+        mixed_hyperlink_stats.text_ascii_replacement_code_units_screened == 2U &&
+        mixed_hyperlink_stats.text_ascii_replacement_runs_succeeded == 0 &&
+        mixed_hyperlink_stats.text_ascii_replacement_runs_fallback == 1 &&
+        mixed_hyperlink_stats.text_ascii_replacement_runs_rejected_hyperlink == 1 &&
+        mixed_hyperlink_stats.text_layout_runs_with_hyperlink == 1 &&
+        mixed_hyperlink_stats.qt_text_layout_calls == 1,
+        "mixed hyperlink ASCII replacement coalesces but keeps fallback metadata");
+    if (profile_scopes_available()) {
+        ok &= check(profile_call_count(
+                mixed_hyperlink_profiler.root_snapshot(),
+                "try_append_ascii_replacement_text_run") == 1U,
+            "mixed hyperlink ASCII replacement fallback keeps the generic replacement scope");
+        ok &= check(profile_call_count(
+                mixed_hyperlink_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run") == 0U,
+            "mixed hyperlink ASCII replacement fallback does not use the trusted fast path");
+    }
+
+    term::Terminal_render_text_run leading_hyperlink =
+        make_direct_text_run(0, 1, QStringLiteral("A"), metrics);
+    leading_hyperlink.hyperlink_id = 77U;
+    const term::Terminal_render_frame leading_hyperlink_frame = make_direct_text_frame(
+        { leading_hyperlink, trailing_plain },
+        metrics);
+
+    term::terminal_renderer_stats_t leading_hyperlink_stats;
+    term::Hierarchical_profiler leading_hyperlink_profiler;
+    ok &= check(render_once(
+            leading_hyperlink_frame,
+            leading_hyperlink_stats,
+            leading_hyperlink_profiler),
+        "leading hyperlink ASCII replacement frame renders");
+    ok &= check(leading_hyperlink_stats.text_resource_runs_before_coalescing == 2 &&
+        leading_hyperlink_stats.text_resource_runs_after_coalescing == 1 &&
+        leading_hyperlink_stats.text_ascii_replacement_runs_trusted_fast_path == 0 &&
+        leading_hyperlink_stats.text_ascii_replacement_runs_screened == 1 &&
+        leading_hyperlink_stats.text_ascii_replacement_code_units_screened == 2U &&
+        leading_hyperlink_stats.text_ascii_replacement_runs_succeeded == 0 &&
+        leading_hyperlink_stats.text_ascii_replacement_runs_fallback == 1 &&
+        leading_hyperlink_stats.text_ascii_replacement_runs_rejected_hyperlink == 1 &&
+        leading_hyperlink_stats.text_layout_runs_with_hyperlink == 1 &&
+        leading_hyperlink_stats.qt_text_layout_calls == 1,
+        "leading hyperlink ASCII replacement coalesces but keeps fallback metadata");
+    if (profile_scopes_available()) {
+        ok &= check(profile_call_count(
+                leading_hyperlink_profiler.root_snapshot(),
+                "try_append_ascii_replacement_text_run") == 1U,
+            "leading hyperlink ASCII replacement fallback keeps the generic replacement scope");
+        ok &= check(profile_call_count(
+                leading_hyperlink_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run") == 0U,
+            "leading hyperlink ASCII replacement fallback does not use the trusted fast path");
+    }
+
+    term::Terminal_render_frame cursor_text_frame = make_direct_text_frame({}, metrics);
+    cursor_text_frame.cursor_text_runs.push_back(
+        make_direct_text_run(0, 1, QStringLiteral("A"), metrics));
+
+    term::terminal_renderer_stats_t cursor_text_stats;
+    term::Hierarchical_profiler cursor_text_profiler;
+    ok &= check(render_once(cursor_text_frame, cursor_text_stats, cursor_text_profiler),
+        "cursor text ASCII replacement frame renders");
+    ok &= check(cursor_text_stats.text_ascii_replacement_runs_trusted_fast_path == 0 &&
+        cursor_text_stats.text_ascii_replacement_runs_screened == 1 &&
+        cursor_text_stats.text_ascii_replacement_runs_fallback == 1 &&
+        cursor_text_stats.text_ascii_replacement_runs_rejected_force_blended_order == 1 &&
+        cursor_text_stats.qt_text_layout_calls == 1,
+        "cursor text bypasses the trusted path under force-blended order");
+
+    return ok;
+}
+
 bool test_qsg_text_resource_key_unifies_coalesced_ascii_with_original_runs(
     QGuiApplication& app)
 {
@@ -4073,7 +4531,8 @@ bool test_qsg_text_resource_key_unifies_coalesced_ascii_with_original_runs(
         second_stats.text_content_failures == 0 &&
         second_stats.text_content_rebuilds == 0 &&
         second_stats.text_content_reused == 1 &&
-        second_stats.text_resource_descriptor_reuses == 1,
+        second_stats.text_resource_descriptor_reuses == 1 &&
+        second_stats.text_ascii_replacement_runs_trusted_fast_path == 0,
         "original multi-character ASCII run reuses the equivalent replacement descriptor");
 
     term::terminal_renderer_stats_t cleanup_stats;
@@ -11701,6 +12160,7 @@ int main(int argc, char** argv)
     ok &= test_qsg_text_resource_descriptor_ignores_decoration_metadata(app);
     ok &= test_qsg_packed_sidecars_do_not_affect_visual_output(app);
     ok &= test_qsg_text_coalescing_rejects_cell_width_drift(app);
+    ok &= test_qsg_ascii_replacement_trusted_fast_path_counters(app);
     ok &= test_qsg_text_resource_key_unifies_coalesced_ascii_with_original_runs(app);
     ok &= test_ascii_coalescing_context_enable_disable_descriptor_identity(app);
     ok &= test_qsg_background_selection_row_cache(app);

@@ -218,6 +218,7 @@ struct renderer_totals_t
     qint64                 text_ascii_replacement_runs_screened                = 0;
     qint64                 text_ascii_replacement_runs_eligible                = 0;
     qint64                 text_ascii_replacement_runs_attempted                = 0;
+    qint64                 text_ascii_replacement_runs_trusted_fast_path        = 0;
     qint64                 text_ascii_replacement_runs_succeeded                = 0;
     qint64                 text_ascii_replacement_runs_all_space_succeeded      = 0;
     qint64                 text_ascii_replacement_runs_fallback                 = 0;
@@ -234,6 +235,7 @@ struct renderer_totals_t
     std::uint64_t          text_ascii_replacement_code_units_screened           = 0U;
     std::uint64_t          text_ascii_replacement_code_units_eligible           = 0U;
     std::uint64_t          text_ascii_replacement_code_units_attempted          = 0U;
+    std::uint64_t          text_ascii_replacement_code_units_trusted_fast_path  = 0U;
     std::uint64_t          text_ascii_replacement_code_units_succeeded          = 0U;
     std::uint64_t          text_ascii_replacement_code_units_fallback           = 0U;
     qint64                 qsg_nodes_created                                    = 0;
@@ -2061,6 +2063,8 @@ void add_renderer_stats(
         stats.text_ascii_replacement_runs_eligible;
     totals.text_ascii_replacement_runs_attempted +=
         stats.text_ascii_replacement_runs_attempted;
+    totals.text_ascii_replacement_runs_trusted_fast_path +=
+        stats.text_ascii_replacement_runs_trusted_fast_path;
     totals.text_ascii_replacement_runs_succeeded +=
         stats.text_ascii_replacement_runs_succeeded;
     totals.text_ascii_replacement_runs_all_space_succeeded +=
@@ -2093,6 +2097,8 @@ void add_renderer_stats(
         stats.text_ascii_replacement_code_units_eligible;
     totals.text_ascii_replacement_code_units_attempted +=
         stats.text_ascii_replacement_code_units_attempted;
+    totals.text_ascii_replacement_code_units_trusted_fast_path +=
+        stats.text_ascii_replacement_code_units_trusted_fast_path;
     totals.text_ascii_replacement_code_units_succeeded +=
         stats.text_ascii_replacement_code_units_succeeded;
     totals.text_ascii_replacement_code_units_fallback +=
@@ -2625,6 +2631,8 @@ void add_renderer_stats(
         stats.text_ascii_replacement_runs_eligible;
     totals.text_ascii_replacement_runs_attempted +=
         stats.text_ascii_replacement_runs_attempted;
+    totals.text_ascii_replacement_runs_trusted_fast_path +=
+        stats.text_ascii_replacement_runs_trusted_fast_path;
     totals.text_ascii_replacement_runs_succeeded +=
         stats.text_ascii_replacement_runs_succeeded;
     totals.text_ascii_replacement_runs_all_space_succeeded +=
@@ -2657,6 +2665,8 @@ void add_renderer_stats(
         stats.text_ascii_replacement_code_units_eligible;
     totals.text_ascii_replacement_code_units_attempted +=
         stats.text_ascii_replacement_code_units_attempted;
+    totals.text_ascii_replacement_code_units_trusted_fast_path +=
+        stats.text_ascii_replacement_code_units_trusted_fast_path;
     totals.text_ascii_replacement_code_units_succeeded +=
         stats.text_ascii_replacement_code_units_succeeded;
     totals.text_ascii_replacement_code_units_fallback +=
@@ -4009,6 +4019,17 @@ QJsonObject normalized_per_consumed_update_json(const Scenario_result& result)
             result.renderer_totals.text_resource_descriptor_reuses,
             denominator));
     counters.insert(
+        QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"),
+        normalized_per_consumed_update_value(
+            result.renderer_totals.text_ascii_replacement_runs_trusted_fast_path,
+            denominator));
+    counters.insert(
+        QStringLiteral("text_ascii_replacement_code_units_trusted_fast_path"),
+        normalized_per_consumed_update_value(
+            static_cast<qint64>(
+                result.renderer_totals.text_ascii_replacement_code_units_trusted_fast_path),
+            denominator));
+    counters.insert(
         QStringLiteral("qsg_nodes_created"),
         normalized_per_consumed_update_value(
             result.renderer_totals.qsg_nodes_created,
@@ -4439,6 +4460,9 @@ QJsonObject scenario_json(const Scenario_result& result)
         QStringLiteral("text_ascii_replacement_runs_attempted"),
         result.renderer_totals.text_ascii_replacement_runs_attempted);
     object.insert(
+        QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"),
+        result.renderer_totals.text_ascii_replacement_runs_trusted_fast_path);
+    object.insert(
         QStringLiteral("text_ascii_replacement_runs_succeeded"),
         result.renderer_totals.text_ascii_replacement_runs_succeeded);
     object.insert(
@@ -4486,6 +4510,10 @@ QJsonObject scenario_json(const Scenario_result& result)
     object.insert(
         QStringLiteral("text_ascii_replacement_code_units_attempted"),
         static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_attempted));
+    object.insert(
+        QStringLiteral("text_ascii_replacement_code_units_trusted_fast_path"),
+        static_cast<qint64>(
+            result.renderer_totals.text_ascii_replacement_code_units_trusted_fast_path));
     object.insert(
         QStringLiteral("text_ascii_replacement_code_units_succeeded"),
         static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_succeeded));
@@ -5112,6 +5140,7 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
         QStringLiteral("text_ascii_replacement_runs_screened"),
         QStringLiteral("text_ascii_replacement_runs_eligible"),
         QStringLiteral("text_ascii_replacement_runs_attempted"),
+        QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"),
         QStringLiteral("text_ascii_replacement_runs_succeeded"),
         QStringLiteral("text_ascii_replacement_runs_all_space_succeeded"),
         QStringLiteral("text_ascii_replacement_runs_fallback"),
@@ -5128,6 +5157,7 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
         QStringLiteral("text_ascii_replacement_code_units_screened"),
         QStringLiteral("text_ascii_replacement_code_units_eligible"),
         QStringLiteral("text_ascii_replacement_code_units_attempted"),
+        QStringLiteral("text_ascii_replacement_code_units_trusted_fast_path"),
         QStringLiteral("text_ascii_replacement_code_units_succeeded"),
         QStringLiteral("text_ascii_replacement_code_units_fallback"),
         QStringLiteral("qsg_nodes_created"),
@@ -5320,6 +5350,8 @@ bool validate_renderer_counter_invariants(
         json_counter(object, QStringLiteral("text_ascii_replacement_runs_eligible"));
     const qint64 ascii_replacement_attempted =
         json_counter(object, QStringLiteral("text_ascii_replacement_runs_attempted"));
+    const qint64 ascii_replacement_trusted =
+        json_counter(object, QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"));
     const qint64 ascii_replacement_succeeded =
         json_counter(object, QStringLiteral("text_ascii_replacement_runs_succeeded"));
     const qint64 ascii_replacement_fallback =
@@ -5327,6 +5359,7 @@ bool validate_renderer_counter_invariants(
     if (ascii_replacement_screened != ascii_replacement_succeeded + ascii_replacement_fallback ||
         ascii_replacement_eligible > ascii_replacement_screened                                ||
         ascii_replacement_attempted > ascii_replacement_eligible                               ||
+        ascii_replacement_trusted > ascii_replacement_attempted                                ||
         ascii_replacement_succeeded > ascii_replacement_attempted)
     {
         *out_error = QStringLiteral("ASCII replacement route counters are inconsistent");
