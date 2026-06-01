@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
+#include "vnm_terminal/internal/stage42_feature_flags.h"
 #include "vnm_terminal/internal/unicode_width.h"
 #include <QByteArray>
 #include <QFontInfo>
@@ -58,66 +59,39 @@ constexpr std::size_t k_eager_render_style_attribute_limit  = 256U;
 constexpr int         k_arc_geometry_segment_count          = 32;
 constexpr int         k_flat_rect_vertices_per_rect         = 6;
 
-// Stage 4.2 isolation switches are benchmark toggles. Values are cached on
-// first use, so A/B comparisons must use separate benchmark processes.
-bool stage42_feature_enabled(const char* name)
-{
-    const QByteArray value = qgetenv(name).trimmed().toLower();
-    return
-        value.isEmpty()       ||
-        (value != "0"         &&
-         value != "false"     &&
-         value != "off"       &&
-         value != "no");
-}
-
 bool stage42_qsg_cached_internal_text_node_enabled()
 {
-    static const bool enabled =
-        stage42_feature_enabled("VNM_TERMINAL_STAGE42_QSG_CACHED_INTERNAL_TEXT_NODE");
-    return enabled;
+    return stage42_feature_flags().qsg_cached_internal_text_node;
 }
 
 bool stage42_qsg_trusted_ascii_unchecked_glyphs_enabled()
 {
-    static const bool enabled =
-        stage42_feature_enabled("VNM_TERMINAL_STAGE42_QSG_TRUSTED_ASCII_UNCHECKED_GLYPHS");
-    return enabled;
+    return stage42_feature_flags().qsg_trusted_ascii_unchecked_glyphs;
 }
 
 bool stage42_qsg_text_makeup_single_char_fast_path_enabled()
 {
-    static const bool enabled =
-        stage42_feature_enabled("VNM_TERMINAL_STAGE42_QSG_TEXT_MAKEUP_SINGLE_CHAR_FAST_PATH");
-    return enabled;
+    return stage42_feature_flags().qsg_text_makeup_single_char_fast_path;
 }
 
 bool stage42_qsg_ascii_resource_prefilter_enabled()
 {
-    static const bool enabled =
-        stage42_feature_enabled("VNM_TERMINAL_STAGE42_QSG_ASCII_RESOURCE_PREFILTER");
-    return enabled;
+    return stage42_feature_flags().qsg_ascii_resource_prefilter;
 }
 
 bool stage42_qsg_group_descriptor_eligibility_enabled()
 {
-    static const bool enabled =
-        stage42_feature_enabled("VNM_TERMINAL_STAGE42_QSG_GROUP_DESCRIPTOR_ELIGIBILITY");
-    return enabled;
+    return stage42_feature_flags().qsg_group_descriptor_eligibility;
 }
 
 bool stage42_qsg_monotonic_dirty_probe_enabled()
 {
-    static const bool enabled =
-        stage42_feature_enabled("VNM_TERMINAL_STAGE42_QSG_MONOTONIC_DIRTY_PROBE");
-    return enabled;
+    return stage42_feature_flags().qsg_monotonic_dirty_probe;
 }
 
 bool stage42_render_cell_row_cache_enabled()
 {
-    static const bool enabled =
-        stage42_feature_enabled("VNM_TERMINAL_STAGE42_RENDER_CELL_ROW_CACHE");
-    return enabled;
+    return stage42_feature_flags().render_cell_row_cache;
 }
 
 #if VNM_TERMINAL_PROFILING_ENABLED

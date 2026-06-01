@@ -1,6 +1,7 @@
 #include "vnm_terminal/internal/terminal_screen_model.h"
 
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/stage42_feature_flags.h"
 #include "vnm_terminal/internal/terminal_history_row_record_codec.h"
 #include "vnm_terminal/internal/terminal_history_row_traversal.h"
 #include "vnm_terminal/internal/terminal_repaint_recovery.h"
@@ -34,38 +35,19 @@ constexpr std::size_t k_printable_ascii_count =
 constexpr int k_resize_repaint_clear_guard_action_budget = 64;
 constexpr std::size_t k_retained_history_ring_capacity_bytes = 64U * 1024U * 1024U;
 
-// Stage 4.2 isolation switches are benchmark toggles. Values are cached on
-// first use, so A/B comparisons must use separate benchmark processes.
-bool stage42_feature_enabled(const char* name)
-{
-    const QByteArray value = qgetenv(name).trimmed().toLower();
-    return
-        value.isEmpty()       ||
-        (value != "0"         &&
-         value != "false"     &&
-         value != "off"       &&
-         value != "no");
-}
-
 bool stage42_model_ascii_direct_print_enabled()
 {
-    static const bool enabled =
-        stage42_feature_enabled("VNM_TERMINAL_STAGE42_MODEL_ASCII_DIRECT_PRINT");
-    return enabled;
+    return stage42_feature_flags().model_ascii_direct_print;
 }
 
 bool stage42_model_ascii_skip_simple_cell_clear_enabled()
 {
-    static const bool enabled =
-        stage42_feature_enabled("VNM_TERMINAL_STAGE42_MODEL_ASCII_SKIP_SIMPLE_CELL_CLEAR");
-    return enabled;
+    return stage42_feature_flags().model_ascii_skip_simple_cell_clear;
 }
 
 bool stage42_snapshot_inline_hyperlink_ids_enabled()
 {
-    static const bool enabled =
-        stage42_feature_enabled("VNM_TERMINAL_STAGE42_SNAPSHOT_INLINE_HYPERLINK_IDS");
-    return enabled;
+    return stage42_feature_flags().snapshot_inline_hyperlink_ids;
 }
 
 template <typename T>
