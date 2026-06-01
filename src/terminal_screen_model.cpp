@@ -7,6 +7,7 @@
 #include "vnm_terminal/internal/unicode_width.h"
 
 #include <QChar>
+#include <QLatin1StringView>
 #include <QStringList>
 #include <algorithm>
 #include <array>
@@ -220,16 +221,6 @@ struct Csi_dispatch_parts
     QByteArray final_bytes;
     QByteArray raw_bytes;
 };
-
-QString scalar_to_string(char32_t codepoint)
-{
-    if (codepoint <= 0xffffU) {
-        return QString(QChar(static_cast<char16_t>(codepoint)));
-    }
-
-    const char32_t text[] = {codepoint};
-    return QString::fromUcs4(text, 1);
-}
 
 quint32 rgba_from_components(int red, int green, int blue)
 {
@@ -1265,9 +1256,9 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
             } while (offset < bytes.size() &&
                 is_printable_ascii_byte(byte_at(bytes, offset)));
 
-            print_text += QString::fromLatin1(
+            print_text.append(QLatin1StringView(
                 bytes.data() + ascii_begin,
-                offset - ascii_begin);
+                offset - ascii_begin));
             continue;
         }
 
@@ -1300,7 +1291,7 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
                 break;
             }
 
-            print_text += scalar_to_string(k_replacement_codepoint);
+            print_text.append(QChar::fromUcs4(k_replacement_codepoint));
             print_text_printable_ascii_only = false;
             flush_print_text();
             actions.push_back(make_malformed_recovery_diagnostic(
@@ -1312,7 +1303,7 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
         }
 
         if (!is_control_byte(byte)) {
-            print_text += scalar_to_string(step.codepoint);
+            print_text.append(QChar::fromUcs4(step.codepoint));
             print_text_printable_ascii_only = false;
         }
         offset += step.bytes_consumed;
@@ -2933,12 +2924,13 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
             snapshot.visible_line_provenance.reserve(
                 static_cast<std::size_t>(m_config.grid_size.rows));
         }
+        std::vector<std::uint64_t> row_referenced_hyperlink_ids;
         for (int row = 0; row < m_config.grid_size.rows; ++row) {
 #if VNM_TERMINAL_PROFILING_ENABLED
             ++rows_visited;
 #endif
+            row_referenced_hyperlink_ids.clear();
             const viewport_row_t viewport_row{row};
-            const std::size_t first_row_cell = snapshot.cells.size();
             const snapshot_row_t snapshot_row = [&]() {
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "Terminal_screen_model::render_snapshot::append_rows::snapshot_row");
@@ -2966,29 +2958,23 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "Terminal_screen_model::render_snapshot::append_rows::append_cells");
 
-                append_snapshot_cells_from_row(snapshot, row_cells->cells(), snapshot_row.value);
+                append_snapshot_cells_from_row(
+                    snapshot,
+                    row_cells->cells(),
+                    snapshot_row.value,
+                    row_referenced_hyperlink_ids);
             }
 
-            std::optional<std::map<std::uint64_t, QByteArray>>
-                row_local_hyperlink_identity_keys;
-            {
-                VNM_TERMINAL_PROFILE_SCOPE(
-                    "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata::lookup");
+            if (row_cells.has_value() && !row_referenced_hyperlink_ids.empty()) {
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata::append");
 
-                row_local_hyperlink_identity_keys =
-                    viewport_row_retained_hyperlink_identity_keys(viewport, row);
-            }
-            {
-                VNM_TERMINAL_PROFILE_SCOPE(
-                    "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata::append");
-
-                append_hyperlink_metadata_for_cells(
-                    snapshot.hyperlinks,
-                    snapshot.cells,
-                    first_row_cell,
-                    row_local_hyperlink_identity_keys.has_value()
-                        ? &*row_local_hyperlink_identity_keys
-                        : nullptr);
+                    append_hyperlink_metadata_for_ids(
+                        snapshot.hyperlinks,
+                        row_referenced_hyperlink_ids,
+                        row_cells->hyperlink_identity_keys());
+                }
             }
 
             std::optional<Terminal_retained_line_provenance> provenance;
@@ -3166,34 +3152,6 @@ Terminal_screen_model::viewport_row_provenance(
     const Terminal_screen_row& active =
         primary_active_grid_rows()[static_cast<std::size_t>(active_row.value)];
     return active.retained_line_provenance;
-}
-
-std::optional<std::map<std::uint64_t, QByteArray>>
-Terminal_screen_model::viewport_row_retained_hyperlink_identity_keys(
-    const Terminal_viewport_state& viewport,
-    int                            viewport_row) const
-{
-    const viewport_row_t row{viewport_row};
-    if (viewport.active_buffer != Terminal_buffer_id::PRIMARY ||
-        !viewport_row_is_valid(row))
-    {
-        return std::nullopt;
-    }
-
-    const std::optional<primary_backing_row_t> backing_row =
-        primary_backing_row_from_viewport(viewport, row);
-    if (!backing_row.has_value() || backing_row->value >= scrollback_size()) {
-        return std::nullopt;
-    }
-
-    const std::optional<retained_row_record_t> retained_record =
-        m_primary_backing.materialize_retained_history_record(
-            static_cast<std::size_t>(backing_row->value));
-    if (!retained_record.has_value()) {
-        return std::nullopt;
-    }
-
-    return retained_record->hyperlink_identity_keys;
 }
 
 Terminal_selection_result Terminal_screen_model::selected_text(
@@ -4376,15 +4334,11 @@ bool Terminal_screen_model::printable_ascii_cell_changes_selection_content(
     }
 #endif
 
-    Cell intended_cell;
-    intended_cell.text              = printable_ascii_cell_text(text);
-    intended_cell.display_width     = 1;
-    intended_cell.wide_continuation = false;
-    intended_cell.occupied          = true;
-
-    return !cells_have_same_selection_content(
-        row.cells[static_cast<std::size_t>(column)],
-        intended_cell);
+    const Cell& cell = row.cells[static_cast<std::size_t>(column)];
+    return cell.text           != printable_ascii_cell_text(text) ||
+        cell.display_width     != 1                               ||
+        cell.wide_continuation                                      ||
+        !cell.occupied;
 }
 
 bool Terminal_screen_model::printable_ascii_span_changes_selection_content(
@@ -4852,9 +4806,12 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
                         m_cursor.column,
                         text.sliced(offset, available_columns - 1));
                 write_printable_ascii_span_content(
-                    m_cursor.row,
+                    screen_row,
                     m_cursor.column,
                     text.sliced(offset, available_columns - 1));
+            }
+            else {
+                mark_terminal_content_changed();
             }
             selection_content_changed =
                 selection_content_changed ||
@@ -4863,12 +4820,12 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
                     m_config.grid_size.columns - 1,
                     text[text.size() - 1]);
             write_printable_ascii_cell_content(
-                { m_cursor.row, m_config.grid_size.columns - 1 },
+                screen_row,
+                m_config.grid_size.columns - 1,
                 text[text.size() - 1]);
             advance_row_content_generation_with_change_flag(
                 screen_row,
                 selection_content_changed);
-            mark_dirty(m_cursor.row);
             m_cursor.column = m_config.grid_size.columns - 1;
             m_pending_wrap = false;
             mark_cursor_dirty();
@@ -4916,16 +4873,21 @@ void Terminal_screen_model::write_printable_ascii_span(
 
     const bool selection_content_changed =
         printable_ascii_span_changes_selection_content(screen_row, first_column, text);
-    write_printable_ascii_span_content(row, first_column, text);
+    write_printable_ascii_span_content(screen_row, first_column, text);
     advance_row_content_generation_with_change_flag(screen_row, selection_content_changed);
     mark_dirty(row);
 }
 
 void Terminal_screen_model::write_printable_ascii_span_content(
-    int                        row,
+    Terminal_screen_row&       row,
     int                        first_column,
     QStringView                text)
 {
+    if (text.isEmpty()) {
+        return;
+    }
+
+    mark_terminal_content_changed();
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled) {
         m_profile_stats.printable_ascii_cells_written +=
@@ -4934,35 +4896,23 @@ void Terminal_screen_model::write_printable_ascii_span_content(
 #endif
     for (qsizetype offset = 0; offset < text.size(); ++offset) {
         write_printable_ascii_cell_content(
-            { row, first_column + static_cast<int>(offset) },
+            row,
+            first_column + static_cast<int>(offset),
             text[offset]);
     }
 }
 
-void Terminal_screen_model::write_printable_ascii_cell(
-    terminal_grid_position_t   position,
-    QChar                      text)
-{
-    Terminal_screen_row& screen_row =
-        active_grid_rows()[static_cast<std::size_t>(position.row)];
-    const bool selection_content_changed =
-        printable_ascii_cell_changes_selection_content(screen_row, position.column, text);
-
-    write_printable_ascii_cell_content(position, text);
-    advance_row_content_generation_with_change_flag(screen_row, selection_content_changed);
-}
-
 void Terminal_screen_model::write_printable_ascii_cell_content(
-    terminal_grid_position_t   position,
+    Terminal_screen_row&       row,
+    int                        column,
     QChar                      text)
 {
-    mark_terminal_content_changed();
-    Cell& cell = active_grid_rows()[position.row].cells[position.column];
+    Cell& cell = row.cells[static_cast<std::size_t>(column)];
     if (cell.wide_continuation || cell.display_width != 1) {
-        clear_cell_at(position);
+        clear_cell_at_content(row, column);
     }
 
-    Cell& target_cell = active_grid_rows()[position.row].cells[position.column];
+    Cell& target_cell = row.cells[static_cast<std::size_t>(column)];
     target_cell.text              = printable_ascii_cell_text(text);
     target_cell.display_width     = 1;
     target_cell.wide_continuation = false;
@@ -5121,12 +5071,21 @@ void Terminal_screen_model::place_cell_text(
 void Terminal_screen_model::clear_cell_span(terminal_grid_position_t position)
 {
     mark_terminal_content_changed();
-    Cell&     cell          = active_grid_rows()[position.row].cells[position.column];
+    Terminal_screen_row& screen_row =
+        active_grid_rows()[static_cast<std::size_t>(position.row)];
+    clear_cell_span_content(screen_row, position.column);
+}
+
+void Terminal_screen_model::clear_cell_span_content(
+    Terminal_screen_row&       row,
+    int                        column)
+{
+    Cell&     cell          = row.cells[static_cast<std::size_t>(column)];
     const int display_width = cell.display_width;
     cell = Cell{};
 
     for (int width_offset = 1; width_offset < display_width; ++width_offset) {
-        active_grid_rows()[position.row].cells[position.column + width_offset] = Cell{};
+        row.cells[static_cast<std::size_t>(column + width_offset)] = Cell{};
     }
 }
 
@@ -5146,6 +5105,40 @@ void Terminal_screen_model::clear_cell_at(terminal_grid_position_t position)
     }
 #endif
     clear_cell_span(base_position);
+}
+
+int Terminal_screen_model::cell_base_column_in_row(
+    const Terminal_screen_row& row,
+    int                        column) const
+{
+    if (!row.cells[static_cast<std::size_t>(column)].wide_continuation) {
+        return column;
+    }
+
+    for (int candidate = column - 1; candidate >= 0; --candidate) {
+        const Cell& cell = row.cells[static_cast<std::size_t>(candidate)];
+        if (!cell.wide_continuation && column - candidate < cell.display_width) {
+            return candidate;
+        }
+    }
+
+    return column;
+}
+
+void Terminal_screen_model::clear_cell_at_content(
+    Terminal_screen_row&       row,
+    int                        column)
+{
+    const int base_column = cell_base_column_in_row(row, column);
+#if VNM_TERMINAL_PROFILING_ENABLED
+    if (m_profile_stats.enabled && m_printable_text_profile_depth > 0) {
+        const Cell& base_cell = row.cells[static_cast<std::size_t>(base_column)];
+        if (base_column != column || base_cell.display_width > 1) {
+            ++m_profile_stats.wide_boundary_repairs_from_text_writes;
+        }
+    }
+#endif
+    clear_cell_span_content(row, base_column);
 }
 
 Terminal_screen_model::Cell Terminal_screen_model::erased_cell() const
@@ -7196,7 +7189,8 @@ Terminal_screen_model::row_cells_for_current_geometry(
 void Terminal_screen_model::append_snapshot_cells_from_row(
     Terminal_render_snapshot&  snapshot,
     const std::vector<Cell>&   row,
-    int                        snapshot_row) const
+    int                        snapshot_row,
+    std::vector<std::uint64_t>& row_referenced_hyperlink_ids) const
 {
     VNM_TERMINAL_PROFILE_SCOPE(
         "Terminal_screen_model::append_snapshot_cells_from_row");
@@ -7218,6 +7212,18 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
             const Cell& cell = visual_row[static_cast<std::size_t>(column)];
             if (!cell.occupied) {
                 continue;
+            }
+
+            if (cell.hyperlink_id != 0U) {
+                const auto insert_position = std::lower_bound(
+                    row_referenced_hyperlink_ids.begin(),
+                    row_referenced_hyperlink_ids.end(),
+                    cell.hyperlink_id);
+                if (insert_position == row_referenced_hyperlink_ids.end() ||
+                    *insert_position != cell.hyperlink_id)
+                {
+                    row_referenced_hyperlink_ids.insert(insert_position, cell.hyperlink_id);
+                }
             }
 
             snapshot.cells.push_back({
@@ -7324,6 +7330,8 @@ Terminal_screen_model::viewport_row_cells(
 
         Viewport_row_cells result;
         result.owned_cells = std::move(retained_record->row.cells);
+        result.owned_hyperlink_identity_keys =
+            std::move(retained_record->hyperlink_identity_keys);
         return result;
     }
 
@@ -7335,25 +7343,12 @@ Terminal_screen_model::viewport_row_cells(
     return Viewport_row_cells{&active.cells};
 }
 
-void Terminal_screen_model::append_hyperlink_metadata_for_cells(
+void Terminal_screen_model::append_hyperlink_metadata_for_ids(
     std::vector<Terminal_render_hyperlink_metadata>& metadata,
-    const std::vector<Terminal_render_cell>&         cells,
-    std::size_t                                      first_cell,
+    std::span<const std::uint64_t>                   hyperlink_ids,
     const std::map<std::uint64_t, QByteArray>*       row_local_identity_keys) const
 {
-    if (first_cell >= cells.size()) {
-        return;
-    }
-
-    std::set<std::uint64_t> referenced_ids;
-    for (std::size_t index = first_cell; index < cells.size(); ++index) {
-        const Terminal_render_cell& cell = cells[index];
-        if (cell.hyperlink_id != 0U) {
-            referenced_ids.insert(cell.hyperlink_id);
-        }
-    }
-
-    for (std::uint64_t hyperlink_id : referenced_ids) {
+    for (std::uint64_t hyperlink_id : hyperlink_ids) {
         const bool already_materialized = std::any_of(
             metadata.begin(),
             metadata.end(),

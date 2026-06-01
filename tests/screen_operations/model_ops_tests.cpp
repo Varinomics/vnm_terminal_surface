@@ -3236,6 +3236,14 @@ bool test_retained_line_content_generation_mutations()
     ok &= check(primary_retained_line_generation(no_autowrap_model, 0) == generation + 1U,
         "no-autowrap clipped last-cell change increments generation");
 
+    term::Terminal_screen_model no_autowrap_prefix_model = make_model(1, 4);
+    no_autowrap_prefix_model.ingest(QByteArrayLiteral("\x1b[?7lABCDE"));
+    generation = primary_retained_line_generation(no_autowrap_prefix_model, 0);
+    no_autowrap_prefix_model.ingest(QByteArrayLiteral("\rAXCDE"));
+    ok &= check(
+        primary_retained_line_generation(no_autowrap_prefix_model, 0) == generation + 1U,
+        "no-autowrap clipped prefix change increments generation");
+
     term::Terminal_screen_model combining_model = make_model(1, 4);
     combining_model.ingest(QByteArrayLiteral("e"));
     generation = primary_retained_line_generation(combining_model, 0);

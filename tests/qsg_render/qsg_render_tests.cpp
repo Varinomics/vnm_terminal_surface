@@ -4197,6 +4197,12 @@ bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
         space_stats.text_ascii_replacement_runs_fallback == 0 &&
         space_stats.text_leaf_nodes_created == 0,
         "trusted all-space ASCII replacement keeps all-space counters and skips text leaves");
+    if (profile_scopes_available()) {
+        ok &= check(profile_call_count(
+                space_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run") == 0U,
+            "trusted all-space ASCII replacement bypasses the trusted append scope");
+    }
 
     const term::Terminal_render_frame mixed_space_frame = make_direct_text_frame(
         {
@@ -4297,11 +4303,21 @@ bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
         "single-run all-space trusted ASCII replacement frame renders");
     ok &= check(single_space_run_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
         single_space_run_stats.text_ascii_replacement_runs_screened == 1 &&
+        single_space_run_stats.text_ascii_replacement_runs_eligible == 1 &&
+        single_space_run_stats.text_ascii_replacement_runs_attempted == 1 &&
+        single_space_run_stats.text_ascii_replacement_runs_succeeded == 1 &&
         single_space_run_stats.text_ascii_replacement_runs_all_space_succeeded == 1 &&
         single_space_run_stats.text_ascii_replacement_code_units_screened == 2U &&
         single_space_run_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U &&
+        single_space_run_stats.text_ascii_replacement_code_units_succeeded == 2U &&
         single_space_run_stats.text_leaf_nodes_created == 0,
         "single-run all-space trusted ASCII replacement preserves all-space fast path");
+    if (profile_scopes_available()) {
+        ok &= check(profile_call_count(
+                single_space_run_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run") == 0U,
+            "single-run all-space trusted ASCII replacement bypasses the trusted append scope");
+    }
 
     term::Terminal_render_text_run decorated_first =
         make_direct_text_run(0, 1, QStringLiteral("A"), metrics);
@@ -10325,21 +10341,48 @@ bool test_qsg_text_sync_dirty_probe_counts_fragmented_ranges(QGuiApplication& ap
     term::terminal_renderer_stats_t fragmented_stats;
     ok &= check(update(fragmented_frame, fragmented_stats),
         "fragmented dirty probe update renders");
-    // Phase 3 commit "move dirty membership to QSG row state" flips the exact
-    // probe count from 11 to one O(1) check per considered row.
     ok &= check(fragmented_stats.text_groups_considered == 5 &&
         fragmented_stats.text_groups_dirty == 3 &&
         fragmented_stats.text_groups_clean == 2 &&
         fragmented_stats.text_dirty_row_ranges == 3 &&
         fragmented_stats.text_dirty_rows == 3 &&
-        fragmented_stats.text_resource_dirty_row_probes == 11,
-        "fragmented dirty row ranges expose current linear probe behavior");
+        fragmented_stats.text_resource_dirty_row_probes == 5,
+        "fragmented dirty row ranges use monotonic range probes");
     ok &= check(fragmented_stats.text_content_rebuilds == 0 &&
         fragmented_stats.text_content_reused == 5 &&
         fragmented_stats.text_resource_descriptor_reuses == 5 &&
         fragmented_stats.text_dirty_descriptor_identical_rows == 3 &&
         fragmented_stats.text_content_failures == 0,
         "fragmented dirty probe update reuses unchanged text resources");
+
+    std::vector<term::Terminal_render_text_run> sparse_runs;
+    const int sparse_rows[] = {0, 1, 2, 5};
+    for (int row : sparse_rows) {
+        sparse_runs.push_back(make_direct_text_run_for_row(
+            row,
+            row,
+            0,
+            1,
+            QString(QChar(static_cast<char16_t>(u'A' + row))),
+            metrics,
+            QColor::fromRgba(viewport_scroll_foreground_rgba(row))));
+    }
+    const term::Terminal_render_frame sparse_trailing_frame =
+        make_direct_text_slot_frame(
+            term::Terminal_buffer_id::PRIMARY,
+            0,
+            6,
+            std::move(sparse_runs),
+            metrics,
+            {{0, 1}, {2, 1}});
+    term::terminal_renderer_stats_t sparse_trailing_stats;
+    ok &= check(update(sparse_trailing_frame, sparse_trailing_stats),
+        "sparse trailing dirty probe update renders");
+    ok &= check(sparse_trailing_stats.text_groups_considered == 4 &&
+        sparse_trailing_stats.text_groups_dirty == 2 &&
+        sparse_trailing_stats.text_groups_clean == 2 &&
+        sparse_trailing_stats.text_resource_dirty_row_probes == 3,
+        "sparse trailing dirty row ranges skip empty rows and past-last probes");
 
     term::terminal_renderer_stats_t cleanup_stats;
     renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);

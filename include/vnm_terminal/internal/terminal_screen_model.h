@@ -243,8 +243,6 @@ struct Terminal_screen_model_profile_stats
     std::uint64_t              printable_ascii_span_characters          = 0U;
     std::uint64_t              printable_ascii_cells_written            = 0U;
     std::uint64_t              max_printable_ascii_span_characters      = 0U;
-    std::uint64_t              printable_ascii_row_copies               = 0U;
-    std::uint64_t              printable_ascii_row_copy_cells           = 0U;
     std::uint64_t              printable_ascii_local_cells_inspected     = 0U;
     std::uint64_t              scalar_span_local_cells_inspected         = 0U;
     std::uint64_t              row_content_generation_comparisons       = 0U;
@@ -470,12 +468,21 @@ private:
 
     struct Viewport_row_cells
     {
-        const std::vector<Cell>* borrowed_cells = nullptr;
-        std::vector<Cell>        owned_cells;
+        const std::vector<Cell>*                  borrowed_cells = nullptr;
+        std::vector<Cell>                         owned_cells;
+        std::optional<std::map<std::uint64_t, QByteArray>>
+                                                owned_hyperlink_identity_keys;
 
         const std::vector<Cell>& cells() const
         {
             return borrowed_cells != nullptr ? *borrowed_cells : owned_cells;
+        }
+
+        const std::map<std::uint64_t, QByteArray>* hyperlink_identity_keys() const
+        {
+            return owned_hyperlink_identity_keys.has_value()
+                ? &*owned_hyperlink_identity_keys
+                : nullptr;
         }
 
         bool materialized() const { return borrowed_cells == nullptr; }
@@ -731,16 +738,13 @@ private:
         QStringView                    text);
 
     void write_printable_ascii_span_content(
-        int                            row,
+        Terminal_screen_row&           row,
         int                            first_column,
         QStringView                    text);
 
-    void write_printable_ascii_cell(
-        terminal_grid_position_t       position,
-        QChar                          text);
-
     void write_printable_ascii_cell_content(
-        terminal_grid_position_t       position,
+        Terminal_screen_row&           row,
+        int                            column,
         QChar                          text);
 
     void put_spacing_scalar(
@@ -767,6 +771,18 @@ private:
 
     void clear_cell_at(
         terminal_grid_position_t       position);
+
+    int cell_base_column_in_row(
+        const Terminal_screen_row&     row,
+        int                            column) const;
+
+    void clear_cell_span_content(
+        Terminal_screen_row&           row,
+        int                            column);
+
+    void clear_cell_at_content(
+        Terminal_screen_row&           row,
+        int                            column);
 
     Cell erased_cell() const;
     void fill_row_with_erased_cells(std::vector<Cell>& row) const;
@@ -998,7 +1014,8 @@ private:
     void append_snapshot_cells_from_row(
         Terminal_render_snapshot&      snapshot,
         const std::vector<Cell>&       row,
-        int                            snapshot_row) const;
+        int                            snapshot_row,
+        std::vector<std::uint64_t>&    row_referenced_hyperlink_ids) const;
 
     QString row_text_from_cells(
         const std::vector<Cell>&       row,
@@ -1016,11 +1033,6 @@ private:
     std::optional<Terminal_retained_line_provenance> viewport_row_provenance(
         const Terminal_viewport_state& viewport,
         int                            viewport_row) const;
-
-    std::optional<std::map<std::uint64_t, QByteArray>>
-        viewport_row_retained_hyperlink_identity_keys(
-            const Terminal_viewport_state& viewport,
-            int                            viewport_row) const;
 
     bool retained_line_descriptor_logical_row(
         Terminal_buffer_id             buffer_id,
@@ -1061,10 +1073,9 @@ private:
         Terminal_buffer_id             buffer_id,
         std::vector<int>&              logical_rows) const;
 
-    void append_hyperlink_metadata_for_cells(
+    void append_hyperlink_metadata_for_ids(
         std::vector<Terminal_render_hyperlink_metadata>& metadata,
-        const std::vector<Terminal_render_cell>&         cells,
-        std::size_t                                      first_cell,
+        std::span<const std::uint64_t>                   hyperlink_ids,
         const std::map<std::uint64_t, QByteArray>*       row_local_identity_keys)
         const;
 
