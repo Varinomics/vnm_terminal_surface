@@ -52,6 +52,8 @@ constexpr std::size_t k_printable_ascii_count               =
 constexpr std::size_t k_max_coalesced_ascii_text_run_length = 384U;
 constexpr qsizetype   k_max_cached_ascii_replacement_shape_length =
     static_cast<qsizetype>(k_max_coalesced_ascii_text_run_length);
+constexpr std::size_t k_cached_ascii_replacement_shape_slot_count =
+    static_cast<std::size_t>(k_max_cached_ascii_replacement_shape_length) + 1U;
 constexpr std::size_t k_eager_render_style_attribute_limit  = 256U;
 constexpr int         k_arc_geometry_segment_count          = 32;
 constexpr int         k_flat_rect_vertices_per_rect         = 6;
@@ -1063,6 +1065,7 @@ struct row_text_group_t
     int                                          viewport_row = 0;
     qreal                                        row_top      = 0.0;
     std::vector<const Terminal_render_text_run*> runs;
+    bool                                         resource_descriptor_runs_eligible = true;
 };
 
 struct Ascii_text_coalescing_context
@@ -1071,6 +1074,8 @@ struct Ascii_text_coalescing_context
     qreal                                         cell_width = 0.0;
     qreal                                         layout_line_ascent = 0.0;
     qreal                                         glyph_position_y   = 0.0;
+    qreal                                         raw_font_ascent    = 0.0;
+    qreal                                         raw_font_descent   = 0.0;
     QFont                                         layout_font;
     QRawFont                                      raw_font;
     std::array<quint32, k_printable_ascii_count> printable_ascii_glyph_indexes{};
@@ -1081,7 +1086,10 @@ struct Ascii_text_coalescing_context
         QList<qsizetype> string_indexes;
     };
 
-    mutable std::map<qsizetype, Replacement_shape> ascii_replacement_shapes;
+    mutable std::array<
+        std::optional<Replacement_shape>,
+        k_cached_ascii_replacement_shape_slot_count> ascii_replacement_shapes;
+    mutable QList<quint32> ascii_replacement_glyph_index_scratch;
 };
 
 class Ascii_text_coalescing_context_cache
@@ -2695,6 +2703,8 @@ bool initialize_printable_ascii_glyph_indexes(Ascii_text_coalescing_context& con
     if (!context.raw_font.isValid()) {
         return false;
     }
+    context.raw_font_ascent  = context.raw_font.ascent();
+    context.raw_font_descent = context.raw_font.descent();
 
     for (int codepoint = k_printable_ascii_first;
         codepoint <= k_printable_ascii_last;
@@ -3137,18 +3147,16 @@ const Ascii_text_coalescing_context::Replacement_shape& cached_ascii_replacement
     Q_ASSERT(text_size > 0);
     Q_ASSERT(text_size <= k_max_cached_ascii_replacement_shape_length);
 
-    const auto found = context.ascii_replacement_shapes.find(text_size);
-    if (found != context.ascii_replacement_shapes.end()) {
-        return found->second;
-    }
-
     // QGlyphRun shares QList payloads. These immutable shape lists are keyed
     // only by run length, so retained glyph runs can share them without raw
-    // pointer lifetime coupling.
-    const auto inserted = context.ascii_replacement_shapes.emplace(
-        text_size,
-        make_ascii_replacement_shape(context, text_size));
-    return inserted.first->second;
+    // pointer lifetime coupling. Slot zero is intentionally unused because
+    // replacement runs are never empty.
+    std::optional<Ascii_text_coalescing_context::Replacement_shape>& shape =
+        context.ascii_replacement_shapes[static_cast<std::size_t>(text_size)];
+    if (!shape.has_value()) {
+        shape.emplace(make_ascii_replacement_shape(context, text_size));
+    }
+    return *shape;
 }
 
 void set_ascii_replacement_shape(
@@ -3169,6 +3177,63 @@ void set_ascii_replacement_shape(
     glyph_run.setStringIndexes(shape.string_indexes);
 }
 
+bool fill_checked_ascii_replacement_glyph_indexes(
+    const Ascii_text_coalescing_context& context,
+    const QString&                       text)
+{
+    const qsizetype text_size = text.size();
+    context.ascii_replacement_glyph_index_scratch.resize(text_size);
+    quint32* const glyph_indexes = context.ascii_replacement_glyph_index_scratch.data();
+
+    for (qsizetype index = 0; index < text_size; ++index) {
+        const ushort codepoint = text.at(index).unicode();
+        if (codepoint < k_printable_ascii_first || codepoint > k_printable_ascii_last) {
+            return false;
+        }
+
+        glyph_indexes[index] =
+            context.printable_ascii_glyph_indexes[printable_ascii_glyph_index(codepoint)];
+    }
+
+    return true;
+}
+
+void fill_trusted_ascii_replacement_glyph_indexes(
+    const Ascii_text_coalescing_context& context,
+    const QString&                       text)
+{
+    const qsizetype text_size = text.size();
+    context.ascii_replacement_glyph_index_scratch.resize(text_size);
+    quint32* const glyph_indexes = context.ascii_replacement_glyph_index_scratch.data();
+
+    for (qsizetype index = 0; index < text_size; ++index) {
+        const ushort codepoint = text.at(index).unicode();
+        Q_ASSERT(codepoint >= k_printable_ascii_first);
+        Q_ASSERT(codepoint <= k_printable_ascii_last);
+        glyph_indexes[index] =
+            context.printable_ascii_glyph_indexes[printable_ascii_glyph_index(codepoint)];
+    }
+}
+
+QGlyphRun make_ascii_replacement_glyph_run_from_scratch(
+    const Ascii_text_coalescing_context& context,
+    const QString&                       text)
+{
+    const qsizetype text_size = text.size();
+
+    QGlyphRun glyph_run;
+    glyph_run.setRawFont(context.raw_font);
+    glyph_run.setGlyphIndexes(context.ascii_replacement_glyph_index_scratch);
+    set_ascii_replacement_shape(glyph_run, context, text_size);
+    glyph_run.setSourceString(text);
+    glyph_run.setBoundingRect(QRectF(
+        0.0,
+        context.glyph_position_y - context.raw_font_ascent,
+        static_cast<qreal>(text_size) * context.cell_width,
+        context.raw_font_ascent + context.raw_font_descent));
+    return glyph_run;
+}
+
 std::optional<QGlyphRun> make_ascii_replacement_glyph_run(
     const Ascii_text_coalescing_context& context,
     const QString&                       text)
@@ -3180,31 +3245,26 @@ std::optional<QGlyphRun> make_ascii_replacement_glyph_run(
         return std::nullopt;
     }
 
-    const qsizetype text_size = text.size();
-    QList<quint32> glyph_indexes(text_size);
-    quint32* const glyph_index_data = glyph_indexes.data();
-
-    for (qsizetype index = 0; index < text_size; ++index) {
-        const ushort codepoint = text.at(index).unicode();
-        if (codepoint < k_printable_ascii_first || codepoint > k_printable_ascii_last) {
-            return std::nullopt;
-        }
-
-        glyph_index_data[index] =
-            context.printable_ascii_glyph_indexes[printable_ascii_glyph_index(codepoint)];
+    if (!fill_checked_ascii_replacement_glyph_indexes(context, text)) {
+        return std::nullopt;
     }
 
-    QGlyphRun glyph_run;
-    glyph_run.setRawFont(context.raw_font);
-    glyph_run.setGlyphIndexes(glyph_indexes);
-    set_ascii_replacement_shape(glyph_run, context, text_size);
-    glyph_run.setSourceString(text);
-    glyph_run.setBoundingRect(QRectF(
-        0.0,
-        context.glyph_position_y - context.raw_font.ascent(),
-        static_cast<qreal>(text_size) * context.cell_width,
-        context.raw_font.ascent() + context.raw_font.descent()));
-    return glyph_run;
+    return make_ascii_replacement_glyph_run_from_scratch(context, text);
+}
+
+std::optional<QGlyphRun> make_trusted_ascii_replacement_glyph_run(
+    const Ascii_text_coalescing_context& context,
+    const QString&                       text)
+{
+    if (!context.raw_font.isValid() ||
+        !std::isfinite(context.cell_width) ||
+        context.cell_width <= 0.0)
+    {
+        return std::nullopt;
+    }
+
+    fill_trusted_ascii_replacement_glyph_indexes(context, text);
+    return make_ascii_replacement_glyph_run_from_scratch(context, text);
 }
 
 enum class Append_ascii_replacement_result
@@ -3379,7 +3439,7 @@ Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
     }
 
     const std::optional<QGlyphRun> glyph_run =
-        make_ascii_replacement_glyph_run(coalescing_context, run.text);
+        make_trusted_ascii_replacement_glyph_run(coalescing_context, run.text);
     if (!glyph_run.has_value()) {
         record_ascii_replacement_fallback(
             stats,
@@ -4365,6 +4425,12 @@ std::vector<row_text_group_t> text_run_groups_by_viewport_row(
             group.row_top      = row_top_for_viewport_row(run.row, frame.cell_metrics);
             group.runs.reserve(static_cast<std::size_t>(run_counts_by_row[row_index]));
         }
+        group.resource_descriptor_runs_eligible =
+            group.resource_descriptor_runs_eligible             &&
+            run.logical_row        == group.identity.logical_row        &&
+            run.retained_line_id   == group.identity.retained_line_id   &&
+            run.content_generation == group.identity.content_generation &&
+            !run.clip_rect.isValid();
         group.runs.push_back(&run);
     }
 
@@ -4451,18 +4517,6 @@ Text_resource_rect_descriptor make_text_resource_rect_descriptor(QRectF rect)
     };
 }
 
-bool text_resource_descriptor_run_is_eligible(
-    const Terminal_render_text_run&    run,
-    const row_text_group_t&            group)
-{
-    return
-        run.row == group.viewport_row                               &&
-        run.logical_row        == group.identity.logical_row        &&
-        run.retained_line_id   == group.identity.retained_line_id   &&
-        run.content_generation == group.identity.content_generation &&
-        !run.clip_rect.isValid();
-}
-
 bool text_resource_source_row_descriptor_is_eligible(
     const Terminal_render_frame&       frame,
     const row_text_group_t&            group)
@@ -4480,19 +4534,7 @@ bool text_resource_source_row_descriptor_is_eligible(
         }
     }
 
-    {
-        VNM_TERMINAL_PROFILE_SCOPE(
-            "text_resource_source_row_descriptor_is_eligible::runs");
-
-        for (const Terminal_render_text_run* run_ptr : group.runs) {
-            const Terminal_render_text_run& run = *run_ptr;
-            if (!text_resource_descriptor_run_is_eligible(run, group)) {
-                return false;
-            }
-        }
-    }
-
-    return true;
+    return group.resource_descriptor_runs_eligible;
 }
 
 template <typename Text_runs>

@@ -3155,6 +3155,10 @@ bool test_retained_line_content_generation_mutations()
     wide_model.ingest(QByteArrayLiteral("\rA"));
     ok &= check(primary_retained_line_generation(wide_model, 0) == generation + 1U,
         "wide-cell occupancy change increments generation");
+    ok &= check(wide_model.row_text(0) == QStringLiteral("A"),
+        "ASCII overwrite of wide base clears continuation");
+    ok &= check(snapshot_valid(wide_model, 144U),
+        "ASCII overwrite of wide base snapshot validates");
 
     const QByteArray wide_scalar      = bytes_from_hex("e4b880");
     const QByteArray other_wide_scalar = bytes_from_hex("e7958c");
@@ -3203,6 +3207,10 @@ bool test_retained_line_content_generation_mutations()
     ok &= check(
         primary_retained_line_generation(wide_continuation_model, 0) == generation + 1U,
         "ASCII overwrite of wide-continuation column increments generation");
+    ok &= check(wide_continuation_model.row_text(0) == QStringLiteral(" A"),
+        "ASCII overwrite of wide-continuation column clears wide base");
+    ok &= check(snapshot_valid(wide_continuation_model, 145U),
+        "ASCII overwrite of wide-continuation column snapshot validates");
 
     term::Terminal_screen_model non_ascii_wide_continuation_model = make_model(1, 4);
     non_ascii_wide_continuation_model.ingest(wide_scalar);

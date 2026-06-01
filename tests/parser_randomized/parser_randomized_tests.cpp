@@ -674,11 +674,13 @@ void append_screen_mutation_payload_summary(
     const QString&         text = {},
     int                    row = 0,
     int                    column = 0,
-    const QByteArray&      hyperlink_identity_key = {})
+    const QByteArray&      hyperlink_identity_key = {},
+    bool                   printable_ascii_only = false)
 {
     out << qstring_hex(text) << ':'
         << row << ':'
-        << column << ":0:"
+        << column << ':'
+        << (printable_ascii_only ? 1 : 0) << ':'
         << byte_array_hex(hyperlink_identity_key);
 }
 
@@ -698,7 +700,9 @@ void append_screen_mutation_summary(
                 out,
                 mutation.text,
                 mutation.row,
-                mutation.column);
+                mutation.column,
+                {},
+                mutation.printable_ascii_only);
         }
 
         void operator()(const term::Screen_set_title_mutation& mutation) const

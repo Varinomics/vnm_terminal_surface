@@ -182,8 +182,9 @@ enum class Terminal_color_query_kind
 struct Screen_print_text_mutation
 {
     QString    text;
-    int        row    = 0;
-    int        column = 0;
+    int        row                  = 0;
+    int        column               = 0;
+    bool       printable_ascii_only = false;
 };
 
 struct Screen_carriage_return_mutation
@@ -401,10 +402,20 @@ inline Parser_action_kind parser_action_kind(const Parser_action& action)
     return std::visit(visitor_t{}, action.payload);
 }
 
-inline Parser_action make_print_text_action(QString text, int row, int column)
+inline Parser_action make_print_text_action(
+    QString    text,
+    int        row,
+    int        column,
+    bool       printable_ascii_only = false)
 {
     return {
-        Screen_mutation{Screen_print_text_mutation{std::move(text), row, column}},
+        Screen_mutation{
+            Screen_print_text_mutation{
+                std::move(text),
+                row,
+                column,
+                printable_ascii_only,
+            }},
     };
 }
 
