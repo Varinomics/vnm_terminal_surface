@@ -4137,51 +4137,36 @@ bool text_resource_descriptor_run_is_eligible(
         !run.clip_rect.isValid();
 }
 
-std::optional<Text_resource_row_descriptor> text_resource_source_row_descriptor(
+bool text_resource_source_row_descriptor_is_eligible(
     const Terminal_render_frame&       frame,
     const row_text_group_t&            group)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("text_resource_source_row_descriptor");
+    VNM_TERMINAL_PROFILE_SCOPE("text_resource_source_row_descriptor_is_eligible");
 
     {
-        VNM_TERMINAL_PROFILE_SCOPE("text_resource_source_row_descriptor::row_gates");
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "text_resource_source_row_descriptor_is_eligible::row_gates");
 
         if (row_has_cursor_text_run(frame, group.viewport_row) ||
             row_has_preedit_caret(frame, group.viewport_row))
         {
-            return std::nullopt;
+            return false;
         }
     }
 
-    Text_resource_row_descriptor descriptor;
     {
-        VNM_TERMINAL_PROFILE_SCOPE("text_resource_source_row_descriptor::reserve");
-
-        descriptor.runs.reserve(group.runs.size());
-    }
-    {
-        VNM_TERMINAL_PROFILE_SCOPE("text_resource_source_row_descriptor::runs");
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "text_resource_source_row_descriptor_is_eligible::runs");
 
         for (const Terminal_render_text_run* run_ptr : group.runs) {
             const Terminal_render_text_run& run = *run_ptr;
             if (!text_resource_descriptor_run_is_eligible(run, group)) {
-                return std::nullopt;
+                return false;
             }
-
-            const QRectF local_rect = row_local_rect(run.rect, group.row_top);
-            descriptor.runs.push_back({
-                run.column,
-                make_text_resource_rect_descriptor(local_rect),
-                run.baseline_origin.x(),
-                run.baseline_origin.y() - group.row_top,
-                run.foreground.rgba(),
-                false,
-                run.text,
-            });
         }
     }
 
-    return descriptor;
+    return true;
 }
 
 template <typename Text_runs>
@@ -4396,12 +4381,12 @@ void sync_text_resource_nodes(
             }
         }
 
-        std::optional<Text_resource_row_descriptor> source_text_resource_descriptor;
+        bool text_resource_descriptor_eligible = false;
         {
-            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::source_descriptor");
+            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::descriptor_eligibility");
 
-            source_text_resource_descriptor =
-                text_resource_source_row_descriptor(
+            text_resource_descriptor_eligible =
+                text_resource_source_row_descriptor_is_eligible(
                     frame,
                     group);
         }
@@ -4409,7 +4394,7 @@ void sync_text_resource_nodes(
             clean_row_cache_skip_available &&
             row_cache_identity_has_valid_retained_provenance(group.identity) &&
             old_slot.has_value() &&
-            source_text_resource_descriptor.has_value() &&
+            text_resource_descriptor_eligible &&
             old_slot->text_resource_descriptor.has_value())
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::clean_cache_skip");
@@ -4478,7 +4463,7 @@ void sync_text_resource_nodes(
         }
 
         std::optional<Text_resource_row_descriptor> text_resource_descriptor;
-        if (source_text_resource_descriptor.has_value()) {
+        if (text_resource_descriptor_eligible) {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::resource_descriptor");
 
             text_resource_descriptor = use_ascii_resource_runs
