@@ -6478,6 +6478,15 @@ bool strict_printable_ascii_classifier_bypass_eligible(
         !has_decoration;
 }
 
+bool terminal_graphic_candidate_text(
+    Terminal_simple_content_text_category  text_category,
+    const QString&                         text)
+{
+    return
+        text_category == Terminal_simple_content_text_category::NON_ASCII &&
+        is_terminal_graphic_text(text);
+}
+
 } // namespace
 
 terminal_simple_content_classification_t classify_terminal_simple_content_cell(
@@ -7123,6 +7132,93 @@ void finalize_packed_render_frame_stats(Terminal_render_frame& frame)
     frame.stats.packed_payload_bytes = packed_payload_byte_count(frame);
 }
 
+void initialize_packed_render_frame_stats(
+    Terminal_render_frame&             frame,
+    const Terminal_render_snapshot&    snapshot,
+    bool                               packed_text_sidecars_enabled)
+{
+    frame.stats.packed_pass_input_cells = packed_text_sidecars_enabled
+        ? static_cast<int>(snapshot.cells.size())
+        : 0;
+    frame.stats.packed_text_sidecars_enabled =
+        packed_text_sidecars_enabled ? 1 : 0;
+    frame.stats.packed_text_sidecars_disabled =
+        packed_text_sidecars_enabled ? 0 : 1;
+}
+
+terminal_packed_render_row_t& append_packed_render_row(
+    Terminal_render_frame&             frame,
+    const Terminal_render_snapshot&    snapshot,
+    int                                row_index)
+{
+    terminal_packed_render_row_t row;
+    row.active_buffer = snapshot.viewport.active_buffer;
+    row.viewport_row  = row_index;
+    row.logical_row   = logical_row_for_viewport_row(snapshot.viewport, row_index);
+    // Span offsets are placeholders until the first span append for each kind.
+    row.first_text_span =
+        static_cast<std::uint32_t>(frame.packed_text_spans.size());
+    row.first_graphic_span =
+        static_cast<std::uint32_t>(frame.packed_graphic_spans.size());
+    frame.packed_rows.push_back(row);
+    return frame.packed_rows.back();
+}
+
+void initialize_disabled_sidecar_packed_rows(
+    Terminal_render_frame&             frame,
+    const Terminal_render_snapshot&    snapshot)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::disabled_sidecar_packed_rows");
+
+    frame.packed_rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
+    for (int row_index = 0; row_index < snapshot.grid_size.rows; ++row_index) {
+        append_packed_render_row(frame, snapshot, row_index);
+    }
+}
+
+void record_disabled_sidecar_packed_graphic_cell(
+    std::vector<std::vector<const Terminal_render_cell*>>& row_table,
+    const Terminal_render_cell&                            cell)
+{
+    const std::size_t row_index = static_cast<std::size_t>(cell.position.row);
+    if (row_index >= row_table.size()) {
+        return;
+    }
+
+    row_table[row_index].push_back(&cell);
+}
+
+void append_disabled_sidecar_packed_graphic_cells(
+    Terminal_render_frame&             frame,
+    std::vector<std::vector<const Terminal_render_cell*>>& row_table,
+    Render_style_attribute_cache&      style_attributes)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::disabled_sidecar_packed_graphics");
+
+    const std::size_t row_count =
+        std::min(row_table.size(), frame.packed_rows.size());
+    for (std::size_t row_index = 0U; row_index < row_count; ++row_index) {
+        std::vector<const Terminal_render_cell*>& row_cells = row_table[row_index];
+        if (row_cells.size() > 1U) {
+            std::stable_sort(
+                row_cells.begin(),
+                row_cells.end(),
+                [](const Terminal_render_cell* left, const Terminal_render_cell* right) {
+                    return left->position.column < right->position.column;
+                });
+        }
+
+        terminal_packed_render_row_t& row = frame.packed_rows[row_index];
+        for (const Terminal_render_cell* cell : row_cells) {
+            append_packed_graphic_cell(
+                frame,
+                row,
+                *cell,
+                style_attributes.attributes(cell->style_id));
+        }
+    }
+}
+
 void build_terminal_render_frame_packed_data(
     Terminal_render_frame&             frame,
     const Terminal_render_snapshot&    snapshot,
@@ -7132,16 +7228,10 @@ void build_terminal_render_frame_packed_data(
     bool                               ime_preedit_visible,
     int                                ime_preedit_row,
     int                                ime_preedit_column,
-    int                                ime_preedit_columns,
-    bool                               packed_text_sidecars_enabled)
+    int                                ime_preedit_columns)
 {
     VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data");
 
-    frame.stats.packed_pass_input_cells = static_cast<int>(snapshot.cells.size());
-    frame.stats.packed_text_sidecars_enabled =
-        packed_text_sidecars_enabled ? 1 : 0;
-    frame.stats.packed_text_sidecars_disabled =
-        packed_text_sidecars_enabled ? 0 : 1;
     if (snapshot.grid_size.rows <= 0 || snapshot.grid_size.columns <= 0) {
         return;
     }
@@ -7157,10 +7247,8 @@ void build_terminal_render_frame_packed_data(
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::reserve");
 
         frame.packed_rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
-        if (packed_text_sidecars_enabled) {
-            frame.packed_text_spans.reserve(snapshot.cells.size() / 2U);
-            frame.packed_text_bytes.reserve(snapshot.cells.size());
-        }
+        frame.packed_text_spans.reserve(snapshot.cells.size() / 2U);
+        frame.packed_text_bytes.reserve(snapshot.cells.size());
         frame.packed_graphic_spans.reserve(snapshot.cells.size() / 8U);
         frame.packed_graphic_codepoints.reserve(snapshot.cells.size() / 8U);
     }
@@ -7169,25 +7257,10 @@ void build_terminal_render_frame_packed_data(
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::scan");
 
         for (int row_index = 0; row_index < snapshot.grid_size.rows; ++row_index) {
-            terminal_packed_render_row_t row;
-            row.active_buffer = snapshot.viewport.active_buffer;
-            row.viewport_row  = row_index;
-            row.logical_row   = logical_row_for_viewport_row(snapshot.viewport, row_index);
-            row.first_text_span =
-                static_cast<std::uint32_t>(frame.packed_text_spans.size());
-            row.first_graphic_span =
-                static_cast<std::uint32_t>(frame.packed_graphic_spans.size());
-            frame.packed_rows.push_back(row);
-
-            terminal_packed_render_row_t& packed_row = frame.packed_rows.back();
+            terminal_packed_render_row_t& packed_row =
+                append_packed_render_row(frame, snapshot, row_index);
             for (const Terminal_render_cell* cell : row_table[static_cast<std::size_t>(row_index)]) {
                 ++frame.stats.packed_pass_cells_scanned;
-                const bool graphic_candidate = is_terminal_graphic_text(cell->text);
-                if (!packed_text_sidecars_enabled && !graphic_candidate) {
-                    ++frame.stats.packed_text_disabled_cells_skipped;
-                    continue;
-                }
-
                 if (block_cursor_covers_cell(*cell, snapshot.cursor, block_cursor_visible) ||
                     ime_preedit_covers_cell(
                         *cell,
@@ -7199,9 +7272,6 @@ void build_terminal_render_frame_packed_data(
                     continue;
                 }
 
-                if (graphic_candidate) {
-                    ++frame.stats.packed_graphic_candidates_classified;
-                }
                 ++frame.stats.dirty_row_lookup_count;
                 const bool dirty_row = snapshot_row_is_dirty(
                     dirty_row_flags,
@@ -7218,6 +7288,12 @@ void build_terminal_render_frame_packed_data(
                         snapshot.styles.size(),
                         has_decoration,
                         dirty_row);
+                const bool graphic_candidate = terminal_graphic_candidate_text(
+                    classification.text_category,
+                    cell->text);
+                if (graphic_candidate) {
+                    ++frame.stats.packed_graphic_candidates_classified;
+                }
 
                 if (classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY) {
                     append_packed_graphic_cell(
@@ -7228,7 +7304,7 @@ void build_terminal_render_frame_packed_data(
                     continue;
                 }
 
-                if (!packed_text_sidecars_enabled || !classification.fast_text_eligible) {
+                if (!classification.fast_text_eligible) {
                     continue;
                 }
 
@@ -7239,12 +7315,6 @@ void build_terminal_render_frame_packed_data(
                     style_attributes.attributes(cell->style_id));
             }
         }
-    }
-
-    {
-        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::finalize");
-
-        finalize_packed_render_frame_stats(frame);
     }
 }
 
@@ -7299,6 +7369,10 @@ Terminal_render_frame build_terminal_render_frame(
         if (frame.stats.dirty_rows == snapshot->grid_size.rows) {
             frame.stats.full_dirty_rows = frame.stats.dirty_rows;
         }
+        initialize_packed_render_frame_stats(
+            frame,
+            *snapshot,
+            options.packed_text_sidecars_enabled);
     }
     const bool valid_grid = snapshot->grid_size.rows > 0 && snapshot->grid_size.columns > 0;
     Snapshot_dirty_row_flags dirty_row_flags;
@@ -7344,6 +7418,7 @@ Terminal_render_frame build_terminal_render_frame(
             snapshot->grid_size.columns - ime_preedit_column)
         : 0;
     Render_style_attribute_cache style_attributes(*snapshot);
+    std::vector<std::vector<const Terminal_render_cell*>> disabled_sidecar_packed_graphic_cells;
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::reserve_outputs");
@@ -7358,6 +7433,15 @@ Terminal_render_frame build_terminal_render_frame(
         frame.cursor_graphic_rects.reserve(4U);
         frame.cursor_graphic_arcs.reserve(2U);
         frame.overlay_rects.reserve(1U);
+        if (!options.packed_text_sidecars_enabled) {
+            frame.packed_graphic_spans.reserve(cell_count / 8U);
+            frame.packed_graphic_codepoints.reserve(cell_count / 8U);
+            if (valid_grid) {
+                initialize_disabled_sidecar_packed_rows(frame, *snapshot);
+                disabled_sidecar_packed_graphic_cells.resize(
+                    static_cast<std::size_t>(snapshot->grid_size.rows));
+            }
+        }
     }
 
     {
@@ -7372,11 +7456,13 @@ Terminal_render_frame build_terminal_render_frame(
             ++frame.stats.cells_considered;
             const bool valid_style_id =
                 static_cast<std::size_t>(cell.style_id) < snapshot->styles.size();
+            const bool valid_render_row =
+                valid_grid                          &&
+                cell.position.row >= 0              &&
+                cell.position.row < snapshot->grid_size.rows;
             const bool valid_render_cell =
                 !cell.wide_continuation                                                  &&
-                valid_grid                                                                &&
-                cell.position.row                       >= 0                              &&
-                cell.position.row                       <  snapshot->grid_size.rows       &&
+                valid_render_row                                                          &&
                 cell.position.column                    >= 0                              &&
                 cell.position.column                    <  snapshot->grid_size.columns    &&
                 cell.display_width                      >  0                              &&
@@ -7415,6 +7501,17 @@ Terminal_render_frame build_terminal_render_frame(
                 eligible_after_all_gates,
                 simple_eligible_rows,
                 simple_eligible_styles);
+
+            if (!options.packed_text_sidecars_enabled &&
+                valid_render_row                     &&
+                !block_cursor_cell                   &&
+                !ime_preedit_cell                    &&
+                terminal_graphic_candidate_text(
+                    classification.text_category,
+                    cell.text))
+            {
+                ++frame.stats.packed_graphic_candidates_classified;
+            }
 
             if (cell.wide_continuation) {
                 ++frame.stats.cells_skipped_wide_continuation;
@@ -7513,6 +7610,15 @@ Terminal_render_frame build_terminal_render_frame(
                 terminal_hard_block_graphic_text_is_supported(cell.text)                &&
                 !block_cursor_cell                                                      &&
                 !ime_preedit_cell;
+            if (!options.packed_text_sidecars_enabled                                  &&
+                classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY &&
+                !block_cursor_cell                                                      &&
+                !ime_preedit_cell)
+            {
+                record_disabled_sidecar_packed_graphic_cell(
+                    disabled_sidecar_packed_graphic_cells,
+                    cell);
+            }
             const bool rendered_as_graphic = packed_hard_graphic_covered ||
                 (!text_is_empty &&
                     append_terminal_graphic_rects(
@@ -7585,19 +7691,36 @@ Terminal_render_frame build_terminal_render_frame(
             frame.stats.simple_content,
             simple_eligible_rows,
             simple_eligible_styles);
+        if (!options.packed_text_sidecars_enabled) {
+            frame.stats.packed_text_disabled_cells_skipped =
+                frame.stats.simple_content.eligible_after_all_gates_cells;
+        }
     }
 
-    build_terminal_render_frame_packed_data(
-        frame,
-        *snapshot,
-        dirty_row_flags,
-        style_attributes,
-        block_cursor_visible,
-        ime_preedit_visible,
-        ime_preedit_row,
-        ime_preedit_column,
-        ime_preedit_columns,
-        options.packed_text_sidecars_enabled);
+    if (options.packed_text_sidecars_enabled) {
+        build_terminal_render_frame_packed_data(
+            frame,
+            *snapshot,
+            dirty_row_flags,
+            style_attributes,
+            block_cursor_visible,
+            ime_preedit_visible,
+            ime_preedit_row,
+            ime_preedit_column,
+            ime_preedit_columns);
+    }
+    else {
+        append_disabled_sidecar_packed_graphic_cells(
+            frame,
+            disabled_sidecar_packed_graphic_cells,
+            style_attributes);
+    }
+
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::finalize");
+
+        finalize_packed_render_frame_stats(frame);
+    }
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::selection");
