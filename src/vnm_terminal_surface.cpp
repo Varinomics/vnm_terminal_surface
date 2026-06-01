@@ -5568,6 +5568,12 @@ term::VNM_TerminalSurface_render_bridge::lifecycle_stats(
         : term::terminal_renderer_lifecycle_stats_t{};
 }
 
+const term::stage42_feature_flags_t&
+term::VNM_TerminalSurface_render_bridge::stage42_feature_flags()
+{
+    return term::stage42_feature_flags();
+}
+
 std::shared_ptr<term::Terminal_renderer_lifecycle_recorder>
 term::VNM_TerminalSurface_render_bridge::lifecycle_recorder(
     VNM_TerminalSurface& surface)
