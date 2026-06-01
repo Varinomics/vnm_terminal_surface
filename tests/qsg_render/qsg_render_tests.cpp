@@ -1204,6 +1204,13 @@ std::uint64_t ascii_text_coalescing_context_call_count(const VNM_TerminalSurface
     return profile_call_count(profile.root, "ascii_text_coalescing_context");
 }
 
+std::uint64_t text_coalescing_context_lookup_call_count(const VNM_TerminalSurface& surface)
+{
+    const term::Render_profile_snapshot_t profile = term::VNM_TerminalSurface_render_bridge::render_profiler_snapshot(
+        surface);
+    return profile_call_count(profile.root, "sync_text_resource_nodes::coalescing::context");
+}
+
 std::uint64_t row_local_text_runs_call_count(const VNM_TerminalSurface& surface)
 {
     const term::Render_profile_snapshot_t profile = term::VNM_TerminalSurface_render_bridge::render_profiler_snapshot(
@@ -3652,6 +3659,8 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
             "multi-row dense render replaces each coalesced row without QTextLayout");
         ok &= check(ascii_text_coalescing_context_call_count(surface) <= 1U,
             "multi-row dense render computes or reuses the ASCII coalescing font gate");
+        ok &= check(text_coalescing_context_lookup_call_count(surface) == 1U,
+            "multi-row dense render resolves the ASCII coalescing context once");
         ok &= check(row_local_text_runs_call_count(surface) == 0U,
             "multi-row dense render keeps every row on the fused ASCII coalescing path");
     }
