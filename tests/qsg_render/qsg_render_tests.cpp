@@ -2934,12 +2934,18 @@ bool test_qsg_snapshot_rendering(QGuiApplication& app)
     ok &= check(first_stats.frame_text_runs == first_stats.frame.text_runs_emitted &&
         first_stats.frame_selection_rects == first_stats.frame.selection_rects_emitted &&
         first_stats.frame_dirty_row_ranges == 0 &&
-        first_stats.frame_packed_rows == first_stats.frame.packed_rows &&
+        first_stats.frame_packed_rows == first_stats.frame.visible_rows &&
+        first_stats.frame.packed_rows == first_stats.frame.visible_rows &&
         first_stats.frame.simple_content.eligible_after_all_gates_cells == 4 &&
+        first_stats.frame.packed_pass_input_cells == 0 &&
         first_stats.frame_packed_text_cells == 0 &&
         first_stats.frame.packed_text_cells == 0 &&
+        first_stats.frame.packed_pass_cells_scanned == 0 &&
+        first_stats.frame.packed_pass_classification_calls == 0 &&
+        first_stats.frame.packed_text_disabled_cells_skipped ==
+            first_stats.frame.simple_content.eligible_after_all_gates_cells &&
         first_stats.frame_packed_payload_bytes > 0U,
-        "first render reports frame vector sizes with QSG packed text sidecars disabled");
+        "first render keeps packed row identity without scanning disabled text sidecars");
     ok &= check(first_stats.background_layer_rebuilt &&
         first_stats.selection_layer_rebuilt &&
         first_stats.graphic_layer_rebuilt &&
@@ -11145,9 +11151,13 @@ bool test_qsg_terminal_graphics_rendering(QGuiApplication& app)
     ok &= check(stats.graphic_layer_rebuilt,
         "terminal graphics render rebuilds the graphic geometry layer");
     ok &= check(stats.frame_packed_graphic_cells >= 2 &&
+        stats.frame_packed_rows == stats.frame.visible_rows &&
         stats.frame_graphic_rects > 0 &&
-        stats.frame_graphic_arcs > 0,
-        "terminal graphics render publishes packed graphics, rects, and arcs");
+        stats.frame_graphic_arcs > 0 &&
+        stats.frame.packed_pass_input_cells == 0 &&
+        stats.frame.packed_pass_cells_scanned == 0 &&
+        stats.frame.packed_pass_classification_calls == 0,
+        "terminal graphics render publishes packed graphics without the packed-data scan");
     if (window_uses_software_scene_graph(window)) {
         ok &= check(stats.graphic_batched_rects == 0 &&
             stats.graphic_batched_vertices == 0,

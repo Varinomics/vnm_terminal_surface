@@ -263,15 +263,17 @@ struct terminal_render_frame_stats_t
     int                                            visible_rows                     = 0;
     int                                            dirty_rows                       = 0;
     int                                            full_dirty_rows                  = 0;
-    // These mirror current input/scanned counts until Phase 4 reuses cell-pass
-    // intermediates and the packed pass stops reclassifying every scanned cell.
     int                                            cell_pass_input_cells            = 0;
     int                                            cell_pass_classification_calls   = 0;
+    // The packed-pass counters describe the separate packed text sidecar scan.
+    // Disabled text sidecars can still emit packed graphics from the cell pass.
     int                                            packed_pass_input_cells          = 0;
     int                                            packed_pass_cells_scanned        = 0;
     int                                            packed_pass_classification_calls = 0;
     int                                            packed_text_sidecars_enabled     = 0;
     int                                            packed_text_sidecars_disabled    = 0;
+    // Fast text cells eligible after cursor/IME gates but not packed because
+    // text sidecars are disabled. These cells still render through text_runs.
     int                                            packed_text_disabled_cells_skipped = 0;
     int                                            packed_graphic_candidates_classified = 0;
     int                                            packed_cells_appended            = 0;
