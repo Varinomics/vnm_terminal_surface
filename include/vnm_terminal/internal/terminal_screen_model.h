@@ -495,6 +495,14 @@ private:
                                   by_row_sequence;
         std::vector<terminal_history_handle_t>
                                   by_logical_row;
+
+        bool invalidated() const
+        {
+            return
+                !valid                 &&
+                by_row_sequence.empty() &&
+                by_logical_row.empty();
+        }
     };
 
     struct Retained_history_storage

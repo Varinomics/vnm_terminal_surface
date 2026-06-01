@@ -1,9 +1,11 @@
 #include "vnm_terminal/internal/parser_action.h"
+#include "vnm_terminal/internal/terminal_screen_model.h"
 #include "helpers/test_check.h"
 
 #include <QByteArray>
 #include <QString>
 #include <iostream>
+#include <iterator>
 #include <variant>
 #include <vector>
 
@@ -12,6 +14,13 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 using vnm_terminal::test_helpers::check;
+
+const term::Screen_print_text_mutation& print_mutation_from(
+    const term::Parser_action& action)
+{
+    return std::get<term::Screen_print_text_mutation>(
+        std::get<term::Screen_mutation>(action.payload));
+}
 
 term::Parser_action dispatch_parser_fixture(QByteArray bytes)
 {
@@ -115,6 +124,8 @@ bool test_printable_and_control_ir()
             term::Screen_mutation_kind::PRINT_TEXT,
         "print fixture mutation kind");
     ok &= check(print_mutation.text == QStringLiteral("text"), "print fixture text");
+    ok &= check(!print_mutation.printable_ascii_only,
+        "print fixture defaults to unknown ASCII classification");
 
     const term::Parser_action esc          = dispatch_parser_fixture(QByteArray("\x1b" "c", 2));
     const auto&               esc_sequence = std::get<term::Parser_control_sequence>(esc.payload);
@@ -200,6 +211,81 @@ bool test_printable_and_control_ir()
     ok &= check(dcs_end_of_input_sequence.terminator ==
         term::Parser_string_terminator::END_OF_INPUT,
         "DCS end-of-input terminator");
+
+    return ok;
+}
+
+bool test_parser_printable_ascii_classification()
+{
+    bool ok = true;
+
+    QByteArray long_ascii;
+    long_ascii.reserve(4096);
+    for (int i = 0; i < 4096; ++i) {
+        long_ascii.append(static_cast<char>('!' + (i % 94)));
+    }
+
+    term::Terminal_byte_stream_parser parser;
+    const std::vector<term::Parser_action> long_actions = parser.ingest(long_ascii);
+    ok &= check(long_actions.size() == 1U, "long ASCII run emits one action");
+    if (long_actions.size() == 1U) {
+        const term::Screen_print_text_mutation& mutation =
+            print_mutation_from(long_actions[0]);
+        ok &= check(mutation.text == QString::fromLatin1(long_ascii),
+            "long ASCII run preserves text");
+        ok &= check(mutation.printable_ascii_only,
+            "long ASCII run is classified as printable ASCII");
+    }
+
+    term::Terminal_byte_stream_parser mixed_parser;
+    std::vector<term::Parser_action> mixed_actions;
+
+    const auto append_actions = [&](std::vector<term::Parser_action> actions) {
+        mixed_actions.insert(
+            mixed_actions.end(),
+            std::make_move_iterator(actions.begin()),
+            std::make_move_iterator(actions.end()));
+    };
+
+    append_actions(mixed_parser.ingest(QByteArray("abc\x1b", 4)));
+
+    QByteArray second_chunk = QByteArrayLiteral("[31mdef\n");
+    second_chunk.append(static_cast<char>(0xc3));
+    append_actions(mixed_parser.ingest(second_chunk));
+
+    QByteArray third_chunk;
+    third_chunk.append(static_cast<char>(0xa9));
+    third_chunk += QByteArrayLiteral("ghi");
+    append_actions(mixed_parser.ingest(third_chunk));
+
+    ok &= check(mixed_actions.size() == 5U,
+        "mixed chunked stream emits split print and control actions");
+    if (mixed_actions.size() == 5U) {
+        const term::Screen_print_text_mutation& first_print =
+            print_mutation_from(mixed_actions[0]);
+        const term::Screen_print_text_mutation& second_print =
+            print_mutation_from(mixed_actions[2]);
+        const term::Screen_print_text_mutation& third_print =
+            print_mutation_from(mixed_actions[4]);
+
+        ok &= check(first_print.text == QStringLiteral("abc") &&
+                first_print.printable_ascii_only,
+            "ASCII before split CSI is classified as printable ASCII");
+        ok &= check(
+            term::parser_action_kind(mixed_actions[1]) ==
+                term::Parser_action_kind::STYLE_MUTATION,
+            "split CSI remains a style action");
+        ok &= check(second_print.text == QStringLiteral("def") &&
+                second_print.printable_ascii_only,
+            "ASCII before control is classified as printable ASCII");
+        ok &= check(
+            term::screen_mutation_kind(std::get<term::Screen_mutation>(
+                mixed_actions[3].payload)) == term::Screen_mutation_kind::LINE_FEED,
+            "control byte remains a line-feed mutation");
+        ok &= check(third_print.text == QString::fromUtf8("\xc3\xa9ghi") &&
+                !third_print.printable_ascii_only,
+            "non-ASCII plus ASCII chunk is not classified as ASCII-only");
+    }
 
     return ok;
 }
@@ -432,6 +518,7 @@ int main()
 {
     bool ok = true;
     ok &= test_printable_and_control_ir();
+    ok &= test_parser_printable_ascii_classification();
     ok &= test_string_terminators_and_dcs_discard();
     ok &= test_terminal_reply_ir();
     ok &= test_malformed_recovery_ir();

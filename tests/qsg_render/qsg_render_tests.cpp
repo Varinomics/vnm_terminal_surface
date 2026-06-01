@@ -9760,6 +9760,90 @@ bool test_qsg_text_resource_descriptor_rejects_preedit_and_clipped_rows(QGuiAppl
     return ok;
 }
 
+bool test_qsg_text_resource_descriptor_rejects_mixed_identity_rows(QGuiApplication& app)
+{
+    bool ok = true;
+    QQuickWindow window;
+    window.setColor(QColor(180, 16, 16));
+    window.resize(260, 100);
+    window.show();
+    pump_events(app, 2);
+
+    const QFont font = term::vnm_terminal_font(QString(), 16.0);
+    const term::terminal_cell_metrics_t metrics = test_metrics();
+    const auto make_frame = [&](bool mixed_identity) {
+        term::Terminal_render_text_run first =
+            make_direct_text_run_for_row(0, 0, 0, 1, QStringLiteral("A"), metrics);
+        term::Terminal_render_text_run second =
+            make_direct_text_run_for_row(
+                0,
+                mixed_identity ? 1 : 0,
+                2,
+                1,
+                QStringLiteral("B"),
+                metrics);
+
+        return make_direct_text_slot_frame(
+            term::Terminal_buffer_id::PRIMARY,
+            0,
+            1,
+            { first, second },
+            metrics,
+            {{0, 1}});
+    };
+
+    term::Qsg_terminal_renderer renderer;
+    QSGNode* node = nullptr;
+    auto update = [&](
+        const term::Terminal_render_frame& frame,
+        term::terminal_renderer_stats_t& stats) {
+        node = renderer.update_node(
+            node,
+            &window,
+            frame,
+            font,
+            1.0,
+            {},
+            stats);
+        return
+            node != nullptr       &&
+            stats.paint_completed &&
+            stats.text_content_failures == 0;
+    };
+
+    const term::Terminal_render_frame base_frame = make_frame(false);
+    term::terminal_renderer_stats_t first_stats;
+    ok &= check(update(base_frame, first_stats),
+        "mixed-identity descriptor baseline renders");
+    ok &= check(first_stats.text_content_rebuilds == 1,
+        "mixed-identity descriptor baseline builds one text resource");
+
+    term::terminal_renderer_stats_t reuse_stats;
+    ok &= check(update(base_frame, reuse_stats),
+        "mixed-identity descriptor unchanged frame renders");
+    ok &= check(reuse_stats.text_content_rebuilds == 0 &&
+        reuse_stats.text_content_reused == 1 &&
+        reuse_stats.text_resource_descriptor_reuses == 1 &&
+        reuse_stats.text_key_builds == 1,
+        "same-identity row uses the descriptor fast path");
+
+    term::terminal_renderer_stats_t mixed_stats;
+    ok &= check(update(make_frame(true), mixed_stats),
+        "mixed-identity descriptor frame renders");
+    ok &= check(mixed_stats.text_content_rebuilds == 0 &&
+        mixed_stats.text_content_reused == 1 &&
+        mixed_stats.text_resource_descriptor_reuses == 0 &&
+        mixed_stats.text_key_match_reuses == 1 &&
+        mixed_stats.text_cache_entries_replaced == 0 &&
+        mixed_stats.text_key_builds > 1 &&
+        mixed_stats.route_fast_text_cells == 0,
+        "mixed-identity rows stay descriptor-ineligible and reuse through the row key path");
+
+    term::terminal_renderer_stats_t cleanup_stats;
+    renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
+    return ok;
+}
+
 bool test_qsg_text_row_slot_active_buffer_identity(QGuiApplication& app)
 {
     bool ok = true;
@@ -12241,6 +12325,7 @@ int main(int argc, char** argv)
     ok &= test_qsg_text_resource_descriptor_complex_transitions(app);
     ok &= test_qsg_text_resource_descriptor_keeps_cursor_text_separate(app);
     ok &= test_qsg_text_resource_descriptor_rejects_preedit_and_clipped_rows(app);
+    ok &= test_qsg_text_resource_descriptor_rejects_mixed_identity_rows(app);
     ok &= test_qsg_text_row_slot_active_buffer_identity(app);
     ok &= test_qsg_text_row_slot_active_buffer_roundtrip_pixels(app);
     ok &= test_qsg_text_row_slot_viewport_order_and_resize_cleanup(app);

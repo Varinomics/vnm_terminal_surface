@@ -81,6 +81,11 @@ bool is_printable_ascii(QChar character)
     return codepoint >= k_printable_ascii_first && codepoint <= k_printable_ascii_last;
 }
 
+bool is_printable_ascii_byte(unsigned char byte)
+{
+    return byte >= k_printable_ascii_first && byte <= k_printable_ascii_last;
+}
+
 terminal_history_handle_t retained_history_handle_from_provenance(
     const Terminal_retained_line_provenance& provenance)
 {
@@ -168,6 +173,8 @@ std::unique_ptr<Terminal_history_row_traversal> make_retained_history_traversal(
 
 const QString& printable_ascii_cell_text(QChar character)
 {
+    Q_ASSERT(is_printable_ascii(character));
+
     static const std::array<QString, k_printable_ascii_count> strings = [] {
         std::array<QString, k_printable_ascii_count> result;
         for (std::size_t index = 0; index < result.size(); ++index) {
@@ -1221,14 +1228,20 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
 {
     std::vector<Parser_action> actions;
     QString print_text;
+    bool    print_text_printable_ascii_only = true;
 
     const auto flush_print_text = [&]() {
         if (print_text.isEmpty()) {
             return;
         }
 
-        actions.push_back(make_print_text_action(std::move(print_text), 0, 0));
+        actions.push_back(make_print_text_action(
+            std::move(print_text),
+            0,
+            0,
+            print_text_printable_ascii_only));
         print_text.clear();
+        print_text_printable_ascii_only = true;
     };
 
     for (qsizetype offset = 0; offset < bytes.size();) {
@@ -1245,7 +1258,23 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
         }
 
         const unsigned char byte = byte_at(bytes, offset);
-        if (byte == 0x1bU || byte == 0x9bU || c1_string_family(byte) != Parser_sequence_family::NONE) {
+        if (is_printable_ascii_byte(byte)) {
+            const qsizetype ascii_begin = offset;
+            do {
+                ++offset;
+            } while (offset < bytes.size() &&
+                is_printable_ascii_byte(byte_at(bytes, offset)));
+
+            print_text += QString::fromLatin1(
+                bytes.data() + ascii_begin,
+                offset - ascii_begin);
+            continue;
+        }
+
+        if (byte == 0x1bU ||
+            byte == 0x9bU ||
+            c1_string_family(byte) != Parser_sequence_family::NONE)
+        {
             flush_print_text();
         }
 
@@ -1272,6 +1301,7 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
             }
 
             print_text += scalar_to_string(k_replacement_codepoint);
+            print_text_printable_ascii_only = false;
             flush_print_text();
             actions.push_back(make_malformed_recovery_diagnostic(
                 QStringLiteral("invalid UTF-8"),
@@ -1283,6 +1313,7 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
 
         if (!is_control_byte(byte)) {
             print_text += scalar_to_string(step.codepoint);
+            print_text_printable_ascii_only = false;
         }
         offset += step.bytes_consumed;
     }
@@ -2103,7 +2134,20 @@ void Terminal_screen_model::apply_action(
             if constexpr (std::is_same_v<mutation_t, Screen_print_text_mutation>) {
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "Terminal_screen_model::apply_action::print_text");
-                put_text(mutation.text);
+                if (mutation.printable_ascii_only) {
+#if VNM_TERMINAL_PROFILING_ENABLED
+                    if (m_profile_stats.enabled) {
+                        ++m_profile_stats.print_text_calls;
+                    }
+#endif
+                    if (!mutation.text.isEmpty()) {
+                        cancel_resize_repaint_clear_guard_before_visible_clear();
+                    }
+                    put_printable_ascii_text(QStringView(mutation.text));
+                }
+                else {
+                    put_text(mutation.text);
+                }
             }
             else
             if constexpr (std::is_same_v<mutation_t, Screen_carriage_return_mutation>) {
@@ -3475,6 +3519,11 @@ void Terminal_screen_model::discard_retained_lookup_cache_for_testing() const
 
 void Terminal_screen_model::invalidate_retained_lookup_caches() const
 {
+    if (m_primary_retained_lookup_cache.invalidated() &&
+        m_alternate_retained_lookup_cache.invalidated()) {
+        return;
+    }
+
     m_primary_retained_lookup_cache.valid = false;
     m_primary_retained_lookup_cache.by_row_sequence.clear();
     m_primary_retained_lookup_cache.by_logical_row.clear();
@@ -4908,15 +4957,18 @@ void Terminal_screen_model::write_printable_ascii_cell_content(
     QChar                      text)
 {
     mark_terminal_content_changed();
-    clear_cell_at(position);
-
     Cell& cell = active_grid_rows()[position.row].cells[position.column];
-    cell.text              = printable_ascii_cell_text(text);
-    cell.display_width     = 1;
-    cell.wide_continuation = false;
-    cell.occupied          = true;
-    cell.style_id          = m_current_style_id;
-    cell.hyperlink_id      = m_current_hyperlink_id;
+    if (cell.wide_continuation || cell.display_width != 1) {
+        clear_cell_at(position);
+    }
+
+    Cell& target_cell = active_grid_rows()[position.row].cells[position.column];
+    target_cell.text              = printable_ascii_cell_text(text);
+    target_cell.display_width     = 1;
+    target_cell.wide_continuation = false;
+    target_cell.occupied          = true;
+    target_cell.style_id          = m_current_style_id;
+    target_cell.hyperlink_id      = m_current_hyperlink_id;
 }
 
 void Terminal_screen_model::put_spacing_scalar(QString text, int display_width)
@@ -6330,12 +6382,13 @@ void Terminal_screen_model::mark_dirty(int row)
 
 void Terminal_screen_model::mark_terminal_content_changed()
 {
-    invalidate_retained_lookup_caches();
     if (m_primary_repaint_recovery_candidate.active &&
         m_active_buffer_id == Terminal_buffer_id::PRIMARY)
     {
         m_primary_repaint_recovery_candidate.visible_row_identity_ambiguous = true;
     }
+
+    invalidate_retained_lookup_caches();
     m_terminal_content_changed = true;
 }
 
