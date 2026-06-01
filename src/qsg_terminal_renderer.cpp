@@ -30,7 +30,6 @@
 #include <limits>
 #include <map>
 #include <optional>
-#include <set>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -7001,12 +7000,41 @@ void record_simple_content_rejection(
     }
 }
 
+struct Simple_content_eligibility_flags
+{
+    std::vector<unsigned char> rows;
+    std::vector<unsigned char> styles;
+};
+
+void record_simple_content_eligible_row_and_style(
+    terminal_simple_content_stats_t&                stats,
+    const terminal_simple_content_classification_t& classification,
+    Simple_content_eligibility_flags&               flags)
+{
+    const std::size_t row_index   = static_cast<std::size_t>(classification.row);
+    const std::size_t style_index = static_cast<std::size_t>(classification.style_id);
+    if (row_index   >= flags.rows.size() ||
+        style_index >= flags.styles.size())
+    {
+        Q_ASSERT(false);
+        return;
+    }
+
+    if (flags.rows[row_index] == 0U) {
+        flags.rows[row_index] = 1U;
+        ++stats.rows_with_eligible_cells;
+    }
+    if (flags.styles[style_index] == 0U) {
+        flags.styles[style_index] = 1U;
+        ++stats.styles_with_eligible_cells;
+    }
+}
+
 void record_simple_content_classification(
-    terminal_simple_content_stats_t&                   stats,
-    const terminal_simple_content_classification_t&    classification,
-    bool                                               eligible_after_all_gates,
-    std::set<int>&                                     eligible_rows,
-    std::set<Terminal_style_id>&                       eligible_styles)
+    terminal_simple_content_stats_t&                stats,
+    const terminal_simple_content_classification_t& classification,
+    bool                                            eligible_after_all_gates,
+    Simple_content_eligibility_flags&               eligibility_flags)
 {
     ++stats.cells_considered;
     record_simple_content_text_category(stats, classification.text_category);
@@ -7028,8 +7056,10 @@ void record_simple_content_classification(
         ++stats.clean_eligible_cells;
     }
 
-    eligible_rows.insert(classification.row);
-    eligible_styles.insert(classification.style_id);
+    record_simple_content_eligible_row_and_style(
+        stats,
+        classification,
+        eligibility_flags);
 }
 
 bool cell_text_decoration_enabled(
@@ -7045,15 +7075,6 @@ bool cell_text_decoration_enabled(
 
     const render_style_attributes_t& style = style_attributes.attributes(cell.style_id);
     return style.underline || style.strike;
-}
-
-void finalize_simple_content_stats(
-    terminal_simple_content_stats_t&   stats,
-    const std::set<int>&               eligible_rows,
-    const std::set<Terminal_style_id>& eligible_styles)
-{
-    stats.rows_with_eligible_cells   = static_cast<int>(eligible_rows.size());
-    stats.styles_with_eligible_cells = static_cast<int>(eligible_styles.size());
 }
 
 bool cell_intersects_grid_columns(
@@ -7642,11 +7663,15 @@ Terminal_render_frame build_terminal_render_frame(
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::cells");
 
-        std::vector<bool> seen_style_ids(snapshot->styles.size(), false);
-        Terminal_style_id previous_style_id     = k_default_terminal_style_id;
-        bool              has_previous_style_id = false;
-        std::set<int> simple_eligible_rows;
-        std::set<Terminal_style_id> simple_eligible_styles;
+        std::vector<unsigned char> seen_style_ids(snapshot->styles.size(), 0U);
+        Terminal_style_id          previous_style_id     = k_default_terminal_style_id;
+        bool                       has_previous_style_id = false;
+
+        Simple_content_eligibility_flags simple_eligibility_flags;
+        simple_eligibility_flags.rows.resize(
+            valid_grid ? static_cast<std::size_t>(snapshot->grid_size.rows) : 0U,
+            0U);
+        simple_eligibility_flags.styles.resize(valid_grid ? snapshot->styles.size() : 0U, 0U);
         for (const Terminal_render_cell& cell : snapshot->cells) {
             ++frame.stats.cells_considered;
             const bool valid_style_id =
@@ -7694,8 +7719,7 @@ Terminal_render_frame build_terminal_render_frame(
                 frame.stats.simple_content,
                 classification,
                 eligible_after_all_gates,
-                simple_eligible_rows,
-                simple_eligible_styles);
+                simple_eligibility_flags);
 
             if (!options.packed_text_sidecars_enabled &&
                 valid_render_row                     &&
@@ -7726,8 +7750,8 @@ Terminal_render_frame build_terminal_render_frame(
             has_previous_style_id = true;
 
             const std::size_t style_index = static_cast<std::size_t>(cell.style_id);
-            if (!seen_style_ids[style_index]) {
-                seen_style_ids[style_index] = true;
+            if (seen_style_ids[style_index] == 0U) {
+                seen_style_ids[style_index] = 1U;
                 ++frame.stats.text_distinct_styles;
             }
 
@@ -7882,10 +7906,6 @@ Terminal_render_frame build_terminal_render_frame(
                 });
             }
         }
-        finalize_simple_content_stats(
-            frame.stats.simple_content,
-            simple_eligible_rows,
-            simple_eligible_styles);
         if (!options.packed_text_sidecars_enabled) {
             frame.stats.packed_text_disabled_cells_skipped =
                 frame.stats.simple_content.eligible_after_all_gates_cells;
