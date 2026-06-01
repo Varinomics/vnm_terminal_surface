@@ -4241,34 +4241,36 @@ bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
             "single-run trusted ASCII replacement bypasses the generic replacement scope");
     }
 
-    const term::Terminal_render_frame varying_size_run_frame = make_direct_text_frame(
+    const term::Terminal_render_frame increasing_size_run_frame = make_direct_text_frame(
         {
-            make_direct_text_run(0, 3, QStringLiteral("ABC"), metrics),
-            make_direct_text_run(4, 1, QStringLiteral("D"), metrics),
+            make_direct_text_run(0,  1, QStringLiteral("A"),     metrics),
+            make_direct_text_run(2,  3, QStringLiteral("BCD"),   metrics),
+            make_direct_text_run(6,  5, QStringLiteral("EFGHI"), metrics),
+            make_direct_text_run(12, 3, QStringLiteral("JKL"),   metrics),
         },
         metrics);
 
-    term::terminal_renderer_stats_t varying_size_run_stats;
-    term::Hierarchical_profiler varying_size_run_profiler;
+    term::terminal_renderer_stats_t increasing_size_run_stats;
+    term::Hierarchical_profiler increasing_size_run_profiler;
     ok &= check(render_once(
-            varying_size_run_frame,
-            varying_size_run_stats,
-            varying_size_run_profiler),
-        "varying-size trusted ASCII replacement frame renders");
-    ok &= check(varying_size_run_stats.text_resource_runs_before_coalescing == 2 &&
-        varying_size_run_stats.text_resource_runs_after_coalescing == 2 &&
-        varying_size_run_stats.qt_text_layout_calls == 0 &&
-        varying_size_run_stats.text_ascii_replacement_runs_trusted_fast_path == 2 &&
-        varying_size_run_stats.text_ascii_replacement_runs_succeeded == 2 &&
-        varying_size_run_stats.text_ascii_replacement_code_units_screened == 4U &&
-        varying_size_run_stats.text_ascii_replacement_code_units_trusted_fast_path == 4U &&
-        varying_size_run_stats.text_ascii_replacement_code_units_succeeded == 4U,
-        "varying-size trusted ASCII replacement keeps consecutive runs independent");
+            increasing_size_run_frame,
+            increasing_size_run_stats,
+            increasing_size_run_profiler),
+        "increasing-size trusted ASCII replacement frame renders");
+    ok &= check(increasing_size_run_stats.text_resource_runs_before_coalescing == 4 &&
+        increasing_size_run_stats.text_resource_runs_after_coalescing == 4 &&
+        increasing_size_run_stats.qt_text_layout_calls == 0 &&
+        increasing_size_run_stats.text_ascii_replacement_runs_trusted_fast_path == 4 &&
+        increasing_size_run_stats.text_ascii_replacement_runs_succeeded == 4 &&
+        increasing_size_run_stats.text_ascii_replacement_code_units_screened == 12U &&
+        increasing_size_run_stats.text_ascii_replacement_code_units_trusted_fast_path == 12U &&
+        increasing_size_run_stats.text_ascii_replacement_code_units_succeeded == 12U,
+        "increasing-size trusted ASCII replacement keeps consecutive runs independent");
     if (profile_scopes_available()) {
         ok &= check(profile_call_count(
-                varying_size_run_profiler.root_snapshot(),
-                "append_trusted_ascii_replacement_text_run") == 2U,
-            "varying-size trusted ASCII replacement records both trusted scopes");
+                increasing_size_run_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run") == 4U,
+            "increasing-size trusted ASCII replacement records every trusted scope");
     }
 
     const term::Terminal_render_frame single_space_run_frame = make_direct_text_frame(
