@@ -2318,6 +2318,178 @@ bool is_printable_ascii_cell_text(const QString& text)
     return codepoint >= 0x20U && codepoint <= 0x7eU;
 }
 
+struct Text_layout_run_makeup
+{
+    std::uint64_t code_units                 = 0U;
+    std::uint64_t space_code_units           = 0U;
+    std::uint64_t printable_ascii_code_units = 0U;
+    std::uint64_t other_ascii_code_units     = 0U;
+    std::uint64_t non_ascii_code_units       = 0U;
+};
+
+Text_layout_run_makeup text_layout_run_makeup(const QString& text)
+{
+    Text_layout_run_makeup makeup;
+    makeup.code_units = static_cast<std::uint64_t>(text.size());
+    for (const QChar character : text) {
+        const ushort code_unit = character.unicode();
+        if (code_unit == 0x20U) {
+            ++makeup.space_code_units;
+        }
+
+        if (code_unit >= 0x20U && code_unit <= 0x7eU) {
+            ++makeup.printable_ascii_code_units;
+            continue;
+        }
+
+        if (code_unit <= 0x7fU) {
+            ++makeup.other_ascii_code_units;
+            continue;
+        }
+
+        ++makeup.non_ascii_code_units;
+    }
+    return makeup;
+}
+
+bool text_layout_run_makeup_is_all_space(const Text_layout_run_makeup& makeup)
+{
+    return makeup.code_units != 0U && makeup.space_code_units == makeup.code_units;
+}
+
+bool text_layout_run_makeup_is_printable_ascii(const Text_layout_run_makeup& makeup)
+{
+    return makeup.code_units != 0U &&
+        makeup.printable_ascii_code_units == makeup.code_units;
+}
+
+void record_text_layout_run_makeup(
+    terminal_renderer_stats_t&         stats,
+    const Terminal_render_text_run&    run,
+    bool                               clipped,
+    bool                               force_blended_order,
+    bool                               ascii_layout_font)
+{
+    const Text_layout_run_makeup makeup = text_layout_run_makeup(run.text);
+    stats.text_layout_code_units += makeup.code_units;
+    stats.text_layout_space_code_units += makeup.space_code_units;
+    stats.text_layout_printable_ascii_code_units +=
+        makeup.printable_ascii_code_units;
+    stats.text_layout_other_ascii_code_units += makeup.other_ascii_code_units;
+    stats.text_layout_non_ascii_code_units   += makeup.non_ascii_code_units;
+
+    const bool all_space           = text_layout_run_makeup_is_all_space(makeup);
+    const bool printable_ascii     = text_layout_run_makeup_is_printable_ascii(makeup);
+    const bool has_printable_ascii = makeup.printable_ascii_code_units != 0U;
+    const bool has_other_ascii     = makeup.other_ascii_code_units != 0U;
+    const bool has_non_ascii       = makeup.non_ascii_code_units != 0U;
+    const bool mixed_ascii_non_ascii =
+        has_non_ascii && (has_printable_ascii || has_other_ascii);
+    const bool pure_non_ascii      = has_non_ascii && !has_printable_ascii && !has_other_ascii;
+    const bool decorated           = run.underline || run.strike;
+    const bool plain_unclipped =
+        !clipped && !force_blended_order && run.hyperlink_id == 0U && !decorated;
+
+    if (makeup.code_units == 1U) {
+        ++stats.text_layout_runs_single_code_unit;
+    }
+    else
+    if (makeup.code_units > 1U) {
+        ++stats.text_layout_runs_multi_code_unit;
+    }
+
+    if (all_space) {
+        ++stats.text_layout_runs_all_space;
+    }
+    if (printable_ascii) {
+        ++stats.text_layout_runs_printable_ascii;
+        if (makeup.space_code_units != 0U) {
+            ++stats.text_layout_runs_printable_ascii_with_space;
+        }
+    }
+    if (has_other_ascii) {
+        ++stats.text_layout_runs_other_ascii;
+    }
+    if (has_non_ascii) {
+        ++stats.text_layout_runs_non_ascii;
+    }
+    if (clipped) {
+        ++stats.text_layout_runs_clipped;
+    }
+    if (ascii_layout_font) {
+        ++stats.text_layout_runs_ascii_layout_font;
+    }
+    if (force_blended_order) {
+        ++stats.text_layout_runs_force_blended_order;
+    }
+    if (run.hyperlink_id != 0U) {
+        ++stats.text_layout_runs_with_hyperlink;
+    }
+    if (decorated) {
+        ++stats.text_layout_runs_with_decoration;
+    }
+    if (mixed_ascii_non_ascii) {
+        ++stats.text_layout_runs_mixed_ascii_non_ascii;
+    }
+    if (pure_non_ascii) {
+        ++stats.text_layout_runs_pure_non_ascii;
+    }
+    if (!plain_unclipped) {
+        return;
+    }
+
+    ++stats.text_layout_runs_plain_unclipped;
+    stats.text_layout_plain_unclipped_code_units += makeup.code_units;
+    if (ascii_layout_font) {
+        ++stats.text_layout_runs_plain_unclipped_ascii_font;
+    }
+    if (all_space) {
+        ++stats.text_layout_runs_all_space_plain_unclipped;
+        stats.text_layout_all_space_plain_unclipped_code_units += makeup.space_code_units;
+    }
+    if (printable_ascii) {
+        ++stats.text_layout_runs_printable_ascii_plain_unclipped;
+        stats.text_layout_printable_ascii_plain_unclipped_code_units +=
+            makeup.printable_ascii_code_units;
+    }
+    if (has_non_ascii) {
+        ++stats.text_layout_runs_non_ascii_plain_unclipped;
+        stats.text_layout_non_ascii_plain_unclipped_code_units +=
+            makeup.non_ascii_code_units;
+    }
+    if (mixed_ascii_non_ascii) {
+        ++stats.text_layout_runs_mixed_ascii_non_ascii_plain_unclipped;
+    }
+    if (pure_non_ascii) {
+        ++stats.text_layout_runs_pure_non_ascii_plain_unclipped;
+    }
+    if (!ascii_layout_font) {
+        return;
+    }
+
+    if (all_space) {
+        ++stats.text_layout_runs_fast_space_candidate;
+        stats.text_layout_fast_space_candidate_code_units += makeup.space_code_units;
+    }
+    if (!printable_ascii) {
+        return;
+    }
+
+    ++stats.text_layout_runs_fast_ascii_candidate;
+    stats.text_layout_fast_ascii_candidate_code_units +=
+        makeup.printable_ascii_code_units;
+    if (makeup.space_code_units == 0U) {
+        ++stats.text_layout_runs_fast_ascii_no_space_candidate;
+    }
+    if (makeup.code_units == 1U) {
+        ++stats.text_layout_runs_fast_ascii_single_candidate;
+    }
+    else
+    if (makeup.code_units > 1U) {
+        ++stats.text_layout_runs_fast_ascii_multi_candidate;
+    }
+}
+
 QFont cell_stable_ascii_layout_font(const QFont& font)
 {
     QFont layout_font = font;
@@ -2576,6 +2748,12 @@ bool prepare_text_run_layout(
     layout.setFont(font);
     ++stats.qt_text_layout_calls;
     ++stats.route_qt_text_layout_runs;
+    record_text_layout_run_makeup(
+        stats,
+        run,
+        clipped,
+        force_blended_order,
+        ascii_layout_font);
     return prepare_text_layout(layout, out_line_ascent);
 }
 
@@ -5465,6 +5643,76 @@ void accumulate_renderer_stats(
         static_cast<std::uint64_t>(stats.route_graphic_geometry_cells);
     total.route_fallback_cells += static_cast<std::uint64_t>(stats.route_fallback_cells);
     total.qt_text_layout_calls += static_cast<std::uint64_t>(stats.qt_text_layout_calls);
+    total.text_layout_runs_single_code_unit +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_single_code_unit);
+    total.text_layout_runs_multi_code_unit +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_multi_code_unit);
+    total.text_layout_runs_all_space +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_all_space);
+    total.text_layout_runs_printable_ascii +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii);
+    total.text_layout_runs_printable_ascii_with_space +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii_with_space);
+    total.text_layout_runs_other_ascii +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_other_ascii);
+    total.text_layout_runs_non_ascii +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_non_ascii);
+    total.text_layout_runs_clipped +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_clipped);
+    total.text_layout_runs_ascii_layout_font +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_ascii_layout_font);
+    total.text_layout_runs_force_blended_order +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_force_blended_order);
+    total.text_layout_runs_with_hyperlink +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_with_hyperlink);
+    total.text_layout_runs_with_decoration +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_with_decoration);
+    total.text_layout_runs_mixed_ascii_non_ascii +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_mixed_ascii_non_ascii);
+    total.text_layout_runs_pure_non_ascii +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_pure_non_ascii);
+    total.text_layout_runs_plain_unclipped +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_plain_unclipped);
+    total.text_layout_runs_plain_unclipped_ascii_font +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_plain_unclipped_ascii_font);
+    total.text_layout_runs_all_space_plain_unclipped +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_all_space_plain_unclipped);
+    total.text_layout_runs_printable_ascii_plain_unclipped +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii_plain_unclipped);
+    total.text_layout_runs_non_ascii_plain_unclipped +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_non_ascii_plain_unclipped);
+    total.text_layout_runs_mixed_ascii_non_ascii_plain_unclipped +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_mixed_ascii_non_ascii_plain_unclipped);
+    total.text_layout_runs_pure_non_ascii_plain_unclipped +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_pure_non_ascii_plain_unclipped);
+    total.text_layout_runs_fast_space_candidate +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_fast_space_candidate);
+    total.text_layout_runs_fast_ascii_candidate +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_candidate);
+    total.text_layout_runs_fast_ascii_no_space_candidate +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_no_space_candidate);
+    total.text_layout_runs_fast_ascii_single_candidate +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_single_candidate);
+    total.text_layout_runs_fast_ascii_multi_candidate +=
+        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_multi_candidate);
+    total.text_layout_code_units += stats.text_layout_code_units;
+    total.text_layout_space_code_units += stats.text_layout_space_code_units;
+    total.text_layout_printable_ascii_code_units +=
+        stats.text_layout_printable_ascii_code_units;
+    total.text_layout_other_ascii_code_units += stats.text_layout_other_ascii_code_units;
+    total.text_layout_non_ascii_code_units   += stats.text_layout_non_ascii_code_units;
+    total.text_layout_plain_unclipped_code_units +=
+        stats.text_layout_plain_unclipped_code_units;
+    total.text_layout_all_space_plain_unclipped_code_units +=
+        stats.text_layout_all_space_plain_unclipped_code_units;
+    total.text_layout_printable_ascii_plain_unclipped_code_units +=
+        stats.text_layout_printable_ascii_plain_unclipped_code_units;
+    total.text_layout_non_ascii_plain_unclipped_code_units +=
+        stats.text_layout_non_ascii_plain_unclipped_code_units;
+    total.text_layout_fast_space_candidate_code_units +=
+        stats.text_layout_fast_space_candidate_code_units;
+    total.text_layout_fast_ascii_candidate_code_units +=
+        stats.text_layout_fast_ascii_candidate_code_units;
     total.qsg_nodes_created    += static_cast<std::uint64_t>(stats.qsg_nodes_created);
     total.qsg_nodes_replaced   += static_cast<std::uint64_t>(stats.qsg_nodes_replaced);
     total.qsg_nodes_destroyed  += static_cast<std::uint64_t>(stats.qsg_nodes_destroyed);
