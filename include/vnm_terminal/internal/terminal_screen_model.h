@@ -258,6 +258,8 @@ struct Terminal_screen_model_profile_stats
     std::uint64_t              render_snapshots_constructed             = 0U;
     std::uint64_t              render_snapshot_rows_visited             = 0U;
     std::uint64_t              render_snapshot_rows_materialized        = 0U;
+    std::uint64_t              render_snapshot_rows_borrowed            = 0U;
+    std::uint64_t              render_snapshot_rows_owned               = 0U;
     std::uint64_t              render_snapshot_cells_scanned            = 0U;
     std::uint64_t              render_snapshot_cells_emitted            = 0U;
     std::uint64_t              render_snapshot_dirty_rows_requested     = 0U;
@@ -464,6 +466,19 @@ private:
     struct viewport_row_t
     {
         int value = 0;
+    };
+
+    struct Viewport_row_cells
+    {
+        const std::vector<Cell>* borrowed_cells = nullptr;
+        std::vector<Cell>        owned_cells;
+
+        const std::vector<Cell>& cells() const
+        {
+            return borrowed_cells != nullptr ? *borrowed_cells : owned_cells;
+        }
+
+        bool materialized() const { return borrowed_cells == nullptr; }
     };
 
     struct retained_lookup_cache_entry_t
@@ -986,7 +1001,7 @@ private:
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
 
-    std::optional<std::vector<Cell>> viewport_row_cells(
+    std::optional<Viewport_row_cells> viewport_row_cells(
         const Terminal_viewport_state& viewport,
         int                            viewport_row) const;
 
