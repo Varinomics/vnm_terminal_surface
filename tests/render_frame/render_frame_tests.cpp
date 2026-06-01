@@ -1104,6 +1104,46 @@ bool test_simple_content_classifier_and_stats()
     return ok;
 }
 
+bool test_frame_stats_count_distinct_rows_and_styles_by_identity()
+{
+    bool ok = true;
+
+    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 4});
+    snapshot.styles.push_back(term::make_default_terminal_text_style());
+    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
+    snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("B")});
+    snapshot.cells.push_back({
+        .position = {1, 0},
+        .text     = QStringLiteral("C"),
+        .style_id = 1U,
+    });
+    snapshot.cells.push_back({.position = {2, 0}, .text = QStringLiteral("D")});
+
+    const term::Terminal_render_frame frame = build(snapshot);
+    ok &= check(frame.stats.text_distinct_styles == 2 &&
+        frame.stats.text_style_changes == 2,
+        "frame stats count distinct styles by identity, not transitions");
+    ok &= check(frame.stats.simple_content.rows_with_eligible_cells == 3 &&
+        frame.stats.simple_content.styles_with_eligible_cells == 2,
+        "simple-content stats count each eligible row and style once");
+
+    term::Terminal_render_snapshot empty_styles_snapshot = empty_snapshot({1, 2});
+    empty_styles_snapshot.styles.clear();
+    empty_styles_snapshot.cells.push_back({
+        .position = {0, 0},
+        .text     = QStringLiteral("A"),
+    });
+
+    const term::Terminal_render_frame empty_styles_frame = build(empty_styles_snapshot);
+    ok &= check(empty_styles_frame.stats.text_distinct_styles == 0 &&
+        empty_styles_frame.stats.simple_content.eligible_cells == 0 &&
+        empty_styles_frame.stats.simple_content.rows_with_eligible_cells == 0 &&
+        empty_styles_frame.stats.simple_content.styles_with_eligible_cells == 0,
+        "frame stats keep empty-style snapshots away from byte-flag indexing");
+
+    return ok;
+}
+
 bool test_classify_terminal_simple_content_cell_unicode_property()
 {
     bool ok = true;
@@ -2454,6 +2494,7 @@ int main()
     ok &= test_preedit_override_takes_precedence_over_snapshot();
     ok &= test_frame_stats_classify_rendered_cells();
     ok &= test_simple_content_classifier_and_stats();
+    ok &= test_frame_stats_count_distinct_rows_and_styles_by_identity();
     ok &= test_classify_terminal_simple_content_cell_unicode_property();
     ok &= test_fragmented_dirty_ranges_drive_simple_content_membership();
     ok &= test_cell_pass_and_packed_pass_classification_agree();
