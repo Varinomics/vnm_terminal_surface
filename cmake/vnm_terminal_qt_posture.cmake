@@ -12,6 +12,14 @@ function(vnm_terminal_allowed_qt_targets out_var)
         PARENT_SCOPE)
 endfunction()
 
+function(vnm_terminal_allowed_qt_link_targets out_var)
+    vnm_terminal_allowed_qt_targets(public_qt_targets)
+    set(${out_var}
+        ${public_qt_targets}
+        Qt6::QuickPrivate
+        PARENT_SCOPE)
+endfunction()
+
 function(vnm_terminal_validate_qt_target target)
     vnm_terminal_allowed_qt_targets(allowed_qt_targets)
 
@@ -31,6 +39,27 @@ function(vnm_terminal_validate_qt_target target)
     if(NOT target IN_LIST allowed_qt_targets)
         message(FATAL_ERROR
             "Qt target ${target} is outside the Qt module allowlist")
+    endif()
+endfunction()
+
+function(vnm_terminal_validate_qt_link_target target)
+    vnm_terminal_allowed_qt_link_targets(allowed_qt_targets)
+    set(normalized_target "${target}")
+
+    if(target MATCHES "^\\$<LINK_ONLY:(Qt6::[A-Za-z0-9_]+)>$")
+        set(normalized_target "${CMAKE_MATCH_1}")
+    elseif(target MATCHES "\\$<.*Qt6::")
+        message(FATAL_ERROR
+            "Qt generator expression ${target} is outside the Qt module allowlist")
+    endif()
+
+    if(NOT normalized_target MATCHES "^Qt6::")
+        return()
+    endif()
+
+    if(NOT normalized_target IN_LIST allowed_qt_targets)
+        message(FATAL_ERROR
+            "Qt target ${normalized_target} is outside the Qt module allowlist")
     endif()
 endfunction()
 
@@ -97,7 +126,7 @@ function(vnm_terminal_validate_qt_link_interface target)
         endif()
 
         foreach(linked_library IN LISTS linked_libraries)
-            vnm_terminal_validate_qt_target(${linked_library})
+            vnm_terminal_validate_qt_link_target(${linked_library})
         endforeach()
     endforeach()
 endfunction()

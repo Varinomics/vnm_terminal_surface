@@ -215,6 +215,27 @@ struct renderer_totals_t
     qint64                 route_graphic_geometry_cells                         = 0;
     qint64                 route_fallback_cells                                 = 0;
     qint64                 qt_text_layout_calls                                 = 0;
+    qint64                 text_ascii_replacement_runs_screened                = 0;
+    qint64                 text_ascii_replacement_runs_eligible                = 0;
+    qint64                 text_ascii_replacement_runs_attempted                = 0;
+    qint64                 text_ascii_replacement_runs_succeeded                = 0;
+    qint64                 text_ascii_replacement_runs_all_space_succeeded      = 0;
+    qint64                 text_ascii_replacement_runs_fallback                 = 0;
+    qint64                 text_ascii_replacement_runs_rejected_clipped         = 0;
+    qint64                 text_ascii_replacement_runs_rejected_force_blended_order = 0;
+    qint64                 text_ascii_replacement_runs_rejected_decoration      = 0;
+    qint64                 text_ascii_replacement_runs_rejected_hyperlink       = 0;
+    qint64                 text_ascii_replacement_runs_rejected_non_printable_ascii = 0;
+    qint64                 text_ascii_replacement_runs_rejected_non_ascii       = 0;
+    qint64                 text_ascii_replacement_runs_rejected_geometry        = 0;
+    qint64                 text_ascii_replacement_runs_rejected_unsupported_font = 0;
+    qint64                 text_ascii_replacement_runs_rejected_internal_node   = 0;
+    qint64                 text_ascii_replacement_runs_rejected_glyph_mapping   = 0;
+    std::uint64_t          text_ascii_replacement_code_units_screened           = 0U;
+    std::uint64_t          text_ascii_replacement_code_units_eligible           = 0U;
+    std::uint64_t          text_ascii_replacement_code_units_attempted          = 0U;
+    std::uint64_t          text_ascii_replacement_code_units_succeeded          = 0U;
+    std::uint64_t          text_ascii_replacement_code_units_fallback           = 0U;
     qint64                 qsg_nodes_created                                    = 0;
     qint64                 qsg_nodes_replaced                                   = 0;
     qint64                 qsg_nodes_destroyed                                  = 0;
@@ -2034,6 +2055,48 @@ void add_renderer_stats(
     totals.route_graphic_geometry_cells   += stats.route_graphic_geometry_cells;
     totals.route_fallback_cells           += stats.route_fallback_cells;
     totals.qt_text_layout_calls           += stats.qt_text_layout_calls;
+    totals.text_ascii_replacement_runs_screened +=
+        stats.text_ascii_replacement_runs_screened;
+    totals.text_ascii_replacement_runs_eligible +=
+        stats.text_ascii_replacement_runs_eligible;
+    totals.text_ascii_replacement_runs_attempted +=
+        stats.text_ascii_replacement_runs_attempted;
+    totals.text_ascii_replacement_runs_succeeded +=
+        stats.text_ascii_replacement_runs_succeeded;
+    totals.text_ascii_replacement_runs_all_space_succeeded +=
+        stats.text_ascii_replacement_runs_all_space_succeeded;
+    totals.text_ascii_replacement_runs_fallback +=
+        stats.text_ascii_replacement_runs_fallback;
+    totals.text_ascii_replacement_runs_rejected_clipped +=
+        stats.text_ascii_replacement_runs_rejected_clipped;
+    totals.text_ascii_replacement_runs_rejected_force_blended_order +=
+        stats.text_ascii_replacement_runs_rejected_force_blended_order;
+    totals.text_ascii_replacement_runs_rejected_decoration +=
+        stats.text_ascii_replacement_runs_rejected_decoration;
+    totals.text_ascii_replacement_runs_rejected_hyperlink +=
+        stats.text_ascii_replacement_runs_rejected_hyperlink;
+    totals.text_ascii_replacement_runs_rejected_non_printable_ascii +=
+        stats.text_ascii_replacement_runs_rejected_non_printable_ascii;
+    totals.text_ascii_replacement_runs_rejected_non_ascii +=
+        stats.text_ascii_replacement_runs_rejected_non_ascii;
+    totals.text_ascii_replacement_runs_rejected_geometry +=
+        stats.text_ascii_replacement_runs_rejected_geometry;
+    totals.text_ascii_replacement_runs_rejected_unsupported_font +=
+        stats.text_ascii_replacement_runs_rejected_unsupported_font;
+    totals.text_ascii_replacement_runs_rejected_internal_node +=
+        stats.text_ascii_replacement_runs_rejected_internal_node;
+    totals.text_ascii_replacement_runs_rejected_glyph_mapping +=
+        stats.text_ascii_replacement_runs_rejected_glyph_mapping;
+    totals.text_ascii_replacement_code_units_screened +=
+        stats.text_ascii_replacement_code_units_screened;
+    totals.text_ascii_replacement_code_units_eligible +=
+        stats.text_ascii_replacement_code_units_eligible;
+    totals.text_ascii_replacement_code_units_attempted +=
+        stats.text_ascii_replacement_code_units_attempted;
+    totals.text_ascii_replacement_code_units_succeeded +=
+        stats.text_ascii_replacement_code_units_succeeded;
+    totals.text_ascii_replacement_code_units_fallback +=
+        stats.text_ascii_replacement_code_units_fallback;
     totals.qsg_nodes_created              += stats.qsg_nodes_created;
     totals.qsg_nodes_replaced             += stats.qsg_nodes_replaced;
     totals.qsg_nodes_destroyed            += stats.qsg_nodes_destroyed;
@@ -2556,6 +2619,48 @@ void add_renderer_stats(
     totals.route_graphic_geometry_cells   += stats.route_graphic_geometry_cells;
     totals.route_fallback_cells           += stats.route_fallback_cells;
     totals.qt_text_layout_calls           += stats.qt_text_layout_calls;
+    totals.text_ascii_replacement_runs_screened +=
+        stats.text_ascii_replacement_runs_screened;
+    totals.text_ascii_replacement_runs_eligible +=
+        stats.text_ascii_replacement_runs_eligible;
+    totals.text_ascii_replacement_runs_attempted +=
+        stats.text_ascii_replacement_runs_attempted;
+    totals.text_ascii_replacement_runs_succeeded +=
+        stats.text_ascii_replacement_runs_succeeded;
+    totals.text_ascii_replacement_runs_all_space_succeeded +=
+        stats.text_ascii_replacement_runs_all_space_succeeded;
+    totals.text_ascii_replacement_runs_fallback +=
+        stats.text_ascii_replacement_runs_fallback;
+    totals.text_ascii_replacement_runs_rejected_clipped +=
+        stats.text_ascii_replacement_runs_rejected_clipped;
+    totals.text_ascii_replacement_runs_rejected_force_blended_order +=
+        stats.text_ascii_replacement_runs_rejected_force_blended_order;
+    totals.text_ascii_replacement_runs_rejected_decoration +=
+        stats.text_ascii_replacement_runs_rejected_decoration;
+    totals.text_ascii_replacement_runs_rejected_hyperlink +=
+        stats.text_ascii_replacement_runs_rejected_hyperlink;
+    totals.text_ascii_replacement_runs_rejected_non_printable_ascii +=
+        stats.text_ascii_replacement_runs_rejected_non_printable_ascii;
+    totals.text_ascii_replacement_runs_rejected_non_ascii +=
+        stats.text_ascii_replacement_runs_rejected_non_ascii;
+    totals.text_ascii_replacement_runs_rejected_geometry +=
+        stats.text_ascii_replacement_runs_rejected_geometry;
+    totals.text_ascii_replacement_runs_rejected_unsupported_font +=
+        stats.text_ascii_replacement_runs_rejected_unsupported_font;
+    totals.text_ascii_replacement_runs_rejected_internal_node +=
+        stats.text_ascii_replacement_runs_rejected_internal_node;
+    totals.text_ascii_replacement_runs_rejected_glyph_mapping +=
+        stats.text_ascii_replacement_runs_rejected_glyph_mapping;
+    totals.text_ascii_replacement_code_units_screened +=
+        stats.text_ascii_replacement_code_units_screened;
+    totals.text_ascii_replacement_code_units_eligible +=
+        stats.text_ascii_replacement_code_units_eligible;
+    totals.text_ascii_replacement_code_units_attempted +=
+        stats.text_ascii_replacement_code_units_attempted;
+    totals.text_ascii_replacement_code_units_succeeded +=
+        stats.text_ascii_replacement_code_units_succeeded;
+    totals.text_ascii_replacement_code_units_fallback +=
+        stats.text_ascii_replacement_code_units_fallback;
     totals.qsg_nodes_created              += stats.qsg_nodes_created;
     totals.qsg_nodes_replaced             += stats.qsg_nodes_replaced;
     totals.qsg_nodes_destroyed            += stats.qsg_nodes_destroyed;
@@ -4325,6 +4430,69 @@ QJsonObject scenario_json(const Scenario_result& result)
         QStringLiteral("qt_text_layout_calls"),
         result.renderer_totals.qt_text_layout_calls);
     object.insert(
+        QStringLiteral("text_ascii_replacement_runs_screened"),
+        result.renderer_totals.text_ascii_replacement_runs_screened);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_eligible"),
+        result.renderer_totals.text_ascii_replacement_runs_eligible);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_attempted"),
+        result.renderer_totals.text_ascii_replacement_runs_attempted);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_succeeded"),
+        result.renderer_totals.text_ascii_replacement_runs_succeeded);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_all_space_succeeded"),
+        result.renderer_totals.text_ascii_replacement_runs_all_space_succeeded);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_fallback"),
+        result.renderer_totals.text_ascii_replacement_runs_fallback);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_rejected_clipped"),
+        result.renderer_totals.text_ascii_replacement_runs_rejected_clipped);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_rejected_force_blended_order"),
+        result.renderer_totals.text_ascii_replacement_runs_rejected_force_blended_order);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_rejected_decoration"),
+        result.renderer_totals.text_ascii_replacement_runs_rejected_decoration);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_rejected_hyperlink"),
+        result.renderer_totals.text_ascii_replacement_runs_rejected_hyperlink);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_rejected_non_printable_ascii"),
+        result.renderer_totals.text_ascii_replacement_runs_rejected_non_printable_ascii);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_rejected_non_ascii"),
+        result.renderer_totals.text_ascii_replacement_runs_rejected_non_ascii);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_rejected_geometry"),
+        result.renderer_totals.text_ascii_replacement_runs_rejected_geometry);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_rejected_unsupported_font"),
+        result.renderer_totals.text_ascii_replacement_runs_rejected_unsupported_font);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_rejected_internal_node"),
+        result.renderer_totals.text_ascii_replacement_runs_rejected_internal_node);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_runs_rejected_glyph_mapping"),
+        result.renderer_totals.text_ascii_replacement_runs_rejected_glyph_mapping);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_code_units_screened"),
+        static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_screened));
+    object.insert(
+        QStringLiteral("text_ascii_replacement_code_units_eligible"),
+        static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_eligible));
+    object.insert(
+        QStringLiteral("text_ascii_replacement_code_units_attempted"),
+        static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_attempted));
+    object.insert(
+        QStringLiteral("text_ascii_replacement_code_units_succeeded"),
+        static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_succeeded));
+    object.insert(
+        QStringLiteral("text_ascii_replacement_code_units_fallback"),
+        static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_fallback));
+    object.insert(
         QStringLiteral("qsg_nodes_created"),
         result.renderer_totals.qsg_nodes_created);
     object.insert(
@@ -4941,6 +5109,27 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
         QStringLiteral("route_graphic_geometry_cells"),
         QStringLiteral("route_fallback_cells"),
         QStringLiteral("qt_text_layout_calls"),
+        QStringLiteral("text_ascii_replacement_runs_screened"),
+        QStringLiteral("text_ascii_replacement_runs_eligible"),
+        QStringLiteral("text_ascii_replacement_runs_attempted"),
+        QStringLiteral("text_ascii_replacement_runs_succeeded"),
+        QStringLiteral("text_ascii_replacement_runs_all_space_succeeded"),
+        QStringLiteral("text_ascii_replacement_runs_fallback"),
+        QStringLiteral("text_ascii_replacement_runs_rejected_clipped"),
+        QStringLiteral("text_ascii_replacement_runs_rejected_force_blended_order"),
+        QStringLiteral("text_ascii_replacement_runs_rejected_decoration"),
+        QStringLiteral("text_ascii_replacement_runs_rejected_hyperlink"),
+        QStringLiteral("text_ascii_replacement_runs_rejected_non_printable_ascii"),
+        QStringLiteral("text_ascii_replacement_runs_rejected_non_ascii"),
+        QStringLiteral("text_ascii_replacement_runs_rejected_geometry"),
+        QStringLiteral("text_ascii_replacement_runs_rejected_unsupported_font"),
+        QStringLiteral("text_ascii_replacement_runs_rejected_internal_node"),
+        QStringLiteral("text_ascii_replacement_runs_rejected_glyph_mapping"),
+        QStringLiteral("text_ascii_replacement_code_units_screened"),
+        QStringLiteral("text_ascii_replacement_code_units_eligible"),
+        QStringLiteral("text_ascii_replacement_code_units_attempted"),
+        QStringLiteral("text_ascii_replacement_code_units_succeeded"),
+        QStringLiteral("text_ascii_replacement_code_units_fallback"),
         QStringLiteral("qsg_nodes_created"),
         QStringLiteral("qsg_nodes_replaced"),
         QStringLiteral("qsg_nodes_destroyed"),
@@ -5122,6 +5311,25 @@ bool validate_renderer_counter_invariants(
             json_counter(object, QStringLiteral("route_qt_text_layout_runs")))
     {
         *out_error = QStringLiteral("renderer route counters are inconsistent");
+        return false;
+    }
+
+    const qint64 ascii_replacement_screened =
+        json_counter(object, QStringLiteral("text_ascii_replacement_runs_screened"));
+    const qint64 ascii_replacement_eligible =
+        json_counter(object, QStringLiteral("text_ascii_replacement_runs_eligible"));
+    const qint64 ascii_replacement_attempted =
+        json_counter(object, QStringLiteral("text_ascii_replacement_runs_attempted"));
+    const qint64 ascii_replacement_succeeded =
+        json_counter(object, QStringLiteral("text_ascii_replacement_runs_succeeded"));
+    const qint64 ascii_replacement_fallback =
+        json_counter(object, QStringLiteral("text_ascii_replacement_runs_fallback"));
+    if (ascii_replacement_screened != ascii_replacement_succeeded + ascii_replacement_fallback ||
+        ascii_replacement_eligible > ascii_replacement_screened                                ||
+        ascii_replacement_attempted > ascii_replacement_eligible                               ||
+        ascii_replacement_succeeded > ascii_replacement_attempted)
+    {
+        *out_error = QStringLiteral("ASCII replacement route counters are inconsistent");
         return false;
     }
 

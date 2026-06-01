@@ -39,7 +39,7 @@ if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_ENABLE_PROFILING)
     set(VNM_TERMINAL_ENABLE_PROFILING ON)
 endif()
 
-find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Quick)
+find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Quick QuickPrivate)
 include(cmake/vnm_terminal_qt_posture.cmake)
 
 set(vnm_terminal_qt_targets
@@ -143,6 +143,10 @@ target_include_directories(vnm_terminal_surface PUBLIC
 
 target_link_libraries(vnm_terminal_surface PUBLIC
     ${vnm_terminal_qt_targets}
+)
+
+target_link_libraries(vnm_terminal_surface PRIVATE
+    Qt6::QuickPrivate
 )
 
 target_compile_definitions(vnm_terminal_surface PUBLIC
