@@ -129,11 +129,14 @@ struct terminal_renderer_stats_t
     int            text_layout_runs_fast_ascii_no_space_candidate       = 0;
     int            text_layout_runs_fast_ascii_single_candidate         = 0;
     int            text_layout_runs_fast_ascii_multi_candidate          = 0;
-    // Replacement counters use screened as the broad denominator and eligible
-    // after all correctness gates pass.
+    // Replacement counters use screened as the broad denominator, eligible
+    // after correctness gates, and attempted for appender handoff.
     int            text_ascii_replacement_runs_screened                = 0;
     int            text_ascii_replacement_runs_eligible                = 0;
     int            text_ascii_replacement_runs_attempted                = 0;
+    // Runs that entered the trusted branch after upstream correctness gates.
+    // Glyph mapping or scene graph submission can still fall back.
+    int            text_ascii_replacement_runs_trusted_fast_path        = 0;
     int            text_ascii_replacement_runs_succeeded                = 0;
     int            text_ascii_replacement_runs_all_space_succeeded      = 0;
     int            text_ascii_replacement_runs_fallback                 = 0;
@@ -161,6 +164,7 @@ struct terminal_renderer_stats_t
     std::uint64_t  text_ascii_replacement_code_units_screened           = 0U;
     std::uint64_t  text_ascii_replacement_code_units_eligible           = 0U;
     std::uint64_t  text_ascii_replacement_code_units_attempted          = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_trusted_fast_path  = 0U;
     std::uint64_t  text_ascii_replacement_code_units_succeeded          = 0U;
     std::uint64_t  text_ascii_replacement_code_units_fallback           = 0U;
     int            qsg_nodes_created                                    = 0;
@@ -313,11 +317,14 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_layout_runs_fast_ascii_no_space_candidate       = 0U;
     std::uint64_t  text_layout_runs_fast_ascii_single_candidate         = 0U;
     std::uint64_t  text_layout_runs_fast_ascii_multi_candidate          = 0U;
-    // Replacement counters use screened as the broad denominator and eligible
-    // after all correctness gates pass.
+    // Replacement counters use screened as the broad denominator, eligible
+    // after correctness gates, and attempted for appender handoff.
     std::uint64_t  text_ascii_replacement_runs_screened                = 0U;
     std::uint64_t  text_ascii_replacement_runs_eligible                = 0U;
     std::uint64_t  text_ascii_replacement_runs_attempted                = 0U;
+    // Runs that entered the trusted branch after upstream correctness gates.
+    // Glyph mapping or scene graph submission can still fall back.
+    std::uint64_t  text_ascii_replacement_runs_trusted_fast_path        = 0U;
     std::uint64_t  text_ascii_replacement_runs_succeeded                = 0U;
     std::uint64_t  text_ascii_replacement_runs_all_space_succeeded      = 0U;
     std::uint64_t  text_ascii_replacement_runs_fallback                 = 0U;
@@ -345,6 +352,7 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_ascii_replacement_code_units_screened           = 0U;
     std::uint64_t  text_ascii_replacement_code_units_eligible           = 0U;
     std::uint64_t  text_ascii_replacement_code_units_attempted          = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_trusted_fast_path  = 0U;
     std::uint64_t  text_ascii_replacement_code_units_succeeded          = 0U;
     std::uint64_t  text_ascii_replacement_code_units_fallback           = 0U;
     std::uint64_t  qsg_nodes_created                                    = 0U;
