@@ -3333,13 +3333,18 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     const term::terminal_renderer_stats_t stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     if (profile_scopes_available()) {
-        ok &= check(prepare_text_layout_call_count(surface) == 1U,
-            "dense same-color row coalesces to one prepare_text_layout call");
+        ok &= check(prepare_text_layout_call_count(surface) == 0U,
+            "dense same-color row bypasses prepare_text_layout through ASCII replacement");
         ok &= check(ascii_text_coalescing_context_call_count(surface) == 1U,
             "dense same-color row computes the ASCII coalescing font gate once");
         ok &= check(row_local_text_runs_call_count(surface) == 0U,
             "dense same-color row fuses row-localization into ASCII coalescing");
     }
+    ok &= check(stats.qt_text_layout_calls == 0 &&
+        stats.text_ascii_replacement_runs_eligible == 1 &&
+        stats.text_ascii_replacement_runs_succeeded == 1 &&
+        stats.text_ascii_replacement_runs_fallback == 0,
+        "dense same-color row renders through the ASCII replacement path");
     ok &= check(stats.text_resource_runs_before_coalescing == 20 &&
         stats.text_resource_runs_after_coalescing == 1,
         "dense same-color row preserves text resource coalescing counters");
@@ -3372,11 +3377,18 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         1),
         "style boundary row renders as one rebuilt text resource row");
     if (profile_scopes_available()) {
-        ok &= check(prepare_text_layout_call_count(surface) == 3U,
-            "style boundary row does not coalesce across foreground changes");
+        ok &= check(prepare_text_layout_call_count(surface) == 0U,
+            "style boundary row bypasses prepare_text_layout for each foreground run");
         ok &= check(ascii_text_coalescing_context_call_count(surface) <= 1U,
             "style boundary row computes or reuses the ASCII coalescing font gate");
     }
+    const term::terminal_renderer_stats_t style_stats =
+        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+    ok &= check(style_stats.qt_text_layout_calls == 0 &&
+        style_stats.text_ascii_replacement_runs_eligible == 3 &&
+        style_stats.text_ascii_replacement_runs_succeeded == 3 &&
+        style_stats.text_ascii_replacement_runs_fallback == 0,
+        "style boundary row keeps foreground boundaries while replacing all ASCII runs");
     const QImage style_image = window.grabWindow();
     ok &= check(!style_image.isNull() &&
         cell_is_nonblank(style_image, 0, 0, metrics) &&
@@ -3396,8 +3408,8 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         1),
         "same-foreground style boundary row renders as one rebuilt text resource row");
     if (profile_scopes_available()) {
-        ok &= check(prepare_text_layout_call_count(surface) == 1U,
-            "same-foreground style boundary row coalesces across non-text style changes");
+        ok &= check(prepare_text_layout_call_count(surface) == 0U,
+            "same-foreground style boundary row bypasses prepare_text_layout after coalescing");
         ok &= check(ascii_text_coalescing_context_call_count(surface) <= 1U,
             "same-foreground style boundary row computes or reuses the ASCII coalescing font gate");
     }
@@ -3406,6 +3418,10 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     ok &= check(same_foreground_stats.background_layer_rebuilt &&
         same_foreground_stats.decoration_layer_rebuilt,
         "same-foreground style boundary still updates background and decoration layers");
+    ok &= check(same_foreground_stats.qt_text_layout_calls == 0 &&
+        same_foreground_stats.text_ascii_replacement_runs_eligible == 1 &&
+        same_foreground_stats.text_ascii_replacement_runs_succeeded == 1,
+        "same-foreground style boundary replaces the coalesced ASCII text run");
     const QImage same_foreground_image = window.grabWindow();
     ok &= check(!same_foreground_image.isNull() &&
         cell_is_nonblank(same_foreground_image, 0, 0, metrics) &&
@@ -3534,11 +3550,17 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         1),
         "wide boundary row renders as one rebuilt text resource row");
     if (profile_scopes_available()) {
-        ok &= check(prepare_text_layout_call_count(surface) == 3U,
-            "wide boundary row leaves non-ASCII wide text off the coalesced ASCII path");
+        ok &= check(prepare_text_layout_call_count(surface) == 1U,
+            "wide boundary row sends only the non-ASCII wide text through prepare_text_layout");
         ok &= check(ascii_text_coalescing_context_call_count(surface) <= 1U,
             "wide boundary row computes or reuses the ASCII coalescing font gate");
     }
+    const term::terminal_renderer_stats_t wide_stats =
+        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+    ok &= check(wide_stats.qt_text_layout_calls == 1 &&
+        wide_stats.text_ascii_replacement_runs_succeeded == 2 &&
+        wide_stats.text_ascii_replacement_runs_rejected_non_ascii == 1,
+        "wide boundary row replaces ASCII runs and falls back for the wide run");
     const QImage wide_image = window.grabWindow();
     ok &= check(!wide_image.isNull() &&
         cell_is_nonblank(wide_image, 0, 0, metrics) &&
@@ -3560,11 +3582,16 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         "long dense row renders as one rebuilt text resource row");
     if (profile_scopes_available()) {
         const std::uint64_t long_prepare_calls = prepare_text_layout_call_count(surface);
-        ok &= check(long_prepare_calls == 2U,
-            "long dense row coalesces into two bounded text layout chunks");
+        ok &= check(long_prepare_calls == 0U,
+            "long dense row replaces both bounded ASCII chunks without QTextLayout");
         ok &= check(ascii_text_coalescing_context_call_count(surface) <= 1U,
             "long dense row computes or reuses the ASCII coalescing font gate");
     }
+    const term::terminal_renderer_stats_t long_stats =
+        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+    ok &= check(long_stats.qt_text_layout_calls == 0 &&
+        long_stats.text_ascii_replacement_runs_succeeded == 2,
+        "long dense row uses replacement for both bounded chunks");
     const QImage long_image = window.grabWindow();
     ok &= check(!long_image.isNull() &&
         cell_is_nonblank(long_image, 0, 0, metrics) &&
@@ -3583,13 +3610,18 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         3),
         "multi-row dense render rebuilds every dense text resource row");
     if (profile_scopes_available()) {
-        ok &= check(prepare_text_layout_call_count(surface) == 3U,
-            "multi-row dense render coalesces each row to one text layout");
+        ok &= check(prepare_text_layout_call_count(surface) == 0U,
+            "multi-row dense render replaces each coalesced row without QTextLayout");
         ok &= check(ascii_text_coalescing_context_call_count(surface) <= 1U,
             "multi-row dense render computes or reuses the ASCII coalescing font gate");
         ok &= check(row_local_text_runs_call_count(surface) == 0U,
             "multi-row dense render keeps every row on the fused ASCII coalescing path");
     }
+    const term::terminal_renderer_stats_t multirow_stats =
+        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+    ok &= check(multirow_stats.qt_text_layout_calls == 0 &&
+        multirow_stats.text_ascii_replacement_runs_succeeded == 3,
+        "multi-row dense render replaces every coalesced ASCII row");
 
     render_profiler->reset();
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
@@ -3603,13 +3635,18 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         1),
         "single-cell row renders as one rebuilt text resource row");
     if (profile_scopes_available()) {
-        ok &= check(prepare_text_layout_call_count(surface) == 1U,
-            "single-cell row keeps one prepare_text_layout call");
-        ok &= check(ascii_text_coalescing_context_call_count(surface) == 0U,
-            "single-cell row skips the ASCII coalescing font gate");
-        ok &= check(row_local_text_runs_call_count(surface) == 1U,
-            "single-cell row falls back to row-local materialization");
+        ok &= check(prepare_text_layout_call_count(surface) == 0U,
+            "single-cell row bypasses prepare_text_layout through ASCII replacement");
+        ok &= check(ascii_text_coalescing_context_call_count(surface) <= 1U,
+            "single-cell row computes or reuses the ASCII replacement font gate");
+        ok &= check(row_local_text_runs_call_count(surface) == 0U,
+            "single-cell row stays on the ASCII replacement materialization path");
     }
+    const term::terminal_renderer_stats_t single_cell_stats =
+        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+    ok &= check(single_cell_stats.qt_text_layout_calls == 0 &&
+        single_cell_stats.text_ascii_replacement_runs_succeeded == 1,
+        "single-cell row uses the broad ASCII replacement path");
     return ok;
 }
 
@@ -3962,7 +3999,7 @@ bool test_qsg_text_coalescing_rejects_cell_width_drift(QGuiApplication& app)
     return ok;
 }
 
-bool test_qsg_text_resource_key_separates_coalesced_ascii_from_original_runs(
+bool test_qsg_text_resource_key_unifies_coalesced_ascii_with_original_runs(
     QGuiApplication& app)
 {
     bool ok = true;
@@ -4009,9 +4046,12 @@ bool test_qsg_text_resource_key_separates_coalesced_ascii_from_original_runs(
         "coalesced/original key test builds the initial coalesced text resource");
     if (profile_scopes_available()) {
         ok &= check(
-            profile_call_count(first_profiler.root_snapshot(), "prepare_text_layout") == 1U,
-            "coalesced/original key test builds the initial row as one coalesced layout");
+            profile_call_count(first_profiler.root_snapshot(), "prepare_text_layout") == 0U,
+            "coalesced/original key test builds the initial row with ASCII replacement");
     }
+    ok &= check(first_stats.text_ascii_replacement_runs_succeeded == 1 &&
+        first_stats.qt_text_layout_calls == 0,
+        "coalesced/original key test replaces the initial coalesced run");
 
     term::terminal_renderer_stats_t second_stats;
     node  = renderer.update_node(
@@ -4025,9 +4065,10 @@ bool test_qsg_text_resource_key_separates_coalesced_ascii_from_original_runs(
     ok   &= check(node != nullptr, "coalesced/original key test keeps the node alive");
     ok   &= check(second_stats.paint_completed &&
         second_stats.text_content_failures == 0 &&
-        second_stats.text_content_rebuilds == 1 &&
-        second_stats.text_content_reused == 0,
-        "original multi-character ASCII run does not alias a coalesced ASCII resource key");
+        second_stats.text_content_rebuilds == 0 &&
+        second_stats.text_content_reused == 1 &&
+        second_stats.text_resource_descriptor_reuses == 1,
+        "original multi-character ASCII run reuses the equivalent replacement descriptor");
 
     term::terminal_renderer_stats_t cleanup_stats;
     renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
@@ -4090,30 +4131,26 @@ bool test_ascii_coalescing_context_enable_disable_descriptor_identity(
     term::terminal_renderer_stats_t disabled_stats;
     ok &= check(update(original_frame, disabled_stats),
         "ASCII coalescing original-route transition renders");
-    ok &= check(disabled_stats.text_content_rebuilds == 1 &&
-        disabled_stats.text_cache_entries_replaced == 1 &&
-        disabled_stats.text_content_reused == 0 &&
-        disabled_stats.text_resource_descriptor_reuses == 0 &&
+    ok &= check(disabled_stats.text_content_rebuilds == 0 &&
+        disabled_stats.text_cache_entries_replaced == 0 &&
+        disabled_stats.text_content_reused == 1 &&
+        disabled_stats.text_resource_descriptor_reuses == 1 &&
         disabled_stats.text_key_match_reuses == 0 &&
         disabled_stats.text_coalescing_candidate_groups == 0 &&
-        disabled_stats.text_coalescing_enabled_groups == 0 &&
-        disabled_stats.text_resource_runs_before_coalescing == 1 &&
-        disabled_stats.text_resource_runs_after_coalescing == 1,
-        "original ASCII route rebuilds instead of reusing the coalesced descriptor");
+        disabled_stats.text_coalescing_enabled_groups == 0,
+        "original ASCII route reuses the equivalent replacement descriptor");
 
     term::terminal_renderer_stats_t reenabled_stats;
     ok &= check(update(coalesced_frame, reenabled_stats),
         "ASCII coalescing re-enabled descriptor route transition renders");
-    ok &= check(reenabled_stats.text_content_rebuilds == 1 &&
-        reenabled_stats.text_cache_entries_replaced == 1 &&
-        reenabled_stats.text_content_reused == 0 &&
-        reenabled_stats.text_resource_descriptor_reuses == 0 &&
+    ok &= check(reenabled_stats.text_content_rebuilds == 0 &&
+        reenabled_stats.text_cache_entries_replaced == 0 &&
+        reenabled_stats.text_content_reused == 1 &&
+        reenabled_stats.text_resource_descriptor_reuses == 1 &&
         reenabled_stats.text_key_match_reuses == 0 &&
         reenabled_stats.text_coalescing_candidate_groups == 1 &&
-        reenabled_stats.text_coalescing_enabled_groups == 1 &&
-        reenabled_stats.text_resource_runs_before_coalescing == 2 &&
-        reenabled_stats.text_resource_runs_after_coalescing == 1,
-        "coalesced ASCII route rebuilds instead of reusing the original descriptor");
+        reenabled_stats.text_coalescing_enabled_groups == 1,
+        "coalesced ASCII route reuses the equivalent original replacement descriptor");
 
     term::terminal_renderer_stats_t reuse_stats;
     ok &= check(update(coalesced_frame, reuse_stats),
@@ -8328,9 +8365,10 @@ bool test_qsg_clipped_text_run_transition_clears_pixels(QGuiApplication& app)
     });
     const term::terminal_renderer_stats_t baseline_stats = item.last_stats();
     ok &= check(!baseline_image.isNull() &&
-        baseline_stats.route_qt_text_layout_runs > 0 &&
+        baseline_stats.route_qt_text_layout_runs == 0 &&
+        baseline_stats.text_ascii_replacement_runs_succeeded == 1 &&
         cell_is_nonblank(baseline_image, 0, 2, metrics),
-        "per-run clip transition baseline renders unclipped text into the later cells");
+        "per-run clip transition baseline replaces unclipped ASCII text into the later cells");
 
     const int before_clipped_render_count = item.render_count();
     item.set_frame(make_frame(
@@ -8851,10 +8889,11 @@ bool test_qsg_text_resource_descriptor_dirty_reuse(QGuiApplication& app)
         changed_stats.text_content_reused == 0 &&
         changed_stats.text_resource_descriptor_reuses == 0 &&
         changed_stats.text_cache_entries_replaced == 1 &&
-        changed_stats.qt_text_layout_calls > 0 &&
+        changed_stats.qt_text_layout_calls == 0 &&
+        changed_stats.text_ascii_replacement_runs_succeeded == 1 &&
         changed_stats.text_leaf_nodes_created > 0 &&
         changed_stats.route_fast_text_cells == 0,
-        "changed text resource descriptor row rebuilds instead of stale-reusing");
+        "changed text resource descriptor row rebuilds through ASCII replacement");
 
     term::terminal_renderer_stats_t cleanup_stats;
     renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
@@ -8947,10 +8986,11 @@ bool test_qsg_text_resource_descriptor_styled_ascii_reuse(QGuiApplication& app)
         foreground_stats.text_content_reused == 0 &&
         foreground_stats.text_resource_descriptor_reuses == 0 &&
         foreground_stats.text_cache_entries_replaced == 1 &&
-        foreground_stats.qt_text_layout_calls > 0 &&
+        foreground_stats.qt_text_layout_calls == 0 &&
+        foreground_stats.text_ascii_replacement_runs_succeeded == 2 &&
         foreground_stats.text_leaf_nodes_created > 0 &&
         foreground_stats.route_fast_text_cells == 0,
-        "foreground color change rebuilds the styled text resource row");
+        "foreground color change rebuilds the styled text resource row through ASCII replacement");
 
     term::terminal_renderer_stats_t cleanup_stats;
     renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
@@ -9481,11 +9521,12 @@ bool test_qsg_text_row_slot_viewport_order_and_resize_cleanup(QGuiApplication& a
         scrolled_stats.text_content_reused == 2 &&
         scrolled_stats.text_content_removed == 1 &&
         scrolled_stats.text_resource_descriptor_reuses == 2 &&
-        scrolled_stats.qt_text_layout_calls == 1 &&
+        scrolled_stats.qt_text_layout_calls == 0 &&
+        scrolled_stats.text_ascii_replacement_runs_succeeded == 1 &&
         scrolled_stats.text_leaf_nodes_created == 1 &&
         scrolled_stats.text_key_builds == 2 &&
         scrolled_stats.text_wrapper_order_rebuilt,
-        "one-line text viewport movement descriptor-reuses overlapping logical rows");
+        "one-line text viewport movement descriptor-reuses overlaps and replaces the new row");
     ok &= check(scrolled_tops.size() == 3U &&
         nearly_equal(scrolled_tops[0], 0.0) &&
         nearly_equal(scrolled_tops[1], metrics.height) &&
@@ -11650,7 +11691,7 @@ int main(int argc, char** argv)
     ok &= test_qsg_text_resource_descriptor_ignores_decoration_metadata(app);
     ok &= test_qsg_packed_sidecars_do_not_affect_visual_output(app);
     ok &= test_qsg_text_coalescing_rejects_cell_width_drift(app);
-    ok &= test_qsg_text_resource_key_separates_coalesced_ascii_from_original_runs(app);
+    ok &= test_qsg_text_resource_key_unifies_coalesced_ascii_with_original_runs(app);
     ok &= test_ascii_coalescing_context_enable_disable_descriptor_identity(app);
     ok &= test_qsg_background_selection_row_cache(app);
     ok &= test_qsg_background_row_cache_uses_batched_geometry(app, false);

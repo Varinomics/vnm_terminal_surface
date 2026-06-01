@@ -102,6 +102,7 @@ struct terminal_renderer_stats_t
     int            route_graphic_geometry_cells                         = 0;
     int            route_fallback_cells                                 = 0;
     int            qt_text_layout_calls                                 = 0;
+    // Slow-path QTextLayout counters. ASCII replacement successes bypass these.
     int            text_layout_runs_single_code_unit                    = 0;
     int            text_layout_runs_multi_code_unit                     = 0;
     int            text_layout_runs_all_space                           = 0;
@@ -128,6 +129,24 @@ struct terminal_renderer_stats_t
     int            text_layout_runs_fast_ascii_no_space_candidate       = 0;
     int            text_layout_runs_fast_ascii_single_candidate         = 0;
     int            text_layout_runs_fast_ascii_multi_candidate          = 0;
+    // Replacement counters use screened as the broad denominator and eligible
+    // after all correctness gates pass.
+    int            text_ascii_replacement_runs_screened                = 0;
+    int            text_ascii_replacement_runs_eligible                = 0;
+    int            text_ascii_replacement_runs_attempted                = 0;
+    int            text_ascii_replacement_runs_succeeded                = 0;
+    int            text_ascii_replacement_runs_all_space_succeeded      = 0;
+    int            text_ascii_replacement_runs_fallback                 = 0;
+    int            text_ascii_replacement_runs_rejected_clipped         = 0;
+    int            text_ascii_replacement_runs_rejected_force_blended_order = 0;
+    int            text_ascii_replacement_runs_rejected_decoration      = 0;
+    int            text_ascii_replacement_runs_rejected_hyperlink       = 0;
+    int            text_ascii_replacement_runs_rejected_non_printable_ascii = 0;
+    int            text_ascii_replacement_runs_rejected_non_ascii       = 0;
+    int            text_ascii_replacement_runs_rejected_geometry        = 0;
+    int            text_ascii_replacement_runs_rejected_unsupported_font = 0;
+    int            text_ascii_replacement_runs_rejected_internal_node   = 0;
+    int            text_ascii_replacement_runs_rejected_glyph_mapping   = 0;
     std::uint64_t  text_layout_code_units                               = 0U;
     std::uint64_t  text_layout_space_code_units                         = 0U;
     std::uint64_t  text_layout_printable_ascii_code_units               = 0U;
@@ -139,6 +158,11 @@ struct terminal_renderer_stats_t
     std::uint64_t  text_layout_non_ascii_plain_unclipped_code_units     = 0U;
     std::uint64_t  text_layout_fast_space_candidate_code_units          = 0U;
     std::uint64_t  text_layout_fast_ascii_candidate_code_units          = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_screened           = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_eligible           = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_attempted          = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_succeeded          = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_fallback           = 0U;
     int            qsg_nodes_created                                    = 0;
     int            qsg_nodes_replaced                                   = 0;
     int            qsg_nodes_destroyed                                  = 0;
@@ -262,6 +286,7 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  route_graphic_geometry_cells                         = 0U;
     std::uint64_t  route_fallback_cells                                 = 0U;
     std::uint64_t  qt_text_layout_calls                                 = 0U;
+    // Slow-path QTextLayout counters. ASCII replacement successes bypass these.
     std::uint64_t  text_layout_runs_single_code_unit                    = 0U;
     std::uint64_t  text_layout_runs_multi_code_unit                     = 0U;
     std::uint64_t  text_layout_runs_all_space                           = 0U;
@@ -288,6 +313,24 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_layout_runs_fast_ascii_no_space_candidate       = 0U;
     std::uint64_t  text_layout_runs_fast_ascii_single_candidate         = 0U;
     std::uint64_t  text_layout_runs_fast_ascii_multi_candidate          = 0U;
+    // Replacement counters use screened as the broad denominator and eligible
+    // after all correctness gates pass.
+    std::uint64_t  text_ascii_replacement_runs_screened                = 0U;
+    std::uint64_t  text_ascii_replacement_runs_eligible                = 0U;
+    std::uint64_t  text_ascii_replacement_runs_attempted                = 0U;
+    std::uint64_t  text_ascii_replacement_runs_succeeded                = 0U;
+    std::uint64_t  text_ascii_replacement_runs_all_space_succeeded      = 0U;
+    std::uint64_t  text_ascii_replacement_runs_fallback                 = 0U;
+    std::uint64_t  text_ascii_replacement_runs_rejected_clipped         = 0U;
+    std::uint64_t  text_ascii_replacement_runs_rejected_force_blended_order = 0U;
+    std::uint64_t  text_ascii_replacement_runs_rejected_decoration      = 0U;
+    std::uint64_t  text_ascii_replacement_runs_rejected_hyperlink       = 0U;
+    std::uint64_t  text_ascii_replacement_runs_rejected_non_printable_ascii = 0U;
+    std::uint64_t  text_ascii_replacement_runs_rejected_non_ascii       = 0U;
+    std::uint64_t  text_ascii_replacement_runs_rejected_geometry        = 0U;
+    std::uint64_t  text_ascii_replacement_runs_rejected_unsupported_font = 0U;
+    std::uint64_t  text_ascii_replacement_runs_rejected_internal_node   = 0U;
+    std::uint64_t  text_ascii_replacement_runs_rejected_glyph_mapping   = 0U;
     std::uint64_t  text_layout_code_units                               = 0U;
     std::uint64_t  text_layout_space_code_units                         = 0U;
     std::uint64_t  text_layout_printable_ascii_code_units               = 0U;
@@ -299,6 +342,11 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_layout_non_ascii_plain_unclipped_code_units     = 0U;
     std::uint64_t  text_layout_fast_space_candidate_code_units          = 0U;
     std::uint64_t  text_layout_fast_ascii_candidate_code_units          = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_screened           = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_eligible           = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_attempted          = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_succeeded          = 0U;
+    std::uint64_t  text_ascii_replacement_code_units_fallback           = 0U;
     std::uint64_t  qsg_nodes_created                                    = 0U;
     std::uint64_t  qsg_nodes_replaced                                   = 0U;
     std::uint64_t  qsg_nodes_destroyed                                  = 0U;

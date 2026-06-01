@@ -10,6 +10,7 @@
 #include <QLatin1Char>
 #include <QMatrix4x4>
 #include <QQuickWindow>
+#include <QRawFont>
 #include <QSGClipNode>
 #include <QSGGeometryNode>
 #include <QSGOpacityNode>
@@ -19,7 +20,9 @@
 #include <QSGVertexColorMaterial>
 #include <QTextLayout>
 #include <QTextOption>
+#include <private/qsginternaltextnode_p.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -43,6 +46,10 @@ constexpr qreal       k_graphic_antialias_feather           = 0.5;
 constexpr qreal       k_ascii_advance_tolerance_floor       = 0.000001;
 constexpr qreal       k_ascii_advance_tolerance_ratio       = 0.0000001;
 constexpr qreal       k_text_geometry_tolerance             = k_ascii_advance_tolerance_floor;
+constexpr int         k_printable_ascii_first               = 0x20;
+constexpr int         k_printable_ascii_last                = 0x7e;
+constexpr std::size_t k_printable_ascii_count               =
+    static_cast<std::size_t>(k_printable_ascii_last - k_printable_ascii_first + 1);
 constexpr std::size_t k_max_coalesced_ascii_text_run_length = 384U;
 constexpr std::size_t k_eager_render_style_attribute_limit  = 256U;
 constexpr int         k_arc_geometry_segment_count          = 32;
@@ -1059,8 +1066,13 @@ struct row_text_group_t
 
 struct Ascii_text_coalescing_context
 {
-    bool                   enabled                            = false;
-    QFont                  layout_font;
+    bool                                          enabled    = false;
+    qreal                                         cell_width = 0.0;
+    qreal                                         layout_line_ascent = 0.0;
+    qreal                                         glyph_position_y   = 0.0;
+    QFont                                         layout_font;
+    QRawFont                                      raw_font;
+    std::array<quint32, k_printable_ascii_count> printable_ascii_glyph_indexes{};
 };
 
 class Ascii_text_coalescing_context_cache
@@ -2289,7 +2301,22 @@ bool is_printable_ascii_text(const QString& text)
 
     for (const QChar character : text) {
         const ushort codepoint = character.unicode();
-        if (codepoint < 0x20U || codepoint > 0x7eU) {
+        if (codepoint < k_printable_ascii_first || codepoint > k_printable_ascii_last) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool is_all_space_text(const QString& text)
+{
+    if (text.isEmpty()) {
+        return false;
+    }
+
+    for (const QChar character : text) {
+        if (character.unicode() != 0x20U) {
             return false;
         }
     }
@@ -2315,7 +2342,12 @@ bool is_printable_ascii_cell_text(const QString& text)
     }
 
     const ushort codepoint = text.at(0).unicode();
-    return codepoint >= 0x20U && codepoint <= 0x7eU;
+    return codepoint >= k_printable_ascii_first && codepoint <= k_printable_ascii_last;
+}
+
+std::size_t printable_ascii_glyph_index(ushort codepoint)
+{
+    return static_cast<std::size_t>(codepoint - k_printable_ascii_first);
 }
 
 struct Text_layout_run_makeup
@@ -2490,6 +2522,103 @@ void record_text_layout_run_makeup(
     }
 }
 
+enum class Ascii_replacement_fallback_reason
+{
+    CLIPPED,
+    FORCE_BLENDED_ORDER,
+    DECORATION,
+    HYPERLINK,
+    NON_PRINTABLE_ASCII,
+    NON_ASCII,
+    GEOMETRY,
+    UNSUPPORTED_FONT,
+    INTERNAL_NODE,
+    GLYPH_MAPPING,
+};
+
+std::uint64_t text_run_code_units(const Terminal_render_text_run& run)
+{
+    return static_cast<std::uint64_t>(run.text.size());
+}
+
+void record_ascii_replacement_screened(
+    terminal_renderer_stats_t&         stats,
+    const Terminal_render_text_run&    run)
+{
+    ++stats.text_ascii_replacement_runs_screened;
+    stats.text_ascii_replacement_code_units_screened += text_run_code_units(run);
+}
+
+void record_ascii_replacement_eligible(
+    terminal_renderer_stats_t&         stats,
+    const Terminal_render_text_run&    run)
+{
+    ++stats.text_ascii_replacement_runs_eligible;
+    stats.text_ascii_replacement_code_units_eligible += text_run_code_units(run);
+}
+
+void record_ascii_replacement_attempted(
+    terminal_renderer_stats_t&         stats,
+    const Terminal_render_text_run&    run)
+{
+    ++stats.text_ascii_replacement_runs_attempted;
+    stats.text_ascii_replacement_code_units_attempted += text_run_code_units(run);
+}
+
+void record_ascii_replacement_succeeded(
+    terminal_renderer_stats_t&         stats,
+    const Terminal_render_text_run&    run,
+    bool                               all_space)
+{
+    ++stats.text_ascii_replacement_runs_succeeded;
+    stats.text_ascii_replacement_code_units_succeeded += text_run_code_units(run);
+    if (all_space) {
+        ++stats.text_ascii_replacement_runs_all_space_succeeded;
+    }
+}
+
+void record_ascii_replacement_fallback(
+    terminal_renderer_stats_t&         stats,
+    const Terminal_render_text_run&    run,
+    Ascii_replacement_fallback_reason  reason)
+{
+    ++stats.text_ascii_replacement_runs_fallback;
+    stats.text_ascii_replacement_code_units_fallback += text_run_code_units(run);
+
+    switch (reason) {
+    case Ascii_replacement_fallback_reason::CLIPPED:
+        ++stats.text_ascii_replacement_runs_rejected_clipped;
+        break;
+    case Ascii_replacement_fallback_reason::FORCE_BLENDED_ORDER:
+        ++stats.text_ascii_replacement_runs_rejected_force_blended_order;
+        break;
+    case Ascii_replacement_fallback_reason::DECORATION:
+        ++stats.text_ascii_replacement_runs_rejected_decoration;
+        break;
+    case Ascii_replacement_fallback_reason::HYPERLINK:
+        ++stats.text_ascii_replacement_runs_rejected_hyperlink;
+        break;
+    case Ascii_replacement_fallback_reason::NON_PRINTABLE_ASCII:
+        ++stats.text_ascii_replacement_runs_rejected_non_printable_ascii;
+        break;
+    case Ascii_replacement_fallback_reason::NON_ASCII:
+        ++stats.text_ascii_replacement_runs_rejected_non_ascii;
+        break;
+    case Ascii_replacement_fallback_reason::GEOMETRY:
+        ++stats.text_ascii_replacement_runs_rejected_geometry;
+        break;
+    case Ascii_replacement_fallback_reason::UNSUPPORTED_FONT:
+        ++stats.text_ascii_replacement_runs_rejected_unsupported_font;
+        break;
+    case Ascii_replacement_fallback_reason::INTERNAL_NODE:
+        ++stats.text_ascii_replacement_runs_rejected_internal_node;
+        break;
+    case Ascii_replacement_fallback_reason::GLYPH_MAPPING:
+        ++stats.text_ascii_replacement_runs_rejected_glyph_mapping;
+        break;
+    }
+}
+
 QFont cell_stable_ascii_layout_font(const QFont& font)
 {
     QFont layout_font = font;
@@ -2508,10 +2637,49 @@ QFont cell_stable_ascii_layout_font(const QFont& font)
     return layout_font;
 }
 
-bool ascii_text_probe_layout_is_cell_stable(const QFont& font, qreal cell_width)
+bool initialize_printable_ascii_glyph_indexes(Ascii_text_coalescing_context& context)
 {
-    const QString probe_text = QStringLiteral("==!=->=><=>=::///www");
-    QTextLayout layout(probe_text, font);
+    context.raw_font = QRawFont::fromFont(context.layout_font);
+    if (!context.raw_font.isValid()) {
+        return false;
+    }
+
+    for (int codepoint = k_printable_ascii_first;
+        codepoint <= k_printable_ascii_last;
+        ++codepoint)
+    {
+        const QChar character(static_cast<ushort>(codepoint));
+        if (!context.raw_font.supportsCharacter(character)) {
+            return false;
+        }
+
+        const QList<quint32> glyph_indexes =
+            context.raw_font.glyphIndexesForString(QString(1, character));
+        if (glyph_indexes.size() != 1 || glyph_indexes.at(0) == 0U) {
+            return false;
+        }
+
+        context.printable_ascii_glyph_indexes[printable_ascii_glyph_index(character.unicode())] =
+            glyph_indexes.at(0);
+    }
+
+    return true;
+}
+
+bool ascii_text_probe_layout_is_cell_stable(Ascii_text_coalescing_context& context)
+{
+    QString probe_text;
+    probe_text.reserve(static_cast<qsizetype>(
+        k_printable_ascii_count + QStringLiteral("==!=->=><=>=::///www").size()));
+    for (int codepoint = k_printable_ascii_first;
+        codepoint <= k_printable_ascii_last;
+        ++codepoint)
+    {
+        probe_text.append(QChar(static_cast<ushort>(codepoint)));
+    }
+    probe_text.append(QStringLiteral("==!=->=><=>=::///www"));
+
+    QTextLayout layout(probe_text, context.layout_font);
     QTextOption option;
     option.setWrapMode(QTextOption::NoWrap);
     layout.setTextOption(option);
@@ -2526,12 +2694,13 @@ bool ascii_text_probe_layout_is_cell_stable(const QFont& font, qreal cell_width)
 
     line.setLineWidth(k_no_wrap_text_line_width);
     line.setPosition(QPointF(0.0, 0.0));
+    context.layout_line_ascent = line.ascent();
     const bool line_is_complete = line.textStart() == 0 &&
         line.textLength() == probe_text.size();
     const bool line_advance_is_stable = ascii_widths_match(
         line.horizontalAdvance(),
-        static_cast<qreal>(probe_text.size()) * cell_width,
-        cell_width);
+        static_cast<qreal>(probe_text.size()) * context.cell_width,
+        context.cell_width);
     const QList<QGlyphRun> glyph_runs = line.glyphRuns(
         0,
         probe_text.size(),
@@ -2545,22 +2714,41 @@ bool ascii_text_probe_layout_is_cell_stable(const QFont& font, qreal cell_width)
     }
 
     qsizetype glyph_count = 0;
+    std::optional<qreal> glyph_position_y;
     std::vector<bool> seen_string_indexes(static_cast<std::size_t>(probe_text.size()));
+    std::array<bool, k_printable_ascii_count> seen_codepoints{};
     for (const QGlyphRun& glyph_run : glyph_runs) {
-        const QList<quint32>   glyph_indexes  = glyph_run.glyphIndexes();
-        const QList<QPointF>   positions      = glyph_run.positions();
-        const QList<qsizetype> string_indexes = glyph_run.stringIndexes();
-        if (glyph_indexes.size() != positions.size() ||
-            glyph_indexes.size() != string_indexes.size())
+        if (glyph_run.rawFont() != context.raw_font) {
+            return false;
+        }
+
+        const QList<quint32>   layout_glyph_indexes = glyph_run.glyphIndexes();
+        const QList<QPointF>   positions            = glyph_run.positions();
+        const QList<qsizetype> string_indexes       = glyph_run.stringIndexes();
+        if (layout_glyph_indexes.size() != positions.size() ||
+            layout_glyph_indexes.size() != string_indexes.size())
         {
             return false;
         }
 
-        for (qsizetype index = 0; index < glyph_indexes.size(); ++index) {
+        for (qsizetype index = 0; index < layout_glyph_indexes.size(); ++index) {
             const qsizetype string_index = string_indexes.at(index);
             if (string_index < 0 || string_index >= probe_text.size()) {
                 return false;
             }
+
+            const ushort codepoint = probe_text.at(string_index).unicode();
+            if (codepoint < k_printable_ascii_first || codepoint > k_printable_ascii_last) {
+                return false;
+            }
+
+            const std::size_t printable_index = printable_ascii_glyph_index(codepoint);
+            if (layout_glyph_indexes.at(index) !=
+                context.printable_ascii_glyph_indexes[printable_index])
+            {
+                return false;
+            }
+            seen_codepoints[printable_index] = true;
 
             const std::size_t seen_index = static_cast<std::size_t>(string_index);
             if (seen_string_indexes[seen_index]) {
@@ -2569,8 +2757,20 @@ bool ascii_text_probe_layout_is_cell_stable(const QFont& font, qreal cell_width)
             seen_string_indexes[seen_index] = true;
 
             if (!within_tolerance(
-                    positions.at(index).x(), static_cast<qreal>(string_index) * cell_width,
-                    ascii_advance_tolerance(cell_width)))
+                    positions.at(index).x(),
+                    static_cast<qreal>(string_index) * context.cell_width,
+                    ascii_advance_tolerance(context.cell_width)))
+            {
+                return false;
+            }
+            if (!glyph_position_y.has_value()) {
+                glyph_position_y = positions.at(index).y();
+            }
+            else
+            if (!within_tolerance(
+                    positions.at(index).y(),
+                    *glyph_position_y,
+                    ascii_advance_tolerance(context.cell_width)))
             {
                 return false;
             }
@@ -2578,7 +2778,22 @@ bool ascii_text_probe_layout_is_cell_stable(const QFont& font, qreal cell_width)
         }
     }
 
-    return glyph_count == probe_text.size();
+    if (glyph_count != probe_text.size()) {
+        return false;
+    }
+    for (bool seen_index : seen_string_indexes) {
+        if (!seen_index) {
+            return false;
+        }
+    }
+    for (bool seen_codepoint : seen_codepoints) {
+        if (!seen_codepoint) {
+            return false;
+        }
+    }
+
+    context.glyph_position_y = *glyph_position_y;
+    return true;
 }
 
 Ascii_text_coalescing_context ascii_text_coalescing_context(
@@ -2593,13 +2808,17 @@ Ascii_text_coalescing_context ascii_text_coalescing_context(
 
     Ascii_text_coalescing_context context;
     context.layout_font = cell_stable_ascii_layout_font(font);
+    context.cell_width  = cell_width;
     const QFontInfo resolved_font(context.layout_font);
     if (!resolved_font.fixedPitch()) {
         return context;
     }
 
     const QFontMetricsF metrics(context.layout_font);
-    for (ushort codepoint = 0x20U; codepoint <= 0x7eU; ++codepoint) {
+    for (int codepoint = k_printable_ascii_first;
+        codepoint <= k_printable_ascii_last;
+        ++codepoint)
+    {
         if (!ascii_advance_matches_cell_width(
                 metrics.horizontalAdvance(QLatin1Char(static_cast<char>(codepoint))), cell_width))
         {
@@ -2607,7 +2826,11 @@ Ascii_text_coalescing_context ascii_text_coalescing_context(
         }
     }
 
-    if (!ascii_text_probe_layout_is_cell_stable(context.layout_font, cell_width)) {
+    if (!initialize_printable_ascii_glyph_indexes(context)) {
+        return context;
+    }
+
+    if (!ascii_text_probe_layout_is_cell_stable(context)) {
         return context;
     }
 
@@ -2648,6 +2871,37 @@ bool is_one_cell_unclipped_printable_ascii_run(
         is_printable_ascii_cell_text(run.text)                  &&
         nearly_same_text_geometry(run.rect.width(), cell_width) &&
         nearly_same_text_geometry(run.baseline_origin.x(), run.rect.left());
+}
+
+bool is_unclipped_printable_ascii_cell_span_run(
+    const Terminal_render_text_run&    run,
+    qreal                              cell_width)
+{
+    if (!std::isfinite(cell_width) ||
+        cell_width <= 0.0          ||
+        !run.rect.isValid())
+    {
+        return false;
+    }
+
+    return
+        !run.clip_rect.isValid()             &&
+        is_printable_ascii_text(run.text)    &&
+        nearly_same_text_geometry(
+            run.rect.width(),
+            static_cast<qreal>(run.text.size()) * cell_width) &&
+        nearly_same_text_geometry(run.baseline_origin.x(), run.rect.left());
+}
+
+bool can_use_ascii_layout_resource_font(
+    const Terminal_render_text_run&    run,
+    qreal                              cell_width)
+{
+    return
+        is_unclipped_printable_ascii_cell_span_run(run, cell_width) &&
+        run.hyperlink_id == 0U                                      &&
+        !run.underline                                             &&
+        !run.strike;
 }
 
 bool text_runs_have_matching_paint(
@@ -2785,6 +3039,225 @@ QSGTextNode* make_text_leaf_node(
     return text_node;
 }
 
+bool ensure_active_text_node(
+    QSGNode&                   parent,
+    QQuickWindow&              window,
+    const QColor&              foreground,
+    const QRectF&              frame_viewport,
+    QSGTextNode*&              active_text_node,
+    QRgb&                      active_foreground_rgba,
+    terminal_renderer_stats_t& stats,
+    int&                       out_text_leaf_nodes_created)
+{
+    if (active_text_node       != nullptr &&
+        active_foreground_rgba == foreground.rgba())
+    {
+        return true;
+    }
+
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("ensure_active_text_node::create_text_node");
+
+        active_text_node = make_text_leaf_node(window, foreground, frame_viewport);
+    }
+    if (active_text_node == nullptr) {
+        return false;
+    }
+
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("ensure_active_text_node::append_child");
+
+        parent.appendChildNode(active_text_node);
+    }
+    active_foreground_rgba = foreground.rgba();
+    ++out_text_leaf_nodes_created;
+    ++stats.qsg_nodes_created;
+    return true;
+}
+
+std::optional<QGlyphRun> make_ascii_replacement_glyph_run(
+    const Ascii_text_coalescing_context& context,
+    const QString&                       text)
+{
+    if (!context.raw_font.isValid() ||
+        !std::isfinite(context.cell_width) ||
+        context.cell_width <= 0.0)
+    {
+        return std::nullopt;
+    }
+
+    QList<quint32> glyph_indexes;
+    QList<QPointF> glyph_positions;
+    QList<qsizetype> string_indexes;
+    glyph_indexes.reserve(text.size());
+    glyph_positions.reserve(text.size());
+    string_indexes.reserve(text.size());
+
+    for (int index = 0; index < text.size(); ++index) {
+        const ushort codepoint = text.at(index).unicode();
+        if (codepoint < k_printable_ascii_first || codepoint > k_printable_ascii_last) {
+            return std::nullopt;
+        }
+
+        glyph_indexes.append(
+            context.printable_ascii_glyph_indexes[printable_ascii_glyph_index(codepoint)]);
+        glyph_positions.append(QPointF(
+            static_cast<qreal>(index) * context.cell_width,
+            context.glyph_position_y));
+        string_indexes.append(index);
+    }
+
+    QGlyphRun glyph_run;
+    glyph_run.setRawFont(context.raw_font);
+    glyph_run.setGlyphIndexes(glyph_indexes);
+    glyph_run.setPositions(glyph_positions);
+    glyph_run.setStringIndexes(string_indexes);
+    glyph_run.setSourceString(text);
+    glyph_run.setBoundingRect(QRectF(
+        0.0,
+        context.glyph_position_y - context.raw_font.ascent(),
+        static_cast<qreal>(text.size()) * context.cell_width,
+        context.raw_font.ascent() + context.raw_font.descent()));
+    return glyph_run;
+}
+
+enum class Append_ascii_replacement_result
+{
+    APPENDED,
+    FALLBACK_TO_QT_LAYOUT,
+    FAILED,
+};
+
+Append_ascii_replacement_result try_append_ascii_replacement_text_run(
+    QSGNode&                           parent,
+    QQuickWindow&                      window,
+    const Ascii_text_coalescing_context*
+                                       coalescing_context,
+    const Terminal_render_text_run&    run,
+    const QRectF&                      frame_viewport,
+    bool                               force_blended_order,
+    bool                               ascii_layout_font,
+    QSGTextNode*&                      active_text_node,
+    QRgb&                              active_foreground_rgba,
+    terminal_renderer_stats_t&         stats,
+    int&                               out_text_leaf_nodes_created)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("try_append_ascii_replacement_text_run");
+
+    record_ascii_replacement_screened(stats, run);
+    if (run.clip_rect.isValid()) {
+        record_ascii_replacement_fallback(
+            stats,
+            run,
+            Ascii_replacement_fallback_reason::CLIPPED);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+    if (force_blended_order) {
+        record_ascii_replacement_fallback(
+            stats,
+            run,
+            Ascii_replacement_fallback_reason::FORCE_BLENDED_ORDER);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+    if (run.underline || run.strike) {
+        record_ascii_replacement_fallback(
+            stats,
+            run,
+            Ascii_replacement_fallback_reason::DECORATION);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+    if (run.hyperlink_id != 0U) {
+        record_ascii_replacement_fallback(
+            stats,
+            run,
+            Ascii_replacement_fallback_reason::HYPERLINK);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+    if (!is_printable_ascii_text(run.text)) {
+        record_ascii_replacement_fallback(
+            stats,
+            run,
+            contains_non_ascii_text(run.text)
+                ? Ascii_replacement_fallback_reason::NON_ASCII
+                : Ascii_replacement_fallback_reason::NON_PRINTABLE_ASCII);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+    if (coalescing_context == nullptr) {
+        record_ascii_replacement_fallback(
+            stats,
+            run,
+            Ascii_replacement_fallback_reason::UNSUPPORTED_FONT);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+    if (!is_unclipped_printable_ascii_cell_span_run(run, coalescing_context->cell_width)) {
+        record_ascii_replacement_fallback(
+            stats,
+            run,
+            Ascii_replacement_fallback_reason::GEOMETRY);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+    if (!ascii_layout_font          ||
+        !coalescing_context->enabled ||
+        !coalescing_context->raw_font.isValid())
+    {
+        record_ascii_replacement_fallback(
+            stats,
+            run,
+            Ascii_replacement_fallback_reason::UNSUPPORTED_FONT);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+
+    record_ascii_replacement_eligible(stats, run);
+    record_ascii_replacement_attempted(stats, run);
+    const bool all_space = is_all_space_text(run.text);
+    if (all_space) {
+        record_ascii_replacement_succeeded(stats, run, true);
+        return Append_ascii_replacement_result::APPENDED;
+    }
+
+    const std::optional<QGlyphRun> glyph_run =
+        make_ascii_replacement_glyph_run(*coalescing_context, run.text);
+    if (!glyph_run.has_value()) {
+        record_ascii_replacement_fallback(
+            stats,
+            run,
+            Ascii_replacement_fallback_reason::GLYPH_MAPPING);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+
+    const QColor foreground = text_node_foreground(run, force_blended_order);
+    if (!ensure_active_text_node(
+            parent,
+            window,
+            foreground,
+            frame_viewport,
+            active_text_node,
+            active_foreground_rgba,
+            stats,
+            out_text_leaf_nodes_created))
+    {
+        return Append_ascii_replacement_result::FAILED;
+    }
+
+    auto* internal_text_node = dynamic_cast<QSGInternalTextNode*>(active_text_node);
+    if (internal_text_node == nullptr) {
+        record_ascii_replacement_fallback(
+            stats,
+            run,
+            Ascii_replacement_fallback_reason::INTERNAL_NODE);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+
+    internal_text_node->addGlyphs(
+        QPointF(
+            run.baseline_origin.x(),
+            run.baseline_origin.y() - coalescing_context->layout_line_ascent),
+        *glyph_run,
+        foreground);
+    record_ascii_replacement_succeeded(stats, run, false);
+    return Append_ascii_replacement_result::APPENDED;
+}
+
 void add_text_run_layout(
     QSGTextNode&                       text_node,
     QTextLayout&                       layout,
@@ -2860,6 +3333,8 @@ bool append_unclipped_text_run_layout(
     QSGNode&                           parent,
     QQuickWindow&                      window,
     const QFont&                       font,
+    const Ascii_text_coalescing_context*
+                                       coalescing_context,
     const Terminal_render_text_run&    run,
     const QRectF&                      frame_viewport,
     bool                               force_blended_order,
@@ -2873,6 +3348,26 @@ bool append_unclipped_text_run_layout(
         return true;
     }
 
+    const Append_ascii_replacement_result replacement_result =
+        try_append_ascii_replacement_text_run(
+            parent,
+            window,
+            coalescing_context,
+            run,
+            frame_viewport,
+            force_blended_order,
+            ascii_layout_font,
+            active_text_node,
+            active_foreground_rgba,
+            stats,
+            out_text_leaf_nodes_created);
+    if (replacement_result == Append_ascii_replacement_result::APPENDED) {
+        return true;
+    }
+    if (replacement_result == Append_ascii_replacement_result::FAILED) {
+        return false;
+    }
+
     QTextLayout layout;
     qreal line_ascent = 0.0;
     if (!prepare_text_run_layout(
@@ -2882,28 +3377,17 @@ bool append_unclipped_text_run_layout(
     }
 
     const QColor foreground = text_node_foreground(run, force_blended_order);
-    if (active_text_node       == nullptr ||
-        active_foreground_rgba != foreground.rgba())
+    if (!ensure_active_text_node(
+            parent,
+            window,
+            foreground,
+            frame_viewport,
+            active_text_node,
+            active_foreground_rgba,
+            stats,
+            out_text_leaf_nodes_created))
     {
-        {
-            VNM_TERMINAL_PROFILE_SCOPE(
-                "append_unclipped_text_run_layout::create_text_node");
-
-            active_text_node = make_text_leaf_node(window, foreground, frame_viewport);
-        }
-        if (active_text_node == nullptr) {
-            return false;
-        }
-
-        {
-            VNM_TERMINAL_PROFILE_SCOPE(
-                "append_unclipped_text_run_layout::append_child");
-
-            parent.appendChildNode(active_text_node);
-        }
-        active_foreground_rgba = foreground.rgba();
-        ++out_text_leaf_nodes_created;
-        ++stats.qsg_nodes_created;
+        return false;
     }
 
     add_text_run_layout(*active_text_node, layout, run, line_ascent);
@@ -2928,6 +3412,13 @@ bool append_batched_text_run_nodes(
         const Terminal_render_text_run& run = runs[index];
         if (run.clip_rect.isValid()) {
             active_text_node = nullptr;
+            if (!run.text.isEmpty()) {
+                record_ascii_replacement_screened(stats, run);
+                record_ascii_replacement_fallback(
+                    stats,
+                    run,
+                    Ascii_replacement_fallback_reason::CLIPPED);
+            }
             if (append_clipped_text_run_node(
                     parent, window, font, run, frame_viewport, force_blended_order,
                     false, stats, out_text_leaf_nodes_created))
@@ -2944,7 +3435,7 @@ bool append_batched_text_run_nodes(
         }
 
         if (!append_unclipped_text_run_layout(
-                parent, window, font, run, frame_viewport, force_blended_order, false,
+                parent, window, font, nullptr, run, frame_viewport, force_blended_order, false,
                 active_text_node, active_foreground_rgba, stats, out_text_leaf_nodes_created))
         {
             return false;
@@ -2982,6 +3473,13 @@ bool append_batched_text_run_nodes(
             : font;
         if (run.clip_rect.isValid()) {
             active_text_node = nullptr;
+            if (!run.text.isEmpty()) {
+                record_ascii_replacement_screened(stats, run);
+                record_ascii_replacement_fallback(
+                    stats,
+                    run,
+                    Ascii_replacement_fallback_reason::CLIPPED);
+            }
             if (append_clipped_text_run_node(
                     parent, window, layout_font, run, frame_viewport, force_blended_order,
                     resource_run.use_ascii_layout_font, stats, out_text_leaf_nodes_created))
@@ -2996,7 +3494,7 @@ bool append_batched_text_run_nodes(
         }
 
         if (!append_unclipped_text_run_layout(
-                parent, window, layout_font, run, frame_viewport, force_blended_order,
+                parent, window, layout_font, coalescing_context, run, frame_viewport, force_blended_order,
                 resource_run.use_ascii_layout_font, active_text_node,
                 active_foreground_rgba, stats, out_text_leaf_nodes_created))
         {
@@ -3216,52 +3714,58 @@ text_resource_run_t row_local_coalesced_ascii_text_resource_run(
     };
 }
 
-bool try_make_row_local_coalesced_ascii_text_resource_runs(
+struct row_local_ascii_text_resource_runs_result_t
+{
+    bool has_ascii_layout_runs = false;
+    bool has_coalesced_runs    = false;
+};
+
+row_local_ascii_text_resource_runs_result_t try_make_row_local_ascii_text_resource_runs(
     const std::vector<const Terminal_render_text_run*>&    runs,
     qreal                                                  row_top,
     qreal                                                  cell_width,
     std::vector<text_resource_run_t>&                      out_runs)
 {
+    row_local_ascii_text_resource_runs_result_t result;
     out_runs.clear();
-    if (runs.size() <  2U          ||
+    if (runs.empty()               ||
         !std::isfinite(cell_width) ||
         cell_width  <= 0.0)
     {
-        return false;
+        return result;
     }
 
-    bool coalesced = false;
+    out_runs.reserve(runs.size());
     for (std::size_t index = 0U; index < runs.size();) {
         const std::size_t past_last_index =
             past_last_coalescible_ascii_source_text_run(runs, index, cell_width);
         if (past_last_index > index + 1U) {
-            if (!coalesced) {
-                out_runs.reserve(runs.size());
-                for (std::size_t prefix_index = 0U; prefix_index < index; ++prefix_index) {
-                    out_runs.push_back({row_local_text_run(*runs[prefix_index], row_top), false});
-                }
-                coalesced = true;
-            }
-
             out_runs.push_back(row_local_coalesced_ascii_text_resource_run(
                 runs,
                 row_top,
                 index,
                 past_last_index));
+            result.has_ascii_layout_runs = true;
+            result.has_coalesced_runs    = true;
             index = past_last_index;
             continue;
         }
 
-        if (coalesced) {
-            out_runs.push_back({row_local_text_run(*runs[index], row_top), false});
-        }
+        const bool use_ascii_layout_font =
+            can_use_ascii_layout_resource_font(*runs[index], cell_width);
+        out_runs.push_back({
+            row_local_text_run(*runs[index], row_top),
+            use_ascii_layout_font,
+        });
+        result.has_ascii_layout_runs =
+            result.has_ascii_layout_runs || use_ascii_layout_font;
         ++index;
     }
 
-    if (!coalesced) {
+    if (!result.has_ascii_layout_runs) {
         out_runs.clear();
     }
-    return coalesced;
+    return result;
 }
 
 void set_text_wrapper_row_top(QSGTransformNode& wrapper, qreal row_top)
@@ -3854,9 +4358,9 @@ void sync_text_resource_nodes(
 
         new_slots.reserve(groups.size());
     }
-    // Scratch storage is live only while use_coalesced_resource_runs selects it.
+    // Scratch storage is live only while use_ascii_resource_runs selects it.
     std::vector<Terminal_render_text_run> local_runs;
-    std::vector<text_resource_run_t> coalesced_resource_runs;
+    std::vector<text_resource_run_t> ascii_resource_runs;
     for (const row_text_group_t& group : groups) {
         std::optional<Terminal_scene_node::Text_resource_cache_slot> old_slot;
         bool dirty_group = false;
@@ -3920,9 +4424,11 @@ void sync_text_resource_nodes(
 
         const Ascii_text_coalescing_context* coalescing_context = nullptr;
         bool local_runs_assigned = false;
-        bool use_coalesced_resource_runs = false;
-        auto select_coalesced_resource_runs_if_enabled = [&]() {
-            ++stats.text_coalescing_candidate_groups;
+        bool use_ascii_resource_runs = false;
+        auto select_ascii_resource_runs_if_enabled = [&](bool has_coalesced_runs) {
+            if (has_coalesced_runs) {
+                ++stats.text_coalescing_candidate_groups;
+            }
             {
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "sync_text_resource_nodes::coalescing::context");
@@ -3931,27 +4437,28 @@ void sync_text_resource_nodes(
                     &coalescing_context_cache.context(font, frame.cell_metrics.width);
             }
             if (coalescing_context->enabled) {
-                ++stats.text_coalescing_enabled_groups;
-                use_coalesced_resource_runs = true;
+                if (has_coalesced_runs) {
+                    ++stats.text_coalescing_enabled_groups;
+                }
+                use_ascii_resource_runs = true;
             }
         };
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::coalescing");
 
-            bool row_local_ascii = false;
+            row_local_ascii_text_resource_runs_result_t row_local_ascii;
             {
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "sync_text_resource_nodes::coalescing::try_ascii");
 
-                row_local_ascii = try_make_row_local_coalesced_ascii_text_resource_runs(
+                row_local_ascii = try_make_row_local_ascii_text_resource_runs(
                     group.runs,
                     group.row_top,
                     frame.cell_metrics.width,
-                    coalesced_resource_runs);
+                    ascii_resource_runs);
             }
-            if (row_local_ascii)
-            {
-                select_coalesced_resource_runs_if_enabled();
+            if (row_local_ascii.has_ascii_layout_runs) {
+                select_ascii_resource_runs_if_enabled(row_local_ascii.has_coalesced_runs);
             }
             else {
                 VNM_TERMINAL_PROFILE_SCOPE(
@@ -3962,7 +4469,7 @@ void sync_text_resource_nodes(
             }
         }
 
-        if (!use_coalesced_resource_runs && !local_runs_assigned) {
+        if (!use_ascii_resource_runs && !local_runs_assigned) {
             VNM_TERMINAL_PROFILE_SCOPE(
                 "sync_text_resource_nodes::coalescing_disabled_row_local_fallback");
 
@@ -3974,8 +4481,8 @@ void sync_text_resource_nodes(
         if (source_text_resource_descriptor.has_value()) {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::resource_descriptor");
 
-            text_resource_descriptor = use_coalesced_resource_runs
-                ? text_resource_row_descriptor_for_runs(coalesced_resource_runs)
+            text_resource_descriptor = use_ascii_resource_runs
+                ? text_resource_row_descriptor_for_runs(ascii_resource_runs)
                 : text_resource_row_descriptor_for_runs(local_runs);
         }
 
@@ -3999,8 +4506,8 @@ void sync_text_resource_nodes(
 
         stats.text_resource_runs_before_coalescing +=
             static_cast<int>(group.runs.size());
-        const int runs_after_coalescing = use_coalesced_resource_runs
-            ? static_cast<int>(coalesced_resource_runs.size())
+        const int runs_after_coalescing = use_ascii_resource_runs
+            ? static_cast<int>(ascii_resource_runs.size())
             : static_cast<int>(group.runs.size());
         stats.text_resource_runs_after_coalescing += runs_after_coalescing;
         if (runs_after_coalescing > 0) {
@@ -4014,8 +4521,8 @@ void sync_text_resource_nodes(
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::resource_key");
 
-            key = use_coalesced_resource_runs
-                ? text_resource_key(coalesced_resource_runs, text_font_key, frame.logical_size)
+            key = use_ascii_resource_runs
+                ? text_resource_key(ascii_resource_runs, text_font_key, frame.logical_size)
                 : text_resource_key(local_runs, text_font_key, frame.logical_size);
             record_text_cache_key_build(stats, key);
         }
@@ -4039,10 +4546,10 @@ void sync_text_resource_nodes(
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::make_resource_node");
 
-            node = use_coalesced_resource_runs
+            node = use_ascii_resource_runs
                 ? make_text_resource_node(
                     window,
-                    coalesced_resource_runs,
+                    ascii_resource_runs,
                     font,
                     frame_viewport,
                     frame.cell_metrics.width,
@@ -5695,6 +6202,40 @@ void accumulate_renderer_stats(
         static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_single_candidate);
     total.text_layout_runs_fast_ascii_multi_candidate +=
         static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_multi_candidate);
+    total.text_ascii_replacement_runs_screened +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_screened);
+    total.text_ascii_replacement_runs_eligible +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_eligible);
+    total.text_ascii_replacement_runs_attempted +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_attempted);
+    total.text_ascii_replacement_runs_succeeded +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_succeeded);
+    total.text_ascii_replacement_runs_all_space_succeeded +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_all_space_succeeded);
+    total.text_ascii_replacement_runs_fallback +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_fallback);
+    total.text_ascii_replacement_runs_rejected_clipped +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_clipped);
+    total.text_ascii_replacement_runs_rejected_force_blended_order +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_force_blended_order);
+    total.text_ascii_replacement_runs_rejected_decoration +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_decoration);
+    total.text_ascii_replacement_runs_rejected_hyperlink +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_hyperlink);
+    total.text_ascii_replacement_runs_rejected_non_printable_ascii +=
+        static_cast<std::uint64_t>(
+            stats.text_ascii_replacement_runs_rejected_non_printable_ascii);
+    total.text_ascii_replacement_runs_rejected_non_ascii +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_non_ascii);
+    total.text_ascii_replacement_runs_rejected_geometry +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_geometry);
+    total.text_ascii_replacement_runs_rejected_unsupported_font +=
+        static_cast<std::uint64_t>(
+            stats.text_ascii_replacement_runs_rejected_unsupported_font);
+    total.text_ascii_replacement_runs_rejected_internal_node +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_internal_node);
+    total.text_ascii_replacement_runs_rejected_glyph_mapping +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_glyph_mapping);
     total.text_layout_code_units += stats.text_layout_code_units;
     total.text_layout_space_code_units += stats.text_layout_space_code_units;
     total.text_layout_printable_ascii_code_units +=
@@ -5713,6 +6254,16 @@ void accumulate_renderer_stats(
         stats.text_layout_fast_space_candidate_code_units;
     total.text_layout_fast_ascii_candidate_code_units +=
         stats.text_layout_fast_ascii_candidate_code_units;
+    total.text_ascii_replacement_code_units_screened +=
+        stats.text_ascii_replacement_code_units_screened;
+    total.text_ascii_replacement_code_units_eligible +=
+        stats.text_ascii_replacement_code_units_eligible;
+    total.text_ascii_replacement_code_units_attempted +=
+        stats.text_ascii_replacement_code_units_attempted;
+    total.text_ascii_replacement_code_units_succeeded +=
+        stats.text_ascii_replacement_code_units_succeeded;
+    total.text_ascii_replacement_code_units_fallback +=
+        stats.text_ascii_replacement_code_units_fallback;
     total.qsg_nodes_created    += static_cast<std::uint64_t>(stats.qsg_nodes_created);
     total.qsg_nodes_replaced   += static_cast<std::uint64_t>(stats.qsg_nodes_replaced);
     total.qsg_nodes_destroyed  += static_cast<std::uint64_t>(stats.qsg_nodes_destroyed);
