@@ -51,6 +51,8 @@ constexpr int         k_printable_ascii_last                = 0x7e;
 constexpr std::size_t k_printable_ascii_count               =
     static_cast<std::size_t>(k_printable_ascii_last - k_printable_ascii_first + 1);
 constexpr std::size_t k_max_coalesced_ascii_text_run_length = 384U;
+constexpr qsizetype   k_max_cached_ascii_replacement_shape_length =
+    static_cast<qsizetype>(k_max_coalesced_ascii_text_run_length);
 constexpr std::size_t k_eager_render_style_attribute_limit  = 256U;
 constexpr int         k_arc_geometry_segment_count          = 32;
 constexpr int         k_flat_rect_vertices_per_rect         = 6;
@@ -1073,13 +1075,14 @@ struct Ascii_text_coalescing_context
     QFont                                         layout_font;
     QRawFont                                      raw_font;
     std::array<quint32, k_printable_ascii_count> printable_ascii_glyph_indexes{};
-};
 
-struct Ascii_replacement_glyph_run_scratch
-{
-    QList<quint32>   glyph_indexes;
-    QList<QPointF>   glyph_positions;
-    QList<qsizetype> string_indexes;
+    struct Replacement_shape
+    {
+        QList<QPointF>   glyph_positions;
+        QList<qsizetype> string_indexes;
+    };
+
+    mutable std::map<qsizetype, Replacement_shape> ascii_replacement_shapes;
 };
 
 class Ascii_text_coalescing_context_cache
@@ -3123,10 +3126,68 @@ bool ensure_active_text_node(
     return true;
 }
 
+Ascii_text_coalescing_context::Replacement_shape make_ascii_replacement_shape(
+    const Ascii_text_coalescing_context& context,
+    qsizetype                            text_size)
+{
+    Ascii_text_coalescing_context::Replacement_shape shape;
+    shape.glyph_positions.resize(text_size);
+    shape.string_indexes.resize(text_size);
+
+    QPointF* const   glyph_positions = shape.glyph_positions.data();
+    qsizetype* const string_indexes  = shape.string_indexes.data();
+    for (qsizetype index = 0; index < text_size; ++index) {
+        glyph_positions[index] = QPointF(
+            static_cast<qreal>(index) * context.cell_width,
+            context.glyph_position_y);
+        string_indexes[index] = index;
+    }
+
+    return shape;
+}
+
+const Ascii_text_coalescing_context::Replacement_shape& cached_ascii_replacement_shape(
+    const Ascii_text_coalescing_context& context,
+    qsizetype                            text_size)
+{
+    Q_ASSERT(text_size > 0);
+    Q_ASSERT(text_size <= k_max_cached_ascii_replacement_shape_length);
+
+    const auto found = context.ascii_replacement_shapes.find(text_size);
+    if (found != context.ascii_replacement_shapes.end()) {
+        return found->second;
+    }
+
+    // QGlyphRun shares QList payloads. These immutable shape lists are keyed
+    // only by run length, so retained glyph runs can share them without raw
+    // pointer lifetime coupling.
+    const auto inserted = context.ascii_replacement_shapes.emplace(
+        text_size,
+        make_ascii_replacement_shape(context, text_size));
+    return inserted.first->second;
+}
+
+void set_ascii_replacement_shape(
+    QGlyphRun&                          glyph_run,
+    const Ascii_text_coalescing_context& context,
+    qsizetype                            text_size)
+{
+    if (text_size <= k_max_cached_ascii_replacement_shape_length) {
+        const auto& shape = cached_ascii_replacement_shape(context, text_size);
+        glyph_run.setPositions(shape.glyph_positions);
+        glyph_run.setStringIndexes(shape.string_indexes);
+        return;
+    }
+
+    const Ascii_text_coalescing_context::Replacement_shape shape =
+        make_ascii_replacement_shape(context, text_size);
+    glyph_run.setPositions(shape.glyph_positions);
+    glyph_run.setStringIndexes(shape.string_indexes);
+}
+
 std::optional<QGlyphRun> make_ascii_replacement_glyph_run(
     const Ascii_text_coalescing_context& context,
-    const QString&                       text,
-    Ascii_replacement_glyph_run_scratch& scratch)
+    const QString&                       text)
 {
     if (!context.raw_font.isValid() ||
         !std::isfinite(context.cell_width) ||
@@ -3136,12 +3197,8 @@ std::optional<QGlyphRun> make_ascii_replacement_glyph_run(
     }
 
     const qsizetype text_size = text.size();
-    scratch.glyph_indexes.clear();
-    scratch.glyph_positions.clear();
-    scratch.string_indexes.clear();
-    scratch.glyph_indexes.reserve(text_size);
-    scratch.glyph_positions.reserve(text_size);
-    scratch.string_indexes.reserve(text_size);
+    QList<quint32> glyph_indexes(text_size);
+    quint32* const glyph_index_data = glyph_indexes.data();
 
     for (qsizetype index = 0; index < text_size; ++index) {
         const ushort codepoint = text.at(index).unicode();
@@ -3149,19 +3206,14 @@ std::optional<QGlyphRun> make_ascii_replacement_glyph_run(
             return std::nullopt;
         }
 
-        scratch.glyph_indexes.append(
-            context.printable_ascii_glyph_indexes[printable_ascii_glyph_index(codepoint)]);
-        scratch.glyph_positions.append(QPointF(
-            static_cast<qreal>(index) * context.cell_width,
-            context.glyph_position_y));
-        scratch.string_indexes.append(index);
+        glyph_index_data[index] =
+            context.printable_ascii_glyph_indexes[printable_ascii_glyph_index(codepoint)];
     }
 
     QGlyphRun glyph_run;
     glyph_run.setRawFont(context.raw_font);
-    glyph_run.setGlyphIndexes(scratch.glyph_indexes);
-    glyph_run.setPositions(scratch.glyph_positions);
-    glyph_run.setStringIndexes(scratch.string_indexes);
+    glyph_run.setGlyphIndexes(glyph_indexes);
+    set_ascii_replacement_shape(glyph_run, context, text_size);
     glyph_run.setSourceString(text);
     glyph_run.setBoundingRect(QRectF(
         0.0,
@@ -3183,8 +3235,6 @@ Append_ascii_replacement_result try_append_ascii_replacement_text_run(
     QQuickWindow&                      window,
     const Ascii_text_coalescing_context*
                                        coalescing_context,
-    Ascii_replacement_glyph_run_scratch&
-                                       glyph_run_scratch,
     const Terminal_render_text_run&    run,
     const QRectF&                      frame_viewport,
     bool                               force_blended_order,
@@ -3269,7 +3319,7 @@ Append_ascii_replacement_result try_append_ascii_replacement_text_run(
     }
 
     const std::optional<QGlyphRun> glyph_run =
-        make_ascii_replacement_glyph_run(*coalescing_context, run.text, glyph_run_scratch);
+        make_ascii_replacement_glyph_run(*coalescing_context, run.text);
     if (!glyph_run.has_value()) {
         record_ascii_replacement_fallback(
             stats,
@@ -3316,8 +3366,6 @@ Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
     QQuickWindow&                      window,
     const Ascii_text_coalescing_context&
                                        coalescing_context,
-    Ascii_replacement_glyph_run_scratch&
-                                       glyph_run_scratch,
     const Terminal_render_text_run&    run,
     const QRectF&                      frame_viewport,
     bool                               trusted_all_space,
@@ -3347,7 +3395,7 @@ Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
     }
 
     const std::optional<QGlyphRun> glyph_run =
-        make_ascii_replacement_glyph_run(coalescing_context, run.text, glyph_run_scratch);
+        make_ascii_replacement_glyph_run(coalescing_context, run.text);
     if (!glyph_run.has_value()) {
         record_ascii_replacement_fallback(
             stats,
@@ -3505,8 +3553,6 @@ bool append_unclipped_text_run_layout(
     const QFont&                       font,
     const Ascii_text_coalescing_context*
                                        coalescing_context,
-    Ascii_replacement_glyph_run_scratch&
-                                       glyph_run_scratch,
     const Terminal_render_text_run&    run,
     const QRectF&                      frame_viewport,
     bool                               force_blended_order,
@@ -3525,7 +3571,6 @@ bool append_unclipped_text_run_layout(
             parent,
             window,
             coalescing_context,
-            glyph_run_scratch,
             run,
             frame_viewport,
             force_blended_order,
@@ -3569,7 +3614,6 @@ bool append_batched_text_run_nodes(
 
     QSGTextNode* active_text_node       = nullptr;
     QRgb         active_foreground_rgba = 0U;
-    Ascii_replacement_glyph_run_scratch glyph_run_scratch;
     for (std::size_t index = 0U; index < runs.size();) {
         const Terminal_render_text_run& run = runs[index];
         if (run.clip_rect.isValid()) {
@@ -3597,7 +3641,7 @@ bool append_batched_text_run_nodes(
         }
 
         if (!append_unclipped_text_run_layout(
-                parent, window, font, nullptr, glyph_run_scratch, run, frame_viewport,
+                parent, window, font, nullptr, run, frame_viewport,
                 force_blended_order, false, active_text_node, active_foreground_rgba, stats,
                 out_text_leaf_nodes_created))
         {
@@ -3627,7 +3671,6 @@ bool append_batched_text_run_nodes(
 
     QSGTextNode* active_text_node       = nullptr;
     QRgb         active_foreground_rgba = 0U;
-    Ascii_replacement_glyph_run_scratch glyph_run_scratch;
     for (const text_resource_run_t& resource_run : runs) {
         const Terminal_render_text_run& run = resource_run.run;
         const bool has_ascii_layout_context =
@@ -3668,7 +3711,6 @@ bool append_batched_text_run_nodes(
                     parent,
                     window,
                     *coalescing_context,
-                    glyph_run_scratch,
                     run,
                     frame_viewport,
                     resource_run.trusted_ascii_replacement_all_space,
@@ -3703,8 +3745,8 @@ bool append_batched_text_run_nodes(
         }
 
         if (!append_unclipped_text_run_layout(
-                parent, window, layout_font, coalescing_context, glyph_run_scratch, run,
-                frame_viewport, force_blended_order, use_ascii_layout_font, active_text_node,
+                parent, window, layout_font, coalescing_context, run, frame_viewport,
+                force_blended_order, use_ascii_layout_font, active_text_node,
                 active_foreground_rgba, stats, out_text_leaf_nodes_created))
         {
             return false;
