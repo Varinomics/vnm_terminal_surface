@@ -312,6 +312,74 @@ bool test_scrollback_wide_rows_are_repaired_on_resize()
     return ok;
 }
 
+bool test_snapshot_rows_cover_primary_retained_and_alternate_sources()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({2, 8});
+#if VNM_TERMINAL_PROFILING_ENABLED
+    model.set_profile_stats_enabled(true);
+#endif
+    model.ingest(QByteArrayLiteral("ONE\r\nTWO\r\nTHREE"));
+
+    ok &= check(model.scrollback_size() == 1, "row-source fixture creates one retained row");
+
+    const term::Terminal_render_snapshot primary_snapshot =
+        model.render_snapshot(request_for_model(model, 12U));
+    ok &= check(row_text(primary_snapshot, 0) == QStringLiteral("TWO") &&
+        row_text(primary_snapshot, 1) == QStringLiteral("THREE"),
+        "tail snapshot uses resident primary active rows");
+    ok &= check_visible_line_provenance_matches_model(
+        model,
+        primary_snapshot,
+        "tail snapshot line provenance matches resident primary rows");
+    ok &= check(term::validate_render_snapshot(primary_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "row-source primary snapshot validates");
+
+    const term::Terminal_render_snapshot retained_snapshot =
+        model.render_snapshot(request_for_model(model, 13U, 1));
+    ok &= check(row_text(retained_snapshot, 0) == QStringLiteral("ONE") &&
+        row_text(retained_snapshot, 1) == QStringLiteral("TWO"),
+        "scrolled snapshot uses retained history and resident primary rows");
+    ok &= check_visible_line_provenance_matches_model(
+        model,
+        retained_snapshot,
+        "scrolled snapshot line provenance matches retained and resident rows");
+    ok &= check(term::validate_render_snapshot(retained_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "row-source retained snapshot validates");
+
+    model.ingest(QByteArrayLiteral("\x1b[?1049hALT"));
+    const term::Terminal_render_snapshot alternate_snapshot =
+        model.render_snapshot(request_for_model(model, 14U));
+    ok &= check(alternate_snapshot.viewport.active_buffer ==
+        term::Terminal_buffer_id::ALTERNATE,
+        "alternate row-source snapshot reports alternate buffer");
+    ok &= check(row_text(alternate_snapshot, 0) == QStringLiteral("ALT") &&
+        row_text(alternate_snapshot, 1).isEmpty(),
+        "alternate snapshot uses resident alternate rows");
+    ok &= check_visible_line_provenance_matches_model(
+        model,
+        alternate_snapshot,
+        "alternate snapshot line provenance matches resident alternate rows");
+    ok &= check(term::validate_render_snapshot(alternate_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "row-source alternate snapshot validates");
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    const term::Terminal_screen_model_profile_stats stats = model.profile_stats();
+    ok &= check(stats.render_snapshots_constructed == 3U &&
+        stats.render_snapshot_rows_visited == 6U &&
+        stats.render_snapshot_rows_materialized == 6U,
+        "row-source snapshots preserve historical visited/materialized profile counts");
+    ok &= check(stats.render_snapshot_rows_borrowed == 5U &&
+        stats.render_snapshot_rows_owned == 1U,
+        "row-source snapshots split borrowed and owned row-cell sources");
+#endif
+
+    return ok;
+}
+
 bool test_alternate_screen_hides_primary_scrollback()
 {
     bool ok = true;
@@ -1006,6 +1074,7 @@ int main()
     bool ok = true;
     ok &= test_owned_styled_wide_hyperlink_scrollback_snapshot();
     ok &= test_scrollback_wide_rows_are_repaired_on_resize();
+    ok &= test_snapshot_rows_cover_primary_retained_and_alternate_sources();
     ok &= test_alternate_screen_hides_primary_scrollback();
     ok &= test_request_metadata_damage_selection_and_ime();
     ok &= test_selection_request_rejects_retained_line_row_reorder();

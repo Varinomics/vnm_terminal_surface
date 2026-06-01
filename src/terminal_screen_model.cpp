@@ -2878,7 +2878,9 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
 #if VNM_TERMINAL_PROFILING_ENABLED
         const std::size_t snapshot_cells_before_append = snapshot.cells.size();
         std::uint64_t rows_visited                     = 0U;
-        std::uint64_t rows_materialized                = 0U;
+        std::uint64_t rows_with_cells                  = 0U;
+        std::uint64_t rows_borrowed                    = 0U;
+        std::uint64_t rows_owned                       = 0U;
 #endif
         {
             VNM_TERMINAL_PROFILE_SCOPE(
@@ -2900,7 +2902,7 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                 return snapshot_row_from_viewport(viewport_row);
             }();
 
-            std::optional<std::vector<Cell>> row_cells;
+            std::optional<Viewport_row_cells> row_cells;
             {
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "Terminal_screen_model::render_snapshot::append_rows::viewport_row_cells");
@@ -2909,12 +2911,18 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
             }
             if (row_cells.has_value()) {
 #if VNM_TERMINAL_PROFILING_ENABLED
-                ++rows_materialized;
+                ++rows_with_cells;
+                if (row_cells->materialized()) {
+                    ++rows_owned;
+                }
+                else {
+                    ++rows_borrowed;
+                }
 #endif
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "Terminal_screen_model::render_snapshot::append_rows::append_cells");
 
-                append_snapshot_cells_from_row(snapshot, *row_cells, snapshot_row.value);
+                append_snapshot_cells_from_row(snapshot, row_cells->cells(), snapshot_row.value);
             }
 
             std::optional<std::map<std::uint64_t, QByteArray>>
@@ -2974,9 +2982,11 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                 snapshot.cells.size() - snapshot_cells_before_append);
             ++m_profile_stats.render_snapshots_constructed;
             m_profile_stats.render_snapshot_rows_visited      += rows_visited;
-            m_profile_stats.render_snapshot_rows_materialized += rows_materialized;
+            m_profile_stats.render_snapshot_rows_materialized += rows_with_cells;
+            m_profile_stats.render_snapshot_rows_borrowed     += rows_borrowed;
+            m_profile_stats.render_snapshot_rows_owned        += rows_owned;
             m_profile_stats.render_snapshot_cells_scanned     +=
-                rows_materialized *
+                rows_with_cells *
                 static_cast<std::uint64_t>(m_config.grid_size.columns);
             m_profile_stats.render_snapshot_cells_emitted     += cells_emitted;
             m_profile_stats.max_render_snapshot_rows_visited =
@@ -3096,11 +3106,22 @@ Terminal_screen_model::viewport_row_provenance(
         return std::nullopt;
     }
 
-    const std::optional<Terminal_screen_row> backing = primary_backing_row(*backing_row);
-    return backing.has_value()
-        ? std::optional<Terminal_retained_line_provenance>(
-            backing->retained_line_provenance)
-        : std::nullopt;
+    if (backing_row->value < scrollback_size()) {
+        const std::optional<retained_row_record_t> retained_record =
+            m_primary_backing.materialize_retained_history_record(
+                static_cast<std::size_t>(backing_row->value));
+        return retained_record.has_value()
+            ? std::optional<Terminal_retained_line_provenance>(
+                retained_record->row.retained_line_provenance)
+            : std::nullopt;
+    }
+
+    const active_grid_row_t active_row{
+        backing_row->value - primary_backing_active_grid_first_row(),
+    };
+    const Terminal_screen_row& active =
+        primary_active_grid_rows()[static_cast<std::size_t>(active_row.value)];
+    return active.retained_line_provenance;
 }
 
 std::optional<std::map<std::uint64_t, QByteArray>>
@@ -7042,7 +7063,7 @@ Terminal_screen_model::primary_backing_row(primary_backing_row_t row) const
                 static_cast<std::size_t>(row.value));
         }
         return retained_record.has_value()
-            ? std::optional<Terminal_screen_row>(retained_record->row)
+            ? std::optional<Terminal_screen_row>(std::move(retained_record->row))
             : std::nullopt;
     }
 
@@ -7212,7 +7233,7 @@ Terminal_screen_model::logical_row_cells(
         : std::nullopt;
 }
 
-std::optional<std::vector<Terminal_screen_model::Cell>>
+std::optional<Terminal_screen_model::Viewport_row_cells>
 Terminal_screen_model::viewport_row_cells(
     const Terminal_viewport_state& viewport,
     int                            viewport_row) const
@@ -7226,7 +7247,7 @@ Terminal_screen_model::viewport_row_cells(
         const Terminal_screen_row* active_row =
             alternate_active_row(active_grid_row_t{row.value});
         return active_row != nullptr
-            ? std::optional<std::vector<Cell>>(active_row->cells)
+            ? std::optional<Viewport_row_cells>(Viewport_row_cells{&active_row->cells})
             : std::nullopt;
     }
 
@@ -7236,10 +7257,29 @@ Terminal_screen_model::viewport_row_cells(
         return std::nullopt;
     }
 
-    const std::optional<Terminal_screen_row> backing = primary_backing_row(*backing_row);
-    return backing.has_value()
-        ? std::optional<std::vector<Cell>>(backing->cells)
-        : std::nullopt;
+    if (backing_row->value < scrollback_size()) {
+        std::optional<retained_row_record_t> retained_record;
+        {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "Terminal_screen_model::viewport_row_cells::retained_history_materialize");
+            retained_record = m_primary_backing.materialize_retained_history_record(
+                static_cast<std::size_t>(backing_row->value));
+        }
+        if (!retained_record.has_value()) {
+            return std::nullopt;
+        }
+
+        Viewport_row_cells result;
+        result.owned_cells = std::move(retained_record->row.cells);
+        return result;
+    }
+
+    const active_grid_row_t active_row{
+        backing_row->value - primary_backing_active_grid_first_row(),
+    };
+    const Terminal_screen_row& active =
+        primary_active_grid_rows()[static_cast<std::size_t>(active_row.value)];
+    return Viewport_row_cells{&active.cells};
 }
 
 void Terminal_screen_model::append_hyperlink_metadata_for_cells(
