@@ -83,6 +83,11 @@ const stage42_feature_flag_metadata_array_t& stage42_feature_flag_metadata()
             &stage42_feature_flags_t::qsg_monotonic_dirty_probe,
         },
         {
+            "qsg_descriptor_reuse_frame_key_independent",
+            "VNM_TERMINAL_STAGE42_QSG_DESCRIPTOR_REUSE_FRAME_KEY_INDEPENDENT",
+            &stage42_feature_flags_t::qsg_descriptor_reuse_frame_key_independent,
+        },
+        {
             "render_cell_row_cache",
             "VNM_TERMINAL_STAGE42_RENDER_CELL_ROW_CACHE",
             &stage42_feature_flags_t::render_cell_row_cache,

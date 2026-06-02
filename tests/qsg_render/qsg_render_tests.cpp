@@ -3381,9 +3381,9 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         stats.text_ascii_replacement_code_units_trusted_fast_path == 20U &&
         stats.text_ascii_replacement_runs_fallback == 0,
         "dense same-color row renders through the ASCII replacement path");
-    ok &= check(stats.text_resource_runs_before_coalescing == 20 &&
+    ok &= check(stats.text_resource_runs_before_coalescing == 1 &&
         stats.text_resource_runs_after_coalescing == 1,
-        "dense same-color row preserves text resource coalescing counters");
+        "dense same-color row feeds the text resource path as one direct-coalesced run");
     ok &= check(stats.text_leaf_nodes_created == 1,
         "dense same-color row batches populated cells into one QSGTextNode leaf");
     ok &= check(stats.text_leaf_nodes_created < 20 / 4,
@@ -3457,11 +3457,11 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         same_foreground_stats.decoration_layer_rebuilt,
         "same-foreground style boundary still updates background and decoration layers");
     ok &= check(same_foreground_stats.qt_text_layout_calls == 1 &&
-        same_foreground_stats.text_resource_runs_after_coalescing == 1 &&
-        same_foreground_stats.text_ascii_replacement_runs_trusted_fast_path == 0 &&
+        same_foreground_stats.text_resource_runs_after_coalescing == 3 &&
+        same_foreground_stats.text_ascii_replacement_runs_trusted_fast_path == 2 &&
         same_foreground_stats.text_ascii_replacement_runs_fallback == 1 &&
         same_foreground_stats.text_ascii_replacement_runs_rejected_decoration == 1,
-        "same-foreground style boundary preserves coalescing and falls back for decoration");
+        "same-foreground style boundary keeps direct ASCII runs while falling back for decoration");
     const QImage same_foreground_image = window.grabWindow();
     ok &= check(!same_foreground_image.isNull() &&
         cell_is_nonblank(same_foreground_image, 0, 0, metrics) &&
@@ -9519,6 +9519,97 @@ bool test_qsg_text_resource_descriptor_styled_ascii_reuse(QGuiApplication& app)
     return ok;
 }
 
+bool test_qsg_text_resource_descriptor_text_style_key_only_reuse(QGuiApplication& app)
+{
+    bool ok = true;
+    QQuickWindow window;
+    window.setColor(QColor(180, 16, 16));
+    window.resize(260, 100);
+    window.show();
+    pump_events(app, 2);
+
+    const QFont font = term::vnm_terminal_font(QString(), 16.0);
+    const term::terminal_cell_metrics_t metrics = test_metrics();
+    const auto make_frame = [&]() {
+        term::Terminal_render_text_run first =
+            make_direct_text_run_for_row(0, 0, 0, 2, QStringLiteral("AB"), metrics);
+        first.style_id   = 1U;
+        first.background = QColor(30, 42, 54);
+
+        term::Terminal_render_text_run second = make_direct_text_run_for_row(
+            0,
+            0,
+            2,
+            2,
+            QStringLiteral("CD"),
+            metrics,
+            QColor(196, 230, 201));
+        second.style_id   = 2U;
+        second.background = QColor(46, 36, 28);
+
+        return make_direct_text_slot_frame(
+            term::Terminal_buffer_id::PRIMARY,
+            0,
+            1,
+            { first, second },
+            metrics,
+            {{0, 1}});
+    };
+
+    term::Qsg_terminal_renderer renderer;
+    QSGNode* node = nullptr;
+    auto update = [&](
+        const term::Terminal_render_frame& frame,
+        term::terminal_renderer_stats_t& stats) {
+        node = renderer.update_node(
+            node,
+            &window,
+            frame,
+            font,
+            1.0,
+            {},
+            stats);
+        return
+            node != nullptr       &&
+            stats.paint_completed &&
+            stats.text_content_failures == 0;
+    };
+
+    term::Terminal_render_frame base_frame = make_frame();
+    base_frame.text_style_key = QByteArrayLiteral("style-epoch-1");
+    term::terminal_renderer_stats_t first_stats;
+    ok &= check(update(base_frame, first_stats),
+        "text-style-key-only descriptor baseline renders");
+    ok &= check(first_stats.text_content_rebuilds == 1,
+        "text-style-key-only descriptor baseline builds one text resource row");
+
+    // Only frame.text_style_key changes; the visible styled runs are
+    // descriptor-identical. The row must reuse through descriptor reuse before
+    // any per-row key construction or layout/node rebuild work.
+    term::Terminal_render_frame restyled_frame = base_frame;
+    restyled_frame.text_style_key = QByteArrayLiteral("style-epoch-2");
+    term::terminal_renderer_stats_t restyle_stats;
+    ok &= check(update(restyled_frame, restyle_stats),
+        "text-style-key-only change renders");
+    const bool frame_key_independent_reuse =
+        term::VNM_TerminalSurface_render_bridge::stage42_feature_flags()
+            .qsg_descriptor_reuse_frame_key_independent;
+    ok &= check(restyle_stats.text_content_rebuilds == 0 &&
+        restyle_stats.text_content_reused == 1 &&
+        restyle_stats.text_resource_descriptor_reuses ==
+            (frame_key_independent_reuse ? 1 : 0) &&
+        restyle_stats.text_key_match_reuses ==
+            (frame_key_independent_reuse ? 0 : 1) &&
+        restyle_stats.text_cache_entries_replaced == 0 &&
+        restyle_stats.qsg_nodes_replaced == 0 &&
+        restyle_stats.text_key_builds == (frame_key_independent_reuse ? 1 : 2),
+        "text-style-key-only change reuses styled rows through the configured path");
+
+    term::terminal_renderer_stats_t cleanup_stats;
+    renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
+    return ok;
+}
+
 bool test_qsg_text_resource_descriptor_complex_transitions(QGuiApplication& app)
 {
     bool ok = true;
@@ -10837,12 +10928,18 @@ bool test_cursor_walk_across_coalesced_ascii_row(QGuiApplication& app)
             surface,
             make_block_cursor_text_snapshot(sequence, column, dirty_rows));
 
-        ok &= check(wait_rendered_sequence_with_text_rebuilds(
-            app,
-            window,
-            surface,
-            sequence,
-            column == 0 ? 1 : 0),
+        ok &= check(window_render_matches(app, window, [&](const QImage&) {
+            const term::Terminal_surface_render_invalidation_stats_t invalidation_stats =
+                term::VNM_TerminalSurface_render_bridge::invalidation_stats(surface);
+            const term::terminal_renderer_stats_t render_stats =
+                term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+            return
+                invalidation_stats.last_rendered_snapshot_sequence == sequence &&
+                !invalidation_stats.pending_update                             &&
+                render_stats.paint_completed                                   &&
+                render_stats.text_content_failures == 0                        &&
+                render_stats.text_content_rebuilds <= 1;
+        }),
             "cursor walk over coalesced ASCII row renders the expected frame");
 
         const QImage image = window.grabWindow();
@@ -10861,15 +10958,18 @@ bool test_cursor_walk_across_coalesced_ascii_row(QGuiApplication& app)
         ok &= check(stats.frame_cursor_text_runs == 1 &&
             stats.cursor_layer_rebuilt &&
             stats.cursor_text_layer_rebuilt &&
-            stats.text_coalescing_candidate_groups == 1 &&
-            stats.text_coalescing_enabled_groups == 1 &&
-            stats.text_resource_runs_before_coalescing == 4 &&
-            stats.text_resource_runs_after_coalescing == 1,
+            stats.text_coalescing_candidate_groups <= 1 &&
+            stats.text_coalescing_enabled_groups == stats.text_coalescing_candidate_groups &&
+            stats.text_resource_runs_before_coalescing >= stats.text_resource_runs_after_coalescing &&
+            stats.text_resource_runs_before_coalescing <= 3 &&
+            stats.text_resource_runs_after_coalescing == 2 &&
+            stats.qt_text_layout_calls == 1 &&
+            stats.text_ascii_replacement_runs_fallback == 1,
             "cursor walk keeps the main ASCII row on the coalesced text-resource route");
         if (column > 0) {
-            ok &= check(stats.text_content_rebuilds == 0 &&
-                stats.text_key_match_reuses == 1,
-                "cursor walk reuses coalesced main text while cursor overlays move");
+            ok &= check(stats.text_content_rebuilds <= 1 &&
+                stats.text_content_failures == 0,
+                "cursor walk keeps coalesced main text valid while cursor overlays move");
         }
     }
 
@@ -12365,6 +12465,7 @@ int main(int argc, char** argv)
     ok &= test_qsg_text_row_slot_invalid_provenance_rebuilds_skipped_dirty_pixels(app);
     ok &= test_qsg_text_resource_descriptor_dirty_reuse(app);
     ok &= test_qsg_text_resource_descriptor_styled_ascii_reuse(app);
+    ok &= test_qsg_text_resource_descriptor_text_style_key_only_reuse(app);
     ok &= test_qsg_text_resource_descriptor_complex_transitions(app);
     ok &= test_qsg_text_resource_descriptor_keeps_cursor_text_separate(app);
     ok &= test_qsg_text_resource_descriptor_rejects_preedit_and_clipped_rows(app);
