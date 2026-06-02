@@ -45,17 +45,10 @@ the repository without reading every implementation detail.
   public API, and Scene Graph constraints.
 - [Repository guide](repository_guide.md) records supported platforms, build
   options, fixture formats, generated artifacts, and operational entry points.
-- [Selection row provenance plan](selection_row_provenance_plan.md) records the
-  implemented retained-line provenance architecture and phase outcomes for
-  selection visual lease preservation.
-- [Selection row provenance manual validation](selection_row_provenance_manual_validation.md)
-  records the manual Codex active-output checklist and trace hints.
-- [Primary backing redesign plans](primary_backing_redesign_plans/README.md)
-  records the current primary backing implementation phases and recovery-policy
-  ownership.
 
 ## Maintenance Rule
 
 Documentation should describe stable contracts, policy, repository structure,
-and supported operational workflows. Keep temporary working notes outside this
-directory.
+and supported operational workflows. Keep temporary working notes, plans,
+reviews, investigations, audits, phase reports, and historical implementation
+artifacts outside this directory.
