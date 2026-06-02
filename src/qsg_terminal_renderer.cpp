@@ -89,6 +89,11 @@ bool stage42_qsg_monotonic_dirty_probe_enabled()
     return stage42_feature_flags().qsg_monotonic_dirty_probe;
 }
 
+bool stage42_qsg_descriptor_reuse_frame_key_independent_enabled()
+{
+    return stage42_feature_flags().qsg_descriptor_reuse_frame_key_independent;
+}
+
 bool stage42_render_cell_row_cache_enabled()
 {
     return stage42_feature_flags().render_cell_row_cache;
@@ -1349,6 +1354,7 @@ public:
     std::vector<Geometry_row_cache_slot>   decoration_row_slots;
     std::vector<Text_resource_cache_slot>  text_row_slots;
     QByteArray                             text_frame_key;
+    QByteArray                             text_layout_frame_key;
     Ascii_text_coalescing_context_cache    text_coalescing_context_cache;
 
 private:
@@ -3175,13 +3181,18 @@ bool ensure_active_text_node(
     QSGTextNode*&              active_text_node,
     QSGInternalTextNode*&      active_internal_text_node,
     QRgb&                      active_foreground_rgba,
+    bool                       reuse_across_foreground,
     terminal_renderer_stats_t& stats,
     int&                       out_text_leaf_nodes_created)
 {
-    if (active_text_node       != nullptr &&
-        active_foreground_rgba == foreground.rgba())
-    {
-        return true;
+    if (active_text_node != nullptr) {
+        if (reuse_across_foreground || active_foreground_rgba == foreground.rgba()) {
+            return true;
+        }
+
+        active_text_node          = nullptr;
+        active_internal_text_node = nullptr;
+        active_foreground_rgba    = 0U;
     }
 
     active_internal_text_node = nullptr;
@@ -3468,6 +3479,7 @@ Append_ascii_replacement_result try_append_ascii_replacement_text_run(
             active_text_node,
             active_internal_text_node,
             active_foreground_rgba,
+            false,
             stats,
             out_text_leaf_nodes_created))
     {
@@ -3578,6 +3590,7 @@ Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
                 active_text_node,
                 active_internal_text_node,
                 active_foreground_rgba,
+                true,
                 stats,
                 out_text_leaf_nodes_created))
         {
@@ -3621,7 +3634,9 @@ void add_text_run_layout(
     QSGTextNode&                       text_node,
     QTextLayout&                       layout,
     const Terminal_render_text_run&    run,
-    qreal                              line_ascent)
+    qreal                              line_ascent,
+    const QColor&                      foreground,
+    QRgb&                              active_foreground_rgba)
 {
     VNM_TERMINAL_PROFILE_SCOPE("add_text_run_layout");
 
@@ -3629,6 +3644,13 @@ void add_text_run_layout(
     {
         VNM_TERMINAL_PROFILE_SCOPE("add_text_run_layout::addTextLayout_call");
 
+        // addTextLayout() paints with the node's current default color. Trusted
+        // glyph runs can share a leaf across foregrounds, so make the fallback
+        // layout color explicit before handing the layout to Qt.
+        if (active_foreground_rgba != foreground.rgba()) {
+            text_node.setColor(foreground);
+            active_foreground_rgba = foreground.rgba();
+        }
         text_node.addTextLayout(origin, &layout);
     }
 }
@@ -3669,13 +3691,14 @@ bool append_clipped_text_run_node(
         }
     }
 
+    const QColor clipped_foreground = text_node_foreground(run, force_blended_order);
     QSGTextNode* text_node = nullptr;
     {
         VNM_TERMINAL_PROFILE_SCOPE("append_clipped_text_run_node::create_text_node");
 
         text_node = make_text_leaf_node(
             window,
-            text_node_foreground(run, force_blended_order),
+            clipped_foreground,
             frame_viewport);
     }
     if (text_node == nullptr) {
@@ -3687,7 +3710,17 @@ bool append_clipped_text_run_node(
     {
         VNM_TERMINAL_PROFILE_SCOPE("append_clipped_text_run_node::add_layout");
 
-        add_text_run_layout(*text_node, layout, run, line_ascent);
+        // This node is dedicated to a single clipped run and was just created
+        // with clipped_foreground, so the setColor() inside the helper is a
+        // no-op; passing it keeps one shared add_text_run_layout code path.
+        QRgb clipped_active_foreground_rgba = clipped_foreground.rgba();
+        add_text_run_layout(
+            *text_node,
+            layout,
+            run,
+            line_ascent,
+            clipped_foreground,
+            clipped_active_foreground_rgba);
     }
 
     {
@@ -3762,6 +3795,7 @@ bool append_unclipped_text_run_qt_layout(
                 active_text_node,
                 active_internal_text_node,
                 active_foreground_rgba,
+                false,
                 stats,
                 out_text_leaf_nodes_created))
         {
@@ -3772,7 +3806,8 @@ bool append_unclipped_text_run_qt_layout(
     {
         VNM_TERMINAL_PROFILE_SCOPE("append_unclipped_text_run_qt_layout::add_layout");
 
-        add_text_run_layout(*active_text_node, layout, run, line_ascent);
+        add_text_run_layout(
+            *active_text_node, layout, run, line_ascent, foreground, active_foreground_rgba);
     }
     return true;
 }
@@ -3909,12 +3944,15 @@ bool append_batched_text_run_nodes(
     QSGTextNode*         active_text_node          = nullptr;
     QSGInternalTextNode* active_internal_text_node = nullptr;
     QRgb                 active_foreground_rgba    = 0U;
+    // Loop-invariant across runs in this row: coalescing_context is fixed for the
+    // whole call. Hoisted out of the per-run loop so dense (Plasma) and many-run
+    // (ParticleVortex) rows do not recompute the pointer/enabled check per run.
+    const bool has_ascii_layout_context =
+        coalescing_context != nullptr && coalescing_context->enabled;
     VNM_TERMINAL_PROFILE_SCOPE("append_batched_text_run_nodes::iterate_runs");
 
     for (const text_resource_run_t& resource_run : runs) {
         const Terminal_render_text_run& run = resource_run.run;
-        const bool has_ascii_layout_context =
-            coalescing_context != nullptr && coalescing_context->enabled;
         const bool use_ascii_layout_font =
             resource_run.use_ascii_layout_font && has_ascii_layout_context;
         Q_ASSERT(!resource_run.use_ascii_layout_font || has_ascii_layout_context);
@@ -4162,17 +4200,53 @@ Terminal_render_text_run row_local_text_run(
     return local_run;
 }
 
-void assign_row_local_text_runs(
+void append_row_local_text_run_preserving_ascii_fallback(
+    const Terminal_render_text_run&        run,
+    qreal                                  row_top,
+    qreal                                  cell_width,
+    std::vector<Terminal_render_text_run>& out_runs)
+{
+    Terminal_render_text_run local_run = row_local_text_run(run, row_top);
+    if (run.text.size() <= 1                                      ||
+        !text_run_has_plain_ascii_replacement_metadata(run)       ||
+        !is_unclipped_printable_ascii_cell_span_run(run, cell_width))
+    {
+        out_runs.push_back(std::move(local_run));
+        return;
+    }
+
+    const qsizetype text_size = run.text.size();
+    out_runs.reserve(out_runs.size() + static_cast<std::size_t>(text_size));
+    for (qsizetype index = 0; index < text_size; ++index) {
+        Terminal_render_text_run cell_run = local_run;
+        cell_run.column = run.column + static_cast<int>(index);
+        cell_run.text   = local_run.text.mid(index, 1);
+        cell_run.rect   = QRectF(
+            local_run.rect.left() + static_cast<qreal>(index) * cell_width,
+            local_run.rect.top(),
+            cell_width,
+            local_run.rect.height());
+        cell_run.baseline_origin.setX(cell_run.rect.left());
+        out_runs.push_back(std::move(cell_run));
+    }
+}
+
+void assign_row_local_text_runs_preserving_ascii_fallback(
     const std::vector<const Terminal_render_text_run*>&    runs,
     qreal                                                  row_top,
+    qreal                                                  cell_width,
     std::vector<Terminal_render_text_run>&                 out_runs)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("row_local_text_runs");
+    VNM_TERMINAL_PROFILE_SCOPE("row_local_text_runs_preserving_ascii_fallback");
 
     out_runs.clear();
     out_runs.reserve(runs.size());
     for (const Terminal_render_text_run* run : runs) {
-        out_runs.push_back(row_local_text_run(*run, row_top));
+        append_row_local_text_run_preserving_ascii_fallback(
+            *run,
+            row_top,
+            cell_width,
+            out_runs);
     }
 }
 
@@ -4571,12 +4645,15 @@ QByteArray text_style_cache_key(
     return key;
 }
 
-QByteArray text_frame_cache_key(
+QByteArray text_layout_frame_cache_key(
     const Terminal_render_frame&   frame,
     const QString&                 font_key)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("text_frame_cache_key");
+    VNM_TERMINAL_PROFILE_SCOPE("text_layout_frame_cache_key");
 
+    // Layout/resource invalidation fields only: font, logical size, cell
+    // metrics, grid, and active buffer. frame.text_style_key is intentionally
+    // excluded so descriptor reuse can ignore frame-level style epoch churn.
     QByteArray key;
     constexpr std::size_t k_string_length_byte_count = sizeof(std::uint64_t);
     key.reserve(
@@ -4595,8 +4672,26 @@ QByteArray text_frame_cache_key(
     append_cache_key_value(key, frame.grid_size.rows);
     append_cache_key_value(key, frame.grid_size.columns);
     append_cache_key_value(key, static_cast<int>(frame.viewport.active_buffer));
-    append_cache_key_byte_array(key, frame.text_style_key);
     return key;
+}
+
+QByteArray text_frame_cache_key(
+    QByteArray            layout_frame_key,
+    const QByteArray&     text_style_key)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("text_frame_cache_key");
+
+    append_cache_key_byte_array(layout_frame_key, text_style_key);
+    return layout_frame_key;
+}
+
+QByteArray text_frame_cache_key(
+    const Terminal_render_frame&   frame,
+    const QString&                 font_key)
+{
+    return text_frame_cache_key(
+        text_layout_frame_cache_key(frame, font_key),
+        frame.text_style_key);
 }
 
 void append_text_rect_key_fields(QByteArray& key, const QRectF& rect)
@@ -5080,17 +5175,36 @@ void sync_text_resource_nodes(
     QRectF     row_clip_rect;
     QString    text_font_key;
     QByteArray current_text_frame_key;
-    bool       same_text_frame_key             = false;
-    bool       clean_row_cache_skip_available  = false;
+    QByteArray current_text_layout_frame_key;
+    bool       same_text_frame_key              = false;
+    bool       descriptor_reuse_frame_key_match = false;
+    bool       clean_row_cache_skip_available   = false;
     {
         VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::initial_setup");
 
-        frame_viewport         = QRectF(QPointF(0.0, 0.0), frame.logical_size);
-        row_clip_rect          = row_text_clip_rect(frame);
-        text_font_key          = font_cache_key(font);
-        current_text_frame_key = text_frame_cache_key(frame, text_font_key);
+        frame_viewport                = QRectF(QPointF(0.0, 0.0), frame.logical_size);
+        row_clip_rect                 = row_text_clip_rect(frame);
+        text_font_key                 = font_cache_key(font);
+        current_text_layout_frame_key = text_layout_frame_cache_key(frame, text_font_key);
+        current_text_frame_key        = text_frame_cache_key(
+            current_text_layout_frame_key,
+            frame.text_style_key);
+        // The layout key is an internal descriptor-reuse guard, not a cache key
+        // submission. Keep text_key_builds tied to full text resource keys so
+        // key-match and descriptor-reuse counters remain comparable.
         record_text_cache_key_build(stats, current_text_frame_key);
-        same_text_frame_key            = root.text_frame_key == current_text_frame_key;
+        same_text_frame_key           = root.text_frame_key == current_text_frame_key;
+        // Descriptor reuse may ignore frame.text_style_key (a frame-level style
+        // epoch). When only the style key changes, descriptor-identical rows are
+        // still reusable, so we fall through to descriptor reuse without rebuilding
+        // per-row keys. Font, logical size, cell metrics, grid, and active buffer
+        // remain reuse-invalidation guards through the layout frame key.
+        const bool same_text_layout_frame_key =
+            root.text_layout_frame_key == current_text_layout_frame_key;
+        descriptor_reuse_frame_key_match =
+            same_text_frame_key ||
+            (stage42_qsg_descriptor_reuse_frame_key_independent_enabled() &&
+                same_text_layout_frame_key);
         clean_row_cache_skip_available =
             !frame.dirty_row_ranges.empty() &&
             same_text_frame_key;
@@ -5236,7 +5350,11 @@ void sync_text_resource_nodes(
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "sync_text_resource_nodes::coalescing::row_local_fallback");
 
-                assign_row_local_text_runs(group.runs, group.row_top, local_runs);
+                assign_row_local_text_runs_preserving_ascii_fallback(
+                    group.runs,
+                    group.row_top,
+                    frame.cell_metrics.width,
+                    local_runs);
                 local_runs_assigned = true;
             }
         }
@@ -5245,7 +5363,11 @@ void sync_text_resource_nodes(
             VNM_TERMINAL_PROFILE_SCOPE(
                 "sync_text_resource_nodes::coalescing_disabled_row_local_fallback");
 
-            assign_row_local_text_runs(group.runs, group.row_top, local_runs);
+            assign_row_local_text_runs_preserving_ascii_fallback(
+                group.runs,
+                group.row_top,
+                frame.cell_metrics.width,
+                local_runs);
             local_runs_assigned = true;
         }
 
@@ -5258,7 +5380,7 @@ void sync_text_resource_nodes(
                 : text_resource_row_descriptor_for_runs(local_runs);
         }
 
-        if (same_text_frame_key &&
+        if (descriptor_reuse_frame_key_match &&
             old_slot.has_value() &&
             text_resource_descriptor.has_value() &&
             old_slot->text_resource_descriptor == text_resource_descriptor)
@@ -5280,7 +5402,7 @@ void sync_text_resource_nodes(
             static_cast<int>(group.runs.size());
         const int runs_after_coalescing = use_ascii_resource_runs
             ? static_cast<int>(ascii_resource_runs.size())
-            : static_cast<int>(group.runs.size());
+            : static_cast<int>(local_runs.size());
         stats.text_resource_runs_after_coalescing += runs_after_coalescing;
         if (runs_after_coalescing > 0) {
             ++stats.text_resource_rows_with_runs;
@@ -5289,17 +5411,33 @@ void sync_text_resource_nodes(
                     stats.text_resource_max_runs_after_coalescing_per_row,
                     runs_after_coalescing);
         }
-        QByteArray key;
-        {
-            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::resource_key");
+        // If descriptor reuse was eligible and both old and new descriptors are
+        // present, a descriptor mismatch proves the full resource key cannot
+        // match. Skip the dead key-match build/probe, but build lazily once a
+        // replacement node actually succeeds so stored slots keep a real key for
+        // later descriptor-ineligible frames.
+        const bool descriptor_mismatch_proves_key_mismatch =
+            descriptor_reuse_frame_key_match              &&
+            old_slot.has_value()                          &&
+            text_resource_descriptor.has_value()          &&
+            old_slot->text_resource_descriptor.has_value() &&
+            old_slot->text_resource_descriptor != text_resource_descriptor;
+        std::optional<QByteArray> key;
+        auto current_text_resource_key = [&]() -> QByteArray& {
+            if (!key.has_value()) {
+                VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::resource_key");
 
-            key = use_ascii_resource_runs
-                ? text_resource_key(ascii_resource_runs, text_font_key, frame.logical_size)
-                : text_resource_key(local_runs, text_font_key, frame.logical_size);
-            record_text_cache_key_build(stats, key);
-        }
-        if (old_slot.has_value() &&
-            old_slot->key == key)
+                key = use_ascii_resource_runs
+                    ? text_resource_key(ascii_resource_runs, text_font_key, frame.logical_size)
+                    : text_resource_key(local_runs, text_font_key, frame.logical_size);
+                record_text_cache_key_build(stats, *key);
+            }
+            return *key;
+        };
+
+        if (!descriptor_mismatch_proves_key_mismatch &&
+            old_slot.has_value() &&
+            old_slot->key == current_text_resource_key())
         {
             VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::key_match_reuse");
 
@@ -5376,7 +5514,7 @@ void sync_text_resource_nodes(
                         "sync_text_resource_nodes::replace_cache_entry::resync_slot");
 
                     old_slot->node                     = node;
-                    old_slot->key                      = std::move(key);
+                    old_slot->key                      = std::move(current_text_resource_key());
                     old_slot->text_resource_descriptor = std::move(text_resource_descriptor);
                     sync_text_wrapper_row_top(*old_slot, group.row_top);
                     set_row_text_clip_rect(*old_slot, row_clip_rect);
@@ -5415,7 +5553,7 @@ void sync_text_resource_nodes(
                         .clip      = clip,
                         .node      = node,
                         .clip_rect = row_clip_rect,
-                        .key       = std::move(key),
+                        .key       = std::move(current_text_resource_key()),
                         .text_resource_descriptor = std::move(text_resource_descriptor),
                         .row_top   = group.row_top,
                     });
@@ -5470,8 +5608,9 @@ void sync_text_resource_nodes(
             append_text_row_slot_in_order(*root.text_layer, slot);
         }
     }
-    root.text_row_slots = std::move(new_slots);
-    root.text_frame_key = current_text_frame_key;
+    root.text_row_slots        = std::move(new_slots);
+    root.text_frame_key        = current_text_frame_key;
+    root.text_layout_frame_key = current_text_layout_frame_key;
 }
 
 int logical_row_for_viewport_row(
@@ -8330,6 +8469,28 @@ Terminal_render_frame build_terminal_render_frame(
                     use_visible_line_provenance)
                 : Terminal_render_line_provenance{};
         };
+        // Open span for direct printable-ASCII text-run coalescing (see the text
+        // emit branch below). Tracks the run currently being grown in
+        // frame.text_runs so contiguous, single-width, plain printable-ASCII cells
+        // with equivalent metadata are merged at emit time instead of one run per
+        // cell. Gaps (empty/graphic cells, row changes) break the span implicitly
+        // through the row/end_column contiguity test, so no explicit reset is
+        // needed outside the emit branch.
+        struct Open_ascii_coalesce_run
+        {
+            bool              valid              = false;
+            std::size_t       index              = 0U;
+            int               row                = 0;
+            int               logical_row        = 0;
+            std::uint64_t     retained_line_id   = 0U;
+            std::uint64_t     content_generation = 0U;
+            int               end_column         = 0;
+            QRgb              foreground_rgba    = 0U;
+            QRgb              background_rgba    = 0U;
+            Terminal_style_id style_id           = k_default_terminal_style_id;
+            int               length             = 0;
+        };
+        Open_ascii_coalesce_run open_ascii_run;
         for (const Terminal_render_cell& cell : snapshot->cells) {
             ++frame.stats.cells_considered;
             if (!cache_row_bookkeeping) {
@@ -8532,7 +8693,65 @@ Terminal_render_frame build_terminal_render_frame(
             }
             else
             if (!text_is_empty) {
-                frame.text_runs.push_back(run);
+                // Direct coalescing of printable-ASCII text runs. Merge this cell
+                // into the open run when it is a contiguous, single-width, plain
+                // (no decoration/hyperlink) printable-ASCII cell that shares the
+                // open run's paint, style, and line provenance, capped at the
+                // same maximum length the downstream coalescer uses. Cursor/IME
+                // cells are kept standalone so block-cursor inverted text and
+                // preedit overlays still copy a single protected cell.
+                const bool coalescable_ascii_cell =
+                    cell.display_width == 1                                    &&
+                    classification.text_category ==
+                        Terminal_simple_content_text_category::PRINTABLE_ASCII &&
+                    cell.text.size() == 1                                      &&
+                    !run.underline                                            &&
+                    !run.strike                                               &&
+                    run.hyperlink_id == 0U                                    &&
+                    !block_cursor_cell                                        &&
+                    !ime_preedit_cell;
+                const QRgb foreground_rgba = foreground.rgba();
+                const QRgb background_rgba = background.rgba();
+                if (coalescable_ascii_cell                                    &&
+                    open_ascii_run.valid                                     &&
+                    open_ascii_run.row                == cell.position.row    &&
+                    open_ascii_run.logical_row        == run.logical_row      &&
+                    open_ascii_run.retained_line_id   == run.retained_line_id &&
+                    open_ascii_run.content_generation == run.content_generation &&
+                    open_ascii_run.end_column         == cell.position.column &&
+                    open_ascii_run.foreground_rgba    == foreground_rgba      &&
+                    open_ascii_run.background_rgba    == background_rgba      &&
+                    open_ascii_run.style_id           == cell.style_id        &&
+                    open_ascii_run.length             <
+                        static_cast<int>(k_max_coalesced_ascii_text_run_length))
+                {
+                    Terminal_render_text_run& open_run =
+                        frame.text_runs[open_ascii_run.index];
+                    open_run.text += cell.text;
+                    open_run.rect.setWidth(
+                        rect.left() + rect.width() - open_run.rect.left());
+                    open_ascii_run.end_column += 1;
+                    ++open_ascii_run.length;
+                }
+                else {
+                    frame.text_runs.push_back(run);
+                    if (coalescable_ascii_cell) {
+                        open_ascii_run.valid              = true;
+                        open_ascii_run.index              = frame.text_runs.size() - 1U;
+                        open_ascii_run.row                = cell.position.row;
+                        open_ascii_run.logical_row        = run.logical_row;
+                        open_ascii_run.retained_line_id   = run.retained_line_id;
+                        open_ascii_run.content_generation = run.content_generation;
+                        open_ascii_run.end_column         = cell.position.column + 1;
+                        open_ascii_run.foreground_rgba    = foreground_rgba;
+                        open_ascii_run.background_rgba    = background_rgba;
+                        open_ascii_run.style_id           = cell.style_id;
+                        open_ascii_run.length             = 1;
+                    }
+                    else {
+                        open_ascii_run.valid = false;
+                    }
+                }
                 ++frame.stats.text_cells_rendered_as_text;
             }
 
