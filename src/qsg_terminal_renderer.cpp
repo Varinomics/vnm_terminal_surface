@@ -995,8 +995,16 @@ void clear_layer(QSGNode& layer)
     VNM_TERMINAL_PROFILE_SCOPE("clear_layer");
 
     while (QSGNode* child = layer.firstChild()) {
-        layer.removeChildNode(child);
-        delete_node_tree(child);
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("clear_layer::detach_child");
+
+            layer.removeChildNode(child);
+        }
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("clear_layer::delete_child_tree");
+
+            delete_node_tree(child);
+        }
     }
 }
 
@@ -1368,9 +1376,15 @@ void destroy_text_cache_entry(Terminal_scene_node::Text_resource_cache_slot& cac
     VNM_TERMINAL_PROFILE_SCOPE("destroy_text_cache_entry");
 
     if (cache.wrapper->parent() != nullptr) {
+        VNM_TERMINAL_PROFILE_SCOPE("destroy_text_cache_entry::detach_wrapper");
+
         cache.wrapper->parent()->removeChildNode(cache.wrapper);
     }
-    delete_node_tree(cache.wrapper);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("destroy_text_cache_entry::delete_wrapper_tree");
+
+        delete_node_tree(cache.wrapper);
+    }
 }
 
 int node_subtree_child_count(const QSGNode& node)
@@ -3005,9 +3019,19 @@ bool prepare_text_layout(QTextLayout& layout, qreal& out_line_ascent)
         VNM_TERMINAL_PROFILE_SCOPE("prepare_text_layout::layout_option_cache_setup");
 
         QTextOption option;
-        option.setWrapMode(QTextOption::NoWrap);
-        layout.setTextOption(option);
-        layout.setCacheEnabled(false);
+        {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "prepare_text_layout::layout_option_cache_setup::option");
+
+            option.setWrapMode(QTextOption::NoWrap);
+        }
+        {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "prepare_text_layout::layout_option_cache_setup::apply");
+
+            layout.setTextOption(option);
+            layout.setCacheEnabled(false);
+        }
     }
 
     QTextLine line;
@@ -3015,8 +3039,16 @@ bool prepare_text_layout(QTextLayout& layout, qreal& out_line_ascent)
     {
         VNM_TERMINAL_PROFILE_SCOPE("prepare_text_layout::begin_createLine");
 
-        layout.beginLayout();
-        line = layout.createLine();
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("prepare_text_layout::begin_createLine::beginLayout");
+
+            layout.beginLayout();
+        }
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("prepare_text_layout::begin_createLine::createLine");
+
+            line = layout.createLine();
+        }
     }
     if (line.isValid()) {
         VNM_TERMINAL_PROFILE_SCOPE("prepare_text_layout::line_setup_metrics");
@@ -3068,6 +3100,8 @@ bool prepare_text_run_layout(
     bool                               ascii_layout_font,
     terminal_renderer_stats_t&         stats)
 {
+    VNM_TERMINAL_PROFILE_SCOPE("prepare_text_run_layout");
+
 #if VNM_TERMINAL_PROFILING_ENABLED
     const text_layout_diagnostic_context_t diagnostic_context{
         &font,
@@ -3080,17 +3114,29 @@ bool prepare_text_run_layout(
         &diagnostic_context);
 #endif
 
-    layout.setText(run.text);
-    layout.setFont(font);
-    ++stats.qt_text_layout_calls;
-    ++stats.route_qt_text_layout_runs;
-    record_text_layout_run_makeup(
-        stats,
-        run,
-        clipped,
-        force_blended_order,
-        ascii_layout_font);
-    return prepare_text_layout(layout, out_line_ascent);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("prepare_text_run_layout::set_text_font");
+
+        layout.setText(run.text);
+        layout.setFont(font);
+    }
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("prepare_text_run_layout::record_stats");
+
+        ++stats.qt_text_layout_calls;
+        ++stats.route_qt_text_layout_runs;
+        record_text_layout_run_makeup(
+            stats,
+            run,
+            clipped,
+            force_blended_order,
+            ascii_layout_font);
+    }
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("prepare_text_run_layout::prepare_layout");
+
+        return prepare_text_layout(layout, out_line_ascent);
+    }
 }
 
 QColor text_node_foreground(const Terminal_render_text_run& run, bool force_blended_order)
@@ -3475,47 +3521,79 @@ Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
     Q_ASSERT(run.rect.isValid());
 
     const std::uint64_t text_code_units = text_run_code_units(run);
-    record_trusted_ascii_replacement_attempt(stats, text_code_units);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::record_attempt");
+
+        record_trusted_ascii_replacement_attempt(stats, text_code_units);
+    }
 
     Q_ASSERT(!is_all_space_text(run.text));
 
     QGlyphRun glyph_run;
-    if (stage42_qsg_trusted_ascii_unchecked_glyphs_enabled()) {
-        glyph_run = make_trusted_ascii_replacement_glyph_run(coalescing_context, run.text);
-    }
-    else {
-        const std::optional<QGlyphRun> checked_glyph_run =
-            make_ascii_replacement_glyph_run(coalescing_context, run.text);
-        if (!checked_glyph_run.has_value()) {
-            record_ascii_replacement_fallback(
-                stats,
-                text_code_units,
-                Ascii_replacement_fallback_reason::GLYPH_MAPPING);
-            return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
-        }
-
-        glyph_run = *checked_glyph_run;
-    }
-
-    const QColor foreground = text_node_foreground(run, false);
-    if (!ensure_active_text_node(
-            parent,
-            window,
-            foreground,
-            frame_viewport,
-            active_text_node,
-            active_internal_text_node,
-            active_foreground_rgba,
-            stats,
-            out_text_leaf_nodes_created))
     {
-        return Append_ascii_replacement_result::FAILED;
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::glyph_setup");
+
+        if (stage42_qsg_trusted_ascii_unchecked_glyphs_enabled()) {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "append_trusted_ascii_replacement_text_run::glyph_setup::unchecked");
+
+            glyph_run = make_trusted_ascii_replacement_glyph_run(coalescing_context, run.text);
+        }
+        else {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "append_trusted_ascii_replacement_text_run::glyph_setup::checked");
+
+            const std::optional<QGlyphRun> checked_glyph_run =
+                make_ascii_replacement_glyph_run(coalescing_context, run.text);
+            if (!checked_glyph_run.has_value()) {
+                record_ascii_replacement_fallback(
+                    stats,
+                    text_code_units,
+                    Ascii_replacement_fallback_reason::GLYPH_MAPPING);
+                return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+            }
+
+            glyph_run = *checked_glyph_run;
+        }
     }
 
-    QSGInternalTextNode* const internal_text_node =
-        stage42_qsg_cached_internal_text_node_enabled()
+    QColor foreground;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::foreground");
+
+        foreground = text_node_foreground(run, false);
+    }
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::ensure_active_text_node");
+
+        if (!ensure_active_text_node(
+                parent,
+                window,
+                foreground,
+                frame_viewport,
+                active_text_node,
+                active_internal_text_node,
+                active_foreground_rgba,
+                stats,
+                out_text_leaf_nodes_created))
+        {
+            return Append_ascii_replacement_result::FAILED;
+        }
+    }
+
+    QSGInternalTextNode* internal_text_node = nullptr;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::internal_node_lookup");
+
+        internal_text_node = stage42_qsg_cached_internal_text_node_enabled()
             ? active_internal_text_node
             : dynamic_cast<QSGInternalTextNode*>(active_text_node);
+    }
     if (internal_text_node == nullptr) {
         record_ascii_replacement_fallback(
             stats,
@@ -3524,12 +3602,17 @@ Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
         return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
     }
 
-    internal_text_node->addGlyphs(
-        QPointF(
-            run.baseline_origin.x(),
-            run.baseline_origin.y() - coalescing_context.layout_line_ascent),
-        glyph_run,
-        foreground);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::addGlyphs_call");
+
+        internal_text_node->addGlyphs(
+            QPointF(
+                run.baseline_origin.x(),
+                run.baseline_origin.y() - coalescing_context.layout_line_ascent),
+            glyph_run,
+            foreground);
+    }
     record_ascii_replacement_succeeded(stats, text_code_units, false);
     return Append_ascii_replacement_result::APPENDED;
 }
@@ -3542,12 +3625,11 @@ void add_text_run_layout(
 {
     VNM_TERMINAL_PROFILE_SCOPE("add_text_run_layout");
 
+    const QPointF origin(run.baseline_origin.x(), run.baseline_origin.y() - line_ascent);
     {
         VNM_TERMINAL_PROFILE_SCOPE("add_text_run_layout::addTextLayout_call");
 
-        text_node.addTextLayout(
-            QPointF(run.baseline_origin.x(), run.baseline_origin.y() - line_ascent),
-            &layout);
+        text_node.addTextLayout(origin, &layout);
     }
 }
 
@@ -3562,16 +3644,29 @@ bool append_clipped_text_run_node(
     terminal_renderer_stats_t&         stats,
     int&                               out_text_leaf_nodes_created)
 {
+    VNM_TERMINAL_PROFILE_SCOPE("append_clipped_text_run_node");
+
     if (run.text.isEmpty()) {
         return true;
     }
 
     QTextLayout layout;
     qreal       line_ascent = 0.0;
-    if (!prepare_text_run_layout(
-            layout, line_ascent, font, run, true, force_blended_order, ascii_layout_font, stats))
     {
-        return true;
+        VNM_TERMINAL_PROFILE_SCOPE("append_clipped_text_run_node::prepare_layout");
+
+        if (!prepare_text_run_layout(
+                layout,
+                line_ascent,
+                font,
+                run,
+                true,
+                force_blended_order,
+                ascii_layout_font,
+                stats))
+        {
+            return true;
+        }
     }
 
     QSGTextNode* text_node = nullptr;
@@ -3589,17 +3684,30 @@ bool append_clipped_text_run_node(
     ++out_text_leaf_nodes_created;
     ++stats.qsg_nodes_created;
 
-    add_text_run_layout(*text_node, layout, run, line_ascent);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("append_clipped_text_run_node::add_layout");
+
+        add_text_run_layout(*text_node, layout, run, line_ascent);
+    }
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("append_clipped_text_run_node::append_child");
 
         auto* clip_node = new QSGClipNode();
-        clip_node->setFlag(QSGNode::OwnedByParent, true);
-        clip_node->setIsRectangular(true);
-        clip_node->setClipRect(run.clip_rect);
-        clip_node->appendChildNode(text_node);
-        parent.appendChildNode(clip_node);
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("append_clipped_text_run_node::append_child::setup_clip");
+
+            clip_node->setFlag(QSGNode::OwnedByParent, true);
+            clip_node->setIsRectangular(true);
+            clip_node->setClipRect(run.clip_rect);
+            clip_node->appendChildNode(text_node);
+        }
+        {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "append_clipped_text_run_node::append_child::append_clip");
+
+            parent.appendChildNode(clip_node);
+        }
         ++stats.qsg_nodes_created;
     }
     return true;
@@ -3619,30 +3727,53 @@ bool append_unclipped_text_run_qt_layout(
     terminal_renderer_stats_t&         stats,
     int&                               out_text_leaf_nodes_created)
 {
+    VNM_TERMINAL_PROFILE_SCOPE("append_unclipped_text_run_qt_layout");
+
     QTextLayout layout;
     qreal       line_ascent = 0.0;
-    if (!prepare_text_run_layout(
-            layout, line_ascent, font, run, false, force_blended_order, ascii_layout_font, stats))
     {
-        return true;
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_unclipped_text_run_qt_layout::prepare_layout");
+
+        if (!prepare_text_run_layout(
+                layout,
+                line_ascent,
+                font,
+                run,
+                false,
+                force_blended_order,
+                ascii_layout_font,
+                stats))
+        {
+            return true;
+        }
     }
 
     const QColor foreground = text_node_foreground(run, force_blended_order);
-    if (!ensure_active_text_node(
-            parent,
-            window,
-            foreground,
-            frame_viewport,
-            active_text_node,
-            active_internal_text_node,
-            active_foreground_rgba,
-            stats,
-            out_text_leaf_nodes_created))
     {
-        return false;
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_unclipped_text_run_qt_layout::ensure_active_text_node");
+
+        if (!ensure_active_text_node(
+                parent,
+                window,
+                foreground,
+                frame_viewport,
+                active_text_node,
+                active_internal_text_node,
+                active_foreground_rgba,
+                stats,
+                out_text_leaf_nodes_created))
+        {
+            return false;
+        }
     }
 
-    add_text_run_layout(*active_text_node, layout, run, line_ascent);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("append_unclipped_text_run_qt_layout::add_layout");
+
+        add_text_run_layout(*active_text_node, layout, run, line_ascent);
+    }
     return true;
 }
 
@@ -3717,6 +3848,8 @@ bool append_batched_text_run_nodes(
     QSGTextNode*         active_text_node          = nullptr;
     QSGInternalTextNode* active_internal_text_node = nullptr;
     QRgb                 active_foreground_rgba    = 0U;
+    VNM_TERMINAL_PROFILE_SCOPE("append_batched_text_run_nodes::iterate_runs");
+
     for (std::size_t index = 0U; index < runs.size();) {
         const Terminal_render_text_run& run = runs[index];
         if (run.clip_rect.isValid()) {
@@ -3776,6 +3909,8 @@ bool append_batched_text_run_nodes(
     QSGTextNode*         active_text_node          = nullptr;
     QSGInternalTextNode* active_internal_text_node = nullptr;
     QRgb                 active_foreground_rgba    = 0U;
+    VNM_TERMINAL_PROFILE_SCOPE("append_batched_text_run_nodes::iterate_runs");
+
     for (const text_resource_run_t& resource_run : runs) {
         const Terminal_render_text_run& run = resource_run.run;
         const bool has_ascii_layout_context =
@@ -3892,17 +4027,38 @@ Terminal_text_resource_node* make_text_resource_node_with_children(
 {
     VNM_TERMINAL_PROFILE_SCOPE("make_text_resource_node");
 
-    auto* node = new Terminal_text_resource_node(lifecycle_recorder);
-    ++stats.qsg_nodes_created;
+    Terminal_text_resource_node* node = nullptr;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("make_text_resource_node::allocate_node");
+
+        node = new Terminal_text_resource_node(lifecycle_recorder);
+        ++stats.qsg_nodes_created;
+    }
     int text_leaf_nodes_created = 0;
-    if (!append_text_runs(*node, text_leaf_nodes_created)) {
-        out_failed = true;
-        stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*node);
-        delete node;
-        return nullptr;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("make_text_resource_node::append_children");
+
+        if (!append_text_runs(*node, text_leaf_nodes_created)) {
+            out_failed = true;
+            {
+                VNM_TERMINAL_PROFILE_SCOPE("make_text_resource_node::failure_bookkeeping");
+
+                stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*node);
+            }
+            {
+                VNM_TERMINAL_PROFILE_SCOPE("make_text_resource_node::failure_delete_node");
+
+                delete node;
+            }
+            return nullptr;
+        }
     }
 
-    out_text_leaf_nodes_created = text_leaf_nodes_created;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("make_text_resource_node::finalize");
+
+        out_text_leaf_nodes_created = text_leaf_nodes_created;
+    }
     return node;
 }
 
@@ -4108,6 +4264,9 @@ void assign_row_local_ascii_text_run_flags(
     qreal                                                  cell_width,
     std::vector<row_local_ascii_text_run_flags_t>&         out_flags)
 {
+    VNM_TERMINAL_PROFILE_SCOPE(
+        "try_make_row_local_ascii_text_resource_runs::scan_flags");
+
     out_flags.resize(runs.size());
     for (std::size_t index = 0U; index < runs.size(); ++index) {
         out_flags[index] = row_local_ascii_text_run_flags(*runs[index], cell_width);
@@ -4143,6 +4302,9 @@ bool row_local_ascii_text_resource_runs_have_candidate(
     const std::vector<row_local_ascii_text_run_flags_t>&   run_flags,
     qreal                                                  cell_width)
 {
+    VNM_TERMINAL_PROFILE_SCOPE(
+        "try_make_row_local_ascii_text_resource_runs::prefilter_scan");
+
     Q_ASSERT(run_flags.size() == runs.size());
 
     for (std::size_t index = 0U; index < runs.size(); ++index) {
@@ -4233,59 +4395,81 @@ row_local_ascii_text_resource_runs_result_t try_make_row_local_ascii_text_resour
     std::vector<text_resource_run_t>&                      out_runs)
 {
     row_local_ascii_text_resource_runs_result_t result;
-    scratch_run_flags.clear();
-    out_runs.clear();
-    if (runs.empty()               ||
-        !std::isfinite(cell_width) ||
-        cell_width  <= 0.0)
     {
-        return result;
-    }
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "try_make_row_local_ascii_text_resource_runs::precheck");
 
-    assign_row_local_ascii_text_run_flags(runs, cell_width, scratch_run_flags);
-    if (stage42_qsg_ascii_resource_prefilter_enabled() &&
-        !row_local_ascii_text_resource_runs_have_candidate(
-            runs,
-            scratch_run_flags,
-            cell_width))
-    {
-        return result;
-    }
-
-    out_runs.reserve(runs.size());
-    for (std::size_t index = 0U; index < runs.size();) {
-        const std::size_t past_last_index =
-            past_last_coalescible_ascii_source_text_run(
-                runs,
-                scratch_run_flags,
-                index,
-                cell_width);
-        if (past_last_index > index + 1U) {
-            out_runs.push_back(row_local_coalesced_ascii_text_resource_run(
-                runs,
-                scratch_run_flags,
-                row_top,
-                index,
-                past_last_index));
-            result.has_ascii_layout_runs = true;
-            result.has_coalesced_runs    = true;
-            index = past_last_index;
-            continue;
+        scratch_run_flags.clear();
+        out_runs.clear();
+        if (runs.empty()               ||
+            !std::isfinite(cell_width) ||
+            cell_width  <= 0.0)
+        {
+            return result;
         }
+    }
 
-        const bool use_ascii_layout_font = scratch_run_flags[index].use_ascii_layout_font;
-        out_runs.push_back({
-            row_local_text_run(*runs[index], row_top),
-            use_ascii_layout_font,
-            use_ascii_layout_font,
-            use_ascii_layout_font && scratch_run_flags[index].all_space,
-        });
-        result.has_ascii_layout_runs =
-            result.has_ascii_layout_runs || use_ascii_layout_font;
-        ++index;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "try_make_row_local_ascii_text_resource_runs::eligibility_flags");
+
+        assign_row_local_ascii_text_run_flags(runs, cell_width, scratch_run_flags);
+    }
+    if (stage42_qsg_ascii_resource_prefilter_enabled()) {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "try_make_row_local_ascii_text_resource_runs::prefilter");
+
+        if (!row_local_ascii_text_resource_runs_have_candidate(
+                runs,
+                scratch_run_flags,
+                cell_width))
+        {
+            return result;
+        }
+    }
+
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "try_make_row_local_ascii_text_resource_runs::build_runs");
+
+        out_runs.reserve(runs.size());
+        for (std::size_t index = 0U; index < runs.size();) {
+            const std::size_t past_last_index =
+                past_last_coalescible_ascii_source_text_run(
+                    runs,
+                    scratch_run_flags,
+                    index,
+                    cell_width);
+            if (past_last_index > index + 1U) {
+                out_runs.push_back(row_local_coalesced_ascii_text_resource_run(
+                    runs,
+                    scratch_run_flags,
+                    row_top,
+                    index,
+                    past_last_index));
+                result.has_ascii_layout_runs = true;
+                result.has_coalesced_runs    = true;
+                index = past_last_index;
+                continue;
+            }
+
+            const bool use_ascii_layout_font = scratch_run_flags[index].use_ascii_layout_font;
+            out_runs.push_back({
+                row_local_text_run(*runs[index], row_top),
+                use_ascii_layout_font,
+                use_ascii_layout_font,
+                use_ascii_layout_font && scratch_run_flags[index].all_space,
+            });
+            result.has_ascii_layout_runs =
+                result.has_ascii_layout_runs || use_ascii_layout_font;
+            ++index;
+        }
     }
 
     if (!result.has_ascii_layout_runs) {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "try_make_row_local_ascii_text_resource_runs::clear_without_ascii_layout");
+
         out_runs.clear();
     }
     return result;
@@ -4834,15 +5018,23 @@ void append_text_row_slot_in_order(
                            slot)
 {
     if (slot.wrapper->parent() != nullptr) {
+        VNM_TERMINAL_PROFILE_SCOPE("append_text_row_slot_in_order::detach_wrapper");
+
         slot.wrapper->parent()->removeChildNode(slot.wrapper);
     }
-    text_layer.appendChildNode(slot.wrapper);
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("append_text_row_slot_in_order::append_wrapper");
+
+        text_layer.appendChildNode(slot.wrapper);
+    }
 }
 
 int destroy_unconsumed_text_row_slots(
     Text_row_slot_transfer&    transfer,
     terminal_renderer_stats_t& stats)
 {
+    VNM_TERMINAL_PROFILE_SCOPE("destroy_unconsumed_text_row_slots");
+
     int rows_removed = 0;
     for (std::size_t index = 0; index < transfer.cache_slots.size(); ++index) {
         if (transfer.consumed_slots[index]) {
@@ -4850,10 +5042,20 @@ int destroy_unconsumed_text_row_slots(
         }
 
         Terminal_scene_node::Text_resource_cache_slot& slot = transfer.cache_slots[index];
-        record_text_cache_entry_nodes_cleared(stats, slot, false);
-        ++stats.text_cache_entries_removed;
-        stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*slot.wrapper);
-        destroy_text_cache_entry(slot);
+        {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "destroy_unconsumed_text_row_slots::bookkeeping");
+
+            record_text_cache_entry_nodes_cleared(stats, slot, false);
+            ++stats.text_cache_entries_removed;
+            stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*slot.wrapper);
+        }
+        {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "destroy_unconsumed_text_row_slots::destroy_entry");
+
+            destroy_text_cache_entry(slot);
+        }
         ++stats.text_content_removed;
         ++rows_removed;
     }
@@ -5148,11 +5350,26 @@ void sync_text_resource_nodes(
                     VNM_TERMINAL_PROFILE_SCOPE(
                         "sync_text_resource_nodes::replace_cache_entry::clear_old");
 
-                    record_text_cache_entry_nodes_cleared(stats, *old_slot, true);
-                    ++stats.qsg_nodes_replaced;
-                    stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*old_slot->node);
-                    old_slot->clip->removeChildNode(old_slot->node);
-                    delete old_slot->node;
+                    {
+                        VNM_TERMINAL_PROFILE_SCOPE(
+                            "sync_text_resource_nodes::replace_cache_entry::clear_old::bookkeeping");
+
+                        record_text_cache_entry_nodes_cleared(stats, *old_slot, true);
+                        ++stats.qsg_nodes_replaced;
+                        stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*old_slot->node);
+                    }
+                    {
+                        VNM_TERMINAL_PROFILE_SCOPE(
+                            "sync_text_resource_nodes::replace_cache_entry::clear_old::detach_node");
+
+                        old_slot->clip->removeChildNode(old_slot->node);
+                    }
+                    {
+                        VNM_TERMINAL_PROFILE_SCOPE(
+                            "sync_text_resource_nodes::replace_cache_entry::clear_old::delete_node");
+
+                        delete old_slot->node;
+                    }
                 }
                 {
                     VNM_TERMINAL_PROFILE_SCOPE(
@@ -5219,10 +5436,20 @@ void sync_text_resource_nodes(
             if (old_slot.has_value()) {
                 VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::failed_cache_cleanup");
 
-                record_text_cache_entry_nodes_cleared(stats, *old_slot, false);
-                ++stats.text_cache_entries_removed;
-                stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*old_slot->wrapper);
-                destroy_text_cache_entry(*old_slot);
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "sync_text_resource_nodes::failed_cache_cleanup::bookkeeping");
+
+                    record_text_cache_entry_nodes_cleared(stats, *old_slot, false);
+                    ++stats.text_cache_entries_removed;
+                    stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*old_slot->wrapper);
+                }
+                {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "sync_text_resource_nodes::failed_cache_cleanup::destroy_entry");
+
+                    destroy_text_cache_entry(*old_slot);
+                }
                 ++stats.text_content_removed;
             }
         }
@@ -8058,15 +8285,22 @@ Terminal_render_frame build_terminal_render_frame(
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::cells");
 
-        std::vector<unsigned char> seen_style_ids(snapshot->styles.size(), 0U);
+        std::vector<unsigned char> seen_style_ids;
         Terminal_style_id          previous_style_id     = k_default_terminal_style_id;
         bool                       has_previous_style_id = false;
 
         Simple_content_eligibility_flags simple_eligibility_flags;
-        simple_eligibility_flags.rows.resize(
-            valid_grid ? static_cast<std::size_t>(snapshot->grid_size.rows) : 0U,
-            0U);
-        simple_eligibility_flags.styles.resize(valid_grid ? snapshot->styles.size() : 0U, 0U);
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::cells::setup");
+
+            seen_style_ids.resize(snapshot->styles.size(), 0U);
+            simple_eligibility_flags.rows.resize(
+                valid_grid ? static_cast<std::size_t>(snapshot->grid_size.rows) : 0U,
+                0U);
+            simple_eligibility_flags.styles.resize(
+                valid_grid ? snapshot->styles.size() : 0U,
+                0U);
+        }
 
         const bool                      cache_row_bookkeeping  =
             stage42_render_cell_row_cache_enabled();
@@ -8076,27 +8310,37 @@ Terminal_render_frame build_terminal_render_frame(
         bool                            cached_block_cursor_row = false;
         bool                            cached_ime_preedit_row  = false;
         Terminal_render_line_provenance cached_line_provenance;
+        auto update_cached_row_bookkeeping = [&](const Terminal_render_cell& cell) {
+            cached_row = cell.position.row;
+            cached_valid_render_row =
+                valid_grid             &&
+                cell.position.row >= 0 &&
+                cell.position.row < snapshot->grid_size.rows;
+            cached_dirty_row = snapshot_row_is_dirty(dirty_row_flags, cell.position.row);
+            cached_block_cursor_row =
+                block_cursor_visible &&
+                cell.position.row == snapshot->cursor.position.row;
+            cached_ime_preedit_row =
+                ime_preedit_visible &&
+                cell.position.row == ime_preedit_row;
+            cached_line_provenance = cached_valid_render_row
+                ? line_provenance_for_viewport_row(
+                    *snapshot,
+                    cell.position.row,
+                    use_visible_line_provenance)
+                : Terminal_render_line_provenance{};
+        };
         for (const Terminal_render_cell& cell : snapshot->cells) {
             ++frame.stats.cells_considered;
-            if (!cache_row_bookkeeping || cell.position.row != cached_row) {
-                cached_row = cell.position.row;
-                cached_valid_render_row =
-                    valid_grid             &&
-                    cell.position.row >= 0 &&
-                    cell.position.row < snapshot->grid_size.rows;
-                cached_dirty_row = snapshot_row_is_dirty(dirty_row_flags, cell.position.row);
-                cached_block_cursor_row =
-                    block_cursor_visible &&
-                    cell.position.row == snapshot->cursor.position.row;
-                cached_ime_preedit_row =
-                    ime_preedit_visible &&
-                    cell.position.row == ime_preedit_row;
-                cached_line_provenance = cached_valid_render_row
-                    ? line_provenance_for_viewport_row(
-                        *snapshot,
-                        cell.position.row,
-                        use_visible_line_provenance)
-                    : Terminal_render_line_provenance{};
+            if (!cache_row_bookkeeping) {
+                update_cached_row_bookkeeping(cell);
+            }
+            else
+            if (cell.position.row != cached_row) {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "build_terminal_render_frame::cells::row_bookkeeping");
+
+                update_cached_row_bookkeeping(cell);
             }
 
             const bool valid_style_id =
@@ -8325,6 +8569,9 @@ Terminal_render_frame build_terminal_render_frame(
             }
         }
         if (!options.packed_text_sidecars_enabled) {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "build_terminal_render_frame::cells::finalize_disabled_sidecars");
+
             frame.stats.packed_text_disabled_cells_skipped =
                 frame.stats.simple_content.eligible_after_all_gates_cells;
         }
