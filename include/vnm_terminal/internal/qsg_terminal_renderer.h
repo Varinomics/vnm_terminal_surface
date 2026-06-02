@@ -94,6 +94,7 @@ struct terminal_renderer_stats_t
     int            text_content_removed                                 = 0;
     int            text_content_failures                                = 0;
     int            text_leaf_nodes_created                              = 0;
+    int            text_leaf_nodes_reused                               = 0;
     int            text_cache_entry_child_nodes_cleared_for_replacement = 0;
     int            text_cache_entry_child_nodes_cleared_for_removal     = 0;
     int            text_cache_entry_max_child_nodes_cleared             = 0;
@@ -139,6 +140,7 @@ struct terminal_renderer_stats_t
     int            text_ascii_replacement_runs_trusted_fast_path        = 0;
     int            text_ascii_replacement_runs_succeeded                = 0;
     int            text_ascii_replacement_runs_all_space_succeeded      = 0;
+    int            text_ascii_replacement_add_glyphs_calls              = 0;
     int            text_ascii_replacement_runs_fallback                 = 0;
     int            text_ascii_replacement_runs_rejected_clipped         = 0;
     int            text_ascii_replacement_runs_rejected_force_blended_order = 0;
@@ -177,6 +179,8 @@ struct terminal_renderer_stats_t
     int            text_groups_dirty                                    = 0;
     int            text_groups_clean                                    = 0;
     int            text_clean_reuse_skips                               = 0;
+    int            text_resource_descriptor_builds                      = 0;
+    int            text_resource_descriptor_builds_avoided              = 0;
     int            text_resource_descriptor_reuses                      = 0;
     int            text_key_builds                                      = 0;
     std::uint64_t  text_key_bytes                                       = 0U;
@@ -282,6 +286,7 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_content_removed                                 = 0U;
     std::uint64_t  text_content_failures                                = 0U;
     std::uint64_t  text_leaf_nodes_created                              = 0U;
+    std::uint64_t  text_leaf_nodes_reused                               = 0U;
     std::uint64_t  text_cache_entry_child_nodes_cleared_for_replacement = 0U;
     std::uint64_t  text_cache_entry_child_nodes_cleared_for_removal     = 0U;
     std::uint64_t  text_cache_entry_max_child_nodes_cleared             = 0U;
@@ -327,6 +332,7 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_ascii_replacement_runs_trusted_fast_path        = 0U;
     std::uint64_t  text_ascii_replacement_runs_succeeded                = 0U;
     std::uint64_t  text_ascii_replacement_runs_all_space_succeeded      = 0U;
+    std::uint64_t  text_ascii_replacement_add_glyphs_calls              = 0U;
     std::uint64_t  text_ascii_replacement_runs_fallback                 = 0U;
     std::uint64_t  text_ascii_replacement_runs_rejected_clipped         = 0U;
     std::uint64_t  text_ascii_replacement_runs_rejected_force_blended_order = 0U;
@@ -365,6 +371,8 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_groups_dirty                                    = 0U;
     std::uint64_t  text_groups_clean                                    = 0U;
     std::uint64_t  text_clean_reuse_skips                               = 0U;
+    std::uint64_t  text_resource_descriptor_builds                      = 0U;
+    std::uint64_t  text_resource_descriptor_builds_avoided              = 0U;
     std::uint64_t  text_resource_descriptor_reuses                      = 0U;
     std::uint64_t  text_key_builds                                      = 0U;
     std::uint64_t  text_key_bytes                                       = 0U;

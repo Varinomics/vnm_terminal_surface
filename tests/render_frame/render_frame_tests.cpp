@@ -79,6 +79,20 @@ const term::Terminal_render_text_run* run_at(
     return nullptr;
 }
 
+std::vector<const term::Terminal_render_text_run*> text_runs_for_row(
+    const term::Terminal_render_frame& frame,
+    int                                row)
+{
+    std::vector<const term::Terminal_render_text_run*> runs;
+    for (const term::Terminal_render_text_run& run : frame.text_runs) {
+        if (run.row == row) {
+            runs.push_back(&run);
+        }
+    }
+
+    return runs;
+}
+
 QString packed_text(
     const term::Terminal_render_frame&         frame,
     const term::terminal_packed_text_span_t&   span)
@@ -404,6 +418,149 @@ bool test_single_cell_unicode_text_is_not_clipped_to_cell()
     return ok;
 }
 
+bool test_direct_ascii_text_runs_coalesce_contiguous_plain_cells()
+{
+    bool ok = true;
+    term::Terminal_render_snapshot snapshot = empty_snapshot({1, 6});
+    snapshot.cursor.visible = false;
+    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
+    snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("B")});
+    snapshot.cells.push_back({.position = {0, 2}, .text = QStringLiteral("C")});
+
+    const term::Terminal_render_frame frame = build(snapshot);
+    ok &= check(frame.text_runs.size() == 1U &&
+        frame.text_runs.front().row == 0 &&
+        frame.text_runs.front().column == 0 &&
+        frame.text_runs.front().text == QStringLiteral("ABC") &&
+        frame.text_runs.front().rect == QRectF(0.0, 0.0, 30.0, 20.0),
+        "contiguous same-style printable ASCII emits one coalesced text run");
+    ok &= check(frame.stats.text_runs_emitted == 1 &&
+        frame.stats.text_cells_rendered_as_text == 3,
+        "coalesced direct ASCII still counts the rendered source cells");
+    return ok;
+}
+
+bool test_direct_ascii_text_runs_split_at_guard_boundaries()
+{
+    bool ok = true;
+    term::Terminal_render_snapshot snapshot = empty_snapshot({5, 8});
+
+    term::Terminal_text_style accent = term::make_default_terminal_text_style();
+    accent.foreground = term::make_rgb_terminal_color_ref(0xffcc1010U);
+    accent.background = term::make_rgb_terminal_color_ref(0xff1030ccU);
+    snapshot.styles.push_back(accent);
+
+    term::Terminal_text_style decorated = term::make_default_terminal_text_style();
+    term::set_terminal_style_attribute(decorated, term::Terminal_style_attribute::UNDERLINE);
+    snapshot.styles.push_back(decorated);
+
+    snapshot.hyperlinks.push_back({17U, QByteArrayLiteral("uri:https://example.test"),
+        QByteArrayLiteral("https://example.test")});
+    snapshot.cursor = {{4, 1}, term::Terminal_cursor_shape::BLOCK, true, false};
+
+    const auto add_cell = [&](
+        int                       row,
+        int                       column,
+        const QString&            text,
+        term::Terminal_style_id   style_id = 0U,
+        std::uint64_t             hyperlink_id = 0U) {
+        term::Terminal_render_cell cell;
+        cell.position     = {row, column};
+        cell.text         = text;
+        cell.hyperlink_id = hyperlink_id;
+        cell.style_id     = style_id;
+        snapshot.cells.push_back(cell);
+    };
+
+    add_cell(0, 0, QStringLiteral("A"));
+    add_cell(0, 1, QStringLiteral("B"), 1U);
+    add_cell(0, 2, QStringLiteral("C"));
+    add_cell(1, 0, QStringLiteral("D"));
+    add_cell(1, 1, QStringLiteral("E"), 2U);
+    add_cell(1, 2, QStringLiteral("F"));
+    add_cell(2, 0, QStringLiteral("G"));
+    add_cell(2, 1, QStringLiteral("H"), 0U, 17U);
+    add_cell(2, 2, QStringLiteral("I"));
+    add_cell(3, 0, QStringLiteral("J"));
+    add_cell(3, 2, QStringLiteral("K"));
+    add_cell(4, 0, QStringLiteral("L"));
+    add_cell(4, 1, QStringLiteral("M"));
+    add_cell(4, 2, QStringLiteral("N"));
+
+    const term::Terminal_render_frame frame = build(snapshot);
+
+    const std::vector<const term::Terminal_render_text_run*> style_runs =
+        text_runs_for_row(frame, 0);
+    ok &= check(style_runs.size() == 3U &&
+        style_runs[0]->text == QStringLiteral("A") &&
+        style_runs[1]->text == QStringLiteral("B") &&
+        style_runs[1]->style_id == 1U &&
+        style_runs[1]->foreground == QColor(204, 16, 16) &&
+        style_runs[1]->background == QColor(16, 48, 204) &&
+        style_runs[2]->text == QStringLiteral("C"),
+        "direct ASCII coalescing splits at foreground/background/style boundaries");
+
+    const std::vector<const term::Terminal_render_text_run*> decoration_runs =
+        text_runs_for_row(frame, 1);
+    ok &= check(decoration_runs.size() == 3U &&
+        decoration_runs[1]->text == QStringLiteral("E") &&
+        decoration_runs[1]->underline,
+        "direct ASCII coalescing splits at decoration boundaries");
+
+    const std::vector<const term::Terminal_render_text_run*> hyperlink_runs =
+        text_runs_for_row(frame, 2);
+    ok &= check(hyperlink_runs.size() == 3U &&
+        hyperlink_runs[1]->text == QStringLiteral("H") &&
+        hyperlink_runs[1]->hyperlink_id == 17U,
+        "direct ASCII coalescing splits at hyperlink boundaries");
+
+    const std::vector<const term::Terminal_render_text_run*> gap_runs =
+        text_runs_for_row(frame, 3);
+    ok &= check(gap_runs.size() == 2U &&
+        gap_runs[0]->text == QStringLiteral("J") &&
+        gap_runs[1]->column == 2 &&
+        gap_runs[1]->text == QStringLiteral("K"),
+        "direct ASCII coalescing splits across column gaps");
+
+    const std::vector<const term::Terminal_render_text_run*> cursor_runs =
+        text_runs_for_row(frame, 4);
+    ok &= check(cursor_runs.size() == 3U &&
+        cursor_runs[0]->text == QStringLiteral("L") &&
+        cursor_runs[1]->text == QStringLiteral("M") &&
+        cursor_runs[2]->text == QStringLiteral("N"),
+        "direct ASCII coalescing splits around a block-cursor-covered cell");
+    ok &= check(frame.cursor_text_runs.size() == 1U &&
+        frame.cursor_text_runs.front().text == QStringLiteral("M"),
+        "block cursor overlay copies only the protected standalone cell");
+    return ok;
+}
+
+bool test_direct_ascii_text_runs_split_at_max_coalesced_length()
+{
+    constexpr int k_expected_max_coalesced_ascii_text_run_length = 384;
+
+    bool ok = true;
+    term::Terminal_render_snapshot snapshot =
+        empty_snapshot({1, k_expected_max_coalesced_ascii_text_run_length + 1});
+    snapshot.cursor.visible = false;
+    for (int column = 0; column <= k_expected_max_coalesced_ascii_text_run_length; ++column) {
+        snapshot.cells.push_back({.position = {0, column}, .text = QStringLiteral("A")});
+    }
+
+    const term::Terminal_render_frame frame = build(snapshot);
+    ok &= check(frame.text_runs.size() == 2U,
+        "direct ASCII coalescing caps the maximum text-run length");
+    ok &= check(frame.text_runs.size() == 2U &&
+        frame.text_runs[0].column == 0 &&
+        frame.text_runs[0].text.size() == k_expected_max_coalesced_ascii_text_run_length &&
+        frame.text_runs[0].rect.width() ==
+            metrics().width * k_expected_max_coalesced_ascii_text_run_length &&
+        frame.text_runs[1].column == k_expected_max_coalesced_ascii_text_run_length &&
+        frame.text_runs[1].text == QStringLiteral("A"),
+        "direct ASCII coalescing starts a new run at the configured length cap");
+    return ok;
+}
+
 bool test_inverse_and_reverse_video_xor()
 {
     bool ok = true;
@@ -472,6 +629,7 @@ bool test_styled_blank_cells_emit_background_rects()
 {
     bool ok = true;
     term::Terminal_render_snapshot snapshot = empty_snapshot({1, 8});
+    snapshot.cursor.visible = false;
 
     term::Terminal_text_style highlighted = term::make_default_terminal_text_style();
     highlighted.background = term::make_rgb_terminal_color_ref(0xff143c78U);
@@ -488,8 +646,10 @@ bool test_styled_blank_cells_emit_background_rects()
         "styled blank cell emits its own background rectangle");
     ok &= check(has_background_rect(frame, QRectF(20.0, 0.0, 10.0, 20.0), highlight_color),
         "adjacent styled blank cell emits its own background rectangle");
-    ok &= check(frame.text_runs.size() == 4U,
-        "styled blank cells remain represented in text runs");
+    ok &= check(frame.text_runs.size() == 1U &&
+        frame.text_runs.front().text == QStringLiteral("A  D") &&
+        frame.text_runs.front().rect.width() == 40.0,
+        "styled blank cells remain represented in coalesced text runs");
     return ok;
 }
 
@@ -2485,6 +2645,9 @@ int main()
     ok &= test_block_cursor_over_graphic_has_overlay_rects();
     ok &= test_mixed_unicode_row_geometry();
     ok &= test_single_cell_unicode_text_is_not_clipped_to_cell();
+    ok &= test_direct_ascii_text_runs_coalesce_contiguous_plain_cells();
+    ok &= test_direct_ascii_text_runs_split_at_guard_boundaries();
+    ok &= test_direct_ascii_text_runs_split_at_max_coalesced_length();
     ok &= test_inverse_and_reverse_video_xor();
     ok &= test_default_and_reverse_full_grid_background();
     ok &= test_styled_blank_cells_emit_background_rects();

@@ -69,6 +69,11 @@ bool stage42_qsg_trusted_ascii_unchecked_glyphs_enabled()
     return stage42_feature_flags().qsg_trusted_ascii_unchecked_glyphs;
 }
 
+bool stage42_qsg_trusted_ascii_glyph_batching_enabled()
+{
+    return stage42_feature_flags().qsg_trusted_ascii_glyph_batching;
+}
+
 bool stage42_qsg_text_makeup_single_char_fast_path_enabled()
 {
     return stage42_feature_flags().qsg_text_makeup_single_char_fast_path;
@@ -89,6 +94,21 @@ bool stage42_qsg_monotonic_dirty_probe_enabled()
     return stage42_feature_flags().qsg_monotonic_dirty_probe;
 }
 
+bool stage42_qsg_text_resource_descriptor_direct_compare_enabled()
+{
+    return stage42_feature_flags().qsg_text_resource_descriptor_direct_compare;
+}
+
+bool stage42_qsg_text_leaf_content_reuse_enabled()
+{
+    return stage42_feature_flags().qsg_text_leaf_content_reuse;
+}
+
+bool stage42_qsg_row_slot_ordered_lookup_enabled()
+{
+    return stage42_feature_flags().qsg_row_slot_ordered_lookup;
+}
+
 bool stage42_qsg_descriptor_reuse_frame_key_independent_enabled()
 {
     return stage42_feature_flags().qsg_descriptor_reuse_frame_key_independent;
@@ -97,6 +117,11 @@ bool stage42_qsg_descriptor_reuse_frame_key_independent_enabled()
 bool stage42_render_cell_row_cache_enabled()
 {
     return stage42_feature_flags().render_cell_row_cache;
+}
+
+bool stage42_render_frame_sorted_row_sort_prefilter_enabled()
+{
+    return stage42_feature_flags().render_frame_sorted_row_sort_prefilter;
 }
 
 #if VNM_TERMINAL_PROFILING_ENABLED
@@ -1403,16 +1428,20 @@ int node_subtree_child_count(const QSGNode& node)
     return count;
 }
 
+int text_cache_entry_destroyed_node_count(int text_node_child_count)
+{
+    // Text cache entries own wrapper -> clip -> text resource node.
+    return text_node_child_count + 3;
+}
+
 #if VNM_TERMINAL_PROFILING_ENABLED
 void record_text_cache_entry_nodes_cleared(
     terminal_renderer_stats_t& stats,
-    const Terminal_scene_node::Text_resource_cache_slot&
-                               cache,
+    int                        nodes_cleared,
     bool                       replacement)
 {
     VNM_TERMINAL_PROFILE_SCOPE("record_text_cache_entry_nodes_cleared");
 
-    const int nodes_cleared = node_subtree_child_count(*cache.node);
     if (replacement) {
         stats.text_cache_entry_child_nodes_cleared_for_replacement += nodes_cleared;
     }
@@ -1426,7 +1455,7 @@ void record_text_cache_entry_nodes_cleared(
 #else
 void record_text_cache_entry_nodes_cleared(
     terminal_renderer_stats_t&,
-    const Terminal_scene_node::Text_resource_cache_slot&,
+    int,
     bool)
 {}
 #endif
@@ -2360,6 +2389,11 @@ bool nearly_same_text_geometry(qreal left, qreal right)
     return within_tolerance(left, right, k_text_geometry_tolerance);
 }
 
+bool text_geometry_at_or_after(qreal left, qreal right)
+{
+    return left > right || nearly_same_text_geometry(left, right);
+}
+
 qreal ascii_advance_tolerance(qreal cell_width)
 {
     return std::max(
@@ -3156,6 +3190,16 @@ QColor text_node_foreground(const Terminal_render_text_run& run, bool force_blen
     return foreground;
 }
 
+void apply_text_leaf_node_state(
+    QSGTextNode&   text_node,
+    const QColor&  foreground,
+    const QRectF&  frame_viewport)
+{
+    text_node.setColor(foreground);
+    text_node.setRenderType(QSGTextNode::QtRendering);
+    text_node.setViewport(frame_viewport);
+}
+
 QSGTextNode* make_text_leaf_node(
     QQuickWindow&  window,
     const QColor&  foreground,
@@ -3167,9 +3211,7 @@ QSGTextNode* make_text_leaf_node(
     }
 
     text_node->setFlag(QSGNode::OwnedByParent, true);
-    text_node->setColor(foreground);
-    text_node->setRenderType(QSGTextNode::QtRendering);
-    text_node->setViewport(frame_viewport);
+    apply_text_leaf_node_state(*text_node, foreground, frame_viewport);
     return text_node;
 }
 
@@ -3371,6 +3413,200 @@ enum class Append_ascii_replacement_result
     FAILED,
 };
 
+struct Trusted_ascii_replacement_batch
+{
+    std::vector<const Terminal_render_text_run*> runs;
+    QColor                                      foreground;
+    int                                         row          = 0;
+    int                                         logical_row  = 0;
+    qreal                                       rect_top       = 0.0;
+    qreal                                       rect_height    = 0.0;
+    qreal                                       baseline_y     = 0.0;
+    qreal                                       first_origin_x = 0.0;
+    qreal                                       last_end_x     = 0.0;
+};
+
+qreal trusted_ascii_replacement_run_end_x(
+    const Ascii_text_coalescing_context& context,
+    const Terminal_render_text_run&      run)
+{
+    return
+        run.baseline_origin.x() +
+        static_cast<qreal>(run.text.size()) * context.cell_width;
+}
+
+bool trusted_ascii_replacement_batch_can_append(
+    const Trusted_ascii_replacement_batch& batch,
+    const Ascii_text_coalescing_context&   context,
+    const Terminal_render_text_run&        run,
+    const QColor&                          foreground)
+{
+    if (batch.runs.empty()) {
+        return true;
+    }
+
+    return
+        batch.foreground.rgba() == foreground.rgba()                         &&
+        batch.row               == run.row                                   &&
+        batch.logical_row       == run.logical_row                           &&
+        nearly_same_text_geometry(batch.rect_top,    run.rect.top())         &&
+        nearly_same_text_geometry(batch.rect_height, run.rect.height())      &&
+        nearly_same_text_geometry(batch.baseline_y,  run.baseline_origin.y()) &&
+        text_geometry_at_or_after(run.baseline_origin.x(), batch.last_end_x) &&
+        text_geometry_at_or_after(
+            trusted_ascii_replacement_run_end_x(context, run),
+            run.baseline_origin.x());
+}
+
+void append_trusted_ascii_replacement_batch_run(
+    Trusted_ascii_replacement_batch&        batch,
+    const Ascii_text_coalescing_context&    context,
+    const Terminal_render_text_run&         run,
+    const QColor&                           foreground)
+{
+    if (batch.runs.empty()) {
+        batch.foreground     = foreground;
+        batch.row            = run.row;
+        batch.logical_row    = run.logical_row;
+        batch.rect_top       = run.rect.top();
+        batch.rect_height    = run.rect.height();
+        batch.baseline_y     = run.baseline_origin.y();
+        batch.first_origin_x = run.baseline_origin.x();
+    }
+
+    batch.runs.push_back(&run);
+    batch.last_end_x = trusted_ascii_replacement_run_end_x(context, run);
+}
+
+std::uint64_t trusted_ascii_replacement_batch_code_units(
+    const Trusted_ascii_replacement_batch& batch)
+{
+    std::uint64_t code_units = 0U;
+    for (const Terminal_render_text_run* run : batch.runs) {
+        code_units += text_run_code_units(*run);
+    }
+    return code_units;
+}
+
+QString trusted_ascii_replacement_batch_text(
+    const Trusted_ascii_replacement_batch& batch)
+{
+    QString text;
+    text.reserve(static_cast<qsizetype>(
+        trusted_ascii_replacement_batch_code_units(batch)));
+    for (const Terminal_render_text_run* run : batch.runs) {
+        text += run->text;
+    }
+    return text;
+}
+
+Ascii_text_coalescing_context::Replacement_shape make_trusted_ascii_replacement_batch_shape(
+    const Ascii_text_coalescing_context&   context,
+    const Trusted_ascii_replacement_batch& batch,
+    qsizetype                              text_size)
+{
+    Ascii_text_coalescing_context::Replacement_shape shape;
+    shape.glyph_positions.resize(text_size);
+    shape.string_indexes.resize(text_size);
+
+    qsizetype index = 0;
+    for (const Terminal_render_text_run* run : batch.runs) {
+        const qreal run_x = run->baseline_origin.x() - batch.first_origin_x;
+        for (qsizetype run_index = 0; run_index < run->text.size(); ++run_index) {
+            shape.glyph_positions[index] = QPointF(
+                run_x + static_cast<qreal>(run_index) * context.cell_width,
+                context.glyph_position_y);
+            shape.string_indexes[index] = index;
+            ++index;
+        }
+    }
+
+    Q_ASSERT(index == text_size);
+    return shape;
+}
+
+QGlyphRun make_trusted_ascii_replacement_batch_glyph_run_from_scratch(
+    const Ascii_text_coalescing_context&   context,
+    const Trusted_ascii_replacement_batch& batch,
+    const QString&                         text)
+{
+    Q_ASSERT(context.enabled);
+    Q_ASSERT(context.raw_font.isValid());
+    Q_ASSERT(std::isfinite(context.cell_width));
+    Q_ASSERT(context.cell_width > 0.0);
+
+    const qsizetype text_size = text.size();
+    const Ascii_text_coalescing_context::Replacement_shape shape =
+        make_trusted_ascii_replacement_batch_shape(context, batch, text_size);
+
+    QGlyphRun glyph_run;
+    glyph_run.setRawFont(context.raw_font);
+    glyph_run.setGlyphIndexes(context.ascii_replacement_glyph_index_scratch);
+    glyph_run.setPositions(shape.glyph_positions);
+    glyph_run.setStringIndexes(shape.string_indexes);
+    glyph_run.setSourceString(text);
+    glyph_run.setBoundingRect(QRectF(
+        0.0,
+        context.glyph_position_y - context.raw_font_ascent,
+        batch.last_end_x - batch.first_origin_x,
+        context.raw_font_ascent + context.raw_font_descent));
+    return glyph_run;
+}
+
+QGlyphRun make_trusted_ascii_replacement_batch_glyph_run(
+    const Ascii_text_coalescing_context&   context,
+    const Trusted_ascii_replacement_batch& batch,
+    const QString&                         text)
+{
+    Q_ASSERT(context.enabled);
+    Q_ASSERT(context.raw_font.isValid());
+    Q_ASSERT(std::isfinite(context.cell_width));
+    Q_ASSERT(context.cell_width > 0.0);
+
+    fill_trusted_ascii_replacement_glyph_indexes(context, text);
+    return make_trusted_ascii_replacement_batch_glyph_run_from_scratch(context, batch, text);
+}
+
+std::optional<QGlyphRun> make_checked_trusted_ascii_replacement_batch_glyph_run(
+    const Ascii_text_coalescing_context&   context,
+    const Trusted_ascii_replacement_batch& batch,
+    const QString&                         text)
+{
+    if (!fill_checked_ascii_replacement_glyph_indexes(context, text)) {
+        return std::nullopt;
+    }
+
+    return make_trusted_ascii_replacement_batch_glyph_run_from_scratch(context, batch, text);
+}
+
+void record_trusted_ascii_replacement_batch_attempt(
+    terminal_renderer_stats_t&             stats,
+    const Trusted_ascii_replacement_batch& batch)
+{
+    for (const Terminal_render_text_run* run : batch.runs) {
+        record_trusted_ascii_replacement_attempt(stats, text_run_code_units(*run));
+    }
+}
+
+void record_trusted_ascii_replacement_batch_success(
+    terminal_renderer_stats_t&             stats,
+    const Trusted_ascii_replacement_batch& batch)
+{
+    for (const Terminal_render_text_run* run : batch.runs) {
+        record_ascii_replacement_succeeded(stats, text_run_code_units(*run), false);
+    }
+}
+
+void record_trusted_ascii_replacement_batch_fallback(
+    terminal_renderer_stats_t&             stats,
+    const Trusted_ascii_replacement_batch& batch,
+    Ascii_replacement_fallback_reason      reason)
+{
+    for (const Terminal_render_text_run* run : batch.runs) {
+        record_ascii_replacement_fallback(stats, *run, reason);
+    }
+}
+
 Append_ascii_replacement_result try_append_ascii_replacement_text_run(
     QSGNode&                           parent,
     QQuickWindow&                      window,
@@ -3504,130 +3740,110 @@ Append_ascii_replacement_result try_append_ascii_replacement_text_run(
             run.baseline_origin.y() - coalescing_context->layout_line_ascent),
         *glyph_run,
         foreground);
+    ++stats.text_ascii_replacement_add_glyphs_calls;
     record_ascii_replacement_succeeded(stats, text_code_units, false);
     return Append_ascii_replacement_result::APPENDED;
 }
 
-Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
-    QSGNode&                           parent,
-    QQuickWindow&                      window,
-    const Ascii_text_coalescing_context&
-                                       coalescing_context,
-    const Terminal_render_text_run&    run,
-    const QRectF&                      frame_viewport,
-    QSGTextNode*&                      active_text_node,
-    QSGInternalTextNode*&              active_internal_text_node,
-    QRgb&                              active_foreground_rgba,
-    terminal_renderer_stats_t&         stats,
-    int&                               out_text_leaf_nodes_created)
+QSGInternalTextNode* single_reusable_text_leaf_node(Terminal_text_resource_node& node)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("append_trusted_ascii_replacement_text_run");
-
-    Q_ASSERT(coalescing_context.enabled);
-    Q_ASSERT(coalescing_context.raw_font.isValid());
-    Q_ASSERT(!run.clip_rect.isValid());
-    Q_ASSERT(run.hyperlink_id == 0U);
-    Q_ASSERT(!run.underline);
-    Q_ASSERT(!run.strike);
-    Q_ASSERT(is_printable_ascii_text(run.text));
-    Q_ASSERT(run.rect.isValid());
-
-    const std::uint64_t text_code_units = text_run_code_units(run);
-    {
-        VNM_TERMINAL_PROFILE_SCOPE(
-            "append_trusted_ascii_replacement_text_run::record_attempt");
-
-        record_trusted_ascii_replacement_attempt(stats, text_code_units);
+    QSGNode* const child = node.firstChild();
+    if (child == nullptr || child->nextSibling() != nullptr) {
+        return nullptr;
     }
 
-    Q_ASSERT(!is_all_space_text(run.text));
+    return dynamic_cast<QSGInternalTextNode*>(child);
+}
+
+bool trusted_ascii_single_leaf_replacement_eligible(
+    const std::vector<text_resource_run_t>&    runs,
+    const Ascii_text_coalescing_context*       coalescing_context)
+{
+    if (runs.size() != 1U                                      ||
+        coalescing_context == nullptr                          ||
+        !coalescing_context->enabled                           ||
+        !coalescing_context->raw_font.isValid())
+    {
+        return false;
+    }
+
+    const text_resource_run_t& resource_run = runs.front();
+    const Terminal_render_text_run& run     = resource_run.run;
+    return
+        resource_run.use_ascii_layout_font                 &&
+        resource_run.trusted_ascii_replacement             &&
+        !resource_run.trusted_ascii_replacement_all_space  &&
+        !run.text.isEmpty()                                &&
+        !run.clip_rect.isValid()                           &&
+        run.hyperlink_id == 0U                             &&
+        !run.underline                                    &&
+        !run.strike                                       &&
+        run.rect.isValid()                                &&
+        is_printable_ascii_text(run.text)                  &&
+        is_unclipped_printable_ascii_cell_span_run(
+            run,
+            coalescing_context->cell_width);
+}
+
+bool refill_text_leaf_with_trusted_ascii_replacement(
+    QSGInternalTextNode&                    internal_text_node,
+    const Ascii_text_coalescing_context&    coalescing_context,
+    const std::vector<text_resource_run_t>& runs,
+    const QRectF&                           frame_viewport,
+    terminal_renderer_stats_t&              stats)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("refill_text_leaf_with_trusted_ascii_replacement");
+
+    Q_ASSERT(trusted_ascii_single_leaf_replacement_eligible(runs, &coalescing_context));
+
+    const Terminal_render_text_run& run = runs.front().run;
+    const std::uint64_t text_code_units = text_run_code_units(run);
 
     QGlyphRun glyph_run;
     {
         VNM_TERMINAL_PROFILE_SCOPE(
-            "append_trusted_ascii_replacement_text_run::glyph_setup");
+            "refill_text_leaf_with_trusted_ascii_replacement::glyph_setup");
 
         if (stage42_qsg_trusted_ascii_unchecked_glyphs_enabled()) {
-            VNM_TERMINAL_PROFILE_SCOPE(
-                "append_trusted_ascii_replacement_text_run::glyph_setup::unchecked");
-
             glyph_run = make_trusted_ascii_replacement_glyph_run(coalescing_context, run.text);
         }
         else {
-            VNM_TERMINAL_PROFILE_SCOPE(
-                "append_trusted_ascii_replacement_text_run::glyph_setup::checked");
-
             const std::optional<QGlyphRun> checked_glyph_run =
                 make_ascii_replacement_glyph_run(coalescing_context, run.text);
             if (!checked_glyph_run.has_value()) {
-                record_ascii_replacement_fallback(
-                    stats,
-                    text_code_units,
-                    Ascii_replacement_fallback_reason::GLYPH_MAPPING);
-                return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+                return false;
             }
 
             glyph_run = *checked_glyph_run;
         }
     }
 
-    QColor foreground;
+    const QColor foreground = text_node_foreground(run, false);
     {
         VNM_TERMINAL_PROFILE_SCOPE(
-            "append_trusted_ascii_replacement_text_run::foreground");
+            "refill_text_leaf_with_trusted_ascii_replacement::clear_and_apply_state");
 
-        foreground = text_node_foreground(run, false);
-    }
-    {
-        VNM_TERMINAL_PROFILE_SCOPE(
-            "append_trusted_ascii_replacement_text_run::ensure_active_text_node");
-
-        if (!ensure_active_text_node(
-                parent,
-                window,
-                foreground,
-                frame_viewport,
-                active_text_node,
-                active_internal_text_node,
-                active_foreground_rgba,
-                true,
-                stats,
-                out_text_leaf_nodes_created))
-        {
-            return Append_ascii_replacement_result::FAILED;
-        }
-    }
-
-    QSGInternalTextNode* internal_text_node = nullptr;
-    {
-        VNM_TERMINAL_PROFILE_SCOPE(
-            "append_trusted_ascii_replacement_text_run::internal_node_lookup");
-
-        internal_text_node = stage42_qsg_cached_internal_text_node_enabled()
-            ? active_internal_text_node
-            : dynamic_cast<QSGInternalTextNode*>(active_text_node);
-    }
-    if (internal_text_node == nullptr) {
-        record_ascii_replacement_fallback(
-            stats,
-            text_code_units,
-            Ascii_replacement_fallback_reason::INTERNAL_NODE);
-        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+        internal_text_node.clear();
+        apply_text_leaf_node_state(internal_text_node, foreground, frame_viewport);
     }
 
     {
         VNM_TERMINAL_PROFILE_SCOPE(
-            "append_trusted_ascii_replacement_text_run::addGlyphs_call");
+            "refill_text_leaf_with_trusted_ascii_replacement::addGlyphs_call");
 
-        internal_text_node->addGlyphs(
+        internal_text_node.addGlyphs(
             QPointF(
                 run.baseline_origin.x(),
                 run.baseline_origin.y() - coalescing_context.layout_line_ascent),
             glyph_run,
             foreground);
+        ++stats.text_ascii_replacement_add_glyphs_calls;
     }
+
+    record_trusted_ascii_replacement_attempt(stats, text_code_units);
     record_ascii_replacement_succeeded(stats, text_code_units, false);
-    return Append_ascii_replacement_result::APPENDED;
+    ++stats.text_leaf_nodes_reused;
+    return true;
 }
 
 void add_text_run_layout(
@@ -3812,6 +4028,213 @@ bool append_unclipped_text_run_qt_layout(
     return true;
 }
 
+Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
+    QSGNode&                           parent,
+    QQuickWindow&                      window,
+    const Ascii_text_coalescing_context&
+                                       coalescing_context,
+    const Trusted_ascii_replacement_batch&
+                                       batch,
+    const QRectF&                      frame_viewport,
+    QSGTextNode*&                      active_text_node,
+    QSGInternalTextNode*&              active_internal_text_node,
+    QRgb&                              active_foreground_rgba,
+    terminal_renderer_stats_t&         stats,
+    int&                               out_text_leaf_nodes_created)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("append_trusted_ascii_replacement_text_run");
+
+    Q_ASSERT(coalescing_context.enabled);
+    Q_ASSERT(coalescing_context.raw_font.isValid());
+    Q_ASSERT(!batch.runs.empty());
+
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::record_attempt");
+
+        record_trusted_ascii_replacement_batch_attempt(stats, batch);
+    }
+
+    QString text;
+    QGlyphRun glyph_run;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::glyph_setup");
+
+        text = trusted_ascii_replacement_batch_text(batch);
+        if (stage42_qsg_trusted_ascii_unchecked_glyphs_enabled()) {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "append_trusted_ascii_replacement_text_run::glyph_setup::unchecked");
+
+            glyph_run = make_trusted_ascii_replacement_batch_glyph_run(
+                coalescing_context,
+                batch,
+                text);
+        }
+        else {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "append_trusted_ascii_replacement_text_run::glyph_setup::checked");
+
+            const std::optional<QGlyphRun> checked_glyph_run =
+                make_checked_trusted_ascii_replacement_batch_glyph_run(
+                    coalescing_context,
+                    batch,
+                    text);
+            if (!checked_glyph_run.has_value()) {
+                record_trusted_ascii_replacement_batch_fallback(
+                    stats,
+                    batch,
+                    Ascii_replacement_fallback_reason::GLYPH_MAPPING);
+                return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+            }
+
+            glyph_run = *checked_glyph_run;
+        }
+    }
+
+    const QColor foreground = batch.foreground;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::ensure_active_text_node");
+
+        if (!ensure_active_text_node(
+                parent,
+                window,
+                foreground,
+                frame_viewport,
+                active_text_node,
+                active_internal_text_node,
+                active_foreground_rgba,
+                true,
+                stats,
+                out_text_leaf_nodes_created))
+        {
+            return Append_ascii_replacement_result::FAILED;
+        }
+    }
+
+    QSGInternalTextNode* internal_text_node = nullptr;
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::internal_node_lookup");
+
+        internal_text_node = stage42_qsg_cached_internal_text_node_enabled()
+            ? active_internal_text_node
+            : dynamic_cast<QSGInternalTextNode*>(active_text_node);
+    }
+    if (internal_text_node == nullptr) {
+        record_trusted_ascii_replacement_batch_fallback(
+            stats,
+            batch,
+            Ascii_replacement_fallback_reason::INTERNAL_NODE);
+        return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
+    }
+
+    {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "append_trusted_ascii_replacement_text_run::addGlyphs_call");
+
+        internal_text_node->addGlyphs(
+            QPointF(
+                batch.first_origin_x,
+                batch.baseline_y - coalescing_context.layout_line_ascent),
+            glyph_run,
+            foreground);
+        ++stats.text_ascii_replacement_add_glyphs_calls;
+    }
+    record_trusted_ascii_replacement_batch_success(stats, batch);
+    return Append_ascii_replacement_result::APPENDED;
+}
+
+bool append_trusted_ascii_replacement_batch_qt_layouts(
+    QSGNode&                           parent,
+    QQuickWindow&                      window,
+    const QFont&                       layout_font,
+    const Trusted_ascii_replacement_batch&
+                                       batch,
+    const QRectF&                      frame_viewport,
+    QSGTextNode*&                      active_text_node,
+    QSGInternalTextNode*&              active_internal_text_node,
+    QRgb&                              active_foreground_rgba,
+    terminal_renderer_stats_t&         stats,
+    int&                               out_text_leaf_nodes_created)
+{
+    for (const Terminal_render_text_run* run : batch.runs) {
+        if (!append_unclipped_text_run_qt_layout(
+                parent,
+                window,
+                layout_font,
+                *run,
+                frame_viewport,
+                false,
+                true,
+                active_text_node,
+                active_internal_text_node,
+                active_foreground_rgba,
+                stats,
+                out_text_leaf_nodes_created))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool flush_trusted_ascii_replacement_batch(
+    QSGNode&                           parent,
+    QQuickWindow&                      window,
+    const QFont&                       layout_font,
+    const Ascii_text_coalescing_context&
+                                       coalescing_context,
+    Trusted_ascii_replacement_batch&   batch,
+    const QRectF&                      frame_viewport,
+    QSGTextNode*&                      active_text_node,
+    QSGInternalTextNode*&              active_internal_text_node,
+    QRgb&                              active_foreground_rgba,
+    terminal_renderer_stats_t&         stats,
+    int&                               out_text_leaf_nodes_created)
+{
+    if (batch.runs.empty()) {
+        return true;
+    }
+
+    const Append_ascii_replacement_result replacement_result =
+        append_trusted_ascii_replacement_text_run(
+            parent,
+            window,
+            coalescing_context,
+            batch,
+            frame_viewport,
+            active_text_node,
+            active_internal_text_node,
+            active_foreground_rgba,
+            stats,
+            out_text_leaf_nodes_created);
+    if (replacement_result == Append_ascii_replacement_result::APPENDED) {
+        batch.runs.clear();
+        return true;
+    }
+    if (replacement_result == Append_ascii_replacement_result::FAILED) {
+        batch.runs.clear();
+        return false;
+    }
+
+    const bool appended = append_trusted_ascii_replacement_batch_qt_layouts(
+        parent,
+        window,
+        layout_font,
+        batch,
+        frame_viewport,
+        active_text_node,
+        active_internal_text_node,
+        active_foreground_rgba,
+        stats,
+        out_text_leaf_nodes_created);
+    batch.runs.clear();
+    return appended;
+}
+
 bool append_unclipped_text_run_layout(
     QSGNode&                           parent,
     QQuickWindow&                      window,
@@ -3949,6 +4372,27 @@ bool append_batched_text_run_nodes(
     // (ParticleVortex) rows do not recompute the pointer/enabled check per run.
     const bool has_ascii_layout_context =
         coalescing_context != nullptr && coalescing_context->enabled;
+    Trusted_ascii_replacement_batch trusted_ascii_batch;
+    const auto flush_trusted_ascii_batch = [&]() {
+        if (trusted_ascii_batch.runs.empty()) {
+            return true;
+        }
+
+        Q_ASSERT(coalescing_context != nullptr);
+        Q_ASSERT(coalescing_context->enabled);
+        return flush_trusted_ascii_replacement_batch(
+            parent,
+            window,
+            coalescing_context->layout_font,
+            *coalescing_context,
+            trusted_ascii_batch,
+            frame_viewport,
+            active_text_node,
+            active_internal_text_node,
+            active_foreground_rgba,
+            stats,
+            out_text_leaf_nodes_created);
+    };
     VNM_TERMINAL_PROFILE_SCOPE("append_batched_text_run_nodes::iterate_runs");
 
     for (const text_resource_run_t& resource_run : runs) {
@@ -3960,6 +4404,9 @@ bool append_batched_text_run_nodes(
             ? coalescing_context->layout_font
             : font;
         if (run.clip_rect.isValid()) {
+            if (!flush_trusted_ascii_batch()) {
+                return false;
+            }
             active_text_node = nullptr;
             active_internal_text_node = nullptr;
             if (!run.text.isEmpty()) {
@@ -3982,7 +4429,9 @@ bool append_batched_text_run_nodes(
             continue;
         }
 
-        if (resource_run.trusted_ascii_replacement && !force_blended_order &&
+        if (stage42_qsg_trusted_ascii_glyph_batching_enabled() &&
+            resource_run.trusted_ascii_replacement              &&
+            !force_blended_order                                &&
             use_ascii_layout_font)
         {
             if (resource_run.trusted_ascii_replacement_all_space) {
@@ -3996,51 +4445,39 @@ bool append_batched_text_run_nodes(
                 Q_ASSERT(is_all_space_text(run.text));
                 Q_ASSERT(run.rect.isValid());
 
+                if (!flush_trusted_ascii_batch()) {
+                    return false;
+                }
                 const std::uint64_t text_code_units = text_run_code_units(run);
                 record_trusted_ascii_replacement_attempt(stats, text_code_units);
                 record_ascii_replacement_succeeded(stats, text_code_units, true);
                 continue;
             }
 
-            const Append_ascii_replacement_result replacement_result =
-                append_trusted_ascii_replacement_text_run(
-                    parent,
-                    window,
+            Q_ASSERT(!run.clip_rect.isValid());
+            Q_ASSERT(coalescing_context != nullptr);
+            const QColor foreground = text_node_foreground(run, false);
+            if (!trusted_ascii_replacement_batch_can_append(
+                    trusted_ascii_batch,
                     *coalescing_context,
                     run,
-                    frame_viewport,
-                    active_text_node,
-                    active_internal_text_node,
-                    active_foreground_rgba,
-                    stats,
-                    out_text_leaf_nodes_created);
-            if (replacement_result == Append_ascii_replacement_result::APPENDED) {
-                continue;
-            }
-            if (replacement_result == Append_ascii_replacement_result::FAILED) {
-                return false;
-            }
-
-            Q_ASSERT(!run.clip_rect.isValid());
-            if (!append_unclipped_text_run_qt_layout(
-                    parent,
-                    window,
-                    layout_font,
-                    run,
-                    frame_viewport,
-                    force_blended_order,
-                    use_ascii_layout_font,
-                    active_text_node,
-                    active_internal_text_node,
-                    active_foreground_rgba,
-                    stats,
-                    out_text_leaf_nodes_created))
+                    foreground))
             {
-                return false;
+                if (!flush_trusted_ascii_batch()) {
+                    return false;
+                }
             }
+            append_trusted_ascii_replacement_batch_run(
+                trusted_ascii_batch,
+                *coalescing_context,
+                run,
+                foreground);
             continue;
         }
 
+        if (!flush_trusted_ascii_batch()) {
+            return false;
+        }
         if (!append_unclipped_text_run_layout(
                 parent, window, layout_font, coalescing_context, run, frame_viewport,
                 force_blended_order, use_ascii_layout_font, active_text_node,
@@ -4051,7 +4488,7 @@ bool append_batched_text_run_nodes(
         }
     }
 
-    return true;
+    return flush_trusted_ascii_batch();
 }
 
 template <typename Append_text_runs>
@@ -5054,6 +5491,48 @@ Text_resource_row_descriptor text_resource_row_descriptor_for_runs(
     return descriptor;
 }
 
+bool text_resource_rect_descriptor_matches_rect(
+    const Text_resource_rect_descriptor&  descriptor,
+    QRectF                                rect)
+{
+    return
+        descriptor.valid  == rect.isValid() &&
+        descriptor.left   == rect.left()    &&
+        descriptor.top    == rect.top()     &&
+        descriptor.width  == rect.width()   &&
+        descriptor.height == rect.height();
+}
+
+template <typename Text_runs>
+bool text_resource_row_descriptor_matches_runs(
+    const Text_resource_row_descriptor&   descriptor,
+    const Text_runs&                      runs)
+{
+    VNM_TERMINAL_PROFILE_SCOPE("text_resource_row_descriptor_matches_runs");
+
+    if (descriptor.runs.size() != runs.size()) {
+        return false;
+    }
+
+    for (std::size_t index = 0U; index < runs.size(); ++index) {
+        const Text_resource_row_run_descriptor& descriptor_run = descriptor.runs[index];
+        const Terminal_render_text_run& run = text_resource_key_run(runs[index]);
+        if (descriptor_run.column != run.column ||
+            !text_resource_rect_descriptor_matches_rect(descriptor_run.rect, run.rect) ||
+            descriptor_run.baseline_x != run.baseline_origin.x() ||
+            descriptor_run.baseline_y != run.baseline_origin.y() ||
+            descriptor_run.foreground_rgba != run.foreground.rgba() ||
+            descriptor_run.uses_ascii_layout_font !=
+                text_resource_key_uses_ascii_layout_font(runs[index]) ||
+            descriptor_run.text != run.text)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool text_row_slot_order_changed(
     const std::vector<Terminal_scene_node::Text_resource_cache_slot>&  previous_slots,
     const std::vector<Terminal_scene_node::Text_resource_cache_slot>&  current_slots)
@@ -5071,40 +5550,165 @@ bool text_row_slot_order_changed(
     return false;
 }
 
-struct Text_row_slot_transfer
+struct row_slot_lookup_entry_t
 {
-    std::vector<Terminal_scene_node::Text_resource_cache_slot> cache_slots;
-    std::map<row_cache_identity_t, std::size_t>                index_by_identity;
-    std::vector<bool>                                          consumed_slots;
+    row_cache_identity_t identity;
+    std::size_t          slot_index = 0U;
 };
 
-Text_row_slot_transfer take_text_row_slots(
-    std::vector<Terminal_scene_node::Text_resource_cache_slot>& row_slots)
+template <typename Slot>
+struct Row_slot_transfer
 {
-    Text_row_slot_transfer transfer;
-    transfer.cache_slots = std::move(row_slots);
-    transfer.index_by_identity.clear();
-    transfer.consumed_slots.assign(transfer.cache_slots.size(), false);
-    for (std::size_t index = 0; index < transfer.cache_slots.size(); ++index) {
-        const auto inserted =
-            transfer.index_by_identity.emplace(transfer.cache_slots[index].identity, index);
-        Q_ASSERT(inserted.second);
+    std::vector<Slot>                           cache_slots;
+    std::map<row_cache_identity_t, std::size_t> index_by_identity;
+    std::vector<bool>                           consumed_slots;
+    std::vector<row_slot_lookup_entry_t>        lookup_slots;
+    std::size_t                                 next_slot              = 0U;
+    bool                                        lookup_slots_built     = false;
+    bool                                        ordered_lookup_enabled = false;
+};
+
+template <typename Slot>
+Row_slot_transfer<Slot> take_row_slots(std::vector<Slot>& row_slots)
+{
+    Row_slot_transfer<Slot> transfer;
+    transfer.cache_slots            = std::move(row_slots);
+    transfer.ordered_lookup_enabled = stage42_qsg_row_slot_ordered_lookup_enabled();
+    if (!transfer.ordered_lookup_enabled) {
+        transfer.consumed_slots.assign(transfer.cache_slots.size(), false);
+        for (std::size_t index = 0U; index < transfer.cache_slots.size(); ++index) {
+            const auto inserted =
+                transfer.index_by_identity.emplace(transfer.cache_slots[index].identity, index);
+            Q_ASSERT(inserted.second);
+        }
     }
     return transfer;
 }
 
-std::optional<Terminal_scene_node::Text_resource_cache_slot> take_text_row_slot(
-    Text_row_slot_transfer&        transfer,
-    const row_cache_identity_t&    identity)
+template <typename Slot>
+void build_row_slot_lookup(Row_slot_transfer<Slot>& transfer)
+{
+    if (transfer.lookup_slots_built) {
+        return;
+    }
+
+    VNM_TERMINAL_PROFILE_SCOPE("build_row_slot_lookup");
+
+    transfer.lookup_slots.reserve(transfer.cache_slots.size());
+    for (std::size_t index = 0U; index < transfer.cache_slots.size(); ++index) {
+        transfer.lookup_slots.push_back({
+            transfer.cache_slots[index].identity,
+            index,
+        });
+    }
+    std::sort(
+        transfer.lookup_slots.begin(),
+        transfer.lookup_slots.end(),
+        [](const row_slot_lookup_entry_t& left, const row_slot_lookup_entry_t& right) {
+            return left.identity < right.identity;
+        });
+    for (std::size_t index = 1U; index < transfer.lookup_slots.size(); ++index) {
+        Q_ASSERT(!(
+            transfer.lookup_slots[index - 1U].identity ==
+            transfer.lookup_slots[index].identity));
+    }
+    transfer.lookup_slots_built = true;
+}
+
+template <typename Slot>
+Slot take_row_slot_at(Row_slot_transfer<Slot>& transfer, std::size_t slot_index)
+{
+    Q_ASSERT(slot_index < transfer.cache_slots.size());
+    Q_ASSERT(transfer.cache_slots[slot_index].wrapper != nullptr);
+
+    Slot slot = std::move(transfer.cache_slots[slot_index]);
+    transfer.cache_slots[slot_index].wrapper = nullptr;
+    return slot;
+}
+
+template <typename Slot>
+std::optional<Slot> take_row_slot_from_eager_map(
+    Row_slot_transfer<Slot>&    transfer,
+    const row_cache_identity_t& identity)
 {
     const auto index = transfer.index_by_identity.find(identity);
     if (index == transfer.index_by_identity.end()) {
         return std::nullopt;
     }
 
+    Q_ASSERT(index->second < transfer.consumed_slots.size());
     Q_ASSERT(!transfer.consumed_slots[index->second]);
     transfer.consumed_slots[index->second] = true;
     return std::move(transfer.cache_slots[index->second]);
+}
+
+template <typename Slot>
+std::optional<Slot> take_row_slot(
+    Row_slot_transfer<Slot>&    transfer,
+    const row_cache_identity_t& identity)
+{
+    if (!transfer.ordered_lookup_enabled) {
+        return take_row_slot_from_eager_map(transfer, identity);
+    }
+
+    while (transfer.next_slot < transfer.cache_slots.size() &&
+        transfer.cache_slots[transfer.next_slot].wrapper == nullptr)
+    {
+        ++transfer.next_slot;
+    }
+
+    if (transfer.next_slot < transfer.cache_slots.size() &&
+        transfer.cache_slots[transfer.next_slot].identity == identity)
+    {
+        const std::size_t slot_index = transfer.next_slot;
+        ++transfer.next_slot;
+        return take_row_slot_at(transfer, slot_index);
+    }
+
+    build_row_slot_lookup(transfer);
+    const auto found = std::lower_bound(
+        transfer.lookup_slots.begin(),
+        transfer.lookup_slots.end(),
+        identity,
+        [](const row_slot_lookup_entry_t& entry, const row_cache_identity_t& target) {
+            return entry.identity < target;
+        });
+    if (found == transfer.lookup_slots.end() ||
+        !(found->identity == identity))
+    {
+        return std::nullopt;
+    }
+
+    return take_row_slot_at(transfer, found->slot_index);
+}
+
+template <typename Slot>
+bool row_slot_transfer_entry_consumed(
+    const Row_slot_transfer<Slot>& transfer,
+    std::size_t                    index)
+{
+    if (transfer.ordered_lookup_enabled) {
+        return transfer.cache_slots[index].wrapper == nullptr;
+    }
+
+    Q_ASSERT(index < transfer.consumed_slots.size());
+    return transfer.consumed_slots[index];
+}
+
+using Text_row_slot_transfer =
+    Row_slot_transfer<Terminal_scene_node::Text_resource_cache_slot>;
+
+Text_row_slot_transfer take_text_row_slots(
+    std::vector<Terminal_scene_node::Text_resource_cache_slot>& row_slots)
+{
+    return take_row_slots(row_slots);
+}
+
+std::optional<Terminal_scene_node::Text_resource_cache_slot> take_text_row_slot(
+    Text_row_slot_transfer&        transfer,
+    const row_cache_identity_t&    identity)
+{
+    return take_row_slot(transfer, identity);
 }
 
 void append_text_row_slot_in_order(
@@ -5132,7 +5736,7 @@ int destroy_unconsumed_text_row_slots(
 
     int rows_removed = 0;
     for (std::size_t index = 0; index < transfer.cache_slots.size(); ++index) {
-        if (transfer.consumed_slots[index]) {
+        if (row_slot_transfer_entry_consumed(transfer, index)) {
             continue;
         }
 
@@ -5141,9 +5745,11 @@ int destroy_unconsumed_text_row_slots(
             VNM_TERMINAL_PROFILE_SCOPE(
                 "destroy_unconsumed_text_row_slots::bookkeeping");
 
-            record_text_cache_entry_nodes_cleared(stats, slot, false);
+            const int text_node_child_count = node_subtree_child_count(*slot.node);
+            record_text_cache_entry_nodes_cleared(stats, text_node_child_count, false);
             ++stats.text_cache_entries_removed;
-            stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*slot.wrapper);
+            stats.qsg_nodes_destroyed +=
+                text_cache_entry_destroyed_node_count(text_node_child_count);
         }
         {
             VNM_TERMINAL_PROFILE_SCOPE(
@@ -5248,6 +5854,8 @@ void sync_text_resource_nodes(
         }
         return *frame_coalescing_context;
     };
+    const bool text_resource_descriptor_direct_compare_enabled =
+        stage42_qsg_text_resource_descriptor_direct_compare_enabled();
     const bool monotonic_dirty_probe_enabled = stage42_qsg_monotonic_dirty_probe_enabled();
     Monotonic_row_dirty_probe dirty_row_probe;
     for (const row_text_group_t& group : groups) {
@@ -5372,30 +5980,64 @@ void sync_text_resource_nodes(
         }
 
         std::optional<Text_resource_row_descriptor> text_resource_descriptor;
-        if (text_resource_descriptor_eligible) {
-            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::resource_descriptor");
+        auto current_text_resource_descriptor = [&]() -> Text_resource_row_descriptor& {
+            Q_ASSERT(text_resource_descriptor_eligible);
+            if (!text_resource_descriptor.has_value()) {
+                VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::resource_descriptor");
 
-            text_resource_descriptor = use_ascii_resource_runs
-                ? text_resource_row_descriptor_for_runs(ascii_resource_runs)
-                : text_resource_row_descriptor_for_runs(local_runs);
-        }
+                ++stats.text_resource_descriptor_builds;
+                text_resource_descriptor = use_ascii_resource_runs
+                    ? text_resource_row_descriptor_for_runs(ascii_resource_runs)
+                    : text_resource_row_descriptor_for_runs(local_runs);
+            }
+            return *text_resource_descriptor;
+        };
 
+        bool descriptor_mismatch_proves_key_mismatch = false;
         if (descriptor_reuse_frame_key_match &&
             old_slot.has_value() &&
-            text_resource_descriptor.has_value() &&
-            old_slot->text_resource_descriptor == text_resource_descriptor)
+            text_resource_descriptor_eligible &&
+            old_slot->text_resource_descriptor.has_value())
         {
-            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::text_resource_descriptor_reuse");
+            bool descriptor_match         = false;
+            bool descriptor_build_avoided = false;
+            if (text_resource_descriptor_direct_compare_enabled) {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "sync_text_resource_nodes::text_resource_descriptor_direct_compare");
 
-            sync_text_wrapper_row_top(*old_slot, group.row_top);
-            set_row_text_clip_rect(*old_slot, row_clip_rect);
-            ++stats.text_content_reused;
-            ++stats.text_resource_descriptor_reuses;
-            if (dirty_group) {
-                ++stats.text_dirty_descriptor_identical_rows;
+                descriptor_match = use_ascii_resource_runs
+                    ? text_resource_row_descriptor_matches_runs(
+                        *old_slot->text_resource_descriptor,
+                        ascii_resource_runs)
+                    : text_resource_row_descriptor_matches_runs(
+                        *old_slot->text_resource_descriptor,
+                        local_runs);
+                descriptor_build_avoided = descriptor_match;
             }
-            new_slots.push_back(std::move(*old_slot));
-            continue;
+            else {
+                descriptor_match =
+                    old_slot->text_resource_descriptor == current_text_resource_descriptor();
+            }
+
+            if (descriptor_match) {
+                VNM_TERMINAL_PROFILE_SCOPE(
+                    "sync_text_resource_nodes::text_resource_descriptor_reuse");
+
+                sync_text_wrapper_row_top(*old_slot, group.row_top);
+                set_row_text_clip_rect(*old_slot, row_clip_rect);
+                ++stats.text_content_reused;
+                ++stats.text_resource_descriptor_reuses;
+                if (descriptor_build_avoided) {
+                    ++stats.text_resource_descriptor_builds_avoided;
+                }
+                if (dirty_group) {
+                    ++stats.text_dirty_descriptor_identical_rows;
+                }
+                new_slots.push_back(std::move(*old_slot));
+                continue;
+            }
+
+            descriptor_mismatch_proves_key_mismatch = true;
         }
 
         stats.text_resource_runs_before_coalescing +=
@@ -5411,17 +6053,9 @@ void sync_text_resource_nodes(
                     stats.text_resource_max_runs_after_coalescing_per_row,
                     runs_after_coalescing);
         }
-        // If descriptor reuse was eligible and both old and new descriptors are
-        // present, a descriptor mismatch proves the full resource key cannot
-        // match. Skip the dead key-match build/probe, but build lazily once a
-        // replacement node actually succeeds so stored slots keep a real key for
-        // later descriptor-ineligible frames.
-        const bool descriptor_mismatch_proves_key_mismatch =
-            descriptor_reuse_frame_key_match              &&
-            old_slot.has_value()                          &&
-            text_resource_descriptor.has_value()          &&
-            old_slot->text_resource_descriptor.has_value() &&
-            old_slot->text_resource_descriptor != text_resource_descriptor;
+        // A mismatch on the exact descriptor-reuse guard proves the full text
+        // resource key cannot match. Skip the dead key probe, then materialize
+        // the descriptor only if a slot is stored.
         std::optional<QByteArray> key;
         auto current_text_resource_key = [&]() -> QByteArray& {
             if (!key.has_value()) {
@@ -5443,11 +6077,53 @@ void sync_text_resource_nodes(
 
             sync_text_wrapper_row_top(*old_slot, group.row_top);
             set_row_text_clip_rect(*old_slot, row_clip_rect);
+            if (text_resource_descriptor_eligible) {
+                (void)current_text_resource_descriptor();
+            }
             old_slot->text_resource_descriptor = std::move(text_resource_descriptor);
             ++stats.text_content_reused;
             ++stats.text_key_match_reuses;
             new_slots.push_back(std::move(*old_slot));
             continue;
+        }
+
+        if (stage42_qsg_text_leaf_content_reuse_enabled() &&
+            old_slot.has_value()                          &&
+            use_ascii_resource_runs                       &&
+            trusted_ascii_single_leaf_replacement_eligible(
+                ascii_resource_runs,
+                coalescing_context))
+        {
+            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::text_leaf_content_reuse");
+
+            QSGInternalTextNode* const reusable_text_leaf =
+                single_reusable_text_leaf_node(*old_slot->node);
+            if (reusable_text_leaf != nullptr &&
+                refill_text_leaf_with_trusted_ascii_replacement(
+                    *reusable_text_leaf,
+                    *coalescing_context,
+                    ascii_resource_runs,
+                    frame_viewport,
+                    stats))
+            {
+                if (text_resource_descriptor_eligible) {
+                    (void)current_text_resource_descriptor();
+                }
+                old_slot->key                      = std::move(current_text_resource_key());
+                old_slot->text_resource_descriptor = std::move(text_resource_descriptor);
+                sync_text_wrapper_row_top(*old_slot, group.row_top);
+                set_row_text_clip_rect(*old_slot, row_clip_rect);
+                new_slots.push_back(std::move(*old_slot));
+                ++stats.text_cache_entries_replaced;
+                ++stats.text_content_rebuilds;
+                if (dirty_group) {
+                    ++stats.text_dirty_rows_rebuilt;
+                }
+                else {
+                    ++stats.text_clean_rows_rebuilt;
+                }
+                continue;
+            }
         }
 
         bool failed                  = false;
@@ -5492,9 +6168,11 @@ void sync_text_resource_nodes(
                         VNM_TERMINAL_PROFILE_SCOPE(
                             "sync_text_resource_nodes::replace_cache_entry::clear_old::bookkeeping");
 
-                        record_text_cache_entry_nodes_cleared(stats, *old_slot, true);
+                        const int text_node_child_count =
+                            node_subtree_child_count(*old_slot->node);
+                        record_text_cache_entry_nodes_cleared(stats, text_node_child_count, true);
                         ++stats.qsg_nodes_replaced;
-                        stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*old_slot->node);
+                        stats.qsg_nodes_destroyed += 1 + text_node_child_count;
                     }
                     {
                         VNM_TERMINAL_PROFILE_SCOPE(
@@ -5513,6 +6191,9 @@ void sync_text_resource_nodes(
                     VNM_TERMINAL_PROFILE_SCOPE(
                         "sync_text_resource_nodes::replace_cache_entry::resync_slot");
 
+                    if (text_resource_descriptor_eligible) {
+                        (void)current_text_resource_descriptor();
+                    }
                     old_slot->node                     = node;
                     old_slot->key                      = std::move(current_text_resource_key());
                     old_slot->text_resource_descriptor = std::move(text_resource_descriptor);
@@ -5547,6 +6228,9 @@ void sync_text_resource_nodes(
                     VNM_TERMINAL_PROFILE_SCOPE(
                         "sync_text_resource_nodes::create_cache_entry::append_slot");
 
+                    if (text_resource_descriptor_eligible) {
+                        (void)current_text_resource_descriptor();
+                    }
                     new_slots.push_back({
                         .identity  = group.identity,
                         .wrapper   = wrapper,
@@ -5578,9 +6262,12 @@ void sync_text_resource_nodes(
                     VNM_TERMINAL_PROFILE_SCOPE(
                         "sync_text_resource_nodes::failed_cache_cleanup::bookkeeping");
 
-                    record_text_cache_entry_nodes_cleared(stats, *old_slot, false);
+                    const int text_node_child_count =
+                        node_subtree_child_count(*old_slot->node);
+                    record_text_cache_entry_nodes_cleared(stats, text_node_child_count, false);
                     ++stats.text_cache_entries_removed;
-                    stats.qsg_nodes_destroyed += 1 + node_subtree_child_count(*old_slot->wrapper);
+                    stats.qsg_nodes_destroyed +=
+                        text_cache_entry_destroyed_node_count(text_node_child_count);
                 }
                 {
                     VNM_TERMINAL_PROFILE_SCOPE(
@@ -6114,40 +6801,20 @@ void destroy_geometry_row_cache_slot(
     delete_node_tree(slot.wrapper);
 }
 
-struct Geometry_row_slot_transfer
-{
-    std::vector<Terminal_scene_node::Geometry_row_cache_slot>  cache_slots;
-    std::map<row_cache_identity_t, std::size_t>                index_by_identity;
-    std::vector<bool>                                          consumed_slots;
-};
+using Geometry_row_slot_transfer =
+    Row_slot_transfer<Terminal_scene_node::Geometry_row_cache_slot>;
 
 Geometry_row_slot_transfer take_geometry_row_slots(
     std::vector<Terminal_scene_node::Geometry_row_cache_slot>& row_slots)
 {
-    Geometry_row_slot_transfer transfer;
-    transfer.cache_slots = std::move(row_slots);
-    transfer.index_by_identity.clear();
-    transfer.consumed_slots.assign(transfer.cache_slots.size(), false);
-    for (std::size_t index = 0; index < transfer.cache_slots.size(); ++index) {
-        const auto inserted =
-            transfer.index_by_identity.emplace(transfer.cache_slots[index].identity, index);
-        Q_ASSERT(inserted.second);
-    }
-    return transfer;
+    return take_row_slots(row_slots);
 }
 
 std::optional<Terminal_scene_node::Geometry_row_cache_slot> take_geometry_row_slot(
     Geometry_row_slot_transfer&    transfer,
     const row_cache_identity_t&    identity)
 {
-    const auto index = transfer.index_by_identity.find(identity);
-    if (index == transfer.index_by_identity.end()) {
-        return std::nullopt;
-    }
-
-    Q_ASSERT(!transfer.consumed_slots[index->second]);
-    transfer.consumed_slots[index->second] = true;
-    return std::move(transfer.cache_slots[index->second]);
+    return take_row_slot(transfer, identity);
 }
 
 void append_geometry_row_slot_in_order(
@@ -6168,7 +6835,7 @@ int destroy_unconsumed_geometry_row_slots(
 {
     int rows_removed = 0;
     for (std::size_t index = 0; index < transfer.cache_slots.size(); ++index) {
-        if (transfer.consumed_slots[index]) {
+        if (row_slot_transfer_entry_consumed(transfer, index)) {
             continue;
         }
 
@@ -7072,6 +7739,7 @@ void accumulate_renderer_stats(
     total.text_content_removed    += static_cast<std::uint64_t>(stats.text_content_removed);
     total.text_content_failures   += static_cast<std::uint64_t>(stats.text_content_failures);
     total.text_leaf_nodes_created += static_cast<std::uint64_t>(stats.text_leaf_nodes_created);
+    total.text_leaf_nodes_reused  += static_cast<std::uint64_t>(stats.text_leaf_nodes_reused);
     total.text_cache_entry_child_nodes_cleared_for_replacement += static_cast<std::uint64_t>(
         stats.text_cache_entry_child_nodes_cleared_for_replacement);
     total.text_cache_entry_child_nodes_cleared_for_removal += static_cast<std::uint64_t>(
@@ -7150,6 +7818,8 @@ void accumulate_renderer_stats(
         static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_succeeded);
     total.text_ascii_replacement_runs_all_space_succeeded +=
         static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_all_space_succeeded);
+    total.text_ascii_replacement_add_glyphs_calls +=
+        static_cast<std::uint64_t>(stats.text_ascii_replacement_add_glyphs_calls);
     total.text_ascii_replacement_runs_fallback +=
         static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_fallback);
     total.text_ascii_replacement_runs_rejected_clipped +=
@@ -7217,6 +7887,10 @@ void accumulate_renderer_stats(
     total.text_groups_dirty      += static_cast<std::uint64_t>(stats.text_groups_dirty);
     total.text_groups_clean      += static_cast<std::uint64_t>(stats.text_groups_clean);
     total.text_clean_reuse_skips += static_cast<std::uint64_t>(stats.text_clean_reuse_skips);
+    total.text_resource_descriptor_builds +=
+        static_cast<std::uint64_t>(stats.text_resource_descriptor_builds);
+    total.text_resource_descriptor_builds_avoided +=
+        static_cast<std::uint64_t>(stats.text_resource_descriptor_builds_avoided);
     total.text_resource_descriptor_reuses +=
         static_cast<std::uint64_t>(stats.text_resource_descriptor_reuses);
     total.text_key_builds       += static_cast<std::uint64_t>(stats.text_key_builds);
@@ -7952,6 +8626,32 @@ bool snapshot_row_is_dirty(
         dirty_row_flags.row_flags[row_index] != 0U;
 }
 
+bool terminal_render_cell_column_less(
+    const Terminal_render_cell*    left,
+    const Terminal_render_cell*    right)
+{
+    return left->position.column < right->position.column;
+}
+
+void stable_sort_terminal_render_cell_row_by_column(
+    std::vector<const Terminal_render_cell*>& row_cells)
+{
+    if (row_cells.size() <= 1U) {
+        return;
+    }
+
+    if (stage42_render_frame_sorted_row_sort_prefilter_enabled() &&
+        std::is_sorted(row_cells.begin(), row_cells.end(), terminal_render_cell_column_less))
+    {
+        return;
+    }
+
+    std::stable_sort(
+        row_cells.begin(),
+        row_cells.end(),
+        terminal_render_cell_column_less);
+}
+
 std::vector<std::vector<const Terminal_render_cell*>> build_explicit_snapshot_row_table(
     const Terminal_render_snapshot& snapshot)
 {
@@ -7969,12 +8669,7 @@ std::vector<std::vector<const Terminal_render_cell*>> build_explicit_snapshot_ro
     }
 
     for (std::vector<const Terminal_render_cell*>& row_cells : row_table) {
-        std::stable_sort(
-            row_cells.begin(),
-            row_cells.end(),
-            [](const Terminal_render_cell* left, const Terminal_render_cell* right) {
-                return left->position.column < right->position.column;
-            });
+        stable_sort_terminal_render_cell_row_by_column(row_cells);
     }
 
     return row_table;
@@ -8176,14 +8871,7 @@ void append_disabled_sidecar_packed_graphic_cells(
         std::min(row_table.size(), frame.packed_rows.size());
     for (std::size_t row_index = 0U; row_index < row_count; ++row_index) {
         std::vector<const Terminal_render_cell*>& row_cells = row_table[row_index];
-        if (row_cells.size() > 1U) {
-            std::stable_sort(
-                row_cells.begin(),
-                row_cells.end(),
-                [](const Terminal_render_cell* left, const Terminal_render_cell* right) {
-                    return left->position.column < right->position.column;
-                });
-        }
+        stable_sort_terminal_render_cell_row_by_column(row_cells);
 
         terminal_packed_render_row_t& row = frame.packed_rows[row_index];
         for (const Terminal_render_cell* cell : row_cells) {
