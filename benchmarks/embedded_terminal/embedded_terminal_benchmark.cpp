@@ -85,7 +85,7 @@ constexpr int k_surface_session_output_high_water_chunks      = 64;
 constexpr int k_surface_session_output_high_water_chunk_bytes = 1024;
 constexpr int k_surface_session_write_high_water_bytes        = 64 * 1024;
 
-constexpr int k_schema_version              = 16;
+constexpr int k_schema_version              = 17;
 constexpr int k_profile_schema_version      = 2;
 constexpr int k_profile_text_format         = 2;
 constexpr int k_flat_rect_vertices_per_rect = 6;
@@ -170,10 +170,13 @@ struct renderer_totals_t
     qint64                 text_content_removed                                 = 0;
     qint64                 text_content_failures                                = 0;
     qint64                 text_leaf_nodes_created                              = 0;
+    qint64                 text_leaf_nodes_reused                               = 0;
     qint64                 text_cache_entry_child_nodes_cleared_for_replacement = 0;
     qint64                 text_cache_entry_child_nodes_cleared_for_removal     = 0;
     qint64                 text_cache_entry_max_child_nodes_cleared             = 0;
     qint64                 text_clean_reuse_skips                               = 0;
+    qint64                 text_resource_descriptor_builds                      = 0;
+    qint64                 text_resource_descriptor_builds_avoided              = 0;
     qint64                 text_resource_descriptor_reuses                      = 0;
     qint64                 text_coalescing_candidate_groups                     = 0;
     qint64                 text_coalescing_enabled_groups                       = 0;
@@ -221,6 +224,7 @@ struct renderer_totals_t
     qint64                 text_ascii_replacement_runs_trusted_fast_path        = 0;
     qint64                 text_ascii_replacement_runs_succeeded                = 0;
     qint64                 text_ascii_replacement_runs_all_space_succeeded      = 0;
+    qint64                 text_ascii_replacement_add_glyphs_calls              = 0;
     qint64                 text_ascii_replacement_runs_fallback                 = 0;
     qint64                 text_ascii_replacement_runs_rejected_clipped         = 0;
     qint64                 text_ascii_replacement_runs_rejected_force_blended_order = 0;
@@ -2036,6 +2040,7 @@ void add_renderer_stats(
     totals.text_content_removed    += stats.text_content_removed;
     totals.text_content_failures   += stats.text_content_failures;
     totals.text_leaf_nodes_created += stats.text_leaf_nodes_created;
+    totals.text_leaf_nodes_reused  += stats.text_leaf_nodes_reused;
     totals.text_cache_entry_child_nodes_cleared_for_replacement +=
         stats.text_cache_entry_child_nodes_cleared_for_replacement;
     totals.text_cache_entry_child_nodes_cleared_for_removal +=
@@ -2044,6 +2049,10 @@ void add_renderer_stats(
         totals.text_cache_entry_max_child_nodes_cleared,
         stats.text_cache_entry_max_child_nodes_cleared);
     totals.text_clean_reuse_skips                   += stats.text_clean_reuse_skips;
+    totals.text_resource_descriptor_builds +=
+        stats.text_resource_descriptor_builds;
+    totals.text_resource_descriptor_builds_avoided +=
+        stats.text_resource_descriptor_builds_avoided;
     totals.text_resource_descriptor_reuses +=
         stats.text_resource_descriptor_reuses;
     totals.text_coalescing_candidate_groups += stats.text_coalescing_candidate_groups;
@@ -2069,6 +2078,8 @@ void add_renderer_stats(
         stats.text_ascii_replacement_runs_succeeded;
     totals.text_ascii_replacement_runs_all_space_succeeded +=
         stats.text_ascii_replacement_runs_all_space_succeeded;
+    totals.text_ascii_replacement_add_glyphs_calls +=
+        stats.text_ascii_replacement_add_glyphs_calls;
     totals.text_ascii_replacement_runs_fallback +=
         stats.text_ascii_replacement_runs_fallback;
     totals.text_ascii_replacement_runs_rejected_clipped +=
@@ -2604,6 +2615,7 @@ void add_renderer_stats(
     totals.text_content_removed    += stats.text_content_removed;
     totals.text_content_failures   += stats.text_content_failures;
     totals.text_leaf_nodes_created += stats.text_leaf_nodes_created;
+    totals.text_leaf_nodes_reused  += stats.text_leaf_nodes_reused;
     totals.text_cache_entry_child_nodes_cleared_for_replacement +=
         stats.text_cache_entry_child_nodes_cleared_for_replacement;
     totals.text_cache_entry_child_nodes_cleared_for_removal +=
@@ -2612,6 +2624,10 @@ void add_renderer_stats(
         totals.text_cache_entry_max_child_nodes_cleared,
         static_cast<qint64>(stats.text_cache_entry_max_child_nodes_cleared));
     totals.text_clean_reuse_skips                   += stats.text_clean_reuse_skips;
+    totals.text_resource_descriptor_builds +=
+        stats.text_resource_descriptor_builds;
+    totals.text_resource_descriptor_builds_avoided +=
+        stats.text_resource_descriptor_builds_avoided;
     totals.text_resource_descriptor_reuses +=
         stats.text_resource_descriptor_reuses;
     totals.text_coalescing_candidate_groups += stats.text_coalescing_candidate_groups;
@@ -2637,6 +2653,8 @@ void add_renderer_stats(
         stats.text_ascii_replacement_runs_succeeded;
     totals.text_ascii_replacement_runs_all_space_succeeded +=
         stats.text_ascii_replacement_runs_all_space_succeeded;
+    totals.text_ascii_replacement_add_glyphs_calls +=
+        stats.text_ascii_replacement_add_glyphs_calls;
     totals.text_ascii_replacement_runs_fallback +=
         stats.text_ascii_replacement_runs_fallback;
     totals.text_ascii_replacement_runs_rejected_clipped +=
@@ -2839,11 +2857,14 @@ bool text_work_observed_for_scenario(
     const term::terminal_renderer_stats_t& stats)
 {
     if (!is_measurement_reuse_only_scenario(scenario_name)) {
-        return stats.text_leaf_nodes_created > 0;
+        return
+            stats.text_leaf_nodes_created > 0 ||
+            stats.text_leaf_nodes_reused  > 0;
     }
 
     return
         stats.text_leaf_nodes_created         > 0 ||
+        stats.text_leaf_nodes_reused          > 0 ||
         stats.text_content_reused             > 0 ||
         stats.text_resource_descriptor_reuses > 0;
 }
@@ -3749,7 +3770,8 @@ Scenario_result run_surface_session_action_scenario(
         result.structural_checks.queue_pressure_observed =
             result.output_high_water_observed;
         result.structural_checks.text_work_observed =
-            result.renderer_totals.text_leaf_nodes_created > 0;
+            result.renderer_totals.text_leaf_nodes_created > 0 ||
+            result.renderer_totals.text_leaf_nodes_reused  > 0;
     }
     else
     if (profile.write_high_water_pressure) {
@@ -3994,6 +4016,11 @@ QJsonObject normalized_per_consumed_update_json(const Scenario_result& result)
             result.renderer_totals.text_leaf_nodes_created,
             denominator));
     counters.insert(
+        QStringLiteral("text_leaf_nodes_reused"),
+        normalized_per_consumed_update_value(
+            result.renderer_totals.text_leaf_nodes_reused,
+            denominator));
+    counters.insert(
         QStringLiteral("text_key_builds"),
         normalized_per_consumed_update_value(
             result.renderer_totals.text_key_builds,
@@ -4019,9 +4046,24 @@ QJsonObject normalized_per_consumed_update_json(const Scenario_result& result)
             result.renderer_totals.text_resource_descriptor_reuses,
             denominator));
     counters.insert(
+        QStringLiteral("text_resource_descriptor_builds"),
+        normalized_per_consumed_update_value(
+            result.renderer_totals.text_resource_descriptor_builds,
+            denominator));
+    counters.insert(
+        QStringLiteral("text_resource_descriptor_builds_avoided"),
+        normalized_per_consumed_update_value(
+            result.renderer_totals.text_resource_descriptor_builds_avoided,
+            denominator));
+    counters.insert(
         QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"),
         normalized_per_consumed_update_value(
             result.renderer_totals.text_ascii_replacement_runs_trusted_fast_path,
+            denominator));
+    counters.insert(
+        QStringLiteral("text_ascii_replacement_add_glyphs_calls"),
+        normalized_per_consumed_update_value(
+            result.renderer_totals.text_ascii_replacement_add_glyphs_calls,
             denominator));
     counters.insert(
         QStringLiteral("text_ascii_replacement_code_units_trusted_fast_path"),
@@ -4316,6 +4358,9 @@ QJsonObject scenario_json(const Scenario_result& result)
         QStringLiteral("text_leaf_nodes_created"),
         result.renderer_totals.text_leaf_nodes_created);
     object.insert(
+        QStringLiteral("text_leaf_nodes_reused"),
+        result.renderer_totals.text_leaf_nodes_reused);
+    object.insert(
         QStringLiteral("text_cache_entry_child_nodes_cleared_for_replacement"),
         result.renderer_totals.text_cache_entry_child_nodes_cleared_for_replacement);
     object.insert(
@@ -4327,6 +4372,12 @@ QJsonObject scenario_json(const Scenario_result& result)
     object.insert(
         QStringLiteral("text_clean_reuse_skips"),
         result.renderer_totals.text_clean_reuse_skips);
+    object.insert(
+        QStringLiteral("text_resource_descriptor_builds"),
+        result.renderer_totals.text_resource_descriptor_builds);
+    object.insert(
+        QStringLiteral("text_resource_descriptor_builds_avoided"),
+        result.renderer_totals.text_resource_descriptor_builds_avoided);
     object.insert(
         QStringLiteral("text_resource_descriptor_reuses"),
         result.renderer_totals.text_resource_descriptor_reuses);
@@ -4468,6 +4519,9 @@ QJsonObject scenario_json(const Scenario_result& result)
     object.insert(
         QStringLiteral("text_ascii_replacement_runs_all_space_succeeded"),
         result.renderer_totals.text_ascii_replacement_runs_all_space_succeeded);
+    object.insert(
+        QStringLiteral("text_ascii_replacement_add_glyphs_calls"),
+        result.renderer_totals.text_ascii_replacement_add_glyphs_calls);
     object.insert(
         QStringLiteral("text_ascii_replacement_runs_fallback"),
         result.renderer_totals.text_ascii_replacement_runs_fallback);
@@ -5096,6 +5150,8 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
 {
     const QStringList counter_keys = {
         QStringLiteral("text_clean_reuse_skips"),
+        QStringLiteral("text_resource_descriptor_builds"),
+        QStringLiteral("text_resource_descriptor_builds_avoided"),
         QStringLiteral("text_resource_descriptor_reuses"),
         QStringLiteral("text_coalescing_candidate_groups"),
         QStringLiteral("text_coalescing_enabled_groups"),
@@ -5143,6 +5199,7 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
         QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"),
         QStringLiteral("text_ascii_replacement_runs_succeeded"),
         QStringLiteral("text_ascii_replacement_runs_all_space_succeeded"),
+        QStringLiteral("text_ascii_replacement_add_glyphs_calls"),
         QStringLiteral("text_ascii_replacement_runs_fallback"),
         QStringLiteral("text_ascii_replacement_runs_rejected_clipped"),
         QStringLiteral("text_ascii_replacement_runs_rejected_force_blended_order"),
@@ -5354,13 +5411,20 @@ bool validate_renderer_counter_invariants(
         json_counter(object, QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"));
     const qint64 ascii_replacement_succeeded =
         json_counter(object, QStringLiteral("text_ascii_replacement_runs_succeeded"));
+    const qint64 ascii_replacement_all_space =
+        json_counter(object, QStringLiteral("text_ascii_replacement_runs_all_space_succeeded"));
+    const qint64 ascii_replacement_add_glyphs =
+        json_counter(object, QStringLiteral("text_ascii_replacement_add_glyphs_calls"));
     const qint64 ascii_replacement_fallback =
         json_counter(object, QStringLiteral("text_ascii_replacement_runs_fallback"));
     if (ascii_replacement_screened != ascii_replacement_succeeded + ascii_replacement_fallback ||
         ascii_replacement_eligible > ascii_replacement_screened                                ||
         ascii_replacement_attempted > ascii_replacement_eligible                               ||
         ascii_replacement_trusted > ascii_replacement_attempted                                ||
-        ascii_replacement_succeeded > ascii_replacement_attempted)
+        ascii_replacement_succeeded > ascii_replacement_attempted                              ||
+        ascii_replacement_all_space > ascii_replacement_succeeded                              ||
+        ascii_replacement_add_glyphs >
+            ascii_replacement_succeeded - ascii_replacement_all_space)
     {
         *out_error = QStringLiteral("ASCII replacement route counters are inconsistent");
         return false;
@@ -5460,14 +5524,32 @@ bool validate_renderer_counter_invariants(
         return false;
     }
 
-    const qint64 text_row_cache_hits = json_counter(
-        object,
-        QStringLiteral("renderer_text_reused_total")) - json_counter(object, QStringLiteral("text_clean_reuse_skips"));
-    if (json_counter(object, QStringLiteral("text_resource_descriptor_reuses")) >
-        text_row_cache_hits)
+    const qint64 text_resource_descriptor_reuses =
+        json_counter(object, QStringLiteral("text_resource_descriptor_reuses"));
+    const qint64 text_row_cache_hits =
+        json_counter(object, QStringLiteral("renderer_text_reused_total")) -
+        json_counter(object, QStringLiteral("text_clean_reuse_skips"));
+    if (text_resource_descriptor_reuses > text_row_cache_hits)
     {
         *out_error = QStringLiteral(
             "text resource descriptor reuses exceed text row-cache hits");
+        return false;
+    }
+
+    const qint64 text_leaf_nodes_reused =
+        json_counter(object, QStringLiteral("text_leaf_nodes_reused"));
+    if (text_leaf_nodes_reused >
+        json_counter(object, QStringLiteral("renderer_text_rebuilds_total")))
+    {
+        *out_error = QStringLiteral("text leaf-node reuse counters are inconsistent");
+        return false;
+    }
+
+    const qint64 text_resource_descriptor_builds_avoided =
+        json_counter(object, QStringLiteral("text_resource_descriptor_builds_avoided"));
+    if (text_resource_descriptor_builds_avoided > text_resource_descriptor_reuses)
+    {
+        *out_error = QStringLiteral("text resource descriptor counters are inconsistent");
         return false;
     }
 
@@ -5643,11 +5725,15 @@ bool validate_per_consumed_update_json(
     const QStringList counter_keys = {
         QStringLiteral("qt_text_layout_calls"),
         QStringLiteral("text_leaf_nodes_created"),
+        QStringLiteral("text_leaf_nodes_reused"),
         QStringLiteral("text_key_builds"),
         QStringLiteral("text_key_bytes"),
         QStringLiteral("renderer_text_rebuilds_total"),
         QStringLiteral("renderer_text_reused_total"),
         QStringLiteral("text_resource_descriptor_reuses"),
+        QStringLiteral("text_resource_descriptor_builds"),
+        QStringLiteral("text_resource_descriptor_builds_avoided"),
+        QStringLiteral("text_ascii_replacement_add_glyphs_calls"),
         QStringLiteral("qsg_nodes_created"),
         QStringLiteral("qsg_nodes_replaced"),
         QStringLiteral("qsg_nodes_destroyed"),
@@ -5774,6 +5860,7 @@ bool validate_measurement_reuse_only_json(
         json_counter(object, QStringLiteral("renderer_text_rebuilds_total")) != 0 ||
         json_counter(object, QStringLiteral("qt_text_layout_calls"))         != 0 ||
         json_counter(object, QStringLiteral("text_leaf_nodes_created"))      != 0 ||
+        json_counter(object, QStringLiteral("text_leaf_nodes_reused"))       != 0 ||
         json_counter(object, QStringLiteral("qsg_nodes_created"))            != 0 ||
         json_counter(object, QStringLiteral("qsg_nodes_replaced"))           != 0 ||
         json_counter(object, QStringLiteral("qsg_nodes_destroyed"))          != 0 ||
@@ -6317,10 +6404,13 @@ bool validate_scenario_json(
         QStringLiteral("renderer_text_removed_total"),
         QStringLiteral("renderer_text_failures_total"),
         QStringLiteral("text_leaf_nodes_created"),
+        QStringLiteral("text_leaf_nodes_reused"),
         QStringLiteral("text_cache_entry_child_nodes_cleared_for_replacement"),
         QStringLiteral("text_cache_entry_child_nodes_cleared_for_removal"),
         QStringLiteral("text_cache_entry_max_child_nodes_cleared"),
         QStringLiteral("text_clean_reuse_skips"),
+        QStringLiteral("text_resource_descriptor_builds"),
+        QStringLiteral("text_resource_descriptor_builds_avoided"),
         QStringLiteral("text_resource_descriptor_reuses"),
         QStringLiteral("text_coalescing_candidate_groups"),
         QStringLiteral("text_coalescing_enabled_groups"),
@@ -6600,8 +6690,10 @@ bool validate_scenario_json(
             object.value(QStringLiteral("bridge_consumed_updates_delta")).toInteger();
         const bool text_work_observed = is_measurement_reuse_only_scenario(scenario_name)
             ? json_counter(object, QStringLiteral("renderer_text_reused_total")) > 0 ||
-                json_counter(object, QStringLiteral("text_leaf_nodes_created")) > 0
-            : json_counter(object, QStringLiteral("text_leaf_nodes_created")) > 0;
+                json_counter(object, QStringLiteral("text_leaf_nodes_created")) > 0 ||
+                json_counter(object, QStringLiteral("text_leaf_nodes_reused"))  > 0
+            : json_counter(object, QStringLiteral("text_leaf_nodes_created")) > 0 ||
+                json_counter(object, QStringLiteral("text_leaf_nodes_reused"))  > 0;
         if (!text_work_observed ||
             bridge_update_requests   < completed_frames              ||
             bridge_consumed_updates  < completed_frames              ||
@@ -6616,6 +6708,7 @@ bool validate_scenario_json(
     }
     else {
         if (json_counter(object, QStringLiteral("text_leaf_nodes_created"))             != 0 ||
+            json_counter(object, QStringLiteral("text_leaf_nodes_reused"))              != 0 ||
             json_counter(object, QStringLiteral("renderer_text_rebuilds_total"))        != 0 ||
             json_counter(object, QStringLiteral("renderer_text_reused_total"))          != 0 ||
             object.value(QStringLiteral("bridge_update_requests_delta")).toInteger()    != 0 ||
@@ -6646,6 +6739,7 @@ bool validate_scenario_json(
             json_counter(object, QStringLiteral("route_fast_text_cells"))                       != 0                ||
             json_counter(object, QStringLiteral("qt_text_layout_calls"))                        != 0                ||
             json_counter(object, QStringLiteral("text_leaf_nodes_created"))                     != 0                ||
+            json_counter(object, QStringLiteral("text_leaf_nodes_reused"))                      != 0                ||
             json_counter(object, QStringLiteral("renderer_text_rebuilds_total"))                != 0                ||
             json_counter(object, QStringLiteral("renderer_text_reused_total"))                  <= 0                ||
             json_counter(object, QStringLiteral("qsg_nodes_created"))                           != 0                ||
@@ -6658,6 +6752,7 @@ bool validate_scenario_json(
                 1.0)                                                                                                ||
             normalized_counters.value(QStringLiteral("qt_text_layout_calls"   )).toDouble(-1.0) != 0.0              ||
             normalized_counters.value(QStringLiteral("text_leaf_nodes_created")).toDouble(-1.0) != 0.0              ||
+            normalized_counters.value(QStringLiteral("text_leaf_nodes_reused" )).toDouble(-1.0) != 0.0              ||
             normalized_counters.value(QStringLiteral("qsg_nodes_created"      )).toDouble(-1.0) != 0.0              ||
             normalized_counters.value(QStringLiteral("qsg_nodes_replaced"     )).toDouble(-1.0) != 0.0              ||
             normalized_counters.value(QStringLiteral("qsg_nodes_destroyed"    )).toDouble(-1.0) != 0.0)

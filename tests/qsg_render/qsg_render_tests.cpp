@@ -1215,7 +1215,7 @@ std::uint64_t row_local_text_runs_call_count(const VNM_TerminalSurface& surface)
 {
     const term::Render_profile_snapshot_t profile = term::VNM_TerminalSurface_render_bridge::render_profiler_snapshot(
         surface);
-    return profile_call_count(profile.root, "row_local_text_runs");
+    return profile_call_count(profile.root, "row_local_text_runs_preserving_ascii_fallback");
 }
 
 term::terminal_cell_metrics_t cell_metrics_for_font(const QFont& font)
@@ -3131,14 +3131,19 @@ bool test_qsg_snapshot_rendering(QGuiApplication& app)
         "single dirty content change avoids clean-skip without retained provenance");
     ok &= check_no_text_content_failures(dirty_stats,
         "single dirty content change has no text content failures");
+    const bool text_leaf_content_reuse =
+        term::VNM_TerminalSurface_render_bridge::stage42_feature_flags()
+            .qsg_text_leaf_content_reuse;
+    const bool text_replacement_churn_ok = text_leaf_content_reuse
+        ? dirty_stats.text_leaf_nodes_reused > 0
+        : dirty_stats.qsg_nodes_replaced > 0 && dirty_stats.qsg_nodes_destroyed > 0;
     ok &= check(dirty_stats.route_fast_text_cells == 0 &&
         dirty_stats.frame.simple_content.route_fast_text_cells > 0 &&
         dirty_stats.frame.simple_content.dirty_eligible_cells == 2 &&
         dirty_stats.frame.simple_content.clean_eligible_cells == 3 &&
         dirty_stats.route_graphic_geometry_cells ==
             dirty_stats.frame.text_cells_rendered_as_graphic &&
-        dirty_stats.qsg_nodes_replaced > 0 &&
-        dirty_stats.qsg_nodes_destroyed > 0 &&
+        text_replacement_churn_ok &&
         dirty_stats.cache_key_builds ==
             dirty_stats.text_key_builds + dirty_stats.rect_key_builds &&
         dirty_stats.cache_key_bytes ==
@@ -3366,6 +3371,21 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
 
     const term::terminal_renderer_stats_t stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+    const bool trusted_ascii_glyph_batching =
+        term::VNM_TerminalSurface_render_bridge::stage42_feature_flags()
+            .qsg_trusted_ascii_glyph_batching;
+    const auto trusted_replacement_run_count_matches =
+        [&](int actual, int expected) {
+            return trusted_ascii_glyph_batching
+                ? actual == expected
+                : actual <= expected;
+        };
+    const auto trusted_replacement_code_units_match =
+        [&](std::uint64_t actual, std::uint64_t expected) {
+            return trusted_ascii_glyph_batching
+                ? actual == expected
+                : actual <= expected;
+        };
     if (profile_scopes_available()) {
         ok &= check(prepare_text_layout_call_count(surface) == 0U,
             "dense same-color row bypasses prepare_text_layout through ASCII replacement");
@@ -3376,9 +3396,13 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     }
     ok &= check(stats.qt_text_layout_calls == 0 &&
         stats.text_ascii_replacement_runs_eligible == 1 &&
-        stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        trusted_replacement_run_count_matches(
+            stats.text_ascii_replacement_runs_trusted_fast_path,
+            1) &&
         stats.text_ascii_replacement_runs_succeeded == 1 &&
-        stats.text_ascii_replacement_code_units_trusted_fast_path == 20U &&
+        trusted_replacement_code_units_match(
+            stats.text_ascii_replacement_code_units_trusted_fast_path,
+            20U) &&
         stats.text_ascii_replacement_runs_fallback == 0,
         "dense same-color row renders through the ASCII replacement path");
     ok &= check(stats.text_resource_runs_before_coalescing == 1 &&
@@ -3422,9 +3446,13 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     ok &= check(style_stats.qt_text_layout_calls == 0 &&
         style_stats.text_ascii_replacement_runs_eligible == 3 &&
-        style_stats.text_ascii_replacement_runs_trusted_fast_path == 3 &&
+        trusted_replacement_run_count_matches(
+            style_stats.text_ascii_replacement_runs_trusted_fast_path,
+            3) &&
         style_stats.text_ascii_replacement_runs_succeeded == 3 &&
-        style_stats.text_ascii_replacement_code_units_trusted_fast_path == 20U &&
+        trusted_replacement_code_units_match(
+            style_stats.text_ascii_replacement_code_units_trusted_fast_path,
+            20U) &&
         style_stats.text_ascii_replacement_runs_fallback == 0,
         "style boundary row keeps foreground boundaries while replacing all ASCII runs");
     const QImage style_image = window.grabWindow();
@@ -3433,6 +3461,21 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         cell_is_nonblank(style_image, 0, 10, metrics) &&
         cell_is_nonblank(style_image, 0, 19, metrics),
         "style boundary row keeps sampled cells visible");
+    ok &= check(count_matching_pixels(
+            style_image,
+            cell_area(0, 0, 1, metrics),
+            default_foreground_pixel) > 3 &&
+        count_matching_pixels(
+            style_image,
+            cell_area(0, 10, 1, metrics),
+            [](QColor color) {
+                return
+                    color.alpha() >  220 &&
+                    color.red()   >  150 &&
+                    color.green() <  130 &&
+                    color.blue()  <  130;
+            }) > 3,
+        "style boundary row keeps distinct foreground colors in the shared text leaf");
 
     render_profiler->reset();
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
@@ -3458,7 +3501,9 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
         "same-foreground style boundary still updates background and decoration layers");
     ok &= check(same_foreground_stats.qt_text_layout_calls == 1 &&
         same_foreground_stats.text_resource_runs_after_coalescing == 3 &&
-        same_foreground_stats.text_ascii_replacement_runs_trusted_fast_path == 2 &&
+        trusted_replacement_run_count_matches(
+            same_foreground_stats.text_ascii_replacement_runs_trusted_fast_path,
+            2) &&
         same_foreground_stats.text_ascii_replacement_runs_fallback == 1 &&
         same_foreground_stats.text_ascii_replacement_runs_rejected_decoration == 1,
         "same-foreground style boundary keeps direct ASCII runs while falling back for decoration");
@@ -3598,9 +3643,13 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     const term::terminal_renderer_stats_t wide_stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     ok &= check(wide_stats.qt_text_layout_calls == 1 &&
-        wide_stats.text_ascii_replacement_runs_trusted_fast_path == 2 &&
+        trusted_replacement_run_count_matches(
+            wide_stats.text_ascii_replacement_runs_trusted_fast_path,
+            2) &&
         wide_stats.text_ascii_replacement_runs_succeeded == 2 &&
-        wide_stats.text_ascii_replacement_code_units_trusted_fast_path == 18U &&
+        trusted_replacement_code_units_match(
+            wide_stats.text_ascii_replacement_code_units_trusted_fast_path,
+            18U) &&
         wide_stats.text_ascii_replacement_runs_rejected_non_ascii == 1,
         "wide boundary row replaces ASCII runs and falls back for the wide run");
     const QImage wide_image = window.grabWindow();
@@ -3632,9 +3681,12 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     const term::terminal_renderer_stats_t long_stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     ok &= check(long_stats.qt_text_layout_calls == 0 &&
-        long_stats.text_ascii_replacement_runs_trusted_fast_path == 2 &&
-        long_stats.text_ascii_replacement_code_units_trusted_fast_path ==
-            static_cast<std::uint64_t>(k_long_dense_column_count) &&
+        trusted_replacement_run_count_matches(
+            long_stats.text_ascii_replacement_runs_trusted_fast_path,
+            2) &&
+        trusted_replacement_code_units_match(
+            long_stats.text_ascii_replacement_code_units_trusted_fast_path,
+            static_cast<std::uint64_t>(k_long_dense_column_count)) &&
         long_stats.text_ascii_replacement_runs_succeeded == 2,
         "long dense row uses replacement for both bounded chunks");
     const QImage long_image = window.grabWindow();
@@ -3667,8 +3719,12 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     const term::terminal_renderer_stats_t multirow_stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     ok &= check(multirow_stats.qt_text_layout_calls == 0 &&
-        multirow_stats.text_ascii_replacement_runs_trusted_fast_path == 3 &&
-        multirow_stats.text_ascii_replacement_code_units_trusted_fast_path == 60U &&
+        trusted_replacement_run_count_matches(
+            multirow_stats.text_ascii_replacement_runs_trusted_fast_path,
+            3) &&
+        trusted_replacement_code_units_match(
+            multirow_stats.text_ascii_replacement_code_units_trusted_fast_path,
+            60U) &&
         multirow_stats.text_ascii_replacement_runs_succeeded == 3,
         "multi-row dense render replaces every coalesced ASCII row");
 
@@ -3694,8 +3750,12 @@ bool test_qsg_text_leaf_batching(QGuiApplication& app)
     const term::terminal_renderer_stats_t single_cell_stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     ok &= check(single_cell_stats.qt_text_layout_calls == 0 &&
-        single_cell_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
-        single_cell_stats.text_ascii_replacement_code_units_trusted_fast_path == 1U &&
+        trusted_replacement_run_count_matches(
+            single_cell_stats.text_ascii_replacement_runs_trusted_fast_path,
+            1) &&
+        trusted_replacement_code_units_match(
+            single_cell_stats.text_ascii_replacement_code_units_trusted_fast_path,
+            1U) &&
         single_cell_stats.text_ascii_replacement_runs_succeeded == 1,
         "single-cell row uses the broad ASCII replacement path");
     return ok;
@@ -4099,7 +4159,9 @@ bool test_qsg_text_coalescing_rejects_cell_width_drift(QGuiApplication& app)
             profiler.root_snapshot(),
             "ascii_text_coalescing_context") == 1U,
             "cell-width-drift direct QSG render evaluates the ASCII coalescing font gate once");
-        ok &= check(profile_call_count(profiler.root_snapshot(), "row_local_text_runs") == 1U,
+        ok &= check(profile_call_count(
+                profiler.root_snapshot(),
+                "row_local_text_runs_preserving_ascii_fallback") == 1U,
             "cell-width-drift direct QSG render falls back to row-local materialization");
     }
 
@@ -4139,6 +4201,9 @@ bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
         renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
         return rendered;
     };
+    const bool trusted_ascii_glyph_batching =
+        term::VNM_TerminalSurface_render_bridge::stage42_feature_flags()
+            .qsg_trusted_ascii_glyph_batching;
 
     const term::Terminal_render_frame trusted_frame = make_direct_text_frame(
         {
@@ -4158,20 +4223,25 @@ bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
         trusted_stats.text_ascii_replacement_runs_screened == 1 &&
         trusted_stats.text_ascii_replacement_runs_eligible == 1 &&
         trusted_stats.text_ascii_replacement_runs_attempted == 1 &&
-        trusted_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        trusted_stats.text_ascii_replacement_runs_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 1 : 0) &&
         trusted_stats.text_ascii_replacement_runs_succeeded == 1 &&
+        trusted_stats.text_ascii_replacement_add_glyphs_calls == 1 &&
         trusted_stats.text_ascii_replacement_runs_fallback == 0 &&
-        trusted_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U,
+        trusted_stats.text_ascii_replacement_code_units_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 2U : 0U),
         "trusted ASCII replacement fast path preserves replacement counters");
     if (profile_scopes_available()) {
         ok &= check(profile_call_count(
                 trusted_profiler.root_snapshot(),
-                "try_append_ascii_replacement_text_run") == 0U,
-            "trusted ASCII replacement fast path bypasses the generic replacement scope");
+                "try_append_ascii_replacement_text_run") ==
+                    (trusted_ascii_glyph_batching ? 0U : 1U),
+            "trusted ASCII replacement fast path uses the configured replacement scope");
         ok &= check(profile_call_count(
                 trusted_profiler.root_snapshot(),
-                "append_trusted_ascii_replacement_text_run") == 1U,
-            "trusted ASCII replacement fast path records its focused scope");
+                "append_trusted_ascii_replacement_text_run") ==
+                    (trusted_ascii_glyph_batching ? 1U : 0U),
+            "trusted ASCII replacement fast path records its focused scope when batching");
     }
 
     const term::Terminal_render_frame space_frame = make_direct_text_frame(
@@ -4189,11 +4259,14 @@ bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
         space_stats.text_ascii_replacement_runs_screened == 1 &&
         space_stats.text_ascii_replacement_runs_eligible == 1 &&
         space_stats.text_ascii_replacement_runs_attempted == 1 &&
-        space_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        space_stats.text_ascii_replacement_runs_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 1 : 0) &&
         space_stats.text_ascii_replacement_runs_succeeded == 1 &&
         space_stats.text_ascii_replacement_runs_all_space_succeeded == 1 &&
-        space_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U &&
+        space_stats.text_ascii_replacement_code_units_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 2U : 0U) &&
         space_stats.text_ascii_replacement_code_units_succeeded == 2U &&
+        space_stats.text_ascii_replacement_add_glyphs_calls == 0 &&
         space_stats.text_ascii_replacement_runs_fallback == 0 &&
         space_stats.text_leaf_nodes_created == 0,
         "trusted all-space ASCII replacement keeps all-space counters and skips text leaves");
@@ -4219,17 +4292,21 @@ bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
         mixed_space_stats.text_ascii_replacement_runs_screened == 1 &&
         mixed_space_stats.text_ascii_replacement_runs_eligible == 1 &&
         mixed_space_stats.text_ascii_replacement_runs_attempted == 1 &&
-        mixed_space_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        mixed_space_stats.text_ascii_replacement_runs_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 1 : 0) &&
         mixed_space_stats.text_ascii_replacement_runs_succeeded == 1 &&
         mixed_space_stats.text_ascii_replacement_runs_all_space_succeeded == 0 &&
-        mixed_space_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U &&
+        mixed_space_stats.text_ascii_replacement_code_units_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 2U : 0U) &&
+        mixed_space_stats.text_ascii_replacement_add_glyphs_calls == 1 &&
         mixed_space_stats.text_ascii_replacement_runs_fallback == 0,
         "trusted mixed-space ASCII replacement uses glyph fast path, not all-space skip");
     if (profile_scopes_available()) {
         ok &= check(profile_call_count(
                 mixed_space_profiler.root_snapshot(),
-                "append_trusted_ascii_replacement_text_run") == 1U,
-            "trusted mixed-space ASCII replacement records the trusted scope");
+                "append_trusted_ascii_replacement_text_run") ==
+                    (trusted_ascii_glyph_batching ? 1U : 0U),
+            "trusted mixed-space ASCII replacement records the trusted scope when batching");
     }
 
     const term::Terminal_render_frame single_run_frame = make_direct_text_frame(
@@ -4245,15 +4322,19 @@ bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
     ok &= check(single_run_stats.text_resource_runs_before_coalescing == 1 &&
         single_run_stats.text_resource_runs_after_coalescing == 1 &&
         single_run_stats.qt_text_layout_calls == 0 &&
-        single_run_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+        single_run_stats.text_ascii_replacement_runs_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 1 : 0) &&
         single_run_stats.text_ascii_replacement_runs_succeeded == 1 &&
-        single_run_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U,
+        single_run_stats.text_ascii_replacement_add_glyphs_calls == 1 &&
+        single_run_stats.text_ascii_replacement_code_units_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 2U : 0U),
         "single-run trusted ASCII replacement uses the non-coalesced trusted branch");
     if (profile_scopes_available()) {
         ok &= check(profile_call_count(
                 single_run_profiler.root_snapshot(),
-                "try_append_ascii_replacement_text_run") == 0U,
-            "single-run trusted ASCII replacement bypasses the generic replacement scope");
+                "try_append_ascii_replacement_text_run") ==
+                    (trusted_ascii_glyph_batching ? 0U : 1U),
+            "single-run trusted ASCII replacement uses the configured replacement scope");
     }
 
     const term::Terminal_render_frame increasing_size_run_frame = make_direct_text_frame(
@@ -4275,18 +4356,46 @@ bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
     ok &= check(increasing_size_run_stats.text_resource_runs_before_coalescing == 4 &&
         increasing_size_run_stats.text_resource_runs_after_coalescing == 4 &&
         increasing_size_run_stats.qt_text_layout_calls == 0 &&
-        increasing_size_run_stats.text_ascii_replacement_runs_trusted_fast_path == 4 &&
+        increasing_size_run_stats.text_ascii_replacement_runs_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 4 : 0) &&
         increasing_size_run_stats.text_ascii_replacement_runs_succeeded == 4 &&
         increasing_size_run_stats.text_ascii_replacement_code_units_screened == 12U &&
-        increasing_size_run_stats.text_ascii_replacement_code_units_trusted_fast_path == 12U &&
-        increasing_size_run_stats.text_ascii_replacement_code_units_succeeded == 12U,
-        "increasing-size trusted ASCII replacement keeps consecutive runs independent");
+        increasing_size_run_stats.text_ascii_replacement_code_units_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 12U : 0U) &&
+        increasing_size_run_stats.text_ascii_replacement_code_units_succeeded == 12U &&
+        increasing_size_run_stats.text_ascii_replacement_add_glyphs_calls ==
+            (trusted_ascii_glyph_batching ? 1 : 4),
+        "increasing-size trusted ASCII replacement uses the configured glyph submission path");
     if (profile_scopes_available()) {
         ok &= check(profile_call_count(
                 increasing_size_run_profiler.root_snapshot(),
-                "append_trusted_ascii_replacement_text_run") == 4U,
-            "increasing-size trusted ASCII replacement records every trusted scope");
+                "append_trusted_ascii_replacement_text_run") ==
+                    (trusted_ascii_glyph_batching ? 1U : 0U),
+            "increasing-size trusted ASCII replacement records one trusted batch scope when batching");
+        ok &= check(profile_call_count(
+                increasing_size_run_profiler.root_snapshot(),
+                "append_trusted_ascii_replacement_text_run::addGlyphs_call") ==
+                    (trusted_ascii_glyph_batching ? 1U : 0U),
+            "increasing-size trusted ASCII replacement submits one glyph batch when batching");
     }
+
+    const term::Terminal_render_frame increasing_size_reference_frame = make_direct_text_frame(
+        {
+            make_direct_text_run(0, 15, QStringLiteral("A BCD EFGHI JKL"), metrics),
+        },
+        metrics);
+    const direct_frame_render_result_t split_render =
+        render_frame_in_fresh_window(app, increasing_size_run_frame, 0);
+    const direct_frame_render_result_t reference_render =
+        render_frame_in_fresh_window(app, increasing_size_reference_frame, 0);
+    ok &= check(!split_render.image.isNull() && !reference_render.image.isNull(),
+        "batched sparse trusted ASCII replacement pixel fixtures render");
+    ok &= check(split_render.stats.text_ascii_replacement_add_glyphs_calls ==
+            (trusted_ascii_glyph_batching ? 1 : 4) &&
+        reference_render.stats.text_ascii_replacement_add_glyphs_calls == 1,
+        "sparse trusted ASCII replacement and reference use expected glyph submission counts");
+    ok &= check(images_have_same_pixels(split_render.image, reference_render.image),
+        "batched sparse trusted ASCII replacement matches single-run pixels");
 
     const term::Terminal_render_frame single_space_run_frame = make_direct_text_frame(
         {
@@ -4301,15 +4410,18 @@ bool test_qsg_ascii_replacement_trusted_fast_path_counters(QGuiApplication& app)
             single_space_run_stats,
             single_space_run_profiler),
         "single-run all-space trusted ASCII replacement frame renders");
-    ok &= check(single_space_run_stats.text_ascii_replacement_runs_trusted_fast_path == 1 &&
+    ok &= check(single_space_run_stats.text_ascii_replacement_runs_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 1 : 0) &&
         single_space_run_stats.text_ascii_replacement_runs_screened == 1 &&
         single_space_run_stats.text_ascii_replacement_runs_eligible == 1 &&
         single_space_run_stats.text_ascii_replacement_runs_attempted == 1 &&
         single_space_run_stats.text_ascii_replacement_runs_succeeded == 1 &&
         single_space_run_stats.text_ascii_replacement_runs_all_space_succeeded == 1 &&
         single_space_run_stats.text_ascii_replacement_code_units_screened == 2U &&
-        single_space_run_stats.text_ascii_replacement_code_units_trusted_fast_path == 2U &&
+        single_space_run_stats.text_ascii_replacement_code_units_trusted_fast_path ==
+            (trusted_ascii_glyph_batching ? 2U : 0U) &&
         single_space_run_stats.text_ascii_replacement_code_units_succeeded == 2U &&
+        single_space_run_stats.text_ascii_replacement_add_glyphs_calls == 0 &&
         single_space_run_stats.text_leaf_nodes_created == 0,
         "single-run all-space trusted ASCII replacement preserves all-space fast path");
     if (profile_scopes_available()) {
@@ -9379,6 +9491,12 @@ bool test_qsg_text_resource_descriptor_dirty_reuse(QGuiApplication& app)
             stats.paint_completed &&
             stats.text_content_failures == 0;
     };
+    const bool direct_descriptor_compare =
+        term::VNM_TerminalSurface_render_bridge::stage42_feature_flags()
+            .qsg_text_resource_descriptor_direct_compare;
+    const bool text_leaf_content_reuse =
+        term::VNM_TerminalSurface_render_bridge::stage42_feature_flags()
+            .qsg_text_leaf_content_reuse;
 
     const term::Terminal_render_frame base_frame =
         make_frame(QStringLiteral("A"), QStringLiteral("B"));
@@ -9386,7 +9504,9 @@ bool test_qsg_text_resource_descriptor_dirty_reuse(QGuiApplication& app)
     ok &= check(update(base_frame, first_stats),
         "text resource descriptor baseline renders");
     ok &= check(first_stats.text_content_rebuilds == 1 &&
-        first_stats.text_cache_entries_created == 1,
+        first_stats.text_cache_entries_created == 1 &&
+        first_stats.text_resource_descriptor_builds == 1 &&
+        first_stats.text_resource_descriptor_builds_avoided == 0,
         "text resource descriptor baseline builds one text row");
 
     term::terminal_renderer_stats_t reuse_stats;
@@ -9401,6 +9521,10 @@ bool test_qsg_text_resource_descriptor_dirty_reuse(QGuiApplication& app)
         reuse_stats.qsg_nodes_replaced == 0 &&
         reuse_stats.text_key_builds == 1 &&
         reuse_stats.text_key_bytes < first_stats.text_key_bytes &&
+        reuse_stats.text_resource_descriptor_builds ==
+            (direct_descriptor_compare ? 0 : 1) &&
+        reuse_stats.text_resource_descriptor_builds_avoided ==
+            (direct_descriptor_compare ? 1 : 0) &&
         reuse_stats.route_fast_text_cells == 0,
         "dirty unchanged text resource row reuses before key/layout/node rebuild work");
 
@@ -9413,12 +9537,250 @@ bool test_qsg_text_resource_descriptor_dirty_reuse(QGuiApplication& app)
         changed_stats.text_cache_entries_replaced == 1 &&
         changed_stats.qt_text_layout_calls == 0 &&
         changed_stats.text_ascii_replacement_runs_succeeded == 1 &&
-        changed_stats.text_leaf_nodes_created > 0 &&
+        changed_stats.text_resource_descriptor_builds == 1 &&
+        changed_stats.text_resource_descriptor_builds_avoided == 0 &&
+        changed_stats.text_leaf_nodes_created == (text_leaf_content_reuse ? 0 : 1) &&
+        changed_stats.text_leaf_nodes_reused == (text_leaf_content_reuse ? 1 : 0) &&
         changed_stats.route_fast_text_cells == 0,
         "changed text resource descriptor row rebuilds through ASCII replacement");
 
     term::terminal_renderer_stats_t cleanup_stats;
     renderer.update_node(node, nullptr, {}, font, 1.0, {}, cleanup_stats);
+    return ok;
+}
+
+bool test_qsg_text_leaf_content_reuse_on_replacement(QGuiApplication& app)
+{
+    bool ok = true;
+    const term::terminal_cell_metrics_t metrics = test_metrics();
+    const bool text_leaf_content_reuse =
+        term::VNM_TerminalSurface_render_bridge::stage42_feature_flags()
+            .qsg_text_leaf_content_reuse;
+    const auto make_frame = [&](QString text, QColor foreground) {
+        std::vector<term::Terminal_render_text_run> runs;
+        runs.reserve(static_cast<std::size_t>(text.size()));
+        for (int column = 0; column < text.size(); ++column) {
+            runs.push_back(make_direct_text_run_for_row(
+                0,
+                0,
+                column,
+                1,
+                QString(text.at(column)),
+                metrics,
+                foreground));
+        }
+
+        return make_direct_text_slot_frame(
+            term::Terminal_buffer_id::PRIMARY,
+            0,
+            1,
+            std::move(runs),
+            metrics,
+            {{0, 1}});
+    };
+    const auto make_single_run_frame = [&](QString text, QColor foreground) {
+        return make_direct_text_slot_frame(
+            term::Terminal_buffer_id::PRIMARY,
+            0,
+            1,
+            {make_direct_text_run_for_row(
+                0,
+                0,
+                0,
+                text.size(),
+                text,
+                metrics,
+                foreground)},
+            metrics,
+            {{0, 1}});
+    };
+    const auto green_setup_pixel = [](QColor color) {
+        return
+            color.green() > 120              &&
+            color.green() > color.red() + 30 &&
+            color.green() > color.blue() + 30;
+    };
+    const auto red_replacement_pixel = [](QColor color) {
+        return
+            color.red()   > 150 &&
+            color.green() < 140 &&
+            color.blue()  < 120;
+    };
+
+    const term::Terminal_render_frame setup_frame =
+        make_frame(QStringLiteral("AB"), QColor(80, 220, 120));
+    const term::Terminal_render_frame replacement_frame =
+        make_frame(QStringLiteral("CD"), QColor(230, 80, 60));
+
+    QQuickWindow window;
+    window.setColor(QColor(180, 16, 16));
+    window.resize(
+        static_cast<int>(std::ceil(setup_frame.logical_size.width())) + 20,
+        static_cast<int>(std::ceil(setup_frame.logical_size.height())) + 20);
+
+    auto lifecycle_recorder = std::make_shared<Renderer_lifecycle_recorder>();
+    Direct_render_item item;
+    item.setParentItem(window.contentItem());
+    item.set_lifecycle_recorder(lifecycle_recorder);
+    item.set_frame(setup_frame);
+    window.show();
+
+    const QImage setup_image = render_window_until(app, window, [&](const QImage& image) {
+        const term::terminal_renderer_stats_t stats = item.last_stats();
+        return
+            stats.paint_completed                        &&
+            stats.text_content_failures == 0             &&
+            stats.text_content_rebuilds == 1             &&
+            stats.text_resource_runs_after_coalescing == 1 &&
+            stats.text_leaf_nodes_created == 1           &&
+            cell_is_nonblank(image, 0, 0, metrics);
+    });
+    const term::terminal_renderer_stats_t setup_stats = item.last_stats();
+    const term::terminal_renderer_lifecycle_stats_t setup_lifecycle_stats =
+        lifecycle_recorder->snapshot();
+    ok &= check(!setup_image.isNull(),
+        "text leaf content reuse setup renders trusted ASCII text");
+    ok &= check(setup_stats.text_leaf_nodes_reused == 0 &&
+        live_text_resource_count(setup_lifecycle_stats) == 1U,
+        "text leaf content reuse setup creates one live text resource");
+
+    const int before_replacement_render_count = item.render_count();
+    item.set_frame(replacement_frame);
+    const QImage replacement_image = render_window_until(app, window, [&](const QImage& image) {
+        const term::terminal_renderer_stats_t stats = item.last_stats();
+        return
+            item.render_count() > before_replacement_render_count &&
+            stats.paint_completed                                &&
+            stats.text_content_failures == 0                     &&
+            stats.text_content_rebuilds == 1                     &&
+            stats.text_cache_entries_replaced == 1               &&
+            count_matching_pixels(
+                image,
+                cell_area(0, 0, 2, metrics),
+                [](QColor color) {
+                    return
+                        color.red()   > 150 &&
+                        color.green() < 140 &&
+                        color.blue()  < 120;
+                }) > 5;
+    });
+    const term::terminal_renderer_stats_t replacement_stats = item.last_stats();
+    const term::terminal_renderer_lifecycle_stats_t replacement_lifecycle_stats =
+        lifecycle_recorder->snapshot();
+    const direct_frame_render_result_t fresh_replacement =
+        render_frame_in_fresh_window(app, replacement_frame, 0);
+    ok &= check(!replacement_image.isNull() &&
+        !fresh_replacement.image.isNull() &&
+        images_have_same_pixels(replacement_image, fresh_replacement.image),
+        "text leaf content replacement pixels match a fresh trusted ASCII render");
+
+    if (text_leaf_content_reuse) {
+        ok &= check(replacement_stats.text_leaf_nodes_reused == 1 &&
+            replacement_stats.text_leaf_nodes_created == 0 &&
+            replacement_stats.qsg_nodes_replaced == 0,
+            "text leaf content replacement reuses the existing text leaf under the flag");
+        ok &= check(
+            replacement_lifecycle_stats.render_text_resources_created ==
+                setup_lifecycle_stats.render_text_resources_created &&
+            replacement_lifecycle_stats.render_text_resources_destroyed ==
+                setup_lifecycle_stats.render_text_resources_destroyed &&
+            live_text_resource_count(replacement_lifecycle_stats) == 1U,
+            "text leaf content replacement keeps the text resource lifecycle stable");
+    }
+    else {
+        ok &= check(replacement_stats.text_leaf_nodes_reused == 0 &&
+            replacement_stats.text_leaf_nodes_created > 0 &&
+            replacement_stats.qsg_nodes_replaced > 0,
+            "disabled text leaf content reuse keeps the replacement allocation path");
+        ok &= check(
+            replacement_lifecycle_stats.render_text_resources_created >
+                setup_lifecycle_stats.render_text_resources_created &&
+            replacement_lifecycle_stats.render_text_resources_destroyed >
+                setup_lifecycle_stats.render_text_resources_destroyed &&
+            live_text_resource_count(replacement_lifecycle_stats) == 1U,
+            "disabled text leaf content reuse replaces the text resource lifecycle");
+    }
+
+    const term::Terminal_render_frame qtext_setup_frame =
+        make_single_run_frame(QStringLiteral("\u00e9\u00e9"), QColor(80, 220, 120));
+    const term::Terminal_render_frame plain_ascii_replacement_frame =
+        make_single_run_frame(QStringLiteral("CD"), QColor(230, 80, 60));
+
+    QQuickWindow qtext_window;
+    qtext_window.setColor(QColor(180, 16, 16));
+    qtext_window.resize(
+        static_cast<int>(std::ceil(qtext_setup_frame.logical_size.width())) + 20,
+        static_cast<int>(std::ceil(qtext_setup_frame.logical_size.height())) + 20);
+
+    Direct_render_item qtext_item;
+    qtext_item.setParentItem(qtext_window.contentItem());
+    qtext_item.set_frame(qtext_setup_frame);
+    qtext_window.show();
+
+    const QImage qtext_setup_image = render_window_until(app, qtext_window, [&](const QImage& image) {
+        const term::terminal_renderer_stats_t stats = qtext_item.last_stats();
+        return
+            stats.paint_completed                            &&
+            stats.text_content_failures == 0                 &&
+            stats.text_content_rebuilds == 1                 &&
+            stats.text_resource_runs_after_coalescing == 1   &&
+            stats.text_leaf_nodes_created == 1               &&
+            stats.qt_text_layout_calls == 1                  &&
+            stats.text_ascii_replacement_runs_rejected_non_ascii == 1 &&
+            count_matching_pixels(
+                image,
+                cell_area(0, 0, 2, metrics),
+                green_setup_pixel) > 5;
+    });
+    const term::terminal_renderer_stats_t qtext_setup_stats = qtext_item.last_stats();
+    ok &= check(!qtext_setup_image.isNull(),
+        "text leaf content reuse setup renders one QTextLayout-populated text leaf");
+    ok &= check(qtext_setup_stats.text_leaf_nodes_reused == 0,
+        "QTextLayout-populated setup creates a fresh text leaf");
+
+    const int before_plain_ascii_render_count = qtext_item.render_count();
+    qtext_item.set_frame(plain_ascii_replacement_frame);
+    const QImage plain_ascii_image = render_window_until(app, qtext_window, [&](const QImage& image) {
+        const term::terminal_renderer_stats_t stats = qtext_item.last_stats();
+        return
+            qtext_item.render_count() > before_plain_ascii_render_count &&
+            stats.paint_completed                                      &&
+            stats.text_content_failures == 0                           &&
+            stats.text_content_rebuilds == 1                           &&
+            stats.text_cache_entries_replaced == 1                     &&
+            stats.qt_text_layout_calls == 0                            &&
+            stats.text_ascii_replacement_runs_succeeded == 1           &&
+            count_matching_pixels(
+                image,
+                cell_area(0, 0, 2, metrics),
+                red_replacement_pixel) > 5;
+    });
+    const term::terminal_renderer_stats_t plain_ascii_stats = qtext_item.last_stats();
+    const direct_frame_render_result_t fresh_plain_ascii =
+        render_frame_in_fresh_window(app, plain_ascii_replacement_frame, 0);
+    const int stale_qtext_pixels = count_matching_pixels(
+        plain_ascii_image,
+        cell_area(0, 0, 2, metrics),
+        green_setup_pixel);
+    ok &= check(!plain_ascii_image.isNull() &&
+        !fresh_plain_ascii.image.isNull() &&
+        images_have_same_pixels(plain_ascii_image, fresh_plain_ascii.image),
+        "QTextLayout-to-trusted-ASCII replacement pixels match a fresh plain ASCII render");
+    ok &= check(stale_qtext_pixels <= 1,
+        "QTextLayout-to-trusted-ASCII replacement clears stale non-ASCII text pixels");
+
+    if (text_leaf_content_reuse) {
+        ok &= check(plain_ascii_stats.text_leaf_nodes_reused == 1 &&
+            plain_ascii_stats.text_leaf_nodes_created == 0 &&
+            plain_ascii_stats.qsg_nodes_replaced == 0,
+            "QTextLayout-to-trusted-ASCII replacement reuses the old text leaf under the flag");
+    }
+    else {
+        ok &= check(plain_ascii_stats.text_leaf_nodes_reused == 0 &&
+            plain_ascii_stats.text_leaf_nodes_created > 0 &&
+            plain_ascii_stats.qsg_nodes_replaced > 0,
+            "disabled text leaf content reuse allocates for QTextLayout-to-ASCII replacement");
+    }
     return ok;
 }
 
@@ -10190,6 +10552,21 @@ bool test_qsg_text_row_slot_viewport_order_and_resize_cleanup(QGuiApplication& a
         }
         return tops;
     };
+    const auto row_color_pixels = [&](const QImage& image, int viewport_row, int logical_row) {
+        return count_matching_pixels(
+            image,
+            cell_area(viewport_row, 0, 20, metrics),
+            [logical_row](QColor color) {
+                return is_viewport_scroll_row_color(color, logical_row);
+            });
+    };
+    const auto frame_row_color_pixels = [&](const QImage& image, int logical_row) {
+        int pixels = 0;
+        for (int viewport_row = 0; viewport_row < 3; ++viewport_row) {
+            pixels += row_color_pixels(image, viewport_row, logical_row);
+        }
+        return pixels;
+    };
 
     const term::Terminal_render_frame baseline_frame = make_direct_text_slot_rows_frame(
         term::Terminal_buffer_id::PRIMARY,
@@ -10206,7 +10583,7 @@ bool test_qsg_text_row_slot_viewport_order_and_resize_cleanup(QGuiApplication& a
 
     const term::Terminal_render_frame scrolled_frame = make_direct_text_slot_rows_frame(
         term::Terminal_buffer_id::PRIMARY,
-        3,
+        5,
         3,
         metrics,
         {{0, 3}});
@@ -10223,16 +10600,58 @@ bool test_qsg_text_row_slot_viewport_order_and_resize_cleanup(QGuiApplication& a
         scrolled_stats.text_leaf_nodes_created == 1 &&
         scrolled_stats.text_key_builds == 2 &&
         scrolled_stats.text_wrapper_order_rebuilt,
-        "one-line text viewport movement descriptor-reuses overlaps and replaces the new row");
+        "one-line text viewport movement reuses rows 5 and 6 and rebuilds row 7");
     ok &= check(scrolled_tops.size() == 3U &&
         nearly_equal(scrolled_tops[0], 0.0) &&
         nearly_equal(scrolled_tops[1], metrics.height) &&
         nearly_equal(scrolled_tops[2], metrics.height * 2.0),
         "text row slot wrappers are reparented in viewport-row order after scroll");
 
+    QQuickWindow pixel_window;
+    pixel_window.setColor(QColor(9, 12, 16));
+    pixel_window.resize(260, 120);
+
+    Direct_render_item pixel_item;
+    pixel_item.setParentItem(pixel_window.contentItem());
+    pixel_item.set_frame(baseline_frame);
+    pixel_window.show();
+
+    const QImage baseline_pixel_image = render_window_until(app, pixel_window, [&](const QImage& image) {
+        const term::terminal_renderer_stats_t stats = pixel_item.last_stats();
+        return
+            pixel_item.render_count() > 0          &&
+            stats.paint_completed                  &&
+            stats.text_content_failures == 0       &&
+            stats.text_content_rebuilds == 3       &&
+            row_color_pixels(image, 0, 4) > 5      &&
+            row_color_pixels(image, 1, 5) > 5      &&
+            row_color_pixels(image, 2, 6) > 5;
+    });
+    ok &= check(!baseline_pixel_image.isNull(),
+        "text row slot old-top-removal pixel baseline renders rows 4, 5, and 6");
+
+    const int before_scrolled_pixel_render_count = pixel_item.render_count();
+    pixel_item.set_frame(scrolled_frame);
+    const QImage scrolled_pixel_image = render_window_until(app, pixel_window, [&](const QImage& image) {
+        const term::terminal_renderer_stats_t stats = pixel_item.last_stats();
+        return
+            pixel_item.render_count() > before_scrolled_pixel_render_count &&
+            stats.paint_completed                                         &&
+            stats.text_content_failures == 0                              &&
+            stats.text_content_rebuilds == 1                              &&
+            stats.text_content_reused == 2                                &&
+            stats.text_content_removed == 1                               &&
+            row_color_pixels(image, 0, 5) > 5                             &&
+            row_color_pixels(image, 1, 6) > 5                             &&
+            row_color_pixels(image, 2, 7) > 5;
+    });
+    const int stale_row_four_pixels = frame_row_color_pixels(scrolled_pixel_image, 4);
+    ok &= check(!scrolled_pixel_image.isNull() && stale_row_four_pixels <= 1,
+        "text row slot scroll removes old logical row 4 pixels after reusing rows 5 and 6");
+
     const term::Terminal_render_frame shrunk_frame = make_direct_text_slot_rows_frame(
         term::Terminal_buffer_id::PRIMARY,
-        3,
+        5,
         2,
         metrics,
         {{0, 2}});
@@ -12381,6 +12800,8 @@ int main(int argc, char** argv)
         has_argument(argc, argv, "--flat-rect-batched-geometry");
     const bool geometry_row_slot_hardware_only =
         has_argument(argc, argv, "--geometry-row-slot-hardware");
+    const bool text_replacement_focused_only =
+        has_argument(argc, argv, "--text-replacement-focused");
     if (software_renderer) {
         QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
     }
@@ -12414,6 +12835,11 @@ int main(int argc, char** argv)
             ok &= test_qsg_geometry_row_slot_active_buffer_identity(app);
             ok &= test_qsg_geometry_row_slot_exact_content_descriptors(app);
         }
+        return ok ? 0 : 1;
+    }
+    if (text_replacement_focused_only) {
+        ok &= test_qsg_ascii_replacement_trusted_fast_path_counters(app);
+        ok &= test_qsg_text_leaf_content_reuse_on_replacement(app);
         return ok ? 0 : 1;
     }
 
@@ -12464,6 +12890,7 @@ int main(int argc, char** argv)
     ok &= test_qsg_text_row_slot_retained_line_provenance_pixels(app);
     ok &= test_qsg_text_row_slot_invalid_provenance_rebuilds_skipped_dirty_pixels(app);
     ok &= test_qsg_text_resource_descriptor_dirty_reuse(app);
+    ok &= test_qsg_text_leaf_content_reuse_on_replacement(app);
     ok &= test_qsg_text_resource_descriptor_styled_ascii_reuse(app);
     ok &= test_qsg_text_resource_descriptor_text_style_key_only_reuse(app);
     ok &= test_qsg_text_resource_descriptor_complex_transitions(app);
