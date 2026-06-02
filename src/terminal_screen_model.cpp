@@ -7286,32 +7286,37 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
         VNM_TERMINAL_PROFILE_SCOPE(
             "Terminal_screen_model::append_snapshot_cells_from_row::scan_cells");
 
-        for (int column = 0; column < column_count; ++column) {
-            const Cell& cell = visual_row[static_cast<std::size_t>(column)];
-            if (!cell.occupied) {
-                continue;
-            }
+        {
+            VNM_TERMINAL_PROFILE_SCOPE(
+                "Terminal_screen_model::append_snapshot_cells_from_row::scan_cells::loop");
 
-            if (collect_hyperlink_ids && cell.hyperlink_id != 0U) {
-                const auto insert_position = std::lower_bound(
-                    row_referenced_hyperlink_ids.begin(),
-                    row_referenced_hyperlink_ids.end(),
-                    cell.hyperlink_id);
-                if (insert_position == row_referenced_hyperlink_ids.end() ||
-                    *insert_position != cell.hyperlink_id)
-                {
-                    row_referenced_hyperlink_ids.insert(insert_position, cell.hyperlink_id);
+            for (int column = 0; column < column_count; ++column) {
+                const Cell& cell = visual_row[static_cast<std::size_t>(column)];
+                if (!cell.occupied) {
+                    continue;
                 }
-            }
 
-            snapshot.cells.push_back({
-                { snapshot_row, column },
-                cell.text,
-                cell.hyperlink_id,
-                cell.display_width,
-                cell.wide_continuation,
-                cell.style_id,
-            });
+                if (collect_hyperlink_ids && cell.hyperlink_id != 0U) {
+                    const auto insert_position = std::lower_bound(
+                        row_referenced_hyperlink_ids.begin(),
+                        row_referenced_hyperlink_ids.end(),
+                        cell.hyperlink_id);
+                    if (insert_position == row_referenced_hyperlink_ids.end() ||
+                        *insert_position != cell.hyperlink_id)
+                    {
+                        row_referenced_hyperlink_ids.insert(insert_position, cell.hyperlink_id);
+                    }
+                }
+
+                snapshot.cells.push_back({
+                    { snapshot_row, column },
+                    cell.text,
+                    cell.hyperlink_id,
+                    cell.display_width,
+                    cell.wide_continuation,
+                    cell.style_id,
+                });
+            }
         }
     }
 }
