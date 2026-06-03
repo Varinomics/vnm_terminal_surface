@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/qsg_atlas_renderer_stage1.h"
 #include "vnm_terminal/internal/qsg_rhi_stage0_probe.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/render_snapshot.h"
@@ -66,6 +67,13 @@ public:
         bool                       enabled);
 
     static qsg_rhi_stage0_probe_frame_t rhi_stage0_probe_frame(
+        const VNM_TerminalSurface& surface);
+
+    static void set_qsg_atlas_stage1_probe_enabled(
+        VNM_TerminalSurface&       surface,
+        bool                       enabled);
+
+    static Qsg_atlas_stage1_frame_report qsg_atlas_stage1_frame(
         const VNM_TerminalSurface& surface);
 
     static Terminal_screen_model_dirty_row_stats dirty_row_stats(
