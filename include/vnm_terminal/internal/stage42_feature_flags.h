@@ -19,7 +19,7 @@ struct stage42_feature_flags_t
     bool qsg_monotonic_dirty_probe                   = true;
     bool qsg_text_resource_descriptor_direct_compare = true;
     bool qsg_text_leaf_content_reuse                 = false;
-    bool qsg_row_slot_ordered_lookup                 = false;
+    bool qsg_row_slot_ordered_lookup                 = true;
     bool qsg_descriptor_reuse_frame_key_independent  = true;
     bool render_cell_row_cache                       = true;
     bool render_frame_sorted_row_sort_prefilter      = false;
