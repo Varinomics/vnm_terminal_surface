@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/qsg_rhi_stage0_probe.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/terminal_session.h"
@@ -59,6 +60,13 @@ public:
     static void set_selection_trace_enabled(
         VNM_TerminalSurface&       surface,
         bool                       enabled);
+
+    static void set_rhi_stage0_probe_enabled(
+        VNM_TerminalSurface&       surface,
+        bool                       enabled);
+
+    static qsg_rhi_stage0_probe_frame_t rhi_stage0_probe_frame(
+        const VNM_TerminalSurface& surface);
 
     static Terminal_screen_model_dirty_row_stats dirty_row_stats(
         const VNM_TerminalSurface& surface);

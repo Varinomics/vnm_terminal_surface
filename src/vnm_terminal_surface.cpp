@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/linux_pty_backend.h"
+#include "vnm_terminal/internal/qsg_rhi_stage0_probe.h"
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
@@ -1744,6 +1745,7 @@ struct VNM_TerminalSurface::Private
     term::Ime_preedit_state                                ime_preedit;
     bool                                                   cursor_blink_visible                  = true;
     term::Qsg_terminal_renderer                            renderer;
+    std::shared_ptr<term::Qsg_rhi_stage0_probe_recorder>   rhi_stage0_probe_recorder;
     term::Terminal_renderer_stats_publisher                renderer_stats_publisher;
 #if VNM_TERMINAL_PROFILING_ENABLED
     mutable std::mutex                                     render_profiler_mutex;
@@ -1762,6 +1764,7 @@ struct VNM_TerminalSurface::Private
     bool                                                   render_update_pending              = false;
     bool                                                   render_node_release_pending        = false;
     bool                                                   render_node_release_requeue_update = false;
+    bool                                                   rhi_stage0_probe_enabled           = false;
     qreal                                                  wheel_scroll_angle_remainder       = 0.0;
     qreal                                                  wheel_scroll_pixel_remainder       = 0.0;
     qreal                                                  wheel_zoom_angle_remainder         = 0.0;
@@ -5326,6 +5329,32 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             return nullptr;
         }
 
+        if (m_private->rhi_stage0_probe_enabled) {
+            if (m_private->rhi_stage0_probe_recorder == nullptr) {
+                m_private->rhi_stage0_probe_recorder =
+                    std::make_shared<term::Qsg_rhi_stage0_probe_recorder>();
+            }
+
+            term::qsg_rhi_stage0_probe_record_window_rhi(
+                m_private->rhi_stage0_probe_recorder,
+                window()->rhi());
+            QSGNode* updated_node = term::update_qsg_rhi_stage0_probe_node(
+                old_node,
+                window(),
+                logical_size,
+                m_private->rhi_stage0_probe_recorder);
+            term::terminal_renderer_stats_t renderer_stats;
+            renderer_stats.paint_completed = updated_node != nullptr;
+            m_private->renderer_stats_publisher.publish(renderer_stats);
+            if (updated_node != nullptr) {
+                m_private->consume_render_update(window());
+            }
+            else {
+                m_private->reset_render_update_schedule();
+            }
+            return updated_node;
+        }
+
         const term::Terminal_render_options options = render_options_for_surface(*this);
         const term::Terminal_render_frame frame = term::build_terminal_render_frame(
             m_private->render_snapshot.get(),
@@ -5432,6 +5461,34 @@ void term::VNM_TerminalSurface_render_bridge::set_selection_trace_enabled(
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.m_selection_trace_enabled = enabled;
+}
+
+void term::VNM_TerminalSurface_render_bridge::set_rhi_stage0_probe_enabled(
+    VNM_TerminalSurface&   surface,
+    bool                   enabled)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    if (surface.m_private->rhi_stage0_probe_enabled == enabled) {
+        return;
+    }
+
+    surface.m_private->rhi_stage0_probe_enabled = enabled;
+    if (surface.m_private->rhi_stage0_probe_recorder == nullptr) {
+        surface.m_private->rhi_stage0_probe_recorder =
+            std::make_shared<term::Qsg_rhi_stage0_probe_recorder>();
+    }
+    surface.m_private->rhi_stage0_probe_recorder->reset();
+    surface.m_private->request_render_update(surface);
+}
+
+term::qsg_rhi_stage0_probe_frame_t
+term::VNM_TerminalSurface_render_bridge::rhi_stage0_probe_frame(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->rhi_stage0_probe_recorder != nullptr
+        ? surface.m_private->rhi_stage0_probe_recorder->snapshot()
+        : term::qsg_rhi_stage0_probe_frame_t{};
 }
 
 term::Terminal_screen_model_dirty_row_stats
