@@ -105,7 +105,8 @@ base = mmap(NULL, 2*cap, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);   // rese
 mmap(base,       cap, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, fd, 0); // half 0
 mmap(base + cap, cap, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, fd, 0); // half 1 (mirror)
 // MAP_SHARED is required so both views alias the same physical pages (MAP_PRIVATE would COW).
-// MADV_DONTDUMP optional. Teardown: munmap(base, 2*cap); close(fd). On any partial failure, munmap the 2x span.
+// MADV_DONTDUMP optional. page size via sysconf(_SC_PAGE_SIZE) (may be 16K/64K on arm64), not a hardcoded 4096.
+// Teardown / any partial failure: a single munmap(base, 2*cap) frees both sub-mappings; then close(fd).
 ```
 
 **Windows (Win10 1803+ placeholder API)**
@@ -115,7 +116,11 @@ base    = VirtualAlloc2(NULL, NULL, 2*cap, MEM_RESERVE|MEM_RESERVE_PLACEHOLDER, 
 VirtualFree(base, cap, MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER);                            // split placeholder
 MapViewOfFile3(section, NULL, base,       0, cap, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
 MapViewOfFile3(section, NULL, base + cap, 0, cap, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
-// cap and base must be allocation-granularity aligned (64 KiB). Teardown: UnmapViewOfFile x2; CloseHandle(section).
+// cap and base must be allocation-granularity aligned (64 KiB).
+// Teardown: UnmapViewOfFile x2; CloseHandle(section). PARTIAL-FAILURE CLEANUP IS STATE-DEPENDENT (per Microsoft's
+// VirtualAlloc2 example Exit: block): track each half as placeholder-or-view — a placeholder is freed with
+// VirtualFree(p,0,MEM_RELEASE); once MapViewOfFile3 succeeds the half is a VIEW (UnmapViewOfFile) and its
+// placeholder pointer must be nulled so it is not also VirtualFree'd (ownership transfers to the view).
 ```
 
 `VirtualAlloc2`/`MapViewOfFile3` require Windows 10 1803+ (in `onecore`/`kernelbase`,
@@ -126,11 +131,16 @@ recommended path; the legacy Sintra-style `VirtualAlloc(2x)`→`VirtualFree`→
 requires it).
 
 **Granularity / alignment.** The mapped region size must be a multiple of the OS
-mapping granularity — page size on POSIX (typically 4 KiB), **allocation granularity
-on Windows (64 KiB)**. `terminal_history_ring_aligned_capacity()` tightens to round
-the requested capacity up to that granularity (it already aligns to a smaller value
-today, so the alignment concept exists). Transient mapping races (multiple threads,
-address-space contention) get a small bounded retry loop, as Sintra does.
+mapping granularity — page size on POSIX (queried via `sysconf(_SC_PAGE_SIZE)`;
+commonly 4 KiB but 16 KiB/64 KiB on some arm64 configs), **allocation granularity on
+Windows (64 KiB)**. `terminal_history_ring_aligned_capacity()` already rounds the
+default backend alignment up to the full page/granularity (e.g. 4096→4096,
+65536→65536; the `*8` factor is the `cap/8` octile coupling, not a sub-page step), so
+the alignment concept exists — the change is that it must use the OS *mapping*
+granularity, and custom sub-page alignments (e.g. the test's 256-byte alignment) are no
+longer mappable. A bounded retry loop is needed only for the legacy Windows fallback
+(address-window race) and `shm_open` name collisions — the placeholder and
+`MAP_FIXED`-into-own-reservation primary paths have no address race and need no retry.
 
 ## What changes in `Terminal_history_ring`
 
@@ -167,24 +177,36 @@ threading model must be stated and verified explicitly.
   the render path consumes the **immutable published snapshot**, not the live ring. If
   that holds, there are no concurrent record reads, so none of Sintra's reader-guard
   machinery is needed.
-- **Verification gate (must pass before zero-copy read lands):** confirm that no thread
-  other than the owner ever *dereferences record bytes*. The ring exposes
-  `std::atomic` `head`/`oldest` sequences and a `Terminal_history_ring_backend_snapshot_status`
-  (`OK`/`STALE`/`RETRY`) — confirm those cross-thread paths read only the **sequence
-  range** (for a best-effort liveness/snapshot check), never record payloads. If any
-  path reads payload bytes off-thread, that specific path must keep a copy (as today)
-  or the ring must add guards; the zero-copy change applies only to the owner-thread
-  read/write sites.
+- **The ring is owned exclusively by the model/GUI thread.** It lives only inside
+  `Terminal_screen_model`'s retained-history storage; every payload-touching call site
+  (`read_record`, `reserve_record`/`commit`, `discard_oldest_records`, the private
+  `copy_record_bytes`) is reached only from the model on the owner thread, and the
+  backend/worker IO files (`native_backend_io_core.cpp`, `linux_pty_backend.cpp`,
+  `windows_conpty_backend.cpp`) contain no reference to the screen model. So there is no
+  cross-thread reader of record bytes today. (Note: the
+  `Terminal_history_ring_backend_snapshot_status` enum and the `SNAPSHOT_STALE`/
+  `SNAPSHOT_RETRY` statuses are **currently-unused scaffolding** — referenced only by a
+  mapping unit test, with no production producer or consumer; they are *not* a live
+  cross-thread protocol and are not the basis of this safety argument.)
+- **Verification gate (must pass before zero-copy read lands):** a `git grep` of the
+  ring's payload API confirming the above — no non-owner thread dereferences record
+  bytes — which holds today. If a future cross-thread payload reader is added, that path
+  must copy (as today) or the ring must add Sintra-style guards; the zero-copy change
+  applies only to owner-thread read/write sites.
 - **Span validity contract:** a `read_scope` span (and a `reservation.payload()` span)
   is valid only until the next **mutating** ring operation (`commit`, `discard`, or any
-  eviction) that could overwrite or evict that region. Consumers must read/decode
-  before the next mutation, or copy explicitly to retain. The current owned-copy
-  read-scope is retain-safe by construction; the zero-copy version makes this a
-  documented contract. Verified consumers (traversal, codec, buffer-transition copy in
-  `terminal_screen_model.cpp:4002`) decode immediately into structured data and do not
-  stash the raw span across a mutation — this must be re-checked per site during
-  migration. In debug builds, poison/guard the reserved-but-uncommitted and
-  just-evicted regions to catch contract violations.
+  eviction) that could overwrite or evict that region. The contract holds structurally,
+  not merely by convention: `decode_terminal_history_row_record` consumes
+  `read_scope.payload()` synchronously into a fully-owning `Terminal_history_row_record`
+  (owned `std::vector`/`QString`), traversal `std::move`s that owned record out, and
+  `materialize_retained_history_record` returns by value — so no ring span escapes into a
+  snapshot. The precise requirement is that the ring is **not mutated during a single
+  decode call**, because the codec's intermediate `payload_view`/`Byte_reader` alias the
+  span for the duration of decode. The buffer-transition copy at
+  `terminal_screen_model.cpp:4003` reads from the *source* ring and writes to a *distinct
+  destination* ring (and uses the already-owned `decoded.record`), so its hazard is null.
+  In debug builds, poison the reserved-but-uncommitted and just-evicted regions to catch
+  any violation.
 
 ## Failure handling
 
@@ -208,9 +230,11 @@ not a default convenience fallback — same reasoning as the renderer plan.
 
 ## Capacity and configuration
 
-- Capacity stays **byte-valued**; `aligned_capacity` rounds up to OS granularity
-  (page / 64 KiB). Tests that assert an exact capacity must accept the granularity-
-  rounded value.
+- Capacity stays **byte-valued**; `aligned_capacity` rounds up to OS mapping granularity
+  (page / 64 KiB). Crucially, **sub-granularity capacities are no longer mappable at all**
+  (not merely rounded): the current `tests/history_ring` tiny-capacity cases (e.g.
+  256/513/768-byte rings) must be re-baselined to page-multiple sizes, and capacity-exact
+  assertions must move to the rounded value.
 - The host's natural unit is **rows** (Windows Terminal exposes a history-line count).
   Mapping "N rows" → byte capacity (N × estimated bytes/row, granularity-rounded) is a
   higher-level concern and **out of scope** for the storage swap, but the magic ring
@@ -267,15 +291,21 @@ stage keeps the public ring contract and the existing tests green.
    two-`memcpy` splits to single `memcpy`s (the region is now contiguous) but still
    copy. Behavior-identical; all existing tests green. This proves the mapping in
    isolation from the API contract change.
-3. **Stage 3 — zero-copy read.** `read_record` returns in-ring spans; delete
-   `copy_record_bytes` and the read-scope owned vector; document the span-validity
-   contract; convert the traversal/codec/buffer-transition read sites; add the
-   zero-copy-read and lifetime-contract tests. (Gated on the threading verification.)
-4. **Stage 4 — zero-copy write.** `reserve_record` returns an in-ring span; `commit`
-   drops the staging copy; delete `write_record_bytes`; convert the codec write site;
-   add zero-copy-write tests.
-5. **Stage 5 — cleanup.** Remove dead split-copy helpers and the now-unused vectors;
-   decide and apply the `cap/8` bound question; dead-code sweep (`git grep`).
+3. **Stage 3 — zero-copy read.** *Iff* the threading gate passes (it does today),
+   `read_record` returns in-ring spans and `copy_record_bytes` + the read-scope owned
+   vector are deleted; otherwise zero-copy is scoped to owner-thread sites and
+   `copy_record_bytes` is retained for any off-thread path. Document the span-validity
+   contract; convert the traversal/codec read sites and the cross-ring buffer-transition
+   site; add the zero-copy-read and lifetime-contract tests.
+4. **Stage 4 — zero-copy write.** `reserve_record` returns an in-ring span; the
+   header/footer framing that `reserve_record` currently pre-writes into the staging
+   vector now lands directly in the ring span, and `commit`'s `validate_record_bytes`
+   reads it back through the mirror; the staging copy and `write_record_bytes` are
+   deleted; convert the codec write site; add zero-copy-write tests.
+5. **Stage 5 — cleanup (dead code only).** Remove the now-dead split-copy helpers and the
+   unused staging/read-scope/`m_storage` vectors; dead-code sweep (`git grep`). The
+   `max_record_bytes = cap/8` relaxation is **not** part of this swap — it is a separate,
+   deferred, test-gated behavior change (see Open Questions), not bundled into the sweep.
 
 ## Risks
 
@@ -287,11 +317,14 @@ stage keeps the public ring contract and the existing tests green.
   principal new correctness hazard; mitigated by single-thread ownership, read-then-
   decode consumers, and debug poisoning, but it is a real contract every read site must
   honor.
-- **Threading assumption.** The whole "no guards needed" argument rests on record bytes
-  never being read off the owner thread. If the verification gate fails, zero-copy read
-  is scoped to owner-thread sites only and the cross-thread path keeps copying.
-- **Granularity-rounded capacity** changes the exact byte capacity; capacity-exact
-  assertions in tests must move to the rounded value.
+- **Threading assumption.** The "no guards needed" argument rests on record bytes never
+  being read off the owner thread — true today (the ring is confined to the model's
+  retained-history storage; the snapshot-status enum is unused scaffolding, not a live
+  cross-thread reader). If a future change adds an off-thread payload reader, zero-copy
+  read is scoped to owner-thread sites only and that path keeps copying.
+- **Granularity-rounded capacity** changes the exact byte capacity, and sub-page
+  capacities become unmappable; the tiny-capacity ring tests must be re-baselined to
+  page-multiple sizes.
 - **Windows API floor** (VirtualAlloc2/MapViewOfFile3 → Win10 1803). State the floor;
   only add the legacy fallback if a target needs it.
 - **Address-space for the 2× reservation** is trivial for scrollback sizes on 64-bit;
@@ -301,8 +334,9 @@ stage keeps the public ring contract and the existing tests green.
 
 - On unrecoverable mapping failure: hard-degrade to zero scrollback (recommended) vs.
   an owner-approved non-mapped fallback for a specific platform.
-- Keep `max_record_bytes = cap/8` for parity, or relax now that there are no reader
-  guards?
+- `max_record_bytes = cap/8`: kept for parity by this swap; relaxing it (now that there
+  are no reader guards) is a **separate, deferred, test-gated change**, not part of this
+  plan's stages.
 - Linux backing: `memfd_create` (cleanest, Linux 3.17+) vs. `shm_open`; fallback order.
 - Should the descriptor index (`m_records` `std::deque`) also become a fixed-capacity
   ring of descriptors (Sintra `Index_stack`-style), removing the last growable
