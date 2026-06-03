@@ -262,6 +262,7 @@ struct Terminal_screen_model_profile_stats
     std::uint64_t              render_snapshot_cells_emitted            = 0U;
     std::uint64_t              render_snapshot_compact_empty_text_cells  = 0U;
     std::uint64_t              render_snapshot_compact_ascii_text_cells  = 0U;
+    std::uint64_t              render_snapshot_inline_single_bmp_text_cells = 0U;
     std::uint64_t              render_snapshot_fallback_qstring_copies   = 0U;
     std::uint64_t              render_snapshot_fallback_text_code_units_copied = 0U;
     std::uint64_t              render_snapshot_fallback_printable_ascii_copies = 0U;

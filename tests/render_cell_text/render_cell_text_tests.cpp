@@ -66,8 +66,11 @@ bool test_default_empty_behavior()
         "default empty");
     ok &= check(value.is_empty(), "default is empty");
     ok &= check(!value.is_inline_printable_ascii(), "default is not inline ASCII");
+    ok &= check(!value.is_inline_single_bmp(), "default is not inline BMP");
     ok &= check(!value.is_fallback_qstring(), "default is not fallback QString");
     ok &= check(!value.single_code_unit().has_value(), "default has no code unit");
+    ok &= check(!value.single_bmp_code_unit().has_value(),
+        "default has no BMP code unit");
     ok &= check(!value.single_printable_ascii_code_unit().has_value(),
         "default has no printable ASCII code unit");
     ok &= check(!value.single_printable_ascii_char().has_value(),
@@ -101,6 +104,7 @@ bool test_inline_printable_ascii_behavior()
         1,
         "inline printable ASCII");
     ok &= check(value.is_inline_printable_ascii(), "ASCII is inline");
+    ok &= check(!value.is_inline_single_bmp(), "ASCII is not inline BMP");
     ok &= check(!value.is_fallback_qstring(), "ASCII is not fallback");
     ok &= check(value.single_code_unit().has_value() &&
         value.single_code_unit().value() == static_cast<ushort>('A'),
@@ -165,6 +169,9 @@ bool test_non_ascii_single_code_point_falls_back()
         "single non-ASCII exposes one UTF-16 code unit");
     ok &= check(!value.single_printable_ascii_code_unit().has_value(),
         "single non-ASCII has no printable ASCII helper");
+    ok &= check(value.single_bmp_code_unit().has_value() &&
+        value.single_bmp_code_unit().value() == static_cast<ushort>(0x754cU),
+        "single non-ASCII fallback exposes BMP helper");
     ok &= check(value == cjk, "single non-ASCII equals QString");
     ok &= check(value == term::Terminal_render_cell_text::fallback(cjk),
         "single non-ASCII equals explicit fallback payload");
@@ -235,14 +242,59 @@ bool test_from_source_cell_semantics()
             single_printable_ascii_code_unit().has_value(),
         "source ASCII fallback still exposes printable helper");
 
-    const QString cjk = QStringLiteral("\u754c");
+    const QString box_graphic   = QStringLiteral("\u2500");
+    const QString block_graphic = QStringLiteral("\u2588");
+    const QString cjk           = QStringLiteral("\u754c");
+    const term::Terminal_render_cell_text box_source =
+        term::Terminal_render_cell_text::from_source_cell(box_graphic, 1, false);
     ok &= check_payload(
-        term::Terminal_render_cell_text::from_source_cell(cjk, 1, false),
+        box_source,
+        box_graphic,
+        term::Terminal_render_cell_text_storage::INLINE_SINGLE_BMP,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        1,
+        "source box drawing BMP");
+    ok &= check(box_source.is_inline_single_bmp() &&
+        !box_source.is_fallback_qstring() &&
+        box_source.fallback_qstring_or_null() == nullptr &&
+        box_source.single_bmp_code_unit().value_or(0U) == 0x2500U,
+        "source box drawing stores only an inline BMP code unit");
+
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(block_graphic, 1, false),
+        block_graphic,
+        term::Terminal_render_cell_text_storage::INLINE_SINGLE_BMP,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        1,
+        "source block graphic BMP");
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(cjk, 2, false),
+        cjk,
+        term::Terminal_render_cell_text_storage::INLINE_SINGLE_BMP,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        1,
+        "source CJK leading BMP");
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(cjk, 0, false),
         cjk,
         term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
         term::Terminal_render_cell_text_category::NON_ASCII,
         1,
-        "source non-ASCII fallback");
+        "source BMP width zero fallback");
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(cjk, -1, false),
+        cjk,
+        term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        1,
+        "source BMP negative width fallback");
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(cjk, 3, false),
+        cjk,
+        term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        1,
+        "source BMP oversized width fallback");
 
     ok &= check_payload(
         term::Terminal_render_cell_text::from_source_cell(ascii, 1, true),
@@ -251,6 +303,65 @@ bool test_from_source_cell_semantics()
         term::Terminal_render_cell_text_category::EMPTY,
         0,
         "source wide continuation");
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(cjk, 0, true),
+        QString(),
+        term::Terminal_render_cell_text_storage::EMPTY,
+        term::Terminal_render_cell_text_category::EMPTY,
+        0,
+        "source BMP wide continuation");
+
+    const QString combining_cluster = QStringLiteral("e\u0301");
+    const QString combining_mark(QChar(0x0301));
+    const QString class_zero_mark(QChar(0x20dd));
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(combining_cluster, 1, false),
+        combining_cluster,
+        term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        2,
+        "source combining cluster fallback");
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(combining_mark, 1, false),
+        combining_mark,
+        term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        1,
+        "source standalone BMP combining mark fallback");
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(class_zero_mark, 1, false),
+        class_zero_mark,
+        term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        1,
+        "source class-zero standalone BMP mark fallback");
+
+    const QString emoji = QString::fromUcs4(U"\U0001F600");
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(emoji, 2, false),
+        emoji,
+        term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        2,
+        "source emoji fallback");
+
+    const QString surrogate_half(QChar(0xd800));
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(surrogate_half, 1, false),
+        surrogate_half,
+        term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        1,
+        "source surrogate half fallback");
+
+    const QString multi_bmp = QStringLiteral("\u2500\u2500");
+    ok &= check_payload(
+        term::Terminal_render_cell_text::from_source_cell(multi_bmp, 2, false),
+        multi_bmp,
+        term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
+        term::Terminal_render_cell_text_category::NON_ASCII,
+        2,
+        "source multi-BMP fallback");
 
     const QString empty;
     ok &= check_payload(

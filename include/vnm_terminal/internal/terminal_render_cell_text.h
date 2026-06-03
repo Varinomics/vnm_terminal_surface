@@ -24,6 +24,7 @@ enum class Terminal_render_cell_text_storage : std::uint8_t
 {
     EMPTY,
     INLINE_PRINTABLE_ASCII,
+    INLINE_SINGLE_BMP,
     FALLBACK_QSTRING,
 };
 
@@ -88,8 +89,8 @@ public:
         Q_ASSERT(is_printable_ascii_code_unit(code_unit));
 
         Terminal_render_cell_text text;
-        text.m_storage = Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII;
-        text.m_printable_ascii_code_unit = code_unit;
+        text.m_storage          = Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII;
+        text.m_inline_code_unit = code_unit;
         return text;
     }
 
@@ -121,6 +122,13 @@ public:
             }
         }
 
+        if ((display_width == 1 || display_width == 2) && text.size() == 1) {
+            const ushort code_unit = text.at(0).unicode();
+            if (is_single_bmp_source_cell_code_unit(code_unit)) {
+                return inline_single_bmp(code_unit);
+            }
+        }
+
         return fallback_copy(text);
     }
 
@@ -149,6 +157,11 @@ public:
         return m_storage == Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII;
     }
 
+    bool is_inline_single_bmp() const noexcept
+    {
+        return m_storage == Terminal_render_cell_text_storage::INLINE_SINGLE_BMP;
+    }
+
     bool is_fallback_qstring() const noexcept
     {
         return m_storage == Terminal_render_cell_text_storage::FALLBACK_QSTRING;
@@ -160,6 +173,7 @@ public:
             case Terminal_render_cell_text_storage::EMPTY:
                 return 0;
             case Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII:
+            case Terminal_render_cell_text_storage::INLINE_SINGLE_BMP:
                 return 1;
             case Terminal_render_cell_text_storage::FALLBACK_QSTRING:
                 return m_fallback_text != nullptr ? m_fallback_text->size() : 0;
@@ -175,6 +189,8 @@ public:
                 return Terminal_render_cell_text_category::EMPTY;
             case Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII:
                 return Terminal_render_cell_text_category::PRINTABLE_ASCII;
+            case Terminal_render_cell_text_storage::INLINE_SINGLE_BMP:
+                return Terminal_render_cell_text_category::NON_ASCII;
             case Terminal_render_cell_text_storage::FALLBACK_QSTRING:
                 return m_fallback_text != nullptr
                     ? category_for_qstring(QStringView(*m_fallback_text))
@@ -187,7 +203,7 @@ public:
     std::optional<ushort> single_printable_ascii_code_unit() const noexcept
     {
         if (m_storage == Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII) {
-            return m_printable_ascii_code_unit;
+            return m_inline_code_unit;
         }
 
         if (m_storage == Terminal_render_cell_text_storage::FALLBACK_QSTRING &&
@@ -217,11 +233,31 @@ public:
             case Terminal_render_cell_text_storage::EMPTY:
                 return std::nullopt;
             case Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII:
-                return m_printable_ascii_code_unit;
+            case Terminal_render_cell_text_storage::INLINE_SINGLE_BMP:
+                return m_inline_code_unit;
             case Terminal_render_cell_text_storage::FALLBACK_QSTRING:
                 return m_fallback_text != nullptr && m_fallback_text->size() == 1
                     ? std::optional<ushort>(m_fallback_text->at(0).unicode())
                     : std::nullopt;
+        }
+
+        return std::nullopt;
+    }
+
+    std::optional<ushort> single_bmp_code_unit() const noexcept
+    {
+        if (m_storage == Terminal_render_cell_text_storage::INLINE_SINGLE_BMP) {
+            return m_inline_code_unit;
+        }
+
+        if (m_storage == Terminal_render_cell_text_storage::FALLBACK_QSTRING &&
+            m_fallback_text != nullptr &&
+            m_fallback_text->size() == 1)
+        {
+            const ushort code_unit = m_fallback_text->at(0).unicode();
+            if (is_single_bmp_code_unit(code_unit)) {
+                return code_unit;
+            }
         }
 
         return std::nullopt;
@@ -240,7 +276,8 @@ public:
             case Terminal_render_cell_text_storage::EMPTY:
                 return;
             case Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII:
-                target += QChar(m_printable_ascii_code_unit);
+            case Terminal_render_cell_text_storage::INLINE_SINGLE_BMP:
+                target += QChar(m_inline_code_unit);
                 return;
             case Terminal_render_cell_text_storage::FALLBACK_QSTRING:
                 if (m_fallback_text != nullptr) {
@@ -256,7 +293,8 @@ public:
             case Terminal_render_cell_text_storage::EMPTY:
                 return {};
             case Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII:
-                return QString(1, QChar(m_printable_ascii_code_unit));
+            case Terminal_render_cell_text_storage::INLINE_SINGLE_BMP:
+                return QString(1, QChar(m_inline_code_unit));
             case Terminal_render_cell_text_storage::FALLBACK_QSTRING:
                 return m_fallback_text != nullptr ? *m_fallback_text : QString();
         }
@@ -270,8 +308,9 @@ public:
             case Terminal_render_cell_text_storage::EMPTY:
                 return text.isEmpty();
             case Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII:
+            case Terminal_render_cell_text_storage::INLINE_SINGLE_BMP:
                 return text.size() == 1 &&
-                    text.at(0).unicode() == m_printable_ascii_code_unit;
+                    text.at(0).unicode() == m_inline_code_unit;
             case Terminal_render_cell_text_storage::FALLBACK_QSTRING:
                 return m_fallback_text != nullptr &&
                     QStringView(*m_fallback_text) == text;
@@ -286,7 +325,9 @@ public:
             case Terminal_render_cell_text_storage::EMPTY:
                 return true;
             case Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII:
-                return is_printable_ascii_code_unit(m_printable_ascii_code_unit);
+                return is_printable_ascii_code_unit(m_inline_code_unit);
+            case Terminal_render_cell_text_storage::INLINE_SINGLE_BMP:
+                return is_single_bmp_code_unit(m_inline_code_unit);
             case Terminal_render_cell_text_storage::FALLBACK_QSTRING:
                 return m_fallback_text != nullptr && !m_fallback_text->isEmpty();
         }
@@ -298,6 +339,46 @@ private:
     static bool is_printable_ascii_code_unit(ushort code_unit) noexcept
     {
         return code_unit >= 0x20U && code_unit <= 0x7eU;
+    }
+
+    static bool is_surrogate_code_unit(ushort code_unit) noexcept
+    {
+        return code_unit >= 0xd800U && code_unit <= 0xdfffU;
+    }
+
+    static bool is_single_bmp_code_unit(ushort code_unit) noexcept
+    {
+        return code_unit >= 0x80U && !is_surrogate_code_unit(code_unit);
+    }
+
+    static bool is_standalone_combining_code_unit(ushort code_unit) noexcept
+    {
+        const QChar codepoint(code_unit);
+        switch (codepoint.category()) {
+            case QChar::Mark_NonSpacing:
+            case QChar::Mark_SpacingCombining:
+            case QChar::Mark_Enclosing:
+                return true;
+            default:
+                return codepoint.combiningClass() != 0U;
+        }
+    }
+
+    static bool is_single_bmp_source_cell_code_unit(ushort code_unit) noexcept
+    {
+        return
+            is_single_bmp_code_unit(code_unit) &&
+            !is_standalone_combining_code_unit(code_unit);
+    }
+
+    static Terminal_render_cell_text inline_single_bmp(ushort code_unit) noexcept
+    {
+        Q_ASSERT(is_single_bmp_code_unit(code_unit));
+
+        Terminal_render_cell_text text;
+        text.m_storage          = Terminal_render_cell_text_storage::INLINE_SINGLE_BMP;
+        text.m_inline_code_unit = code_unit;
+        return text;
     }
 
     static Terminal_render_cell_text from_qstring(QString text)
@@ -357,13 +438,14 @@ private:
 
     void copy_from(const Terminal_render_cell_text& other)
     {
-        m_storage                   = other.m_storage;
-        m_printable_ascii_code_unit = other.m_printable_ascii_code_unit;
+        m_storage          = other.m_storage;
+        m_inline_code_unit = other.m_inline_code_unit;
         m_fallback_text.reset();
         switch (other.m_storage) {
             case Terminal_render_cell_text_storage::EMPTY:
                 return;
             case Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII:
+            case Terminal_render_cell_text_storage::INLINE_SINGLE_BMP:
                 return;
             case Terminal_render_cell_text_storage::FALLBACK_QSTRING:
                 if (other.m_fallback_text != nullptr) {
@@ -375,19 +457,21 @@ private:
 
     void move_from(Terminal_render_cell_text&& other)
     {
-        m_storage                   = other.m_storage;
-        m_printable_ascii_code_unit = other.m_printable_ascii_code_unit;
-        m_fallback_text             = std::move(other.m_fallback_text);
+        m_storage          = other.m_storage;
+        m_inline_code_unit = other.m_inline_code_unit;
+        m_fallback_text    = std::move(other.m_fallback_text);
 
-        other.m_storage                   = Terminal_render_cell_text_storage::EMPTY;
-        other.m_printable_ascii_code_unit = 0U;
+        other.m_storage          = Terminal_render_cell_text_storage::EMPTY;
+        other.m_inline_code_unit = 0U;
     }
 
     Terminal_render_cell_text_storage m_storage =
         Terminal_render_cell_text_storage::EMPTY;
-    ushort                            m_printable_ascii_code_unit = 0U;
+    ushort                            m_inline_code_unit = 0U;
     std::unique_ptr<QString>          m_fallback_text;
 };
+
+static_assert(sizeof(Terminal_render_cell_text) <= 16U);
 
 inline bool operator==(
     const Terminal_render_cell_text& left,

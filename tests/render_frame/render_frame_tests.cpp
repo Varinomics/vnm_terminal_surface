@@ -66,6 +66,17 @@ term::Terminal_render_frame build(
             ime_preedit_override);
 }
 
+term::Terminal_render_cell_text source_cell_text(
+    const QString&  text,
+    int             display_width,
+    bool            wide_continuation = false)
+{
+    return term::Terminal_render_cell_text::from_source_cell(
+        text,
+        display_width,
+        wide_continuation);
+}
+
 const term::Terminal_render_text_run* run_at(
     const term::Terminal_render_frame&     frame,
     int                                    row,
@@ -245,22 +256,48 @@ bool test_terminal_graphics_use_grid_rects()
 {
     bool ok = true;
     term::Terminal_render_snapshot snapshot = empty_snapshot({3, 8});
-    snapshot.cells.push_back({{0, 0}, QStringLiteral("\u250c"), 0U, 1, false, 0U});
-    snapshot.cells.push_back({{0, 1}, QStringLiteral("\u2500"), 0U, 1, false, 0U});
-    snapshot.cells.push_back({{0, 2}, QStringLiteral("\u2510"), 0U, 1, false, 0U});
-    snapshot.cells.push_back({{1, 0}, QStringLiteral("\u2502"), 0U, 1, false, 0U});
-    snapshot.cells.push_back({{1, 1}, QStringLiteral("\u2588"), 0U, 1, false, 0U});
-    snapshot.cells.push_back({{1, 2}, QStringLiteral("\u2598"), 0U, 1, false, 0U});
+    snapshot.cursor.visible = false;
+
+    const auto add_graphic_cell = [&](
+        int             row,
+        int             column,
+        const QString&  text) {
+        snapshot.cells.push_back({
+            {row, column},
+            source_cell_text(text, 1),
+            0U,
+            1,
+            false,
+            0U,
+        });
+    };
+
+    add_graphic_cell(0, 0, QStringLiteral("\u250c"));
+    add_graphic_cell(0, 1, QStringLiteral("\u2500"));
+    add_graphic_cell(0, 2, QStringLiteral("\u2510"));
+    add_graphic_cell(1, 0, QStringLiteral("\u2502"));
+    add_graphic_cell(1, 1, QStringLiteral("\u2588"));
+    add_graphic_cell(1, 2, QStringLiteral("\u2598"));
     snapshot.cells.push_back({{2, 0}, QStringLiteral("A"), 0U, 1, false, 0U});
 
     const term::Terminal_render_frame frame = build(snapshot);
+    ok &= check(std::all_of(
+        snapshot.cells.begin(),
+        snapshot.cells.begin() + 6,
+        [](const term::Terminal_render_cell& cell) {
+            return
+                cell.text.is_inline_single_bmp() &&
+                cell.text.fallback_qstring_or_null() == nullptr;
+        }), "terminal graphic fixture stores source graphics as inline BMP");
     ok &= check(frame.text_runs.size() == 1U &&
         frame.text_runs.front().text == QStringLiteral("A"),
         "terminal graphic cells bypass font text runs");
-    ok &= check(frame.stats.packed_graphic_cells >= 2 &&
+    ok &= check(frame.stats.packed_graphic_candidates_classified == 6 &&
+        frame.stats.packed_graphic_cells == 6 &&
+        has_packed_graphic_codepoint(frame, 0x2500U) &&
         has_packed_graphic_codepoint(frame, 0x2588U) &&
         has_packed_graphic_codepoint(frame, 0x2598U),
-        "terminal graphic cells preserve hard block source codepoints in packed sidecars");
+        "terminal graphic cells preserve inline BMP codepoints in packed sidecars");
     ok &= check(has_graphic_rect(frame, QRectF(10.0, 9.5, 10.0, 1.0)),
         "horizontal box drawing remains in direct graphic rectangles");
     ok &= check(has_graphic_rect_antialias(frame, QRectF(10.0, 9.5, 10.0, 1.0), true),
@@ -269,6 +306,173 @@ bool test_terminal_graphics_use_grid_rects()
         "packed full block is not duplicated into direct graphic rectangles");
     ok &= check(!has_graphic_rect(frame, QRectF(20.0, 20.0, 5.0, 10.0)),
         "packed quadrant block is not duplicated into direct graphic rectangles");
+    return ok;
+}
+
+bool test_stale_inline_bmp_category_uses_text_fallback()
+{
+    bool ok = true;
+    term::Terminal_render_snapshot snapshot = empty_snapshot({1, 2});
+    snapshot.cells.push_back({
+        {0, 0},
+        source_cell_text(QStringLiteral("\u2588"), 1),
+        0U,
+        1,
+        false,
+        0U,
+        term::Terminal_render_cell_text_category::PRINTABLE_ASCII,
+    });
+
+    const term::terminal_simple_content_classification_t classification =
+        term::classify_terminal_simple_content_cell(
+            snapshot.cells.front(),
+            snapshot.grid_size,
+            snapshot.styles.size(),
+            false,
+            true);
+    ok &= check(classification.route == term::Terminal_simple_content_route::FALLBACK &&
+        classification.rejection_reason ==
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING,
+        "stale inline-BMP cached category is rejected before graphic routing");
+
+    const term::Terminal_render_frame frame = build(snapshot);
+    ok &= check(frame.graphic_rects.empty() &&
+        frame.graphic_arcs.empty()          &&
+        frame.text_runs.size() == 1U        &&
+        frame.text_runs.front().text == QStringLiteral("\u2588"),
+        "stale inline-BMP graphic cell renders through the text fallback path");
+    return ok;
+}
+
+bool test_rejected_graphic_cells_stay_on_text_route()
+{
+    bool ok = true;
+
+    enum class text_storage_t
+    {
+        FALLBACK_QSTRING,
+        INLINE_SINGLE_BMP,
+    };
+
+    struct rejected_graphic_case_t
+    {
+        const char*     message        = "";
+        text_storage_t  storage        = text_storage_t::FALLBACK_QSTRING;
+        int             display_width  = 1;
+        bool            has_decoration = false;
+        std::uint64_t   hyperlink_id   = 0U;
+        term::Terminal_simple_content_rejection_reason
+                        expected_reason =
+                            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH;
+    };
+
+    const std::vector<rejected_graphic_case_t> cases = {
+        {
+            "fallback QString graphic with invalid text width stays textual",
+            text_storage_t::FALLBACK_QSTRING,
+            2,
+            false,
+            0U,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
+        },
+        {
+            "inline BMP graphic with invalid text width stays textual",
+            text_storage_t::INLINE_SINGLE_BMP,
+            2,
+            false,
+            0U,
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
+        },
+        {
+            "fallback QString graphic with decoration stays textual",
+            text_storage_t::FALLBACK_QSTRING,
+            1,
+            true,
+            0U,
+            term::Terminal_simple_content_rejection_reason::DECORATION,
+        },
+        {
+            "inline BMP graphic with decoration stays textual",
+            text_storage_t::INLINE_SINGLE_BMP,
+            1,
+            true,
+            0U,
+            term::Terminal_simple_content_rejection_reason::DECORATION,
+        },
+        {
+            "fallback QString graphic with hyperlink stays textual",
+            text_storage_t::FALLBACK_QSTRING,
+            1,
+            false,
+            17U,
+            term::Terminal_simple_content_rejection_reason::HYPERLINK,
+        },
+        {
+            "inline BMP graphic with hyperlink stays textual",
+            text_storage_t::INLINE_SINGLE_BMP,
+            1,
+            false,
+            17U,
+            term::Terminal_simple_content_rejection_reason::HYPERLINK,
+        },
+    };
+
+    const QString graphic_text = QStringLiteral("\u2500");
+    for (const rejected_graphic_case_t& entry : cases) {
+        term::Terminal_render_snapshot snapshot = empty_snapshot({1, 4});
+        snapshot.cursor.visible = false;
+
+        if (entry.has_decoration) {
+            term::Terminal_text_style decorated =
+                term::make_default_terminal_text_style();
+            term::set_terminal_style_attribute(
+                decorated,
+                term::Terminal_style_attribute::UNDERLINE);
+            snapshot.styles.push_back(decorated);
+        }
+
+        if (entry.hyperlink_id != 0U) {
+            snapshot.hyperlinks.push_back({
+                entry.hyperlink_id,
+                QByteArrayLiteral("uri:https://example.test"),
+                QByteArrayLiteral("https://example.test"),
+            });
+        }
+
+        term::Terminal_render_cell cell;
+        cell.position      = {0, 0};
+        cell.text          = entry.storage == text_storage_t::INLINE_SINGLE_BMP
+            ? source_cell_text(graphic_text, entry.display_width)
+            : term::Terminal_render_cell_text::fallback(graphic_text);
+        cell.display_width = entry.display_width;
+        cell.style_id      = entry.has_decoration ? 1U : 0U;
+        cell.hyperlink_id  = entry.hyperlink_id;
+        snapshot.cells.push_back(cell);
+
+        const term::terminal_simple_content_classification_t classification =
+            term::classify_terminal_simple_content_cell(
+                snapshot.cells.front(),
+                snapshot.grid_size,
+                snapshot.styles.size(),
+                entry.has_decoration,
+                true);
+        ok &= check(!classification.fast_text_eligible &&
+            classification.route == term::Terminal_simple_content_route::QT_TEXT_LAYOUT &&
+            classification.rejection_reason == entry.expected_reason,
+            entry.message);
+
+        const term::Terminal_render_frame frame = build(snapshot);
+        ok &= check(frame.stats.text_cells_rendered_as_graphic == 0 &&
+            frame.stats.packed_graphic_cells == 0                 &&
+            frame.packed_graphic_codepoints.empty()               &&
+            frame.graphic_rects.empty()                           &&
+            frame.graphic_arcs.empty(),
+            "rejected graphic cell emits no packed or direct graphic geometry");
+        ok &= check(frame.text_runs.size() == 1U &&
+            frame.text_runs.front().text == graphic_text,
+            "rejected graphic cell remains available to Qt text layout");
+    }
+
     return ok;
 }
 
@@ -350,7 +554,7 @@ bool test_mixed_unicode_row_geometry()
     bool ok = true;
     term::Terminal_render_snapshot snapshot = empty_snapshot({2, 14});
     snapshot.cells.push_back({{0, 0}, QStringLiteral("A"), 0U, 1, false, 0U});
-    snapshot.cells.push_back({{0, 1}, QStringLiteral("\u754c"), 0U, 2, false, 0U});
+    snapshot.cells.push_back({{0, 1}, source_cell_text(QStringLiteral("\u754c"), 2), 0U, 2, false, 0U});
     snapshot.cells.push_back({{0, 2}, {}, 0U, 0, true, 0U});
     snapshot.cells.push_back({{0, 3}, QStringLiteral("Z"), 0U, 1, false, 0U});
     snapshot.cells.push_back({{0, 4}, QStringLiteral("e\u0301"), 0U, 1, false, 0U});
@@ -363,14 +567,18 @@ bool test_mixed_unicode_row_geometry()
     snapshot.cells.push_back({{0, 11}, QStringLiteral("S"), 0U, 1, false, 0U});
 
     const term::Terminal_render_frame frame = build(snapshot);
+    ok &= check(snapshot.cells[1].text.is_inline_single_bmp() &&
+        snapshot.cells[1].text.fallback_qstring_or_null() == nullptr,
+        "mixed row CJK fixture stores the leading wide cell as inline BMP");
     ok &= check(frame.text_runs.size() == 9U,
         "mixed row skips wide continuations but keeps base clusters");
     ok &= check(run_at(frame, 0, 0) != nullptr &&
         run_at(frame, 0, 0)->rect == QRectF(0.0, 0.0, 10.0, 20.0),
         "ASCII run stays in column 0");
     ok &= check(run_at(frame, 0, 1) != nullptr &&
+        run_at(frame, 0, 1)->text == QStringLiteral("\u754c") &&
         run_at(frame, 0, 1)->rect == QRectF(10.0, 0.0, 20.0, 20.0),
-        "CJK wide run spans columns 1-2");
+        "inline BMP CJK wide run stays on the text route and spans columns 1-2");
     ok &= check(run_at(frame, 0, 3) != nullptr &&
         run_at(frame, 0, 3)->rect == QRectF(30.0, 0.0, 10.0, 20.0),
         "ASCII sentinel after CJK stays aligned");
@@ -996,8 +1204,25 @@ bool test_simple_content_classifier_and_stats()
             term::Terminal_simple_content_rejection_reason::NON_ASCII_TEXT,
         "simple-content classifier keeps non-ASCII text on the Qt text route");
 
+    term::Terminal_render_cell inline_cjk_cell = ascii_cell;
+    inline_cjk_cell.text          = source_cell_text(QStringLiteral("\u754c"), 2);
+    inline_cjk_cell.display_width = 2;
+    const term::terminal_simple_content_classification_t inline_cjk_classification =
+        term::classify_terminal_simple_content_cell(
+            inline_cjk_cell,
+            grid_size,
+            2U,
+            false,
+            false);
+    ok &= check(!inline_cjk_classification.fast_text_eligible &&
+        inline_cjk_classification.route ==
+            term::Terminal_simple_content_route::QT_TEXT_LAYOUT &&
+        inline_cjk_classification.rejection_reason ==
+            term::Terminal_simple_content_rejection_reason::MULTI_CELL_TEXT,
+        "simple-content classifier keeps inline BMP CJK on the Qt text route");
+
     term::Terminal_render_cell graphic_cell = ascii_cell;
-    graphic_cell.text = QStringLiteral("\u2588");
+    graphic_cell.text = source_cell_text(QStringLiteral("\u2588"), 1);
     const term::terminal_simple_content_classification_t graphic_classification =
         term::classify_terminal_simple_content_cell(
             graphic_cell,
@@ -1011,6 +1236,23 @@ bool test_simple_content_classifier_and_stats()
         graphic_classification.rejection_reason ==
             term::Terminal_simple_content_rejection_reason::TERMINAL_GRAPHIC,
         "simple-content classifier sends terminal graphics to geometry");
+
+    term::Terminal_render_cell stale_graphic_cell = graphic_cell;
+    stale_graphic_cell.text_category =
+        term::Terminal_render_cell_text_category::PRINTABLE_ASCII;
+    const term::terminal_simple_content_classification_t stale_graphic_classification =
+        term::classify_terminal_simple_content_cell(
+            stale_graphic_cell,
+            grid_size,
+            2U,
+            false,
+            false);
+    ok &= check(!stale_graphic_classification.fast_text_eligible &&
+        stale_graphic_classification.route ==
+            term::Terminal_simple_content_route::FALLBACK &&
+        stale_graphic_classification.rejection_reason ==
+            term::Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING,
+        "simple-content classifier fails closed on stale inline BMP categories");
 
     term::Terminal_render_cell hyperlink_cell = ascii_cell;
     hyperlink_cell.hyperlink_id = 9U;
@@ -2138,14 +2380,14 @@ bool test_packed_graphics_exclude_unrepresented_cells()
     });
 
     const term::Terminal_render_frame semantic_frame = build(semantic_snapshot);
-    ok &= check(semantic_frame.stats.text_cells_rendered_as_graphic == 4,
-        "unrepresented graphic sidecar cases still use canonical visual graphics");
+    ok &= check(semantic_frame.stats.text_cells_rendered_as_graphic == 1,
+        "unrepresented graphic sidecar cases stay off direct graphic rendering");
     ok &= check(semantic_frame.stats.packed_graphic_cells == 1 &&
         semantic_frame.packed_graphic_codepoints.size() == 1U &&
         semantic_frame.packed_graphic_codepoints.front() == 0x250cU,
         "packed graphics exclude hyperlink, decorated, and width-mismatched graphics");
-    ok &= check(has_graphic_rect(semantic_frame, QRectF(40.0, 0.0, 20.0, 20.0)),
-        "width-mismatched hard block remains on the direct graphic route");
+    ok &= check(!has_graphic_rect(semantic_frame, QRectF(40.0, 0.0, 20.0, 20.0)),
+        "width-mismatched hard block stays on the text route");
     ok &= check(semantic_frame.stats.simple_content.route_graphic_geometry_cells == 1 &&
         semantic_frame.stats.simple_content.rejection_hyperlink_cells == 1 &&
         semantic_frame.stats.simple_content.rejection_decoration_cells == 1 &&
@@ -2350,7 +2592,7 @@ bool test_disabled_packed_text_sidecars_skip_scan_and_keep_graphics()
 
     const term::Terminal_render_frame semantic_frame =
         build(semantic_snapshot, render_options);
-    ok &= check(semantic_frame.stats.text_cells_rendered_as_graphic == 4 &&
+    ok &= check(semantic_frame.stats.text_cells_rendered_as_graphic == 1 &&
         semantic_frame.stats.packed_graphic_candidates_classified == 4 &&
         semantic_frame.stats.packed_text_disabled_cells_skipped == 0 &&
         semantic_frame.stats.packed_graphic_cells == 1 &&
@@ -2668,6 +2910,8 @@ int main()
     bool ok = true;
     ok &= test_plain_text_color_inverse_and_wide_skip();
     ok &= test_terminal_graphics_use_grid_rects();
+    ok &= test_stale_inline_bmp_category_uses_text_fallback();
+    ok &= test_rejected_graphic_cells_stay_on_text_route();
     ok &= test_rounded_box_corners_use_arc_primitives();
     ok &= test_block_cursor_over_graphic_has_overlay_rects();
     ok &= test_mixed_unicode_row_geometry();
