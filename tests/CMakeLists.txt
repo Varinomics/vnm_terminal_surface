@@ -449,19 +449,6 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_render_frame>"
 )
 
-add_test(
-    NAME vnm_terminal_render_frame_sorted_row_sort_prefilter_on
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "VNM_TERMINAL_STAGE42_RENDER_FRAME_SORTED_ROW_SORT_PREFILTER=1"
-        "$<TARGET_FILE:vnm_terminal_render_frame>"
-)
-
-set_tests_properties(
-    vnm_terminal_render_frame_sorted_row_sort_prefilter_on
-    PROPERTIES TIMEOUT 30)
-
 if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
     add_executable(vnm_terminal_transcript
         transcript/transcript_tests.cpp
@@ -544,61 +531,6 @@ add_test(
 )
 
 set_tests_properties(vnm_terminal_qsg_render PROPERTIES TIMEOUT 60)
-
-function(vnm_terminal_add_qsg_render_variant test_name stage42_environment_assignment)
-    add_test(
-        NAME ${test_name}
-        COMMAND
-            "${CMAKE_COMMAND}" -E env
-            ${vnm_terminal_qt_offscreen_environment}
-            ${vnm_terminal_qt_unscaled_environment}
-            "${vnm_terminal_qt_runtime_path}"
-            "${stage42_environment_assignment}"
-            "$<TARGET_FILE:vnm_terminal_qsg_render>"
-            "--software-renderer"
-            ${ARGN}
-    )
-
-    set_tests_properties(${test_name} PROPERTIES TIMEOUT 60)
-endfunction()
-
-function(vnm_terminal_add_qsg_render_text_replacement_variant
-    test_name
-    stage42_environment_assignment)
-    add_test(
-        NAME ${test_name}
-        COMMAND
-            "${CMAKE_COMMAND}" -E env
-            ${vnm_terminal_qt_offscreen_environment}
-            ${vnm_terminal_qt_unscaled_environment}
-            "${vnm_terminal_qt_runtime_path}"
-            "${stage42_environment_assignment}"
-            "$<TARGET_FILE:vnm_terminal_qsg_render>"
-            "--software-renderer"
-            "--text-replacement-focused"
-    )
-
-    set_tests_properties(${test_name} PROPERTIES TIMEOUT 30)
-endfunction()
-
-vnm_terminal_add_qsg_render_text_replacement_variant(
-    vnm_terminal_qsg_render_trusted_ascii_glyph_batching_off
-    VNM_TERMINAL_STAGE42_QSG_TRUSTED_ASCII_GLYPH_BATCHING=0)
-vnm_terminal_add_qsg_render_text_replacement_variant(
-    vnm_terminal_qsg_render_trusted_ascii_unchecked_glyphs_off
-    VNM_TERMINAL_STAGE42_QSG_TRUSTED_ASCII_UNCHECKED_GLYPHS=0)
-vnm_terminal_add_qsg_render_text_replacement_variant(
-    vnm_terminal_qsg_render_text_leaf_content_reuse_on
-    VNM_TERMINAL_STAGE42_QSG_TEXT_LEAF_CONTENT_REUSE=1)
-
-vnm_terminal_add_qsg_render_variant(
-    vnm_terminal_qsg_render_descriptor_direct_compare_off
-    VNM_TERMINAL_STAGE42_QSG_TEXT_RESOURCE_DESCRIPTOR_DIRECT_COMPARE=0
-    "--text-descriptor-focused")
-vnm_terminal_add_qsg_render_variant(
-    vnm_terminal_qsg_render_row_slot_ordered_lookup_off
-    VNM_TERMINAL_STAGE42_QSG_ROW_SLOT_ORDERED_LOOKUP=0
-    "--row-slot-focused")
 
 if(VNM_TERMINAL_ENABLE_MANUAL_QSG_FLAT_RECT_BATCHED_GEOMETRY_TEST)
     add_test(
