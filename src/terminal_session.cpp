@@ -3182,12 +3182,7 @@ Terminal_session_result Terminal_session::process_command(Terminal_session_comma
             return process_backend_error_command(command);
     }
 
-    return {
-        Terminal_session_result_code::ACCEPTED,
-        command.sequence,
-        false,
-        std::nullopt,
-    };
+    return make_accepted_result(command.sequence);
 }
 
 Terminal_session_result Terminal_session::process_start_command(
@@ -3217,12 +3212,10 @@ Terminal_session_result Terminal_session::process_start_command(
         m_process_state = Terminal_process_state::FAILED;
         m_backend_ready = false;
         record_backend_error(command.sequence, *config_result.error);
-        return {
-            Terminal_session_result_code::INVALID_ARGUMENT,
+        return make_rejected_result(
             command.sequence,
-            false,
-            config_result.error,
-        };
+            Terminal_session_result_code::INVALID_ARGUMENT,
+            *config_result.error);
     }
 
     if (!is_terminal_screen_model_grid_size_supported(*command.launch_config->initial_grid_size)) {
@@ -3262,26 +3255,18 @@ Terminal_session_result Terminal_session::process_start_command(
         if (!m_backend_error_queued_during_command) {
             record_backend_error(command.sequence, *backend_result.error);
         }
-        return {
-            Terminal_session_result_code::BACKEND_REJECTED,
-            command.sequence,
-            false,
-            backend_result.error,
-        };
+        return make_backend_rejected_result(command.sequence, backend_result.error);
     }
 
     if (m_stop_requested) {
         m_process_state            = Terminal_process_state::RUNNING;
         m_backend_ready            = false;
         m_backend_geometry_in_sync = false;
-        return {
-            Terminal_session_result_code::BACKEND_REJECTED,
+        return make_backend_rejected_result(
             command.sequence,
-            false,
             make_backend_error(
                 Terminal_backend_error_code::OUTPUT_OVERFLOW,
-                QStringLiteral("backend output overflowed during start")),
-        };
+                QStringLiteral("backend output overflowed during start")));
     }
 
     m_process_state            = Terminal_process_state::RUNNING;
@@ -3293,12 +3278,7 @@ Terminal_session_result Terminal_session::process_start_command(
         QStringLiteral("process started"),
     });
 
-    return {
-        Terminal_session_result_code::ACCEPTED,
-        command.sequence,
-        false,
-        std::nullopt,
-    };
+    return make_accepted_result(command.sequence);
 }
 
 Terminal_session_result Terminal_session::process_write_command(
@@ -3351,20 +3331,10 @@ Terminal_session_result Terminal_session::process_write_command(
     const Terminal_backend_result backend_result = m_backend->write(command.bytes);
     if (is_backend_rejection(backend_result)) {
         record_backend_error(command.sequence, *backend_result.error);
-        return {
-            Terminal_session_result_code::BACKEND_REJECTED,
-            command.sequence,
-            false,
-            backend_result.error,
-        };
+        return make_backend_rejected_result(command.sequence, backend_result.error);
     }
 
-    return {
-        Terminal_session_result_code::ACCEPTED,
-        command.sequence,
-        false,
-        std::nullopt,
-    };
+    return make_accepted_result(command.sequence);
 }
 
 Terminal_session_result Terminal_session::process_resize_command(
@@ -3389,21 +3359,10 @@ Terminal_session_result Terminal_session::process_resize_command(
         resize.backend_result           = Terminal_backend_resize_result::FAILED;
         resize.snapshot_grid_size       = m_grid_size;
         resize.backend_geometry_in_sync = m_backend_geometry_in_sync;
-        record_resize_transaction(resize);
-#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
-        if (m_config.transcript_recorder != nullptr) {
-            (void)m_config.transcript_recorder->record_session_resize(command.sequence, resize);
-        }
-#endif
-        record_notification({
-            Terminal_session_notification_kind::RESIZE_TRANSACTION,
-            command.sequence,
-            QStringLiteral("resize rejected"),
-            std::nullopt,
-            std::nullopt,
+        finalize_resize_transaction(
             resize,
-            false,
-        });
+            command.sequence,
+            QStringLiteral("resize rejected"));
 
         return make_rejected_result(
             command.sequence,
@@ -3423,21 +3382,10 @@ Terminal_session_result Terminal_session::process_resize_command(
         resize.backend_result           = Terminal_backend_resize_result::FAILED;
         resize.snapshot_grid_size       = m_grid_size;
         resize.backend_geometry_in_sync = m_backend_geometry_in_sync;
-        record_resize_transaction(resize);
-#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
-        if (m_config.transcript_recorder != nullptr) {
-            (void)m_config.transcript_recorder->record_session_resize(command.sequence, resize);
-        }
-#endif
-        record_notification({
-            Terminal_session_notification_kind::RESIZE_TRANSACTION,
-            command.sequence,
-            QStringLiteral("resize requires a running backend"),
-            std::nullopt,
-            std::nullopt,
+        finalize_resize_transaction(
             resize,
-            false,
-        });
+            command.sequence,
+            QStringLiteral("resize requires a running backend"));
 
         return make_rejected_result(
             command.sequence,
@@ -3472,15 +3420,6 @@ Terminal_session_result Terminal_session::process_resize_command(
         invalidate_public_projection(
             Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED);
     }
-    const auto advance_selection_content_basis_for_resize_publication = [&] {
-        const Terminal_screen_model_result selection_basis_result =
-            model_result_with_deferred_synchronized_row_origins(model_result);
-        advance_selection_content_basis_for_model_result(
-            selection_basis_result,
-            previous_viewport,
-            previous_grid_size);
-    };
-
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     if (m_config.transcript_recorder != nullptr) {
         (void)m_config.transcript_recorder->record_session_resize_request(command.sequence, resize);
@@ -3493,6 +3432,7 @@ Terminal_session_result Terminal_session::process_resize_command(
         resize.backend_result           = Terminal_backend_resize_result::FAILED;
         resize.backend_geometry_in_sync = false;
         m_backend_geometry_in_sync      = false;
+        // The failed resize path keeps the backend error before the resize-failed notification.
         record_resize_transaction(resize);
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
         if (m_config.transcript_recorder != nullptr) {
@@ -3510,76 +3450,96 @@ Terminal_session_result Terminal_session::process_resize_command(
             false,
         });
 
-        if (!render_snapshot_available &&
-            (grid_size_changed || backend_geometry_was_in_sync ||
-                m_latest_render_snapshot == nullptr))
-        {
-            advance_selection_content_basis_for_resize_publication();
-            publish_synchronized_resize_snapshot(
-                command.sequence,
-                QStringLiteral("resize geometry snapshot ready"));
-        }
-        else
-        if (render_snapshot_available &&
-            (model_result_warrants_render_snapshot(model_result) ||
-                backend_geometry_was_in_sync))
-        {
-            advance_selection_content_basis_for_resize_publication();
-            publish_render_snapshot(command.sequence, QStringLiteral("resize snapshot ready"));
-        }
-
-        return {
-            Terminal_session_result_code::BACKEND_REJECTED,
+        publish_resize_outcome(
             command.sequence,
-            false,
-            backend_result.error,
-        };
+            render_snapshot_available,
+            grid_size_changed,
+            backend_geometry_was_in_sync,
+            model_result,
+            previous_viewport,
+            previous_grid_size);
+
+        return make_backend_rejected_result(command.sequence, backend_result.error);
     }
 
     resize.backend_result           = Terminal_backend_resize_result::APPLIED;
     resize.backend_geometry_in_sync = true;
     m_backend_geometry_in_sync      = true;
+    finalize_resize_transaction(
+        resize,
+        command.sequence,
+        QStringLiteral("resize applied"));
+
+    publish_resize_outcome(
+        command.sequence,
+        render_snapshot_available,
+        grid_size_changed,
+        !backend_geometry_was_in_sync,
+        model_result,
+        previous_viewport,
+        previous_grid_size);
+
+    return make_accepted_result(command.sequence);
+}
+
+void Terminal_session::finalize_resize_transaction(
+    const Terminal_resize_transaction& resize,
+    std::uint64_t                      sequence,
+    QString                            message)
+{
     record_resize_transaction(resize);
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     if (m_config.transcript_recorder != nullptr) {
-        (void)m_config.transcript_recorder->record_session_resize(command.sequence, resize);
+        (void)m_config.transcript_recorder->record_session_resize(sequence, resize);
     }
 #endif
     record_notification({
         Terminal_session_notification_kind::RESIZE_TRANSACTION,
-        command.sequence,
-        QStringLiteral("resize applied"),
+        sequence,
+        std::move(message),
         std::nullopt,
         std::nullopt,
         resize,
         false,
     });
+}
+
+void Terminal_session::publish_resize_outcome(
+    std::uint64_t                       sequence,
+    bool                                render_snapshot_available,
+    bool                                grid_size_changed,
+    bool                                geometry_transition_warrants_publication,
+    const Terminal_screen_model_result& model_result,
+    const Terminal_viewport_state&      previous_viewport,
+    terminal_grid_size_t                previous_grid_size)
+{
+    const auto advance_selection_content_basis_for_resize_publication = [&] {
+        const Terminal_screen_model_result selection_basis_result =
+            model_result_with_deferred_synchronized_row_origins(model_result);
+        advance_selection_content_basis_for_model_result(
+            selection_basis_result,
+            previous_viewport,
+            previous_grid_size);
+    };
 
     if (!render_snapshot_available &&
         (grid_size_changed ||
-            !backend_geometry_was_in_sync ||
+            geometry_transition_warrants_publication ||
             m_latest_render_snapshot == nullptr))
     {
         advance_selection_content_basis_for_resize_publication();
         publish_synchronized_resize_snapshot(
-            command.sequence,
+            sequence,
             QStringLiteral("resize geometry snapshot ready"));
     }
     else
     if (render_snapshot_available &&
         (model_result_warrants_render_snapshot(model_result) ||
-            !backend_geometry_was_in_sync))
+            geometry_transition_warrants_publication))
     {
         advance_selection_content_basis_for_resize_publication();
-        publish_render_snapshot(command.sequence, QStringLiteral("resize snapshot ready"));
+        publish_render_snapshot(sequence, QStringLiteral("resize snapshot ready"));
     }
-
-    return {
-        Terminal_session_result_code::ACCEPTED,
-        command.sequence,
-        false,
-        std::nullopt,
-    };
 }
 
 Terminal_session_result Terminal_session::process_interrupt_command(
@@ -3602,20 +3562,10 @@ Terminal_session_result Terminal_session::process_interrupt_command(
         if (!m_backend_error_queued_during_command) {
             record_backend_error(command.sequence, *backend_result.error);
         }
-        return {
-            Terminal_session_result_code::BACKEND_REJECTED,
-            command.sequence,
-            false,
-            backend_result.error,
-        };
+        return make_backend_rejected_result(command.sequence, backend_result.error);
     }
 
-    return {
-        Terminal_session_result_code::ACCEPTED,
-        command.sequence,
-        false,
-        std::nullopt,
-    };
+    return make_accepted_result(command.sequence);
 }
 
 Terminal_session_result Terminal_session::process_terminate_command(
@@ -3645,20 +3595,10 @@ Terminal_session_result Terminal_session::process_terminate_command(
         if (!m_backend_error_queued_during_command) {
             record_backend_error(command.sequence, *backend_result.error);
         }
-        return {
-            Terminal_session_result_code::BACKEND_REJECTED,
-            command.sequence,
-            false,
-            backend_result.error,
-        };
+        return make_backend_rejected_result(command.sequence, backend_result.error);
     }
 
-    return {
-        Terminal_session_result_code::ACCEPTED,
-        command.sequence,
-        false,
-        std::nullopt,
-    };
+    return make_accepted_result(command.sequence);
 }
 
 Terminal_session_result Terminal_session::process_force_release_synchronized_output_command(
@@ -3723,12 +3663,7 @@ Terminal_session_result Terminal_session::force_release_synchronized_output_lock
         reset_public_projection_lifecycle();
     }
 
-    return {
-        Terminal_session_result_code::ACCEPTED,
-        sequence,
-        false,
-        std::nullopt,
-    };
+    return make_accepted_result(sequence);
 }
 
 Terminal_session_result Terminal_session::process_backend_output_command(
@@ -3777,12 +3712,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
         backend_output_is_plain_ascii_without_prescan_intro(command.bytes);
     if (use_plain_ascii_prescan_fast_path) {
         ingest_backend_output_segment(command.sequence, QByteArrayView(command.bytes));
-        return {
-            Terminal_session_result_code::ACCEPTED,
-            command.sequence,
-            false,
-            std::nullopt,
-        };
+        return make_accepted_result(command.sequence);
     }
 
     QByteArray combined_output;
@@ -3909,12 +3839,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
         command.bytes,
         m_backend_output_prescan_utf8_state);
 
-    return {
-        Terminal_session_result_code::ACCEPTED,
-        command.sequence,
-        false,
-        std::nullopt,
-    };
+    return make_accepted_result(command.sequence);
 }
 
 Terminal_session_result Terminal_session::process_backend_exit_command(
@@ -3961,12 +3886,7 @@ Terminal_session_result Terminal_session::process_backend_exit_command(
         false,
     });
 
-    return {
-        Terminal_session_result_code::ACCEPTED,
-        command.sequence,
-        false,
-        std::nullopt,
-    };
+    return make_accepted_result(command.sequence);
 }
 
 Terminal_session_result Terminal_session::process_backend_error_command(
@@ -3982,12 +3902,7 @@ Terminal_session_result Terminal_session::process_backend_error_command(
     }
 
     record_backend_error(command.sequence, *command.error);
-    return {
-        Terminal_session_result_code::ACCEPTED,
-        command.sequence,
-        false,
-        std::nullopt,
-    };
+    return make_accepted_result(command.sequence);
 }
 
 Terminal_backend_callbacks Terminal_session::make_backend_callbacks()
@@ -6231,6 +6146,29 @@ Terminal_session_result Terminal_session::make_rejected_result(
 {
     return {
         code,
+        sequence,
+        false,
+        std::move(error),
+    };
+}
+
+Terminal_session_result Terminal_session::make_accepted_result(
+    std::uint64_t                  sequence) const
+{
+    return {
+        Terminal_session_result_code::ACCEPTED,
+        sequence,
+        false,
+        std::nullopt,
+    };
+}
+
+Terminal_session_result Terminal_session::make_backend_rejected_result(
+    std::uint64_t                          sequence,
+    std::optional<Terminal_backend_error>  error) const
+{
+    return {
+        Terminal_session_result_code::BACKEND_REJECTED,
         sequence,
         false,
         std::move(error),

@@ -2,7 +2,6 @@
 
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
-#include "vnm_terminal/internal/stage42_feature_flags.h"
 #include "vnm_terminal/internal/unicode_width.h"
 #include <QByteArray>
 #include <QFontInfo>
@@ -59,71 +58,6 @@ constexpr std::size_t k_cached_ascii_replacement_shape_slot_count =
 constexpr std::size_t k_eager_render_style_attribute_limit  = 256U;
 constexpr int         k_arc_geometry_segment_count          = 32;
 constexpr int         k_flat_rect_vertices_per_rect         = 6;
-
-bool stage42_qsg_cached_internal_text_node_enabled()
-{
-    return stage42_feature_flags().qsg_cached_internal_text_node;
-}
-
-bool stage42_qsg_trusted_ascii_unchecked_glyphs_enabled()
-{
-    return stage42_feature_flags().qsg_trusted_ascii_unchecked_glyphs;
-}
-
-bool stage42_qsg_trusted_ascii_glyph_batching_enabled()
-{
-    return stage42_feature_flags().qsg_trusted_ascii_glyph_batching;
-}
-
-bool stage42_qsg_text_makeup_single_char_fast_path_enabled()
-{
-    return stage42_feature_flags().qsg_text_makeup_single_char_fast_path;
-}
-
-bool stage42_qsg_ascii_resource_prefilter_enabled()
-{
-    return stage42_feature_flags().qsg_ascii_resource_prefilter;
-}
-
-bool stage42_qsg_group_descriptor_eligibility_enabled()
-{
-    return stage42_feature_flags().qsg_group_descriptor_eligibility;
-}
-
-bool stage42_qsg_monotonic_dirty_probe_enabled()
-{
-    return stage42_feature_flags().qsg_monotonic_dirty_probe;
-}
-
-bool stage42_qsg_text_resource_descriptor_direct_compare_enabled()
-{
-    return stage42_feature_flags().qsg_text_resource_descriptor_direct_compare;
-}
-
-bool stage42_qsg_text_leaf_content_reuse_enabled()
-{
-    return stage42_feature_flags().qsg_text_leaf_content_reuse;
-}
-
-bool stage42_qsg_row_slot_ordered_lookup_enabled()
-{
-    return stage42_feature_flags().qsg_row_slot_ordered_lookup;
-}
-
-bool stage42_qsg_descriptor_reuse_frame_key_independent_enabled()
-{
-    return stage42_feature_flags().qsg_descriptor_reuse_frame_key_independent;
-}
-
-bool stage42_render_cell_row_cache_enabled()
-{
-    return stage42_feature_flags().render_cell_row_cache;
-}
-
-bool stage42_render_frame_sorted_row_sort_prefilter_enabled()
-{
-    return stage42_feature_flags().render_frame_sorted_row_sort_prefilter;
-}
 
 #if VNM_TERMINAL_PROFILING_ENABLED
 constexpr std::uint64_t k_slow_text_layout_threshold_ns           = 10U * 1000U * 1000U;
@@ -1177,21 +1111,20 @@ private:
     std::map<QString, Ascii_text_coalescing_context> m_contexts;
 };
 
-struct row_rect_group_t
+// A row's worth of geometry primitives (rects or arcs) attributed to one
+// viewport row. The rect and arc variants were structurally identical apart
+// from the element type and member name, so they share one template.
+template <typename Element>
+struct Row_element_group
 {
-    row_cache_identity_t              identity;
-    int                               viewport_row = 0;
-    qreal                             row_top      = 0.0;
-    std::vector<Terminal_render_rect> rects;
+    row_cache_identity_t   identity;
+    int                    viewport_row = 0;
+    qreal                  row_top      = 0.0;
+    std::vector<Element>   elements;
 };
 
-struct row_arc_group_t
-{
-    row_cache_identity_t             identity;
-    int                              viewport_row = 0;
-    qreal                            row_top      = 0.0;
-    std::vector<Terminal_render_arc> arcs;
-};
+using Row_rect_group = Row_element_group<Terminal_render_rect>;
+using Row_arc_group  = Row_element_group<Terminal_render_arc>;
 
 struct text_resource_run_t
 {
@@ -1216,8 +1149,6 @@ struct Text_resource_rect_descriptor
     qreal  top    = 0.0;
     qreal  width  = 0.0;
     qreal  height = 0.0;
-
-    bool operator==(const Text_resource_rect_descriptor&) const = default;
 };
 
 struct Text_resource_row_run_descriptor
@@ -1229,15 +1160,11 @@ struct Text_resource_row_run_descriptor
     QRgb                          foreground_rgba = 0U;
     bool                          uses_ascii_layout_font = false;
     QString                       text;
-
-    bool operator==(const Text_resource_row_run_descriptor&) const = default;
 };
 
 struct Text_resource_row_descriptor
 {
     std::vector<Text_resource_row_run_descriptor> runs;
-
-    bool operator==(const Text_resource_row_descriptor&) const = default;
 };
 
 class Terminal_scene_node final : public QSGNode
@@ -3310,9 +3237,7 @@ bool ensure_active_text_node(
 
         parent.appendChildNode(active_text_node);
     }
-    active_internal_text_node = stage42_qsg_cached_internal_text_node_enabled()
-        ? dynamic_cast<QSGInternalTextNode*>(active_text_node)
-        : nullptr;
+    active_internal_text_node = dynamic_cast<QSGInternalTextNode*>(active_text_node);
     active_foreground_rgba = foreground.rgba();
     ++out_text_leaf_nodes_created;
     ++stats.qsg_nodes_created;
@@ -3448,19 +3373,6 @@ std::optional<QGlyphRun> make_ascii_replacement_glyph_run(
         return std::nullopt;
     }
 
-    return make_ascii_replacement_glyph_run_from_scratch(context, text);
-}
-
-QGlyphRun make_trusted_ascii_replacement_glyph_run(
-    const Ascii_text_coalescing_context& context,
-    const QString&                       text)
-{
-    Q_ASSERT(context.enabled);
-    Q_ASSERT(context.raw_font.isValid());
-    Q_ASSERT(std::isfinite(context.cell_width));
-    Q_ASSERT(context.cell_width > 0.0);
-
-    fill_trusted_ascii_replacement_glyph_indexes(context, text);
     return make_ascii_replacement_glyph_run_from_scratch(context, text);
 }
 
@@ -3625,18 +3537,6 @@ QGlyphRun make_trusted_ascii_replacement_batch_glyph_run(
     return make_trusted_ascii_replacement_batch_glyph_run_from_scratch(context, batch, text);
 }
 
-std::optional<QGlyphRun> make_checked_trusted_ascii_replacement_batch_glyph_run(
-    const Ascii_text_coalescing_context&   context,
-    const Trusted_ascii_replacement_batch& batch,
-    const QString&                         text)
-{
-    if (!fill_checked_ascii_replacement_glyph_indexes(context, text)) {
-        return std::nullopt;
-    }
-
-    return make_trusted_ascii_replacement_batch_glyph_run_from_scratch(context, batch, text);
-}
-
 void record_trusted_ascii_replacement_batch_attempt(
     terminal_renderer_stats_t&             stats,
     const Trusted_ascii_replacement_batch& batch)
@@ -3780,10 +3680,7 @@ Append_ascii_replacement_result try_append_ascii_replacement_text_run(
         return Append_ascii_replacement_result::FAILED;
     }
 
-    QSGInternalTextNode* const internal_text_node =
-        stage42_qsg_cached_internal_text_node_enabled()
-            ? active_internal_text_node
-            : dynamic_cast<QSGInternalTextNode*>(active_text_node);
+    QSGInternalTextNode* const internal_text_node = active_internal_text_node;
     if (internal_text_node == nullptr) {
         record_ascii_replacement_fallback(
             stats,
@@ -3801,107 +3698,6 @@ Append_ascii_replacement_result try_append_ascii_replacement_text_run(
     ++stats.text_ascii_replacement_add_glyphs_calls;
     record_ascii_replacement_succeeded(stats, text_code_units, false);
     return Append_ascii_replacement_result::APPENDED;
-}
-
-QSGInternalTextNode* single_reusable_text_leaf_node(Terminal_text_resource_node& node)
-{
-    QSGNode* const child = node.firstChild();
-    if (child == nullptr || child->nextSibling() != nullptr) {
-        return nullptr;
-    }
-
-    return dynamic_cast<QSGInternalTextNode*>(child);
-}
-
-bool trusted_ascii_single_leaf_replacement_eligible(
-    const std::vector<text_resource_run_t>&    runs,
-    const Ascii_text_coalescing_context*       coalescing_context)
-{
-    if (runs.size() != 1U                                      ||
-        coalescing_context == nullptr                          ||
-        !coalescing_context->enabled                           ||
-        !coalescing_context->raw_font.isValid())
-    {
-        return false;
-    }
-
-    const text_resource_run_t& resource_run = runs.front();
-    const Terminal_render_text_run& run     = resource_run.run;
-    return
-        resource_run.use_ascii_layout_font                 &&
-        resource_run.trusted_ascii_replacement             &&
-        !resource_run.trusted_ascii_replacement_all_space  &&
-        !run.text.isEmpty()                                &&
-        !run.clip_rect.isValid()                           &&
-        run.hyperlink_id == 0U                             &&
-        !run.underline                                    &&
-        !run.strike                                       &&
-        run.rect.isValid()                                &&
-        is_printable_ascii_text(run.text)                  &&
-        is_unclipped_printable_ascii_cell_span_run(
-            run,
-            coalescing_context->cell_width);
-}
-
-bool refill_text_leaf_with_trusted_ascii_replacement(
-    QSGInternalTextNode&                    internal_text_node,
-    const Ascii_text_coalescing_context&    coalescing_context,
-    const std::vector<text_resource_run_t>& runs,
-    const QRectF&                           frame_viewport,
-    terminal_renderer_stats_t&              stats)
-{
-    VNM_TERMINAL_PROFILE_SCOPE("refill_text_leaf_with_trusted_ascii_replacement");
-
-    Q_ASSERT(trusted_ascii_single_leaf_replacement_eligible(runs, &coalescing_context));
-
-    const Terminal_render_text_run& run = runs.front().run;
-    const std::uint64_t text_code_units = text_run_code_units(run);
-
-    QGlyphRun glyph_run;
-    {
-        VNM_TERMINAL_PROFILE_SCOPE(
-            "refill_text_leaf_with_trusted_ascii_replacement::glyph_setup");
-
-        if (stage42_qsg_trusted_ascii_unchecked_glyphs_enabled()) {
-            glyph_run = make_trusted_ascii_replacement_glyph_run(coalescing_context, run.text);
-        }
-        else {
-            const std::optional<QGlyphRun> checked_glyph_run =
-                make_ascii_replacement_glyph_run(coalescing_context, run.text);
-            if (!checked_glyph_run.has_value()) {
-                return false;
-            }
-
-            glyph_run = *checked_glyph_run;
-        }
-    }
-
-    const QColor foreground = text_node_foreground(run, false);
-    {
-        VNM_TERMINAL_PROFILE_SCOPE(
-            "refill_text_leaf_with_trusted_ascii_replacement::clear_and_apply_state");
-
-        internal_text_node.clear();
-        apply_text_leaf_node_state(internal_text_node, foreground, frame_viewport);
-    }
-
-    {
-        VNM_TERMINAL_PROFILE_SCOPE(
-            "refill_text_leaf_with_trusted_ascii_replacement::addGlyphs_call");
-
-        internal_text_node.addGlyphs(
-            QPointF(
-                run.baseline_origin.x(),
-                run.baseline_origin.y() - coalescing_context.layout_line_ascent),
-            glyph_run,
-            foreground);
-        ++stats.text_ascii_replacement_add_glyphs_calls;
-    }
-
-    record_trusted_ascii_replacement_attempt(stats, text_code_units);
-    record_ascii_replacement_succeeded(stats, text_code_units, false);
-    ++stats.text_leaf_nodes_reused;
-    return true;
 }
 
 void add_text_run_layout(
@@ -4120,7 +3916,7 @@ Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
             "append_trusted_ascii_replacement_text_run::glyph_setup");
 
         text = trusted_ascii_replacement_batch_text(batch);
-        if (stage42_qsg_trusted_ascii_unchecked_glyphs_enabled()) {
+        {
             VNM_TERMINAL_PROFILE_SCOPE(
                 "append_trusted_ascii_replacement_text_run::glyph_setup::unchecked");
 
@@ -4128,25 +3924,6 @@ Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
                 coalescing_context,
                 batch,
                 text);
-        }
-        else {
-            VNM_TERMINAL_PROFILE_SCOPE(
-                "append_trusted_ascii_replacement_text_run::glyph_setup::checked");
-
-            const std::optional<QGlyphRun> checked_glyph_run =
-                make_checked_trusted_ascii_replacement_batch_glyph_run(
-                    coalescing_context,
-                    batch,
-                    text);
-            if (!checked_glyph_run.has_value()) {
-                record_trusted_ascii_replacement_batch_fallback(
-                    stats,
-                    batch,
-                    Ascii_replacement_fallback_reason::GLYPH_MAPPING);
-                return Append_ascii_replacement_result::FALLBACK_TO_QT_LAYOUT;
-            }
-
-            glyph_run = *checked_glyph_run;
         }
     }
 
@@ -4176,9 +3953,7 @@ Append_ascii_replacement_result append_trusted_ascii_replacement_text_run(
         VNM_TERMINAL_PROFILE_SCOPE(
             "append_trusted_ascii_replacement_text_run::internal_node_lookup");
 
-        internal_text_node = stage42_qsg_cached_internal_text_node_enabled()
-            ? active_internal_text_node
-            : dynamic_cast<QSGInternalTextNode*>(active_text_node);
+        internal_text_node = active_internal_text_node;
     }
     if (internal_text_node == nullptr) {
         record_trusted_ascii_replacement_batch_fallback(
@@ -4487,9 +4262,8 @@ bool append_batched_text_run_nodes(
             continue;
         }
 
-        if (stage42_qsg_trusted_ascii_glyph_batching_enabled() &&
-            resource_run.trusted_ascii_replacement              &&
-            !force_blended_order                                &&
+        if (resource_run.trusted_ascii_replacement &&
+            !force_blended_order                   &&
             use_ascii_layout_font)
         {
             if (resource_run.trusted_ascii_replacement_all_space) {
@@ -4785,7 +4559,7 @@ row_local_ascii_text_run_flags_t row_local_ascii_text_run_flags(
     const qsizetype text_size       = run.text.size();
     bool            printable_ascii = false;
     bool            all_space       = false;
-    if (stage42_qsg_text_makeup_single_char_fast_path_enabled() && text_size == 1) {
+    if (text_size == 1) {
         const ushort code_unit = run.text.at(0).unicode();
         printable_ascii =
             code_unit >= k_printable_ascii_first &&
@@ -4984,7 +4758,7 @@ row_local_ascii_text_resource_runs_result_t try_make_row_local_ascii_text_resour
 
         assign_row_local_ascii_text_run_flags(runs, cell_width, scratch_run_flags);
     }
-    if (stage42_qsg_ascii_resource_prefilter_enabled()) {
+    {
         VNM_TERMINAL_PROFILE_SCOPE(
             "try_make_row_local_ascii_text_resource_runs::prefilter");
 
@@ -5336,14 +5110,12 @@ std::vector<row_text_group_t> text_run_groups_by_viewport_row(
             group.row_top      = row_top_for_viewport_row(run.row, frame.cell_metrics);
             group.runs.reserve(static_cast<std::size_t>(run_counts_by_row[row_index]));
         }
-        if (stage42_qsg_group_descriptor_eligibility_enabled()) {
-            group.resource_descriptor_runs_eligible =
-                group.resource_descriptor_runs_eligible             &&
-                run.logical_row        == group.identity.logical_row        &&
-                run.retained_line_id   == group.identity.retained_line_id   &&
-                run.content_generation == group.identity.content_generation &&
-                !run.clip_rect.isValid();
-        }
+        group.resource_descriptor_runs_eligible =
+            group.resource_descriptor_runs_eligible             &&
+            run.logical_row        == group.identity.logical_row        &&
+            run.retained_line_id   == group.identity.retained_line_id   &&
+            run.content_generation == group.identity.content_generation &&
+            !run.clip_rect.isValid();
         group.runs.push_back(&run);
     }
 
@@ -5371,24 +5143,6 @@ struct row_dirty_probe_result_t
     bool dirty  = false;
     int  probes = 0;
 };
-
-row_dirty_probe_result_t row_dirty_probe(
-    const Terminal_render_frame&   frame,
-    int                            row)
-{
-    row_dirty_probe_result_t result;
-    for (const Terminal_render_dirty_row_range& range : frame.dirty_row_ranges) {
-        ++result.probes;
-        if (row >= range.first_row && row < range.first_row + range.row_count) {
-            result.dirty = true;
-            return result;
-        }
-        if (row < range.first_row) {
-            return result;
-        }
-    }
-    return result;
-}
 
 class Monotonic_row_dirty_probe
 {
@@ -5469,18 +5223,6 @@ Text_resource_rect_descriptor make_text_resource_rect_descriptor(QRectF rect)
     };
 }
 
-bool text_resource_descriptor_run_is_eligible(
-    const Terminal_render_text_run&    run,
-    const row_text_group_t&            group)
-{
-    return
-        run.row == group.viewport_row                               &&
-        run.logical_row        == group.identity.logical_row        &&
-        run.retained_line_id   == group.identity.retained_line_id   &&
-        run.content_generation == group.identity.content_generation &&
-        !run.clip_rect.isValid();
-}
-
 bool text_resource_source_row_descriptor_is_eligible(
     const Terminal_render_frame&       frame,
     const row_text_group_t&            group)
@@ -5498,23 +5240,7 @@ bool text_resource_source_row_descriptor_is_eligible(
         }
     }
 
-    if (stage42_qsg_group_descriptor_eligibility_enabled()) {
-        return group.resource_descriptor_runs_eligible;
-    }
-
-    {
-        VNM_TERMINAL_PROFILE_SCOPE(
-            "text_resource_source_row_descriptor_is_eligible::runs");
-
-        for (const Terminal_render_text_run* run_ptr : group.runs) {
-            const Terminal_render_text_run& run = *run_ptr;
-            if (!text_resource_descriptor_run_is_eligible(run, group)) {
-                return false;
-            }
-        }
-    }
-
-    return true;
+    return group.resource_descriptor_runs_eligible;
 }
 
 template <typename Text_runs>
@@ -5617,29 +5343,17 @@ struct row_slot_lookup_entry_t
 template <typename Slot>
 struct Row_slot_transfer
 {
-    std::vector<Slot>                           cache_slots;
-    std::map<row_cache_identity_t, std::size_t> index_by_identity;
-    std::vector<bool>                           consumed_slots;
-    std::vector<row_slot_lookup_entry_t>        lookup_slots;
-    std::size_t                                 next_slot              = 0U;
-    bool                                        lookup_slots_built     = false;
-    bool                                        ordered_lookup_enabled = false;
+    std::vector<Slot>                    cache_slots;
+    std::vector<row_slot_lookup_entry_t> lookup_slots;
+    std::size_t                          next_slot          = 0U;
+    bool                                 lookup_slots_built = false;
 };
 
 template <typename Slot>
 Row_slot_transfer<Slot> take_row_slots(std::vector<Slot>& row_slots)
 {
     Row_slot_transfer<Slot> transfer;
-    transfer.cache_slots            = std::move(row_slots);
-    transfer.ordered_lookup_enabled = stage42_qsg_row_slot_ordered_lookup_enabled();
-    if (!transfer.ordered_lookup_enabled) {
-        transfer.consumed_slots.assign(transfer.cache_slots.size(), false);
-        for (std::size_t index = 0U; index < transfer.cache_slots.size(); ++index) {
-            const auto inserted =
-                transfer.index_by_identity.emplace(transfer.cache_slots[index].identity, index);
-            Q_ASSERT(inserted.second);
-        }
-    }
+    transfer.cache_slots = std::move(row_slots);
     return transfer;
 }
 
@@ -5685,30 +5399,10 @@ Slot take_row_slot_at(Row_slot_transfer<Slot>& transfer, std::size_t slot_index)
 }
 
 template <typename Slot>
-std::optional<Slot> take_row_slot_from_eager_map(
-    Row_slot_transfer<Slot>&    transfer,
-    const row_cache_identity_t& identity)
-{
-    const auto index = transfer.index_by_identity.find(identity);
-    if (index == transfer.index_by_identity.end()) {
-        return std::nullopt;
-    }
-
-    Q_ASSERT(index->second < transfer.consumed_slots.size());
-    Q_ASSERT(!transfer.consumed_slots[index->second]);
-    transfer.consumed_slots[index->second] = true;
-    return std::move(transfer.cache_slots[index->second]);
-}
-
-template <typename Slot>
 std::optional<Slot> take_row_slot(
     Row_slot_transfer<Slot>&    transfer,
     const row_cache_identity_t& identity)
 {
-    if (!transfer.ordered_lookup_enabled) {
-        return take_row_slot_from_eager_map(transfer, identity);
-    }
-
     while (transfer.next_slot < transfer.cache_slots.size() &&
         transfer.cache_slots[transfer.next_slot].wrapper == nullptr)
     {
@@ -5745,12 +5439,7 @@ bool row_slot_transfer_entry_consumed(
     const Row_slot_transfer<Slot>& transfer,
     std::size_t                    index)
 {
-    if (transfer.ordered_lookup_enabled) {
-        return transfer.cache_slots[index].wrapper == nullptr;
-    }
-
-    Q_ASSERT(index < transfer.consumed_slots.size());
-    return transfer.consumed_slots[index];
+    return transfer.cache_slots[index].wrapper == nullptr;
 }
 
 using Text_row_slot_transfer =
@@ -5867,8 +5556,7 @@ void sync_text_resource_nodes(
             root.text_layout_frame_key == current_text_layout_frame_key;
         descriptor_reuse_frame_key_match =
             same_text_frame_key ||
-            (stage42_qsg_descriptor_reuse_frame_key_independent_enabled() &&
-                same_text_layout_frame_key);
+            same_text_layout_frame_key;
         clean_row_cache_skip_available =
             !frame.dirty_row_ranges.empty() &&
             same_text_frame_key;
@@ -5912,9 +5600,6 @@ void sync_text_resource_nodes(
         }
         return *frame_coalescing_context;
     };
-    const bool text_resource_descriptor_direct_compare_enabled =
-        stage42_qsg_text_resource_descriptor_direct_compare_enabled();
-    const bool monotonic_dirty_probe_enabled = stage42_qsg_monotonic_dirty_probe_enabled();
     Monotonic_row_dirty_probe dirty_row_probe;
     for (const row_text_group_t& group : groups) {
         std::optional<Terminal_scene_node::Text_resource_cache_slot> old_slot;
@@ -5933,9 +5618,7 @@ void sync_text_resource_nodes(
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "sync_text_resource_nodes::group_bookkeeping::dirty_probe");
 
-                dirty_probe = monotonic_dirty_probe_enabled
-                    ? dirty_row_probe.probe(frame, group.viewport_row)
-                    : row_dirty_probe(frame, group.viewport_row);
+                dirty_probe = dirty_row_probe.probe(frame, group.viewport_row);
             }
             {
                 VNM_TERMINAL_PROFILE_SCOPE(
@@ -6059,7 +5742,7 @@ void sync_text_resource_nodes(
         {
             bool descriptor_match         = false;
             bool descriptor_build_avoided = false;
-            if (text_resource_descriptor_direct_compare_enabled) {
+            {
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "sync_text_resource_nodes::text_resource_descriptor_direct_compare");
 
@@ -6071,10 +5754,6 @@ void sync_text_resource_nodes(
                         *old_slot->text_resource_descriptor,
                         local_runs);
                 descriptor_build_avoided = descriptor_match;
-            }
-            else {
-                descriptor_match =
-                    old_slot->text_resource_descriptor == current_text_resource_descriptor();
             }
 
             if (descriptor_match) {
@@ -6143,45 +5822,6 @@ void sync_text_resource_nodes(
             ++stats.text_key_match_reuses;
             new_slots.push_back(std::move(*old_slot));
             continue;
-        }
-
-        if (stage42_qsg_text_leaf_content_reuse_enabled() &&
-            old_slot.has_value()                          &&
-            use_ascii_resource_runs                       &&
-            trusted_ascii_single_leaf_replacement_eligible(
-                ascii_resource_runs,
-                coalescing_context))
-        {
-            VNM_TERMINAL_PROFILE_SCOPE("sync_text_resource_nodes::text_leaf_content_reuse");
-
-            QSGInternalTextNode* const reusable_text_leaf =
-                single_reusable_text_leaf_node(*old_slot->node);
-            if (reusable_text_leaf != nullptr &&
-                refill_text_leaf_with_trusted_ascii_replacement(
-                    *reusable_text_leaf,
-                    *coalescing_context,
-                    ascii_resource_runs,
-                    frame_viewport,
-                    stats))
-            {
-                if (text_resource_descriptor_eligible) {
-                    (void)current_text_resource_descriptor();
-                }
-                old_slot->key                      = std::move(current_text_resource_key());
-                old_slot->text_resource_descriptor = std::move(text_resource_descriptor);
-                sync_text_wrapper_row_top(*old_slot, group.row_top);
-                set_row_text_clip_rect(*old_slot, row_clip_rect);
-                new_slots.push_back(std::move(*old_slot));
-                ++stats.text_cache_entries_replaced;
-                ++stats.text_content_rebuilds;
-                if (dirty_group) {
-                    ++stats.text_dirty_rows_rebuilt;
-                }
-                else {
-                    ++stats.text_clean_rows_rebuilt;
-                }
-                continue;
-            }
         }
 
         bool failed                  = false;
@@ -6504,26 +6144,40 @@ Terminal_rect_resource_node* make_rect_wrapper_node(
     return wrapper;
 }
 
-struct rect_layer_groups_t
+// Result of attributing geometry primitives (rects or arcs) to viewport rows.
+// frame_elements holds the primitives that could not be row-attributed (the
+// "frame" group); row_groups holds the per-row groups.
+template <typename Element>
+struct Element_layer_groups
 {
-    std::vector<Terminal_render_rect>  frame_rects;
-    std::vector<row_rect_group_t>      row_groups;
-    bool                               needs_flat_fallback = false;
+    std::vector<Element>                       frame_elements;
+    std::vector<Row_element_group<Element>>    row_groups;
+    bool                                       needs_flat_fallback = false;
 };
 
-rect_layer_groups_t rect_layer_groups(
-    const Terminal_render_frame&               frame,
-    const std::vector<Terminal_render_rect>&   rects,
-    bool                                       full_viewport_rect_is_frame)
+using Rect_layer_groups = Element_layer_groups<Terminal_render_rect>;
+using Arc_layer_groups  = Element_layer_groups<Terminal_render_arc>;
+
+// Group geometry primitives by viewport row, preserving exact grouping and
+// flat-fallback behavior. row_for(frame, element) returns the element's
+// viewport row, or std::nullopt to route it into the frame group. The rect and
+// arc paths differ only in element type and how the viewport row is computed,
+// so they share this one template.
+template <typename Element, typename Row_for_fn>
+Element_layer_groups<Element> element_layer_groups(
+    const Terminal_render_frame&         frame,
+    const std::vector<Element>&          elements,
+    const char*                          profile_scope_name,
+    Row_for_fn&&                         row_for)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("rect_layer_groups");
+    VNM_TERMINAL_PROFILE_SCOPE(profile_scope_name);
 
     constexpr std::size_t k_missing_row_group_index =
         std::numeric_limits<std::size_t>::max();
 
-    rect_layer_groups_t groups;
+    Element_layer_groups<Element> groups;
     groups.row_groups.reserve(std::min<std::size_t>(
-        rects.size(),
+        elements.size(),
         static_cast<std::size_t>(std::max(frame.grid_size.rows, 0))));
 
     std::vector<std::size_t> row_index_by_viewport_row(
@@ -6540,20 +6194,19 @@ rect_layer_groups_t rect_layer_groups(
         active_viewport_row.reset();
     };
 
-    bool saw_row_rect = false;
-    for (const Terminal_render_rect& rect : rects) {
-        const std::optional<int> viewport_row =
-            row_for_rect(frame, rect, full_viewport_rect_is_frame);
+    bool saw_row_element = false;
+    for (const Element& element : elements) {
+        const std::optional<int> viewport_row = row_for(frame, element);
         if (!viewport_row.has_value()) {
-            if (saw_row_rect) {
+            if (saw_row_element) {
                 groups.needs_flat_fallback = true;
             }
-            groups.frame_rects.push_back(rect);
+            groups.frame_elements.push_back(element);
             close_active_row();
             continue;
         }
 
-        saw_row_rect = true;
+        saw_row_element = true;
         if (!active_viewport_row.has_value() ||
             *active_viewport_row != *viewport_row)
         {
@@ -6575,12 +6228,12 @@ rect_layer_groups_t rect_layer_groups(
                 },
                 .viewport_row = *viewport_row,
                 .row_top      = row_top_for_viewport_row(*viewport_row, frame.cell_metrics),
-                .rects        = {},
+                .elements     = {},
             });
         }
 
-        row_rect_group_t& group = groups.row_groups[group_index];
-        group.rects.push_back(rect);
+        Row_element_group<Element>& group = groups.row_groups[group_index];
+        group.elements.push_back(element);
     }
 
     return groups;
@@ -6609,84 +6262,32 @@ std::vector<Terminal_render_arc> row_local_arcs(
     return local_arcs;
 }
 
-struct arc_layer_groups_t
+// Rebuild a frame-group layer when its content key changes. The rect and arc
+// variants differed only in which append routine populated the layer, so they
+// now share this core helper; append_into_layer(QSGNode& layer) performs the
+// element-specific append.
+template <typename Append_fn>
+bool sync_frame_geometry_group(
+    QSGNode&                       frame_layer,
+    QByteArray&                    cached_key,
+    const QByteArray&              key,
+    Append_fn&&                    append_into_layer,
+    terminal_renderer_stats_t*     stats = nullptr)
 {
-    std::vector<Terminal_render_arc>   frame_arcs;
-    std::vector<row_arc_group_t>       row_groups;
-    bool                               needs_flat_fallback = false;
-};
-
-arc_layer_groups_t arc_layer_groups(
-    const Terminal_render_frame&               frame,
-    const std::vector<Terminal_render_arc>&    arcs)
-{
-    VNM_TERMINAL_PROFILE_SCOPE("arc_layer_groups");
-
-    constexpr std::size_t k_missing_row_group_index =
-        std::numeric_limits<std::size_t>::max();
-
-    arc_layer_groups_t groups;
-    groups.row_groups.reserve(std::min<std::size_t>(
-        arcs.size(),
-        static_cast<std::size_t>(std::max(frame.grid_size.rows, 0))));
-
-    std::vector<std::size_t> row_index_by_viewport_row(
-        static_cast<std::size_t>(std::max(frame.grid_size.rows, 0)),
-        k_missing_row_group_index);
-    std::vector<bool> closed_viewport_rows(row_index_by_viewport_row.size(), false);
-    std::optional<int> active_viewport_row;
-    const auto close_active_row = [&]() {
-        if (!active_viewport_row.has_value()) {
-            return;
-        }
-
-        closed_viewport_rows[static_cast<std::size_t>(*active_viewport_row)] = true;
-        active_viewport_row.reset();
-    };
-
-    bool saw_row_arc = false;
-    for (const Terminal_render_arc& arc : arcs) {
-        const std::optional<int> viewport_row = row_for_arc(frame, arc);
-        if (!viewport_row.has_value()) {
-            if (saw_row_arc) {
-                groups.needs_flat_fallback = true;
-            }
-            groups.frame_arcs.push_back(arc);
-            close_active_row();
-            continue;
-        }
-
-        saw_row_arc = true;
-        if (!active_viewport_row.has_value() ||
-            *active_viewport_row != *viewport_row)
-        {
-            close_active_row();
-            if (closed_viewport_rows[static_cast<std::size_t>(*viewport_row)]) {
-                groups.needs_flat_fallback = true;
-            }
-            active_viewport_row = *viewport_row;
-        }
-
-        std::size_t& group_index =
-            row_index_by_viewport_row[static_cast<std::size_t>(*viewport_row)];
-        if (group_index == k_missing_row_group_index) {
-            group_index = groups.row_groups.size();
-            groups.row_groups.push_back({
-                .identity     = {
-                    frame.viewport.active_buffer,
-                    logical_row_for_viewport_row(frame.viewport, *viewport_row),
-                },
-                .viewport_row = *viewport_row,
-                .row_top      = row_top_for_viewport_row(*viewport_row, frame.cell_metrics),
-                .arcs         = {},
-            });
-        }
-
-        row_arc_group_t& group = groups.row_groups[group_index];
-        group.arcs.push_back(arc);
+    if (cached_key == key) {
+        return false;
     }
 
-    return groups;
+    if (stats != nullptr) {
+        stats->qsg_nodes_destroyed += node_subtree_child_count(frame_layer);
+    }
+    clear_layer(frame_layer);
+    append_into_layer(frame_layer);
+    if (stats != nullptr) {
+        stats->qsg_nodes_created += node_subtree_child_count(frame_layer);
+    }
+    cached_key = key;
+    return true;
 }
 
 bool sync_frame_rect_group(
@@ -6698,42 +6299,18 @@ bool sync_frame_rect_group(
     qreal                                      device_pixel_ratio,
     terminal_renderer_stats_t*                 stats = nullptr)
 {
-    if (cached_key == key) {
-        return false;
-    }
-
-    if (stats != nullptr) {
-        stats->qsg_nodes_destroyed += node_subtree_child_count(frame_layer);
-    }
-    clear_layer(frame_layer);
-    append_graphic_nodes(
-        &frame_layer,
-        rects,
-        {},
-        use_software_graphic_fallback,
-        device_pixel_ratio);
-    if (stats != nullptr) {
-        stats->qsg_nodes_created += node_subtree_child_count(frame_layer);
-    }
-    cached_key = key;
-    return true;
-}
-
-bool sync_frame_rect_group(
-    QSGNode&                                   frame_layer,
-    QByteArray&                                cached_key,
-    const std::vector<Terminal_render_rect>&   rects,
-    bool                                       use_software_graphic_fallback,
-    qreal                                      device_pixel_ratio,
-    terminal_renderer_stats_t*                 stats = nullptr)
-{
-    return sync_frame_rect_group(
+    return sync_frame_geometry_group(
         frame_layer,
         cached_key,
-        rect_layer_key(rects, {}, use_software_graphic_fallback, device_pixel_ratio),
-        rects,
-        use_software_graphic_fallback,
-        device_pixel_ratio,
+        key,
+        [&](QSGNode& layer) {
+            append_graphic_nodes(
+                &layer,
+                rects,
+                {},
+                use_software_graphic_fallback,
+                device_pixel_ratio);
+        },
         stats);
 }
 
@@ -6746,41 +6323,17 @@ bool sync_frame_arc_group(
     qreal                                      device_pixel_ratio,
     terminal_renderer_stats_t*                 stats = nullptr)
 {
-    if (cached_key == key) {
-        return false;
-    }
-
-    if (stats != nullptr) {
-        stats->qsg_nodes_destroyed += node_subtree_child_count(frame_layer);
-    }
-    clear_layer(frame_layer);
-    append_arc_nodes(
-        &frame_layer,
-        arcs,
-        use_software_graphic_fallback,
-        device_pixel_ratio);
-    if (stats != nullptr) {
-        stats->qsg_nodes_created += node_subtree_child_count(frame_layer);
-    }
-    cached_key = key;
-    return true;
-}
-
-bool sync_frame_arc_group(
-    QSGNode&                                   frame_layer,
-    QByteArray&                                cached_key,
-    const std::vector<Terminal_render_arc>&    arcs,
-    bool                                       use_software_graphic_fallback,
-    qreal                                      device_pixel_ratio,
-    terminal_renderer_stats_t*                 stats = nullptr)
-{
-    return sync_frame_arc_group(
+    return sync_frame_geometry_group(
         frame_layer,
         cached_key,
-        rect_layer_key({}, arcs, use_software_graphic_fallback, device_pixel_ratio),
-        arcs,
-        use_software_graphic_fallback,
-        device_pixel_ratio,
+        key,
+        [&](QSGNode& layer) {
+            append_arc_nodes(
+                &layer,
+                arcs,
+                use_software_graphic_fallback,
+                device_pixel_ratio);
+        },
         stats);
 }
 
@@ -7090,8 +6643,13 @@ bool sync_batched_rect_row_layer(
     renderer_stat(stats, config.rows_removed)      = 0;
     renderer_stat(stats, config.cache_fallbacks)   = 0;
 
-    const rect_layer_groups_t groups =
-        rect_layer_groups(frame, rects, config.full_viewport_rect_is_frame);
+    const Rect_layer_groups groups = element_layer_groups(
+        frame,
+        rects,
+        "rect_layer_groups",
+        [&](const Terminal_render_frame& f, const Terminal_render_rect& rect) {
+            return row_for_rect(f, rect, config.full_viewport_rect_is_frame);
+        });
     const QByteArray current_layer_descriptor = geometry_row_layer_descriptor(
         current_layer_content_key,
         groups.row_groups);
@@ -7133,7 +6691,7 @@ bool sync_batched_rect_row_layer(
     }
 
     const std::vector<Terminal_render_rect> frame_group_rects =
-        rects_for_frame_group(frame_rects, groups.frame_rects);
+        rects_for_frame_group(frame_rects, groups.frame_elements);
     const QByteArray frame_group_key = rect_layer_key(
         frame_group_rects,
         {},
@@ -7152,17 +6710,17 @@ bool sync_batched_rect_row_layer(
     Geometry_row_slot_transfer old_slots = take_geometry_row_slots(row_slots);
     std::vector<Terminal_scene_node::Geometry_row_cache_slot> new_slots;
     new_slots.reserve(groups.row_groups.size());
-    for (const row_rect_group_t& group : groups.row_groups) {
+    for (const Row_rect_group& group : groups.row_groups) {
         const std::vector<Terminal_render_rect> local_rects =
-            row_local_rects(group.rects, group.row_top);
+            row_local_rects(group.elements, group.row_top);
         stats.rect_resource_rects_before_coalescing +=
-            static_cast<int>(group.rects.size());
+            static_cast<int>(group.elements.size());
         stats.rect_resource_rects_after_coalescing +=
             static_cast<int>(local_rects.size());
         add_optional_renderer_stat(
             stats,
             config.row_rects_before_coalescing,
-            static_cast<int>(group.rects.size()));
+            static_cast<int>(group.elements.size()));
         add_optional_renderer_stat(
             stats,
             config.row_rects_after_coalescing,
@@ -7361,7 +6919,13 @@ bool sync_arc_row_layer(
     out_rows_removed      = 0;
     out_cache_fallbacks   = 0;
 
-    const arc_layer_groups_t groups = arc_layer_groups(frame, arcs);
+    const Arc_layer_groups groups = element_layer_groups(
+        frame,
+        arcs,
+        "arc_layer_groups",
+        [](const Terminal_render_frame& f, const Terminal_render_arc& arc) {
+            return row_for_arc(f, arc);
+        });
     const QByteArray current_layer_descriptor = geometry_row_layer_descriptor(
         current_layer_content_key,
         groups.row_groups);
@@ -7393,7 +6957,7 @@ bool sync_arc_row_layer(
 
     const QByteArray frame_group_key = rect_layer_key(
         {},
-        groups.frame_arcs,
+        groups.frame_elements,
         use_software_graphic_fallback,
         device_pixel_ratio);
     record_rect_cache_key_build(stats, frame_group_key);
@@ -7401,7 +6965,7 @@ bool sync_arc_row_layer(
         frame_layer,
         frame_key,
         frame_group_key,
-        groups.frame_arcs,
+        groups.frame_elements,
         use_software_graphic_fallback,
         device_pixel_ratio,
         &stats);
@@ -7409,9 +6973,9 @@ bool sync_arc_row_layer(
     Geometry_row_slot_transfer old_slots = take_geometry_row_slots(row_slots);
     std::vector<Terminal_scene_node::Geometry_row_cache_slot> new_slots;
     new_slots.reserve(groups.row_groups.size());
-    for (const row_arc_group_t& group : groups.row_groups) {
+    for (const Row_arc_group& group : groups.row_groups) {
         const std::vector<Terminal_render_arc> local_arcs =
-            row_local_arcs(group.arcs, group.row_top);
+            row_local_arcs(group.elements, group.row_top);
         const QByteArray key = rect_layer_key(
             {},
             local_arcs,
@@ -7700,353 +7264,268 @@ void accumulate_simple_content_stats(
     terminal_simple_content_cumulative_stats_t&    total,
     const terminal_simple_content_stats_t&         stats);
 
+// Field-list X-macro (see accumulate_simple_content_stats for rationale).
+// simple_content is a nested struct accumulated separately below.
+#define VNM_RENDER_FRAME_STATS_FIELDS(X) \
+    X(visible_rows) \
+    X(dirty_rows) \
+    X(full_dirty_rows) \
+    X(cell_pass_input_cells) \
+    X(cell_pass_classification_calls) \
+    X(packed_pass_input_cells) \
+    X(packed_pass_cells_scanned) \
+    X(packed_pass_classification_calls) \
+    X(packed_text_sidecars_enabled) \
+    X(packed_text_sidecars_disabled) \
+    X(packed_text_disabled_cells_skipped) \
+    X(packed_graphic_candidates_classified) \
+    X(packed_cells_appended) \
+    X(dirty_row_lookup_count) \
+    X(cells_considered) \
+    X(cells_skipped_invalid) \
+    X(cells_skipped_wide_continuation) \
+    X(cells_rendered) \
+    X(text_cells_empty) \
+    X(text_cells_rendered_as_text) \
+    X(text_cells_rendered_as_graphic) \
+    X(text_cells_printable_ascii) \
+    X(text_cells_other_ascii) \
+    X(text_cells_non_ascii) \
+    X(text_cells_simple_ascii) \
+    X(text_cells_single_width) \
+    X(text_cells_multi_width) \
+    X(text_cells_with_decorations) \
+    X(text_cells_with_hyperlink) \
+    X(text_style_changes) \
+    X(text_distinct_styles) \
+    X(background_rects_emitted) \
+    X(selection_rects_emitted) \
+    X(graphic_rects_emitted) \
+    X(graphic_arcs_emitted) \
+    X(text_runs_emitted) \
+    X(cursor_text_runs_emitted) \
+    X(decoration_rects_emitted) \
+    X(cursor_rects_emitted) \
+    X(cursor_graphic_rects_emitted) \
+    X(cursor_graphic_arcs_emitted) \
+    X(overlay_rects_emitted) \
+    X(packed_rows) \
+    X(packed_text_spans) \
+    X(packed_text_cells) \
+    X(packed_text_ascii_direct_cells) \
+    X(packed_text_ascii_direct_bytes) \
+    X(packed_text_utf8_cells) \
+    X(packed_text_utf8_input_units) \
+    X(packed_text_utf8_output_bytes) \
+    X(packed_graphic_spans) \
+    X(packed_graphic_cells) \
+    X(packed_payload_bytes) \
+    /**/
+
 void accumulate_frame_stats(
     terminal_render_frame_cumulative_stats_t&      total,
     const terminal_render_frame_stats_t&           stats)
 {
     accumulate_simple_content_stats(total.simple_content, stats.simple_content);
-    total.visible_rows          += static_cast<std::uint64_t>(stats.visible_rows);
-    total.dirty_rows            += static_cast<std::uint64_t>(stats.dirty_rows);
-    total.full_dirty_rows       += static_cast<std::uint64_t>(stats.full_dirty_rows);
-    total.cell_pass_input_cells += static_cast<std::uint64_t>(stats.cell_pass_input_cells);
-    total.cell_pass_classification_calls +=
-        static_cast<std::uint64_t>(stats.cell_pass_classification_calls);
-    total.packed_pass_input_cells += static_cast<std::uint64_t>(stats.packed_pass_input_cells);
-    total.packed_pass_cells_scanned +=
-        static_cast<std::uint64_t>(stats.packed_pass_cells_scanned);
-    total.packed_pass_classification_calls +=
-        static_cast<std::uint64_t>(stats.packed_pass_classification_calls);
-    total.packed_text_sidecars_enabled +=
-        static_cast<std::uint64_t>(stats.packed_text_sidecars_enabled);
-    total.packed_text_sidecars_disabled +=
-        static_cast<std::uint64_t>(stats.packed_text_sidecars_disabled);
-    total.packed_text_disabled_cells_skipped +=
-        static_cast<std::uint64_t>(stats.packed_text_disabled_cells_skipped);
-    total.packed_graphic_candidates_classified +=
-        static_cast<std::uint64_t>(stats.packed_graphic_candidates_classified);
-    total.packed_cells_appended +=
-        static_cast<std::uint64_t>(stats.packed_cells_appended);
-    total.dirty_row_lookup_count += static_cast<std::uint64_t>(stats.dirty_row_lookup_count);
-    total.cells_considered      += static_cast<std::uint64_t>(stats.cells_considered);
-    total.cells_skipped_invalid += static_cast<std::uint64_t>(stats.cells_skipped_invalid);
-    total.cells_skipped_wide_continuation +=
-        static_cast<std::uint64_t>(stats.cells_skipped_wide_continuation);
-    total.cells_rendered   += static_cast<std::uint64_t>(stats.cells_rendered);
-    total.text_cells_empty += static_cast<std::uint64_t>(stats.text_cells_empty);
-    total.text_cells_rendered_as_text     +=
-        static_cast<std::uint64_t>(stats.text_cells_rendered_as_text);
-    total.text_cells_rendered_as_graphic  +=
-        static_cast<std::uint64_t>(stats.text_cells_rendered_as_graphic);
-    total.text_cells_printable_ascii      +=
-        static_cast<std::uint64_t>(stats.text_cells_printable_ascii);
-    total.text_cells_other_ascii          +=
-        static_cast<std::uint64_t>(stats.text_cells_other_ascii);
-    total.text_cells_non_ascii            +=
-        static_cast<std::uint64_t>(stats.text_cells_non_ascii);
-    total.text_cells_simple_ascii         +=
-        static_cast<std::uint64_t>(stats.text_cells_simple_ascii);
-    total.text_cells_single_width         +=
-        static_cast<std::uint64_t>(stats.text_cells_single_width);
-    total.text_cells_multi_width          +=
-        static_cast<std::uint64_t>(stats.text_cells_multi_width);
-    total.text_cells_with_decorations     +=
-        static_cast<std::uint64_t>(stats.text_cells_with_decorations);
-    total.text_cells_with_hyperlink       +=
-        static_cast<std::uint64_t>(stats.text_cells_with_hyperlink);
-    total.text_style_changes   += static_cast<std::uint64_t>(stats.text_style_changes);
-    total.text_distinct_styles += static_cast<std::uint64_t>(stats.text_distinct_styles);
-    total.background_rects_emitted        +=
-        static_cast<std::uint64_t>(stats.background_rects_emitted);
-    total.selection_rects_emitted         +=
-        static_cast<std::uint64_t>(stats.selection_rects_emitted);
-    total.graphic_rects_emitted           +=
-        static_cast<std::uint64_t>(stats.graphic_rects_emitted);
-    total.graphic_arcs_emitted            +=
-        static_cast<std::uint64_t>(stats.graphic_arcs_emitted);
-    total.text_runs_emitted               += static_cast<std::uint64_t>(stats.text_runs_emitted);
-    total.cursor_text_runs_emitted        +=
-        static_cast<std::uint64_t>(stats.cursor_text_runs_emitted);
-    total.decoration_rects_emitted        +=
-        static_cast<std::uint64_t>(stats.decoration_rects_emitted);
-    total.cursor_rects_emitted            += static_cast<std::uint64_t>(stats.cursor_rects_emitted);
-    total.cursor_graphic_rects_emitted    +=
-        static_cast<std::uint64_t>(stats.cursor_graphic_rects_emitted);
-    total.cursor_graphic_arcs_emitted     +=
-        static_cast<std::uint64_t>(stats.cursor_graphic_arcs_emitted);
-    total.overlay_rects_emitted += static_cast<std::uint64_t>(stats.overlay_rects_emitted);
-    total.packed_rows           += static_cast<std::uint64_t>(stats.packed_rows);
-    total.packed_text_spans     += static_cast<std::uint64_t>(stats.packed_text_spans);
-    total.packed_text_cells     += static_cast<std::uint64_t>(stats.packed_text_cells);
-    total.packed_text_ascii_direct_cells +=
-        static_cast<std::uint64_t>(stats.packed_text_ascii_direct_cells);
-    total.packed_graphic_spans            +=
-        static_cast<std::uint64_t>(stats.packed_graphic_spans);
-    total.packed_graphic_cells            +=
-        static_cast<std::uint64_t>(stats.packed_graphic_cells);
-    total.packed_text_ascii_direct_bytes += stats.packed_text_ascii_direct_bytes;
-    total.packed_text_utf8_cells         += stats.packed_text_utf8_cells;
-    total.packed_text_utf8_input_units   += stats.packed_text_utf8_input_units;
-    total.packed_text_utf8_output_bytes  += stats.packed_text_utf8_output_bytes;
-    total.packed_payload_bytes           += stats.packed_payload_bytes;
+#define VNM_ACCUMULATE_FIELD(field) \
+    total.field += static_cast<std::uint64_t>(stats.field);
+    VNM_RENDER_FRAME_STATS_FIELDS(VNM_ACCUMULATE_FIELD)
+#undef VNM_ACCUMULATE_FIELD
 }
+
+#undef VNM_RENDER_FRAME_STATS_FIELDS
+
+// Field-list X-macro (see accumulate_simple_content_stats for rationale).
+// Fields needing non-trivial handling are excluded and written by hand in
+// the function body.
+#define VNM_RENDERER_STATS_FIELDS(X) \
+    X(text_content_rebuilds) \
+    X(text_content_reused) \
+    X(text_content_removed) \
+    X(text_content_failures) \
+    X(text_leaf_nodes_created) \
+    X(text_leaf_nodes_reused) \
+    X(text_cache_entry_child_nodes_cleared_for_replacement) \
+    X(text_cache_entry_child_nodes_cleared_for_removal) \
+    X(route_fast_text_cells) \
+    X(route_qt_text_layout_runs) \
+    X(route_graphic_geometry_cells) \
+    X(route_fallback_cells) \
+    X(qt_text_layout_calls) \
+    X(text_layout_runs_single_code_unit) \
+    X(text_layout_runs_multi_code_unit) \
+    X(text_layout_runs_all_space) \
+    X(text_layout_runs_printable_ascii) \
+    X(text_layout_runs_printable_ascii_with_space) \
+    X(text_layout_runs_other_ascii) \
+    X(text_layout_runs_non_ascii) \
+    X(text_layout_runs_clipped) \
+    X(text_layout_runs_ascii_layout_font) \
+    X(text_layout_runs_force_blended_order) \
+    X(text_layout_runs_with_hyperlink) \
+    X(text_layout_runs_with_decoration) \
+    X(text_layout_runs_mixed_ascii_non_ascii) \
+    X(text_layout_runs_pure_non_ascii) \
+    X(text_layout_runs_plain_unclipped) \
+    X(text_layout_runs_plain_unclipped_ascii_font) \
+    X(text_layout_runs_all_space_plain_unclipped) \
+    X(text_layout_runs_printable_ascii_plain_unclipped) \
+    X(text_layout_runs_non_ascii_plain_unclipped) \
+    X(text_layout_runs_mixed_ascii_non_ascii_plain_unclipped) \
+    X(text_layout_runs_pure_non_ascii_plain_unclipped) \
+    X(text_layout_runs_fast_space_candidate) \
+    X(text_layout_runs_fast_ascii_candidate) \
+    X(text_layout_runs_fast_ascii_no_space_candidate) \
+    X(text_layout_runs_fast_ascii_single_candidate) \
+    X(text_layout_runs_fast_ascii_multi_candidate) \
+    X(text_ascii_replacement_runs_screened) \
+    X(text_ascii_replacement_runs_eligible) \
+    X(text_ascii_replacement_runs_attempted) \
+    X(text_ascii_replacement_runs_trusted_fast_path) \
+    X(text_ascii_replacement_runs_succeeded) \
+    X(text_ascii_replacement_runs_all_space_succeeded) \
+    X(text_ascii_replacement_add_glyphs_calls) \
+    X(text_ascii_replacement_runs_fallback) \
+    X(text_ascii_replacement_runs_rejected_clipped) \
+    X(text_ascii_replacement_runs_rejected_force_blended_order) \
+    X(text_ascii_replacement_runs_rejected_decoration) \
+    X(text_ascii_replacement_runs_rejected_hyperlink) \
+    X(text_ascii_replacement_runs_rejected_non_printable_ascii) \
+    X(text_ascii_replacement_runs_rejected_non_ascii) \
+    X(text_ascii_replacement_runs_rejected_geometry) \
+    X(text_ascii_replacement_runs_rejected_unsupported_font) \
+    X(text_ascii_replacement_runs_rejected_internal_node) \
+    X(text_ascii_replacement_runs_rejected_glyph_mapping) \
+    X(text_layout_code_units) \
+    X(text_layout_space_code_units) \
+    X(text_layout_printable_ascii_code_units) \
+    X(text_layout_other_ascii_code_units) \
+    X(text_layout_non_ascii_code_units) \
+    X(text_layout_plain_unclipped_code_units) \
+    X(text_layout_all_space_plain_unclipped_code_units) \
+    X(text_layout_printable_ascii_plain_unclipped_code_units) \
+    X(text_layout_non_ascii_plain_unclipped_code_units) \
+    X(text_layout_fast_space_candidate_code_units) \
+    X(text_layout_fast_ascii_candidate_code_units) \
+    X(text_ascii_replacement_code_units_screened) \
+    X(text_ascii_replacement_code_units_eligible) \
+    X(text_ascii_replacement_code_units_attempted) \
+    X(text_ascii_replacement_code_units_trusted_fast_path) \
+    X(text_ascii_replacement_code_units_succeeded) \
+    X(text_ascii_replacement_code_units_fallback) \
+    X(qsg_nodes_created) \
+    X(qsg_nodes_replaced) \
+    X(qsg_nodes_destroyed) \
+    X(background_qsg_nodes_created) \
+    X(background_qsg_nodes_replaced) \
+    X(background_qsg_nodes_destroyed) \
+    X(text_groups_considered) \
+    X(text_groups_dirty) \
+    X(text_groups_clean) \
+    X(text_clean_reuse_skips) \
+    X(text_resource_descriptor_builds) \
+    X(text_resource_descriptor_builds_avoided) \
+    X(text_resource_descriptor_reuses) \
+    X(text_key_builds) \
+    X(text_key_bytes) \
+    X(rect_key_builds) \
+    X(rect_key_bytes) \
+    X(cache_key_builds) \
+    X(cache_key_bytes) \
+    X(text_dirty_row_ranges) \
+    X(text_dirty_rows) \
+    X(text_resource_dirty_row_probes) \
+    X(text_runs_considered) \
+    X(text_coalescing_candidate_groups) \
+    X(text_coalescing_enabled_groups) \
+    X(text_resource_rows_with_runs) \
+    X(text_resource_runs_before_coalescing) \
+    X(text_resource_runs_after_coalescing) \
+    X(text_dirty_descriptor_identical_rows) \
+    X(text_key_match_reuses) \
+    X(text_dirty_rows_rebuilt) \
+    X(text_clean_rows_rebuilt) \
+    X(rect_resource_rects_before_coalescing) \
+    X(rect_resource_rects_after_coalescing) \
+    X(background_row_rects_before_coalescing) \
+    X(background_row_rects_after_coalescing) \
+    X(background_batched_rects) \
+    X(background_batched_vertices) \
+    X(selection_batched_rects) \
+    X(selection_batched_vertices) \
+    X(graphic_batched_rects) \
+    X(graphic_batched_vertices) \
+    X(decoration_batched_rects) \
+    X(decoration_batched_vertices) \
+    X(text_cache_entries_created) \
+    X(text_cache_entries_replaced) \
+    X(text_cache_entries_removed) \
+    X(frame_background_rects) \
+    X(frame_selection_rects) \
+    X(frame_graphic_rects) \
+    X(frame_graphic_arcs) \
+    X(frame_text_runs) \
+    X(frame_cursor_text_runs) \
+    X(frame_decorations) \
+    X(frame_cursors) \
+    X(frame_cursor_graphic_rects) \
+    X(frame_cursor_graphic_arcs) \
+    X(frame_overlay_rects) \
+    X(frame_dirty_row_ranges) \
+    X(frame_packed_rows) \
+    X(frame_packed_text_spans) \
+    X(frame_packed_text_cells) \
+    X(frame_packed_graphic_spans) \
+    X(frame_packed_graphic_cells) \
+    X(frame_packed_payload_bytes) \
+    X(row_cache_hits) \
+    X(row_cache_clean_skips) \
+    X(background_rows_rebuilt) \
+    X(background_rows_reused) \
+    X(background_row_clean_reuse_skips) \
+    X(background_rows_removed) \
+    X(background_row_cache_fallbacks) \
+    X(selection_rows_rebuilt) \
+    X(selection_rows_reused) \
+    X(selection_row_clean_reuse_skips) \
+    X(selection_rows_removed) \
+    X(selection_row_cache_fallbacks) \
+    X(decoration_rows_rebuilt) \
+    X(decoration_rows_reused) \
+    X(decoration_row_clean_reuse_skips) \
+    X(decoration_rows_removed) \
+    X(decoration_row_cache_fallbacks) \
+    X(graphic_rect_rows_rebuilt) \
+    X(graphic_rect_rows_reused) \
+    X(graphic_rect_row_clean_reuse_skips) \
+    X(graphic_rect_rows_removed) \
+    X(graphic_rect_row_cache_fallbacks) \
+    X(graphic_arc_rows_rebuilt) \
+    X(graphic_arc_rows_reused) \
+    X(graphic_arc_row_clean_reuse_skips) \
+    X(graphic_arc_rows_removed) \
+    X(graphic_arc_row_cache_fallbacks) \
+    /**/
 
 void accumulate_renderer_stats(
     terminal_renderer_cumulative_stats_t&  total,
     const terminal_renderer_stats_t&       stats)
 {
+    // Fields touched specially (different src/dst name, std::max, or a
+    // nested sub-struct) are written by hand; the remaining pure
+    // total.<field> += static_cast<std::uint64_t>(stats.<field>) fields are
+    // generated from the X-macro below. Every field is written exactly once,
+    // so the relative order of these two groups does not matter.
     ++total.frames_published;
     total.paint_completed_frames += count_from_bool(stats.paint_completed);
     total.root_reused_frames     += count_from_bool(stats.root_reused);
     accumulate_frame_stats(total.frame, stats.frame);
-    total.text_content_rebuilds   += static_cast<std::uint64_t>(stats.text_content_rebuilds);
-    total.text_content_reused     += static_cast<std::uint64_t>(stats.text_content_reused);
-    total.text_content_removed    += static_cast<std::uint64_t>(stats.text_content_removed);
-    total.text_content_failures   += static_cast<std::uint64_t>(stats.text_content_failures);
-    total.text_leaf_nodes_created += static_cast<std::uint64_t>(stats.text_leaf_nodes_created);
-    total.text_leaf_nodes_reused  += static_cast<std::uint64_t>(stats.text_leaf_nodes_reused);
-    total.text_cache_entry_child_nodes_cleared_for_replacement += static_cast<std::uint64_t>(
-        stats.text_cache_entry_child_nodes_cleared_for_replacement);
-    total.text_cache_entry_child_nodes_cleared_for_removal += static_cast<std::uint64_t>(
-        stats.text_cache_entry_child_nodes_cleared_for_removal);
-    total.text_cache_entry_max_child_nodes_cleared  = std::max(
+    total.text_cache_entry_max_child_nodes_cleared = std::max(
         total.text_cache_entry_max_child_nodes_cleared,
         static_cast<std::uint64_t>(stats.text_cache_entry_max_child_nodes_cleared));
-    total.route_fast_text_cells                    += static_cast<std::uint64_t>(stats.route_fast_text_cells);
-    total.route_qt_text_layout_runs      +=
-        static_cast<std::uint64_t>(stats.route_qt_text_layout_runs);
-    total.route_graphic_geometry_cells   +=
-        static_cast<std::uint64_t>(stats.route_graphic_geometry_cells);
-    total.route_fallback_cells += static_cast<std::uint64_t>(stats.route_fallback_cells);
-    total.qt_text_layout_calls += static_cast<std::uint64_t>(stats.qt_text_layout_calls);
-    total.text_layout_runs_single_code_unit +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_single_code_unit);
-    total.text_layout_runs_multi_code_unit +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_multi_code_unit);
-    total.text_layout_runs_all_space +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_all_space);
-    total.text_layout_runs_printable_ascii +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii);
-    total.text_layout_runs_printable_ascii_with_space +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii_with_space);
-    total.text_layout_runs_other_ascii +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_other_ascii);
-    total.text_layout_runs_non_ascii +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_non_ascii);
-    total.text_layout_runs_clipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_clipped);
-    total.text_layout_runs_ascii_layout_font +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_ascii_layout_font);
-    total.text_layout_runs_force_blended_order +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_force_blended_order);
-    total.text_layout_runs_with_hyperlink +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_with_hyperlink);
-    total.text_layout_runs_with_decoration +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_with_decoration);
-    total.text_layout_runs_mixed_ascii_non_ascii +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_mixed_ascii_non_ascii);
-    total.text_layout_runs_pure_non_ascii +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_pure_non_ascii);
-    total.text_layout_runs_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_plain_unclipped);
-    total.text_layout_runs_plain_unclipped_ascii_font +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_plain_unclipped_ascii_font);
-    total.text_layout_runs_all_space_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_all_space_plain_unclipped);
-    total.text_layout_runs_printable_ascii_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii_plain_unclipped);
-    total.text_layout_runs_non_ascii_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_non_ascii_plain_unclipped);
-    total.text_layout_runs_mixed_ascii_non_ascii_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_mixed_ascii_non_ascii_plain_unclipped);
-    total.text_layout_runs_pure_non_ascii_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_pure_non_ascii_plain_unclipped);
-    total.text_layout_runs_fast_space_candidate +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_space_candidate);
-    total.text_layout_runs_fast_ascii_candidate +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_candidate);
-    total.text_layout_runs_fast_ascii_no_space_candidate +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_no_space_candidate);
-    total.text_layout_runs_fast_ascii_single_candidate +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_single_candidate);
-    total.text_layout_runs_fast_ascii_multi_candidate +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_multi_candidate);
-    total.text_ascii_replacement_runs_screened +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_screened);
-    total.text_ascii_replacement_runs_eligible +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_eligible);
-    total.text_ascii_replacement_runs_attempted +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_attempted);
-    total.text_ascii_replacement_runs_trusted_fast_path +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_trusted_fast_path);
-    total.text_ascii_replacement_runs_succeeded +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_succeeded);
-    total.text_ascii_replacement_runs_all_space_succeeded +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_all_space_succeeded);
-    total.text_ascii_replacement_add_glyphs_calls +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_add_glyphs_calls);
-    total.text_ascii_replacement_runs_fallback +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_fallback);
-    total.text_ascii_replacement_runs_rejected_clipped +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_clipped);
-    total.text_ascii_replacement_runs_rejected_force_blended_order +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_force_blended_order);
-    total.text_ascii_replacement_runs_rejected_decoration +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_decoration);
-    total.text_ascii_replacement_runs_rejected_hyperlink +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_hyperlink);
-    total.text_ascii_replacement_runs_rejected_non_printable_ascii +=
-        static_cast<std::uint64_t>(
-            stats.text_ascii_replacement_runs_rejected_non_printable_ascii);
-    total.text_ascii_replacement_runs_rejected_non_ascii +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_non_ascii);
-    total.text_ascii_replacement_runs_rejected_geometry +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_geometry);
-    total.text_ascii_replacement_runs_rejected_unsupported_font +=
-        static_cast<std::uint64_t>(
-            stats.text_ascii_replacement_runs_rejected_unsupported_font);
-    total.text_ascii_replacement_runs_rejected_internal_node +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_internal_node);
-    total.text_ascii_replacement_runs_rejected_glyph_mapping +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_glyph_mapping);
-    total.text_layout_code_units += stats.text_layout_code_units;
-    total.text_layout_space_code_units += stats.text_layout_space_code_units;
-    total.text_layout_printable_ascii_code_units +=
-        stats.text_layout_printable_ascii_code_units;
-    total.text_layout_other_ascii_code_units += stats.text_layout_other_ascii_code_units;
-    total.text_layout_non_ascii_code_units   += stats.text_layout_non_ascii_code_units;
-    total.text_layout_plain_unclipped_code_units +=
-        stats.text_layout_plain_unclipped_code_units;
-    total.text_layout_all_space_plain_unclipped_code_units +=
-        stats.text_layout_all_space_plain_unclipped_code_units;
-    total.text_layout_printable_ascii_plain_unclipped_code_units +=
-        stats.text_layout_printable_ascii_plain_unclipped_code_units;
-    total.text_layout_non_ascii_plain_unclipped_code_units +=
-        stats.text_layout_non_ascii_plain_unclipped_code_units;
-    total.text_layout_fast_space_candidate_code_units +=
-        stats.text_layout_fast_space_candidate_code_units;
-    total.text_layout_fast_ascii_candidate_code_units +=
-        stats.text_layout_fast_ascii_candidate_code_units;
-    total.text_ascii_replacement_code_units_screened +=
-        stats.text_ascii_replacement_code_units_screened;
-    total.text_ascii_replacement_code_units_eligible +=
-        stats.text_ascii_replacement_code_units_eligible;
-    total.text_ascii_replacement_code_units_attempted +=
-        stats.text_ascii_replacement_code_units_attempted;
-    total.text_ascii_replacement_code_units_trusted_fast_path +=
-        stats.text_ascii_replacement_code_units_trusted_fast_path;
-    total.text_ascii_replacement_code_units_succeeded +=
-        stats.text_ascii_replacement_code_units_succeeded;
-    total.text_ascii_replacement_code_units_fallback +=
-        stats.text_ascii_replacement_code_units_fallback;
-    total.qsg_nodes_created    += static_cast<std::uint64_t>(stats.qsg_nodes_created);
-    total.qsg_nodes_replaced   += static_cast<std::uint64_t>(stats.qsg_nodes_replaced);
-    total.qsg_nodes_destroyed  += static_cast<std::uint64_t>(stats.qsg_nodes_destroyed);
-    total.background_qsg_nodes_created   +=
-        static_cast<std::uint64_t>(stats.background_qsg_nodes_created);
-    total.background_qsg_nodes_replaced  +=
-        static_cast<std::uint64_t>(stats.background_qsg_nodes_replaced);
-    total.background_qsg_nodes_destroyed +=
-        static_cast<std::uint64_t>(stats.background_qsg_nodes_destroyed);
-    total.text_groups_considered += static_cast<std::uint64_t>(stats.text_groups_considered);
-    total.text_groups_dirty      += static_cast<std::uint64_t>(stats.text_groups_dirty);
-    total.text_groups_clean      += static_cast<std::uint64_t>(stats.text_groups_clean);
-    total.text_clean_reuse_skips += static_cast<std::uint64_t>(stats.text_clean_reuse_skips);
-    total.text_resource_descriptor_builds +=
-        static_cast<std::uint64_t>(stats.text_resource_descriptor_builds);
-    total.text_resource_descriptor_builds_avoided +=
-        static_cast<std::uint64_t>(stats.text_resource_descriptor_builds_avoided);
-    total.text_resource_descriptor_reuses +=
-        static_cast<std::uint64_t>(stats.text_resource_descriptor_reuses);
-    total.text_key_builds       += static_cast<std::uint64_t>(stats.text_key_builds);
-    total.text_key_bytes        += stats.text_key_bytes;
-    total.rect_key_builds       += static_cast<std::uint64_t>(stats.rect_key_builds);
-    total.rect_key_bytes        += stats.rect_key_bytes;
-    total.cache_key_builds      += static_cast<std::uint64_t>(stats.cache_key_builds);
-    total.cache_key_bytes       += stats.cache_key_bytes;
-    total.text_dirty_row_ranges += static_cast<std::uint64_t>(stats.text_dirty_row_ranges);
-    total.text_dirty_rows       += static_cast<std::uint64_t>(stats.text_dirty_rows);
-    total.text_resource_dirty_row_probes +=
-        static_cast<std::uint64_t>(stats.text_resource_dirty_row_probes);
-    total.text_runs_considered  += static_cast<std::uint64_t>(stats.text_runs_considered);
-    total.text_coalescing_candidate_groups +=
-        static_cast<std::uint64_t>(stats.text_coalescing_candidate_groups);
-    total.text_coalescing_enabled_groups   +=
-        static_cast<std::uint64_t>(stats.text_coalescing_enabled_groups);
-    total.text_resource_rows_with_runs +=
-        static_cast<std::uint64_t>(stats.text_resource_rows_with_runs);
     total.text_resource_max_runs_after_coalescing_per_row = std::max(
         total.text_resource_max_runs_after_coalescing_per_row,
         static_cast<std::uint64_t>(stats.text_resource_max_runs_after_coalescing_per_row));
-    total.text_resource_runs_before_coalescing += static_cast<std::uint64_t>(
-        stats.text_resource_runs_before_coalescing);
-    total.text_resource_runs_after_coalescing +=
-        static_cast<std::uint64_t>(stats.text_resource_runs_after_coalescing);
-    total.text_dirty_descriptor_identical_rows +=
-        static_cast<std::uint64_t>(stats.text_dirty_descriptor_identical_rows);
-    total.text_key_match_reuses +=
-        static_cast<std::uint64_t>(stats.text_key_match_reuses);
-    total.text_dirty_rows_rebuilt +=
-        static_cast<std::uint64_t>(stats.text_dirty_rows_rebuilt);
-    total.text_clean_rows_rebuilt +=
-        static_cast<std::uint64_t>(stats.text_clean_rows_rebuilt);
-    total.rect_resource_rects_before_coalescing  += static_cast<std::uint64_t>(
-        stats.rect_resource_rects_before_coalescing);
-    total.rect_resource_rects_after_coalescing   += static_cast<std::uint64_t>(
-        stats.rect_resource_rects_after_coalescing);
-    total.background_row_rects_before_coalescing += static_cast<std::uint64_t>(
-        stats.background_row_rects_before_coalescing);
-    total.background_row_rects_after_coalescing  += static_cast<std::uint64_t>(
-        stats.background_row_rects_after_coalescing);
-    total.background_batched_rects +=
-        static_cast<std::uint64_t>(stats.background_batched_rects);
-    total.background_batched_vertices +=
-        static_cast<std::uint64_t>(stats.background_batched_vertices);
-    total.selection_batched_rects +=
-        static_cast<std::uint64_t>(stats.selection_batched_rects);
-    total.selection_batched_vertices +=
-        static_cast<std::uint64_t>(stats.selection_batched_vertices);
-    total.graphic_batched_rects +=
-        static_cast<std::uint64_t>(stats.graphic_batched_rects);
-    total.graphic_batched_vertices +=
-        static_cast<std::uint64_t>(stats.graphic_batched_vertices);
-    total.decoration_batched_rects +=
-        static_cast<std::uint64_t>(stats.decoration_batched_rects);
-    total.decoration_batched_vertices +=
-        static_cast<std::uint64_t>(stats.decoration_batched_vertices);
-    total.text_cache_entries_created       +=
-        static_cast<std::uint64_t>(stats.text_cache_entries_created);
-    total.text_cache_entries_replaced      +=
-        static_cast<std::uint64_t>(stats.text_cache_entries_replaced);
-    total.text_cache_entries_removed       +=
-        static_cast<std::uint64_t>(stats.text_cache_entries_removed);
-    total.frame_background_rects += static_cast<std::uint64_t>(stats.frame_background_rects);
-    total.frame_selection_rects  += static_cast<std::uint64_t>(stats.frame_selection_rects);
-    total.frame_graphic_rects    += static_cast<std::uint64_t>(stats.frame_graphic_rects);
-    total.frame_graphic_arcs     += static_cast<std::uint64_t>(stats.frame_graphic_arcs);
-    total.frame_text_runs        += static_cast<std::uint64_t>(stats.frame_text_runs);
-    total.frame_cursor_text_runs += static_cast<std::uint64_t>(stats.frame_cursor_text_runs);
-    total.frame_decorations      += static_cast<std::uint64_t>(stats.frame_decorations);
-    total.frame_cursors          += static_cast<std::uint64_t>(stats.frame_cursors);
-    total.frame_cursor_graphic_rects       +=
-        static_cast<std::uint64_t>(stats.frame_cursor_graphic_rects);
-    total.frame_cursor_graphic_arcs        +=
-        static_cast<std::uint64_t>(stats.frame_cursor_graphic_arcs);
-    total.frame_overlay_rects              += static_cast<std::uint64_t>(stats.frame_overlay_rects);
-    total.frame_dirty_row_ranges           +=
-        static_cast<std::uint64_t>(stats.frame_dirty_row_ranges);
-    total.frame_packed_rows                += static_cast<std::uint64_t>(stats.frame_packed_rows);
-    total.frame_packed_text_spans          +=
-        static_cast<std::uint64_t>(stats.frame_packed_text_spans);
-    total.frame_packed_text_cells          +=
-        static_cast<std::uint64_t>(stats.frame_packed_text_cells);
-    total.frame_packed_graphic_spans       +=
-        static_cast<std::uint64_t>(stats.frame_packed_graphic_spans);
-    total.frame_packed_graphic_cells       +=
-        static_cast<std::uint64_t>(stats.frame_packed_graphic_cells);
-    total.frame_packed_payload_bytes += stats.frame_packed_payload_bytes;
-    total.row_cache_hits             += static_cast<std::uint64_t>(stats.row_cache_hits);
-    total.row_cache_clean_skips            +=
-        static_cast<std::uint64_t>(stats.row_cache_clean_skips);
     total.text_wrapper_order_rebuilds   += count_from_bool(stats.text_wrapper_order_rebuilt);
     total.background_layer_rebuilds     += count_from_bool(stats.background_layer_rebuilt);
     total.selection_layer_rebuilds      += count_from_bool(stats.selection_layer_rebuilt);
@@ -8056,48 +7535,13 @@ void accumulate_renderer_stats(
     total.cursor_graphic_layer_rebuilds += count_from_bool(stats.cursor_graphic_layer_rebuilt);
     total.cursor_text_layer_rebuilds    += count_from_bool(stats.cursor_text_layer_rebuilt);
     total.overlay_layer_rebuilds        += count_from_bool(stats.overlay_layer_rebuilt);
-    total.background_rows_rebuilt       += static_cast<std::uint64_t>(stats.background_rows_rebuilt);
-    total.background_rows_reused        += static_cast<std::uint64_t>(stats.background_rows_reused);
-    total.background_row_clean_reuse_skips +=
-        static_cast<std::uint64_t>(stats.background_row_clean_reuse_skips);
-    total.background_rows_removed          += static_cast<std::uint64_t>(stats.background_rows_removed);
-    total.background_row_cache_fallbacks   +=
-        static_cast<std::uint64_t>(stats.background_row_cache_fallbacks);
-    total.selection_rows_rebuilt += static_cast<std::uint64_t>(stats.selection_rows_rebuilt);
-    total.selection_rows_reused  += static_cast<std::uint64_t>(stats.selection_rows_reused);
-    total.selection_row_clean_reuse_skips  +=
-        static_cast<std::uint64_t>(stats.selection_row_clean_reuse_skips);
-    total.selection_rows_removed           += static_cast<std::uint64_t>(stats.selection_rows_removed);
-    total.selection_row_cache_fallbacks    +=
-        static_cast<std::uint64_t>(stats.selection_row_cache_fallbacks);
-    total.decoration_rows_rebuilt += static_cast<std::uint64_t>(stats.decoration_rows_rebuilt);
-    total.decoration_rows_reused  += static_cast<std::uint64_t>(stats.decoration_rows_reused);
-    total.decoration_row_clean_reuse_skips +=
-        static_cast<std::uint64_t>(stats.decoration_row_clean_reuse_skips);
-    total.decoration_rows_removed          += static_cast<std::uint64_t>(stats.decoration_rows_removed);
-    total.decoration_row_cache_fallbacks   +=
-        static_cast<std::uint64_t>(stats.decoration_row_cache_fallbacks);
-    total.graphic_rect_rows_rebuilt        +=
-        static_cast<std::uint64_t>(stats.graphic_rect_rows_rebuilt);
-    total.graphic_rect_rows_reused         +=
-        static_cast<std::uint64_t>(stats.graphic_rect_rows_reused);
-    total.graphic_rect_row_clean_reuse_skips +=
-        static_cast<std::uint64_t>(stats.graphic_rect_row_clean_reuse_skips);
-    total.graphic_rect_rows_removed        +=
-        static_cast<std::uint64_t>(stats.graphic_rect_rows_removed);
-    total.graphic_rect_row_cache_fallbacks +=
-        static_cast<std::uint64_t>(stats.graphic_rect_row_cache_fallbacks);
-    total.graphic_arc_rows_rebuilt         +=
-        static_cast<std::uint64_t>(stats.graphic_arc_rows_rebuilt);
-    total.graphic_arc_rows_reused          +=
-        static_cast<std::uint64_t>(stats.graphic_arc_rows_reused);
-    total.graphic_arc_row_clean_reuse_skips +=
-        static_cast<std::uint64_t>(stats.graphic_arc_row_clean_reuse_skips);
-    total.graphic_arc_rows_removed         +=
-        static_cast<std::uint64_t>(stats.graphic_arc_rows_removed);
-    total.graphic_arc_row_cache_fallbacks  +=
-        static_cast<std::uint64_t>(stats.graphic_arc_row_cache_fallbacks);
+#define VNM_ACCUMULATE_FIELD(field) \
+    total.field += static_cast<std::uint64_t>(stats.field);
+    VNM_RENDERER_STATS_FIELDS(VNM_ACCUMULATE_FIELD)
+#undef VNM_ACCUMULATE_FIELD
 }
+
+#undef VNM_RENDERER_STATS_FIELDS
 
 }
 
@@ -8337,71 +7781,56 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
 
 namespace {
 
+// Per-field accumulation is pure boilerplate: total.<field> +=
+// static_cast<std::uint64_t>(stats.<field>) for every field. The X-macro
+// below lists the field names ONCE so the accumulate body cannot drift from
+// the struct. Field names are deliberately unchanged (a benchmark and tests
+// read them). static_cast is a no-op for fields that are already uint64_t.
+#define VNM_SIMPLE_CONTENT_STATS_FIELDS(X) \
+    X(cells_considered) \
+    X(eligible_cells) \
+    X(eligible_after_all_gates_cells) \
+    X(rows_with_eligible_cells) \
+    X(styles_with_eligible_cells) \
+    X(dirty_eligible_cells) \
+    X(clean_eligible_cells) \
+    X(text_category_empty_cells) \
+    X(text_category_printable_ascii_cells) \
+    X(text_category_other_ascii_cells) \
+    X(text_category_non_ascii_cells) \
+    X(route_none_cells) \
+    X(route_fast_text_cells) \
+    X(route_qt_text_layout_cells) \
+    X(route_graphic_geometry_cells) \
+    X(route_fallback_cells) \
+    X(rejection_none_cells) \
+    X(rejection_empty_text_cells) \
+    X(rejection_invalid_grid_cells) \
+    X(rejection_invalid_position_cells) \
+    X(rejection_invalid_style_id_cells) \
+    X(rejection_wide_continuation_cells) \
+    X(rejection_invalid_display_width_cells) \
+    X(rejection_invalid_text_encoding_cells) \
+    X(rejection_invalid_text_width_cells) \
+    X(rejection_multi_cell_text_cells) \
+    X(rejection_non_printable_ascii_cells) \
+    X(rejection_non_ascii_text_cells) \
+    X(rejection_decoration_cells) \
+    X(rejection_hyperlink_cells) \
+    X(rejection_terminal_graphic_cells) \
+    /**/
+
 void accumulate_simple_content_stats(
     terminal_simple_content_cumulative_stats_t&    total,
     const terminal_simple_content_stats_t&         stats)
 {
-    total.cells_considered += static_cast<std::uint64_t>(stats.cells_considered);
-    total.eligible_cells   += static_cast<std::uint64_t>(stats.eligible_cells);
-    total.eligible_after_all_gates_cells      +=
-        static_cast<std::uint64_t>(stats.eligible_after_all_gates_cells);
-    total.rows_with_eligible_cells            +=
-        static_cast<std::uint64_t>(stats.rows_with_eligible_cells);
-    total.styles_with_eligible_cells          +=
-        static_cast<std::uint64_t>(stats.styles_with_eligible_cells);
-    total.dirty_eligible_cells                +=
-        static_cast<std::uint64_t>(stats.dirty_eligible_cells);
-    total.clean_eligible_cells                +=
-        static_cast<std::uint64_t>(stats.clean_eligible_cells);
-    total.text_category_empty_cells           +=
-        static_cast<std::uint64_t>(stats.text_category_empty_cells);
-    total.text_category_printable_ascii_cells +=
-        static_cast<std::uint64_t>(stats.text_category_printable_ascii_cells);
-    total.text_category_other_ascii_cells     +=
-        static_cast<std::uint64_t>(stats.text_category_other_ascii_cells);
-    total.text_category_non_ascii_cells       +=
-        static_cast<std::uint64_t>(stats.text_category_non_ascii_cells);
-    total.route_none_cells                    +=
-        static_cast<std::uint64_t>(stats.route_none_cells);
-    total.route_fast_text_cells               +=
-        static_cast<std::uint64_t>(stats.route_fast_text_cells);
-    total.route_qt_text_layout_cells          +=
-        static_cast<std::uint64_t>(stats.route_qt_text_layout_cells);
-    total.route_graphic_geometry_cells        +=
-        static_cast<std::uint64_t>(stats.route_graphic_geometry_cells);
-    total.route_fallback_cells                +=
-        static_cast<std::uint64_t>(stats.route_fallback_cells);
-    total.rejection_none_cells                +=
-        static_cast<std::uint64_t>(stats.rejection_none_cells);
-    total.rejection_empty_text_cells          +=
-        static_cast<std::uint64_t>(stats.rejection_empty_text_cells);
-    total.rejection_invalid_grid_cells        +=
-        static_cast<std::uint64_t>(stats.rejection_invalid_grid_cells);
-    total.rejection_invalid_position_cells    +=
-        static_cast<std::uint64_t>(stats.rejection_invalid_position_cells);
-    total.rejection_invalid_style_id_cells    +=
-        static_cast<std::uint64_t>(stats.rejection_invalid_style_id_cells);
-    total.rejection_wide_continuation_cells   +=
-        static_cast<std::uint64_t>(stats.rejection_wide_continuation_cells);
-    total.rejection_invalid_display_width_cells += static_cast<std::uint64_t>(
-        stats.rejection_invalid_display_width_cells);
-    total.rejection_invalid_text_encoding_cells += static_cast<std::uint64_t>(
-        stats.rejection_invalid_text_encoding_cells);
-    total.rejection_invalid_text_width_cells  +=
-        static_cast<std::uint64_t>(stats.rejection_invalid_text_width_cells);
-    total.rejection_multi_cell_text_cells     +=
-        static_cast<std::uint64_t>(stats.rejection_multi_cell_text_cells);
-    total.rejection_non_printable_ascii_cells +=
-        static_cast<std::uint64_t>(stats.rejection_non_printable_ascii_cells);
-    total.rejection_non_ascii_text_cells      +=
-        static_cast<std::uint64_t>(stats.rejection_non_ascii_text_cells);
-    total.rejection_decoration_cells          +=
-        static_cast<std::uint64_t>(stats.rejection_decoration_cells);
-    total.rejection_hyperlink_cells           +=
-        static_cast<std::uint64_t>(stats.rejection_hyperlink_cells);
-    total.rejection_terminal_graphic_cells    +=
-        static_cast<std::uint64_t>(stats.rejection_terminal_graphic_cells);
+#define VNM_ACCUMULATE_FIELD(field) \
+    total.field += static_cast<std::uint64_t>(stats.field);
+    VNM_SIMPLE_CONTENT_STATS_FIELDS(VNM_ACCUMULATE_FIELD)
+#undef VNM_ACCUMULATE_FIELD
 }
+
+#undef VNM_SIMPLE_CONTENT_STATS_FIELDS
 
 void record_simple_content_text_category(
     terminal_simple_content_stats_t&       stats,
@@ -8701,12 +8130,6 @@ void stable_sort_terminal_render_cell_row_by_column(
     std::vector<const Terminal_render_cell*>& row_cells)
 {
     if (row_cells.size() <= 1U) {
-        return;
-    }
-
-    if (stage42_render_frame_sorted_row_sort_prefilter_enabled() &&
-        std::is_sorted(row_cells.begin(), row_cells.end(), terminal_render_cell_column_less))
-    {
         return;
     }
 
@@ -9211,8 +8634,6 @@ Terminal_render_frame build_terminal_render_frame(
                 0U);
         }
 
-        const bool                      cache_row_bookkeeping  =
-            stage42_render_cell_row_cache_enabled();
         int                             cached_row              = std::numeric_limits<int>::min();
         bool                            cached_valid_render_row = false;
         bool                            cached_dirty_row        = false;
@@ -9263,10 +8684,6 @@ Terminal_render_frame build_terminal_render_frame(
         Open_ascii_coalesce_run open_ascii_run;
         for (const Terminal_render_cell& cell : snapshot->cells) {
             ++frame.stats.cells_considered;
-            if (!cache_row_bookkeeping) {
-                update_cached_row_bookkeeping(cell);
-            }
-            else
             if (cell.position.row != cached_row) {
                 VNM_TERMINAL_PROFILE_SCOPE(
                     "build_terminal_render_frame::cells::row_bookkeeping");

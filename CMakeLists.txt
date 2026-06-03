@@ -64,7 +64,6 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/render_snapshot.h
     include/vnm_terminal/internal/selection_contract.h
     include/vnm_terminal/internal/session_contract.h
-    include/vnm_terminal/internal/stage42_feature_flags.h
     include/vnm_terminal/internal/terminal_canvas_fixture_contract.h
     include/vnm_terminal/internal/terminal_history_ring.h
     include/vnm_terminal/internal/terminal_history_row_record_codec.h
@@ -102,7 +101,6 @@ add_library(vnm_terminal_surface STATIC
     src/qt_grid_metrics_provider.cpp
     src/selection_contract.cpp
     src/session_contract.cpp
-    src/stage42_feature_flags.cpp
     src/unicode_width_tables.cpp
     src/viewport_contract.cpp
     src/vnm_terminal_font.cpp
