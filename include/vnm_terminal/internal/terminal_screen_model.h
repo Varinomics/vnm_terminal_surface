@@ -807,6 +807,14 @@ private:
     void delete_cells(
         int                            count);
 
+    void clear_wide_continuation_boundary(
+        std::vector<Cell>&             row,
+        int                            column);
+
+    void finalize_row_cell_mutation(
+        Terminal_screen_row&           screen_row,
+        const std::vector<Cell>&       before_cells);
+
     void insert_lines(
         int                            count);
 
@@ -917,6 +925,7 @@ private:
     void horizontal_tab();
     void mark_cursor_dirty();
     void mark_dirty(int row);
+    void mark_dirty_rows(int first, int last);
     void mark_terminal_content_changed();
     void mark_active_buffer_changed();
     void mark_grid_reflow_changed();

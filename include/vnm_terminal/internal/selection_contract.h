@@ -80,6 +80,10 @@ struct terminal_history_handle_t
     std::uint64_t              row_sequence       = 0U;
     std::uint32_t              record_bytes       = 0U;
     std::uint64_t              content_generation = 0U;
+
+    friend bool operator==(
+        const terminal_history_handle_t&,
+        const terminal_history_handle_t&) = default;
 };
 
 inline terminal_history_handle_t terminal_history_handle_from_retained_identity(
@@ -108,6 +112,10 @@ struct terminal_grid_position_t
 {
     int                        row    = 0;
     int                        column = 0;
+
+    friend bool operator==(
+        const terminal_grid_position_t&,
+        const terminal_grid_position_t&) = default;
 };
 
 struct Terminal_selection_range
@@ -115,12 +123,20 @@ struct Terminal_selection_range
     terminal_grid_position_t   start;
     terminal_grid_position_t   end;
     Terminal_selection_mode    mode   = Terminal_selection_mode::NORMAL;
+
+    friend bool operator==(
+        const Terminal_selection_range&,
+        const Terminal_selection_range&) = default;
 };
 
 struct terminal_selection_content_basis_t
 {
     std::uint64_t              content_generation     = 0U;
     std::uint64_t              grid_reflow_generation = 0U;
+
+    friend bool operator==(
+        const terminal_selection_content_basis_t&,
+        const terminal_selection_content_basis_t&) = default;
 };
 
 struct terminal_selection_source_identity_t
@@ -139,6 +155,10 @@ struct terminal_selection_line_lease_t
 {
     int                                row_offset         = 0;
     terminal_history_handle_t          history_handle;
+
+    friend bool operator==(
+        const terminal_selection_line_lease_t&,
+        const terminal_selection_line_lease_t&) = default;
 };
 
 struct terminal_selection_visual_lease_t
@@ -160,69 +180,6 @@ struct terminal_selection_visual_lease_t
                                        selected_lines;
 };
 
-inline bool operator==(
-    terminal_grid_position_t lhs,
-    terminal_grid_position_t rhs)
-{
-    return lhs.row == rhs.row && lhs.column == rhs.column;
-}
-
-inline bool operator!=(
-    terminal_grid_position_t lhs,
-    terminal_grid_position_t rhs)
-{
-    return !(lhs == rhs);
-}
-
-inline bool operator==(
-    const Terminal_selection_range& lhs,
-    const Terminal_selection_range& rhs)
-{
-    return lhs.start == rhs.start && lhs.end == rhs.end && lhs.mode == rhs.mode;
-}
-
-inline bool operator!=(
-    const Terminal_selection_range& lhs,
-    const Terminal_selection_range& rhs)
-{
-    return !(lhs == rhs);
-}
-
-inline bool operator==(
-    terminal_selection_content_basis_t lhs,
-    terminal_selection_content_basis_t rhs)
-{
-    return
-        lhs.content_generation     == rhs.content_generation &&
-        lhs.grid_reflow_generation == rhs.grid_reflow_generation;
-}
-
-inline bool operator!=(
-    terminal_selection_content_basis_t lhs,
-    terminal_selection_content_basis_t rhs)
-{
-    return !(lhs == rhs);
-}
-
-inline bool operator==(
-    terminal_history_handle_t lhs,
-    terminal_history_handle_t rhs)
-{
-    return
-        lhs.epoch              == rhs.epoch              &&
-        lhs.byte_sequence      == rhs.byte_sequence      &&
-        lhs.row_sequence       == rhs.row_sequence       &&
-        lhs.record_bytes       == rhs.record_bytes       &&
-        lhs.content_generation == rhs.content_generation;
-}
-
-inline bool operator!=(
-    terminal_history_handle_t lhs,
-    terminal_history_handle_t rhs)
-{
-    return !(lhs == rhs);
-}
-
 inline terminal_selection_line_lease_t terminal_selection_line_lease_from_retained_identity(
     int           row_offset,
     std::uint64_t retained_line_id,
@@ -232,22 +189,6 @@ inline terminal_selection_line_lease_t terminal_selection_line_lease_from_retain
         row_offset,
         terminal_history_handle_from_retained_identity(retained_line_id, content_generation),
     };
-}
-
-inline bool operator==(
-    terminal_selection_line_lease_t lhs,
-    terminal_selection_line_lease_t rhs)
-{
-    return
-        lhs.row_offset     == rhs.row_offset     &&
-        lhs.history_handle == rhs.history_handle;
-}
-
-inline bool operator!=(
-    terminal_selection_line_lease_t lhs,
-    terminal_selection_line_lease_t rhs)
-{
-    return !(lhs == rhs);
 }
 
 struct Terminal_selection_result
