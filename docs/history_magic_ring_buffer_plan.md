@@ -232,9 +232,11 @@ not a default convenience fallback — same reasoning as the renderer plan.
 
 - Capacity stays **byte-valued**; `aligned_capacity` rounds up to OS mapping granularity
   (page / 64 KiB). Crucially, **sub-granularity capacities are no longer mappable at all**
-  (not merely rounded): the current `tests/history_ring` tiny-capacity cases (e.g.
-  256/513/768-byte rings) must be re-baselined to page-multiple sizes, and capacity-exact
-  assertions must move to the rounded value.
+  (not merely rounded): the sub-page fixtures — `tests/history_ring` tiny-capacity cases
+  (the 256-byte-aligned `{513}`/`{512}` rings) **and** the `{2048, 2048}` rings in
+  `tests/history_row_record_codec` (the codec and traversal fixtures, which depend on a
+  physical wrap and first-row eviction within 2048 bytes) — must be re-baselined to
+  page-multiple capacities, and capacity-exact assertions must move to the rounded value.
 - The host's natural unit is **rows** (Windows Terminal exposes a history-line count).
   Mapping "N rows" → byte capacity (N × estimated bytes/row, granularity-rounded) is a
   higher-level concern and **out of scope** for the storage swap, but the magic ring
@@ -250,8 +252,12 @@ not a default convenience fallback — same reasoning as the renderer plan.
 Parity first, then the new primitive, then the zero-copy boundaries.
 
 - **Parity oracle:** `tests/history_ring`, `tests/history_row_record_codec`, plus the
-  history-traversal tests stay green unchanged through Stage 2; record bytes produced
-  for given inputs must be byte-identical to the current ring.
+  history-traversal tests are the oracle; record bytes produced for given inputs stay
+  byte-identical to the current ring. One mechanical, behavior-preserving exception at
+  the Stage-2 swap: fixtures that construct **sub-page-capacity** rings and depend on
+  exact capacity, wrap position, or eviction timing (see Capacity) are re-baselined to
+  page-multiple capacities in the same slice — the logical scenario and the encoded
+  bytes are unchanged, only the chosen capacity.
 - **Magic-buffer unit tests** (new, `tests/magic_ring_buffer` or folded into
   `history_ring`):
   - *Aliasing:* a write through `base[i]` is visible at `base[i + cap]` and vice-versa.
@@ -323,8 +329,9 @@ stage keeps the public ring contract and the existing tests green.
   cross-thread reader). If a future change adds an off-thread payload reader, zero-copy
   read is scoped to owner-thread sites only and that path keeps copying.
 - **Granularity-rounded capacity** changes the exact byte capacity, and sub-page
-  capacities become unmappable; the tiny-capacity ring tests must be re-baselined to
-  page-multiple sizes.
+  capacities become unmappable; the sub-page fixtures in both `tests/history_ring` and
+  `tests/history_row_record_codec` (the `{2048, 2048}` codec/traversal rings) must be
+  re-baselined to page-multiple sizes.
 - **Windows API floor** (VirtualAlloc2/MapViewOfFile3 → Win10 1803). State the floor;
   only add the legacy fallback if a target needs it.
 - **Address-space for the 2× reservation** is trivial for scrollback sizes on 64-bit;
