@@ -556,6 +556,7 @@ function(vnm_terminal_add_qsg_render_variant test_name stage42_environment_assig
             "${stage42_environment_assignment}"
             "$<TARGET_FILE:vnm_terminal_qsg_render>"
             "--software-renderer"
+            ${ARGN}
     )
 
     set_tests_properties(${test_name} PROPERTIES TIMEOUT 60)
@@ -592,10 +593,12 @@ vnm_terminal_add_qsg_render_text_replacement_variant(
 
 vnm_terminal_add_qsg_render_variant(
     vnm_terminal_qsg_render_descriptor_direct_compare_off
-    VNM_TERMINAL_STAGE42_QSG_TEXT_RESOURCE_DESCRIPTOR_DIRECT_COMPARE=0)
+    VNM_TERMINAL_STAGE42_QSG_TEXT_RESOURCE_DESCRIPTOR_DIRECT_COMPARE=0
+    "--text-descriptor-focused")
 vnm_terminal_add_qsg_render_variant(
     vnm_terminal_qsg_render_row_slot_ordered_lookup_off
-    VNM_TERMINAL_STAGE42_QSG_ROW_SLOT_ORDERED_LOOKUP=0)
+    VNM_TERMINAL_STAGE42_QSG_ROW_SLOT_ORDERED_LOOKUP=0
+    "--row-slot-focused")
 
 if(VNM_TERMINAL_ENABLE_MANUAL_QSG_FLAT_RECT_BATCHED_GEOMETRY_TEST)
     add_test(
@@ -1122,6 +1125,7 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_qt_posture>"
         "${CMAKE_COMMAND}"
         "${CMAKE_GENERATOR}"
+        "$<IF:$<BOOL:${CMAKE_MAKE_PROGRAM}>,${CMAKE_MAKE_PROGRAM},->"
         "${CMAKE_SOURCE_DIR}"
         "${CMAKE_BINARY_DIR}/qt_posture_cases"
 )
@@ -1421,39 +1425,21 @@ if(TARGET vnm_terminal_parser_libfuzzer)
     )
 endif()
 
-set(vnm_terminal_distribution_guard_configure_args
-    "-G" "${CMAKE_GENERATOR}"
-)
-
-if(NOT "${CMAKE_GENERATOR_PLATFORM}" STREQUAL "")
-    list(APPEND vnm_terminal_distribution_guard_configure_args
-        "-A" "${CMAKE_GENERATOR_PLATFORM}"
-    )
-endif()
-
-if(NOT "${CMAKE_GENERATOR_TOOLSET}" STREQUAL "")
-    list(APPEND vnm_terminal_distribution_guard_configure_args
-        "-T" "${CMAKE_GENERATOR_TOOLSET}"
-    )
-endif()
-
 add_test(
     NAME vnm_terminal_surface_rejects_distribution_transcript_build
     COMMAND
         "${CMAKE_COMMAND}"
-        ${vnm_terminal_distribution_guard_configure_args}
-        -S "${PROJECT_SOURCE_DIR}"
-        -B "${CMAKE_CURRENT_BINARY_DIR}/vnm_terminal_surface_distribution_guard"
-        -DVNM_TERMINAL_DISTRIBUTION_BUILD=ON
-        -DVNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON
-        -DVNM_TERMINAL_SURFACE_BUILD_TESTING=OFF
+        "-Dgenerator=${CMAKE_GENERATOR}"
+        "-Dgenerator_platform=${CMAKE_GENERATOR_PLATFORM}"
+        "-Dgenerator_toolset=${CMAKE_GENERATOR_TOOLSET}"
+        "-Dsource_dir=${PROJECT_SOURCE_DIR}"
+        "-Dbinary_dir=${CMAKE_CURRENT_BINARY_DIR}/vnm_terminal_surface_distribution_guard"
+        "-Dexpected_regex=VNM_TERMINAL_DISTRIBUTION_BUILD=ON requires"
+        -P "${PROJECT_SOURCE_DIR}/tools/expect_configure_failure.cmake"
 )
 
 set_tests_properties(vnm_terminal_surface_rejects_distribution_transcript_build PROPERTIES
-    PASS_REGULAR_EXPRESSION
-        "VNM_TERMINAL_DISTRIBUTION_BUILD=ON requires"
     TIMEOUT 30
-    WILL_FAIL TRUE
 )
 
 

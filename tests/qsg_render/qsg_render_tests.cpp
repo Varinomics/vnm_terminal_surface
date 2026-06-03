@@ -12802,6 +12802,10 @@ int main(int argc, char** argv)
         has_argument(argc, argv, "--geometry-row-slot-hardware");
     const bool text_replacement_focused_only =
         has_argument(argc, argv, "--text-replacement-focused");
+    const bool text_descriptor_focused_only =
+        has_argument(argc, argv, "--text-descriptor-focused");
+    const bool row_slot_focused_only =
+        has_argument(argc, argv, "--row-slot-focused");
     if (software_renderer) {
         QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
     }
@@ -12840,6 +12844,23 @@ int main(int argc, char** argv)
     if (text_replacement_focused_only) {
         ok &= test_qsg_ascii_replacement_trusted_fast_path_counters(app);
         ok &= test_qsg_text_leaf_content_reuse_on_replacement(app);
+        return ok ? 0 : 1;
+    }
+    if (text_descriptor_focused_only) {
+        ok &= test_qsg_text_resource_descriptor_dirty_reuse(app);
+        ok &= test_qsg_text_resource_descriptor_styled_ascii_reuse(app);
+        ok &= test_qsg_text_resource_descriptor_text_style_key_only_reuse(app);
+        ok &= test_qsg_text_resource_descriptor_complex_transitions(app);
+        ok &= test_qsg_text_resource_descriptor_keeps_cursor_text_separate(app);
+        ok &= test_qsg_text_resource_descriptor_rejects_preedit_and_clipped_rows(app);
+        ok &= test_qsg_text_resource_descriptor_rejects_mixed_identity_rows(app);
+        return ok ? 0 : 1;
+    }
+    if (row_slot_focused_only) {
+        ok &= test_qsg_geometry_row_slot_exact_content_descriptors(app);
+        ok &= test_qsg_text_row_slot_exact_content_descriptors(app);
+        ok &= test_qsg_text_row_slot_viewport_order_and_resize_cleanup(app);
+        ok &= test_qsg_text_row_slot_dirty_clean_skip_safety(app);
         return ok ? 0 : 1;
     }
 

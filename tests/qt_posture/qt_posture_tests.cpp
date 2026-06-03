@@ -59,20 +59,26 @@ std::string synthetic_project(
 Case_result run_case(
     const std::string& cmake_exe,
     const std::string& generator,
+    const std::string& make_program,
     const fs::path&    project_dir,
     const std::string& label)
 {
     const fs::path output_path = project_dir / (label + ".out");
     const fs::path build_dir   = project_dir / "build";
+    const std::string make_program_arg = make_program.empty() || make_program == "-"
+        ? std::string()
+        : " -DCMAKE_MAKE_PROGRAM=" + quote_for_command(make_program);
 
 #if defined(_WIN32)
     const std::string command = "cmd.exe /S /C \"\"" + cmake_exe + "\" -S " +
         quote_for_command(project_dir) + " -B " + quote_for_command(build_dir) +
-        " -G \"" + generator + "\" > " + quote_for_command(output_path) + " 2>&1\"";
+        " -G \"" + generator + "\"" + make_program_arg + " > " +
+        quote_for_command(output_path) + " 2>&1\"";
 #else
     const std::string command = quote_for_command(cmake_exe) + " -S " +
         quote_for_command(project_dir) + " -B " + quote_for_command(build_dir) +
-        " -G \"" + generator + "\" > " + quote_for_command(output_path) + " 2>&1";
+        " -G \"" + generator + "\"" + make_program_arg + " > " +
+        quote_for_command(output_path) + " 2>&1";
 #endif
 
     Case_result result;
@@ -110,15 +116,16 @@ bool expect_failure(
 
 int main(int argc, char** argv)
 {
-    if (argc != 5) {
-        std::cerr << "usage: qt_posture_tests <cmake> <generator> <repo-root> <work-dir>\n";
+    if (argc != 6) {
+        std::cerr << "usage: qt_posture_tests <cmake> <generator> <make-program> <repo-root> <work-dir>\n";
         return 2;
     }
 
     const std::string cmake_exe    = argv[1];
     const std::string generator    = argv[2];
-    const fs::path    repo_root    = argv[3];
-    const fs::path    work_dir     = argv[4];
+    const std::string make_program = argv[3];
+    const fs::path    repo_root    = argv[4];
+    const fs::path    work_dir     = argv[5];
     const fs::path    posture_file = repo_root / "cmake" / "vnm_terminal_qt_posture.cmake";
 
     fs::create_directories(work_dir);
@@ -143,7 +150,7 @@ int main(int argc, char** argv)
                     quick_type,
                     direct_targets,
                     extra_lines));
-            return run_case(cmake_exe, generator, project_dir, label);
+            return run_case(cmake_exe, generator, make_program, project_dir, label);
         };
 
     ok &= expect_success(
@@ -194,7 +201,7 @@ int main(int argc, char** argv)
             "target_link_libraries(example INTERFACE $<LINK_ONLY:Qt6::Network>)\n"
             "vnm_terminal_validate_qt_link_interface(example)\n"),
         "forbidden_genex_qt_module",
-        "Qt generator expression $<LINK_ONLY:Qt6::Network> is outside");
+        "Qt target Qt6::Network is outside the Qt module allowlist");
 
     ok &= expect_failure(
         run_script("static_lgpl", "lgpl_dynamic", "STATIC", "SHARED", "SHARED",

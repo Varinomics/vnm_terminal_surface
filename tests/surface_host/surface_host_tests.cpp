@@ -2054,8 +2054,8 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
             ok &= check(!expected_text.isEmpty() && expected_text.contains(anchor_text),
                 "scrollback-spanning copy shortcut selected_text includes offscreen text");
             ok &= check(selection_snapshot != nullptr &&
-                selection_snapshot->selection_spans.empty(),
-                "scrollback-spanning copy shortcut suppresses spans without full visible proof");
+                !selection_snapshot->selection_spans.empty(),
+                "scrollback-spanning copy shortcut publishes visible proven spans");
             ok &= check(selection_snapshot != nullptr &&
                 !snapshot_contains_text(*selection_snapshot, anchor_text),
                 "scrollback-spanning copy shortcut anchor text is outside the visible snapshot");
