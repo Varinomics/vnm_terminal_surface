@@ -263,6 +263,20 @@ private:
     Terminal_session_result process_resize_command(
         Terminal_session_command   command);
 
+    void finalize_resize_transaction(
+        const Terminal_resize_transaction&     resize,
+        std::uint64_t                          sequence,
+        QString                                message);
+
+    void publish_resize_outcome(
+        std::uint64_t                          sequence,
+        bool                                   render_snapshot_available,
+        bool                                   grid_size_changed,
+        bool                                   geometry_in_sync_condition,
+        const Terminal_screen_model_result&    model_result,
+        const Terminal_viewport_state&         previous_viewport,
+        terminal_grid_size_t                   previous_grid_size);
+
     Terminal_session_result process_interrupt_command(
         const Terminal_session_command&        command);
 
@@ -474,6 +488,13 @@ private:
         std::uint64_t                          sequence,
         Terminal_session_result_code           code,
         Terminal_backend_error                 error) const;
+
+    Terminal_session_result make_accepted_result(
+        std::uint64_t                          sequence) const;
+
+    Terminal_session_result make_backend_rejected_result(
+        std::uint64_t                          sequence,
+        std::optional<Terminal_backend_error>  error) const;
 
     std::uint64_t next_sequence();
     std::uint64_t next_resize_id();
