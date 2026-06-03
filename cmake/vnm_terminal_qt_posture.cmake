@@ -16,6 +16,7 @@ function(vnm_terminal_allowed_qt_link_targets out_var)
     vnm_terminal_allowed_qt_targets(public_qt_targets)
     set(${out_var}
         ${public_qt_targets}
+        Qt6::GuiPrivate
         Qt6::QuickPrivate
         PARENT_SCOPE)
 endfunction()

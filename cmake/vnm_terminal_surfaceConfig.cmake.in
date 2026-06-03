@@ -2,7 +2,24 @@
 
 include(CMakeFindDependencyMacro)
 
-find_dependency(Qt6 6.7 COMPONENTS Core Gui Quick QuickPrivate)
+set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR
+    "@VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR@")
+set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR
+    "@VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR@")
+
+find_dependency(Qt6
+    "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR}.${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR}"
+    COMPONENTS Core Gui Quick QuickPrivate GuiPrivate)
+
+if((NOT "${Qt6_VERSION_MAJOR}" STREQUAL "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR}") OR
+    (NOT "${Qt6_VERSION_MINOR}" STREQUAL "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR}"))
+    message(FATAL_ERROR
+        "vnm_terminal_surface was built against Qt "
+        "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR}."
+        "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR}.x private APIs, "
+        "but this consumer resolved Qt ${Qt6_VERSION}. Use the same Qt minor "
+        "or rebuild vnm_terminal_surface from source.")
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/vnm_terminal_surfaceTargets.cmake")
 

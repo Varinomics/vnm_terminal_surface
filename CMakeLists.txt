@@ -33,6 +33,9 @@ option(VNM_TERMINAL_SURFACE_BUILD_TESTING
 option(VNM_TERMINAL_BUILD_REQUIRED_READINESS "Build vnm_terminal_surface readiness validation gates" OFF)
 option(VNM_TERMINAL_BUILD_BENCHMARKS "Build vnm_terminal_surface benchmark executables" OFF)
 option(VNM_TERMINAL_ENABLE_PROFILING "Compile vnm_terminal_surface profile scope instrumentation" OFF)
+option(VNM_TERMINAL_ENABLE_SHADER_GENERATION
+    "Require Qt ShaderTools for source-tree shader package generation"
+    OFF)
 if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_BUILD_BENCHMARKS)
     set(VNM_TERMINAL_BUILD_BENCHMARKS ON)
 endif()
@@ -40,7 +43,19 @@ if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_ENABLE_PROFILING)
     set(VNM_TERMINAL_ENABLE_PROFILING ON)
 endif()
 
-find_package(Qt6 6.7 REQUIRED COMPONENTS Core Gui Quick QuickPrivate)
+set(vnm_terminal_qt_components
+    Core
+    Gui
+    Quick
+    QuickPrivate
+    GuiPrivate
+)
+
+if(VNM_TERMINAL_ENABLE_SHADER_GENERATION)
+    list(APPEND vnm_terminal_qt_components ShaderTools)
+endif()
+
+find_package(Qt6 6.7 REQUIRED COMPONENTS ${vnm_terminal_qt_components})
 include(cmake/vnm_terminal_qt_posture.cmake)
 
 set(vnm_terminal_qt_targets
@@ -52,6 +67,9 @@ set(vnm_terminal_qt_targets
 vnm_terminal_validate_qt_posture(DIRECT_TARGETS
     ${vnm_terminal_qt_targets}
 )
+
+set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR "${Qt6_VERSION_MAJOR}")
+set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR "${Qt6_VERSION_MINOR}")
 
 add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/backend_contract.h
@@ -148,6 +166,7 @@ target_link_libraries(vnm_terminal_surface PUBLIC
 )
 
 target_link_libraries(vnm_terminal_surface PRIVATE
+    Qt6::GuiPrivate
     Qt6::QuickPrivate
 )
 
