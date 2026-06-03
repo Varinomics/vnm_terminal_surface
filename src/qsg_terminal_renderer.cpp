@@ -1111,21 +1111,20 @@ private:
     std::map<QString, Ascii_text_coalescing_context> m_contexts;
 };
 
-struct row_rect_group_t
+// A row's worth of geometry primitives (rects or arcs) attributed to one
+// viewport row. The rect and arc variants were structurally identical apart
+// from the element type and member name, so they share one template.
+template <typename Element>
+struct row_element_group_t
 {
-    row_cache_identity_t              identity;
-    int                               viewport_row = 0;
-    qreal                             row_top      = 0.0;
-    std::vector<Terminal_render_rect> rects;
+    row_cache_identity_t   identity;
+    int                    viewport_row = 0;
+    qreal                  row_top      = 0.0;
+    std::vector<Element>   elements;
 };
 
-struct row_arc_group_t
-{
-    row_cache_identity_t             identity;
-    int                              viewport_row = 0;
-    qreal                            row_top      = 0.0;
-    std::vector<Terminal_render_arc> arcs;
-};
+using row_rect_group_t = row_element_group_t<Terminal_render_rect>;
+using row_arc_group_t  = row_element_group_t<Terminal_render_arc>;
 
 struct text_resource_run_t
 {
@@ -6145,26 +6144,39 @@ Terminal_rect_resource_node* make_rect_wrapper_node(
     return wrapper;
 }
 
-struct rect_layer_groups_t
+// Result of attributing geometry primitives (rects or arcs) to viewport rows.
+// frame_elements holds the primitives that could not be row-attributed (the
+// "frame" group); row_groups holds the per-row groups.
+template <typename Element>
+struct element_layer_groups_t
 {
-    std::vector<Terminal_render_rect>  frame_rects;
-    std::vector<row_rect_group_t>      row_groups;
-    bool                               needs_flat_fallback = false;
+    std::vector<Element>                       frame_elements;
+    std::vector<row_element_group_t<Element>>  row_groups;
+    bool                                       needs_flat_fallback = false;
 };
 
-rect_layer_groups_t rect_layer_groups(
-    const Terminal_render_frame&               frame,
-    const std::vector<Terminal_render_rect>&   rects,
-    bool                                       full_viewport_rect_is_frame)
+using rect_layer_groups_t = element_layer_groups_t<Terminal_render_rect>;
+using arc_layer_groups_t  = element_layer_groups_t<Terminal_render_arc>;
+
+// Group geometry primitives by viewport row, preserving exact grouping and
+// flat-fallback behavior. row_for(frame, element) returns the element's
+// viewport row, or std::nullopt to route it into the frame group. The rect and
+// arc paths differ only in element type and how the viewport row is computed,
+// so they share this one template.
+template <typename Element, typename RowForFn>
+element_layer_groups_t<Element> element_layer_groups(
+    const Terminal_render_frame&         frame,
+    const std::vector<Element>&          elements,
+    RowForFn&&                           row_for)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("rect_layer_groups");
+    VNM_TERMINAL_PROFILE_SCOPE("element_layer_groups");
 
     constexpr std::size_t k_missing_row_group_index =
         std::numeric_limits<std::size_t>::max();
 
-    rect_layer_groups_t groups;
+    element_layer_groups_t<Element> groups;
     groups.row_groups.reserve(std::min<std::size_t>(
-        rects.size(),
+        elements.size(),
         static_cast<std::size_t>(std::max(frame.grid_size.rows, 0))));
 
     std::vector<std::size_t> row_index_by_viewport_row(
@@ -6181,20 +6193,19 @@ rect_layer_groups_t rect_layer_groups(
         active_viewport_row.reset();
     };
 
-    bool saw_row_rect = false;
-    for (const Terminal_render_rect& rect : rects) {
-        const std::optional<int> viewport_row =
-            row_for_rect(frame, rect, full_viewport_rect_is_frame);
+    bool saw_row_element = false;
+    for (const Element& element : elements) {
+        const std::optional<int> viewport_row = row_for(frame, element);
         if (!viewport_row.has_value()) {
-            if (saw_row_rect) {
+            if (saw_row_element) {
                 groups.needs_flat_fallback = true;
             }
-            groups.frame_rects.push_back(rect);
+            groups.frame_elements.push_back(element);
             close_active_row();
             continue;
         }
 
-        saw_row_rect = true;
+        saw_row_element = true;
         if (!active_viewport_row.has_value() ||
             *active_viewport_row != *viewport_row)
         {
@@ -6216,12 +6227,12 @@ rect_layer_groups_t rect_layer_groups(
                 },
                 .viewport_row = *viewport_row,
                 .row_top      = row_top_for_viewport_row(*viewport_row, frame.cell_metrics),
-                .rects        = {},
+                .elements     = {},
             });
         }
 
-        row_rect_group_t& group = groups.row_groups[group_index];
-        group.rects.push_back(rect);
+        row_element_group_t<Element>& group = groups.row_groups[group_index];
+        group.elements.push_back(element);
     }
 
     return groups;
@@ -6250,84 +6261,32 @@ std::vector<Terminal_render_arc> row_local_arcs(
     return local_arcs;
 }
 
-struct arc_layer_groups_t
+// Rebuild a frame-group layer when its content key changes. The rect and arc
+// variants differed only in which append routine populated the layer, so they
+// now share this core helper; append_into_layer(QSGNode& layer) performs the
+// element-specific append.
+template <typename AppendFn>
+bool sync_frame_geometry_group(
+    QSGNode&                       frame_layer,
+    QByteArray&                    cached_key,
+    const QByteArray&              key,
+    AppendFn&&                     append_into_layer,
+    terminal_renderer_stats_t*     stats = nullptr)
 {
-    std::vector<Terminal_render_arc>   frame_arcs;
-    std::vector<row_arc_group_t>       row_groups;
-    bool                               needs_flat_fallback = false;
-};
-
-arc_layer_groups_t arc_layer_groups(
-    const Terminal_render_frame&               frame,
-    const std::vector<Terminal_render_arc>&    arcs)
-{
-    VNM_TERMINAL_PROFILE_SCOPE("arc_layer_groups");
-
-    constexpr std::size_t k_missing_row_group_index =
-        std::numeric_limits<std::size_t>::max();
-
-    arc_layer_groups_t groups;
-    groups.row_groups.reserve(std::min<std::size_t>(
-        arcs.size(),
-        static_cast<std::size_t>(std::max(frame.grid_size.rows, 0))));
-
-    std::vector<std::size_t> row_index_by_viewport_row(
-        static_cast<std::size_t>(std::max(frame.grid_size.rows, 0)),
-        k_missing_row_group_index);
-    std::vector<bool> closed_viewport_rows(row_index_by_viewport_row.size(), false);
-    std::optional<int> active_viewport_row;
-    const auto close_active_row = [&]() {
-        if (!active_viewport_row.has_value()) {
-            return;
-        }
-
-        closed_viewport_rows[static_cast<std::size_t>(*active_viewport_row)] = true;
-        active_viewport_row.reset();
-    };
-
-    bool saw_row_arc = false;
-    for (const Terminal_render_arc& arc : arcs) {
-        const std::optional<int> viewport_row = row_for_arc(frame, arc);
-        if (!viewport_row.has_value()) {
-            if (saw_row_arc) {
-                groups.needs_flat_fallback = true;
-            }
-            groups.frame_arcs.push_back(arc);
-            close_active_row();
-            continue;
-        }
-
-        saw_row_arc = true;
-        if (!active_viewport_row.has_value() ||
-            *active_viewport_row != *viewport_row)
-        {
-            close_active_row();
-            if (closed_viewport_rows[static_cast<std::size_t>(*viewport_row)]) {
-                groups.needs_flat_fallback = true;
-            }
-            active_viewport_row = *viewport_row;
-        }
-
-        std::size_t& group_index =
-            row_index_by_viewport_row[static_cast<std::size_t>(*viewport_row)];
-        if (group_index == k_missing_row_group_index) {
-            group_index = groups.row_groups.size();
-            groups.row_groups.push_back({
-                .identity     = {
-                    frame.viewport.active_buffer,
-                    logical_row_for_viewport_row(frame.viewport, *viewport_row),
-                },
-                .viewport_row = *viewport_row,
-                .row_top      = row_top_for_viewport_row(*viewport_row, frame.cell_metrics),
-                .arcs         = {},
-            });
-        }
-
-        row_arc_group_t& group = groups.row_groups[group_index];
-        group.arcs.push_back(arc);
+    if (cached_key == key) {
+        return false;
     }
 
-    return groups;
+    if (stats != nullptr) {
+        stats->qsg_nodes_destroyed += node_subtree_child_count(frame_layer);
+    }
+    clear_layer(frame_layer);
+    append_into_layer(frame_layer);
+    if (stats != nullptr) {
+        stats->qsg_nodes_created += node_subtree_child_count(frame_layer);
+    }
+    cached_key = key;
+    return true;
 }
 
 bool sync_frame_rect_group(
@@ -6339,42 +6298,18 @@ bool sync_frame_rect_group(
     qreal                                      device_pixel_ratio,
     terminal_renderer_stats_t*                 stats = nullptr)
 {
-    if (cached_key == key) {
-        return false;
-    }
-
-    if (stats != nullptr) {
-        stats->qsg_nodes_destroyed += node_subtree_child_count(frame_layer);
-    }
-    clear_layer(frame_layer);
-    append_graphic_nodes(
-        &frame_layer,
-        rects,
-        {},
-        use_software_graphic_fallback,
-        device_pixel_ratio);
-    if (stats != nullptr) {
-        stats->qsg_nodes_created += node_subtree_child_count(frame_layer);
-    }
-    cached_key = key;
-    return true;
-}
-
-bool sync_frame_rect_group(
-    QSGNode&                                   frame_layer,
-    QByteArray&                                cached_key,
-    const std::vector<Terminal_render_rect>&   rects,
-    bool                                       use_software_graphic_fallback,
-    qreal                                      device_pixel_ratio,
-    terminal_renderer_stats_t*                 stats = nullptr)
-{
-    return sync_frame_rect_group(
+    return sync_frame_geometry_group(
         frame_layer,
         cached_key,
-        rect_layer_key(rects, {}, use_software_graphic_fallback, device_pixel_ratio),
-        rects,
-        use_software_graphic_fallback,
-        device_pixel_ratio,
+        key,
+        [&](QSGNode& layer) {
+            append_graphic_nodes(
+                &layer,
+                rects,
+                {},
+                use_software_graphic_fallback,
+                device_pixel_ratio);
+        },
         stats);
 }
 
@@ -6387,41 +6322,17 @@ bool sync_frame_arc_group(
     qreal                                      device_pixel_ratio,
     terminal_renderer_stats_t*                 stats = nullptr)
 {
-    if (cached_key == key) {
-        return false;
-    }
-
-    if (stats != nullptr) {
-        stats->qsg_nodes_destroyed += node_subtree_child_count(frame_layer);
-    }
-    clear_layer(frame_layer);
-    append_arc_nodes(
-        &frame_layer,
-        arcs,
-        use_software_graphic_fallback,
-        device_pixel_ratio);
-    if (stats != nullptr) {
-        stats->qsg_nodes_created += node_subtree_child_count(frame_layer);
-    }
-    cached_key = key;
-    return true;
-}
-
-bool sync_frame_arc_group(
-    QSGNode&                                   frame_layer,
-    QByteArray&                                cached_key,
-    const std::vector<Terminal_render_arc>&    arcs,
-    bool                                       use_software_graphic_fallback,
-    qreal                                      device_pixel_ratio,
-    terminal_renderer_stats_t*                 stats = nullptr)
-{
-    return sync_frame_arc_group(
+    return sync_frame_geometry_group(
         frame_layer,
         cached_key,
-        rect_layer_key({}, arcs, use_software_graphic_fallback, device_pixel_ratio),
-        arcs,
-        use_software_graphic_fallback,
-        device_pixel_ratio,
+        key,
+        [&](QSGNode& layer) {
+            append_arc_nodes(
+                &layer,
+                arcs,
+                use_software_graphic_fallback,
+                device_pixel_ratio);
+        },
         stats);
 }
 
@@ -6731,8 +6642,12 @@ bool sync_batched_rect_row_layer(
     renderer_stat(stats, config.rows_removed)      = 0;
     renderer_stat(stats, config.cache_fallbacks)   = 0;
 
-    const rect_layer_groups_t groups =
-        rect_layer_groups(frame, rects, config.full_viewport_rect_is_frame);
+    const rect_layer_groups_t groups = element_layer_groups(
+        frame,
+        rects,
+        [&](const Terminal_render_frame& f, const Terminal_render_rect& rect) {
+            return row_for_rect(f, rect, config.full_viewport_rect_is_frame);
+        });
     const QByteArray current_layer_descriptor = geometry_row_layer_descriptor(
         current_layer_content_key,
         groups.row_groups);
@@ -6774,7 +6689,7 @@ bool sync_batched_rect_row_layer(
     }
 
     const std::vector<Terminal_render_rect> frame_group_rects =
-        rects_for_frame_group(frame_rects, groups.frame_rects);
+        rects_for_frame_group(frame_rects, groups.frame_elements);
     const QByteArray frame_group_key = rect_layer_key(
         frame_group_rects,
         {},
@@ -6795,15 +6710,15 @@ bool sync_batched_rect_row_layer(
     new_slots.reserve(groups.row_groups.size());
     for (const row_rect_group_t& group : groups.row_groups) {
         const std::vector<Terminal_render_rect> local_rects =
-            row_local_rects(group.rects, group.row_top);
+            row_local_rects(group.elements, group.row_top);
         stats.rect_resource_rects_before_coalescing +=
-            static_cast<int>(group.rects.size());
+            static_cast<int>(group.elements.size());
         stats.rect_resource_rects_after_coalescing +=
             static_cast<int>(local_rects.size());
         add_optional_renderer_stat(
             stats,
             config.row_rects_before_coalescing,
-            static_cast<int>(group.rects.size()));
+            static_cast<int>(group.elements.size()));
         add_optional_renderer_stat(
             stats,
             config.row_rects_after_coalescing,
@@ -7002,7 +6917,12 @@ bool sync_arc_row_layer(
     out_rows_removed      = 0;
     out_cache_fallbacks   = 0;
 
-    const arc_layer_groups_t groups = arc_layer_groups(frame, arcs);
+    const arc_layer_groups_t groups = element_layer_groups(
+        frame,
+        arcs,
+        [](const Terminal_render_frame& f, const Terminal_render_arc& arc) {
+            return row_for_arc(f, arc);
+        });
     const QByteArray current_layer_descriptor = geometry_row_layer_descriptor(
         current_layer_content_key,
         groups.row_groups);
@@ -7034,7 +6954,7 @@ bool sync_arc_row_layer(
 
     const QByteArray frame_group_key = rect_layer_key(
         {},
-        groups.frame_arcs,
+        groups.frame_elements,
         use_software_graphic_fallback,
         device_pixel_ratio);
     record_rect_cache_key_build(stats, frame_group_key);
@@ -7042,7 +6962,7 @@ bool sync_arc_row_layer(
         frame_layer,
         frame_key,
         frame_group_key,
-        groups.frame_arcs,
+        groups.frame_elements,
         use_software_graphic_fallback,
         device_pixel_ratio,
         &stats);
@@ -7052,7 +6972,7 @@ bool sync_arc_row_layer(
     new_slots.reserve(groups.row_groups.size());
     for (const row_arc_group_t& group : groups.row_groups) {
         const std::vector<Terminal_render_arc> local_arcs =
-            row_local_arcs(group.arcs, group.row_top);
+            row_local_arcs(group.elements, group.row_top);
         const QByteArray key = rect_layer_key(
             {},
             local_arcs,
@@ -7341,347 +7261,263 @@ void accumulate_simple_content_stats(
     terminal_simple_content_cumulative_stats_t&    total,
     const terminal_simple_content_stats_t&         stats);
 
+// Field-list X-macro (see accumulate_simple_content_stats for rationale).
+// simple_content is a nested struct accumulated separately below.
+#define VNM_RENDER_FRAME_STATS_FIELDS(X) \
+    X(visible_rows) \
+    X(dirty_rows) \
+    X(full_dirty_rows) \
+    X(cell_pass_input_cells) \
+    X(cell_pass_classification_calls) \
+    X(packed_pass_input_cells) \
+    X(packed_pass_cells_scanned) \
+    X(packed_pass_classification_calls) \
+    X(packed_text_sidecars_enabled) \
+    X(packed_text_sidecars_disabled) \
+    X(packed_text_disabled_cells_skipped) \
+    X(packed_graphic_candidates_classified) \
+    X(packed_cells_appended) \
+    X(dirty_row_lookup_count) \
+    X(cells_considered) \
+    X(cells_skipped_invalid) \
+    X(cells_skipped_wide_continuation) \
+    X(cells_rendered) \
+    X(text_cells_empty) \
+    X(text_cells_rendered_as_text) \
+    X(text_cells_rendered_as_graphic) \
+    X(text_cells_printable_ascii) \
+    X(text_cells_other_ascii) \
+    X(text_cells_non_ascii) \
+    X(text_cells_simple_ascii) \
+    X(text_cells_single_width) \
+    X(text_cells_multi_width) \
+    X(text_cells_with_decorations) \
+    X(text_cells_with_hyperlink) \
+    X(text_style_changes) \
+    X(text_distinct_styles) \
+    X(background_rects_emitted) \
+    X(selection_rects_emitted) \
+    X(graphic_rects_emitted) \
+    X(graphic_arcs_emitted) \
+    X(text_runs_emitted) \
+    X(cursor_text_runs_emitted) \
+    X(decoration_rects_emitted) \
+    X(cursor_rects_emitted) \
+    X(cursor_graphic_rects_emitted) \
+    X(cursor_graphic_arcs_emitted) \
+    X(overlay_rects_emitted) \
+    X(packed_rows) \
+    X(packed_text_spans) \
+    X(packed_text_cells) \
+    X(packed_graphic_spans) \
+    X(packed_graphic_cells) \
+    X(packed_payload_bytes) \
+    /**/
+
 void accumulate_frame_stats(
     terminal_render_frame_cumulative_stats_t&      total,
     const terminal_render_frame_stats_t&           stats)
 {
     accumulate_simple_content_stats(total.simple_content, stats.simple_content);
-    total.visible_rows          += static_cast<std::uint64_t>(stats.visible_rows);
-    total.dirty_rows            += static_cast<std::uint64_t>(stats.dirty_rows);
-    total.full_dirty_rows       += static_cast<std::uint64_t>(stats.full_dirty_rows);
-    total.cell_pass_input_cells += static_cast<std::uint64_t>(stats.cell_pass_input_cells);
-    total.cell_pass_classification_calls +=
-        static_cast<std::uint64_t>(stats.cell_pass_classification_calls);
-    total.packed_pass_input_cells += static_cast<std::uint64_t>(stats.packed_pass_input_cells);
-    total.packed_pass_cells_scanned +=
-        static_cast<std::uint64_t>(stats.packed_pass_cells_scanned);
-    total.packed_pass_classification_calls +=
-        static_cast<std::uint64_t>(stats.packed_pass_classification_calls);
-    total.packed_text_sidecars_enabled +=
-        static_cast<std::uint64_t>(stats.packed_text_sidecars_enabled);
-    total.packed_text_sidecars_disabled +=
-        static_cast<std::uint64_t>(stats.packed_text_sidecars_disabled);
-    total.packed_text_disabled_cells_skipped +=
-        static_cast<std::uint64_t>(stats.packed_text_disabled_cells_skipped);
-    total.packed_graphic_candidates_classified +=
-        static_cast<std::uint64_t>(stats.packed_graphic_candidates_classified);
-    total.packed_cells_appended +=
-        static_cast<std::uint64_t>(stats.packed_cells_appended);
-    total.dirty_row_lookup_count += static_cast<std::uint64_t>(stats.dirty_row_lookup_count);
-    total.cells_considered      += static_cast<std::uint64_t>(stats.cells_considered);
-    total.cells_skipped_invalid += static_cast<std::uint64_t>(stats.cells_skipped_invalid);
-    total.cells_skipped_wide_continuation +=
-        static_cast<std::uint64_t>(stats.cells_skipped_wide_continuation);
-    total.cells_rendered   += static_cast<std::uint64_t>(stats.cells_rendered);
-    total.text_cells_empty += static_cast<std::uint64_t>(stats.text_cells_empty);
-    total.text_cells_rendered_as_text     +=
-        static_cast<std::uint64_t>(stats.text_cells_rendered_as_text);
-    total.text_cells_rendered_as_graphic  +=
-        static_cast<std::uint64_t>(stats.text_cells_rendered_as_graphic);
-    total.text_cells_printable_ascii      +=
-        static_cast<std::uint64_t>(stats.text_cells_printable_ascii);
-    total.text_cells_other_ascii          +=
-        static_cast<std::uint64_t>(stats.text_cells_other_ascii);
-    total.text_cells_non_ascii            +=
-        static_cast<std::uint64_t>(stats.text_cells_non_ascii);
-    total.text_cells_simple_ascii         +=
-        static_cast<std::uint64_t>(stats.text_cells_simple_ascii);
-    total.text_cells_single_width         +=
-        static_cast<std::uint64_t>(stats.text_cells_single_width);
-    total.text_cells_multi_width          +=
-        static_cast<std::uint64_t>(stats.text_cells_multi_width);
-    total.text_cells_with_decorations     +=
-        static_cast<std::uint64_t>(stats.text_cells_with_decorations);
-    total.text_cells_with_hyperlink       +=
-        static_cast<std::uint64_t>(stats.text_cells_with_hyperlink);
-    total.text_style_changes   += static_cast<std::uint64_t>(stats.text_style_changes);
-    total.text_distinct_styles += static_cast<std::uint64_t>(stats.text_distinct_styles);
-    total.background_rects_emitted        +=
-        static_cast<std::uint64_t>(stats.background_rects_emitted);
-    total.selection_rects_emitted         +=
-        static_cast<std::uint64_t>(stats.selection_rects_emitted);
-    total.graphic_rects_emitted           +=
-        static_cast<std::uint64_t>(stats.graphic_rects_emitted);
-    total.graphic_arcs_emitted            +=
-        static_cast<std::uint64_t>(stats.graphic_arcs_emitted);
-    total.text_runs_emitted               += static_cast<std::uint64_t>(stats.text_runs_emitted);
-    total.cursor_text_runs_emitted        +=
-        static_cast<std::uint64_t>(stats.cursor_text_runs_emitted);
-    total.decoration_rects_emitted        +=
-        static_cast<std::uint64_t>(stats.decoration_rects_emitted);
-    total.cursor_rects_emitted            += static_cast<std::uint64_t>(stats.cursor_rects_emitted);
-    total.cursor_graphic_rects_emitted    +=
-        static_cast<std::uint64_t>(stats.cursor_graphic_rects_emitted);
-    total.cursor_graphic_arcs_emitted     +=
-        static_cast<std::uint64_t>(stats.cursor_graphic_arcs_emitted);
-    total.overlay_rects_emitted += static_cast<std::uint64_t>(stats.overlay_rects_emitted);
-    total.packed_rows           += static_cast<std::uint64_t>(stats.packed_rows);
-    total.packed_text_spans     += static_cast<std::uint64_t>(stats.packed_text_spans);
-    total.packed_text_cells     += static_cast<std::uint64_t>(stats.packed_text_cells);
-    total.packed_graphic_spans            +=
-        static_cast<std::uint64_t>(stats.packed_graphic_spans);
-    total.packed_graphic_cells            +=
-        static_cast<std::uint64_t>(stats.packed_graphic_cells);
-    total.packed_payload_bytes            += stats.packed_payload_bytes;
+#define VNM_ACCUMULATE_FIELD(field) \
+    total.field += static_cast<std::uint64_t>(stats.field);
+    VNM_RENDER_FRAME_STATS_FIELDS(VNM_ACCUMULATE_FIELD)
+#undef VNM_ACCUMULATE_FIELD
 }
+
+#undef VNM_RENDER_FRAME_STATS_FIELDS
+
+// Field-list X-macro (see accumulate_simple_content_stats for rationale).
+// Fields needing non-trivial handling are excluded and written by hand in
+// the function body.
+#define VNM_RENDERER_STATS_FIELDS(X) \
+    X(text_content_rebuilds) \
+    X(text_content_reused) \
+    X(text_content_removed) \
+    X(text_content_failures) \
+    X(text_leaf_nodes_created) \
+    X(text_leaf_nodes_reused) \
+    X(text_cache_entry_child_nodes_cleared_for_replacement) \
+    X(text_cache_entry_child_nodes_cleared_for_removal) \
+    X(route_fast_text_cells) \
+    X(route_qt_text_layout_runs) \
+    X(route_graphic_geometry_cells) \
+    X(route_fallback_cells) \
+    X(qt_text_layout_calls) \
+    X(text_layout_runs_single_code_unit) \
+    X(text_layout_runs_multi_code_unit) \
+    X(text_layout_runs_all_space) \
+    X(text_layout_runs_printable_ascii) \
+    X(text_layout_runs_printable_ascii_with_space) \
+    X(text_layout_runs_other_ascii) \
+    X(text_layout_runs_non_ascii) \
+    X(text_layout_runs_clipped) \
+    X(text_layout_runs_ascii_layout_font) \
+    X(text_layout_runs_force_blended_order) \
+    X(text_layout_runs_with_hyperlink) \
+    X(text_layout_runs_with_decoration) \
+    X(text_layout_runs_mixed_ascii_non_ascii) \
+    X(text_layout_runs_pure_non_ascii) \
+    X(text_layout_runs_plain_unclipped) \
+    X(text_layout_runs_plain_unclipped_ascii_font) \
+    X(text_layout_runs_all_space_plain_unclipped) \
+    X(text_layout_runs_printable_ascii_plain_unclipped) \
+    X(text_layout_runs_non_ascii_plain_unclipped) \
+    X(text_layout_runs_mixed_ascii_non_ascii_plain_unclipped) \
+    X(text_layout_runs_pure_non_ascii_plain_unclipped) \
+    X(text_layout_runs_fast_space_candidate) \
+    X(text_layout_runs_fast_ascii_candidate) \
+    X(text_layout_runs_fast_ascii_no_space_candidate) \
+    X(text_layout_runs_fast_ascii_single_candidate) \
+    X(text_layout_runs_fast_ascii_multi_candidate) \
+    X(text_ascii_replacement_runs_screened) \
+    X(text_ascii_replacement_runs_eligible) \
+    X(text_ascii_replacement_runs_attempted) \
+    X(text_ascii_replacement_runs_trusted_fast_path) \
+    X(text_ascii_replacement_runs_succeeded) \
+    X(text_ascii_replacement_runs_all_space_succeeded) \
+    X(text_ascii_replacement_add_glyphs_calls) \
+    X(text_ascii_replacement_runs_fallback) \
+    X(text_ascii_replacement_runs_rejected_clipped) \
+    X(text_ascii_replacement_runs_rejected_force_blended_order) \
+    X(text_ascii_replacement_runs_rejected_decoration) \
+    X(text_ascii_replacement_runs_rejected_hyperlink) \
+    X(text_ascii_replacement_runs_rejected_non_printable_ascii) \
+    X(text_ascii_replacement_runs_rejected_non_ascii) \
+    X(text_ascii_replacement_runs_rejected_geometry) \
+    X(text_ascii_replacement_runs_rejected_unsupported_font) \
+    X(text_ascii_replacement_runs_rejected_internal_node) \
+    X(text_ascii_replacement_runs_rejected_glyph_mapping) \
+    X(text_layout_code_units) \
+    X(text_layout_space_code_units) \
+    X(text_layout_printable_ascii_code_units) \
+    X(text_layout_other_ascii_code_units) \
+    X(text_layout_non_ascii_code_units) \
+    X(text_layout_plain_unclipped_code_units) \
+    X(text_layout_all_space_plain_unclipped_code_units) \
+    X(text_layout_printable_ascii_plain_unclipped_code_units) \
+    X(text_layout_non_ascii_plain_unclipped_code_units) \
+    X(text_layout_fast_space_candidate_code_units) \
+    X(text_layout_fast_ascii_candidate_code_units) \
+    X(text_ascii_replacement_code_units_screened) \
+    X(text_ascii_replacement_code_units_eligible) \
+    X(text_ascii_replacement_code_units_attempted) \
+    X(text_ascii_replacement_code_units_trusted_fast_path) \
+    X(text_ascii_replacement_code_units_succeeded) \
+    X(text_ascii_replacement_code_units_fallback) \
+    X(qsg_nodes_created) \
+    X(qsg_nodes_replaced) \
+    X(qsg_nodes_destroyed) \
+    X(background_qsg_nodes_created) \
+    X(background_qsg_nodes_replaced) \
+    X(background_qsg_nodes_destroyed) \
+    X(text_groups_considered) \
+    X(text_groups_dirty) \
+    X(text_groups_clean) \
+    X(text_clean_reuse_skips) \
+    X(text_resource_descriptor_builds) \
+    X(text_resource_descriptor_builds_avoided) \
+    X(text_resource_descriptor_reuses) \
+    X(text_key_builds) \
+    X(text_key_bytes) \
+    X(rect_key_builds) \
+    X(rect_key_bytes) \
+    X(cache_key_builds) \
+    X(cache_key_bytes) \
+    X(text_dirty_row_ranges) \
+    X(text_dirty_rows) \
+    X(text_resource_dirty_row_probes) \
+    X(text_runs_considered) \
+    X(text_coalescing_candidate_groups) \
+    X(text_coalescing_enabled_groups) \
+    X(text_resource_rows_with_runs) \
+    X(text_resource_runs_before_coalescing) \
+    X(text_resource_runs_after_coalescing) \
+    X(text_dirty_descriptor_identical_rows) \
+    X(text_key_match_reuses) \
+    X(text_dirty_rows_rebuilt) \
+    X(text_clean_rows_rebuilt) \
+    X(rect_resource_rects_before_coalescing) \
+    X(rect_resource_rects_after_coalescing) \
+    X(background_row_rects_before_coalescing) \
+    X(background_row_rects_after_coalescing) \
+    X(background_batched_rects) \
+    X(background_batched_vertices) \
+    X(selection_batched_rects) \
+    X(selection_batched_vertices) \
+    X(graphic_batched_rects) \
+    X(graphic_batched_vertices) \
+    X(decoration_batched_rects) \
+    X(decoration_batched_vertices) \
+    X(text_cache_entries_created) \
+    X(text_cache_entries_replaced) \
+    X(text_cache_entries_removed) \
+    X(frame_background_rects) \
+    X(frame_selection_rects) \
+    X(frame_graphic_rects) \
+    X(frame_graphic_arcs) \
+    X(frame_text_runs) \
+    X(frame_cursor_text_runs) \
+    X(frame_decorations) \
+    X(frame_cursors) \
+    X(frame_cursor_graphic_rects) \
+    X(frame_cursor_graphic_arcs) \
+    X(frame_overlay_rects) \
+    X(frame_dirty_row_ranges) \
+    X(frame_packed_rows) \
+    X(frame_packed_text_spans) \
+    X(frame_packed_text_cells) \
+    X(frame_packed_graphic_spans) \
+    X(frame_packed_graphic_cells) \
+    X(frame_packed_payload_bytes) \
+    X(row_cache_hits) \
+    X(row_cache_clean_skips) \
+    X(background_rows_rebuilt) \
+    X(background_rows_reused) \
+    X(background_row_clean_reuse_skips) \
+    X(background_rows_removed) \
+    X(background_row_cache_fallbacks) \
+    X(selection_rows_rebuilt) \
+    X(selection_rows_reused) \
+    X(selection_row_clean_reuse_skips) \
+    X(selection_rows_removed) \
+    X(selection_row_cache_fallbacks) \
+    X(decoration_rows_rebuilt) \
+    X(decoration_rows_reused) \
+    X(decoration_row_clean_reuse_skips) \
+    X(decoration_rows_removed) \
+    X(decoration_row_cache_fallbacks) \
+    X(graphic_rect_rows_rebuilt) \
+    X(graphic_rect_rows_reused) \
+    X(graphic_rect_row_clean_reuse_skips) \
+    X(graphic_rect_rows_removed) \
+    X(graphic_rect_row_cache_fallbacks) \
+    X(graphic_arc_rows_rebuilt) \
+    X(graphic_arc_rows_reused) \
+    X(graphic_arc_row_clean_reuse_skips) \
+    X(graphic_arc_rows_removed) \
+    X(graphic_arc_row_cache_fallbacks) \
+    /**/
 
 void accumulate_renderer_stats(
     terminal_renderer_cumulative_stats_t&  total,
     const terminal_renderer_stats_t&       stats)
 {
+    // Fields touched specially (different src/dst name, std::max, or a
+    // nested sub-struct) are written by hand; the remaining pure
+    // total.<field> += static_cast<std::uint64_t>(stats.<field>) fields are
+    // generated from the X-macro below. Every field is written exactly once,
+    // so the relative order of these two groups does not matter.
     ++total.frames_published;
     total.paint_completed_frames += count_from_bool(stats.paint_completed);
     total.root_reused_frames     += count_from_bool(stats.root_reused);
     accumulate_frame_stats(total.frame, stats.frame);
-    total.text_content_rebuilds   += static_cast<std::uint64_t>(stats.text_content_rebuilds);
-    total.text_content_reused     += static_cast<std::uint64_t>(stats.text_content_reused);
-    total.text_content_removed    += static_cast<std::uint64_t>(stats.text_content_removed);
-    total.text_content_failures   += static_cast<std::uint64_t>(stats.text_content_failures);
-    total.text_leaf_nodes_created += static_cast<std::uint64_t>(stats.text_leaf_nodes_created);
-    total.text_leaf_nodes_reused  += static_cast<std::uint64_t>(stats.text_leaf_nodes_reused);
-    total.text_cache_entry_child_nodes_cleared_for_replacement += static_cast<std::uint64_t>(
-        stats.text_cache_entry_child_nodes_cleared_for_replacement);
-    total.text_cache_entry_child_nodes_cleared_for_removal += static_cast<std::uint64_t>(
-        stats.text_cache_entry_child_nodes_cleared_for_removal);
-    total.text_cache_entry_max_child_nodes_cleared  = std::max(
+    total.text_cache_entry_max_child_nodes_cleared = std::max(
         total.text_cache_entry_max_child_nodes_cleared,
         static_cast<std::uint64_t>(stats.text_cache_entry_max_child_nodes_cleared));
-    total.route_fast_text_cells                    += static_cast<std::uint64_t>(stats.route_fast_text_cells);
-    total.route_qt_text_layout_runs      +=
-        static_cast<std::uint64_t>(stats.route_qt_text_layout_runs);
-    total.route_graphic_geometry_cells   +=
-        static_cast<std::uint64_t>(stats.route_graphic_geometry_cells);
-    total.route_fallback_cells += static_cast<std::uint64_t>(stats.route_fallback_cells);
-    total.qt_text_layout_calls += static_cast<std::uint64_t>(stats.qt_text_layout_calls);
-    total.text_layout_runs_single_code_unit +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_single_code_unit);
-    total.text_layout_runs_multi_code_unit +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_multi_code_unit);
-    total.text_layout_runs_all_space +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_all_space);
-    total.text_layout_runs_printable_ascii +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii);
-    total.text_layout_runs_printable_ascii_with_space +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii_with_space);
-    total.text_layout_runs_other_ascii +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_other_ascii);
-    total.text_layout_runs_non_ascii +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_non_ascii);
-    total.text_layout_runs_clipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_clipped);
-    total.text_layout_runs_ascii_layout_font +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_ascii_layout_font);
-    total.text_layout_runs_force_blended_order +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_force_blended_order);
-    total.text_layout_runs_with_hyperlink +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_with_hyperlink);
-    total.text_layout_runs_with_decoration +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_with_decoration);
-    total.text_layout_runs_mixed_ascii_non_ascii +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_mixed_ascii_non_ascii);
-    total.text_layout_runs_pure_non_ascii +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_pure_non_ascii);
-    total.text_layout_runs_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_plain_unclipped);
-    total.text_layout_runs_plain_unclipped_ascii_font +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_plain_unclipped_ascii_font);
-    total.text_layout_runs_all_space_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_all_space_plain_unclipped);
-    total.text_layout_runs_printable_ascii_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii_plain_unclipped);
-    total.text_layout_runs_non_ascii_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_non_ascii_plain_unclipped);
-    total.text_layout_runs_mixed_ascii_non_ascii_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_mixed_ascii_non_ascii_plain_unclipped);
-    total.text_layout_runs_pure_non_ascii_plain_unclipped +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_pure_non_ascii_plain_unclipped);
-    total.text_layout_runs_fast_space_candidate +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_space_candidate);
-    total.text_layout_runs_fast_ascii_candidate +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_candidate);
-    total.text_layout_runs_fast_ascii_no_space_candidate +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_no_space_candidate);
-    total.text_layout_runs_fast_ascii_single_candidate +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_single_candidate);
-    total.text_layout_runs_fast_ascii_multi_candidate +=
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_multi_candidate);
-    total.text_ascii_replacement_runs_screened +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_screened);
-    total.text_ascii_replacement_runs_eligible +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_eligible);
-    total.text_ascii_replacement_runs_attempted +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_attempted);
-    total.text_ascii_replacement_runs_trusted_fast_path +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_trusted_fast_path);
-    total.text_ascii_replacement_runs_succeeded +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_succeeded);
-    total.text_ascii_replacement_runs_all_space_succeeded +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_all_space_succeeded);
-    total.text_ascii_replacement_add_glyphs_calls +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_add_glyphs_calls);
-    total.text_ascii_replacement_runs_fallback +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_fallback);
-    total.text_ascii_replacement_runs_rejected_clipped +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_clipped);
-    total.text_ascii_replacement_runs_rejected_force_blended_order +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_force_blended_order);
-    total.text_ascii_replacement_runs_rejected_decoration +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_decoration);
-    total.text_ascii_replacement_runs_rejected_hyperlink +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_hyperlink);
-    total.text_ascii_replacement_runs_rejected_non_printable_ascii +=
-        static_cast<std::uint64_t>(
-            stats.text_ascii_replacement_runs_rejected_non_printable_ascii);
-    total.text_ascii_replacement_runs_rejected_non_ascii +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_non_ascii);
-    total.text_ascii_replacement_runs_rejected_geometry +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_geometry);
-    total.text_ascii_replacement_runs_rejected_unsupported_font +=
-        static_cast<std::uint64_t>(
-            stats.text_ascii_replacement_runs_rejected_unsupported_font);
-    total.text_ascii_replacement_runs_rejected_internal_node +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_internal_node);
-    total.text_ascii_replacement_runs_rejected_glyph_mapping +=
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_glyph_mapping);
-    total.text_layout_code_units += stats.text_layout_code_units;
-    total.text_layout_space_code_units += stats.text_layout_space_code_units;
-    total.text_layout_printable_ascii_code_units +=
-        stats.text_layout_printable_ascii_code_units;
-    total.text_layout_other_ascii_code_units += stats.text_layout_other_ascii_code_units;
-    total.text_layout_non_ascii_code_units   += stats.text_layout_non_ascii_code_units;
-    total.text_layout_plain_unclipped_code_units +=
-        stats.text_layout_plain_unclipped_code_units;
-    total.text_layout_all_space_plain_unclipped_code_units +=
-        stats.text_layout_all_space_plain_unclipped_code_units;
-    total.text_layout_printable_ascii_plain_unclipped_code_units +=
-        stats.text_layout_printable_ascii_plain_unclipped_code_units;
-    total.text_layout_non_ascii_plain_unclipped_code_units +=
-        stats.text_layout_non_ascii_plain_unclipped_code_units;
-    total.text_layout_fast_space_candidate_code_units +=
-        stats.text_layout_fast_space_candidate_code_units;
-    total.text_layout_fast_ascii_candidate_code_units +=
-        stats.text_layout_fast_ascii_candidate_code_units;
-    total.text_ascii_replacement_code_units_screened +=
-        stats.text_ascii_replacement_code_units_screened;
-    total.text_ascii_replacement_code_units_eligible +=
-        stats.text_ascii_replacement_code_units_eligible;
-    total.text_ascii_replacement_code_units_attempted +=
-        stats.text_ascii_replacement_code_units_attempted;
-    total.text_ascii_replacement_code_units_trusted_fast_path +=
-        stats.text_ascii_replacement_code_units_trusted_fast_path;
-    total.text_ascii_replacement_code_units_succeeded +=
-        stats.text_ascii_replacement_code_units_succeeded;
-    total.text_ascii_replacement_code_units_fallback +=
-        stats.text_ascii_replacement_code_units_fallback;
-    total.qsg_nodes_created    += static_cast<std::uint64_t>(stats.qsg_nodes_created);
-    total.qsg_nodes_replaced   += static_cast<std::uint64_t>(stats.qsg_nodes_replaced);
-    total.qsg_nodes_destroyed  += static_cast<std::uint64_t>(stats.qsg_nodes_destroyed);
-    total.background_qsg_nodes_created   +=
-        static_cast<std::uint64_t>(stats.background_qsg_nodes_created);
-    total.background_qsg_nodes_replaced  +=
-        static_cast<std::uint64_t>(stats.background_qsg_nodes_replaced);
-    total.background_qsg_nodes_destroyed +=
-        static_cast<std::uint64_t>(stats.background_qsg_nodes_destroyed);
-    total.text_groups_considered += static_cast<std::uint64_t>(stats.text_groups_considered);
-    total.text_groups_dirty      += static_cast<std::uint64_t>(stats.text_groups_dirty);
-    total.text_groups_clean      += static_cast<std::uint64_t>(stats.text_groups_clean);
-    total.text_clean_reuse_skips += static_cast<std::uint64_t>(stats.text_clean_reuse_skips);
-    total.text_resource_descriptor_builds +=
-        static_cast<std::uint64_t>(stats.text_resource_descriptor_builds);
-    total.text_resource_descriptor_builds_avoided +=
-        static_cast<std::uint64_t>(stats.text_resource_descriptor_builds_avoided);
-    total.text_resource_descriptor_reuses +=
-        static_cast<std::uint64_t>(stats.text_resource_descriptor_reuses);
-    total.text_key_builds       += static_cast<std::uint64_t>(stats.text_key_builds);
-    total.text_key_bytes        += stats.text_key_bytes;
-    total.rect_key_builds       += static_cast<std::uint64_t>(stats.rect_key_builds);
-    total.rect_key_bytes        += stats.rect_key_bytes;
-    total.cache_key_builds      += static_cast<std::uint64_t>(stats.cache_key_builds);
-    total.cache_key_bytes       += stats.cache_key_bytes;
-    total.text_dirty_row_ranges += static_cast<std::uint64_t>(stats.text_dirty_row_ranges);
-    total.text_dirty_rows       += static_cast<std::uint64_t>(stats.text_dirty_rows);
-    total.text_resource_dirty_row_probes +=
-        static_cast<std::uint64_t>(stats.text_resource_dirty_row_probes);
-    total.text_runs_considered  += static_cast<std::uint64_t>(stats.text_runs_considered);
-    total.text_coalescing_candidate_groups +=
-        static_cast<std::uint64_t>(stats.text_coalescing_candidate_groups);
-    total.text_coalescing_enabled_groups   +=
-        static_cast<std::uint64_t>(stats.text_coalescing_enabled_groups);
-    total.text_resource_rows_with_runs +=
-        static_cast<std::uint64_t>(stats.text_resource_rows_with_runs);
     total.text_resource_max_runs_after_coalescing_per_row = std::max(
         total.text_resource_max_runs_after_coalescing_per_row,
         static_cast<std::uint64_t>(stats.text_resource_max_runs_after_coalescing_per_row));
-    total.text_resource_runs_before_coalescing += static_cast<std::uint64_t>(
-        stats.text_resource_runs_before_coalescing);
-    total.text_resource_runs_after_coalescing +=
-        static_cast<std::uint64_t>(stats.text_resource_runs_after_coalescing);
-    total.text_dirty_descriptor_identical_rows +=
-        static_cast<std::uint64_t>(stats.text_dirty_descriptor_identical_rows);
-    total.text_key_match_reuses +=
-        static_cast<std::uint64_t>(stats.text_key_match_reuses);
-    total.text_dirty_rows_rebuilt +=
-        static_cast<std::uint64_t>(stats.text_dirty_rows_rebuilt);
-    total.text_clean_rows_rebuilt +=
-        static_cast<std::uint64_t>(stats.text_clean_rows_rebuilt);
-    total.rect_resource_rects_before_coalescing  += static_cast<std::uint64_t>(
-        stats.rect_resource_rects_before_coalescing);
-    total.rect_resource_rects_after_coalescing   += static_cast<std::uint64_t>(
-        stats.rect_resource_rects_after_coalescing);
-    total.background_row_rects_before_coalescing += static_cast<std::uint64_t>(
-        stats.background_row_rects_before_coalescing);
-    total.background_row_rects_after_coalescing  += static_cast<std::uint64_t>(
-        stats.background_row_rects_after_coalescing);
-    total.background_batched_rects +=
-        static_cast<std::uint64_t>(stats.background_batched_rects);
-    total.background_batched_vertices +=
-        static_cast<std::uint64_t>(stats.background_batched_vertices);
-    total.selection_batched_rects +=
-        static_cast<std::uint64_t>(stats.selection_batched_rects);
-    total.selection_batched_vertices +=
-        static_cast<std::uint64_t>(stats.selection_batched_vertices);
-    total.graphic_batched_rects +=
-        static_cast<std::uint64_t>(stats.graphic_batched_rects);
-    total.graphic_batched_vertices +=
-        static_cast<std::uint64_t>(stats.graphic_batched_vertices);
-    total.decoration_batched_rects +=
-        static_cast<std::uint64_t>(stats.decoration_batched_rects);
-    total.decoration_batched_vertices +=
-        static_cast<std::uint64_t>(stats.decoration_batched_vertices);
-    total.text_cache_entries_created       +=
-        static_cast<std::uint64_t>(stats.text_cache_entries_created);
-    total.text_cache_entries_replaced      +=
-        static_cast<std::uint64_t>(stats.text_cache_entries_replaced);
-    total.text_cache_entries_removed       +=
-        static_cast<std::uint64_t>(stats.text_cache_entries_removed);
-    total.frame_background_rects += static_cast<std::uint64_t>(stats.frame_background_rects);
-    total.frame_selection_rects  += static_cast<std::uint64_t>(stats.frame_selection_rects);
-    total.frame_graphic_rects    += static_cast<std::uint64_t>(stats.frame_graphic_rects);
-    total.frame_graphic_arcs     += static_cast<std::uint64_t>(stats.frame_graphic_arcs);
-    total.frame_text_runs        += static_cast<std::uint64_t>(stats.frame_text_runs);
-    total.frame_cursor_text_runs += static_cast<std::uint64_t>(stats.frame_cursor_text_runs);
-    total.frame_decorations      += static_cast<std::uint64_t>(stats.frame_decorations);
-    total.frame_cursors          += static_cast<std::uint64_t>(stats.frame_cursors);
-    total.frame_cursor_graphic_rects       +=
-        static_cast<std::uint64_t>(stats.frame_cursor_graphic_rects);
-    total.frame_cursor_graphic_arcs        +=
-        static_cast<std::uint64_t>(stats.frame_cursor_graphic_arcs);
-    total.frame_overlay_rects              += static_cast<std::uint64_t>(stats.frame_overlay_rects);
-    total.frame_dirty_row_ranges           +=
-        static_cast<std::uint64_t>(stats.frame_dirty_row_ranges);
-    total.frame_packed_rows                += static_cast<std::uint64_t>(stats.frame_packed_rows);
-    total.frame_packed_text_spans          +=
-        static_cast<std::uint64_t>(stats.frame_packed_text_spans);
-    total.frame_packed_text_cells          +=
-        static_cast<std::uint64_t>(stats.frame_packed_text_cells);
-    total.frame_packed_graphic_spans       +=
-        static_cast<std::uint64_t>(stats.frame_packed_graphic_spans);
-    total.frame_packed_graphic_cells       +=
-        static_cast<std::uint64_t>(stats.frame_packed_graphic_cells);
-    total.frame_packed_payload_bytes += stats.frame_packed_payload_bytes;
-    total.row_cache_hits             += static_cast<std::uint64_t>(stats.row_cache_hits);
-    total.row_cache_clean_skips            +=
-        static_cast<std::uint64_t>(stats.row_cache_clean_skips);
     total.text_wrapper_order_rebuilds   += count_from_bool(stats.text_wrapper_order_rebuilt);
     total.background_layer_rebuilds     += count_from_bool(stats.background_layer_rebuilt);
     total.selection_layer_rebuilds      += count_from_bool(stats.selection_layer_rebuilt);
@@ -7691,48 +7527,13 @@ void accumulate_renderer_stats(
     total.cursor_graphic_layer_rebuilds += count_from_bool(stats.cursor_graphic_layer_rebuilt);
     total.cursor_text_layer_rebuilds    += count_from_bool(stats.cursor_text_layer_rebuilt);
     total.overlay_layer_rebuilds        += count_from_bool(stats.overlay_layer_rebuilt);
-    total.background_rows_rebuilt       += static_cast<std::uint64_t>(stats.background_rows_rebuilt);
-    total.background_rows_reused        += static_cast<std::uint64_t>(stats.background_rows_reused);
-    total.background_row_clean_reuse_skips +=
-        static_cast<std::uint64_t>(stats.background_row_clean_reuse_skips);
-    total.background_rows_removed          += static_cast<std::uint64_t>(stats.background_rows_removed);
-    total.background_row_cache_fallbacks   +=
-        static_cast<std::uint64_t>(stats.background_row_cache_fallbacks);
-    total.selection_rows_rebuilt += static_cast<std::uint64_t>(stats.selection_rows_rebuilt);
-    total.selection_rows_reused  += static_cast<std::uint64_t>(stats.selection_rows_reused);
-    total.selection_row_clean_reuse_skips  +=
-        static_cast<std::uint64_t>(stats.selection_row_clean_reuse_skips);
-    total.selection_rows_removed           += static_cast<std::uint64_t>(stats.selection_rows_removed);
-    total.selection_row_cache_fallbacks    +=
-        static_cast<std::uint64_t>(stats.selection_row_cache_fallbacks);
-    total.decoration_rows_rebuilt += static_cast<std::uint64_t>(stats.decoration_rows_rebuilt);
-    total.decoration_rows_reused  += static_cast<std::uint64_t>(stats.decoration_rows_reused);
-    total.decoration_row_clean_reuse_skips +=
-        static_cast<std::uint64_t>(stats.decoration_row_clean_reuse_skips);
-    total.decoration_rows_removed          += static_cast<std::uint64_t>(stats.decoration_rows_removed);
-    total.decoration_row_cache_fallbacks   +=
-        static_cast<std::uint64_t>(stats.decoration_row_cache_fallbacks);
-    total.graphic_rect_rows_rebuilt        +=
-        static_cast<std::uint64_t>(stats.graphic_rect_rows_rebuilt);
-    total.graphic_rect_rows_reused         +=
-        static_cast<std::uint64_t>(stats.graphic_rect_rows_reused);
-    total.graphic_rect_row_clean_reuse_skips +=
-        static_cast<std::uint64_t>(stats.graphic_rect_row_clean_reuse_skips);
-    total.graphic_rect_rows_removed        +=
-        static_cast<std::uint64_t>(stats.graphic_rect_rows_removed);
-    total.graphic_rect_row_cache_fallbacks +=
-        static_cast<std::uint64_t>(stats.graphic_rect_row_cache_fallbacks);
-    total.graphic_arc_rows_rebuilt         +=
-        static_cast<std::uint64_t>(stats.graphic_arc_rows_rebuilt);
-    total.graphic_arc_rows_reused          +=
-        static_cast<std::uint64_t>(stats.graphic_arc_rows_reused);
-    total.graphic_arc_row_clean_reuse_skips +=
-        static_cast<std::uint64_t>(stats.graphic_arc_row_clean_reuse_skips);
-    total.graphic_arc_rows_removed         +=
-        static_cast<std::uint64_t>(stats.graphic_arc_rows_removed);
-    total.graphic_arc_row_cache_fallbacks  +=
-        static_cast<std::uint64_t>(stats.graphic_arc_row_cache_fallbacks);
+#define VNM_ACCUMULATE_FIELD(field) \
+    total.field += static_cast<std::uint64_t>(stats.field);
+    VNM_RENDERER_STATS_FIELDS(VNM_ACCUMULATE_FIELD)
+#undef VNM_ACCUMULATE_FIELD
 }
+
+#undef VNM_RENDERER_STATS_FIELDS
 
 }
 
@@ -7972,71 +7773,56 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
 
 namespace {
 
+// Per-field accumulation is pure boilerplate: total.<field> +=
+// static_cast<std::uint64_t>(stats.<field>) for every field. The X-macro
+// below lists the field names ONCE so the accumulate body cannot drift from
+// the struct. Field names are deliberately unchanged (a benchmark and tests
+// read them). static_cast is a no-op for fields that are already uint64_t.
+#define VNM_SIMPLE_CONTENT_STATS_FIELDS(X) \
+    X(cells_considered) \
+    X(eligible_cells) \
+    X(eligible_after_all_gates_cells) \
+    X(rows_with_eligible_cells) \
+    X(styles_with_eligible_cells) \
+    X(dirty_eligible_cells) \
+    X(clean_eligible_cells) \
+    X(text_category_empty_cells) \
+    X(text_category_printable_ascii_cells) \
+    X(text_category_other_ascii_cells) \
+    X(text_category_non_ascii_cells) \
+    X(route_none_cells) \
+    X(route_fast_text_cells) \
+    X(route_qt_text_layout_cells) \
+    X(route_graphic_geometry_cells) \
+    X(route_fallback_cells) \
+    X(rejection_none_cells) \
+    X(rejection_empty_text_cells) \
+    X(rejection_invalid_grid_cells) \
+    X(rejection_invalid_position_cells) \
+    X(rejection_invalid_style_id_cells) \
+    X(rejection_wide_continuation_cells) \
+    X(rejection_invalid_display_width_cells) \
+    X(rejection_invalid_text_encoding_cells) \
+    X(rejection_invalid_text_width_cells) \
+    X(rejection_multi_cell_text_cells) \
+    X(rejection_non_printable_ascii_cells) \
+    X(rejection_non_ascii_text_cells) \
+    X(rejection_decoration_cells) \
+    X(rejection_hyperlink_cells) \
+    X(rejection_terminal_graphic_cells) \
+    /**/
+
 void accumulate_simple_content_stats(
     terminal_simple_content_cumulative_stats_t&    total,
     const terminal_simple_content_stats_t&         stats)
 {
-    total.cells_considered += static_cast<std::uint64_t>(stats.cells_considered);
-    total.eligible_cells   += static_cast<std::uint64_t>(stats.eligible_cells);
-    total.eligible_after_all_gates_cells      +=
-        static_cast<std::uint64_t>(stats.eligible_after_all_gates_cells);
-    total.rows_with_eligible_cells            +=
-        static_cast<std::uint64_t>(stats.rows_with_eligible_cells);
-    total.styles_with_eligible_cells          +=
-        static_cast<std::uint64_t>(stats.styles_with_eligible_cells);
-    total.dirty_eligible_cells                +=
-        static_cast<std::uint64_t>(stats.dirty_eligible_cells);
-    total.clean_eligible_cells                +=
-        static_cast<std::uint64_t>(stats.clean_eligible_cells);
-    total.text_category_empty_cells           +=
-        static_cast<std::uint64_t>(stats.text_category_empty_cells);
-    total.text_category_printable_ascii_cells +=
-        static_cast<std::uint64_t>(stats.text_category_printable_ascii_cells);
-    total.text_category_other_ascii_cells     +=
-        static_cast<std::uint64_t>(stats.text_category_other_ascii_cells);
-    total.text_category_non_ascii_cells       +=
-        static_cast<std::uint64_t>(stats.text_category_non_ascii_cells);
-    total.route_none_cells                    +=
-        static_cast<std::uint64_t>(stats.route_none_cells);
-    total.route_fast_text_cells               +=
-        static_cast<std::uint64_t>(stats.route_fast_text_cells);
-    total.route_qt_text_layout_cells          +=
-        static_cast<std::uint64_t>(stats.route_qt_text_layout_cells);
-    total.route_graphic_geometry_cells        +=
-        static_cast<std::uint64_t>(stats.route_graphic_geometry_cells);
-    total.route_fallback_cells                +=
-        static_cast<std::uint64_t>(stats.route_fallback_cells);
-    total.rejection_none_cells                +=
-        static_cast<std::uint64_t>(stats.rejection_none_cells);
-    total.rejection_empty_text_cells          +=
-        static_cast<std::uint64_t>(stats.rejection_empty_text_cells);
-    total.rejection_invalid_grid_cells        +=
-        static_cast<std::uint64_t>(stats.rejection_invalid_grid_cells);
-    total.rejection_invalid_position_cells    +=
-        static_cast<std::uint64_t>(stats.rejection_invalid_position_cells);
-    total.rejection_invalid_style_id_cells    +=
-        static_cast<std::uint64_t>(stats.rejection_invalid_style_id_cells);
-    total.rejection_wide_continuation_cells   +=
-        static_cast<std::uint64_t>(stats.rejection_wide_continuation_cells);
-    total.rejection_invalid_display_width_cells += static_cast<std::uint64_t>(
-        stats.rejection_invalid_display_width_cells);
-    total.rejection_invalid_text_encoding_cells += static_cast<std::uint64_t>(
-        stats.rejection_invalid_text_encoding_cells);
-    total.rejection_invalid_text_width_cells  +=
-        static_cast<std::uint64_t>(stats.rejection_invalid_text_width_cells);
-    total.rejection_multi_cell_text_cells     +=
-        static_cast<std::uint64_t>(stats.rejection_multi_cell_text_cells);
-    total.rejection_non_printable_ascii_cells +=
-        static_cast<std::uint64_t>(stats.rejection_non_printable_ascii_cells);
-    total.rejection_non_ascii_text_cells      +=
-        static_cast<std::uint64_t>(stats.rejection_non_ascii_text_cells);
-    total.rejection_decoration_cells          +=
-        static_cast<std::uint64_t>(stats.rejection_decoration_cells);
-    total.rejection_hyperlink_cells           +=
-        static_cast<std::uint64_t>(stats.rejection_hyperlink_cells);
-    total.rejection_terminal_graphic_cells    +=
-        static_cast<std::uint64_t>(stats.rejection_terminal_graphic_cells);
+#define VNM_ACCUMULATE_FIELD(field) \
+    total.field += static_cast<std::uint64_t>(stats.field);
+    VNM_SIMPLE_CONTENT_STATS_FIELDS(VNM_ACCUMULATE_FIELD)
+#undef VNM_ACCUMULATE_FIELD
 }
+
+#undef VNM_SIMPLE_CONTENT_STATS_FIELDS
 
 void record_simple_content_text_category(
     terminal_simple_content_stats_t&       stats,
