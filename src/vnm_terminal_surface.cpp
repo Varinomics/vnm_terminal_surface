@@ -5474,6 +5474,16 @@ term::VNM_TerminalSurface_render_bridge::session_profile_stats(
         : term::Terminal_session_profile_stats{};
 }
 
+void term::VNM_TerminalSurface_render_bridge::set_session_profile_stats_enabled_for_benchmark(
+    VNM_TerminalSurface&   surface,
+    bool                   enabled)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    if (surface.m_private->session != nullptr) {
+        surface.m_private->session->set_profile_stats_enabled(enabled);
+    }
+}
+
 void term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(
     VNM_TerminalSurface&               surface,
     bool                               visible)

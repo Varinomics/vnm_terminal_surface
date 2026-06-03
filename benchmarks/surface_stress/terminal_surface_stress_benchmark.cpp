@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -16,30 +17,60 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
+enum class Text_pattern
+{
+    LEGACY_ASCII_BLOCK,
+    ASCII,
+    BLOCK,
+    BOX,
+    CJK,
+    MIXED_NON_ASCII,
+    EMOJI,
+};
+
 struct Benchmark_options
 {
-    int frames         = 180;
-    int warmup_frames  = 10;
-    int rows           = 235;
-    int columns        = 873;
-    int dirty_rows     = 235;
+    int frames           = 180;
+    int warmup_frames    = 10;
+    int rows             = 235;
+    int columns          = 873;
+    int dirty_rows       = 235;
     int dirty_row_stride = 1;
-    int graphics_every = 11;
-    int style_period   = 8;
+    int graphics_every   = 11;
+    int style_period     = 8;
+    Text_pattern text_pattern = Text_pattern::LEGACY_ASCII_BLOCK;
     bool packed_text_sidecars_enabled = false;
+    bool model_profile_stats_enabled  = false;
 };
 
 struct Benchmark_totals
 {
     std::uint64_t snapshot_cells = 0U;
     std::uint64_t snapshot_dirty_rows_visible = 0U;
+    term::terminal_simple_content_cumulative_stats_t simple_content;
     std::uint64_t frame_cell_pass_input_cells = 0U;
+    std::uint64_t frame_cell_pass_classification_calls = 0U;
+    std::uint64_t frame_packed_pass_input_cells = 0U;
     std::uint64_t frame_dirty_row_lookup_count = 0U;
     std::uint64_t frame_dirty_row_range_lookup_count = 0U;
     std::uint64_t frame_dirty_row_range_scan_steps = 0U;
     std::uint64_t frame_packed_pass_cells_scanned = 0U;
+    std::uint64_t frame_packed_pass_classification_calls = 0U;
+    std::uint64_t frame_packed_text_sidecars_enabled = 0U;
+    std::uint64_t frame_packed_text_sidecars_disabled = 0U;
+    std::uint64_t frame_packed_text_disabled_cells_skipped = 0U;
+    std::uint64_t frame_packed_graphic_candidates_classified = 0U;
+    std::uint64_t frame_packed_cells_appended = 0U;
+    std::uint64_t frame_compact_ascii_text_direct_appends = 0U;
+    std::uint64_t frame_compact_ascii_qstring_materializations = 0U;
     std::uint64_t frame_text_runs_emitted = 0U;
     std::uint64_t frame_graphic_rects_emitted = 0U;
+    std::uint64_t frame_packed_text_cells = 0U;
+    std::uint64_t frame_packed_text_ascii_direct_cells = 0U;
+    std::uint64_t frame_packed_text_ascii_direct_bytes = 0U;
+    std::uint64_t frame_packed_text_utf8_cells = 0U;
+    std::uint64_t frame_packed_text_utf8_input_units = 0U;
+    std::uint64_t frame_packed_text_utf8_output_bytes = 0U;
     std::uint64_t frame_packed_graphic_cells = 0U;
     std::uint64_t checksum = 0U;
 };
@@ -67,6 +98,52 @@ int dirty_row_range_scan_steps(const Stats& stats)
 double elapsed_ms(Clock::time_point begin, Clock::time_point end)
 {
     return std::chrono::duration<double, std::milli>(end - begin).count();
+}
+
+QString text_pattern_name(Text_pattern pattern)
+{
+    switch (pattern) {
+        case Text_pattern::LEGACY_ASCII_BLOCK:
+            return QStringLiteral("legacy_ascii_block");
+        case Text_pattern::ASCII:
+            return QStringLiteral("ascii");
+        case Text_pattern::BLOCK:
+            return QStringLiteral("block");
+        case Text_pattern::BOX:
+            return QStringLiteral("box");
+        case Text_pattern::CJK:
+            return QStringLiteral("cjk");
+        case Text_pattern::MIXED_NON_ASCII:
+            return QStringLiteral("mixed_non_ascii");
+        case Text_pattern::EMOJI:
+            return QStringLiteral("emoji");
+    }
+
+    return QStringLiteral("unknown");
+}
+
+std::optional<Text_pattern> parse_text_pattern(const std::string& value)
+{
+    if (value == "ascii") {
+        return Text_pattern::ASCII;
+    }
+    if (value == "block") {
+        return Text_pattern::BLOCK;
+    }
+    if (value == "box") {
+        return Text_pattern::BOX;
+    }
+    if (value == "cjk") {
+        return Text_pattern::CJK;
+    }
+    if (value == "mixed_non_ascii") {
+        return Text_pattern::MIXED_NON_ASCII;
+    }
+    if (value == "emoji") {
+        return Text_pattern::EMOJI;
+    }
+
+    return std::nullopt;
 }
 
 bool parse_int_arg(
@@ -113,6 +190,30 @@ Benchmark_options parse_options(int argc, char** argv)
             ++index;
             continue;
         }
+        if (argument == "--model-profile-stats") {
+            options.model_profile_stats_enabled = true;
+            ++index;
+            continue;
+        }
+        if (argument == "--text-pattern") {
+            if (index + 1 >= argc) {
+                std::cerr << "--text-pattern requires a value\n";
+                std::exit(2);
+            }
+
+            const std::optional<Text_pattern> pattern =
+                parse_text_pattern(argv[index + 1]);
+            if (!pattern.has_value()) {
+                std::cerr
+                    << "--text-pattern requires one of "
+                    << "ascii|block|box|cjk|mixed_non_ascii|emoji\n";
+                std::exit(2);
+            }
+
+            options.text_pattern = *pattern;
+            index += 2;
+            continue;
+        }
         if (argument == "--help") {
             std::cout
                 << "Usage: vnm_terminal_surface_stress_benchmark [options]\n"
@@ -124,7 +225,9 @@ Benchmark_options parse_options(int argc, char** argv)
                 << "  --dirty-row-stride <n>       strided dirty row walk; fragmentation requires --dirty-rows < --rows, default 1\n"
                 << "  --graphics-every <n>         emit U+2588 every N cells, 0 disables\n"
                 << "  --style-period <n>           ANSI color variation period, 0 disables\n"
-                << "  --packed-text-sidecars       enable packed text sidecars\n";
+                << "  --text-pattern <name>        ascii|block|box|cjk|mixed_non_ascii|emoji; default preserves old mixed ASCII+U+2588 via --graphics-every\n"
+                << "  --packed-text-sidecars       enable packed text sidecars\n"
+                << "  --model-profile-stats        reset/enable model profile counters after warmup in profiling builds\n";
             std::exit(0);
         }
 
@@ -184,6 +287,40 @@ std::vector<int> dirty_rows_for_frame(const Benchmark_options& options, int fram
     return rows;
 }
 
+QChar ascii_pattern_char(int pattern)
+{
+    return QChar(static_cast<ushort>(u'A' + (pattern % 26)));
+}
+
+QChar box_pattern_char(int row, int column, int frame_index)
+{
+    const int selector = (row * 3 + column * 5 + frame_index) % 7;
+    if (selector == 0) {
+        return QChar(static_cast<ushort>(0x253cU));
+    }
+    if (selector % 2 == 0) {
+        return QChar(static_cast<ushort>(0x2502U));
+    }
+    return QChar(static_cast<ushort>(0x2500U));
+}
+
+void append_wide_or_space(QString& text, int& column, int columns, const QString& wide_text)
+{
+    if (column + 1 < columns) {
+        text += wide_text;
+        column += 2;
+        return;
+    }
+
+    text += QChar(u' ');
+    ++column;
+}
+
+QString emoji_marker()
+{
+    return QString::fromUtf8("\xF0\x9F\x99\x82");
+}
+
 QString row_text_for_frame(
     const Benchmark_options& options,
     int                      frame_index,
@@ -191,16 +328,80 @@ QString row_text_for_frame(
 {
     QString text;
     text.reserve(options.columns);
-    for (int column = 0; column < options.columns; ++column) {
+    int column = 0;
+    while (column < options.columns) {
         const int pattern = frame_index * 17 + row * 31 + column * 7;
-        if (options.graphics_every > 0 && pattern % options.graphics_every == 0) {
-            text += QStringLiteral("\u2588");
-            continue;
-        }
+        switch (options.text_pattern) {
+            case Text_pattern::LEGACY_ASCII_BLOCK:
+                if (options.graphics_every > 0 &&
+                    pattern % options.graphics_every == 0)
+                {
+                    text += QChar(static_cast<ushort>(0x2588U));
+                }
+                else {
+                    text += ascii_pattern_char(pattern);
+                }
+                ++column;
+                break;
 
-        const char16_t character =
-            static_cast<char16_t>(u'A' + (pattern % 26));
-        text += QChar(character);
+            case Text_pattern::ASCII:
+                text += ascii_pattern_char(pattern);
+                ++column;
+                break;
+
+            case Text_pattern::BLOCK:
+                text += QChar(static_cast<ushort>(0x2588U));
+                ++column;
+                break;
+
+            case Text_pattern::BOX:
+                text += box_pattern_char(row, column, frame_index);
+                ++column;
+                break;
+
+            case Text_pattern::CJK:
+                append_wide_or_space(text, column, options.columns, QStringLiteral("\u754c"));
+                break;
+
+            case Text_pattern::EMOJI:
+                append_wide_or_space(text, column, options.columns, emoji_marker());
+                break;
+
+            case Text_pattern::MIXED_NON_ASCII: {
+                const int selector = pattern % 19;
+                if (selector == 0 && column + 1 < options.columns) {
+                    append_wide_or_space(
+                        text,
+                        column,
+                        options.columns,
+                        QStringLiteral("\u754c"));
+                    break;
+                }
+                if (selector == 1 && column + 1 < options.columns) {
+                    append_wide_or_space(text, column, options.columns, emoji_marker());
+                    break;
+                }
+                if (selector == 2) {
+                    text += QStringLiteral("e\u0301");
+                    ++column;
+                    break;
+                }
+                if (selector == 3) {
+                    text += QChar(static_cast<ushort>(0x2588U));
+                    ++column;
+                    break;
+                }
+                if (selector == 4) {
+                    text += box_pattern_char(row, column, frame_index);
+                    ++column;
+                    break;
+                }
+
+                text += ascii_pattern_char(pattern);
+                ++column;
+                break;
+            }
+        }
     }
     return text;
 }
@@ -270,6 +471,52 @@ term::terminal_cell_metrics_t benchmark_cell_metrics()
     return metrics;
 }
 
+void accumulate_simple_content_stats(
+    term::terminal_simple_content_cumulative_stats_t&    totals,
+    const term::terminal_simple_content_stats_t&         stats)
+{
+    totals.cells_considered               += stats.cells_considered;
+    totals.eligible_cells                 += stats.eligible_cells;
+    totals.eligible_after_all_gates_cells += stats.eligible_after_all_gates_cells;
+    totals.rows_with_eligible_cells       += stats.rows_with_eligible_cells;
+    totals.styles_with_eligible_cells     += stats.styles_with_eligible_cells;
+    totals.dirty_eligible_cells           += stats.dirty_eligible_cells;
+    totals.clean_eligible_cells           += stats.clean_eligible_cells;
+    totals.text_category_empty_cells      += stats.text_category_empty_cells;
+    totals.text_category_printable_ascii_cells +=
+        stats.text_category_printable_ascii_cells;
+    totals.text_category_other_ascii_cells += stats.text_category_other_ascii_cells;
+    totals.text_category_non_ascii_cells   += stats.text_category_non_ascii_cells;
+    totals.route_none_cells                += stats.route_none_cells;
+    totals.route_fast_text_cells           += stats.route_fast_text_cells;
+    totals.route_qt_text_layout_cells      += stats.route_qt_text_layout_cells;
+    totals.route_graphic_geometry_cells    += stats.route_graphic_geometry_cells;
+    totals.route_fallback_cells            += stats.route_fallback_cells;
+    totals.rejection_none_cells            += stats.rejection_none_cells;
+    totals.rejection_empty_text_cells      += stats.rejection_empty_text_cells;
+    totals.rejection_invalid_grid_cells    += stats.rejection_invalid_grid_cells;
+    totals.rejection_invalid_position_cells += stats.rejection_invalid_position_cells;
+    totals.rejection_invalid_style_id_cells += stats.rejection_invalid_style_id_cells;
+    totals.rejection_wide_continuation_cells +=
+        stats.rejection_wide_continuation_cells;
+    totals.rejection_invalid_display_width_cells +=
+        stats.rejection_invalid_display_width_cells;
+    totals.rejection_invalid_text_encoding_cells +=
+        stats.rejection_invalid_text_encoding_cells;
+    totals.rejection_invalid_text_width_cells +=
+        stats.rejection_invalid_text_width_cells;
+    totals.rejection_multi_cell_text_cells +=
+        stats.rejection_multi_cell_text_cells;
+    totals.rejection_non_printable_ascii_cells +=
+        stats.rejection_non_printable_ascii_cells;
+    totals.rejection_non_ascii_text_cells +=
+        stats.rejection_non_ascii_text_cells;
+    totals.rejection_decoration_cells       += stats.rejection_decoration_cells;
+    totals.rejection_hyperlink_cells        += stats.rejection_hyperlink_cells;
+    totals.rejection_terminal_graphic_cells +=
+        stats.rejection_terminal_graphic_cells;
+}
+
 void accumulate_frame_stats(
     Benchmark_totals&                         totals,
     const term::Terminal_render_snapshot&     snapshot,
@@ -280,8 +527,13 @@ void accumulate_frame_stats(
         totals.snapshot_dirty_rows_visible += static_cast<std::uint64_t>(range.row_count);
     }
 
+    accumulate_simple_content_stats(totals.simple_content, frame.stats.simple_content);
     totals.frame_cell_pass_input_cells +=
         static_cast<std::uint64_t>(frame.stats.cell_pass_input_cells);
+    totals.frame_cell_pass_classification_calls +=
+        static_cast<std::uint64_t>(frame.stats.cell_pass_classification_calls);
+    totals.frame_packed_pass_input_cells +=
+        static_cast<std::uint64_t>(frame.stats.packed_pass_input_cells);
     totals.frame_dirty_row_lookup_count +=
         static_cast<std::uint64_t>(frame.stats.dirty_row_lookup_count);
     totals.frame_dirty_row_range_lookup_count +=
@@ -290,10 +542,38 @@ void accumulate_frame_stats(
         static_cast<std::uint64_t>(dirty_row_range_scan_steps(frame.stats));
     totals.frame_packed_pass_cells_scanned +=
         static_cast<std::uint64_t>(frame.stats.packed_pass_cells_scanned);
+    totals.frame_packed_pass_classification_calls +=
+        static_cast<std::uint64_t>(frame.stats.packed_pass_classification_calls);
+    totals.frame_packed_text_sidecars_enabled +=
+        static_cast<std::uint64_t>(frame.stats.packed_text_sidecars_enabled);
+    totals.frame_packed_text_sidecars_disabled +=
+        static_cast<std::uint64_t>(frame.stats.packed_text_sidecars_disabled);
+    totals.frame_packed_text_disabled_cells_skipped +=
+        static_cast<std::uint64_t>(frame.stats.packed_text_disabled_cells_skipped);
+    totals.frame_packed_graphic_candidates_classified +=
+        static_cast<std::uint64_t>(frame.stats.packed_graphic_candidates_classified);
+    totals.frame_packed_cells_appended +=
+        static_cast<std::uint64_t>(frame.stats.packed_cells_appended);
+    totals.frame_compact_ascii_text_direct_appends +=
+        static_cast<std::uint64_t>(frame.stats.compact_ascii_text_direct_appends);
+    totals.frame_compact_ascii_qstring_materializations +=
+        static_cast<std::uint64_t>(frame.stats.compact_ascii_qstring_materializations);
     totals.frame_text_runs_emitted +=
         static_cast<std::uint64_t>(frame.stats.text_runs_emitted);
     totals.frame_graphic_rects_emitted +=
         static_cast<std::uint64_t>(frame.stats.graphic_rects_emitted);
+    totals.frame_packed_text_cells +=
+        static_cast<std::uint64_t>(frame.stats.packed_text_cells);
+    totals.frame_packed_text_ascii_direct_cells +=
+        static_cast<std::uint64_t>(frame.stats.packed_text_ascii_direct_cells);
+    totals.frame_packed_text_ascii_direct_bytes +=
+        frame.stats.packed_text_ascii_direct_bytes;
+    totals.frame_packed_text_utf8_cells +=
+        frame.stats.packed_text_utf8_cells;
+    totals.frame_packed_text_utf8_input_units +=
+        frame.stats.packed_text_utf8_input_units;
+    totals.frame_packed_text_utf8_output_bytes +=
+        frame.stats.packed_text_utf8_output_bytes;
     totals.frame_packed_graphic_cells +=
         static_cast<std::uint64_t>(frame.stats.packed_graphic_cells);
     totals.checksum +=
@@ -311,6 +591,134 @@ void print_metric(const char* name, std::uint64_t value)
 void print_metric(const char* name, double value)
 {
     std::cout << name << '=' << value << '\n';
+}
+
+void print_simple_content_stats(
+    const term::terminal_simple_content_cumulative_stats_t& stats)
+{
+    print_metric("simple_content.cells_considered", stats.cells_considered);
+    print_metric("simple_content.eligible_cells", stats.eligible_cells);
+    print_metric(
+        "simple_content.eligible_after_all_gates_cells",
+        stats.eligible_after_all_gates_cells);
+    print_metric("simple_content.rows_with_eligible_cells", stats.rows_with_eligible_cells);
+    print_metric(
+        "simple_content.styles_with_eligible_cells",
+        stats.styles_with_eligible_cells);
+    print_metric("simple_content.dirty_eligible_cells", stats.dirty_eligible_cells);
+    print_metric("simple_content.clean_eligible_cells", stats.clean_eligible_cells);
+    print_metric(
+        "simple_content.text_category_empty_cells",
+        stats.text_category_empty_cells);
+    print_metric(
+        "simple_content.text_category_printable_ascii_cells",
+        stats.text_category_printable_ascii_cells);
+    print_metric(
+        "simple_content.text_category_other_ascii_cells",
+        stats.text_category_other_ascii_cells);
+    print_metric(
+        "simple_content.text_category_non_ascii_cells",
+        stats.text_category_non_ascii_cells);
+    print_metric("simple_content.route_none_cells", stats.route_none_cells);
+    print_metric("simple_content.route_fast_text_cells", stats.route_fast_text_cells);
+    print_metric(
+        "simple_content.route_qt_text_layout_cells",
+        stats.route_qt_text_layout_cells);
+    print_metric(
+        "simple_content.route_graphic_geometry_cells",
+        stats.route_graphic_geometry_cells);
+    print_metric("simple_content.route_fallback_cells", stats.route_fallback_cells);
+    print_metric("simple_content.rejection_none_cells", stats.rejection_none_cells);
+    print_metric(
+        "simple_content.rejection_empty_text_cells",
+        stats.rejection_empty_text_cells);
+    print_metric(
+        "simple_content.rejection_invalid_grid_cells",
+        stats.rejection_invalid_grid_cells);
+    print_metric(
+        "simple_content.rejection_invalid_position_cells",
+        stats.rejection_invalid_position_cells);
+    print_metric(
+        "simple_content.rejection_invalid_style_id_cells",
+        stats.rejection_invalid_style_id_cells);
+    print_metric(
+        "simple_content.rejection_wide_continuation_cells",
+        stats.rejection_wide_continuation_cells);
+    print_metric(
+        "simple_content.rejection_invalid_display_width_cells",
+        stats.rejection_invalid_display_width_cells);
+    print_metric(
+        "simple_content.rejection_invalid_text_encoding_cells",
+        stats.rejection_invalid_text_encoding_cells);
+    print_metric(
+        "simple_content.rejection_invalid_text_width_cells",
+        stats.rejection_invalid_text_width_cells);
+    print_metric(
+        "simple_content.rejection_multi_cell_text_cells",
+        stats.rejection_multi_cell_text_cells);
+    print_metric(
+        "simple_content.rejection_non_printable_ascii_cells",
+        stats.rejection_non_printable_ascii_cells);
+    print_metric(
+        "simple_content.rejection_non_ascii_text_cells",
+        stats.rejection_non_ascii_text_cells);
+    print_metric(
+        "simple_content.rejection_decoration_cells",
+        stats.rejection_decoration_cells);
+    print_metric(
+        "simple_content.rejection_hyperlink_cells",
+        stats.rejection_hyperlink_cells);
+    print_metric(
+        "simple_content.rejection_terminal_graphic_cells",
+        stats.rejection_terminal_graphic_cells);
+}
+
+void print_model_profile_stats(
+    const term::Terminal_screen_model_profile_stats& stats)
+{
+    print_metric("model_profile.print_text_calls", stats.print_text_calls);
+    print_metric(
+        "model_profile.printable_ascii_span_calls",
+        stats.printable_ascii_span_calls);
+    print_metric(
+        "model_profile.printable_ascii_span_characters",
+        stats.printable_ascii_span_characters);
+    print_metric(
+        "model_profile.printable_ascii_cells_written",
+        stats.printable_ascii_cells_written);
+    print_metric(
+        "model_profile.render_snapshot_cells_scanned",
+        stats.render_snapshot_cells_scanned);
+    print_metric(
+        "model_profile.render_snapshot_cells_emitted",
+        stats.render_snapshot_cells_emitted);
+    print_metric(
+        "model_profile.render_snapshot_compact_empty_text_cells",
+        stats.render_snapshot_compact_empty_text_cells);
+    print_metric(
+        "model_profile.render_snapshot_compact_ascii_text_cells",
+        stats.render_snapshot_compact_ascii_text_cells);
+    print_metric(
+        "model_profile.render_snapshot_fallback_qstring_copies",
+        stats.render_snapshot_fallback_qstring_copies);
+    print_metric(
+        "model_profile.render_snapshot_fallback_text_code_units_copied",
+        stats.render_snapshot_fallback_text_code_units_copied);
+    print_metric(
+        "model_profile.render_snapshot_fallback_printable_ascii_copies",
+        stats.render_snapshot_fallback_printable_ascii_copies);
+    print_metric(
+        "model_profile.render_snapshot_fallback_other_ascii_copies",
+        stats.render_snapshot_fallback_other_ascii_copies);
+    print_metric(
+        "model_profile.render_snapshot_fallback_single_non_ascii_copies",
+        stats.render_snapshot_fallback_single_non_ascii_copies);
+    print_metric(
+        "model_profile.render_snapshot_fallback_multi_text_copies",
+        stats.render_snapshot_fallback_multi_text_copies);
+    print_metric(
+        "model_profile.max_render_snapshot_fallback_text_units_per_cell",
+        stats.max_render_snapshot_fallback_text_units_per_cell);
 }
 
 }
@@ -336,8 +744,22 @@ int main(int argc, char** argv)
     double total_ms = 0.0;
     Benchmark_totals totals;
 
+#if VNM_TERMINAL_PROFILING_ENABLED
+    if (options.model_profile_stats_enabled) {
+        model.set_profile_stats_enabled(false);
+    }
+#endif
+
     const int total_frames = options.warmup_frames + options.frames;
     for (int frame_index = 0; frame_index < total_frames; ++frame_index) {
+        if (options.model_profile_stats_enabled &&
+            frame_index == options.warmup_frames)
+        {
+#if VNM_TERMINAL_PROFILING_ENABLED
+            model.set_profile_stats_enabled(true);
+#endif
+        }
+
         const bool measured = frame_index >= options.warmup_frames;
         const std::vector<int> dirty_rows =
             dirty_rows_for_frame(options, frame_index);
@@ -388,8 +810,23 @@ int main(int argc, char** argv)
     print_metric("dirty_row_stride", static_cast<std::uint64_t>(options.dirty_row_stride));
     print_metric("graphics_every", static_cast<std::uint64_t>(options.graphics_every));
     print_metric("style_period", static_cast<std::uint64_t>(options.style_period));
+    std::cout << "text_pattern=" << text_pattern_name(options.text_pattern).toUtf8().constData()
+        << '\n';
     std::cout << "packed_text_sidecars_enabled="
         << (options.packed_text_sidecars_enabled ? "true" : "false") << '\n';
+    std::cout << "model_profile_stats_requested="
+        << (options.model_profile_stats_enabled ? "true" : "false") << '\n';
+#if VNM_TERMINAL_PROFILING_ENABLED
+    const term::Terminal_screen_model_profile_stats model_profile_stats =
+        model.profile_stats();
+    const bool model_profile_stats_available =
+        options.model_profile_stats_enabled && model_profile_stats.enabled;
+#else
+    const term::Terminal_screen_model_profile_stats model_profile_stats;
+    const bool model_profile_stats_available = false;
+#endif
+    std::cout << "model_profile_stats_available="
+        << (model_profile_stats_available ? "true" : "false") << '\n';
     print_metric("total_ms", total_ms);
     print_metric("frames_per_second", frames * 1000.0 / total_ms);
     print_metric("ingest_ms_total", ingest_ms);
@@ -402,7 +839,18 @@ int main(int argc, char** argv)
     print_metric(
         "snapshot_dirty_rows_visible_per_frame",
         static_cast<double>(totals.snapshot_dirty_rows_visible) / frames);
+    print_simple_content_stats(totals.simple_content);
+    print_metric(
+        "route_graphic_geometry_cells",
+        totals.simple_content.route_graphic_geometry_cells);
+    print_metric(
+        "route_qt_text_layout_cells",
+        totals.simple_content.route_qt_text_layout_cells);
     print_metric("frame_cell_pass_input_cells", totals.frame_cell_pass_input_cells);
+    print_metric(
+        "frame_cell_pass_classification_calls",
+        totals.frame_cell_pass_classification_calls);
+    print_metric("frame_packed_pass_input_cells", totals.frame_packed_pass_input_cells);
     print_metric("frame_dirty_row_lookup_count", totals.frame_dirty_row_lookup_count);
     print_metric(
         "frame_dirty_row_range_lookup_count",
@@ -411,9 +859,48 @@ int main(int argc, char** argv)
         "frame_dirty_row_range_scan_steps",
         totals.frame_dirty_row_range_scan_steps);
     print_metric("frame_packed_pass_cells_scanned", totals.frame_packed_pass_cells_scanned);
+    print_metric(
+        "frame_packed_pass_classification_calls",
+        totals.frame_packed_pass_classification_calls);
+    print_metric(
+        "frame_packed_text_sidecars_enabled",
+        totals.frame_packed_text_sidecars_enabled);
+    print_metric(
+        "frame_packed_text_sidecars_disabled",
+        totals.frame_packed_text_sidecars_disabled);
+    print_metric(
+        "frame_packed_text_disabled_cells_skipped",
+        totals.frame_packed_text_disabled_cells_skipped);
+    print_metric(
+        "frame_packed_graphic_candidates_classified",
+        totals.frame_packed_graphic_candidates_classified);
+    print_metric("frame_packed_cells_appended", totals.frame_packed_cells_appended);
+    print_metric(
+        "frame_compact_ascii_text_direct_appends",
+        totals.frame_compact_ascii_text_direct_appends);
+    print_metric(
+        "frame_compact_ascii_qstring_materializations",
+        totals.frame_compact_ascii_qstring_materializations);
     print_metric("frame_text_runs_emitted", totals.frame_text_runs_emitted);
     print_metric("frame_graphic_rects_emitted", totals.frame_graphic_rects_emitted);
+    print_metric("frame_packed_text_cells", totals.frame_packed_text_cells);
+    print_metric(
+        "frame_packed_text_ascii_direct_cells",
+        totals.frame_packed_text_ascii_direct_cells);
+    print_metric(
+        "frame_packed_text_ascii_direct_bytes",
+        totals.frame_packed_text_ascii_direct_bytes);
+    print_metric("frame_packed_text_utf8_cells", totals.frame_packed_text_utf8_cells);
+    print_metric(
+        "frame_packed_text_utf8_input_units",
+        totals.frame_packed_text_utf8_input_units);
+    print_metric(
+        "frame_packed_text_utf8_output_bytes",
+        totals.frame_packed_text_utf8_output_bytes);
     print_metric("frame_packed_graphic_cells", totals.frame_packed_graphic_cells);
+    if (model_profile_stats_available) {
+        print_model_profile_stats(model_profile_stats);
+    }
     print_metric("checksum", totals.checksum);
     return 0;
 }
