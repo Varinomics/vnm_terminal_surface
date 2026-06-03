@@ -69,9 +69,6 @@ public:
     static Terminal_screen_model_profile_stats model_profile_stats(
         const VNM_TerminalSurface& surface);
 
-    static Terminal_session_profile_stats session_profile_stats(
-        const VNM_TerminalSurface& surface);
-
     static void set_cursor_blink_visible(
         VNM_TerminalSurface&       surface,
         bool                       visible);
