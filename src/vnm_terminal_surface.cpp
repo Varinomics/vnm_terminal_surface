@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/linux_pty_backend.h"
+#include "vnm_terminal/internal/qsg_atlas_renderer_stage1.h"
 #include "vnm_terminal/internal/qsg_rhi_stage0_probe.h"
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
@@ -1746,6 +1747,7 @@ struct VNM_TerminalSurface::Private
     bool                                                   cursor_blink_visible                  = true;
     term::Qsg_terminal_renderer                            renderer;
     std::shared_ptr<term::Qsg_rhi_stage0_probe_recorder>   rhi_stage0_probe_recorder;
+    std::shared_ptr<term::Qsg_atlas_stage1_recorder>       qsg_atlas_stage1_recorder;
     term::Terminal_renderer_stats_publisher                renderer_stats_publisher;
 #if VNM_TERMINAL_PROFILING_ENABLED
     mutable std::mutex                                     render_profiler_mutex;
@@ -1765,6 +1767,10 @@ struct VNM_TerminalSurface::Private
     bool                                                   render_node_release_pending        = false;
     bool                                                   render_node_release_requeue_update = false;
     bool                                                   rhi_stage0_probe_enabled           = false;
+    bool                                                   qsg_atlas_stage1_probe_enabled     = false;
+    std::uint64_t                                          qsg_atlas_stage1_capture_sequence  = 0U;
+    std::uint64_t                                          qsg_atlas_font_epoch               = 0U;
+    QString                                                qsg_atlas_font_epoch_key;
     qreal                                                  wheel_scroll_angle_remainder       = 0.0;
     qreal                                                  wheel_scroll_pixel_remainder       = 0.0;
     qreal                                                  wheel_zoom_angle_remainder         = 0.0;
@@ -4560,6 +4566,16 @@ void VNM_TerminalSurface::refresh_grid_metrics()
     m_private->render_font               = term::vnm_terminal_font(m_font_family, m_font_size);
     m_private->render_device_pixel_ratio = current_device_pixel_ratio(window());
     m_private->render_light_theme        = is_light_theme(m_color_theme);
+    const QString atlas_font_epoch_key = QStringLiteral("%1|%2")
+        .arg(m_private->render_font.toString())
+        .arg(m_private->render_device_pixel_ratio, 0, 'g', 17);
+    if (m_private->qsg_atlas_font_epoch_key != atlas_font_epoch_key) {
+        m_private->qsg_atlas_font_epoch_key = atlas_font_epoch_key;
+        ++m_private->qsg_atlas_font_epoch;
+        if (m_private->qsg_atlas_font_epoch == 0U) {
+            m_private->qsg_atlas_font_epoch = 1U;
+        }
+    }
     m_private->grid_metrics_provider.set_font(m_private->render_font);
     m_private->grid_metrics_provider.set_device_pixel_ratio(
         m_private->render_device_pixel_ratio);
@@ -5355,6 +5371,45 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             return updated_node;
         }
 
+        if (m_private->qsg_atlas_stage1_probe_enabled) {
+            if (m_private->qsg_atlas_stage1_recorder == nullptr) {
+                m_private->qsg_atlas_stage1_recorder =
+                    std::make_shared<term::Qsg_atlas_stage1_recorder>();
+            }
+
+            const term::Terminal_render_options options = render_options_for_surface(*this);
+            term::Captured_atlas_frame captured_frame =
+                term::capture_qsg_atlas_stage1_frame(
+                    m_private->render_snapshot,
+                    m_private->ime_preedit,
+                    options,
+                    m_private->cell_metrics,
+                    logical_size,
+                    m_private->render_font,
+                    device_pixel_ratio,
+                    m_private->qsg_atlas_font_epoch,
+                    ++m_private->qsg_atlas_stage1_capture_sequence,
+                    m_private->cursor_blink_visible);
+            QSGNode* updated_node = term::update_qsg_atlas_stage1_node(
+                old_node,
+                std::move(captured_frame),
+                m_private->qsg_atlas_stage1_recorder);
+            term::terminal_renderer_stats_t renderer_stats;
+            renderer_stats.paint_completed = updated_node != nullptr;
+            m_private->renderer_stats_publisher.publish(renderer_stats);
+            if (updated_node != nullptr) {
+                m_private->consume_render_update(window());
+                m_private->render_invalidation_stats.last_rendered_snapshot_sequence =
+                    m_private->render_snapshot != nullptr
+                        ? m_private->render_snapshot->metadata.sequence
+                        : 0U;
+            }
+            else {
+                m_private->reset_render_update_schedule();
+            }
+            return updated_node;
+        }
+
         const term::Terminal_render_options options = render_options_for_surface(*this);
         const term::Terminal_render_frame frame = term::build_terminal_render_frame(
             m_private->render_snapshot.get(),
@@ -5489,6 +5544,34 @@ term::VNM_TerminalSurface_render_bridge::rhi_stage0_probe_frame(
     return surface.m_private->rhi_stage0_probe_recorder != nullptr
         ? surface.m_private->rhi_stage0_probe_recorder->snapshot()
         : term::qsg_rhi_stage0_probe_frame_t{};
+}
+
+void term::VNM_TerminalSurface_render_bridge::set_qsg_atlas_stage1_probe_enabled(
+    VNM_TerminalSurface&   surface,
+    bool                   enabled)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    if (surface.m_private->qsg_atlas_stage1_probe_enabled == enabled) {
+        return;
+    }
+
+    surface.m_private->qsg_atlas_stage1_probe_enabled = enabled;
+    if (surface.m_private->qsg_atlas_stage1_recorder == nullptr) {
+        surface.m_private->qsg_atlas_stage1_recorder =
+            std::make_shared<term::Qsg_atlas_stage1_recorder>();
+    }
+    surface.m_private->qsg_atlas_stage1_recorder->reset();
+    surface.m_private->request_render_update(surface);
+}
+
+term::Qsg_atlas_stage1_frame_report
+term::VNM_TerminalSurface_render_bridge::qsg_atlas_stage1_frame(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->qsg_atlas_stage1_recorder != nullptr
+        ? surface.m_private->qsg_atlas_stage1_recorder->snapshot()
+        : term::Qsg_atlas_stage1_frame_report{};
 }
 
 term::Terminal_screen_model_dirty_row_stats
