@@ -7777,11 +7777,17 @@ void accumulate_frame_stats(
     total.packed_rows           += static_cast<std::uint64_t>(stats.packed_rows);
     total.packed_text_spans     += static_cast<std::uint64_t>(stats.packed_text_spans);
     total.packed_text_cells     += static_cast<std::uint64_t>(stats.packed_text_cells);
+    total.packed_text_ascii_direct_cells +=
+        static_cast<std::uint64_t>(stats.packed_text_ascii_direct_cells);
     total.packed_graphic_spans            +=
         static_cast<std::uint64_t>(stats.packed_graphic_spans);
     total.packed_graphic_cells            +=
         static_cast<std::uint64_t>(stats.packed_graphic_cells);
-    total.packed_payload_bytes            += stats.packed_payload_bytes;
+    total.packed_text_ascii_direct_bytes += stats.packed_text_ascii_direct_bytes;
+    total.packed_text_utf8_cells         += stats.packed_text_utf8_cells;
+    total.packed_text_utf8_input_units   += stats.packed_text_utf8_input_units;
+    total.packed_text_utf8_output_bytes  += stats.packed_text_utf8_output_bytes;
+    total.packed_payload_bytes           += stats.packed_payload_bytes;
 }
 
 void accumulate_renderer_stats(
@@ -8747,6 +8753,8 @@ void append_packed_text_bytes(
         const std::size_t byte_offset = frame.packed_text_bytes.size();
         frame.packed_text_bytes.resize(byte_offset + static_cast<std::size_t>(text.size()));
 
+        ++frame.stats.packed_text_ascii_direct_cells;
+        frame.stats.packed_text_ascii_direct_bytes += static_cast<std::uint64_t>(text.size());
         const ushort* code_units = text.utf16();
         char* bytes = frame.packed_text_bytes.data() + byte_offset;
         for (qsizetype index = 0; index < text.size(); ++index) {
@@ -8757,6 +8765,9 @@ void append_packed_text_bytes(
     }
 
     const QByteArray bytes = text.toUtf8();
+    ++frame.stats.packed_text_utf8_cells;
+    frame.stats.packed_text_utf8_input_units  += static_cast<std::uint64_t>(text.size());
+    frame.stats.packed_text_utf8_output_bytes += static_cast<std::uint64_t>(bytes.size());
     frame.packed_text_bytes.insert(
         frame.packed_text_bytes.end(),
         bytes.constData(),

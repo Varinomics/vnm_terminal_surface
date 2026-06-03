@@ -1671,6 +1671,10 @@ bool test_fragmented_dirty_ranges_drive_simple_content_membership()
         "fragmented dirty row membership exposes cell-pass and packed-pass classification calls");
     ok &= check(frame.stats.packed_text_cells == 4,
         "fragmented dirty row membership also feeds packed text sidecar classification");
+    ok &= check(frame.stats.packed_text_ascii_direct_cells == 4 &&
+        frame.stats.packed_text_ascii_direct_bytes == 4U &&
+        frame.stats.packed_text_utf8_cells == 0U,
+        "printable ASCII packed text cells use the direct byte-copy path");
 
     return ok;
 }
@@ -2005,6 +2009,10 @@ bool test_packed_text_rows_spans_and_order()
         frame.stats.packed_text_spans == 4 &&
         frame.stats.packed_text_cells == 6,
         "packed text spans count coalesced simple text cells");
+    ok &= check(frame.stats.packed_text_ascii_direct_cells == 6 &&
+        frame.stats.packed_text_ascii_direct_bytes == 6U &&
+        frame.stats.packed_text_utf8_cells == 0U,
+        "packed text byte-path counters match the accepted ASCII cells");
 
     const term::terminal_packed_render_row_t& row_zero = frame.packed_rows[0];
     ok &= check(row_zero.first_text_span == 0U && row_zero.text_span_count == 3U,
