@@ -1044,11 +1044,6 @@ private:
         const Terminal_viewport_state& viewport,
         int                            viewport_row) const;
 
-    std::optional<std::map<std::uint64_t, QByteArray>>
-        viewport_row_retained_hyperlink_identity_keys(
-            const Terminal_viewport_state& viewport,
-            int                            viewport_row) const;
-
     bool retained_line_descriptor_logical_row(
         Terminal_buffer_id             buffer_id,
         terminal_selection_line_lease_t descriptor,
@@ -1087,13 +1082,6 @@ private:
         const Terminal_render_selection_request& request,
         Terminal_buffer_id             buffer_id,
         std::vector<int>&              logical_rows) const;
-
-    void append_hyperlink_metadata_for_cells(
-        std::vector<Terminal_render_hyperlink_metadata>& metadata,
-        const std::vector<Terminal_render_cell>&         cells,
-        std::size_t                                      first_cell,
-        const std::map<std::uint64_t, QByteArray>*       row_local_identity_keys)
-        const;
 
     void append_hyperlink_metadata_for_ids(
         std::vector<Terminal_render_hyperlink_metadata>& metadata,

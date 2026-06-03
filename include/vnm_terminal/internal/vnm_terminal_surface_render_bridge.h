@@ -4,7 +4,6 @@
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/render_snapshot.h"
-#include "vnm_terminal/internal/stage42_feature_flags.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include <QString>
@@ -99,8 +98,6 @@ public:
 
     static terminal_renderer_lifecycle_stats_t lifecycle_stats(
         const VNM_TerminalSurface& surface);
-
-    static const stage42_feature_flags_t& stage42_feature_flags();
 
     static std::shared_ptr<Terminal_renderer_lifecycle_recorder> lifecycle_recorder(
         VNM_TerminalSurface&       surface);
