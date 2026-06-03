@@ -433,6 +433,8 @@ private:
     struct Cell
     {
         QString                        text              = QStringLiteral(" ");
+        Terminal_render_cell_text_category
+                                       text_category     = Terminal_render_cell_text_category::PRINTABLE_ASCII;
         int                            display_width     = 1;
         bool                           wide_continuation = false;
         bool                           occupied          = false;

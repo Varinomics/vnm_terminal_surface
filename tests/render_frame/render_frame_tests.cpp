@@ -959,7 +959,22 @@ bool test_simple_content_classifier_and_stats()
         ascii_classification.text_category ==
             term::Terminal_simple_content_text_category::PRINTABLE_ASCII &&
         ascii_classification.dirty_row,
-        "simple-content classifier accepts clean one-cell printable ASCII");
+        "simple-content classifier accepts clean one-cell printable ASCII with fallback category");
+
+    term::Terminal_render_cell cached_ascii_cell = ascii_cell;
+    cached_ascii_cell.text_category =
+        term::Terminal_render_cell_text_category::PRINTABLE_ASCII;
+    const term::terminal_simple_content_classification_t cached_ascii_classification =
+        term::classify_terminal_simple_content_cell(
+            cached_ascii_cell,
+            grid_size,
+            2U,
+            false,
+            true);
+    ok &= check(cached_ascii_classification.fast_text_eligible &&
+        cached_ascii_classification.text_category ==
+            term::Terminal_simple_content_text_category::PRINTABLE_ASCII,
+        "simple-content classifier accepts cached printable ASCII category");
 
     term::Terminal_render_cell non_ascii_cell = ascii_cell;
     non_ascii_cell.text = QStringLiteral("\u03c0");

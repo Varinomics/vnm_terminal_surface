@@ -124,6 +124,33 @@ bool is_single_unicode_scalar(QStringView text)
         is_low_surrogate(text[1]);
 }
 
+Terminal_render_cell_text_category render_cell_text_category(QStringView text)
+{
+    if (text.isEmpty()) {
+        return Terminal_render_cell_text_category::EMPTY;
+    }
+
+    unsigned int outside_printable_ascii = 0U;
+    unsigned int non_ascii               = 0U;
+    const qsizetype text_size            = text.size();
+    const QChar* characters              = text.data();
+    for (qsizetype index = 0; index < text_size; ++index) {
+        const unsigned int code_unit = characters[index].unicode();
+        outside_printable_ascii |= static_cast<unsigned int>(
+            code_unit - k_printable_ascii_first >
+                k_printable_ascii_last - k_printable_ascii_first);
+        non_ascii |= code_unit;
+    }
+
+    if (outside_printable_ascii == 0U) {
+        return Terminal_render_cell_text_category::PRINTABLE_ASCII;
+    }
+
+    return (non_ascii & ~0x7fU) != 0U
+        ? Terminal_render_cell_text_category::NON_ASCII
+        : Terminal_render_cell_text_category::OTHER_ASCII;
+}
+
 bool printable_ascii_block_is_all_printable(const char* block)
 {
     // Unsigned underflow makes below-range bytes fail the span check without a branch.
@@ -244,14 +271,103 @@ const QString& printable_ascii_cell_text(QChar character)
 {
     Q_ASSERT(is_printable_ascii(character));
 
-    static const std::array<QString, k_printable_ascii_count> strings = [] {
-        std::array<QString, k_printable_ascii_count> result;
-        for (std::size_t index = 0; index < result.size(); ++index) {
-            result[index] = QString(QChar(
-                static_cast<ushort>(k_printable_ascii_first + index)));
-        }
-        return result;
-    }();
+    static const std::array<QString, k_printable_ascii_count> strings{
+        QStringLiteral(" "),
+        QStringLiteral("!"),
+        QStringLiteral("\""),
+        QStringLiteral("#"),
+        QStringLiteral("$"),
+        QStringLiteral("%"),
+        QStringLiteral("&"),
+        QStringLiteral("'"),
+        QStringLiteral("("),
+        QStringLiteral(")"),
+        QStringLiteral("*"),
+        QStringLiteral("+"),
+        QStringLiteral(","),
+        QStringLiteral("-"),
+        QStringLiteral("."),
+        QStringLiteral("/"),
+        QStringLiteral("0"),
+        QStringLiteral("1"),
+        QStringLiteral("2"),
+        QStringLiteral("3"),
+        QStringLiteral("4"),
+        QStringLiteral("5"),
+        QStringLiteral("6"),
+        QStringLiteral("7"),
+        QStringLiteral("8"),
+        QStringLiteral("9"),
+        QStringLiteral(":"),
+        QStringLiteral(";"),
+        QStringLiteral("<"),
+        QStringLiteral("="),
+        QStringLiteral(">"),
+        QStringLiteral("?"),
+        QStringLiteral("@"),
+        QStringLiteral("A"),
+        QStringLiteral("B"),
+        QStringLiteral("C"),
+        QStringLiteral("D"),
+        QStringLiteral("E"),
+        QStringLiteral("F"),
+        QStringLiteral("G"),
+        QStringLiteral("H"),
+        QStringLiteral("I"),
+        QStringLiteral("J"),
+        QStringLiteral("K"),
+        QStringLiteral("L"),
+        QStringLiteral("M"),
+        QStringLiteral("N"),
+        QStringLiteral("O"),
+        QStringLiteral("P"),
+        QStringLiteral("Q"),
+        QStringLiteral("R"),
+        QStringLiteral("S"),
+        QStringLiteral("T"),
+        QStringLiteral("U"),
+        QStringLiteral("V"),
+        QStringLiteral("W"),
+        QStringLiteral("X"),
+        QStringLiteral("Y"),
+        QStringLiteral("Z"),
+        QStringLiteral("["),
+        QStringLiteral("\\"),
+        QStringLiteral("]"),
+        QStringLiteral("^"),
+        QStringLiteral("_"),
+        QStringLiteral("`"),
+        QStringLiteral("a"),
+        QStringLiteral("b"),
+        QStringLiteral("c"),
+        QStringLiteral("d"),
+        QStringLiteral("e"),
+        QStringLiteral("f"),
+        QStringLiteral("g"),
+        QStringLiteral("h"),
+        QStringLiteral("i"),
+        QStringLiteral("j"),
+        QStringLiteral("k"),
+        QStringLiteral("l"),
+        QStringLiteral("m"),
+        QStringLiteral("n"),
+        QStringLiteral("o"),
+        QStringLiteral("p"),
+        QStringLiteral("q"),
+        QStringLiteral("r"),
+        QStringLiteral("s"),
+        QStringLiteral("t"),
+        QStringLiteral("u"),
+        QStringLiteral("v"),
+        QStringLiteral("w"),
+        QStringLiteral("x"),
+        QStringLiteral("y"),
+        QStringLiteral("z"),
+        QStringLiteral("{"),
+        QStringLiteral("|"),
+        QStringLiteral("}"),
+        QStringLiteral("~"),
+    };
 
     return strings[static_cast<std::size_t>(
         character.unicode() - k_printable_ascii_first)];
@@ -4979,6 +5095,7 @@ void Terminal_screen_model::write_printable_ascii_cell_content(
 
     Cell& target_cell = row.cells[static_cast<std::size_t>(column)];
     target_cell.text              = printable_ascii_cell_text(text);
+    target_cell.text_category     = Terminal_render_cell_text_category::PRINTABLE_ASCII;
     target_cell.display_width     = 1;
     target_cell.wide_continuation = false;
     target_cell.occupied          = true;
@@ -5099,6 +5216,7 @@ void Terminal_screen_model::install_cell_span(
 
     Cell& cell = screen_row.cells[position.column];
     cell.text              = std::move(text);
+    cell.text_category     = render_cell_text_category(QStringView(cell.text));
     cell.display_width     = display_width;
     cell.wide_continuation = false;
     cell.occupied          = true;
@@ -5109,6 +5227,7 @@ void Terminal_screen_model::install_cell_span(
         clear_cell_at({position.row, position.column + width_offset});
         Cell& continuation = active_grid_rows()[position.row].cells[position.column + width_offset];
         continuation.text              = {};
+        continuation.text_category     = Terminal_render_cell_text_category::EMPTY;
         continuation.display_width     = 0;
         continuation.wide_continuation = true;
         continuation.occupied          = true;
@@ -6986,6 +7105,7 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
     for (const Terminal_history_row_cell& cell : history_record.cells) {
         retained_record.row.cells.push_back({
             cell.text,
+            render_cell_text_category(QStringView(cell.text)),
             cell.display_width,
             cell.wide_continuation,
             cell.occupied,
@@ -7339,6 +7459,7 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
                     cell.display_width,
                     cell.wide_continuation,
                     cell.style_id,
+                    cell.text_category,
                 });
             }
         }

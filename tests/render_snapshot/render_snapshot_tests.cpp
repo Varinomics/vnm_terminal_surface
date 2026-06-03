@@ -73,6 +73,20 @@ const term::Terminal_render_cell* cell_with_text(
     return nullptr;
 }
 
+const term::Terminal_render_cell* cell_at(
+    const term::Terminal_render_snapshot&  snapshot,
+    int                                    row,
+    int                                    column)
+{
+    for (const term::Terminal_render_cell& cell : snapshot.cells) {
+        if (cell.position.row == row && cell.position.column == column) {
+            return &cell;
+        }
+    }
+
+    return nullptr;
+}
+
 const term::Terminal_render_hyperlink_metadata* hyperlink_by_id(
     const term::Terminal_render_snapshot&  snapshot,
     std::uint64_t                          hyperlink_id)
@@ -387,6 +401,76 @@ bool test_snapshot_rows_cover_primary_retained_and_alternate_sources()
         stats.max_render_snapshot_text_units_per_cell == 1U,
         "row-source snapshots expose skipped cells and max copied text width");
 #endif
+
+    return ok;
+}
+
+bool test_snapshot_cells_cache_text_category()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({2, 8});
+    model.ingest(
+        QByteArrayLiteral("AZ") +
+        QStringLiteral("\u754c").toUtf8());
+
+    const term::Terminal_render_snapshot snapshot =
+        model.render_snapshot(request_for_model(model, 18U));
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "text-category snapshot fixture validates");
+
+    const term::Terminal_render_cell* ascii_cell = cell_at(snapshot, 0, 0);
+    ok &= check(ascii_cell != nullptr &&
+        ascii_cell->text_category ==
+            term::Terminal_render_cell_text_category::PRINTABLE_ASCII,
+        "printable ASCII snapshot cell carries cached category");
+
+    const term::Terminal_render_cell* non_ascii_cell =
+        cell_with_text(snapshot, QStringLiteral("\u754c"));
+    ok &= check(non_ascii_cell != nullptr &&
+        non_ascii_cell->text_category ==
+            term::Terminal_render_cell_text_category::NON_ASCII,
+        "non-ASCII snapshot cell carries cached category");
+
+    const term::Terminal_render_cell* continuation_cell = non_ascii_cell != nullptr
+        ? cell_at(snapshot, non_ascii_cell->position.row, non_ascii_cell->position.column + 1)
+        : nullptr;
+    ok &= check(continuation_cell != nullptr &&
+        continuation_cell->wide_continuation &&
+        continuation_cell->text_category ==
+            term::Terminal_render_cell_text_category::EMPTY,
+        "wide continuation snapshot cell carries empty cached category");
+
+    term::Terminal_render_snapshot unknown_category_snapshot = snapshot;
+    bool unknown_category_written = false;
+    for (term::Terminal_render_cell& cell : unknown_category_snapshot.cells) {
+        if (cell.position.row == 0 && cell.position.column == 0) {
+            cell.text_category = term::Terminal_render_cell_text_category::UNKNOWN;
+            unknown_category_written = true;
+            break;
+        }
+    }
+    ok &= check(unknown_category_written &&
+        term::validate_render_snapshot(unknown_category_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "unknown text category remains valid for fallback classification");
+
+    term::Terminal_render_snapshot stale_category_snapshot = snapshot;
+    bool stale_category_written = false;
+    for (term::Terminal_render_cell& cell : stale_category_snapshot.cells) {
+        if (non_ascii_cell != nullptr &&
+            cell.position.row    == non_ascii_cell->position.row &&
+            cell.position.column == non_ascii_cell->position.column)
+        {
+            cell.text_category = term::Terminal_render_cell_text_category::PRINTABLE_ASCII;
+            stale_category_written = true;
+            break;
+        }
+    }
+    ok &= check(stale_category_written &&
+        term::validate_render_snapshot(stale_category_snapshot).status ==
+            term::Terminal_render_snapshot_status::INVALID_CELL_TEXT_CATEGORY,
+        "snapshot validation rejects stale cached text category");
 
     return ok;
 }
@@ -1086,6 +1170,7 @@ int main()
     ok &= test_owned_styled_wide_hyperlink_scrollback_snapshot();
     ok &= test_scrollback_wide_rows_are_repaired_on_resize();
     ok &= test_snapshot_rows_cover_primary_retained_and_alternate_sources();
+    ok &= test_snapshot_cells_cache_text_category();
     ok &= test_alternate_screen_hides_primary_scrollback();
     ok &= test_request_metadata_damage_selection_and_ime();
     ok &= test_selection_request_rejects_retained_line_row_reorder();
