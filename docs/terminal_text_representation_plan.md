@@ -11,8 +11,9 @@ possible.
 
 ## Goals
 
-- Reduce `QString` construction, copying, UTF-16 scanning, and `toUtf8()`
-  conversion in hot render-frame and renderer paths.
+- Reduce `QString` copy/refcount traffic, text-object footprint, UTF-16
+  classification scans, and remaining `toUtf8()` conversion in hot
+  render-frame and renderer paths.
 - Preserve public Qt/QML API compatibility.
 - Preserve exact behavior for Unicode width, combining characters, wide glyphs,
   emoji, selection, copy/paste, transcript diagnostics, and Qt text-layout
@@ -37,16 +38,33 @@ The backend/parser path naturally receives bytes and can optimize byte scanning.
 The renderer path mostly receives `QString` text runs, because Qt stores text as
 UTF-16 and Qt text APIs consume `QString`.
 
-This makes in-place UTF-16 scans cheap for current renderer code, but it also
-means ASCII-heavy terminal content can still pay for:
+This makes in-place UTF-16 scans cheap for current renderer code, but it does
+not mean the code still pays the original easy cost for every printable ASCII
+cell. Current source already includes two important optimizations:
 
-- per-cell or per-run `QString` storage;
-- repeated UTF-16 classification;
-- conversion to UTF-8 for packed payloads;
-- allocations around small text values.
+- `printable_ascii_cell_text()` returns references into a static array of 95
+  interned printable-ASCII `QString`s, and printable ASCII cell writes store
+  those values. The common single-cell ASCII path therefore pays `QString`
+  handle assignment/refcount traffic, not a fresh heap allocation per cell.
+- Renderer-side ASCII fast paths already exist. The frame collects printable
+  ASCII/simple-ASCII counters, packed text sidecars copy printable ASCII UTF-16
+  code units directly to bytes, and QSG paths include trusted-ASCII glyph
+  replacement, batching, and resource prefiltering.
+
+The remaining plausible costs are narrower:
+
+- atomic refcount churn when cells are copied, especially from model rows into
+  render snapshots;
+- memory footprint from storing a `QString` handle in every model cell and
+  emitted render cell;
+- repeated UTF-16 classification when the same trusted ASCII text is recognized
+  again at later stages;
+- `toUtf8()` conversion for non-ASCII fallback and for paths that still lack an
+  ASCII side channel.
 
 The highest-confidence improvement area is ASCII-heavy render-frame construction
-and renderer submission, not public Qt API replacement.
+and renderer submission, not public Qt API replacement and not broad `QString`
+replacement.
 
 ## Proposed Internal Types
 
@@ -92,6 +110,15 @@ The first implementation does not need every category. It can start with
 `EMPTY`, `ASCII_CELL`, `ASCII_BYTES`, and `QSTRING`, then add `UTF8_BYTES` only
 after the ASCII path is proven.
 
+Before committing to the full category set, Stage 3 should also evaluate a
+simpler cell-storage design: inline storage for an empty value or one Unicode
+scalar (`char32_t` plus display metadata), with a side table or owned fallback
+only for multi-codepoint grapheme/combining cases. That shape may remove
+`QString` from all single-codepoint cells, not only printable ASCII cells, while
+keeping branch count lower than a broad five-kind text variant. The stage should
+choose the simpler representation if it covers the measured hot cells and keeps
+Qt materialization at the existing boundaries.
+
 ## Boundary Rules
 
 `QString` remains required at these boundaries:
@@ -120,17 +147,29 @@ must materialize or retain `QString`.
 
 Add focused counters before changing storage:
 
-- `QString` text cell/run creations in render-frame construction.
-- `QString::toUtf8()` calls in renderer packing.
+- cells copied from model rows into render snapshots, split by printable ASCII,
+  single-codepoint non-ASCII, multi-codepoint text, and empty/unoccupied cells.
+- proxy counts for `QString` handle/refcount traffic in the model-to-snapshot
+  copy path. Direct Qt atomic-refcount counts are not portable, so the first
+  gate should use copy-site counts plus profiler timings.
+- render snapshot construction time and renderer packing time, using the
+  existing profile scopes where possible.
+- `QString::toUtf8()` calls and converted byte volume in renderer packing and
+  width-measurement fallback paths.
 - ASCII vs non-ASCII render text volume.
 - single-cell ASCII vs multi-cell ASCII counts.
-- fallback materialization counts after introducing internal text.
+- packed-text bytes emitted through the direct printable-ASCII copy path vs
+  UTF-8 conversion.
+- clean-row/cache reuse rates, so benchmark results are not misread when row
+  caching masks run-construction cost.
+- fallback materialization counts after introducing any internal text type.
 
 Validation:
 
 - no behavior change;
 - benchmark output includes enough counters to decide which storage category
-  matters most.
+  matters most;
+- measurements include both CMDG and at least one ordinary shell workload.
 
 ### Stage 2: Add Read-Only Terminal Text Views
 
@@ -151,10 +190,10 @@ Validation:
 - CMDG benchmarks;
 - no public API changes.
 
-### Stage 3: Store ASCII Cell Text Compactly
+### Stage 3: Prototype Compact Cell Text Storage
 
-Change the narrowest internal structure that currently stores common one-cell
-ASCII text as `QString` so it can store inline ASCII instead.
+Change the narrowest internal structure that currently stores common cell text
+as `QString` so it can store compact text for the measured hot case.
 
 Candidate areas:
 
@@ -162,8 +201,17 @@ Candidate areas:
 - render cell construction;
 - render text run assembly.
 
-This stage should avoid changing non-ASCII storage. A cell that is not exactly
-one printable ASCII code point should continue to use the existing path.
+The default prototype target is the model `Cell` text field and the
+model-to-snapshot copy path, because current ASCII writes already avoid per-cell
+allocation but snapshot publication still copies `QString` handles into
+`Terminal_render_cell`. The prototype should compare:
+
+- inline printable ASCII only;
+- inline single Unicode scalar plus fallback side storage for complex text.
+
+Do not change public Qt/QML APIs or Unicode width policy in this stage. A cell
+that cannot be represented by the selected compact form must continue through
+the existing `QString` fallback.
 
 Validation:
 
@@ -181,6 +229,12 @@ payload references without materializing `QString`.
 Renderer paths should consume ASCII directly when they already use ASCII glyph
 replacement or packed payload emission. They should materialize `QString` only
 when falling back to Qt text layout.
+
+This stage is explicitly conditional. Current renderer code already has
+printable-ASCII classification, packed ASCII byte copying, trusted-ASCII glyph
+replacement, batching, and resource prefiltering. Stage 4 should run only if
+Stage 1 and Stage 3 show that the remaining renderer/frame boundary still costs
+enough to justify another representation crossing.
 
 Validation:
 
@@ -258,7 +312,9 @@ coordinated cross-repo batch under the shared governance rules.
 
 Continue the migration only if benchmark and counter evidence shows one of:
 
-- fewer `QString` allocations/conversions in hot paths;
+- fewer `QString` handle copies/refcount operations in hot paths;
+- lower model-cell or snapshot-cell memory footprint in the target workload;
+- fewer UTF-16 rescans or UTF-8 conversions in hot paths;
 - lower renderer/frame construction time;
 - equal or better CMDG scene/draw/paint throughput;
 - no regression in ordinary shell rendering and Unicode behavior.
