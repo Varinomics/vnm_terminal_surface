@@ -7411,31 +7411,63 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
                     continue;
                 }
 
+                Terminal_render_cell_text snapshot_text =
+                    Terminal_render_cell_text::from_source_cell(
+                        cell.text,
+                        cell.display_width,
+                        cell.wide_continuation);
+                const Terminal_render_cell_text_category snapshot_text_category =
+                    snapshot_text.category();
+
 #if VNM_TERMINAL_PROFILING_ENABLED
                 if (profile_enabled) {
-                    const QStringView text(cell.text);
-                    const std::uint64_t code_units =
-                        static_cast<std::uint64_t>(text.size());
-                    ++m_profile_stats.render_snapshot_qstring_copies;
-                    m_profile_stats.render_snapshot_text_code_units_copied += code_units;
-                    m_profile_stats.max_render_snapshot_text_units_per_cell =
-                        std::max(
-                            m_profile_stats.max_render_snapshot_text_units_per_cell,
-                            code_units);
+                    switch (snapshot_text.storage()) {
+                        case Terminal_render_cell_text_storage::EMPTY:
+                            ++m_profile_stats.render_snapshot_compact_empty_text_cells;
+                            break;
+                        case Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII:
+                            ++m_profile_stats.render_snapshot_compact_ascii_text_cells;
+                            break;
+                        case Terminal_render_cell_text_storage::FALLBACK_QSTRING: {
+                            const QString* fallback_text =
+                                snapshot_text.fallback_qstring_or_null();
+                            const QStringView text(*fallback_text);
+                            const std::uint64_t code_units =
+                                static_cast<std::uint64_t>(text.size());
+                            ++m_profile_stats.render_snapshot_fallback_qstring_copies;
+                            m_profile_stats.
+                                render_snapshot_fallback_text_code_units_copied +=
+                                    code_units;
+                            m_profile_stats.
+                                max_render_snapshot_fallback_text_units_per_cell =
+                                    std::max(
+                                        m_profile_stats.
+                                            max_render_snapshot_fallback_text_units_per_cell,
+                                        code_units);
 
-                    if (text.isEmpty()) {
-                        ++m_profile_stats.render_snapshot_empty_text_copies;
-                    }
-                    else
-                    if (is_printable_ascii_text(text)) {
-                        ++m_profile_stats.render_snapshot_ascii_text_copies;
-                    }
-                    else
-                    if (is_single_unicode_scalar(text)) {
-                        ++m_profile_stats.render_snapshot_single_non_ascii_copies;
-                    }
-                    else {
-                        ++m_profile_stats.render_snapshot_multi_text_copies;
+                            if (snapshot_text_category ==
+                                Terminal_render_cell_text_category::PRINTABLE_ASCII)
+                            {
+                                ++m_profile_stats.
+                                    render_snapshot_fallback_printable_ascii_copies;
+                            }
+                            else
+                            if (snapshot_text_category ==
+                                Terminal_render_cell_text_category::OTHER_ASCII)
+                            {
+                                ++m_profile_stats.
+                                    render_snapshot_fallback_other_ascii_copies;
+                            }
+                            else
+                            if (is_single_unicode_scalar(text)) {
+                                ++m_profile_stats.
+                                    render_snapshot_fallback_single_non_ascii_copies;
+                            }
+                            else {
+                                ++m_profile_stats.render_snapshot_fallback_multi_text_copies;
+                            }
+                            break;
+                        }
                     }
                 }
 #endif
@@ -7454,12 +7486,12 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
 
                 snapshot.cells.push_back({
                     { snapshot_row, column },
-                    cell.text,
+                    std::move(snapshot_text),
                     cell.hyperlink_id,
                     cell.display_width,
                     cell.wide_continuation,
                     cell.style_id,
-                    cell.text_category,
+                    snapshot_text_category,
                 });
             }
         }

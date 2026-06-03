@@ -54,7 +54,7 @@ QString row_text(const term::Terminal_render_snapshot& snapshot, int row)
     QString text;
     for (const term::Terminal_render_cell& cell : snapshot.cells) {
         if (cell.position.row == row && !cell.wide_continuation) {
-            text += cell.text;
+            cell.text.append_to(text);
         }
     }
     return text;
@@ -389,17 +389,19 @@ bool test_snapshot_rows_cover_primary_retained_and_alternate_sources()
     ok &= check(stats.render_snapshot_rows_borrowed == 5U &&
         stats.render_snapshot_rows_owned == 1U,
         "row-source snapshots split borrowed and owned row-cell sources");
-    ok &= check(stats.render_snapshot_qstring_copies == 17U &&
-        stats.render_snapshot_text_code_units_copied == 17U &&
-        stats.render_snapshot_ascii_text_copies == 17U,
-        "row-source snapshots count printable ASCII QString copy pressure");
-    ok &= check(stats.render_snapshot_empty_text_copies == 0U &&
-        stats.render_snapshot_single_non_ascii_copies == 0U &&
-        stats.render_snapshot_multi_text_copies == 0U,
-        "row-source snapshots keep non-ASCII and complex copy categories empty");
+    ok &= check(stats.render_snapshot_compact_ascii_text_cells == 17U &&
+        stats.render_snapshot_compact_empty_text_cells == 0U &&
+        stats.render_snapshot_fallback_qstring_copies == 0U,
+        "row-source snapshots count compact printable ASCII cells without QString copies");
+    ok &= check(stats.render_snapshot_fallback_text_code_units_copied == 0U &&
+        stats.render_snapshot_fallback_printable_ascii_copies == 0U &&
+        stats.render_snapshot_fallback_other_ascii_copies == 0U &&
+        stats.render_snapshot_fallback_single_non_ascii_copies == 0U &&
+        stats.render_snapshot_fallback_multi_text_copies == 0U,
+        "row-source snapshots keep fallback copy categories empty for compact ASCII");
     ok &= check(stats.render_snapshot_unoccupied_cells_skipped == 31U &&
-        stats.max_render_snapshot_text_units_per_cell == 1U,
-        "row-source snapshots expose skipped cells and max copied text width");
+        stats.max_render_snapshot_fallback_text_units_per_cell == 0U,
+        "row-source snapshots expose skipped cells and fallback copied text width");
 #endif
 
     return ok;
@@ -424,6 +426,16 @@ bool test_snapshot_cells_cache_text_category()
         ascii_cell->text_category ==
             term::Terminal_render_cell_text_category::PRINTABLE_ASCII,
         "printable ASCII snapshot cell carries cached category");
+    ok &= check(ascii_cell != nullptr &&
+        ascii_cell->text.storage() ==
+            term::Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII,
+        "printable ASCII snapshot cell uses compact inline storage");
+    ok &= check(ascii_cell != nullptr &&
+        ascii_cell->text.fallback_qstring_or_null() == nullptr &&
+        ascii_cell->text.single_printable_ascii_code_unit().has_value() &&
+        ascii_cell->text.single_printable_ascii_code_unit().value() ==
+            static_cast<ushort>('A'),
+        "printable ASCII snapshot cell stores an inline code unit without fallback QString");
 
     const term::Terminal_render_cell* non_ascii_cell =
         cell_with_text(snapshot, QStringLiteral("\u754c"));
@@ -431,6 +443,10 @@ bool test_snapshot_cells_cache_text_category()
         non_ascii_cell->text_category ==
             term::Terminal_render_cell_text_category::NON_ASCII,
         "non-ASCII snapshot cell carries cached category");
+    ok &= check(non_ascii_cell != nullptr &&
+        non_ascii_cell->text.storage() ==
+            term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
+        "non-ASCII snapshot cell uses fallback QString storage");
 
     const term::Terminal_render_cell* continuation_cell = non_ascii_cell != nullptr
         ? cell_at(snapshot, non_ascii_cell->position.row, non_ascii_cell->position.column + 1)
@@ -440,6 +456,10 @@ bool test_snapshot_cells_cache_text_category()
         continuation_cell->text_category ==
             term::Terminal_render_cell_text_category::EMPTY,
         "wide continuation snapshot cell carries empty cached category");
+    ok &= check(continuation_cell != nullptr &&
+        continuation_cell->text.storage() ==
+            term::Terminal_render_cell_text_storage::EMPTY,
+        "wide continuation snapshot cell uses empty compact storage");
 
     term::Terminal_render_snapshot unknown_category_snapshot = snapshot;
     bool unknown_category_written = false;

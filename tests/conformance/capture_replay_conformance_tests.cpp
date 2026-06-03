@@ -328,7 +328,7 @@ std::vector<QString> row_cells_keys(const term::Terminal_render_snapshot& snapsh
             .arg(static_cast<qulonglong>(attributes.foreground_rgba), 0, 16)
             .arg(static_cast<qulonglong>(attributes.background_rgba), 0, 16)
             .arg(static_cast<qulonglong>(attributes.style_attributes), 0, 16)
-            .arg(cell.text);
+            .arg(cell.text.to_qstring());
     }
     return keys;
 }

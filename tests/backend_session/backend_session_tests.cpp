@@ -405,7 +405,7 @@ QString snapshot_row_text(
         QString cell_text = QStringLiteral(" ");
         for (const term::Terminal_render_cell& cell : snapshot.cells) {
             if (cell.position.row == row && cell.position.column == column) {
-                cell_text = cell.text;
+                cell_text = cell.text.to_qstring();
                 break;
             }
         }
@@ -442,7 +442,7 @@ QString projection_row_text(
         QString cell_text = QStringLiteral(" ");
         for (const term::Terminal_render_cell& cell : projection_row.cells) {
             if (cell.position.column == column) {
-                cell_text = cell.text;
+                cell_text = cell.text.to_qstring();
                 break;
             }
         }
@@ -4663,7 +4663,7 @@ bool test_public_projection_phase1_compacts_copied_metadata()
         style_only_session->latest_render_snapshot();
     const term::Terminal_render_cell* source_style_only_cell =
         style_only_snapshot.has_value() && style_only_cell != nullptr
-            ? snapshot_cell_with_text(*style_only_snapshot, style_only_cell->text)
+            ? snapshot_cell_with_text(*style_only_snapshot, style_only_cell->text.to_qstring())
             : nullptr;
     ok &= check(style_only_projection.has_value() &&
         style_only_snapshot.has_value() &&

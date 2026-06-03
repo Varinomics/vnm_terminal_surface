@@ -593,7 +593,7 @@ QString projection_row_text(const term::Terminal_public_projection_row& row)
         if (cell == nullptr || cell->wide_continuation) {
             continue;
         }
-        text += cell->text;
+        cell->text.append_to(text);
     }
     return text;
 }
@@ -704,7 +704,7 @@ QString snapshot_row_text(const term::Terminal_render_snapshot& snapshot, int ro
             continue;
         }
         if (!cell->wide_continuation) {
-            text += cell->text;
+            cell->text.append_to(text);
         }
     }
     return text;
