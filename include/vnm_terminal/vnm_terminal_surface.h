@@ -484,7 +484,6 @@ private:
     bool                     m_transcript_snapshot_diagnostics      = false;
     bool                     m_transcript_timing_diagnostics        = false;
     bool                     m_wheel_trace_enabled                  = false;
-    bool                     m_selection_trace_enabled              = false;
     int                      m_synchronized_output_stale_timeout_ms = 1000;
     Synchronized_output_scroll_policy m_synchronized_output_scroll_policy =
         Synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION;

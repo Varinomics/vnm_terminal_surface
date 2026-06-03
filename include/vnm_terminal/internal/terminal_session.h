@@ -36,25 +36,6 @@ using Terminal_ime_commit_result  = Terminal_input_event_result;
 using Terminal_paste_text_result  = Terminal_input_event_result;
 using Terminal_focus_event_result = Terminal_input_event_result;
 
-struct Terminal_session_profile_stats
-{
-    bool                       enabled                               = false;
-    std::uint64_t              render_snapshot_requests              = 0U;
-    std::uint64_t              render_snapshots_constructed          = 0U;
-    std::uint64_t              render_snapshot_publications          = 0U;
-    std::uint64_t              content_snapshot_publications         = 0U;
-    std::uint64_t              selection_snapshot_publications       = 0U;
-    std::uint64_t              geometry_snapshot_publications        = 0U;
-    std::uint64_t              public_projection_scroll_requests     = 0U;
-    std::uint64_t              public_projection_scroll_publications = 0U;
-    std::uint64_t              dirty_coalescing_attempts             = 0U;
-    std::uint64_t              dirty_coalescing_applied              = 0U;
-    std::uint64_t              zero_dirty_snapshot_publications      = 0U;
-    std::uint64_t              snapshots_superseded_before_render    = 0U;
-    std::uint64_t              snapshots_marked_rendered            = 0U;
-    std::uint64_t              max_unrendered_snapshot_generations   = 0U;
-};
-
 class Terminal_session
 {
 public:
@@ -212,12 +193,9 @@ public:
     Ime_preedit_state ime_preedit_state() const;
     std::uint64_t ime_preedit_generation() const;
     std::optional<Terminal_screen_model_result> last_model_ingest_result() const;
-    void set_dirty_row_stats_enabled(bool enabled);
     Terminal_screen_model_dirty_row_stats dirty_row_stats() const;
     Terminal_screen_model_dirty_row_timeline dirty_row_timeline() const;
-    void set_profile_stats_enabled(bool enabled);
     Terminal_screen_model_profile_stats model_profile_stats() const;
-    Terminal_session_profile_stats profile_stats() const;
     std::optional<Terminal_backend_exit> exit_status() const;
 
     /**
@@ -595,7 +573,6 @@ private:
     Terminal_bell_state                                    m_bell_state;
     Selection_contract_controller                          m_selection;
     terminal_selection_content_basis_t                     m_selection_content_basis;
-    Terminal_session_profile_stats                         m_profile_stats;
     Terminal_buffer_id                         m_selection_buffer_id =
         Terminal_buffer_id::PRIMARY;
     bool                                                   m_deferred_viewport_changed = false;

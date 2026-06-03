@@ -53,14 +53,6 @@ public:
     static Render_profile_snapshot_t render_profiler_snapshot(
         const VNM_TerminalSurface& surface);
 
-    static void set_dirty_row_stats_enabled(
-        VNM_TerminalSurface&       surface,
-        bool                       enabled);
-
-    static void set_selection_trace_enabled(
-        VNM_TerminalSurface&       surface,
-        bool                       enabled);
-
     static Terminal_screen_model_dirty_row_stats dirty_row_stats(
         const VNM_TerminalSurface& surface);
 
@@ -68,9 +60,6 @@ public:
         const VNM_TerminalSurface& surface);
 
     static Terminal_screen_model_profile_stats model_profile_stats(
-        const VNM_TerminalSurface& surface);
-
-    static Terminal_session_profile_stats session_profile_stats(
         const VNM_TerminalSurface& surface);
 
     static void set_cursor_blink_visible(
