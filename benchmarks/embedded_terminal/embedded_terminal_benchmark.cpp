@@ -1802,6 +1802,8 @@ QString render_snapshot_status_name(term::Terminal_render_snapshot_status status
             return QStringLiteral("INVALID_CELL_POSITION");
         case term::Terminal_render_snapshot_status::INVALID_CELL_WIDTH:
             return QStringLiteral("INVALID_CELL_WIDTH");
+        case term::Terminal_render_snapshot_status::INVALID_CELL_TEXT_CATEGORY:
+            return QStringLiteral("INVALID_CELL_TEXT_CATEGORY");
         case term::Terminal_render_snapshot_status::INVALID_CELL_OVERLAP:
             return QStringLiteral("INVALID_CELL_OVERLAP");
         case term::Terminal_render_snapshot_status::INVALID_WIDE_CELL_CONTINUATION:
@@ -1822,6 +1824,8 @@ QString render_snapshot_status_name(term::Terminal_render_snapshot_status status
             return QStringLiteral("INVALID_LINE_PROVENANCE");
         case term::Terminal_render_snapshot_status::INVALID_HYPERLINK_METADATA:
             return QStringLiteral("INVALID_HYPERLINK_METADATA");
+        case term::Terminal_render_snapshot_status::INVALID_SNAPSHOT_BASIS_PURPOSE:
+            return QStringLiteral("INVALID_SNAPSHOT_BASIS_PURPOSE");
     }
 
     return QStringLiteral("UNKNOWN");

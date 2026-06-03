@@ -2445,16 +2445,6 @@ bool contains_non_ascii_text(const QString& text)
     return false;
 }
 
-bool is_printable_ascii_cell_text(const QString& text)
-{
-    if (text.size() != 1) {
-        return false;
-    }
-
-    const ushort codepoint = text.at(0).unicode();
-    return codepoint >= k_printable_ascii_first && codepoint <= k_printable_ascii_last;
-}
-
 std::size_t printable_ascii_glyph_index(ushort codepoint)
 {
     return static_cast<std::size_t>(codepoint - k_printable_ascii_first);
@@ -7579,13 +7569,48 @@ Terminal_simple_content_text_category simple_content_text_category(const QString
         return Terminal_simple_content_text_category::EMPTY;
     }
 
-    if (is_printable_ascii_text(text)) {
+    unsigned int outside_printable_ascii = 0U;
+    unsigned int non_ascii               = 0U;
+    const qsizetype text_size            = text.size();
+    const ushort* code_units             = text.utf16();
+    for (qsizetype index = 0; index < text_size; ++index) {
+        const unsigned int code_unit = code_units[index];
+        outside_printable_ascii |= static_cast<unsigned int>(
+            code_unit - k_printable_ascii_first >
+                k_printable_ascii_last - k_printable_ascii_first);
+        non_ascii |= code_unit;
+    }
+
+    if (outside_printable_ascii == 0U) {
         return Terminal_simple_content_text_category::PRINTABLE_ASCII;
     }
 
-    return contains_non_ascii_text(text)
+    return (non_ascii & ~0x7fU) != 0U
         ? Terminal_simple_content_text_category::NON_ASCII
         : Terminal_simple_content_text_category::OTHER_ASCII;
+}
+
+Terminal_simple_content_text_category simple_content_text_category(
+    const Terminal_render_cell& cell)
+{
+    static_assert(
+        static_cast<int>(Terminal_render_cell_text_category::EMPTY) ==
+            static_cast<int>(Terminal_simple_content_text_category::EMPTY));
+    static_assert(
+        static_cast<int>(Terminal_render_cell_text_category::PRINTABLE_ASCII) ==
+            static_cast<int>(Terminal_simple_content_text_category::PRINTABLE_ASCII));
+    static_assert(
+        static_cast<int>(Terminal_render_cell_text_category::OTHER_ASCII) ==
+            static_cast<int>(Terminal_simple_content_text_category::OTHER_ASCII));
+    static_assert(
+        static_cast<int>(Terminal_render_cell_text_category::NON_ASCII) ==
+            static_cast<int>(Terminal_simple_content_text_category::NON_ASCII));
+
+    if (cell.text_category != Terminal_render_cell_text_category::UNKNOWN) {
+        return static_cast<Terminal_simple_content_text_category>(cell.text_category);
+    }
+
+    return simple_content_text_category(cell.text);
 }
 
 Terminal_simple_content_rejection_reason unrepresented_simple_cell_semantics_rejection(
@@ -7604,11 +7629,13 @@ Terminal_simple_content_rejection_reason unrepresented_simple_cell_semantics_rej
 }
 
 bool strict_printable_ascii_classifier_bypass_eligible(
-    const Terminal_render_cell&    cell,
-    bool                           has_decoration)
+    const Terminal_render_cell&           cell,
+    Terminal_simple_content_text_category text_category,
+    bool                                  has_decoration)
 {
     return
-        is_printable_ascii_cell_text(cell.text) &&
+        text_category == Terminal_simple_content_text_category::PRINTABLE_ASCII &&
+        cell.text.size() == 1                  &&
         cell.display_width == 1                 &&
         !cell.wide_continuation                 &&
         cell.hyperlink_id == 0U                 &&
@@ -7616,8 +7643,8 @@ bool strict_printable_ascii_classifier_bypass_eligible(
 }
 
 bool terminal_graphic_candidate_text(
-    Terminal_simple_content_text_category  text_category,
-    const QString&                         text)
+    Terminal_simple_content_text_category text_category,
+    const QString&                        text)
 {
     return
         text_category == Terminal_simple_content_text_category::NON_ASCII &&
@@ -7635,7 +7662,7 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
     Terminal_shaped_presentation_mode  presentation_mode)
 {
     terminal_simple_content_classification_t classification;
-    classification.text_category = simple_content_text_category(cell.text);
+    classification.text_category = simple_content_text_category(cell);
     classification.row           = cell.position.row;
     classification.style_id      = cell.style_id;
     classification.dirty_row     = dirty_row;
@@ -7690,7 +7717,11 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
             Terminal_simple_content_rejection_reason::EMPTY_TEXT);
     }
 
-    if (strict_printable_ascii_classifier_bypass_eligible(cell, has_decoration)) {
+    if (strict_printable_ascii_classifier_bypass_eligible(
+            cell,
+            classification.text_category,
+            has_decoration))
+    {
         classification.route = Terminal_simple_content_route::FAST_TEXT;
         classification.rejection_reason =
             Terminal_simple_content_rejection_reason::NONE;
@@ -8168,22 +8199,24 @@ std::uint32_t packed_color_rgba(const QColor& color)
 }
 
 void append_packed_text_bytes(
-    Terminal_render_frame&             frame,
-    terminal_packed_text_span_t&       span,
-    const QString&                     text)
+    Terminal_render_frame&                   frame,
+    terminal_packed_text_span_t&             span,
+    const QString&                           text,
+    Terminal_simple_content_text_category    text_category)
 {
-    if (is_printable_ascii_text(text)) {
+    if (text_category == Terminal_simple_content_text_category::PRINTABLE_ASCII) {
         const std::size_t byte_offset = frame.packed_text_bytes.size();
-        frame.packed_text_bytes.resize(byte_offset + static_cast<std::size_t>(text.size()));
+        const qsizetype text_size     = text.size();
+        frame.packed_text_bytes.resize(byte_offset + static_cast<std::size_t>(text_size));
 
         ++frame.stats.packed_text_ascii_direct_cells;
-        frame.stats.packed_text_ascii_direct_bytes += static_cast<std::uint64_t>(text.size());
+        frame.stats.packed_text_ascii_direct_bytes += static_cast<std::uint64_t>(text_size);
         const ushort* code_units = text.utf16();
         char* bytes = frame.packed_text_bytes.data() + byte_offset;
-        for (qsizetype index = 0; index < text.size(); ++index) {
+        for (qsizetype index = 0; index < text_size; ++index) {
             bytes[index] = static_cast<char>(code_units[index]);
         }
-        span.text_length += static_cast<std::uint32_t>(text.size());
+        span.text_length += static_cast<std::uint32_t>(text_size);
         return;
     }
 
@@ -8199,10 +8232,11 @@ void append_packed_text_bytes(
 }
 
 void append_packed_text_cell(
-    Terminal_render_frame&             frame,
-    terminal_packed_render_row_t&      row,
-    const Terminal_render_cell&        cell,
-    const render_style_attributes_t&   style)
+    Terminal_render_frame&                   frame,
+    terminal_packed_render_row_t&            row,
+    const Terminal_render_cell&              cell,
+    const render_style_attributes_t&         style,
+    Terminal_simple_content_text_category    text_category)
 {
     const std::uint32_t foreground_rgba = packed_color_rgba(style.foreground);
     const std::uint32_t background_rgba = packed_color_rgba(style.background);
@@ -8216,7 +8250,7 @@ void append_packed_text_cell(
             span.background_rgba                  == background_rgba)
         {
             span.column_count += cell.display_width;
-            append_packed_text_bytes(frame, span, cell.text);
+            append_packed_text_bytes(frame, span, cell.text, text_category);
             ++frame.stats.packed_text_cells;
             ++frame.stats.packed_cells_appended;
             return;
@@ -8235,7 +8269,7 @@ void append_packed_text_cell(
     span.foreground_rgba = foreground_rgba;
     span.background_rgba = background_rgba;
     span.text_offset     = static_cast<std::uint32_t>(frame.packed_text_bytes.size());
-    append_packed_text_bytes(frame, span, cell.text);
+    append_packed_text_bytes(frame, span, cell.text, text_category);
     frame.packed_text_spans.push_back(span);
     ++row.text_span_count;
     ++frame.stats.packed_text_cells;
@@ -8482,7 +8516,8 @@ void build_terminal_render_frame_packed_data(
                     frame,
                     packed_row,
                     *cell,
-                    style_attributes.attributes(cell->style_id));
+                    style_attributes.attributes(cell->style_id),
+                    classification.text_category);
             }
         }
     }
