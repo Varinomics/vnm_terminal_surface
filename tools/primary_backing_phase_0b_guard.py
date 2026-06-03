@@ -107,6 +107,9 @@ RECOVERY_ALLOWED_LINES_BY_PATH = {
         "void Terminal_screen_model::begin_primary_repaint_recovery_candidate()",
         "finish_primary_repaint_recovery_candidate(true);",
         "m_primary_repaint_recovery_candidate.rows                         = active_grid_rows();",
+        "m_primary_repaint_recovery_candidate.hyperlink_identity_keys.clear();",
+        "for (const Terminal_screen_row& row : m_primary_repaint_recovery_candidate.rows) {",
+        "m_primary_repaint_recovery_candidate.hyperlink_identity_keys.insert(",
         "m_primary_repaint_recovery_candidate.scrollback_rows              = scrollback_size();",
         "m_primary_repaint_recovery_candidate.unmatched_finish_budget      = 1;",
         "m_primary_repaint_recovery_candidate.pending_non_home_addressed_row = -1;",
@@ -156,6 +159,9 @@ RECOVERY_ALLOWED_LINES_BY_PATH = {
     Path("tests/windows_conpty_backend/windows_conpty_backend_tests.cpp"): {
         "recovery_model_config.recover_scrollback_from_primary_repaints = true;",
     },
+    Path("tests/backend_session/backend_session_tests.cpp"): {
+        "config.recover_scrollback_from_primary_repaints = true;",
+    },
     Path("tests/screen_operations/model_ops_tests.cpp"): {
         "config.recover_scrollback_from_primary_repaints = true;",
     },
@@ -177,7 +183,7 @@ RECOVERY_ALLOWED_LINE_COUNT_OVERRIDES_BY_PATH = {
         "advance_resize_repaint_clear_guard();": 2,
         "cancel_primary_repaint_recovery_candidate();": 8,
         "cancel_resize_repaint_clear_guard();": 6,
-        "cancel_resize_repaint_clear_guard_before_visible_clear();": 3,
+        "cancel_resize_repaint_clear_guard_before_visible_clear();": 4,
         "finish_primary_repaint_recovery_candidate(false);": 2,
         "if (!m_config.recover_scrollback_from_primary_repaints ||": 3,
         "if (m_primary_repaint_recovery_candidate.active &&": 4,

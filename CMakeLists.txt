@@ -1,4 +1,18 @@
 cmake_minimum_required(VERSION 3.21)
+
+option(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY
+    "Build diagnostic transcript capture/replay recorder, replay tool, and transcript tests"
+    OFF)
+option(VNM_TERMINAL_DISTRIBUTION_BUILD
+    "Configure a distribution build; diagnostic transcript capture/replay must stay disabled"
+    OFF)
+
+if(VNM_TERMINAL_DISTRIBUTION_BUILD AND VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
+    message(FATAL_ERROR
+        "VNM_TERMINAL_DISTRIBUTION_BUILD=ON requires "
+        "VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=OFF")
+endif()
+
 project(vnm_terminal_surface LANGUAGES CXX VERSION 0.1.0)
 
 include(GNUInstallDirs)
@@ -19,19 +33,6 @@ option(VNM_TERMINAL_SURFACE_BUILD_TESTING
 option(VNM_TERMINAL_BUILD_REQUIRED_READINESS "Build vnm_terminal_surface readiness validation gates" OFF)
 option(VNM_TERMINAL_BUILD_BENCHMARKS "Build vnm_terminal_surface benchmark executables" OFF)
 option(VNM_TERMINAL_ENABLE_PROFILING "Compile vnm_terminal_surface profile scope instrumentation" OFF)
-option(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY
-    "Build diagnostic transcript capture/replay recorder, replay tool, and transcript tests"
-    OFF)
-option(VNM_TERMINAL_DISTRIBUTION_BUILD
-    "Configure a distribution build; diagnostic transcript capture/replay must stay disabled"
-    OFF)
-
-if(VNM_TERMINAL_DISTRIBUTION_BUILD AND VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
-    message(FATAL_ERROR
-        "VNM_TERMINAL_DISTRIBUTION_BUILD=ON requires "
-        "VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=OFF")
-endif()
-
 if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_BUILD_BENCHMARKS)
     set(VNM_TERMINAL_BUILD_BENCHMARKS ON)
 endif()
