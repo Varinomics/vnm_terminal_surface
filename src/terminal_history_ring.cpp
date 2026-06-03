@@ -505,14 +505,15 @@ Terminal_history_ring_read_scope Terminal_history_ring::read_record(std::uint64_
         return Terminal_history_ring_read_scope(Terminal_history_ring_status::OUT_OF_LIVE_RANGE);
     }
 
-    const auto descriptor_it = std::find_if(
+    const auto descriptor_it = std::lower_bound(
         m_records.begin(),
         m_records.end(),
-        [&](terminal_history_ring_record_descriptor_t descriptor) {
-            return descriptor.byte_sequence == byte_sequence;
+        byte_sequence,
+        [](terminal_history_ring_record_descriptor_t descriptor, std::uint64_t sequence) {
+            return descriptor.byte_sequence < sequence;
         });
 
-    if (descriptor_it == m_records.end()) {
+    if (descriptor_it == m_records.end() || descriptor_it->byte_sequence != byte_sequence) {
         return Terminal_history_ring_read_scope(Terminal_history_ring_status::NOT_RECORD_BOUNDARY);
     }
 

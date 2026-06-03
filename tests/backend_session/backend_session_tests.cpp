@@ -5345,23 +5345,25 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
     config.synchronized_output_scroll_policy =
         term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
 
+    term::Terminal_session_config session_config = config;
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     QTemporaryDir transcript_dir;
     ok &= check(transcript_dir.isValid(),
         "Phase 3 boundary transcript directory is valid");
     const QString transcript_path =
         transcript_dir.filePath(QStringLiteral("phase3-boundaries.ndjson"));
     QString transcript_error;
-    term::Terminal_session_config transcript_config = config;
-    transcript_config.transcript_recorder =
+    session_config.transcript_recorder =
         term::Terminal_transcript_recorder::create(
             transcript_path,
             true,
             &transcript_error);
-    ok &= check(transcript_config.transcript_recorder != nullptr,
+    ok &= check(session_config.transcript_recorder != nullptr,
         "Phase 3 boundary transcript recorder opens");
+#endif
 
     std::unique_ptr<term::Terminal_session> session;
-    Scripted_backend* backend = make_session(session, transcript_config);
+    Scripted_backend* backend = make_session(session, session_config);
     term::Terminal_launch_config launch_config = valid_launch_config();
     launch_config.initial_grid_size = {3, 24};
     ok &= check(session->start(launch_config).code ==
@@ -5405,7 +5407,8 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
         "Phase 3 suffix publishes after release and public projection state is cleaned");
 
     session.reset();
-    transcript_config.transcript_recorder.reset();
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    session_config.transcript_recorder.reset();
     const std::optional<std::vector<term::Terminal_transcript_event>> events =
         term::read_terminal_transcript(transcript_path, &transcript_error);
     ok &= check(events.has_value(),
@@ -5437,6 +5440,7 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
             !release_text.contains(QStringLiteral("post")),
             "Phase 3 same-chunk DECRST transcript release snapshot excludes suffix bytes");
     }
+#endif
 
     std::unique_ptr<term::Terminal_session> force_session;
     Scripted_backend* force_backend = make_session(force_session, config);
@@ -8641,6 +8645,7 @@ bool test_synchronized_output_defers_content_until_release()
     term::Terminal_session_config ordered_force_release_config;
     ordered_force_release_config.synchronized_output_scroll_policy =
         term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     QTemporaryDir ordered_force_transcript_dir;
     ok &= check(ordered_force_transcript_dir.isValid(),
         "ordered force-release transcript directory is valid");
@@ -8654,6 +8659,7 @@ bool test_synchronized_output_defers_content_until_release()
             &ordered_force_transcript_error);
     ok &= check(ordered_force_release_config.transcript_recorder != nullptr,
         "ordered force-release transcript recorder opens");
+#endif
 
     std::unique_ptr<term::Terminal_session> ordered_force_release_session;
     Scripted_backend* ordered_force_release_backend =
@@ -8711,6 +8717,7 @@ bool test_synchronized_output_defers_content_until_release()
         "later callback output publishes after the force-release snapshot");
 
     ordered_force_release_session.reset();
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     ordered_force_release_config.transcript_recorder.reset();
     const std::optional<std::vector<term::Terminal_transcript_event>>
         ordered_force_events =
@@ -8761,6 +8768,7 @@ bool test_synchronized_output_defers_content_until_release()
             later_text.contains(QStringLiteral("XYZ")),
             "ordered force-release transcript publishes later queued output separately");
     }
+#endif
 
     std::unique_ptr<term::Terminal_session> same_csi_session;
     Scripted_backend* same_csi_backend = make_session(same_csi_session);

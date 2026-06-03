@@ -32,6 +32,7 @@ constexpr ushort   k_printable_ascii_first = 0x20U;
 constexpr ushort   k_printable_ascii_last  = 0x7eU;
 constexpr std::size_t k_printable_ascii_count =
     k_printable_ascii_last - k_printable_ascii_first + 1U;
+constexpr int k_printable_ascii_scan_block_bytes = 32;
 constexpr int k_resize_repaint_clear_guard_action_budget = 64;
 constexpr std::size_t k_retained_history_ring_capacity_bytes = 64U * 1024U * 1024U;
 
@@ -103,6 +104,37 @@ bool is_printable_ascii(QChar character)
 bool is_printable_ascii_byte(unsigned char byte)
 {
     return byte >= k_printable_ascii_first && byte <= k_printable_ascii_last;
+}
+
+bool printable_ascii_block_is_all_printable(const char* block)
+{
+    // Unsigned underflow makes below-range bytes fail the span check without a branch.
+    unsigned int outside_block = 0U;
+    for (int i = 0; i < k_printable_ascii_scan_block_bytes; ++i) {
+        const unsigned int byte = static_cast<unsigned char>(block[i]);
+        outside_block |= static_cast<unsigned int>(
+            byte - k_printable_ascii_first > k_printable_ascii_last - k_printable_ascii_first);
+    }
+    return outside_block == 0U;
+}
+
+qsizetype printable_ascii_run_end(QByteArrayView bytes, qsizetype offset)
+{
+    const char* data = bytes.data();
+    qsizetype current = offset;
+    while (current <= bytes.size() - k_printable_ascii_scan_block_bytes) {
+        if (!printable_ascii_block_is_all_printable(data + current)) {
+            break;
+        }
+        current += k_printable_ascii_scan_block_bytes;
+    }
+
+    while (current < bytes.size() &&
+        is_printable_ascii_byte(static_cast<unsigned char>(data[current])))
+    {
+        ++current;
+    }
+    return current;
 }
 
 terminal_history_handle_t retained_history_handle_from_provenance(
@@ -1269,10 +1301,7 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
         const unsigned char byte = byte_at(bytes, offset);
         if (is_printable_ascii_byte(byte)) {
             const qsizetype ascii_begin = offset;
-            do {
-                ++offset;
-            } while (offset < bytes.size() &&
-                is_printable_ascii_byte(byte_at(bytes, offset)));
+            offset = printable_ascii_run_end(bytes, offset);
 
             print_text.append(QLatin1StringView(
                 bytes.data() + ascii_begin,
@@ -2724,6 +2753,8 @@ void Terminal_screen_model::apply_sgr_sequence(const Terminal_sgr_sequence& sequ
     for (const Terminal_sgr_operation& operation : sequence.operations) {
         apply_sgr_operation(operation);
     }
+
+    m_current_style_id = intern_style(m_current_style);
 }
 
 void Terminal_screen_model::apply_sgr_operation(const Terminal_sgr_operation& operation)
@@ -2745,8 +2776,6 @@ void Terminal_screen_model::apply_sgr_operation(const Terminal_sgr_operation& op
             m_current_style.background = operation.color;
             break;
     }
-
-    m_current_style_id = intern_style(m_current_style);
 }
 
 Terminal_style_id Terminal_screen_model::intern_style(const Terminal_text_style& style)

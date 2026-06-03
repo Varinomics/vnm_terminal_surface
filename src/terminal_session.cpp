@@ -1430,6 +1430,26 @@ qsizetype trailing_incomplete_csi_start(
     return -1;
 }
 
+bool utf8_scan_state_is_reset(const Terminal_utf8_scan_state& state)
+{
+    return
+        state.continuation_remaining == 0     &&
+        state.next_minimum           == 0x80U &&
+        state.next_maximum           == 0xbfU;
+}
+
+bool backend_output_is_plain_ascii_without_prescan_intro(QByteArrayView bytes)
+{
+    for (const char byte : bytes) {
+        const unsigned char value = static_cast<unsigned char>(byte);
+        if (value == 0x1bU || value == 0x9bU || value >= 0x80U) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool uses_deferred_backend_callbacks(const Terminal_session_config& config)
 {
     return static_cast<bool>(config.backend_event_notifier);
@@ -3774,6 +3794,21 @@ Terminal_session_result Terminal_session::process_backend_output_command(
 
     const Terminal_utf8_scan_state backend_output_prescan_utf8_state =
         m_backend_output_prescan_utf8_state;
+    const bool use_plain_ascii_prescan_fast_path =
+        !command.bytes.isEmpty()                                      &&
+        m_backend_output_prescan_pending.isEmpty()                    &&
+        utf8_scan_state_is_reset(backend_output_prescan_utf8_state)   &&
+        backend_output_is_plain_ascii_without_prescan_intro(command.bytes);
+    if (use_plain_ascii_prescan_fast_path) {
+        ingest_backend_output_segment(command.sequence, QByteArrayView(command.bytes));
+        return {
+            Terminal_session_result_code::ACCEPTED,
+            command.sequence,
+            false,
+            std::nullopt,
+        };
+    }
+
     QByteArray combined_output;
     QByteArrayView remaining(command.bytes);
     if (!m_backend_output_prescan_pending.isEmpty()) {

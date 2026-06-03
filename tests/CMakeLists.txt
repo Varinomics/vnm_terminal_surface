@@ -594,8 +594,8 @@ vnm_terminal_add_qsg_render_variant(
     vnm_terminal_qsg_render_descriptor_direct_compare_off
     VNM_TERMINAL_STAGE42_QSG_TEXT_RESOURCE_DESCRIPTOR_DIRECT_COMPARE=0)
 vnm_terminal_add_qsg_render_variant(
-    vnm_terminal_qsg_render_row_slot_ordered_lookup_on
-    VNM_TERMINAL_STAGE42_QSG_ROW_SLOT_ORDERED_LOOKUP=1)
+    vnm_terminal_qsg_render_row_slot_ordered_lookup_off
+    VNM_TERMINAL_STAGE42_QSG_ROW_SLOT_ORDERED_LOOKUP=0)
 
 if(VNM_TERMINAL_ENABLE_MANUAL_QSG_FLAT_RECT_BATCHED_GEOMETRY_TEST)
     add_test(
@@ -1252,6 +1252,10 @@ add_executable(vnm_terminal_backend_session
 
 target_link_libraries(vnm_terminal_backend_session PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
+)
+
+target_compile_definitions(vnm_terminal_backend_session PRIVATE
+    VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY}>
 )
 
 set_target_properties(vnm_terminal_backend_session PROPERTIES

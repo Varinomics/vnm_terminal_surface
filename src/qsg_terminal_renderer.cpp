@@ -50,6 +50,7 @@ constexpr int         k_printable_ascii_first               = 0x20;
 constexpr int         k_printable_ascii_last                = 0x7e;
 constexpr std::size_t k_printable_ascii_count               =
     static_cast<std::size_t>(k_printable_ascii_last - k_printable_ascii_first + 1);
+constexpr int         k_utf16_classifier_block_code_units    = 32;
 constexpr std::size_t k_max_coalesced_ascii_text_run_length = 384U;
 constexpr qsizetype   k_max_cached_ascii_replacement_shape_length =
     static_cast<qsizetype>(k_max_coalesced_ascii_text_run_length);
@@ -2411,17 +2412,57 @@ bool ascii_advance_matches_cell_width(qreal advance, qreal cell_width)
     return ascii_widths_match(advance, cell_width, cell_width);
 }
 
+bool utf16_block_is_printable_ascii(const ushort* block)
+{
+    // Unsigned underflow makes below-range code units fail the span check without a branch.
+    unsigned int outside_block = 0U;
+    for (int i = 0; i < k_utf16_classifier_block_code_units; ++i) {
+        const unsigned int code_unit = block[i];
+        outside_block |= static_cast<unsigned int>(
+            code_unit - k_printable_ascii_first > k_printable_ascii_last - k_printable_ascii_first);
+    }
+    return outside_block == 0U;
+}
+
+bool utf16_block_is_all_space(const ushort* block)
+{
+    unsigned int non_space = 0U;
+    for (int i = 0; i < k_utf16_classifier_block_code_units; ++i) {
+        non_space |= static_cast<unsigned int>(block[i] ^ 0x20U);
+    }
+    return non_space == 0U;
+}
+
+bool utf16_block_has_non_ascii(const ushort* block)
+{
+    unsigned int non_ascii = 0U;
+    for (int i = 0; i < k_utf16_classifier_block_code_units; ++i) {
+        non_ascii |= block[i];
+    }
+    return (non_ascii & ~0x7fU) != 0U;
+}
+
 bool is_printable_ascii_text(const QString& text)
 {
     if (text.isEmpty()) {
         return false;
     }
 
-    for (const QChar character : text) {
-        const ushort codepoint = character.unicode();
-        if (codepoint < k_printable_ascii_first || codepoint > k_printable_ascii_last) {
+    const ushort* code_units = text.utf16();
+    qsizetype index = 0;
+    while (index <= text.size() - k_utf16_classifier_block_code_units) {
+        if (!utf16_block_is_printable_ascii(code_units + index)) {
             return false;
         }
+        index += k_utf16_classifier_block_code_units;
+    }
+
+    while (index < text.size()) {
+        const ushort code_unit = code_units[index];
+        if (code_unit < k_printable_ascii_first || code_unit > k_printable_ascii_last) {
+            return false;
+        }
+        ++index;
     }
 
     return true;
@@ -2433,10 +2474,20 @@ bool is_all_space_text(const QString& text)
         return false;
     }
 
-    for (const QChar character : text) {
-        if (character.unicode() != 0x20U) {
+    const ushort* code_units = text.utf16();
+    qsizetype index = 0;
+    while (index <= text.size() - k_utf16_classifier_block_code_units) {
+        if (!utf16_block_is_all_space(code_units + index)) {
             return false;
         }
+        index += k_utf16_classifier_block_code_units;
+    }
+
+    while (index < text.size()) {
+        if (code_units[index] != 0x20U) {
+            return false;
+        }
+        ++index;
     }
 
     return true;
@@ -2444,10 +2495,24 @@ bool is_all_space_text(const QString& text)
 
 bool contains_non_ascii_text(const QString& text)
 {
-    for (const QChar character : text) {
-        if (character.unicode() > 0x7fU) {
+    if (text.isEmpty()) {
+        return false;
+    }
+
+    const ushort* code_units = text.utf16();
+    qsizetype index = 0;
+    while (index <= text.size() - k_utf16_classifier_block_code_units) {
+        if (utf16_block_has_non_ascii(code_units + index)) {
             return true;
         }
+        index += k_utf16_classifier_block_code_units;
+    }
+
+    while (index < text.size()) {
+        if (code_units[index] > 0x7fU) {
+            return true;
+        }
+        ++index;
     }
 
     return false;
@@ -2481,23 +2546,16 @@ Text_layout_run_makeup text_layout_run_makeup(const QString& text)
 {
     Text_layout_run_makeup makeup;
     makeup.code_units = static_cast<std::uint64_t>(text.size());
-    for (const QChar character : text) {
-        const ushort code_unit = character.unicode();
-        if (code_unit == 0x20U) {
-            ++makeup.space_code_units;
-        }
-
-        if (code_unit >= 0x20U && code_unit <= 0x7eU) {
-            ++makeup.printable_ascii_code_units;
-            continue;
-        }
-
-        if (code_unit <= 0x7fU) {
-            ++makeup.other_ascii_code_units;
-            continue;
-        }
-
-        ++makeup.non_ascii_code_units;
+    const ushort* code_units = text.utf16();
+    for (qsizetype index = 0; index < text.size(); ++index) {
+        const ushort code_unit = code_units[index];
+        const bool printable_ascii =
+            code_unit >= k_printable_ascii_first && code_unit <= k_printable_ascii_last;
+        makeup.space_code_units += static_cast<std::uint64_t>(code_unit == 0x20U);
+        makeup.printable_ascii_code_units += static_cast<std::uint64_t>(printable_ascii);
+        makeup.other_ascii_code_units += static_cast<std::uint64_t>(
+            !printable_ascii && code_unit <= 0x7fU);
+        makeup.non_ascii_code_units += static_cast<std::uint64_t>(code_unit > 0x7fU);
     }
     return makeup;
 }
@@ -8685,6 +8743,19 @@ void append_packed_text_bytes(
     terminal_packed_text_span_t&       span,
     const QString&                     text)
 {
+    if (is_printable_ascii_text(text)) {
+        const std::size_t byte_offset = frame.packed_text_bytes.size();
+        frame.packed_text_bytes.resize(byte_offset + static_cast<std::size_t>(text.size()));
+
+        const ushort* code_units = text.utf16();
+        char* bytes = frame.packed_text_bytes.data() + byte_offset;
+        for (qsizetype index = 0; index < text.size(); ++index) {
+            bytes[index] = static_cast<char>(code_units[index]);
+        }
+        span.text_length += static_cast<std::uint32_t>(text.size());
+        return;
+    }
+
     const QByteArray bytes = text.toUtf8();
     frame.packed_text_bytes.insert(
         frame.packed_text_bytes.end(),
