@@ -76,6 +76,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/ime_contract.h
     include/vnm_terminal/internal/metrics_contract.h
     include/vnm_terminal/internal/parser_action.h
+    include/vnm_terminal/internal/qsg_rhi_stage0_probe.h
     include/vnm_terminal/internal/qsg_terminal_render_frame.h
     include/vnm_terminal/internal/qsg_terminal_renderer.h
     include/vnm_terminal/internal/qt_grid_metrics_provider.h
@@ -116,6 +117,7 @@ add_library(vnm_terminal_surface STATIC
     src/terminal_screen_model.cpp
     src/metrics_contract.cpp
     src/native_backend_io_core.cpp
+    src/qsg_rhi_stage0_probe.cpp
     src/qsg_terminal_renderer.cpp
     src/qt_grid_metrics_provider.cpp
     src/selection_contract.cpp

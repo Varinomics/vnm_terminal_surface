@@ -104,6 +104,8 @@ set(VNM_TERMINAL_EXTERNAL_CONFORMANCE_TIMEOUT "300" CACHE STRING
     "CTest timeout, in seconds, for external conformance commands.")
 set(VNM_TERMINAL_ENABLE_MANUAL_QSG_FLAT_RECT_BATCHED_GEOMETRY_TEST OFF CACHE BOOL
     "Add the manual QSG flat-rect batched-geometry CTest for non-software scene graph hosts.")
+set(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE0_SMOKE OFF CACHE BOOL
+    "Add the Stage 0 QRhi render-node hardware smoke CTest.")
 
 function(vnm_terminal_configure_test_process target_name)
     target_include_directories(${target_name} PRIVATE
@@ -567,6 +569,61 @@ if(VNM_TERMINAL_ENABLE_MANUAL_QSG_FLAT_RECT_BATCHED_GEOMETRY_TEST)
         LABELS "manual;qsg;hardware"
         TIMEOUT 60
     )
+endif()
+
+add_executable(vnm_terminal_qsg_rhi_stage0_probe
+    qsg_rhi_stage0_probe/rhi_stage0_probe_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_qsg_rhi_stage0_probe PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+    Qt6::QuickPrivate
+)
+
+set_target_properties(vnm_terminal_qsg_rhi_stage0_probe PROPERTIES
+    AUTOMOC OFF
+)
+
+if(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE0_SMOKE)
+    set(vnm_terminal_qsg_rhi_stage0_probe_backends)
+    if(WIN32)
+        list(APPEND vnm_terminal_qsg_rhi_stage0_probe_backends
+            d3d11
+            d3d12
+            vulkan
+            opengl
+        )
+    elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD)$")
+        list(APPEND vnm_terminal_qsg_rhi_stage0_probe_backends
+            vulkan
+            opengl
+        )
+    elseif(APPLE)
+        list(APPEND vnm_terminal_qsg_rhi_stage0_probe_backends
+            opengl
+        )
+    endif()
+
+    foreach(stage0_backend IN LISTS vnm_terminal_qsg_rhi_stage0_probe_backends)
+        add_test(
+            NAME vnm_terminal_qsg_rhi_stage0_probe_${stage0_backend}
+            COMMAND
+                "${CMAKE_COMMAND}" -E env
+                ${vnm_terminal_qt_unscaled_environment}
+                "${vnm_terminal_qt_runtime_path}"
+                "$<TARGET_FILE:vnm_terminal_qsg_rhi_stage0_probe>"
+                "--backend"
+                "${stage0_backend}"
+        )
+
+        set_tests_properties(
+            vnm_terminal_qsg_rhi_stage0_probe_${stage0_backend}
+            PROPERTIES
+                LABELS "qsg;hardware;stage0"
+                SKIP_RETURN_CODE 77
+                TIMEOUT 60
+        )
+    endforeach()
 endif()
 
 add_executable(vnm_terminal_shaping_contract
@@ -1307,6 +1364,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_render_snapshot
     vnm_terminal_render_frame
     vnm_terminal_qsg_render
+    vnm_terminal_qsg_rhi_stage0_probe
     vnm_terminal_shaping_contract
     vnm_terminal_qsg_text_node
     vnm_terminal_input_encoder
