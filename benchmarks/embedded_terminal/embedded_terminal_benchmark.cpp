@@ -85,7 +85,7 @@ constexpr int k_surface_session_output_high_water_chunks      = 64;
 constexpr int k_surface_session_output_high_water_chunk_bytes = 1024;
 constexpr int k_surface_session_write_high_water_bytes        = 64 * 1024;
 
-constexpr int k_schema_version              = 17;
+constexpr int k_schema_version              = 18;
 constexpr int k_profile_schema_version      = 2;
 constexpr int k_profile_text_format         = 2;
 constexpr int k_flat_rect_vertices_per_rect = 6;
@@ -99,6 +99,8 @@ const QString k_surface_session_viewport_pan_execution_mode =
     QStringLiteral("surface_session_viewport_pan");
 const QString k_surface_session_sustained_output_execution_mode =
     QStringLiteral("surface_session_sustained_output");
+const QString k_surface_session_text_output_execution_mode =
+    QStringLiteral("surface_session_text_output");
 const QString k_surface_session_scrollback_limit_execution_mode = QStringLiteral(
     "surface_session_scrollback_growth_limit");
 const QString k_surface_session_alternate_churn_execution_mode = QStringLiteral(
@@ -498,6 +500,12 @@ struct Scenario_result
     QString                queue_pressure_semantics           = QStringLiteral("not_applicable");
     int                    workload_actions_expected_count    = 0;
     int                    workload_actions_accepted_count    = 0;
+    bool                   model_profile_stats_available      = false;
+    bool                   session_profile_stats_available    = false;
+    term::Terminal_screen_model_profile_stats
+                           model_profile_stats;
+    term::Terminal_session_profile_stats
+                           session_profile_stats;
     QString                dominant_latency_component         = QStringLiteral("no_completed_samples");
     QString                primary_pressure                   = QStringLiteral("no_completed_samples");
     std::vector<profile_thread_snapshot_t>
@@ -513,7 +521,7 @@ struct Benchmark_context
     int                    default_scrollback_limit = 0;
 };
 
-QStringList scenario_names()
+QStringList default_scenario_names()
 {
     return {
         QStringLiteral("dense_repaint"),
@@ -537,12 +545,32 @@ QStringList scenario_names()
     };
 }
 
+QStringList scenario_names()
+{
+    QStringList names = default_scenario_names();
+    names.append({
+        QStringLiteral("block_graphics_full_dirty_reuse_only"),
+        QStringLiteral("box_graphics_full_dirty_reuse_only"),
+        QStringLiteral("cjk_full_dirty_reuse_only"),
+        QStringLiteral("mixed_non_ascii_full_dirty_reuse_only"),
+        QStringLiteral("surface_session_block_graphics_output"),
+        QStringLiteral("surface_session_box_graphics_output"),
+        QStringLiteral("surface_session_cjk_output"),
+        QStringLiteral("surface_session_mixed_non_ascii_output"),
+    });
+    return names;
+}
+
 bool is_measurement_reuse_only_scenario(const QString& scenario_name)
 {
     return
         scenario_name == QStringLiteral("ascii_full_dirty_reuse_only")        ||
         scenario_name == QStringLiteral("styled_ascii_full_dirty_reuse_only") ||
-        scenario_name == QStringLiteral("mixed_text_full_dirty_reuse_only");
+        scenario_name == QStringLiteral("mixed_text_full_dirty_reuse_only")   ||
+        scenario_name == QStringLiteral("block_graphics_full_dirty_reuse_only") ||
+        scenario_name == QStringLiteral("box_graphics_full_dirty_reuse_only") ||
+        scenario_name == QStringLiteral("cjk_full_dirty_reuse_only")          ||
+        scenario_name == QStringLiteral("mixed_non_ascii_full_dirty_reuse_only");
 }
 
 bool is_surface_session_scenario(const QString& scenario_name)
@@ -555,7 +583,11 @@ bool is_surface_session_scenario(const QString& scenario_name)
         scenario_name == QStringLiteral("surface_session_alternate_churn")   ||
         scenario_name == QStringLiteral("surface_session_paste_write")       ||
         scenario_name == QStringLiteral("surface_session_output_high_water") ||
-        scenario_name == QStringLiteral("surface_session_write_high_water");
+        scenario_name == QStringLiteral("surface_session_write_high_water")  ||
+        scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
+        scenario_name == QStringLiteral("surface_session_box_graphics_output") ||
+        scenario_name == QStringLiteral("surface_session_cjk_output")        ||
+        scenario_name == QStringLiteral("surface_session_mixed_non_ascii_output");
 }
 
 QString scenario_source_mode(const QString& scenario_name)
@@ -577,6 +609,14 @@ QString scenario_execution_mode(const QString& scenario_name)
 
     if (scenario_name == QStringLiteral("surface_session_sustained_output")) {
         return k_surface_session_sustained_output_execution_mode;
+    }
+
+    if (scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
+        scenario_name == QStringLiteral("surface_session_box_graphics_output")   ||
+        scenario_name == QStringLiteral("surface_session_cjk_output")            ||
+        scenario_name == QStringLiteral("surface_session_mixed_non_ascii_output"))
+    {
+        return k_surface_session_text_output_execution_mode;
     }
 
     if (scenario_name == QStringLiteral("surface_session_scrollback_limit")) {
@@ -1034,7 +1074,7 @@ Parse_result parse_arguments(const QStringList& arguments)
     }
 
     if (result.options.scenario_names.isEmpty()) {
-        result.options.scenario_names = scenario_names();
+        result.options.scenario_names = default_scenario_names();
     }
 
     if (!validate_output_path_collisions(result.options, &result.error)) {
@@ -1066,6 +1106,18 @@ QByteArray numbered_workload_lines(const QString& prefix, int phase, int count)
             .toUtf8();
     }
     return bytes;
+}
+
+grid_size_t current_surface_grid(
+    const Benchmark_context& context,
+    const App_options&       options)
+{
+    const int rows = context.surface.rows();
+    const int columns = context.surface.columns();
+    return {
+        rows    > 0 ? rows    : options.grid.rows,
+        columns > 0 ? columns : options.grid.columns,
+    };
 }
 
 QByteArray alternate_screen_churn_payload(int phase)
@@ -1308,6 +1360,55 @@ void update_backend_measurement_deltas(
         result.output_pause_disabled_count > 0;
 }
 
+void set_surface_session_profile_stats_enabled_after_warmup(
+    Benchmark_context& context,
+    const App_options& options)
+{
+#if VNM_TERMINAL_PROFILING_ENABLED
+    if (options.profile) {
+        term::VNM_TerminalSurface_render_bridge::
+            set_session_profile_stats_enabled_for_benchmark(context.surface, true);
+    }
+#else
+    Q_UNUSED(context);
+    Q_UNUSED(options);
+#endif
+}
+
+void keep_surface_session_profile_stats_disabled_for_warmup(
+    Benchmark_context& context)
+{
+#if VNM_TERMINAL_PROFILING_ENABLED
+    term::VNM_TerminalSurface_render_bridge::
+        set_session_profile_stats_enabled_for_benchmark(context.surface, false);
+#else
+    Q_UNUSED(context);
+#endif
+}
+
+void capture_surface_session_profile_stats(
+    Scenario_result&        result,
+    Benchmark_context&      context,
+    const App_options&      options)
+{
+#if VNM_TERMINAL_PROFILING_ENABLED
+    if (!options.profile) {
+        return;
+    }
+
+    result.model_profile_stats =
+        term::VNM_TerminalSurface_render_bridge::model_profile_stats(context.surface);
+    result.session_profile_stats =
+        term::VNM_TerminalSurface_render_bridge::session_profile_stats(context.surface);
+    result.model_profile_stats_available   = result.model_profile_stats.enabled;
+    result.session_profile_stats_available = result.session_profile_stats.enabled;
+#else
+    Q_UNUSED(result);
+    Q_UNUSED(context);
+    Q_UNUSED(options);
+#endif
+}
+
 term::Terminal_color_state benchmark_color_state()
 {
     term::Terminal_color_state state;
@@ -1346,6 +1447,33 @@ QString ascii_marker(int row, int column, int phase)
     return QString(QChar(value));
 }
 
+term::Terminal_render_cell make_render_cell(
+    int                       row,
+    int                       column,
+    const QString&            text,
+    int                       display_width,
+    bool                      wide_continuation,
+    term::Terminal_style_id   style_id = term::k_default_terminal_style_id)
+{
+    term::Terminal_render_cell_text render_text =
+        term::Terminal_render_cell_text::from_source_cell(
+            text,
+            display_width,
+            wide_continuation);
+    const term::Terminal_render_cell_text_category text_category =
+        render_text.category();
+
+    return {
+        { row, column },
+        std::move(render_text),
+        0U,
+        display_width,
+        wide_continuation,
+        style_id,
+        text_category,
+    };
+}
+
 void append_render_cell(
     term::Terminal_render_snapshot&    snapshot,
     int                                row,
@@ -1355,19 +1483,160 @@ void append_render_cell(
     bool                               wide_continuation,
     term::Terminal_style_id            style_id = term::k_default_terminal_style_id)
 {
-    snapshot.cells.push_back({
-        { row, column },
+    snapshot.cells.push_back(make_render_cell(
+        row,
+        column,
         text,
-        0U,
         display_width,
         wide_continuation,
-        style_id,
-    });
+        style_id));
 }
 
 QString emoji_marker()
 {
     return QString::fromUtf8("\xF0\x9F\x99\x82");
+}
+
+enum class Text_output_pattern
+{
+    BLOCK_GRAPHICS,
+    BOX_GRAPHICS,
+    CJK,
+    MIXED_NON_ASCII,
+};
+
+struct pattern_cell_t
+{
+    QString text;
+    int     display_width = 1;
+};
+
+QChar box_graphic_marker(int row, int column, int phase)
+{
+    const int selector = (row * 3 + column * 5 + phase) % 7;
+    if (selector == 0) {
+        return QChar(static_cast<ushort>(0x253cU));
+    }
+    if (selector % 2 == 0) {
+        return QChar(static_cast<ushort>(0x2502U));
+    }
+    return QChar(static_cast<ushort>(0x2500U));
+}
+
+std::optional<Text_output_pattern> text_output_pattern_for_scenario(
+    const QString& scenario_name)
+{
+    if (scenario_name == QStringLiteral("block_graphics_full_dirty_reuse_only") ||
+        scenario_name == QStringLiteral("surface_session_block_graphics_output"))
+    {
+        return Text_output_pattern::BLOCK_GRAPHICS;
+    }
+
+    if (scenario_name == QStringLiteral("box_graphics_full_dirty_reuse_only") ||
+        scenario_name == QStringLiteral("surface_session_box_graphics_output"))
+    {
+        return Text_output_pattern::BOX_GRAPHICS;
+    }
+
+    if (scenario_name == QStringLiteral("cjk_full_dirty_reuse_only") ||
+        scenario_name == QStringLiteral("surface_session_cjk_output"))
+    {
+        return Text_output_pattern::CJK;
+    }
+
+    if (scenario_name == QStringLiteral("mixed_non_ascii_full_dirty_reuse_only") ||
+        scenario_name == QStringLiteral("surface_session_mixed_non_ascii_output"))
+    {
+        return Text_output_pattern::MIXED_NON_ASCII;
+    }
+
+    return std::nullopt;
+}
+
+bool is_surface_session_text_output_scenario(const QString& scenario_name)
+{
+    return
+        scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
+        scenario_name == QStringLiteral("surface_session_box_graphics_output")   ||
+        scenario_name == QStringLiteral("surface_session_cjk_output")            ||
+        scenario_name == QStringLiteral("surface_session_mixed_non_ascii_output");
+}
+
+pattern_cell_t pattern_cell(
+    Text_output_pattern   pattern,
+    int                   row,
+    int                   column,
+    int                   columns,
+    int                   phase)
+{
+    switch (pattern) {
+        case Text_output_pattern::BLOCK_GRAPHICS:
+            return { QString(QChar(static_cast<ushort>(0x2588U))), 1 };
+
+        case Text_output_pattern::BOX_GRAPHICS:
+            return { QString(box_graphic_marker(row, column, phase)), 1 };
+
+        case Text_output_pattern::CJK:
+            return column + 1 < columns
+                ? pattern_cell_t{ QStringLiteral("\u754c"), 2 }
+                : pattern_cell_t{ QStringLiteral(" "), 1 };
+
+        case Text_output_pattern::MIXED_NON_ASCII: {
+            const int selector = (row * 11 + column * 7 + phase * 5) % 19;
+            if (selector == 0 && column + 1 < columns) {
+                return { QStringLiteral("\u754c"), 2 };
+            }
+            if (selector == 1 && column + 1 < columns) {
+                return { emoji_marker(), 2 };
+            }
+            if (selector == 2) {
+                return { QStringLiteral("e\u0301"), 1 };
+            }
+            if (selector == 3) {
+                return { QString(QChar(static_cast<ushort>(0x2588U))), 1 };
+            }
+            if (selector == 4) {
+                return { QString(box_graphic_marker(row, column, phase)), 1 };
+            }
+            return { ascii_marker(row, column, phase), 1 };
+        }
+    }
+
+    return { ascii_marker(row, column, phase), 1 };
+}
+
+QString text_pattern_row(
+    Text_output_pattern   pattern,
+    int                   row,
+    int                   columns,
+    int                   phase)
+{
+    QString text;
+    text.reserve(columns);
+    int column = 0;
+    while (column < columns) {
+        const pattern_cell_t cell = pattern_cell(pattern, row, column, columns, phase);
+        text += cell.text;
+        column += cell.display_width;
+    }
+    return text;
+}
+
+QByteArray text_output_grid_payload(
+    Text_output_pattern   pattern,
+    grid_size_t           grid,
+    int                   phase)
+{
+    QByteArray bytes;
+    bytes.reserve(static_cast<qsizetype>(grid.rows * (grid.columns * 4 + 16)));
+    bytes += "\x1b[H";
+    for (int row = 0; row < grid.rows; ++row) {
+        bytes += "\x1b[";
+        bytes += QByteArray::number(row + 1);
+        bytes += ";1H";
+        bytes += text_pattern_row(pattern, row, grid.columns, phase).toUtf8();
+    }
+    return bytes;
 }
 
 std::shared_ptr<const term::Terminal_render_snapshot> make_dense_repaint_snapshot(
@@ -1380,14 +1649,13 @@ std::shared_ptr<const term::Terminal_render_snapshot> make_dense_repaint_snapsho
         static_cast<std::size_t>(grid.columns));
     for (int row = 0; row < grid.rows; ++row) {
         for (int column = 0; column < grid.columns; ++column) {
-            snapshot.cells.push_back({
-                { row, column },
+            append_render_cell(
+                snapshot,
+                row,
+                column,
                 ascii_marker(row, column, phase),
-                0U,
                 1,
-                false,
-                0U,
-            });
+                false);
         }
     }
 
@@ -1507,6 +1775,36 @@ make_mixed_text_full_dirty_reuse_only_snapshot(
     return std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot));
 }
 
+std::shared_ptr<const term::Terminal_render_snapshot>
+make_pattern_full_dirty_reuse_only_snapshot(
+    grid_size_t           grid,
+    std::uint64_t         sequence,
+    Text_output_pattern   pattern)
+{
+    term::Terminal_render_snapshot snapshot = make_base_snapshot(grid, sequence, true);
+    snapshot.cells.reserve(static_cast<std::size_t>(grid.rows) *
+        static_cast<std::size_t>(grid.columns));
+    for (int row = 0; row < grid.rows; ++row) {
+        int column = 0;
+        while (column < grid.columns) {
+            const pattern_cell_t cell = pattern_cell(pattern, row, column, grid.columns, 0);
+            append_render_cell(
+                snapshot,
+                row,
+                column,
+                cell.text,
+                cell.display_width,
+                false);
+            if (cell.display_width == 2) {
+                append_render_cell(snapshot, row, column + 1, {}, 0, true);
+            }
+            column += cell.display_width;
+        }
+    }
+
+    return std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot));
+}
+
 std::shared_ptr<const term::Terminal_render_snapshot> make_scroll_burst_snapshot(
     grid_size_t    grid,
     std::uint64_t  sequence,
@@ -1520,14 +1818,13 @@ std::shared_ptr<const term::Terminal_render_snapshot> make_scroll_burst_snapshot
     for (int row = 0; row < grid.rows; ++row) {
         const int source_row = row + phase;
         for (int column = 0; column < grid.columns; ++column) {
-            snapshot.cells.push_back({
-                { row, column },
+            append_render_cell(
+                snapshot,
+                row,
+                column,
                 ascii_marker(source_row, column, phase),
-                0U,
                 1,
-                false,
-                0U,
-            });
+                false);
         }
     }
 
@@ -1550,14 +1847,13 @@ std::shared_ptr<const term::Terminal_render_snapshot> make_resize_bounce_snapsho
         static_cast<std::size_t>(grid.columns));
     for (int row = 0; row < grid.rows; ++row) {
         for (int column = 0; column < grid.columns; ++column) {
-            snapshot.cells.push_back({
-                { row, column },
+            append_render_cell(
+                snapshot,
+                row,
+                column,
                 ascii_marker(row, column, phase + 11),
-                0U,
                 1,
-                false,
-                0U,
-            });
+                false);
         }
     }
 
@@ -1576,34 +1872,25 @@ std::shared_ptr<const term::Terminal_render_snapshot> make_unicode_wide_row_snap
     int       column = 0;
     while (column < grid.columns) {
         if (column + 1 < grid.columns && (column + phase) % 5 != 0) {
-            snapshot.cells.push_back({
-                { row, column },
+            append_render_cell(
+                snapshot,
+                row,
+                column,
                 QStringLiteral("\u754c"),
-                0U,
                 2,
-                false,
-                0U,
-            });
-            snapshot.cells.push_back({
-                { row, column + 1 },
-                {},
-                0U,
-                0,
-                true,
-                0U,
-            });
+                false);
+            append_render_cell(snapshot, row, column + 1, {}, 0, true);
             column += 2;
             continue;
         }
 
-        snapshot.cells.push_back({
-            { row, column },
+        append_render_cell(
+            snapshot,
+            row,
+            column,
             ascii_marker(row, column, phase + 23),
-            0U,
             1,
-            false,
-            0U,
-        });
+            false);
         ++column;
     }
 
@@ -1629,14 +1916,13 @@ std::shared_ptr<const term::Terminal_render_snapshot> make_cursor_repaint_snapsh
 
     const int row = snapshot.cursor.position.row;
     for (int column = 0; column < grid.columns; ++column) {
-        snapshot.cells.push_back({
-            { row, column },
+        append_render_cell(
+            snapshot,
+            row,
+            column,
             ascii_marker(row, column, phase + 31),
-            0U,
             1,
-            false,
-            0U,
-        });
+            false);
     }
     snapshot.dirty_row_ranges = {{row, 1}};
     return std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot));
@@ -1703,14 +1989,7 @@ make_single_row_geometry_update_snapshot(
         }
 
         occupied[static_cast<std::size_t>(column)] = true;
-        snapshot.cells.push_back({
-            { row, column },
-            text,
-            0U,
-            1,
-            false,
-            style_id,
-        });
+        append_render_cell(snapshot, row, column, text, 1, false, style_id);
         return true;
     };
 
@@ -2860,6 +3139,24 @@ bool text_work_observed_for_scenario(
     const QString&                         scenario_name,
     const term::terminal_renderer_stats_t& stats)
 {
+    if (scenario_name == QStringLiteral("block_graphics_full_dirty_reuse_only") ||
+        scenario_name == QStringLiteral("box_graphics_full_dirty_reuse_only")   ||
+        scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
+        scenario_name == QStringLiteral("surface_session_box_graphics_output"))
+    {
+        return
+            stats.graphic_rect_rows_rebuilt > 0 ||
+            stats.graphic_rect_rows_reused  > 0 ||
+            stats.frame_packed_graphic_cells > 0;
+    }
+
+    if (is_surface_session_text_output_scenario(scenario_name)) {
+        return
+            stats.text_leaf_nodes_created > 0 ||
+            stats.text_leaf_nodes_reused  > 0 ||
+            stats.frame_text_runs         > 0;
+    }
+
     if (!is_measurement_reuse_only_scenario(scenario_name)) {
         return
             stats.text_leaf_nodes_created > 0 ||
@@ -2870,7 +3167,9 @@ bool text_work_observed_for_scenario(
         stats.text_leaf_nodes_created         > 0 ||
         stats.text_leaf_nodes_reused          > 0 ||
         stats.text_content_reused             > 0 ||
-        stats.text_resource_descriptor_reuses > 0;
+        stats.text_resource_descriptor_reuses > 0 ||
+        stats.graphic_rect_rows_reused        > 0 ||
+        stats.graphic_arc_rows_reused         > 0;
 }
 
 void update_structural_checks(
@@ -2985,6 +3284,17 @@ std::vector<std::shared_ptr<const term::Terminal_render_snapshot>> make_scenario
             make_mixed_text_full_dirty_reuse_only_snapshot(
                 grid,
                 take_sequence(context)),
+        };
+    }
+
+    const std::optional<Text_output_pattern> text_pattern =
+        text_output_pattern_for_scenario(scenario_name);
+    if (text_pattern.has_value() && !is_surface_session_text_output_scenario(scenario_name)) {
+        return {
+            make_pattern_full_dirty_reuse_only_snapshot(
+                grid,
+                take_sequence(context),
+                *text_pattern),
         };
     }
 
@@ -3315,6 +3625,8 @@ Scenario_result run_surface_session_scroll_scenario(
     result.structural_checks.scrollback_rows_available =
         result.viewport_scrollback_rows > 0;
 
+    keep_surface_session_profile_stats_disabled_for_warmup(context);
+
     for (int warmup_index = 0; warmup_index < options.warmup; ++warmup_index) {
         surface_session_wheel_burst_t burst;
         QElapsedTimer elapsed_timer;
@@ -3343,6 +3655,8 @@ Scenario_result run_surface_session_scroll_scenario(
         : result.viewport_initial_offset_from_tail;
     const backend_measurement_baseline_t backend_baseline =
         backend_measurement_baseline(*backend_ptr);
+
+    set_surface_session_profile_stats_enabled_after_warmup(context, options);
 
     const term::Terminal_surface_render_invalidation_stats_t bridge_before =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(context.surface);
@@ -3397,6 +3711,7 @@ Scenario_result run_surface_session_scroll_scenario(
     update_backend_measurement_deltas(result, *backend_ptr, backend_baseline);
     result.backend_errors_total = backend_error_count;
     result.structural_checks.backend_errors_zero = backend_error_count == 0;
+    capture_surface_session_profile_stats(result, context, options);
     const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(context.surface);
     result.scrollback_limit_observed =
@@ -3423,6 +3738,10 @@ struct surface_session_action_profile_t
 
 surface_session_action_profile_t surface_session_action_profile(const QString& scenario_name)
 {
+    if (is_surface_session_text_output_scenario(scenario_name)) {
+        return { 0, 0, 0, false, false, false, false, true };
+    }
+
     if (scenario_name == QStringLiteral("surface_session_scrollback_limit")) {
         return {
             4,
@@ -3464,8 +3783,17 @@ surface_session_action_profile_t surface_session_action_profile(const QString& s
     };
 }
 
-QByteArray surface_session_action_payload(const QString& scenario_name, int phase)
+QByteArray surface_session_action_payload(
+    const QString&  scenario_name,
+    grid_size_t     grid,
+    int             phase)
 {
+    const std::optional<Text_output_pattern> text_pattern =
+        text_output_pattern_for_scenario(scenario_name);
+    if (text_pattern.has_value()) {
+        return text_output_grid_payload(*text_pattern, grid, phase);
+    }
+
     if (scenario_name == QStringLiteral("surface_session_alternate_churn")) {
         return alternate_screen_churn_payload(phase);
     }
@@ -3509,6 +3837,7 @@ Attempt_result run_surface_session_action_attempt(
     const QElapsedTimer&                       elapsed_timer,
     Scripted_backend&                          backend,
     const QString&                             scenario_name,
+    grid_size_t                                grid,
     int                                        phase,
     const surface_session_action_profile_t&    profile,
     bool*                                      out_action_accepted)
@@ -3543,7 +3872,7 @@ Attempt_result run_surface_session_action_attempt(
     }
     else {
         *out_action_accepted = backend.emit_output(
-            surface_session_action_payload(scenario_name, phase));
+            surface_session_action_payload(scenario_name, grid, phase));
     }
     const qint64 action_ns = action_timer.nsecsElapsed();
 
@@ -3610,6 +3939,7 @@ Scenario_result run_surface_session_action_scenario(
     context.surface.setSize(QSizeF(
         static_cast<qreal>(options.window_size.width()),
         static_cast<qreal>(options.window_size.height())));
+    const grid_size_t surface_grid = current_surface_grid(context, options);
     const int effective_scrollback_limit = profile.scrollback_limit > 0
         ? profile.scrollback_limit
         : context.default_scrollback_limit;
@@ -3626,6 +3956,14 @@ Scenario_result run_surface_session_action_scenario(
         });
 
     auto backend = std::make_unique<Scripted_backend>();
+    const std::optional<Text_output_pattern> initial_text_pattern =
+        text_output_pattern_for_scenario(scenario_name);
+    if (initial_text_pattern.has_value()) {
+        backend->outputs_during_start = {
+            text_output_grid_payload(*initial_text_pattern, surface_grid, 0),
+        };
+    }
+    else
     if (profile.initial_output_lines > 0) {
         backend->outputs_during_start = {
             numbered_workload_lines(
@@ -3670,6 +4008,8 @@ Scenario_result run_surface_session_action_scenario(
     result.rows    = initial_snapshot != nullptr ? initial_snapshot->grid_size.rows : 0;
     result.columns = initial_snapshot != nullptr ? initial_snapshot->grid_size.columns : 0;
 
+    keep_surface_session_profile_stats_disabled_for_warmup(context);
+
     for (int warmup_index = 0; warmup_index < options.warmup; ++warmup_index) {
         bool action_accepted = false;
         QElapsedTimer elapsed_timer;
@@ -3679,6 +4019,7 @@ Scenario_result run_surface_session_action_scenario(
             elapsed_timer,
             *backend_ptr,
             scenario_name,
+            surface_grid,
             warmup_index,
             profile,
             &action_accepted);
@@ -3699,6 +4040,8 @@ Scenario_result run_surface_session_action_scenario(
     const backend_measurement_baseline_t backend_baseline =
         backend_measurement_baseline(*backend_ptr);
 
+    set_surface_session_profile_stats_enabled_after_warmup(context, options);
+
     const term::Terminal_surface_render_invalidation_stats_t bridge_before =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(context.surface);
     const term::terminal_renderer_lifecycle_stats_t lifecycle_before =
@@ -3717,6 +4060,7 @@ Scenario_result run_surface_session_action_scenario(
             elapsed_timer,
             *backend_ptr,
             scenario_name,
+            surface_grid,
             phase,
             profile,
             &action_accepted);
@@ -3757,6 +4101,7 @@ Scenario_result run_surface_session_action_scenario(
     update_backend_measurement_deltas(result, *backend_ptr, backend_baseline);
     result.backend_errors_total = backend_error_count;
     result.structural_checks.backend_errors_zero = backend_error_count == 0;
+    capture_surface_session_profile_stats(result, context, options);
 
     const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(context.surface);
@@ -4216,6 +4561,243 @@ QJsonObject process_memory_json(const memory_summary_t& memory)
     return object;
 }
 
+void insert_profile_counter(
+    QJsonObject&        object,
+    const QString&      key,
+    std::uint64_t       value)
+{
+    object.insert(key, static_cast<qint64>(value));
+}
+
+QJsonObject model_profile_stats_json(
+    const term::Terminal_screen_model_profile_stats& stats,
+    bool                                             available)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("available"), available);
+    object.insert(QStringLiteral("enabled"),   stats.enabled);
+    insert_profile_counter(object, QStringLiteral("print_text_calls"), stats.print_text_calls);
+    insert_profile_counter(
+        object,
+        QStringLiteral("printable_ascii_span_calls"),
+        stats.printable_ascii_span_calls);
+    insert_profile_counter(
+        object,
+        QStringLiteral("printable_ascii_span_characters"),
+        stats.printable_ascii_span_characters);
+    insert_profile_counter(
+        object,
+        QStringLiteral("printable_ascii_cells_written"),
+        stats.printable_ascii_cells_written);
+    insert_profile_counter(
+        object,
+        QStringLiteral("max_printable_ascii_span_characters"),
+        stats.max_printable_ascii_span_characters);
+    insert_profile_counter(
+        object,
+        QStringLiteral("printable_ascii_local_cells_inspected"),
+        stats.printable_ascii_local_cells_inspected);
+    insert_profile_counter(
+        object,
+        QStringLiteral("scalar_span_local_cells_inspected"),
+        stats.scalar_span_local_cells_inspected);
+    insert_profile_counter(
+        object,
+        QStringLiteral("row_content_generation_comparisons"),
+        stats.row_content_generation_comparisons);
+    insert_profile_counter(
+        object,
+        QStringLiteral("row_content_generation_comparison_cells"),
+        stats.row_content_generation_comparison_cells);
+    insert_profile_counter(
+        object,
+        QStringLiteral("row_content_generation_advances"),
+        stats.row_content_generation_advances);
+    insert_profile_counter(
+        object,
+        QStringLiteral("wide_boundary_repairs_from_text_writes"),
+        stats.wide_boundary_repairs_from_text_writes);
+    insert_profile_counter(
+        object,
+        QStringLiteral("dirty_marks_from_text_writes"),
+        stats.dirty_marks_from_text_writes);
+    insert_profile_counter(
+        object,
+        QStringLiteral("line_wraps_from_text_writes"),
+        stats.line_wraps_from_text_writes);
+    insert_profile_counter(
+        object,
+        QStringLiteral("scrollback_appends_from_text_writes"),
+        stats.scrollback_appends_from_text_writes);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_requests"),
+        stats.render_snapshot_requests);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshots_constructed"),
+        stats.render_snapshots_constructed);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_rows_visited"),
+        stats.render_snapshot_rows_visited);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_rows_materialized"),
+        stats.render_snapshot_rows_materialized);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_rows_borrowed"),
+        stats.render_snapshot_rows_borrowed);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_rows_owned"),
+        stats.render_snapshot_rows_owned);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_cells_scanned"),
+        stats.render_snapshot_cells_scanned);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_cells_emitted"),
+        stats.render_snapshot_cells_emitted);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_compact_empty_text_cells"),
+        stats.render_snapshot_compact_empty_text_cells);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_compact_ascii_text_cells"),
+        stats.render_snapshot_compact_ascii_text_cells);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_fallback_qstring_copies"),
+        stats.render_snapshot_fallback_qstring_copies);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_fallback_text_code_units_copied"),
+        stats.render_snapshot_fallback_text_code_units_copied);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_fallback_printable_ascii_copies"),
+        stats.render_snapshot_fallback_printable_ascii_copies);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_fallback_other_ascii_copies"),
+        stats.render_snapshot_fallback_other_ascii_copies);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_fallback_single_non_ascii_copies"),
+        stats.render_snapshot_fallback_single_non_ascii_copies);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_fallback_multi_text_copies"),
+        stats.render_snapshot_fallback_multi_text_copies);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_unoccupied_cells_skipped"),
+        stats.render_snapshot_unoccupied_cells_skipped);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_dirty_rows_requested"),
+        stats.render_snapshot_dirty_rows_requested);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_dirty_rows_visible"),
+        stats.render_snapshot_dirty_rows_visible);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_full_repaint_fallbacks"),
+        stats.render_snapshot_full_repaint_fallbacks);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_viewport_fallbacks"),
+        stats.render_snapshot_viewport_fallbacks);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_zero_dirty_publications"),
+        stats.render_snapshot_zero_dirty_publications);
+    insert_profile_counter(
+        object,
+        QStringLiteral("max_render_snapshot_rows_visited"),
+        stats.max_render_snapshot_rows_visited);
+    insert_profile_counter(
+        object,
+        QStringLiteral("max_render_snapshot_cells_emitted"),
+        stats.max_render_snapshot_cells_emitted);
+    insert_profile_counter(
+        object,
+        QStringLiteral("max_render_snapshot_fallback_text_units_per_cell"),
+        stats.max_render_snapshot_fallback_text_units_per_cell);
+    return object;
+}
+
+QJsonObject session_profile_stats_json(
+    const term::Terminal_session_profile_stats& stats,
+    bool                                        available)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("available"), available);
+    object.insert(QStringLiteral("enabled"),   stats.enabled);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_requests"),
+        stats.render_snapshot_requests);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshots_constructed"),
+        stats.render_snapshots_constructed);
+    insert_profile_counter(
+        object,
+        QStringLiteral("render_snapshot_publications"),
+        stats.render_snapshot_publications);
+    insert_profile_counter(
+        object,
+        QStringLiteral("content_snapshot_publications"),
+        stats.content_snapshot_publications);
+    insert_profile_counter(
+        object,
+        QStringLiteral("selection_snapshot_publications"),
+        stats.selection_snapshot_publications);
+    insert_profile_counter(
+        object,
+        QStringLiteral("geometry_snapshot_publications"),
+        stats.geometry_snapshot_publications);
+    insert_profile_counter(
+        object,
+        QStringLiteral("public_projection_scroll_requests"),
+        stats.public_projection_scroll_requests);
+    insert_profile_counter(
+        object,
+        QStringLiteral("public_projection_scroll_publications"),
+        stats.public_projection_scroll_publications);
+    insert_profile_counter(
+        object,
+        QStringLiteral("dirty_coalescing_attempts"),
+        stats.dirty_coalescing_attempts);
+    insert_profile_counter(
+        object,
+        QStringLiteral("dirty_coalescing_applied"),
+        stats.dirty_coalescing_applied);
+    insert_profile_counter(
+        object,
+        QStringLiteral("zero_dirty_snapshot_publications"),
+        stats.zero_dirty_snapshot_publications);
+    insert_profile_counter(
+        object,
+        QStringLiteral("snapshots_superseded_before_render"),
+        stats.snapshots_superseded_before_render);
+    insert_profile_counter(
+        object,
+        QStringLiteral("snapshots_marked_rendered"),
+        stats.snapshots_marked_rendered);
+    insert_profile_counter(
+        object,
+        QStringLiteral("max_unrendered_snapshot_generations"),
+        stats.max_unrendered_snapshot_generations);
+    return object;
+}
+
 qint64 profile_nanoseconds(std::chrono::nanoseconds duration)
 {
     return static_cast<qint64>(duration.count());
@@ -4308,6 +4890,16 @@ QJsonObject scenario_profile_summary_json(const Scenario_result& result)
     object.insert(
         QStringLiteral("decoration_batched_rects"),
         result.renderer_totals.decoration_batched_rects);
+    object.insert(
+        QStringLiteral("model_profile_stats"),
+        model_profile_stats_json(
+            result.model_profile_stats,
+            result.model_profile_stats_available));
+    object.insert(
+        QStringLiteral("session_profile_stats"),
+        session_profile_stats_json(
+            result.session_profile_stats,
+            result.session_profile_stats_available));
     object.insert(QStringLiteral("profile"), scenario_profile_value(result));
     return object;
 }
@@ -4894,6 +5486,16 @@ QJsonObject scenario_json(const Scenario_result& result)
         QStringLiteral("workload_actions_accepted_count"),
         result.workload_actions_accepted_count);
     object.insert(
+        QStringLiteral("model_profile_stats"),
+        model_profile_stats_json(
+            result.model_profile_stats,
+            result.model_profile_stats_available));
+    object.insert(
+        QStringLiteral("session_profile_stats"),
+        session_profile_stats_json(
+            result.session_profile_stats,
+            result.session_profile_stats_available));
+    object.insert(
         QStringLiteral("dominant_latency_component"),
         result.dominant_latency_component);
     object.insert(QStringLiteral("primary_pressure"), result.primary_pressure);
@@ -5111,6 +5713,111 @@ bool validate_nonnegative_integer_json_field(
     }
 
     return true;
+}
+
+bool validate_profile_stats_json_object(
+    const QJsonObject& object,
+    const QString&     key,
+    const QStringList& counter_keys,
+    bool               expected_available,
+    QString*           out_error)
+{
+    const QJsonValue value = object.value(key);
+    if (!value.isObject()) {
+        *out_error = QStringLiteral("scenario profile stats key is not an object: %1")
+            .arg(key);
+        return false;
+    }
+
+    const QJsonObject stats = value.toObject();
+    if (!stats.value(QStringLiteral("available")).isBool() ||
+        !stats.value(QStringLiteral("enabled")).isBool())
+    {
+        *out_error = QStringLiteral("scenario profile stats metadata is invalid: %1")
+            .arg(key);
+        return false;
+    }
+
+    const bool available = stats.value(QStringLiteral("available")).toBool();
+    const bool enabled   = stats.value(QStringLiteral("enabled")).toBool();
+    if (available != expected_available || enabled != expected_available) {
+        *out_error = QStringLiteral("scenario profile stats availability is inconsistent: %1")
+            .arg(key);
+        return false;
+    }
+
+    for (const QString& counter_key : counter_keys) {
+        if (!validate_nonnegative_integer_json_field(stats, counter_key, key, out_error)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+QStringList model_profile_counter_keys()
+{
+    return {
+        QStringLiteral("print_text_calls"),
+        QStringLiteral("printable_ascii_span_calls"),
+        QStringLiteral("printable_ascii_span_characters"),
+        QStringLiteral("printable_ascii_cells_written"),
+        QStringLiteral("max_printable_ascii_span_characters"),
+        QStringLiteral("printable_ascii_local_cells_inspected"),
+        QStringLiteral("scalar_span_local_cells_inspected"),
+        QStringLiteral("row_content_generation_comparisons"),
+        QStringLiteral("row_content_generation_comparison_cells"),
+        QStringLiteral("row_content_generation_advances"),
+        QStringLiteral("wide_boundary_repairs_from_text_writes"),
+        QStringLiteral("dirty_marks_from_text_writes"),
+        QStringLiteral("line_wraps_from_text_writes"),
+        QStringLiteral("scrollback_appends_from_text_writes"),
+        QStringLiteral("render_snapshot_requests"),
+        QStringLiteral("render_snapshots_constructed"),
+        QStringLiteral("render_snapshot_rows_visited"),
+        QStringLiteral("render_snapshot_rows_materialized"),
+        QStringLiteral("render_snapshot_rows_borrowed"),
+        QStringLiteral("render_snapshot_rows_owned"),
+        QStringLiteral("render_snapshot_cells_scanned"),
+        QStringLiteral("render_snapshot_cells_emitted"),
+        QStringLiteral("render_snapshot_compact_empty_text_cells"),
+        QStringLiteral("render_snapshot_compact_ascii_text_cells"),
+        QStringLiteral("render_snapshot_fallback_qstring_copies"),
+        QStringLiteral("render_snapshot_fallback_text_code_units_copied"),
+        QStringLiteral("render_snapshot_fallback_printable_ascii_copies"),
+        QStringLiteral("render_snapshot_fallback_other_ascii_copies"),
+        QStringLiteral("render_snapshot_fallback_single_non_ascii_copies"),
+        QStringLiteral("render_snapshot_fallback_multi_text_copies"),
+        QStringLiteral("render_snapshot_unoccupied_cells_skipped"),
+        QStringLiteral("render_snapshot_dirty_rows_requested"),
+        QStringLiteral("render_snapshot_dirty_rows_visible"),
+        QStringLiteral("render_snapshot_full_repaint_fallbacks"),
+        QStringLiteral("render_snapshot_viewport_fallbacks"),
+        QStringLiteral("render_snapshot_zero_dirty_publications"),
+        QStringLiteral("max_render_snapshot_rows_visited"),
+        QStringLiteral("max_render_snapshot_cells_emitted"),
+        QStringLiteral("max_render_snapshot_fallback_text_units_per_cell"),
+    };
+}
+
+QStringList session_profile_counter_keys()
+{
+    return {
+        QStringLiteral("render_snapshot_requests"),
+        QStringLiteral("render_snapshots_constructed"),
+        QStringLiteral("render_snapshot_publications"),
+        QStringLiteral("content_snapshot_publications"),
+        QStringLiteral("selection_snapshot_publications"),
+        QStringLiteral("geometry_snapshot_publications"),
+        QStringLiteral("public_projection_scroll_requests"),
+        QStringLiteral("public_projection_scroll_publications"),
+        QStringLiteral("dirty_coalescing_attempts"),
+        QStringLiteral("dirty_coalescing_applied"),
+        QStringLiteral("zero_dirty_snapshot_publications"),
+        QStringLiteral("snapshots_superseded_before_render"),
+        QStringLiteral("snapshots_marked_rendered"),
+        QStringLiteral("max_unrendered_snapshot_generations"),
+    };
 }
 
 bool validate_lifecycle_json(const QJsonObject& object, QString* out_error)
@@ -5859,15 +6566,20 @@ bool validate_measurement_reuse_only_json(
         return false;
     }
 
-    if (json_counter(object, QStringLiteral("renderer_text_reused_total"))   <= 0 ||
-        json_counter(object, QStringLiteral("text_clean_reuse_skips"))       != 0 ||
-        json_counter(object, QStringLiteral("renderer_text_rebuilds_total")) != 0 ||
-        json_counter(object, QStringLiteral("qt_text_layout_calls"))         != 0 ||
-        json_counter(object, QStringLiteral("text_leaf_nodes_created"))      != 0 ||
-        json_counter(object, QStringLiteral("text_leaf_nodes_reused"))       != 0 ||
-        json_counter(object, QStringLiteral("qsg_nodes_created"))            != 0 ||
-        json_counter(object, QStringLiteral("qsg_nodes_replaced"))           != 0 ||
-        json_counter(object, QStringLiteral("qsg_nodes_destroyed"))          != 0 ||
+    const bool reusable_work_observed =
+        json_counter(object, QStringLiteral("renderer_text_reused_total")) > 0 ||
+        json_counter(object, QStringLiteral("graphic_rect_rows_reused"))   > 0 ||
+        json_counter(object, QStringLiteral("graphic_arc_rows_reused"))    > 0 ||
+        json_counter(object, QStringLiteral("frame_packed_graphic_cells")) > 0;
+    if (!reusable_work_observed                                                       ||
+        json_counter(object, QStringLiteral("text_clean_reuse_skips"))       != 0     ||
+        json_counter(object, QStringLiteral("renderer_text_rebuilds_total")) != 0     ||
+        json_counter(object, QStringLiteral("qt_text_layout_calls"))         != 0     ||
+        json_counter(object, QStringLiteral("text_leaf_nodes_created"))      != 0     ||
+        json_counter(object, QStringLiteral("text_leaf_nodes_reused"))       != 0     ||
+        json_counter(object, QStringLiteral("qsg_nodes_created"))            != 0     ||
+        json_counter(object, QStringLiteral("qsg_nodes_replaced"))           != 0     ||
+        json_counter(object, QStringLiteral("qsg_nodes_destroyed"))          != 0     ||
         json_counter(object, QStringLiteral("route_fast_text_cells"))        != 0)
     {
         *out_error = QStringLiteral(
@@ -6078,6 +6790,29 @@ bool profile_node_has_descendant(const QJsonObject& node, const QString& name)
     return false;
 }
 
+bool profile_node_has_descendant_in_scope(
+    const QJsonObject& node,
+    const QString&     scope_name)
+{
+    const QString node_name = node.value(QStringLiteral("name")).toString();
+    if (node_name == scope_name ||
+        node_name.startsWith(scope_name + QStringLiteral("::")))
+    {
+        return true;
+    }
+
+    const QJsonArray children = node.value(QStringLiteral("children")).toArray();
+    for (const QJsonValue& child_value : children) {
+        if (child_value.isObject() &&
+            profile_node_has_descendant_in_scope(child_value.toObject(), scope_name))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool validate_scenario_profile_value(
     const QJsonValue&  value,
     const QString&     label,
@@ -6196,7 +6931,7 @@ bool validate_scenario_profile_value(
         }
         profile_has_packed_data_scope =
             profile_has_packed_data_scope ||
-            profile_node_has_descendant(
+            profile_node_has_descendant_in_scope(
                 root.toObject(),
                 QStringLiteral("build_terminal_render_frame::packed_data"));
         profile_has_background_row_scope =
@@ -6567,6 +7302,8 @@ bool validate_scenario_json(
         QStringLiteral("queue_pressure_semantics"),
         QStringLiteral("workload_actions_expected_count"),
         QStringLiteral("workload_actions_accepted_count"),
+        QStringLiteral("model_profile_stats"),
+        QStringLiteral("session_profile_stats"),
         QStringLiteral("dominant_latency_component"),
         QStringLiteral("primary_pressure"),
         QStringLiteral("structural_checks"),
@@ -6594,6 +7331,20 @@ bool validate_scenario_json(
         !validate_renderer_counter_json(object, out_error)                                       ||
         !validate_renderer_counter_invariants(object, out_error)                                 ||
         !validate_per_consumed_update_json(object, out_error)                                    ||
+        !validate_profile_stats_json_object(
+            object,
+            QStringLiteral("model_profile_stats"),
+            model_profile_counter_keys(),
+            options.profile && is_surface_session_scenario(
+                object.value(QStringLiteral("name")).toString()),
+            out_error)                                                                           ||
+        !validate_profile_stats_json_object(
+            object,
+            QStringLiteral("session_profile_stats"),
+            session_profile_counter_keys(),
+            options.profile && is_surface_session_scenario(
+                object.value(QStringLiteral("name")).toString()),
+            out_error)                                                                           ||
         !validate_scenario_profile_json(object, out_error))
     {
         return false;
@@ -6692,12 +7443,20 @@ bool validate_scenario_json(
             object.value(QStringLiteral("bridge_coalesced_requests_delta")).toInteger();
         const qint64 bridge_consumed_updates =
             object.value(QStringLiteral("bridge_consumed_updates_delta")).toInteger();
+        const bool graphic_work_observed =
+            json_counter(object, QStringLiteral("graphic_rect_rows_rebuilt")) > 0 ||
+            json_counter(object, QStringLiteral("graphic_rect_rows_reused"))  > 0 ||
+            json_counter(object, QStringLiteral("frame_packed_graphic_cells")) > 0;
         const bool text_work_observed = is_measurement_reuse_only_scenario(scenario_name)
             ? json_counter(object, QStringLiteral("renderer_text_reused_total")) > 0 ||
                 json_counter(object, QStringLiteral("text_leaf_nodes_created")) > 0 ||
-                json_counter(object, QStringLiteral("text_leaf_nodes_reused"))  > 0
+                json_counter(object, QStringLiteral("text_leaf_nodes_reused"))  > 0 ||
+                graphic_work_observed
             : json_counter(object, QStringLiteral("text_leaf_nodes_created")) > 0 ||
-                json_counter(object, QStringLiteral("text_leaf_nodes_reused"))  > 0;
+                json_counter(object, QStringLiteral("text_leaf_nodes_reused"))  > 0 ||
+                (is_surface_session_text_output_scenario(scenario_name) &&
+                    (graphic_work_observed ||
+                        json_counter(object, QStringLiteral("frame_text_runs")) > 0));
         if (!text_work_observed ||
             bridge_update_requests   < completed_frames              ||
             bridge_consumed_updates  < completed_frames              ||
@@ -6816,6 +7575,122 @@ bool validate_scenario_json(
             *out_error = QStringLiteral(
                 "mixed text reuse-only descriptor counters were not observed: %1"
             ).arg(scenario_name);
+            return false;
+        }
+    }
+
+    if (scenario_name == QStringLiteral("block_graphics_full_dirty_reuse_only") ||
+        scenario_name == QStringLiteral("box_graphics_full_dirty_reuse_only"))
+    {
+        if (json_counter(object, QStringLiteral("simple_content_route_graphic_geometry_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("route_graphic_geometry_cells"))                <= 0 ||
+            json_counter(object, QStringLiteral("frame_packed_graphic_cells"))                  <= 0)
+        {
+            *out_error = QStringLiteral(
+                "graphic reuse-only route counters were not observed: %1")
+                .arg(scenario_name);
+            return false;
+        }
+    }
+
+    if (scenario_name == QStringLiteral("cjk_full_dirty_reuse_only")) {
+        if (json_counter(object, QStringLiteral("frame_text_runs")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_text_category_non_ascii_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_route_qt_text_layout_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_rejection_wide_continuation_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("renderer_text_reused_total")) <= 0)
+        {
+            *out_error = QStringLiteral(
+                "CJK reuse-only route counters were not observed: %1")
+                .arg(scenario_name);
+            return false;
+        }
+    }
+
+    if (scenario_name == QStringLiteral("mixed_non_ascii_full_dirty_reuse_only")) {
+        const qint64 non_ascii_rejections =
+            json_counter(object, QStringLiteral("simple_content_rejection_non_ascii_text_cells")) +
+            json_counter(object, QStringLiteral("simple_content_rejection_multi_cell_text_cells"));
+        if (json_counter(object, QStringLiteral("frame_text_runs")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_text_category_printable_ascii_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_text_category_non_ascii_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_route_graphic_geometry_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_route_qt_text_layout_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_rejection_wide_continuation_cells")) <= 0 ||
+            non_ascii_rejections <= 0 ||
+            json_counter(object, QStringLiteral("renderer_text_reused_total")) <= 0)
+        {
+            *out_error = QStringLiteral(
+                "mixed non-ASCII reuse-only route counters were not observed: %1")
+                .arg(scenario_name);
+            return false;
+        }
+    }
+
+    if (scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
+        scenario_name == QStringLiteral("surface_session_box_graphics_output"))
+    {
+        if (json_counter(object, QStringLiteral("simple_content_route_graphic_geometry_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("route_graphic_geometry_cells"))                <= 0 ||
+            json_counter(object, QStringLiteral("frame_packed_graphic_cells"))                  <= 0 ||
+            object.value(QStringLiteral("session_snapshots_observed")).toInt() !=
+                object.value(QStringLiteral("iterations")).toInt())
+        {
+            *out_error = QStringLiteral(
+                "surface/session graphic output counters were not observed: %1")
+                .arg(scenario_name);
+            return false;
+        }
+    }
+
+    if (scenario_name == QStringLiteral("surface_session_cjk_output")) {
+        if (json_counter(object, QStringLiteral("frame_text_runs")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_text_category_non_ascii_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_route_qt_text_layout_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_rejection_wide_continuation_cells")) <= 0 ||
+            object.value(QStringLiteral("session_snapshots_observed")).toInt() !=
+                object.value(QStringLiteral("iterations")).toInt())
+        {
+            *out_error = QStringLiteral(
+                "surface/session CJK output counters were not observed: %1")
+                .arg(scenario_name);
+            return false;
+        }
+    }
+
+    if (scenario_name == QStringLiteral("surface_session_mixed_non_ascii_output")) {
+        const qint64 non_ascii_rejections =
+            json_counter(object, QStringLiteral("simple_content_rejection_non_ascii_text_cells")) +
+            json_counter(object, QStringLiteral("simple_content_rejection_multi_cell_text_cells"));
+        if (json_counter(object, QStringLiteral("frame_text_runs")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_text_category_printable_ascii_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_text_category_non_ascii_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_route_graphic_geometry_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_route_qt_text_layout_cells")) <= 0 ||
+            json_counter(object, QStringLiteral("simple_content_rejection_wide_continuation_cells")) <= 0 ||
+            non_ascii_rejections <= 0 ||
+            object.value(QStringLiteral("session_snapshots_observed")).toInt() !=
+                object.value(QStringLiteral("iterations")).toInt())
+        {
+            *out_error = QStringLiteral(
+                "surface/session mixed non-ASCII output counters were not observed: %1")
+                .arg(scenario_name);
+            return false;
+        }
+    }
+
+    if (options.profile && is_surface_session_text_output_scenario(scenario_name)) {
+        const QJsonObject model_profile =
+            object.value(QStringLiteral("model_profile_stats")).toObject();
+        const QJsonObject session_profile =
+            object.value(QStringLiteral("session_profile_stats")).toObject();
+        if (model_profile.value(QStringLiteral("render_snapshot_cells_scanned")).toInteger() <= 0 ||
+            model_profile.value(QStringLiteral("render_snapshot_cells_emitted")).toInteger() <= 0 ||
+            session_profile.value(QStringLiteral("render_snapshot_publications")).toInteger() <= 0)
+        {
+            *out_error = QStringLiteral(
+                "surface/session profile counters were not observed: %1")
+                .arg(scenario_name);
             return false;
         }
     }
@@ -6940,9 +7815,17 @@ bool validate_scenario_json(
 
     const QJsonObject lifecycle =
         object.value(QStringLiteral("lifecycle_delta")).toObject();
+    const bool graphics_only_scenario =
+        scenario_name == QStringLiteral("block_graphics_full_dirty_reuse_only") ||
+        scenario_name == QStringLiteral("box_graphics_full_dirty_reuse_only")   ||
+        scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
+        scenario_name == QStringLiteral("surface_session_box_graphics_output");
+    const bool live_render_resources_observed = graphics_only_scenario
+        ? json_counter(object, QStringLiteral("frame_graphic_rects")) > 0 ||
+            json_counter(object, QStringLiteral("frame_packed_graphic_cells")) > 0
+        : lifecycle.value(QStringLiteral("live_text_resources")).toInteger() > 0;
     if (lifecycle.value(QStringLiteral("live_root_nodes")).toInteger()         >  1 ||
-        (render_expected &&
-            lifecycle.value(QStringLiteral("live_text_resources")).toInteger() <= 0))
+        (render_expected && !live_render_resources_observed))
     {
         *out_error = QStringLiteral("scenario lifecycle counters failed: %1")
             .arg(object.value(QStringLiteral("name")).toString());
@@ -7288,6 +8171,22 @@ bool validate_profile_json_output(
         {
             *out_error = QStringLiteral("profile scenario metadata is inconsistent: %1")
                 .arg(name);
+            return false;
+        }
+
+        if (!validate_profile_stats_json_object(
+                scenario,
+                QStringLiteral("model_profile_stats"),
+                model_profile_counter_keys(),
+                options.profile && is_surface_session_scenario(name),
+                out_error) ||
+            !validate_profile_stats_json_object(
+                scenario,
+                QStringLiteral("session_profile_stats"),
+                session_profile_counter_keys(),
+                options.profile && is_surface_session_scenario(name),
+                out_error))
+        {
             return false;
         }
 

@@ -137,6 +137,41 @@ if(BUILD_TESTING AND TARGET vnm_terminal_embedded_benchmark)
         TIMEOUT 90
     )
 
+    add_test(
+        NAME vnm_terminal_embedded_benchmark_single_bmp_render_cell_gate
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_benchmark_qt_offscreen_environment}
+            "QT_SCALE_FACTOR=1"
+            "QT_SCREEN_SCALE_FACTORS="
+            "QT_AUTO_SCREEN_SCALE_FACTOR=0"
+            "QT_DEVICE_PIXEL_RATIO="
+            "QT_SCALE_FACTOR_ROUNDING_POLICY=PassThrough"
+            "${vnm_terminal_benchmark_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_embedded_benchmark>"
+            "--software-renderer"
+            "--iterations" "1"
+            "--warmup" "1"
+            "--window-size" "240x120"
+            "--grid" "6x20"
+            "--scenario" "block_graphics_full_dirty_reuse_only"
+            "--scenario" "box_graphics_full_dirty_reuse_only"
+            "--scenario" "cjk_full_dirty_reuse_only"
+            "--scenario" "mixed_non_ascii_full_dirty_reuse_only"
+            "--scenario" "surface_session_block_graphics_output"
+            "--scenario" "surface_session_box_graphics_output"
+            "--scenario" "surface_session_cjk_output"
+            "--scenario" "surface_session_mixed_non_ascii_output"
+            "--output" "${CMAKE_CURRENT_BINARY_DIR}/single_bmp_render_cell_gate_output.json"
+            "--quiet"
+            "--validate-json"
+    )
+
+    set_tests_properties(vnm_terminal_embedded_benchmark_single_bmp_render_cell_gate PROPERTIES
+        LABELS "readiness;benchmark;renderer"
+        TIMEOUT 90
+    )
+
     if(VNM_TERMINAL_ENABLE_PROFILING)
         add_test(
             NAME vnm_terminal_embedded_benchmark_profile_validate

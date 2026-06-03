@@ -72,6 +72,10 @@ public:
     static Terminal_session_profile_stats session_profile_stats(
         const VNM_TerminalSurface& surface);
 
+    static void set_session_profile_stats_enabled_for_benchmark(
+        VNM_TerminalSurface&       surface,
+        bool                       enabled);
+
     static void set_cursor_blink_visible(
         VNM_TerminalSurface&       surface,
         bool                       visible);
