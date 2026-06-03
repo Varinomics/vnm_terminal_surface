@@ -325,6 +325,8 @@ struct Terminal_render_cell
                                text_category     = Terminal_render_cell_text_category::UNKNOWN;
 };
 
+static_assert(sizeof(Terminal_render_cell) <= 48U);
+
 struct Terminal_render_cursor
 {
     terminal_grid_position_t   position;

@@ -7428,6 +7428,9 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
                         case Terminal_render_cell_text_storage::INLINE_PRINTABLE_ASCII:
                             ++m_profile_stats.render_snapshot_compact_ascii_text_cells;
                             break;
+                        case Terminal_render_cell_text_storage::INLINE_SINGLE_BMP:
+                            ++m_profile_stats.render_snapshot_inline_single_bmp_text_cells;
+                            break;
                         case Terminal_render_cell_text_storage::FALLBACK_QSTRING: {
                             const QString* fallback_text =
                                 snapshot_text.fallback_qstring_or_null();

@@ -445,8 +445,13 @@ bool test_snapshot_cells_cache_text_category()
         "non-ASCII snapshot cell carries cached category");
     ok &= check(non_ascii_cell != nullptr &&
         non_ascii_cell->text.storage() ==
-            term::Terminal_render_cell_text_storage::FALLBACK_QSTRING,
-        "non-ASCII snapshot cell uses fallback QString storage");
+            term::Terminal_render_cell_text_storage::INLINE_SINGLE_BMP,
+        "non-ASCII snapshot cell uses inline BMP storage");
+    ok &= check(non_ascii_cell != nullptr &&
+        non_ascii_cell->text.fallback_qstring_or_null() == nullptr &&
+        non_ascii_cell->text.single_bmp_code_unit().has_value() &&
+        non_ascii_cell->text.single_bmp_code_unit().value() == 0x754cU,
+        "non-ASCII snapshot cell stores an inline BMP code unit without fallback QString");
 
     const term::Terminal_render_cell* continuation_cell = non_ascii_cell != nullptr
         ? cell_at(snapshot, non_ascii_cell->position.row, non_ascii_cell->position.column + 1)
@@ -491,6 +496,36 @@ bool test_snapshot_cells_cache_text_category()
         term::validate_render_snapshot(stale_category_snapshot).status ==
             term::Terminal_render_snapshot_status::INVALID_CELL_TEXT_CATEGORY,
         "snapshot validation rejects stale cached text category");
+
+    return ok;
+}
+
+bool test_snapshot_profile_counts_inline_single_bmp_cells()
+{
+    bool ok = true;
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    term::Terminal_screen_model model = make_model({1, 8});
+    model.set_profile_stats_enabled(true);
+    model.ingest(QString::fromUcs4(U"\u2500\u2588\u754c\U0001F600").toUtf8());
+
+    const term::Terminal_render_snapshot snapshot =
+        model.render_snapshot(request_for_model(model, 19U));
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "inline-BMP profile snapshot validates");
+
+    const term::Terminal_screen_model_profile_stats stats = model.profile_stats();
+    ok &= check(stats.render_snapshot_inline_single_bmp_text_cells == 3U,
+        "snapshot profile counts box, block, and CJK leading cells as inline BMP");
+    ok &= check(stats.render_snapshot_fallback_qstring_copies == 1U &&
+        stats.render_snapshot_fallback_single_non_ascii_copies == 1U,
+        "snapshot profile leaves emoji on the fallback single-scalar path");
+    ok &= check(stats.render_snapshot_compact_empty_text_cells == 2U &&
+        stats.render_snapshot_fallback_text_code_units_copied == 2U &&
+        stats.max_render_snapshot_fallback_text_units_per_cell == 2U,
+        "snapshot profile separates wide continuations and emoji UTF-16 copies");
+#endif
 
     return ok;
 }
@@ -1191,6 +1226,7 @@ int main()
     ok &= test_scrollback_wide_rows_are_repaired_on_resize();
     ok &= test_snapshot_rows_cover_primary_retained_and_alternate_sources();
     ok &= test_snapshot_cells_cache_text_category();
+    ok &= test_snapshot_profile_counts_inline_single_bmp_cells();
     ok &= test_alternate_screen_hides_primary_scrollback();
     ok &= test_request_metadata_damage_selection_and_ime();
     ok &= test_selection_request_rejects_retained_line_row_reorder();

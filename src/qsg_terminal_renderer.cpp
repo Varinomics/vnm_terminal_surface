@@ -7638,7 +7638,7 @@ Terminal_simple_content_text_category simple_content_text_category(const QString
 }
 
 Terminal_simple_content_text_category simple_content_text_category(
-    const Terminal_render_cell_text& text)
+    Terminal_render_cell_text_category category)
 {
     static_assert(
         static_cast<int>(Terminal_render_cell_text_category::EMPTY) ==
@@ -7653,34 +7653,58 @@ Terminal_simple_content_text_category simple_content_text_category(
         static_cast<int>(Terminal_render_cell_text_category::NON_ASCII) ==
             static_cast<int>(Terminal_simple_content_text_category::NON_ASCII));
 
-    return static_cast<Terminal_simple_content_text_category>(text.category());
+    switch (category) {
+        case Terminal_render_cell_text_category::EMPTY:
+        case Terminal_render_cell_text_category::PRINTABLE_ASCII:
+        case Terminal_render_cell_text_category::OTHER_ASCII:
+        case Terminal_render_cell_text_category::NON_ASCII:
+            return static_cast<Terminal_simple_content_text_category>(category);
+        case Terminal_render_cell_text_category::UNKNOWN:
+            break;
+    }
+
+    return Terminal_simple_content_text_category::EMPTY;
+}
+
+Terminal_simple_content_text_category simple_content_text_category(
+    const Terminal_render_cell_text& text)
+{
+    return simple_content_text_category(text.category());
+}
+
+struct Simple_content_text_category_state
+{
+    Terminal_simple_content_text_category category =
+        Terminal_simple_content_text_category::EMPTY;
+    bool                                  cache_sound = true;
+};
+
+Simple_content_text_category_state simple_content_text_category_state(
+    const Terminal_render_cell& cell)
+{
+    const Terminal_render_cell_text_category actual_render_category =
+        cell.text.category();
+    const Terminal_simple_content_text_category actual_category =
+        simple_content_text_category(actual_render_category);
+    if (cell.text_category != Terminal_render_cell_text_category::UNKNOWN &&
+        cell.text_category == actual_render_category)
+    {
+        return {
+            simple_content_text_category(cell.text_category),
+            true,
+        };
+    }
+
+    return {
+        actual_category,
+        cell.text_category == Terminal_render_cell_text_category::UNKNOWN,
+    };
 }
 
 Terminal_simple_content_text_category simple_content_text_category(
     const Terminal_render_cell& cell)
 {
-    static_assert(
-        static_cast<int>(Terminal_render_cell_text_category::EMPTY) ==
-            static_cast<int>(Terminal_simple_content_text_category::EMPTY));
-    static_assert(
-        static_cast<int>(Terminal_render_cell_text_category::PRINTABLE_ASCII) ==
-            static_cast<int>(Terminal_simple_content_text_category::PRINTABLE_ASCII));
-    static_assert(
-        static_cast<int>(Terminal_render_cell_text_category::OTHER_ASCII) ==
-            static_cast<int>(Terminal_simple_content_text_category::OTHER_ASCII));
-    static_assert(
-        static_cast<int>(Terminal_render_cell_text_category::NON_ASCII) ==
-            static_cast<int>(Terminal_simple_content_text_category::NON_ASCII));
-
-    const Terminal_simple_content_text_category actual_category =
-        simple_content_text_category(cell.text);
-    if (cell.text_category != Terminal_render_cell_text_category::UNKNOWN &&
-        cell.text_category == cell.text.category())
-    {
-        return static_cast<Terminal_simple_content_text_category>(cell.text_category);
-    }
-
-    return actual_category;
+    return simple_content_text_category_state(cell).category;
 }
 
 Terminal_simple_content_rejection_reason unrepresented_simple_cell_semantics_rejection(
@@ -7732,7 +7756,9 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
     Terminal_shaped_presentation_mode  presentation_mode)
 {
     terminal_simple_content_classification_t classification;
-    classification.text_category = simple_content_text_category(cell);
+    const Simple_content_text_category_state text_category_state =
+        simple_content_text_category_state(cell);
+    classification.text_category = text_category_state.category;
     classification.row           = cell.position.row;
     classification.style_id      = cell.style_id;
     classification.dirty_row     = dirty_row;
@@ -7787,6 +7813,12 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
             Terminal_simple_content_rejection_reason::EMPTY_TEXT);
     }
 
+    if (!text_category_state.cache_sound) {
+        return reject(
+            Terminal_simple_content_route::FALLBACK,
+            Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING);
+    }
+
     if (strict_printable_ascii_classifier_bypass_eligible(
             cell,
             classification.text_category,
@@ -7799,8 +7831,66 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
         return classification;
     }
 
+    const Terminal_simple_content_rejection_reason semantics_rejection =
+        unrepresented_simple_cell_semantics_rejection(cell, has_decoration);
+
     if (cell.text.single_printable_ascii_code_unit().has_value()) {
         if (cell.display_width != 1) {
+            return
+                reject(
+                    Terminal_simple_content_route::QT_TEXT_LAYOUT,
+                    Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH);
+        }
+    }
+    else
+    if (cell.text.is_inline_single_bmp()) {
+        if (is_terminal_graphic_text(cell.text)) {
+            if (cell.display_width != 1) {
+                return reject(
+                    Terminal_simple_content_route::QT_TEXT_LAYOUT,
+                    Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH);
+            }
+
+            if (semantics_rejection != Terminal_simple_content_rejection_reason::NONE) {
+                return reject(
+                    Terminal_simple_content_route::QT_TEXT_LAYOUT,
+                    semantics_rejection);
+            }
+
+            return reject(
+                Terminal_simple_content_route::GRAPHIC_GEOMETRY,
+                Terminal_simple_content_rejection_reason::TERMINAL_GRAPHIC);
+        }
+
+        const std::optional<ushort> inline_code_unit = cell.text.single_bmp_code_unit();
+        if (!inline_code_unit.has_value()) {
+            return reject(
+                Terminal_simple_content_route::QT_TEXT_LAYOUT,
+                Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING);
+        }
+
+        const QString inline_text(1, QChar(*inline_code_unit));
+        Terminal_cell_shaping_input shaping_input;
+        shaping_input.column            = cell.position.column;
+        shaping_input.text              = inline_text;
+        shaping_input.display_width     = cell.display_width;
+        shaping_input.wide_continuation = cell.wide_continuation;
+        shaping_input.style_id          = cell.style_id;
+        shaping_input.hyperlink_id      = cell.hyperlink_id;
+        shaping_input.presentation_mode = presentation_mode;
+
+        const Terminal_shaped_run_status scalar_status =
+            validate_cell_text_scalars(shaping_input.text);
+        if (scalar_status != Terminal_shaped_run_status::OK) {
+            return
+                reject(
+                    Terminal_simple_content_route::QT_TEXT_LAYOUT,
+                    Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING);
+        }
+
+        const Terminal_shaped_run_status width_status =
+            validate_cell_text_width(shaping_input);
+        if (width_status != Terminal_shaped_run_status::OK) {
             return
                 reject(
                     Terminal_simple_content_route::QT_TEXT_LAYOUT,
@@ -7851,9 +7941,6 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
                 Terminal_simple_content_rejection_reason::MULTI_CELL_TEXT);
     }
 
-    const Terminal_simple_content_rejection_reason semantics_rejection = unrepresented_simple_cell_semantics_rejection(
-        cell,
-        has_decoration);
     if (is_terminal_graphic_text(cell.text)) {
         if (semantics_rejection != Terminal_simple_content_rejection_reason::NONE) {
             return reject(
@@ -9009,6 +9096,7 @@ Terminal_render_frame build_terminal_render_frame(
             }
             const bool rendered_as_graphic = packed_hard_graphic_covered ||
                 (!text_is_empty &&
+                    classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY &&
                     append_terminal_graphic_rects(
                         frame.graphic_rects,
                         frame.graphic_arcs,

@@ -85,7 +85,7 @@ constexpr int k_surface_session_output_high_water_chunks      = 64;
 constexpr int k_surface_session_output_high_water_chunk_bytes = 1024;
 constexpr int k_surface_session_write_high_water_bytes        = 64 * 1024;
 
-constexpr int k_schema_version              = 18;
+constexpr int k_schema_version              = 19;
 constexpr int k_profile_schema_version      = 2;
 constexpr int k_profile_text_format         = 2;
 constexpr int k_flat_rect_vertices_per_rect = 6;
@@ -4671,6 +4671,10 @@ QJsonObject model_profile_stats_json(
         stats.render_snapshot_compact_ascii_text_cells);
     insert_profile_counter(
         object,
+        QStringLiteral("render_snapshot_inline_single_bmp_text_cells"),
+        stats.render_snapshot_inline_single_bmp_text_cells);
+    insert_profile_counter(
+        object,
         QStringLiteral("render_snapshot_fallback_qstring_copies"),
         stats.render_snapshot_fallback_qstring_copies);
     insert_profile_counter(
@@ -5782,6 +5786,7 @@ QStringList model_profile_counter_keys()
         QStringLiteral("render_snapshot_cells_emitted"),
         QStringLiteral("render_snapshot_compact_empty_text_cells"),
         QStringLiteral("render_snapshot_compact_ascii_text_cells"),
+        QStringLiteral("render_snapshot_inline_single_bmp_text_cells"),
         QStringLiteral("render_snapshot_fallback_qstring_copies"),
         QStringLiteral("render_snapshot_fallback_text_code_units_copied"),
         QStringLiteral("render_snapshot_fallback_printable_ascii_copies"),
@@ -6016,6 +6021,57 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
 qint64 json_counter(const QJsonObject& object, const QString& key)
 {
     return object.value(key).toInteger();
+}
+
+bool scenario_requires_inline_single_bmp_model_profile(const QString& scenario_name)
+{
+    return
+        scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
+        scenario_name == QStringLiteral("surface_session_box_graphics_output")   ||
+        scenario_name == QStringLiteral("surface_session_cjk_output");
+}
+
+bool scenario_requires_zero_single_non_ascii_fallbacks(const QString& scenario_name)
+{
+    return
+        scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
+        scenario_name == QStringLiteral("surface_session_box_graphics_output");
+}
+
+bool validate_inline_single_bmp_model_profile_stats(
+    const QJsonObject& model_profile,
+    const QString&     scenario_name,
+    QString*           out_error)
+{
+    if (!scenario_requires_inline_single_bmp_model_profile(scenario_name)) {
+        return true;
+    }
+
+    if (json_counter(
+            model_profile,
+            QStringLiteral("render_snapshot_inline_single_bmp_text_cells")) <= 0)
+    {
+        *out_error = QStringLiteral(
+            "surface/session inline BMP profile counter was not observed: %1")
+            .arg(scenario_name);
+        return false;
+    }
+
+    if (scenario_requires_zero_single_non_ascii_fallbacks(scenario_name) &&
+        (json_counter(
+             model_profile,
+             QStringLiteral("render_snapshot_fallback_single_non_ascii_copies")) != 0 ||
+            json_counter(
+                model_profile,
+                QStringLiteral("render_snapshot_fallback_qstring_copies")) != 0))
+    {
+        *out_error = QStringLiteral(
+            "surface/session BMP graphics still used fallback text copies: %1")
+            .arg(scenario_name);
+        return false;
+    }
+
+    return true;
 }
 
 bool validate_renderer_counter_invariants(
@@ -7686,11 +7742,17 @@ bool validate_scenario_json(
             object.value(QStringLiteral("session_profile_stats")).toObject();
         if (model_profile.value(QStringLiteral("render_snapshot_cells_scanned")).toInteger() <= 0 ||
             model_profile.value(QStringLiteral("render_snapshot_cells_emitted")).toInteger() <= 0 ||
-            session_profile.value(QStringLiteral("render_snapshot_publications")).toInteger() <= 0)
+            session_profile.value(QStringLiteral("render_snapshot_publications")).toInteger() <= 0 ||
+            !validate_inline_single_bmp_model_profile_stats(
+                model_profile,
+                scenario_name,
+                out_error))
         {
-            *out_error = QStringLiteral(
-                "surface/session profile counters were not observed: %1")
-                .arg(scenario_name);
+            if (out_error->isEmpty()) {
+                *out_error = QStringLiteral(
+                    "surface/session profile counters were not observed: %1")
+                    .arg(scenario_name);
+            }
             return false;
         }
     }
@@ -8185,6 +8247,15 @@ bool validate_profile_json_output(
                 QStringLiteral("session_profile_stats"),
                 session_profile_counter_keys(),
                 options.profile && is_surface_session_scenario(name),
+                out_error))
+        {
+            return false;
+        }
+
+        if (options.profile &&
+            !validate_inline_single_bmp_model_profile_stats(
+                scenario.value(QStringLiteral("model_profile_stats")).toObject(),
+                name,
                 out_error))
         {
             return false;
