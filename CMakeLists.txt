@@ -73,6 +73,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/terminal_public_projection.h
     include/vnm_terminal/internal/terminal_repaint_recovery.h
     include/vnm_terminal/internal/terminal_resize_controller.h
+    include/vnm_terminal/internal/terminal_render_cell_text.h
     include/vnm_terminal/internal/terminal_screen_model.h
     include/vnm_terminal/internal/terminal_session.h
     include/vnm_terminal/internal/terminal_transcript.h

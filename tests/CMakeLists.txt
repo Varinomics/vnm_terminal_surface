@@ -409,6 +409,26 @@ add_test(
         "--expect-scaled"
 )
 
+add_executable(vnm_terminal_render_cell_text
+    render_cell_text/render_cell_text_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_render_cell_text PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_render_cell_text PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_render_cell_text
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_render_cell_text>"
+)
+
 add_executable(vnm_terminal_render_snapshot
     render_snapshot/render_snapshot_tests.cpp
 )
@@ -1283,6 +1303,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_canvas_fixture_contract
     vnm_terminal_qt_render_smoke
     vnm_terminal_qt_metrics
+    vnm_terminal_render_cell_text
     vnm_terminal_render_snapshot
     vnm_terminal_render_frame
     vnm_terminal_qsg_render
