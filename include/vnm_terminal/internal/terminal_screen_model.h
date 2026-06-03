@@ -260,12 +260,14 @@ struct Terminal_screen_model_profile_stats
     std::uint64_t              render_snapshot_rows_owned               = 0U;
     std::uint64_t              render_snapshot_cells_scanned            = 0U;
     std::uint64_t              render_snapshot_cells_emitted            = 0U;
-    std::uint64_t              render_snapshot_qstring_copies           = 0U;
-    std::uint64_t              render_snapshot_text_code_units_copied   = 0U;
-    std::uint64_t              render_snapshot_empty_text_copies        = 0U;
-    std::uint64_t              render_snapshot_ascii_text_copies        = 0U;
-    std::uint64_t              render_snapshot_single_non_ascii_copies  = 0U;
-    std::uint64_t              render_snapshot_multi_text_copies        = 0U;
+    std::uint64_t              render_snapshot_compact_empty_text_cells  = 0U;
+    std::uint64_t              render_snapshot_compact_ascii_text_cells  = 0U;
+    std::uint64_t              render_snapshot_fallback_qstring_copies   = 0U;
+    std::uint64_t              render_snapshot_fallback_text_code_units_copied = 0U;
+    std::uint64_t              render_snapshot_fallback_printable_ascii_copies = 0U;
+    std::uint64_t              render_snapshot_fallback_other_ascii_copies = 0U;
+    std::uint64_t              render_snapshot_fallback_single_non_ascii_copies = 0U;
+    std::uint64_t              render_snapshot_fallback_multi_text_copies = 0U;
     std::uint64_t              render_snapshot_unoccupied_cells_skipped = 0U;
     std::uint64_t              render_snapshot_dirty_rows_requested     = 0U;
     std::uint64_t              render_snapshot_dirty_rows_visible       = 0U;
@@ -274,7 +276,7 @@ struct Terminal_screen_model_profile_stats
     std::uint64_t              render_snapshot_zero_dirty_publications  = 0U;
     std::uint64_t              max_render_snapshot_rows_visited         = 0U;
     std::uint64_t              max_render_snapshot_cells_emitted        = 0U;
-    std::uint64_t              max_render_snapshot_text_units_per_cell  = 0U;
+    std::uint64_t              max_render_snapshot_fallback_text_units_per_cell = 0U;
 };
 
 class Terminal_byte_stream_parser

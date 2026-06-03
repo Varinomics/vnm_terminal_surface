@@ -876,6 +876,28 @@ bool append_terminal_graphic_rects(
         metrics);
 }
 
+bool append_terminal_graphic_rects(
+    std::vector<Terminal_render_rect>& rects,
+    std::vector<Terminal_render_arc>&  arcs,
+    const QRectF&                      cell,
+    const Terminal_render_cell_text&   text,
+    const QColor&                      color,
+    terminal_cell_metrics_t            metrics)
+{
+    const std::optional<ushort> codepoint = text.single_code_unit();
+    if (!codepoint.has_value()) {
+        return false;
+    }
+
+    return append_terminal_graphic_codepoint_rects(
+        rects,
+        arcs,
+        cell,
+        *codepoint,
+        color,
+        metrics);
+}
+
 bool terminal_block_graphic_is_supported(ushort codepoint)
 {
     std::vector<Terminal_render_rect> rects;
@@ -901,6 +923,12 @@ bool terminal_hard_block_graphic_text_is_supported(const QString& text)
         terminal_hard_block_graphic_is_supported(text.at(0).unicode());
 }
 
+bool terminal_hard_block_graphic_text_is_supported(const Terminal_render_cell_text& text)
+{
+    const std::optional<ushort> codepoint = text.single_code_unit();
+    return codepoint.has_value() && terminal_hard_block_graphic_is_supported(*codepoint);
+}
+
 bool is_terminal_graphic_text(const QString& text)
 {
     if (text.size() != 1) {
@@ -915,6 +943,22 @@ bool is_terminal_graphic_text(const QString& text)
     return
         find_terminal_box_stroke_spec(codepoint) != nullptr ||
         find_terminal_box_arc_spec(codepoint)    != nullptr;
+}
+
+bool is_terminal_graphic_text(const Terminal_render_cell_text& text)
+{
+    const std::optional<ushort> codepoint = text.single_code_unit();
+    if (!codepoint.has_value()) {
+        return false;
+    }
+
+    if (terminal_hard_block_graphic_is_supported(*codepoint)) {
+        return true;
+    }
+
+    return
+        find_terminal_box_stroke_spec(*codepoint) != nullptr ||
+        find_terminal_box_arc_spec(*codepoint)    != nullptr;
 }
 
 QColor cursor_graphic_overlay_color(QColor color)
@@ -7286,6 +7330,9 @@ void accumulate_simple_content_stats(
     X(text_cells_multi_width) \
     X(text_cells_with_decorations) \
     X(text_cells_with_hyperlink) \
+    X(compact_ascii_cells_seen) \
+    X(compact_ascii_text_direct_appends) \
+    X(compact_ascii_qstring_materializations) \
     X(text_style_changes) \
     X(text_distinct_styles) \
     X(background_rects_emitted) \
@@ -7591,6 +7638,25 @@ Terminal_simple_content_text_category simple_content_text_category(const QString
 }
 
 Terminal_simple_content_text_category simple_content_text_category(
+    const Terminal_render_cell_text& text)
+{
+    static_assert(
+        static_cast<int>(Terminal_render_cell_text_category::EMPTY) ==
+            static_cast<int>(Terminal_simple_content_text_category::EMPTY));
+    static_assert(
+        static_cast<int>(Terminal_render_cell_text_category::PRINTABLE_ASCII) ==
+            static_cast<int>(Terminal_simple_content_text_category::PRINTABLE_ASCII));
+    static_assert(
+        static_cast<int>(Terminal_render_cell_text_category::OTHER_ASCII) ==
+            static_cast<int>(Terminal_simple_content_text_category::OTHER_ASCII));
+    static_assert(
+        static_cast<int>(Terminal_render_cell_text_category::NON_ASCII) ==
+            static_cast<int>(Terminal_simple_content_text_category::NON_ASCII));
+
+    return static_cast<Terminal_simple_content_text_category>(text.category());
+}
+
+Terminal_simple_content_text_category simple_content_text_category(
     const Terminal_render_cell& cell)
 {
     static_assert(
@@ -7606,11 +7672,15 @@ Terminal_simple_content_text_category simple_content_text_category(
         static_cast<int>(Terminal_render_cell_text_category::NON_ASCII) ==
             static_cast<int>(Terminal_simple_content_text_category::NON_ASCII));
 
-    if (cell.text_category != Terminal_render_cell_text_category::UNKNOWN) {
+    const Terminal_simple_content_text_category actual_category =
+        simple_content_text_category(cell.text);
+    if (cell.text_category != Terminal_render_cell_text_category::UNKNOWN &&
+        cell.text_category == cell.text.category())
+    {
         return static_cast<Terminal_simple_content_text_category>(cell.text_category);
     }
 
-    return simple_content_text_category(cell.text);
+    return actual_category;
 }
 
 Terminal_simple_content_rejection_reason unrepresented_simple_cell_semantics_rejection(
@@ -7635,7 +7705,7 @@ bool strict_printable_ascii_classifier_bypass_eligible(
 {
     return
         text_category == Terminal_simple_content_text_category::PRINTABLE_ASCII &&
-        cell.text.size() == 1                  &&
+        cell.text.single_printable_ascii_code_unit().has_value() &&
         cell.display_width == 1                 &&
         !cell.wide_continuation                 &&
         cell.hyperlink_id == 0U                 &&
@@ -7644,7 +7714,7 @@ bool strict_printable_ascii_classifier_bypass_eligible(
 
 bool terminal_graphic_candidate_text(
     Terminal_simple_content_text_category text_category,
-    const QString&                        text)
+    const Terminal_render_cell_text&      text)
 {
     return
         text_category == Terminal_simple_content_text_category::NON_ASCII &&
@@ -7711,7 +7781,7 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
     }
 
     classification.valid_terminal_cell = true;
-    if (cell.text.isEmpty()) {
+    if (cell.text.is_empty()) {
         return reject(
             Terminal_simple_content_route::NONE,
             Terminal_simple_content_rejection_reason::EMPTY_TEXT);
@@ -7729,31 +7799,49 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
         return classification;
     }
 
-    Terminal_cell_shaping_input shaping_input;
-    shaping_input.column            = cell.position.column;
-    shaping_input.text              = cell.text;
-    shaping_input.display_width     = cell.display_width;
-    shaping_input.wide_continuation = cell.wide_continuation;
-    shaping_input.style_id          = cell.style_id;
-    shaping_input.hyperlink_id      = cell.hyperlink_id;
-    shaping_input.presentation_mode = presentation_mode;
-
-    const Terminal_shaped_run_status scalar_status =
-        validate_cell_text_scalars(shaping_input.text);
-    if (scalar_status != Terminal_shaped_run_status::OK) {
-        return
-            reject(
-                Terminal_simple_content_route::QT_TEXT_LAYOUT,
-                Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING);
+    if (cell.text.single_printable_ascii_code_unit().has_value()) {
+        if (cell.display_width != 1) {
+            return
+                reject(
+                    Terminal_simple_content_route::QT_TEXT_LAYOUT,
+                    Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH);
+        }
     }
+    else {
+        const QString* fallback_text = cell.text.fallback_qstring_or_null();
+        if (fallback_text == nullptr) {
+            return
+                reject(
+                    Terminal_simple_content_route::QT_TEXT_LAYOUT,
+                    Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING);
+        }
 
-    const Terminal_shaped_run_status width_status =
-        validate_cell_text_width(shaping_input);
-    if (width_status != Terminal_shaped_run_status::OK) {
-        return
-            reject(
-                Terminal_simple_content_route::QT_TEXT_LAYOUT,
-                Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH);
+        Terminal_cell_shaping_input shaping_input;
+        shaping_input.column            = cell.position.column;
+        shaping_input.text              = *fallback_text;
+        shaping_input.display_width     = cell.display_width;
+        shaping_input.wide_continuation = cell.wide_continuation;
+        shaping_input.style_id          = cell.style_id;
+        shaping_input.hyperlink_id      = cell.hyperlink_id;
+        shaping_input.presentation_mode = presentation_mode;
+
+        const Terminal_shaped_run_status scalar_status =
+            validate_cell_text_scalars(shaping_input.text);
+        if (scalar_status != Terminal_shaped_run_status::OK) {
+            return
+                reject(
+                    Terminal_simple_content_route::QT_TEXT_LAYOUT,
+                    Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING);
+        }
+
+        const Terminal_shaped_run_status width_status =
+            validate_cell_text_width(shaping_input);
+        if (width_status != Terminal_shaped_run_status::OK) {
+            return
+                reject(
+                    Terminal_simple_content_route::QT_TEXT_LAYOUT,
+                    Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH);
+        }
     }
 
     if (cell.display_width != 1) {
@@ -8201,28 +8289,40 @@ std::uint32_t packed_color_rgba(const QColor& color)
 void append_packed_text_bytes(
     Terminal_render_frame&                   frame,
     terminal_packed_text_span_t&             span,
-    const QString&                           text,
+    const Terminal_render_cell_text&         text,
     Terminal_simple_content_text_category    text_category)
 {
     if (text_category == Terminal_simple_content_text_category::PRINTABLE_ASCII) {
         const std::size_t byte_offset = frame.packed_text_bytes.size();
-        const qsizetype text_size     = text.size();
+        const qsizetype text_size     = text.code_unit_count();
         frame.packed_text_bytes.resize(byte_offset + static_cast<std::size_t>(text_size));
 
         ++frame.stats.packed_text_ascii_direct_cells;
         frame.stats.packed_text_ascii_direct_bytes += static_cast<std::uint64_t>(text_size);
-        const ushort* code_units = text.utf16();
         char* bytes = frame.packed_text_bytes.data() + byte_offset;
-        for (qsizetype index = 0; index < text_size; ++index) {
-            bytes[index] = static_cast<char>(code_units[index]);
+        const std::optional<ushort> inline_code_unit =
+            text.single_printable_ascii_code_unit();
+        if (inline_code_unit.has_value()) {
+            bytes[0] = static_cast<char>(*inline_code_unit);
+        }
+        else {
+            const QString* fallback_text = text.fallback_qstring_or_null();
+            Q_ASSERT(fallback_text != nullptr);
+            const ushort* code_units = fallback_text->utf16();
+            for (qsizetype index = 0; index < text_size; ++index) {
+                bytes[index] = static_cast<char>(code_units[index]);
+            }
         }
         span.text_length += static_cast<std::uint32_t>(text_size);
         return;
     }
 
-    const QByteArray bytes = text.toUtf8();
+    const QString* fallback_text = text.fallback_qstring_or_null();
+    Q_ASSERT(fallback_text != nullptr);
+    const QByteArray bytes = fallback_text->toUtf8();
     ++frame.stats.packed_text_utf8_cells;
-    frame.stats.packed_text_utf8_input_units  += static_cast<std::uint64_t>(text.size());
+    frame.stats.packed_text_utf8_input_units  +=
+        static_cast<std::uint64_t>(fallback_text->size());
     frame.stats.packed_text_utf8_output_bytes += static_cast<std::uint64_t>(bytes.size());
     frame.packed_text_bytes.insert(
         frame.packed_text_bytes.end(),
@@ -8295,8 +8395,10 @@ void append_packed_graphic_cell(
         {
             span.column_count += cell.display_width;
             ++span.codepoint_count;
+            const std::optional<ushort> codepoint = cell.text.single_code_unit();
+            Q_ASSERT(codepoint.has_value());
             frame.packed_graphic_codepoints.push_back(
-                static_cast<std::uint32_t>(cell.text.at(0).unicode()));
+                static_cast<std::uint32_t>(*codepoint));
             ++frame.stats.packed_graphic_cells;
             ++frame.stats.packed_cells_appended;
             return;
@@ -8317,8 +8419,9 @@ void append_packed_graphic_cell(
     span.codepoint_offset =
         static_cast<std::uint32_t>(frame.packed_graphic_codepoints.size());
     span.codepoint_count  = 1U;
-    frame.packed_graphic_codepoints.push_back(
-        static_cast<std::uint32_t>(cell.text.at(0).unicode()));
+    const std::optional<ushort> codepoint = cell.text.single_code_unit();
+    Q_ASSERT(codepoint.has_value());
+    frame.packed_graphic_codepoints.push_back(static_cast<std::uint32_t>(*codepoint));
     frame.packed_graphic_spans.push_back(span);
     ++row.graphic_span_count;
     ++frame.stats.packed_graphic_cells;
@@ -8397,6 +8500,24 @@ void record_disabled_sidecar_packed_graphic_cell(
     }
 
     row_table[row_index].push_back(&cell);
+}
+
+void append_cell_text_to_text_run(
+    Terminal_render_frame&           frame,
+    Terminal_render_text_run&        run,
+    const Terminal_render_cell_text& text)
+{
+    const std::optional<ushort> inline_code_unit =
+        text.is_inline_printable_ascii()
+            ? text.single_printable_ascii_code_unit()
+            : std::nullopt;
+    if (inline_code_unit.has_value()) {
+        run.text += QChar(*inline_code_unit);
+        ++frame.stats.compact_ascii_text_direct_appends;
+        return;
+    }
+
+    text.append_to(run.text);
 }
 
 void append_disabled_sidecar_packed_graphic_cells(
@@ -8818,11 +8939,15 @@ Terminal_render_frame build_terminal_render_frame(
             }
 
             const Terminal_render_line_provenance& line_provenance = cached_line_provenance;
-            const bool text_is_empty = cell.text.isEmpty();
+            const bool text_is_empty = cell.text.is_empty();
             if (text_is_empty) {
                 ++frame.stats.text_cells_empty;
             }
             else {
+                if (cell.text.is_inline_printable_ascii()) {
+                    ++frame.stats.compact_ascii_cells_seen;
+                }
+
                 if (cell.display_width == 1) {
                     ++frame.stats.text_cells_single_width;
                 }
@@ -8861,7 +8986,6 @@ Terminal_render_frame build_terminal_render_frame(
             run.column             = cell.position.column;
             run.rect               = rect;
             run.baseline_origin    = QPointF(rect.left(), rect.top() + cell_metrics.ascent);
-            run.text               = cell.text;
             run.foreground         = foreground;
             run.background         = background;
             run.style_id           = cell.style_id;
@@ -8922,11 +9046,13 @@ Terminal_render_frame build_terminal_render_frame(
                 // same maximum length the downstream coalescer uses. Cursor/IME
                 // cells are kept standalone so block-cursor inverted text and
                 // preedit overlays still copy a single protected cell.
+                const std::optional<ushort> printable_ascii_code_unit =
+                    cell.text.single_printable_ascii_code_unit();
                 const bool coalescable_ascii_cell =
                     cell.display_width == 1                                    &&
                     classification.text_category ==
                         Terminal_simple_content_text_category::PRINTABLE_ASCII &&
-                    cell.text.size() == 1                                      &&
+                    printable_ascii_code_unit.has_value()                      &&
                     !run.underline                                            &&
                     !run.strike                                               &&
                     run.hyperlink_id == 0U                                    &&
@@ -8949,14 +9075,21 @@ Terminal_render_frame build_terminal_render_frame(
                 {
                     Terminal_render_text_run& open_run =
                         frame.text_runs[open_ascii_run.index];
-                    open_run.text += cell.text;
+                    open_run.text += QChar(*printable_ascii_code_unit);
+                    if (cell.text.is_inline_printable_ascii()) {
+                        ++frame.stats.compact_ascii_text_direct_appends;
+                    }
                     open_run.rect.setWidth(
                         rect.left() + rect.width() - open_run.rect.left());
                     open_ascii_run.end_column += 1;
                     ++open_ascii_run.length;
                 }
                 else {
-                    frame.text_runs.push_back(run);
+                    Terminal_render_text_run emitted_run = run;
+                    emitted_run.text.reserve(
+                        static_cast<qsizetype>(cell.text.code_unit_count()));
+                    append_cell_text_to_text_run(frame, emitted_run, cell.text);
+                    frame.text_runs.push_back(std::move(emitted_run));
                     if (coalescable_ascii_cell) {
                         open_ascii_run.valid              = true;
                         open_ascii_run.index              = frame.text_runs.size() - 1U;

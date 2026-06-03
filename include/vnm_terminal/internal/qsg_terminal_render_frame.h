@@ -293,6 +293,9 @@ struct terminal_render_frame_stats_t
     int                                            text_cells_multi_width          = 0;
     int                                            text_cells_with_decorations     = 0;
     int                                            text_cells_with_hyperlink       = 0;
+    int                                            compact_ascii_cells_seen        = 0;
+    int                                            compact_ascii_text_direct_appends = 0;
+    int                                            compact_ascii_qstring_materializations = 0;
     int                                            text_style_changes              = 0;
     int                                            text_distinct_styles            = 0;
     int                                            background_rects_emitted        = 0;
@@ -351,6 +354,9 @@ struct terminal_render_frame_cumulative_stats_t
     std::uint64_t                                  text_cells_multi_width          = 0U;
     std::uint64_t                                  text_cells_with_decorations     = 0U;
     std::uint64_t                                  text_cells_with_hyperlink       = 0U;
+    std::uint64_t                                  compact_ascii_cells_seen        = 0U;
+    std::uint64_t                                  compact_ascii_text_direct_appends = 0U;
+    std::uint64_t                                  compact_ascii_qstring_materializations = 0U;
     std::uint64_t                                  text_style_changes              = 0U;
     std::uint64_t                                  text_distinct_styles            = 0U;
     std::uint64_t                                  background_rects_emitted        = 0U;

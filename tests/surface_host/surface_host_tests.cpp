@@ -419,7 +419,7 @@ QString snapshot_row_text(
         QString cell_text = QStringLiteral(" ");
         for (const term::Terminal_render_cell& cell : snapshot.cells) {
             if (cell.position.row == row && cell.position.column == column) {
-                cell_text = cell.text;
+                cell_text = cell.text.to_qstring();
                 break;
             }
         }

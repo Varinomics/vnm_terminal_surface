@@ -1546,7 +1546,8 @@ bool check_expected_final_state(
                 label + ": expected wide base cell is a continuation");
             ok &= check(base_cell->display_width == test_case.expected_wide_cell_width,
                 label + ": expected wide base cell width differs");
-            ok &= check(base_cell->text.toUtf8() == test_case.expected_wide_cell_text_utf8,
+            ok &= check(base_cell->text.to_qstring().toUtf8() ==
+                    test_case.expected_wide_cell_text_utf8,
                 label + ": expected wide base cell text differs");
         }
 

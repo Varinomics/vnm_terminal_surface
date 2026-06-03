@@ -437,6 +437,10 @@ bool test_direct_ascii_text_runs_coalesce_contiguous_plain_cells()
     ok &= check(frame.stats.text_runs_emitted == 1 &&
         frame.stats.text_cells_rendered_as_text == 3,
         "coalesced direct ASCII still counts the rendered source cells");
+    ok &= check(frame.stats.compact_ascii_cells_seen == 3 &&
+        frame.stats.compact_ascii_text_direct_appends == 3 &&
+        frame.stats.compact_ascii_qstring_materializations == 0,
+        "compact ASCII frame path appends code units without per-cell materialization");
     return ok;
 }
 
