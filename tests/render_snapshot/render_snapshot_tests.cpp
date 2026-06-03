@@ -375,6 +375,17 @@ bool test_snapshot_rows_cover_primary_retained_and_alternate_sources()
     ok &= check(stats.render_snapshot_rows_borrowed == 5U &&
         stats.render_snapshot_rows_owned == 1U,
         "row-source snapshots split borrowed and owned row-cell sources");
+    ok &= check(stats.render_snapshot_qstring_copies == 17U &&
+        stats.render_snapshot_text_code_units_copied == 17U &&
+        stats.render_snapshot_ascii_text_copies == 17U,
+        "row-source snapshots count printable ASCII QString copy pressure");
+    ok &= check(stats.render_snapshot_empty_text_copies == 0U &&
+        stats.render_snapshot_single_non_ascii_copies == 0U &&
+        stats.render_snapshot_multi_text_copies == 0U,
+        "row-source snapshots keep non-ASCII and complex copy categories empty");
+    ok &= check(stats.render_snapshot_unoccupied_cells_skipped == 31U &&
+        stats.max_render_snapshot_text_units_per_cell == 1U,
+        "row-source snapshots expose skipped cells and max copied text width");
 #endif
 
     return ok;

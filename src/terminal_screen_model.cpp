@@ -106,6 +106,40 @@ bool is_printable_ascii_byte(unsigned char byte)
     return byte >= k_printable_ascii_first && byte <= k_printable_ascii_last;
 }
 
+bool is_printable_ascii_text(QStringView text)
+{
+    for (QChar character : text) {
+        if (!is_printable_ascii(character)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool is_high_surrogate(QChar character)
+{
+    const ushort code_unit = character.unicode();
+    return code_unit >= 0xd800U && code_unit <= 0xdbffU;
+}
+
+bool is_low_surrogate(QChar character)
+{
+    const ushort code_unit = character.unicode();
+    return code_unit >= 0xdc00U && code_unit <= 0xdfffU;
+}
+
+bool is_single_unicode_scalar(QStringView text)
+{
+    if (text.size() == 1) {
+        return !is_high_surrogate(text[0]) && !is_low_surrogate(text[0]);
+    }
+
+    return text.size() == 2 &&
+        is_high_surrogate(text[0]) &&
+        is_low_surrogate(text[1]);
+}
+
 bool printable_ascii_block_is_all_printable(const char* block)
 {
     // Unsigned underflow makes below-range bytes fail the span check without a branch.
@@ -7319,11 +7353,48 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
             VNM_TERMINAL_PROFILE_SCOPE(
                 "Terminal_screen_model::append_snapshot_cells_from_row::scan_cells::loop");
 
+#if VNM_TERMINAL_PROFILING_ENABLED
+            const bool profile_enabled = m_profile_stats.enabled;
+#endif
             for (int column = 0; column < column_count; ++column) {
                 const Cell& cell = visual_row[static_cast<std::size_t>(column)];
                 if (!cell.occupied) {
+#if VNM_TERMINAL_PROFILING_ENABLED
+                    if (profile_enabled) {
+                        ++m_profile_stats.render_snapshot_unoccupied_cells_skipped;
+                    }
+#endif
                     continue;
                 }
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+                if (profile_enabled) {
+                    const QStringView text(cell.text);
+                    const std::uint64_t code_units =
+                        static_cast<std::uint64_t>(text.size());
+                    ++m_profile_stats.render_snapshot_qstring_copies;
+                    m_profile_stats.render_snapshot_text_code_units_copied += code_units;
+                    m_profile_stats.max_render_snapshot_text_units_per_cell =
+                        std::max(
+                            m_profile_stats.max_render_snapshot_text_units_per_cell,
+                            code_units);
+
+                    if (text.isEmpty()) {
+                        ++m_profile_stats.render_snapshot_empty_text_copies;
+                    }
+                    else
+                    if (is_printable_ascii_text(text)) {
+                        ++m_profile_stats.render_snapshot_ascii_text_copies;
+                    }
+                    else
+                    if (is_single_unicode_scalar(text)) {
+                        ++m_profile_stats.render_snapshot_single_non_ascii_copies;
+                    }
+                    else {
+                        ++m_profile_stats.render_snapshot_multi_text_copies;
+                    }
+                }
+#endif
 
                 if (collect_hyperlink_ids && cell.hyperlink_id != 0U) {
                     const auto insert_position = std::lower_bound(

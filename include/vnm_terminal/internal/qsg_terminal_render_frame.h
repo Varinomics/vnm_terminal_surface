@@ -309,8 +309,13 @@ struct terminal_render_frame_stats_t
     int                                            packed_rows                     = 0;
     int                                            packed_text_spans               = 0;
     int                                            packed_text_cells               = 0;
+    int                                            packed_text_ascii_direct_cells  = 0;
     int                                            packed_graphic_spans            = 0;
     int                                            packed_graphic_cells            = 0;
+    std::uint64_t                                  packed_text_ascii_direct_bytes  = 0U;
+    std::uint64_t                                  packed_text_utf8_cells          = 0U;
+    std::uint64_t                                  packed_text_utf8_input_units    = 0U;
+    std::uint64_t                                  packed_text_utf8_output_bytes   = 0U;
     std::uint64_t                                  packed_payload_bytes            = 0U;
 };
 
@@ -362,8 +367,13 @@ struct terminal_render_frame_cumulative_stats_t
     std::uint64_t                                  packed_rows                     = 0U;
     std::uint64_t                                  packed_text_spans               = 0U;
     std::uint64_t                                  packed_text_cells               = 0U;
+    std::uint64_t                                  packed_text_ascii_direct_cells  = 0U;
     std::uint64_t                                  packed_graphic_spans            = 0U;
     std::uint64_t                                  packed_graphic_cells            = 0U;
+    std::uint64_t                                  packed_text_ascii_direct_bytes  = 0U;
+    std::uint64_t                                  packed_text_utf8_cells          = 0U;
+    std::uint64_t                                  packed_text_utf8_input_units    = 0U;
+    std::uint64_t                                  packed_text_utf8_output_bytes   = 0U;
     std::uint64_t                                  packed_payload_bytes            = 0U;
 };
 
