@@ -1787,14 +1787,6 @@ Terminal_key_event_result Terminal_session::write_key_event(const QKeyEvent& eve
     return write_key_event_locked(event, Backend_callback_drain_policy::DRAIN_CALLBACKS);
 }
 
-Terminal_key_event_result Terminal_session::write_key_event_from_drained_state(
-    const QKeyEvent& event)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    return write_key_event_locked(event, Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
-}
-
 Terminal_key_event_result Terminal_session::write_key_event_locked(
     const QKeyEvent&                   event,
     Backend_callback_drain_policy      drain_policy)
@@ -1842,14 +1834,6 @@ Terminal_mouse_event_result Terminal_session::write_mouse_event(Terminal_mouse_e
     process_pending_commands();
 
     return write_mouse_event_locked(event, Backend_callback_drain_policy::DRAIN_CALLBACKS);
-}
-
-Terminal_mouse_event_result Terminal_session::write_mouse_event_from_drained_state(
-    Terminal_mouse_event event)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    return write_mouse_event_locked(event, Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
 }
 
 Terminal_mouse_event_result Terminal_session::write_mouse_event_locked(
@@ -2067,14 +2051,6 @@ Terminal_viewport_scroll_result Terminal_session::scroll_viewport_lines(int line
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     drain_backend_callback_commands();
     process_pending_commands();
-
-    return scroll_viewport_lines_locked(line_delta);
-}
-
-Terminal_viewport_scroll_result Terminal_session::scroll_viewport_lines_from_drained_state(
-    int line_delta)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     return scroll_viewport_lines_locked(line_delta);
 }
@@ -4160,10 +4136,7 @@ void Terminal_session::record_processed_command(Terminal_session_command command
         return;
     }
 
-    m_processed_commands.push_back(std::move(command));
-    if (m_processed_commands.size() > m_config.trace_command_limit) {
-        m_processed_commands.erase(m_processed_commands.begin());
-    }
+    push_bounded(m_processed_commands, std::move(command), m_config.trace_command_limit);
 }
 
 void Terminal_session::record_notification(Terminal_session_notification notification)
@@ -4174,10 +4147,7 @@ void Terminal_session::record_notification(Terminal_session_notification notific
         return;
     }
 
-    m_notifications.push_back(std::move(notification));
-    if (m_notifications.size() > m_config.trace_notification_limit) {
-        m_notifications.erase(m_notifications.begin());
-    }
+    push_bounded(m_notifications, std::move(notification), m_config.trace_notification_limit);
 }
 
 void Terminal_session::record_pending_notification(
@@ -4248,10 +4218,7 @@ void Terminal_session::record_resize_transaction(Terminal_resize_transaction res
         return;
     }
 
-    m_resize_transactions.push_back(resize);
-    if (m_resize_transactions.size() > m_config.trace_resize_limit) {
-        m_resize_transactions.erase(m_resize_transactions.begin());
-    }
+    push_bounded(m_resize_transactions, std::move(resize), m_config.trace_resize_limit);
 }
 
 void Terminal_session::record_backend_output_capture_chunk(QByteArrayView bytes)
@@ -4273,10 +4240,7 @@ void Terminal_session::record_output_chunk(QByteArray bytes)
         return;
     }
 
-    m_output_chunks.push_back(std::move(bytes));
-    if (m_output_chunks.size() > m_config.trace_output_chunk_limit) {
-        m_output_chunks.erase(m_output_chunks.begin());
-    }
+    push_bounded(m_output_chunks, std::move(bytes), m_config.trace_output_chunk_limit);
 }
 
 void Terminal_session::record_output_activity(std::uint64_t sequence)
@@ -6208,10 +6172,7 @@ void Terminal_session::record_result(Terminal_session_result result)
         }
     }
 
-    m_results.push_back(std::move(result));
-    if (m_results.size() > m_config.trace_result_limit) {
-        m_results.erase(m_results.begin());
-    }
+    push_bounded(m_results, std::move(result), m_config.trace_result_limit);
 }
 
 Terminal_session_result Terminal_session::result_for_sequence(

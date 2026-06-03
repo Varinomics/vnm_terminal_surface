@@ -87,16 +87,8 @@ public:
 
     Terminal_key_event_result write_key_event(
         const QKeyEvent&           event);
-    // Caller must have just drained backend callbacks and processed pending
-    // commands. Post-barrier callbacks stay queued for the next owner drain.
-    Terminal_key_event_result write_key_event_from_drained_state(
-        const QKeyEvent&           event);
 
     Terminal_mouse_event_result write_mouse_event(
-        Terminal_mouse_event       event);
-    // Caller must have just drained backend callbacks and processed pending
-    // commands. Post-barrier callbacks stay queued for the next owner drain.
-    Terminal_mouse_event_result write_mouse_event_from_drained_state(
         Terminal_mouse_event       event);
 
     Terminal_ime_commit_result write_ime_commit(
@@ -123,10 +115,6 @@ public:
         terminal_grid_size_t       grid_size);
 
     Terminal_viewport_scroll_result scroll_viewport_lines(
-        int                        line_delta);
-    // Caller must have just drained backend callbacks and processed pending
-    // commands. Post-barrier callbacks stay queued for the next owner drain.
-    Terminal_viewport_scroll_result scroll_viewport_lines_from_drained_state(
         int                        line_delta);
 
     Terminal_viewport_scroll_result scroll_viewport_lines_from_published_state(
@@ -337,6 +325,15 @@ private:
     Terminal_backend_callbacks make_backend_callbacks();
     void drain_backend_callback_commands();
     void pause_backend_output_from_callback_ingress();
+
+    template<class T>
+    static void push_bounded(std::vector<T>& values, T value, std::size_t limit)
+    {
+        values.push_back(std::move(value));
+        if (values.size() > limit) {
+            values.erase(values.begin());
+        }
+    }
 
     void record_processed_command(
         Terminal_session_command   command);

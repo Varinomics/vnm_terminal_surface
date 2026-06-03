@@ -2328,6 +2328,16 @@ void Terminal_screen_model::apply_control_sequence(
         return csi_parameter_value(groups, 0U, default_value, value);
     };
 
+    const auto single_count = [&](int& value) {
+        if (!single_parameter(1, value)) {
+            return false;
+        }
+        if (value < 1) {
+            value = 1;
+        }
+        return true;
+    };
+
     const bool has_no_prefix =
         sequence.private_marker.isEmpty() && sequence.intermediates.isEmpty();
     const unsigned char final_byte = static_cast<unsigned char>(sequence.final_bytes.front());
@@ -2343,19 +2353,8 @@ void Terminal_screen_model::apply_control_sequence(
                                 malformed();
                                 return;
                             }
-                            if (!parse_simple_parameters()) {
+                            if (!single_count(count)) {
                                 return;
-                            }
-                            if (groups.size() > 1U) {
-                                malformed();
-                                return;
-                            }
-                            if (!csi_parameter_value(groups, 0U, 1, count)) {
-                                malformed();
-                                return;
-                            }
-                            if (count < 1) {
-                                count = 1;
                             }
 
                             if (final_byte == 'A') { move_cursor_relative(-count, 0); } else
@@ -2453,8 +2452,9 @@ void Terminal_screen_model::apply_control_sequence(
                                 malformed();
                                 return;
                             }
-                            if (!single_parameter(1, count)) { return;    }
-                            if (count < 1)                   { count = 1; }
+                            if (!single_count(count)) {
+                                return;
+                            }
 
                             erase_characters(count);
                             return;
@@ -5438,6 +5438,29 @@ void Terminal_screen_model::erase_characters(int count)
         m_cursor.column + bounded_count - 1);
 }
 
+void Terminal_screen_model::clear_wide_continuation_boundary(
+    std::vector<Cell>& row,
+    int                column)
+{
+    if (column >= 0                          &&
+        column <  m_config.grid_size.columns &&
+        row[static_cast<std::size_t>(column)].wide_continuation)
+    {
+        erase_cell_at({m_cursor.row, column});
+    }
+}
+
+void Terminal_screen_model::finalize_row_cell_mutation(
+    Terminal_screen_row&     screen_row,
+    const std::vector<Cell>& before_cells)
+{
+    repair_wide_spans_in_row(screen_row.cells, m_config.grid_size.columns);
+
+    m_pending_wrap = false;
+    advance_row_content_generation_if_changed(screen_row, before_cells);
+    mark_dirty(m_cursor.row);
+}
+
 void Terminal_screen_model::insert_cells(int count)
 {
     mark_terminal_content_changed();
@@ -5446,16 +5469,8 @@ void Terminal_screen_model::insert_cells(int count)
     std::vector<Cell>& row = screen_row.cells;
     const std::vector<Cell> before_cells = row;
 
-    const auto clear_wide_boundary = [&](int column) {
-        if (column >= 0                          &&
-            column <  m_config.grid_size.columns &&
-            row[static_cast<std::size_t>(column)].wide_continuation)
-        {
-            erase_cell_at({m_cursor.row, column});
-        }
-    };
-    clear_wide_boundary(m_cursor.column);
-    clear_wide_boundary(m_config.grid_size.columns - count);
+    clear_wide_continuation_boundary(row, m_cursor.column);
+    clear_wide_continuation_boundary(row, m_config.grid_size.columns - count);
 
     std::move_backward(
         row.begin() + m_cursor.column,
@@ -5466,11 +5481,8 @@ void Terminal_screen_model::insert_cells(int count)
     for (int column = m_cursor.column; column < m_cursor.column + count; ++column) {
         row[static_cast<std::size_t>(column)] = replacement;
     }
-    repair_wide_spans_in_row(row, m_config.grid_size.columns);
 
-    m_pending_wrap = false;
-    advance_row_content_generation_if_changed(screen_row, before_cells);
-    mark_dirty(m_cursor.row);
+    finalize_row_cell_mutation(screen_row, before_cells);
 }
 
 void Terminal_screen_model::delete_cells(int count)
@@ -5481,18 +5493,10 @@ void Terminal_screen_model::delete_cells(int count)
     std::vector<Cell>& row = screen_row.cells;
     const std::vector<Cell> before_cells = row;
 
-    const auto clear_wide_boundary = [&](int column) {
-        if (column >= 0                          &&
-            column <  m_config.grid_size.columns &&
-            row[static_cast<std::size_t>(column)].wide_continuation)
-        {
-            erase_cell_at({m_cursor.row, column});
-        }
-    };
     for (int column = m_cursor.column; column < m_cursor.column + count; ++column) {
         erase_cell_at({m_cursor.row, column});
     }
-    clear_wide_boundary(m_cursor.column + count);
+    clear_wide_continuation_boundary(row, m_cursor.column + count);
 
     std::move(
         row.begin() + m_cursor.column + count,
@@ -5506,11 +5510,8 @@ void Terminal_screen_model::delete_cells(int count)
     {
         row[static_cast<std::size_t>(column)] = replacement;
     }
-    repair_wide_spans_in_row(row, m_config.grid_size.columns);
 
-    m_pending_wrap = false;
-    advance_row_content_generation_if_changed(screen_row, before_cells);
-    mark_dirty(m_cursor.row);
+    finalize_row_cell_mutation(screen_row, before_cells);
 }
 
 void Terminal_screen_model::insert_lines(int count)
@@ -5531,9 +5532,7 @@ void Terminal_screen_model::insert_lines(int count)
     }
 
     m_pending_wrap = false;
-    for (int row = m_cursor.row; row <= m_scroll_bottom; ++row) {
-        mark_dirty(row);
-    }
+    mark_dirty_rows(m_cursor.row, m_scroll_bottom);
 }
 
 void Terminal_screen_model::delete_lines(int count)
@@ -5554,9 +5553,7 @@ void Terminal_screen_model::delete_lines(int count)
     }
 
     m_pending_wrap = false;
-    for (int row = m_cursor.row; row <= m_scroll_bottom; ++row) {
-        mark_dirty(row);
-    }
+    mark_dirty_rows(m_cursor.row, m_scroll_bottom);
 }
 
 terminal_grid_position_t Terminal_screen_model::cell_base_position(
@@ -6059,9 +6056,7 @@ void Terminal_screen_model::scroll_up_region(
         replace_row_with_erased_retained_line(active_grid_rows()[static_cast<std::size_t>(bottom)]);
     }
 
-    for (int row = top; row <= bottom; ++row) {
-        mark_dirty(row);
-    }
+    mark_dirty_rows(top, bottom);
 }
 
 void Terminal_screen_model::scroll_down_region(int top, int bottom, int count)
@@ -6076,9 +6071,7 @@ void Terminal_screen_model::scroll_down_region(int top, int bottom, int count)
         replace_row_with_erased_retained_line(active_grid_rows()[static_cast<std::size_t>(top)]);
     }
 
-    for (int row = top; row <= bottom; ++row) {
-        mark_dirty(row);
-    }
+    mark_dirty_rows(top, bottom);
 }
 
 void Terminal_screen_model::reverse_index()
@@ -6477,6 +6470,13 @@ void Terminal_screen_model::mark_dirty(int row)
 #else
     Q_UNUSED(inserted);
 #endif
+}
+
+void Terminal_screen_model::mark_dirty_rows(int first, int last)
+{
+    for (int row = first; row <= last; ++row) {
+        mark_dirty(row);
+    }
 }
 
 void Terminal_screen_model::mark_terminal_content_changed()
