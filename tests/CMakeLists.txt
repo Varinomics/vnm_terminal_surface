@@ -1395,6 +1395,31 @@ set_tests_properties(vnm_terminal_surface_rejects_distribution_transcript_build 
     TIMEOUT 30
 )
 
+add_test(
+    NAME vnm_terminal_surface_package_rejects_qt_private_api_minor_mismatch
+    COMMAND
+        "${CMAKE_COMMAND}"
+        "-Dgenerator=${CMAKE_GENERATOR}"
+        "-Dgenerator_platform=${CMAKE_GENERATOR_PLATFORM}"
+        "-Dgenerator_toolset=${CMAKE_GENERATOR_TOOLSET}"
+        "-Dmake_program=${CMAKE_MAKE_PROGRAM}"
+        "-Dpackage_binary_dir=${CMAKE_BINARY_DIR}"
+        "-Dinstall_config=$<CONFIG>"
+        "-Dinstall_dir=${CMAKE_CURRENT_BINARY_DIR}/package_smoke_private_qt_minor/install"
+        "-Dmismatch_install_dir=${CMAKE_CURRENT_BINARY_DIR}/package_smoke_private_qt_minor/mismatch_install"
+        "-Dconsumer_source_dir=${PROJECT_SOURCE_DIR}/tests/package_smoke"
+        "-Dconsumer_binary_dir=${CMAKE_CURRENT_BINARY_DIR}/package_smoke_private_qt_minor/consumer_build"
+        "-Dqt6_dir=${Qt6_DIR}"
+        "-Dqt_private_api_version_major=${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR}"
+        "-Dqt_private_api_version_minor=${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR}"
+        -P "${PROJECT_SOURCE_DIR}/tests/package_smoke/expect_private_qt_minor_mismatch.cmake"
+)
+
+set_tests_properties(vnm_terminal_surface_package_rejects_qt_private_api_minor_mismatch PROPERTIES
+    LABELS "package;posture"
+    TIMEOUT 120
+)
+
 
 
 

@@ -48,7 +48,11 @@ std::string synthetic_project(
     out << "add_library(Qt6::Core " << core_type << " IMPORTED)\n";
     out << "add_library(Qt6::Gui " << gui_type << " IMPORTED)\n";
     out << "add_library(Qt6::Quick " << quick_type << " IMPORTED)\n";
+    out << "add_library(Qt6::GuiPrivate INTERFACE IMPORTED)\n";
+    out << "add_library(Qt6::QuickPrivate INTERFACE IMPORTED)\n";
     out << "add_library(Qt6::Network SHARED IMPORTED)\n";
+    out << "add_library(Qt6::NetworkPrivate INTERFACE IMPORTED)\n";
+    out << "add_library(Qt6::ShaderTools INTERFACE IMPORTED)\n";
     out << "set(VNM_TERMINAL_QT_LICENSE_ROUTE \"" << route << "\" CACHE STRING \"\")\n";
     out << "include(\"" << posture_file.generic_string() << "\")\n";
     out << "vnm_terminal_validate_qt_posture(DIRECT_TARGETS " << direct_targets << ")\n";
@@ -158,6 +162,38 @@ int main(int argc, char** argv)
             "Qt6::Core Qt6::Gui Qt6::Quick", ""),
         "allowed_shared");
 
+    ok &= expect_success(
+        run_script("allowed_gui_private_link_interface",
+            "lgpl_dynamic",
+            "SHARED",
+            "SHARED",
+            "SHARED",
+            "Qt6::Core Qt6::Gui Qt6::Quick",
+            "add_library(example INTERFACE)\n"
+            "target_link_libraries(example INTERFACE Qt6::GuiPrivate)\n"
+            "vnm_terminal_validate_qt_link_interface(example)\n"),
+        "allowed_gui_private_link_interface");
+
+    ok &= expect_success(
+        run_script("allowed_gui_private_link_only", "lgpl_dynamic", "SHARED", "SHARED", "SHARED",
+            "Qt6::Core Qt6::Gui Qt6::Quick",
+            "add_library(example INTERFACE)\n"
+            "target_link_libraries(example INTERFACE $<LINK_ONLY:Qt6::GuiPrivate>)\n"
+            "vnm_terminal_validate_qt_link_interface(example)\n"),
+        "allowed_gui_private_link_only");
+
+    ok &= expect_failure(
+        run_script("forbidden_direct_gui_private", "lgpl_dynamic", "SHARED", "SHARED", "SHARED",
+            "Qt6::Core Qt6::Gui Qt6::Quick Qt6::GuiPrivate", ""),
+        "forbidden_direct_gui_private",
+        "Qt target Qt6::GuiPrivate is outside the Qt module allowlist");
+
+    ok &= expect_failure(
+        run_script("forbidden_direct_quick_private", "lgpl_dynamic", "SHARED", "SHARED", "SHARED",
+            "Qt6::Core Qt6::Gui Qt6::Quick Qt6::QuickPrivate", ""),
+        "forbidden_direct_quick_private",
+        "Qt target Qt6::QuickPrivate is outside the Qt module allowlist");
+
     ok &= expect_failure(
         run_script("forbidden_qt_module", "lgpl_dynamic", "SHARED", "SHARED", "SHARED",
             "Qt6::Core Qt6::Gui Qt6::Quick Qt6::Network", ""),
@@ -202,6 +238,38 @@ int main(int argc, char** argv)
             "vnm_terminal_validate_qt_link_interface(example)\n"),
         "forbidden_genex_qt_module",
         "Qt target Qt6::Network is outside the Qt module allowlist");
+
+    ok &= expect_failure(
+        run_script("forbidden_link_only_private_module",
+            "lgpl_dynamic",
+            "SHARED",
+            "SHARED",
+            "SHARED",
+            "Qt6::Core Qt6::Gui Qt6::Quick",
+            "add_library(example INTERFACE)\n"
+            "target_link_libraries(example INTERFACE $<LINK_ONLY:Qt6::NetworkPrivate>)\n"
+            "vnm_terminal_validate_qt_link_interface(example)\n"),
+        "forbidden_link_only_private_module",
+        "Qt target Qt6::NetworkPrivate is outside the Qt module allowlist");
+
+    ok &= expect_failure(
+        run_script("forbidden_shader_tools_direct", "lgpl_dynamic", "SHARED", "SHARED", "SHARED",
+            "Qt6::Core Qt6::Gui Qt6::Quick Qt6::ShaderTools", ""),
+        "forbidden_shader_tools_direct",
+        "Qt target Qt6::ShaderTools is outside the Qt module allowlist");
+
+    ok &= expect_failure(
+        run_script("forbidden_shader_tools_link_interface",
+            "lgpl_dynamic",
+            "SHARED",
+            "SHARED",
+            "SHARED",
+            "Qt6::Core Qt6::Gui Qt6::Quick",
+            "add_library(example INTERFACE)\n"
+            "target_link_libraries(example INTERFACE Qt6::ShaderTools)\n"
+            "vnm_terminal_validate_qt_link_interface(example)\n"),
+        "forbidden_shader_tools_link_interface",
+        "Qt target Qt6::ShaderTools is outside the Qt module allowlist");
 
     ok &= expect_failure(
         run_script("static_lgpl", "lgpl_dynamic", "STATIC", "SHARED", "SHARED",

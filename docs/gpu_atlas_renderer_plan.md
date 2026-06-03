@@ -232,29 +232,23 @@ since-versions in Stage 0.
 
 QRhi is **private Qt API** (`Qt::GuiPrivate`, `rhi/`-prefixed headers) with no
 source/binary-compatibility guarantee across Qt versions. The project's posture gate
-(`cmake/vnm_terminal_qt_posture.cmake`) currently allows only
-`Qt6::Core`/`Qt6::Gui`/`Qt6::Quick` as direct targets and those plus
-`Qt6::QuickPrivate` as link targets, and `FATAL_ERROR`s on anything else. So the plan's
-earlier framing that QRhi is "already in the allowlist / adds no module" is wrong:
-adopting QRhi adds `Qt6::GuiPrivate`.
+(`cmake/vnm_terminal_qt_posture.cmake`) allows `Qt6::Core`/`Qt6::Gui`/`Qt6::Quick`
+as direct targets and permits private Qt modules only as link targets:
+`Qt6::GuiPrivate`, `$<LINK_ONLY:Qt6::GuiPrivate>`, `Qt6::QuickPrivate`, and
+`$<LINK_ONLY:Qt6::QuickPrivate>`. Anything else still fails posture validation.
 
-Required, in the same batch as adoption:
+The source and installed-package CMake posture must stay paired: root `find_package`
+and `cmake/vnm_terminal_surfaceConfig.cmake.in` include `GuiPrivate`; posture tests
+cover allowed and forbidden direct/link-only private targets. If compile-scope
+isolation matters, atlas sources are built through a dedicated object library that
+alone receives `GuiPrivate` include usage; the final static target still exports the
+private link dependency.
 
-- Amend source and installed-package CMake together: root `find_package` and
-  `cmake/vnm_terminal_surfaceConfig.cmake.in` include `GuiPrivate`;
-  `cmake/vnm_terminal_qt_posture.cmake` permits `Qt6::GuiPrivate` and
-  `$<LINK_ONLY:Qt6::GuiPrivate>` as link targets; posture tests cover allowed and
-  forbidden direct/link-only private targets. If compile-scope isolation matters, atlas
-  sources are built through a dedicated object library that alone receives `GuiPrivate`
-  include usage; the final static target still exports the private link dependency.
-- Document the no-BC-guarantee consequence in the policy posture section: builds using
-  the atlas renderer are tied to the exact Qt minor version, exactly like the existing
-  `Qt6::QuickPrivate` dependency. The LGPL/commercial posture is unchanged (still no new
-  public module, still within Gui).
-- For installed/binary package consumption, the generated config records the Qt
-  major/minor used to build `vnm_terminal_surface` and rejects consumers using a
-  different Qt minor when private Qt APIs are enabled. Source `add_subdirectory`
-  consumption remains valid because the surface is rebuilt against the consumer's Qt.
+The no-BC-guarantee consequence is product posture: installed/binary builds using
+private Qt APIs are tied to the Qt major/minor used to build `vnm_terminal_surface`,
+exactly like the existing `Qt6::QuickPrivate` dependency. The LGPL/commercial posture
+is unchanged (still no new public module, still within Gui). Source `add_subdirectory`
+consumption remains valid because the surface is rebuilt against the consumer's Qt.
 
 ## Shader pipeline
 
@@ -266,9 +260,10 @@ built with the same Qt minor used for the product, or explicitly pinned to the s
 floor if prebuilt shader blobs are checked in.
 
 `Qt6::ShaderTools` is a build-time-only source-tree requirement for generating embedded
-`.qsb` resources. It is added to the root source build `find_package` only when shader
-generation is enabled, is not linked to `vnm_terminal_surface`, is not added to
-`vnm_terminal_allowed_qt_link_targets`, and is not added to installed
+`.qsb` resources. It is added to the root source build `find_package` only when
+`VNM_TERMINAL_ENABLE_SHADER_GENERATION` is enabled, is not linked to
+`vnm_terminal_surface`, is not added to `vnm_terminal_allowed_qt_link_targets`, and is
+not added to installed
 `vnm_terminal_surfaceConfig.cmake.in` `find_dependency()` because installed/binary
 packages consume already-embedded shader resources.
 
@@ -474,23 +469,28 @@ renderer's, per the [parity principle](#behavioral-parity-principle)).
 | Complex scripts (Arabic/Indic cross-cell shaping) | scope decision required | match current per-cell behavior exactly; do not "improve" it here |
 | Ligatures | out | terminals disable; match current behavior |
 
-## Policy and posture amendments required
+## Pre-Stage-0 policy and posture acceptance gate
 
-Two scoped amendments land in the same batch as adoption; neither is a silent weakening.
+The pre-Stage-0 posture slice applies the narrow policy and package prerequisites that
+make QRhi/atlas exploration executable. This is an acceptance gate, not implementation
+authorization: Stage 0 remains blocked until the bound-confirmation gate passes and the
+maintainer accepts the amended policy/posture.
 
-1. **[Qt rendering policy](qt_rendering_policy.md)** currently forbids "glyph atlas,
-   glyph-tile, QImage-to-texture, QSGTexture, or parallel simple-text renderer route" and
-   limits `QGlyphRun` to validation. Proposed amendment:
+1. **[Qt rendering policy](qt_rendering_policy.md).** The policy permits a GPU
+   glyph-atlas backend to cache glyphs rasterized by Qt's font engine
+   (`QRawFont::alphaMapForGlyph`) into atlas textures and composite cells through
+   instanced QRhi draws. Direct HarfBuzz, FreeType, and ICU dependencies remain
+   prohibited; shaping, rasterization, and fallback stay with Qt's font engine. At
+   cutover, this backend replaces the `QSGTextNode` text route, and the replaced route
+   is removed in the same batch. `QGlyphRun` remains validation/probing-only around the
+   Qt text route and does not move text ownership away from `frame.text_runs`.
 
-   > A GPU glyph-atlas renderer backend MAY cache glyphs rasterized by Qt's font engine
-   > (`QRawFont::alphaMapForGlyph`) into atlas textures and composite cells via instanced
-   > QRhi draws. Direct HarfBuzz, FreeType, and ICU dependencies remain prohibited;
-   > shaping, rasterization, and fallback stay with Qt's font engine. The `QSGTextNode`
-   > text route it replaces is removed at cutover.
-
-2. **Qt dependency posture** — see
-   [above](#qt-dependency-posture-amendment-required): permit `Qt6::GuiPrivate`, document
-   the version-tied (no-BC) consequence.
+2. **Qt dependency posture.** See
+   [above](#qt-dependency-posture-amendment-required): source/package CMake permits
+   `Qt6::GuiPrivate` as a private link dependency, records the Qt private-API
+   major/minor for installed packages, rejects installed consumers with a different Qt
+   minor, and keeps `Qt6::ShaderTools` source-tree build-time-only when shader
+   generation is enabled.
 
 ## Staged rollout
 
@@ -641,7 +641,7 @@ This plan does not authorize implementation. Gates preceding Stage 0:
    frame wall time or is the dominant scaling component in the resolution/grid-control
    run.
 2. **Policy + posture amendments.** The maintainer accepts the
-   [rendering-policy and Qt-posture amendments](#policy-and-posture-amendments-required).
+   [pre-Stage-0 policy/posture acceptance gate](#pre-stage-0-policy-and-posture-acceptance-gate).
 
 Start Stage 1 only if the Stage 0 spike exit evidence passes. Start Stage 5 only if the
 CMDG performance gate and the layered parity gate both pass.

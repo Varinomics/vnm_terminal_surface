@@ -358,6 +358,7 @@ struct App_options
     QString                profile_text_path;
     bool                   quiet             = false;
     bool                   validate_json     = false;
+    bool                   include_attempts  = false;
     bool                   software_renderer = false;
     bool                   profile           = false;
     bool                   help_requested    = false;
@@ -412,6 +413,19 @@ struct Attempt_result
     bool                                              rendered_pixels_changed       = true;
     QImage                                            rendered_image;
     QString                                           snapshot_status               = QStringLiteral("OK");
+};
+
+struct raw_attempt_sample_t
+{
+    int                    attempt_index                 = 0;
+    QString                status                        = QStringLiteral("ok");
+    bool                   completed                     = false;
+    int                    completed_count               = 0;
+    std::uint64_t          render_consumed_count         = 0U;
+    qint64                 elapsed_ns                    = 0;
+    qint64                 scene_graph_update_latency_ns = 0;
+    qint64                 scene_graph_render_wait_ns    = 0;
+    qint64                 readback_ns                   = 0;
 };
 
 struct surface_session_wheel_burst_t
@@ -471,6 +485,8 @@ struct Scenario_result
     renderer_totals_t      renderer_totals;
     bridge_delta_t         bridge_delta;
     lifecycle_delta_t      lifecycle_delta;
+    std::vector<raw_attempt_sample_t>
+                           raw_attempts;
     Structural_checks      structural_checks;
     bool                   viewport_metrics_applicable        = false;
     int                    viewport_scrollback_rows           = 0;
@@ -663,6 +679,7 @@ void print_usage()
 #endif
         << "  --quiet                   suppress stdout when --output is used\n"
         << "  --validate-json           validate emitted JSON and scenario status\n"
+        << "  --include-attempts        include raw measured attempt timings in JSON\n"
         << "  --software-renderer       use the Qt software scene graph\n";
 }
 
@@ -934,6 +951,12 @@ Parse_result parse_arguments(const QStringList& arguments)
 
         if (argument_is(argument, "--validate-json")) {
             result.options.validate_json = true;
+            ++index;
+            continue;
+        }
+
+        if (argument_is(argument, "--include-attempts")) {
+            result.options.include_attempts = true;
             ++index;
             continue;
         }
@@ -2862,6 +2885,39 @@ bridge_delta_t bridge_delta(
     };
 }
 
+QString attempt_status(const Attempt_result& attempt)
+{
+    if (!attempt.completed) {
+        return QStringLiteral("timeout");
+    }
+
+    if (!attempt.snapshot_valid) {
+        return attempt.snapshot_status.isEmpty()
+            ? QStringLiteral("failed")
+            : attempt.snapshot_status;
+    }
+
+    return QStringLiteral("ok");
+}
+
+raw_attempt_sample_t raw_attempt_sample(
+    int                       attempt_index,
+    const Attempt_result&     attempt,
+    const bridge_delta_t&     attempt_bridge_delta)
+{
+    raw_attempt_sample_t sample;
+    sample.attempt_index                 = attempt_index;
+    sample.status                        = attempt_status(attempt);
+    sample.completed                     = attempt.completed && attempt.snapshot_valid;
+    sample.completed_count               = sample.completed ? 1 : 0;
+    sample.render_consumed_count         = attempt_bridge_delta.consumed_updates;
+    sample.elapsed_ns                    = attempt.elapsed_ns;
+    sample.scene_graph_update_latency_ns = attempt.scene_graph_update_latency_ns;
+    sample.scene_graph_render_wait_ns    = attempt.scene_graph_render_wait_ns;
+    sample.readback_ns                   = attempt.readback_ns;
+    return sample;
+}
+
 lifecycle_delta_t lifecycle_delta(
     const term::terminal_renderer_lifecycle_stats_t&   before,
     const term::terminal_renderer_lifecycle_stats_t&   after)
@@ -3665,17 +3721,30 @@ Scenario_result run_surface_session_scroll_scenario(
 
     Timing_samples timing_samples;
     reserve_timing_samples(timing_samples, options.iterations);
+    if (options.include_attempts) {
+        result.raw_attempts.reserve(static_cast<std::size_t>(options.iterations));
+    }
 
     for (int iteration = 0; iteration < options.iterations; ++iteration) {
         surface_session_wheel_burst_t burst;
         QElapsedTimer elapsed_timer;
         elapsed_timer.start();
+        const term::Terminal_surface_render_invalidation_stats_t attempt_bridge_before =
+            term::VNM_TerminalSurface_render_bridge::invalidation_stats(context.surface);
         Attempt_result attempt = run_surface_session_scroll_attempt(
             context,
             elapsed_timer,
             output_line_count,
             scroll_profile,
             &burst);
+        const term::Terminal_surface_render_invalidation_stats_t attempt_bridge_after =
+            term::VNM_TerminalSurface_render_bridge::invalidation_stats(context.surface);
+        if (options.include_attempts) {
+            result.raw_attempts.push_back(raw_attempt_sample(
+                iteration,
+                attempt,
+                bridge_delta(attempt_bridge_before, attempt_bridge_after)));
+        }
 
         add_renderer_stats(result.renderer_totals, attempt.renderer_stats);
         update_structural_checks(result, attempt);
@@ -4049,12 +4118,17 @@ Scenario_result run_surface_session_action_scenario(
 
     Timing_samples timing_samples;
     reserve_timing_samples(timing_samples, options.iterations);
+    if (options.include_attempts) {
+        result.raw_attempts.reserve(static_cast<std::size_t>(options.iterations));
+    }
 
     for (int iteration = 0; iteration < options.iterations; ++iteration) {
         const int phase           = options.warmup + iteration;
         bool      action_accepted = false;
         QElapsedTimer elapsed_timer;
         elapsed_timer.start();
+        const term::Terminal_surface_render_invalidation_stats_t attempt_bridge_before =
+            term::VNM_TerminalSurface_render_bridge::invalidation_stats(context.surface);
         Attempt_result attempt = run_surface_session_action_attempt(
             context,
             elapsed_timer,
@@ -4064,6 +4138,14 @@ Scenario_result run_surface_session_action_scenario(
             phase,
             profile,
             &action_accepted);
+        const term::Terminal_surface_render_invalidation_stats_t attempt_bridge_after =
+            term::VNM_TerminalSurface_render_bridge::invalidation_stats(context.surface);
+        if (options.include_attempts) {
+            result.raw_attempts.push_back(raw_attempt_sample(
+                iteration,
+                attempt,
+                bridge_delta(attempt_bridge_before, attempt_bridge_after)));
+        }
 
         add_renderer_stats(result.renderer_totals, attempt.renderer_stats);
         if (profile.render_expected) {
@@ -4178,11 +4260,24 @@ Scenario_result run_scenario_impl(
 
     Timing_samples timing_samples;
     reserve_timing_samples(timing_samples, options.iterations);
+    if (options.include_attempts) {
+        result.raw_attempts.reserve(static_cast<std::size_t>(options.iterations));
+    }
 
     for (int iteration = 0; iteration < options.iterations; ++iteration) {
         const int phase = options.warmup + iteration;
+        const term::Terminal_surface_render_invalidation_stats_t attempt_bridge_before =
+            term::VNM_TerminalSurface_render_bridge::invalidation_stats(context.surface);
         Attempt_result attempt =
             run_snapshot_bridge_attempt(context, options, scenario_name, phase);
+        const term::Terminal_surface_render_invalidation_stats_t attempt_bridge_after =
+            term::VNM_TerminalSurface_render_bridge::invalidation_stats(context.surface);
+        if (options.include_attempts) {
+            result.raw_attempts.push_back(raw_attempt_sample(
+                iteration,
+                attempt,
+                bridge_delta(attempt_bridge_before, attempt_bridge_after)));
+        }
 
         add_renderer_stats(result.renderer_totals, attempt.renderer_stats);
         update_structural_checks(result, attempt);
@@ -4876,6 +4971,39 @@ QJsonValue scenario_profile_value(const Scenario_result& result)
         : QJsonValue(scenario_profile_json(result.profile_threads));
 }
 
+QJsonObject raw_attempt_sample_json(
+    const QString&               scenario_name,
+    const raw_attempt_sample_t&  sample)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("scenario"),                      scenario_name);
+    object.insert(QStringLiteral("attempt_index"),                 sample.attempt_index);
+    object.insert(QStringLiteral("status"),                        sample.status);
+    object.insert(QStringLiteral("completed"),                     sample.completed);
+    object.insert(QStringLiteral("completed_count"),               sample.completed_count);
+    object.insert(
+        QStringLiteral("render_consumed_count"),
+        static_cast<qint64>(sample.render_consumed_count));
+    object.insert(QStringLiteral("elapsed_ns"),                    sample.elapsed_ns);
+    object.insert(
+        QStringLiteral("scene_graph_update_latency_ns"),
+        sample.scene_graph_update_latency_ns);
+    object.insert(
+        QStringLiteral("scene_graph_render_wait_ns"),
+        sample.scene_graph_render_wait_ns);
+    object.insert(QStringLiteral("readback_ns"), sample.readback_ns);
+    return object;
+}
+
+QJsonArray raw_attempts_json(const Scenario_result& result)
+{
+    QJsonArray attempts;
+    for (const raw_attempt_sample_t& sample : result.raw_attempts) {
+        attempts.push_back(raw_attempt_sample_json(result.name, sample));
+    }
+    return attempts;
+}
+
 QJsonObject scenario_profile_summary_json(const Scenario_result& result)
 {
     QJsonObject object;
@@ -4908,7 +5036,9 @@ QJsonObject scenario_profile_summary_json(const Scenario_result& result)
     return object;
 }
 
-QJsonObject scenario_json(const Scenario_result& result)
+QJsonObject scenario_json(
+    const Scenario_result& result,
+    bool                   include_attempts)
 {
     QJsonObject window_size;
     window_size.insert(QStringLiteral("width"),  result.window_size.width());
@@ -5506,6 +5636,9 @@ QJsonObject scenario_json(const Scenario_result& result)
     object.insert(
         QStringLiteral("structural_checks"),
         structural_checks_json(result.structural_checks));
+    if (include_attempts) {
+        object.insert(QStringLiteral("attempts"), raw_attempts_json(result));
+    }
     object.insert(QStringLiteral("profile"), scenario_profile_value(result));
     return object;
 }
@@ -7171,6 +7304,13 @@ bool validate_profiling_metadata_json(
     return true;
 }
 
+bool validate_raw_attempts_json(
+    const QJsonObject& object,
+    const QString&     scenario_name,
+    int                iterations,
+    int                completed_frames,
+    QString*           out_error);
+
 bool validate_scenario_json(
     const QJsonObject& object,
     const App_options& options,
@@ -7808,6 +7948,17 @@ bool validate_scenario_json(
         }
     }
 
+    if (options.include_attempts &&
+        !validate_raw_attempts_json(
+            object,
+            scenario_name,
+            object.value(QStringLiteral("iterations")).toInt(),
+            completed_frames,
+            out_error))
+    {
+        return false;
+    }
+
     const QJsonObject process_memory = object.value(QStringLiteral("process_memory")).toObject();
     const int memory_sample_count = process_memory
         .value(QStringLiteral("resident_bytes"))
@@ -7979,6 +8130,86 @@ bool validate_scenario_registry_json(const QJsonArray& registry, QString* out_er
                 .arg(name);
             return false;
         }
+    }
+
+    return true;
+}
+
+bool validate_raw_attempts_json(
+    const QJsonObject& object,
+    const QString&     scenario_name,
+    int                iterations,
+    int                completed_frames,
+    QString*           out_error)
+{
+    const QJsonArray attempts = object.value(QStringLiteral("attempts")).toArray();
+    if (attempts.size() != iterations) {
+        *out_error = QStringLiteral("scenario raw attempt count mismatch: %1")
+            .arg(scenario_name);
+        return false;
+    }
+
+    qint64 completed_count_sum = 0;
+    qint64 render_consumed_sum = 0;
+    for (int index = 0; index < attempts.size(); ++index) {
+        if (!attempts[index].isObject()) {
+            *out_error = QStringLiteral("scenario raw attempt entry is not an object: %1")
+                .arg(scenario_name);
+            return false;
+        }
+
+        const QJsonObject attempt = attempts[index].toObject();
+        if (attempt.value(QStringLiteral("scenario")).toString()      != scenario_name ||
+            attempt.value(QStringLiteral("attempt_index")).toInt(-1) != index         ||
+            !attempt.value(QStringLiteral("completed")).isBool()                     ||
+            attempt.value(QStringLiteral("status")).toString().isEmpty())
+        {
+            *out_error = QStringLiteral("scenario raw attempt metadata mismatch: %1")
+                .arg(scenario_name);
+            return false;
+        }
+
+        const bool   completed       = attempt.value(QStringLiteral("completed")).toBool();
+        const qint64 completed_count =
+            attempt.value(QStringLiteral("completed_count")).toInteger(-1);
+        if (completed_count != (completed ? 1 : 0)) {
+            *out_error = QStringLiteral("scenario raw attempt completed count mismatch: %1")
+                .arg(scenario_name);
+            return false;
+        }
+
+        const QStringList timing_keys = {
+            QStringLiteral("elapsed_ns"),
+            QStringLiteral("scene_graph_update_latency_ns"),
+            QStringLiteral("scene_graph_render_wait_ns"),
+            QStringLiteral("readback_ns"),
+            QStringLiteral("render_consumed_count"),
+        };
+        for (const QString& timing_key : timing_keys) {
+            if (attempt.value(timing_key).toInteger(-1) < 0) {
+                *out_error = QStringLiteral("scenario raw attempt timing is invalid: %1.%2")
+                    .arg(scenario_name)
+                    .arg(timing_key);
+                return false;
+            }
+        }
+
+        completed_count_sum += completed_count;
+        render_consumed_sum += attempt.value(QStringLiteral("render_consumed_count")).toInteger();
+    }
+
+    if (completed_count_sum != completed_frames) {
+        *out_error = QStringLiteral("scenario raw attempt completed sum mismatch: %1")
+            .arg(scenario_name);
+        return false;
+    }
+
+    const qint64 aggregate_consumed =
+        object.value(QStringLiteral("bridge_consumed_updates_delta")).toInteger();
+    if (render_consumed_sum != aggregate_consumed) {
+        *out_error = QStringLiteral("scenario raw attempt consumed-update sum mismatch: %1")
+            .arg(scenario_name);
+        return false;
     }
 
     return true;
@@ -8602,7 +8833,7 @@ int main(int argc, char** argv)
     bool ok = true;
     for (const QString& scenario_name : options.scenario_names) {
         const Scenario_result result = run_scenario(context, options, scenario_name);
-        scenario_array.push_back(scenario_json(result));
+        scenario_array.push_back(scenario_json(result, options.include_attempts));
         scenario_results.push_back(result);
         ok = ok && result.status == QStringLiteral("ok");
     }

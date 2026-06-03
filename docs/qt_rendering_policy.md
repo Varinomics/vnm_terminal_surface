@@ -12,6 +12,24 @@ The direct Qt module allowlist is:
 - `Qt6::Gui`
 - `Qt6::Quick`
 
+Private Qt module use is limited to link-scope posture entries:
+
+- `Qt6::GuiPrivate`
+- `Qt6::QuickPrivate`
+
+These private modules are not direct product modules. They expose private Qt
+APIs with no source or binary compatibility guarantee across Qt releases.
+Installed/binary `vnm_terminal_surface` packages are tied to the Qt major/minor
+used to build them, and the generated package config rejects consumers that
+resolve a different Qt minor. Source-tree consumers that use `add_subdirectory`
+rebuild the surface against their selected Qt and are not an installed-package
+minor-mismatch case.
+
+`Qt6::ShaderTools` is a source-tree build tool only when
+`VNM_TERMINAL_ENABLE_SHADER_GENERATION` enables shader package generation. It is
+not linked to `vnm_terminal_surface`, not part of the Qt posture link allowlist,
+and not an installed package dependency.
+
 The project uses Qt through either a commercial Qt license held by the
 distributor or the LGPL-compatible dynamic-linking route recorded in
 `THIRD_PARTY_NOTICES.md` and `THIRD_PARTY/`. The default
@@ -37,18 +55,22 @@ through public `QTextLayout` and `QSGTextNode` APIs, including
 are overlay input derived from it.
 
 Geometry routes may use public QSG geometry and material APIs. Private Qt text
-and scene graph APIs are not part of the renderer contract.
+and scene graph APIs are not part of the renderer contract. QRhi rendering may
+use `Qt6::GuiPrivate` and Qt `rhi/` private headers only under the private Qt
+module posture above.
 
 `QImage` and `QPainter` are acceptable for test framebuffer readback and narrow
 diagnostics. They are not the production terminal-row renderer and are not a
 `QImage`-to-texture text route.
 
-No production glyph atlas, glyph-tile, `QImage`-to-texture, `QSGTexture`, or
-parallel simple-text renderer route is part of the contract. `QGlyphRun` may be
-used only for validation or probing around the existing Qt text route; it does
-not move text ownership away from `frame.text_runs`.
-
-No direct HarfBuzz, FreeType, or ICU dependency is adopted for rendering.
+A GPU glyph-atlas renderer backend may cache glyphs rasterized by Qt's font
+engine (`QRawFont::alphaMapForGlyph`) into atlas textures and composite cells
+through instanced QRhi draws. Direct HarfBuzz, FreeType, and ICU dependencies
+remain prohibited; shaping, rasterization, and fallback stay with Qt's font
+engine. At cutover, this backend replaces the `QSGTextNode` text route, and the
+replaced route is removed in the same batch. `QGlyphRun` may be used only for
+validation or probing around the Qt text route; it does not move text ownership
+away from `frame.text_runs`.
 
 Packed row, text, and graphic sidecars are owned by `Terminal_render_frame`.
 They are auxiliary classification, diagnostics, accounting, cache-key, row
