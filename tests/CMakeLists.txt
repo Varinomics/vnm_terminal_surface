@@ -32,10 +32,33 @@ function(vnm_terminal_qt_offscreen_test_environment out_var)
         PARENT_SCOPE)
 endfunction()
 
+function(vnm_terminal_qt_readback_test_environment out_var)
+    if(WIN32)
+        set(${out_var}
+            "QT_QPA_PLATFORM=windows"
+            "QSG_RENDER_LOOP=threaded"
+            "QSG_RHI_BACKEND=d3d11"
+            PARENT_SCOPE)
+    else()
+        set(${out_var}
+            ${vnm_terminal_qt_offscreen_environment}
+            PARENT_SCOPE)
+    endif()
+endfunction()
+
 vnm_terminal_require_qt_plugin_file(
     Qt6::QOffscreenIntegrationPlugin
     "CTest offscreen runs")
 vnm_terminal_qt_offscreen_test_environment(vnm_terminal_qt_offscreen_environment)
+vnm_terminal_qt_readback_test_environment(vnm_terminal_qt_readback_environment)
+
+if(WIN32)
+    set(vnm_terminal_qt_windows_qpa_environment
+        "QT_QPA_PLATFORM=windows"
+    )
+else()
+    set(vnm_terminal_qt_windows_qpa_environment)
+endif()
 
 set(vnm_terminal_qt_scale_environment
     "QT_SCREEN_SCALE_FACTORS="
@@ -51,6 +74,11 @@ set(vnm_terminal_qt_unscaled_environment
 
 set(vnm_terminal_qt_scaled_environment
     "QT_SCALE_FACTOR=1.5"
+    ${vnm_terminal_qt_scale_environment}
+)
+
+set(vnm_terminal_qt_fractional_environment
+    "QT_SCALE_FACTOR=1.25"
     ${vnm_terminal_qt_scale_environment}
 )
 
@@ -102,18 +130,14 @@ set(VNM_TERMINAL_GRAPHICS_CONFORMANCE_COMMAND "" CACHE STRING
     "Semicolon-separated external graphics conformance command.")
 set(VNM_TERMINAL_EXTERNAL_CONFORMANCE_TIMEOUT "300" CACHE STRING
     "CTest timeout, in seconds, for external conformance commands.")
-set(VNM_TERMINAL_ENABLE_MANUAL_QSG_FLAT_RECT_BATCHED_GEOMETRY_TEST OFF CACHE BOOL
-    "Add the manual QSG flat-rect batched-geometry CTest for non-software scene graph hosts.")
-set(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE0_SMOKE OFF CACHE BOOL
-    "Add the Stage 0 QRhi render-node hardware smoke CTest.")
-set(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE1_SMOKE OFF CACHE BOOL
-    "Add the Stage 1 atlas/capture QRhi render-node hardware smoke CTests.")
-set(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE2_PARITY OFF CACHE BOOL
-    "Add the Stage 2 GPU atlas renderer hardware parity CTests.")
-set(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE3_PARITY OFF CACHE BOOL
-    "Add the Stage 3 GPU atlas renderer hardware parity CTests.")
-set(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE4_REPORT OFF CACHE BOOL
-    "Add the Stage 4 GPU atlas renderer hardware report CTests.")
+set(VNM_TERMINAL_ENABLE_GPU_ATLAS_SMOKE OFF CACHE BOOL
+    "Add the canonical atlas QRhi render-node hardware smoke CTests.")
+set(VNM_TERMINAL_ENABLE_GPU_ATLAS_PIXEL_PARITY OFF CACHE BOOL
+    "Add the canonical atlas pixel-parity hardware CTests.")
+set(VNM_TERMINAL_ENABLE_GPU_ATLAS_LAYOUT_PARITY OFF CACHE BOOL
+    "Add the canonical atlas layout-parity hardware CTests.")
+set(VNM_TERMINAL_ENABLE_GPU_ATLAS_REPORT OFF CACHE BOOL
+    "Add the canonical atlas hardware report CTests.")
 
 function(vnm_terminal_configure_test_process target_name)
     target_include_directories(${target_name} PRIVATE
@@ -380,7 +404,7 @@ add_test(
     NAME vnm_terminal_qt_render_smoke
     COMMAND
         "${CMAKE_COMMAND}" -E env
-        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_readback_environment}
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_qt_render_smoke>"
 )
@@ -528,320 +552,285 @@ if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
     endif()
 endif()
 
-add_executable(vnm_terminal_qsg_render
-    qsg_render/qsg_render_tests.cpp
+add_executable(vnm_terminal_qsg_atlas
+    qsg_atlas/atlas_tests.cpp
 )
 
-target_link_libraries(vnm_terminal_qsg_render PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set(vnm_terminal_qsg_renderer_source_files
-    "${PROJECT_SOURCE_DIR}/src/qsg_terminal_renderer.cpp"
-)
-list(JOIN vnm_terminal_qsg_renderer_source_files "|" vnm_terminal_qsg_renderer_source_paths)
-
-target_compile_definitions(vnm_terminal_qsg_render PRIVATE
-    VNM_TERMINAL_QSG_RENDERER_SOURCE_PATHS="${vnm_terminal_qsg_renderer_source_paths}"
-)
-
-set_target_properties(vnm_terminal_qsg_render PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_qsg_render
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        ${vnm_terminal_qt_offscreen_environment}
-        ${vnm_terminal_qt_unscaled_environment}
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_qsg_render>"
-        "--software-renderer"
-)
-
-set_tests_properties(vnm_terminal_qsg_render PROPERTIES TIMEOUT 60)
-
-if(VNM_TERMINAL_ENABLE_MANUAL_QSG_FLAT_RECT_BATCHED_GEOMETRY_TEST)
-    add_test(
-        NAME vnm_terminal_qsg_render_flat_rect_batched_geometry
-        COMMAND
-            "${CMAKE_COMMAND}" -E env
-            ${vnm_terminal_qt_unscaled_environment}
-            "${vnm_terminal_qt_runtime_path}"
-            "$<TARGET_FILE:vnm_terminal_qsg_render>"
-            "--flat-rect-batched-geometry"
-    )
-
-    set_tests_properties(vnm_terminal_qsg_render_flat_rect_batched_geometry PROPERTIES
-        LABELS "manual;qsg;hardware"
-        TIMEOUT 60
-    )
-endif()
-
-add_executable(vnm_terminal_qsg_rhi_stage0_probe
-    qsg_rhi_stage0_probe/rhi_stage0_probe_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_qsg_rhi_stage0_probe PRIVATE
+target_link_libraries(vnm_terminal_qsg_atlas PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
     Qt6::QuickPrivate
 )
 
-set_target_properties(vnm_terminal_qsg_rhi_stage0_probe PROPERTIES
-    AUTOMOC OFF
-)
-
-if(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE0_SMOKE)
-    set(vnm_terminal_qsg_rhi_stage0_probe_backends)
-    if(WIN32)
-        list(APPEND vnm_terminal_qsg_rhi_stage0_probe_backends
-            d3d11
-            d3d12
-            vulkan
-            opengl
-        )
-    elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD)$")
-        list(APPEND vnm_terminal_qsg_rhi_stage0_probe_backends
-            vulkan
-            opengl
-        )
-    elseif(APPLE)
-        list(APPEND vnm_terminal_qsg_rhi_stage0_probe_backends
-            opengl
-        )
-    endif()
-
-    foreach(stage0_backend IN LISTS vnm_terminal_qsg_rhi_stage0_probe_backends)
-        add_test(
-            NAME vnm_terminal_qsg_rhi_stage0_probe_${stage0_backend}
-            COMMAND
-                "${CMAKE_COMMAND}" -E env
-                ${vnm_terminal_qt_unscaled_environment}
-                "${vnm_terminal_qt_runtime_path}"
-                "$<TARGET_FILE:vnm_terminal_qsg_rhi_stage0_probe>"
-                "--backend"
-                "${stage0_backend}"
-        )
-
-        set_tests_properties(
-            vnm_terminal_qsg_rhi_stage0_probe_${stage0_backend}
-            PROPERTIES
-                LABELS "qsg;hardware;stage0"
-                SKIP_RETURN_CODE 77
-                TIMEOUT 60
-        )
-    endforeach()
-endif()
-
-add_executable(vnm_terminal_qsg_atlas_stage1
-    qsg_atlas_stage1/atlas_stage1_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_qsg_atlas_stage1 PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-target_compile_definitions(vnm_terminal_qsg_atlas_stage1 PRIVATE
-    VNM_TERMINAL_QSG_ATLAS_STAGE1_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/qsg_atlas_renderer_stage1.cpp"
+target_compile_definitions(vnm_terminal_qsg_atlas PRIVATE
+    VNM_TERMINAL_QSG_ATLAS_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/qsg_atlas_renderer.cpp"
     VNM_TERMINAL_SURFACE_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/vnm_terminal_surface.cpp"
 )
 
-set_target_properties(vnm_terminal_qsg_atlas_stage1 PROPERTIES
+set_target_properties(vnm_terminal_qsg_atlas PROPERTIES
     AUTOMOC OFF
 )
 
+if(WIN32)
+    add_custom_command(
+        TARGET vnm_terminal_qsg_atlas
+        POST_BUILD
+        COMMAND "$<TARGET_FILE_DIR:Qt6::Core>/windeployqt.exe"
+            --no-compiler-runtime
+            --no-translations
+            "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+        VERBATIM
+    )
+endif()
+
 add_test(
-    NAME vnm_terminal_qsg_atlas_stage1
+    NAME vnm_terminal_qsg_atlas
     COMMAND
         "${CMAKE_COMMAND}" -E env
         ${vnm_terminal_qt_offscreen_environment}
         ${vnm_terminal_qt_unscaled_environment}
         "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_qsg_atlas_stage1>"
+        "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
 )
 
-set_tests_properties(vnm_terminal_qsg_atlas_stage1 PROPERTIES
-    LABELS "qsg;atlas;stage1"
+set_tests_properties(vnm_terminal_qsg_atlas PROPERTIES
+    LABELS "qsg;atlas"
     TIMEOUT 60
 )
 
-if(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE1_SMOKE)
-    set(vnm_terminal_qsg_atlas_stage1_smoke_backends)
+if(WIN32)
+    set(vnm_terminal_qsg_atlas_dense_grid_environment
+        ${vnm_terminal_qt_windows_qpa_environment}
+        "QSG_RENDER_LOOP=threaded"
+        ${vnm_terminal_qt_fractional_environment}
+    )
+    add_test(
+        NAME vnm_terminal_qsg_atlas_dense_grid_d3d11
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qsg_atlas_dense_grid_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+            "--dense-grid-smoke"
+            "--backend"
+            "d3d11"
+    )
+
+    set_tests_properties(
+        vnm_terminal_qsg_atlas_dense_grid_d3d11
+        PROPERTIES
+            LABELS "qsg;hardware;atlas;cutover;dense-grid"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 90
+    )
+
+    set(vnm_terminal_qsg_atlas_host_state_environment
+        ${vnm_terminal_qt_windows_qpa_environment}
+        "QSG_RENDER_LOOP=threaded"
+        ${vnm_terminal_qt_unscaled_environment}
+    )
+    add_test(
+        NAME vnm_terminal_qsg_atlas_host_state_d3d11
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qsg_atlas_host_state_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+            "--host-state-smoke"
+            "--backend"
+            "d3d11"
+    )
+
+    set_tests_properties(
+        vnm_terminal_qsg_atlas_host_state_d3d11
+        PROPERTIES
+            LABELS "qsg;hardware;atlas;host-state;cutover"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 120
+    )
+endif()
+
+if(VNM_TERMINAL_ENABLE_GPU_ATLAS_SMOKE)
+    set(vnm_terminal_qsg_atlas_smoke_backends)
     if(WIN32)
-        list(APPEND vnm_terminal_qsg_atlas_stage1_smoke_backends
+        list(APPEND vnm_terminal_qsg_atlas_smoke_backends
             d3d11
             d3d12
             vulkan
             opengl
         )
     elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD)$")
-        list(APPEND vnm_terminal_qsg_atlas_stage1_smoke_backends
+        list(APPEND vnm_terminal_qsg_atlas_smoke_backends
             vulkan
             opengl
         )
     elseif(APPLE)
-        list(APPEND vnm_terminal_qsg_atlas_stage1_smoke_backends
+        list(APPEND vnm_terminal_qsg_atlas_smoke_backends
             opengl
         )
     endif()
 
-    foreach(stage1_backend IN LISTS vnm_terminal_qsg_atlas_stage1_smoke_backends)
-        foreach(stage1_render_loop IN ITEMS threaded basic)
+    foreach(atlas_backend IN LISTS vnm_terminal_qsg_atlas_smoke_backends)
+        foreach(atlas_render_loop IN ITEMS threaded basic)
             add_test(
-                NAME vnm_terminal_qsg_atlas_stage1_${stage1_render_loop}_${stage1_backend}
+                NAME vnm_terminal_qsg_atlas_${atlas_render_loop}_${atlas_backend}
                 COMMAND
                     "${CMAKE_COMMAND}" -E env
-                    "QSG_RENDER_LOOP=${stage1_render_loop}"
+                    ${vnm_terminal_qt_windows_qpa_environment}
+                    "QSG_RENDER_LOOP=${atlas_render_loop}"
                     ${vnm_terminal_qt_unscaled_environment}
                     "${vnm_terminal_qt_runtime_path}"
-                    "$<TARGET_FILE:vnm_terminal_qsg_atlas_stage1>"
+                    "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
                     "--render-smoke"
                     "--backend"
-                    "${stage1_backend}"
+                    "${atlas_backend}"
             )
 
             set_tests_properties(
-                vnm_terminal_qsg_atlas_stage1_${stage1_render_loop}_${stage1_backend}
+                vnm_terminal_qsg_atlas_${atlas_render_loop}_${atlas_backend}
                 PROPERTIES
-                    LABELS "qsg;hardware;atlas;stage1"
+                    LABELS "qsg;hardware;atlas"
                     SKIP_RETURN_CODE 77
                     TIMEOUT 60
             )
         endforeach()
     endforeach()
+
 endif()
 
-if(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE2_PARITY)
-    set(vnm_terminal_qsg_atlas_stage2_parity_backends)
+if(VNM_TERMINAL_ENABLE_GPU_ATLAS_PIXEL_PARITY)
+    set(vnm_terminal_qsg_atlas_pixel_parity_backends)
     if(WIN32)
-        list(APPEND vnm_terminal_qsg_atlas_stage2_parity_backends
+        list(APPEND vnm_terminal_qsg_atlas_pixel_parity_backends
             d3d11
             d3d12
             vulkan
             opengl
         )
     elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD)$")
-        list(APPEND vnm_terminal_qsg_atlas_stage2_parity_backends
+        list(APPEND vnm_terminal_qsg_atlas_pixel_parity_backends
             vulkan
             opengl
         )
     elseif(APPLE)
-        list(APPEND vnm_terminal_qsg_atlas_stage2_parity_backends
+        list(APPEND vnm_terminal_qsg_atlas_pixel_parity_backends
             opengl
         )
     endif()
 
-    foreach(stage2_backend IN LISTS vnm_terminal_qsg_atlas_stage2_parity_backends)
+    foreach(atlas_pixel_backend IN LISTS vnm_terminal_qsg_atlas_pixel_parity_backends)
         add_test(
-            NAME vnm_terminal_qsg_atlas_stage2_parity_${stage2_backend}
+            NAME vnm_terminal_qsg_atlas_pixel_parity_${atlas_pixel_backend}
             COMMAND
                 "${CMAKE_COMMAND}" -E env
+                ${vnm_terminal_qt_windows_qpa_environment}
                 "QSG_RENDER_LOOP=threaded"
                 ${vnm_terminal_qt_unscaled_environment}
                 "${vnm_terminal_qt_runtime_path}"
-                "$<TARGET_FILE:vnm_terminal_qsg_atlas_stage1>"
-                "--stage2-parity"
+                "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+                "--pixel-parity"
                 "--backend"
-                "${stage2_backend}"
+                "${atlas_pixel_backend}"
         )
 
         set_tests_properties(
-            vnm_terminal_qsg_atlas_stage2_parity_${stage2_backend}
+            vnm_terminal_qsg_atlas_pixel_parity_${atlas_pixel_backend}
             PROPERTIES
-                LABELS "qsg;hardware;atlas;stage2;parity"
+                LABELS "qsg;hardware;atlas;pixel-parity"
                 SKIP_RETURN_CODE 77
                 TIMEOUT 90
         )
     endforeach()
 endif()
 
-if(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE3_PARITY)
-    set(vnm_terminal_qsg_atlas_stage3_parity_backends)
+if(VNM_TERMINAL_ENABLE_GPU_ATLAS_LAYOUT_PARITY)
+    set(vnm_terminal_qsg_atlas_layout_parity_backends)
     if(WIN32)
-        list(APPEND vnm_terminal_qsg_atlas_stage3_parity_backends
+        list(APPEND vnm_terminal_qsg_atlas_layout_parity_backends
             d3d11
             d3d12
             vulkan
             opengl
         )
     elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD)$")
-        list(APPEND vnm_terminal_qsg_atlas_stage3_parity_backends
+        list(APPEND vnm_terminal_qsg_atlas_layout_parity_backends
             vulkan
             opengl
         )
     elseif(APPLE)
-        list(APPEND vnm_terminal_qsg_atlas_stage3_parity_backends
+        list(APPEND vnm_terminal_qsg_atlas_layout_parity_backends
             opengl
         )
     endif()
 
-    foreach(stage3_backend IN LISTS vnm_terminal_qsg_atlas_stage3_parity_backends)
+    foreach(atlas_layout_backend IN LISTS vnm_terminal_qsg_atlas_layout_parity_backends)
         add_test(
-            NAME vnm_terminal_qsg_atlas_stage3_parity_${stage3_backend}
+            NAME vnm_terminal_qsg_atlas_layout_parity_${atlas_layout_backend}
             COMMAND
                 "${CMAKE_COMMAND}" -E env
+                ${vnm_terminal_qt_windows_qpa_environment}
                 "QSG_RENDER_LOOP=threaded"
                 ${vnm_terminal_qt_unscaled_environment}
                 "${vnm_terminal_qt_runtime_path}"
-                "$<TARGET_FILE:vnm_terminal_qsg_atlas_stage1>"
-                "--stage3-parity"
+                "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+                "--layout-parity"
                 "--backend"
-                "${stage3_backend}"
+                "${atlas_layout_backend}"
         )
 
         set_tests_properties(
-            vnm_terminal_qsg_atlas_stage3_parity_${stage3_backend}
+            vnm_terminal_qsg_atlas_layout_parity_${atlas_layout_backend}
             PROPERTIES
-                LABELS "qsg;hardware;atlas;stage3;parity"
+                LABELS "qsg;hardware;atlas;layout-parity"
                 SKIP_RETURN_CODE 77
                 TIMEOUT 120
         )
     endforeach()
 endif()
 
-if(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE4_REPORT)
-    set(vnm_terminal_qsg_atlas_stage4_report_backends)
+if(VNM_TERMINAL_ENABLE_GPU_ATLAS_REPORT)
+    set(vnm_terminal_qsg_atlas_report_backends)
     if(WIN32)
-        list(APPEND vnm_terminal_qsg_atlas_stage4_report_backends
+        list(APPEND vnm_terminal_qsg_atlas_report_backends
             d3d11
             d3d12
             vulkan
             opengl
         )
     elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD)$")
-        list(APPEND vnm_terminal_qsg_atlas_stage4_report_backends
+        list(APPEND vnm_terminal_qsg_atlas_report_backends
             vulkan
             opengl
         )
     elseif(APPLE)
-        list(APPEND vnm_terminal_qsg_atlas_stage4_report_backends
+        list(APPEND vnm_terminal_qsg_atlas_report_backends
             opengl
         )
     endif()
 
-    foreach(stage4_backend IN LISTS vnm_terminal_qsg_atlas_stage4_report_backends)
+    foreach(atlas_report_backend IN LISTS vnm_terminal_qsg_atlas_report_backends)
         add_test(
-            NAME vnm_terminal_qsg_atlas_stage4_report_${stage4_backend}
+            NAME vnm_terminal_qsg_atlas_report_${atlas_report_backend}
             COMMAND
                 "${CMAKE_COMMAND}" -E env
+                ${vnm_terminal_qt_windows_qpa_environment}
                 "QSG_RENDER_LOOP=threaded"
                 ${vnm_terminal_qt_unscaled_environment}
                 "${vnm_terminal_qt_runtime_path}"
-                "$<TARGET_FILE:vnm_terminal_qsg_atlas_stage1>"
-                "--stage4-report"
+                "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+                "--atlas-report"
                 "--backend"
-                "${stage4_backend}"
+                "${atlas_report_backend}"
         )
 
         set_tests_properties(
-            vnm_terminal_qsg_atlas_stage4_report_${stage4_backend}
+            vnm_terminal_qsg_atlas_report_${atlas_report_backend}
             PROPERTIES
-                LABELS "qsg;hardware;atlas;stage4;report"
+                LABELS "qsg;hardware;atlas;report"
                 SKIP_RETURN_CODE 77
                 TIMEOUT 120
         )
     endforeach()
+
 endif()
 
 add_executable(vnm_terminal_shaping_contract
@@ -862,38 +851,6 @@ add_test(
         "${CMAKE_COMMAND}" -E env
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_shaping_contract>"
-)
-
-add_executable(vnm_terminal_qsg_text_node
-    qsg_text_node/qsg_text_node_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_qsg_text_node PRIVATE
-    Qt6::Core
-    Qt6::Gui
-    Qt6::Quick
-)
-
-target_compile_definitions(vnm_terminal_qsg_text_node PRIVATE
-    VNM_TERMINAL_TEST_MONOSPACE_FONT_PATH="${PROJECT_SOURCE_DIR}/resources/fonts/vnm_framework_monospace.ttf"
-)
-
-set_target_properties(vnm_terminal_qsg_text_node PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_qsg_text_node
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        ${vnm_terminal_qt_offscreen_environment}
-        ${vnm_terminal_qt_unscaled_environment}
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_qsg_text_node>"
-        "--software-renderer"
-)
-set_tests_properties(vnm_terminal_qsg_text_node PROPERTIES
-    TIMEOUT 60
 )
 
 add_executable(vnm_terminal_surface_host
@@ -1581,11 +1538,8 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_render_cell_text
     vnm_terminal_render_snapshot
     vnm_terminal_render_frame
-    vnm_terminal_qsg_render
-    vnm_terminal_qsg_rhi_stage0_probe
-    vnm_terminal_qsg_atlas_stage1
+    vnm_terminal_qsg_atlas
     vnm_terminal_shaping_contract
-    vnm_terminal_qsg_text_node
     vnm_terminal_input_encoder
     vnm_terminal_surface_host
     vnm_terminal_behavior_smoke

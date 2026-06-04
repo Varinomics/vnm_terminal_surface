@@ -1,11 +1,8 @@
 # GPU Glyph-Atlas Renderer Plan
 
-Status: **proposal, gated.** This plan describes an alternate GPU renderer backend
-for `VNM_TerminalSurface`. It is not an adopted decision. Proceeding requires the
-[Decision Gates](#decision-gates) to pass first: a rendering bound diagnosis that
-confirms the terminal's own rendering is the bottleneck, a scoped amendment to the
-[Qt rendering policy](qt_rendering_policy.md), and a scoped amendment to the Qt
-dependency posture (QRhi is private API).
+Status: **Stage 5 cutover batch.** The atlas renderer is the canonical
+renderer backend for `VNM_TerminalSurface`; the previous Qt text-node renderer
+path and temporary selection switches are removed in this cutover batch.
 
 This document is a companion to [architecture](architecture.md),
 [Qt rendering policy](qt_rendering_policy.md), and
@@ -15,15 +12,15 @@ a different, larger problem in a different layer.
 
 ## Single canonical renderer
 
-The atlas renderer **replaces** `QSGTextNode` as the sole renderer; there is no
-permanent fallback and no Rule 1 exception. The product targets accelerated (QRhi)
+The atlas renderer **replaces** the previous Qt text-node renderer as the sole
+renderer; there is no permanent fallback and no Rule 1 exception. The product
+targets accelerated (QRhi)
 rendering only and does not support Qt Quick's software (`QPainter`) scene-graph
-adaptation, so there is no environment where `QSGTextNode` would be needed and the
-atlas renderer would not run — under the RHI backend both render through the same
-`QRhi`, so if QRhi is unavailable the window cannot render at all. `QSGTextNode` is
-kept only as a default-off experimental path *during* bring-up (Stages 0–4) for revert
-safety; the cutover batch makes the atlas renderer canonical and deletes the
-`QSGTextNode` consumer in the same commit, per change-governance Rule 1.
+adaptation, so there is no supported deployment where the removed renderer would
+be needed and the atlas renderer would not run. Under the RHI backend both
+render through the same `QRhi`; if QRhi is unavailable the window cannot render.
+Stage 5 makes the atlas renderer canonical and deletes the previous renderer
+consumer in the same batch, per change-governance Rule 1.
 
 ## Motivation
 
@@ -53,7 +50,7 @@ tuning difference.
 
 **Goal:** close the rendering gap for animated full-grid content while preserving the
 public `VNM_TerminalSurface` contract, the parser/model/session pipeline, and exact
-visual parity with the current renderer.
+visual parity with the canonical atlas renderer's accepted Stage 5 behavior.
 
 **Non-goal:** writing a font rasterizer or shaper. Qt continues to perform font
 loading, fallback selection, shaping, and glyph rasterization. This plan owns only
@@ -61,10 +58,11 @@ glyph caching and GPU composition.
 
 ## Behavioral parity principle
 
-The atlas renderer must reproduce the **current** `QSGTextNode` renderer's behavior
-exactly, including its present limitations — not an idealized renderer. Where the
-current renderer ignores an attribute or declines a case, the atlas renderer does the
-same. Concretely, the current renderer (per `src/qsg_terminal_renderer.cpp`):
+The atlas renderer must reproduce the accepted Stage 5 terminal rendering
+behavior exactly, including the previous renderer's intentional limitations -
+not an idealized renderer. Where the previous renderer ignored an attribute or
+declined a case, the atlas renderer does the same. Concretely, the accepted
+behavior is:
 
 - does **not** synthesize separate BOLD/ITALIC faces — one base `render_font` per run;
   `render_style_attributes` consults only UNDERLINE/STRIKE/INVERSE/FAINT/INVISIBLE;
@@ -99,10 +97,10 @@ render snapshot -> render frame -> renderer                             [REPLACE
   event/IME/focus handling, backend selection, `Terminal_session`, parser, screen
   model, `Terminal_render_snapshot`, and `Terminal_render_frame` as the renderer input
   contract.
-- **Replaced:** the snapshot/frame-to-`QSGNode` consumer (`qsg_terminal_renderer.cpp`)
-  gains a GPU-atlas consumer driven from `updatePaintNode`. During bring-up the atlas
-  consumer is behind a default-off flag; at cutover it replaces the `QSGNode` consumer,
-  which is deleted in the same batch (Rule 1).
+- **Replaced:** the snapshot/frame-to-`QSGNode` consumer is the canonical
+  GPU-atlas consumer captured from `updatePaintNode` and prepared/rendered by
+  the atlas `QSGRenderNode`. The previous text-node consumer and its selection
+  surfaces are deleted in the same batch (Rule 1).
 - **Reused:** `Qt_grid_metrics_provider` for cell metrics; `cell_stable_shaping.h` for
   cell-to-cluster/glyph orchestration and ownership invariants; the snapshot's style
   table, color state, cursor, selection spans + line provenance, dirty-row ranges,
@@ -150,16 +148,12 @@ RGBA. No direct HarfBuzz, FreeType, or ICU dependency is introduced.
 This is the most load-bearing part of the design, because the project's threaded
 render loop changes what is safe.
 
-Today, the entire frame build runs inside `updatePaintNode`, which reads
-GUI-thread-owned mutable state **by direct reference** (`m_private->render_snapshot`,
-`m_private->ime_preedit`, `m_private->cursor_blink_visible`, `m_private->cell_metrics`,
-`m_private->render_font`, `m_private->render_device_pixel_ratio`, plus the item's
-`boundingRect()`). That is safe only because, under the threaded render loop,
-`updatePaintNode` runs on the render thread **with the GUI thread blocked** at sync.
-
-A `QSGRenderNode` is different: its `prepare()`/`render()` run on the render thread
-**after** the sync point, with the GUI thread running free. Dereferencing
-`m_private->...` from `render()` would be a data race. Therefore:
+The canonical path captures immutable inputs inside `updatePaintNode` while the
+GUI thread is blocked at sync. `QSGRenderNode::prepare()` then builds the
+`Terminal_render_frame`, populates the atlas, and prepares instance buffers from
+that captured value on the render thread. `QSGRenderNode::render()` only submits
+the prepared QRhi work. Dereferencing `m_private->...` from `prepare()` or
+`render()` would be a data race. Therefore:
 
 - The render node must **capture immutable copies of every input at sync time**
   (inside `updatePaintNode`, GUI thread blocked): the `shared_ptr<const Terminal_render_snapshot>`
@@ -168,7 +162,7 @@ A `QSGRenderNode` is different: its `prepare()`/`render()` run on the render thr
   viewport math, and not reachable from `RenderState`), device-pixel-ratio, the active
   font, and the resolved `Terminal_render_options` (cursor/selection/preedit/bell
   colors, cursor shape/blink overrides, `underline_hyperlinks`, `visual_bell_enabled`).
-  `render()` reads only this captured state, never `m_private`.
+  `prepare()` and `render()` read only this captured state, never `m_private`.
 - **Font invalidation is delivered through captured state, not a cross-thread signal.**
   `refresh_grid_metrics` is GUI-thread-only; the atlas cannot subscribe to it from the
   render thread. Each captured frame carries a font/size/DPR epoch; when the epoch
@@ -184,8 +178,10 @@ A `QSGRenderNode` is different: its `prepare()`/`render()` run on the render thr
   copy/upload/update batches for atlas pages, instance buffers, uniform buffers, and
   epoch rebuilds are recorded in `QSGRenderNode::prepare()` before the render pass.
   `render()` only binds prepared pipelines/resources, applies viewport/scissor/stencil
-  state, and issues draws. A glyph miss discovered too late for `prepare()` renders a
-  replacement or previous prepared tile; it never uploads inside `render()`.
+  state, and issues draws. A glyph miss discovered during preparation is either rendered
+  through an explicit replacement path or recorded in atlas failure counters that fail
+  readiness validation; it never disappears behind a successful render report, and it
+  never uploads inside `render()`.
   `prepare()` should enumerate and populate all glyphs needed by the captured frame
   before instance data is finalized. If a late miss remains possible, `render()` may only
   mark render-node-local state and use a captured thread-safe queued notifier whose sole
@@ -224,13 +220,13 @@ Two ways to drive QRhi inside Qt Quick:
   it changes the surface's base class and adds an extra offscreen composite per frame.
 
 **Recommendation:** `QSGRenderNode`. It preserves the `QQuickItem` facade and
-`updatePaintNode` structure (with the state-capture discipline above), avoids the extra
-offscreen composite, and its QRhi entry points are stable since 6.6. Confirm exact
-since-versions in Stage 0.
+`updatePaintNode` capture structure (with the state-capture discipline above), avoids the
+extra offscreen composite, and its QRhi entry points are stable since 6.6. Backend
+identity tests prove the active QRhi backend for backend-specific atlas gates.
 
 ## Qt dependency posture amendment (required)
 
-QRhi is **private Qt API** (`Qt::GuiPrivate`, `rhi/`-prefixed headers) with no
+QRhi is **private Qt API** (`Qt6::GuiPrivate`, `rhi/`-prefixed headers) with no
 source/binary-compatibility guarantee across Qt versions. The project's posture gate
 (`cmake/vnm_terminal_qt_posture.cmake`) allows `Qt6::Core`/`Qt6::Gui`/`Qt6::Quick`
 as direct targets and permits private Qt modules only as link targets:
@@ -252,20 +248,20 @@ consumption remains valid because the surface is rebuilt against the consumer's 
 
 ## Shader pipeline
 
-Atlas shaders are Vulkan-style GLSL sources under `resources/shaders/`, built with
-`qt6_add_shaders` from a build-time `Qt6::ShaderTools` component, embedded in the Qt
-resource system, and loaded with `QShader::fromSerialized`. No runtime
-`QShaderBaker`/ShaderTools dependency is introduced. Generated shader packages are
-built with the same Qt minor used for the product, or explicitly pinned to the supported
-floor if prebuilt shader blobs are checked in.
+Atlas shaders are Vulkan-style GLSL sources under `resources/shaders/`, with
+checked-in `.qsb` packages embedded in the Qt resource system and loaded with
+`QShader::fromSerialized`. The current CMake target consumes those checked-in
+packages; it does not run `qt6_add_shaders` or regenerate shader packages as part
+of the target build. No runtime `QShaderBaker`/ShaderTools dependency is
+introduced.
 
-`Qt6::ShaderTools` is a build-time-only source-tree requirement for generating embedded
-`.qsb` resources. It is added to the root source build `find_package` only when
-`VNM_TERMINAL_ENABLE_SHADER_GENERATION` is enabled, is not linked to
-`vnm_terminal_surface`, is not added to `vnm_terminal_allowed_qt_link_targets`, and is
-not added to installed
-`vnm_terminal_surfaceConfig.cmake.in` `find_dependency()` because installed/binary
-packages consume already-embedded shader resources.
+`Qt6::ShaderTools` is source-tree tooling only when
+`VNM_TERMINAL_ENABLE_SHADER_GENERATION` is enabled. That option adds ShaderTools
+to the root source build `find_package` so local shader-package tooling can be
+available, but it is not linked to `vnm_terminal_surface`, is not added to
+`vnm_terminal_allowed_qt_link_targets`, and is not added to installed
+`vnm_terminal_surfaceConfig.cmake.in` `find_dependency()` because
+installed/binary packages consume already-embedded shader resources.
 
 ## The glyph atlas
 
@@ -422,33 +418,31 @@ The snapshot carries a viewport/scroll model the renderer must honor:
   `visible_line_provenance` is invalid; the renderer emits the spans the snapshot
   carries, so selection never paints on stale/scrolled rows.
 
-## Renderer selection during bring-up
+## Canonical renderer posture
 
-The atlas renderer is gated behind a build-time option (default off) plus a runtime
-property, so it can be exercised and parity-tested alongside the default `QSGTextNode`
-renderer during Stages 0–4. This selection is **transitional**: at cutover the atlas
-renderer becomes unconditional and the option, the runtime property, and the
-`QSGTextNode` consumer are all removed in the same batch (Rule 1).
+Stage 5 has one production renderer path. `VNM_TerminalSurface::updatePaintNode`
+performs invalid/null guards, captures immutable render inputs, and returns the
+canonical atlas render node. The render node builds the `Terminal_render_frame`
+and prepares atlas resources in `QSGRenderNode::prepare()`. There is no
+build-time renderer option, runtime renderer property, hidden app selection flag,
+or RHI probe path that can replace the atlas renderer in production.
 
 There is no automatic-fallback-on-error path. The product requires a QRhi (RHI)
-backend; `QSGTextNode` and the atlas renderer both run on the same `QRhi` under that
-backend, so there is no "QRhi failed but QSGTextNode works" state to guard — if QRhi is
-unavailable the window cannot render at all. QRhi backend availability is a deployment
-requirement, validated once at the Stage-0 spike. Atlas-budget overflow is handled by
-eviction, not by switching renderers; glyph-rasterization failures draw the replacement
-glyph, as any renderer does.
+backend; if QRhi is unavailable the window cannot render. Atlas-budget overflow is
+handled within the atlas path by the documented budget/eviction policy, not by
+switching renderers; glyph-rasterization failures must either draw an explicit
+replacement path or be recorded in atlas failure counters that fail readiness
+validation.
 
-The Qt Quick software scene-graph adaptation (`QSGRendererInterface::Software`, including
-the current `vnm_terminal --software-renderer` diagnostics) is not an atlas path because
-`QQuickWindow::rhi()` is null there. During Stages 0–4 existing software-scene-graph
-tests remain only for the transitional `QSGTextNode` path, or are duplicated onto a named
-accelerated QRhi backend. Stage 5 removes or redefines `vnm_terminal --software-renderer`
-and any CMDG/test options that still imply the software adaptation.
+The Qt Quick software scene-graph adaptation (`Qt Quick software scene graph`) is
+not an atlas path because `QQuickWindow::rhi()` is null there. The companion app
+no longer exposes a software scene-graph launch flag that can select a different
+render path.
 
 ## Text-correctness surface
 
-Each case states the **initial scope** and the **behavior to match** (the current
-renderer's, per the [parity principle](#behavioral-parity-principle)).
+Each case states the accepted Stage 5 behavior to match, per the
+[parity principle](#behavioral-parity-principle).
 
 | Case | Initial scope | Behavior to match |
 | --- | --- | --- |
@@ -463,41 +457,42 @@ renderer's, per the [parity principle](#behavioral-parity-principle)).
 | Block-cursor inverse text | yes | glyph cell: solid fill + inverted glyph; graphic cell: fill carved around graphic + inverted graphic |
 | Selection / IME-preedit background | yes | semi-transparent, composited **below** glyphs |
 | Hyperlink underline | yes | option-gated on `underline_hyperlinks` (off by default) |
-| Color emoji | **bring-up defer only** | before cutover, emoji-presenting clusters must either pass the parity gate on the supported Qt version/backend or be explicitly documented as matching the current renderer's observed fallback/replacement behavior |
+| Color emoji | yes | match Qt's shaped presentation on the supported Qt/backend when color tiles are available; unsupported color-alpha glyphs are demoted to the documented coverage path and surfaced through atlas counters |
 | Font fallback | yes | Qt selects the fallback face; cache keyed by face id |
 | Subpixel/LCD AA | out (initial) | grayscale AA only; revisit if parity requires |
-| Complex scripts (Arabic/Indic cross-cell shaping) | scope decision required | match current per-cell behavior exactly; do not "improve" it here |
+| Complex scripts (Arabic/Indic cross-cell shaping) | yes | match the existing per-cell terminal behavior exactly; improving cross-cell shaping is out of scope for this cutover |
 | Ligatures | out | terminals disable; match current behavior |
 
 ## Pre-Stage-0 policy and posture acceptance gate
 
-The pre-Stage-0 posture slice applies the narrow policy and package prerequisites that
-make QRhi/atlas exploration executable. This is an acceptance gate, not implementation
-authorization: Stage 0 remains blocked until the bound-confirmation gate passes and the
-maintainer accepts the amended policy/posture.
+The pre-Stage-0 posture slice applied the narrow policy and package
+prerequisites that made QRhi/atlas exploration executable. That gate is retained
+as historical evidence for why QRhi private API use is allowed and how package
+posture is validated.
 
 1. **[Qt rendering policy](qt_rendering_policy.md).** The policy permits a GPU
    glyph-atlas backend to cache glyphs rasterized by Qt's font engine
    (`QRawFont::alphaMapForGlyph`) into atlas textures and composite cells through
    instanced QRhi draws. Direct HarfBuzz, FreeType, and ICU dependencies remain
    prohibited; shaping, rasterization, and fallback stay with Qt's font engine. At
-   cutover, this backend replaces the `QSGTextNode` text route, and the replaced route
-   is removed in the same batch. `QGlyphRun` remains validation/probing-only around the
-   Qt text route and does not move text ownership away from `frame.text_runs`.
+   cutover, this backend replaces the previous Qt text-node route, and the
+   replaced route is removed in the same batch. `QGlyphRun` remains
+   validation/probing-only around Qt font behavior and does not move text
+   ownership away from `frame.text_runs`.
 
 2. **Qt dependency posture.** See
    [above](#qt-dependency-posture-amendment-required): source/package CMake permits
    `Qt6::GuiPrivate` as a private link dependency, records the Qt private-API
    major/minor for installed packages, rejects installed consumers with a different Qt
    minor, and keeps `Qt6::ShaderTools` source-tree build-time-only when shader
-   generation is enabled.
+   tooling is enabled.
 
 ## Staged rollout
 
-Per the [change governance](https://github.com/Varinomics/varinomics-standards) shared
-multi-batch rules: small, individually gated batches; the `QSGTextNode` renderer stays
-selectable (behind a default-off flag) through bring-up for revert safety, and is
-deleted at cutover in the same batch that makes the atlas renderer canonical (Rule 1).
+Per the [change governance](https://github.com/Varinomics/varinomics-standards)
+shared multi-batch rules: small, individually gated batches, with Stage 5 as
+the single cutover batch that makes the atlas renderer canonical and deletes the
+previous renderer consumer plus its selection surfaces (Rule 1).
 
 - **Stage 0 — spike.** Confirm `QSGRenderNode` QRhi entry points and the posture
   amendment on the supported QRhi backends; stand up a trivial instanced quad behind the
@@ -513,18 +508,21 @@ deleted at cutover in the same batch that makes the atlas renderer canonical (Ru
   atlas, `Format_Indexed8` conversion, render-thread-local `QRawFont` rasterization, and
   the sync-time state capture. Exit evidence: cache-key tests including physical pixel
   size and fallback face id; packing/stride/format-conversion tests; epoch invalidation
-  tests; `Captured_atlas_frame` value built only during `updatePaintNode`; source-posture
-  check and render smoke proving `prepare()`/`render()` read only the captured value and
-  render-thread QRhi/QSGRenderNode accessors, never `VNM_TerminalSurface`, `m_private`,
-  `boundingRect()`, GUI-owned options, direct GUI update scheduling, or GUI-object
-  dereference. Run capture smoke under both
+  tests; `Captured_atlas_frame` value captured only during `updatePaintNode`;
+  `Terminal_render_frame` value built only from that captured value during
+  `QSGRenderNode::prepare()`; source-posture check and render smoke proving
+  `prepare()`/`render()` read only the captured value and render-thread
+  QRhi/QSGRenderNode accessors, never `VNM_TerminalSurface`, `m_private`,
+  `boundingRect()`, GUI-owned options, direct GUI update scheduling, or
+  GUI-object dereference. Run capture smoke under both
   `QSG_RENDER_LOOP=threaded` and `QSG_RENDER_LOOP=basic`, including a test that mutates
   GUI-thread surface state after sync and verifies the rendered frame uses the captured
   snapshot/options/font epoch. No cutover.
 - **Stage 2 — background + selection/preedit-bg + glyph + decoration + cursor passes.**
   In the reference paint order. Covers ASCII/BMP glyphs, FAINT/INVISIBLE/INVERSE
   resolution, below-glyph selection/preedit fills, block-cursor inversion (glyph and
-  graphic carve-out), and decoration colors. Behind the selection flag, default off.
+  graphic carve-out), and decoration colors. Historical bring-up used temporary
+  selection controls; Stage 5 deletes those controls.
   Exit evidence: named parity corpus results with exact masked zero-diff regions for
   fills/decorations and per-backend AA budgets for glyphs.
 - **Stage 3 — graphics, scroll/viewport, selection provenance, fallback faces.** Box/block
@@ -537,15 +535,16 @@ deleted at cutover in the same batch that makes the atlas renderer canonical (Ru
   rotating-buffer tests, non-dirty selection/cursor/preedit/options/visual-bell
   invalidation tests, PUBLIC_PROJECTION/SCROLL full-reupload tests, atlas memory/page
   budget counters, and CMDG performance gate.
-- **Stage 5 — cutover.** If the gates pass, make the atlas renderer unconditional and
-  **delete the `QSGTextNode` consumer, the build-time option, and the runtime property in
-  the same batch** (Rule 1), removing any orphaned dead code (verified via `git grep`).
-  Update the companion `vnm_terminal` app and its profile-text counters in the same
-  cross-repo batch (see [Cross-repo](#cross-repo-coordination)). Exit evidence: cross-repo
-  deletion grep, build, tests, parity gate, and CMDG gate.
+- **Stage 5 - cutover.** Make the atlas renderer unconditional and **delete
+  the previous text-node consumer, the build-time option, and the runtime
+  property in the same batch** (Rule 1), removing any orphaned dead code
+  (verified via `git grep`). Update the companion `vnm_terminal` app and
+  its profile atlas counters in the same cross-repo batch (see
+  [Cross-repo](#cross-repo-coordination)). Exit evidence: cross-repo deletion
+  grep, build, tests, parity gate, and CMDG gate.
 
-Each stage is independently revertable because the QSG renderer remains the default and
-the atlas renderer stays behind a default-off flag until the Stage 5 cutover.
+Stages 0-4 are historical bring-up gates. Stage 5 is the non-selectable cutover:
+after this batch the atlas renderer is the only production renderer path.
 
 ## Cross-repo coordination
 
@@ -558,11 +557,11 @@ successor file list:
   `include/vnm_terminal/internal/vnm_terminal_surface_render_bridge.h`,
   `include/vnm_terminal/internal/hierarchical_profiler.h`,
   `include/vnm_terminal/internal/metrics_contract.h`, `src/vnm_terminal_surface.cpp`,
-  `src/metrics_contract.cpp`, `tests/qsg_render/qsg_render_tests.cpp`,
-  `tests/qsg_text_node/qsg_text_node_tests.cpp`, `tests/render_frame/render_frame_tests.cpp`,
+  `src/metrics_contract.cpp`, `tests/qsg_atlas/atlas_tests.cpp`,
+  the deleted text-node consumer tests, `tests/render_frame/render_frame_tests.cpp`,
   `tests/surface_host/surface_host_tests.cpp`, `tests/qt_render_smoke/render_smoke_tests.cpp`,
   `tests/qt_metrics/qt_metrics_tests.cpp`, `tests/package_smoke/CMakeLists.txt`, and
-  `tests/CMakeLists.txt` if the public `QSGTextNode` probe is retired,
+  `tests/CMakeLists.txt` for canonical atlas test registration and removed probes,
   `benchmarks/embedded_terminal/CMakeLists.txt`,
   `benchmarks/embedded_terminal/embedded_terminal_benchmark.cpp`,
   `benchmarks/surface_stress/terminal_surface_stress_benchmark.cpp`,
@@ -574,83 +573,98 @@ successor file list:
   `benchmarks/cmdg_nelostie/README.md`, `tests/CMakeLists.txt`,
   `tests/expect_metrics_json.cmake`, and `docs/debugging_knowledge.md`.
 
-Concrete successor touch-points: the app's profile-text counter parsing (the
-compact/fallback counter names introduced for the text-representation work, plus any new
-atlas-renderer counters), removal or redefinition of `--software-renderer`, removal of
-any transitional renderer-selection the app exposed during bring-up, and package config
-minor-version enforcement. Exit requires `git grep` in both repos for transitional
-selector/property names, `QSGTextNode` consumer assumptions, and stale counter names.
+Concrete successor touch-points: the app's profile atlas counter parsing for
+canonical atlas counters, removal of any transitional app switch that could pick
+a different render path, and package config minor-version enforcement. Exit
+requires `git grep` in both repos for transitional selector/property names,
+previous text-node consumer assumptions, and stale counter names.
+
+Stage 5 successor coverage inspection found several planned files that do not
+need code changes after cutover inspection:
+
+- `include/vnm_terminal/internal/qsg_terminal_render_frame.h`: the frame remains
+  the atlas input contract and contains no renderer selector.
+- `include/vnm_terminal/internal/hierarchical_profiler.h`: profiler primitives
+  are renderer-neutral; app profile text now adds atlas counters at the writer.
+- `include/vnm_terminal/internal/metrics_contract.h` and
+  `src/metrics_contract.cpp`: the surface metrics contract remains stable; app
+  runtime metrics add `qsg_atlas` at the app schema boundary.
+- `tests/render_frame/render_frame_tests.cpp`: frame-builder invariants are still
+  canonical atlas inputs and do not reference the removed consumer.
+- `tests/package_smoke/CMakeLists.txt`: package posture exports no renderer
+  selector; private Qt minor enforcement remains unchanged.
+- `benchmarks/surface_stress/terminal_surface_stress_benchmark.cpp`: the stress
+  benchmark exercises the canonical surface path and takes no renderer option.
+- `cmake/vnm_terminal_qt_posture.cmake` and
+  `cmake/vnm_terminal_surfaceConfig.cmake.in`: QRhi/private-Qt posture and
+  package config already describe the canonical atlas dependency set and export
+  no render-path selection option.
 
 ## Testing and benchmarks
 
-A bit-exact cross-renderer oracle is **not** achievable: the reference rasterizes via
-`QSGTextNode` at `QtRendering` (Qt font-engine grayscale), while the atlas rasterizes via
-`QRawFont::alphaMapForGlyph` and composites in a custom shader, and results differ across
-QRhi backends (Vulkan/Metal/D3D/GL) in hinting, gamma/blend space, and snapping. The
-existing tests are also not an exact oracle — they sample colors with tolerance 4–12, and
-the only exact compares are same-renderer self-consistency. So the parity gate is layered
-and must be built as new work:
+Bit-exact historical cross-renderer parity is **not** achievable: the previous
+renderer rasterized through Qt text-node material paths, while the atlas
+rasterizes through `QRawFont::alphaMapForGlyph` and composites in a custom
+shader. Results differ across QRhi backends (Vulkan/Metal/D3D/GL) in hinting,
+gamma/blend space, and snapping. Canonical parity therefore uses layered atlas
+smoke, pixel-parity, layout-parity, and atlas-report checks on an accelerated
+QRhi backend, with archived historical artifacts used only where a cross-run
+comparison remains meaningful.
 
 - **Exact, masked** parity on non-antialiased elements: backgrounds, selection fill,
   block-cursor fill, solid decorations — masked-region byte-diffs.
 - **Perceptual/structural** parity on glyph and antialiased-geometry regions: a per-pixel
   max-delta plus a budget on the count of deviating pixels (or SSIM), with **separate
   budgets per backend**. The deterministic CI parity gate runs on one explicitly
-  supported accelerated QRhi backend fixed by Stage 0 (for example D3D11 on Windows CI),
+  supported accelerated QRhi backend fixed by the canonical backend gate
+  (for example D3D11 on Windows CI),
   selected before the first `QQuickWindow` via `QSG_RHI_BACKEND` or
   `QQuickWindow::setGraphicsApi`, with Qt minor version, font, DPR, window size, graphics
   API, and backend-specific tolerances recorded in artifacts. Do not use
-  `QSGRendererInterface::Software` for atlas parity; backend-specific software adapters
-  such as `QSG_RHI_PREFER_SOFTWARE_RENDERER=1` are allowed only if Stage 0 proves they
-  still produce a non-null `QQuickWindow::rhi()`. The single-subpixel-bucket positional
-  delta (≤ ~1px) is folded into this budget.
+  `Qt Quick software scene graph` for atlas parity; Stage 5 evidence must come
+  from a non-skipped accelerated QRhi backend. The single-subpixel-bucket
+  positional delta is folded into this budget.
 - **Glyph-correctness corpora:** ASCII, BMP/CJK, box/block graphics, combining marks, wide
   cells, presentation-selector pairs, font fallback — from the existing unicode-width,
   shaping-contract, and render tests.
-- **Existing suites** (`render_snapshot`, `render_frame`, `qsg_render`,
-  `shaping_contract`, `screen_*`, conformance) stay green for the unchanged snapshot
-  contract and the selectable QSG path.
-- **Performance gate (CMDG).** Measure the CMDG suite, hardware, windowed, against the
-  `QSGTextNode` baseline using `vnm_terminal` `benchmarks/cmdg_nelostie` Release runs
-  with profiling off for timing, `OFFSCREEN=OFF`, `SOFTWARE_RENDERER=OFF`, fixed
-  window/font/frame limit/scenes/repeats, artifact tags for baseline/candidate, and
-  warmed or interleaved ordering with CPU-frequency counters when available. Profile-text
-  runs are separate. Compare `scene_frames_per_second`, `draw_frames_per_second`,
-  terminal `paint_frames_per_second`, renderer counters, GPU timing, and atlas
-  memory/page metrics. Pass requires at least 25% median improvement on the motivating
-  CMDG scenes, no default CMDG scene regression over 5%, no ordinary shell/render smoke
-  regression, and no atlas overflow outside the declared budget.
+- **Existing suites** (`render_snapshot`, `render_frame`, `qsg_atlas`,
+  `shaping_contract`, `screen_*`, conformance) stay green for the unchanged
+  snapshot/frame contract and the canonical atlas path.
+- **Performance gate (CMDG).** Measure the full CMDG suite, hardware, windowed,
+  with `vnm_terminal` `benchmarks/cmdg_nelostie` Release runs, profiling off for
+  timing, `OFFSCREEN=OFF`, fixed window/font/frame limit/scenes/repeats, and
+  warmed or interleaved ordering with CPU-frequency counters when available.
+  The canonical Stage 5 gate can ingest an archived pre-cutover baseline JSON
+  and compare `scene_frames_per_second`, `draw_frames_per_second`, terminal
+  `paint_frames_per_second`, renderer counters, and atlas memory/page metrics.
+  Pass requires at least 25% median terminal-paint FPS improvement on the
+  motivating CMDG scenes, no default CMDG scene regression over 5%, no ordinary
+  shell/render smoke regression, and no atlas overflow outside the declared
+  budget.
 
 Exact bit parity is an explicit non-goal; tolerances are documented per element class, not
 as one global number.
 
 ## Decision Gates
 
-This plan does not authorize implementation. Gates preceding Stage 0:
+Earlier bring-up gates are historical evidence. Stage 5 exit is gated on:
 
-1. **Bound confirmation.** A render-thread/GPU diagnosis confirming the terminal's own
-   rendering — not host content, input backlog, vsync idling, or producer starvation — is
-   the bottleneck on the target scenes. It records scene list, window/font/frame limit,
-   Qt version, QRhi backend, render loop, hardware, build flags, vsync setting, p50/p95
-   frame time, `QSG_RENDER_TIMING`, terminal/CMDG metrics JSON, profile text,
-   resolution/grid-scaling results, and GPU timer-query results or an explicit
-   unavailable note. The gate passes only when the same CMDG scenes/window/font as the
-   performance gate reach `frame_limit`, terminal metrics show no backend errors/timeouts,
-   vsync is disabled or proven non-capping, model/snapshot append/copy remains below 20%
-   of frame wall time, and render-thread + GPU/present work accounts for at least 70% of
-   frame wall time or is the dominant scaling component in the resolution/grid-control
-   run.
-2. **Policy + posture amendments.** The maintainer accepts the
-   [pre-Stage-0 policy/posture acceptance gate](#pre-stage-0-policy-and-posture-acceptance-gate).
-
-Start Stage 1 only if the Stage 0 spike exit evidence passes. Start Stage 5 only if the
-CMDG performance gate and the layered parity gate both pass.
-
+1. Cross-repo deletion grep for removed renderer selectors, deleted RHI probe
+   selectors, text-node consumer assumptions, deleted test paths, and stale
+   counter names.
+2. Full surface and app builds/tests, plus selected non-skipped accelerated
+   atlas smoke/parity/report tests on a QRhi backend.
+3. Canonical CMDG full-suite gate with six default scenes, windowed hardware
+   rendering, 300-frame scene limit, three repeats, and canonical `qsg_atlas`
+   metrics/counters present.
+4. Archived retired-renderer baseline comparison when a matching pre-cutover
+   baseline artifact is supplied: motivating scenes must improve terminal paint
+   FPS by at least 25%, and default scenes must not regress by more than 5%.
 ## Risks
 
-- **Maintenance burden.** A glyph cache + instanced renderer + atlas lifecycle is a real,
-  ongoing component that replaces `QSGTextNode`'s free correctness — after cutover the
-  product owns this rendering path with no fallback.
+- **Maintenance burden.** A glyph cache + instanced renderer + atlas lifecycle
+  is a real, ongoing component; after cutover the product owns this rendering
+  path with no fallback.
 - **Private-API exposure.** `Qt6::GuiPrivate`/QRhi has no BC guarantee; builds are tied to
   the exact Qt minor version (like the existing `QuickPrivate` use). A Qt upgrade may
   require renderer changes.
@@ -667,12 +681,18 @@ CMDG performance gate and the layered parity gate both pass.
 - **Cross-repo coordination.** The `vnm_terminal` app and its counters change with the
   cutover batch.
 
-## Open questions
+## Resolved Cutover Decisions
 
-- `QSGRenderNode` vs `QQuickRhiItem` for production (Stage-0 spike resolves;
-  recommendation is `QSGRenderNode`).
-- Grayscale-only AA acceptable, or is subpixel/LCD AA required for parity?
-- Complex-script scope: match current per-cell behavior exactly (default) vs improve (out
-  of scope for the perf goal).
-- Atlas page budget and whether any measured workload needs eviction.
-- Color-emoji minimum Qt version (defer on 6.7, or raise that feature to 6.9).
+- Production uses `QSGRenderNode`; `QQuickRhiItem` is not the production path.
+- Grayscale coverage atlas rendering is the accepted Stage 5 antialiasing
+  contract; subpixel/LCD AA is not required for cutover parity.
+- Complex scripts match existing per-cell terminal behavior exactly. Improving
+  cross-cell shaping is out of scope for this renderer cutover.
+- Atlas page budget is enforced by atlas/report counters and CMDG gate checks;
+  measured Stage 5 workloads must not overflow the declared budget.
+- Color emoji follows the supported Qt/backend behavior documented in the
+  text-correctness table; unsupported color-alpha glyphs are demoted to the
+  coverage path and counted, not deferred as a cutover blocker.
+- Qt version policy follows the package posture: source builds use the active
+  supported Qt, and installed packages are tied to the Qt major/minor used to
+  build `vnm_terminal_surface`.

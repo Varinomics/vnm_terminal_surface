@@ -22,8 +22,8 @@ The surface owns the Qt-facing boundary for one terminal session:
 - routes host operations such as paste, selection access, viewport scrolling,
   interrupt, terminate, and OSC 52 clipboard decisions into the same ordered
   session pipeline as backend output;
-- renders immutable session snapshots through Qt Scene Graph nodes in
-  `updatePaintNode()`.
+- captures immutable session snapshots in `updatePaintNode()` and renders them
+  through the canonical atlas Qt Scene Graph render node.
 
 The GUI thread owns the public surface and the session state behind it. Backend
 threads report output, exit, and errors back through queued session callbacks.
@@ -261,9 +261,10 @@ At a high level:
 - `geometryChange()` and relevant `itemChange()` cases refresh metrics, bind
   window and screen signals, report focus changes, and handle scene-graph
   invalidation.
-- `updatePaintNode()` builds a render frame from the latest immutable snapshot
-  and updates the QSG renderer. `releaseResources()` schedules render-node
-  release through the Qt Scene Graph lifecycle.
+- `updatePaintNode()` captures immutable render inputs and updates the QSG
+  render node. The render node builds the render frame and prepares atlas
+  resources in `QSGRenderNode::prepare()`. `releaseResources()` schedules
+  render-node release through the Qt Scene Graph lifecycle.
 
 ## Host Responsibilities
 

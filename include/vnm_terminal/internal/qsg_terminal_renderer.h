@@ -12,9 +12,6 @@
 #define VNM_TERMINAL_PROFILING_ENABLED 0
 #endif
 
-class QQuickWindow;
-class QSGNode;
-
 namespace vnm_terminal::internal {
 
 struct Terminal_render_text_run;
@@ -93,8 +90,8 @@ struct terminal_renderer_stats_t
     int            text_content_reused                                  = 0;
     int            text_content_removed                                 = 0;
     int            text_content_failures                                = 0;
-    int            text_leaf_nodes_created                              = 0;
-    int            text_leaf_nodes_reused                               = 0;
+    int            atlas_work_created                                   = 0;
+    int            atlas_work_reused                                    = 0;
     int            text_cache_entry_child_nodes_cleared_for_replacement = 0;
     int            text_cache_entry_child_nodes_cleared_for_removal     = 0;
     int            text_cache_entry_max_child_nodes_cleared             = 0;
@@ -285,8 +282,8 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_content_reused                                  = 0U;
     std::uint64_t  text_content_removed                                 = 0U;
     std::uint64_t  text_content_failures                                = 0U;
-    std::uint64_t  text_leaf_nodes_created                              = 0U;
-    std::uint64_t  text_leaf_nodes_reused                               = 0U;
+    std::uint64_t  atlas_work_created                                   = 0U;
+    std::uint64_t  atlas_work_reused                                    = 0U;
     std::uint64_t  text_cache_entry_child_nodes_cleared_for_replacement = 0U;
     std::uint64_t  text_cache_entry_child_nodes_cleared_for_removal     = 0U;
     std::uint64_t  text_cache_entry_max_child_nodes_cleared             = 0U;
@@ -571,36 +568,6 @@ private:
 
     mutable std::mutex                    m_mutex;
     terminal_renderer_lifecycle_stats_t   m_stats;
-};
-
-class Qsg_terminal_renderer final
-{
-public:
-#if VNM_TERMINAL_PROFILING_ENABLED
-    QSGNode* update_node(
-        QSGNode*                   old_node,
-        QQuickWindow*              window,
-        const Terminal_render_frame&
-                                   frame,
-        const QFont&               font,
-        qreal                      device_pixel_ratio,
-        std::shared_ptr<Terminal_renderer_lifecycle_recorder>
-                                   lifecycle_recorder,
-        terminal_renderer_stats_t& out_stats,
-        std::shared_ptr<Terminal_text_layout_slow_diagnostics_recorder>
-                                   slow_text_layout_recorder = {});
-#else
-    QSGNode* update_node(
-        QSGNode*                   old_node,
-        QQuickWindow*              window,
-        const Terminal_render_frame&
-                                   frame,
-        const QFont&               font,
-        qreal                      device_pixel_ratio,
-        std::shared_ptr<Terminal_renderer_lifecycle_recorder>
-                                   lifecycle_recorder,
-        terminal_renderer_stats_t& out_stats);
-#endif
 };
 
 }

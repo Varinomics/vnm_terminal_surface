@@ -53,7 +53,7 @@ jobs:
         working-directory: build
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --output-on-failure -E "^vnm_terminal_qsg_render$"
+        run: ctest --output-on-failure
 
       - name: Install package
         run: cmake --install build --config ${CMAKE_BUILD_TYPE} --prefix "${GITHUB_WORKSPACE}/install"
@@ -104,4 +104,4 @@ jobs:
         working-directory: build-transcript
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --output-on-failure -E "^vnm_terminal_qsg_render$"
+        run: ctest --output-on-failure

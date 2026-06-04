@@ -52,6 +52,7 @@
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -85,7 +86,7 @@ constexpr int k_surface_session_output_high_water_chunks      = 64;
 constexpr int k_surface_session_output_high_water_chunk_bytes = 1024;
 constexpr int k_surface_session_write_high_water_bytes        = 64 * 1024;
 
-constexpr int k_schema_version              = 19;
+constexpr int k_schema_version              = 20;
 constexpr int k_profile_schema_version      = 2;
 constexpr int k_profile_text_format         = 2;
 constexpr int k_flat_rect_vertices_per_rect = 6;
@@ -171,8 +172,8 @@ struct renderer_totals_t
     qint64                 text_content_reused                                  = 0;
     qint64                 text_content_removed                                 = 0;
     qint64                 text_content_failures                                = 0;
-    qint64                 text_leaf_nodes_created                              = 0;
-    qint64                 text_leaf_nodes_reused                               = 0;
+    qint64                 atlas_work_created                                  = 0;
+    qint64                 atlas_work_reused                                   = 0;
     qint64                 text_cache_entry_child_nodes_cleared_for_replacement = 0;
     qint64                 text_cache_entry_child_nodes_cleared_for_removal     = 0;
     qint64                 text_cache_entry_max_child_nodes_cleared             = 0;
@@ -359,7 +360,6 @@ struct App_options
     bool                   quiet             = false;
     bool                   validate_json     = false;
     bool                   include_attempts  = false;
-    bool                   software_renderer = false;
     bool                   profile           = false;
     bool                   help_requested    = false;
     bool                   list_scenarios    = false;
@@ -391,7 +391,40 @@ struct Structural_checks
     bool                   scrollback_limit_respected      = true;
     bool                   workload_actions_accepted       = true;
     bool                   queue_pressure_observed         = true;
+    bool                   atlas_frame_observed            = true;
+    bool                   atlas_render_observed           = true;
+    bool                   atlas_instances_observed        = true;
+    bool                   atlas_budget_valid              = true;
+    bool                   atlas_failures_zero             = true;
     QString                snapshot_status                 = QStringLiteral("OK");
+};
+
+struct atlas_renderer_observation_t
+{
+    qint64                 capture_count_max                  = 0;
+    qint64                 prepare_count_max                  = 0;
+    qint64                 render_count_max                   = 0;
+    bool                   command_buffer_observed            = false;
+    bool                   render_target_observed             = false;
+    bool                   rhi_observed                       = false;
+    bool                   drew_observed                      = false;
+    qint64                 rect_instances_max                 = 0;
+    qint64                 glyph_instances_max                = 0;
+    qint64                 glyph_buffer_instances_max         = 0;
+    qint64                 rect_draw_calls_max                = 0;
+    qint64                 glyph_draw_calls_max               = 0;
+    qint64                 draw_calls_max                     = 0;
+    qint64                 page_count_max                     = 0;
+    qint64                 page_budget_max                    = 0;
+    qint64                 page_bytes_max                     = 0;
+    qint64                 allocated_bytes_max                = 0;
+    qint64                 budget_bytes_max                   = 0;
+    qint64                 used_bytes_max                     = 0;
+    qint64                 failed_inserts_max                 = 0;
+    qint64                 glyph_missed_instances_max         = 0;
+    qint64                 glyph_color_alpha_failures_max     = 0;
+    qint64                 glyph_coverage_failures_max        = 0;
+    qint64                 glyph_atlas_insert_failures_max    = 0;
 };
 
 struct Attempt_result
@@ -412,6 +445,7 @@ struct Attempt_result
     bool                                              visible_pixels_observed       = false;
     bool                                              rendered_pixels_changed       = true;
     QImage                                            rendered_image;
+    term::Qsg_atlas_frame_report                      atlas_report;
     QString                                           snapshot_status               = QStringLiteral("OK");
 };
 
@@ -483,6 +517,8 @@ struct Scenario_result
     sample_summary_t       readback_ns;
     memory_summary_t       process_memory;
     renderer_totals_t      renderer_totals;
+    atlas_renderer_observation_t
+                           atlas_renderer;
     bridge_delta_t         bridge_delta;
     lifecycle_delta_t      lifecycle_delta;
     std::vector<raw_attempt_sample_t>
@@ -679,8 +715,7 @@ void print_usage()
 #endif
         << "  --quiet                   suppress stdout when --output is used\n"
         << "  --validate-json           validate emitted JSON and scenario status\n"
-        << "  --include-attempts        include raw measured attempt timings in JSON\n"
-        << "  --software-renderer       use the Qt software scene graph\n";
+        << "  --include-attempts        include raw measured attempt timings in JSON\n";
 }
 
 void print_scenarios()
@@ -957,12 +992,6 @@ Parse_result parse_arguments(const QStringList& arguments)
 
         if (argument_is(argument, "--include-attempts")) {
             result.options.include_attempts = true;
-            ++index;
-            continue;
-        }
-
-        if (argument_is(argument, "--software-renderer")) {
-            result.options.software_renderer = true;
             ++index;
             continue;
         }
@@ -2148,11 +2177,16 @@ bool render_completion_reached(
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(surface);
     const term::terminal_renderer_stats_t renderer_stats = term::VNM_TerminalSurface_render_bridge::last_renderer_stats(
         surface);
+    const term::Qsg_atlas_frame_report atlas_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
     return
         invalidation_stats.last_rendered_snapshot_sequence >= sequence &&
         !invalidation_stats.pending_update                             &&
         renderer_stats.paint_completed                                 &&
-        renderer_stats.text_content_failures == 0;
+        renderer_stats.text_content_failures == 0                       &&
+        atlas_report.render_count > 0U                                  &&
+        atlas_report.drew                                               &&
+        atlas_report.render_snapshot_sequence >= sequence;
 }
 
 bool image_has_visible_terminal_pixels(const QImage& image)
@@ -2345,8 +2379,8 @@ void add_renderer_stats(
     totals.text_content_reused     += stats.text_content_reused;
     totals.text_content_removed    += stats.text_content_removed;
     totals.text_content_failures   += stats.text_content_failures;
-    totals.text_leaf_nodes_created += stats.text_leaf_nodes_created;
-    totals.text_leaf_nodes_reused  += stats.text_leaf_nodes_reused;
+    totals.atlas_work_created      += stats.atlas_work_created;
+    totals.atlas_work_reused       += stats.atlas_work_reused;
     totals.text_cache_entry_child_nodes_cleared_for_replacement +=
         stats.text_cache_entry_child_nodes_cleared_for_replacement;
     totals.text_cache_entry_child_nodes_cleared_for_removal +=
@@ -2576,6 +2610,8 @@ Attempt_result submit_snapshots_and_wait(
         add_renderer_stats(
             result.renderer_stats,
             term::VNM_TerminalSurface_render_bridge::last_renderer_stats(context.surface));
+        result.atlas_report =
+            term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(context.surface);
         if (!wait_result.completed) {
             break;
         }
@@ -2719,6 +2755,8 @@ Attempt_result wait_for_session_snapshot(
     result.rendered_image             = wait_result.rendered_image;
     result.renderer_stats =
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(context.surface);
+    result.atlas_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(context.surface);
     result.invalidation_stats =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(context.surface);
     result.elapsed_ns                    = elapsed_timer.nsecsElapsed();
@@ -2953,8 +2991,8 @@ void add_renderer_stats(
     totals.text_content_reused     += stats.text_content_reused;
     totals.text_content_removed    += stats.text_content_removed;
     totals.text_content_failures   += stats.text_content_failures;
-    totals.text_leaf_nodes_created += stats.text_leaf_nodes_created;
-    totals.text_leaf_nodes_reused  += stats.text_leaf_nodes_reused;
+    totals.atlas_work_created      += stats.atlas_work_created;
+    totals.atlas_work_reused       += stats.atlas_work_reused;
     totals.text_cache_entry_child_nodes_cleared_for_replacement +=
         stats.text_cache_entry_child_nodes_cleared_for_replacement;
     totals.text_cache_entry_child_nodes_cleared_for_removal +=
@@ -3203,29 +3241,171 @@ bool text_work_observed_for_scenario(
         return
             stats.graphic_rect_rows_rebuilt > 0 ||
             stats.graphic_rect_rows_reused  > 0 ||
-            stats.frame_packed_graphic_cells > 0;
+            stats.frame_packed_graphic_cells > 0 ||
+            stats.atlas_work_created         > 0 ||
+            stats.atlas_work_reused          > 0 ||
+            stats.frame_text_runs            > 0;
     }
 
     if (is_surface_session_text_output_scenario(scenario_name)) {
         return
-            stats.text_leaf_nodes_created > 0 ||
-            stats.text_leaf_nodes_reused  > 0 ||
+            stats.atlas_work_created > 0 ||
+            stats.atlas_work_reused  > 0 ||
             stats.frame_text_runs         > 0;
     }
 
     if (!is_measurement_reuse_only_scenario(scenario_name)) {
         return
-            stats.text_leaf_nodes_created > 0 ||
-            stats.text_leaf_nodes_reused  > 0;
+            stats.atlas_work_created > 0 ||
+            stats.atlas_work_reused  > 0;
     }
 
     return
-        stats.text_leaf_nodes_created         > 0 ||
-        stats.text_leaf_nodes_reused          > 0 ||
+        stats.atlas_work_created             > 0 ||
+        stats.atlas_work_reused              > 0 ||
         stats.text_content_reused             > 0 ||
         stats.text_resource_descriptor_reuses > 0 ||
         stats.graphic_rect_rows_reused        > 0 ||
         stats.graphic_arc_rows_reused         > 0;
+}
+
+qint64 atlas_counter_value(std::uint64_t value)
+{
+    constexpr std::uint64_t k_max_qint64 =
+        static_cast<std::uint64_t>(std::numeric_limits<qint64>::max());
+    return value > k_max_qint64
+        ? std::numeric_limits<qint64>::max()
+        : static_cast<qint64>(value);
+}
+
+void update_atlas_renderer_observation(
+    atlas_renderer_observation_t&       observation,
+    const term::Qsg_atlas_frame_report& report)
+{
+    observation.capture_count_max = std::max(
+        observation.capture_count_max,
+        atlas_counter_value(report.capture_count));
+    observation.prepare_count_max = std::max(
+        observation.prepare_count_max,
+        atlas_counter_value(report.prepare_count));
+    observation.render_count_max = std::max(
+        observation.render_count_max,
+        atlas_counter_value(report.render_count));
+    observation.command_buffer_observed =
+        observation.command_buffer_observed || report.command_buffer_non_null;
+    observation.render_target_observed =
+        observation.render_target_observed || report.render_target_non_null;
+    observation.rhi_observed = observation.rhi_observed || report.rhi_non_null;
+    observation.drew_observed = observation.drew_observed || report.drew;
+    observation.rect_instances_max = std::max(
+        observation.rect_instances_max,
+        static_cast<qint64>(report.frame_build.rect_instances));
+    observation.glyph_instances_max = std::max(
+        observation.glyph_instances_max,
+        static_cast<qint64>(report.frame_build.glyph_instances));
+    observation.glyph_buffer_instances_max = std::max(
+        observation.glyph_buffer_instances_max,
+        static_cast<qint64>(report.render.glyph_buffer_instances));
+    observation.rect_draw_calls_max = std::max(
+        observation.rect_draw_calls_max,
+        static_cast<qint64>(report.render.rect_draw_calls));
+    observation.glyph_draw_calls_max = std::max(
+        observation.glyph_draw_calls_max,
+        static_cast<qint64>(report.render.glyph_draw_calls));
+    observation.draw_calls_max = std::max(
+        observation.draw_calls_max,
+        static_cast<qint64>(report.render.draw_calls));
+    observation.page_count_max = std::max(
+        observation.page_count_max,
+        static_cast<qint64>(report.render.atlas_page_count));
+    observation.page_budget_max = std::max(
+        observation.page_budget_max,
+        static_cast<qint64>(report.render.atlas_page_budget));
+    observation.page_bytes_max = std::max(
+        observation.page_bytes_max,
+        atlas_counter_value(report.render.atlas_page_bytes));
+    observation.allocated_bytes_max = std::max(
+        observation.allocated_bytes_max,
+        atlas_counter_value(report.render.atlas_allocated_bytes));
+    observation.budget_bytes_max = std::max(
+        observation.budget_bytes_max,
+        atlas_counter_value(report.render.atlas_budget_bytes));
+    observation.used_bytes_max = std::max(
+        observation.used_bytes_max,
+        atlas_counter_value(report.render.atlas_used_bytes));
+    observation.failed_inserts_max = std::max(
+        observation.failed_inserts_max,
+        atlas_counter_value(report.render.atlas_failed_inserts));
+    observation.glyph_missed_instances_max = std::max(
+        observation.glyph_missed_instances_max,
+        static_cast<qint64>(report.frame_build.glyph_missed_instances));
+    observation.glyph_color_alpha_failures_max = std::max(
+        observation.glyph_color_alpha_failures_max,
+        static_cast<qint64>(report.frame_build.glyph_color_alpha_failures));
+    observation.glyph_coverage_failures_max = std::max(
+        observation.glyph_coverage_failures_max,
+        static_cast<qint64>(report.frame_build.glyph_coverage_failures));
+    observation.glyph_atlas_insert_failures_max = std::max(
+        observation.glyph_atlas_insert_failures_max,
+        static_cast<qint64>(report.frame_build.glyph_atlas_insert_failures));
+}
+
+bool atlas_frame_observed_for_attempt(
+    const Attempt_result& attempt)
+{
+    return
+        attempt.atlas_report.capture_count > 0U &&
+        attempt.atlas_report.prepare_count > 0U &&
+        attempt.atlas_report.render_snapshot_sequence == attempt.sequence;
+}
+
+bool atlas_render_observed_for_attempt(
+    const Attempt_result& attempt)
+{
+    return
+        attempt.atlas_report.render_count > 0U            &&
+        attempt.atlas_report.command_buffer_non_null      &&
+        attempt.atlas_report.render_target_non_null       &&
+        attempt.atlas_report.rhi_non_null                 &&
+        attempt.atlas_report.drew;
+}
+
+bool atlas_instances_observed_for_attempt(
+    const Attempt_result& attempt)
+{
+    const qint64 logical_instances =
+        static_cast<qint64>(attempt.atlas_report.frame_build.rect_instances) +
+        static_cast<qint64>(attempt.atlas_report.frame_build.glyph_instances);
+    const qint64 buffer_instances =
+        static_cast<qint64>(attempt.atlas_report.render.rect_buffer.active_instance_count) +
+        static_cast<qint64>(attempt.atlas_report.render.glyph_buffer_instances);
+    return
+        logical_instances                 > 0 &&
+        buffer_instances                  > 0 &&
+        attempt.atlas_report.render.draw_calls > 0;
+}
+
+bool atlas_budget_valid_for_attempt(
+    const Attempt_result& attempt)
+{
+    const term::Qsg_atlas_render_summary& render = attempt.atlas_report.render;
+    return
+        render.atlas_page_budget     >= 1 &&
+        render.atlas_budget_bytes    >  0U &&
+        render.atlas_allocated_bytes <= render.atlas_budget_bytes &&
+        render.atlas_used_bytes      <= render.atlas_allocated_bytes;
+}
+
+bool atlas_failures_zero_for_attempt(
+    const Attempt_result& attempt)
+{
+    return
+        attempt.atlas_report.render.atlas_failed_inserts        == 0U &&
+        attempt.atlas_report.cache.failed_inserts               == 0U &&
+        attempt.atlas_report.frame_build.glyph_missed_instances      == 0  &&
+        attempt.atlas_report.frame_build.glyph_color_alpha_failures  == 0  &&
+        attempt.atlas_report.frame_build.glyph_coverage_failures     == 0  &&
+        attempt.atlas_report.frame_build.glyph_atlas_insert_failures == 0;
 }
 
 void update_structural_checks(
@@ -3258,6 +3438,21 @@ void update_structural_checks(
     result.structural_checks.rendered_pixels_changed =
         result.structural_checks.rendered_pixels_changed &&
         attempt.rendered_pixels_changed;
+    result.structural_checks.atlas_frame_observed =
+        result.structural_checks.atlas_frame_observed &&
+        atlas_frame_observed_for_attempt(attempt);
+    result.structural_checks.atlas_render_observed =
+        result.structural_checks.atlas_render_observed &&
+        atlas_render_observed_for_attempt(attempt);
+    result.structural_checks.atlas_instances_observed =
+        result.structural_checks.atlas_instances_observed &&
+        atlas_instances_observed_for_attempt(attempt);
+    result.structural_checks.atlas_budget_valid =
+        result.structural_checks.atlas_budget_valid &&
+        atlas_budget_valid_for_attempt(attempt);
+    result.structural_checks.atlas_failures_zero =
+        result.structural_checks.atlas_failures_zero &&
+        atlas_failures_zero_for_attempt(attempt);
 }
 
 void finish_scenario_status(Scenario_result& result)
@@ -3277,7 +3472,12 @@ void finish_scenario_status(Scenario_result& result)
             !result.structural_checks.paint_completed ||
             !result.structural_checks.text_content_failures_zero ||
             !result.structural_checks.text_work_observed ||
-            !result.structural_checks.visible_pixels_observed);
+            !result.structural_checks.visible_pixels_observed ||
+            !result.structural_checks.atlas_frame_observed ||
+            !result.structural_checks.atlas_render_observed ||
+            !result.structural_checks.atlas_instances_observed ||
+            !result.structural_checks.atlas_budget_valid ||
+            !result.structural_checks.atlas_failures_zero);
     const bool viewport_checks_failed =
         result.viewport_metrics_applicable &&
         (!result.structural_checks.rendered_pixels_changed ||
@@ -3747,6 +3947,7 @@ Scenario_result run_surface_session_scroll_scenario(
         }
 
         add_renderer_stats(result.renderer_totals, attempt.renderer_stats);
+        update_atlas_renderer_observation(result.atlas_renderer, attempt.atlas_report);
         update_structural_checks(result, attempt);
         update_surface_session_viewport_checks(result, burst);
         result.wheel_events_accepted_count += burst.accepted_count;
@@ -4149,6 +4350,9 @@ Scenario_result run_surface_session_action_scenario(
 
         add_renderer_stats(result.renderer_totals, attempt.renderer_stats);
         if (profile.render_expected) {
+            update_atlas_renderer_observation(result.atlas_renderer, attempt.atlas_report);
+        }
+        if (profile.render_expected) {
             update_structural_checks(result, attempt);
         }
         ++result.workload_actions_expected_count;
@@ -4201,8 +4405,8 @@ Scenario_result run_surface_session_action_scenario(
         result.structural_checks.queue_pressure_observed =
             result.output_high_water_observed;
         result.structural_checks.text_work_observed =
-            result.renderer_totals.text_leaf_nodes_created > 0 ||
-            result.renderer_totals.text_leaf_nodes_reused  > 0;
+            result.renderer_totals.atlas_work_created > 0 ||
+            result.renderer_totals.atlas_work_reused  > 0;
     }
     else
     if (profile.write_high_water_pressure) {
@@ -4280,6 +4484,7 @@ Scenario_result run_scenario_impl(
         }
 
         add_renderer_stats(result.renderer_totals, attempt.renderer_stats);
+        update_atlas_renderer_observation(result.atlas_renderer, attempt.atlas_report);
         update_structural_checks(result, attempt);
 
         if (!attempt.completed) {
@@ -4311,6 +4516,38 @@ Scenario_result run_scenario_impl(
     return result;
 }
 
+bool profile_snapshot_has_descendant(
+    const term::Profile_node_snapshot& node,
+    std::string_view                   name)
+{
+    if (std::string_view(node.name) == name) {
+        return true;
+    }
+
+    for (const term::Profile_node_snapshot& child : node.children) {
+        if (profile_snapshot_has_descendant(child, name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool render_profile_snapshot_has_atlas_scopes(
+    const term::Render_profile_snapshot_t& profile_snapshot)
+{
+    return
+        profile_snapshot_has_descendant(
+            profile_snapshot.root,
+            "Qsg_atlas_render_node::prepare") &&
+        profile_snapshot_has_descendant(
+            profile_snapshot.root,
+            "Qsg_atlas_render_node::prepare_atlas_instances") &&
+        profile_snapshot_has_descendant(
+            profile_snapshot.root,
+            "Qsg_atlas_render_node::render");
+}
+
 term::Render_profile_snapshot_t wait_for_render_profile_quiescence(
     Benchmark_context& context)
 {
@@ -4334,7 +4571,9 @@ term::Render_profile_snapshot_t wait_for_render_profile_quiescence(
         const term::Render_profile_snapshot_t profile_snapshot =
             term::VNM_TerminalSurface_render_bridge::render_profiler_snapshot(
                 context.surface);
-        if (profile_snapshot.sequence >= snapshot->metadata.sequence) {
+        if (profile_snapshot.sequence >= snapshot->metadata.sequence &&
+            render_profile_snapshot_has_atlas_scopes(profile_snapshot))
+        {
             return profile_snapshot;
         }
 
@@ -4455,14 +4694,14 @@ QJsonObject normalized_per_consumed_update_json(const Scenario_result& result)
             result.renderer_totals.qt_text_layout_calls,
             denominator));
     counters.insert(
-        QStringLiteral("text_leaf_nodes_created"),
+        QStringLiteral("atlas_work_created"),
         normalized_per_consumed_update_value(
-            result.renderer_totals.text_leaf_nodes_created,
+            result.renderer_totals.atlas_work_created,
             denominator));
     counters.insert(
-        QStringLiteral("text_leaf_nodes_reused"),
+        QStringLiteral("atlas_work_reused"),
         normalized_per_consumed_update_value(
-            result.renderer_totals.text_leaf_nodes_reused,
+            result.renderer_totals.atlas_work_reused,
             denominator));
     counters.insert(
         QStringLiteral("text_key_builds"),
@@ -4591,6 +4830,13 @@ QJsonObject structural_checks_json(const Structural_checks& checks)
     object.insert(
         QStringLiteral("queue_pressure_observed"),
         checks.queue_pressure_observed);
+    object.insert(QStringLiteral("atlas_frame_observed"), checks.atlas_frame_observed);
+    object.insert(QStringLiteral("atlas_render_observed"), checks.atlas_render_observed);
+    object.insert(
+        QStringLiteral("atlas_instances_observed"),
+        checks.atlas_instances_observed);
+    object.insert(QStringLiteral("atlas_budget_valid"),  checks.atlas_budget_valid);
+    object.insert(QStringLiteral("atlas_failures_zero"), checks.atlas_failures_zero);
     return object;
 }
 
@@ -5085,11 +5331,67 @@ QJsonObject scenario_json(
         QStringLiteral("renderer_text_failures_total"),
         result.renderer_totals.text_content_failures);
     object.insert(
-        QStringLiteral("text_leaf_nodes_created"),
-        result.renderer_totals.text_leaf_nodes_created);
+        QStringLiteral("atlas_capture_count_max"),
+        result.atlas_renderer.capture_count_max);
     object.insert(
-        QStringLiteral("text_leaf_nodes_reused"),
-        result.renderer_totals.text_leaf_nodes_reused);
+        QStringLiteral("atlas_prepare_count_max"),
+        result.atlas_renderer.prepare_count_max);
+    object.insert(
+        QStringLiteral("atlas_render_count_max"),
+        result.atlas_renderer.render_count_max);
+    object.insert(
+        QStringLiteral("atlas_command_buffer_observed"),
+        result.atlas_renderer.command_buffer_observed);
+    object.insert(
+        QStringLiteral("atlas_render_target_observed"),
+        result.atlas_renderer.render_target_observed);
+    object.insert(QStringLiteral("atlas_rhi_observed"), result.atlas_renderer.rhi_observed);
+    object.insert(QStringLiteral("atlas_drew_observed"), result.atlas_renderer.drew_observed);
+    object.insert(
+        QStringLiteral("atlas_rect_instances_max"),
+        result.atlas_renderer.rect_instances_max);
+    object.insert(
+        QStringLiteral("atlas_glyph_instances_max"),
+        result.atlas_renderer.glyph_instances_max);
+    object.insert(
+        QStringLiteral("atlas_glyph_buffer_instances_max"),
+        result.atlas_renderer.glyph_buffer_instances_max);
+    object.insert(
+        QStringLiteral("atlas_rect_draw_calls_max"),
+        result.atlas_renderer.rect_draw_calls_max);
+    object.insert(
+        QStringLiteral("atlas_glyph_draw_calls_max"),
+        result.atlas_renderer.glyph_draw_calls_max);
+    object.insert(QStringLiteral("atlas_draw_calls_max"), result.atlas_renderer.draw_calls_max);
+    object.insert(QStringLiteral("atlas_page_count_max"), result.atlas_renderer.page_count_max);
+    object.insert(QStringLiteral("atlas_page_budget_max"), result.atlas_renderer.page_budget_max);
+    object.insert(QStringLiteral("atlas_page_bytes_max"), result.atlas_renderer.page_bytes_max);
+    object.insert(
+        QStringLiteral("atlas_allocated_bytes_max"),
+        result.atlas_renderer.allocated_bytes_max);
+    object.insert(QStringLiteral("atlas_budget_bytes_max"), result.atlas_renderer.budget_bytes_max);
+    object.insert(QStringLiteral("atlas_used_bytes_max"), result.atlas_renderer.used_bytes_max);
+    object.insert(
+        QStringLiteral("atlas_failed_inserts_max"),
+        result.atlas_renderer.failed_inserts_max);
+    object.insert(
+        QStringLiteral("atlas_glyph_missed_instances_max"),
+        result.atlas_renderer.glyph_missed_instances_max);
+    object.insert(
+        QStringLiteral("atlas_glyph_color_alpha_failures_max"),
+        result.atlas_renderer.glyph_color_alpha_failures_max);
+    object.insert(
+        QStringLiteral("atlas_glyph_coverage_failures_max"),
+        result.atlas_renderer.glyph_coverage_failures_max);
+    object.insert(
+        QStringLiteral("atlas_glyph_atlas_insert_failures_max"),
+        result.atlas_renderer.glyph_atlas_insert_failures_max);
+    object.insert(
+        QStringLiteral("atlas_work_created"),
+        result.renderer_totals.atlas_work_created);
+    object.insert(
+        QStringLiteral("atlas_work_reused"),
+        result.renderer_totals.atlas_work_reused);
     object.insert(
         QStringLiteral("text_cache_entry_child_nodes_cleared_for_replacement"),
         result.renderer_totals.text_cache_entry_child_nodes_cleared_for_replacement);
@@ -5671,7 +5973,12 @@ bool required_structural_checks_passed(const QJsonObject& object)
             !checks.value(QStringLiteral("paint_completed")).toBool()                 ||
             !checks.value(QStringLiteral("text_content_failures_zero")).toBool()      ||
             !checks.value(QStringLiteral("text_work_observed")).toBool()              ||
-            !checks.value(QStringLiteral("visible_pixels_observed")).toBool()))
+            !checks.value(QStringLiteral("visible_pixels_observed")).toBool()         ||
+            !checks.value(QStringLiteral("atlas_frame_observed")).toBool()            ||
+            !checks.value(QStringLiteral("atlas_render_observed")).toBool()           ||
+            !checks.value(QStringLiteral("atlas_instances_observed")).toBool()        ||
+            !checks.value(QStringLiteral("atlas_budget_valid")).toBool()              ||
+            !checks.value(QStringLiteral("atlas_failures_zero")).toBool()))
     {
         return false;
     }
@@ -6290,10 +6597,12 @@ bool validate_renderer_counter_invariants(
         return false;
     }
 
-    if (json_counter(object, QStringLiteral("route_fast_text_cells")) != 0 ||
+    if (json_counter(object, QStringLiteral("route_fast_text_cells")) <
+            candidate_fast_text_cells ||
         json_counter(object, QStringLiteral("route_graphic_geometry_cells")) <
-            simple_content_graphic_route_cells                             ||
-        json_counter(object, QStringLiteral("route_fallback_cells"))  != 0 ||
+            simple_content_graphic_route_cells ||
+        json_counter(object, QStringLiteral("route_fallback_cells")) <
+            json_counter(object, QStringLiteral("simple_content_route_fallback_cells")) ||
         json_counter(object, QStringLiteral("qt_text_layout_calls")) !=
             json_counter(object, QStringLiteral("route_qt_text_layout_runs")))
     {
@@ -6436,12 +6745,12 @@ bool validate_renderer_counter_invariants(
         return false;
     }
 
-    const qint64 text_leaf_nodes_reused =
-        json_counter(object, QStringLiteral("text_leaf_nodes_reused"));
-    if (text_leaf_nodes_reused >
+    const qint64 atlas_work_reused =
+        json_counter(object, QStringLiteral("atlas_work_reused"));
+    if (atlas_work_reused >
         json_counter(object, QStringLiteral("renderer_text_rebuilds_total")))
     {
-        *out_error = QStringLiteral("text leaf-node reuse counters are inconsistent");
+        *out_error = QStringLiteral("atlas work reuse counters are inconsistent");
         return false;
     }
 
@@ -6624,8 +6933,8 @@ bool validate_per_consumed_update_json(
     const QJsonObject counters = counters_value.toObject();
     const QStringList counter_keys = {
         QStringLiteral("qt_text_layout_calls"),
-        QStringLiteral("text_leaf_nodes_created"),
-        QStringLiteral("text_leaf_nodes_reused"),
+        QStringLiteral("atlas_work_created"),
+        QStringLiteral("atlas_work_reused"),
         QStringLiteral("text_key_builds"),
         QStringLiteral("text_key_bytes"),
         QStringLiteral("renderer_text_rebuilds_total"),
@@ -6725,61 +7034,6 @@ bool validate_per_consumed_update_json(
         out_error);
 }
 
-bool validate_measurement_reuse_only_json(
-    const QJsonObject& object,
-    const QString&     scenario_name,
-    QString*           out_error)
-{
-    if (!is_measurement_reuse_only_scenario(scenario_name)) {
-        return true;
-    }
-
-    const qint64 completed_frames =
-        object.value(QStringLiteral("completed_frames")).toInteger();
-    const qint64 bridge_update_requests =
-        object.value(QStringLiteral("bridge_update_requests_delta")).toInteger();
-    const qint64 bridge_scheduled_updates =
-        object.value(QStringLiteral("bridge_scheduled_updates_delta")).toInteger();
-    const qint64 bridge_coalesced_requests =
-        object.value(QStringLiteral("bridge_coalesced_requests_delta")).toInteger();
-    const qint64 bridge_consumed_updates =
-        object.value(QStringLiteral("bridge_consumed_updates_delta")).toInteger();
-    if (bridge_consumed_updates   != completed_frames ||
-        bridge_update_requests    != completed_frames ||
-        bridge_scheduled_updates  != completed_frames ||
-        bridge_coalesced_requests != 0)
-    {
-        *out_error = QStringLiteral(
-            "reuse-only scenario did not isolate one update per measured attempt: %1"
-        ).arg(scenario_name);
-        return false;
-    }
-
-    const bool reusable_work_observed =
-        json_counter(object, QStringLiteral("renderer_text_reused_total")) > 0 ||
-        json_counter(object, QStringLiteral("graphic_rect_rows_reused"))   > 0 ||
-        json_counter(object, QStringLiteral("graphic_arc_rows_reused"))    > 0 ||
-        json_counter(object, QStringLiteral("frame_packed_graphic_cells")) > 0;
-    if (!reusable_work_observed                                                       ||
-        json_counter(object, QStringLiteral("text_clean_reuse_skips"))       != 0     ||
-        json_counter(object, QStringLiteral("renderer_text_rebuilds_total")) != 0     ||
-        json_counter(object, QStringLiteral("qt_text_layout_calls"))         != 0     ||
-        json_counter(object, QStringLiteral("text_leaf_nodes_created"))      != 0     ||
-        json_counter(object, QStringLiteral("text_leaf_nodes_reused"))       != 0     ||
-        json_counter(object, QStringLiteral("qsg_nodes_created"))            != 0     ||
-        json_counter(object, QStringLiteral("qsg_nodes_replaced"))           != 0     ||
-        json_counter(object, QStringLiteral("qsg_nodes_destroyed"))          != 0     ||
-        json_counter(object, QStringLiteral("route_fast_text_cells"))        != 0)
-    {
-        *out_error = QStringLiteral(
-            "reuse-only scenario reported rebuild/layout/node churn: %1")
-            .arg(scenario_name);
-        return false;
-    }
-
-    return true;
-}
-
 bool profile_nonnegative_integer_field(
     const QJsonObject& object,
     const QString&     key,
@@ -6801,6 +7055,170 @@ bool profile_nonnegative_integer_field(
     }
 
     *out_value = static_cast<qint64>(numeric_value);
+    return true;
+}
+
+bool validate_atlas_renderer_json(
+    const QJsonObject& object,
+    QString*           out_error)
+{
+    const QString label = QStringLiteral("scenario");
+    const QStringList numeric_keys = {
+        QStringLiteral("atlas_capture_count_max"),
+        QStringLiteral("atlas_prepare_count_max"),
+        QStringLiteral("atlas_render_count_max"),
+        QStringLiteral("atlas_rect_instances_max"),
+        QStringLiteral("atlas_glyph_instances_max"),
+        QStringLiteral("atlas_glyph_buffer_instances_max"),
+        QStringLiteral("atlas_rect_draw_calls_max"),
+        QStringLiteral("atlas_glyph_draw_calls_max"),
+        QStringLiteral("atlas_draw_calls_max"),
+        QStringLiteral("atlas_page_count_max"),
+        QStringLiteral("atlas_page_budget_max"),
+        QStringLiteral("atlas_page_bytes_max"),
+        QStringLiteral("atlas_allocated_bytes_max"),
+        QStringLiteral("atlas_budget_bytes_max"),
+        QStringLiteral("atlas_used_bytes_max"),
+        QStringLiteral("atlas_failed_inserts_max"),
+        QStringLiteral("atlas_glyph_missed_instances_max"),
+        QStringLiteral("atlas_glyph_color_alpha_failures_max"),
+        QStringLiteral("atlas_glyph_coverage_failures_max"),
+        QStringLiteral("atlas_glyph_atlas_insert_failures_max"),
+    };
+
+    qint64 atlas_capture_count_max               = 0;
+    qint64 atlas_prepare_count_max               = 0;
+    qint64 atlas_render_count_max                = 0;
+    qint64 atlas_rect_instances_max              = 0;
+    qint64 atlas_glyph_instances_max             = 0;
+    qint64 atlas_glyph_buffer_instances_max      = 0;
+    qint64 atlas_rect_draw_calls_max             = 0;
+    qint64 atlas_glyph_draw_calls_max            = 0;
+    qint64 atlas_draw_calls_max                  = 0;
+    qint64 atlas_page_count_max                  = 0;
+    qint64 atlas_page_budget_max                 = 0;
+    qint64 atlas_page_bytes_max                  = 0;
+    qint64 atlas_allocated_bytes_max             = 0;
+    qint64 atlas_budget_bytes_max                = 0;
+    qint64 atlas_used_bytes_max                  = 0;
+    qint64 atlas_failed_inserts_max              = 0;
+    qint64 atlas_glyph_missed_instances_max      = 0;
+    qint64 atlas_glyph_color_alpha_failures_max  = 0;
+    qint64 atlas_glyph_coverage_failures_max     = 0;
+    qint64 atlas_glyph_atlas_insert_failures_max = 0;
+    qint64* const numeric_outputs[] = {
+        &atlas_capture_count_max,
+        &atlas_prepare_count_max,
+        &atlas_render_count_max,
+        &atlas_rect_instances_max,
+        &atlas_glyph_instances_max,
+        &atlas_glyph_buffer_instances_max,
+        &atlas_rect_draw_calls_max,
+        &atlas_glyph_draw_calls_max,
+        &atlas_draw_calls_max,
+        &atlas_page_count_max,
+        &atlas_page_budget_max,
+        &atlas_page_bytes_max,
+        &atlas_allocated_bytes_max,
+        &atlas_budget_bytes_max,
+        &atlas_used_bytes_max,
+        &atlas_failed_inserts_max,
+        &atlas_glyph_missed_instances_max,
+        &atlas_glyph_color_alpha_failures_max,
+        &atlas_glyph_coverage_failures_max,
+        &atlas_glyph_atlas_insert_failures_max,
+    };
+    for (qsizetype index = 0; index < numeric_keys.size(); ++index) {
+        if (!profile_nonnegative_integer_field(
+                object,
+                numeric_keys[index],
+                label,
+                numeric_outputs[static_cast<std::size_t>(index)],
+                out_error))
+        {
+            return false;
+        }
+    }
+
+    const QStringList bool_keys = {
+        QStringLiteral("atlas_command_buffer_observed"),
+        QStringLiteral("atlas_render_target_observed"),
+        QStringLiteral("atlas_rhi_observed"),
+        QStringLiteral("atlas_drew_observed"),
+    };
+    for (const QString& key : bool_keys) {
+        if (!object.value(key).isBool()) {
+            *out_error = QStringLiteral("scenario atlas key is not boolean: %1").arg(key);
+            return false;
+        }
+    }
+
+    const bool render_expected =
+        object.value(QStringLiteral("render_expected")).toBool(true);
+    const qint64 logical_instances =
+        atlas_rect_instances_max + atlas_glyph_instances_max;
+    const qint64 component_draw_calls =
+        atlas_rect_draw_calls_max + atlas_glyph_draw_calls_max;
+    const bool atlas_budget_valid =
+        atlas_page_budget_max      >= 1 &&
+        atlas_budget_bytes_max     >  0 &&
+        atlas_allocated_bytes_max  <= atlas_budget_bytes_max &&
+        atlas_used_bytes_max       <= atlas_allocated_bytes_max;
+    const bool atlas_failures_zero =
+        atlas_failed_inserts_max              == 0 &&
+        atlas_glyph_missed_instances_max      == 0 &&
+        atlas_glyph_color_alpha_failures_max  == 0 &&
+        atlas_glyph_coverage_failures_max     == 0 &&
+        atlas_glyph_atlas_insert_failures_max == 0;
+
+    if (render_expected) {
+        if (atlas_capture_count_max <= 0 ||
+            atlas_prepare_count_max <= 0 ||
+            atlas_render_count_max  <= 0 ||
+            !object.value(QStringLiteral("atlas_command_buffer_observed")).toBool() ||
+            !object.value(QStringLiteral("atlas_render_target_observed")).toBool()  ||
+            !object.value(QStringLiteral("atlas_rhi_observed")).toBool()            ||
+            !object.value(QStringLiteral("atlas_drew_observed")).toBool()           ||
+            logical_instances       <= 0 ||
+            component_draw_calls    <= 0 ||
+            atlas_draw_calls_max    <= 0)
+        {
+            *out_error = QStringLiteral("scenario atlas render evidence is missing");
+            return false;
+        }
+
+        if (!atlas_budget_valid) {
+            *out_error = QStringLiteral("scenario atlas budget counters are invalid");
+            return false;
+        }
+
+        if (!atlas_failures_zero) {
+            *out_error = QStringLiteral("scenario atlas failure counters are nonzero");
+            return false;
+        }
+    }
+    else {
+        for (const QString& key : numeric_keys) {
+            qint64 value = 0;
+            if (!profile_nonnegative_integer_field(object, key, label, &value, out_error)) {
+                return false;
+            }
+            if (value != 0) {
+                *out_error = QStringLiteral("scenario no-render atlas counter is nonzero: %1")
+                    .arg(key);
+                return false;
+            }
+        }
+
+        for (const QString& key : bool_keys) {
+            if (object.value(key).toBool()) {
+                *out_error = QStringLiteral("scenario no-render atlas flag is true: %1")
+                    .arg(key);
+                return false;
+            }
+        }
+    }
+
     return true;
 }
 
@@ -7005,10 +7423,6 @@ bool profile_node_has_descendant_in_scope(
 bool validate_scenario_profile_value(
     const QJsonValue&  value,
     const QString&     label,
-    bool               require_background_batched_update_scope,
-    bool               require_selection_batched_update_scope,
-    bool               require_graphic_batched_update_scope,
-    bool               require_decoration_batched_update_scope,
     QString*           out_error)
 {
     if (!value.isObject()) {
@@ -7053,17 +7467,13 @@ bool validate_scenario_profile_value(
     }
 
     QStringList seen_thread_keys;
-    bool gui_thread_has_run_scenario                 = false;
-    bool render_thread_has_update_paint_node         = false;
-    bool profile_has_packed_data_scope               = false;
-    bool profile_has_background_row_scope            = false;
-    bool profile_has_selection_row_scope             = false;
-    bool profile_has_graphic_row_scope               = false;
-    bool profile_has_decoration_row_scope            = false;
-    bool profile_has_background_batched_update_scope = false;
-    bool profile_has_selection_batched_update_scope  = false;
-    bool profile_has_graphic_batched_update_scope    = false;
-    bool profile_has_decoration_batched_update_scope = false;
+    bool gui_thread_has_run_scenario         = false;
+    bool render_thread_has_update_paint_node = false;
+    bool profile_has_atlas_prepare_scope      = false;
+    bool profile_has_atlas_instances_scope    = false;
+    bool profile_has_render_frame_scope       = false;
+    bool profile_has_render_frame_cells_scope = false;
+    bool profile_has_packed_data_scope        = false;
     for (int index = 0; index < threads.size(); ++index) {
         if (!threads[index].isObject()) {
             *out_error = QStringLiteral("scenario profile thread is not an object: %1[%2]")
@@ -7118,51 +7528,31 @@ bool validate_scenario_profile_value(
                 root.toObject(),
                 QStringLiteral("VNM_TerminalSurface::updatePaintNode"));
         }
+        profile_has_atlas_prepare_scope =
+            profile_has_atlas_prepare_scope ||
+            profile_node_has_descendant(
+                root.toObject(),
+                QStringLiteral("Qsg_atlas_render_node::prepare"));
+        profile_has_atlas_instances_scope =
+            profile_has_atlas_instances_scope ||
+            profile_node_has_descendant(
+                root.toObject(),
+                QStringLiteral("Qsg_atlas_render_node::prepare_atlas_instances"));
         profile_has_packed_data_scope =
             profile_has_packed_data_scope ||
             profile_node_has_descendant_in_scope(
                 root.toObject(),
                 QStringLiteral("build_terminal_render_frame::packed_data"));
-        profile_has_background_row_scope =
-            profile_has_background_row_scope ||
+        profile_has_render_frame_scope =
+            profile_has_render_frame_scope ||
             profile_node_has_descendant(
                 root.toObject(),
-                QStringLiteral("sync_background_rect_row_layer"));
-        profile_has_selection_row_scope =
-            profile_has_selection_row_scope ||
-            profile_node_has_descendant(
+                QStringLiteral("build_terminal_render_frame"));
+        profile_has_render_frame_cells_scope =
+            profile_has_render_frame_cells_scope ||
+            profile_node_has_descendant_in_scope(
                 root.toObject(),
-                QStringLiteral("sync_selection_rect_row_layer"));
-        profile_has_graphic_row_scope =
-            profile_has_graphic_row_scope ||
-            profile_node_has_descendant(
-                root.toObject(),
-                QStringLiteral("sync_graphic_rect_row_layer"));
-        profile_has_decoration_row_scope =
-            profile_has_decoration_row_scope ||
-            profile_node_has_descendant(
-                root.toObject(),
-                QStringLiteral("sync_decoration_rect_row_layer"));
-        profile_has_background_batched_update_scope =
-            profile_has_background_batched_update_scope ||
-            profile_node_has_descendant(
-                root.toObject(),
-                QStringLiteral("update_background_batched_rect_geometry"));
-        profile_has_selection_batched_update_scope =
-            profile_has_selection_batched_update_scope ||
-            profile_node_has_descendant(
-                root.toObject(),
-                QStringLiteral("update_selection_batched_rect_geometry"));
-        profile_has_graphic_batched_update_scope =
-            profile_has_graphic_batched_update_scope ||
-            profile_node_has_descendant(
-                root.toObject(),
-                QStringLiteral("update_graphic_batched_rect_geometry"));
-        profile_has_decoration_batched_update_scope =
-            profile_has_decoration_batched_update_scope ||
-            profile_node_has_descendant(
-                root.toObject(),
-                QStringLiteral("update_decoration_batched_rect_geometry"));
+                QStringLiteral("build_terminal_render_frame::cells"));
     }
 
     if (!seen_thread_keys.contains(
@@ -7177,46 +7567,13 @@ bool validate_scenario_profile_value(
 
     if (!gui_thread_has_run_scenario ||
         !render_thread_has_update_paint_node ||
-        !profile_has_packed_data_scope ||
-        !profile_has_background_row_scope ||
-        !profile_has_selection_row_scope ||
-        !profile_has_graphic_row_scope ||
-        !profile_has_decoration_row_scope)
+        !profile_has_atlas_prepare_scope ||
+        !profile_has_atlas_instances_scope ||
+        !profile_has_render_frame_scope ||
+        !profile_has_render_frame_cells_scope ||
+        !profile_has_packed_data_scope)
     {
         *out_error = QStringLiteral("scenario profile required scopes are missing: %1")
-            .arg(label);
-        return false;
-    }
-
-    if (require_background_batched_update_scope &&
-        !profile_has_background_batched_update_scope)
-    {
-        *out_error = QStringLiteral(
-            "scenario profile background batched-geometry scope is missing: %1")
-            .arg(label);
-        return false;
-    }
-    if (require_selection_batched_update_scope &&
-        !profile_has_selection_batched_update_scope)
-    {
-        *out_error = QStringLiteral(
-            "scenario profile selection batched-geometry scope is missing: %1")
-            .arg(label);
-        return false;
-    }
-    if (require_graphic_batched_update_scope &&
-        !profile_has_graphic_batched_update_scope)
-    {
-        *out_error = QStringLiteral(
-            "scenario profile graphic batched-geometry scope is missing: %1")
-            .arg(label);
-        return false;
-    }
-    if (require_decoration_batched_update_scope &&
-        !profile_has_decoration_batched_update_scope)
-    {
-        *out_error = QStringLiteral(
-            "scenario profile decoration batched-geometry scope is missing: %1")
             .arg(label);
         return false;
     }
@@ -7233,22 +7590,10 @@ bool validate_scenario_profile_json(
         return true;
     }
 
-    const bool require_background_batched_update_scope =
-        json_counter(object, QStringLiteral("background_batched_rects")) > 0;
-    const bool require_selection_batched_update_scope =
-        json_counter(object, QStringLiteral("selection_batched_rects")) > 0;
-    const bool require_graphic_batched_update_scope =
-        json_counter(object, QStringLiteral("graphic_batched_rects")) > 0;
-    const bool require_decoration_batched_update_scope =
-        json_counter(object, QStringLiteral("decoration_batched_rects")) > 0;
     return
         validate_scenario_profile_value(
             profile,
             QStringLiteral("scenario.profile"),
-            require_background_batched_update_scope,
-            require_selection_batched_update_scope,
-            require_graphic_batched_update_scope,
-            require_decoration_batched_update_scope,
             out_error);
 }
 
@@ -7338,8 +7683,32 @@ bool validate_scenario_json(
         QStringLiteral("renderer_text_reused_total"),
         QStringLiteral("renderer_text_removed_total"),
         QStringLiteral("renderer_text_failures_total"),
-        QStringLiteral("text_leaf_nodes_created"),
-        QStringLiteral("text_leaf_nodes_reused"),
+        QStringLiteral("atlas_capture_count_max"),
+        QStringLiteral("atlas_prepare_count_max"),
+        QStringLiteral("atlas_render_count_max"),
+        QStringLiteral("atlas_command_buffer_observed"),
+        QStringLiteral("atlas_render_target_observed"),
+        QStringLiteral("atlas_rhi_observed"),
+        QStringLiteral("atlas_drew_observed"),
+        QStringLiteral("atlas_rect_instances_max"),
+        QStringLiteral("atlas_glyph_instances_max"),
+        QStringLiteral("atlas_glyph_buffer_instances_max"),
+        QStringLiteral("atlas_rect_draw_calls_max"),
+        QStringLiteral("atlas_glyph_draw_calls_max"),
+        QStringLiteral("atlas_draw_calls_max"),
+        QStringLiteral("atlas_page_count_max"),
+        QStringLiteral("atlas_page_budget_max"),
+        QStringLiteral("atlas_page_bytes_max"),
+        QStringLiteral("atlas_allocated_bytes_max"),
+        QStringLiteral("atlas_budget_bytes_max"),
+        QStringLiteral("atlas_used_bytes_max"),
+        QStringLiteral("atlas_failed_inserts_max"),
+        QStringLiteral("atlas_glyph_missed_instances_max"),
+        QStringLiteral("atlas_glyph_color_alpha_failures_max"),
+        QStringLiteral("atlas_glyph_coverage_failures_max"),
+        QStringLiteral("atlas_glyph_atlas_insert_failures_max"),
+        QStringLiteral("atlas_work_created"),
+        QStringLiteral("atlas_work_reused"),
         QStringLiteral("text_cache_entry_child_nodes_cleared_for_replacement"),
         QStringLiteral("text_cache_entry_child_nodes_cleared_for_removal"),
         QStringLiteral("text_cache_entry_max_child_nodes_cleared"),
@@ -7526,6 +7895,7 @@ bool validate_scenario_json(
         !validate_lifecycle_json(object, out_error)                                              ||
         !validate_renderer_counter_json(object, out_error)                                       ||
         !validate_renderer_counter_invariants(object, out_error)                                 ||
+        !validate_atlas_renderer_json(object, out_error)                                         ||
         !validate_per_consumed_update_json(object, out_error)                                    ||
         !validate_profile_stats_json_object(
             object,
@@ -7620,16 +7990,6 @@ bool validate_scenario_json(
         return false;
     }
 
-    if (options.software_renderer &&
-        (json_counter(object, QStringLiteral("graphic_batched_rects")) != 0 ||
-         json_counter(object, QStringLiteral("graphic_batched_vertices")) != 0))
-    {
-        *out_error = QStringLiteral(
-            "software renderer reported graphic batched-geometry counters: %1"
-        ).arg(scenario_name);
-        return false;
-    }
-
     if (render_expected) {
         const qint64 bridge_update_requests =
             object.value(QStringLiteral("bridge_update_requests_delta")).toInteger();
@@ -7645,11 +8005,11 @@ bool validate_scenario_json(
             json_counter(object, QStringLiteral("frame_packed_graphic_cells")) > 0;
         const bool text_work_observed = is_measurement_reuse_only_scenario(scenario_name)
             ? json_counter(object, QStringLiteral("renderer_text_reused_total")) > 0 ||
-                json_counter(object, QStringLiteral("text_leaf_nodes_created")) > 0 ||
-                json_counter(object, QStringLiteral("text_leaf_nodes_reused"))  > 0 ||
+                json_counter(object, QStringLiteral("atlas_work_created")) > 0 ||
+                json_counter(object, QStringLiteral("atlas_work_reused"))  > 0 ||
                 graphic_work_observed
-            : json_counter(object, QStringLiteral("text_leaf_nodes_created")) > 0 ||
-                json_counter(object, QStringLiteral("text_leaf_nodes_reused"))  > 0 ||
+            : json_counter(object, QStringLiteral("atlas_work_created")) > 0 ||
+                json_counter(object, QStringLiteral("atlas_work_reused"))  > 0 ||
                 (is_surface_session_text_output_scenario(scenario_name) &&
                     (graphic_work_observed ||
                         json_counter(object, QStringLiteral("frame_text_runs")) > 0));
@@ -7666,8 +8026,8 @@ bool validate_scenario_json(
         }
     }
     else {
-        if (json_counter(object, QStringLiteral("text_leaf_nodes_created"))             != 0 ||
-            json_counter(object, QStringLiteral("text_leaf_nodes_reused"))              != 0 ||
+        if (json_counter(object, QStringLiteral("atlas_work_created"))             != 0 ||
+            json_counter(object, QStringLiteral("atlas_work_reused"))              != 0 ||
             json_counter(object, QStringLiteral("renderer_text_rebuilds_total"))        != 0 ||
             json_counter(object, QStringLiteral("renderer_text_reused_total"))          != 0 ||
             object.value(QStringLiteral("bridge_update_requests_delta")).toInteger()    != 0 ||
@@ -7677,253 +8037,6 @@ bool validate_scenario_json(
             object.value(QStringLiteral("session_snapshots_observed")).toInt()          != 0)
         {
             *out_error = QStringLiteral("scenario no-render accounting failed: %1")
-                .arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (!validate_measurement_reuse_only_json(object, scenario_name, out_error)) {
-        return false;
-    }
-
-    if (scenario_name == QStringLiteral("ascii_full_dirty_reuse_only")) {
-        const qint64 consumed_updates =
-            json_counter(object, QStringLiteral("bridge_consumed_updates_delta"));
-        const QJsonObject per_update =
-            object.value(QStringLiteral("per_consumed_update")).toObject();
-        const QJsonObject normalized_counters =
-            per_update.value(QStringLiteral("counters")).toObject();
-        if (json_counter(object, QStringLiteral("text_resource_descriptor_reuses"))             <= 0                ||
-            json_counter(object, QStringLiteral("text_clean_reuse_skips"))                      != 0                ||
-            json_counter(object, QStringLiteral("route_fast_text_cells"))                       != 0                ||
-            json_counter(object, QStringLiteral("qt_text_layout_calls"))                        != 0                ||
-            json_counter(object, QStringLiteral("text_leaf_nodes_created"))                     != 0                ||
-            json_counter(object, QStringLiteral("text_leaf_nodes_reused"))                      != 0                ||
-            json_counter(object, QStringLiteral("renderer_text_rebuilds_total"))                != 0                ||
-            json_counter(object, QStringLiteral("renderer_text_reused_total"))                  <= 0                ||
-            json_counter(object, QStringLiteral("qsg_nodes_created"))                           != 0                ||
-            json_counter(object, QStringLiteral("qsg_nodes_replaced"))                          != 0                ||
-            json_counter(object, QStringLiteral("qsg_nodes_destroyed"))                         != 0                ||
-            json_counter(object, QStringLiteral("text_key_builds"))                             != consumed_updates ||
-            json_counter(object, QStringLiteral("text_key_bytes"))                              <= 0                ||
-            !json_numbers_match(
-                normalized_counters.value(QStringLiteral("text_key_builds"        )).toDouble(-1.0),
-                1.0)                                                                                                ||
-            normalized_counters.value(QStringLiteral("qt_text_layout_calls"   )).toDouble(-1.0) != 0.0              ||
-            normalized_counters.value(QStringLiteral("text_leaf_nodes_created")).toDouble(-1.0) != 0.0              ||
-            normalized_counters.value(QStringLiteral("text_leaf_nodes_reused" )).toDouble(-1.0) != 0.0              ||
-            normalized_counters.value(QStringLiteral("qsg_nodes_created"      )).toDouble(-1.0) != 0.0              ||
-            normalized_counters.value(QStringLiteral("qsg_nodes_replaced"     )).toDouble(-1.0) != 0.0              ||
-            normalized_counters.value(QStringLiteral("qsg_nodes_destroyed"    )).toDouble(-1.0) != 0.0)
-        {
-            *out_error = QStringLiteral(
-                "ASCII reuse-only text-resource descriptor path was not isolated: %1"
-            ).arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (scenario_name == QStringLiteral("ascii_full_dirty_same_content")) {
-        if (json_counter(object, QStringLiteral("text_resource_descriptor_reuses")) <= 0 ||
-            json_counter(object, QStringLiteral("text_clean_reuse_skips"))          != 0 ||
-            json_counter(object, QStringLiteral("route_fast_text_cells"))           != 0)
-        {
-            *out_error = QStringLiteral(
-                "text-resource descriptor reuse was not observed: %1")
-                .arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (scenario_name == QStringLiteral("styled_ascii_full_dirty_reuse_only")) {
-        const qint64 consumed_updates =
-            json_counter(object, QStringLiteral("bridge_consumed_updates_delta"));
-        if (json_counter(object, QStringLiteral("frame_text_runs")) <= 0                                          ||
-            json_counter( object, QStringLiteral("simple_content_text_category_printable_ascii_cells")) <= 0      ||
-            json_counter(object, QStringLiteral("simple_content_styles_with_eligible_cells")) <= consumed_updates ||
-            json_counter(object, QStringLiteral("text_resource_descriptor_reuses")) <= 0                          ||
-            json_counter(object, QStringLiteral("text_key_builds")) != consumed_updates                           ||
-            json_counter(object, QStringLiteral("route_fast_text_cells")) != 0)
-        {
-            *out_error = QStringLiteral(
-                "styled ASCII reuse-only descriptor counters were not observed: %1"
-            ).arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (scenario_name == QStringLiteral("mixed_text_full_dirty_reuse_only")) {
-        const qint64 consumed_updates =
-            json_counter(object, QStringLiteral("bridge_consumed_updates_delta"));
-        const qint64 non_ascii_rejections = json_counter(
-            object,
-            QStringLiteral("simple_content_rejection_non_ascii_text_cells")) +
-            json_counter(object, QStringLiteral("simple_content_rejection_multi_cell_text_cells"));
-        if (json_counter(object, QStringLiteral("frame_text_runs")) <= 0                                     ||
-            json_counter( object, QStringLiteral("simple_content_text_category_printable_ascii_cells")) <= 0 ||
-            json_counter( object, QStringLiteral("simple_content_text_category_non_ascii_cells")) <= 0       ||
-            json_counter( object, QStringLiteral("simple_content_rejection_wide_continuation_cells")) <= 0   ||
-            non_ascii_rejections <= 0                                                                        ||
-            json_counter(object, QStringLiteral("text_resource_descriptor_reuses")) <= 0                     ||
-            json_counter(object, QStringLiteral("text_key_builds")) != consumed_updates                      ||
-            json_counter(object, QStringLiteral("route_fast_text_cells")) != 0)
-        {
-            *out_error = QStringLiteral(
-                "mixed text reuse-only descriptor counters were not observed: %1"
-            ).arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (scenario_name == QStringLiteral("block_graphics_full_dirty_reuse_only") ||
-        scenario_name == QStringLiteral("box_graphics_full_dirty_reuse_only"))
-    {
-        if (json_counter(object, QStringLiteral("simple_content_route_graphic_geometry_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("route_graphic_geometry_cells"))                <= 0 ||
-            json_counter(object, QStringLiteral("frame_packed_graphic_cells"))                  <= 0)
-        {
-            *out_error = QStringLiteral(
-                "graphic reuse-only route counters were not observed: %1")
-                .arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (scenario_name == QStringLiteral("cjk_full_dirty_reuse_only")) {
-        if (json_counter(object, QStringLiteral("frame_text_runs")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_text_category_non_ascii_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_route_qt_text_layout_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_rejection_wide_continuation_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("renderer_text_reused_total")) <= 0)
-        {
-            *out_error = QStringLiteral(
-                "CJK reuse-only route counters were not observed: %1")
-                .arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (scenario_name == QStringLiteral("mixed_non_ascii_full_dirty_reuse_only")) {
-        const qint64 non_ascii_rejections =
-            json_counter(object, QStringLiteral("simple_content_rejection_non_ascii_text_cells")) +
-            json_counter(object, QStringLiteral("simple_content_rejection_multi_cell_text_cells"));
-        if (json_counter(object, QStringLiteral("frame_text_runs")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_text_category_printable_ascii_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_text_category_non_ascii_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_route_graphic_geometry_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_route_qt_text_layout_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_rejection_wide_continuation_cells")) <= 0 ||
-            non_ascii_rejections <= 0 ||
-            json_counter(object, QStringLiteral("renderer_text_reused_total")) <= 0)
-        {
-            *out_error = QStringLiteral(
-                "mixed non-ASCII reuse-only route counters were not observed: %1")
-                .arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
-        scenario_name == QStringLiteral("surface_session_box_graphics_output"))
-    {
-        if (json_counter(object, QStringLiteral("simple_content_route_graphic_geometry_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("route_graphic_geometry_cells"))                <= 0 ||
-            json_counter(object, QStringLiteral("frame_packed_graphic_cells"))                  <= 0 ||
-            object.value(QStringLiteral("session_snapshots_observed")).toInt() !=
-                object.value(QStringLiteral("iterations")).toInt())
-        {
-            *out_error = QStringLiteral(
-                "surface/session graphic output counters were not observed: %1")
-                .arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (scenario_name == QStringLiteral("surface_session_cjk_output")) {
-        if (json_counter(object, QStringLiteral("frame_text_runs")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_text_category_non_ascii_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_route_qt_text_layout_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_rejection_wide_continuation_cells")) <= 0 ||
-            object.value(QStringLiteral("session_snapshots_observed")).toInt() !=
-                object.value(QStringLiteral("iterations")).toInt())
-        {
-            *out_error = QStringLiteral(
-                "surface/session CJK output counters were not observed: %1")
-                .arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (scenario_name == QStringLiteral("surface_session_mixed_non_ascii_output")) {
-        const qint64 non_ascii_rejections =
-            json_counter(object, QStringLiteral("simple_content_rejection_non_ascii_text_cells")) +
-            json_counter(object, QStringLiteral("simple_content_rejection_multi_cell_text_cells"));
-        if (json_counter(object, QStringLiteral("frame_text_runs")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_text_category_printable_ascii_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_text_category_non_ascii_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_route_graphic_geometry_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_route_qt_text_layout_cells")) <= 0 ||
-            json_counter(object, QStringLiteral("simple_content_rejection_wide_continuation_cells")) <= 0 ||
-            non_ascii_rejections <= 0 ||
-            object.value(QStringLiteral("session_snapshots_observed")).toInt() !=
-                object.value(QStringLiteral("iterations")).toInt())
-        {
-            *out_error = QStringLiteral(
-                "surface/session mixed non-ASCII output counters were not observed: %1")
-                .arg(scenario_name);
-            return false;
-        }
-    }
-
-    if (options.profile && is_surface_session_text_output_scenario(scenario_name)) {
-        const QJsonObject model_profile =
-            object.value(QStringLiteral("model_profile_stats")).toObject();
-        const QJsonObject session_profile =
-            object.value(QStringLiteral("session_profile_stats")).toObject();
-        if (model_profile.value(QStringLiteral("render_snapshot_cells_scanned")).toInteger() <= 0 ||
-            model_profile.value(QStringLiteral("render_snapshot_cells_emitted")).toInteger() <= 0 ||
-            session_profile.value(QStringLiteral("render_snapshot_publications")).toInteger() <= 0 ||
-            !validate_inline_single_bmp_model_profile_stats(
-                model_profile,
-                scenario_name,
-                out_error))
-        {
-            if (out_error->isEmpty()) {
-                *out_error = QStringLiteral(
-                    "surface/session profile counters were not observed: %1")
-                    .arg(scenario_name);
-            }
-            return false;
-        }
-    }
-
-    if (scenario_name == QStringLiteral("single_row_geometry_update")) {
-        const qint64 graphic_arc_work = json_counter(
-            object,
-            QStringLiteral("graphic_arc_rows_rebuilt")) +
-            json_counter(object, QStringLiteral("graphic_arc_row_cache_fallbacks"));
-        const bool all_row_families_skipped_cleanly =
-            json_counter(object, QStringLiteral("background_row_clean_reuse_skips"))   > 0 &&
-            json_counter(object, QStringLiteral("selection_row_clean_reuse_skips"))    > 0 &&
-            json_counter(object, QStringLiteral("decoration_row_clean_reuse_skips"))   > 0 &&
-            json_counter(object, QStringLiteral("graphic_rect_row_clean_reuse_skips")) > 0 &&
-            json_counter(object, QStringLiteral("graphic_arc_row_clean_reuse_skips"))  > 0;
-        if (json_counter(object, QStringLiteral("background_rows_rebuilt"))      <= 0  ||
-            (!options.software_renderer &&
-                json_counter(object, QStringLiteral("background_batched_rects")) <= 0) ||
-            json_counter(object, QStringLiteral("selection_rows_rebuilt"))       <= 0  ||
-            (!options.software_renderer &&
-                json_counter(object, QStringLiteral("selection_batched_rects"))  <= 0) ||
-            json_counter(object, QStringLiteral("decoration_rows_rebuilt"))      <= 0  ||
-            (!options.software_renderer &&
-                json_counter(object, QStringLiteral("decoration_batched_rects")) <= 0) ||
-            json_counter(object, QStringLiteral("graphic_rect_rows_rebuilt"))    <= 0  ||
-            (!options.software_renderer &&
-                json_counter(object, QStringLiteral("graphic_batched_rects"))    <= 0) ||
-            graphic_arc_work                                                     <= 0  ||
-            !all_row_families_skipped_cleanly)
-        {
-            *out_error = QStringLiteral("geometry row-cache counters were not observed: %1")
                 .arg(scenario_name);
             return false;
         }
@@ -8028,17 +8141,20 @@ bool validate_scenario_json(
 
     const QJsonObject lifecycle =
         object.value(QStringLiteral("lifecycle_delta")).toObject();
-    const bool graphics_only_scenario =
-        scenario_name == QStringLiteral("block_graphics_full_dirty_reuse_only") ||
-        scenario_name == QStringLiteral("box_graphics_full_dirty_reuse_only")   ||
-        scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
-        scenario_name == QStringLiteral("surface_session_box_graphics_output");
-    const bool live_render_resources_observed = graphics_only_scenario
-        ? json_counter(object, QStringLiteral("frame_graphic_rects")) > 0 ||
-            json_counter(object, QStringLiteral("frame_packed_graphic_cells")) > 0
-        : lifecycle.value(QStringLiteral("live_text_resources")).toInteger() > 0;
-    if (lifecycle.value(QStringLiteral("live_root_nodes")).toInteger()         >  1 ||
-        (render_expected && !live_render_resources_observed))
+    const bool frame_work_observed =
+        json_counter(object, QStringLiteral("frame_background_rects"))     > 0 ||
+        json_counter(object, QStringLiteral("frame_selection_rects"))      > 0 ||
+        json_counter(object, QStringLiteral("frame_graphic_rects"))        > 0 ||
+        json_counter(object, QStringLiteral("frame_graphic_arcs"))         > 0 ||
+        json_counter(object, QStringLiteral("frame_text_runs"))            > 0 ||
+        json_counter(object, QStringLiteral("frame_cursor_text_runs"))     > 0 ||
+        json_counter(object, QStringLiteral("frame_decorations"))          > 0 ||
+        json_counter(object, QStringLiteral("frame_cursors"))              > 0 ||
+        json_counter(object, QStringLiteral("frame_packed_graphic_cells")) > 0;
+    const qint64 live_root_nodes =
+        lifecycle.value(QStringLiteral("live_root_nodes")).toInteger();
+    if (live_root_nodes > 1 ||
+        (render_expected && (live_root_nodes <= 0 || !frame_work_observed)))
     {
         *out_error = QStringLiteral("scenario lifecycle counters failed: %1")
             .arg(object.value(QStringLiteral("name")).toString());
@@ -8234,8 +8350,7 @@ bool validate_json_output(
     const QJsonObject root = document.object();
     if (root.value(QStringLiteral("source_mode")).toString()     != root_source_mode(options)    ||
         root.value(QStringLiteral("execution_mode")).toString()  != root_execution_mode(options) ||
-        !root.value(QStringLiteral("software_renderer")).isBool()                                ||
-        root.value(QStringLiteral("software_renderer")).toBool() != options.software_renderer)
+        root.value(QStringLiteral("renderer")).toString()        != QStringLiteral("atlas"))
     {
         *out_error = QStringLiteral("benchmark root execution metadata does not match request");
         return false;
@@ -8371,7 +8486,7 @@ QJsonObject make_profile_root_json(
     root.insert(QStringLiteral("schema_version"),    k_schema_version);
     root.insert(QStringLiteral("benchmark"),         QStringLiteral("vnm_terminal_embedded_benchmark"));
     root.insert(QStringLiteral("profile_format"),    QStringLiteral("hierarchical_profiler"));
-    root.insert(QStringLiteral("software_renderer"), options.software_renderer);
+    root.insert(QStringLiteral("renderer"),          QStringLiteral("atlas"));
     root.insert(QStringLiteral("profiling"),         profiling_metadata_json(options));
     root.insert(QStringLiteral("status"),            ok ? QStringLiteral("ok") : QStringLiteral("failed"));
     root.insert(QStringLiteral("scenarios"),         scenarios);
@@ -8400,8 +8515,7 @@ bool validate_profile_json_output(
             QStringLiteral("vnm_terminal_embedded_benchmark")                        ||
         root.value(QStringLiteral("profile_format")).toString() !=
             QStringLiteral("hierarchical_profiler")                                  ||
-        !root.value(QStringLiteral("software_renderer")).isBool()                    ||
-        root.value(QStringLiteral("software_renderer")).toBool() != options.software_renderer)
+        root.value(QStringLiteral("renderer")).toString() != QStringLiteral("atlas"))
     {
         *out_error = QStringLiteral("profile root metadata changed");
         return false;
@@ -8493,9 +8607,9 @@ bool validate_profile_json_output(
         }
 
         if (!validate_scenario_profile_value(
-                scenario.value(QStringLiteral("profile")), QStringLiteral("profile.scenarios[%1]").arg(index),
-                background_batched_rects > 0, selection_batched_rects > 0,
-                graphic_batched_rects    > 0, decoration_batched_rects > 0, out_error))
+                scenario.value(QStringLiteral("profile")),
+                QStringLiteral("profile.scenarios[%1]").arg(index),
+                out_error))
         {
             return false;
         }
@@ -8626,7 +8740,7 @@ QJsonObject make_root_json(
     root.insert(QStringLiteral("benchmark"), QStringLiteral("vnm_terminal_embedded_benchmark"));
     root.insert(QStringLiteral("source_mode"), root_source_mode(options));
     root.insert(QStringLiteral("execution_mode"), root_execution_mode(options));
-    root.insert(QStringLiteral("software_renderer"), options.software_renderer);
+    root.insert(QStringLiteral("renderer"), QStringLiteral("atlas"));
     root.insert(QStringLiteral("latency_semantics"), k_latency_semantics);
     root.insert(QStringLiteral("elapsed_semantics"), k_elapsed_semantics);
     root.insert(QStringLiteral("memory_sample_semantics"), k_memory_sample_semantics);
@@ -8730,18 +8844,14 @@ bool initialize_surface(Benchmark_context& context)
         false).completed;
 }
 
-bool window_uses_software_scene_graph(const QQuickWindow& window)
-{
-    const QSGRendererInterface* renderer_interface = window.rendererInterface();
-    return
-        renderer_interface                != nullptr &&
-        renderer_interface->graphicsApi() == QSGRendererInterface::Software;
-}
-
 } // namespace
 
 int main(int argc, char** argv)
 {
+#if defined(Q_OS_WIN)
+    QQuickWindow::setGraphicsApi(QSGRendererInterface::Direct3D11Rhi);
+#endif
+
     const QStringList  arguments    = raw_arguments(argc, argv);
     const Parse_result parse_result = parse_arguments(arguments);
     if (parse_result.options.help_requested) {
@@ -8768,11 +8878,6 @@ int main(int argc, char** argv)
             << precondition_error.toUtf8().constData() << '\n';
         return 1;
     }
-
-    if (options.software_renderer) {
-        QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
-    }
-    const bool software_renderer_requested = options.software_renderer;
 
     QGuiApplication app(argc, argv);
     QCoreApplication::setApplicationName(QStringLiteral("vnm_terminal_embedded_benchmark"));
@@ -8805,25 +8910,11 @@ int main(int argc, char** argv)
 
     Benchmark_context context{app, window, surface, 1000U, surface.scrollback_limit()};
     if (!initialize_surface(context)) {
-        options.software_renderer = window_uses_software_scene_graph(window);
-        const QString initialization_error =
-            software_renderer_requested && !options.software_renderer
-                ? QStringLiteral("software renderer request was not honored")
-                : QStringLiteral("initial render did not complete");
         const QJsonObject root = make_root_json(
             options,
             {},
             false,
-            initialization_error);
-        return emit_json_and_status(options, root, {}, false);
-    }
-    options.software_renderer = window_uses_software_scene_graph(window);
-    if (software_renderer_requested && !options.software_renderer) {
-        const QJsonObject root = make_root_json(
-            options,
-            {},
-            false,
-            QStringLiteral("software renderer request was not honored"));
+            QStringLiteral("initial render did not complete"));
         return emit_json_and_status(options, root, {}, false);
     }
 

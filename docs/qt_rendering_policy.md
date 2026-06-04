@@ -25,10 +25,13 @@ resolve a different Qt minor. Source-tree consumers that use `add_subdirectory`
 rebuild the surface against their selected Qt and are not an installed-package
 minor-mismatch case.
 
-`Qt6::ShaderTools` is a source-tree build tool only when
-`VNM_TERMINAL_ENABLE_SHADER_GENERATION` enables shader package generation. It is
-not linked to `vnm_terminal_surface`, not part of the Qt posture link allowlist,
-and not an installed package dependency.
+`Qt6::ShaderTools` is source-tree tooling only when
+`VNM_TERMINAL_ENABLE_SHADER_GENERATION` is enabled. The current build embeds
+checked-in `.qsb` shader packages from `resources/shaders/`; the option only
+requires the ShaderTools component for source-tree shader tooling and does not
+wire shader package regeneration into the target build. ShaderTools is not
+linked to `vnm_terminal_surface`, not part of the Qt posture link allowlist, and
+not an installed package dependency.
 
 The project uses Qt through either a commercial Qt license held by the
 distributor or the LGPL-compatible dynamic-linking route recorded in
@@ -48,39 +51,40 @@ child `QQuickItem` per cell, and it does not render terminal rows or frames by
 painting text into `QImage` with `QPainter`.
 
 Current production text input is `Terminal_render_frame::text_runs` plus cursor
-inverse-text input from `Terminal_render_frame::cursor_text_runs`. Those runs go
-through public `QTextLayout` and `QSGTextNode` APIs, including
-`QQuickWindow::createTextNode()` and `QSGTextNode::addTextLayout()`.
-`frame.text_runs` remains the canonical terminal text input; cursor text runs
-are overlay input derived from it.
+inverse-text input from `Terminal_render_frame::cursor_text_runs`. The canonical
+atlas renderer rasterizes glyph coverage through Qt's font engine, caches it in
+atlas textures, and composites cells through QRhi-backed scene graph render
+nodes. `frame.text_runs` remains the canonical terminal text input; cursor text
+runs are overlay input derived from it.
 
-Geometry routes may use public QSG geometry and material APIs. Private Qt text
-and scene graph APIs are not part of the renderer contract. QRhi rendering may
-use `Qt6::GuiPrivate` and Qt `rhi/` private headers only under the private Qt
-module posture above.
+Geometry routes may use public QSG geometry and material APIs. The canonical
+atlas renderer may use QRhi through `Qt6::GuiPrivate` and Qt `rhi/` private
+headers only under the private Qt module posture above; that private-API use is
+part of the renderer contract and is guarded by the package minor-version
+checks. Private Qt text APIs remain outside the terminal text ownership
+contract.
 
 `QImage` and `QPainter` are acceptable for test framebuffer readback and narrow
 diagnostics. They are not the production terminal-row renderer and are not a
 `QImage`-to-texture text route.
 
-A GPU glyph-atlas renderer backend may cache glyphs rasterized by Qt's font
-engine (`QRawFont::alphaMapForGlyph`) into atlas textures and composite cells
-through instanced QRhi draws. Direct HarfBuzz, FreeType, and ICU dependencies
-remain prohibited; shaping, rasterization, and fallback stay with Qt's font
-engine. At cutover, this backend replaces the `QSGTextNode` text route, and the
-replaced route is removed in the same batch. `QGlyphRun` may be used only for
-validation or probing around the Qt text route; it does not move text ownership
-away from `frame.text_runs`.
+The GPU glyph-atlas renderer caches glyphs rasterized by Qt's font engine
+(`QRawFont::alphaMapForGlyph`) into atlas textures and composites cells through
+instanced QRhi draws. Direct HarfBuzz, FreeType, and ICU dependencies remain
+prohibited; shaping, rasterization, and fallback stay with Qt's font engine.
+`QGlyphRun` may be used only for validation around Qt font behavior; it does not
+move text ownership away from `frame.text_runs`.
 
 Packed row, text, and graphic sidecars are owned by `Terminal_render_frame`.
 They are auxiliary classification, diagnostics, accounting, cache-key, row
 identity, or graphics-route inputs. Packed text sidecars do not own terminal
 text and do not retire or replace `frame.text_runs`.
 
-`Terminal_scene_node` may keep reusable row caches keyed by active buffer,
-logical row, and exact content or layer descriptors. Clean-row reuse is internal
-and must respect dirty rows, viewport identity, geometry, style/color state, and
-descriptor equality before preserving Qt nodes.
+The atlas render node may keep reusable QRhi resources and row/layer upload
+state keyed by active buffer, logical row, and exact content or layer
+descriptors. Clean-row reuse is internal and must respect dirty rows, viewport
+identity, geometry, style/color state, and descriptor equality before preserving
+renderer-local GPU state.
 
 ## Cell Ownership
 

@@ -342,9 +342,12 @@ bool pump_until(QGuiApplication& app, Predicate predicate, int rounds = 20)
 bool window_render_matches(
     QGuiApplication&               app,
     QQuickWindow&                  window,
+    VNM_TerminalSurface&           surface,
     const std::function<bool()>&   predicate)
 {
     for (int i = 0; i < 30; ++i) {
+        surface.update();
+        window.requestUpdate();
         pump_events(app, 1);
         const QImage image = window.grabWindow();
         if (!image.isNull() && predicate()) {
@@ -355,21 +358,20 @@ bool window_render_matches(
     return false;
 }
 
-bool render_surface_sequence(
+bool capture_surface_sequence(
     QGuiApplication&               app,
     QQuickWindow&                  window,
-    const VNM_TerminalSurface&     surface,
+    VNM_TerminalSurface&           surface,
     std::uint64_t                  sequence)
 {
-    return window_render_matches(app, window, [&] {
-        const term::Terminal_surface_render_invalidation_stats_t invalidation_stats =
-            term::VNM_TerminalSurface_render_bridge::invalidation_stats(surface);
+    return window_render_matches(app, window, surface, [&] {
         const term::terminal_renderer_stats_t renderer_stats =
             term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+        const term::Qsg_atlas_frame_report atlas_report =
+            term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
         return
-            invalidation_stats.last_rendered_snapshot_sequence == sequence &&
-            !invalidation_stats.pending_update                             &&
-            renderer_stats.paint_completed                                 &&
+            atlas_report.capture_count > 0U                         &&
+            atlas_report.captured_snapshot_sequence == sequence      &&
             renderer_stats.text_content_failures == 0;
     });
 }
@@ -398,16 +400,14 @@ bool has_live_render_tree(const term::terminal_renderer_lifecycle_stats_t& stats
 {
     return
         has_valid_lifecycle_resource_counts(stats) &&
-        live_root_node_count(stats) == 1U          &&
-        live_text_resource_count(stats) > 0U;
+        live_root_node_count(stats) == 1U;
 }
 
 bool has_no_live_render_resources(const term::terminal_renderer_lifecycle_stats_t& stats)
 {
     return
         has_valid_lifecycle_resource_counts(stats) &&
-        live_root_node_count(stats) == 0U          &&
-        live_text_resource_count(stats) == 0U;
+        live_root_node_count(stats) == 0U;
 }
 
 QString snapshot_row_text(
@@ -1102,12 +1102,12 @@ bool test_surface_session_snapshot_burst_coalesces_to_latest_render(QGuiApplicat
         return ok;
     }
 
-    ok &= check(render_surface_sequence(
+    ok &= check(capture_surface_sequence(
         app,
         fixture.window,
         fixture.surface,
         baseline_snapshot->metadata.sequence),
-        "surface sync burst renders baseline before rapid updates");
+        "surface sync burst captures baseline before rapid updates");
     const term::Terminal_surface_render_invalidation_stats_t baseline_stats =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
 
@@ -1173,17 +1173,16 @@ bool test_surface_session_snapshot_burst_coalesces_to_latest_render(QGuiApplicat
     ok &= check(burst_pending_stats.pending_update,
         "surface sync burst has one pending render before the delayed paint");
 
-    ok &= check(render_surface_sequence(
+    ok &= check(capture_surface_sequence(
         app,
         fixture.window,
         fixture.surface,
         latest_snapshot_sequence),
-        "surface sync burst renders the newest coalesced session snapshot");
-    const term::Terminal_surface_render_invalidation_stats_t rendered_stats =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    ok &= check(rendered_stats.last_rendered_snapshot_sequence == latest_snapshot_sequence &&
-        !rendered_stats.pending_update,
-        "surface sync burst reports the latest rendered snapshot sequence");
+        "surface sync burst captures the newest coalesced session snapshot");
+    const term::Qsg_atlas_frame_report captured_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+    ok &= check(captured_report.captured_snapshot_sequence == latest_snapshot_sequence,
+        "surface sync burst reports the latest captured snapshot sequence");
 
     return ok;
 }
@@ -1214,12 +1213,12 @@ bool test_surface_session_single_drain_coalesces_dirty_rows(QGuiApplication& app
         return ok;
     }
 
-    ok &= check(render_surface_sequence(
+    ok &= check(capture_surface_sequence(
         app,
         fixture.window,
         fixture.surface,
         baseline_snapshot->metadata.sequence),
-        "surface single-drain dirty coalescing renders baseline");
+        "surface single-drain dirty coalescing captures baseline");
     const term::Terminal_surface_render_invalidation_stats_t baseline_stats =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
 
@@ -1249,14 +1248,14 @@ bool test_surface_session_single_drain_coalesces_dirty_rows(QGuiApplication& app
     ok &= check(pending_stats.update_requests == baseline_stats.update_requests + 1U,
         "surface single-drain dirty coalescing schedules one surface snapshot");
 
-    ok &= check(render_surface_sequence(
+    ok &= check(capture_surface_sequence(
         app,
         fixture.window,
         fixture.surface,
         snapshot->metadata.sequence),
-        "surface single-drain dirty coalescing renders latest snapshot");
-    const term::terminal_renderer_stats_t render_stats = term::VNM_TerminalSurface_render_bridge::last_renderer_stats(
-        fixture.surface);
+        "surface single-drain dirty coalescing captures latest snapshot");
+    const term::terminal_renderer_stats_t render_stats =
+        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
     ok &= check(render_stats.text_content_rebuilds >= 3,
         "surface single-drain dirty coalescing rebuilds all skipped changed rows");
 
@@ -10757,12 +10756,12 @@ bool test_heap_surface_destroy_closes_queued_worker_callback(QGuiApplication& ap
         snapshot_contains_text(*snapshot, QStringLiteral("heap-lifecycle")),
         "heap-destroy lifecycle has a live session snapshot before destruction");
     if (snapshot != nullptr) {
-        ok &= check(render_surface_sequence(
+        ok &= check(capture_surface_sequence(
             app,
             *window,
             *surface,
             snapshot->metadata.sequence),
-            "heap-destroy lifecycle renders session resources before destruction");
+            "heap-destroy lifecycle captures session resources before destruction");
     }
     ok &= check(pump_until(app, [&] {
         return has_live_render_tree(lifecycle_recorder->snapshot());
@@ -10850,12 +10849,12 @@ bool test_window_destroy_keeps_surface_session_until_surface_destroy(QGuiApplica
 
     window->show();
     if (snapshot != nullptr) {
-        ok &= check(render_surface_sequence(
+        ok &= check(capture_surface_sequence(
             app,
             *window,
             *surface,
             snapshot->metadata.sequence),
-            "window-destroy lifecycle renders session resources before window destruction");
+            "window-destroy lifecycle captures session resources before window destruction");
     }
 
     const term::terminal_renderer_lifecycle_stats_t setup_stats =

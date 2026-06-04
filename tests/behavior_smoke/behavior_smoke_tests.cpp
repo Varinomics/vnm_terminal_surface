@@ -962,7 +962,6 @@ bool run_host_behavior_smokes(const QString& fixture_path, const QString& host_p
         const command_result_t result = run_process(
             host_path,
             {
-                QStringLiteral("--software-renderer"),
                 QStringLiteral("--window-size"),
                 QStringLiteral("640x320"),
                 QStringLiteral("--timeout-ms"),
