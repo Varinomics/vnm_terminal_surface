@@ -69,6 +69,7 @@ public:
     void reset();
 
     QSize page_size() const { return m_page_size; }
+    int max_pages() const { return m_max_pages; }
     int page_count() const;
 
 private:
@@ -103,7 +104,13 @@ struct Glyph_atlas_cache_stats
     std::uint64_t lookups       = 0U;
     std::uint64_t hits          = 0U;
     std::uint64_t inserts       = 0U;
+    std::uint64_t failed_inserts = 0U;
+    std::uint64_t page_bytes    = 0U;
+    std::uint64_t allocated_bytes = 0U;
+    std::uint64_t budget_bytes  = 0U;
+    std::uint64_t used_bytes    = 0U;
     int           page_count    = 0;
+    int           page_budget   = 0;
     QSize         page_size;
 };
 
@@ -149,6 +156,133 @@ struct Qsg_atlas_stage3_frame_summary
     bool                             public_projection_full_repaint = false;
     bool                             scroll_full_repaint       = false;
     bool                             full_repaint_fallback     = false;
+};
+
+constexpr int k_qsg_atlas_stage4_all_rows = -1;
+constexpr int k_qsg_atlas_stage4_non_row  = -2;
+
+struct Qsg_atlas_stage4_buffer_update_range
+{
+    int byte_offset = 0;
+    int byte_count  = 0;
+};
+
+struct Qsg_atlas_stage4_buffer_update_summary
+{
+    int  rhi_frames_in_flight          = 1;
+    int  rhi_frame_slot                = 0;
+    int  instance_count                = 0;
+    int  active_instance_count         = 0;
+    int  instance_bytes                = 0;
+    int  buffer_bytes                  = 0;
+    int  dirty_rows                    = 0;
+    int  seeded_slots                  = 0;
+    int  full_uploads                  = 0;
+    int  partial_uploads               = 0;
+    int  uploaded_bytes                = 0;
+    bool full_upload                   = false;
+    bool partial_upload                = false;
+    bool skipped_upload                = false;
+    bool rotating_slot_seed_upload     = false;
+    bool buffer_recreated_upload       = false;
+    bool instance_layout_changed_upload = false;
+    bool full_repaint_upload           = false;
+    bool non_dirty_state_upload        = false;
+    bool row_stable_layout             = false;
+};
+
+struct Qsg_atlas_stage4_buffer_update_plan
+{
+    Qsg_atlas_stage4_buffer_update_summary
+                                  summary;
+    std::vector<Qsg_atlas_stage4_buffer_update_range>
+                                  ranges;
+};
+
+struct Qsg_atlas_stage4_row_stable_range
+{
+    int row            = k_qsg_atlas_stage4_non_row;
+    int first_instance = 0;
+    int instance_count = 0;
+};
+
+struct Qsg_atlas_stage4_buffer_update_input
+{
+    int                                      frames_in_flight = 1;
+    int                                      frame_slot       = 0;
+    int                                      row_count        = 0;
+    int                                      instance_size    = 1;
+    const char*                              bytes            = nullptr;
+    int                                      byte_count       = 0;
+    const std::vector<int>*                  instance_rows    = nullptr;
+    QByteArray                               layout_key;
+    std::vector<Terminal_render_dirty_row_range>
+                                             dirty_row_ranges;
+    bool                                     buffer_recreated = false;
+    bool                                     force_full_reupload = false;
+    bool                                     non_dirty_state_invalidation = false;
+    int                                      active_instance_count = -1;
+    bool                                     row_stable_layout = false;
+    const std::vector<Qsg_atlas_stage4_row_stable_range>*
+                                             row_stable_ranges = nullptr;
+};
+
+class Qsg_atlas_stage4_buffer_upload_planner final
+{
+public:
+    void reset();
+
+    Qsg_atlas_stage4_buffer_update_plan plan(
+        const Qsg_atlas_stage4_buffer_update_input& input);
+
+private:
+    void resize_slots(int frames_in_flight);
+
+    int                         m_frames_in_flight = 0;
+    std::vector<QByteArray>     m_slot_bytes;
+    std::vector<std::vector<int>>
+                                m_slot_instance_rows;
+    std::vector<QByteArray>     m_slot_layout_keys;
+    std::vector<unsigned char>  m_seeded_slots;
+};
+
+struct Qsg_atlas_stage4_frame_summary
+{
+    Qsg_atlas_stage4_buffer_update_summary
+                  rect_buffer;
+    Qsg_atlas_stage4_buffer_update_summary
+                  glyph_buffer;
+    int           direct_ascii_text_runs            = 0;
+    int           qt_layout_text_runs                = 0;
+    int           direct_ascii_glyph_instances       = 0;
+    int           qt_layout_glyph_instances          = 0;
+    int           glyph_buffer_instances             = 0;
+    int           glyph_text_row_capacity            = 0;
+    int           glyph_cursor_text_row_capacity     = 0;
+    int           background_rects_before_coalescing = 0;
+    int           background_rects_after_coalescing  = 0;
+    int           background_rects_coalesced         = 0;
+    int           rect_draw_calls                    = 0;
+    int           glyph_draw_calls                   = 0;
+    int           draw_calls                         = 0;
+    int           atlas_page_count                   = 0;
+    int           atlas_page_budget                  = 0;
+    std::uint64_t atlas_page_bytes                   = 0U;
+    std::uint64_t atlas_allocated_bytes              = 0U;
+    std::uint64_t atlas_budget_bytes                 = 0U;
+    std::uint64_t atlas_used_bytes                   = 0U;
+    std::uint64_t atlas_failed_inserts               = 0U;
+    bool          coverage_texture_uploaded          = false;
+    bool          coverage_texture_skipped           = false;
+    bool          full_dirty_range_reupload          = false;
+    bool          public_projection_full_reupload    = false;
+    bool          scroll_full_reupload               = false;
+    bool          non_dirty_selection_invalidation   = false;
+    bool          non_dirty_cursor_invalidation      = false;
+    bool          non_dirty_preedit_invalidation     = false;
+    bool          non_dirty_options_invalidation     = false;
+    bool          non_dirty_visual_bell_invalidation = false;
+    bool          font_epoch_invalidation            = false;
 };
 
 class Glyph_atlas_cache final
@@ -235,6 +369,8 @@ struct Qsg_atlas_stage1_frame_report
                   cache;
     Qsg_atlas_stage3_frame_summary
                   stage3;
+    Qsg_atlas_stage4_frame_summary
+                  stage4;
 };
 
 class Qsg_atlas_stage1_recorder final
@@ -256,7 +392,8 @@ public:
         std::uint64_t                 prepare_thread_id,
         std::uint64_t                 raw_font_raster_thread_id,
         const Glyph_atlas_cache_stats& cache,
-        const Qsg_atlas_stage3_frame_summary& stage3);
+        const Qsg_atlas_stage3_frame_summary& stage3,
+        const Qsg_atlas_stage4_frame_summary& stage4);
     void record_render(
         const Captured_atlas_frame& frame,
         QRect                       viewport_rect,

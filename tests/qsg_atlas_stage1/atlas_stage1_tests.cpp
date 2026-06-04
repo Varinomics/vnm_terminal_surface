@@ -30,6 +30,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace term = vnm_terminal::internal;
@@ -1782,6 +1783,483 @@ bool test_epoch_invalidation()
     return ok;
 }
 
+struct Stage4_test_instance
+{
+    int row_marker = 0;
+    int value      = 0;
+};
+
+QByteArray stage4_instance_bytes(
+    const std::vector<Stage4_test_instance>& instances)
+{
+    return QByteArray(
+        reinterpret_cast<const char*>(instances.data()),
+        static_cast<int>(instances.size() * sizeof(Stage4_test_instance)));
+}
+
+bool test_stage4_rotating_buffer_planner()
+{
+    term::Qsg_atlas_stage4_buffer_upload_planner planner;
+    const std::vector<int> rows = {0, 1, 2};
+    const QByteArray layout_key = QByteArrayLiteral("stable-layout");
+    const std::vector<term::Terminal_render_dirty_row_range> dirty_row_1 = {{1, 1}};
+
+    std::vector<Stage4_test_instance> base = {
+        {0, 10},
+        {1, 20},
+        {2, 30},
+    };
+    std::vector<Stage4_test_instance> row_1_changed = base;
+    row_1_changed[1].value = 21;
+
+    const QByteArray base_bytes = stage4_instance_bytes(base);
+    const QByteArray changed_bytes = stage4_instance_bytes(row_1_changed);
+    const std::vector<int> shifted_rows = {0, 1, 1};
+    std::vector<Stage4_test_instance> shifted_row_owner = row_1_changed;
+    shifted_row_owner[2].row_marker = 1;
+    shifted_row_owner[2].value      = 31;
+    const QByteArray shifted_row_owner_bytes =
+        stage4_instance_bytes(shifted_row_owner);
+    const std::vector<int> grown_rows = {0, 1, 1, 1};
+    std::vector<Stage4_test_instance> grown_row_owner = shifted_row_owner;
+    grown_row_owner.push_back({1, 40});
+    const QByteArray grown_row_owner_bytes =
+        stage4_instance_bytes(grown_row_owner);
+    const term::Qsg_atlas_stage4_buffer_update_plan seed_slot_0 =
+        planner.plan({
+            2,
+            0,
+            3,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            base_bytes.constData(),
+            static_cast<int>(base_bytes.size()),
+            &rows,
+            layout_key,
+            {},
+            false,
+            false,
+            false,
+        });
+    const term::Qsg_atlas_stage4_buffer_update_plan seed_slot_1 =
+        planner.plan({
+            2,
+            1,
+            3,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            base_bytes.constData(),
+            static_cast<int>(base_bytes.size()),
+            &rows,
+            layout_key,
+            {},
+            false,
+            false,
+            false,
+        });
+    const term::Qsg_atlas_stage4_buffer_update_plan partial_slot_0 =
+        planner.plan({
+            2,
+            0,
+            3,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            changed_bytes.constData(),
+            static_cast<int>(changed_bytes.size()),
+            &rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+        });
+    const term::Qsg_atlas_stage4_buffer_update_plan partial_slot_1 =
+        planner.plan({
+            2,
+            1,
+            3,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            changed_bytes.constData(),
+            static_cast<int>(changed_bytes.size()),
+            &rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+        });
+    const term::Qsg_atlas_stage4_buffer_update_plan clean_slot_0 =
+        planner.plan({
+            2,
+            0,
+            3,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            changed_bytes.constData(),
+            static_cast<int>(changed_bytes.size()),
+            &rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+        });
+    const term::Qsg_atlas_stage4_buffer_update_plan shifted_rows_slot_0 =
+        planner.plan({
+            2,
+            0,
+            3,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            shifted_row_owner_bytes.constData(),
+            static_cast<int>(shifted_row_owner_bytes.size()),
+            &shifted_rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+        });
+    const term::Qsg_atlas_stage4_buffer_update_plan grown_rows_slot_0 =
+        planner.plan({
+            2,
+            0,
+            3,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            grown_row_owner_bytes.constData(),
+            static_cast<int>(grown_row_owner_bytes.size()),
+            &grown_rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+        });
+
+    bool ok = true;
+    ok &= check(seed_slot_0.summary.full_upload &&
+            seed_slot_0.summary.rotating_slot_seed_upload &&
+            seed_slot_0.ranges.size() == 1U,
+        "Stage 4 planner seeds rotating buffer slot 0 with a full upload");
+    ok &= check(seed_slot_1.summary.full_upload &&
+            seed_slot_1.summary.rotating_slot_seed_upload &&
+            seed_slot_1.summary.seeded_slots == 2,
+        "Stage 4 planner seeds rotating buffer slot 1 independently");
+    ok &= check(partial_slot_0.summary.partial_upload &&
+            !partial_slot_0.summary.full_upload &&
+            partial_slot_0.ranges.size() == 1U &&
+            partial_slot_0.ranges.front().byte_offset ==
+                static_cast<int>(sizeof(Stage4_test_instance)) &&
+            partial_slot_0.ranges.front().byte_count ==
+                static_cast<int>(sizeof(Stage4_test_instance)),
+        "Stage 4 planner emits a dirty-row byte range for slot 0");
+    ok &= check(partial_slot_1.summary.partial_upload &&
+            !partial_slot_1.summary.full_upload &&
+            partial_slot_1.ranges.size() == 1U,
+        "Stage 4 planner keeps per-slot mirrors for the rotating buffer");
+    ok &= check(clean_slot_0.summary.skipped_upload &&
+            clean_slot_0.summary.uploaded_bytes == 0,
+        "Stage 4 planner skips uploads when the active slot already matches");
+    ok &= check(shifted_rows_slot_0.summary.partial_upload &&
+            !shifted_rows_slot_0.summary.full_upload &&
+            !shifted_rows_slot_0.summary.instance_layout_changed_upload &&
+            shifted_rows_slot_0.ranges.size() == 1U &&
+            shifted_rows_slot_0.ranges.front().byte_offset ==
+                static_cast<int>(2U * sizeof(Stage4_test_instance)) &&
+            shifted_rows_slot_0.ranges.front().byte_count ==
+                static_cast<int>(sizeof(Stage4_test_instance)),
+        "Stage 4 planner diffs row-owner changes when layout bytes stay sized");
+    ok &= check(grown_rows_slot_0.summary.partial_upload &&
+            !grown_rows_slot_0.summary.full_upload &&
+            grown_rows_slot_0.summary.instance_layout_changed_upload &&
+            grown_rows_slot_0.ranges.size() == 1U &&
+            grown_rows_slot_0.ranges.front().byte_offset ==
+                static_cast<int>(3U * sizeof(Stage4_test_instance)) &&
+            grown_rows_slot_0.ranges.front().byte_count ==
+                static_cast<int>(sizeof(Stage4_test_instance)),
+        "Stage 4 planner appends dirty-row instances without full upload");
+    return ok;
+}
+
+bool test_stage4_row_stable_glyph_planner()
+{
+    term::Qsg_atlas_stage4_buffer_upload_planner planner;
+    constexpr int row_count    = 3;
+    constexpr int row_capacity = 2;
+    const std::vector<int> rows = {
+        0, 0,
+        1, 1,
+        2, 2,
+    };
+    const QByteArray layout_key = QByteArrayLiteral("row-stable-glyph-layout");
+    const std::vector<term::Terminal_render_dirty_row_range> dirty_row_1 = {{1, 1}};
+
+    std::vector<Stage4_test_instance> base = {
+        {0, 10}, {0, 11},
+        {1, 20}, {1, 0},
+        {2, 30}, {2, 31},
+    };
+    std::vector<Stage4_test_instance> dirty_row_grown = base;
+    dirty_row_grown[3] = {1, 21};
+    std::vector<Stage4_test_instance> dirty_row_shrunk = base;
+    dirty_row_shrunk[2] = {1, 0};
+    std::vector<Stage4_test_instance> clean_row_and_dirty_row_changed =
+        dirty_row_grown;
+    clean_row_and_dirty_row_changed[0].value = 12;
+
+    const QByteArray base_bytes = stage4_instance_bytes(base);
+    const QByteArray dirty_row_grown_bytes =
+        stage4_instance_bytes(dirty_row_grown);
+    const QByteArray dirty_row_shrunk_bytes =
+        stage4_instance_bytes(dirty_row_shrunk);
+    const QByteArray clean_row_and_dirty_row_changed_bytes =
+        stage4_instance_bytes(clean_row_and_dirty_row_changed);
+    (void)planner.plan({
+        1,
+        0,
+        row_count,
+        static_cast<int>(sizeof(Stage4_test_instance)),
+        base_bytes.constData(),
+        static_cast<int>(base_bytes.size()),
+        &rows,
+        layout_key,
+        {},
+        false,
+        false,
+        false,
+        5,
+        true,
+    });
+
+    const term::Qsg_atlas_stage4_buffer_update_plan dirty =
+        planner.plan({
+            1,
+            0,
+            row_count,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            dirty_row_grown_bytes.constData(),
+            static_cast<int>(dirty_row_grown_bytes.size()),
+            &rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+            6,
+            true,
+        });
+    term::Qsg_atlas_stage4_buffer_upload_planner shrink_planner;
+    (void)shrink_planner.plan({
+        1,
+        0,
+        row_count,
+        static_cast<int>(sizeof(Stage4_test_instance)),
+        dirty_row_grown_bytes.constData(),
+        static_cast<int>(dirty_row_grown_bytes.size()),
+        &rows,
+        layout_key,
+        {},
+        false,
+        false,
+        false,
+        6,
+        true,
+    });
+    const term::Qsg_atlas_stage4_buffer_update_plan shrink =
+        shrink_planner.plan({
+            1,
+            0,
+            row_count,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            dirty_row_shrunk_bytes.constData(),
+            static_cast<int>(dirty_row_shrunk_bytes.size()),
+            &rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+            4,
+            true,
+        });
+
+    term::Qsg_atlas_stage4_buffer_upload_planner fallback_planner;
+    (void)fallback_planner.plan({
+        1,
+        0,
+        row_count,
+        static_cast<int>(sizeof(Stage4_test_instance)),
+        base_bytes.constData(),
+        static_cast<int>(base_bytes.size()),
+        &rows,
+        layout_key,
+        {},
+        false,
+        false,
+        false,
+        5,
+        true,
+    });
+    const term::Qsg_atlas_stage4_buffer_update_plan clean_slot_fallback =
+        fallback_planner.plan({
+            1,
+            0,
+            row_count,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            clean_row_and_dirty_row_changed_bytes.constData(),
+            static_cast<int>(clean_row_and_dirty_row_changed_bytes.size()),
+            &rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+            6,
+            true,
+        });
+
+    bool ok = true;
+    ok &= check(dirty.summary.row_stable_layout &&
+            dirty.summary.active_instance_count == 6 &&
+            dirty.summary.instance_count == row_count * row_capacity,
+        "Stage 4 row-stable glyph planner reports active and reserved instances");
+    ok &= check(dirty.summary.partial_upload &&
+            !dirty.summary.full_upload &&
+            !dirty.summary.non_dirty_state_upload &&
+            dirty.ranges.size() == 1U &&
+            dirty.ranges.front().byte_offset ==
+                static_cast<int>(3U * sizeof(Stage4_test_instance)) &&
+            dirty.ranges.front().byte_count ==
+                static_cast<int>(sizeof(Stage4_test_instance)),
+        "Stage 4 row-stable glyph planner patches dirty-row growth without "
+        "full-uploading stable clean rows");
+    ok &= check(shrink.summary.row_stable_layout &&
+            shrink.summary.partial_upload &&
+            !shrink.summary.full_upload &&
+            !shrink.summary.non_dirty_state_upload &&
+            shrink.summary.active_instance_count == 4 &&
+            shrink.ranges.size() == 1U &&
+            shrink.ranges.front().byte_offset ==
+                static_cast<int>(2U * sizeof(Stage4_test_instance)) &&
+            shrink.ranges.front().byte_count ==
+                static_cast<int>(2U * sizeof(Stage4_test_instance)),
+        "Stage 4 row-stable glyph planner patches dirty-row shrink-to-empty "
+        "without full-uploading stable clean rows");
+    ok &= check(clean_slot_fallback.summary.row_stable_layout &&
+            clean_slot_fallback.summary.full_upload &&
+            !clean_slot_fallback.summary.partial_upload &&
+            clean_slot_fallback.summary.non_dirty_state_upload &&
+            clean_slot_fallback.ranges.size() == 1U &&
+            clean_slot_fallback.ranges.front().byte_offset == 0 &&
+            clean_slot_fallback.ranges.front().byte_count ==
+                static_cast<int>(clean_row_and_dirty_row_changed_bytes.size()),
+        "Stage 4 row-stable glyph planner full-uploads when a clean-row slot "
+        "changes beside dirty-row content");
+    return ok;
+}
+
+bool test_stage4_non_dirty_and_full_reupload_planner()
+{
+    term::Qsg_atlas_stage4_buffer_upload_planner planner;
+    const std::vector<int> rows = {0, 1};
+    const QByteArray layout_key = QByteArrayLiteral("layout");
+    std::vector<Stage4_test_instance> instances = {
+        {0, 10},
+        {1, 20},
+    };
+    const QByteArray bytes = stage4_instance_bytes(instances);
+    (void)planner.plan({
+        1,
+        0,
+        2,
+        static_cast<int>(sizeof(Stage4_test_instance)),
+        bytes.constData(),
+        static_cast<int>(bytes.size()),
+        &rows,
+        layout_key,
+        {},
+        false,
+        false,
+        false,
+    });
+
+    bool ok = true;
+    for (const char* invalidation : {
+            "selection",
+            "cursor",
+            "preedit",
+            "options",
+            "visual_bell",
+        })
+    {
+        const term::Qsg_atlas_stage4_buffer_update_plan non_dirty =
+            planner.plan({
+                1,
+                0,
+                2,
+                static_cast<int>(sizeof(Stage4_test_instance)),
+                bytes.constData(),
+                static_cast<int>(bytes.size()),
+                &rows,
+                layout_key,
+                {},
+                false,
+                false,
+                true,
+            });
+        ok &= check(non_dirty.summary.full_upload &&
+                non_dirty.summary.non_dirty_state_upload,
+            std::string("Stage 4 planner full-uploads on non-dirty ") +
+                invalidation + " invalidation");
+    }
+
+    const term::Qsg_atlas_stage4_buffer_update_plan public_projection =
+        planner.plan({
+            1,
+            0,
+            2,
+            static_cast<int>(sizeof(Stage4_test_instance)),
+            bytes.constData(),
+            static_cast<int>(bytes.size()),
+            &rows,
+            layout_key,
+            {{0, 2}},
+            false,
+            true,
+            false,
+        });
+    ok &= check(public_projection.summary.full_upload &&
+            public_projection.summary.full_repaint_upload,
+        "Stage 4 planner full-uploads PUBLIC_PROJECTION/SCROLL repaint frames");
+    return ok;
+}
+
+bool test_stage4_atlas_budget_stats()
+{
+    term::Glyph_coverage_tile tile;
+    tile.size           = QSize(2, 2);
+    tile.bytes_per_line = 2;
+    tile.bytes          = byte_array({1, 2, 3, 4});
+
+    term::Glyph_atlas_cache cache(QSize(4, 4));
+    cache.set_epoch(1U);
+    const term::Glyph_atlas_slot first = cache.insert_or_get(
+        term::qsg_atlas_cache_key(10U, QStringLiteral("face"), 12.0, 0),
+        tile);
+    const term::Glyph_atlas_slot second = cache.insert_or_get(
+        term::qsg_atlas_cache_key(11U, QStringLiteral("face"), 12.0, 0),
+        tile);
+    const term::Glyph_atlas_cache_stats stats = cache.stats();
+
+    bool ok = true;
+    ok &= check(first.is_valid() && !second.is_valid(),
+        "Stage 4 atlas budget test reaches the one-page cap");
+    ok &= check(stats.page_budget == 1 &&
+            stats.page_count == 1 &&
+            stats.page_bytes == 16U &&
+            stats.allocated_bytes == 16U &&
+            stats.budget_bytes == 16U,
+        "Stage 4 atlas stats report page count, allocation, and budget bytes");
+    ok &= check(stats.used_bytes == 4U && stats.failed_inserts == 1U,
+        "Stage 4 atlas stats report used coverage bytes and failed inserts");
+    return ok;
+}
+
 bool report_ready_for_render(const term::Qsg_atlas_stage1_frame_report& report)
 {
     return
@@ -1794,6 +2272,17 @@ bool report_ready_for_render(const term::Qsg_atlas_stage1_frame_report& report)
         report.r8_upload_recorded           &&
         report.raw_font_rasterized          &&
         report.raw_font_rasterized_in_prepare;
+}
+
+bool stage4_report_render_state_ready(const term::Qsg_atlas_stage1_frame_report& report)
+{
+    return
+        report.prepare_count > 0U       &&
+        report.render_count > 0U        &&
+        report.drew                     &&
+        report.command_buffer_non_null  &&
+        report.render_target_non_null   &&
+        report.rhi_non_null;
 }
 
 bool pump_until(
@@ -1812,6 +2301,30 @@ bool pump_until(
         const term::Qsg_atlas_stage1_frame_report report =
             term::VNM_TerminalSurface_render_bridge::qsg_atlas_stage1_frame(surface);
         if (predicate(report)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool pump_next_stage4_report(
+    QGuiApplication&    app,
+    QQuickWindow&       window,
+    VNM_TerminalSurface& surface,
+    std::uint64_t       previous_prepare_count,
+    term::Qsg_atlas_stage1_frame_report& out_report,
+    int                 attempts = 120)
+{
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        surface.update();
+        window.requestUpdate();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        const term::Qsg_atlas_stage1_frame_report report =
+            term::VNM_TerminalSurface_render_bridge::qsg_atlas_stage1_frame(surface);
+        if (report.prepare_count > previous_prepare_count) {
+            out_report = report;
             return true;
         }
     }
@@ -1931,6 +2444,679 @@ int test_render_smoke(QGuiApplication& app)
     return ok ? 0 : 1;
 }
 
+term::Terminal_render_snapshot make_stage4_report_snapshot(std::uint64_t sequence)
+{
+    term::Terminal_render_snapshot snapshot =
+        make_stage2_base_snapshot({3, 8}, sequence);
+    snapshot.cursor.visible = false;
+    snapshot.cells.push_back(
+        make_stage2_cell(0, 0, QStringLiteral("A"), 1, term::k_default_terminal_style_id));
+    return snapshot;
+}
+
+term::Terminal_render_snapshot make_stage4_row_stable_text_snapshot(
+    std::uint64_t sequence,
+    QString       middle_text,
+    int           middle_display_width,
+    bool          add_wide_continuations,
+    std::vector<term::Terminal_render_dirty_row_range>
+                  dirty_row_ranges)
+{
+    term::Terminal_render_snapshot snapshot =
+        make_stage2_base_snapshot({3, 8}, sequence);
+    snapshot.cursor.visible    = false;
+    snapshot.dirty_row_ranges  = std::move(dirty_row_ranges);
+    snapshot.cells.push_back(
+        make_stage2_cell(0, 0, QStringLiteral("A"), 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_stage2_cell(
+            1,
+            0,
+            middle_text,
+            middle_display_width,
+            term::k_default_terminal_style_id));
+    if (add_wide_continuations) {
+        const int continuation_columns =
+            std::min(middle_display_width, snapshot.grid_size.columns);
+        for (int column = 1; column < continuation_columns; ++column) {
+            snapshot.cells.push_back(
+                make_stage2_continuation_cell(
+                    1,
+                    column,
+                    term::k_default_terminal_style_id));
+        }
+    }
+    snapshot.cells.push_back(
+        make_stage2_cell(2, 0, QStringLiteral("C"), 1, term::k_default_terminal_style_id));
+    return snapshot;
+}
+
+term::Terminal_render_snapshot make_stage4_row_stable_text_snapshot(
+    std::uint64_t sequence,
+    QString       middle_text,
+    std::vector<term::Terminal_render_dirty_row_range>
+                  dirty_row_ranges)
+{
+    const int middle_display_width = static_cast<int>(middle_text.size());
+    return make_stage4_row_stable_text_snapshot(
+        sequence,
+        std::move(middle_text),
+        middle_display_width,
+        false,
+        std::move(dirty_row_ranges));
+}
+
+bool pump_stage4_seeded_glyph_slots(
+    QGuiApplication& app,
+    QQuickWindow&    window,
+    VNM_TerminalSurface& surface,
+    term::Qsg_atlas_stage1_frame_report& report,
+    int              attempts = 12)
+{
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        const term::Qsg_atlas_stage4_buffer_update_summary& glyph_buffer =
+            report.stage4.glyph_buffer;
+        if (glyph_buffer.seeded_slots >= glyph_buffer.rhi_frames_in_flight) {
+            return true;
+        }
+
+        const std::uint64_t previous_prepare_count = report.prepare_count;
+        if (!pump_next_stage4_report(
+                app,
+                window,
+                surface,
+                previous_prepare_count,
+                report))
+        {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+bool run_stage4_glyph_row_stable_report_case(
+    QGuiApplication& app,
+    const char*      name,
+    const term::Terminal_render_snapshot& baseline_snapshot,
+    const term::Terminal_render_snapshot& mutated_snapshot,
+    const std::function<bool(const term::Qsg_atlas_stage4_frame_summary&)>&
+                     extra_expected,
+    bool             expect_full_fallback = false)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_theme(QStringLiteral("default"));
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(baseline_snapshot));
+    term::VNM_TerminalSurface_render_bridge::set_qsg_atlas_stage1_probe_enabled(
+        surface,
+        true);
+
+    window.show();
+    const bool baseline_rendered = pump_until(
+        app,
+        window,
+        surface,
+        stage4_report_render_state_ready);
+    term::Qsg_atlas_stage1_frame_report baseline_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_stage1_frame(surface);
+    if (!baseline_rendered ||
+        !pump_stage4_seeded_glyph_slots(app, window, surface, baseline_report))
+    {
+        std::cerr << "FAIL: Stage 4 glyph row-stable " << name
+            << " could not seed all glyph buffer slots"
+            << " prepare_count=" << baseline_report.prepare_count
+            << " seeded_slots=" << baseline_report.stage4.glyph_buffer.seeded_slots
+            << " frames_in_flight="
+            << baseline_report.stage4.glyph_buffer.rhi_frames_in_flight
+            << '\n';
+        return false;
+    }
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(mutated_snapshot));
+
+    term::Qsg_atlas_stage1_frame_report report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_stage1_frame(surface);
+    const bool prepared = pump_next_stage4_report(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        report);
+    const term::Qsg_atlas_stage4_frame_summary& stage4 = report.stage4;
+    const term::Qsg_atlas_stage4_buffer_update_summary& glyph_buffer =
+        stage4.glyph_buffer;
+    const bool partial_update =
+        glyph_buffer.row_stable_layout       &&
+        glyph_buffer.partial_upload          &&
+        !glyph_buffer.full_upload            &&
+        !glyph_buffer.non_dirty_state_upload &&
+        glyph_buffer.uploaded_bytes > 0      &&
+        glyph_buffer.uploaded_bytes < glyph_buffer.buffer_bytes;
+    const bool full_fallback =
+        glyph_buffer.row_stable_layout       &&
+        glyph_buffer.full_upload             &&
+        !glyph_buffer.partial_upload         &&
+        glyph_buffer.non_dirty_state_upload  &&
+        glyph_buffer.uploaded_bytes == glyph_buffer.buffer_bytes;
+    const bool expected_upload =
+        expect_full_fallback ? full_fallback : partial_update;
+    const bool extra = prepared && extra_expected(stage4);
+
+    if (!prepared || !expected_upload || !extra) {
+        std::cerr << "Stage 4 glyph row-stable " << name
+            << " prepared=" << prepared
+            << " glyph_full=" << glyph_buffer.full_upload
+            << " glyph_partial=" << glyph_buffer.partial_upload
+            << " glyph_non_dirty=" << glyph_buffer.non_dirty_state_upload
+            << " glyph_uploaded=" << glyph_buffer.uploaded_bytes
+            << " glyph_buffer_bytes=" << glyph_buffer.buffer_bytes
+            << " row_stable=" << glyph_buffer.row_stable_layout
+            << " glyph_text_capacity=" << stage4.glyph_text_row_capacity
+            << " glyph_cursor_text_capacity="
+            << stage4.glyph_cursor_text_row_capacity
+            << " qt_layout_runs=" << stage4.qt_layout_text_runs
+            << " non_dirty_cursor="
+            << stage4.non_dirty_cursor_invalidation
+            << '\n';
+    }
+
+    bool ok = true;
+    ok &= check(prepared,
+        std::string("Stage 4 glyph row-stable ") + name +
+            " reaches a prepared frame");
+    ok &= check(expected_upload,
+        std::string("Stage 4 glyph row-stable ") + name +
+            (expect_full_fallback
+                ? " falls back to a full glyph upload"
+                : " patches only dirty row glyph bytes"));
+    ok &= check(extra,
+        std::string("Stage 4 glyph row-stable ") + name +
+            " reports expected case counters");
+    return ok;
+}
+
+bool test_stage4_glyph_row_stable_dirty_update(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_theme(QStringLiteral("default"));
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_stage4_row_stable_text_snapshot(
+                930U,
+                QStringLiteral("B"),
+                {{0, 3}})));
+    term::VNM_TerminalSurface_render_bridge::set_qsg_atlas_stage1_probe_enabled(
+        surface,
+        true);
+
+    window.show();
+    const bool baseline_rendered = pump_until(
+        app,
+        window,
+        surface,
+        stage4_report_render_state_ready);
+    term::Qsg_atlas_stage1_frame_report baseline_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_stage1_frame(surface);
+    if (!baseline_rendered ||
+        !pump_stage4_seeded_glyph_slots(app, window, surface, baseline_report))
+    {
+        std::cerr << "FAIL: Stage 4 glyph row-stable dirty update could not seed "
+            << "all glyph buffer slots"
+            << " prepare_count=" << baseline_report.prepare_count
+            << " seeded_slots=" << baseline_report.stage4.glyph_buffer.seeded_slots
+            << " frames_in_flight="
+            << baseline_report.stage4.glyph_buffer.rhi_frames_in_flight
+            << '\n';
+        return false;
+    }
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_stage4_row_stable_text_snapshot(
+                931U,
+                QStringLiteral("BC"),
+                {{1, 1}})));
+
+    term::Qsg_atlas_stage1_frame_report report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_stage1_frame(surface);
+    const bool prepared = pump_next_stage4_report(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        report);
+    const term::Qsg_atlas_stage4_buffer_update_summary& glyph_buffer =
+        report.stage4.glyph_buffer;
+
+    if (!prepared ||
+        !glyph_buffer.partial_upload ||
+        glyph_buffer.full_upload ||
+        glyph_buffer.non_dirty_state_upload)
+    {
+        std::cerr << "Stage 4 glyph row-stable dirty update"
+            << " prepared=" << prepared
+            << " glyph_full=" << glyph_buffer.full_upload
+            << " glyph_partial=" << glyph_buffer.partial_upload
+            << " glyph_non_dirty=" << glyph_buffer.non_dirty_state_upload
+            << " glyph_uploaded=" << glyph_buffer.uploaded_bytes
+            << " glyph_buffer_bytes=" << glyph_buffer.buffer_bytes
+            << " row_stable=" << glyph_buffer.row_stable_layout
+            << '\n';
+    }
+
+    bool ok = true;
+    ok &= check(prepared,
+        "Stage 4 glyph row-stable dirty update reaches a prepared frame");
+    ok &= check(glyph_buffer.row_stable_layout &&
+            glyph_buffer.active_instance_count < glyph_buffer.instance_count &&
+            report.stage4.glyph_text_row_capacity >= 8,
+        "Stage 4 glyph row-stable dirty update reserves stable row slots");
+    ok &= check(glyph_buffer.partial_upload &&
+            !glyph_buffer.full_upload &&
+            !glyph_buffer.non_dirty_state_upload &&
+            glyph_buffer.uploaded_bytes > 0 &&
+            glyph_buffer.uploaded_bytes < glyph_buffer.buffer_bytes,
+        "Stage 4 glyph row-stable dirty update patches the dirty row only");
+    return ok;
+}
+
+bool test_stage4_glyph_row_stable_wide_update(QGuiApplication& app)
+{
+    const term::Terminal_render_snapshot baseline =
+        make_stage4_row_stable_text_snapshot(
+            940U,
+            QString::fromUtf8("\xe7\x95\x8c"),
+            2,
+            true,
+            {{0, 3}});
+    const term::Terminal_render_snapshot mutated =
+        make_stage4_row_stable_text_snapshot(
+            941U,
+            QString::fromUtf8("\xe8\xaa\x9e"),
+            2,
+            true,
+            {{1, 1}});
+    return run_stage4_glyph_row_stable_report_case(
+        app,
+        "wide glyph row",
+        baseline,
+        mutated,
+        [](const term::Qsg_atlas_stage4_frame_summary& stage4) {
+            return stage4.glyph_text_row_capacity > 0 &&
+                stage4.qt_layout_text_runs > 0;
+        });
+}
+
+bool test_stage4_glyph_row_stable_combining_update(QGuiApplication& app)
+{
+    const term::Terminal_render_snapshot baseline =
+        make_stage4_row_stable_text_snapshot(
+            950U,
+            QString::fromUtf8("e\xcc\x81"),
+            1,
+            false,
+            {{0, 3}});
+    const term::Terminal_render_snapshot mutated =
+        make_stage4_row_stable_text_snapshot(
+            951U,
+            QString::fromUtf8("o\xcc\x82"),
+            1,
+            false,
+            {{1, 1}});
+    return run_stage4_glyph_row_stable_report_case(
+        app,
+        "combining-mark row",
+        baseline,
+        mutated,
+        [](const term::Qsg_atlas_stage4_frame_summary& stage4) {
+            return stage4.glyph_text_row_capacity > 0 &&
+                stage4.qt_layout_text_runs > 0;
+        });
+}
+
+bool test_stage4_glyph_row_stable_cursor_dirty_update(QGuiApplication& app)
+{
+    term::Terminal_render_snapshot baseline =
+        make_stage4_row_stable_text_snapshot(
+            960U,
+            QStringLiteral("."),
+            1,
+            false,
+            {{0, 3}});
+    term::Terminal_render_snapshot mutated =
+        make_stage4_row_stable_text_snapshot(
+            961U,
+            QStringLiteral("!"),
+            1,
+            false,
+            {{1, 1}});
+    baseline.cursor.position      = {1, 0};
+    baseline.cursor.visible       = true;
+    baseline.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    baseline.cursor.blink_enabled = false;
+    mutated.cursor.position      = {1, 0};
+    mutated.cursor.visible       = true;
+    mutated.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    mutated.cursor.blink_enabled = false;
+
+    return run_stage4_glyph_row_stable_report_case(
+        app,
+        "cursor glyph row",
+        baseline,
+        mutated,
+        [](const term::Qsg_atlas_stage4_frame_summary& stage4) {
+            return stage4.glyph_cursor_text_row_capacity > 0 &&
+                !stage4.non_dirty_cursor_invalidation;
+        });
+}
+
+bool test_stage4_glyph_row_stable_cursor_clean_row_fallback(QGuiApplication& app)
+{
+    term::Terminal_render_snapshot baseline =
+        make_stage4_row_stable_text_snapshot(
+            970U,
+            QStringLiteral("."),
+            1,
+            false,
+            {{0, 3}});
+    term::Terminal_render_snapshot mutated =
+        make_stage4_row_stable_text_snapshot(
+            971U,
+            QStringLiteral("!"),
+            1,
+            false,
+            {{1, 1}});
+    baseline.cells.push_back(
+        make_stage2_cell(
+            0,
+            1,
+            QStringLiteral("D"),
+            1,
+            term::k_default_terminal_style_id));
+    mutated.cells.push_back(
+        make_stage2_cell(
+            0,
+            1,
+            QStringLiteral("D"),
+            1,
+            term::k_default_terminal_style_id));
+    baseline.cursor.position      = {0, 0};
+    baseline.cursor.visible       = true;
+    baseline.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    baseline.cursor.blink_enabled = false;
+    mutated.cursor.position      = {0, 1};
+    mutated.cursor.visible       = true;
+    mutated.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    mutated.cursor.blink_enabled = false;
+
+    return run_stage4_glyph_row_stable_report_case(
+        app,
+        "clean-row cursor glyph",
+        baseline,
+        mutated,
+        [](const term::Qsg_atlas_stage4_frame_summary& stage4) {
+            return stage4.glyph_cursor_text_row_capacity > 0 &&
+                !stage4.non_dirty_cursor_invalidation;
+        },
+        true);
+}
+
+bool run_stage4_report_case(
+    QGuiApplication& app,
+    const char*      name,
+    const std::function<void(VNM_TerminalSurface&, term::Terminal_render_snapshot&)>&
+                     mutate,
+    const std::function<bool(const term::Qsg_atlas_stage4_frame_summary&)>&
+                     expected,
+    bool             set_snapshot_before_mutate = false)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_theme(QStringLiteral("default"));
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_stage4_report_snapshot(900U)));
+    term::VNM_TerminalSurface_render_bridge::set_qsg_atlas_stage1_probe_enabled(
+        surface,
+        true);
+
+    window.show();
+    const bool baseline_rendered = pump_until(
+        app,
+        window,
+        surface,
+        stage4_report_render_state_ready);
+    const term::Qsg_atlas_stage1_frame_report baseline_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_stage1_frame(surface);
+    if (!baseline_rendered) {
+        std::cerr << "FAIL: Stage 4 report case " << name
+            << " lost usable QRhi render state after backend probe\n";
+        return false;
+    }
+
+    term::Terminal_render_snapshot mutated = make_stage4_report_snapshot(901U);
+    mutated.dirty_row_ranges.clear();
+    if (set_snapshot_before_mutate) {
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            surface,
+            std::make_shared<const term::Terminal_render_snapshot>(mutated));
+        mutate(surface, mutated);
+    }
+    else {
+        mutate(surface, mutated);
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            surface,
+            std::make_shared<const term::Terminal_render_snapshot>(mutated));
+    }
+
+    const std::uint64_t previous_prepare_count = baseline_report.prepare_count;
+    term::Qsg_atlas_stage1_frame_report report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_stage1_frame(surface);
+    const bool prepared = pump_next_stage4_report(
+        app,
+        window,
+        surface,
+        previous_prepare_count,
+        report);
+    const bool reported = prepared && expected(report.stage4);
+    if (!reported) {
+        const term::Qsg_atlas_stage4_frame_summary& stage4 = report.stage4;
+        std::cerr << "Stage 4 report case " << name
+            << " prepare_count=" << report.prepare_count
+            << " previous_prepare_count=" << previous_prepare_count
+            << " selection=" << stage4.non_dirty_selection_invalidation
+            << " cursor=" << stage4.non_dirty_cursor_invalidation
+            << " preedit=" << stage4.non_dirty_preedit_invalidation
+            << " options=" << stage4.non_dirty_options_invalidation
+            << " visual_bell=" << stage4.non_dirty_visual_bell_invalidation
+            << " rect_full=" << stage4.rect_buffer.full_upload
+            << " glyph_full=" << stage4.glyph_buffer.full_upload
+            << '\n';
+    }
+
+    bool ok = true;
+    ok &= check(reported, std::string("Stage 4 report invalidation case ") + name);
+    ok &= check(report.stage4.rect_buffer.full_upload ||
+            report.stage4.glyph_buffer.full_upload,
+        std::string("Stage 4 report full-uploads at least one instance buffer for ") +
+            name);
+    return ok;
+}
+
+bool stage4_report_backend_usable(QGuiApplication& app)
+{
+    Stage2_parity_fixture probe = make_stage3_base_fixture(
+        "stage4_backend_probe",
+        {3, 8},
+        899U,
+        stage2_metrics());
+    probe.snapshot.cells.push_back(
+        make_stage2_cell(0, 0, QStringLiteral("A"), 1, term::k_default_terminal_style_id));
+    const Stage2_render_result atlas = render_stage2_fixture(app, probe, true);
+    const bool rendered =
+        atlas.ready &&
+        stage4_report_render_state_ready(atlas.atlas_report);
+    if (!rendered) {
+        std::cerr << "SKIP: Stage 4 report backend probe did not reach usable QRhi "
+            << "render state"
+            << " prepare_count=" << atlas.atlas_report.prepare_count
+            << " render_count=" << atlas.atlas_report.render_count
+            << " rhi_non_null=" << atlas.atlas_report.rhi_non_null
+            << '\n';
+    }
+    return rendered;
+}
+
+int test_stage4_report(QGuiApplication& app, const char* backend)
+{
+    (void)backend;
+
+    if (!stage4_report_backend_usable(app)) {
+        return k_unsupported_backend_skip_return_code;
+    }
+
+    bool ok = true;
+    ok &= run_stage4_report_case(
+        app,
+        "selection",
+        [](VNM_TerminalSurface&, term::Terminal_render_snapshot& snapshot) {
+            snapshot.selection_spans.push_back({
+                {{0, 1}, {0, 3}, term::Terminal_selection_mode::NORMAL},
+                0,
+                1,
+                2,
+            });
+        },
+        [](const term::Qsg_atlas_stage4_frame_summary& stage4) {
+            return stage4.non_dirty_selection_invalidation;
+        });
+    ok &= run_stage4_report_case(
+        app,
+        "cursor",
+        [](VNM_TerminalSurface&, term::Terminal_render_snapshot& snapshot) {
+            snapshot.cursor.visible       = true;
+            snapshot.cursor.blink_enabled = false;
+            snapshot.cursor.position      = {1, 2};
+        },
+        [](const term::Qsg_atlas_stage4_frame_summary& stage4) {
+            return stage4.non_dirty_cursor_invalidation;
+        });
+    ok &= run_stage4_report_case(
+        app,
+        "preedit",
+        [](VNM_TerminalSurface& surface, term::Terminal_render_snapshot&) {
+            term::Ime_preedit_state state;
+            state.text            = QStringLiteral("x");
+            state.cursor_position = 1;
+            state.active          = true;
+            term::VNM_TerminalSurface_render_bridge::set_ime_preedit_state(
+                surface,
+                std::move(state));
+        },
+        [](const term::Qsg_atlas_stage4_frame_summary& stage4) {
+            return stage4.non_dirty_preedit_invalidation;
+        },
+        true);
+    ok &= run_stage4_report_case(
+        app,
+        "options",
+        [](VNM_TerminalSurface& surface, term::Terminal_render_snapshot&) {
+            surface.set_cursor_style(VNM_TerminalSurface::Cursor_style::UNDERLINE);
+        },
+        [](const term::Qsg_atlas_stage4_frame_summary& stage4) {
+            return stage4.non_dirty_options_invalidation;
+        },
+        true);
+    ok &= run_stage4_report_case(
+        app,
+        "visual_bell",
+        [](VNM_TerminalSurface&, term::Terminal_render_snapshot& snapshot) {
+            snapshot.metadata.visual_bell_active = true;
+        },
+        [](const term::Qsg_atlas_stage4_frame_summary& stage4) {
+            return stage4.non_dirty_visual_bell_invalidation;
+        });
+    ok &= test_stage4_glyph_row_stable_dirty_update(app);
+    ok &= test_stage4_glyph_row_stable_wide_update(app);
+    ok &= test_stage4_glyph_row_stable_combining_update(app);
+    ok &= test_stage4_glyph_row_stable_cursor_dirty_update(app);
+    ok &= test_stage4_glyph_row_stable_cursor_clean_row_fallback(app);
+
+    Stage2_parity_fixture public_scroll = make_stage3_base_fixture(
+        "stage4_public_projection_scroll",
+        {3, 8},
+        920U,
+        stage2_metrics());
+    public_scroll.snapshot.basis =
+        term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION;
+    public_scroll.snapshot.purpose =
+        term::Terminal_render_snapshot_purpose::SCROLL;
+    public_scroll.snapshot.styles.push_back(rgb_style(0xfff8f8f2U, 0xff204050U));
+    public_scroll.snapshot.cells.push_back(
+        make_stage2_cell(0, 0, QStringLiteral("A"), 1, term::k_default_terminal_style_id));
+    public_scroll.snapshot.cells.push_back(
+        make_stage2_cell(1, 1, QStringLiteral(" "), 1, 1U));
+    public_scroll.snapshot.cells.push_back(
+        make_stage2_cell(1, 2, QStringLiteral(" "), 1, 1U));
+    const Stage2_render_result atlas = render_stage2_fixture(app, public_scroll, true);
+    if (!atlas.ready) {
+        std::cerr << "FAIL: Stage 4 public projection report lost usable QRhi "
+            << "render state after backend probe\n";
+        return 1;
+    }
+
+    const term::Qsg_atlas_stage4_frame_summary& stage4 = atlas.atlas_report.stage4;
+    ok &= check(stage4.full_dirty_range_reupload &&
+            stage4.public_projection_full_reupload &&
+            stage4.scroll_full_reupload,
+        "Stage 4 report marks PUBLIC_PROJECTION/SCROLL as full reupload");
+    ok &= check(stage4.rect_buffer.full_repaint_upload ||
+            stage4.glyph_buffer.full_repaint_upload,
+        "Stage 4 report routes PUBLIC_PROJECTION/SCROLL through full buffer upload");
+    ok &= check(stage4.background_rects_before_coalescing >
+            stage4.background_rects_after_coalescing,
+        "Stage 4 report records background coalescing");
+    ok &= check(stage4.draw_calls > 0 &&
+            stage4.rect_draw_calls > 0 &&
+            stage4.glyph_draw_calls > 0,
+        "Stage 4 report records minimized non-empty draw calls");
+    ok &= check(stage4.atlas_page_budget >= 1 &&
+            stage4.atlas_page_bytes > 0U &&
+            stage4.atlas_budget_bytes >= stage4.atlas_allocated_bytes,
+        "Stage 4 report records atlas memory and page budget counters");
+    return ok ? 0 : 1;
+}
+
 bool run_unit_tests()
 {
     bool ok = true;
@@ -1939,6 +3125,10 @@ bool run_unit_tests()
     ok &= test_packing_and_stride_copy();
     ok &= test_indexed8_and_grayscale_conversion();
     ok &= test_epoch_invalidation();
+    ok &= test_stage4_rotating_buffer_planner();
+    ok &= test_stage4_row_stable_glyph_planner();
+    ok &= test_stage4_non_dirty_and_full_reupload_planner();
+    ok &= test_stage4_atlas_budget_stats();
     return ok;
 }
 
@@ -1949,12 +3139,16 @@ int main(int argc, char** argv)
     const bool render_smoke = has_argument(argc, argv, "--render-smoke");
     const bool stage2_parity = has_argument(argc, argv, "--stage2-parity");
     const bool stage3_parity = has_argument(argc, argv, "--stage3-parity");
+    const bool stage4_report = has_argument(argc, argv, "--stage4-report");
     const char* backend = argument_value(argc, argv, "--backend", "d3d11");
-    if (render_smoke || stage2_parity || stage3_parity) {
+    if (render_smoke || stage2_parity || stage3_parity || stage4_report) {
         configure_graphics_api(backend);
     }
 
     QGuiApplication app(argc, argv);
+    if (stage4_report) {
+        return test_stage4_report(app, backend);
+    }
     if (stage3_parity) {
         return test_stage3_parity(app, backend);
     }
