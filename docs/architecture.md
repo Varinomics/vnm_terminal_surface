@@ -19,8 +19,8 @@ backend output bytes
     -> Terminal_screen_model
     -> Terminal_render_snapshot
     -> Terminal_render_frame
-    -> Qsg_terminal_renderer
-    -> Qt Scene Graph nodes
+    -> qsg_atlas_renderer
+    -> Qt Scene Graph / QRhi nodes
 
 Qt input / paste / IME / focus
     -> VNM_TerminalSurface
@@ -224,11 +224,13 @@ The session stores the latest snapshot as a
 generation. The surface sync path copies the shared handle into the surface
 through `VNM_TerminalSurface_render_bridge` and schedules a Qt Quick update.
 
-The surface's `updatePaintNode` override builds a `Terminal_render_frame` with
-the frame-building path in `src/qsg_terminal_renderer.cpp`. The frame owns
-per-frame vectors of rects, arcs, text runs, cursor primitives, decorations,
-overlays, dirty row ranges, and packed row/text/graphic sidecars. The QSG
-renderer turns that frame into reusable Qt Scene Graph nodes.
+The surface's `updatePaintNode` override captures immutable render inputs and
+returns the canonical atlas render node in `src/qsg_atlas_renderer.cpp`. The
+render node builds the `Terminal_render_frame` in `QSGRenderNode::prepare()`
+using the frame-building path in `src/qsg_terminal_renderer.cpp`, prepares atlas
+pages and instance buffers, then submits QRhi draws in `render()`. The frame
+owns per-frame vectors of rects, arcs, text runs, cursor primitives,
+decorations, overlays, dirty row ranges, and packed row/text/graphic sidecars.
 
 `Terminal_render_frame::text_runs` is the canonical renderer input for terminal
 text. `Terminal_render_frame::cursor_text_runs` carries cursor inverse-text
@@ -237,27 +239,30 @@ classification, and cache data; they do not own text and do not replace
 `frame.text_runs`. Packed row and graphic sidecars may support graphics-route
 grouping and row identity.
 
-`Terminal_scene_node` owns renderer-local reusable row caches keyed by active
-buffer, logical row, and exact content or layer descriptors. Clean-row reuse is
-an internal optimization and must respect dirty rows, viewport identity,
-geometry, style/color state, and descriptor equality.
+The atlas render node owns renderer-local QRhi resources, glyph-atlas pages,
+instance buffers, and reusable row/layer upload state keyed by active buffer,
+logical row, and exact content or layer descriptors. Clean-row reuse is an
+internal optimization and must respect dirty rows, viewport identity, geometry,
+style/color state, and descriptor equality.
 
-Text rendering uses public Qt APIs, including `QTextLayout` and `QSGTextNode`,
-through the allowed Qt Core, Gui, and Quick modules. The production renderer
-does not paint terminal rows or frames into `QImage` with `QPainter`, and it
-does not allocate one child `QQuickItem` per cell. The detailed constraints are
-in [Qt rendering policy](qt_rendering_policy.md).
+Text rendering uses the atlas renderer's Qt font-engine rasterization and QRhi
+composition path through the allowed Qt Core, Gui, Quick, GuiPrivate, and
+QuickPrivate posture. The production renderer does not paint terminal rows or
+frames into `QImage` with `QPainter`, and it does not allocate one child
+`QQuickItem` per cell. The detailed constraints are in
+[Qt rendering policy](qt_rendering_policy.md).
 
-Cell ownership is model-owned. Qt owns glyph shaping, fallback, text-node,
-material, and render-thread details behind public APIs. Those details do not
-redefine terminal cell identity.
+Cell ownership is model-owned. Qt owns glyph shaping, fallback, font-engine
+rasterization, and render-thread details behind public APIs and the allowed QRhi
+private API posture. Those details do not redefine terminal cell identity.
 
 Look at:
 
 - `include/vnm_terminal/internal/render_snapshot.h` for snapshot invariants.
 - `include/vnm_terminal/internal/qsg_terminal_render_frame.h` for render-frame
   primitives.
-- `src/qsg_terminal_renderer.cpp` for frame building and QSG node updates.
+- `src/qsg_terminal_renderer.cpp` for frame building.
+- `src/qsg_atlas_renderer.cpp` for atlas render-node updates.
 - `src/vnm_terminal_surface.cpp` for Qt scene graph lifecycle integration.
 
 ## Threading And Ownership
@@ -272,10 +277,12 @@ exit, and error commands through the session callback lifetime and wake the
 surface through a queued Qt invocation. They do not mutate parser, model,
 viewport, selection, or render state directly.
 
-Qt calls `updatePaintNode` on the scene graph update path. That path consumes
-immutable snapshot handles and renderer-local resources. Renderer diagnostics and
-lifecycle recorders use small mutex-protected publishers for cross-thread test
-and diagnostic reads.
+Qt calls `updatePaintNode` on the scene graph update path. That path captures
+immutable snapshot handles and render options while the GUI thread is blocked.
+Frame building, atlas population, and instance-buffer preparation then run from
+the render node's `prepare()` on the render thread. Renderer diagnostics,
+profiling snapshots, and lifecycle recorders use small mutex-protected
+publishers for cross-thread test and diagnostic reads.
 
 Look at:
 

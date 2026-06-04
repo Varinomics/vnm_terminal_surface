@@ -34,7 +34,7 @@ option(VNM_TERMINAL_BUILD_REQUIRED_READINESS "Build vnm_terminal_surface readine
 option(VNM_TERMINAL_BUILD_BENCHMARKS "Build vnm_terminal_surface benchmark executables" OFF)
 option(VNM_TERMINAL_ENABLE_PROFILING "Compile vnm_terminal_surface profile scope instrumentation" OFF)
 option(VNM_TERMINAL_ENABLE_SHADER_GENERATION
-    "Require Qt ShaderTools for source-tree shader package generation"
+    "Require Qt ShaderTools for source-tree shader tooling"
     OFF)
 if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_BUILD_BENCHMARKS)
     set(VNM_TERMINAL_BUILD_BENCHMARKS ON)
@@ -76,8 +76,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/ime_contract.h
     include/vnm_terminal/internal/metrics_contract.h
     include/vnm_terminal/internal/parser_action.h
-    include/vnm_terminal/internal/qsg_atlas_renderer_stage1.h
-    include/vnm_terminal/internal/qsg_rhi_stage0_probe.h
+    include/vnm_terminal/internal/qsg_atlas_renderer.h
     include/vnm_terminal/internal/qsg_terminal_render_frame.h
     include/vnm_terminal/internal/qsg_terminal_renderer.h
     include/vnm_terminal/internal/qt_grid_metrics_provider.h
@@ -118,8 +117,7 @@ add_library(vnm_terminal_surface STATIC
     src/terminal_screen_model.cpp
     src/metrics_contract.cpp
     src/native_backend_io_core.cpp
-    src/qsg_atlas_renderer_stage1.cpp
-    src/qsg_rhi_stage0_probe.cpp
+    src/qsg_atlas_renderer.cpp
     src/qsg_terminal_renderer.cpp
     src/qt_grid_metrics_provider.cpp
     src/selection_contract.cpp

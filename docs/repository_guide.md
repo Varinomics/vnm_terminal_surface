@@ -37,6 +37,11 @@ benchmarks.
 The project requires CMake 3.21 or newer, C++20, and Qt 6.7 Core, Gui, and
 Quick.
 
+The atlas renderer uses Qt private modules for QRhi integration
+(`Qt6::GuiPrivate` and `Qt6::QuickPrivate`) under the project Qt posture checks.
+Installed binary packages are tied to the Qt major/minor used to build the
+surface; source-tree consumers rebuild the surface against their own Qt.
+
 - `BUILD_TESTING` is the standard CTest switch. Leave it on for normal
   development when `VNM_TERMINAL_SURFACE_BUILD_TESTING=ON`.
 - `VNM_TERMINAL_SURFACE_BUILD_TESTING` is `ON` when the surface is the top-level
@@ -126,7 +131,7 @@ CTest names are the stable way to find a test. The main families are:
   `vnm_terminal_linux_pty_backend`: session and platform backend behavior.
 - `vnm_terminal_qt_*`, `vnm_terminal_render_*`,
   `vnm_terminal_qsg_*`, and `vnm_terminal_shaping_contract`: metrics, render
-  snapshots, render frames, QSG rendering, shaping, and QSG text-node checks.
+  snapshots, render frames, atlas QSG rendering, and shaping checks.
 - `vnm_terminal_surface_host`, `vnm_terminal_input_encoder`, and
   `vnm_terminal_behavior_smoke`: public surface host behavior, input encoding,
   and behavior-smoke launches through the canvas fixture.
@@ -217,24 +222,31 @@ ctest --test-dir build-profile -C Release -R "^vnm_terminal_embedded_benchmark_p
 
 The benchmark supports `--list-scenarios`, repeated `--scenario <name>`,
 `--iterations`, `--warmup`, `--grid`, `--window-size`, JSON output,
-hierarchical profile output, `--software-renderer`, and `--validate-json`.
+hierarchical profile output, and `--validate-json`.
 Profile flags such as `--profile`, `--profile-json`, and `--profile-text`
 require a `VNM_TERMINAL_ENABLE_PROFILING=ON` build.
 
-Benchmark JSON uses `schema_version` 16. Profile JSON uses
+Benchmark JSON uses `schema_version` 20. Profile JSON uses
 `profile_schema_version` 2, `time_unit` `ns`, and
 `thread_semantics` `separate_thread_trees`, with separate GUI and render thread
-trees. Schema 16 includes text coalescing counters:
+trees. Schema 20 includes text coalescing counters:
 `text_coalescing_candidate_groups`, `text_coalescing_enabled_groups`,
 `text_resource_runs_before_coalescing`, and
 `text_resource_runs_after_coalescing`. Validation enforces
 `text_coalescing_enabled_groups <= text_coalescing_candidate_groups` and
 `text_resource_runs_after_coalescing <= text_resource_runs_before_coalescing`.
+Readback readiness validation also requires visible pixels and atlas render
+signals (`atlas_frame_observed`, `atlas_render_observed`,
+`atlas_instances_observed`, `atlas_budget_valid`, and
+`atlas_failures_zero`). Profiling validation waits for the atlas render-thread
+sequence and requires `Qsg_atlas_render_node::prepare`,
+`Qsg_atlas_render_node::prepare_atlas_instances`, and
+`Qsg_atlas_render_node::render` scopes before accepting a scenario profile.
 
 `vnm_terminal_embedded_benchmark_validate` is structural validation under the
-offscreen/software renderer path, not a performance comparison. Use no-profile
-Release benchmark runs for user-visible timing. Use profiling-enabled Release
-runs only for attribution, route counts, and scope timing.
+configured Qt runtime path, not a performance comparison. Use no-profile Release
+benchmark runs for user-visible timing. Use profiling-enabled Release runs only
+for attribution, route counts, and scope timing.
 
 Benchmark comparisons should record the build directory, profiling state,
 renderer backend, scenario list, grid, window size, warmup count, iteration
@@ -289,9 +301,10 @@ build contract:
 - Qt Core, Gui, and Quick are allowed through either the commercial route or the
   LGPL-compatible dynamic-linking route. GPL-only Qt modules are not allowed in
   the product dependency graph.
-- The renderer uses public Qt Scene Graph and text APIs. Private Qt APIs,
-  per-cell `QQuickItem` trees, and production row/frame `QImage` text rendering
-  are outside the renderer contract.
+- The renderer contract is the documented QSG atlas path, including its
+  QRhi/private-Qt integration under the project Qt posture checks. Per-cell
+  `QQuickItem` trees and production row/frame `QImage` text rendering remain
+  outside that contract.
 - `THIRD_PARTY/*.toml` records reviewed dependency metadata. Qt and Unicode data
   are not vendored dependency source trees.
 - `THIRD_PARTY_NOTICES.md` records project notices for Qt and Unicode data.

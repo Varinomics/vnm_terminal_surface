@@ -1,9 +1,9 @@
 <RCC>
   <qresource prefix="/vnm_terminal_surface">
     <file alias="fonts/vnm_framework_monospace.ttf">fonts/vnm_framework_monospace.ttf</file>
-    <file alias="shaders/stage0_quad.frag.qsb">shaders/stage0_quad.frag.qsb</file>
-    <file alias="shaders/stage0_quad.vert.qsb">shaders/stage0_quad.vert.qsb</file>
-    <file alias="shaders/stage2_glyph.frag.qsb">shaders/stage2_glyph.frag.qsb</file>
-    <file alias="shaders/stage2_glyph.vert.qsb">shaders/stage2_glyph.vert.qsb</file>
+    <file alias="shaders/atlas_quad.frag.qsb">shaders/atlas_quad.frag.qsb</file>
+    <file alias="shaders/atlas_quad.vert.qsb">shaders/atlas_quad.vert.qsb</file>
+    <file alias="shaders/atlas_glyph.frag.qsb">shaders/atlas_glyph.frag.qsb</file>
+    <file alias="shaders/atlas_glyph.vert.qsb">shaders/atlas_glyph.vert.qsb</file>
   </qresource>
 </RCC>

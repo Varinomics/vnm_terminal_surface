@@ -22,6 +22,8 @@ class QSGNode;
 
 namespace vnm_terminal::internal {
 
+class Hierarchical_profiler;
+
 struct Glyph_atlas_cache_key
 {
     quint32 glyph_index         = 0U;
@@ -58,8 +60,8 @@ struct Glyph_atlas_slot
 class Glyph_atlas_packer final
 {
 public:
-    // Stage 1 uploads one R8 atlas texture; page 1+ is rejected until GPU
-    // multi-page addressing exists.
+    // The current atlas budget is one R8 texture page; page 1+ is rejected
+    // until GPU multi-page addressing exists.
     explicit Glyph_atlas_packer(
         QSize page_size,
         int   gutter = 1,
@@ -114,7 +116,7 @@ struct Glyph_atlas_cache_stats
     QSize         page_size;
 };
 
-struct Qsg_atlas_stage3_frame_summary
+struct Qsg_atlas_frame_build_summary
 {
     Terminal_render_snapshot_basis   snapshot_basis =
         Terminal_render_snapshot_basis::LIVE_CONTENT;
@@ -145,6 +147,10 @@ struct Qsg_atlas_stage3_frame_summary
     int                              fallback_glyph_faces      = 0;
     int                              emoji_presentation_runs   = 0;
     int                              color_glyph_alpha_demotions = 0;
+    int                              glyph_color_alpha_failures = 0;
+    int                              glyph_coverage_failures   = 0;
+    int                              glyph_atlas_insert_failures = 0;
+    int                              glyph_missed_instances    = 0;
     int                              first_packed_logical_row  = 0;
     Terminal_buffer_id               first_packed_active_buffer =
         Terminal_buffer_id::PRIMARY;
@@ -158,16 +164,16 @@ struct Qsg_atlas_stage3_frame_summary
     bool                             full_repaint_fallback     = false;
 };
 
-constexpr int k_qsg_atlas_stage4_all_rows = -1;
-constexpr int k_qsg_atlas_stage4_non_row  = -2;
+constexpr int k_qsg_atlas_all_rows = -1;
+constexpr int k_qsg_atlas_non_row  = -2;
 
-struct Qsg_atlas_stage4_buffer_update_range
+struct Qsg_atlas_buffer_update_range
 {
     int byte_offset = 0;
     int byte_count  = 0;
 };
 
-struct Qsg_atlas_stage4_buffer_update_summary
+struct Qsg_atlas_buffer_update_summary
 {
     int  rhi_frames_in_flight          = 1;
     int  rhi_frame_slot                = 0;
@@ -191,22 +197,22 @@ struct Qsg_atlas_stage4_buffer_update_summary
     bool row_stable_layout             = false;
 };
 
-struct Qsg_atlas_stage4_buffer_update_plan
+struct Qsg_atlas_buffer_update_plan
 {
-    Qsg_atlas_stage4_buffer_update_summary
+    Qsg_atlas_buffer_update_summary
                                   summary;
-    std::vector<Qsg_atlas_stage4_buffer_update_range>
+    std::vector<Qsg_atlas_buffer_update_range>
                                   ranges;
 };
 
-struct Qsg_atlas_stage4_row_stable_range
+struct Qsg_atlas_row_stable_range
 {
-    int row            = k_qsg_atlas_stage4_non_row;
+    int row            = k_qsg_atlas_non_row;
     int first_instance = 0;
     int instance_count = 0;
 };
 
-struct Qsg_atlas_stage4_buffer_update_input
+struct Qsg_atlas_buffer_update_input
 {
     int                                      frames_in_flight = 1;
     int                                      frame_slot       = 0;
@@ -223,17 +229,17 @@ struct Qsg_atlas_stage4_buffer_update_input
     bool                                     non_dirty_state_invalidation = false;
     int                                      active_instance_count = -1;
     bool                                     row_stable_layout = false;
-    const std::vector<Qsg_atlas_stage4_row_stable_range>*
+    const std::vector<Qsg_atlas_row_stable_range>*
                                              row_stable_ranges = nullptr;
 };
 
-class Qsg_atlas_stage4_buffer_upload_planner final
+class Qsg_atlas_buffer_upload_planner final
 {
 public:
     void reset();
 
-    Qsg_atlas_stage4_buffer_update_plan plan(
-        const Qsg_atlas_stage4_buffer_update_input& input);
+    Qsg_atlas_buffer_update_plan plan(
+        const Qsg_atlas_buffer_update_input& input);
 
 private:
     void resize_slots(int frames_in_flight);
@@ -246,11 +252,11 @@ private:
     std::vector<unsigned char>  m_seeded_slots;
 };
 
-struct Qsg_atlas_stage4_frame_summary
+struct Qsg_atlas_render_summary
 {
-    Qsg_atlas_stage4_buffer_update_summary
+    Qsg_atlas_buffer_update_summary
                   rect_buffer;
-    Qsg_atlas_stage4_buffer_update_summary
+    Qsg_atlas_buffer_update_summary
                   glyph_buffer;
     int           direct_ascii_text_runs            = 0;
     int           qt_layout_text_runs                = 0;
@@ -328,13 +334,15 @@ struct Captured_atlas_frame
     terminal_cell_metrics_t          cell_metrics;
     QSizeF                           logical_size;
     QFont                            font;
+    std::shared_ptr<Hierarchical_profiler>
+                                     render_profiler;
     qreal                            device_pixel_ratio  = 1.0;
     std::uint64_t                    font_epoch          = 0U;
     std::uint64_t                    capture_sequence    = 0U;
     bool                             cursor_blink_visible = true;
 };
 
-struct Qsg_atlas_stage1_frame_report
+struct Qsg_atlas_frame_report
 {
     std::uint64_t capture_count                   = 0U;
     std::uint64_t prepare_count                   = 0U;
@@ -342,16 +350,22 @@ struct Qsg_atlas_stage1_frame_report
     std::uint64_t capture_sequence                = 0U;
     std::uint64_t captured_snapshot_sequence      = 0U;
     std::uint64_t captured_font_epoch             = 0U;
+    std::uint64_t first_render_capture_sequence   = 0U;
     std::uint64_t first_captured_snapshot_sequence = 0U;
     std::uint64_t first_captured_font_epoch       = 0U;
     std::uint64_t first_render_snapshot_sequence  = 0U;
     std::uint64_t first_render_font_epoch         = 0U;
-    QColor        captured_probe_color;
-    QColor        first_captured_probe_color;
-    QColor        first_render_probe_color;
+    std::uint64_t render_capture_sequence         = 0U;
+    std::uint64_t render_snapshot_sequence        = 0U;
+    std::uint64_t render_font_epoch               = 0U;
+    QColor        captured_diagnostic_color;
+    QColor        first_captured_diagnostic_color;
+    QColor        first_render_diagnostic_color;
+    QColor        render_diagnostic_color;
     bool          captured_light_options          = false;
     bool          first_captured_light_options    = false;
     bool          first_render_light_options      = false;
+    bool          render_light_options            = false;
     bool          command_buffer_non_null         = false;
     bool          render_target_non_null          = false;
     bool          rhi_non_null                    = false;
@@ -367,13 +381,13 @@ struct Qsg_atlas_stage1_frame_report
     std::uint64_t raw_font_raster_thread_id       = 0U;
     Glyph_atlas_cache_stats
                   cache;
-    Qsg_atlas_stage3_frame_summary
-                  stage3;
-    Qsg_atlas_stage4_frame_summary
-                  stage4;
+    Qsg_atlas_frame_build_summary
+                  frame_build;
+    Qsg_atlas_render_summary
+                  render;
 };
 
-class Qsg_atlas_stage1_recorder final
+class Qsg_atlas_recorder final
 {
 public:
     void reset();
@@ -392,18 +406,18 @@ public:
         std::uint64_t                 prepare_thread_id,
         std::uint64_t                 raw_font_raster_thread_id,
         const Glyph_atlas_cache_stats& cache,
-        const Qsg_atlas_stage3_frame_summary& stage3,
-        const Qsg_atlas_stage4_frame_summary& stage4);
+        const Qsg_atlas_frame_build_summary& frame_build,
+        const Qsg_atlas_render_summary& render_summary);
     void record_render(
         const Captured_atlas_frame& frame,
         QRect                       viewport_rect,
         bool                        drew);
 
-    Qsg_atlas_stage1_frame_report snapshot() const;
+    Qsg_atlas_frame_report snapshot() const;
 
 private:
     mutable std::mutex            m_mutex;
-    Qsg_atlas_stage1_frame_report m_report;
+    Qsg_atlas_frame_report m_report;
 };
 
 Glyph_coverage_tile qsg_atlas_coverage_tile_from_image(const QImage& image);
@@ -424,7 +438,7 @@ Glyph_atlas_cache_key qsg_atlas_cache_key(
     qreal   physical_pixel_size,
     int     subpixel_bucket);
 
-Captured_atlas_frame capture_qsg_atlas_stage1_frame(
+Captured_atlas_frame capture_qsg_atlas_frame(
     std::shared_ptr<const Terminal_render_snapshot>
                                   snapshot,
     Ime_preedit_state             ime_preedit,
@@ -432,17 +446,19 @@ Captured_atlas_frame capture_qsg_atlas_stage1_frame(
     terminal_cell_metrics_t       cell_metrics,
     QSizeF                        logical_size,
     QFont                         font,
+    std::shared_ptr<Hierarchical_profiler>
+                                  render_profiler,
     qreal                         device_pixel_ratio,
     std::uint64_t                 font_epoch,
     std::uint64_t                 capture_sequence,
     bool                          cursor_blink_visible);
 
-QColor qsg_atlas_stage1_probe_color(const Captured_atlas_frame& frame);
+QColor qsg_atlas_diagnostic_color(const Captured_atlas_frame& frame);
 
-QSGNode* update_qsg_atlas_stage1_node(
+QSGNode* update_qsg_atlas_node(
     QSGNode*                                      old_node,
     Captured_atlas_frame                         frame,
-    const std::shared_ptr<Qsg_atlas_stage1_recorder>&
+    const std::shared_ptr<Qsg_atlas_recorder>&
                                                   recorder);
 
 }

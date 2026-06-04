@@ -11,7 +11,7 @@ interactive terminal-canvas applications inside Varinomics products.
 The public UI component is `VNM_TerminalSurface`, a C++ `QQuickItem`. The
 surface starts a platform terminal backend, receives PTY or ConPTY output,
 parses terminal byte streams, updates a terminal screen model, and renders the
-visible terminal with Qt Scene Graph nodes.
+visible terminal through the GPU atlas Qt Scene Graph path.
 
 The target behavior is a real interactive terminal, not a log viewer. Alternate
 screen, cursor addressing, scrollback, resize propagation, keyboard modes, mouse
@@ -36,8 +36,10 @@ part of the product shape.
   alternate screen, modes, and escape-sequence effects.
 - `src/terminal_input_encoder.cpp` maps Qt input events to terminal byte
   sequences.
-- `src/qsg_terminal_renderer.cpp` converts render snapshots into Qt Scene Graph
-  nodes.
+- `src/qsg_terminal_renderer.cpp` builds renderer frames and shared renderer
+  diagnostics/helpers.
+- `src/qsg_atlas_renderer.cpp` owns the canonical QSG render node and QRhi
+  glyph-atlas rendering path.
 - `tools/terminal_canvas_fixture` builds `vnm_terminal_canvas_fixture`, a small
   scripted child process used by automated terminal behavior tests.
 - `tests` contains contract, model, backend, renderer, host, conformance,
@@ -63,7 +65,7 @@ backend output bytes
     -> parser action IR
     -> Terminal_screen_model and viewport state
     -> immutable render snapshot
-    -> QSG renderer
+    -> QSG atlas renderer
     -> visible terminal
 
 Qt key / mouse / paste / IME events
@@ -108,7 +110,8 @@ exit notifications pass through one ordered session pipeline.
 - To change rendering, start with
   `include/vnm_terminal/internal/render_snapshot.h`,
   `include/vnm_terminal/internal/qsg_terminal_render_frame.h`, and
-  `src/qsg_terminal_renderer.cpp`.
+  `src/qsg_terminal_renderer.cpp` for frame-building/shared helpers; use
+  `src/qsg_atlas_renderer.cpp` for render-node and QRhi atlas changes.
 - To add or update fixtures, start with
   `tools/terminal_canvas_fixture/terminal_canvas_fixture.cpp` and
   the relevant tests under `tests`. The canvas fixture is an executable child

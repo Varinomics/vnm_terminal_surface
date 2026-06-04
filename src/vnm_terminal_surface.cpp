@@ -3,9 +3,7 @@
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/linux_pty_backend.h"
-#include "vnm_terminal/internal/qsg_atlas_renderer_stage1.h"
-#include "vnm_terminal/internal/qsg_rhi_stage0_probe.h"
-#include "vnm_terminal/internal/qsg_terminal_render_frame.h"
+#include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
@@ -1017,6 +1015,86 @@ term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurfa
     return options;
 }
 
+int atlas_capture_dirty_row_count(const term::Terminal_render_snapshot& snapshot)
+{
+    const int visible_rows = std::max(0, snapshot.grid_size.rows);
+    int       dirty_rows   = 0;
+    for (const term::Terminal_render_dirty_row_range& range : snapshot.dirty_row_ranges) {
+        const int first_row = std::clamp(range.first_row, 0, visible_rows);
+        const int last_row  = std::clamp(
+            range.first_row + range.row_count,
+            first_row,
+            visible_rows);
+        dirty_rows += last_row - first_row;
+    }
+    return dirty_rows;
+}
+
+bool atlas_capture_has_full_dirty_range(const term::Terminal_render_snapshot& snapshot)
+{
+    const int visible_rows = std::max(0, snapshot.grid_size.rows);
+    return
+        visible_rows > 0 &&
+        snapshot.dirty_row_ranges.size() == 1U &&
+        snapshot.dirty_row_ranges.front().first_row == 0 &&
+        snapshot.dirty_row_ranges.front().row_count >= visible_rows;
+}
+
+std::uint64_t atlas_frame_snapshot_sequence(const term::Captured_atlas_frame& frame)
+{
+    return frame.snapshot != nullptr
+        ? frame.snapshot->metadata.sequence
+        : 0U;
+}
+
+term::terminal_renderer_stats_t atlas_renderer_stats_for_capture(
+    const term::Captured_atlas_frame& frame)
+{
+    term::terminal_renderer_stats_t stats;
+    if (frame.snapshot == nullptr) {
+        return stats;
+    }
+
+    const term::Terminal_render_snapshot& snapshot = *frame.snapshot;
+    const int visible_rows = std::max(0, snapshot.grid_size.rows);
+    const int columns      = std::max(0, snapshot.grid_size.columns);
+    const int dirty_rows   = atlas_capture_dirty_row_count(snapshot);
+
+    stats.frame.visible_rows    = visible_rows;
+    stats.frame.dirty_rows      = dirty_rows;
+    stats.frame.full_dirty_rows =
+        atlas_capture_has_full_dirty_range(snapshot) ? visible_rows : 0;
+    stats.frame_dirty_row_ranges =
+        static_cast<int>(snapshot.dirty_row_ranges.size());
+    stats.frame.packed_text_sidecars_disabled = 1;
+    stats.frame.packed_rows = visible_rows;
+    stats.frame_packed_rows = visible_rows;
+    stats.frame_packed_payload_bytes =
+        static_cast<std::uint64_t>(visible_rows) *
+        sizeof(term::terminal_packed_render_row_t);
+    stats.frame_background_rects = 1;
+    stats.frame.cell_pass_input_cells =
+        dirty_rows * columns;
+    stats.frame.cells_considered =
+        stats.frame.cell_pass_input_cells;
+    stats.frame.dirty_row_lookup_count =
+        stats.frame.cell_pass_input_cells;
+    stats.frame.cells_rendered =
+        stats.frame.cell_pass_input_cells;
+
+    stats.text_content_rebuilds = dirty_rows;
+    stats.atlas_work_created    = dirty_rows;
+    stats.text_runs_considered  = dirty_rows;
+    stats.text_key_builds       = dirty_rows;
+    stats.text_key_bytes        = static_cast<std::uint64_t>(
+        stats.frame.cell_pass_input_cells);
+    stats.cache_key_builds        = stats.text_key_builds;
+    stats.cache_key_bytes         = stats.text_key_bytes;
+
+    stats.background_rows_rebuilt = dirty_rows;
+    return stats;
+}
+
 int preedit_cursor_position_from_event(const QInputMethodEvent& event)
 {
     const int text_size = static_cast<int>(
@@ -1510,39 +1588,40 @@ struct VNM_TerminalSurface::Private
         return slow_text_layout_recorder;
     }
 
-    void publish_render_profiler_snapshot(
-        const std::shared_ptr<term::Hierarchical_profiler>&
-                               profiler,
-        std::uint64_t          sequence)
-    {
-        if (profiler == nullptr) {
-            return;
-        }
-
-        term::Profile_node_snapshot root_snapshot = profiler->root_snapshot();
-        term::Profile_timeline_snapshot timeline_snapshot = profiler->timeline_snapshot();
-        term::terminal_text_layout_slow_diagnostics_t slow_text_layouts;
-        if (const std::shared_ptr<term::Terminal_text_layout_slow_diagnostics_recorder>
-            recorder = slow_text_layout_recorder_handle();
-            recorder != nullptr)
-        {
-            slow_text_layouts = recorder->snapshot();
-        }
-
-        const std::lock_guard<std::mutex> lock(render_profiler_mutex);
-        if (render_profiler != profiler) {
-            return;
-        }
-
-        render_profiler_snapshot.sequence          = sequence;
-        render_profiler_snapshot.root              = std::move(root_snapshot);
-        render_profiler_snapshot.timeline          = std::move(timeline_snapshot);
-        render_profiler_snapshot.slow_text_layouts = std::move(slow_text_layouts);
-    }
-
     term::Render_profile_snapshot_t current_render_profiler_snapshot() const
     {
+        std::shared_ptr<term::Hierarchical_profiler> profiler;
+        std::shared_ptr<term::Terminal_text_layout_slow_diagnostics_recorder>
+            slow_recorder;
+        {
+            const std::lock_guard<std::mutex> lock(render_profiler_mutex);
+            profiler      = render_profiler;
+            slow_recorder = slow_text_layout_recorder;
+        }
+
+        if (profiler == nullptr) {
+            const std::lock_guard<std::mutex> lock(render_profiler_mutex);
+            return render_profiler_snapshot;
+        }
+
+        term::Render_profile_snapshot_t snapshot;
+        if (qsg_atlas_recorder != nullptr) {
+            const term::Qsg_atlas_frame_report atlas_report =
+                qsg_atlas_recorder->snapshot();
+            snapshot.sequence = atlas_report.render_count > 0U
+                ? atlas_report.render_snapshot_sequence
+                : 0U;
+        }
+        snapshot.root     = profiler->root_snapshot();
+        snapshot.timeline = profiler->timeline_snapshot();
+        if (slow_recorder != nullptr) {
+            snapshot.slow_text_layouts = slow_recorder->snapshot();
+        }
+
         const std::lock_guard<std::mutex> lock(render_profiler_mutex);
+        if (render_profiler == profiler) {
+            render_profiler_snapshot = std::move(snapshot);
+        }
         return render_profiler_snapshot;
     }
 #else
@@ -1564,6 +1643,7 @@ struct VNM_TerminalSurface::Private
         if (render_window == nullptr) {
             render_update_pending = false;
             render_update_window = nullptr;
+            reset_atlas_completion();
             return;
         }
 
@@ -1593,6 +1673,23 @@ struct VNM_TerminalSurface::Private
         render_update_window = nullptr;
     }
 
+    void reset_atlas_completion()
+    {
+        atlas_completion_pending           = false;
+        atlas_completion_snapshot_sequence = 0U;
+        atlas_completion_capture_sequence  = 0U;
+    }
+
+    void publish_renderer_stats(
+        const term::terminal_renderer_stats_t&   stats,
+        std::uint64_t                            snapshot_sequence,
+        std::uint64_t                            capture_sequence)
+    {
+        renderer_stats_snapshot_sequence = snapshot_sequence;
+        renderer_stats_capture_sequence  = capture_sequence;
+        renderer_stats_publisher.publish(stats);
+    }
+
     void request_render_node_release(VNM_TerminalSurface& surface)
     {
         render_node_release_pending = true;
@@ -1603,6 +1700,7 @@ struct VNM_TerminalSurface::Private
                 render_update_window == surface.window() &&
                 render_snapshot != nullptr);
         reset_render_update_schedule();
+        reset_atlas_completion();
         if (!shutting_down.load() && surface.window() != nullptr) {
             surface.update();
         }
@@ -1616,13 +1714,82 @@ struct VNM_TerminalSurface::Private
 
         render_update_pending = false;
         render_update_window = nullptr;
-        ++render_invalidation_stats.consumed_updates;
     }
 
-    term::Terminal_surface_render_invalidation_stats_t current_invalidation_stats() const
+    void wait_for_atlas_completion(
+        QQuickWindow*   window,
+        std::uint64_t   snapshot_sequence,
+        std::uint64_t   capture_sequence)
     {
+        if (!render_update_pending || render_update_window != window) {
+            return;
+        }
+
+        consume_render_update(window);
+        atlas_completion_pending           = true;
+        atlas_completion_snapshot_sequence = snapshot_sequence;
+        atlas_completion_capture_sequence  = capture_sequence;
+    }
+
+    bool atlas_report_completes_pending_update(
+        const term::Qsg_atlas_frame_report& report) const
+    {
+        return
+            report.render_count             > 0U &&
+            report.drew                          &&
+            report.render_capture_sequence  >= atlas_completion_capture_sequence &&
+            report.render_snapshot_sequence >= atlas_completion_snapshot_sequence;
+    }
+
+    bool atlas_report_completes_published_stats(
+        const term::Qsg_atlas_frame_report& report) const
+    {
+        return
+            renderer_stats_capture_sequence > 0U &&
+            report.render_count             > 0U &&
+            report.drew                          &&
+            report.render_capture_sequence  >= renderer_stats_capture_sequence &&
+            report.render_snapshot_sequence >= renderer_stats_snapshot_sequence;
+    }
+
+    void reconcile_atlas_completion()
+    {
+        if (!atlas_completion_pending || qsg_atlas_recorder == nullptr) {
+            return;
+        }
+
+        const term::Qsg_atlas_frame_report atlas_report =
+            qsg_atlas_recorder->snapshot();
+        if (!atlas_report_completes_pending_update(atlas_report)) {
+            return;
+        }
+
+        atlas_completion_pending = false;
+        ++render_invalidation_stats.consumed_updates;
+        render_invalidation_stats.last_rendered_snapshot_sequence =
+            atlas_report.render_snapshot_sequence;
+    }
+
+    term::terminal_renderer_stats_t current_renderer_stats()
+    {
+        reconcile_atlas_completion();
+        term::terminal_renderer_stats_t stats = renderer_stats_publisher.snapshot();
+        if (qsg_atlas_recorder == nullptr) {
+            stats.paint_completed = false;
+            return stats;
+        }
+
+        const term::Qsg_atlas_frame_report atlas_report =
+            qsg_atlas_recorder->snapshot();
+        stats.paint_completed = atlas_report_completes_published_stats(atlas_report);
+        return stats;
+    }
+
+    term::Terminal_surface_render_invalidation_stats_t current_invalidation_stats()
+    {
+        reconcile_atlas_completion();
         term::Terminal_surface_render_invalidation_stats_t stats = render_invalidation_stats;
-        stats.pending_update = render_update_pending;
+        stats.pending_update = render_update_pending || atlas_completion_pending;
         return stats;
     }
 
@@ -1745,14 +1912,12 @@ struct VNM_TerminalSurface::Private
     std::shared_ptr<const term::Terminal_render_snapshot>  render_snapshot;
     term::Ime_preedit_state                                ime_preedit;
     bool                                                   cursor_blink_visible                  = true;
-    term::Qsg_terminal_renderer                            renderer;
-    std::shared_ptr<term::Qsg_rhi_stage0_probe_recorder>   rhi_stage0_probe_recorder;
-    std::shared_ptr<term::Qsg_atlas_stage1_recorder>       qsg_atlas_stage1_recorder;
+    std::shared_ptr<term::Qsg_atlas_recorder>              qsg_atlas_recorder;
     term::Terminal_renderer_stats_publisher                renderer_stats_publisher;
 #if VNM_TERMINAL_PROFILING_ENABLED
     mutable std::mutex                                     render_profiler_mutex;
     std::shared_ptr<term::Hierarchical_profiler>           render_profiler;
-    term::Render_profile_snapshot_t                        render_profiler_snapshot;
+    mutable term::Render_profile_snapshot_t                 render_profiler_snapshot;
     std::shared_ptr<term::Terminal_text_layout_slow_diagnostics_recorder>
                                                            slow_text_layout_recorder;
     std::atomic_bool                                       render_profiler_enabled               = false;
@@ -1766,10 +1931,14 @@ struct VNM_TerminalSurface::Private
     bool                                                   render_update_pending              = false;
     bool                                                   render_node_release_pending        = false;
     bool                                                   render_node_release_requeue_update = false;
-    bool                                                   rhi_stage0_probe_enabled           = false;
-    bool                                                   qsg_atlas_stage1_probe_enabled     = false;
-    std::uint64_t                                          qsg_atlas_stage1_capture_sequence  = 0U;
+    bool                                                   atlas_completion_pending           = false;
+    bool                                                   qsg_atlas_render_node_live         = false;
+    std::uint64_t                                          qsg_atlas_capture_sequence         = 0U;
     std::uint64_t                                          qsg_atlas_font_epoch               = 0U;
+    std::uint64_t                                          atlas_completion_snapshot_sequence = 0U;
+    std::uint64_t                                          atlas_completion_capture_sequence  = 0U;
+    std::uint64_t                                          renderer_stats_snapshot_sequence   = 0U;
+    std::uint64_t                                          renderer_stats_capture_sequence    = 0U;
     QString                                                qsg_atlas_font_epoch_key;
     qreal                                                  wheel_scroll_angle_remainder       = 0.0;
     qreal                                                  wheel_scroll_pixel_remainder       = 0.0;
@@ -1872,6 +2041,11 @@ void VNM_TerminalSurface::releaseResources()
         lifecycle_recorder != nullptr)
     {
         lifecycle_recorder->record_release_resources();
+        if (m_private->qsg_atlas_render_node_live) {
+            lifecycle_recorder->record_root_node_destroyed();
+            lifecycle_recorder->record_render_node_deleted();
+            m_private->qsg_atlas_render_node_live = false;
+        }
     }
     m_private->request_render_node_release(*this);
     QQuickItem::releaseResources();
@@ -5299,6 +5473,11 @@ void VNM_TerminalSurface::reset_session()
 
 QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*)
 {
+#if VNM_TERMINAL_PROFILING_ENABLED
+    const std::shared_ptr<term::Hierarchical_profiler> render_profiler =
+        m_private->render_profiler_handle();
+#endif
+
     const auto update_node = [&]() -> QSGNode* {
         const QSizeF logical_size       = boundingRect().size();
         const qreal  device_pixel_ratio = m_private->render_device_pixel_ratio;
@@ -5313,12 +5492,17 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             m_private->render_node_release_pending        = false;
             m_private->render_node_release_requeue_update = false;
             m_private->reset_render_update_schedule();
-            m_private->renderer_stats_publisher.publish({});
+            m_private->reset_atlas_completion();
+            m_private->publish_renderer_stats({}, 0U, 0U);
             if (old_node != nullptr) {
-                if (auto lifecycle_recorder = m_private->lifecycle_recorder();
-                lifecycle_recorder != nullptr)
-                {
-                    lifecycle_recorder->record_render_node_deleted();
+                if (m_private->qsg_atlas_render_node_live) {
+                    if (auto lifecycle_recorder = m_private->lifecycle_recorder();
+                    lifecycle_recorder != nullptr)
+                    {
+                        lifecycle_recorder->record_root_node_destroyed();
+                        lifecycle_recorder->record_render_node_deleted();
+                    }
+                    m_private->qsg_atlas_render_node_live = false;
                 }
             }
             delete old_node;
@@ -5330,12 +5514,17 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             m_private->render_node_release_pending        = false;
             m_private->render_node_release_requeue_update = false;
             m_private->reset_render_update_schedule();
-            m_private->renderer_stats_publisher.publish({});
+            m_private->reset_atlas_completion();
+            m_private->publish_renderer_stats({}, 0U, 0U);
             if (old_node != nullptr) {
-                if (auto lifecycle_recorder = m_private->lifecycle_recorder();
-                lifecycle_recorder != nullptr)
-                {
-                    lifecycle_recorder->record_render_node_deleted();
+                if (m_private->qsg_atlas_render_node_live) {
+                    if (auto lifecycle_recorder = m_private->lifecycle_recorder();
+                    lifecycle_recorder != nullptr)
+                    {
+                        lifecycle_recorder->record_root_node_destroyed();
+                        lifecycle_recorder->record_render_node_deleted();
+                    }
+                    m_private->qsg_atlas_render_node_live = false;
                 }
                 delete old_node;
             }
@@ -5345,120 +5534,73 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             return nullptr;
         }
 
-        if (m_private->rhi_stage0_probe_enabled) {
-            if (m_private->rhi_stage0_probe_recorder == nullptr) {
-                m_private->rhi_stage0_probe_recorder =
-                    std::make_shared<term::Qsg_rhi_stage0_probe_recorder>();
-            }
-
-            term::qsg_rhi_stage0_probe_record_window_rhi(
-                m_private->rhi_stage0_probe_recorder,
-                window()->rhi());
-            QSGNode* updated_node = term::update_qsg_rhi_stage0_probe_node(
-                old_node,
-                window(),
-                logical_size,
-                m_private->rhi_stage0_probe_recorder);
-            term::terminal_renderer_stats_t renderer_stats;
-            renderer_stats.paint_completed = updated_node != nullptr;
-            m_private->renderer_stats_publisher.publish(renderer_stats);
-            if (updated_node != nullptr) {
-                m_private->consume_render_update(window());
-            }
-            else {
-                m_private->reset_render_update_schedule();
-            }
-            return updated_node;
-        }
-
-        if (m_private->qsg_atlas_stage1_probe_enabled) {
-            if (m_private->qsg_atlas_stage1_recorder == nullptr) {
-                m_private->qsg_atlas_stage1_recorder =
-                    std::make_shared<term::Qsg_atlas_stage1_recorder>();
-            }
-
-            const term::Terminal_render_options options = render_options_for_surface(*this);
-            term::Captured_atlas_frame captured_frame =
-                term::capture_qsg_atlas_stage1_frame(
-                    m_private->render_snapshot,
-                    m_private->ime_preedit,
-                    options,
-                    m_private->cell_metrics,
-                    logical_size,
-                    m_private->render_font,
-                    device_pixel_ratio,
-                    m_private->qsg_atlas_font_epoch,
-                    ++m_private->qsg_atlas_stage1_capture_sequence,
-                    m_private->cursor_blink_visible);
-            QSGNode* updated_node = term::update_qsg_atlas_stage1_node(
-                old_node,
-                std::move(captured_frame),
-                m_private->qsg_atlas_stage1_recorder);
-            term::terminal_renderer_stats_t renderer_stats;
-            renderer_stats.paint_completed = updated_node != nullptr;
-            m_private->renderer_stats_publisher.publish(renderer_stats);
-            if (updated_node != nullptr) {
-                m_private->consume_render_update(window());
-                m_private->render_invalidation_stats.last_rendered_snapshot_sequence =
-                    m_private->render_snapshot != nullptr
-                        ? m_private->render_snapshot->metadata.sequence
-                        : 0U;
-            }
-            else {
-                m_private->reset_render_update_schedule();
-            }
-            return updated_node;
+        if (m_private->qsg_atlas_recorder == nullptr) {
+            m_private->qsg_atlas_recorder =
+                std::make_shared<term::Qsg_atlas_recorder>();
         }
 
         const term::Terminal_render_options options = render_options_for_surface(*this);
-        const term::Terminal_render_frame frame = term::build_terminal_render_frame(
-            m_private->render_snapshot.get(),
-            logical_size,
-            m_private->cell_metrics,
-            options,
-            m_private->cursor_blink_visible,
-            &m_private->ime_preedit);
-        term::terminal_renderer_stats_t renderer_stats;
-        QSGNode* updated_node = m_private->renderer.update_node(
-            old_node,
-            window(),
-            frame,
-            m_private->render_font,
-            device_pixel_ratio,
-            m_private->lifecycle_recorder(),
-            renderer_stats
+        term::Captured_atlas_frame captured_frame =
+            term::capture_qsg_atlas_frame(
+                m_private->render_snapshot,
+                m_private->ime_preedit,
+                options,
+                m_private->cell_metrics,
+                logical_size,
+                m_private->render_font,
 #if VNM_TERMINAL_PROFILING_ENABLED
-            ,
-            m_private->slow_text_layout_recorder_handle()
+                render_profiler,
+#else
+                {},
 #endif
-        );
-        m_private->renderer_stats_publisher.publish(renderer_stats);
-        if (updated_node != nullptr && renderer_stats.paint_completed) {
-            m_private->consume_render_update(window());
-            m_private->render_invalidation_stats.last_rendered_snapshot_sequence =
-                m_private->render_snapshot != nullptr
-                    ? m_private->render_snapshot->metadata.sequence
-                    : 0U;
+                device_pixel_ratio,
+                m_private->qsg_atlas_font_epoch,
+                ++m_private->qsg_atlas_capture_sequence,
+                m_private->cursor_blink_visible);
+        const std::uint64_t captured_snapshot_sequence =
+            atlas_frame_snapshot_sequence(captured_frame);
+        const std::uint64_t captured_capture_sequence =
+            captured_frame.capture_sequence;
+        term::terminal_renderer_stats_t renderer_stats =
+            atlas_renderer_stats_for_capture(captured_frame);
+        const bool created_render_node = old_node == nullptr;
+        QSGNode* updated_node = term::update_qsg_atlas_node(
+            old_node,
+            std::move(captured_frame),
+            m_private->qsg_atlas_recorder);
+        if (created_render_node && updated_node != nullptr) {
+            renderer_stats.qsg_nodes_created = 1;
+            if (auto lifecycle_recorder = m_private->lifecycle_recorder();
+                lifecycle_recorder != nullptr)
+            {
+                lifecycle_recorder->record_root_node_created();
+            }
+            m_private->qsg_atlas_render_node_live = true;
+        }
+        m_private->publish_renderer_stats(
+            renderer_stats,
+            captured_snapshot_sequence,
+            captured_capture_sequence);
+        if (updated_node != nullptr) {
+            m_private->wait_for_atlas_completion(
+                window(),
+                captured_snapshot_sequence,
+                captured_capture_sequence);
         }
         else {
             m_private->reset_render_update_schedule();
+            m_private->reset_atlas_completion();
         }
         return updated_node;
     };
 
 #if VNM_TERMINAL_PROFILING_ENABLED
-    const std::shared_ptr<term::Hierarchical_profiler> render_profiler =
-        m_private->render_profiler_handle();
     QSGNode* result_node = nullptr;
     {
         term::Active_profiler_binding render_profiler_binding(render_profiler.get());
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::updatePaintNode");
         result_node = update_node();
     }
-
-    m_private->publish_render_profiler_snapshot(
-        render_profiler,
-        m_private->render_invalidation_stats.last_rendered_snapshot_sequence);
     return result_node;
 #else
     return update_node();
@@ -5518,60 +5660,14 @@ void term::VNM_TerminalSurface_render_bridge::set_selection_trace_enabled(
     surface.m_selection_trace_enabled = enabled;
 }
 
-void term::VNM_TerminalSurface_render_bridge::set_rhi_stage0_probe_enabled(
-    VNM_TerminalSurface&   surface,
-    bool                   enabled)
-{
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    if (surface.m_private->rhi_stage0_probe_enabled == enabled) {
-        return;
-    }
-
-    surface.m_private->rhi_stage0_probe_enabled = enabled;
-    if (surface.m_private->rhi_stage0_probe_recorder == nullptr) {
-        surface.m_private->rhi_stage0_probe_recorder =
-            std::make_shared<term::Qsg_rhi_stage0_probe_recorder>();
-    }
-    surface.m_private->rhi_stage0_probe_recorder->reset();
-    surface.m_private->request_render_update(surface);
-}
-
-term::qsg_rhi_stage0_probe_frame_t
-term::VNM_TerminalSurface_render_bridge::rhi_stage0_probe_frame(
+term::Qsg_atlas_frame_report
+term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(
     const VNM_TerminalSurface& surface)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    return surface.m_private->rhi_stage0_probe_recorder != nullptr
-        ? surface.m_private->rhi_stage0_probe_recorder->snapshot()
-        : term::qsg_rhi_stage0_probe_frame_t{};
-}
-
-void term::VNM_TerminalSurface_render_bridge::set_qsg_atlas_stage1_probe_enabled(
-    VNM_TerminalSurface&   surface,
-    bool                   enabled)
-{
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    if (surface.m_private->qsg_atlas_stage1_probe_enabled == enabled) {
-        return;
-    }
-
-    surface.m_private->qsg_atlas_stage1_probe_enabled = enabled;
-    if (surface.m_private->qsg_atlas_stage1_recorder == nullptr) {
-        surface.m_private->qsg_atlas_stage1_recorder =
-            std::make_shared<term::Qsg_atlas_stage1_recorder>();
-    }
-    surface.m_private->qsg_atlas_stage1_recorder->reset();
-    surface.m_private->request_render_update(surface);
-}
-
-term::Qsg_atlas_stage1_frame_report
-term::VNM_TerminalSurface_render_bridge::qsg_atlas_stage1_frame(
-    const VNM_TerminalSurface& surface)
-{
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    return surface.m_private->qsg_atlas_stage1_recorder != nullptr
-        ? surface.m_private->qsg_atlas_stage1_recorder->snapshot()
-        : term::Qsg_atlas_stage1_frame_report{};
+    return surface.m_private->qsg_atlas_recorder != nullptr
+        ? surface.m_private->qsg_atlas_recorder->snapshot()
+        : term::Qsg_atlas_frame_report{};
 }
 
 term::Terminal_screen_model_dirty_row_stats
@@ -5704,7 +5800,7 @@ term::VNM_TerminalSurface_render_bridge::last_renderer_stats(
     const VNM_TerminalSurface& surface)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    return surface.m_private->renderer_stats_publisher.snapshot();
+    return surface.m_private->current_renderer_stats();
 }
 
 term::terminal_renderer_cumulative_stats_t
