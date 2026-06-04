@@ -1,5 +1,6 @@
 #include "vnm_terminal/internal/qsg_atlas_renderer_stage1.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
+#include "vnm_terminal/internal/terminal_graphic_geometry.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
@@ -25,6 +26,7 @@
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -167,6 +169,7 @@ struct Stage2_glyph_mask
 struct Stage2_parity_fixture
 {
     std::string                         name;
+    int                                 stage = 2;
     term::Terminal_render_snapshot      snapshot;
     QSizeF                              logical_size;
     std::vector<Stage2_exact_mask_class>
@@ -398,6 +401,25 @@ term::Terminal_render_cell make_stage2_continuation_cell(
     };
 }
 
+void set_stage2_visible_line_provenance(
+    term::Terminal_render_snapshot& snapshot,
+    std::uint64_t                   retained_line_id_base = 1U,
+    std::uint64_t                   content_generation = 1U)
+{
+    snapshot.visible_line_provenance.clear();
+    snapshot.visible_line_provenance.reserve(
+        static_cast<std::size_t>(std::max(0, snapshot.grid_size.rows)));
+    const int first_logical_row =
+        static_cast<int>(term::render_snapshot_first_visible_logical_row(snapshot));
+    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
+        snapshot.visible_line_provenance.push_back({
+            first_logical_row + row,
+            retained_line_id_base + static_cast<std::uint64_t>(row),
+            content_generation,
+        });
+    }
+}
+
 term::Terminal_render_snapshot make_stage2_base_snapshot(
     term::terminal_grid_size_t grid_size,
     std::uint64_t              sequence)
@@ -415,14 +437,7 @@ term::Terminal_render_snapshot make_stage2_base_snapshot(
     snapshot.dirty_row_ranges = {{0, grid_size.rows}};
     snapshot.cursor.position  = {0, 0};
     snapshot.cursor.visible   = false;
-    snapshot.visible_line_provenance.reserve(static_cast<std::size_t>(grid_size.rows));
-    for (int row = 0; row < grid_size.rows; ++row) {
-        snapshot.visible_line_provenance.push_back({
-            row,
-            static_cast<std::uint64_t>(row + 1),
-            1U,
-        });
-    }
+    set_stage2_visible_line_provenance(snapshot);
     return snapshot;
 }
 
@@ -600,10 +615,325 @@ std::vector<Stage2_parity_fixture> make_stage2_parity_fixtures()
     };
 }
 
+Stage2_parity_fixture make_stage3_base_fixture(
+    std::string                  name,
+    term::terminal_grid_size_t   grid_size,
+    std::uint64_t                sequence,
+    term::terminal_cell_metrics_t metrics)
+{
+    Stage2_parity_fixture fixture;
+    fixture.name         = std::move(name);
+    fixture.stage        = 3;
+    fixture.snapshot     = make_stage2_base_snapshot(grid_size, sequence);
+    fixture.logical_size = QSizeF(
+        metrics.width * static_cast<qreal>(grid_size.columns),
+        metrics.height * static_cast<qreal>(grid_size.rows));
+    return fixture;
+}
+
+QRectF stage3_cell_fraction_rect(
+    int                          row,
+    int                          column,
+    qreal                        x,
+    qreal                        y,
+    qreal                        width,
+    qreal                        height,
+    term::terminal_cell_metrics_t metrics)
+{
+    const QRectF cell = stage2_cell_rect(row, column, 1, metrics);
+    return QRectF(
+        cell.left() + cell.width() * x,
+        cell.top() + cell.height() * y,
+        cell.width() * width,
+        cell.height() * height);
+}
+
+std::vector<QRectF> stage3_supported_hard_block_masks(
+    term::terminal_cell_metrics_t metrics)
+{
+    return {
+        stage2_cell_rect(0, 0, 1, metrics),
+        stage3_cell_fraction_rect(0, 2, 0.0, 0.0, 0.5, 1.0, metrics),
+        stage3_cell_fraction_rect(0, 4, 0.0, 0.0, 0.5, 0.5, metrics),
+        stage3_cell_fraction_rect(0, 4, 0.0, 0.5, 0.5, 0.5, metrics),
+        stage3_cell_fraction_rect(0, 4, 0.5, 0.5, 0.5, 0.5, metrics),
+    };
+}
+
+std::vector<QRectF> stage3_arc_background_exclusion_masks(
+    term::terminal_cell_metrics_t metrics)
+{
+    return {
+        stage3_cell_fraction_rect(0, 0, 0.00, 0.00, 0.25, 0.25, metrics),
+        stage3_cell_fraction_rect(0, 1, 0.75, 0.00, 0.25, 0.25, metrics),
+        stage3_cell_fraction_rect(0, 2, 0.75, 0.75, 0.25, 0.25, metrics),
+        stage3_cell_fraction_rect(0, 3, 0.00, 0.75, 0.25, 0.25, metrics),
+    };
+}
+
+QColor stage3_grid_background(const term::Terminal_render_snapshot& snapshot)
+{
+    return QColor::fromRgba(snapshot.color_state.default_background_rgba);
+}
+
+std::vector<Stage2_parity_fixture> make_stage3_parity_fixtures()
+{
+    const term::terminal_cell_metrics_t metrics = stage2_metrics();
+
+    Stage2_parity_fixture blocks = make_stage3_base_fixture(
+        "graphics_supported_unsupported_blocks",
+        {2, 12},
+        730U,
+        metrics);
+    const term::Terminal_style_id block_accent = 1U;
+    const term::Terminal_style_id shade_accent = 2U;
+    blocks.snapshot.styles.push_back(rgb_style(0xff55e6c1U, 0xff101820U));
+    blocks.snapshot.styles.push_back(rgb_style(0xffffd166U, 0xff101820U));
+    blocks.snapshot.cells.push_back(
+        make_stage2_cell(0, 0, QStringLiteral("\u2588"), 1, block_accent));
+    blocks.snapshot.cells.push_back(
+        make_stage2_cell(0, 2, QStringLiteral("\u258c"), 1, block_accent));
+    blocks.snapshot.cells.push_back(
+        make_stage2_cell(0, 4, QStringLiteral("\u2599"), 1, block_accent));
+    blocks.snapshot.cells.push_back(
+        make_stage2_cell(1, 0, QStringLiteral("\u2591"), 1, shade_accent));
+    const term::Terminal_render_frame block_frame =
+        stage2_expected_frame(blocks, metrics);
+    append_exact_class(
+        blocks,
+        "packed_hard_blocks",
+        inset_masks(stage3_supported_hard_block_masks(metrics), 1.0, 1.0));
+    append_text_glyph_masks(blocks, block_frame.text_runs);
+
+    Stage2_parity_fixture arcs = make_stage3_base_fixture(
+        "box_arcs",
+        {1, 8},
+        731U,
+        metrics);
+    arcs.snapshot.styles.push_back(rgb_style(0xff8be9fdU, 0xff101820U));
+    arcs.snapshot.cells.push_back(
+        make_stage2_cell(0, 0, QStringLiteral("\u256d"), 1, block_accent));
+    arcs.snapshot.cells.push_back(
+        make_stage2_cell(0, 1, QStringLiteral("\u256e"), 1, block_accent));
+    arcs.snapshot.cells.push_back(
+        make_stage2_cell(0, 2, QStringLiteral("\u256f"), 1, block_accent));
+    arcs.snapshot.cells.push_back(
+        make_stage2_cell(0, 3, QStringLiteral("\u2570"), 1, block_accent));
+    const term::Terminal_render_frame arc_frame =
+        stage2_expected_frame(arcs, metrics);
+    append_exact_class(
+        arcs,
+        "arc_background_exclusion",
+        stage3_arc_background_exclusion_masks(metrics));
+    for (const term::Terminal_render_arc& arc : arc_frame.graphic_arcs) {
+        arcs.glyph_masks.push_back({
+            arc.rect,
+            stage3_grid_background(arcs.snapshot),
+            true,
+        });
+    }
+
+    Stage2_parity_fixture cursor_box = make_stage3_base_fixture(
+        "block_cursor_antialiased_box",
+        {1, 8},
+        737U,
+        metrics);
+    cursor_box.snapshot.styles.push_back(rgb_style(0xff8be9fdU, 0xff101820U));
+    cursor_box.snapshot.cursor.position      = {0, 2};
+    cursor_box.snapshot.cursor.visible       = true;
+    cursor_box.snapshot.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    cursor_box.snapshot.cursor.blink_enabled = false;
+    cursor_box.snapshot.cells.push_back(
+        make_stage2_cell(0, 2, QStringLiteral("\u2500"), 1, block_accent));
+    const term::Terminal_render_frame cursor_box_frame =
+        stage2_expected_frame(cursor_box, metrics);
+    append_exact_class(
+        cursor_box,
+        "box_cursor_fill_carveout",
+        inset_masks(cursor_masks(cursor_box_frame.cursors), 1.0, 2.0));
+    cursor_box.glyph_masks.push_back({
+        stage2_cell_rect(0, 2, 1, metrics),
+        stage2_render_options().cursor_color,
+        true,
+    });
+
+    Stage2_parity_fixture cursor_vertical_box = make_stage3_base_fixture(
+        "block_cursor_antialiased_vertical_box",
+        {1, 8},
+        739U,
+        metrics);
+    cursor_vertical_box.snapshot.styles.push_back(rgb_style(0xff8be9fdU, 0xff101820U));
+    cursor_vertical_box.snapshot.cursor.position      = {0, 2};
+    cursor_vertical_box.snapshot.cursor.visible       = true;
+    cursor_vertical_box.snapshot.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    cursor_vertical_box.snapshot.cursor.blink_enabled = false;
+    cursor_vertical_box.snapshot.cells.push_back(
+        make_stage2_cell(0, 2, QStringLiteral("\u2502"), 1, block_accent));
+    const term::Terminal_render_frame cursor_vertical_box_frame =
+        stage2_expected_frame(cursor_vertical_box, metrics);
+    append_exact_class(
+        cursor_vertical_box,
+        "vertical_box_cursor_fill_carveout",
+        inset_masks(cursor_masks(cursor_vertical_box_frame.cursors), 1.0, 2.0));
+    cursor_vertical_box.glyph_masks.push_back({
+        stage2_cell_rect(0, 2, 1, metrics),
+        stage2_render_options().cursor_color,
+        true,
+    });
+
+    Stage2_parity_fixture scrollback = make_stage3_base_fixture(
+        "viewport_scrollback_selection",
+        {3, 8},
+        732U,
+        metrics);
+    scrollback.snapshot.viewport.follow_tail      = false;
+    scrollback.snapshot.viewport.scrollback_rows  = 8;
+    scrollback.snapshot.viewport.offset_from_tail = 2;
+    set_stage2_visible_line_provenance(scrollback.snapshot, 900U, 77U);
+    scrollback.snapshot.selection_spans.push_back({
+        {{6, 4}, {6, 7}, term::Terminal_selection_mode::NORMAL},
+        0,
+        4,
+        3,
+    });
+    scrollback.snapshot.cells.push_back(
+        make_stage2_cell(0, 1, QStringLiteral("row"), 3, term::k_default_terminal_style_id));
+    append_exact_class(
+        scrollback,
+        "scrollback_selection",
+        {inset_rect(stage2_cell_rect(0, 4, 3, metrics), 2.0, 2.0)});
+    append_text_glyph_masks(
+        scrollback,
+        stage2_expected_frame(scrollback, metrics).text_runs);
+
+    Stage2_parity_fixture alternate = make_stage3_base_fixture(
+        "alternate_viewport",
+        {2, 8},
+        733U,
+        metrics);
+    alternate.snapshot.viewport.active_buffer    = term::Terminal_buffer_id::ALTERNATE;
+    alternate.snapshot.viewport.follow_tail      = true;
+    alternate.snapshot.viewport.scrollback_rows  = 0;
+    alternate.snapshot.viewport.offset_from_tail = 0;
+    alternate.snapshot.styles.push_back(rgb_style(0xff55e6c1U, 0xff101820U));
+    set_stage2_visible_line_provenance(alternate.snapshot, 950U, 5U);
+    alternate.snapshot.cells.push_back(
+        make_stage2_cell(0, 0, QStringLiteral("\u2588"), 1, block_accent));
+    append_exact_class(
+        alternate,
+        "packed_hard_blocks",
+        {inset_rect(stage2_cell_rect(0, 0, 1, metrics), 1.0, 1.0)});
+
+    Stage2_parity_fixture public_scroll = make_stage3_base_fixture(
+        "public_projection_scroll_full_repaint",
+        {2, 6},
+        734U,
+        metrics);
+    public_scroll.snapshot.basis =
+        term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION;
+    public_scroll.snapshot.purpose =
+        term::Terminal_render_snapshot_purpose::SCROLL;
+    append_exact_class(
+        public_scroll,
+        "full_repaint_background",
+        {inset_rect(QRectF(QPointF(0.0, 0.0), public_scroll.logical_size), 2.0, 2.0)});
+
+    Stage2_parity_fixture suppressed = make_stage3_base_fixture(
+        "selection_provenance_suppressed",
+        {2, 8},
+        735U,
+        metrics);
+    suppressed.snapshot.visible_line_provenance.clear();
+    suppressed.snapshot.selection_spans.push_back({
+        {{0, 1}, {0, 5}, term::Terminal_selection_mode::NORMAL},
+        0,
+        1,
+        4,
+    });
+    term::suppress_selection_spans_without_valid_line_provenance(suppressed.snapshot);
+    append_exact_class(
+        suppressed,
+        "suppressed_selection_background",
+        {inset_rect(QRectF(QPointF(0.0, 0.0), suppressed.logical_size), 2.0, 2.0)});
+
+    Stage2_parity_fixture fallback = make_stage3_base_fixture(
+        "fallback_fonts",
+        {2, 10},
+        736U,
+        metrics);
+    fallback.snapshot.styles.push_back(rgb_style(0xfff78c6cU, 0xff101820U));
+    fallback.snapshot.cells.push_back(
+        make_stage2_cell(0, 0, QStringLiteral("A"), 1, block_accent));
+    fallback.snapshot.cells.push_back(
+        make_stage2_cell(0, 2, QString::fromUtf8("\xe7\x95\x8c"), 2, block_accent));
+    fallback.snapshot.cells.push_back(make_stage2_continuation_cell(0, 3, block_accent));
+    fallback.snapshot.cells.push_back(
+        make_stage2_cell(1, 0, QStringLiteral("B"), 1, block_accent));
+    append_text_glyph_masks(
+        fallback,
+        stage2_expected_frame(fallback, metrics).text_runs);
+
+    Stage2_parity_fixture emoji = make_stage3_base_fixture(
+        "emoji_policy",
+        {1, 8},
+        738U,
+        metrics);
+    emoji.snapshot.styles.push_back(rgb_style(0xfff78c6cU, 0xff101820U));
+    emoji.snapshot.cells.push_back(
+        make_stage2_cell(0, 0, QStringLiteral("E"), 1, block_accent));
+    emoji.snapshot.cells.push_back(
+        make_stage2_cell(0, 2, QString::fromUcs4(U"\U0001F600"), 2, block_accent));
+    emoji.snapshot.cells.push_back(make_stage2_continuation_cell(0, 3, block_accent));
+    append_text_glyph_masks(
+        emoji,
+        stage2_expected_frame(emoji, metrics).text_runs);
+
+    return {
+        std::move(blocks),
+        std::move(arcs),
+        std::move(cursor_box),
+        std::move(cursor_vertical_box),
+        std::move(scrollback),
+        std::move(alternate),
+        std::move(public_scroll),
+        std::move(suppressed),
+        std::move(fallback),
+        std::move(emoji),
+    };
+}
+
 Stage2_aa_budget stage2_budget_for_backend(
     const char*         backend,
     const std::string&  fixture_name)
 {
+    if (fixture_name == "graphics_supported_unsupported_blocks") {
+        return {276, 215, 276, 145, 190};
+    }
+
+    if (fixture_name == "box_arcs") {
+        return {1104, 255, 260, 90, 190};
+    }
+
+    if (fixture_name == "block_cursor_antialiased_box") {
+        return {276, 120, 60, 35, 80};
+    }
+
+    if (fixture_name == "block_cursor_antialiased_vertical_box") {
+        return {276, 200, 75, 55, 100};
+    }
+
+    if (fixture_name == "viewport_scrollback_selection") {
+        return {782, 210, 300, 200, 260};
+    }
+
+    if (fixture_name == "fallback_fonts") {
+        return {1081, 235, 650, 440, 540};
+    }
+
+    if (fixture_name == "emoji_policy") {
+        return {805, 245, 560, 340, 450};
+    }
+
     if (fixture_name == "ascii_bmp_attributes") {
         if (std::strcmp(backend, "d3d11") == 0) {
             return {3003, 230, 1350, 850, 1050};
@@ -846,13 +1176,16 @@ bool compare_stage2_fixture(
     const Stage2_render_result&  atlas,
     const char*                  backend)
 {
+    const int stage = fixture.stage;
     if (!reference.ready || !atlas.ready) {
-        std::cerr << "FAIL: Stage 2 parity fixture " << fixture.name
+        std::cerr << "FAIL: Stage " << stage << " parity fixture "
+            << fixture.name
             << " did not render both backends\n";
         return false;
     }
     if (reference.image.size() != atlas.image.size()) {
-        std::cerr << "FAIL: Stage 2 parity fixture " << fixture.name
+        std::cerr << "FAIL: Stage " << stage << " parity fixture "
+            << fixture.name
             << " rendered different image sizes\n";
         return false;
     }
@@ -870,13 +1203,15 @@ bool compare_stage2_fixture(
         exact_diff_pixels     += exact.diff_pixels;
         exact_max_delta        = std::max(exact_max_delta, exact.max_delta);
         if (exact.compared_pixels == 0) {
-            std::cerr << "FAIL: Stage 2 parity fixture " << fixture.name
+            std::cerr << "FAIL: Stage " << stage << " parity fixture "
+                << fixture.name
                 << " exact class " << exact_class.name
                 << " compared zero pixels\n";
             ok = false;
         }
         if (exact.diff_pixels != 0) {
-            std::cerr << "FAIL: Stage 2 parity fixture " << fixture.name
+            std::cerr << "FAIL: Stage " << stage << " parity fixture "
+                << fixture.name
                 << " exact class " << exact_class.name
                 << " changed " << exact.diff_pixels
                 << " / " << exact.compared_pixels
@@ -914,9 +1249,11 @@ bool compare_stage2_fixture(
         atlas.image,
         fixture.glyph_masks);
     if (!fixture.glyph_masks.empty() &&
+        budget.compared_pixels > 0 &&
         glyphs.compared_pixels != budget.compared_pixels)
     {
-        std::cerr << "FAIL: Stage 2 parity fixture " << fixture.name
+        std::cerr << "FAIL: Stage " << stage << " parity fixture "
+            << fixture.name
             << " glyph compared pixels changed on " << backend
             << ": compared pixels " << glyphs.compared_pixels
             << " / " << budget.compared_pixels << '\n';
@@ -926,7 +1263,8 @@ bool compare_stage2_fixture(
         (glyphs.max_delta > budget.max_delta ||
         glyphs.diff_pixels > budget.diff_pixels)
     ) {
-        std::cerr << "FAIL: Stage 2 parity fixture " << fixture.name
+        std::cerr << "FAIL: Stage " << stage << " parity fixture "
+            << fixture.name
             << " glyph budget exceeded on " << backend
             << ": diff pixels " << glyphs.diff_pixels << " / " << budget.diff_pixels
             << ", max delta " << glyphs.max_delta << " / " << budget.max_delta << '\n';
@@ -936,7 +1274,8 @@ bool compare_stage2_fixture(
         (glyphs.atlas_ink_pixels < budget.min_ink_pixels ||
             glyphs.atlas_ink_pixels > budget.max_ink_pixels))
     {
-        std::cerr << "FAIL: Stage 2 parity fixture " << fixture.name
+        std::cerr << "FAIL: Stage " << stage << " parity fixture "
+            << fixture.name
             << " glyph ink budget exceeded on " << backend
             << ": atlas ink pixels " << glyphs.atlas_ink_pixels
             << " / [" << budget.min_ink_pixels
@@ -946,7 +1285,7 @@ bool compare_stage2_fixture(
     }
 
     if (ok) {
-        std::cout << "PASS: Stage 2 parity " << fixture.name
+        std::cout << "PASS: Stage " << stage << " parity " << fixture.name
             << " backend=" << backend
             << " exact_diff_pixels=" << exact_diff_pixels
             << " exact_compared_pixels=" << exact_compared_pixels
@@ -980,6 +1319,200 @@ int test_stage2_parity(QGuiApplication& app, const char* backend)
         }
 
         ok &= compare_stage2_fixture(fixture, reference, atlas, backend);
+    }
+    return ok ? 0 : 1;
+}
+
+bool check_stage3_report(
+    bool                         condition,
+    const Stage2_parity_fixture& fixture,
+    const char*                  message)
+{
+    if (!condition) {
+        std::cerr << "FAIL: Stage 3 report fixture " << fixture.name
+            << ": " << message << '\n';
+        return false;
+    }
+
+    return true;
+}
+
+bool validate_stage3_report(
+    const Stage2_parity_fixture&                 fixture,
+    const term::Qsg_atlas_stage1_frame_report&  report)
+{
+    const term::Qsg_atlas_stage3_frame_summary& stage3 = report.stage3;
+    bool ok = true;
+    ok &= check_stage3_report(
+        stage3.packed_rows == fixture.snapshot.grid_size.rows,
+        fixture,
+        "packed row count matches the viewport");
+    ok &= check_stage3_report(
+        stage3.rect_instances + stage3.glyph_instances > 0,
+        fixture,
+        "atlas emitted at least one render instance");
+    ok &= check_stage3_report(
+        stage3.color_glyph_alpha_demotions == 0,
+        fixture,
+        "color glyph images stayed rejected instead of entering the R8 atlas");
+
+    if (fixture.name == "graphics_supported_unsupported_blocks") {
+        ok &= check_stage3_report(
+            stage3.packed_graphic_cells >= 3,
+            fixture,
+            "supported hard blocks reached packed graphic spans");
+        ok &= check_stage3_report(
+            stage3.packed_hard_block_rects > 0,
+            fixture,
+            "packed hard blocks were reconstructed as atlas rectangles");
+        ok &= check_stage3_report(
+            stage3.frame_text_runs > 0 && stage3.glyph_instances > 0,
+            fixture,
+            "unsupported shade block stayed on the text fallback path");
+    }
+    else
+    if (fixture.name == "box_arcs") {
+        ok &= check_stage3_report(
+            stage3.frame_graphic_arcs == 4,
+            fixture,
+            "rounded box corners stayed on the direct arc route");
+        ok &= check_stage3_report(
+            stage3.graphic_arc_raster_rects > 0,
+            fixture,
+            "arc primitives were rasterized into atlas rect instances");
+    }
+    else
+    if (fixture.name == "block_cursor_antialiased_box" ||
+        fixture.name == "block_cursor_antialiased_vertical_box") {
+        ok &= check_stage3_report(
+            stage3.frame_graphic_rects > 0 &&
+                stage3.frame_cursor_graphic_rects > 0,
+            fixture,
+            "block cursor over box drawing used graphic and cursor graphic rect routes");
+    }
+    else
+    if (fixture.name == "viewport_scrollback_selection") {
+        ok &= check_stage3_report(
+            stage3.viewport_active_buffer == term::Terminal_buffer_id::PRIMARY &&
+                stage3.viewport_scrollback_rows == 8 &&
+                stage3.viewport_offset_from_tail == 2,
+            fixture,
+            "primary scrollback viewport metadata was preserved");
+        ok &= check_stage3_report(
+            stage3.selection_provenance_valid && stage3.frame_selection_rects == 1,
+            fixture,
+            "valid provenance allowed the selection span to render");
+        ok &= check_stage3_report(
+            stage3.first_packed_logical_row == 6 &&
+                stage3.first_packed_active_buffer == term::Terminal_buffer_id::PRIMARY,
+            fixture,
+            "packed row identity follows primary scrollback position");
+        ok &= check_stage3_report(
+            stage3.first_text_logical_row == 6 &&
+                stage3.first_text_retained_line_id == 900U &&
+                stage3.first_text_content_generation == 77U,
+            fixture,
+            "text row identity follows visible-line provenance");
+    }
+    else
+    if (fixture.name == "alternate_viewport") {
+        ok &= check_stage3_report(
+            stage3.viewport_active_buffer == term::Terminal_buffer_id::ALTERNATE,
+            fixture,
+            "alternate-screen viewport metadata was preserved");
+        ok &= check_stage3_report(
+            stage3.first_packed_active_buffer == term::Terminal_buffer_id::ALTERNATE &&
+                stage3.first_packed_logical_row == 0,
+            fixture,
+            "packed row identity separates alternate rows from primary scrollback");
+    }
+    else
+    if (fixture.name == "public_projection_scroll_full_repaint") {
+        ok &= check_stage3_report(
+            stage3.snapshot_basis ==
+                term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+                stage3.snapshot_purpose ==
+                    term::Terminal_render_snapshot_purpose::SCROLL,
+            fixture,
+            "PUBLIC_PROJECTION/SCROLL snapshot metadata was recorded");
+        ok &= check_stage3_report(
+            stage3.full_dirty_range                 &&
+                stage3.public_projection_full_repaint &&
+                stage3.scroll_full_repaint            &&
+                stage3.full_repaint_fallback,
+            fixture,
+            "public scroll snapshot used the full-repaint fallback");
+    }
+    else
+    if (fixture.name == "selection_provenance_suppressed") {
+        ok &= check_stage3_report(
+            !stage3.selection_provenance_valid &&
+                stage3.frame_selection_rects == 0,
+            fixture,
+            "selection was suppressed when visible-line provenance was unavailable");
+    }
+    else
+    if (fixture.name == "fallback_fonts") {
+        ok &= check_stage3_report(
+            stage3.distinct_glyph_faces >= 2,
+            fixture,
+            "base-font ASCII and fallback text produced distinct glyph faces");
+        ok &= check_stage3_report(
+            stage3.fallback_glyph_faces >= 1,
+            fixture,
+            "fallback font face ids were observed in shaped glyph runs");
+        ok &= check_stage3_report(
+            stage3.fallback_glyph_faces < stage3.distinct_glyph_faces,
+            fixture,
+            "base-font face remains distinct from fallback faces");
+    }
+    else
+    if (fixture.name == "emoji_policy") {
+        ok &= check_stage3_report(
+            stage3.emoji_presentation_runs > 0,
+            fixture,
+            "emoji presentation text runs were identified");
+        ok &= check_stage3_report(
+            stage3.glyph_instances > 0,
+            fixture,
+            "emoji policy rendered through monochrome atlas glyph instances");
+    }
+
+    if (ok) {
+        std::cout << "PASS: Stage 3 report " << fixture.name
+            << " packed_rows=" << stage3.packed_rows
+            << " packed_graphic_cells=" << stage3.packed_graphic_cells
+            << " packed_hard_block_rects=" << stage3.packed_hard_block_rects
+            << " graphic_arc_raster_rects=" << stage3.graphic_arc_raster_rects
+            << " selection_rects=" << stage3.frame_selection_rects
+            << " distinct_faces=" << stage3.distinct_glyph_faces
+            << " fallback_faces=" << stage3.fallback_glyph_faces
+            << " emoji_runs=" << stage3.emoji_presentation_runs
+            << " color_glyph_demotions=" << stage3.color_glyph_alpha_demotions
+            << " first_packed_row=" << stage3.first_packed_logical_row
+            << " rect_instances=" << stage3.rect_instances
+            << " glyph_instances=" << stage3.glyph_instances << '\n';
+    }
+    return ok;
+}
+
+int test_stage3_parity(QGuiApplication& app, const char* backend)
+{
+    bool ok = true;
+    for (const Stage2_parity_fixture& fixture : make_stage3_parity_fixtures()) {
+        const Stage2_render_result reference = render_stage2_fixture(app, fixture, false);
+        const Stage2_render_result atlas = render_stage2_fixture(app, fixture, true);
+        if (!atlas.ready &&
+            (atlas.atlas_report.prepare_count == 0U ||
+                atlas.atlas_report.render_count == 0U ||
+                (atlas.atlas_report.prepare_count > 0U && !atlas.atlas_report.rhi_non_null)))
+        {
+            std::cerr << "SKIP: Stage 3 parity did not reach usable QRhi render state\n";
+            return k_unsupported_backend_skip_return_code;
+        }
+
+        ok &= compare_stage2_fixture(fixture, reference, atlas, backend);
+        ok &= validate_stage3_report(fixture, atlas.atlas_report);
     }
     return ok ? 0 : 1;
 }
@@ -1187,6 +1720,16 @@ bool test_indexed8_and_grayscale_conversion()
     const term::Glyph_coverage_tile gray_tile =
         term::qsg_atlas_coverage_tile_from_image(gray);
 
+    QImage argb(3, 2, QImage::Format_ARGB32);
+    argb.setPixelColor(0, 0, QColor(10, 20, 30, 11));
+    argb.setPixelColor(1, 0, QColor(10, 20, 30, 12));
+    argb.setPixelColor(2, 0, QColor(10, 20, 30, 13));
+    argb.setPixelColor(0, 1, QColor(10, 20, 30, 21));
+    argb.setPixelColor(1, 1, QColor(10, 20, 30, 22));
+    argb.setPixelColor(2, 1, QColor(10, 20, 30, 23));
+    const term::Glyph_coverage_tile argb_tile =
+        term::qsg_atlas_coverage_tile_from_image(argb);
+
     QImage rgb(3, 2, QImage::Format_RGB32);
     rgb.fill(QColor(10, 20, 30));
     const term::Glyph_coverage_tile rgb_tile =
@@ -1201,6 +1744,8 @@ bool test_indexed8_and_grayscale_conversion()
             gray_tile.bytes_per_line == 3 &&
             gray_tile.bytes == byte_array({7, 8, 9, 17, 18, 19}),
         "Format_Grayscale8 glyph alpha map conversion honors source stride");
+    ok &= check(!argb_tile.is_valid(),
+        "alpha-bearing color glyph maps are rejected until RGBA atlas support lands");
     ok &= check(!rgb_tile.is_valid(),
         "RGB subpixel glyph maps are rejected for the R8 atlas");
     return ok;
@@ -1403,12 +1948,16 @@ int main(int argc, char** argv)
 {
     const bool render_smoke = has_argument(argc, argv, "--render-smoke");
     const bool stage2_parity = has_argument(argc, argv, "--stage2-parity");
+    const bool stage3_parity = has_argument(argc, argv, "--stage3-parity");
     const char* backend = argument_value(argc, argv, "--backend", "d3d11");
-    if (render_smoke || stage2_parity) {
+    if (render_smoke || stage2_parity || stage3_parity) {
         configure_graphics_api(backend);
     }
 
     QGuiApplication app(argc, argv);
+    if (stage3_parity) {
+        return test_stage3_parity(app, backend);
+    }
     if (stage2_parity) {
         return test_stage2_parity(app, backend);
     }
