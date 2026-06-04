@@ -5633,6 +5633,14 @@ void term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(
     surface.m_private->request_render_update(surface);
 }
 
+void term::VNM_TerminalSurface_render_bridge::set_ime_preedit_state(
+    VNM_TerminalSurface&               surface,
+    Ime_preedit_state                  state)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    surface.m_private->set_ime_preedit_state(surface, std::move(state));
+}
+
 bool term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
     VNM_TerminalSurface&               surface,
     std::unique_ptr<Terminal_backend>  backend,

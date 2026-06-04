@@ -96,6 +96,10 @@ public:
         VNM_TerminalSurface&       surface,
         bool                       visible);
 
+    static void set_ime_preedit_state(
+        VNM_TerminalSurface&       surface,
+        Ime_preedit_state          state);
+
     static bool start_process_with_backend(
         VNM_TerminalSurface&                   surface,
         std::unique_ptr<Terminal_backend>      backend,

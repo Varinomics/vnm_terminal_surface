@@ -386,7 +386,7 @@ bool test_copy_move_assignment_value_semantics()
     ok &= check(fallback_copy == fallback_text,
         "fallback copy keeps original text after source reassignment");
     ok &= check(fallback_original == QStringLiteral("Z"),
-        "fallback source can be reassigned to inline text");
+        "fallback object accepts inline-text reassignment");
 
     term::Terminal_render_cell_text fallback_assigned;
     fallback_assigned = fallback_copy;
