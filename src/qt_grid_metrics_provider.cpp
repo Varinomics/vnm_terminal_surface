@@ -18,6 +18,18 @@ qreal normalized_device_pixel_ratio(qreal device_pixel_ratio)
     return device_pixel_ratio;
 }
 
+qreal snap_metric_up_to_device_pixel(qreal value, qreal device_pixel_ratio)
+{
+    if (!std::isfinite(value) || value <= 0.0) {
+        return value;
+    }
+
+    const qreal physical_value =
+        value * normalized_device_pixel_ratio(device_pixel_ratio);
+    return std::ceil(physical_value) /
+        normalized_device_pixel_ratio(device_pixel_ratio);
+}
+
 }
 
 Qt_grid_metrics_provider::Qt_grid_metrics_provider() = default;
@@ -30,15 +42,24 @@ Qt_grid_metrics_provider::Qt_grid_metrics_provider(QFont font, qreal device_pixe
 
 terminal_cell_metrics_t Qt_grid_metrics_provider::cell_metrics() const
 {
-    // QQuickItem geometry and published grid metrics are logical pixels. DPR is
-    // retained only as invalidation/configuration state unless physical-pixel
-    // snapping is introduced here.
     const QFontMetricsF metrics(m_font);
+    const qreal width =
+        snap_metric_up_to_device_pixel(
+            metrics.horizontalAdvance(QLatin1Char('M')),
+            m_device_pixel_ratio);
+    const qreal ascent =
+        snap_metric_up_to_device_pixel(metrics.ascent(), m_device_pixel_ratio);
+    const qreal descent =
+        snap_metric_up_to_device_pixel(metrics.descent(), m_device_pixel_ratio);
+    const qreal height = std::max(
+        snap_metric_up_to_device_pixel(metrics.lineSpacing(), m_device_pixel_ratio),
+        ascent + descent);
+
     return {
-        metrics.horizontalAdvance(QLatin1Char('M')),
-        metrics.lineSpacing(),
-        metrics.ascent(),
-        metrics.descent(),
+        width,
+        height,
+        ascent,
+        descent,
     };
 }
 
