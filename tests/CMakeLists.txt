@@ -110,6 +110,8 @@ set(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE1_SMOKE OFF CACHE BOOL
     "Add the Stage 1 atlas/capture QRhi render-node hardware smoke CTests.")
 set(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE2_PARITY OFF CACHE BOOL
     "Add the Stage 2 GPU atlas renderer hardware parity CTests.")
+set(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE3_PARITY OFF CACHE BOOL
+    "Add the Stage 3 GPU atlas renderer hardware parity CTests.")
 
 function(vnm_terminal_configure_test_process target_name)
     target_include_directories(${target_name} PRIVATE
@@ -748,6 +750,50 @@ if(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE2_PARITY)
                 LABELS "qsg;hardware;atlas;stage2;parity"
                 SKIP_RETURN_CODE 77
                 TIMEOUT 90
+        )
+    endforeach()
+endif()
+
+if(VNM_TERMINAL_ENABLE_GPU_ATLAS_STAGE3_PARITY)
+    set(vnm_terminal_qsg_atlas_stage3_parity_backends)
+    if(WIN32)
+        list(APPEND vnm_terminal_qsg_atlas_stage3_parity_backends
+            d3d11
+            d3d12
+            vulkan
+            opengl
+        )
+    elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD)$")
+        list(APPEND vnm_terminal_qsg_atlas_stage3_parity_backends
+            vulkan
+            opengl
+        )
+    elseif(APPLE)
+        list(APPEND vnm_terminal_qsg_atlas_stage3_parity_backends
+            opengl
+        )
+    endif()
+
+    foreach(stage3_backend IN LISTS vnm_terminal_qsg_atlas_stage3_parity_backends)
+        add_test(
+            NAME vnm_terminal_qsg_atlas_stage3_parity_${stage3_backend}
+            COMMAND
+                "${CMAKE_COMMAND}" -E env
+                "QSG_RENDER_LOOP=threaded"
+                ${vnm_terminal_qt_unscaled_environment}
+                "${vnm_terminal_qt_runtime_path}"
+                "$<TARGET_FILE:vnm_terminal_qsg_atlas_stage1>"
+                "--stage3-parity"
+                "--backend"
+                "${stage3_backend}"
+        )
+
+        set_tests_properties(
+            vnm_terminal_qsg_atlas_stage3_parity_${stage3_backend}
+            PROPERTIES
+                LABELS "qsg;hardware;atlas;stage3;parity"
+                SKIP_RETURN_CODE 77
+                TIMEOUT 120
         )
     endforeach()
 endif()

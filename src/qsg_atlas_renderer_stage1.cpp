@@ -1,4 +1,6 @@
 #include "vnm_terminal/internal/qsg_atlas_renderer_stage1.h"
+#include "vnm_terminal/internal/terminal_graphic_geometry.h"
+#include "vnm_terminal/internal/unicode_width.h"
 
 #include <QFile>
 #include <QGlyphRun>
@@ -13,6 +15,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <tuple>
 #include <utility>
 
@@ -64,9 +67,13 @@ struct Stage1_pass_range
 
 struct Stage1_prepare_result
 {
-    bool          raw_font_rasterized = false;
-    std::uint64_t raster_thread       = 0U;
-    int           rasterized_glyphs   = 0;
+    bool                            raw_font_rasterized = false;
+    std::uint64_t                   raster_thread       = 0U;
+    int                             rasterized_glyphs   = 0;
+    QString                         base_face_id;
+    std::set<QString>               glyph_face_ids;
+    std::set<QString>               fallback_face_ids;
+    Qsg_atlas_stage3_frame_summary  stage3;
 };
 
 const std::array<Stage1_vertex, 6> k_stage1_quad_vertices = {{
@@ -211,6 +218,75 @@ QColor atlas_cursor_graphic_overlay_color(QColor color)
     return color;
 }
 
+qreal atlas_logical_pixel_size(qreal device_pixel_ratio)
+{
+    return 1.0 / std::max<qreal>(1.0, device_pixel_ratio);
+}
+
+qreal atlas_antialiased_rect_pixel_coverage(
+    const Terminal_render_rect& rect,
+    QPointF                     point)
+{
+    const QRectF& shape = rect.rect;
+    if (shape.width() >= shape.height()) {
+        if (point.x() < shape.left() || point.x() > shape.right()) {
+            return 0.0;
+        }
+
+        const qreal distance = std::abs(point.y() - shape.center().y());
+        return std::clamp(
+            shape.height() * 0.5 + k_terminal_graphic_antialias_feather - distance,
+            0.0,
+            1.0);
+    }
+
+    if (point.y() < shape.top() || point.y() > shape.bottom()) {
+        return 0.0;
+    }
+
+    const qreal distance = std::abs(point.x() - shape.center().x());
+    return std::clamp(
+        shape.width() * 0.5 + k_terminal_graphic_antialias_feather - distance,
+        0.0,
+        1.0);
+}
+
+bool dirty_range_covers_full_grid(const Terminal_render_frame& frame)
+{
+    return
+        frame.grid_size.rows > 0 &&
+        frame.dirty_row_ranges.size() == 1U &&
+        frame.dirty_row_ranges.front().first_row == 0 &&
+        frame.dirty_row_ranges.front().row_count >= frame.grid_size.rows;
+}
+
+bool text_has_emoji_presentation(const QString& text)
+{
+    const QByteArray utf8 = text.toUtf8();
+    const Terminal_utf8_width_result width =
+        measure_utf8_width(QByteArrayView(utf8.constData(), utf8.size()));
+    return std::any_of(
+        width.codepoints.begin(),
+        width.codepoints.end(),
+        [](const Terminal_codepoint_width& codepoint) {
+            return codepoint.width_class == Terminal_unicode_width_class::EMOJI_PRESENTATION ||
+                codepoint.presentation == Terminal_unicode_presentation::EMOJI;
+        });
+}
+
+bool qsg_atlas_image_format_is_color_alpha(QImage::Format format)
+{
+    switch (format) {
+        case QImage::Format_ARGB32:
+        case QImage::Format_ARGB32_Premultiplied:
+        case QImage::Format_RGBA8888:
+        case QImage::Format_RGBA8888_Premultiplied:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void store_rect(float* target, const QRectF& rect)
 {
     target[0] = static_cast<float>(rect.x());
@@ -320,7 +396,8 @@ public:
                 rasterized_glyphs,
                 prepare_thread,
                 raster_thread,
-                m_cache.stats());
+                m_cache.stats(),
+                prepare_result.stage3);
         }
     }
 
@@ -352,12 +429,13 @@ public:
 
             draw_rect_pass(command_buffer, m_background_pass);
             draw_rect_pass(command_buffer, m_selection_pass);
-            draw_rect_pass(command_buffer, m_cursor_graphic_underlay_pass);
+            draw_rect_pass(command_buffer, m_graphic_pass);
             draw_glyph_pass(command_buffer, m_text_pass);
             draw_rect_pass(command_buffer, m_decoration_pass);
             draw_rect_pass(command_buffer, m_cursor_pass);
             draw_rect_pass(command_buffer, m_cursor_graphic_pass);
             draw_glyph_pass(command_buffer, m_cursor_text_pass);
+            draw_rect_pass(command_buffer, m_overlay_pass);
             drew = total_instance_count() > 0U;
         }
 
@@ -637,16 +715,54 @@ private:
 
     Stage1_pass_range append_cursor_graphic_pass(
         const std::vector<Terminal_render_rect>& rects,
+        const std::vector<Terminal_render_arc>&  arcs,
+        Stage1_prepare_result&                   result,
         qreal                                    opacity)
     {
         Stage1_pass_range range;
         range.first = static_cast<quint32>(m_rect_instances.size());
         for (const Terminal_render_rect& rect : rects) {
-            append_rect_instance(
-                rect.rect,
-                atlas_cursor_graphic_overlay_color(rect.color),
-                opacity);
+            Terminal_render_rect overlay_rect = rect;
+            overlay_rect.color = atlas_cursor_graphic_overlay_color(rect.color);
+            append_graphic_rect_instance(overlay_rect, opacity);
         }
+        const int before_arcs = static_cast<int>(m_rect_instances.size());
+        for (Terminal_render_arc arc : arcs) {
+            arc.color = atlas_cursor_graphic_overlay_color(arc.color);
+            append_arc_instances(arc, opacity);
+        }
+        result.stage3.cursor_graphic_arc_raster_rects +=
+            static_cast<int>(m_rect_instances.size()) - before_arcs;
+        range.count =
+            static_cast<quint32>(m_rect_instances.size()) - range.first;
+        return range;
+    }
+
+    Stage1_pass_range append_graphic_pass(
+        const Terminal_render_frame& render_frame,
+        qreal                        opacity,
+        Stage1_prepare_result&       result)
+    {
+        Stage1_pass_range range;
+        range.first = static_cast<quint32>(m_rect_instances.size());
+        for (const Terminal_render_rect& rect : render_frame.graphic_rects) {
+            append_graphic_rect_instance(rect, opacity);
+        }
+
+        const std::vector<Terminal_render_rect> packed_hard_blocks =
+            terminal_render_packed_hard_graphic_rects(render_frame);
+        result.stage3.packed_hard_block_rects =
+            static_cast<int>(packed_hard_blocks.size());
+        for (const Terminal_render_rect& rect : packed_hard_blocks) {
+            append_graphic_rect_instance(rect, opacity);
+        }
+
+        const int before_arcs = static_cast<int>(m_rect_instances.size());
+        for (const Terminal_render_arc& arc : render_frame.graphic_arcs) {
+            append_arc_instances(arc, opacity);
+        }
+        result.stage3.graphic_arc_raster_rects =
+            static_cast<int>(m_rect_instances.size()) - before_arcs;
         range.count =
             static_cast<quint32>(m_rect_instances.size()) - range.first;
         return range;
@@ -682,6 +798,112 @@ private:
         m_rect_instances.push_back(instance);
     }
 
+    void append_graphic_rect_instance(
+        const Terminal_render_rect& rect,
+        qreal                       opacity)
+    {
+        if (rect.antialias) {
+            append_antialiased_rect_instances(rect, opacity);
+            return;
+        }
+
+        append_rect_instance(rect.rect, rect.color, opacity);
+    }
+
+    template <typename Coverage_fn>
+    int append_coverage_rasterized_rect_instances(
+        const QRectF&   bounds,
+        const QColor&   color,
+        qreal           opacity,
+        Coverage_fn     coverage_at)
+    {
+        const qreal pixel  = atlas_logical_pixel_size(m_frame.device_pixel_ratio);
+        const int   left   = static_cast<int>(std::floor(bounds.left()   / pixel));
+        const int   top    = static_cast<int>(std::floor(bounds.top()    / pixel));
+        const int   right  = static_cast<int>(std::ceil(bounds.right()   / pixel));
+        const int   bottom = static_cast<int>(std::ceil(bounds.bottom()  / pixel));
+
+        int instance_count = 0;
+        for (int y = top; y < bottom; ++y) {
+            bool   has_span   = false;
+            int    span_start = left;
+            QColor span_color;
+            for (int x = left; x < right; ++x) {
+                const QPointF center(
+                    (static_cast<qreal>(x) + 0.5) * pixel,
+                    (static_cast<qreal>(y) + 0.5) * pixel);
+                const qreal coverage = coverage_at(center);
+                const QColor span_pixel_color = coverage > 0.0
+                    ? terminal_render_coverage_color(color, coverage)
+                    : QColor(0, 0, 0, 0);
+                if (has_span && span_pixel_color.rgba() == span_color.rgba()) {
+                    continue;
+                }
+
+                if (has_span) {
+                    append_rect_instance(
+                        QRectF(
+                            static_cast<qreal>(span_start) * pixel,
+                            static_cast<qreal>(y) * pixel,
+                            static_cast<qreal>(x - span_start) * pixel,
+                            pixel),
+                        span_color,
+                        opacity);
+                    ++instance_count;
+                }
+                has_span   = span_pixel_color.alpha() != 0;
+                span_start = x;
+                span_color = span_pixel_color;
+            }
+
+            if (has_span) {
+                append_rect_instance(
+                    QRectF(
+                        static_cast<qreal>(span_start) * pixel,
+                        static_cast<qreal>(y) * pixel,
+                        static_cast<qreal>(right - span_start) * pixel,
+                        pixel),
+                    span_color,
+                    opacity);
+                ++instance_count;
+            }
+        }
+        return instance_count;
+    }
+
+    void append_antialiased_rect_instances(
+        const Terminal_render_rect& rect,
+        qreal                       opacity)
+    {
+        const QRectF bounds = rect.rect.adjusted(
+            -k_terminal_graphic_antialias_feather,
+            -k_terminal_graphic_antialias_feather,
+            k_terminal_graphic_antialias_feather,
+            k_terminal_graphic_antialias_feather);
+        (void)append_coverage_rasterized_rect_instances(
+            bounds,
+            rect.color,
+            opacity,
+            [&](QPointF center) {
+                return atlas_antialiased_rect_pixel_coverage(rect, center);
+            });
+    }
+
+    void append_arc_instances(
+        const Terminal_render_arc& arc,
+        qreal                      opacity)
+    {
+        const terminal_render_arc_geometry_t arc_spec =
+            terminal_render_arc_geometry(arc);
+        (void)append_coverage_rasterized_rect_instances(
+            arc.rect,
+            arc.color,
+            opacity,
+            [&](QPointF center) {
+                return terminal_render_arc_pixel_coverage(arc, arc_spec, center);
+            });
+    }
+
     Stage1_prepare_result prepare_stage2_instances()
     {
         m_cache.set_epoch(m_frame.font_epoch);
@@ -689,14 +911,19 @@ private:
         m_glyph_instances.clear();
         m_background_pass     = {};
         m_selection_pass      = {};
-        m_cursor_graphic_underlay_pass = {};
+        m_graphic_pass        = {};
         m_text_pass           = {};
         m_decoration_pass     = {};
         m_cursor_pass         = {};
         m_cursor_graphic_pass = {};
         m_cursor_text_pass    = {};
+        m_overlay_pass        = {};
 
         Stage1_prepare_result result;
+        const QRawFont base_raw_font = QRawFont::fromFont(m_frame.font);
+        result.base_face_id = base_raw_font.isValid()
+            ? qsg_atlas_face_id_for_raw_font(base_raw_font)
+            : QString();
         Terminal_render_options options = m_frame.options;
         options.packed_text_sidecars_enabled = false;
         const Terminal_render_frame render_frame = build_terminal_render_frame(
@@ -710,40 +937,90 @@ private:
         const qreal opacity = std::clamp(inheritedOpacity(), 0.0, 1.0);
         m_background_pass     = append_rect_pass(render_frame.background_rects, opacity);
         m_selection_pass      = append_rect_pass(render_frame.selection_rects, opacity);
-        m_cursor_graphic_underlay_pass =
-            append_cursor_graphic_underlay_pass(render_frame, opacity);
+        m_graphic_pass        = append_graphic_pass(render_frame, opacity, result);
         m_text_pass           = append_text_pass(render_frame.text_runs, opacity, result);
         m_decoration_pass     = append_decoration_pass(render_frame.decorations, opacity);
         m_cursor_pass         = append_cursor_pass(render_frame.cursors, opacity);
-        // Full graphics rendering is a Stage 3 concern; Stage 2 only needs
-        // the block-cursor carve-out rects emitted by the shared frame builder.
         m_cursor_graphic_pass =
-            append_cursor_graphic_pass(render_frame.cursor_graphic_rects, opacity);
+            append_cursor_graphic_pass(
+                render_frame.cursor_graphic_rects,
+                render_frame.cursor_graphic_arcs,
+                result,
+                opacity);
         m_cursor_text_pass    = append_text_pass(render_frame.cursor_text_runs, opacity, result);
+        m_overlay_pass        = append_rect_pass(render_frame.overlay_rects, opacity);
         result.raw_font_rasterized = result.rasterized_glyphs > 0;
+        finalize_stage3_summary(render_frame, result);
         return result;
     }
 
-    Stage1_pass_range append_cursor_graphic_underlay_pass(
+    void finalize_stage3_summary(
         const Terminal_render_frame& render_frame,
-        qreal                        opacity)
+        Stage1_prepare_result&       result)
     {
-        Stage1_pass_range range;
-        range.first = static_cast<quint32>(m_rect_instances.size());
-        for (const Terminal_render_rect& graphic_rect : render_frame.graphic_rects) {
-            const bool intersects_cursor_graphic = std::any_of(
-                render_frame.cursor_graphic_rects.begin(),
-                render_frame.cursor_graphic_rects.end(),
-                [&](const Terminal_render_rect& cursor_graphic_rect) {
-                    return graphic_rect.rect.intersects(cursor_graphic_rect.rect);
-                });
-            if (intersects_cursor_graphic) {
-                append_rect_instance(graphic_rect.rect, graphic_rect.color, opacity);
-            }
+        Qsg_atlas_stage3_frame_summary& summary = result.stage3;
+        if (m_frame.snapshot != nullptr) {
+            summary.snapshot_basis    = m_frame.snapshot->basis;
+            summary.snapshot_purpose  = m_frame.snapshot->purpose;
+            summary.selection_provenance_valid =
+                render_snapshot_visible_line_provenance_is_valid(*m_frame.snapshot);
         }
-        range.count =
-            static_cast<quint32>(m_rect_instances.size()) - range.first;
-        return range;
+        summary.viewport_active_buffer    = render_frame.viewport.active_buffer;
+        summary.viewport_offset_from_tail = render_frame.viewport.offset_from_tail;
+        summary.viewport_scrollback_rows  = render_frame.viewport.scrollback_rows;
+        summary.dirty_rows                = render_frame.stats.dirty_rows;
+        summary.full_dirty_rows           = render_frame.stats.full_dirty_rows;
+        summary.frame_background_rects    =
+            static_cast<int>(render_frame.background_rects.size());
+        summary.frame_selection_rects     =
+            static_cast<int>(render_frame.selection_rects.size());
+        summary.frame_graphic_rects       =
+            static_cast<int>(render_frame.graphic_rects.size());
+        summary.frame_graphic_arcs        =
+            static_cast<int>(render_frame.graphic_arcs.size());
+        summary.frame_text_runs           =
+            static_cast<int>(render_frame.text_runs.size());
+        summary.frame_cursor_graphic_rects =
+            static_cast<int>(render_frame.cursor_graphic_rects.size());
+        summary.frame_cursor_graphic_arcs =
+            static_cast<int>(render_frame.cursor_graphic_arcs.size());
+        summary.frame_overlay_rects       =
+            static_cast<int>(render_frame.overlay_rects.size());
+        summary.packed_rows               =
+            static_cast<int>(render_frame.packed_rows.size());
+        summary.packed_graphic_cells      = render_frame.stats.packed_graphic_cells;
+        summary.rect_instances            =
+            static_cast<int>(m_rect_instances.size());
+        summary.glyph_instances           =
+            static_cast<int>(m_glyph_instances.size());
+        summary.distinct_glyph_faces      =
+            static_cast<int>(result.glyph_face_ids.size());
+        summary.fallback_glyph_faces      =
+            static_cast<int>(result.fallback_face_ids.size());
+        summary.full_dirty_range          = dirty_range_covers_full_grid(render_frame);
+        summary.public_projection_full_repaint =
+            summary.snapshot_basis == Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+            summary.full_dirty_range;
+        summary.scroll_full_repaint =
+            summary.snapshot_purpose == Terminal_render_snapshot_purpose::SCROLL &&
+            summary.full_dirty_range;
+        summary.full_repaint_fallback =
+            summary.public_projection_full_repaint ||
+            summary.scroll_full_repaint            ||
+            summary.full_dirty_range;
+
+        if (!render_frame.packed_rows.empty()) {
+            const terminal_packed_render_row_t& first_row =
+                render_frame.packed_rows.front();
+            summary.first_packed_logical_row   = first_row.logical_row;
+            summary.first_packed_active_buffer = first_row.active_buffer;
+        }
+        if (!render_frame.text_runs.empty()) {
+            const Terminal_render_text_run& first_run = render_frame.text_runs.front();
+            summary.first_text_logical_row        = first_run.logical_row;
+            summary.first_text_retained_line_id   = first_run.retained_line_id;
+            summary.first_text_content_generation = first_run.content_generation;
+        }
     }
 
     void append_text_run(
@@ -753,6 +1030,10 @@ private:
     {
         if (run.text.isEmpty()) {
             return;
+        }
+
+        if (text_has_emoji_presentation(run.text)) {
+            ++result.stage3.emoji_presentation_runs;
         }
 
         QTextLayout layout(run.text, m_frame.font);
@@ -805,6 +1086,12 @@ private:
         QRawFont raster_font = raw_font;
         raster_font.setPixelSize(physical_pixel_size);
         const QString face_id = qsg_atlas_face_id_for_raw_font(raw_font);
+        if (!face_id.isEmpty()) {
+            result.glyph_face_ids.insert(face_id);
+            if (!result.base_face_id.isEmpty() && face_id != result.base_face_id) {
+                result.fallback_face_ids.insert(face_id);
+            }
+        }
         const qreal device_pixel_ratio = std::max<qreal>(1.0, m_frame.device_pixel_ratio);
         for (int index = 0; index < glyph_count; ++index) {
             const quint32 glyph_index = glyph_indexes.at(index);
@@ -824,6 +1111,9 @@ private:
                 const QImage alpha_map = raster_font.alphaMapForGlyph(
                     glyph_index,
                     QRawFont::PixelAntialiasing);
+                if (qsg_atlas_image_format_is_color_alpha(alpha_map.format())) {
+                    ++result.stage3.color_glyph_alpha_demotions;
+                }
                 const Glyph_coverage_tile tile =
                     qsg_atlas_coverage_tile_from_image(alpha_map);
                 if (!tile.is_valid()) {
@@ -1073,12 +1363,13 @@ private:
     std::vector<Stage1_glyph_instance>       m_glyph_instances;
     Stage1_pass_range                        m_background_pass;
     Stage1_pass_range                        m_selection_pass;
-    Stage1_pass_range                        m_cursor_graphic_underlay_pass;
+    Stage1_pass_range                        m_graphic_pass;
     Stage1_pass_range                        m_text_pass;
     Stage1_pass_range                        m_decoration_pass;
     Stage1_pass_range                        m_cursor_pass;
     Stage1_pass_range                        m_cursor_graphic_pass;
     Stage1_pass_range                        m_cursor_text_pass;
+    Stage1_pass_range                        m_overlay_pass;
     QRhiBuffer*                              m_vertex_buffer = nullptr;
     QRhiBuffer*                              m_rect_instance_buffer = nullptr;
     QRhiBuffer*                              m_glyph_instance_buffer = nullptr;
@@ -1377,7 +1668,8 @@ void Qsg_atlas_stage1_recorder::record_prepare(
     int                            rasterized_glyphs,
     std::uint64_t                  prepare_thread_id,
     std::uint64_t                  raw_font_raster_thread_id,
-    const Glyph_atlas_cache_stats& cache)
+    const Glyph_atlas_cache_stats& cache,
+    const Qsg_atlas_stage3_frame_summary& stage3)
 {
     (void)frame;
 
@@ -1395,6 +1687,7 @@ void Qsg_atlas_stage1_recorder::record_prepare(
     m_report.raw_font_raster_thread_id      = raw_font_raster_thread_id;
     m_report.atlas_page_count               = cache.page_count;
     m_report.cache                          = cache;
+    m_report.stage3                         = stage3;
 }
 
 void Qsg_atlas_stage1_recorder::record_render(

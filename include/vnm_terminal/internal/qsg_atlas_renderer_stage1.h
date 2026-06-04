@@ -107,6 +107,50 @@ struct Glyph_atlas_cache_stats
     QSize         page_size;
 };
 
+struct Qsg_atlas_stage3_frame_summary
+{
+    Terminal_render_snapshot_basis   snapshot_basis =
+        Terminal_render_snapshot_basis::LIVE_CONTENT;
+    Terminal_render_snapshot_purpose snapshot_purpose =
+        Terminal_render_snapshot_purpose::CONTENT;
+    Terminal_buffer_id               viewport_active_buffer =
+        Terminal_buffer_id::PRIMARY;
+    int                              viewport_offset_from_tail = 0;
+    int                              viewport_scrollback_rows  = 0;
+    int                              dirty_rows                = 0;
+    int                              full_dirty_rows           = 0;
+    int                              frame_background_rects    = 0;
+    int                              frame_selection_rects     = 0;
+    int                              frame_graphic_rects       = 0;
+    int                              frame_graphic_arcs        = 0;
+    int                              frame_text_runs           = 0;
+    int                              frame_cursor_graphic_rects = 0;
+    int                              frame_cursor_graphic_arcs = 0;
+    int                              frame_overlay_rects       = 0;
+    int                              packed_rows               = 0;
+    int                              packed_graphic_cells      = 0;
+    int                              packed_hard_block_rects   = 0;
+    int                              graphic_arc_raster_rects  = 0;
+    int                              cursor_graphic_arc_raster_rects = 0;
+    int                              rect_instances            = 0;
+    int                              glyph_instances           = 0;
+    int                              distinct_glyph_faces      = 0;
+    int                              fallback_glyph_faces      = 0;
+    int                              emoji_presentation_runs   = 0;
+    int                              color_glyph_alpha_demotions = 0;
+    int                              first_packed_logical_row  = 0;
+    Terminal_buffer_id               first_packed_active_buffer =
+        Terminal_buffer_id::PRIMARY;
+    int                              first_text_logical_row = 0;
+    std::uint64_t                    first_text_retained_line_id = 0U;
+    std::uint64_t                    first_text_content_generation = 0U;
+    bool                             selection_provenance_valid = false;
+    bool                             full_dirty_range          = false;
+    bool                             public_projection_full_repaint = false;
+    bool                             scroll_full_repaint       = false;
+    bool                             full_repaint_fallback     = false;
+};
+
 class Glyph_atlas_cache final
 {
 public:
@@ -189,6 +233,8 @@ struct Qsg_atlas_stage1_frame_report
     std::uint64_t raw_font_raster_thread_id       = 0U;
     Glyph_atlas_cache_stats
                   cache;
+    Qsg_atlas_stage3_frame_summary
+                  stage3;
 };
 
 class Qsg_atlas_stage1_recorder final
@@ -209,7 +255,8 @@ public:
         int                           rasterized_glyphs,
         std::uint64_t                 prepare_thread_id,
         std::uint64_t                 raw_font_raster_thread_id,
-        const Glyph_atlas_cache_stats& cache);
+        const Glyph_atlas_cache_stats& cache,
+        const Qsg_atlas_stage3_frame_summary& stage3);
     void record_render(
         const Captured_atlas_frame& frame,
         QRect                       viewport_rect,
