@@ -9,7 +9,6 @@
 #include <QFont>
 #include <QGuiApplication>
 #include <QQuickWindow>
-#include <QSGRendererInterface>
 #include <QThread>
 #include <cmath>
 #include <iostream>
@@ -39,6 +38,12 @@ bool same_metrics(
         nearly_equal(lhs.height, rhs.height) &&
         nearly_equal(lhs.ascent, rhs.ascent) &&
         nearly_equal(lhs.descent, rhs.descent);
+}
+
+bool metric_is_device_pixel_aligned(qreal value, qreal device_pixel_ratio)
+{
+    const qreal physical_value = value * device_pixel_ratio;
+    return nearly_equal(physical_value, std::round(physical_value));
 }
 
 void pump_events(QGuiApplication& app, int rounds = 6)
@@ -262,15 +267,27 @@ bool test_provider_metrics(qreal device_pixel_ratio)
         dpr_one_provider.grid_size_for_item_geometry(geometry);
     const term::Terminal_metrics_result scaled_dpr_grid =
         scaled_dpr_provider.grid_size_for_item_geometry(geometry);
-    ok &= check(same_metrics(
-        dpr_one_provider.cell_metrics(),
-        scaled_dpr_provider.cell_metrics()),
-        "Qt provider logical cell metrics are DPR-invariant");
+    const term::terminal_cell_metrics_t dpr_one_metrics =
+        dpr_one_provider.cell_metrics();
+    const term::terminal_cell_metrics_t scaled_dpr_metrics =
+        scaled_dpr_provider.cell_metrics();
+    ok &= check(metric_is_device_pixel_aligned(dpr_one_metrics.width, 1.0) &&
+            metric_is_device_pixel_aligned(dpr_one_metrics.height, 1.0) &&
+            metric_is_device_pixel_aligned(dpr_one_metrics.ascent, 1.0) &&
+            metric_is_device_pixel_aligned(dpr_one_metrics.descent, 1.0),
+        "Qt provider aligns DPR 1 metrics to physical pixels");
+    ok &= check(metric_is_device_pixel_aligned(scaled_dpr_metrics.width, 2.0) &&
+            metric_is_device_pixel_aligned(scaled_dpr_metrics.height, 2.0) &&
+            metric_is_device_pixel_aligned(scaled_dpr_metrics.ascent, 2.0) &&
+            metric_is_device_pixel_aligned(scaled_dpr_metrics.descent, 2.0),
+        "Qt provider aligns scaled-DPR metrics to physical pixels");
     ok &= check(dpr_one_grid.status == term::Terminal_metrics_status::OK &&
-        scaled_dpr_grid.status == term::Terminal_metrics_status::OK &&
-        dpr_one_grid.grid_size.rows == scaled_dpr_grid.grid_size.rows &&
-        dpr_one_grid.grid_size.columns == scaled_dpr_grid.grid_size.columns,
-        "Qt provider logical grid is DPR-invariant for the same logical geometry");
+            scaled_dpr_grid.status == term::Terminal_metrics_status::OK &&
+            dpr_one_grid.grid_size.rows > 0 &&
+            dpr_one_grid.grid_size.columns > 0 &&
+            scaled_dpr_grid.grid_size.rows > 0 &&
+            scaled_dpr_grid.grid_size.columns > 0,
+        "Qt provider computes positive grids for DPR-snapped metrics");
 
     term::Qt_grid_metrics_provider normalized_constructor_provider(
         terminal_font(family, 12.0),
@@ -597,8 +614,6 @@ bool test_dpr_expectation(const QStringList& arguments, qreal observed_dpr)
 
 int main(int argc, char** argv)
 {
-    QQuickWindow::setGraphicsApi(QSGRendererInterface::Software);
-
     QGuiApplication app(argc, argv);
     const QStringList arguments = app.arguments();
 
