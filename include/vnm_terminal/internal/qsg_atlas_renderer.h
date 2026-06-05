@@ -6,6 +6,7 @@
 #include <QColor>
 #include <QFont>
 #include <QImage>
+#include <QPoint>
 #include <QRawFont>
 #include <QRect>
 #include <QSize>
@@ -24,12 +25,42 @@ namespace vnm_terminal::internal {
 
 class Hierarchical_profiler;
 
+enum class Glyph_coverage_kind
+{
+    UNKNOWN,
+    GRAYSCALE_MASK,
+    LCD_RGB_MASK,
+    LCD_BGR_MASK,
+    COLOR_IMAGE,
+    AMBIGUOUS,
+    UNSUPPORTED,
+};
+
+enum class Glyph_lcd_order
+{
+    UNKNOWN,
+    RGB,
+    BGR,
+};
+
+enum class Glyph_image_presentation
+{
+    UNKNOWN,
+    TEXT,
+    COLOR,
+};
+
 struct Glyph_atlas_cache_key
 {
-    quint32 glyph_index         = 0U;
-    QString fallback_face_id;
-    qreal   physical_pixel_size = 0.0;
-    int     subpixel_bucket     = 0;
+    quint32                  glyph_index         = 0U;
+    QString                  fallback_face_id;
+    qreal                    physical_pixel_size = 0.0;
+    Glyph_image_presentation presentation =
+        Glyph_image_presentation::TEXT;
+    Glyph_coverage_kind      coverage_kind       =
+        Glyph_coverage_kind::GRAYSCALE_MASK;
+    Glyph_lcd_order          lcd_order           = Glyph_lcd_order::UNKNOWN;
+    int                      subpixel_bucket     = 0;
 };
 
 bool operator==(
@@ -49,23 +80,93 @@ struct Glyph_coverage_tile
     bool is_valid() const;
 };
 
-struct Glyph_atlas_slot
+struct Glyph_rgba_tile
 {
-    int   page = -1;
-    QRect rect;
+    Glyph_coverage_kind coverage_kind =
+        Glyph_coverage_kind::UNKNOWN;
+    Glyph_lcd_order     lcd_order = Glyph_lcd_order::UNKNOWN;
+    QSize               size;
+    int                 bytes_per_line = 0;
+    QImage::Format      source_format = QImage::Format_Invalid;
+    QByteArray          bytes;
 
     bool is_valid() const;
+};
+
+struct Glyph_atlas_slot
+{
+    int                 page          = -1;
+    QRect               rect;
+    QPoint              physical_offset;
+    Glyph_coverage_kind coverage_kind = Glyph_coverage_kind::UNKNOWN;
+    Glyph_lcd_order     lcd_order     = Glyph_lcd_order::UNKNOWN;
+
+    bool is_valid() const;
+};
+
+enum class Qsg_atlas_sampler_mode
+{
+    UNKNOWN,
+    NEAREST,
+    LINEAR,
+};
+
+struct Glyph_coverage_counts
+{
+    int grayscale_masks    = 0;
+    int lcd_rgb_masks      = 0;
+    int lcd_bgr_masks      = 0;
+    int color_images       = 0;
+    int ambiguous_images   = 0;
+    int unsupported_images = 0;
+    int missed_images      = 0;
+};
+
+struct Qsg_atlas_glyph_image_diagnostic
+{
+    Glyph_coverage_kind      coverage_kind =
+        Glyph_coverage_kind::UNKNOWN;
+    Glyph_image_presentation presentation =
+        Glyph_image_presentation::UNKNOWN;
+    QImage::Format           source_format        = QImage::Format_Invalid;
+    QSize                    source_size;
+    quint32                  glyph_index          = 0U;
+    QString                  fallback_face_id;
+    int                      text_run_index       = 0;
+    int                      glyph_run_index      = 0;
+    int                      glyph_index_in_run   = 0;
+    qsizetype                source_string_start  = 0;
+    qsizetype                source_string_end    = 0;
+};
+
+enum class Qsg_atlas_glyph_miss_cause
+{
+    NONE,
+    UNSUPPORTED_IMAGE,
+    ATLAS_INSERT_FAILED,
+};
+
+struct Qsg_atlas_glyph_miss_diagnostic
+{
+    bool                            valid = false;
+    Qsg_atlas_glyph_miss_cause      cause =
+        Qsg_atlas_glyph_miss_cause::NONE;
+    Qsg_atlas_glyph_image_diagnostic image;
+    QSize                           tile_size;
+    int                             tile_bytes_per_line = 0;
+    int                             atlas_page_count    = 0;
+    int                             atlas_page_budget   = 0;
+    QSize                           atlas_page_size;
 };
 
 class Glyph_atlas_packer final
 {
 public:
-    // The current atlas budget is one R8 texture page; page 1+ is rejected
-    // until GPU multi-page addressing exists.
+    // Texture-array page addressing is part of the RGBA atlas contract.
     explicit Glyph_atlas_packer(
         QSize page_size,
         int   gutter = 1,
-        int   max_pages = 1);
+        int   max_pages = 4);
 
     std::optional<Glyph_atlas_slot> pack(QSize tile_size);
     void reset();
@@ -116,6 +217,14 @@ struct Glyph_atlas_cache_stats
     QSize         page_size;
 };
 
+struct Glyph_rgba_cache_accounting
+{
+    std::uint64_t page_bytes      = 0U;
+    std::uint64_t allocated_bytes = 0U;
+    std::uint64_t budget_bytes    = 0U;
+    std::uint64_t used_bytes      = 0U;
+};
+
 struct Qsg_atlas_frame_build_summary
 {
     Terminal_render_snapshot_basis   snapshot_basis =
@@ -143,14 +252,16 @@ struct Qsg_atlas_frame_build_summary
     int                              cursor_graphic_arc_raster_rects = 0;
     int                              rect_instances            = 0;
     int                              glyph_instances           = 0;
+    int                              max_glyph_instance_page   = -1;
     int                              distinct_glyph_faces      = 0;
     int                              fallback_glyph_faces      = 0;
     int                              emoji_presentation_runs   = 0;
-    int                              color_glyph_alpha_demotions = 0;
-    int                              glyph_color_alpha_failures = 0;
     int                              glyph_coverage_failures   = 0;
     int                              glyph_atlas_insert_failures = 0;
     int                              glyph_missed_instances    = 0;
+    Glyph_coverage_counts            glyph_coverage;
+    Qsg_atlas_glyph_miss_diagnostic  first_glyph_miss;
+    int                              snapped_origin_failures   = 0;
     int                              first_packed_logical_row  = 0;
     Terminal_buffer_id               first_packed_active_buffer =
         Terminal_buffer_id::PRIMARY;
@@ -233,6 +344,36 @@ struct Qsg_atlas_buffer_update_input
                                              row_stable_ranges = nullptr;
 };
 
+struct Qsg_atlas_shaped_glyph_record
+{
+    int                 text_run_index      = 0;
+    bool                cursor_text_run     = false;
+    int                 glyph_run_index     = 0;
+    int                 glyph_index_in_run  = 0;
+    int                 row                 = 0;
+    int                 logical_row         = 0;
+    std::uint64_t       retained_line_id    = 0U;
+    std::uint64_t       content_generation  = 0U;
+    int                 run_column          = 0;
+    int                 owner_column        = 0;
+    int                 owner_cell_span     = 1;
+    qsizetype           source_string_start = 0;
+    qsizetype           source_string_end   = 0;
+    quint32             glyph_index         = 0U;
+    QRawFont            raw_font;
+    QString             fallback_face_id;
+    qreal               physical_pixel_size = 0.0;
+    QPointF             glyph_origin;
+    QRectF              glyph_bounds;
+};
+
+struct Qsg_atlas_shaped_text_run_result
+{
+    std::vector<Qsg_atlas_shaped_glyph_record> records;
+    int                 missing_string_indexes = 0;
+    int                 invalid_string_indexes = 0;
+};
+
 class Qsg_atlas_buffer_upload_planner final
 {
 public:
@@ -258,10 +399,10 @@ struct Qsg_atlas_render_summary
                   rect_buffer;
     Qsg_atlas_buffer_update_summary
                   glyph_buffer;
-    int           direct_ascii_text_runs            = 0;
-    int           qt_layout_text_runs                = 0;
-    int           direct_ascii_glyph_instances       = 0;
-    int           qt_layout_glyph_instances          = 0;
+    int           shaped_text_runs                  = 0;
+    int           shaped_glyph_records              = 0;
+    int           shaped_missing_string_indexes     = 0;
+    int           shaped_invalid_string_indexes     = 0;
     int           glyph_buffer_instances             = 0;
     int           glyph_text_row_capacity            = 0;
     int           glyph_cursor_text_row_capacity     = 0;
@@ -278,8 +419,16 @@ struct Qsg_atlas_render_summary
     std::uint64_t atlas_budget_bytes                 = 0U;
     std::uint64_t atlas_used_bytes                   = 0U;
     std::uint64_t atlas_failed_inserts               = 0U;
+    Qsg_atlas_sampler_mode
+                  glyph_sampler_mode                 =
+                      Qsg_atlas_sampler_mode::UNKNOWN;
     bool          coverage_texture_uploaded          = false;
     bool          coverage_texture_skipped           = false;
+    bool          atlas_page_pressure                = false;
+    bool          glyph_shader_package_available     = false;
+    bool          dual_source_probe_shader_package_available = false;
+    bool          dual_source_blend_factors_available = false;
+    bool          dual_source_blend_factors_runtime_probe = false;
     bool          full_dirty_range_reupload          = false;
     bool          public_projection_full_reupload    = false;
     bool          scroll_full_reupload               = false;
@@ -291,6 +440,31 @@ struct Qsg_atlas_render_summary
     bool          font_epoch_invalidation            = false;
 };
 
+struct Qsg_atlas_producer_summary
+{
+    int text_runs_considered          = 0;
+    int text_runs_empty               = 0;
+    int shape_cache_lookups           = 0;
+    int shape_cache_hits              = 0;
+    int shape_cache_misses            = 0;
+    int shape_cache_inserts           = 0;
+    int shape_cache_pruned            = 0;
+    int shape_cache_entries           = 0;
+    int shaped_runs_built             = 0;
+    int shaped_runs_reused            = 0;
+    int shaped_glyph_records_built    = 0;
+    int shaped_glyph_records_reused   = 0;
+    int presentation_run_scans        = 0;
+    int presentation_source_scans     = 0;
+    int presentation_fast_text_runs   = 0;
+    int presentation_emoji_runs       = 0;
+    int slot_resolutions_built        = 0;
+    int slot_resolutions_reused       = 0;
+    int simple_path_attempts          = 0;
+    int simple_path_used              = 0;
+    int simple_path_fallbacks         = 0;
+};
+
 class Glyph_atlas_cache final
 {
 public:
@@ -299,10 +473,11 @@ public:
     void set_epoch(std::uint64_t epoch);
     void reset();
 
-    const Glyph_atlas_slot* find(const Glyph_atlas_cache_key& key) const;
+    const Glyph_atlas_slot* find(const Glyph_atlas_cache_key& key);
     Glyph_atlas_slot insert_or_get(
         const Glyph_atlas_cache_key& key,
-        const Glyph_coverage_tile&   tile);
+        const Glyph_rgba_tile&       tile,
+        QPoint                       physical_offset = {});
 
     Glyph_atlas_cache_stats stats() const;
     const QByteArray& page_bytes(int page) const;
@@ -317,7 +492,7 @@ private:
     void copy_tile_to_slot(
         int                        page,
         const QRect&               rect,
-        const Glyph_coverage_tile& tile);
+        const Glyph_rgba_tile&      tile);
 
     Glyph_atlas_packer                     m_packer;
     std::map<Glyph_atlas_cache_key, Entry> m_entries;
@@ -369,8 +544,8 @@ struct Qsg_atlas_frame_report
     bool          command_buffer_non_null         = false;
     bool          render_target_non_null          = false;
     bool          rhi_non_null                    = false;
-    bool          r8_texture_created              = false;
-    bool          r8_upload_recorded              = false;
+    bool          coverage_texture_created        = false;
+    bool          coverage_upload_recorded        = false;
     bool          raw_font_rasterized             = false;
     bool          raw_font_rasterized_in_prepare  = false;
     int           rasterized_glyphs               = 0;
@@ -385,6 +560,8 @@ struct Qsg_atlas_frame_report
                   frame_build;
     Qsg_atlas_render_summary
                   render;
+    Qsg_atlas_producer_summary
+                  producer;
 };
 
 class Qsg_atlas_recorder final
@@ -398,8 +575,8 @@ public:
         bool                          command_buffer_non_null,
         bool                          render_target_non_null,
         bool                          rhi_non_null,
-        bool                          r8_texture_created,
-        bool                          r8_upload_recorded,
+        bool                          coverage_texture_created,
+        bool                          coverage_upload_recorded,
         bool                          raw_font_rasterized,
         bool                          raw_font_rasterized_in_prepare,
         int                           rasterized_glyphs,
@@ -407,7 +584,8 @@ public:
         std::uint64_t                 raw_font_raster_thread_id,
         const Glyph_atlas_cache_stats& cache,
         const Qsg_atlas_frame_build_summary& frame_build,
-        const Qsg_atlas_render_summary& render_summary);
+        const Qsg_atlas_render_summary& render_summary,
+        const Qsg_atlas_producer_summary& producer_summary);
     void record_render(
         const Captured_atlas_frame& frame,
         QRect                       viewport_rect,
@@ -422,6 +600,35 @@ private:
 
 Glyph_coverage_tile qsg_atlas_coverage_tile_from_image(const QImage& image);
 
+Glyph_rgba_tile qsg_atlas_rgba_tile_from_image(
+    const QImage&             image,
+    Glyph_image_presentation  presentation =
+        Glyph_image_presentation::UNKNOWN);
+
+std::uint64_t qsg_atlas_rgba_tile_byte_count(QSize size);
+
+Glyph_rgba_cache_accounting qsg_atlas_rgba_cache_accounting(
+    const Glyph_atlas_cache_stats& cache);
+
+Glyph_coverage_kind qsg_atlas_classify_glyph_image_candidate(
+    const QImage&             image,
+    Glyph_image_presentation  presentation = Glyph_image_presentation::UNKNOWN);
+
+Qsg_atlas_glyph_image_diagnostic qsg_atlas_glyph_image_diagnostic_from_record(
+    const Qsg_atlas_shaped_glyph_record& record,
+    const QImage&                        image,
+    Glyph_image_presentation             presentation);
+
+const char* qsg_atlas_glyph_coverage_kind_name(Glyph_coverage_kind kind);
+
+const char* qsg_atlas_glyph_miss_cause_name(
+    Qsg_atlas_glyph_miss_cause cause);
+
+const char* qsg_atlas_glyph_image_presentation_name(
+    Glyph_image_presentation presentation);
+
+const char* qsg_atlas_sampler_mode_name(Qsg_atlas_sampler_mode mode);
+
 QString qsg_atlas_face_id_for_raw_font(const QRawFont& raw_font);
 
 qreal qsg_atlas_physical_pixel_size(
@@ -432,11 +639,38 @@ qreal qsg_atlas_physical_pixel_size(
     const QRawFont& raw_font,
     qreal           device_pixel_ratio);
 
+QPoint qsg_atlas_glyph_physical_offset_for_raster_font(
+    const QRawFont&           raster_font,
+    quint32                   glyph_index,
+    Glyph_image_presentation  presentation);
+
+QPointF qsg_atlas_snapped_physical_point(
+    QPointF point,
+    qreal   device_pixel_ratio);
+
+QRectF qsg_atlas_snapped_glyph_draw_rect(
+    QPointF glyph_origin,
+    QPoint  glyph_physical_offset,
+    QSize   glyph_physical_size,
+    qreal   device_pixel_ratio);
+
 Glyph_atlas_cache_key qsg_atlas_cache_key(
-    quint32 glyph_index,
-    QString fallback_face_id,
-    qreal   physical_pixel_size,
-    int     subpixel_bucket);
+    quint32              glyph_index,
+    QString              fallback_face_id,
+    qreal                physical_pixel_size,
+    int                  subpixel_bucket,
+    Glyph_coverage_kind  coverage_kind =
+        Glyph_coverage_kind::GRAYSCALE_MASK,
+    Glyph_image_presentation presentation =
+        Glyph_image_presentation::TEXT);
+
+Qsg_atlas_shaped_text_run_result qsg_atlas_shape_text_run(
+    const Terminal_render_text_run& run,
+    const QFont&                    font,
+    terminal_cell_metrics_t         cell_metrics,
+    qreal                           device_pixel_ratio,
+    int                             text_run_index = 0,
+    bool                            cursor_text_run = false);
 
 Captured_atlas_frame capture_qsg_atlas_frame(
     std::shared_ptr<const Terminal_render_snapshot>

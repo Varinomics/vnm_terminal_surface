@@ -8,7 +8,10 @@ This document is a companion to [architecture](architecture.md),
 [Qt rendering policy](qt_rendering_policy.md), and
 [terminal text representation plan](terminal_text_representation_plan.md). The
 text-representation work remains a valid CPU-side optimization; this plan addresses
-a different, larger problem in a different layer.
+a different, larger problem in a different layer. The LCD/subpixel and RGBA
+follow-up roadmap lives in
+[LCD subpixel glyph atlas plan](lcd_subpixel_glyph_atlas_plan.md); its batch
+numbering is separate from this document's historical Stage 0-5 cutover sequence.
 
 ## Single canonical renderer
 
@@ -130,18 +133,17 @@ GPU). The Qt equivalent:
 
 The compact cell text is a Unicode payload, not a glyph identity. Glyph ids,
 glyph positions, fallback face identity, and `QRawFont` ownership come from Qt
-shaping (`QTextLayout`/`QGlyphRun`) for every non-trusted-fast path, including
-single-BMP CJK/symbol cells. A Unicode scalar is never used as an atlas cache
-key. The only layout bypass is the trusted printable-ASCII route, and only after
-the same support, fixed-pitch, clipping, and no-fallback checks used by the
-current ASCII replacement path.
+shaping (`QTextLayout`/`QGlyphRun`) for atlas glyph production, including
+printable ASCII, single-BMP CJK, and symbol cells. A Unicode scalar is never used
+as an atlas cache key. Printable ASCII may still be coalesced into
+`frame.text_runs` before render submission, but atlas production uses the same
+shaped glyph-record path as every other text run.
 
 `QRawFont::alphaMapForGlyph` returns a `QImage` in `Format_Indexed8` for grayscale AA
-(or `Format_RGB32` for subpixel), and the color-font image for color glyphs — it is
-**not** a raw single-channel coverage buffer. The renderer must `convertToFormat` to
-an 8-bit single-channel format (`Format_Grayscale8`/`Format_Alpha8`) and honor
-`bytesPerLine` stride before uploading to an R8 `QRhiTexture`; color tiles upload as
-RGBA. No direct HarfBuzz, FreeType, or ICU dependency is introduced.
+(or an RGB/BGR image for subpixel), and the color-font image for color glyphs; it is
+**not** a raw single-channel coverage buffer. Production classifies each image by
+coverage kind, normalizes candidate pixels into explicit RGBA byte order, and uploads
+RGBA atlas pages. No direct HarfBuzz, FreeType, or ICU dependency is introduced.
 
 ## Threading and state capture
 
@@ -265,23 +267,26 @@ installed/binary packages consume already-embedded shader resources.
 
 ## The glyph atlas
 
-- **Cache key:** `(glyph index, font face id, physical pixel size, subpixel-position
-  bucket)`. Physical pixel size is logical size × device-pixel-ratio. Monospace cell
-  snapping makes subpixel buckets few; start with a single horizontal bucket and
-  grayscale AA, and fold the resulting sub-pixel positional delta into the parity
-  tolerance (see [Testing](#testing-and-benchmarks)). FAINT/INVISIBLE are color, not
-  glyph, effects and are not in the key; BOLD/ITALIC are not in the key because the
-  reference does not synthesize them.
-- **Tile kinds:** an R8 coverage atlas for monochrome glyphs and an RGBA atlas for
-  color glyphs. **Tile-kind selection is driven by the cluster's
-  `Terminal_shaped_presentation_mode`** (EMOJI vs TEXT/DEFAULT) and the existing
-  VS15/VS16 width policy — not guessed from the glyph. `REPLACEMENT` (U+FFFD) clusters
-  route as ordinary mono glyphs.
+- **Cache key:** `(glyph index, font face id, physical pixel size, coverage kind,
+  LCD order, subpixel-position bucket)`. Physical pixel size is logical size times
+  device-pixel-ratio. Monospace cell
+  snapping makes subpixel buckets few; the current renderer uses a single
+  horizontal bucket and nearest sampling for snapped text. FAINT/INVISIBLE are
+  color, not glyph, effects and are not in the key; BOLD/ITALIC are not in the
+  key because the reference does not synthesize them.
+- **Tile kinds:** the production atlas stores RGBA tiles classified as grayscale
+  masks, LCD RGB/BGR masks, color images, ambiguous inputs, or unsupported inputs
+  using the requested presentation plus image-channel evidence. `REPLACEMENT`
+  (U+FFFD) clusters route as ordinary text glyphs.
 - **Packing:** shelf/skyline bin-packing into one or a few `QRhiTexture` pages.
-- **Population:** lazy. On first sighting, Qt rasterizes the glyph once; the result is
-  converted (`Format_Indexed8` → single-channel, or RGBA for color) and uploaded; later
-  frames sample the cached tile. Steady-state animated content reaches a stable working
-  set.
+- **Population:** lazy. On first sighting, Qt rasterizes the glyph once; production
+  uploads the normalized RGBA tile for the accepted coverage kind. Later frames
+  sample the cached tile. Steady-state animated content reaches a stable working set.
+- **Prepared text reuse:** once shaped glyphs and atlas slots are resolved, the
+  render node may reuse that prepared work for unchanged retained lines/runs.
+  Reused work is not a fallback renderer; it re-emits current RGBA/LCD atlas
+  glyph instances after reapplying current placement, clipping, color, opacity,
+  and pass state. Producer evidence is reported under `qsg_atlas.producer`.
 - **Eviction:** none initially (terminal glyph sets are small and bounded). If a measured
   workload overflows the page budget, add LRU page eviction (and, as a hard cap, draw the
   replacement glyph rather than failing). Overflow is handled within the atlas, not by
@@ -457,9 +462,9 @@ Each case states the accepted Stage 5 behavior to match, per the
 | Block-cursor inverse text | yes | glyph cell: solid fill + inverted glyph; graphic cell: fill carved around graphic + inverted graphic |
 | Selection / IME-preedit background | yes | semi-transparent, composited **below** glyphs |
 | Hyperlink underline | yes | option-gated on `underline_hyperlinks` (off by default) |
-| Color emoji | yes | match Qt's shaped presentation on the supported Qt/backend when color tiles are available; unsupported color-alpha glyphs are demoted to the documented coverage path and surfaced through atlas counters |
+| Color emoji | yes | match Qt's shaped presentation on the supported Qt/backend when color tiles are available; color-image atlas tiles composite without foreground tint |
 | Font fallback | yes | Qt selects the fallback face; cache keyed by face id |
-| Subpixel/LCD AA | out (initial) | grayscale AA only; revisit if parity requires |
+| Subpixel/LCD AA | staged | classifier/probe paths request and classify LCD masks; production compositing lands with the RGBA atlas switch |
 | Complex scripts (Arabic/Indic cross-cell shaping) | yes | match the existing per-cell terminal behavior exactly; improving cross-cell shaping is out of scope for this cutover |
 | Ligatures | out | terminals disable; match current behavior |
 
@@ -684,15 +689,16 @@ Earlier bring-up gates are historical evidence. Stage 5 exit is gated on:
 ## Resolved Cutover Decisions
 
 - Production uses `QSGRenderNode`; `QQuickRhiItem` is not the production path.
-- Grayscale coverage atlas rendering is the accepted Stage 5 antialiasing
-  contract; subpixel/LCD AA is not required for cutover parity.
+- Production atlas rendering uses RGBA atlas pages and coverage-kind-aware LCD,
+  grayscale, and color compositing.
 - Complex scripts match existing per-cell terminal behavior exactly. Improving
   cross-cell shaping is out of scope for this renderer cutover.
 - Atlas page budget is enforced by atlas/report counters and CMDG gate checks;
   measured Stage 5 workloads must not overflow the declared budget.
 - Color emoji follows the supported Qt/backend behavior documented in the
-  text-correctness table; unsupported color-alpha glyphs are demoted to the
-  coverage path and counted, not deferred as a cutover blocker.
+  text-correctness table. Color-image candidates composite without foreground tint,
+  and the classifier path preserves source-format diagnostics for ambiguous or
+  unsupported glyph images.
 - Qt version policy follows the package posture: source builds use the active
   supported Qt, and installed packages are tied to the Qt major/minor used to
   build `vnm_terminal_surface`.

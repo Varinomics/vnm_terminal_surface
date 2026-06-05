@@ -564,6 +564,8 @@ target_link_libraries(vnm_terminal_qsg_atlas PRIVATE
 target_compile_definitions(vnm_terminal_qsg_atlas PRIVATE
     VNM_TERMINAL_QSG_ATLAS_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/qsg_atlas_renderer.cpp"
     VNM_TERMINAL_SURFACE_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/vnm_terminal_surface.cpp"
+    VNM_TERMINAL_TEST_BUILD_TYPE="$<CONFIG>"
+    VNM_TERMINAL_PROFILING_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_PROFILING}>
 )
 
 set_target_properties(vnm_terminal_qsg_atlas PROPERTIES
@@ -644,6 +646,33 @@ if(WIN32)
         vnm_terminal_qsg_atlas_host_state_d3d11
         PROPERTIES
             LABELS "qsg;hardware;atlas;host-state;cutover"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 120
+    )
+
+    set(vnm_terminal_qsg_atlas_lcd_probe_environment
+        ${vnm_terminal_qt_windows_qpa_environment}
+        "QSG_RENDER_LOOP=threaded"
+        "QSG_RHI_BACKEND=d3d11"
+        "VNM_TERMINAL_LCD_ATLAS_ARTIFACT_DIR=${CMAKE_CURRENT_BINARY_DIR}/lcd_atlas_probe_d3d11"
+        ${vnm_terminal_qt_unscaled_environment}
+    )
+    add_test(
+        NAME vnm_terminal_qsg_atlas_lcd_capability_probe_d3d11
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qsg_atlas_lcd_probe_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+            "--lcd-capability-probe"
+            "--backend"
+            "d3d11"
+    )
+
+    set_tests_properties(
+        vnm_terminal_qsg_atlas_lcd_capability_probe_d3d11
+        PROPERTIES
+            LABELS "qsg;hardware;atlas;lcd-probe"
             SKIP_RETURN_CODE 77
             TIMEOUT 120
     )

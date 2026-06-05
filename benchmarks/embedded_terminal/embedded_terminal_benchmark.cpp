@@ -422,7 +422,6 @@ struct atlas_renderer_observation_t
     qint64                 used_bytes_max                     = 0;
     qint64                 failed_inserts_max                 = 0;
     qint64                 glyph_missed_instances_max         = 0;
-    qint64                 glyph_color_alpha_failures_max     = 0;
     qint64                 glyph_coverage_failures_max        = 0;
     qint64                 glyph_atlas_insert_failures_max    = 0;
 };
@@ -3339,9 +3338,6 @@ void update_atlas_renderer_observation(
     observation.glyph_missed_instances_max = std::max(
         observation.glyph_missed_instances_max,
         static_cast<qint64>(report.frame_build.glyph_missed_instances));
-    observation.glyph_color_alpha_failures_max = std::max(
-        observation.glyph_color_alpha_failures_max,
-        static_cast<qint64>(report.frame_build.glyph_color_alpha_failures));
     observation.glyph_coverage_failures_max = std::max(
         observation.glyph_coverage_failures_max,
         static_cast<qint64>(report.frame_build.glyph_coverage_failures));
@@ -3403,7 +3399,6 @@ bool atlas_failures_zero_for_attempt(
         attempt.atlas_report.render.atlas_failed_inserts        == 0U &&
         attempt.atlas_report.cache.failed_inserts               == 0U &&
         attempt.atlas_report.frame_build.glyph_missed_instances      == 0  &&
-        attempt.atlas_report.frame_build.glyph_color_alpha_failures  == 0  &&
         attempt.atlas_report.frame_build.glyph_coverage_failures     == 0  &&
         attempt.atlas_report.frame_build.glyph_atlas_insert_failures == 0;
 }
@@ -5378,9 +5373,6 @@ QJsonObject scenario_json(
         QStringLiteral("atlas_glyph_missed_instances_max"),
         result.atlas_renderer.glyph_missed_instances_max);
     object.insert(
-        QStringLiteral("atlas_glyph_color_alpha_failures_max"),
-        result.atlas_renderer.glyph_color_alpha_failures_max);
-    object.insert(
         QStringLiteral("atlas_glyph_coverage_failures_max"),
         result.atlas_renderer.glyph_coverage_failures_max);
     object.insert(
@@ -7081,7 +7073,6 @@ bool validate_atlas_renderer_json(
         QStringLiteral("atlas_used_bytes_max"),
         QStringLiteral("atlas_failed_inserts_max"),
         QStringLiteral("atlas_glyph_missed_instances_max"),
-        QStringLiteral("atlas_glyph_color_alpha_failures_max"),
         QStringLiteral("atlas_glyph_coverage_failures_max"),
         QStringLiteral("atlas_glyph_atlas_insert_failures_max"),
     };
@@ -7103,7 +7094,6 @@ bool validate_atlas_renderer_json(
     qint64 atlas_used_bytes_max                  = 0;
     qint64 atlas_failed_inserts_max              = 0;
     qint64 atlas_glyph_missed_instances_max      = 0;
-    qint64 atlas_glyph_color_alpha_failures_max  = 0;
     qint64 atlas_glyph_coverage_failures_max     = 0;
     qint64 atlas_glyph_atlas_insert_failures_max = 0;
     qint64* const numeric_outputs[] = {
@@ -7124,7 +7114,6 @@ bool validate_atlas_renderer_json(
         &atlas_used_bytes_max,
         &atlas_failed_inserts_max,
         &atlas_glyph_missed_instances_max,
-        &atlas_glyph_color_alpha_failures_max,
         &atlas_glyph_coverage_failures_max,
         &atlas_glyph_atlas_insert_failures_max,
     };
@@ -7167,7 +7156,6 @@ bool validate_atlas_renderer_json(
     const bool atlas_failures_zero =
         atlas_failed_inserts_max              == 0 &&
         atlas_glyph_missed_instances_max      == 0 &&
-        atlas_glyph_color_alpha_failures_max  == 0 &&
         atlas_glyph_coverage_failures_max     == 0 &&
         atlas_glyph_atlas_insert_failures_max == 0;
 
@@ -7704,7 +7692,6 @@ bool validate_scenario_json(
         QStringLiteral("atlas_used_bytes_max"),
         QStringLiteral("atlas_failed_inserts_max"),
         QStringLiteral("atlas_glyph_missed_instances_max"),
-        QStringLiteral("atlas_glyph_color_alpha_failures_max"),
         QStringLiteral("atlas_glyph_coverage_failures_max"),
         QStringLiteral("atlas_glyph_atlas_insert_failures_max"),
         QStringLiteral("atlas_work_created"),
