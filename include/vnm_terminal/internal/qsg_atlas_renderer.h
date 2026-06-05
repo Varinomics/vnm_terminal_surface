@@ -242,14 +242,8 @@ struct Qsg_atlas_frame_build_summary
     int                              frame_graphic_rects       = 0;
     int                              frame_graphic_arcs        = 0;
     int                              frame_text_runs           = 0;
-    int                              frame_cursor_graphic_rects = 0;
-    int                              frame_cursor_graphic_arcs = 0;
     int                              frame_overlay_rects       = 0;
     int                              packed_rows               = 0;
-    int                              packed_graphic_cells      = 0;
-    int                              packed_hard_block_rects   = 0;
-    int                              graphic_arc_raster_rects  = 0;
-    int                              cursor_graphic_arc_raster_rects = 0;
     int                              rect_instances            = 0;
     int                              glyph_instances           = 0;
     int                              max_glyph_instance_page   = -1;
@@ -465,6 +459,34 @@ struct Qsg_atlas_producer_summary
     int simple_path_fallbacks         = 0;
 };
 
+struct Qsg_atlas_warm_lazy_summary
+{
+    bool          warm_completed           = false;
+    std::uint64_t warm_epoch               = 0U;
+    int           warm_seed_strings        = 0;
+    int           warm_shaped_glyph_records = 0;
+    int           warm_covered_glyph_records = 0;
+    int           warm_skipped_glyph_records = 0;
+    int           warm_environment_skipped_glyph_records = 0;
+    int           warm_failed_glyph_records = 0;
+    int           warm_missing_string_indexes = 0;
+    int           warm_invalid_string_indexes = 0;
+    int           warm_unsupported_images  = 0;
+    int           warm_cache_hits          = 0;
+    int           warm_insert_attempts     = 0;
+    int           warm_inserts             = 0;
+    int           warm_failed_inserts      = 0;
+    double        warm_elapsed_ms          = 0.0;
+    bool          warm_page_pressure       = false;
+    int           lazy_insert_attempts     = 0;
+    int           lazy_inserts             = 0;
+    int           lazy_failed_inserts      = 0;
+    double        lazy_elapsed_ms          = 0.0;
+    int           lazy_max_insert_us       = 0;
+    int           lazy_frames              = 0;
+    int           incomplete_frames        = 0;
+};
+
 class Glyph_atlas_cache final
 {
 public:
@@ -562,6 +584,8 @@ struct Qsg_atlas_frame_report
                   render;
     Qsg_atlas_producer_summary
                   producer;
+    Qsg_atlas_warm_lazy_summary
+                  warm_lazy;
 };
 
 class Qsg_atlas_recorder final
@@ -585,7 +609,8 @@ public:
         const Glyph_atlas_cache_stats& cache,
         const Qsg_atlas_frame_build_summary& frame_build,
         const Qsg_atlas_render_summary& render_summary,
-        const Qsg_atlas_producer_summary& producer_summary);
+        const Qsg_atlas_producer_summary& producer_summary,
+        const Qsg_atlas_warm_lazy_summary& warm_lazy_summary);
     void record_render(
         const Captured_atlas_frame& frame,
         QRect                       viewport_rect,

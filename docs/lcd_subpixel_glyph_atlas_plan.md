@@ -22,8 +22,10 @@ them, but they do not define the quality target for this change.
   The atlas renderer owns placement, cache ownership, uploads, and drawing.
 - All shaped glyphs use one atlas text path in production.
 - Printable ASCII, non-ASCII BMP glyphs, CJK, combining clusters after shaping,
-  fallback-font glyphs, color glyph images, box drawing, block elements,
-  Braille, and Powerline/Nerd-font symbols are handled by the atlas text path.
+  fallback-font glyphs, color glyph images, Braille, and Powerline/Nerd-font
+  symbols are handled by the atlas text path. Grid-defined terminal graphics
+  (box drawing and block/shade elements) use frame graphic primitives so they
+  stay cell-aligned and continuous.
 - A broad glyph set is warmed for each font epoch, zoom level, and device pixel
   ratio. Glyphs outside that set are inserted lazily through the same cache.
 - `QSGTextNode` is allowed only as a test/reference renderer, not as a production
@@ -45,11 +47,10 @@ draw-builder path as every other glyph. Public counters expose route-neutral
 shaped text runs and shaped glyph records rather than direct-ASCII versus
 Qt-layout ownership.
 
-The current frame builder also routes supported box drawing and block-element
-characters into terminal graphic geometry before they become text runs. This
-plan changes that ownership for the listed glyph families: they must be shaped
-and drawn by the atlas text path, with superseded geometry-route docs and tests
-updated in the same batch.
+The frame builder routes supported box drawing and block/shade elements into
+terminal graphic geometry before they become text runs. That ownership remains
+the production path for grid-defined symbols; Braille and other font-defined
+symbols are shaped and drawn by the atlas text path.
 
 ### Batch 5P Producer Reuse
 
@@ -485,12 +486,12 @@ Acceptance gates:
 - frame report confirms nearest glyph sampling and page-addressed rendering;
 - `vnm_terminal` builds and CMDG/report validators pass if report fields changed.
 
-### Batch 6 - Physical-Pixel Placement And Graphics-Family Text Routing
+### Batch 6 - Physical-Pixel Placement And Grid Graphics Quality
 
 Purpose:
 
-- remove the remaining blur source and route the listed text-like graphic
-  families through shaped atlas glyphs.
+- remove the remaining blur source while preserving grid-aligned primitives for
+  box drawing and block/shade elements.
 
 Primary files:
 
@@ -515,10 +516,10 @@ Work:
 - validate texel-center UVs and atlas gutter handling;
 - apply the same policy to all shaped text runs, clipped runs, and cursor inverse
   text;
-- reroute box drawing, block elements, Braille, and related text-like symbol
-  families from graphic geometry into `text_runs` and shaped atlas glyphs;
-- update or retire geometry-route docs/tests that asserted those families were
-  drawn as rect/arc primitives.
+- keep box drawing and block/shade elements on `graphic_rects`/`graphic_arcs`
+  so continuous surfaces and rounded corners remain grid-aligned;
+- keep Braille and font-defined text symbols in `text_runs` and shaped atlas
+  glyphs.
 
 Acceptance gates:
 
@@ -527,8 +528,8 @@ Acceptance gates:
 - `Process:` fixture is manually approved against the Qt text reference and
   stored with artifact metadata;
 - snapped-origin failure counters remain zero on the demo and fixture set;
-- box drawing, block elements, Braille, and ordinary text all report shaped atlas
-  glyph instances, not graphic rect/arc instances.
+- box drawing and block/shade elements report graphic rect/arc primitives;
+  Braille and ordinary text report shaped atlas glyph instances.
 - `rg "GRAPHIC_GEOMETRY|packed_hard_block|graphic_arc_raster|block_rects"`
   finds only geometry routes that still own non-text graphics or tests/docs that
   accurately describe those remaining routes.

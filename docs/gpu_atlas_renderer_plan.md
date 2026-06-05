@@ -71,10 +71,10 @@ behavior is:
   `render_style_attributes` consults only UNDERLINE/STRIKE/INVERSE/FAINT/INVISIBLE;
 - resolves FAINT by halving foreground alpha and INVISIBLE by `foreground = background`
   on the CPU before emission;
-- inverts the block cursor by re-drawing the owning glyph (or, for a box/block cell,
-  the graphic geometry) in the cell's *background* color clipped to the cursor rect —
-  and for a graphic cell it *carves the graphic shape out of* the cursor fill rather
-  than overpainting a solid fill;
+- inverts the block cursor by drawing the solid cursor fill, then re-drawing the
+  owning glyph in the cell's *background* color clipped to the cursor rect;
+  cursor/IME-covered grid graphics stay on this protected text path, while
+  ordinary box drawing and block/shade elements use grid-aligned primitives;
 - composites the semi-transparent selection fill and IME-preedit background **below**
   the glyph/graphic layers, not on top;
 - gates hyperlink underline on the host option `underline_hyperlinks` (off by default)
@@ -279,9 +279,12 @@ installed/binary packages consume already-embedded shader resources.
   using the requested presentation plus image-channel evidence. `REPLACEMENT`
   (U+FFFD) clusters route as ordinary text glyphs.
 - **Packing:** shelf/skyline bin-packing into one or a few `QRhiTexture` pages.
-- **Population:** lazy. On first sighting, Qt rasterizes the glyph once; production
-  uploads the normalized RGBA tile for the accepted coverage kind. Later frames
-  sample the cached tile. Steady-state animated content reaches a stable working set.
+- **Population:** warmed plus lazy. Each font/DPR/cell-metric warm key shapes a
+  bounded source-controlled seed set through Qt and inserts supported seed glyphs
+  into the atlas before visible text is processed. Glyphs outside that seed still
+  insert lazily through the same raster/cache path. Later frames sample the cached
+  tile, and reports expose warm/lazy insertion counts, failures, latency, and page
+  pressure.
 - **Prepared text reuse:** once shaped glyphs and atlas slots are resolved, the
   render node may reuse that prepared work for unchanged retained lines/runs.
   Reused work is not a fallback renderer; it re-emits current RGBA/LCD atlas
@@ -330,22 +333,11 @@ and is enforced by painter's-order emission, not depth.
    `visible_line_provenance` is invalid (`suppress_selection_spans_without_valid_line_provenance`),
    so the renderer emits whatever spans the snapshot carries and cannot paint selection
    on stale/scrolled rows. Colors from captured `Terminal_render_options`.
-3. **Graphic pass.** Box-drawing (U+2500–U+257F) and arcs come through
-   `frame.graphic_rects`/`graphic_arcs` as instanced rects/arcs. **Hard block-element
-   graphics means the current `terminal_hard_block_graphic_is_supported` set only:**
-   implemented U+2580–U+2590 and U+2596–U+259F forms. Unsupported shade/one-eighth
-   variants remain text/atlas glyphs exactly as today. Supported hard blocks, regardless
-   of the `packed_text_sidecars_enabled` setting (off in production), are routed through
-   the packed graphic sidecar
-   (`frame.packed_rows`/`packed_graphic_spans`/`packed_graphic_codepoints`), not
-   `frame.graphic_rects` — except a hard-block cell *under the cursor or IME preedit*,
-   where supported hard blocks also populate cursor/normal graphic primitives needed for
-   inversion/preedit parity. The atlas renderer must reproduce the packed hard blocks by decoding the
-   packed graphic spans (as the reference does via `packed_hard_graphic_rects`) or by
-   re-deriving them from snapshot cells via `append_terminal_graphic_codepoint_rects`.
-   Treating `frame.graphic_rects` as the complete graphic set silently drops every block
-   element — the dense-block content that motivates this work. Both routes use the
-   existing geometry path, not the atlas.
+3. **Graphic pass.** Grid-defined terminal graphics from the frame builder:
+   box-drawing rects/arcs and block/shade elements are emitted as
+   `frame.graphic_rects`/`frame.graphic_arcs`, then drawn as QRhi primitives.
+   Braille and other font-defined text symbols remain terminal text. The frame
+   contract no longer exposes packed graphic sidecars for these symbols.
 4. **Glyph (text) pass.** One instanced draw family over occupied owning text clusters.
    Per-instance data: cell rect/origin, atlas page + UV, **fully-resolved RGBA
    foreground** (post FAINT alpha-halving / INVISIBLE `fg=bg` / INVERSE — resolved on the
@@ -377,11 +369,9 @@ and is enforced by painter's-order emission, not depth.
    - over a **glyph** cell: fill the cell with the cursor color, then re-draw the owning
      glyph instance within the cursor rect in the inverted color (cell background as
      foreground) — the AA glyph blends over the solid fill.
-   - over a **box/block-graphic** cell: the fill is the cursor rect **minus the graphic
-     rects** (`cursor_rects_excluding_graphics` subtracts `cursor_graphic_rects` only,
-     not arcs), and the inverted graphic is drawn into the carved gap. For arc glyphs
-     (U+256D–U+2570) the fill is not carved and the inverted arc overpaints it, matching
-     the reference.
+   - over a **box/block/shade/Braille symbol** cell: use the protected glyph-cell
+     path above for cursor-covered cells; ordinary unprotected box/block/shade
+     cells render in the graphic pass.
    - over an **empty** cell: fill only.
    - over a **wide** cell: the block cursor rect is a single cell and the inverted glyph
      is clipped to it, so only the cursor-column slice inverts; the rest of the wide
@@ -452,14 +442,15 @@ Each case states the accepted Stage 5 behavior to match, per the
 | Case | Initial scope | Behavior to match |
 | --- | --- | --- |
 | Printable ASCII, single BMP scalar (CJK, Latin-1, symbols) | yes | shaped glyph, mono tile |
-| Box-drawing / supported hard-block graphics | yes | existing geometry route (instanced rects/arcs), not atlas; unsupported block/shade variants remain text glyphs |
+| Box-drawing / block and shade elements | yes | grid-aligned `frame.graphic_rects` / `frame.graphic_arcs` primitives; no packed graphic sidecars |
+| Braille and other font-defined text symbols | yes | shaped glyphs through `frame.text_runs` and the atlas text path |
 | Combining marks / single-cell clusters | yes | shaped cluster via `cell_stable_shaping.h`, one owning cluster that may emit multiple glyph instances |
 | Wide (2-cell) glyphs | yes | one owning cluster spanning two columns; continuation cells emit nothing (owning span covers them) |
 | BOLD / ITALIC | yes | **match reference: not separately synthesized** (single base font) |
 | FAINT / INVISIBLE | yes | resolved RGBA foreground (alpha-halved / fg=bg) carried per instance |
 | INVERSE / reverse video | yes | resolved fg/bg swap on CPU as today |
 | SGR BLINK | yes | match reference (no attribute blink animation) |
-| Block-cursor inverse text | yes | glyph cell: solid fill + inverted glyph; graphic cell: fill carved around graphic + inverted graphic |
+| Block-cursor inverse text | yes | solid fill + inverted glyph clipped to the cursor cell, including text-like symbols |
 | Selection / IME-preedit background | yes | semi-transparent, composited **below** glyphs |
 | Hyperlink underline | yes | option-gated on `underline_hyperlinks` (off by default) |
 | Color emoji | yes | match Qt's shaped presentation on the supported Qt/backend when color tiles are available; color-image atlas tiles composite without foreground tint |
@@ -509,7 +500,7 @@ previous renderer consumer plus its selection surfaces (Rule 1).
   `0xff`; depth writes disabled; `changedStates()` reports `ViewportState |
   ScissorState` when those states are changed; normal hosting, clipped hosting, and
   `layer.enabled` ancestor hosting.
-- **Stage 1 — atlas + capture infrastructure.** Glyph cache, bin-packing, R8 coverage
+- **Stage 1 — atlas + capture infrastructure.** Glyph cache, bin-packing, coverage
   atlas, `Format_Indexed8` conversion, render-thread-local `QRawFont` rasterization, and
   the sync-time state capture. Exit evidence: cache-key tests including physical pixel
   size and fallback face id; packing/stride/format-conversion tests; epoch invalidation
@@ -525,13 +516,15 @@ previous renderer consumer plus its selection surfaces (Rule 1).
   snapshot/options/font epoch. No cutover.
 - **Stage 2 — background + selection/preedit-bg + glyph + decoration + cursor passes.**
   In the reference paint order. Covers ASCII/BMP glyphs, FAINT/INVISIBLE/INVERSE
-  resolution, below-glyph selection/preedit fills, block-cursor inversion (glyph and
-  graphic carve-out), and decoration colors. Historical bring-up used temporary
+  resolution, below-glyph selection/preedit fills, block-cursor inversion through
+  clipped cursor glyphs, and decoration colors. Historical bring-up used temporary
   selection controls; Stage 5 deletes those controls.
   Exit evidence: named parity corpus results with exact masked zero-diff regions for
   fills/decorations and per-backend AA budgets for glyphs.
-- **Stage 3 — graphics, scroll/viewport, selection provenance, fallback faces.** Box/block
-  geometry route, viewport/scrollback/alternate, PUBLIC_PROJECTION/SCROLL full-repaint
+- **Stage 3 — terminal graphics, scroll/viewport, selection provenance, fallback faces.**
+  Box/block/shade primitive routing, Braille/text-symbol glyph routing,
+  viewport/scrollback/alternate,
+  PUBLIC_PROJECTION/SCROLL full-repaint
   fallback, provenance-gated selection, font fallback. Exit evidence: parity corpus
   covering supported/unsupported hard blocks, box arcs, scrollback/alternate viewport,
   selection provenance, fallback fonts, emoji policy, and row-reuse identities.
@@ -629,7 +622,7 @@ comparison remains meaningful.
   `Qt Quick software scene graph` for atlas parity; Stage 5 evidence must come
   from a non-skipped accelerated QRhi backend. The single-subpixel-bucket
   positional delta is folded into this budget.
-- **Glyph-correctness corpora:** ASCII, BMP/CJK, box/block graphics, combining marks, wide
+- **Glyph-correctness corpora:** ASCII, BMP/CJK, Braille/text symbols, combining marks, wide
   cells, presentation-selector pairs, font fallback — from the existing unicode-width,
   shaping-contract, and render tests.
 - **Existing suites** (`render_snapshot`, `render_frame`, `qsg_atlas`,
@@ -640,9 +633,9 @@ comparison remains meaningful.
   timing, `OFFSCREEN=OFF`, fixed window/font/frame limit/scenes/repeats, and
   warmed or interleaved ordering with CPU-frequency counters when available.
   The canonical Stage 5 gate can ingest an archived pre-cutover baseline JSON
-  and compare `scene_frames_per_second`, `draw_frames_per_second`, terminal
-  `paint_frames_per_second`, renderer counters, and atlas memory/page metrics.
-  Pass requires at least 25% median terminal-paint FPS improvement on the
+  and compare `scene_frames_per_second`, `draw_frames_per_second`,
+  renderer-frame evidence FPS, renderer counters, and atlas memory/page metrics.
+  Pass requires at least 25% median renderer-frame FPS improvement on the
   motivating CMDG scenes, no default CMDG scene regression over 5%, no ordinary
   shell/render smoke regression, and no atlas overflow outside the declared
   budget.
@@ -663,8 +656,9 @@ Earlier bring-up gates are historical evidence. Stage 5 exit is gated on:
    rendering, 300-frame scene limit, three repeats, and canonical `qsg_atlas`
    metrics/counters present.
 4. Archived retired-renderer baseline comparison when a matching pre-cutover
-   baseline artifact is supplied: motivating scenes must improve terminal paint
+   baseline artifact is supplied: motivating scenes must improve renderer-frame
    FPS by at least 25%, and default scenes must not regress by more than 5%.
+
 ## Risks
 
 - **Maintenance burden.** A glyph cache + instanced renderer + atlas lifecycle

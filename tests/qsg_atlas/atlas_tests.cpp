@@ -1,5 +1,6 @@
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
+#include "vnm_terminal/internal/qsg_atlas_warm_set.h"
 #include "vnm_terminal/internal/terminal_graphic_geometry.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
@@ -42,6 +43,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string_view>
 #include <string>
 #include <utility>
 #include <vector>
@@ -588,16 +590,6 @@ QSize pixel_window_physical_pixel_size(
             static_cast<qreal>(logical_pixels.height()) * dpr))));
 }
 
-QColor pixel_atlas_cursor_graphic_overlay_color(QColor color)
-{
-    if (color.alpha() == 254) {
-        color.setRed(std::min(255, color.red() + 1));
-        color.setGreen(std::min(255, color.green() + 1));
-        color.setBlue(std::min(255, color.blue() + 1));
-    }
-    return color;
-}
-
 qreal pixel_logical_pixel_size(qreal device_pixel_ratio)
 {
     return 1.0 / std::max<qreal>(
@@ -1010,22 +1002,6 @@ void paint_pixel_reference_text_runs(
             font,
             cell_metrics,
             device_pixel_ratio);
-    }
-}
-
-void paint_pixel_reference_cursor_graphics(
-    QImage&                                    image,
-    const std::vector<term::Terminal_render_rect>& rects,
-    const std::vector<term::Terminal_render_arc>&  arcs,
-    qreal                                      device_pixel_ratio)
-{
-    for (term::Terminal_render_rect rect : rects) {
-        rect.color = pixel_atlas_cursor_graphic_overlay_color(rect.color);
-        paint_pixel_reference_rect(image, rect, device_pixel_ratio);
-    }
-    for (term::Terminal_render_arc arc : arcs) {
-        arc.color = pixel_atlas_cursor_graphic_overlay_color(arc.color);
-        paint_pixel_reference_arc(image, arc, device_pixel_ratio);
     }
 }
 
@@ -1442,7 +1418,7 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
         {inset_rect(pixel_cell_rect(0, 3, 1, metrics), 2.0, 2.0)});
 
     Pixel_parity_fixture graphic_cursor = make_pixel_parity_base_fixture(
-        "block_cursor_graphic_carveout",
+        "block_cursor_block_element_text",
         false,
         {1, 8},
         714U,
@@ -1459,12 +1435,12 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
         pixel_expected_frame(graphic_cursor);
     append_exact_class(
         graphic_cursor,
-        "graphic_cursor_fill_carveout",
-        inset_masks(cursor_masks(graphic_frame.cursors), 1.0, 2.0));
-    append_exact_class(
+        "block_element_cursor_fill_outside_glyph",
+        cursor_text_fill_masks(pixel_cell_rect(0, 3, 1, metrics)));
+    append_text_glyph_masks(
         graphic_cursor,
-        "graphic_cursor_overlay",
-        inset_masks(rect_masks(graphic_frame.cursor_graphic_rects), 1.0, 2.0));
+        graphic_frame.cursor_text_runs,
+        pixel_render_options().cursor_color);
 
     return {
         std::move(fills),
@@ -1491,51 +1467,6 @@ Pixel_parity_fixture make_layout_parity_base_fixture(
         device_pixel_ratio);
 }
 
-QRectF layout_cell_fraction_rect(
-    int                          row,
-    int                          column,
-    qreal                        x,
-    qreal                        y,
-    qreal                        width,
-    qreal                        height,
-    term::terminal_cell_metrics_t metrics)
-{
-    const QRectF cell = pixel_cell_rect(row, column, 1, metrics);
-    return QRectF(
-        cell.left() + cell.width() * x,
-        cell.top() + cell.height() * y,
-        cell.width() * width,
-        cell.height() * height);
-}
-
-std::vector<QRectF> layout_supported_hard_block_masks(
-    term::terminal_cell_metrics_t metrics)
-{
-    return {
-        pixel_cell_rect(0, 0, 1, metrics),
-        layout_cell_fraction_rect(0, 2, 0.0, 0.0, 0.5, 1.0, metrics),
-        layout_cell_fraction_rect(0, 4, 0.0, 0.0, 0.5, 0.5, metrics),
-        layout_cell_fraction_rect(0, 4, 0.0, 0.5, 0.5, 0.5, metrics),
-        layout_cell_fraction_rect(0, 4, 0.5, 0.5, 0.5, 0.5, metrics),
-    };
-}
-
-std::vector<QRectF> layout_arc_background_exclusion_masks(
-    term::terminal_cell_metrics_t metrics)
-{
-    return {
-        layout_cell_fraction_rect(0, 0, 0.00, 0.00, 0.25, 0.25, metrics),
-        layout_cell_fraction_rect(0, 1, 0.75, 0.00, 0.25, 0.25, metrics),
-        layout_cell_fraction_rect(0, 2, 0.75, 0.75, 0.25, 0.25, metrics),
-        layout_cell_fraction_rect(0, 3, 0.00, 0.75, 0.25, 0.25, metrics),
-    };
-}
-
-QColor layout_grid_background(const term::Terminal_render_snapshot& snapshot)
-{
-    return QColor::fromRgba(snapshot.color_state.default_background_rgba);
-}
-
 std::vector<Pixel_parity_fixture> make_layout_parity_fixtures(qreal device_pixel_ratio)
 {
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
@@ -1560,10 +1491,6 @@ std::vector<Pixel_parity_fixture> make_layout_parity_fixtures(qreal device_pixel
     blocks.snapshot.cells.push_back(
         make_pixel_cell(1, 0, QStringLiteral("\u2591"), 1, shade_accent));
     const term::Terminal_render_frame block_frame = pixel_expected_frame(blocks);
-    append_exact_class(
-        blocks,
-        "packed_hard_blocks",
-        inset_masks(layout_supported_hard_block_masks(metrics), 1.0, 1.0));
     append_text_glyph_masks(blocks, block_frame.text_runs);
 
     Pixel_parity_fixture arcs = make_layout_parity_base_fixture(
@@ -1581,18 +1508,9 @@ std::vector<Pixel_parity_fixture> make_layout_parity_fixtures(qreal device_pixel
         make_pixel_cell(0, 2, QStringLiteral("\u256f"), 1, block_accent));
     arcs.snapshot.cells.push_back(
         make_pixel_cell(0, 3, QStringLiteral("\u2570"), 1, block_accent));
-    const term::Terminal_render_frame arc_frame = pixel_expected_frame(arcs);
-    append_exact_class(
+    append_text_glyph_masks(
         arcs,
-        "arc_background_exclusion",
-        layout_arc_background_exclusion_masks(metrics));
-    for (const term::Terminal_render_arc& arc : arc_frame.graphic_arcs) {
-        arcs.glyph_masks.push_back({
-            arc.rect,
-            layout_grid_background(arcs.snapshot),
-            true,
-        });
-    }
+        pixel_expected_frame(arcs).text_runs);
 
     Pixel_parity_fixture cursor_box = make_layout_parity_base_fixture(
         "block_cursor_antialiased_box",
@@ -1611,13 +1529,12 @@ std::vector<Pixel_parity_fixture> make_layout_parity_fixtures(qreal device_pixel
         pixel_expected_frame(cursor_box);
     append_exact_class(
         cursor_box,
-        "box_cursor_fill_carveout",
-        inset_masks(cursor_masks(cursor_box_frame.cursors), 1.0, 2.0));
-    cursor_box.glyph_masks.push_back({
-        pixel_cell_rect(0, 2, 1, metrics),
-        pixel_render_options().cursor_color,
-        true,
-    });
+        "box_cursor_fill_outside_glyph",
+        cursor_text_fill_masks(pixel_cell_rect(0, 2, 1, metrics)));
+    append_text_glyph_masks(
+        cursor_box,
+        cursor_box_frame.cursor_text_runs,
+        pixel_render_options().cursor_color);
 
     Pixel_parity_fixture cursor_vertical_box = make_layout_parity_base_fixture(
         "block_cursor_antialiased_vertical_box",
@@ -1636,13 +1553,12 @@ std::vector<Pixel_parity_fixture> make_layout_parity_fixtures(qreal device_pixel
         pixel_expected_frame(cursor_vertical_box);
     append_exact_class(
         cursor_vertical_box,
-        "vertical_box_cursor_fill_carveout",
-        inset_masks(cursor_masks(cursor_vertical_box_frame.cursors), 1.0, 2.0));
-    cursor_vertical_box.glyph_masks.push_back({
-        pixel_cell_rect(0, 2, 1, metrics),
-        pixel_render_options().cursor_color,
-        true,
-    });
+        "vertical_box_cursor_fill_outside_glyph",
+        cursor_text_fill_masks(pixel_cell_rect(0, 2, 1, metrics)));
+    append_text_glyph_masks(
+        cursor_vertical_box,
+        cursor_vertical_box_frame.cursor_text_runs,
+        pixel_render_options().cursor_color);
 
     Pixel_parity_fixture scrollback = make_layout_parity_base_fixture(
         "viewport_scrollback_selection",
@@ -1684,10 +1600,9 @@ std::vector<Pixel_parity_fixture> make_layout_parity_fixtures(qreal device_pixel
     set_pixel_visible_line_provenance(alternate.snapshot, 950U, 5U);
     alternate.snapshot.cells.push_back(
         make_pixel_cell(0, 0, QStringLiteral("\u2588"), 1, block_accent));
-    append_exact_class(
+    append_text_glyph_masks(
         alternate,
-        "packed_hard_blocks",
-        {inset_rect(pixel_cell_rect(0, 0, 1, metrics), 1.0, 1.0)});
+        pixel_expected_frame(alternate).text_runs);
 
     Pixel_parity_fixture public_scroll = make_layout_parity_base_fixture(
         "public_projection_scroll_full_repaint",
@@ -1794,8 +1709,16 @@ Pixel_aa_budget pixel_budget_for_backend(
         return {288, 200, 75, 0.0};
     }
 
+    if (fixture_name == "block_cursor_block_element_text") {
+        return {288, 200, 75, 0.0};
+    }
+
     if (fixture_name == "viewport_scrollback_selection") {
         return {816, 210, 300, 0.35};
+    }
+
+    if (fixture_name == "alternate_viewport") {
+        return {288, 220, 260, 0.0};
     }
 
     if (fixture_name == "fallback_fonts") {
@@ -2587,10 +2510,6 @@ Pixel_render_result render_pixel_reference_fixture(
         result.image,
         frame.graphic_rects,
         result.device_pixel_ratio);
-    paint_pixel_reference_rects(
-        result.image,
-        term::terminal_render_packed_hard_graphic_rects(frame),
-        result.device_pixel_ratio);
     paint_pixel_reference_arcs(
         result.image,
         frame.graphic_arcs,
@@ -2616,11 +2535,6 @@ Pixel_render_result render_pixel_reference_fixture(
     paint_pixel_reference_cursors(
         result.image,
         frame.cursors,
-        result.device_pixel_ratio);
-    paint_pixel_reference_cursor_graphics(
-        result.image,
-        frame.cursor_graphic_rects,
-        frame.cursor_graphic_arcs,
         result.device_pixel_ratio);
     {
         QPainter painter(&result.image);
@@ -2980,10 +2894,6 @@ Pixel_render_result render_atlas_rgba_reference_fixture(
         result.image,
         frame.graphic_rects,
         result.device_pixel_ratio);
-    paint_pixel_reference_rects(
-        result.image,
-        term::terminal_render_packed_hard_graphic_rects(frame),
-        result.device_pixel_ratio);
     paint_pixel_reference_arcs(
         result.image,
         frame.graphic_arcs,
@@ -3004,11 +2914,6 @@ Pixel_render_result render_atlas_rgba_reference_fixture(
     paint_pixel_reference_cursors(
         result.image,
         frame.cursors,
-        result.device_pixel_ratio);
-    paint_pixel_reference_cursor_graphics(
-        result.image,
-        frame.cursor_graphic_rects,
-        frame.cursor_graphic_arcs,
         result.device_pixel_ratio);
     paint_atlas_rgba_reference_text_runs(
         result.image,
@@ -3466,37 +3371,35 @@ bool validate_frame_build_report(
 
     if (fixture.name == "graphics_supported_unsupported_blocks") {
         ok &= check_frame_build_report(
-            frame_build.packed_graphic_cells >= 3,
+            frame_build.frame_graphic_rects > 0 &&
+                frame_build.frame_graphic_arcs == 0,
             fixture,
-            "supported hard blocks reached packed graphic spans");
+            "block and shade elements produced graphic rectangles");
         ok &= check_frame_build_report(
-            frame_build.packed_hard_block_rects > 0,
+            frame_build.frame_text_runs == 0 && frame_build.glyph_instances == 0,
             fixture,
-            "packed hard blocks were reconstructed as atlas rectangles");
-        ok &= check_frame_build_report(
-            frame_build.frame_text_runs > 0 && frame_build.glyph_instances > 0,
-            fixture,
-            "unsupported shade block stayed on the text fallback path");
+            "block and shade elements stayed off shaped glyph instances");
     }
     else
     if (fixture.name == "box_arcs") {
         ok &= check_frame_build_report(
-            frame_build.frame_graphic_arcs == 4,
+            frame_build.frame_graphic_rects == 0 &&
+                frame_build.frame_graphic_arcs == 4,
             fixture,
-            "rounded box corners stayed on the direct arc route");
+            "rounded box corners produced graphic arcs");
         ok &= check_frame_build_report(
-            frame_build.graphic_arc_raster_rects > 0,
+            frame_build.frame_text_runs == 0 && frame_build.glyph_instances == 0,
             fixture,
-            "arc primitives were rasterized into atlas rect instances");
+            "rounded box corners stayed off shaped glyph instances");
     }
     else
     if (fixture.name == "block_cursor_antialiased_box" ||
         fixture.name == "block_cursor_antialiased_vertical_box") {
         ok &= check_frame_build_report(
-            frame_build.frame_graphic_rects > 0 &&
-                frame_build.frame_cursor_graphic_rects > 0,
+            frame_build.frame_graphic_rects == 0 &&
+                frame_build.glyph_instances > 0,
             fixture,
-            "block cursor over box drawing used graphic and cursor graphic rect routes");
+            "block cursor over box drawing used shaped glyph cursor text");
     }
     else
     if (fixture.name == "viewport_scrollback_selection") {
@@ -3589,9 +3492,6 @@ bool validate_frame_build_report(
     if (ok) {
         std::cout << "PASS: atlas layout report " << fixture.name
             << " packed_rows=" << frame_build.packed_rows
-            << " packed_graphic_cells=" << frame_build.packed_graphic_cells
-            << " packed_hard_block_rects=" << frame_build.packed_hard_block_rects
-            << " graphic_arc_raster_rects=" << frame_build.graphic_arc_raster_rects
             << " selection_rects=" << frame_build.frame_selection_rects
             << " distinct_faces=" << frame_build.distinct_glyph_faces
             << " fallback_faces=" << frame_build.fallback_glyph_faces
@@ -5537,18 +5437,323 @@ bool test_atlas_budget_stats()
     return ok;
 }
 
-bool report_ready_for_render(const term::Qsg_atlas_frame_report& report)
+QString warm_seed_qstring(const term::qsg_atlas_warm_seed_string_t& seed)
+{
+    return QString::fromUtf16(
+        seed.text.data(),
+        static_cast<qsizetype>(seed.text.size()));
+}
+
+bool warm_set_has_family(std::string_view family)
+{
+    return std::any_of(
+        term::k_qsg_atlas_warm_seed_strings.begin(),
+        term::k_qsg_atlas_warm_seed_strings.end(),
+        [family](const term::qsg_atlas_warm_seed_string_t& seed) {
+            return seed.family == family;
+        });
+}
+
+struct Warm_family_coverage_result
+{
+    int shaped_records       = 0;
+    int inserted_records     = 0;
+    int unsupported_records  = 0;
+    int non_rendering_records = 0;
+    int failed_inserts       = 0;
+};
+
+struct Warm_required_probe
+{
+    std::string_view    label;
+    std::u16string_view text;
+    bool                allow_environment_skip = false;
+};
+
+bool warm_seed_source_range_is_non_rendering(
+    const QString& text,
+    qsizetype      source_start,
+    qsizetype      source_end)
+{
+    if (source_start < 0 || source_start >= text.size()) {
+        return false;
+    }
+
+    const qsizetype bounded_end =
+        std::clamp(source_end, source_start + 1, text.size());
+    for (qsizetype index = source_start; index < bounded_end; ++index) {
+        const QChar ch = text.at(index);
+        if (ch.isSpace()) {
+            continue;
+        }
+
+        switch (ch.category()) {
+            case QChar::Mark_NonSpacing:
+            case QChar::Mark_SpacingCombining:
+            case QChar::Mark_Enclosing:
+            case QChar::Other_Format:
+            case QChar::Other_Control:
+                continue;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
+
+bool warm_coverage_is_concrete(const Warm_family_coverage_result& coverage)
+{
+    return coverage.inserted_records > 0 && coverage.failed_inserts == 0;
+}
+
+bool warm_family_allows_environment_skip(std::string_view family)
 {
     return
-        report.render_count > 0U            &&
-        report.drew                         &&
-        report.command_buffer_non_null      &&
-        report.render_target_non_null       &&
-        report.rhi_non_null                 &&
-        report.coverage_texture_created     &&
-        report.coverage_upload_recorded     &&
-        report.raw_font_rasterized          &&
-        report.raw_font_rasterized_in_prepare;
+        family == std::string_view("pua_powerline_nerd") ||
+        family == std::string_view("emoji_clusters");
+}
+
+Warm_family_coverage_result warm_family_coverage(
+    const term::qsg_atlas_warm_seed_string_t& seed,
+    const QFont&                              font,
+    term::terminal_cell_metrics_t             metrics)
+{
+    const QString text = warm_seed_qstring(seed);
+    term::Terminal_render_text_run run;
+    run.row             = 0;
+    run.logical_row     = 0;
+    run.column          = 0;
+    run.text            = text;
+    run.foreground      = QColor(Qt::white);
+    run.background      = QColor(Qt::transparent);
+    run.rect            = QRectF(
+        0.0,
+        0.0,
+        static_cast<qreal>(std::max<qsizetype>(1, text.size())) *
+            metrics.width,
+        metrics.height);
+    run.baseline_origin = QPointF(0.0, metrics.ascent);
+
+    const bool emoji_presentation_run =
+        seed.family == std::string_view("emoji_clusters");
+    const term::Qsg_atlas_shaped_text_run_result shaped =
+        term::qsg_atlas_shape_text_run(run, font, metrics, 1.0, 0, false);
+
+    Warm_family_coverage_result result;
+    result.shaped_records = static_cast<int>(shaped.records.size());
+    term::Glyph_atlas_cache cache(QSize(256, 256));
+    cache.set_epoch(1U);
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        if (record.glyph_bounds.width() <= 0.0 ||
+            record.glyph_bounds.height() <= 0.0)
+        {
+            if (warm_seed_source_range_is_non_rendering(
+                    text,
+                    record.source_string_start,
+                    record.source_string_end))
+            {
+                ++result.non_rendering_records;
+            }
+            else {
+                ++result.unsupported_records;
+            }
+            continue;
+        }
+
+        QRawFont raster_font = record.raw_font;
+        raster_font.setPixelSize(record.physical_pixel_size);
+        term::Glyph_image_presentation presentation =
+            emoji_presentation_run
+                ? term::Glyph_image_presentation::COLOR
+                : term::Glyph_image_presentation::TEXT;
+
+        const QRawFont::AntialiasingType antialiasing =
+            presentation == term::Glyph_image_presentation::TEXT
+                ? QRawFont::SubPixelAntialiasing
+                : QRawFont::PixelAntialiasing;
+        const QImage alpha_map =
+            raster_font.alphaMapForGlyph(record.glyph_index, antialiasing);
+        const term::Glyph_rgba_tile tile =
+            term::qsg_atlas_rgba_tile_from_image(alpha_map, presentation);
+        if (!tile.is_valid()) {
+            ++result.unsupported_records;
+            continue;
+        }
+
+        const term::Glyph_atlas_slot slot = cache.insert_or_get(
+            term::qsg_atlas_cache_key(
+                record.glyph_index,
+                record.fallback_face_id,
+                record.physical_pixel_size,
+                0,
+                tile.coverage_kind,
+                presentation),
+            tile,
+            term::qsg_atlas_glyph_physical_offset_for_raster_font(
+                raster_font,
+                record.glyph_index,
+                presentation));
+        if (slot.is_valid()) {
+            ++result.inserted_records;
+        }
+        else {
+            ++result.failed_inserts;
+        }
+    }
+    return result;
+}
+
+bool test_atlas_warm_set_table_and_shaping()
+{
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(1.0);
+    const QFont font = term::vnm_terminal_font(QString(), 18.0);
+
+    std::size_t code_units = 0U;
+    int shaped_records     = 0;
+    bool ok                = true;
+    for (const term::qsg_atlas_warm_seed_string_t& seed :
+        term::k_qsg_atlas_warm_seed_strings)
+    {
+        const QString text = warm_seed_qstring(seed);
+        code_units += static_cast<std::size_t>(text.size());
+        term::Terminal_render_text_run run;
+        run.row             = 0;
+        run.logical_row     = 0;
+        run.column          = 0;
+        run.text            = text;
+        run.foreground      = QColor(Qt::white);
+        run.background      = QColor(Qt::transparent);
+        run.rect            = QRectF(
+            0.0,
+            0.0,
+            static_cast<qreal>(std::max<qsizetype>(1, text.size())) *
+                metrics.width,
+            metrics.height);
+        run.baseline_origin = QPointF(0.0, metrics.ascent);
+
+        const term::Qsg_atlas_shaped_text_run_result shaped =
+            term::qsg_atlas_shape_text_run(run, font, metrics, 1.0, 0, false);
+        shaped_records += static_cast<int>(shaped.records.size());
+        ok &= check(!text.isEmpty(), "warm-set seed strings are non-empty");
+        ok &= check(!shaped.records.empty(),
+            "warm-set seed strings shape through Qt");
+    }
+
+    ok &= check(
+        term::k_qsg_atlas_warm_seed_strings.size() <=
+            term::k_qsg_atlas_warm_seed_string_budget,
+        "warm-set seed string count stays within the source budget");
+    ok &= check(
+        code_units <= term::k_qsg_atlas_warm_seed_code_unit_budget,
+        "warm-set seed code-unit count stays within the source budget");
+    ok &= check(
+        shaped_records <=
+            static_cast<int>(term::k_qsg_atlas_warm_seed_shaped_record_budget),
+        "warm-set shaped record count stays within the source budget");
+
+    for (std::string_view family : {
+        std::string_view("ascii_common"),
+        std::string_view("latin_1"),
+        std::string_view("latin_extended_a"),
+        std::string_view("greek"),
+        std::string_view("cyrillic"),
+        std::string_view("symbols_currency_math"),
+        std::string_view("terminal_graphics"),
+        std::string_view("pua_powerline_nerd"),
+        std::string_view("cjk_kana_hangul"),
+        std::string_view("combining_clusters"),
+        std::string_view("emoji_clusters"),
+    }) {
+        ok &= check(warm_set_has_family(family),
+            "warm-set table contains every required family");
+    }
+
+    for (const term::qsg_atlas_warm_seed_string_t& seed :
+        term::k_qsg_atlas_warm_seed_strings)
+    {
+        const Warm_family_coverage_result coverage =
+            warm_family_coverage(seed, font, metrics);
+        const bool family_covered = coverage.inserted_records > 0 &&
+            coverage.failed_inserts == 0;
+        if (!family_covered && warm_family_allows_environment_skip(seed.family)) {
+            std::cerr << "SKIP: warm-set family " << seed.family
+                << " has no concrete atlas entries on this font environment"
+                << " shaped=" << coverage.shaped_records
+                << " unsupported=" << coverage.unsupported_records
+                << " non_rendering=" << coverage.non_rendering_records
+                << " failed_inserts=" << coverage.failed_inserts
+                << '\n';
+            continue;
+        }
+        ok &= check(family_covered,
+            "warm-set family shapes into concrete atlas entries");
+    }
+    return ok;
+}
+
+bool test_atlas_warm_set_representative_family_coverage()
+{
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(1.0);
+    const QFont font = term::vnm_terminal_font(QString(), 18.0);
+    constexpr std::array<Warm_required_probe, 11> probes = {{
+        {"latin_1",              u"\u00e9",                         false},
+        {"latin_extended_a",     u"\u0141",                         false},
+        {"greek_cyrillic",       u"\u03a9\u0411",                   false},
+        {"symbols_math_arrows",  u"\u20ac\u2192\u2211",             false},
+        {"box_drawing",          u"\u2500\u2502\u251c",             false},
+        {"block_elements",       u"\u2588\u258c\u2591",             false},
+        {"braille",              u"\u2801\u28ff",                   false},
+        {"pua_powerline_nerd",   u"\ue0b0\uf120",                   true},
+        {"cjk_kana_hangul",      u"\u4e2d\u3042\uac00",             false},
+        {"combining_clusters",   u"e\u0301",                        false},
+        {"emoji_clusters",       u"\u2615\ufe0f\U0001f600",         true},
+    }};
+
+    bool ok = true;
+    for (const Warm_required_probe& probe : probes) {
+        const term::qsg_atlas_warm_seed_string_t seed{
+            probe.text,
+            probe.label,
+        };
+        const Warm_family_coverage_result coverage =
+            warm_family_coverage(seed, font, metrics);
+        if (!warm_coverage_is_concrete(coverage) &&
+            probe.allow_environment_skip)
+        {
+            std::cerr << "SKIP: warm-set probe " << probe.label
+                << " has no concrete atlas entries on this font environment"
+                << " shaped=" << coverage.shaped_records
+                << " unsupported=" << coverage.unsupported_records
+                << " non_rendering=" << coverage.non_rendering_records
+                << " failed_inserts=" << coverage.failed_inserts
+                << '\n';
+            continue;
+        }
+        ok &= check(warm_coverage_is_concrete(coverage),
+            "warm-set representative probe shapes into atlas entries");
+    }
+    return ok;
+}
+
+bool atlas_report_has_prepare_glyph_coverage_evidence(
+    const term::Qsg_atlas_frame_report& report)
+{
+    if (report.raw_font_rasterized_in_prepare &&
+        report.prepare_thread_id == report.raw_font_raster_thread_id)
+    {
+        return true;
+    }
+
+    const term::Qsg_atlas_warm_lazy_summary& warm_lazy = report.warm_lazy;
+    return
+        warm_lazy.warm_completed                &&
+        warm_lazy.warm_epoch == report.render_font_epoch &&
+        warm_lazy.warm_covered_glyph_records > 0 &&
+        warm_lazy.warm_failed_glyph_records == 0 &&
+        warm_lazy.warm_missing_string_indexes == 0 &&
+        warm_lazy.warm_invalid_string_indexes == 0 &&
+        warm_lazy.warm_unsupported_images == 0 &&
+        warm_lazy.warm_failed_inserts == 0;
 }
 
 bool atlas_report_render_state_ready(const term::Qsg_atlas_frame_report& report)
@@ -6201,18 +6406,26 @@ int test_render_smoke(QGuiApplication& app, const char* backend)
 
     window.show();
 
-    const bool rendered = pump_until(
+    term::Qsg_atlas_frame_report report;
+    bool render_state_observed = false;
+    const bool coverage_ready = pump_until(
         app,
         window,
         surface,
-        [&](const term::Qsg_atlas_frame_report& report) {
-            return report_ready_for_render(report) && mutation_done.load();
+        [&](const term::Qsg_atlas_frame_report& current_report) {
+            const bool render_ready =
+                atlas_report_render_state_ready(current_report);
+            if (render_ready || !render_state_observed) {
+                report = current_report;
+            }
+            render_state_observed = render_state_observed || render_ready;
+            return render_ready && mutation_done.load() &&
+                atlas_report_has_prepare_glyph_coverage_evidence(
+                    current_report);
         });
     QObject::disconnect(mutation_connection);
 
-    const term::Qsg_atlas_frame_report report =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    if (!rendered &&
+    if (!render_state_observed &&
         (report.prepare_count == 0U ||
             report.render_count == 0U ||
             (report.prepare_count > 0U && !report.rhi_non_null)))
@@ -6222,7 +6435,7 @@ int test_render_smoke(QGuiApplication& app, const char* backend)
     }
 
     bool ok = true;
-    ok &= check(rendered,
+    ok &= check(atlas_report_render_state_ready(report),
         "atlas render smoke draws the captured frame");
     ok &= check(report.first_render_snapshot_sequence == 601U,
         "atlas render smoke uses captured snapshot for first render");
@@ -6239,9 +6452,9 @@ int test_render_smoke(QGuiApplication& app, const char* backend)
         "threaded atlas smoke mutates GUI-thread state after sync through beforeRendering");
     ok &= check(!basic_loop || mutation_done.load(),
         "basic atlas smoke mutates GUI state after sync through beforeRendering");
-    ok &= check(report.raw_font_rasterized_in_prepare &&
-            report.prepare_thread_id == report.raw_font_raster_thread_id,
-        "atlas smoke rasterizes QRawFont glyphs in prepare");
+    ok &= check(coverage_ready &&
+            atlas_report_has_prepare_glyph_coverage_evidence(report),
+        "atlas smoke covers QRawFont glyphs through prepare");
     return ok ? 0 : 1;
 }
 
@@ -6357,8 +6570,8 @@ int test_dense_grid_smoke(QGuiApplication& app, const char* backend)
         "dense atlas X grid uses canonical producer glyph records");
     ok &= check(report.producer.simple_path_used > 0,
         "dense atlas X grid uses the simple producer path for printable ASCII");
-    ok &= check(report.cache.inserts <= 1U,
-        "dense atlas X grid reuses one atlas coverage tile for repeated X glyphs");
+    ok &= check(report.warm_lazy.lazy_inserts <= 1,
+        "dense atlas X grid reuses one visible-frame atlas coverage tile for repeated X glyphs");
     ok &= check(report.render.atlas_failed_inserts == 0U,
         "dense atlas X grid packs all required glyph coverage");
     ok &= check(!image.isNull(),
@@ -7158,6 +7371,226 @@ bool atlas_report_backend_usable(
             << '\n';
     }
     return rendered;
+}
+
+term::Terminal_render_snapshot make_warm_lazy_seed_snapshot(
+    std::uint64_t sequence)
+{
+    term::Terminal_render_snapshot snapshot =
+        make_pixel_base_snapshot({2, 16}, sequence);
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 0, QStringLiteral("A"), 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 2, QString::fromUtf8("\xce\xa9"), 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 4, QString::fromUtf8("\xd0\x91"), 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 6, QStringLiteral("\u2500"), 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 8, QStringLiteral("\u2588"), 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 10, QStringLiteral("\u2801"), 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 12, QString::fromUtf8("\xe4\xb8\xad"), 2, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_continuation_cell(0, 13, term::k_default_terminal_style_id));
+    return snapshot;
+}
+
+term::Terminal_render_snapshot make_warm_lazy_outside_seed_snapshot(
+    std::uint64_t sequence)
+{
+    term::Terminal_render_snapshot snapshot =
+        make_pixel_base_snapshot({2, 16}, sequence);
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 0, QString::fromUtf8("\xe6\xbc\xa2"), 2, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_continuation_cell(0, 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 3, QString::fromUcs4(U"\U0001F9EA"), 2, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_continuation_cell(0, 4, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 6, QStringLiteral("\u2603"), 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 8, QStringLiteral("\u1e9e"), 1, term::k_default_terminal_style_id));
+    return snapshot;
+}
+
+bool pump_warm_lazy_report_after(
+    QGuiApplication&                 app,
+    QQuickWindow&                    window,
+    VNM_TerminalSurface&             surface,
+    std::uint64_t                    previous_prepare_count,
+    term::Qsg_atlas_frame_report&    out_report)
+{
+    return pump_until(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            if (report.prepare_count <= previous_prepare_count ||
+                !atlas_report_render_state_ready(report))
+            {
+                return false;
+            }
+
+            out_report = report;
+            return true;
+        },
+        160);
+}
+
+void print_warm_lazy_summary(
+    const char*                                label,
+    const term::Qsg_atlas_warm_lazy_summary&  summary)
+{
+    std::cerr << "warm/lazy " << label
+        << " completed=" << summary.warm_completed
+        << " seed_strings=" << summary.warm_seed_strings
+        << " shaped=" << summary.warm_shaped_glyph_records
+        << " covered=" << summary.warm_covered_glyph_records
+        << " skipped=" << summary.warm_skipped_glyph_records
+        << " environment_skipped="
+        << summary.warm_environment_skipped_glyph_records
+        << " failed_records=" << summary.warm_failed_glyph_records
+        << " missing_indexes=" << summary.warm_missing_string_indexes
+        << " invalid_indexes=" << summary.warm_invalid_string_indexes
+        << " unsupported=" << summary.warm_unsupported_images
+        << " warm_failed_inserts=" << summary.warm_failed_inserts
+        << " lazy_attempts=" << summary.lazy_insert_attempts
+        << " lazy_inserts=" << summary.lazy_inserts
+        << " lazy_failed=" << summary.lazy_failed_inserts
+        << " lazy_frames=" << summary.lazy_frames
+        << " incomplete_frames=" << summary.incomplete_frames
+        << '\n';
+}
+
+int test_atlas_warm_lazy_smoke(QGuiApplication& app, const char* backend)
+{
+    const int backend_status =
+        verify_requested_backend(app, backend, "atlas warm/lazy smoke");
+    if (backend_status != 0) {
+        return backend_status;
+    }
+
+    const qreal device_pixel_ratio =
+        pixel_probe_render_window_device_pixel_ratio(app);
+    if (!atlas_report_backend_usable(app, device_pixel_ratio)) {
+        return k_unsupported_backend_skip_return_code;
+    }
+
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+    const QSizeF logical_size = pixel_logical_size({2, 16}, metrics);
+
+    QQuickWindow window;
+    window.setColor(QColor(1, 2, 3));
+    window.resize(pixel_window_logical_pixel_size(logical_size));
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(logical_size);
+    surface.set_font_family(QString());
+    surface.set_font_size(18.0);
+    term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(
+        surface,
+        true);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_warm_lazy_seed_snapshot(991U)));
+
+    window.show();
+    app.processEvents(QEventLoop::AllEvents, 50);
+
+    term::Qsg_atlas_frame_report seed_report;
+    if (!pump_warm_lazy_report_after(app, window, surface, 0U, seed_report)) {
+        std::cerr << "FAIL: atlas warm/lazy smoke did not render seed fixture\n";
+        return 1;
+    }
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_warm_lazy_outside_seed_snapshot(992U)));
+    term::Qsg_atlas_frame_report lazy_report;
+    if (!pump_warm_lazy_report_after(
+            app,
+            window,
+            surface,
+            seed_report.prepare_count,
+            lazy_report))
+    {
+        std::cerr << "FAIL: atlas warm/lazy smoke did not render lazy fixture\n";
+        return 1;
+    }
+
+    const term::Qsg_atlas_warm_lazy_summary& seed = seed_report.warm_lazy;
+    const term::Qsg_atlas_warm_lazy_summary& lazy = lazy_report.warm_lazy;
+    bool ok = true;
+    ok &= check(seed.warm_completed, "warm/lazy smoke completes atlas prewarm");
+    ok &= check(
+        seed.warm_seed_strings ==
+            static_cast<int>(term::k_qsg_atlas_warm_seed_strings.size()),
+        "warm/lazy smoke reports the source-controlled seed count");
+    ok &= check(seed.warm_shaped_glyph_records > 0,
+        "warm/lazy smoke reports shaped warm glyph records");
+    ok &= check(seed.warm_covered_glyph_records > 0,
+        "warm/lazy smoke reports covered warm glyph records");
+    ok &= check(seed.warm_failed_glyph_records == 0 &&
+            seed.warm_missing_string_indexes == 0   &&
+            seed.warm_invalid_string_indexes == 0   &&
+            seed.warm_unsupported_images == 0,
+        "warm/lazy smoke reports no hidden warm seed failures");
+    ok &= check(seed.warm_insert_attempts > 0 && seed.warm_inserts > 0,
+        "warm/lazy smoke reports warm cache insertions");
+    ok &= check(seed.warm_failed_inserts == 0,
+        "warm/lazy smoke reports zero warm failed inserts");
+    ok &= check(seed.warm_elapsed_ms >= 0.0,
+        "warm/lazy smoke reports warm elapsed time");
+    ok &= check(seed.lazy_insert_attempts == 0 &&
+            seed.lazy_inserts == 0          &&
+            seed.lazy_failed_inserts == 0   &&
+            seed.lazy_frames == 0,
+        "warm/lazy smoke seed fixture has no frame-time lazy insertions");
+    ok &= check(seed.incomplete_frames == 0 &&
+            seed_report.frame_build.glyph_missed_instances == 0 &&
+            seed_report.frame_build.glyph_coverage_failures == 0 &&
+            seed_report.frame_build.glyph_atlas_insert_failures == 0,
+        "warm/lazy smoke seed fixture reports complete glyph coverage");
+
+    ok &= check(lazy.warm_completed && lazy.warm_epoch == seed.warm_epoch,
+        "warm/lazy smoke keeps the same completed warm epoch");
+    ok &= check(lazy.warm_failed_glyph_records == 0 &&
+            lazy.warm_missing_string_indexes == 0   &&
+            lazy.warm_invalid_string_indexes == 0   &&
+            lazy.warm_unsupported_images == 0,
+        "warm/lazy smoke keeps warm seed failure counters at zero");
+    ok &= check(lazy.lazy_insert_attempts > seed.lazy_insert_attempts,
+        "warm/lazy smoke records outside-seed frame-time lazy attempts");
+    ok &= check(lazy.lazy_inserts > seed.lazy_inserts,
+        "warm/lazy smoke inserts outside-seed probes lazily");
+    ok &= check(lazy.lazy_failed_inserts == 0,
+        "warm/lazy smoke reports zero lazy failed inserts");
+    ok &= check(lazy.lazy_frames > seed.lazy_frames,
+        "warm/lazy smoke counts the lazy-insertion frame");
+    ok &= check(lazy.lazy_elapsed_ms >= seed.lazy_elapsed_ms &&
+            lazy.lazy_max_insert_us > 0,
+        "warm/lazy smoke reports lazy insertion latency");
+    ok &= check(lazy.incomplete_frames == 0 &&
+            lazy_report.frame_build.glyph_missed_instances == 0 &&
+            lazy_report.frame_build.glyph_coverage_failures == 0 &&
+            lazy_report.frame_build.glyph_atlas_insert_failures == 0,
+        "warm/lazy smoke lazy fixture reports complete glyph coverage");
+
+    window.hide();
+    app.processEvents(QEventLoop::AllEvents, 50);
+    if (!ok) {
+        print_warm_lazy_summary("seed", seed);
+        print_warm_lazy_summary("lazy", lazy);
+    }
+    return ok ? 0 : 1;
 }
 
 struct Lcd_probe_family
@@ -8668,6 +9101,8 @@ bool run_unit_tests()
     ok &= test_atlas_row_stable_glyph_planner();
     ok &= test_atlas_non_dirty_and_full_reupload_planner();
     ok &= test_atlas_budget_stats();
+    ok &= test_atlas_warm_set_table_and_shaping();
+    ok &= test_atlas_warm_set_representative_family_coverage();
     return ok;
 }
 
@@ -8680,12 +9115,14 @@ int main(int argc, char** argv)
     const bool pixel_parity = has_argument(argc, argv, "--pixel-parity");
     const bool layout_parity = has_argument(argc, argv, "--layout-parity");
     const bool atlas_report = has_argument(argc, argv, "--atlas-report");
+    const bool warm_lazy_smoke = has_argument(argc, argv, "--warm-lazy-smoke");
     const bool lcd_capability_probe =
         has_argument(argc, argv, "--lcd-capability-probe");
     const bool host_state_smoke = has_argument(argc, argv, "--host-state-smoke");
     const char* backend = argument_value(argc, argv, "--backend", "d3d11");
     if (render_smoke || dense_grid_smoke || pixel_parity || layout_parity ||
-        atlas_report || lcd_capability_probe || host_state_smoke)
+        atlas_report || warm_lazy_smoke || lcd_capability_probe ||
+        host_state_smoke)
     {
         configure_graphics_api(backend);
     }
@@ -8696,6 +9133,9 @@ int main(int argc, char** argv)
     }
     if (atlas_report) {
         return test_atlas_report(app, backend);
+    }
+    if (warm_lazy_smoke) {
+        return test_atlas_warm_lazy_smoke(app, backend);
     }
     if (lcd_capability_probe) {
         return test_lcd_capability_probe(app, backend);
