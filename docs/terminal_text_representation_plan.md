@@ -26,8 +26,9 @@ possible.
 
 - Do not replace public `QString` properties, signals, slots, or invokables.
 - Do not remove `QString` from Qt boundary code.
-- Do not bypass `QTextLayout` for text that needs shaping, combining behavior,
-  non-ASCII glyph fallback, or existing Qt rendering guarantees.
+- Do not bypass `QTextLayout` for atlas glyph production or for text that needs
+  shaping, combining behavior, non-ASCII glyph fallback, or existing Qt
+  rendering guarantees.
 - Do not change terminal Unicode width policy as part of this migration.
 - Do not remove current renderer fallback paths until benchmarks and tests prove
   the new representation covers the intended cases.
@@ -47,9 +48,10 @@ cell. Current source already includes two important optimizations:
   those values. The common single-cell ASCII path therefore pays `QString`
   handle assignment/refcount traffic, not a fresh heap allocation per cell.
 - Renderer-side ASCII fast paths already exist. The frame collects printable
-  ASCII/simple-ASCII counters, packed text sidecars copy printable ASCII UTF-16
-  code units directly to bytes, and QSG paths include trusted-ASCII glyph
-  replacement, batching, and resource prefiltering.
+  ASCII/simple-ASCII counters, and packed text sidecars copy printable ASCII
+  UTF-16 code units directly to bytes for representation and accounting. Atlas
+  glyph production shapes printable ASCII into the same glyph records as other
+  text.
 
 The remaining plausible costs are narrower:
 
@@ -135,7 +137,7 @@ Internal byte-backed text can be used where the code only needs:
 - empty/single-cell checks;
 - printable ASCII classification;
 - packed render-frame payloads;
-- raw glyph fast paths;
+- renderer-side classification and packing paths;
 - byte-preserving backend-to-model-to-frame transit for simple text.
 
 Any call site that needs locale-sensitive, shaped, or UTF-16-indexed behavior
@@ -226,13 +228,14 @@ Validation:
 Extend render-frame text runs so ASCII runs can carry byte spans or packed ASCII
 payload references without materializing `QString`.
 
-Renderer paths should consume ASCII directly when they already use ASCII glyph
-replacement or packed payload emission. They should materialize `QString` only
-when falling back to Qt text layout.
+Renderer paths may consume compact ASCII spans directly for packing or report
+accounting. The atlas renderer must shape those spans into canonical glyph
+records rather than using a separate ASCII glyph producer. Paths that need Qt
+text APIs should materialize `QString` at the boundary that consumes them.
 
 This stage is explicitly conditional. Current renderer code already has
-printable-ASCII classification, packed ASCII byte copying, trusted-ASCII glyph
-replacement, batching, and resource prefiltering. Stage 4 should run only if
+printable-ASCII classification, packed ASCII byte copying, batching, resource
+prefiltering, and shaped atlas glyph production. Stage 4 should run only if
 Stage 1 and Stage 3 show that the remaining renderer/frame boundary still costs
 enough to justify another representation crossing.
 

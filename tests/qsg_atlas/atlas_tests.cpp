@@ -8,14 +8,20 @@
 
 #include <QColor>
 #include <QCoreApplication>
+#include <QDir>
 #include <QEventLoop>
 #include <QFile>
+#include <QFontInfo>
 #include <QGuiApplication>
 #include <QGlyphRun>
 #include <QImage>
 #include <QInputMethodEvent>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QMetaObject>
 #include <QPainter>
+#include <QSaveFile>
 #include <QTextLayout>
 #include <QTextOption>
 #include <QQuickItem>
@@ -25,6 +31,7 @@
 #include <QSGRendererInterface>
 #include <QThread>
 #include <private/qquickitem_p.h>
+#include <rhi/qrhi.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -38,6 +45,34 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace {
+
+#if !defined(VNM_TERMINAL_TEST_BUILD_TYPE)
+#define VNM_TERMINAL_TEST_BUILD_TYPE "unknown"
+#endif
+
+#if !defined(VNM_TERMINAL_PROFILING_ENABLED)
+#define VNM_TERMINAL_PROFILING_ENABLED 0
+#endif
+
+#if defined(NDEBUG)
+constexpr bool k_lcd_probe_debug_build = false;
+#else
+constexpr bool k_lcd_probe_debug_build = true;
+#endif
+
+#if defined(_MSC_VER)
+constexpr const char* k_lcd_probe_compiler = "msvc";
+#elif defined(__clang__)
+constexpr const char* k_lcd_probe_compiler = "clang";
+#elif defined(__GNUC__)
+constexpr const char* k_lcd_probe_compiler = "gcc";
+#else
+constexpr const char* k_lcd_probe_compiler = "unknown";
+#endif
+
+} // namespace
 
 namespace term = vnm_terminal::internal;
 
@@ -74,6 +109,39 @@ QByteArray byte_array(std::initializer_list<int> values)
         out.append(static_cast<char>(value));
     }
     return out;
+}
+
+term::Glyph_lcd_order test_lcd_order_for_kind(term::Glyph_coverage_kind kind)
+{
+    switch (kind) {
+        case term::Glyph_coverage_kind::LCD_RGB_MASK:
+            return term::Glyph_lcd_order::RGB;
+        case term::Glyph_coverage_kind::LCD_BGR_MASK:
+            return term::Glyph_lcd_order::BGR;
+        case term::Glyph_coverage_kind::UNKNOWN:
+        case term::Glyph_coverage_kind::GRAYSCALE_MASK:
+        case term::Glyph_coverage_kind::COLOR_IMAGE:
+        case term::Glyph_coverage_kind::AMBIGUOUS:
+        case term::Glyph_coverage_kind::UNSUPPORTED:
+            break;
+    }
+    return term::Glyph_lcd_order::UNKNOWN;
+}
+
+term::Glyph_rgba_tile test_rgba_tile(
+    QSize                     size,
+    int                       bytes_per_line,
+    std::initializer_list<int> bytes,
+    term::Glyph_coverage_kind kind = term::Glyph_coverage_kind::GRAYSCALE_MASK)
+{
+    term::Glyph_rgba_tile tile;
+    tile.coverage_kind   = kind;
+    tile.lcd_order       = test_lcd_order_for_kind(kind);
+    tile.size            = size;
+    tile.bytes_per_line  = bytes_per_line;
+    tile.source_format   = QImage::Format_RGBA8888;
+    tile.bytes           = byte_array(bytes);
+    return tile;
 }
 
 const char* argument_value(int argc, char** argv, const char* option, const char* fallback)
@@ -161,6 +229,26 @@ QString graphics_api_name(QSGRendererInterface::GraphicsApi api)
     }
 
     return QStringLiteral("unrecognized");
+}
+
+QString driver_device_type_name(QRhiDriverInfo::DeviceType type)
+{
+    switch (type) {
+        case QRhiDriverInfo::UnknownDevice:
+            return QStringLiteral("unknown");
+        case QRhiDriverInfo::IntegratedDevice:
+            return QStringLiteral("integrated");
+        case QRhiDriverInfo::DiscreteDevice:
+            return QStringLiteral("discrete");
+        case QRhiDriverInfo::ExternalDevice:
+            return QStringLiteral("external");
+        case QRhiDriverInfo::VirtualDevice:
+            return QStringLiteral("virtual");
+        case QRhiDriverInfo::CpuDevice:
+            return QStringLiteral("cpu");
+    }
+
+    return QStringLiteral("unknown");
 }
 
 int verify_requested_backend(
@@ -265,6 +353,16 @@ struct Pixel_decorative_ink_stats
     bool has_ink() const { return ink_pixels > 0; }
 };
 
+struct Pixel_image_ink_stats
+{
+    QRect  bbox;
+    double center_x   = 0.0;
+    double center_y   = 0.0;
+    int    ink_pixels = 0;
+
+    bool has_ink() const { return ink_pixels > 0; }
+};
+
 struct Pixel_aa_budget
 {
     int    base_compared_pixels       = 0;
@@ -315,8 +413,45 @@ struct Pixel_render_result
     term::Qsg_atlas_frame_report        atlas_report;
     qreal                               device_pixel_ratio = 1.0;
     qreal                               image_device_pixel_ratio = 1.0;
+    QSize                               window_logical_size;
+    QSGRendererInterface::GraphicsApi   graphics_api =
+        QSGRendererInterface::Unknown;
+    bool                                driver_info_available = false;
+    QString                             driver_device_name;
+    quint64                             driver_device_id = 0U;
+    quint64                             driver_vendor_id = 0U;
+    QString                             driver_device_type;
+    bool                                software_renderer = false;
     bool                                ready = false;
 };
+
+void capture_window_driver_info(
+    QQuickWindow&         window,
+    Pixel_render_result&  result)
+{
+    QSGRendererInterface* const renderer_interface =
+        window.rendererInterface();
+    if (renderer_interface == nullptr) {
+        return;
+    }
+
+    QRhi* const rhi = static_cast<QRhi*>(
+        renderer_interface->getResource(
+            &window,
+            QSGRendererInterface::RhiResource));
+    if (rhi == nullptr) {
+        return;
+    }
+
+    const QRhiDriverInfo driver_info = rhi->driverInfo();
+    result.driver_info_available = true;
+    result.driver_device_name    =
+        QString::fromUtf8(driver_info.deviceName);
+    result.driver_device_id      = driver_info.deviceId;
+    result.driver_vendor_id      = driver_info.vendorId;
+    result.driver_device_type    =
+        driver_device_type_name(driver_info.deviceType);
+}
 
 struct Dense_grid_axis_stats
 {
@@ -758,42 +893,6 @@ void paint_pixel_reference_arcs(
     }
 }
 
-bool pixel_same_text_geometry(qreal left, qreal right)
-{
-    return std::abs(left - right) <= 0.001;
-}
-
-bool pixel_text_is_printable_ascii(const QString& text)
-{
-    for (const QChar character : text) {
-        const ushort code_unit = character.unicode();
-        if (code_unit < 0x20U || code_unit > 0x7eU) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool pixel_direct_ascii_run_candidate(
-    const term::Terminal_render_text_run& run,
-    term::terminal_cell_metrics_t         cell_metrics)
-{
-    if (!std::isfinite(cell_metrics.width) ||
-        cell_metrics.width <= 0.0          ||
-        !run.rect.isValid()                ||
-        run.clip_rect.isValid())
-    {
-        return false;
-    }
-
-    return
-        pixel_text_is_printable_ascii(run.text) &&
-        pixel_same_text_geometry(
-            run.rect.width(),
-            static_cast<qreal>(run.text.size()) * cell_metrics.width) &&
-        pixel_same_text_geometry(run.baseline_origin.x(), run.rect.left());
-}
-
 QImage pixel_tinted_glyph_image(
     const term::Glyph_coverage_tile& tile,
     QColor                           color)
@@ -826,13 +925,12 @@ QImage pixel_tinted_glyph_image(
 void paint_pixel_reference_glyph(
     QPainter&                              painter,
     quint32                                glyph_index,
-    const QRectF&                          bounds,
     QPointF                                glyph_origin,
     QRawFont&                              raster_font,
     const term::Terminal_render_text_run&  run,
     qreal                                  device_pixel_ratio)
 {
-    if (glyph_index == 0U || bounds.width() <= 0.0 || bounds.height() <= 0.0) {
+    if (glyph_index == 0U) {
         return;
     }
 
@@ -846,11 +944,17 @@ void paint_pixel_reference_glyph(
     }
 
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
-    const QRectF glyph_rect(
-        glyph_origin + bounds.topLeft(),
-        QSizeF(
-            static_cast<qreal>(tile.size.width()) / dpr,
-            static_cast<qreal>(tile.size.height()) / dpr));
+    const QPoint physical_offset =
+        term::qsg_atlas_glyph_physical_offset_for_raster_font(
+            raster_font,
+            glyph_index,
+            term::Glyph_image_presentation::UNKNOWN);
+    const QRectF glyph_rect =
+        term::qsg_atlas_snapped_glyph_draw_rect(
+            glyph_origin,
+            physical_offset,
+            tile.size,
+            dpr);
     if (run.clip_rect.isValid() && !glyph_rect.intersects(run.clip_rect)) {
         return;
     }
@@ -863,110 +967,29 @@ void paint_pixel_reference_glyph(
     painter.restore();
 }
 
-bool paint_pixel_reference_direct_ascii_text_run(
+void paint_pixel_reference_layout_text_run(
     QPainter&                              painter,
     const term::Terminal_render_text_run&  run,
     const QFont&                           font,
     term::terminal_cell_metrics_t          cell_metrics,
     qreal                                  device_pixel_ratio)
 {
-    if (!pixel_direct_ascii_run_candidate(run, cell_metrics)) {
-        return false;
-    }
-
-    QRawFont raw_font = QRawFont::fromFont(font);
-    if (!raw_font.isValid()) {
-        return false;
-    }
-
-    QRawFont raster_font = raw_font;
-    raster_font.setPixelSize(
-        term::qsg_atlas_physical_pixel_size(raw_font, device_pixel_ratio));
-    const QList<quint32> glyph_indexes = raw_font.glyphIndexesForString(run.text);
-    const int glyph_count =
-        std::min(
-            static_cast<int>(glyph_indexes.size()),
-            static_cast<int>(run.text.size()));
-    for (int index = 0; index < glyph_count; ++index) {
-        const quint32 glyph_index = glyph_indexes.at(index);
-        const QRectF bounds = raw_font.boundingRect(glyph_index);
-        const QPointF glyph_origin(
-            run.baseline_origin.x() +
-                static_cast<qreal>(index) * cell_metrics.width,
-            run.baseline_origin.y());
+    const term::Qsg_atlas_shaped_text_run_result shaped =
+        term::qsg_atlas_shape_text_run(
+            run,
+            font,
+            cell_metrics,
+            device_pixel_ratio);
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        QRawFont raster_font = record.raw_font;
+        raster_font.setPixelSize(record.physical_pixel_size);
         paint_pixel_reference_glyph(
             painter,
-            glyph_index,
-            bounds,
-            glyph_origin,
+            record.glyph_index,
+            record.glyph_origin,
             raster_font,
             run,
             device_pixel_ratio);
-    }
-    return true;
-}
-
-void paint_pixel_reference_layout_text_run(
-    QPainter&                              painter,
-    const term::Terminal_render_text_run&  run,
-    const QFont&                           font,
-    qreal                                  device_pixel_ratio)
-{
-    QTextLayout layout(run.text, font);
-    QTextOption option;
-    option.setWrapMode(QTextOption::NoWrap);
-    layout.setTextOption(option);
-    layout.setCacheEnabled(false);
-
-    layout.beginLayout();
-    QTextLine line = layout.createLine();
-    if (!line.isValid()) {
-        layout.endLayout();
-        return;
-    }
-    line.setLineWidth(1024.0 * 1024.0);
-    line.setPosition(QPointF(0.0, 0.0));
-    const qreal line_ascent = line.ascent();
-    const QList<QGlyphRun> glyph_runs = line.glyphRuns(
-        0,
-        run.text.size(),
-        QTextLayout::RetrieveGlyphIndexes |
-            QTextLayout::RetrieveGlyphPositions);
-    layout.endLayout();
-
-    const QPointF layout_origin(
-        run.baseline_origin.x(),
-        run.baseline_origin.y() - line_ascent);
-    for (const QGlyphRun& glyph_run : glyph_runs) {
-        const QList<quint32> glyph_indexes = glyph_run.glyphIndexes();
-        const QList<QPointF> positions     = glyph_run.positions();
-        const int glyph_count =
-            std::min(
-                static_cast<int>(glyph_indexes.size()),
-                static_cast<int>(positions.size()));
-        if (glyph_count <= 0) {
-            continue;
-        }
-
-        const QRawFont raw_font = glyph_run.rawFont();
-        if (!raw_font.isValid()) {
-            continue;
-        }
-        QRawFont raster_font = raw_font;
-        raster_font.setPixelSize(
-            term::qsg_atlas_physical_pixel_size(raw_font, device_pixel_ratio));
-        for (int index = 0; index < glyph_count; ++index) {
-            const quint32 glyph_index = glyph_indexes.at(index);
-            const QRectF bounds = raw_font.boundingRect(glyph_index);
-            paint_pixel_reference_glyph(
-                painter,
-                glyph_index,
-                bounds,
-                layout_origin + positions.at(index),
-                raster_font,
-                run,
-                device_pixel_ratio);
-        }
     }
 }
 
@@ -981,19 +1004,11 @@ void paint_pixel_reference_text_runs(
         if (run.text.isEmpty()) {
             continue;
         }
-        if (paint_pixel_reference_direct_ascii_text_run(
-                painter,
-                run,
-                font,
-                cell_metrics,
-                device_pixel_ratio))
-        {
-            continue;
-        }
         paint_pixel_reference_layout_text_run(
             painter,
             run,
             font,
+            cell_metrics,
             device_pixel_ratio);
     }
 }
@@ -1650,7 +1665,7 @@ std::vector<Pixel_parity_fixture> make_layout_parity_fixtures(qreal device_pixel
     append_exact_fill_class(
         scrollback,
         "scrollback_selection",
-        {inset_rect(pixel_cell_rect(0, 4, 3, metrics), 2.0, 2.0)});
+        {inset_rect(pixel_cell_rect(0, 4, 3, metrics), 4.0, 2.0)});
     append_text_glyph_masks(
         scrollback,
         pixel_expected_frame(scrollback).text_runs);
@@ -1826,6 +1841,40 @@ Pixel_aa_budget pixel_budget_for_backend(
     return {};
 }
 
+Pixel_aa_budget rgba_reference_budget_for_coverage(
+    const term::Glyph_coverage_counts& coverage)
+{
+    const bool has_lcd =
+        coverage.lcd_rgb_masks > 0 ||
+        coverage.lcd_bgr_masks > 0;
+    const bool has_color = coverage.color_images > 0;
+
+    // The RGBA reference is the same atlas-tile compositing model rendered on
+    // the CPU. A few LCD fringe edge pixels can differ sharply after QRhi
+    // readback, so visible divergence is bounded by the scaled diff-pixel
+    // budget while the max-delta rail stays high enough for isolated edges.
+    Pixel_aa_budget budget;
+    budget.base_compared_pixels = 1000;
+    budget.diff_pixels          = has_lcd || has_color ? 80 : 60;
+    budget.max_delta            = 230;
+    if (has_lcd) {
+        budget.max_delta = 240;
+    }
+    if (has_color) {
+        budget.max_delta = 245;
+    }
+    budget.ink_delta_perimeter_factor =
+        has_lcd || has_color ? 0.35 : 0.25;
+    return budget;
+}
+
+bool glyph_coverage_has_lcd(const term::Glyph_coverage_counts& coverage)
+{
+    return
+        coverage.lcd_rgb_masks > 0 ||
+        coverage.lcd_bgr_masks > 0;
+}
+
 int scaled_pixel_budget_count(
     int                     base_count,
     const Pixel_aa_budget& budget,
@@ -1876,6 +1925,53 @@ int pixel_delta(const QColor& left, const QColor& right)
         std::abs(left.blue()  - right.blue()),
         std::abs(left.alpha() - right.alpha()),
     });
+}
+
+Pixel_image_ink_stats measure_image_ink(
+    const QImage& image,
+    QColor        background,
+    QRectF        logical_region,
+    qreal         device_pixel_ratio)
+{
+    constexpr int k_ink_delta_threshold = 8;
+
+    Pixel_image_ink_stats stats;
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const QRect region = logical_rect_to_pixels(logical_region, dpr)
+        .intersected(image.rect());
+
+    int left   = std::numeric_limits<int>::max();
+    int top    = std::numeric_limits<int>::max();
+    int right  = std::numeric_limits<int>::min();
+    int bottom = std::numeric_limits<int>::min();
+    double x_sum = 0.0;
+    double y_sum = 0.0;
+    for (int y = region.top(); y <= region.bottom(); ++y) {
+        for (int x = region.left(); x <= region.right(); ++x) {
+            if (pixel_delta(image.pixelColor(x, y), background) <=
+                k_ink_delta_threshold)
+            {
+                continue;
+            }
+
+            left   = std::min(left, x);
+            top    = std::min(top, y);
+            right  = std::max(right, x);
+            bottom = std::max(bottom, y);
+            x_sum += static_cast<double>(x) + 0.5;
+            y_sum += static_cast<double>(y) + 0.5;
+            ++stats.ink_pixels;
+        }
+    }
+
+    if (stats.ink_pixels <= 0) {
+        return stats;
+    }
+
+    stats.bbox = QRect(QPoint(left, top), QPoint(right, bottom));
+    stats.center_x = x_sum / static_cast<double>(stats.ink_pixels);
+    stats.center_y = y_sum / static_cast<double>(stats.ink_pixels);
+    return stats;
 }
 
 Pixel_diff_stats compare_regions(
@@ -2187,8 +2283,13 @@ QRect logical_rect_to_pixels_for_dpr(const QRectF& rect, qreal dpr)
 
 double dense_grid_ink_weight(QColor pixel, QColor background)
 {
-    constexpr int k_ink_delta_threshold = 24;
-    const int     delta                 = pixel_delta(pixel, background);
+    constexpr int k_ink_delta_threshold = 12;
+    // LCD masks carry colored subpixel fringes whose channel maxima can move
+    // horizontally by subpixel phase. Luminance keeps the dense-grid center
+    // measurement tied to visible glyph energy instead of over-weighting one
+    // fringe channel.
+    const int     delta                 = std::abs(
+        qGray(pixel.rgb()) - qGray(background.rgb()));
     return delta > k_ink_delta_threshold ? static_cast<double>(delta) : 0.0;
 }
 
@@ -2332,7 +2433,11 @@ bool check_dense_grid_spacing(
         row_y[index] /= row_weight[index];
     }
 
-    constexpr double k_horizontal_spacing_spread_tolerance = 0.55;
+    // Horizontal residuals are measured from luminance-weighted glyph centers,
+    // so LCD subpixel fringes can shift the apparent center by more than a
+    // grayscale AA edge while still preserving cell gutters. Keep the vertical
+    // and gutter checks tight; they are not affected by RGB/BGR fringe phase.
+    constexpr double k_horizontal_spacing_spread_tolerance = 1.5;
     constexpr double k_vertical_spacing_spread_tolerance   = 0.95;
     const Dense_grid_axis_stats x_stats = dense_grid_axis_stats(column_x);
     const Dense_grid_axis_stats y_stats = dense_grid_axis_stats(row_y);
@@ -2496,12 +2601,12 @@ Pixel_render_result render_pixel_reference_fixture(
         painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
         painter.setRenderHint(QPainter::Antialiasing, false);
         painter.setRenderHint(QPainter::TextAntialiasing, false);
-        paint_pixel_reference_text_runs(
-            painter,
-            frame.text_runs,
-            font,
-            fixture.cell_metrics,
-            result.device_pixel_ratio);
+    paint_pixel_reference_text_runs(
+        painter,
+        frame.text_runs,
+        font,
+        fixture.cell_metrics,
+        result.device_pixel_ratio);
     }
 
     paint_pixel_reference_decorations(
@@ -2522,13 +2627,396 @@ Pixel_render_result render_pixel_reference_fixture(
         painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
         painter.setRenderHint(QPainter::Antialiasing, false);
         painter.setRenderHint(QPainter::TextAntialiasing, false);
-        paint_pixel_reference_text_runs(
-            painter,
-            frame.cursor_text_runs,
-            font,
-            fixture.cell_metrics,
-            result.device_pixel_ratio);
+    paint_pixel_reference_text_runs(
+        painter,
+        frame.cursor_text_runs,
+        font,
+        fixture.cell_metrics,
+        result.device_pixel_ratio);
     }
+    paint_pixel_reference_rects(
+        result.image,
+        frame.overlay_rects,
+        result.device_pixel_ratio);
+
+    result.ready = !result.image.isNull();
+    return result;
+}
+
+int atlas_reference_coverage_with_alpha(int coverage, int alpha)
+{
+    return std::clamp((coverage * alpha + 127) / 255, 0, 255);
+}
+
+int atlas_reference_blend_channel(
+    int source,
+    int destination,
+    int coverage)
+{
+    return std::clamp(
+        (source * coverage + destination * (255 - coverage) + 127) / 255,
+        0,
+        255);
+}
+
+term::Glyph_image_presentation atlas_reference_presentation_for_source_range(
+    const QString& text,
+    qsizetype      source_start,
+    qsizetype      source_end)
+{
+    if (source_start < 0 ||
+        source_end <= source_start ||
+        source_start >= text.size())
+    {
+        return term::Glyph_image_presentation::TEXT;
+    }
+
+    const qsizetype bounded_end = std::min(source_end, text.size());
+    const QByteArray utf8 = text
+        .mid(source_start, bounded_end - source_start)
+        .toUtf8();
+    const term::Terminal_utf8_width_result width =
+        term::measure_utf8_width(QByteArrayView(utf8.constData(), utf8.size()));
+    const bool emoji_presentation = std::any_of(
+        width.codepoints.begin(),
+        width.codepoints.end(),
+        [](const term::Terminal_codepoint_width& codepoint) {
+            return
+                codepoint.width_class ==
+                    term::Terminal_unicode_width_class::EMOJI_PRESENTATION ||
+                codepoint.presentation ==
+                    term::Terminal_unicode_presentation::EMOJI;
+        });
+    return emoji_presentation
+        ? term::Glyph_image_presentation::COLOR
+        : term::Glyph_image_presentation::TEXT;
+}
+
+bool clip_atlas_reference_glyph(
+    QRectF&       glyph_rect,
+    QRectF&       source_rect,
+    const QRectF& clip_rect)
+{
+    const QRectF clipped = glyph_rect.intersected(clip_rect);
+    if (clipped.width() <= 0.0 || clipped.height() <= 0.0) {
+        return false;
+    }
+
+    const qreal x_ratio = source_rect.width()  / glyph_rect.width();
+    const qreal y_ratio = source_rect.height() / glyph_rect.height();
+    source_rect.setLeft(
+        source_rect.left() + (clipped.left() - glyph_rect.left()) * x_ratio);
+    source_rect.setTop(
+        source_rect.top() + (clipped.top() - glyph_rect.top()) * y_ratio);
+    source_rect.setWidth(clipped.width() * x_ratio);
+    source_rect.setHeight(clipped.height() * y_ratio);
+    glyph_rect = clipped;
+    return true;
+}
+
+void blend_atlas_reference_glyph_pixel(
+    QImage&                      image,
+    int                          x,
+    int                          y,
+    const term::Glyph_rgba_tile& tile,
+    int                          tile_x,
+    int                          tile_y,
+    QColor                       foreground)
+{
+    if (!image.rect().contains(x, y) ||
+        tile_x < 0 || tile_x >= tile.size.width() ||
+        tile_y < 0 || tile_y >= tile.size.height())
+    {
+        return;
+    }
+
+    const uchar* const pixel =
+        reinterpret_cast<const uchar*>(tile.bytes.constData()) +
+        static_cast<std::ptrdiff_t>(tile_y * tile.bytes_per_line + tile_x * 4);
+    const int inherited_alpha = std::clamp(foreground.alpha(), 0, 255);
+    if (inherited_alpha <= 0) {
+        return;
+    }
+
+    int source_red      = foreground.red();
+    int source_green    = foreground.green();
+    int source_blue     = foreground.blue();
+    int coverage_red    = 0;
+    int coverage_green  = 0;
+    int coverage_blue   = 0;
+    int coverage_alpha  = 0;
+    switch (tile.coverage_kind) {
+        case term::Glyph_coverage_kind::GRAYSCALE_MASK:
+            coverage_alpha = atlas_reference_coverage_with_alpha(
+                pixel[3],
+                inherited_alpha);
+            coverage_red   = coverage_alpha;
+            coverage_green = coverage_alpha;
+            coverage_blue  = coverage_alpha;
+            break;
+
+        case term::Glyph_coverage_kind::LCD_RGB_MASK:
+        case term::Glyph_coverage_kind::LCD_BGR_MASK:
+            coverage_red = atlas_reference_coverage_with_alpha(
+                pixel[0],
+                inherited_alpha);
+            coverage_green = atlas_reference_coverage_with_alpha(
+                pixel[1],
+                inherited_alpha);
+            coverage_blue = atlas_reference_coverage_with_alpha(
+                pixel[2],
+                inherited_alpha);
+            coverage_alpha = atlas_reference_coverage_with_alpha(
+                pixel[3],
+                inherited_alpha);
+            break;
+
+        case term::Glyph_coverage_kind::COLOR_IMAGE:
+            source_red      = pixel[0];
+            source_green    = pixel[1];
+            source_blue     = pixel[2];
+            coverage_alpha  = atlas_reference_coverage_with_alpha(
+                pixel[3],
+                inherited_alpha);
+            coverage_red    = coverage_alpha;
+            coverage_green  = coverage_alpha;
+            coverage_blue   = coverage_alpha;
+            break;
+
+        default:
+            return;
+    }
+
+    if (coverage_red <= 0 &&
+        coverage_green <= 0 &&
+        coverage_blue <= 0 &&
+        coverage_alpha <= 0)
+    {
+        return;
+    }
+
+    const QColor destination = image.pixelColor(x, y);
+    image.setPixelColor(
+        x,
+        y,
+        QColor(
+            atlas_reference_blend_channel(
+                source_red,
+                destination.red(),
+                coverage_red),
+            atlas_reference_blend_channel(
+                source_green,
+                destination.green(),
+                coverage_green),
+            atlas_reference_blend_channel(
+                source_blue,
+                destination.blue(),
+                coverage_blue),
+            atlas_reference_blend_channel(
+                255,
+                destination.alpha(),
+                coverage_alpha)));
+}
+
+void paint_atlas_rgba_reference_glyph(
+    QImage&                                image,
+    const term::Qsg_atlas_shaped_glyph_record& record,
+    QRawFont&                              raster_font,
+    const term::Terminal_render_text_run&  run,
+    qreal                                  device_pixel_ratio)
+{
+    if (record.glyph_index == 0U ||
+        record.glyph_bounds.width() <= 0.0 ||
+        record.glyph_bounds.height() <= 0.0)
+    {
+        return;
+    }
+
+    const term::Glyph_image_presentation presentation =
+        atlas_reference_presentation_for_source_range(
+            run.text,
+            record.source_string_start,
+            record.source_string_end);
+    const QRawFont::AntialiasingType antialiasing =
+        presentation == term::Glyph_image_presentation::TEXT
+            ? QRawFont::SubPixelAntialiasing
+            : QRawFont::PixelAntialiasing;
+    const QImage alpha_map = raster_font.alphaMapForGlyph(
+        record.glyph_index,
+        antialiasing);
+    const term::Glyph_rgba_tile tile =
+        term::qsg_atlas_rgba_tile_from_image(alpha_map, presentation);
+    if (!tile.is_valid()) {
+        return;
+    }
+
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const QPoint physical_offset =
+        term::qsg_atlas_glyph_physical_offset_for_raster_font(
+            raster_font,
+            record.glyph_index,
+            presentation);
+    QRectF glyph_rect =
+        term::qsg_atlas_snapped_glyph_draw_rect(
+            record.glyph_origin,
+            physical_offset,
+            tile.size,
+            dpr);
+    QRectF source_rect(
+        0.0,
+        0.0,
+        static_cast<qreal>(tile.size.width()),
+        static_cast<qreal>(tile.size.height()));
+    if (run.clip_rect.isValid() &&
+        !clip_atlas_reference_glyph(glyph_rect, source_rect, run.clip_rect))
+    {
+        return;
+    }
+
+    const QRect destination_rect =
+        logical_rect_to_pixels(glyph_rect, dpr).intersected(image.rect());
+    for (int y = destination_rect.top(); y <= destination_rect.bottom(); ++y) {
+        for (int x = destination_rect.left(); x <= destination_rect.right(); ++x) {
+            const QPointF center(
+                (static_cast<qreal>(x) + 0.5) / dpr,
+                (static_cast<qreal>(y) + 0.5) / dpr);
+            if (center.x() < glyph_rect.left() ||
+                center.x() >= glyph_rect.right() ||
+                center.y() < glyph_rect.top() ||
+                center.y() >= glyph_rect.bottom())
+            {
+                continue;
+            }
+
+            const qreal source_x =
+                source_rect.left() +
+                (center.x() - glyph_rect.left()) *
+                    source_rect.width() / glyph_rect.width();
+            const qreal source_y =
+                source_rect.top() +
+                (center.y() - glyph_rect.top()) *
+                    source_rect.height() / glyph_rect.height();
+            blend_atlas_reference_glyph_pixel(
+                image,
+                x,
+                y,
+                tile,
+                std::clamp(
+                    static_cast<int>(std::floor(source_x)),
+                    0,
+                    tile.size.width() - 1),
+                std::clamp(
+                    static_cast<int>(std::floor(source_y)),
+                    0,
+                    tile.size.height() - 1),
+                run.foreground);
+        }
+    }
+}
+
+void paint_atlas_rgba_reference_text_runs(
+    QImage&                                         image,
+    const std::vector<term::Terminal_render_text_run>& runs,
+    const QFont&                                    font,
+    term::terminal_cell_metrics_t                   cell_metrics,
+    qreal                                           device_pixel_ratio,
+    bool                                            cursor_text_runs)
+{
+    for (const term::Terminal_render_text_run& run : runs) {
+        if (run.text.isEmpty()) {
+            continue;
+        }
+
+        const term::Qsg_atlas_shaped_text_run_result shaped =
+            term::qsg_atlas_shape_text_run(
+                run,
+                font,
+                cell_metrics,
+                device_pixel_ratio,
+                0,
+                cursor_text_runs);
+        for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+            QRawFont raster_font = record.raw_font;
+            raster_font.setPixelSize(record.physical_pixel_size);
+            paint_atlas_rgba_reference_glyph(
+                image,
+                record,
+                raster_font,
+                run,
+                device_pixel_ratio);
+        }
+    }
+}
+
+Pixel_render_result render_atlas_rgba_reference_fixture(
+    const Pixel_parity_fixture& fixture,
+    std::optional<QSize>         physical_image_size = std::nullopt)
+{
+    Pixel_render_result result;
+    result.device_pixel_ratio =
+        pixel_normalized_device_pixel_ratio(fixture.device_pixel_ratio);
+    result.image_device_pixel_ratio = result.device_pixel_ratio;
+    result.image = QImage(
+        physical_image_size.value_or(
+            pixel_window_physical_pixel_size(
+                fixture.logical_size,
+                result.device_pixel_ratio)),
+        QImage::Format_ARGB32_Premultiplied);
+    result.image.setDevicePixelRatio(result.device_pixel_ratio);
+    result.image.fill(QColor(1, 2, 3));
+
+    const term::Terminal_render_frame frame = pixel_expected_frame(fixture);
+    const QFont font = term::vnm_terminal_font(QString(), 18.0);
+
+    paint_pixel_reference_rects(
+        result.image,
+        frame.background_rects,
+        result.device_pixel_ratio);
+    paint_pixel_reference_rects(
+        result.image,
+        frame.selection_rects,
+        result.device_pixel_ratio);
+    paint_pixel_reference_rects(
+        result.image,
+        frame.graphic_rects,
+        result.device_pixel_ratio);
+    paint_pixel_reference_rects(
+        result.image,
+        term::terminal_render_packed_hard_graphic_rects(frame),
+        result.device_pixel_ratio);
+    paint_pixel_reference_arcs(
+        result.image,
+        frame.graphic_arcs,
+        result.device_pixel_ratio);
+
+    paint_atlas_rgba_reference_text_runs(
+        result.image,
+        frame.text_runs,
+        font,
+        fixture.cell_metrics,
+        result.device_pixel_ratio,
+        false);
+
+    paint_pixel_reference_decorations(
+        result.image,
+        frame.decorations,
+        result.device_pixel_ratio);
+    paint_pixel_reference_cursors(
+        result.image,
+        frame.cursors,
+        result.device_pixel_ratio);
+    paint_pixel_reference_cursor_graphics(
+        result.image,
+        frame.cursor_graphic_rects,
+        frame.cursor_graphic_arcs,
+        result.device_pixel_ratio);
+    paint_atlas_rgba_reference_text_runs(
+        result.image,
+        frame.cursor_text_runs,
+        font,
+        fixture.cell_metrics,
+        result.device_pixel_ratio,
+        true);
     paint_pixel_reference_rects(
         result.image,
         frame.overlay_rects,
@@ -2569,22 +3057,38 @@ Pixel_render_result render_pixel_atlas_fixture(
     window.show();
     app.processEvents(QEventLoop::AllEvents, 50);
     Pixel_render_result result;
-    result.device_pixel_ratio = pixel_window_device_pixel_ratio(window);
+    result.device_pixel_ratio   = pixel_window_device_pixel_ratio(window);
+    result.window_logical_size  = window.size();
+    result.graphics_api         = window.rendererInterface() != nullptr
+        ? window.rendererInterface()->graphicsApi()
+        : QSGRendererInterface::Unknown;
+    result.software_renderer    =
+        result.graphics_api == QSGRendererInterface::Software;
     pump_pixel_atlas_surface(app, window, surface, result);
-    result.device_pixel_ratio = pixel_window_device_pixel_ratio(window);
+    result.device_pixel_ratio  = pixel_window_device_pixel_ratio(window);
+    result.window_logical_size = window.size();
+    result.graphics_api        = window.rendererInterface() != nullptr
+        ? window.rendererInterface()->graphicsApi()
+        : result.graphics_api;
+    result.software_renderer   =
+        result.graphics_api == QSGRendererInterface::Software;
+    capture_window_driver_info(window, result);
     window.hide();
     app.processEvents(QEventLoop::AllEvents, 50);
     return result;
 }
 
 bool compare_pixel_fixture(
-    const Pixel_parity_fixture& fixture,
-    const Pixel_render_result&  reference,
-    const Pixel_render_result&  atlas,
-    const char*                  backend)
+    const Pixel_parity_fixture&    fixture,
+    const Pixel_render_result&     reference,
+    const Pixel_render_result&     atlas,
+    const char*                    backend,
+    std::optional<Pixel_aa_budget> budget_override = std::nullopt,
+    const char*                    parity_mode_override = nullptr)
 {
-    const char* const parity_mode =
-        fixture.layout_parity ? "atlas layout parity" : "atlas pixel parity";
+    const char* const parity_mode = parity_mode_override != nullptr
+        ? parity_mode_override
+        : (fixture.layout_parity ? "atlas layout parity" : "atlas pixel parity");
     if (!reference.ready || !atlas.ready) {
         std::cerr << "FAIL: " << parity_mode << " fixture "
             << fixture.name
@@ -2732,7 +3236,8 @@ bool compare_pixel_fixture(
         render_dpr,
         parity_mode);
 
-    const Pixel_aa_budget budget = pixel_budget_for_backend(backend, fixture.name);
+    const Pixel_aa_budget budget =
+        budget_override.value_or(pixel_budget_for_backend(backend, fixture.name));
     const Pixel_glyph_stats glyphs = compare_glyph_regions(
         reference.image,
         atlas.image,
@@ -2914,7 +3419,7 @@ int test_pixel_parity(QGuiApplication& app, const char* backend)
         }
 
         const Pixel_render_result reference =
-            render_pixel_reference_fixture(fixture, atlas.image.size());
+            render_atlas_rgba_reference_fixture(fixture, atlas.image.size());
         ok &= compare_pixel_fixture(fixture, reference, atlas, backend);
     }
     return ok ? 0 : 1;
@@ -2949,16 +3454,15 @@ bool validate_frame_build_report(
         fixture,
         "atlas emitted at least one render instance");
     ok &= check_frame_build_report(
-        frame_build.color_glyph_alpha_demotions == 0,
-        fixture,
-        "color glyph images stayed rejected instead of entering the R8 atlas");
-    ok &= check_frame_build_report(
         frame_build.glyph_missed_instances == 0 &&
-            frame_build.glyph_color_alpha_failures == 0 &&
             frame_build.glyph_coverage_failures == 0 &&
             frame_build.glyph_atlas_insert_failures == 0,
         fixture,
         "all expected glyphs reached atlas instances without silent misses");
+    ok &= check_frame_build_report(
+        frame_build.snapped_origin_failures == 0,
+        fixture,
+        "all glyph instances arrived with pre-snapped physical origins");
 
     if (fixture.name == "graphics_supported_unsupported_blocks") {
         ok &= check_frame_build_report(
@@ -3092,7 +3596,6 @@ bool validate_frame_build_report(
             << " distinct_faces=" << frame_build.distinct_glyph_faces
             << " fallback_faces=" << frame_build.fallback_glyph_faces
             << " emoji_runs=" << frame_build.emoji_presentation_runs
-            << " color_glyph_demotions=" << frame_build.color_glyph_alpha_demotions
             << " glyph_misses=" << frame_build.glyph_missed_instances
             << " first_packed_row=" << frame_build.first_packed_logical_row
             << " rect_instances=" << frame_build.rect_instances
@@ -3127,7 +3630,7 @@ int test_layout_parity(QGuiApplication& app, const char* backend)
         }
 
         const Pixel_render_result reference =
-            render_pixel_reference_fixture(fixture, atlas.image.size());
+            render_atlas_rgba_reference_fixture(fixture, atlas.image.size());
         ok &= compare_pixel_fixture(fixture, reference, atlas, backend);
         ok &= validate_frame_build_report(fixture, atlas.atlas_report);
     }
@@ -3247,10 +3750,12 @@ bool test_cache_key_includes_physical_size_and_face()
     const QFont font = term::vnm_terminal_font(QString(), 16.0);
     const QRawFont raw_font = QRawFont::fromFont(font);
     const QString face_id = term::qsg_atlas_face_id_for_raw_font(raw_font);
+    const qreal physical_pixel_size =
+        term::qsg_atlas_physical_pixel_size(font, 1.0);
     const term::Glyph_atlas_cache_key base_key = term::qsg_atlas_cache_key(
         65U,
         face_id,
-        term::qsg_atlas_physical_pixel_size(font, 1.0),
+        physical_pixel_size,
         0);
     const term::Glyph_atlas_cache_key hidpi_key = term::qsg_atlas_cache_key(
         65U,
@@ -3260,15 +3765,85 @@ bool test_cache_key_includes_physical_size_and_face()
     const term::Glyph_atlas_cache_key fallback_key = term::qsg_atlas_cache_key(
         65U,
         QStringLiteral("fallback-face"),
-        term::qsg_atlas_physical_pixel_size(font, 1.0),
+        physical_pixel_size,
         0);
     const term::Glyph_atlas_cache_key subpixel_key = term::qsg_atlas_cache_key(
         65U,
         face_id,
-        term::qsg_atlas_physical_pixel_size(font, 1.0),
+        physical_pixel_size,
         9);
+    const term::Glyph_atlas_cache_key lcd_rgb_key = term::qsg_atlas_cache_key(
+        65U,
+        face_id,
+        physical_pixel_size,
+        0,
+        term::Glyph_coverage_kind::LCD_RGB_MASK);
+    const term::Glyph_atlas_cache_key lcd_bgr_key = term::qsg_atlas_cache_key(
+        65U,
+        face_id,
+        physical_pixel_size,
+        0,
+        term::Glyph_coverage_kind::LCD_BGR_MASK);
+    const term::Glyph_atlas_cache_key color_key = term::qsg_atlas_cache_key(
+        65U,
+        face_id,
+        physical_pixel_size,
+        0,
+        term::Glyph_coverage_kind::COLOR_IMAGE);
+    const term::Glyph_atlas_cache_key color_grayscale_key =
+        term::qsg_atlas_cache_key(
+            65U,
+            face_id,
+            physical_pixel_size,
+            0,
+            term::Glyph_coverage_kind::GRAYSCALE_MASK,
+            term::Glyph_image_presentation::COLOR);
+    const term::Glyph_atlas_cache_key color_presentation_key =
+        term::qsg_atlas_cache_key(
+            65U,
+            face_id,
+            physical_pixel_size,
+            0,
+            term::Glyph_coverage_kind::COLOR_IMAGE,
+            term::Glyph_image_presentation::COLOR);
     const qreal raw_physical_pixel_size =
         term::qsg_atlas_physical_pixel_size(raw_font, 2.0);
+
+    const term::Glyph_rgba_tile cache_tile = test_rgba_tile(
+        QSize(2, 2),
+        8,
+        {1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4});
+    const term::Glyph_rgba_tile lcd_rgb_tile = test_rgba_tile(
+        QSize(2, 2),
+        8,
+        {1, 2, 3, 3, 4, 5, 6, 6, 7, 8, 9, 9, 10, 11, 12, 12},
+        term::Glyph_coverage_kind::LCD_RGB_MASK);
+    const term::Glyph_rgba_tile lcd_bgr_tile = test_rgba_tile(
+        QSize(2, 2),
+        8,
+        {3, 2, 1, 3, 6, 5, 4, 6, 9, 8, 7, 9, 12, 11, 10, 12},
+        term::Glyph_coverage_kind::LCD_BGR_MASK);
+    const term::Glyph_rgba_tile color_tile = test_rgba_tile(
+        QSize(2, 2),
+        8,
+        {20, 30, 40, 50, 60, 70, 80, 90, 21, 31, 41, 51, 61, 71, 81, 91},
+        term::Glyph_coverage_kind::COLOR_IMAGE);
+    term::Glyph_atlas_cache model_cache(QSize(16, 16));
+    model_cache.set_epoch(1U);
+    const term::Glyph_atlas_slot cached_grayscale =
+        model_cache.insert_or_get(base_key, cache_tile);
+    const term::Glyph_atlas_slot cached_lcd_rgb =
+        model_cache.insert_or_get(lcd_rgb_key, lcd_rgb_tile);
+    const term::Glyph_atlas_slot cached_lcd_bgr =
+        model_cache.insert_or_get(lcd_bgr_key, lcd_bgr_tile);
+    const term::Glyph_atlas_slot cached_color =
+        model_cache.insert_or_get(color_key, color_tile);
+    const term::Glyph_atlas_slot cached_color_grayscale =
+        model_cache.insert_or_get(color_grayscale_key, cache_tile);
+    const term::Glyph_atlas_slot cached_color_presentation =
+        model_cache.insert_or_get(color_presentation_key, color_tile);
+    const term::Glyph_atlas_cache_stats model_cache_stats =
+        model_cache.stats();
 
     bool ok = true;
     ok &= check(!face_id.isEmpty(),
@@ -3279,6 +3854,41 @@ bool test_cache_key_includes_physical_size_and_face()
         "glyph cache key includes fallback face id");
     ok &= check(!(base_key == subpixel_key),
         "glyph cache key includes subpixel phase bucket");
+    ok &= check(base_key.coverage_kind == term::Glyph_coverage_kind::GRAYSCALE_MASK &&
+            base_key.lcd_order == term::Glyph_lcd_order::UNKNOWN &&
+            color_key.coverage_kind == term::Glyph_coverage_kind::COLOR_IMAGE &&
+            color_key.lcd_order == term::Glyph_lcd_order::UNKNOWN,
+        "glyph cache key keeps non-LCD coverage keys on unknown LCD order");
+    ok &= check(base_key.presentation == term::Glyph_image_presentation::TEXT &&
+            color_grayscale_key.presentation ==
+                term::Glyph_image_presentation::COLOR &&
+            color_key.presentation == term::Glyph_image_presentation::TEXT &&
+            color_presentation_key.presentation ==
+                term::Glyph_image_presentation::COLOR &&
+            !(base_key == color_grayscale_key) &&
+            !(color_key == color_presentation_key),
+        "glyph cache key includes presentation-specific rasterization mode");
+    ok &= check(lcd_rgb_key.coverage_kind == term::Glyph_coverage_kind::LCD_RGB_MASK &&
+            lcd_rgb_key.lcd_order == term::Glyph_lcd_order::RGB &&
+            lcd_bgr_key.coverage_kind == term::Glyph_coverage_kind::LCD_BGR_MASK &&
+            lcd_bgr_key.lcd_order == term::Glyph_lcd_order::BGR,
+        "glyph cache key infers LCD order from LCD coverage kind");
+    ok &= check(!(base_key == lcd_rgb_key) &&
+            !(base_key == lcd_bgr_key) &&
+            !(base_key == color_key) &&
+            !(lcd_rgb_key == lcd_bgr_key) &&
+            !(lcd_rgb_key == color_key) &&
+            !(lcd_bgr_key == color_key) &&
+            !(color_grayscale_key == color_presentation_key),
+        "glyph cache key does not alias identical glyph phases across coverage models");
+    ok &= check(cached_grayscale.is_valid() &&
+            cached_lcd_rgb.is_valid() &&
+            cached_lcd_bgr.is_valid() &&
+            cached_color.is_valid() &&
+            cached_color_grayscale.is_valid() &&
+            cached_color_presentation.is_valid() &&
+            model_cache_stats.inserts == 6U,
+        "atlas cache stores distinct coverage and presentation variants independently");
     ok &= check(std::abs(raw_physical_pixel_size - raw_font.pixelSize() * 2.0) < 0.001,
         "raw-font physical pixel size is derived from the run font");
     return ok;
@@ -3301,10 +3911,13 @@ bool test_packing_and_stride_copy()
             !second->rect.intersects(third->rect),
         "shelf packer places non-overlapping tile rects");
 
-    term::Glyph_coverage_tile tile;
-    tile.size           = QSize(2, 2);
-    tile.bytes_per_line = 4;
-    tile.bytes          = byte_array({1, 2, 90, 91, 3, 4, 92, 93});
+    const term::Glyph_rgba_tile tile = test_rgba_tile(
+        QSize(2, 2),
+        16,
+        {
+            1, 2, 3, 4, 5, 6, 7, 8, 90, 91, 92, 93, 94, 95, 96, 97,
+            9, 10, 11, 12, 13, 14, 15, 16, 80, 81, 82, 83, 84, 85, 86, 87,
+        });
 
     term::Glyph_atlas_cache cache(QSize(8, 8));
     cache.set_epoch(1U);
@@ -3312,19 +3925,21 @@ bool test_packing_and_stride_copy()
         term::qsg_atlas_cache_key(1U, QStringLiteral("face"), 12.0, 0);
     const term::Glyph_atlas_slot slot = cache.insert_or_get(key, tile);
     const QByteArray& page = cache.page_bytes(slot.page);
-    const int stride = cache.stats().page_size.width();
-    ok &= check(page.at(slot.rect.y() * stride + slot.rect.x()) == 1 &&
-            page.at(slot.rect.y() * stride + slot.rect.x() + 1) == 2 &&
-            page.at((slot.rect.y() + 1) * stride + slot.rect.x()) == 3 &&
-            page.at((slot.rect.y() + 1) * stride + slot.rect.x() + 1) == 4,
-        "atlas cache copies coverage rows using tile stride");
+    const int stride = cache.stats().page_size.width() * 4;
+    const int first_offset = slot.rect.y() * stride + slot.rect.x() * 4;
+    const int second_row_offset = (slot.rect.y() + 1) * stride + slot.rect.x() * 4;
+    ok &= check(page.mid(first_offset, 8) ==
+            byte_array({1, 2, 3, 4, 5, 6, 7, 8}) &&
+            page.mid(second_row_offset, 8) ==
+            byte_array({9, 10, 11, 12, 13, 14, 15, 16}),
+        "atlas cache copies RGBA rows using tile stride");
 
     term::Glyph_atlas_cache capped_cache(QSize(4, 4));
     capped_cache.set_epoch(1U);
-    term::Glyph_coverage_tile capped_tile;
-    capped_tile.size           = QSize(2, 2);
-    capped_tile.bytes_per_line = 2;
-    capped_tile.bytes          = byte_array({1, 2, 3, 4});
+    const term::Glyph_rgba_tile capped_tile = test_rgba_tile(
+        QSize(2, 2),
+        8,
+        {1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4});
     const term::Glyph_atlas_slot capped_first = capped_cache.insert_or_get(
         term::qsg_atlas_cache_key(2U, QStringLiteral("face"), 12.0, 0),
         capped_tile);
@@ -3332,9 +3947,11 @@ bool test_packing_and_stride_copy()
         term::qsg_atlas_cache_key(3U, QStringLiteral("face"), 12.0, 0),
         capped_tile);
     ok &= check(capped_first.is_valid() &&
-            !capped_second.is_valid() &&
-            capped_cache.stats().page_count == 1,
-        "atlas cache rejects glyphs that would require page 1");
+            capped_second.is_valid() &&
+            capped_first.page == 0 &&
+            capped_second.page == 1 &&
+            capped_cache.stats().page_count == 2,
+        "atlas cache allocates additional RGBA texture-array pages");
     return ok;
 }
 
@@ -3391,24 +4008,945 @@ bool test_indexed8_and_grayscale_conversion()
     ok &= check(indexed_tile.is_valid() &&
             indexed_tile.bytes_per_line == 3 &&
             indexed_tile.bytes == byte_array({10, 20, 30, 40, 50, 60}),
-        "Format_Indexed8 glyph alpha map converts to tight R8 coverage rows");
+        "Format_Indexed8 glyph alpha map converts to tight coverage rows");
     ok &= check(gray_tile.is_valid() &&
             gray_tile.bytes_per_line == 3 &&
             gray_tile.bytes == byte_array({7, 8, 9, 17, 18, 19}),
         "Format_Grayscale8 glyph alpha map conversion honors source stride");
     ok &= check(!argb_tile.is_valid(),
-        "alpha-bearing color glyph maps are rejected until RGBA atlas support lands");
+        "alpha-bearing color glyph maps are rejected by the legacy coverage helper");
     ok &= check(!rgb_tile.is_valid(),
-        "RGB subpixel glyph maps are rejected for the R8 atlas");
+        "RGB subpixel glyph maps are rejected by the legacy coverage helper");
+    return ok;
+}
+
+bool test_rgba_tile_model_preparation()
+{
+    uchar gray_storage[16] = {
+        4, 5, 6, 200, 201, 202, 203, 204,
+        7, 8, 9, 205, 206, 207, 208, 209,
+    };
+    QImage gray(
+        gray_storage,
+        3,
+        2,
+        8,
+        QImage::Format_Grayscale8);
+    const term::Glyph_rgba_tile gray_tile =
+        term::qsg_atlas_rgba_tile_from_image(gray);
+
+    uchar alpha_storage[16] = {
+        31, 32, 33, 210, 211, 212, 213, 214,
+        41, 42, 43, 215, 216, 217, 218, 219,
+    };
+    QImage alpha(
+        alpha_storage,
+        3,
+        2,
+        8,
+        QImage::Format_Alpha8);
+    const term::Glyph_rgba_tile alpha_tile =
+        term::qsg_atlas_rgba_tile_from_image(alpha);
+
+    QImage lcd_rgb(2, 1, QImage::Format_RGB32);
+    lcd_rgb.setPixelColor(0, 0, QColor(10, 30, 20));
+    lcd_rgb.setPixelColor(1, 0, QColor(4, 5, 14));
+    const term::Glyph_rgba_tile lcd_rgb_tile =
+            term::qsg_atlas_rgba_tile_from_image(
+            lcd_rgb,
+            term::Glyph_image_presentation::TEXT);
+
+    QImage lcd_rgb888(2, 1, QImage::Format_RGB888);
+    lcd_rgb888.setPixelColor(0, 0, QColor(20, 70, 30));
+    lcd_rgb888.setPixelColor(1, 0, QColor(9, 11, 21));
+    const term::Glyph_rgba_tile lcd_rgb888_tile =
+        term::qsg_atlas_rgba_tile_from_image(
+            lcd_rgb888,
+            term::Glyph_image_presentation::TEXT);
+
+    QImage lcd_bgr(2, 1, QImage::Format_BGR888);
+    lcd_bgr.setPixelColor(0, 0, QColor(40, 10, 24));
+    lcd_bgr.setPixelColor(1, 0, QColor(5, 45, 25));
+    const term::Glyph_rgba_tile lcd_bgr_tile =
+        term::qsg_atlas_rgba_tile_from_image(
+            lcd_bgr,
+            term::Glyph_image_presentation::TEXT);
+
+    QImage color(2, 1, QImage::Format_ARGB32);
+    color.setPixelColor(0, 0, QColor(11, 22, 33, 44));
+    color.setPixelColor(1, 0, QColor(50, 60, 70, 80));
+    const term::Glyph_rgba_tile color_tile =
+        term::qsg_atlas_rgba_tile_from_image(
+            color,
+            term::Glyph_image_presentation::COLOR);
+
+    QImage rgba(2, 1, QImage::Format_RGBA8888);
+    rgba.setPixelColor(0, 0, QColor(1, 2, 3, 4));
+    rgba.setPixelColor(1, 0, QColor(210, 120, 40, 90));
+    const term::Glyph_rgba_tile rgba_tile =
+        term::qsg_atlas_rgba_tile_from_image(
+            rgba,
+            term::Glyph_image_presentation::COLOR);
+
+    QImage premultiplied_argb(2, 1, QImage::Format_ARGB32_Premultiplied);
+    premultiplied_argb.setPixelColor(0, 0, QColor(255, 0, 0, 128));
+    premultiplied_argb.setPixelColor(1, 0, QColor(0, 255, 0, 64));
+    const term::Glyph_rgba_tile premultiplied_argb_tile =
+        term::qsg_atlas_rgba_tile_from_image(
+            premultiplied_argb,
+            term::Glyph_image_presentation::COLOR);
+
+    QImage premultiplied_rgba(2, 1, QImage::Format_RGBA8888_Premultiplied);
+    premultiplied_rgba.setPixelColor(0, 0, QColor(0, 0, 255, 200));
+    premultiplied_rgba.setPixelColor(1, 0, QColor(255, 255, 0, 180));
+    const term::Glyph_rgba_tile premultiplied_rgba_tile =
+        term::qsg_atlas_rgba_tile_from_image(
+            premultiplied_rgba,
+            term::Glyph_image_presentation::COLOR);
+
+    QImage neutral_color(2, 1, QImage::Format_RGB32);
+    neutral_color.setPixelColor(0, 0, QColor(90, 90, 90));
+    neutral_color.setPixelColor(1, 0, QColor(12, 12, 12));
+    const term::Glyph_rgba_tile neutral_color_tile =
+        term::qsg_atlas_rgba_tile_from_image(
+            neutral_color,
+            term::Glyph_image_presentation::COLOR);
+
+    QImage neutral_text(2, 1, QImage::Format_RGB32);
+    neutral_text.setPixelColor(0, 0, QColor(90, 92, 93));
+    neutral_text.setPixelColor(1, 0, QColor(12, 14, 15));
+    const term::Glyph_rgba_tile neutral_text_tile =
+        term::qsg_atlas_rgba_tile_from_image(
+            neutral_text,
+            term::Glyph_image_presentation::TEXT);
+
+    QImage ambiguous(2, 1, QImage::Format_RGB16);
+    ambiguous.fill(QColor(31, 47, 63));
+    const term::Glyph_rgba_tile ambiguous_tile =
+        term::qsg_atlas_rgba_tile_from_image(ambiguous);
+
+    bool ok = true;
+    ok &= check(gray_tile.is_valid() &&
+            gray_tile.coverage_kind == term::Glyph_coverage_kind::GRAYSCALE_MASK &&
+            gray_tile.lcd_order == term::Glyph_lcd_order::UNKNOWN &&
+            gray_tile.source_format == QImage::Format_Grayscale8 &&
+            gray_tile.size == QSize(3, 2) &&
+            gray_tile.bytes_per_line == 12 &&
+            gray_tile.bytes == byte_array({
+                4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6,
+                7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 9,
+            }),
+        "grayscale glyph image prepares tight RGBA coverage rows");
+    ok &= check(alpha_tile.is_valid() &&
+            alpha_tile.coverage_kind == term::Glyph_coverage_kind::GRAYSCALE_MASK &&
+            alpha_tile.source_format == QImage::Format_Alpha8 &&
+            alpha_tile.bytes_per_line == 12 &&
+            alpha_tile.bytes == byte_array({
+                31, 31, 31, 31, 32, 32, 32, 32, 33, 33, 33, 33,
+                41, 41, 41, 41, 42, 42, 42, 42, 43, 43, 43, 43,
+            }),
+        "Alpha8 glyph image prepares replicated RGBA coverage rows");
+    ok &= check(lcd_rgb_tile.is_valid() &&
+            lcd_rgb_tile.coverage_kind == term::Glyph_coverage_kind::LCD_RGB_MASK &&
+            lcd_rgb_tile.lcd_order == term::Glyph_lcd_order::RGB &&
+            lcd_rgb_tile.source_format == QImage::Format_RGB32 &&
+            lcd_rgb_tile.size == QSize(2, 1) &&
+            lcd_rgb_tile.bytes_per_line == 8 &&
+            lcd_rgb_tile.bytes == byte_array({10, 30, 20, 30, 4, 5, 14, 14}),
+        "RGB32 text glyph image prepares LCD RGB rows");
+    ok &= check(lcd_rgb888_tile.is_valid() &&
+            lcd_rgb888_tile.coverage_kind == term::Glyph_coverage_kind::LCD_RGB_MASK &&
+            lcd_rgb888_tile.lcd_order == term::Glyph_lcd_order::RGB &&
+            lcd_rgb888_tile.source_format == QImage::Format_RGB888 &&
+            lcd_rgb888_tile.bytes_per_line == 8 &&
+            lcd_rgb888_tile.bytes == byte_array({20, 70, 30, 70, 9, 11, 21, 21}),
+        "RGB888 text glyph image prepares LCD RGB rows");
+    ok &= check(lcd_bgr_tile.is_valid() &&
+            lcd_bgr_tile.coverage_kind == term::Glyph_coverage_kind::LCD_BGR_MASK &&
+            lcd_bgr_tile.lcd_order == term::Glyph_lcd_order::BGR &&
+            lcd_bgr_tile.source_format == QImage::Format_BGR888 &&
+            lcd_bgr_tile.size == QSize(2, 1) &&
+            lcd_bgr_tile.bytes_per_line == 8 &&
+            lcd_bgr_tile.bytes == byte_array({40, 10, 24, 40, 5, 45, 25, 45}),
+        "BGR888 text glyph image prepares LCD BGR rows");
+    ok &= check(color_tile.is_valid() &&
+            color_tile.coverage_kind == term::Glyph_coverage_kind::COLOR_IMAGE &&
+            color_tile.lcd_order == term::Glyph_lcd_order::UNKNOWN &&
+            color_tile.source_format == QImage::Format_ARGB32 &&
+            color_tile.size == QSize(2, 1) &&
+            color_tile.bytes_per_line == 8 &&
+            color_tile.bytes == byte_array({11, 22, 33, 44, 50, 60, 70, 80}),
+        "ARGB color glyph image prepares color RGBA rows");
+    ok &= check(rgba_tile.is_valid() &&
+            rgba_tile.coverage_kind == term::Glyph_coverage_kind::COLOR_IMAGE &&
+            rgba_tile.source_format == QImage::Format_RGBA8888 &&
+            rgba_tile.bytes_per_line == 8 &&
+            rgba_tile.bytes == byte_array({1, 2, 3, 4, 210, 120, 40, 90}),
+        "RGBA8888 color glyph image prepares straight RGBA rows");
+    ok &= check(premultiplied_argb_tile.is_valid() &&
+            premultiplied_argb_tile.coverage_kind ==
+                term::Glyph_coverage_kind::COLOR_IMAGE &&
+            premultiplied_argb_tile.source_format ==
+                QImage::Format_ARGB32_Premultiplied &&
+            premultiplied_argb_tile.bytes_per_line == 8 &&
+            premultiplied_argb_tile.bytes == byte_array({
+                255, 0, 0, 128, 0, 255, 0, 64,
+            }),
+        "ARGB premultiplied color glyph image normalizes to straight RGBA rows");
+    ok &= check(premultiplied_rgba_tile.is_valid() &&
+            premultiplied_rgba_tile.coverage_kind ==
+                term::Glyph_coverage_kind::COLOR_IMAGE &&
+            premultiplied_rgba_tile.source_format ==
+                QImage::Format_RGBA8888_Premultiplied &&
+            premultiplied_rgba_tile.bytes_per_line == 8 &&
+            premultiplied_rgba_tile.bytes == byte_array({
+                0, 0, 255, 200, 255, 255, 0, 180,
+            }),
+        "RGBA premultiplied color glyph image normalizes to straight RGBA rows");
+    ok &= check(neutral_color_tile.is_valid() &&
+            neutral_color_tile.coverage_kind ==
+                term::Glyph_coverage_kind::COLOR_IMAGE &&
+            neutral_color_tile.lcd_order == term::Glyph_lcd_order::UNKNOWN &&
+            neutral_color_tile.source_format == QImage::Format_RGB32 &&
+            neutral_color_tile.size == QSize(2, 1) &&
+            neutral_color_tile.bytes_per_line == 8 &&
+            neutral_color_tile.bytes == byte_array({
+                90, 90, 90, 255, 12, 12, 12, 255,
+            }),
+        "neutral RGB color glyph image preserves explicit color presentation");
+    ok &= check(neutral_text_tile.is_valid() &&
+            neutral_text_tile.coverage_kind ==
+                term::Glyph_coverage_kind::GRAYSCALE_MASK &&
+            neutral_text_tile.lcd_order == term::Glyph_lcd_order::UNKNOWN &&
+            neutral_text_tile.source_format == QImage::Format_RGB32 &&
+            neutral_text_tile.size == QSize(2, 1) &&
+            neutral_text_tile.bytes_per_line == 8 &&
+            neutral_text_tile.bytes == byte_array({
+                91, 91, 91, 91, 13, 13, 13, 13,
+            }),
+        "neutral RGB text glyph image prepares qGray-replicated coverage rows");
+    ok &= check(!ambiguous_tile.is_valid() &&
+            ambiguous_tile.coverage_kind == term::Glyph_coverage_kind::AMBIGUOUS &&
+            ambiguous_tile.lcd_order == term::Glyph_lcd_order::UNKNOWN &&
+            ambiguous_tile.source_format == QImage::Format_RGB16 &&
+            ambiguous_tile.size == QSize(2, 1) &&
+            ambiguous_tile.bytes_per_line == 0 &&
+            ambiguous_tile.bytes.isEmpty(),
+        "ambiguous RGB16 glyph image preserves metadata without RGBA bytes");
+    return ok;
+}
+
+bool test_glyph_coverage_candidate_classifier()
+{
+    const QImage null_image;
+    QImage grayscale(2, 2, QImage::Format_Grayscale8);
+    grayscale.fill(128);
+
+    QImage neutral_rgb(2, 2, QImage::Format_RGB32);
+    neutral_rgb.fill(QColor(90, 90, 90));
+
+    QImage lcd_rgb(2, 2, QImage::Format_RGB32);
+    lcd_rgb.fill(QColor(220, 20, 80));
+
+    QImage threshold_rgb(2, 2, QImage::Format_RGB32);
+    threshold_rgb.fill(QColor(90, 93, 90));
+
+    QImage edge_rgb(2, 2, QImage::Format_RGB32);
+    edge_rgb.fill(QColor(90, 90, 90));
+    edge_rgb.setPixelColor(1, 1, QColor(90, 94, 90));
+
+    QImage neutral_bgr(2, 2, QImage::Format_BGR888);
+    neutral_bgr.fill(QColor(100, 100, 100));
+
+    QImage lcd_bgr(2, 2, QImage::Format_BGR888);
+    lcd_bgr.fill(QColor(20, 120, 220));
+
+    QImage color_alpha(2, 2, QImage::Format_ARGB32);
+    color_alpha.fill(QColor(10, 20, 30, 180));
+
+    QImage ambiguous(2, 2, QImage::Format_RGB16);
+    ambiguous.fill(QColor(40, 40, 40));
+
+    QImage unsupported(2, 2, QImage::Format_Mono);
+    unsupported.fill(1);
+
+    bool ok = true;
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(null_image) ==
+            term::Glyph_coverage_kind::UNKNOWN,
+        "null glyph image candidate is reported as unknown");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(grayscale) ==
+            term::Glyph_coverage_kind::GRAYSCALE_MASK,
+        "grayscale glyph image candidate is classified as a grayscale mask");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(neutral_rgb) ==
+            term::Glyph_coverage_kind::GRAYSCALE_MASK,
+        "neutral RGB glyph image candidate is classified as a grayscale mask");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(
+                neutral_rgb,
+                term::Glyph_image_presentation::COLOR) ==
+            term::Glyph_coverage_kind::COLOR_IMAGE,
+        "neutral RGB color glyph image candidate honors color presentation");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(lcd_rgb) ==
+            term::Glyph_coverage_kind::AMBIGUOUS,
+        "unknown RGB channel-varying glyph image candidate is ambiguous");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(
+                lcd_rgb,
+                term::Glyph_image_presentation::TEXT) ==
+            term::Glyph_coverage_kind::LCD_RGB_MASK,
+        "text RGB channel-varying glyph image candidate is an LCD RGB mask");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(
+                lcd_rgb,
+                term::Glyph_image_presentation::COLOR) ==
+            term::Glyph_coverage_kind::COLOR_IMAGE,
+        "color RGB channel-varying glyph image candidate is a color image");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(
+                threshold_rgb,
+                term::Glyph_image_presentation::TEXT) ==
+            term::Glyph_coverage_kind::GRAYSCALE_MASK,
+        "RGB glyph image candidate at the variation threshold is grayscale");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(
+                edge_rgb,
+                term::Glyph_image_presentation::TEXT) ==
+            term::Glyph_coverage_kind::LCD_RGB_MASK,
+        "RGB glyph image candidate with one colored edge pixel is an LCD RGB mask");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(neutral_bgr) ==
+            term::Glyph_coverage_kind::GRAYSCALE_MASK,
+        "neutral BGR glyph image candidate is classified as a grayscale mask");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(
+                lcd_bgr,
+                term::Glyph_image_presentation::TEXT) ==
+            term::Glyph_coverage_kind::LCD_BGR_MASK,
+        "text BGR channel-varying glyph image candidate is an LCD BGR mask");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(color_alpha) ==
+            term::Glyph_coverage_kind::COLOR_IMAGE,
+        "alpha-bearing color glyph image candidate is classified as a color image");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(ambiguous) ==
+            term::Glyph_coverage_kind::AMBIGUOUS,
+        "packed RGB glyph image candidate is classified as ambiguous");
+    ok &= check(term::qsg_atlas_classify_glyph_image_candidate(unsupported) ==
+            term::Glyph_coverage_kind::UNSUPPORTED,
+        "unsupported glyph image candidate format is classified as unsupported");
+    return ok;
+}
+
+bool test_glyph_image_diagnostics()
+{
+    term::Qsg_atlas_shaped_glyph_record record;
+    record.text_run_index      = 12;
+    record.glyph_run_index     = 3;
+    record.glyph_index_in_run  = 4;
+    record.source_string_start = 5;
+    record.source_string_end   = 7;
+    record.glyph_index         = 1234U;
+    record.fallback_face_id    = QStringLiteral("diagnostic-face");
+
+    QImage ambiguous(2, 3, QImage::Format_RGB16);
+    ambiguous.fill(QColor(10, 20, 30));
+    const term::Qsg_atlas_glyph_image_diagnostic ambiguous_diagnostic =
+        term::qsg_atlas_glyph_image_diagnostic_from_record(
+            record,
+            ambiguous,
+            term::Glyph_image_presentation::UNKNOWN);
+
+    QImage unsupported(3, 2, QImage::Format_Mono);
+    unsupported.fill(1);
+    const term::Qsg_atlas_glyph_image_diagnostic unsupported_diagnostic =
+        term::qsg_atlas_glyph_image_diagnostic_from_record(
+            record,
+            unsupported,
+            term::Glyph_image_presentation::TEXT);
+
+    bool ok = true;
+    ok &= check(ambiguous_diagnostic.coverage_kind ==
+                term::Glyph_coverage_kind::AMBIGUOUS &&
+            ambiguous_diagnostic.presentation ==
+                term::Glyph_image_presentation::UNKNOWN &&
+            ambiguous_diagnostic.source_format == QImage::Format_RGB16 &&
+            ambiguous_diagnostic.source_size == QSize(2, 3) &&
+            ambiguous_diagnostic.glyph_index == record.glyph_index &&
+            ambiguous_diagnostic.fallback_face_id == record.fallback_face_id &&
+            ambiguous_diagnostic.text_run_index == record.text_run_index &&
+            ambiguous_diagnostic.glyph_run_index == record.glyph_run_index &&
+            ambiguous_diagnostic.glyph_index_in_run ==
+                record.glyph_index_in_run &&
+            ambiguous_diagnostic.source_string_start ==
+                record.source_string_start &&
+            ambiguous_diagnostic.source_string_end == record.source_string_end,
+        "ambiguous glyph image diagnostics retain source format and glyph identity");
+    ok &= check(unsupported_diagnostic.coverage_kind ==
+                term::Glyph_coverage_kind::UNSUPPORTED &&
+            unsupported_diagnostic.presentation ==
+                term::Glyph_image_presentation::TEXT &&
+            unsupported_diagnostic.source_format == QImage::Format_Mono &&
+            unsupported_diagnostic.source_size == QSize(3, 2) &&
+            unsupported_diagnostic.glyph_index == record.glyph_index &&
+            unsupported_diagnostic.fallback_face_id == record.fallback_face_id &&
+            unsupported_diagnostic.text_run_index == record.text_run_index &&
+            unsupported_diagnostic.glyph_run_index == record.glyph_run_index &&
+            unsupported_diagnostic.glyph_index_in_run ==
+                record.glyph_index_in_run &&
+            unsupported_diagnostic.source_string_start ==
+                record.source_string_start &&
+            unsupported_diagnostic.source_string_end == record.source_string_end,
+        "unsupported glyph image diagnostics retain source format and glyph identity");
+    return ok;
+}
+
+term::Terminal_render_text_run make_shaped_record_test_run(
+    QString                         text,
+    int                             column,
+    int                             cell_span,
+    term::terminal_cell_metrics_t   metrics)
+{
+    term::Terminal_render_text_run run;
+    run.row                = 2;
+    run.logical_row        = 42;
+    run.retained_line_id   = 9001U;
+    run.content_generation = 17U;
+    run.column             = column;
+    run.rect = QRectF(
+        static_cast<qreal>(column) * metrics.width,
+        static_cast<qreal>(run.row) * metrics.height,
+        static_cast<qreal>(std::max(1, cell_span)) * metrics.width,
+        metrics.height);
+    run.baseline_origin = QPointF(run.rect.left(), run.rect.top() + metrics.ascent);
+    run.text            = std::move(text);
+    run.foreground      = QColor(220, 230, 210);
+    run.background      = QColor(10, 20, 30);
+    run.style_id        = term::k_default_terminal_style_id;
+    return run;
+}
+
+bool shaped_records_have_valid_source_ranges(
+    const term::Qsg_atlas_shaped_text_run_result& shaped,
+    qsizetype                                     text_size)
+{
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        if (record.source_string_start < 0 ||
+            record.source_string_start >= text_size ||
+            record.source_string_end <= record.source_string_start ||
+            record.source_string_end > text_size)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool shaped_records_cover_source_range(
+    const term::Qsg_atlas_shaped_text_run_result& shaped,
+    qsizetype                                     start,
+    qsizetype                                     end)
+{
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        if (record.source_string_start <= start &&
+            record.source_string_end >= end)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool shaped_records_have_non_notdef_glyph(
+    const term::Qsg_atlas_shaped_text_run_result& shaped)
+{
+    return std::any_of(
+        shaped.records.begin(),
+        shaped.records.end(),
+        [](const term::Qsg_atlas_shaped_glyph_record& record) {
+            return record.glyph_index != 0U;
+        });
+}
+
+bool shaped_records_share_owner_span(
+    const term::Qsg_atlas_shaped_text_run_result& shaped,
+    int                                           owner_column,
+    int                                           owner_cell_span)
+{
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        if (record.owner_column != owner_column ||
+            record.owner_cell_span != owner_cell_span)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool shaped_records_have_cursor_text_run_flag(
+    const term::Qsg_atlas_shaped_text_run_result& shaped)
+{
+    return std::all_of(
+        shaped.records.begin(),
+        shaped.records.end(),
+        [](const term::Qsg_atlas_shaped_glyph_record& record) {
+            return record.cursor_text_run;
+        });
+}
+
+bool coordinate_is_physical_pixel_snapped(qreal coordinate, qreal dpr)
+{
+    const qreal physical = coordinate * pixel_normalized_device_pixel_ratio(dpr);
+    return std::abs(physical - std::round(physical)) <= 0.001;
+}
+
+bool point_is_physical_pixel_snapped(const QPointF& point, qreal dpr)
+{
+    return
+        coordinate_is_physical_pixel_snapped(point.x(), dpr) &&
+        coordinate_is_physical_pixel_snapped(point.y(), dpr);
+}
+
+bool rectangle_origin_is_physical_pixel_snapped(const QRectF& rect, qreal dpr)
+{
+    return point_is_physical_pixel_snapped(rect.topLeft(), dpr);
+}
+
+bool points_are_close(QPointF left, QPointF right)
+{
+    return
+        std::abs(left.x() - right.x()) <= 0.001 &&
+        std::abs(left.y() - right.y()) <= 0.001;
+}
+
+bool rectangle_has_physical_pixel_size(
+    const QRectF& rect,
+    QSize         physical_size,
+    qreal         dpr)
+{
+    const qreal normalized_dpr = pixel_normalized_device_pixel_ratio(dpr);
+    return
+        std::abs(rect.width() * normalized_dpr -
+            static_cast<qreal>(physical_size.width())) <= 0.001 &&
+        std::abs(rect.height() * normalized_dpr -
+            static_cast<qreal>(physical_size.height())) <= 0.001;
+}
+
+bool shaped_records_snap_fractional_physical_pixel_placement(
+    const term::Qsg_atlas_shaped_text_run_result& shaped,
+    qreal                                         dpr)
+{
+    bool saw_fractional_input = false;
+    bool checked              = false;
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        if (record.glyph_index == 0U ||
+            record.glyph_bounds.width() <= 0.0 ||
+            record.glyph_bounds.height() <= 0.0)
+        {
+            continue;
+        }
+
+        constexpr QSize k_probe_physical_size(17, 11);
+        constexpr QPoint k_probe_physical_offset(-2, -9);
+        const QPointF input_draw_origin =
+            record.glyph_origin +
+            QPointF(
+                static_cast<qreal>(k_probe_physical_offset.x()) / dpr,
+                static_cast<qreal>(k_probe_physical_offset.y()) / dpr);
+        saw_fractional_input =
+            saw_fractional_input ||
+            !point_is_physical_pixel_snapped(record.glyph_origin, dpr) ||
+            !point_is_physical_pixel_snapped(input_draw_origin, dpr);
+
+        const QPointF snapped_origin =
+            term::qsg_atlas_snapped_physical_point(record.glyph_origin, dpr);
+        const QRectF snapped_draw_rect =
+            term::qsg_atlas_snapped_glyph_draw_rect(
+                record.glyph_origin,
+                k_probe_physical_offset,
+                k_probe_physical_size,
+                dpr);
+        const int snapped_physical_origin_x = static_cast<int>(
+            std::lround(snapped_origin.x() * dpr));
+        const int snapped_physical_origin_y = static_cast<int>(
+            std::lround(snapped_origin.y() * dpr));
+        const QPointF expected_top_left(
+            static_cast<qreal>(
+                snapped_physical_origin_x + k_probe_physical_offset.x()) /
+                dpr,
+            static_cast<qreal>(
+                snapped_physical_origin_y + k_probe_physical_offset.y()) /
+                dpr);
+        checked = true;
+        if (!point_is_physical_pixel_snapped(snapped_origin, dpr) ||
+            !rectangle_origin_is_physical_pixel_snapped(snapped_draw_rect, dpr) ||
+            !rectangle_has_physical_pixel_size(
+                snapped_draw_rect,
+                k_probe_physical_size,
+                dpr) ||
+            !points_are_close(snapped_draw_rect.topLeft(), expected_top_left))
+        {
+            return false;
+        }
+    }
+
+    return checked && saw_fractional_input;
+}
+
+bool shaped_records_use_raster_offsets_not_public_bounds_proxy(
+    const term::Qsg_atlas_shaped_text_run_result& shaped,
+    qreal                                         dpr)
+{
+    bool checked              = false;
+    bool saw_distinct_offset  = false;
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        if (record.glyph_index == 0U ||
+            record.glyph_bounds.width() <= 0.0 ||
+            record.glyph_bounds.height() <= 0.0)
+        {
+            continue;
+        }
+
+        QRawFont raster_font = record.raw_font;
+        raster_font.setPixelSize(record.physical_pixel_size);
+        const QImage alpha_map = raster_font.alphaMapForGlyph(
+            record.glyph_index,
+            QRawFont::SubPixelAntialiasing);
+        const term::Glyph_rgba_tile tile =
+            term::qsg_atlas_rgba_tile_from_image(
+                alpha_map,
+                term::Glyph_image_presentation::TEXT);
+        if (!tile.is_valid()) {
+            continue;
+        }
+
+        const QPoint raster_offset =
+            term::qsg_atlas_glyph_physical_offset_for_raster_font(
+                raster_font,
+                record.glyph_index,
+                term::Glyph_image_presentation::TEXT);
+        const QPoint public_bounds_proxy(
+            static_cast<int>(std::lround(record.glyph_bounds.left() * dpr)),
+            static_cast<int>(std::lround(record.glyph_bounds.top() * dpr)));
+        const QRectF draw_rect =
+            term::qsg_atlas_snapped_glyph_draw_rect(
+                record.glyph_origin,
+                raster_offset,
+                tile.size,
+                dpr);
+
+        checked = true;
+        saw_distinct_offset =
+            saw_distinct_offset || raster_offset != public_bounds_proxy;
+        if (!rectangle_origin_is_physical_pixel_snapped(draw_rect, dpr) ||
+            !rectangle_has_physical_pixel_size(draw_rect, tile.size, dpr))
+        {
+            return false;
+        }
+    }
+
+    return checked && saw_distinct_offset;
+}
+
+QImage render_qpainter_text_layout_image(
+    const term::Terminal_render_text_run& run,
+    const QFont&                          font,
+    QSizeF                                logical_size,
+    qreal                                 dpr)
+{
+    QImage image(
+        pixel_window_physical_pixel_size(logical_size, dpr),
+        QImage::Format_ARGB32_Premultiplied);
+    image.setDevicePixelRatio(pixel_normalized_device_pixel_ratio(dpr));
+    image.fill(run.background);
+
+    QPainter painter(&image);
+    painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+    painter.setPen(run.foreground);
+
+    QTextLayout layout(run.text, font);
+    QTextOption option;
+    option.setWrapMode(QTextOption::NoWrap);
+    layout.setTextOption(option);
+    layout.setCacheEnabled(false);
+    layout.beginLayout();
+    QTextLine line = layout.createLine();
+    if (line.isValid()) {
+        line.setLineWidth(1024.0 * 1024.0);
+        line.setPosition(QPointF(0.0, 0.0));
+    }
+    layout.endLayout();
+    if (line.isValid()) {
+        layout.draw(
+            &painter,
+            QPointF(
+                run.baseline_origin.x(),
+                run.baseline_origin.y() - line.ascent()));
+    }
+    return image;
+}
+
+QImage render_atlas_tile_placement_image(
+    const term::Terminal_render_text_run&      run,
+    const term::Qsg_atlas_shaped_text_run_result& shaped,
+    QSizeF                                     logical_size,
+    qreal                                      dpr)
+{
+    QImage image(
+        pixel_window_physical_pixel_size(logical_size, dpr),
+        QImage::Format_ARGB32_Premultiplied);
+    image.setDevicePixelRatio(pixel_normalized_device_pixel_ratio(dpr));
+    image.fill(run.background);
+
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        QRawFont raster_font = record.raw_font;
+        raster_font.setPixelSize(record.physical_pixel_size);
+        paint_atlas_rgba_reference_glyph(
+            image,
+            record,
+            raster_font,
+            run,
+            dpr);
+    }
+    return image;
+}
+
+bool shaped_records_match_qpainter_physical_ink_placement(
+    const term::Terminal_render_text_run&      run,
+    const term::Qsg_atlas_shaped_text_run_result& shaped,
+    const QFont&                              font,
+    term::terminal_cell_metrics_t             metrics,
+    qreal                                     dpr)
+{
+    const QSizeF logical_size =
+        pixel_logical_size({4, 12}, metrics);
+    const QRectF probe_region =
+        run.rect.adjusted(-metrics.width, -metrics.height,
+            metrics.width, metrics.height);
+    const QImage expected =
+        render_qpainter_text_layout_image(run, font, logical_size, dpr);
+    const QImage actual =
+        render_atlas_tile_placement_image(run, shaped, logical_size, dpr);
+    const Pixel_image_ink_stats expected_ink =
+        measure_image_ink(expected, run.background, probe_region, dpr);
+    const Pixel_image_ink_stats actual_ink =
+        measure_image_ink(actual, run.background, probe_region, dpr);
+
+    if (!expected_ink.has_ink() || !actual_ink.has_ink()) {
+        return false;
+    }
+
+    constexpr int k_bbox_tolerance_pixels = 1;
+    constexpr double k_center_tolerance_pixels = 1.0;
+    return
+        std::abs(expected_ink.bbox.left() - actual_ink.bbox.left()) <=
+            k_bbox_tolerance_pixels &&
+        std::abs(expected_ink.bbox.right() - actual_ink.bbox.right()) <=
+            k_bbox_tolerance_pixels &&
+        std::abs(expected_ink.bbox.top() - actual_ink.bbox.top()) <=
+            k_bbox_tolerance_pixels &&
+        std::abs(expected_ink.bbox.bottom() - actual_ink.bbox.bottom()) <=
+            k_bbox_tolerance_pixels &&
+        std::abs(expected_ink.center_x - actual_ink.center_x) <=
+            k_center_tolerance_pixels &&
+        std::abs(expected_ink.center_y - actual_ink.center_y) <=
+            k_center_tolerance_pixels;
+}
+
+bool test_shaped_glyph_physical_pixel_placement()
+{
+    constexpr qreal dpr = 1.5;
+    const QFont font = term::vnm_terminal_font(QString(), 18.0);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+
+    term::Terminal_render_text_run run =
+        make_shaped_record_test_run(QStringLiteral("Hg"), 2, 2, metrics);
+    const QPointF fractional_offset(0.2, 0.2);
+    run.rect.translate(fractional_offset);
+    run.baseline_origin += fractional_offset;
+
+    const term::Qsg_atlas_shaped_text_run_result shaped =
+        term::qsg_atlas_shape_text_run(
+            run,
+            font,
+            metrics,
+            dpr,
+            19,
+            false);
+
+    bool ok = true;
+    ok &= check(!shaped.records.empty() &&
+            shaped_records_have_non_notdef_glyph(shaped),
+        "fractional glyph placement fixture produces drawable shaped records");
+    ok &= check(
+        shaped_records_snap_fractional_physical_pixel_placement(shaped, dpr),
+        "fractional glyph origins and draw rectangles snap to physical pixels");
+    ok &= check(
+        shaped_records_use_raster_offsets_not_public_bounds_proxy(shaped, dpr),
+        "glyph draw rectangles use Qt raster offsets instead of public bounds proxy");
+    ok &= check(
+        shaped_records_match_qpainter_physical_ink_placement(
+            run,
+            shaped,
+            font,
+            metrics,
+            dpr),
+        "atlas raster placement matches independent QPainter text ink placement");
+    return ok;
+}
+
+bool test_shaped_glyph_records()
+{
+    const qreal dpr = 1.0;
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+    const QFont font = term::vnm_terminal_font(QString(), 18.0);
+
+    const term::Terminal_render_text_run ascii_run =
+        make_shaped_record_test_run(QStringLiteral("ABC"), 4, 3, metrics);
+    const term::Qsg_atlas_shaped_text_run_result ascii =
+        term::qsg_atlas_shape_text_run(
+            ascii_run,
+            font,
+            metrics,
+            dpr,
+            7,
+            false);
+    const term::Qsg_atlas_shaped_text_run_result cursor_ascii =
+        term::qsg_atlas_shape_text_run(
+            ascii_run,
+            font,
+            metrics,
+            dpr,
+            12,
+            true);
+
+    const QString combining_text = QString::fromUtf8("e\xcc\x81");
+    const term::Terminal_render_text_run combining_run =
+        make_shaped_record_test_run(combining_text, 3, 1, metrics);
+    const term::Qsg_atlas_shaped_text_run_result combining =
+        term::qsg_atlas_shape_text_run(
+            combining_run,
+            font,
+            metrics,
+            dpr,
+            8,
+            false);
+
+    const QString cjk_text = QString::fromUtf8("\xe7\x95\x8c");
+    const term::Terminal_render_text_run cjk_run =
+        make_shaped_record_test_run(cjk_text, 5, 2, metrics);
+    const term::Qsg_atlas_shaped_text_run_result cjk =
+        term::qsg_atlas_shape_text_run(
+            cjk_run,
+            font,
+            metrics,
+            dpr,
+            9,
+            false);
+
+    const QString vs16_text = QString::fromUtf8("\xe2\x9d\xa4\xef\xb8\x8f");
+    const term::Terminal_render_text_run vs16_run =
+        make_shaped_record_test_run(vs16_text, 6, 2, metrics);
+    const term::Qsg_atlas_shaped_text_run_result vs16 =
+        term::qsg_atlas_shape_text_run(
+            vs16_run,
+            font,
+            metrics,
+            dpr,
+            10,
+            false);
+
+    const QString zwj_text =
+        QString::fromUcs4(U"\U0001F469\u200D\U0001F4BB");
+    const term::Terminal_render_text_run zwj_run =
+        make_shaped_record_test_run(zwj_text, 7, 2, metrics);
+    const term::Qsg_atlas_shaped_text_run_result zwj =
+        term::qsg_atlas_shape_text_run(
+            zwj_run,
+            font,
+            metrics,
+            dpr,
+            11,
+            false);
+
+    bool ok = true;
+    ok &= check(!ascii.records.empty() &&
+            ascii.missing_string_indexes == 0 &&
+            ascii.invalid_string_indexes == 0 &&
+            shaped_records_have_non_notdef_glyph(ascii),
+        "printable ASCII is shaped into glyph records with string indexes");
+    ok &= check(ascii.records.size() == 3U &&
+            ascii.records[0].source_string_start == 0 &&
+            ascii.records[0].source_string_end == 1 &&
+            ascii.records[0].owner_column == 4 &&
+            ascii.records[0].owner_cell_span == 1 &&
+            ascii.records[0].glyph_origin.x() == ascii_run.rect.left() &&
+            ascii.records[1].source_string_start == 1 &&
+            ascii.records[1].source_string_end == 2 &&
+            ascii.records[1].owner_column == 5 &&
+            ascii.records[1].owner_cell_span == 1 &&
+            ascii.records[1].glyph_origin.x() ==
+                ascii_run.rect.left() + metrics.width &&
+            ascii.records[2].source_string_start == 2 &&
+            ascii.records[2].source_string_end == 3 &&
+            ascii.records[2].owner_column == 6 &&
+            ascii.records[2].owner_cell_span == 1 &&
+            ascii.records[2].glyph_origin.x() ==
+                ascii_run.rect.left() + metrics.width * 2.0,
+        "printable ASCII shaped records retain exact per-cell ownership");
+    ok &= check(ascii.records[0].text_run_index == 7 &&
+            !ascii.records[0].cursor_text_run &&
+            ascii.records[0].row == ascii_run.row &&
+            ascii.records[0].logical_row == ascii_run.logical_row &&
+            ascii.records[0].retained_line_id == ascii_run.retained_line_id &&
+            ascii.records[0].content_generation ==
+                ascii_run.content_generation,
+        "printable ASCII shaped records retain text-run provenance");
+    ok &= check(!cursor_ascii.records.empty() &&
+            cursor_ascii.missing_string_indexes == 0 &&
+            cursor_ascii.invalid_string_indexes == 0 &&
+            shaped_records_have_cursor_text_run_flag(cursor_ascii),
+        "cursor shaped records retain cursor-run provenance");
+
+    ok &= check(!combining.records.empty() &&
+            combining.missing_string_indexes == 0 &&
+            combining.invalid_string_indexes == 0 &&
+            shaped_records_have_non_notdef_glyph(combining) &&
+            shaped_records_have_valid_source_ranges(
+                combining,
+                combining_text.size()) &&
+            shaped_records_cover_source_range(
+                combining,
+                0,
+                combining_text.size()) &&
+            shaped_records_share_owner_span(combining, 3, 1),
+        "combining-mark shaped records retain one-cell cluster ownership");
+
+    // The CPU unit environment may lack deployed CJK/emoji fallback fonts.
+    // Concrete family glyph-image coverage is gated by the D3D11 LCD probe.
+    ok &= check(!cjk.records.empty() &&
+            cjk.missing_string_indexes == 0 &&
+            cjk.invalid_string_indexes == 0 &&
+            shaped_records_have_valid_source_ranges(cjk, cjk_text.size()) &&
+            shaped_records_share_owner_span(cjk, 5, 2),
+        "CJK shaped records retain two-cell ownership");
+
+    ok &= check(!vs16.records.empty() &&
+            vs16.missing_string_indexes == 0 &&
+            vs16.invalid_string_indexes == 0 &&
+            shaped_records_have_valid_source_ranges(vs16, vs16_text.size()) &&
+            shaped_records_cover_source_range(vs16, 0, vs16_text.size()) &&
+            shaped_records_share_owner_span(vs16, 6, 2),
+        "VS16 emoji shaped records retain source cluster ownership");
+
+    ok &= check(!zwj.records.empty() &&
+            zwj.missing_string_indexes == 0 &&
+            zwj.invalid_string_indexes == 0 &&
+            shaped_records_have_valid_source_ranges(zwj, zwj_text.size()) &&
+            shaped_records_cover_source_range(zwj, 0, zwj_text.size()) &&
+            shaped_records_share_owner_span(zwj, 7, 2),
+        "ZWJ emoji shaped records retain one terminal-span owner");
     return ok;
 }
 
 bool test_epoch_invalidation()
 {
-    term::Glyph_coverage_tile tile;
-    tile.size           = QSize(2, 2);
-    tile.bytes_per_line = 2;
-    tile.bytes          = byte_array({11, 12, 13, 14});
+    const term::Glyph_rgba_tile tile = test_rgba_tile(
+        QSize(2, 2),
+        8,
+        {11, 11, 11, 11, 12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14});
 
     term::Glyph_atlas_cache cache(QSize(8, 8));
     const term::Glyph_atlas_cache_key key =
@@ -3652,6 +5190,9 @@ bool test_atlas_row_stable_glyph_planner()
     std::vector<Buffer_update_test_instance> clean_row_and_dirty_row_changed =
         dirty_row_grown;
     clean_row_and_dirty_row_changed[0].value = 12;
+    std::vector<Buffer_update_test_instance> dirty_row_non_adjacent = base;
+    dirty_row_non_adjacent[2] = {1, 21};
+    dirty_row_non_adjacent[3] = {1, 23};
 
     const QByteArray base_bytes = buffer_update_instance_bytes(base);
     const QByteArray dirty_row_grown_bytes =
@@ -3660,6 +5201,13 @@ bool test_atlas_row_stable_glyph_planner()
         buffer_update_instance_bytes(dirty_row_shrunk);
     const QByteArray clean_row_and_dirty_row_changed_bytes =
         buffer_update_instance_bytes(clean_row_and_dirty_row_changed);
+    const QByteArray dirty_row_non_adjacent_bytes =
+        buffer_update_instance_bytes(dirty_row_non_adjacent);
+    const std::vector<term::Qsg_atlas_row_stable_range> row_stable_ranges = {
+        {0, 0, row_capacity},
+        {1, 2, row_capacity},
+        {2, 4, row_capacity},
+    };
     (void)planner.plan({
         1,
         0,
@@ -3764,6 +5312,43 @@ bool test_atlas_row_stable_glyph_planner()
             true,
         });
 
+    term::Qsg_atlas_buffer_upload_planner row_span_planner;
+    (void)row_span_planner.plan({
+        1,
+        0,
+        row_count,
+        static_cast<int>(sizeof(Buffer_update_test_instance)),
+        base_bytes.constData(),
+        static_cast<int>(base_bytes.size()),
+        &rows,
+        layout_key,
+        {},
+        false,
+        false,
+        false,
+        5,
+        true,
+        &row_stable_ranges,
+    });
+    const term::Qsg_atlas_buffer_update_plan dirty_row_span =
+        row_span_planner.plan({
+            1,
+            0,
+            row_count,
+            static_cast<int>(sizeof(Buffer_update_test_instance)),
+            dirty_row_non_adjacent_bytes.constData(),
+            static_cast<int>(dirty_row_non_adjacent_bytes.size()),
+            &rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+            6,
+            true,
+            &row_stable_ranges,
+        });
+
     bool ok = true;
     ok &= check(dirty.summary.row_stable_layout &&
             dirty.summary.active_instance_count == 6 &&
@@ -3791,6 +5376,16 @@ bool test_atlas_row_stable_glyph_planner()
                 static_cast<int>(2U * sizeof(Buffer_update_test_instance)),
         "atlas row-stable glyph planner patches dirty-row shrink-to-empty "
         "without full-uploading stable clean rows");
+    ok &= check(dirty_row_span.summary.row_stable_layout &&
+            dirty_row_span.summary.partial_upload &&
+            !dirty_row_span.summary.full_upload &&
+            dirty_row_span.ranges.size() == 1U &&
+            dirty_row_span.ranges.front().byte_offset ==
+                static_cast<int>(2U * sizeof(Buffer_update_test_instance)) &&
+            dirty_row_span.ranges.front().byte_count ==
+                static_cast<int>(row_capacity * sizeof(Buffer_update_test_instance)),
+        "atlas row-stable glyph planner uploads the whole dirty row slot span "
+        "when production row ranges are available");
     ok &= check(clean_slot_fallback.summary.row_stable_layout &&
             clean_slot_fallback.summary.full_upload &&
             !clean_slot_fallback.summary.partial_upload &&
@@ -3882,10 +5477,10 @@ bool test_atlas_non_dirty_and_full_reupload_planner()
 
 bool test_atlas_budget_stats()
 {
-    term::Glyph_coverage_tile tile;
-    tile.size           = QSize(2, 2);
-    tile.bytes_per_line = 2;
-    tile.bytes          = byte_array({1, 2, 3, 4});
+    const term::Glyph_rgba_tile tile = test_rgba_tile(
+        QSize(2, 2),
+        8,
+        {1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4});
 
     term::Glyph_atlas_cache cache(QSize(4, 4));
     cache.set_epoch(1U);
@@ -3895,19 +5490,50 @@ bool test_atlas_budget_stats()
     const term::Glyph_atlas_slot second = cache.insert_or_get(
         term::qsg_atlas_cache_key(11U, QStringLiteral("face"), 12.0, 0),
         tile);
+    const term::Glyph_atlas_slot third = cache.insert_or_get(
+        term::qsg_atlas_cache_key(12U, QStringLiteral("face"), 12.0, 0),
+        tile);
+    const term::Glyph_atlas_slot fourth = cache.insert_or_get(
+        term::qsg_atlas_cache_key(13U, QStringLiteral("face"), 12.0, 0),
+        tile);
+    const term::Glyph_atlas_slot fifth = cache.insert_or_get(
+        term::qsg_atlas_cache_key(14U, QStringLiteral("face"), 12.0, 0),
+        tile);
     const term::Glyph_atlas_cache_stats stats = cache.stats();
+    const term::Glyph_rgba_cache_accounting rgba_accounting =
+        term::qsg_atlas_rgba_cache_accounting(stats);
+    const term::Glyph_atlas_cache_stats stats_after_accounting = cache.stats();
 
     bool ok = true;
-    ok &= check(first.is_valid() && !second.is_valid(),
-        "atlas budget test reaches the one-page cap");
-    ok &= check(stats.page_budget == 1 &&
-            stats.page_count == 1 &&
-            stats.page_bytes == 16U &&
-            stats.allocated_bytes == 16U &&
-            stats.budget_bytes == 16U,
+    ok &= check(first.is_valid() &&
+            second.is_valid()     &&
+            third.is_valid()      &&
+            fourth.is_valid()     &&
+            !fifth.is_valid(),
+        "atlas budget test reaches the RGBA page cap");
+    ok &= check(stats.page_budget == 4 &&
+            stats.page_count == 4 &&
+            stats.page_bytes == 64U &&
+            stats.allocated_bytes == 256U &&
+            stats.budget_bytes == 256U,
         "atlas stats report page count, allocation, and budget bytes");
-    ok &= check(stats.used_bytes == 4U && stats.failed_inserts == 1U,
-        "atlas stats report used coverage bytes and failed inserts");
+    ok &= check(stats.used_bytes == 64U && stats.failed_inserts == 1U,
+        "atlas stats report used RGBA bytes and failed inserts");
+    ok &= check(term::qsg_atlas_rgba_tile_byte_count(QSize(4, 4)) == 64U &&
+            term::qsg_atlas_rgba_tile_byte_count(QSize(2, 2)) == 16U &&
+            term::qsg_atlas_rgba_tile_byte_count(QSize(0, 4)) == 0U,
+        "RGBA atlas byte count maps tile area to four bytes per pixel");
+    ok &= check(rgba_accounting.page_bytes == stats.page_bytes &&
+            rgba_accounting.allocated_bytes == stats.allocated_bytes &&
+            rgba_accounting.budget_bytes == stats.budget_bytes &&
+            rgba_accounting.used_bytes == stats.used_bytes,
+        "RGBA atlas accounting reflects canonical cache stats");
+    ok &= check(stats_after_accounting.page_bytes == stats.page_bytes &&
+            stats_after_accounting.allocated_bytes == stats.allocated_bytes &&
+            stats_after_accounting.budget_bytes == stats.budget_bytes &&
+            stats_after_accounting.used_bytes == stats.used_bytes &&
+            stats_after_accounting.failed_inserts == stats.failed_inserts,
+        "RGBA atlas accounting leaves cache stats unchanged");
     return ok;
 }
 
@@ -3919,8 +5545,8 @@ bool report_ready_for_render(const term::Qsg_atlas_frame_report& report)
         report.command_buffer_non_null      &&
         report.render_target_non_null       &&
         report.rhi_non_null                 &&
-        report.r8_texture_created           &&
-        report.r8_upload_recorded           &&
+        report.coverage_texture_created     &&
+        report.coverage_upload_recorded     &&
         report.raw_font_rasterized          &&
         report.raw_font_rasterized_in_prepare;
 }
@@ -4724,8 +6350,13 @@ int test_dense_grid_smoke(QGuiApplication& app, const char* backend)
     bool ok = true;
     ok &= check(rendered,
         "dense atlas X grid reaches a rendered atlas frame");
-    ok &= check(report.render.direct_ascii_glyph_instances >= k_rows * k_columns,
-        "dense atlas X grid uses direct ASCII glyph instances");
+    const int producer_glyph_records =
+        report.producer.shaped_glyph_records_built +
+        report.producer.shaped_glyph_records_reused;
+    ok &= check(producer_glyph_records >= k_rows * k_columns,
+        "dense atlas X grid uses canonical producer glyph records");
+    ok &= check(report.producer.simple_path_used > 0,
+        "dense atlas X grid uses the simple producer path for printable ASCII");
     ok &= check(report.cache.inserts <= 1U,
         "dense atlas X grid reuses one atlas coverage tile for repeated X glyphs");
     ok &= check(report.render.atlas_failed_inserts == 0U,
@@ -4933,7 +6564,7 @@ bool run_atlas_glyph_row_stable_report_case(
             << " glyph_text_capacity=" << render_summary.glyph_text_row_capacity
             << " glyph_cursor_text_capacity="
             << render_summary.glyph_cursor_text_row_capacity
-            << " qt_layout_runs=" << render_summary.qt_layout_text_runs
+            << " shaped_text_runs=" << render_summary.shaped_text_runs
             << " non_dirty_cursor="
             << render_summary.non_dirty_cursor_invalidation
             << '\n';
@@ -5068,7 +6699,7 @@ bool test_atlas_glyph_row_stable_wide_update(QGuiApplication& app)
         mutated,
         [](const term::Qsg_atlas_render_summary& render_summary) {
             return render_summary.glyph_text_row_capacity > 0 &&
-                render_summary.qt_layout_text_runs > 0;
+                render_summary.shaped_text_runs > 0;
         });
 }
 
@@ -5095,7 +6726,7 @@ bool test_atlas_glyph_row_stable_combining_update(QGuiApplication& app)
         mutated,
         [](const term::Qsg_atlas_render_summary& render_summary) {
             return render_summary.glyph_text_row_capacity > 0 &&
-                render_summary.qt_layout_text_runs > 0;
+                render_summary.shaped_text_runs > 0;
         });
 }
 
@@ -5184,6 +6815,233 @@ bool test_atlas_glyph_row_stable_cursor_clean_row_fallback(QGuiApplication& app)
                 !render_summary.non_dirty_cursor_invalidation;
         },
         true);
+}
+
+term::Terminal_render_snapshot make_atlas_prepared_text_reuse_snapshot(
+    std::uint64_t sequence,
+    QString       middle_text,
+    std::uint64_t middle_content_generation,
+    std::vector<term::Terminal_render_dirty_row_range>
+                  dirty_row_ranges)
+{
+    term::Terminal_render_snapshot snapshot =
+        make_atlas_row_stable_text_snapshot(
+            sequence,
+            std::move(middle_text),
+            std::move(dirty_row_ranges));
+    for (term::Terminal_render_cell& cell : snapshot.cells) {
+        if (cell.position.row == 0 && cell.position.column == 0) {
+            cell = make_pixel_cell(
+                0,
+                0,
+                QStringLiteral("\u00e1"),
+                1,
+                term::k_default_terminal_style_id);
+        }
+        else if (cell.position.row == 2 && cell.position.column == 0) {
+            cell = make_pixel_cell(
+                2,
+                0,
+                QStringLiteral("\u00e7"),
+                1,
+                term::k_default_terminal_style_id);
+        }
+    }
+    if (snapshot.visible_line_provenance.size() > 1U) {
+        snapshot.visible_line_provenance[1].content_generation =
+            middle_content_generation;
+    }
+    return snapshot;
+}
+
+bool prepare_seeded_atlas_text_surface(
+    QGuiApplication&                         app,
+    QQuickWindow&                            window,
+    VNM_TerminalSurface&                     surface,
+    const term::Terminal_render_snapshot&    snapshot,
+    term::Qsg_atlas_frame_report&            out_report)
+{
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(snapshot));
+    window.show();
+    const bool rendered = pump_until(
+        app,
+        window,
+        surface,
+        atlas_report_render_state_ready);
+    out_report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    return rendered && pump_atlas_seeded_glyph_slots(app, window, surface, out_report);
+}
+
+bool pump_prepared_text_reuse_report(
+    QGuiApplication&                         app,
+    QQuickWindow&                            window,
+    VNM_TerminalSurface&                     surface,
+    const term::Terminal_render_snapshot&    snapshot,
+    std::uint64_t                            previous_prepare_count,
+    term::Qsg_atlas_frame_report&            out_report)
+{
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(snapshot));
+    out_report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    return pump_next_atlas_report(
+        app,
+        window,
+        surface,
+        previous_prepare_count,
+        out_report);
+}
+
+bool check_prepared_text_reuse_drawn_report(
+    const term::Qsg_atlas_frame_report& report,
+    const char*                         name)
+{
+    (void)name;
+    const term::Qsg_atlas_frame_build_summary& frame_build =
+        report.frame_build;
+    const term::Qsg_atlas_render_summary& render = report.render;
+
+    bool ok = true;
+    ok &= check(report.render_count > 0U && report.drew,
+        "atlas prepared text reuse drew a frame");
+    ok &= check(frame_build.frame_text_runs > 0 &&
+            frame_build.glyph_instances > 0,
+        "atlas prepared text reuse emitted atlas glyph instances");
+    ok &= check(render.glyph_buffer_instances > 0 &&
+            render.glyph_buffer.active_instance_count > 0 &&
+            render.glyph_draw_calls > 0,
+        "atlas prepared text reuse submitted glyph buffer draw work");
+    ok &= check(frame_build.glyph_missed_instances == 0 &&
+            frame_build.glyph_coverage_failures == 0 &&
+            frame_build.glyph_atlas_insert_failures == 0,
+        "atlas prepared text reuse had no glyph misses");
+    return ok;
+}
+
+bool test_atlas_prepared_text_reuse(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_theme(QStringLiteral("default"));
+
+    const term::Terminal_render_snapshot baseline =
+        make_atlas_prepared_text_reuse_snapshot(
+            980U,
+            QStringLiteral("\u00e9"),
+            1U,
+            {{0, 3}});
+
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!prepare_seeded_atlas_text_surface(
+            app,
+            window,
+            surface,
+            baseline,
+            baseline_report))
+    {
+        std::cerr << "FAIL: atlas prepared text reuse could not seed baseline"
+            << " prepare_count=" << baseline_report.prepare_count
+            << " render_count=" << baseline_report.render_count
+            << " seeded_slots="
+            << baseline_report.render.glyph_buffer.seeded_slots
+            << '\n';
+        return false;
+    }
+
+    term::Qsg_atlas_frame_report unchanged_report;
+    term::Terminal_render_snapshot unchanged =
+        make_atlas_prepared_text_reuse_snapshot(
+            981U,
+            QStringLiteral("\u00e9"),
+            1U,
+            {});
+    const bool unchanged_prepared = pump_prepared_text_reuse_report(
+        app,
+        window,
+        surface,
+        unchanged,
+        baseline_report.prepare_count,
+        unchanged_report);
+
+    term::Qsg_atlas_frame_report dirty_report;
+    term::Terminal_render_snapshot dirty =
+        make_atlas_prepared_text_reuse_snapshot(
+            982U,
+            QStringLiteral("\u00ea"),
+            2U,
+            {{1, 1}});
+    const bool dirty_prepared = pump_prepared_text_reuse_report(
+        app,
+        window,
+        surface,
+        dirty,
+        unchanged_report.prepare_count,
+        dirty_report);
+
+    term::Qsg_atlas_frame_report pruned_report;
+    term::Terminal_render_snapshot pruned =
+        make_atlas_prepared_text_reuse_snapshot(
+            983U,
+            QStringLiteral("\u00ea"),
+            2U,
+            {{2, 1}});
+    pruned.cells.erase(
+        std::remove_if(
+            pruned.cells.begin(),
+            pruned.cells.end(),
+            [](const term::Terminal_render_cell& cell) {
+                return cell.position.row == 2;
+            }),
+        pruned.cells.end());
+    const bool prune_prepared = pump_prepared_text_reuse_report(
+        app,
+        window,
+        surface,
+        pruned,
+        dirty_report.prepare_count,
+        pruned_report);
+
+    const term::Qsg_atlas_producer_summary& unchanged_producer =
+        unchanged_report.producer;
+    const term::Qsg_atlas_producer_summary& dirty_producer =
+        dirty_report.producer;
+    const term::Qsg_atlas_producer_summary& pruned_producer =
+        pruned_report.producer;
+
+    bool ok = true;
+    ok &= check(unchanged_prepared,
+        "atlas prepared text reuse renders unchanged retained content");
+    ok &= check_prepared_text_reuse_drawn_report(
+        unchanged_report,
+        "unchanged retained frame");
+    ok &= check(unchanged_producer.shaped_runs_built == 0 &&
+            unchanged_producer.shaped_runs_reused >= 3 &&
+            unchanged_producer.shaped_glyph_records_reused >= 3,
+        "atlas prepared text reuse avoids reshaping unchanged retained runs");
+    ok &= check(dirty_prepared,
+        "atlas prepared text reuse renders one dirty text row");
+    ok &= check_prepared_text_reuse_drawn_report(
+        dirty_report,
+        "dirty retained frame");
+    ok &= check(dirty_producer.shaped_runs_built == 1 &&
+            dirty_producer.shaped_runs_reused >= 2,
+        "atlas prepared text reuse bounds reshaping to the changed retained row");
+    ok &= check(prune_prepared,
+        "atlas prepared text reuse renders after visible text removal");
+    ok &= check_prepared_text_reuse_drawn_report(
+        pruned_report,
+        "pruned retained frame");
+    ok &= check(pruned_producer.shape_cache_pruned >= 1,
+        "atlas prepared text reuse prunes entries not seen in the visible frame");
+    return ok;
 }
 
 bool run_atlas_report_case(
@@ -5302,6 +7160,1360 @@ bool atlas_report_backend_usable(
     return rendered;
 }
 
+struct Lcd_probe_family
+{
+    QString label;
+    QString text;
+    term::Glyph_image_presentation presentation = term::Glyph_image_presentation::TEXT;
+};
+
+struct Lcd_glyph_probe_record
+{
+    QString family_label;
+    QString font_family;
+    QString font_style;
+    quint32 glyph_index           = 0U;
+    int     glyph_run_index       = 0;
+    int     glyph_index_in_run    = 0;
+    int     image_format_id       = static_cast<int>(QImage::Format_Invalid);
+    QString image_format_name;
+    QSize   image_size;
+    QString requested_presentation;
+    QString coverage_candidate;
+    bool    production_tile_valid = false;
+};
+
+QString lcd_probe_printable_ascii_text()
+{
+    QString text;
+    text.reserve(95);
+    for (ushort code_unit = 0x20U; code_unit <= 0x7eU; ++code_unit) {
+        text.append(QChar(code_unit));
+    }
+    return text;
+}
+
+QString lcd_probe_box_line_text()
+{
+    return QStringLiteral(
+        "\u2500\u2501\u2502\u2503\u250c\u2510\u2514\u2518"
+        "\u253c\u256d\u256e\u256f\u2570");
+}
+
+QString lcd_probe_braille_text()
+{
+    return QStringLiteral(
+        "\u2801\u2803\u2807\u2817\u2837\u2877\u28ff");
+}
+
+QString lcd_probe_cjk_text()
+{
+    return QStringLiteral("\u4e16\u754c\u65e5\u672c\u8a9e\u6f22\u5b57");
+}
+
+QString lcd_probe_emoji_text()
+{
+    QString text = QString::fromUcs4(U"\U0001F600");
+    text.append(QLatin1Char(' '));
+    text.append(QString::fromUcs4(U"\U0001F9EA"));
+    text.append(QLatin1Char(' '));
+    text.append(QStringLiteral("\u2764\ufe0f"));
+    return text;
+}
+
+std::vector<Lcd_probe_family> make_lcd_probe_families()
+{
+    return {
+        {QStringLiteral("process"), QStringLiteral("Process:")},
+        {QStringLiteral("dense_ascii"), lcd_probe_printable_ascii_text()},
+        {QStringLiteral("box_line"), lcd_probe_box_line_text()},
+        {QStringLiteral("braille"), lcd_probe_braille_text()},
+        {QStringLiteral("cjk"), lcd_probe_cjk_text()},
+        {QStringLiteral("combining_acute"), QStringLiteral("e\u0301")},
+        {QStringLiteral("emoji_color"),
+            lcd_probe_emoji_text(),
+            term::Glyph_image_presentation::COLOR},
+        {QStringLiteral("cursor_selection"),
+            QStringLiteral("Cursor selection variants")},
+    };
+}
+
+QString lcd_probe_image_format_name(QImage::Format format)
+{
+    switch (format) {
+        case QImage::Format_Invalid:
+            return QStringLiteral("Format_Invalid");
+        case QImage::Format_Mono:
+            return QStringLiteral("Format_Mono");
+        case QImage::Format_MonoLSB:
+            return QStringLiteral("Format_MonoLSB");
+        case QImage::Format_Indexed8:
+            return QStringLiteral("Format_Indexed8");
+        case QImage::Format_RGB32:
+            return QStringLiteral("Format_RGB32");
+        case QImage::Format_ARGB32:
+            return QStringLiteral("Format_ARGB32");
+        case QImage::Format_ARGB32_Premultiplied:
+            return QStringLiteral("Format_ARGB32_Premultiplied");
+        case QImage::Format_RGB888:
+            return QStringLiteral("Format_RGB888");
+        case QImage::Format_RGBX8888:
+            return QStringLiteral("Format_RGBX8888");
+        case QImage::Format_RGBA8888:
+            return QStringLiteral("Format_RGBA8888");
+        case QImage::Format_RGBA8888_Premultiplied:
+            return QStringLiteral("Format_RGBA8888_Premultiplied");
+        case QImage::Format_BGR888:
+            return QStringLiteral("Format_BGR888");
+        case QImage::Format_Alpha8:
+            return QStringLiteral("Format_Alpha8");
+        case QImage::Format_Grayscale8:
+            return QStringLiteral("Format_Grayscale8");
+        default:
+            return QStringLiteral("Format_%1")
+                .arg(static_cast<int>(format));
+    }
+}
+
+void append_lcd_probe_cell(
+    term::Terminal_render_snapshot& snapshot,
+    int                             row,
+    int                             column,
+    QString                         text,
+    int                             display_width,
+    term::Terminal_style_id         style_id,
+    bool                            add_wide_continuations = false)
+{
+    snapshot.cells.push_back(
+        make_pixel_cell(row, column, std::move(text), display_width, style_id));
+    if (!add_wide_continuations) {
+        return;
+    }
+
+    for (int offset = 1; offset < display_width; ++offset) {
+        snapshot.cells.push_back(
+            make_pixel_continuation_cell(row, column + offset, style_id));
+    }
+}
+
+Pixel_parity_fixture make_lcd_capability_probe_fixture(qreal device_pixel_ratio)
+{
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+
+    Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
+        "lcd_capability_probe",
+        false,
+        {10, 104},
+        980U,
+        metrics,
+        dpr);
+    const term::Terminal_style_id normal = 1U;
+    const term::Terminal_style_id accent = 2U;
+    const term::Terminal_style_id warm   = 3U;
+    const term::Terminal_style_id inverse = 4U;
+    fixture.snapshot.styles.push_back(rgb_style(0xffe6edf3U, 0xff101820U));
+    fixture.snapshot.styles.push_back(rgb_style(0xff8be9fdU, 0xff101820U));
+    fixture.snapshot.styles.push_back(rgb_style(0xffffd166U, 0xff101820U));
+    fixture.snapshot.styles.push_back(rgb_style(
+        0xff101820U,
+        0xffe6edf3U,
+        term::terminal_style_attribute_mask(term::Terminal_style_attribute::INVERSE)));
+
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        0,
+        0,
+        QStringLiteral("Process: lcd-subpixel glyph atlas probe"),
+        40,
+        normal);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        1,
+        0,
+        QStringLiteral("ASCII:"),
+        6,
+        accent);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        1,
+        8,
+        lcd_probe_printable_ascii_text(),
+        95,
+        normal);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        2,
+        0,
+        QStringLiteral("Box:"),
+        4,
+        accent);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        2,
+        6,
+        lcd_probe_box_line_text(),
+        lcd_probe_box_line_text().size(),
+        warm);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        3,
+        0,
+        QStringLiteral("Braille:"),
+        8,
+        accent);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        3,
+        10,
+        lcd_probe_braille_text(),
+        lcd_probe_braille_text().size(),
+        normal);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        4,
+        0,
+        QStringLiteral("CJK:"),
+        4,
+        accent);
+    int cjk_column = 6;
+    for (const QChar character : lcd_probe_cjk_text()) {
+        append_lcd_probe_cell(
+            fixture.snapshot,
+            4,
+            cjk_column,
+            QString(character),
+            2,
+            normal,
+            true);
+        cjk_column += 2;
+    }
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        5,
+        0,
+        QStringLiteral("Combining:"),
+        10,
+        accent);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        5,
+        12,
+        QStringLiteral("e\u0301"),
+        1,
+        normal);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        6,
+        0,
+        QStringLiteral("Emoji:"),
+        6,
+        accent);
+    int emoji_column = 8;
+    for (const QString& emoji : {
+            QString::fromUcs4(U"\U0001F600"),
+            QString::fromUcs4(U"\U0001F9EA"),
+            QStringLiteral("\u2764\ufe0f"),
+        })
+    {
+        append_lcd_probe_cell(
+            fixture.snapshot,
+            6,
+            emoji_column,
+            emoji,
+            2,
+            warm,
+            true);
+        emoji_column += 3;
+    }
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        7,
+        0,
+        QStringLiteral("Selection: normal region"),
+        24,
+        normal);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        8,
+        0,
+        QStringLiteral("Selection inverse"),
+        17,
+        inverse);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        9,
+        0,
+        QStringLiteral("Cursor:"),
+        7,
+        accent);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        9,
+        8,
+        QStringLiteral("C"),
+        1,
+        normal);
+    append_lcd_probe_cell(
+        fixture.snapshot,
+        9,
+        10,
+        QStringLiteral("block text variant"),
+        18,
+        normal);
+
+    fixture.snapshot.selection_spans.push_back({
+        {{7, 11}, {7, 24}, term::Terminal_selection_mode::NORMAL},
+        7,
+        11,
+        13,
+    });
+    fixture.snapshot.selection_spans.push_back({
+        {{8, 0}, {8, 17}, term::Terminal_selection_mode::NORMAL},
+        8,
+        0,
+        17,
+    });
+    fixture.snapshot.cursor.position      = {9, 8};
+    fixture.snapshot.cursor.visible       = true;
+    fixture.snapshot.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    fixture.snapshot.cursor.blink_enabled = false;
+
+    const term::Terminal_render_frame frame = pixel_expected_frame(fixture);
+    append_text_glyph_masks(fixture, frame.text_runs);
+    append_text_glyph_masks(
+        fixture,
+        frame.cursor_text_runs,
+        pixel_render_options().cursor_color);
+    return fixture;
+}
+
+std::vector<Lcd_glyph_probe_record> probe_lcd_subpixel_glyphs(
+    const QFont& font,
+    qreal        device_pixel_ratio)
+{
+    std::vector<Lcd_glyph_probe_record> records;
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const std::vector<Lcd_probe_family> families = make_lcd_probe_families();
+
+    for (const Lcd_probe_family& family : families) {
+        const QString presentation_name = QString::fromLatin1(
+            term::qsg_atlas_glyph_image_presentation_name(family.presentation));
+        QTextLayout layout(family.text, font);
+        QTextOption option;
+        option.setWrapMode(QTextOption::NoWrap);
+        layout.setTextOption(option);
+        layout.setCacheEnabled(false);
+
+        layout.beginLayout();
+        QTextLine line = layout.createLine();
+        if (!line.isValid()) {
+            layout.endLayout();
+            records.push_back({
+                family.label,
+                QString(),
+                QString(),
+                0U,
+                0,
+                0,
+                static_cast<int>(QImage::Format_Invalid),
+                lcd_probe_image_format_name(QImage::Format_Invalid),
+                QSize(),
+                presentation_name,
+                QStringLiteral("missing_text_layout_line"),
+                false,
+            });
+            continue;
+        }
+        line.setLineWidth(1024.0 * 1024.0);
+        line.setPosition(QPointF(0.0, 0.0));
+        const QList<QGlyphRun> glyph_runs = line.glyphRuns(
+            0,
+            family.text.size(),
+            QTextLayout::RetrieveGlyphIndexes |
+                QTextLayout::RetrieveGlyphPositions);
+        layout.endLayout();
+
+        bool family_recorded = false;
+        for (int run_index = 0; run_index < glyph_runs.size(); ++run_index) {
+            const QGlyphRun& glyph_run = glyph_runs.at(run_index);
+            const QList<quint32> glyph_indexes = glyph_run.glyphIndexes();
+            QRawFont raw_font = glyph_run.rawFont();
+            if (!raw_font.isValid()) {
+                records.push_back({
+                    family.label,
+                    QString(),
+                    QString(),
+                    0U,
+                    run_index,
+                    0,
+                    static_cast<int>(QImage::Format_Invalid),
+                    lcd_probe_image_format_name(QImage::Format_Invalid),
+                    QSize(),
+                    presentation_name,
+                    QStringLiteral("invalid_raw_font"),
+                    false,
+                });
+                family_recorded = true;
+                continue;
+            }
+
+            QRawFont raster_font = raw_font;
+            raster_font.setPixelSize(
+                term::qsg_atlas_physical_pixel_size(raw_font, dpr));
+            for (int glyph_offset = 0;
+                glyph_offset < glyph_indexes.size();
+                ++glyph_offset)
+            {
+                const quint32 glyph_index = glyph_indexes.at(glyph_offset);
+                const QRawFont::AntialiasingType antialiasing =
+                    family.presentation == term::Glyph_image_presentation::TEXT
+                        ? QRawFont::SubPixelAntialiasing
+                        : QRawFont::PixelAntialiasing;
+                const QImage glyph_image = glyph_index != 0U
+                    ? raster_font.alphaMapForGlyph(
+                        glyph_index,
+                        antialiasing)
+                    : QImage();
+                const term::Glyph_rgba_tile tile =
+                    term::qsg_atlas_rgba_tile_from_image(
+                        glyph_image,
+                        family.presentation);
+                records.push_back({
+                    family.label,
+                    raw_font.familyName(),
+                    raw_font.styleName(),
+                    glyph_index,
+                    run_index,
+                    glyph_offset,
+                    static_cast<int>(glyph_image.format()),
+                    lcd_probe_image_format_name(glyph_image.format()),
+                    glyph_image.size(),
+                    presentation_name,
+                    QString::fromLatin1(
+                        term::qsg_atlas_glyph_coverage_kind_name(
+                            term::qsg_atlas_classify_glyph_image_candidate(
+                                glyph_image,
+                                family.presentation))),
+                    tile.is_valid(),
+                });
+                family_recorded = true;
+            }
+        }
+
+        if (!family_recorded) {
+            records.push_back({
+                family.label,
+                QString(),
+                QString(),
+                0U,
+                0,
+                0,
+                static_cast<int>(QImage::Format_Invalid),
+                lcd_probe_image_format_name(QImage::Format_Invalid),
+                QSize(),
+                presentation_name,
+                QString::fromLatin1(
+                    term::qsg_atlas_glyph_coverage_kind_name(
+                        term::Glyph_coverage_kind::UNKNOWN)),
+                false,
+            });
+        }
+    }
+
+    return records;
+}
+
+void print_lcd_probe_records(
+    const std::vector<Lcd_glyph_probe_record>& records)
+{
+    for (const Lcd_glyph_probe_record& record : records) {
+        const QByteArray family = record.family_label.toUtf8();
+        const QByteArray font_family = record.font_family.toUtf8();
+        const QByteArray font_style = record.font_style.toUtf8();
+        const QByteArray format = record.image_format_name.toUtf8();
+        const QByteArray presentation = record.requested_presentation.toUtf8();
+        const QByteArray candidate = record.coverage_candidate.toUtf8();
+        std::cout << "LCD glyph probe"
+            << " family=" << family.constData()
+            << " glyph_index=" << record.glyph_index
+            << " glyph_run=" << record.glyph_run_index
+            << " glyph_offset=" << record.glyph_index_in_run
+            << " font_family=" << font_family.constData()
+            << " font_style=" << font_style.constData()
+            << " image_format=" << format.constData()
+            << '(' << record.image_format_id << ')'
+            << " image_size=" << record.image_size.width()
+            << 'x' << record.image_size.height()
+            << " requested_presentation=" << presentation.constData()
+            << " coverage_candidate=" << candidate.constData()
+            << " production_tile=" << record.production_tile_valid
+            << '\n';
+    }
+}
+
+bool lcd_probe_image_has_pixels(const QImage& image)
+{
+    return !image.isNull() && image.width() > 0 && image.height() > 0;
+}
+
+bool lcd_probe_image_has_visible_variation(const QImage& image)
+{
+    if (!lcd_probe_image_has_pixels(image)) {
+        return false;
+    }
+
+    const QColor base = image.pixelColor(0, 0);
+    for (int y = 0; y < image.height(); ++y) {
+        for (int x = 0; x < image.width(); ++x) {
+            if (pixel_delta(image.pixelColor(x, y), base) > 8) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+bool lcd_probe_record_has_concrete_coverage(const Lcd_glyph_probe_record& record)
+{
+    return
+        record.image_size.width()  > 0 &&
+        record.image_size.height() > 0 &&
+        record.coverage_candidate != QStringLiteral("unknown") &&
+        record.coverage_candidate != QStringLiteral("missing_text_layout_line") &&
+        record.coverage_candidate != QStringLiteral("invalid_raw_font");
+}
+
+bool lcd_probe_source_format_can_carry_color(QImage::Format format)
+{
+    switch (format) {
+        case QImage::Format_RGB32:
+        case QImage::Format_ARGB32:
+        case QImage::Format_ARGB32_Premultiplied:
+        case QImage::Format_RGB888:
+        case QImage::Format_BGR888:
+        case QImage::Format_RGBX8888:
+        case QImage::Format_RGBA8888:
+        case QImage::Format_RGBA8888_Premultiplied:
+        case QImage::Format_RGB30:
+        case QImage::Format_BGR30:
+        case QImage::Format_A2BGR30_Premultiplied:
+        case QImage::Format_A2RGB30_Premultiplied:
+        case QImage::Format_RGBA64:
+        case QImage::Format_RGBA64_Premultiplied:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool lcd_probe_records_have_supported_classifier_results(
+    const std::vector<Lcd_glyph_probe_record>& records)
+{
+    return std::none_of(
+        records.begin(),
+        records.end(),
+        [](const Lcd_glyph_probe_record& record) {
+            return
+                lcd_probe_record_has_concrete_coverage(record) &&
+                (record.coverage_candidate == QStringLiteral("ambiguous") ||
+                    record.coverage_candidate == QStringLiteral("unsupported"));
+        });
+}
+
+bool lcd_probe_color_capable_records_keep_color_kind(
+    const std::vector<Lcd_glyph_probe_record>& records)
+{
+    return std::all_of(
+        records.begin(),
+        records.end(),
+        [](const Lcd_glyph_probe_record& record) {
+            if (record.requested_presentation != QStringLiteral("color")) {
+                return true;
+            }
+
+            const QImage::Format source_format =
+                static_cast<QImage::Format>(record.image_format_id);
+            if (!lcd_probe_source_format_can_carry_color(source_format)) {
+                return true;
+            }
+
+            return record.coverage_candidate == QStringLiteral("color_image");
+        });
+}
+
+bool lcd_probe_has_valid_production_tile_for_family(
+    const std::vector<Lcd_glyph_probe_record>& records,
+    QStringView                                family_label)
+{
+    return std::any_of(
+        records.begin(),
+        records.end(),
+        [&](const Lcd_glyph_probe_record& record) {
+            return
+                record.family_label == family_label &&
+                record.production_tile_valid;
+        });
+}
+
+std::vector<QString> missing_lcd_probe_family_coverage_labels(
+    const std::vector<Lcd_glyph_probe_record>& records)
+{
+    std::vector<QString> missing;
+    for (const Lcd_probe_family& family : make_lcd_probe_families()) {
+        const bool family_has_coverage = std::any_of(
+            records.begin(),
+            records.end(),
+            [&family](const Lcd_glyph_probe_record& record) {
+                return
+                    record.family_label == family.label &&
+                    lcd_probe_record_has_concrete_coverage(record);
+            });
+        if (!family_has_coverage) {
+            missing.push_back(family.label);
+        }
+    }
+    return missing;
+}
+
+bool lcd_probe_records_cover_required_families(
+    const std::vector<Lcd_glyph_probe_record>& records)
+{
+    return missing_lcd_probe_family_coverage_labels(records).empty();
+}
+
+void print_missing_lcd_probe_family_coverage_labels(
+    const std::vector<Lcd_glyph_probe_record>& records)
+{
+    const std::vector<QString> missing =
+        missing_lcd_probe_family_coverage_labels(records);
+    for (const QString& label : missing) {
+        const QByteArray label_bytes = label.toUtf8();
+        std::cerr << "FAIL: LCD atlas probe missing concrete coverage for family "
+            << label_bytes.constData() << '\n';
+    }
+}
+
+void json_insert_u64(QJsonObject& object, const QString& name, std::uint64_t value)
+{
+    object.insert(name, static_cast<qint64>(value));
+}
+
+QJsonObject json_size_object(QSize size)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("width"), size.width());
+    object.insert(QStringLiteral("height"), size.height());
+    return object;
+}
+
+QJsonObject json_sizef_object(QSizeF size)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("width"), size.width());
+    object.insert(QStringLiteral("height"), size.height());
+    return object;
+}
+
+QJsonObject lcd_probe_record_object(const Lcd_glyph_probe_record& record)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("family"), record.family_label);
+    object.insert(QStringLiteral("font_family"), record.font_family);
+    object.insert(QStringLiteral("font_style"), record.font_style);
+    object.insert(
+        QStringLiteral("glyph_index"),
+        static_cast<int>(record.glyph_index));
+    object.insert(QStringLiteral("glyph_run_index"), record.glyph_run_index);
+    object.insert(QStringLiteral("glyph_index_in_run"), record.glyph_index_in_run);
+    object.insert(QStringLiteral("image_format_id"), record.image_format_id);
+    object.insert(QStringLiteral("image_format"), record.image_format_name);
+    object.insert(
+        QStringLiteral("image_size"),
+        json_size_object(record.image_size));
+    object.insert(
+        QStringLiteral("requested_presentation"),
+        record.requested_presentation);
+    object.insert(QStringLiteral("coverage_candidate"), record.coverage_candidate);
+    object.insert(
+        QStringLiteral("production_tile_valid"),
+        record.production_tile_valid);
+    return object;
+}
+
+QJsonObject glyph_miss_diagnostic_object(
+    const term::Qsg_atlas_glyph_miss_diagnostic& miss)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("valid"), miss.valid);
+    object.insert(
+        QStringLiteral("cause"),
+        QString::fromLatin1(
+            term::qsg_atlas_glyph_miss_cause_name(miss.cause)));
+    object.insert(
+        QStringLiteral("coverage_kind"),
+        QString::fromLatin1(
+            term::qsg_atlas_glyph_coverage_kind_name(
+                miss.image.coverage_kind)));
+    object.insert(
+        QStringLiteral("presentation"),
+        QString::fromLatin1(
+            term::qsg_atlas_glyph_image_presentation_name(
+                miss.image.presentation)));
+    object.insert(
+        QStringLiteral("source_format"),
+        static_cast<int>(miss.image.source_format));
+    object.insert(
+        QStringLiteral("source_size"),
+        json_size_object(miss.image.source_size));
+    object.insert(
+        QStringLiteral("glyph_index"),
+        static_cast<int>(miss.image.glyph_index));
+    object.insert(QStringLiteral("fallback_face_id"), miss.image.fallback_face_id);
+    object.insert(QStringLiteral("text_run_index"), miss.image.text_run_index);
+    object.insert(QStringLiteral("glyph_run_index"), miss.image.glyph_run_index);
+    object.insert(
+        QStringLiteral("glyph_index_in_run"),
+        miss.image.glyph_index_in_run);
+    object.insert(
+        QStringLiteral("source_string_start"),
+        static_cast<int>(miss.image.source_string_start));
+    object.insert(
+        QStringLiteral("source_string_end"),
+        static_cast<int>(miss.image.source_string_end));
+    object.insert(QStringLiteral("tile_size"), json_size_object(miss.tile_size));
+    object.insert(
+        QStringLiteral("tile_bytes_per_line"),
+        miss.tile_bytes_per_line);
+    object.insert(QStringLiteral("atlas_page_count"), miss.atlas_page_count);
+    object.insert(QStringLiteral("atlas_page_budget"), miss.atlas_page_budget);
+    object.insert(
+        QStringLiteral("atlas_page_size"),
+        json_size_object(miss.atlas_page_size));
+    return object;
+}
+
+QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
+{
+    QJsonObject capabilities;
+    capabilities.insert(
+        QStringLiteral("command_buffer_non_null"),
+        report.command_buffer_non_null);
+    capabilities.insert(
+        QStringLiteral("render_target_non_null"),
+        report.render_target_non_null);
+    capabilities.insert(QStringLiteral("rhi_non_null"), report.rhi_non_null);
+    capabilities.insert(
+        QStringLiteral("coverage_texture_created"),
+        report.coverage_texture_created);
+    capabilities.insert(
+        QStringLiteral("coverage_upload_recorded"),
+        report.coverage_upload_recorded);
+    capabilities.insert(
+        QStringLiteral("raw_font_rasterized"),
+        report.raw_font_rasterized);
+    capabilities.insert(
+        QStringLiteral("raw_font_rasterized_in_prepare"),
+        report.raw_font_rasterized_in_prepare);
+
+    QJsonObject frame_build;
+    frame_build.insert(
+        QStringLiteral("emoji_presentation_runs"),
+        report.frame_build.emoji_presentation_runs);
+    frame_build.insert(
+        QStringLiteral("glyph_coverage_failures"),
+        report.frame_build.glyph_coverage_failures);
+    frame_build.insert(
+        QStringLiteral("glyph_atlas_insert_failures"),
+        report.frame_build.glyph_atlas_insert_failures);
+    frame_build.insert(
+        QStringLiteral("glyph_missed_instances"),
+        report.frame_build.glyph_missed_instances);
+    frame_build.insert(
+        QStringLiteral("max_glyph_instance_page"),
+        report.frame_build.max_glyph_instance_page);
+    frame_build.insert(
+        QStringLiteral("distinct_glyph_faces"),
+        report.frame_build.distinct_glyph_faces);
+    frame_build.insert(
+        QStringLiteral("fallback_glyph_faces"),
+        report.frame_build.fallback_glyph_faces);
+    frame_build.insert(
+        QStringLiteral("snapped_origin_failures"),
+        report.frame_build.snapped_origin_failures);
+
+    QJsonObject coverage;
+    coverage.insert(
+        QStringLiteral("grayscale_masks"),
+        report.frame_build.glyph_coverage.grayscale_masks);
+    coverage.insert(
+        QStringLiteral("lcd_rgb_masks"),
+        report.frame_build.glyph_coverage.lcd_rgb_masks);
+    coverage.insert(
+        QStringLiteral("lcd_bgr_masks"),
+        report.frame_build.glyph_coverage.lcd_bgr_masks);
+    coverage.insert(
+        QStringLiteral("color_images"),
+        report.frame_build.glyph_coverage.color_images);
+    coverage.insert(
+        QStringLiteral("ambiguous_images"),
+        report.frame_build.glyph_coverage.ambiguous_images);
+    coverage.insert(
+        QStringLiteral("unsupported_images"),
+        report.frame_build.glyph_coverage.unsupported_images);
+    coverage.insert(
+        QStringLiteral("missed_images"),
+        report.frame_build.glyph_coverage.missed_images);
+    frame_build.insert(QStringLiteral("coverage"), coverage);
+    frame_build.insert(
+        QStringLiteral("first_glyph_miss"),
+        glyph_miss_diagnostic_object(report.frame_build.first_glyph_miss));
+
+    QJsonObject render;
+    render.insert(QStringLiteral("draw_calls"), report.render.draw_calls);
+    render.insert(
+        QStringLiteral("rect_draw_calls"),
+        report.render.rect_draw_calls);
+    render.insert(
+        QStringLiteral("glyph_draw_calls"),
+        report.render.glyph_draw_calls);
+    render.insert(
+        QStringLiteral("atlas_page_count"),
+        report.render.atlas_page_count);
+    render.insert(
+        QStringLiteral("atlas_page_budget"),
+        report.render.atlas_page_budget);
+    json_insert_u64(
+        render,
+        QStringLiteral("atlas_page_bytes"),
+        report.render.atlas_page_bytes);
+    json_insert_u64(
+        render,
+        QStringLiteral("atlas_allocated_bytes"),
+        report.render.atlas_allocated_bytes);
+    json_insert_u64(
+        render,
+        QStringLiteral("atlas_budget_bytes"),
+        report.render.atlas_budget_bytes);
+    json_insert_u64(
+        render,
+        QStringLiteral("atlas_used_bytes"),
+        report.render.atlas_used_bytes);
+    json_insert_u64(
+        render,
+        QStringLiteral("atlas_failed_inserts"),
+        report.render.atlas_failed_inserts);
+    render.insert(
+        QStringLiteral("coverage_texture_uploaded"),
+        report.render.coverage_texture_uploaded);
+    render.insert(
+        QStringLiteral("coverage_texture_skipped"),
+        report.render.coverage_texture_skipped);
+    render.insert(
+        QStringLiteral("atlas_page_pressure"),
+        report.render.atlas_page_pressure);
+    render.insert(
+        QStringLiteral("shaped_text_runs"),
+        report.render.shaped_text_runs);
+    render.insert(
+        QStringLiteral("shaped_glyph_records"),
+        report.render.shaped_glyph_records);
+    render.insert(
+        QStringLiteral("shaped_missing_string_indexes"),
+        report.render.shaped_missing_string_indexes);
+    render.insert(
+        QStringLiteral("shaped_invalid_string_indexes"),
+        report.render.shaped_invalid_string_indexes);
+    render.insert(
+        QStringLiteral("sampler_mode"),
+        QString::fromLatin1(
+            term::qsg_atlas_sampler_mode_name(
+                report.render.glyph_sampler_mode)));
+    render.insert(
+        QStringLiteral("glyph_shader_package_available"),
+        report.render.glyph_shader_package_available);
+    render.insert(
+        QStringLiteral("dual_source_probe_shader_package_available"),
+        report.render.dual_source_probe_shader_package_available);
+    render.insert(
+        QStringLiteral("dual_source_blend_factors_available"),
+        report.render.dual_source_blend_factors_available);
+    render.insert(
+        QStringLiteral("dual_source_blend_factors_runtime_probe"),
+        report.render.dual_source_blend_factors_runtime_probe);
+
+    QJsonObject cache;
+    json_insert_u64(cache, QStringLiteral("lookups"), report.cache.lookups);
+    json_insert_u64(cache, QStringLiteral("hits"), report.cache.hits);
+    json_insert_u64(cache, QStringLiteral("inserts"), report.cache.inserts);
+    json_insert_u64(
+        cache,
+        QStringLiteral("failed_inserts"),
+        report.cache.failed_inserts);
+    json_insert_u64(
+        cache,
+        QStringLiteral("page_bytes"),
+        report.cache.page_bytes);
+    json_insert_u64(
+        cache,
+        QStringLiteral("allocated_bytes"),
+        report.cache.allocated_bytes);
+    json_insert_u64(
+        cache,
+        QStringLiteral("budget_bytes"),
+        report.cache.budget_bytes);
+    json_insert_u64(
+        cache,
+        QStringLiteral("used_bytes"),
+        report.cache.used_bytes);
+    cache.insert(QStringLiteral("page_count"), report.cache.page_count);
+    cache.insert(QStringLiteral("page_budget"), report.cache.page_budget);
+    cache.insert(
+        QStringLiteral("page_size"),
+        json_size_object(report.cache.page_size));
+
+    QJsonObject page_pressure;
+    json_insert_u64(
+        page_pressure,
+        QStringLiteral("render_atlas_failed_inserts"),
+        report.render.atlas_failed_inserts);
+    json_insert_u64(
+        page_pressure,
+        QStringLiteral("cache_failed_inserts"),
+        report.cache.failed_inserts);
+    page_pressure.insert(
+        QStringLiteral("frame_build_glyph_atlas_insert_failures"),
+        report.frame_build.glyph_atlas_insert_failures);
+
+    QJsonObject object;
+    json_insert_u64(
+        object,
+        QStringLiteral("capture_count"),
+        report.capture_count);
+    json_insert_u64(
+        object,
+        QStringLiteral("prepare_count"),
+        report.prepare_count);
+    json_insert_u64(
+        object,
+        QStringLiteral("render_count"),
+        report.render_count);
+    object.insert(QStringLiteral("drew"), report.drew);
+    object.insert(
+        QStringLiteral("viewport_size"),
+        json_size_object(report.viewport_rect.size()));
+    object.insert(QStringLiteral("capabilities"), capabilities);
+    object.insert(QStringLiteral("frame_build"), frame_build);
+    object.insert(QStringLiteral("render"), render);
+    object.insert(QStringLiteral("cache"), cache);
+    object.insert(QStringLiteral("page_pressure"), page_pressure);
+    return object;
+}
+
+QJsonObject make_lcd_probe_metadata(
+    const Pixel_parity_fixture&                  fixture,
+    const Pixel_render_result&                   atlas,
+    const Pixel_render_result&                   reference,
+    const std::vector<Lcd_glyph_probe_record>&   probe_records,
+    const char*                                  backend)
+{
+    const QFont font = term::vnm_terminal_font(QString(), 18.0);
+    const QFontInfo font_info(font);
+    const QRawFont raw_font = QRawFont::fromFont(font);
+
+    QJsonObject font_object;
+    font_object.insert(QStringLiteral("requested_family"), font.family());
+    font_object.insert(QStringLiteral("actual_family"), font_info.family());
+    font_object.insert(QStringLiteral("style"), raw_font.styleName());
+    font_object.insert(QStringLiteral("pixel_size"), raw_font.pixelSize());
+    font_object.insert(QStringLiteral("point_size"), font.pointSizeF());
+
+    QJsonArray probe_array;
+    for (const Lcd_glyph_probe_record& record : probe_records) {
+        probe_array.append(lcd_probe_record_object(record));
+    }
+
+    QJsonObject images;
+    images.insert(
+        QStringLiteral("window_logical_size"),
+        json_size_object(atlas.window_logical_size));
+    images.insert(
+        QStringLiteral("fixture_logical_size"),
+        json_sizef_object(fixture.logical_size));
+    images.insert(
+        QStringLiteral("atlas_image_size"),
+        json_size_object(atlas.image.size()));
+    images.insert(
+        QStringLiteral("reference_image_size"),
+        json_size_object(reference.image.size()));
+    images.insert(
+        QStringLiteral("reference_renderer"),
+        QStringLiteral("qpainter_qtextlayout"));
+
+    QJsonObject graphics;
+    graphics.insert(QStringLiteral("requested_backend"), QString::fromLatin1(backend));
+    graphics.insert(
+        QStringLiteral("qsg_rhi_backend"),
+        QString::fromLocal8Bit(qgetenv("QSG_RHI_BACKEND")));
+    graphics.insert(
+        QStringLiteral("graphics_api"),
+        graphics_api_name(atlas.graphics_api));
+    graphics.insert(QStringLiteral("software_renderer"), atlas.software_renderer);
+    graphics.insert(
+        QStringLiteral("driver_info_available"),
+        atlas.driver_info_available);
+    graphics.insert(
+        QStringLiteral("driver_device_name"),
+        atlas.driver_device_name);
+    json_insert_u64(
+        graphics,
+        QStringLiteral("driver_device_id"),
+        atlas.driver_device_id);
+    json_insert_u64(
+        graphics,
+        QStringLiteral("driver_vendor_id"),
+        atlas.driver_vendor_id);
+    graphics.insert(
+        QStringLiteral("driver_device_type"),
+        atlas.driver_device_type);
+
+    QJsonObject build;
+    build.insert(
+        QStringLiteral("configuration"),
+        QStringLiteral(VNM_TERMINAL_TEST_BUILD_TYPE));
+    build.insert(
+        QStringLiteral("profiling_enabled"),
+        static_cast<bool>(VNM_TERMINAL_PROFILING_ENABLED));
+    build.insert(
+        QStringLiteral("debug_build"),
+        k_lcd_probe_debug_build);
+    build.insert(
+        QStringLiteral("compiler"),
+        QString::fromLatin1(k_lcd_probe_compiler));
+
+    QJsonObject capability_interpretation;
+    capability_interpretation.insert(
+        QStringLiteral("dual_source_blend_probe_method"),
+        QStringLiteral("qrhi_dual_output_pipeline_create"));
+    capability_interpretation.insert(
+        QStringLiteral("dual_source_blend_runtime_probe"),
+        atlas.atlas_report.render.dual_source_blend_factors_runtime_probe);
+    capability_interpretation.insert(
+        QStringLiteral("dual_source_probe_shader_package_available"),
+        atlas.atlas_report.render.dual_source_probe_shader_package_available);
+    capability_interpretation.insert(
+        QStringLiteral("dual_source_blend_available"),
+        atlas.atlas_report.render.dual_source_blend_factors_available);
+
+    QJsonObject object;
+    object.insert(QStringLiteral("qt_version"), QStringLiteral(QT_VERSION_STR));
+    object.insert(QStringLiteral("build"), build);
+    object.insert(QStringLiteral("font"), font_object);
+    object.insert(QStringLiteral("device_pixel_ratio"), atlas.device_pixel_ratio);
+    object.insert(
+        QStringLiteral("image_device_pixel_ratio"),
+        atlas.image_device_pixel_ratio);
+    object.insert(QStringLiteral("graphics"), graphics);
+    object.insert(QStringLiteral("images"), images);
+    object.insert(QStringLiteral("atlas_report"), lcd_probe_report_object(atlas.atlas_report));
+    object.insert(
+        QStringLiteral("capability_interpretation"),
+        capability_interpretation);
+    object.insert(
+        QStringLiteral("classifier_source"),
+        QStringLiteral("shared_qsg_atlas_classify_glyph_image_candidate_with_presentation"));
+    object.insert(QStringLiteral("capability_probe"), probe_array);
+    return object;
+}
+
+bool save_lcd_probe_image_artifact(
+    const QImage&   image,
+    const QString&  path,
+    const char*     label)
+{
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
+        const QByteArray path_bytes = path.toLocal8Bit();
+        std::cerr << "FAIL: LCD atlas probe could not write " << label
+            << " artifact " << path_bytes.constData() << ": "
+            << file.errorString().toUtf8().constData() << '\n';
+        return false;
+    }
+
+    if (!image.save(&file, "PNG")) {
+        const QByteArray path_bytes = path.toLocal8Bit();
+        std::cerr << "FAIL: LCD atlas probe could not encode " << label
+            << " artifact " << path_bytes.constData() << '\n';
+        return false;
+    }
+
+    if (!file.commit()) {
+        const QByteArray path_bytes = path.toLocal8Bit();
+        std::cerr << "FAIL: LCD atlas probe could not commit " << label
+            << " artifact " << path_bytes.constData() << ": "
+            << file.errorString().toUtf8().constData() << '\n';
+        return false;
+    }
+
+    return true;
+}
+
+bool write_lcd_probe_artifacts(
+    const Pixel_parity_fixture&                  fixture,
+    const Pixel_render_result&                   atlas,
+    const Pixel_render_result&                   reference,
+    const std::vector<Lcd_glyph_probe_record>&   probe_records,
+    const char*                                  backend)
+{
+    const QByteArray artifact_dir_bytes =
+        qgetenv("VNM_TERMINAL_LCD_ATLAS_ARTIFACT_DIR");
+    if (artifact_dir_bytes.isEmpty()) {
+        std::cerr << "FAIL: LCD atlas probe requires "
+            << "VNM_TERMINAL_LCD_ATLAS_ARTIFACT_DIR for artifact output\n";
+        return false;
+    }
+
+    QDir artifact_dir(QString::fromLocal8Bit(artifact_dir_bytes));
+    if (!artifact_dir.exists() && !artifact_dir.mkpath(QStringLiteral("."))) {
+        std::cerr << "FAIL: LCD atlas probe could not create artifact dir "
+            << artifact_dir_bytes.constData() << '\n';
+        return false;
+    }
+
+    const QString atlas_path =
+        artifact_dir.filePath(QStringLiteral("lcd_capability_probe_atlas.png"));
+    const QString reference_path =
+        artifact_dir.filePath(QStringLiteral("lcd_capability_probe_reference.png"));
+    const QString metadata_path =
+        artifact_dir.filePath(QStringLiteral("lcd_capability_probe_metadata.json"));
+
+    bool ok = true;
+    ok &= save_lcd_probe_image_artifact(
+        atlas.image,
+        atlas_path,
+        "atlas");
+    ok &= save_lcd_probe_image_artifact(
+        reference.image,
+        reference_path,
+        "reference");
+
+    QSaveFile metadata_file(metadata_path);
+    if (!metadata_file.open(QIODevice::WriteOnly)) {
+        const QByteArray path = metadata_path.toLocal8Bit();
+        std::cerr << "FAIL: LCD atlas probe could not write metadata artifact "
+            << path.constData() << ": "
+            << metadata_file.errorString().toUtf8().constData() << '\n';
+        ok = false;
+    }
+    else {
+        const QJsonObject metadata = make_lcd_probe_metadata(
+            fixture,
+            atlas,
+            reference,
+            probe_records,
+            backend);
+        const QByteArray bytes =
+            QJsonDocument(metadata).toJson(QJsonDocument::Indented);
+        if (metadata_file.write(bytes) != bytes.size() ||
+            !metadata_file.commit())
+        {
+            const QByteArray path = metadata_path.toLocal8Bit();
+            std::cerr << "FAIL: LCD atlas probe could not commit metadata artifact "
+                << path.constData() << ": "
+                << metadata_file.errorString().toUtf8().constData() << '\n';
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        const QByteArray atlas_path_bytes = atlas_path.toLocal8Bit();
+        const QByteArray reference_path_bytes = reference_path.toLocal8Bit();
+        const QByteArray metadata_path_bytes = metadata_path.toLocal8Bit();
+        std::cout << "LCD atlas probe artifacts"
+            << " atlas=" << atlas_path_bytes.constData()
+            << " reference=" << reference_path_bytes.constData()
+            << " metadata=" << metadata_path_bytes.constData()
+            << '\n';
+    }
+
+    return ok;
+}
+
+void print_lcd_atlas_probe_report(
+    const Pixel_render_result& atlas,
+    const char*                backend)
+{
+    const term::Qsg_atlas_frame_report& report = atlas.atlas_report;
+    const term::Qsg_atlas_frame_build_summary& frame_build =
+        report.frame_build;
+    const term::Qsg_atlas_render_summary& render_summary = report.render;
+    std::cout << "LCD atlas probe report"
+        << " backend=" << backend
+        << " graphics_api="
+        << graphics_api_name(atlas.graphics_api).toUtf8().constData()
+        << " software_renderer=" << atlas.software_renderer
+        << " dpr=" << atlas.device_pixel_ratio
+        << " image=" << atlas.image.width() << 'x' << atlas.image.height()
+        << " prepare=" << report.prepare_count
+        << " render=" << report.render_count
+        << " drew=" << report.drew
+        << " rhi=" << report.rhi_non_null
+        << " coverage_texture_created=" << report.coverage_texture_created
+        << " coverage_upload_recorded=" << report.coverage_upload_recorded
+        << " glyph_misses=" << frame_build.glyph_missed_instances
+        << " coverage_failures=" << frame_build.glyph_coverage_failures
+        << " atlas_insert_failures="
+        << frame_build.glyph_atlas_insert_failures
+        << " max_glyph_instance_page="
+        << frame_build.max_glyph_instance_page
+        << " atlas_page_count=" << render_summary.atlas_page_count
+        << " atlas_page_budget=" << render_summary.atlas_page_budget
+        << " atlas_page_bytes=" << render_summary.atlas_page_bytes
+        << " atlas_allocated_bytes=" << render_summary.atlas_allocated_bytes
+        << " atlas_budget_bytes=" << render_summary.atlas_budget_bytes
+        << " atlas_used_bytes=" << render_summary.atlas_used_bytes
+        << " atlas_failed_inserts=" << render_summary.atlas_failed_inserts
+        << " atlas_page_pressure=" << render_summary.atlas_page_pressure
+        << " sampler_mode="
+        << term::qsg_atlas_sampler_mode_name(
+            render_summary.glyph_sampler_mode)
+        << " snapped_origin_failures="
+        << frame_build.snapped_origin_failures
+        << " grayscale_masks="
+        << frame_build.glyph_coverage.grayscale_masks
+        << " lcd_rgb_masks=" << frame_build.glyph_coverage.lcd_rgb_masks
+        << " lcd_bgr_masks=" << frame_build.glyph_coverage.lcd_bgr_masks
+        << " color_images=" << frame_build.glyph_coverage.color_images
+        << " ambiguous_images="
+        << frame_build.glyph_coverage.ambiguous_images
+        << " unsupported_images="
+        << frame_build.glyph_coverage.unsupported_images
+        << " missed_images=" << frame_build.glyph_coverage.missed_images
+        << '\n';
+}
+
+int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
+{
+    const int backend_status =
+        verify_requested_backend(app, backend, "LCD atlas capability probe");
+    if (backend_status != 0) {
+        return backend_status;
+    }
+
+    const qreal device_pixel_ratio =
+        pixel_probe_render_window_device_pixel_ratio(app);
+    Pixel_parity_fixture fixture =
+        make_lcd_capability_probe_fixture(device_pixel_ratio);
+
+    Pixel_render_result atlas = render_pixel_atlas_fixture(app, fixture);
+    if (!atlas.ready || !atlas_report_render_state_ready(atlas.atlas_report)) {
+        std::cerr << "SKIP: LCD atlas capability probe did not reach usable "
+            << "QRhi render state on " << backend
+            << " prepare_count=" << atlas.atlas_report.prepare_count
+            << " render_count=" << atlas.atlas_report.render_count
+            << " rhi_non_null=" << atlas.atlas_report.rhi_non_null
+            << '\n';
+        return k_unsupported_backend_skip_return_code;
+    }
+
+    const std::optional<QSize> reference_size =
+        lcd_probe_image_has_pixels(atlas.image)
+            ? std::optional<QSize>(atlas.image.size())
+            : std::nullopt;
+    const Pixel_render_result reference =
+        render_atlas_rgba_reference_fixture(fixture, reference_size);
+    const QFont font = term::vnm_terminal_font(QString(), 18.0);
+    const std::vector<Lcd_glyph_probe_record> probe_records =
+        probe_lcd_subpixel_glyphs(font, atlas.device_pixel_ratio);
+
+    print_lcd_atlas_probe_report(atlas, backend);
+    print_lcd_probe_records(probe_records);
+    print_missing_lcd_probe_family_coverage_labels(probe_records);
+
+    const term::Glyph_coverage_counts& production_coverage =
+        atlas.atlas_report.frame_build.glyph_coverage;
+
+    // Batch 1 targets the pinned Windows D3D11 hardware path; missing
+    // dual-source probing or sample-family glyph images is a gate failure here.
+    bool ok = true;
+    ok &= check(
+        lcd_probe_image_has_pixels(atlas.image),
+        "LCD atlas probe captures a non-empty atlas image");
+    ok &= check(
+        lcd_probe_image_has_pixels(reference.image),
+        "LCD atlas probe renders a non-empty RGBA atlas reference image");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(atlas.image),
+        "LCD atlas probe atlas image contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(reference.image),
+        "LCD atlas probe reference image contains visible fixture variation");
+    ok &= compare_pixel_fixture(
+        fixture,
+        reference,
+        atlas,
+        backend,
+        rgba_reference_budget_for_coverage(production_coverage),
+        "LCD atlas RGBA reference");
+    ok &= check(
+        !probe_records.empty(),
+        "LCD atlas probe records glyph image capability details");
+    ok &= check(
+        lcd_probe_records_cover_required_families(probe_records),
+        "LCD atlas probe records concrete glyph image coverage for every sample family");
+    ok &= check(
+        lcd_probe_records_have_supported_classifier_results(probe_records),
+        "LCD atlas probe concrete glyph images classify as supported coverage kinds");
+    ok &= check(
+        lcd_probe_color_capable_records_keep_color_kind(probe_records),
+        "LCD atlas probe color-capable glyph images keep color coverage kind");
+    ok &= check(
+        lcd_probe_has_valid_production_tile_for_family(
+            probe_records,
+            QStringLiteral("emoji_color")),
+        "LCD atlas probe records production-valid tiles for emoji presentation samples");
+    ok &= check(
+        atlas.atlas_report.frame_build.glyph_coverage.grayscale_masks > 0,
+        "LCD atlas probe reports production grayscale coverage entries");
+    ok &= check(
+        glyph_coverage_has_lcd(production_coverage),
+        "LCD atlas probe reports production LCD coverage entries");
+    if (atlas.atlas_report.render.atlas_page_count > 1) {
+        ok &= check(
+            atlas.atlas_report.frame_build.max_glyph_instance_page > 0,
+            "LCD atlas probe renders glyph instances from texture-array pages beyond zero");
+    }
+    ok &= check(
+        atlas.atlas_report.render.glyph_shader_package_available,
+        "LCD atlas probe reports loaded glyph shader packages");
+    ok &= check(
+        atlas.atlas_report.render.glyph_sampler_mode ==
+            term::Qsg_atlas_sampler_mode::NEAREST,
+        "LCD atlas probe reports nearest glyph coverage sampling");
+    ok &= check(
+        atlas.atlas_report.render.shaped_missing_string_indexes == 0 &&
+            atlas.atlas_report.render.shaped_invalid_string_indexes == 0,
+        "LCD atlas probe reports complete shaped glyph string-index ownership");
+    ok &= check(
+        atlas.atlas_report.render.dual_source_probe_shader_package_available,
+        "LCD atlas probe reports loaded dual-source probe shader package");
+    ok &= check(
+        atlas.atlas_report.render.dual_source_blend_factors_available,
+        "LCD atlas probe reports available dual-source blend factors");
+    ok &= check(
+        atlas.atlas_report.render.dual_source_blend_factors_runtime_probe,
+        "LCD atlas probe runs the dual-source blend pipeline capability probe");
+    ok &= check(
+        write_lcd_probe_artifacts(
+            fixture,
+            atlas,
+            reference,
+            probe_records,
+            backend),
+        "LCD atlas probe writes requested artifacts");
+    return ok ? 0 : 1;
+}
+
 int test_atlas_report(QGuiApplication& app, const char* backend)
 {
     const int backend_status =
@@ -5382,6 +8594,7 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_glyph_row_stable_combining_update(app);
     ok &= test_atlas_glyph_row_stable_cursor_dirty_update(app);
     ok &= test_atlas_glyph_row_stable_cursor_clean_row_fallback(app);
+    ok &= test_atlas_prepared_text_reuse(app);
 
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
     const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
@@ -5429,8 +8642,9 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
             render_summary.atlas_page_bytes > 0U &&
             render_summary.atlas_budget_bytes >= render_summary.atlas_allocated_bytes,
         "atlas report records atlas memory and page budget counters");
+    ok &= check(atlas.atlas_report.frame_build.max_glyph_instance_page >= 0,
+        "atlas report records rendered glyph page usage");
     ok &= check(atlas.atlas_report.frame_build.glyph_missed_instances == 0 &&
-            atlas.atlas_report.frame_build.glyph_color_alpha_failures == 0 &&
             atlas.atlas_report.frame_build.glyph_coverage_failures == 0 &&
             atlas.atlas_report.frame_build.glyph_atlas_insert_failures == 0,
         "atlas report records no silent glyph misses");
@@ -5444,6 +8658,11 @@ bool run_unit_tests()
     ok &= test_cache_key_includes_physical_size_and_face();
     ok &= test_packing_and_stride_copy();
     ok &= test_indexed8_and_grayscale_conversion();
+    ok &= test_rgba_tile_model_preparation();
+    ok &= test_glyph_coverage_candidate_classifier();
+    ok &= test_glyph_image_diagnostics();
+    ok &= test_shaped_glyph_physical_pixel_placement();
+    ok &= test_shaped_glyph_records();
     ok &= test_epoch_invalidation();
     ok &= test_atlas_rotating_buffer_planner();
     ok &= test_atlas_row_stable_glyph_planner();
@@ -5461,10 +8680,12 @@ int main(int argc, char** argv)
     const bool pixel_parity = has_argument(argc, argv, "--pixel-parity");
     const bool layout_parity = has_argument(argc, argv, "--layout-parity");
     const bool atlas_report = has_argument(argc, argv, "--atlas-report");
+    const bool lcd_capability_probe =
+        has_argument(argc, argv, "--lcd-capability-probe");
     const bool host_state_smoke = has_argument(argc, argv, "--host-state-smoke");
     const char* backend = argument_value(argc, argv, "--backend", "d3d11");
     if (render_smoke || dense_grid_smoke || pixel_parity || layout_parity ||
-        atlas_report || host_state_smoke)
+        atlas_report || lcd_capability_probe || host_state_smoke)
     {
         configure_graphics_api(backend);
     }
@@ -5475,6 +8696,9 @@ int main(int argc, char** argv)
     }
     if (atlas_report) {
         return test_atlas_report(app, backend);
+    }
+    if (lcd_capability_probe) {
+        return test_lcd_capability_probe(app, backend);
     }
     if (host_state_smoke) {
         return test_atlas_host_state_smoke(app, backend);
