@@ -32,6 +32,8 @@
 #include <QRawFont>
 #include <QRectF>
 #include <QSGRendererInterface>
+#include <QSGSimpleRectNode>
+#include <QSGTextNode>
 #include <QThread>
 #include <private/qquickitem_p.h>
 #include <rhi/qrhi.h>
@@ -570,6 +572,175 @@ term::Terminal_render_frame pixel_expected_frame(
         true,
         &fixture.snapshot.ime_preedit);
 }
+
+void append_qsg_reference_rect(
+    QSGNode& parent,
+    QRectF   rect,
+    QColor   color)
+{
+    if (rect.width() <= 0.0 || rect.height() <= 0.0 || color.alpha() <= 0) {
+        return;
+    }
+
+    parent.appendChildNode(new QSGSimpleRectNode(rect, color));
+}
+
+void append_qsg_reference_rects(
+    QSGNode&                                    parent,
+    const std::vector<term::Terminal_render_rect>& rects)
+{
+    for (const term::Terminal_render_rect& rect : rects) {
+        append_qsg_reference_rect(parent, rect.rect, rect.color);
+    }
+}
+
+void append_qsg_reference_decorations(
+    QSGNode&                                            parent,
+    const std::vector<term::Terminal_render_decoration>& decorations)
+{
+    for (const term::Terminal_render_decoration& decoration : decorations) {
+        append_qsg_reference_rect(parent, decoration.rect, decoration.color);
+    }
+}
+
+void append_qsg_reference_cursors(
+    QSGNode&                                                  parent,
+    const std::vector<term::Terminal_render_cursor_primitive>& cursors)
+{
+    for (const term::Terminal_render_cursor_primitive& cursor : cursors) {
+        append_qsg_reference_rect(parent, cursor.rect, cursor.color);
+    }
+}
+
+bool append_qsg_reference_text_run(
+    QSGNode&                              parent,
+    QQuickWindow&                         window,
+    const term::Terminal_render_text_run& run,
+    const QFont&                          font,
+    QRectF                                viewport)
+{
+    if (run.text.isEmpty()) {
+        return true;
+    }
+
+    QTextLayout layout(run.text, font);
+    QTextOption option;
+    option.setWrapMode(QTextOption::NoWrap);
+    layout.setTextOption(option);
+    layout.setCacheEnabled(false);
+
+    layout.beginLayout();
+    QTextLine line = layout.createLine();
+    if (line.isValid()) {
+        line.setLineWidth(1024.0 * 1024.0);
+        line.setPosition(QPointF(0.0, 0.0));
+    }
+    layout.endLayout();
+    if (!line.isValid()) {
+        return true;
+    }
+
+    std::unique_ptr<QSGTextNode> text_node(window.createTextNode());
+    if (text_node == nullptr) {
+        return false;
+    }
+
+    text_node->setColor(run.foreground);
+    text_node->setRenderType(QSGTextNode::QtRendering);
+    text_node->setViewport(viewport);
+    text_node->addTextLayout(
+        QPointF(
+            run.baseline_origin.x(),
+            run.baseline_origin.y() - line.ascent()),
+        &layout);
+    parent.appendChildNode(text_node.release());
+    return true;
+}
+
+bool append_qsg_reference_text_runs(
+    QSGNode&                                         parent,
+    QQuickWindow&                                    window,
+    const std::vector<term::Terminal_render_text_run>& runs,
+    const QFont&                                     font,
+    QRectF                                           viewport)
+{
+    bool ok = true;
+    for (const term::Terminal_render_text_run& run : runs) {
+        ok &= append_qsg_reference_text_run(
+            parent,
+            window,
+            run,
+            font,
+            viewport);
+    }
+    return ok;
+}
+
+class Qsg_text_reference_item final : public QQuickItem
+{
+public:
+    explicit Qsg_text_reference_item(Pixel_parity_fixture fixture)
+    :
+        m_fixture(std::move(fixture)),
+        m_font(term::vnm_terminal_font(QString(), 18.0))
+    {
+        setFlag(QQuickItem::ItemHasContents, true);
+        setSize(m_fixture.logical_size);
+    }
+
+    bool text_node_available() const
+    {
+        return m_text_node_available.load(std::memory_order_acquire);
+    }
+
+protected:
+    QSGNode* updatePaintNode(
+        QSGNode*           old_node,
+        UpdatePaintNodeData*) override
+    {
+        delete old_node;
+
+        std::unique_ptr<QSGNode> root(new QSGNode);
+        QQuickWindow* const current_window = window();
+        if (current_window == nullptr) {
+            return root.release();
+        }
+
+        const term::Terminal_render_frame frame = pixel_expected_frame(m_fixture);
+        const QRectF viewport(QPointF(0.0, 0.0), frame.logical_size);
+
+        append_qsg_reference_rects(*root, frame.background_rects);
+        append_qsg_reference_rects(*root, frame.selection_rects);
+        append_qsg_reference_rects(*root, frame.graphic_rects);
+        if (!append_qsg_reference_text_runs(
+                *root,
+                *current_window,
+                frame.text_runs,
+                m_font,
+                viewport))
+        {
+            m_text_node_available.store(false, std::memory_order_release);
+        }
+        append_qsg_reference_decorations(*root, frame.decorations);
+        append_qsg_reference_cursors(*root, frame.cursors);
+        if (!append_qsg_reference_text_runs(
+                *root,
+                *current_window,
+                frame.cursor_text_runs,
+                m_font,
+                viewport))
+        {
+            m_text_node_available.store(false, std::memory_order_release);
+        }
+        append_qsg_reference_rects(*root, frame.overlay_rects);
+        return root.release();
+    }
+
+private:
+    Pixel_parity_fixture m_fixture;
+    QFont                m_font;
+    std::atomic_bool     m_text_node_available{true};
+};
 
 QSize pixel_window_logical_pixel_size(QSizeF logical_size)
 {
@@ -2978,6 +3149,69 @@ Pixel_render_result render_pixel_atlas_fixture(
         ? window.rendererInterface()->graphicsApi()
         : result.graphics_api;
     result.software_renderer   =
+        result.graphics_api == QSGRendererInterface::Software;
+    capture_window_driver_info(window, result);
+    window.hide();
+    app.processEvents(QEventLoop::AllEvents, 50);
+    return result;
+}
+
+bool pump_qsg_text_reference_item(
+    QGuiApplication&          app,
+    QQuickWindow&             window,
+    Qsg_text_reference_item&  item,
+    Pixel_render_result&      out)
+{
+    for (int attempt = 0; attempt < 120; ++attempt) {
+        item.update();
+        window.requestUpdate();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        out.image = window.grabWindow();
+        if (out.image.isNull()) {
+            continue;
+        }
+
+        out.image_device_pixel_ratio =
+            pixel_normalized_device_pixel_ratio(out.image.devicePixelRatio());
+        if (item.text_node_available()) {
+            out.ready = true;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+Pixel_render_result render_qsg_text_reference_fixture(
+    QGuiApplication&             app,
+    const Pixel_parity_fixture&  fixture)
+{
+    QQuickWindow window;
+    window.setColor(QColor(1, 2, 3));
+    window.resize(pixel_window_logical_pixel_size(fixture.logical_size));
+
+    Qsg_text_reference_item item(fixture);
+    item.setParentItem(window.contentItem());
+
+    window.show();
+    app.processEvents(QEventLoop::AllEvents, 50);
+
+    Pixel_render_result result;
+    result.device_pixel_ratio  = pixel_window_device_pixel_ratio(window);
+    result.window_logical_size = window.size();
+    result.graphics_api        = window.rendererInterface() != nullptr
+        ? window.rendererInterface()->graphicsApi()
+        : QSGRendererInterface::Unknown;
+    result.software_renderer =
+        result.graphics_api == QSGRendererInterface::Software;
+    pump_qsg_text_reference_item(app, window, item, result);
+    result.device_pixel_ratio  = pixel_window_device_pixel_ratio(window);
+    result.window_logical_size = window.size();
+    result.graphics_api        = window.rendererInterface() != nullptr
+        ? window.rendererInterface()->graphicsApi()
+        : result.graphics_api;
+    result.software_renderer =
         result.graphics_api == QSGRendererInterface::Software;
     capture_window_driver_info(window, result);
     window.hide();
@@ -8422,6 +8656,83 @@ QJsonObject json_sizef_object(QSizeF size)
     return object;
 }
 
+QJsonObject lcd_probe_glyph_stats_object(const Pixel_glyph_stats& stats)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("compared_pixels"), stats.compared_pixels);
+    object.insert(QStringLiteral("diff_pixels"), stats.diff_pixels);
+    object.insert(QStringLiteral("max_delta"), stats.max_delta);
+    object.insert(
+        QStringLiteral("reference_ink_pixels"),
+        stats.reference_ink_pixels);
+    object.insert(QStringLiteral("atlas_ink_pixels"), stats.atlas_ink_pixels);
+    object.insert(QStringLiteral("perimeter_pixels"), stats.perimeter_pixels);
+    object.insert(
+        QStringLiteral("mask_count"),
+        static_cast<int>(stats.masks.size()));
+    return object;
+}
+
+QJsonObject lcd_probe_render_result_object(const Pixel_render_result& result)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("ready"), result.ready);
+    object.insert(
+        QStringLiteral("image_size"),
+        json_size_object(result.image.size()));
+    object.insert(
+        QStringLiteral("window_logical_size"),
+        json_size_object(result.window_logical_size));
+    object.insert(
+        QStringLiteral("device_pixel_ratio"),
+        result.device_pixel_ratio);
+    object.insert(
+        QStringLiteral("image_device_pixel_ratio"),
+        result.image_device_pixel_ratio);
+    object.insert(
+        QStringLiteral("graphics_api"),
+        graphics_api_name(result.graphics_api));
+    object.insert(
+        QStringLiteral("software_renderer"),
+        result.software_renderer);
+    return object;
+}
+
+QJsonObject lcd_probe_qt_text_reference_comparison_object(
+    const Pixel_parity_fixture& fixture,
+    const Pixel_render_result&  atlas,
+    const Pixel_render_result&  qt_text_reference)
+{
+    const Pixel_glyph_stats glyphs = compare_glyph_regions(
+        qt_text_reference.image,
+        atlas.image,
+        fixture.glyph_masks,
+        fixture.device_pixel_ratio);
+
+    QJsonObject object;
+    object.insert(
+        QStringLiteral("image_size_match"),
+        qt_text_reference.image.size() == atlas.image.size());
+    object.insert(
+        QStringLiteral("render_dpr_match"),
+        pixel_device_pixel_ratios_match(
+            qt_text_reference.device_pixel_ratio,
+            atlas.device_pixel_ratio));
+    object.insert(
+        QStringLiteral("image_dpr_match"),
+        pixel_device_pixel_ratios_match(
+            qt_text_reference.image_device_pixel_ratio,
+            atlas.image_device_pixel_ratio));
+    object.insert(
+        QStringLiteral("glyph_mask_stats"),
+        lcd_probe_glyph_stats_object(glyphs));
+    object.insert(
+        QStringLiteral("renderer_contract"),
+        QStringLiteral(
+            "diagnostic only: Qt text-node quality signal, not a pixel-equivalence target"));
+    return object;
+}
+
 QJsonObject lcd_probe_record_object(const Lcd_glyph_probe_record& record)
 {
     QJsonObject object;
@@ -8721,6 +9032,7 @@ QJsonObject make_lcd_probe_metadata(
     const Pixel_parity_fixture&                  fixture,
     const Pixel_render_result&                   atlas,
     const Pixel_render_result&                   reference,
+    const Pixel_render_result&                   qt_text_reference,
     const std::vector<Lcd_glyph_probe_record>&   probe_records,
     const char*                                  backend)
 {
@@ -8755,7 +9067,13 @@ QJsonObject make_lcd_probe_metadata(
         json_size_object(reference.image.size()));
     images.insert(
         QStringLiteral("reference_renderer"),
-        QStringLiteral("qpainter_qtextlayout"));
+        QStringLiteral("cpu_atlas_rgba_reference"));
+    images.insert(
+        QStringLiteral("qt_text_reference_image_size"),
+        json_size_object(qt_text_reference.image.size()));
+    images.insert(
+        QStringLiteral("qt_text_reference_renderer"),
+        QStringLiteral("qsg_text_node_qt_rendering"));
 
     QJsonObject graphics;
     graphics.insert(QStringLiteral("requested_backend"), QString::fromLatin1(backend));
@@ -8822,6 +9140,18 @@ QJsonObject make_lcd_probe_metadata(
         atlas.image_device_pixel_ratio);
     object.insert(QStringLiteral("graphics"), graphics);
     object.insert(QStringLiteral("images"), images);
+    object.insert(
+        QStringLiteral("cpu_atlas_reference"),
+        lcd_probe_render_result_object(reference));
+    object.insert(
+        QStringLiteral("qt_text_node_reference"),
+        lcd_probe_render_result_object(qt_text_reference));
+    object.insert(
+        QStringLiteral("qt_text_node_comparison"),
+        lcd_probe_qt_text_reference_comparison_object(
+            fixture,
+            atlas,
+            qt_text_reference));
     object.insert(QStringLiteral("atlas_report"), lcd_probe_report_object(atlas.atlas_report));
     object.insert(
         QStringLiteral("capability_interpretation"),
@@ -8869,6 +9199,7 @@ bool write_lcd_probe_artifacts(
     const Pixel_parity_fixture&                  fixture,
     const Pixel_render_result&                   atlas,
     const Pixel_render_result&                   reference,
+    const Pixel_render_result&                   qt_text_reference,
     const std::vector<Lcd_glyph_probe_record>&   probe_records,
     const char*                                  backend)
 {
@@ -8891,6 +9222,9 @@ bool write_lcd_probe_artifacts(
         artifact_dir.filePath(QStringLiteral("lcd_capability_probe_atlas.png"));
     const QString reference_path =
         artifact_dir.filePath(QStringLiteral("lcd_capability_probe_reference.png"));
+    const QString qt_text_reference_path =
+        artifact_dir.filePath(
+            QStringLiteral("lcd_capability_probe_qt_text_reference.png"));
     const QString metadata_path =
         artifact_dir.filePath(QStringLiteral("lcd_capability_probe_metadata.json"));
 
@@ -8903,6 +9237,10 @@ bool write_lcd_probe_artifacts(
         reference.image,
         reference_path,
         "reference");
+    ok &= save_lcd_probe_image_artifact(
+        qt_text_reference.image,
+        qt_text_reference_path,
+        "Qt text reference");
 
     QSaveFile metadata_file(metadata_path);
     if (!metadata_file.open(QIODevice::WriteOnly)) {
@@ -8917,6 +9255,7 @@ bool write_lcd_probe_artifacts(
             fixture,
             atlas,
             reference,
+            qt_text_reference,
             probe_records,
             backend);
         const QByteArray bytes =
@@ -8935,10 +9274,14 @@ bool write_lcd_probe_artifacts(
     if (ok) {
         const QByteArray atlas_path_bytes = atlas_path.toLocal8Bit();
         const QByteArray reference_path_bytes = reference_path.toLocal8Bit();
+        const QByteArray qt_text_reference_path_bytes =
+            qt_text_reference_path.toLocal8Bit();
         const QByteArray metadata_path_bytes = metadata_path.toLocal8Bit();
         std::cout << "LCD atlas probe artifacts"
             << " atlas=" << atlas_path_bytes.constData()
             << " reference=" << reference_path_bytes.constData()
+            << " qt_text_reference="
+            << qt_text_reference_path_bytes.constData()
             << " metadata=" << metadata_path_bytes.constData()
             << '\n';
     }
@@ -9029,11 +9372,30 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             : std::nullopt;
     const Pixel_render_result reference =
         render_atlas_rgba_reference_fixture(fixture, reference_size);
+    const Pixel_render_result qt_text_reference =
+        render_qsg_text_reference_fixture(app, fixture);
     const QFont font = term::vnm_terminal_font(QString(), 18.0);
     const std::vector<Lcd_glyph_probe_record> probe_records =
         probe_lcd_subpixel_glyphs(font, atlas.device_pixel_ratio);
+    const Pixel_glyph_stats qt_text_glyphs = compare_glyph_regions(
+        qt_text_reference.image,
+        atlas.image,
+        fixture.glyph_masks,
+        fixture.device_pixel_ratio);
 
     print_lcd_atlas_probe_report(atlas, backend);
+    std::cout << "LCD atlas Qt text-node reference"
+        << " ready=" << qt_text_reference.ready
+        << " image=" << qt_text_reference.image.width()
+        << 'x' << qt_text_reference.image.height()
+        << " render_dpr=" << qt_text_reference.device_pixel_ratio
+        << " image_dpr=" << qt_text_reference.image_device_pixel_ratio
+        << " glyph_compared_pixels=" << qt_text_glyphs.compared_pixels
+        << " glyph_diff_pixels=" << qt_text_glyphs.diff_pixels
+        << " glyph_max_delta=" << qt_text_glyphs.max_delta
+        << " qt_text_ink_pixels=" << qt_text_glyphs.reference_ink_pixels
+        << " atlas_ink_pixels=" << qt_text_glyphs.atlas_ink_pixels
+        << '\n';
     print_lcd_probe_records(probe_records);
     print_missing_lcd_probe_family_coverage_labels(probe_records);
 
@@ -9050,11 +9412,36 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         lcd_probe_image_has_pixels(reference.image),
         "LCD atlas probe renders a non-empty RGBA atlas reference image");
     ok &= check(
+        qt_text_reference.ready &&
+            lcd_probe_image_has_pixels(qt_text_reference.image),
+        "LCD atlas probe captures a non-empty Qt text-node reference image");
+    ok &= check(
         lcd_probe_image_has_visible_variation(atlas.image),
         "LCD atlas probe atlas image contains visible fixture variation");
     ok &= check(
         lcd_probe_image_has_visible_variation(reference.image),
         "LCD atlas probe reference image contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(qt_text_reference.image),
+        "LCD atlas probe Qt text-node reference contains visible fixture variation");
+    ok &= check(
+        qt_text_reference.image.size() == atlas.image.size(),
+        "LCD atlas probe Qt text-node reference uses the atlas image size");
+    ok &= check(
+        pixel_device_pixel_ratios_match(
+            qt_text_reference.device_pixel_ratio,
+            atlas.device_pixel_ratio) &&
+            pixel_device_pixel_ratios_match(
+                qt_text_reference.image_device_pixel_ratio,
+                atlas.image_device_pixel_ratio),
+        "LCD atlas probe Qt text-node reference uses the atlas DPR");
+    ok &= check(
+        qt_text_glyphs.compared_pixels > 0,
+        "LCD atlas probe Qt text-node comparison covers glyph mask pixels");
+    ok &= check(
+        qt_text_glyphs.reference_ink_pixels > 0 &&
+            qt_text_glyphs.atlas_ink_pixels > 0,
+        "LCD atlas probe Qt text-node comparison sees glyph ink in both renderers");
     ok &= compare_pixel_fixture(
         fixture,
         reference,
@@ -9115,6 +9502,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             fixture,
             atlas,
             reference,
+            qt_text_reference,
             probe_records,
             backend),
         "LCD atlas probe writes requested artifacts");
