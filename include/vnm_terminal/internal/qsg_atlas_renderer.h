@@ -654,6 +654,8 @@ const char* qsg_atlas_glyph_image_presentation_name(
 
 const char* qsg_atlas_sampler_mode_name(Qsg_atlas_sampler_mode mode);
 
+QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font);
+
 QString qsg_atlas_face_id_for_raw_font(const QRawFont& raw_font);
 
 qreal qsg_atlas_physical_pixel_size(

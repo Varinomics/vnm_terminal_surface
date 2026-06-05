@@ -13,6 +13,7 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QFontInfo>
+#include <QFontMetricsF>
 #include <QGuiApplication>
 #include <QGlyphRun>
 #include <QImage>
@@ -20,6 +21,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLatin1Char>
 #include <QMetaObject>
 #include <QPainter>
 #include <QSaveFile>
@@ -4687,6 +4689,178 @@ bool test_shaped_glyph_physical_pixel_placement()
     return ok;
 }
 
+constexpr ushort k_ascii_layout_probe_first = 0x20U;
+constexpr ushort k_ascii_layout_probe_last  = 0x7eU;
+
+QString ascii_layout_probe_text()
+{
+    QString text;
+    text.reserve(static_cast<qsizetype>(
+        k_ascii_layout_probe_last - k_ascii_layout_probe_first + 1U +
+        QStringLiteral("==!=->=><=>=::///www").size()));
+    for (ushort value = k_ascii_layout_probe_first;
+        value <= k_ascii_layout_probe_last;
+        ++value)
+    {
+        text.append(QChar(value));
+    }
+    text.append(QStringLiteral("==!=->=><=>=::///www"));
+    return text;
+}
+
+bool ascii_layout_positions_are_cell_stable(
+    const QString&                  probe_text,
+    const QFont&                    layout_font,
+    term::terminal_cell_metrics_t   metrics)
+{
+    QTextLayout layout(probe_text, layout_font);
+    QTextOption option;
+    option.setWrapMode(QTextOption::NoWrap);
+    layout.setTextOption(option);
+    layout.setCacheEnabled(false);
+
+    layout.beginLayout();
+    QTextLine line = layout.createLine();
+    if (!line.isValid()) {
+        layout.endLayout();
+        return false;
+    }
+    line.setLineWidth(1024.0 * 1024.0);
+    line.setPosition(QPointF(0.0, 0.0));
+    const bool line_is_complete =
+        line.textStart() == 0 && line.textLength() == probe_text.size();
+    const QList<QGlyphRun> glyph_runs = line.glyphRuns(
+        0,
+        probe_text.size(),
+        QTextLayout::RetrieveGlyphIndexes   |
+            QTextLayout::RetrieveGlyphPositions |
+            QTextLayout::RetrieveStringIndexes);
+    layout.endLayout();
+
+    if (!line_is_complete) {
+        return false;
+    }
+
+    const QRawFont raw_font = QRawFont::fromFont(layout_font);
+    if (!raw_font.isValid()) {
+        return false;
+    }
+
+    std::optional<qreal> glyph_position_y;
+    std::vector<bool> seen_string_indexes(
+        static_cast<std::size_t>(probe_text.size()));
+    for (const QGlyphRun& glyph_run : glyph_runs) {
+        if (term::qsg_atlas_face_id_for_raw_font(glyph_run.rawFont()) !=
+            term::qsg_atlas_face_id_for_raw_font(raw_font))
+        {
+            return false;
+        }
+
+        const QList<quint32>   glyph_indexes  = glyph_run.glyphIndexes();
+        const QList<QPointF>   positions      = glyph_run.positions();
+        const QList<qsizetype> string_indexes = glyph_run.stringIndexes();
+        if (glyph_indexes.size() != positions.size() ||
+            glyph_indexes.size() != string_indexes.size())
+        {
+            return false;
+        }
+
+        for (qsizetype index = 0; index < glyph_indexes.size(); ++index) {
+            const qsizetype string_index = string_indexes.at(index);
+            if (string_index < 0 || string_index >= probe_text.size()) {
+                return false;
+            }
+
+            const QChar code_unit = probe_text.at(string_index);
+            const QList<quint32> raw_indexes =
+                raw_font.glyphIndexesForString(QString(1, code_unit));
+            if (raw_indexes.size() != 1 ||
+                raw_indexes.at(0) == 0U ||
+                raw_indexes.at(0) != glyph_indexes.at(index))
+            {
+                return false;
+            }
+
+            const QPointF position = positions.at(index);
+            const qreal expected_x =
+                static_cast<qreal>(string_index) * metrics.width;
+            if (std::abs(position.x() - expected_x) > 0.001) {
+                return false;
+            }
+            if (!glyph_position_y.has_value()) {
+                glyph_position_y = position.y();
+            }
+            else
+            if (std::abs(position.y() - *glyph_position_y) > 0.001) {
+                return false;
+            }
+
+            seen_string_indexes[static_cast<std::size_t>(string_index)] = true;
+        }
+    }
+
+    for (bool seen : seen_string_indexes) {
+        if (!seen) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool test_cell_stable_ascii_layout_font()
+{
+    const QFont font = term::vnm_terminal_font(QString(), 18.0);
+    const QFont layout_font =
+        term::qsg_atlas_cell_stable_ascii_layout_font(font);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(1.0);
+
+    bool ok = true;
+    ok &= check(!layout_font.kerning(),
+        "cell-stable ASCII layout font disables kerning");
+    ok &= check(
+        (static_cast<int>(layout_font.styleStrategy()) &
+            static_cast<int>(QFont::PreferNoShaping)) != 0,
+        "cell-stable ASCII layout font requests no shaping");
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0)
+    for (QFont::Tag tag : {
+        QFont::Tag("calt"),
+        QFont::Tag("clig"),
+        QFont::Tag("dlig"),
+        QFont::Tag("hlig"),
+        QFont::Tag("liga"),
+        QFont::Tag("rlig"),
+    }) {
+        ok &= check(layout_font.featureValue(tag) == 0U,
+            "cell-stable ASCII layout font disables ASCII ligature features");
+    }
+#endif
+    const QFontInfo resolved_font(layout_font);
+    ok &= check(resolved_font.fixedPitch(),
+        "cell-stable ASCII layout font resolves to a fixed-pitch face");
+
+    const QFontMetricsF font_metrics(layout_font);
+    for (ushort value = k_ascii_layout_probe_first;
+        value <= k_ascii_layout_probe_last;
+        ++value)
+    {
+        ok &= check(
+            std::abs(
+                font_metrics.horizontalAdvance(
+                    QLatin1Char(static_cast<char>(value))) -
+                metrics.width) <= 0.001,
+            "cell-stable ASCII glyph advances match terminal cell width");
+    }
+
+    ok &= check(
+        ascii_layout_positions_are_cell_stable(
+            ascii_layout_probe_text(),
+            layout_font,
+            metrics),
+        "cell-stable ASCII probe keeps one glyph per source cell");
+    return ok;
+}
+
 bool test_shaped_glyph_records()
 {
     const qreal dpr = 1.0;
@@ -9095,6 +9269,7 @@ bool run_unit_tests()
     ok &= test_glyph_coverage_candidate_classifier();
     ok &= test_glyph_image_diagnostics();
     ok &= test_shaped_glyph_physical_pixel_placement();
+    ok &= test_cell_stable_ascii_layout_font();
     ok &= test_shaped_glyph_records();
     ok &= test_epoch_invalidation();
     ok &= test_atlas_rotating_buffer_planner();
