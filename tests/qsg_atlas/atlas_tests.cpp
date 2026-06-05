@@ -47,6 +47,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string_view>
 #include <string>
 #include <utility>
@@ -8024,6 +8025,45 @@ struct Lcd_glyph_probe_record
     bool    production_tile_valid = false;
 };
 
+enum class Raster_variant_kind
+{
+    ATLAS_CURRENT_PHYSICAL,
+    ATLAS_FLOOR_PHYSICAL,
+    ATLAS_ROUND_PHYSICAL,
+    ATLAS_CEIL_PHYSICAL,
+    QT_TEXT_LAYOUT,
+};
+
+struct Raster_variant_glyph_image_stats
+{
+    qreal actual_raster_pixel_size = 0.0;
+    int   glyph_image_count        = 0;
+    int   valid_tile_count         = 0;
+    QSize max_glyph_image_size;
+};
+
+struct Raster_variant_probe_record
+{
+    QString               sample;
+    QString               variant;
+    QString               comparison_scope;
+    QSize                 image_size;
+    qreal                 nominal_raster_pixel_size = 0.0;
+    qreal                 actual_raster_pixel_size = 0.0;
+    int                   glyph_image_count        = 0;
+    int                   valid_tile_count         = 0;
+    QSize                 max_glyph_image_size;
+    Pixel_diff_stats      diff_to_qt_text_layout;
+    Pixel_image_ink_stats ink;
+    int                   distinct_ink_rgb_colors = 0;
+};
+
+struct Raster_variant_probe_result
+{
+    QImage                                    sheet;
+    std::vector<Raster_variant_probe_record> records;
+};
+
 QString lcd_probe_printable_ascii_text()
 {
     QString text;
@@ -8465,6 +8505,424 @@ std::vector<Lcd_glyph_probe_record> probe_lcd_subpixel_glyphs(
     return records;
 }
 
+QString raster_variant_kind_name(Raster_variant_kind kind)
+{
+    switch (kind) {
+        case Raster_variant_kind::ATLAS_CURRENT_PHYSICAL:
+            return QStringLiteral("atlas_current_physical");
+        case Raster_variant_kind::ATLAS_FLOOR_PHYSICAL:
+            return QStringLiteral("atlas_floor_physical");
+        case Raster_variant_kind::ATLAS_ROUND_PHYSICAL:
+            return QStringLiteral("atlas_round_physical");
+        case Raster_variant_kind::ATLAS_CEIL_PHYSICAL:
+            return QStringLiteral("atlas_ceil_physical");
+        case Raster_variant_kind::QT_TEXT_LAYOUT:
+            return QStringLiteral("qt_text_layout");
+    }
+
+    return QStringLiteral("unknown");
+}
+
+std::vector<QString> raster_variant_probe_samples()
+{
+    return {
+        QStringLiteral("e"),
+        QStringLiteral("W"),
+        QStringLiteral("OpenAI Codex (v0.137.0)"),
+    };
+}
+
+std::vector<Raster_variant_kind> raster_variant_probe_kinds()
+{
+    return {
+        Raster_variant_kind::QT_TEXT_LAYOUT,
+        Raster_variant_kind::ATLAS_CURRENT_PHYSICAL,
+        Raster_variant_kind::ATLAS_FLOOR_PHYSICAL,
+        Raster_variant_kind::ATLAS_ROUND_PHYSICAL,
+        Raster_variant_kind::ATLAS_CEIL_PHYSICAL,
+    };
+}
+
+qreal raster_variant_pixel_size(
+    qreal               physical_pixel_size,
+    Raster_variant_kind kind)
+{
+    const qreal safe_size = std::isfinite(physical_pixel_size)
+        ? std::max<qreal>(1.0, physical_pixel_size)
+        : 1.0;
+    switch (kind) {
+        case Raster_variant_kind::ATLAS_FLOOR_PHYSICAL:
+            return std::max<qreal>(1.0, std::floor(safe_size));
+        case Raster_variant_kind::ATLAS_ROUND_PHYSICAL:
+            return std::max<qreal>(1.0, std::round(safe_size));
+        case Raster_variant_kind::ATLAS_CEIL_PHYSICAL:
+            return std::max<qreal>(1.0, std::ceil(safe_size));
+        case Raster_variant_kind::ATLAS_CURRENT_PHYSICAL:
+        case Raster_variant_kind::QT_TEXT_LAYOUT:
+            break;
+    }
+    return safe_size;
+}
+
+int raster_variant_text_cells(const QString& text)
+{
+    const QByteArray utf8 = text.toUtf8();
+    return std::max(
+        1,
+        term::measure_utf8_width(
+            QByteArrayView(utf8.constData(), utf8.size())).cells);
+}
+
+QString raster_variant_comparison_scope(const QString& text)
+{
+    return raster_variant_text_cells(text) == 1
+        ? QStringLiteral("glyph-local")
+        : QStringLiteral("layout-sensitive-terminal-cell-run");
+}
+
+QSizeF raster_variant_sample_logical_size(
+    const QString&                 text,
+    term::terminal_cell_metrics_t  metrics)
+{
+    constexpr qreal k_padding = 8.0;
+    const int cells = std::max(12, raster_variant_text_cells(text) + 2);
+    return QSizeF(
+        k_padding * 2.0 + metrics.width  * static_cast<qreal>(cells),
+        k_padding * 2.0 + metrics.height);
+}
+
+term::Terminal_render_text_run raster_variant_sample_run(
+    const QString&                 text,
+    term::terminal_cell_metrics_t  metrics,
+    QColor                         foreground,
+    QColor                         background)
+{
+    constexpr qreal k_padding = 8.0;
+    const int cells = std::max(1, raster_variant_text_cells(text));
+    const QRectF rect(
+        k_padding,
+        k_padding,
+        metrics.width * static_cast<qreal>(cells),
+        metrics.height);
+
+    term::Terminal_render_text_run run;
+    run.text            = text;
+    run.rect            = rect;
+    run.baseline_origin = QPointF(rect.left(), rect.top() + metrics.ascent);
+    run.foreground      = foreground;
+    run.background      = background;
+    return run;
+}
+
+QRectF raster_variant_probe_region(
+    const term::Terminal_render_text_run& run,
+    term::terminal_cell_metrics_t         metrics)
+{
+    return run.rect.adjusted(
+        -metrics.width,
+        -metrics.height * 0.5,
+        metrics.width,
+        metrics.height * 0.5);
+}
+
+QImage make_raster_variant_base_image(QSizeF logical_size, qreal dpr, QColor background)
+{
+    QImage image(
+        pixel_window_physical_pixel_size(logical_size, dpr),
+        QImage::Format_ARGB32_Premultiplied);
+    image.setDevicePixelRatio(pixel_normalized_device_pixel_ratio(dpr));
+    image.fill(background);
+    return image;
+}
+
+Raster_variant_glyph_image_stats raster_variant_glyph_image_stats(
+    const QString&                 text,
+    const QFont&                   font,
+    term::terminal_cell_metrics_t  metrics,
+    qreal                          device_pixel_ratio,
+    Raster_variant_kind            kind,
+    QColor                         foreground,
+    QColor                         background)
+{
+    Raster_variant_glyph_image_stats stats;
+    if (kind == Raster_variant_kind::QT_TEXT_LAYOUT) {
+        return stats;
+    }
+
+    const term::Terminal_render_text_run run =
+        raster_variant_sample_run(text, metrics, foreground, background);
+    const term::Qsg_atlas_shaped_text_run_result shaped =
+        term::qsg_atlas_shape_text_run(
+            run,
+            font,
+            metrics,
+            device_pixel_ratio,
+            0,
+            false);
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        if (record.glyph_index == 0U) {
+            continue;
+        }
+
+        QRawFont raster_font = record.raw_font;
+        raster_font.setPixelSize(
+            raster_variant_pixel_size(record.physical_pixel_size, kind));
+        if (stats.actual_raster_pixel_size <= 0.0) {
+            stats.actual_raster_pixel_size = raster_font.pixelSize();
+        }
+
+        const term::Glyph_image_presentation presentation =
+            atlas_reference_presentation_for_source_range(
+                run.text,
+                record.source_string_start,
+                record.source_string_end);
+        const QRawFont::AntialiasingType antialiasing =
+            presentation == term::Glyph_image_presentation::TEXT
+                ? QRawFont::SubPixelAntialiasing
+                : QRawFont::PixelAntialiasing;
+        const QImage glyph_image = raster_font.alphaMapForGlyph(
+            record.glyph_index,
+            antialiasing);
+        if (glyph_image.isNull()) {
+            continue;
+        }
+
+        ++stats.glyph_image_count;
+        stats.max_glyph_image_size = QSize(
+            std::max(stats.max_glyph_image_size.width(), glyph_image.width()),
+            std::max(stats.max_glyph_image_size.height(), glyph_image.height()));
+        const term::Glyph_rgba_tile tile =
+            term::qsg_atlas_rgba_tile_from_image(glyph_image, presentation);
+        if (tile.is_valid()) {
+            ++stats.valid_tile_count;
+        }
+    }
+    return stats;
+}
+
+QImage render_atlas_raster_variant_sample(
+    const QString&                 text,
+    const QFont&                   font,
+    term::terminal_cell_metrics_t  metrics,
+    qreal                          device_pixel_ratio,
+    Raster_variant_kind            kind,
+    QColor                         foreground,
+    QColor                         background)
+{
+    const QSizeF logical_size = raster_variant_sample_logical_size(text, metrics);
+    const term::Terminal_render_text_run run =
+        raster_variant_sample_run(text, metrics, foreground, background);
+    if (kind == Raster_variant_kind::QT_TEXT_LAYOUT) {
+        return render_qpainter_text_layout_image(
+            run,
+            font,
+            logical_size,
+            device_pixel_ratio);
+    }
+
+    QImage image =
+        make_raster_variant_base_image(logical_size, device_pixel_ratio, background);
+    const term::Qsg_atlas_shaped_text_run_result shaped =
+        term::qsg_atlas_shape_text_run(
+            run,
+            font,
+            metrics,
+            device_pixel_ratio,
+            0,
+            false);
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        QRawFont raster_font = record.raw_font;
+        raster_font.setPixelSize(
+            raster_variant_pixel_size(record.physical_pixel_size, kind));
+        paint_atlas_rgba_reference_glyph(
+            image,
+            record,
+            raster_font,
+            run,
+            device_pixel_ratio);
+    }
+    return image;
+}
+
+int count_distinct_ink_rgb_colors(
+    const QImage& image,
+    QColor        background,
+    QRectF        logical_region,
+    qreal         device_pixel_ratio)
+{
+    constexpr int k_ink_delta_threshold = 8;
+
+    std::set<QRgb> colors;
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const QRect region = logical_rect_to_pixels(logical_region, dpr)
+        .intersected(image.rect());
+    for (int y = region.top(); y <= region.bottom(); ++y) {
+        for (int x = region.left(); x <= region.right(); ++x) {
+            const QColor pixel = image.pixelColor(x, y);
+            if (pixel_delta(pixel, background) <= k_ink_delta_threshold) {
+                continue;
+            }
+            colors.insert(qRgb(pixel.red(), pixel.green(), pixel.blue()));
+        }
+    }
+    return static_cast<int>(colors.size());
+}
+
+QImage raster_variant_sheet_image(
+    const std::vector<std::pair<Raster_variant_probe_record, QImage>>& rows,
+    QColor                                                            background)
+{
+    constexpr int k_padding     = 12;
+    constexpr int k_label_width = 360;
+    int sample_width  = 1;
+    int sample_height = 1;
+    for (const auto& row : rows) {
+        sample_width  = std::max(sample_width,  row.second.width());
+        sample_height = std::max(sample_height, row.second.height());
+    }
+
+    const int row_height = sample_height + k_padding;
+    QImage sheet(
+        QSize(
+            k_label_width + sample_width + k_padding * 3,
+            k_padding + row_height * static_cast<int>(rows.size())),
+        QImage::Format_ARGB32_Premultiplied);
+    sheet.fill(background);
+
+    QPainter painter(&sheet);
+    painter.setRenderHint(QPainter::TextAntialiasing, true);
+    painter.setPen(QColor(220, 230, 238));
+    for (int index = 0; index < static_cast<int>(rows.size()); ++index) {
+        const Raster_variant_probe_record& record = rows[static_cast<std::size_t>(index)].first;
+        QImage image = rows[static_cast<std::size_t>(index)].second;
+        image.setDevicePixelRatio(1.0);
+        const int top = k_padding + index * row_height;
+        painter.drawText(
+            QRect(0, top, k_label_width, sample_height),
+            Qt::AlignRight | Qt::AlignVCenter,
+            record.sample + QStringLiteral(" / ") + record.variant);
+        painter.drawImage(QPoint(k_label_width + k_padding, top), image);
+    }
+    return sheet;
+}
+
+Raster_variant_probe_result render_lcd_raster_variant_probe(qreal device_pixel_ratio)
+{
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const QFont font = term::vnm_terminal_font(QString(), 18.0);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+    const QColor background(13, 24, 31);
+    const QColor foreground(238, 244, 248);
+    const std::vector<QString> samples = raster_variant_probe_samples();
+    const std::vector<Raster_variant_kind> variants =
+        raster_variant_probe_kinds();
+
+    Raster_variant_probe_result result;
+    std::vector<std::pair<Raster_variant_probe_record, QImage>> rows;
+    const qreal nominal_physical_pixel_size =
+        term::qsg_atlas_physical_pixel_size(font, dpr);
+    for (const QString& sample : samples) {
+        const term::Terminal_render_text_run run =
+            raster_variant_sample_run(sample, metrics, foreground, background);
+        const QRectF probe_region = raster_variant_probe_region(run, metrics);
+        const QImage qt_reference =
+            render_atlas_raster_variant_sample(
+                sample,
+                font,
+                metrics,
+                dpr,
+                Raster_variant_kind::QT_TEXT_LAYOUT,
+                foreground,
+                background);
+        for (const Raster_variant_kind variant : variants) {
+            const QImage image = render_atlas_raster_variant_sample(
+                sample,
+                font,
+                metrics,
+                dpr,
+                variant,
+                foreground,
+                background);
+            Raster_variant_probe_record record;
+            record.sample = sample;
+            record.variant = raster_variant_kind_name(variant);
+            record.comparison_scope = raster_variant_comparison_scope(sample);
+            record.image_size = image.size();
+            record.nominal_raster_pixel_size =
+                raster_variant_pixel_size(nominal_physical_pixel_size, variant);
+            const Raster_variant_glyph_image_stats glyph_stats =
+                raster_variant_glyph_image_stats(
+                    sample,
+                    font,
+                    metrics,
+                    dpr,
+                    variant,
+                    foreground,
+                    background);
+            record.actual_raster_pixel_size =
+                glyph_stats.actual_raster_pixel_size;
+            record.glyph_image_count    = glyph_stats.glyph_image_count;
+            record.valid_tile_count     = glyph_stats.valid_tile_count;
+            record.max_glyph_image_size = glyph_stats.max_glyph_image_size;
+            record.diff_to_qt_text_layout =
+                compare_regions(image, qt_reference, {probe_region}, dpr);
+            record.ink = measure_image_ink(image, background, probe_region, dpr);
+            record.distinct_ink_rgb_colors =
+                count_distinct_ink_rgb_colors(
+                    image,
+                    background,
+                    probe_region,
+                    dpr);
+            result.records.push_back(record);
+            rows.push_back({std::move(record), image});
+        }
+    }
+    result.sheet = raster_variant_sheet_image(rows, background);
+    return result;
+}
+
+bool raster_variant_probe_record_is_usable(
+    const Raster_variant_probe_record& record)
+{
+    if (record.image_size.isEmpty() ||
+        record.diff_to_qt_text_layout.compared_pixels <= 0 ||
+        record.ink.ink_pixels <= 0 ||
+        record.distinct_ink_rgb_colors <= 0)
+    {
+        return false;
+    }
+
+    if (record.variant == raster_variant_kind_name(
+            Raster_variant_kind::QT_TEXT_LAYOUT))
+    {
+        return true;
+    }
+
+    return
+        record.actual_raster_pixel_size > 0.0 &&
+        record.glyph_image_count > 0          &&
+        record.valid_tile_count > 0           &&
+        !record.max_glyph_image_size.isEmpty();
+}
+
+bool raster_variant_probe_records_are_usable(
+    const Raster_variant_probe_result& result)
+{
+    const std::size_t expected_records =
+        raster_variant_probe_samples().size() *
+        raster_variant_probe_kinds().size();
+    if (result.records.size() != expected_records) {
+        return false;
+    }
+
+    for (const Raster_variant_probe_record& record : result.records) {
+        if (!raster_variant_probe_record_is_usable(record)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void print_lcd_probe_records(
     const std::vector<Lcd_glyph_probe_record>& records)
 {
@@ -8695,6 +9153,92 @@ QJsonObject lcd_probe_render_result_object(const Pixel_render_result& result)
     object.insert(
         QStringLiteral("software_renderer"),
         result.software_renderer);
+    return object;
+}
+
+QJsonObject pixel_diff_stats_object(const Pixel_diff_stats& stats)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("compared_pixels"), stats.compared_pixels);
+    object.insert(QStringLiteral("diff_pixels"), stats.diff_pixels);
+    object.insert(QStringLiteral("max_delta"), stats.max_delta);
+    return object;
+}
+
+QJsonObject json_rect_object(const QRect& rect)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("x"), rect.x());
+    object.insert(QStringLiteral("y"), rect.y());
+    object.insert(QStringLiteral("width"), rect.width());
+    object.insert(QStringLiteral("height"), rect.height());
+    return object;
+}
+
+QJsonObject pixel_image_ink_stats_object(const Pixel_image_ink_stats& stats)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("ink_pixels"), stats.ink_pixels);
+    object.insert(QStringLiteral("bbox"), json_rect_object(stats.bbox));
+    object.insert(QStringLiteral("center_x"), stats.center_x);
+    object.insert(QStringLiteral("center_y"), stats.center_y);
+    return object;
+}
+
+QJsonObject raster_variant_probe_record_object(
+    const Raster_variant_probe_record& record)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("sample"), record.sample);
+    object.insert(QStringLiteral("variant"), record.variant);
+    object.insert(QStringLiteral("comparison_scope"), record.comparison_scope);
+    object.insert(
+        QStringLiteral("image_size"),
+        json_size_object(record.image_size));
+    object.insert(
+        QStringLiteral("nominal_raster_pixel_size"),
+        record.nominal_raster_pixel_size);
+    object.insert(
+        QStringLiteral("actual_raster_pixel_size"),
+        record.actual_raster_pixel_size);
+    object.insert(
+        QStringLiteral("glyph_image_count"),
+        record.glyph_image_count);
+    object.insert(
+        QStringLiteral("valid_tile_count"),
+        record.valid_tile_count);
+    object.insert(
+        QStringLiteral("max_glyph_image_size"),
+        json_size_object(record.max_glyph_image_size));
+    object.insert(
+        QStringLiteral("diff_to_qt_text_layout"),
+        pixel_diff_stats_object(record.diff_to_qt_text_layout));
+    object.insert(
+        QStringLiteral("ink"),
+        pixel_image_ink_stats_object(record.ink));
+    object.insert(
+        QStringLiteral("distinct_ink_rgb_colors"),
+        record.distinct_ink_rgb_colors);
+    return object;
+}
+
+QJsonObject raster_variant_probe_object(
+    const Raster_variant_probe_result& result)
+{
+    QJsonArray records;
+    for (const Raster_variant_probe_record& record : result.records) {
+        records.append(raster_variant_probe_record_object(record));
+    }
+
+    QJsonObject object;
+    object.insert(
+        QStringLiteral("sheet_image_size"),
+        json_size_object(result.sheet.size()));
+    object.insert(QStringLiteral("records"), records);
+    object.insert(
+        QStringLiteral("renderer_contract"),
+        QStringLiteral(
+            "diagnostic only: raster-size variants for glyph-quality classification"));
     return object;
 }
 
@@ -9033,6 +9577,7 @@ QJsonObject make_lcd_probe_metadata(
     const Pixel_render_result&                   atlas,
     const Pixel_render_result&                   reference,
     const Pixel_render_result&                   qt_text_reference,
+    const Raster_variant_probe_result&           raster_variants,
     const std::vector<Lcd_glyph_probe_record>&   probe_records,
     const char*                                  backend)
 {
@@ -9152,6 +9697,9 @@ QJsonObject make_lcd_probe_metadata(
             fixture,
             atlas,
             qt_text_reference));
+    object.insert(
+        QStringLiteral("raster_variant_probe"),
+        raster_variant_probe_object(raster_variants));
     object.insert(QStringLiteral("atlas_report"), lcd_probe_report_object(atlas.atlas_report));
     object.insert(
         QStringLiteral("capability_interpretation"),
@@ -9200,6 +9748,7 @@ bool write_lcd_probe_artifacts(
     const Pixel_render_result&                   atlas,
     const Pixel_render_result&                   reference,
     const Pixel_render_result&                   qt_text_reference,
+    const Raster_variant_probe_result&           raster_variants,
     const std::vector<Lcd_glyph_probe_record>&   probe_records,
     const char*                                  backend)
 {
@@ -9225,6 +9774,9 @@ bool write_lcd_probe_artifacts(
     const QString qt_text_reference_path =
         artifact_dir.filePath(
             QStringLiteral("lcd_capability_probe_qt_text_reference.png"));
+    const QString raster_variant_path =
+        artifact_dir.filePath(
+            QStringLiteral("lcd_capability_probe_raster_variants.png"));
     const QString metadata_path =
         artifact_dir.filePath(QStringLiteral("lcd_capability_probe_metadata.json"));
 
@@ -9241,6 +9793,10 @@ bool write_lcd_probe_artifacts(
         qt_text_reference.image,
         qt_text_reference_path,
         "Qt text reference");
+    ok &= save_lcd_probe_image_artifact(
+        raster_variants.sheet,
+        raster_variant_path,
+        "raster variant probe");
 
     QSaveFile metadata_file(metadata_path);
     if (!metadata_file.open(QIODevice::WriteOnly)) {
@@ -9256,6 +9812,7 @@ bool write_lcd_probe_artifacts(
             atlas,
             reference,
             qt_text_reference,
+            raster_variants,
             probe_records,
             backend);
         const QByteArray bytes =
@@ -9276,12 +9833,16 @@ bool write_lcd_probe_artifacts(
         const QByteArray reference_path_bytes = reference_path.toLocal8Bit();
         const QByteArray qt_text_reference_path_bytes =
             qt_text_reference_path.toLocal8Bit();
+        const QByteArray raster_variant_path_bytes =
+            raster_variant_path.toLocal8Bit();
         const QByteArray metadata_path_bytes = metadata_path.toLocal8Bit();
         std::cout << "LCD atlas probe artifacts"
             << " atlas=" << atlas_path_bytes.constData()
             << " reference=" << reference_path_bytes.constData()
             << " qt_text_reference="
             << qt_text_reference_path_bytes.constData()
+            << " raster_variants="
+            << raster_variant_path_bytes.constData()
             << " metadata=" << metadata_path_bytes.constData()
             << '\n';
     }
@@ -9374,6 +9935,8 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         render_atlas_rgba_reference_fixture(fixture, reference_size);
     const Pixel_render_result qt_text_reference =
         render_qsg_text_reference_fixture(app, fixture);
+    const Raster_variant_probe_result raster_variants =
+        render_lcd_raster_variant_probe(fixture.device_pixel_ratio);
     const QFont font = term::vnm_terminal_font(QString(), 18.0);
     const std::vector<Lcd_glyph_probe_record> probe_records =
         probe_lcd_subpixel_glyphs(font, atlas.device_pixel_ratio);
@@ -9424,6 +9987,13 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     ok &= check(
         lcd_probe_image_has_visible_variation(qt_text_reference.image),
         "LCD atlas probe Qt text-node reference contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_pixels(raster_variants.sheet) &&
+            lcd_probe_image_has_visible_variation(raster_variants.sheet),
+        "LCD atlas probe raster variant sheet contains visible diagnostic content");
+    ok &= check(
+        raster_variant_probe_records_are_usable(raster_variants),
+        "LCD atlas probe records complete raster variant diagnostics");
     ok &= check(
         qt_text_reference.image.size() == atlas.image.size(),
         "LCD atlas probe Qt text-node reference uses the atlas image size");
@@ -9503,6 +10073,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             atlas,
             reference,
             qt_text_reference,
+            raster_variants,
             probe_records,
             backend),
         "LCD atlas probe writes requested artifacts");
