@@ -102,8 +102,6 @@ struct terminal_packed_render_row_t
     int                        logical_row        = 0;
     std::uint32_t              first_text_span    = 0U;
     std::uint32_t              text_span_count    = 0U;
-    std::uint32_t              first_graphic_span = 0U;
-    std::uint32_t              graphic_span_count = 0U;
 };
 
 struct terminal_packed_text_span_t
@@ -115,17 +113,6 @@ struct terminal_packed_text_span_t
     std::uint32_t              background_rgba = 0U;
     std::uint32_t              text_offset     = 0U;
     std::uint32_t              text_length     = 0U;
-};
-
-struct terminal_packed_graphic_span_t
-{
-    int                        first_column     = 0;
-    int                        column_count     = 0;
-    Terminal_style_id          style_id         = k_default_terminal_style_id;
-    std::uint32_t              foreground_rgba  = 0U;
-    std::uint32_t              background_rgba  = 0U;
-    std::uint32_t              codepoint_offset = 0U;
-    std::uint32_t              codepoint_count  = 0U;
 };
 
 enum class Terminal_simple_content_text_category
@@ -141,7 +128,6 @@ enum class Terminal_simple_content_route
     NONE,
     FAST_TEXT,
     QT_TEXT_LAYOUT,
-    GRAPHIC_GEOMETRY,
     FALLBACK,
 };
 
@@ -161,7 +147,6 @@ enum class Terminal_simple_content_rejection_reason
     NON_ASCII_TEXT,
     DECORATION,
     HYPERLINK,
-    TERMINAL_GRAPHIC,
 };
 
 struct terminal_simple_content_classification_t
@@ -195,7 +180,6 @@ struct terminal_simple_content_stats_t
     int                route_none_cells                      = 0;
     int                route_fast_text_cells                 = 0;
     int                route_qt_text_layout_cells            = 0;
-    int                route_graphic_geometry_cells          = 0;
     int                route_fallback_cells                  = 0;
     int                rejection_none_cells                  = 0;
     int                rejection_empty_text_cells            = 0;
@@ -211,7 +195,6 @@ struct terminal_simple_content_stats_t
     int                rejection_non_ascii_text_cells        = 0;
     int                rejection_decoration_cells            = 0;
     int                rejection_hyperlink_cells             = 0;
-    int                rejection_terminal_graphic_cells      = 0;
 };
 
 struct terminal_simple_content_cumulative_stats_t
@@ -230,7 +213,6 @@ struct terminal_simple_content_cumulative_stats_t
     std::uint64_t      route_none_cells                      = 0U;
     std::uint64_t      route_fast_text_cells                 = 0U;
     std::uint64_t      route_qt_text_layout_cells            = 0U;
-    std::uint64_t      route_graphic_geometry_cells          = 0U;
     std::uint64_t      route_fallback_cells                  = 0U;
     std::uint64_t      rejection_none_cells                  = 0U;
     std::uint64_t      rejection_empty_text_cells            = 0U;
@@ -246,7 +228,6 @@ struct terminal_simple_content_cumulative_stats_t
     std::uint64_t      rejection_non_ascii_text_cells        = 0U;
     std::uint64_t      rejection_decoration_cells            = 0U;
     std::uint64_t      rejection_hyperlink_cells             = 0U;
-    std::uint64_t      rejection_terminal_graphic_cells      = 0U;
 };
 
 terminal_simple_content_classification_t classify_terminal_simple_content_cell(
@@ -266,7 +247,6 @@ struct terminal_render_frame_stats_t
     int                                            cell_pass_input_cells            = 0;
     int                                            cell_pass_classification_calls   = 0;
     // The packed-pass counters describe the separate packed text sidecar scan.
-    // Disabled text sidecars can still emit packed graphics from the cell pass.
     int                                            packed_pass_input_cells          = 0;
     int                                            packed_pass_cells_scanned        = 0;
     int                                            packed_pass_classification_calls = 0;
@@ -275,7 +255,6 @@ struct terminal_render_frame_stats_t
     // Fast text cells eligible after cursor/IME gates but not packed because
     // text sidecars are disabled. These cells still render through text_runs.
     int                                            packed_text_disabled_cells_skipped = 0;
-    int                                            packed_graphic_candidates_classified = 0;
     int                                            packed_cells_appended            = 0;
     int                                            dirty_row_lookup_count           = 0;
     int                                            cells_considered                = 0;
@@ -284,7 +263,6 @@ struct terminal_render_frame_stats_t
     int                                            cells_rendered                  = 0;
     int                                            text_cells_empty                = 0;
     int                                            text_cells_rendered_as_text     = 0;
-    int                                            text_cells_rendered_as_graphic  = 0;
     int                                            text_cells_printable_ascii      = 0;
     int                                            text_cells_other_ascii          = 0;
     int                                            text_cells_non_ascii            = 0;
@@ -306,15 +284,11 @@ struct terminal_render_frame_stats_t
     int                                            cursor_text_runs_emitted        = 0;
     int                                            decoration_rects_emitted        = 0;
     int                                            cursor_rects_emitted            = 0;
-    int                                            cursor_graphic_rects_emitted    = 0;
-    int                                            cursor_graphic_arcs_emitted     = 0;
     int                                            overlay_rects_emitted           = 0;
     int                                            packed_rows                     = 0;
     int                                            packed_text_spans               = 0;
     int                                            packed_text_cells               = 0;
     int                                            packed_text_ascii_direct_cells  = 0;
-    int                                            packed_graphic_spans            = 0;
-    int                                            packed_graphic_cells            = 0;
     std::uint64_t                                  packed_text_ascii_direct_bytes  = 0U;
     std::uint64_t                                  packed_text_utf8_cells          = 0U;
     std::uint64_t                                  packed_text_utf8_input_units    = 0U;
@@ -336,7 +310,6 @@ struct terminal_render_frame_cumulative_stats_t
     std::uint64_t                                  packed_text_sidecars_enabled     = 0U;
     std::uint64_t                                  packed_text_sidecars_disabled    = 0U;
     std::uint64_t                                  packed_text_disabled_cells_skipped = 0U;
-    std::uint64_t                                  packed_graphic_candidates_classified = 0U;
     std::uint64_t                                  packed_cells_appended            = 0U;
     std::uint64_t                                  dirty_row_lookup_count           = 0U;
     std::uint64_t                                  cells_considered                = 0U;
@@ -345,7 +318,6 @@ struct terminal_render_frame_cumulative_stats_t
     std::uint64_t                                  cells_rendered                  = 0U;
     std::uint64_t                                  text_cells_empty                = 0U;
     std::uint64_t                                  text_cells_rendered_as_text     = 0U;
-    std::uint64_t                                  text_cells_rendered_as_graphic  = 0U;
     std::uint64_t                                  text_cells_printable_ascii      = 0U;
     std::uint64_t                                  text_cells_other_ascii          = 0U;
     std::uint64_t                                  text_cells_non_ascii            = 0U;
@@ -367,15 +339,11 @@ struct terminal_render_frame_cumulative_stats_t
     std::uint64_t                                  cursor_text_runs_emitted        = 0U;
     std::uint64_t                                  decoration_rects_emitted        = 0U;
     std::uint64_t                                  cursor_rects_emitted            = 0U;
-    std::uint64_t                                  cursor_graphic_rects_emitted    = 0U;
-    std::uint64_t                                  cursor_graphic_arcs_emitted     = 0U;
     std::uint64_t                                  overlay_rects_emitted           = 0U;
     std::uint64_t                                  packed_rows                     = 0U;
     std::uint64_t                                  packed_text_spans               = 0U;
     std::uint64_t                                  packed_text_cells               = 0U;
     std::uint64_t                                  packed_text_ascii_direct_cells  = 0U;
-    std::uint64_t                                  packed_graphic_spans            = 0U;
-    std::uint64_t                                  packed_graphic_cells            = 0U;
     std::uint64_t                                  packed_text_ascii_direct_bytes  = 0U;
     std::uint64_t                                  packed_text_utf8_cells          = 0U;
     std::uint64_t                                  packed_text_utf8_input_units    = 0U;
@@ -398,15 +366,11 @@ struct Terminal_render_frame
     std::vector<Terminal_render_text_run>          cursor_text_runs;
     std::vector<Terminal_render_decoration>        decorations;
     std::vector<Terminal_render_cursor_primitive>  cursors;
-    std::vector<Terminal_render_rect>              cursor_graphic_rects;
-    std::vector<Terminal_render_arc>               cursor_graphic_arcs;
     std::vector<Terminal_render_rect>              overlay_rects;
     std::vector<Terminal_render_dirty_row_range>   dirty_row_ranges;
     std::vector<terminal_packed_render_row_t>      packed_rows;
     std::vector<terminal_packed_text_span_t>       packed_text_spans;
     std::vector<char>                              packed_text_bytes;
-    std::vector<terminal_packed_graphic_span_t>    packed_graphic_spans;
-    std::vector<std::uint32_t>                     packed_graphic_codepoints;
     terminal_render_frame_stats_t                  stats;
 };
 

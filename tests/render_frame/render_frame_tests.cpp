@@ -120,22 +120,26 @@ QString packed_text_payload(const term::Terminal_render_frame& frame)
         static_cast<int>(frame.packed_text_bytes.size()));
 }
 
-bool has_packed_graphic_codepoint(
-    const term::Terminal_render_frame& frame,
-    std::uint32_t                      codepoint)
-{
-    return std::find(
-        frame.packed_graphic_codepoints.begin(),
-        frame.packed_graphic_codepoints.end(),
-        codepoint) != frame.packed_graphic_codepoints.end();
-}
-
 bool has_graphic_rect(
     const term::Terminal_render_frame& frame,
     const QRectF&                      rect)
 {
     for (const term::Terminal_render_rect& graphic_rect : frame.graphic_rects) {
         if (graphic_rect.rect == rect) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool has_graphic_arc(
+    const term::Terminal_render_frame& frame,
+    term::Terminal_render_arc_kind     kind,
+    const QRectF&                      rect)
+{
+    for (const term::Terminal_render_arc& arc : frame.graphic_arcs) {
+        if (arc.kind == kind && arc.rect == rect) {
             return true;
         }
     }
@@ -170,40 +174,6 @@ bool has_background_rect(
     for (const term::Terminal_render_rect& background_rect : frame.background_rects) {
         if (background_rect.rect  == rect &&
             background_rect.color == color)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool has_graphic_rect_antialias(
-    const term::Terminal_render_frame& frame,
-    const QRectF&                      rect,
-    bool                               antialias)
-{
-    for (const term::Terminal_render_rect& graphic_rect : frame.graphic_rects) {
-        if (graphic_rect.rect      == rect &&
-            graphic_rect.antialias == antialias)
-        {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool has_graphic_arc(
-    const term::Terminal_render_frame& frame,
-    term::Terminal_render_arc_kind     kind,
-    const QRectF&                      rect,
-    qreal                              stroke)
-{
-    for (const term::Terminal_render_arc& arc : frame.graphic_arcs) {
-        if (arc.kind   == kind &&
-            arc.rect   == rect &&
-            arc.stroke == stroke)
         {
             return true;
         }
@@ -252,7 +222,7 @@ bool test_plain_text_color_inverse_and_wide_skip()
     return ok;
 }
 
-bool test_terminal_graphics_use_grid_rects()
+bool test_terminal_graphics_use_grid_primitives()
 {
     bool ok = true;
     term::Terminal_render_snapshot snapshot = empty_snapshot({3, 8});
@@ -278,34 +248,35 @@ bool test_terminal_graphics_use_grid_rects()
     add_graphic_cell(1, 0, QStringLiteral("\u2502"));
     add_graphic_cell(1, 1, QStringLiteral("\u2588"));
     add_graphic_cell(1, 2, QStringLiteral("\u2598"));
+    add_graphic_cell(1, 3, QStringLiteral("\u2592"));
+    add_graphic_cell(1, 4, QStringLiteral("\u2801"));
     snapshot.cells.push_back({{2, 0}, QStringLiteral("A"), 0U, 1, false, 0U});
 
     const term::Terminal_render_frame frame = build(snapshot);
     ok &= check(std::all_of(
         snapshot.cells.begin(),
-        snapshot.cells.begin() + 6,
+        snapshot.cells.begin() + 8,
         [](const term::Terminal_render_cell& cell) {
             return
                 cell.text.is_inline_single_bmp() &&
                 cell.text.fallback_qstring_or_null() == nullptr;
         }), "terminal graphic fixture stores source graphics as inline BMP");
-    ok &= check(frame.text_runs.size() == 1U &&
-        frame.text_runs.front().text == QStringLiteral("A"),
-        "terminal graphic cells bypass font text runs");
-    ok &= check(frame.stats.packed_graphic_candidates_classified == 6 &&
-        frame.stats.packed_graphic_cells == 6 &&
-        has_packed_graphic_codepoint(frame, 0x2500U) &&
-        has_packed_graphic_codepoint(frame, 0x2588U) &&
-        has_packed_graphic_codepoint(frame, 0x2598U),
-        "terminal graphic cells preserve inline BMP codepoints in packed sidecars");
+    ok &= check(frame.text_runs.size() == 2U &&
+        run_at(frame, 1, 4) != nullptr &&
+        run_at(frame, 2, 0) != nullptr,
+        "Braille and ASCII remain on text runs");
     ok &= check(has_graphic_rect(frame, QRectF(10.0, 9.5, 10.0, 1.0)),
-        "horizontal box drawing remains in direct graphic rectangles");
-    ok &= check(has_graphic_rect_antialias(frame, QRectF(10.0, 9.5, 10.0, 1.0), true),
-        "box drawing line strokes request antialiased rendering");
-    ok &= check(!has_graphic_rect(frame, QRectF(10.0, 20.0, 10.0, 20.0)),
-        "packed full block is not duplicated into direct graphic rectangles");
-    ok &= check(!has_graphic_rect(frame, QRectF(20.0, 20.0, 5.0, 10.0)),
-        "packed quadrant block is not duplicated into direct graphic rectangles");
+        "horizontal box drawing uses grid-aligned graphic rectangles");
+    ok &= check(has_graphic_rect(frame, QRectF(10.0, 20.0, 10.0, 20.0)),
+        "full block fills the entire cell");
+    ok &= check(has_graphic_rect(frame, QRectF(20.0, 20.0, 5.0, 10.0)),
+        "quadrant block uses cell-grid geometry");
+    ok &= check(has_graphic_rect(frame, QRectF(30.0, 20.0, 10.0, 20.0)),
+        "shade block fills the full cell with alpha geometry");
+    ok &= check(frame.stats.text_cells_rendered_as_text == 2 &&
+        frame.stats.graphic_rects_emitted >= 6              &&
+        frame.stats.graphic_arcs_emitted == 0,
+        "terminal graphics are counted as primitive output, not text glyphs");
     return ok;
 }
 
@@ -333,7 +304,7 @@ bool test_stale_inline_bmp_category_uses_text_fallback()
     ok &= check(classification.route == term::Terminal_simple_content_route::FALLBACK &&
         classification.rejection_reason ==
             term::Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING,
-        "stale inline-BMP cached category is rejected before graphic routing");
+        "stale inline-BMP cached category is rejected before text routing");
 
     const term::Terminal_render_frame frame = build(snapshot);
     ok &= check(frame.graphic_rects.empty() &&
@@ -462,12 +433,9 @@ bool test_rejected_graphic_cells_stay_on_text_route()
             entry.message);
 
         const term::Terminal_render_frame frame = build(snapshot);
-        ok &= check(frame.stats.text_cells_rendered_as_graphic == 0 &&
-            frame.stats.packed_graphic_cells == 0                 &&
-            frame.packed_graphic_codepoints.empty()               &&
-            frame.graphic_rects.empty()                           &&
+        ok &= check(frame.graphic_rects.empty()                   &&
             frame.graphic_arcs.empty(),
-            "rejected graphic cell emits no packed or direct graphic geometry");
+            "rejected text-like symbol emits no direct graphic geometry");
         ok &= check(frame.text_runs.size() == 1U &&
             frame.text_runs.front().text == graphic_text,
             "rejected graphic cell remains available to Qt text layout");
@@ -480,6 +448,7 @@ bool test_rounded_box_corners_use_arc_primitives()
 {
     bool ok = true;
     term::Terminal_render_snapshot snapshot = empty_snapshot({1, 4});
+    snapshot.cursor.visible = false;
     snapshot.cells.push_back({{0, 0}, QStringLiteral("\u256d"), 0U, 1, false, 0U});
     snapshot.cells.push_back({{0, 1}, QStringLiteral("\u256e"), 0U, 1, false, 0U});
     snapshot.cells.push_back({{0, 2}, QStringLiteral("\u256f"), 0U, 1, false, 0U});
@@ -487,7 +456,7 @@ bool test_rounded_box_corners_use_arc_primitives()
 
     const term::Terminal_render_frame frame = build(snapshot);
     ok &= check(frame.text_runs.empty(),
-        "rounded box corners bypass font text runs");
+        "rounded box corners bypass shaped text runs");
     ok &= check(frame.graphic_rects.empty(),
         "rounded box corners do not fall back to square corner rectangles");
     ok &= check(frame.graphic_arcs.size() == 4U,
@@ -495,31 +464,27 @@ bool test_rounded_box_corners_use_arc_primitives()
     ok &= check(has_graphic_arc(
         frame,
         term::Terminal_render_arc_kind::DOWN_RIGHT,
-        QRectF(0.0, 0.0, 10.0, 20.0),
-        1.0),
+        QRectF(0.0, 0.0, 10.0, 20.0)),
         "rounded down-right corner produces a down-right arc");
     ok &= check(has_graphic_arc(
         frame,
         term::Terminal_render_arc_kind::DOWN_LEFT,
-        QRectF(10.0, 0.0, 10.0, 20.0),
-        1.0),
+        QRectF(10.0, 0.0, 10.0, 20.0)),
         "rounded down-left corner produces a down-left arc");
     ok &= check(has_graphic_arc(
         frame,
         term::Terminal_render_arc_kind::UP_LEFT,
-        QRectF(20.0, 0.0, 10.0, 20.0),
-        1.0),
+        QRectF(20.0, 0.0, 10.0, 20.0)),
         "rounded up-left corner produces an up-left arc");
     ok &= check(has_graphic_arc(
         frame,
         term::Terminal_render_arc_kind::UP_RIGHT,
-        QRectF(30.0, 0.0, 10.0, 20.0),
-        1.0),
+        QRectF(30.0, 0.0, 10.0, 20.0)),
         "rounded up-right corner produces an up-right arc");
     return ok;
 }
 
-bool test_block_cursor_over_graphic_has_overlay_rects()
+bool test_block_cursor_over_text_like_symbol_uses_cursor_text()
 {
     bool ok = true;
     term::Terminal_render_snapshot snapshot = empty_snapshot({2, 4});
@@ -527,25 +492,54 @@ bool test_block_cursor_over_graphic_has_overlay_rects()
     snapshot.cells.push_back({{0, 1}, QStringLiteral("\u2500"), 0U, 1, false, 0U});
 
     const term::Terminal_render_frame frame = build(snapshot);
-    ok &= check(frame.text_runs.empty(),
-        "cursor-covered primitive graphic still bypasses main font text runs");
-    ok &= check(frame.cursors.size() == 2U &&
-        frame.cursors[0].kind == term::Terminal_cursor_shape::BLOCK &&
-        frame.cursors[1].kind == term::Terminal_cursor_shape::BLOCK,
-        "block cursor over primitive graphic is split around the graphic overlay");
-    ok &= check(frame.graphic_rects.size() == 1U &&
-        frame.graphic_rects.front().rect == QRectF(10.0, 9.5, 10.0, 1.0),
-        "primitive graphic remains in the normal graphic layer");
-    ok &= check(frame.cursor_graphic_rects.size() == 1U &&
-        frame.cursor_graphic_rects.front().rect == frame.graphic_rects.front().rect &&
-        frame.cursor_graphic_rects.front().antialias &&
-        frame.cursor_graphic_rects.front().color.red() == 9 &&
-        frame.cursor_graphic_rects.front().color.green() == 12 &&
-        frame.cursor_graphic_rects.front().color.blue() == 16 &&
-        frame.cursor_graphic_rects.front().color.alpha() == 254,
-        "block cursor over primitive graphic emits a contrasting graphic overlay");
-    ok &= check(frame.cursor_text_runs.empty(),
-        "primitive graphic cursor overlay does not synthesize font cursor text");
+    ok &= check(frame.text_runs.size() == 1U &&
+        frame.text_runs.front().text == QStringLiteral("\u2500"),
+        "cursor-covered text-like symbol remains in main text runs");
+    ok &= check(frame.cursors.size() == 1U &&
+        frame.cursors.front().kind == term::Terminal_cursor_shape::BLOCK,
+        "block cursor over text-like symbol uses one normal cursor rect");
+    ok &= check(frame.graphic_rects.empty() &&
+        frame.graphic_arcs.empty(),
+        "block cursor over text-like symbol emits no graphic overlay primitives");
+    ok &= check(frame.cursor_text_runs.size() == 1U &&
+        frame.cursor_text_runs.front().text == QStringLiteral("\u2500") &&
+        frame.cursor_text_runs.front().clip_rect == frame.cursors.front().rect,
+        "block cursor inverse text comes from the shaped text run");
+    return ok;
+}
+
+bool test_terminal_graphics_use_geometry_with_selection_and_ime_text()
+{
+    bool ok = true;
+    term::Terminal_render_snapshot snapshot = empty_snapshot({2, 6});
+    snapshot.cursor.visible                 = false;
+    snapshot.cursor.position                = {1, 1};
+    snapshot.selection_spans.push_back({
+        {{0, 0}, {0, 3}, term::Terminal_selection_mode::NORMAL},
+        0,
+        0,
+        3,
+    });
+    snapshot.ime_preedit.active          = true;
+    snapshot.ime_preedit.text            = QStringLiteral("\u2801");
+    snapshot.ime_preedit.cursor_position = 1;
+    snapshot.cells.push_back({{0, 0}, QStringLiteral("\u250c"), 0U, 1, false, 0U});
+    snapshot.cells.push_back({{0, 1}, QStringLiteral("\u2500"), 0U, 1, false, 0U});
+    snapshot.cells.push_back({{0, 2}, QStringLiteral("\u2510"), 0U, 1, false, 0U});
+    snapshot.cells.push_back({{1, 1}, QStringLiteral("\u2588"), 0U, 1, false, 0U});
+
+    const term::Terminal_render_frame frame = build(snapshot);
+    ok &= check(frame.text_runs.size() == 2U &&
+        run_at(frame, 1, 1) != nullptr &&
+        frame.text_runs.back().text == QStringLiteral("\u2801"),
+        "IME-covered terminal graphic remains on shaped text runs");
+    ok &= check(frame.selection_rects.size() == 2U &&
+        frame.selection_rects[0].rect == QRectF(0.0, 0.0, 30.0, 20.0) &&
+        frame.selection_rects[1].rect == QRectF(10.0, 20.0, 10.0, 20.0),
+        "selection and IME background rectangles cover terminal graphic cells");
+    ok &= check(!frame.graphic_rects.empty() &&
+        frame.stats.graphic_arcs_emitted == 0,
+        "unprotected selected box drawing uses graphic geometry");
     return ok;
 }
 
@@ -626,7 +620,7 @@ bool test_single_cell_unicode_text_is_not_clipped_to_cell()
     return ok;
 }
 
-bool test_direct_ascii_text_runs_coalesce_contiguous_plain_cells()
+bool test_coalesced_ascii_text_runs_coalesce_contiguous_plain_cells()
 {
     bool ok = true;
     term::Terminal_render_snapshot snapshot = empty_snapshot({1, 6});
@@ -644,7 +638,7 @@ bool test_direct_ascii_text_runs_coalesce_contiguous_plain_cells()
         "contiguous same-style printable ASCII emits one coalesced text run");
     ok &= check(frame.stats.text_runs_emitted == 1 &&
         frame.stats.text_cells_rendered_as_text == 3,
-        "coalesced direct ASCII still counts the rendered source cells");
+        "coalesced ASCII still counts the rendered source cells");
     ok &= check(frame.stats.compact_ascii_cells_seen == 3 &&
         frame.stats.compact_ascii_text_direct_appends == 3 &&
         frame.stats.compact_ascii_qstring_materializations == 0,
@@ -652,7 +646,7 @@ bool test_direct_ascii_text_runs_coalesce_contiguous_plain_cells()
     return ok;
 }
 
-bool test_direct_ascii_text_runs_split_at_guard_boundaries()
+bool test_coalesced_ascii_text_runs_split_at_guard_boundaries()
 {
     bool ok = true;
     term::Terminal_render_snapshot snapshot = empty_snapshot({5, 8});
@@ -710,21 +704,21 @@ bool test_direct_ascii_text_runs_split_at_guard_boundaries()
         style_runs[1]->foreground == QColor(204, 16, 16) &&
         style_runs[1]->background == QColor(16, 48, 204) &&
         style_runs[2]->text == QStringLiteral("C"),
-        "direct ASCII coalescing splits at foreground/background/style boundaries");
+        "coalesced ASCII splits at foreground/background/style boundaries");
 
     const std::vector<const term::Terminal_render_text_run*> decoration_runs =
         text_runs_for_row(frame, 1);
     ok &= check(decoration_runs.size() == 3U &&
         decoration_runs[1]->text == QStringLiteral("E") &&
         decoration_runs[1]->underline,
-        "direct ASCII coalescing splits at decoration boundaries");
+        "coalesced ASCII splits at decoration boundaries");
 
     const std::vector<const term::Terminal_render_text_run*> hyperlink_runs =
         text_runs_for_row(frame, 2);
     ok &= check(hyperlink_runs.size() == 3U &&
         hyperlink_runs[1]->text == QStringLiteral("H") &&
         hyperlink_runs[1]->hyperlink_id == 17U,
-        "direct ASCII coalescing splits at hyperlink boundaries");
+        "coalesced ASCII splits at hyperlink boundaries");
 
     const std::vector<const term::Terminal_render_text_run*> gap_runs =
         text_runs_for_row(frame, 3);
@@ -732,7 +726,7 @@ bool test_direct_ascii_text_runs_split_at_guard_boundaries()
         gap_runs[0]->text == QStringLiteral("J") &&
         gap_runs[1]->column == 2 &&
         gap_runs[1]->text == QStringLiteral("K"),
-        "direct ASCII coalescing splits across column gaps");
+        "coalesced ASCII splits across column gaps");
 
     const std::vector<const term::Terminal_render_text_run*> cursor_runs =
         text_runs_for_row(frame, 4);
@@ -740,14 +734,14 @@ bool test_direct_ascii_text_runs_split_at_guard_boundaries()
         cursor_runs[0]->text == QStringLiteral("L") &&
         cursor_runs[1]->text == QStringLiteral("M") &&
         cursor_runs[2]->text == QStringLiteral("N"),
-        "direct ASCII coalescing splits around a block-cursor-covered cell");
+        "coalesced ASCII splits around a block-cursor-covered cell");
     ok &= check(frame.cursor_text_runs.size() == 1U &&
         frame.cursor_text_runs.front().text == QStringLiteral("M"),
         "block cursor overlay copies only the protected standalone cell");
     return ok;
 }
 
-bool test_direct_ascii_text_runs_split_at_max_coalesced_length()
+bool test_coalesced_ascii_text_runs_split_at_max_coalesced_length()
 {
     constexpr int k_expected_max_coalesced_ascii_text_run_length = 384;
 
@@ -761,7 +755,7 @@ bool test_direct_ascii_text_runs_split_at_max_coalesced_length()
 
     const term::Terminal_render_frame frame = build(snapshot);
     ok &= check(frame.text_runs.size() == 2U,
-        "direct ASCII coalescing caps the maximum text-run length");
+        "coalesced ASCII caps the maximum text-run length");
     ok &= check(frame.text_runs.size() == 2U &&
         frame.text_runs[0].column == 0 &&
         frame.text_runs[0].text.size() == k_expected_max_coalesced_ascii_text_run_length &&
@@ -1128,8 +1122,9 @@ bool test_frame_stats_classify_rendered_cells()
         frame.stats.cells_rendered == 4,
         "frame stats distinguish skipped and rendered cells");
     ok &= check(frame.stats.text_cells_rendered_as_text == 3 &&
-        frame.stats.text_cells_rendered_as_graphic == 1,
-        "frame stats distinguish text and graphic cell rendering");
+        frame.graphic_rects.size() == 1U &&
+        frame.graphic_arcs.empty(),
+        "frame stats count block elements as graphic primitives");
     ok &= check(frame.stats.text_cells_printable_ascii == 1 &&
         frame.stats.text_cells_simple_ascii == 1 &&
         frame.stats.text_cells_non_ascii == 3,
@@ -1142,8 +1137,7 @@ bool test_frame_stats_classify_rendered_cells()
         frame.stats.text_style_changes == 1,
         "frame stats capture style and decoration churn");
     ok &= check(frame.stats.text_runs_emitted == 3 &&
-        frame.stats.packed_graphic_cells == 1 &&
-        frame.stats.graphic_rects_emitted == 0 &&
+        frame.stats.graphic_rects_emitted == 1 &&
         frame.stats.decoration_rects_emitted == 1,
         "frame stats count emitted primitives");
     return ok;
@@ -1232,10 +1226,10 @@ bool test_simple_content_classifier_and_stats()
             false);
     ok &= check(!graphic_classification.fast_text_eligible &&
         graphic_classification.route ==
-            term::Terminal_simple_content_route::GRAPHIC_GEOMETRY &&
+            term::Terminal_simple_content_route::QT_TEXT_LAYOUT &&
         graphic_classification.rejection_reason ==
-            term::Terminal_simple_content_rejection_reason::TERMINAL_GRAPHIC,
-        "simple-content classifier sends terminal graphics to geometry");
+            term::Terminal_simple_content_rejection_reason::NON_ASCII_TEXT,
+        "simple-content classifier keeps block elements on the Qt text route");
 
     term::Terminal_render_cell stale_graphic_cell = graphic_cell;
     stale_graphic_cell.text_category =
@@ -1488,13 +1482,11 @@ bool test_simple_content_classifier_and_stats()
         simple_stats.text_category_empty_cells == 1,
         "simple-content frame stats classify text categories");
     ok &= check(simple_stats.route_fast_text_cells == 3 &&
-        simple_stats.route_qt_text_layout_cells == 2 &&
-        simple_stats.route_graphic_geometry_cells == 1 &&
+        simple_stats.route_qt_text_layout_cells == 3 &&
         simple_stats.route_none_cells == 1,
         "simple-content frame stats count canonical routes");
     ok &= check(simple_stats.rejection_none_cells == 3 &&
-        simple_stats.rejection_non_ascii_text_cells == 1 &&
-        simple_stats.rejection_terminal_graphic_cells == 1 &&
+        simple_stats.rejection_non_ascii_text_cells == 2 &&
         simple_stats.rejection_empty_text_cells == 1 &&
         simple_stats.rejection_hyperlink_cells == 1,
         "simple-content frame stats count rejection reasons");
@@ -1964,7 +1956,6 @@ bool test_cell_pass_and_packed_pass_classification_agree()
                        expected_reason       =
                            term::Terminal_simple_content_rejection_reason::NONE;
         QString        expected_packed_text;
-        std::uint32_t  expected_graphic      = 0U;
         int            expected_dirty_fast   = 0;
         int            expected_clean_fast   = 0;
     };
@@ -1979,7 +1970,6 @@ bool test_cell_pass_and_packed_pass_classification_agree()
             term::Terminal_simple_content_route::FAST_TEXT,
             term::Terminal_simple_content_rejection_reason::NONE,
             QStringLiteral("A"),
-            0U,
             1,
             0,
         },
@@ -1992,7 +1982,6 @@ bool test_cell_pass_and_packed_pass_classification_agree()
             term::Terminal_simple_content_route::FAST_TEXT,
             term::Terminal_simple_content_rejection_reason::NONE,
             QStringLiteral("B"),
-            0U,
             0,
             1,
         },
@@ -2006,15 +1995,13 @@ bool test_cell_pass_and_packed_pass_classification_agree()
             term::Terminal_simple_content_rejection_reason::NON_ASCII_TEXT,
         },
         {
-            "terminal graphic cell agrees on packed graphic route",
+            "block-element cell agrees on text route",
             QStringLiteral("\u2588"),
             decoration_t::NONE,
             0U,
             true,
-            term::Terminal_simple_content_route::GRAPHIC_GEOMETRY,
-            term::Terminal_simple_content_rejection_reason::TERMINAL_GRAPHIC,
-            {},
-            0x2588U,
+            term::Terminal_simple_content_route::QT_TEXT_LAYOUT,
+            term::Terminal_simple_content_rejection_reason::NON_ASCII_TEXT,
         },
         {
             "underlined ASCII cell stays off packed fast text",
@@ -2055,8 +2042,6 @@ bool test_cell_pass_and_packed_pass_classification_agree()
                 return stats.route_fast_text_cells;
             case term::Terminal_simple_content_route::QT_TEXT_LAYOUT:
                 return stats.route_qt_text_layout_cells;
-            case term::Terminal_simple_content_route::GRAPHIC_GEOMETRY:
-                return stats.route_graphic_geometry_cells;
             case term::Terminal_simple_content_route::FALLBACK:
                 return stats.route_fallback_cells;
         }
@@ -2068,7 +2053,6 @@ bool test_cell_pass_and_packed_pass_classification_agree()
             stats.route_none_cells             +
             stats.route_fast_text_cells        +
             stats.route_qt_text_layout_cells   +
-            stats.route_graphic_geometry_cells +
             stats.route_fallback_cells;
     };
     const auto rejection_count = [](
@@ -2103,8 +2087,6 @@ bool test_cell_pass_and_packed_pass_classification_agree()
                 return stats.rejection_decoration_cells;
             case term::Terminal_simple_content_rejection_reason::HYPERLINK:
                 return stats.rejection_hyperlink_cells;
-            case term::Terminal_simple_content_rejection_reason::TERMINAL_GRAPHIC:
-                return stats.rejection_terminal_graphic_cells;
         }
         return 0;
     };
@@ -2124,8 +2106,7 @@ bool test_cell_pass_and_packed_pass_classification_agree()
             stats.rejection_non_printable_ascii_cells   +
             stats.rejection_non_ascii_text_cells        +
             stats.rejection_decoration_cells            +
-            stats.rejection_hyperlink_cells             +
-            stats.rejection_terminal_graphic_cells;
+            stats.rejection_hyperlink_cells;
     };
 
     for (const agreement_case_t& entry : cases) {
@@ -2183,20 +2164,11 @@ bool test_cell_pass_and_packed_pass_classification_agree()
 
         if (entry.expected_route == term::Terminal_simple_content_route::FAST_TEXT) {
             ok &= check(frame.stats.packed_text_cells == 1 &&
-                frame.stats.packed_graphic_cells == 0 &&
                 packed_text_payload(frame) == entry.expected_packed_text,
                 "packed text output agrees with the fast-text classification");
         }
-        else
-        if (entry.expected_route == term::Terminal_simple_content_route::GRAPHIC_GEOMETRY) {
-            ok &= check(frame.stats.packed_text_cells == 0 &&
-                frame.stats.packed_graphic_cells == 1 &&
-                has_packed_graphic_codepoint(frame, entry.expected_graphic),
-                "packed graphic output agrees with the graphic classification");
-        }
         else {
-            ok &= check(frame.stats.packed_text_cells == 0 &&
-                frame.stats.packed_graphic_cells == 0,
+            ok &= check(frame.stats.packed_text_cells == 0,
                 "packed output excludes cells rejected from packed fast routes");
         }
     }
@@ -2300,142 +2272,7 @@ bool test_packed_text_rows_spans_and_order()
     return ok;
 }
 
-bool test_packed_graphic_source_codepoint_spans()
-{
-    bool ok = true;
-    term::Terminal_render_snapshot snapshot = empty_snapshot({2, 8});
-    snapshot.cursor.visible = false;
-
-    term::Terminal_text_style accent = term::make_default_terminal_text_style();
-    accent.foreground = term::make_rgb_terminal_color_ref(0xff20d0f0U);
-    snapshot.styles.push_back(accent);
-
-    snapshot.cells.push_back({.position = {0, 2}, .text = QStringLiteral("\u2588")});
-    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("\u250c")});
-    snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("\u2500")});
-    snapshot.cells.push_back({.position = {0, 4}, .text = QStringLiteral("\u2510"), .style_id = 1U});
-    snapshot.cells.push_back({.position = {1, 0}, .text = QStringLiteral("A")});
-
-    const term::Terminal_render_frame frame = build(snapshot);
-    ok &= check(has_graphic_rect(frame, QRectF(10.0, 9.5, 10.0, 1.0)) &&
-        !has_graphic_rect(frame, QRectF(20.0, 0.0, 10.0, 20.0)),
-        "packed hard blocks are not duplicated while box graphics remain direct");
-    ok &= check(frame.packed_graphic_spans.size() == 2U &&
-        frame.packed_graphic_codepoints.size() == 4U &&
-        frame.stats.packed_graphic_spans == 2 &&
-        frame.stats.packed_graphic_cells == 4,
-        "packed graphics store source codepoint spans");
-
-    const term::terminal_packed_graphic_span_t& default_span =
-        frame.packed_graphic_spans[0];
-    ok &= check(default_span.first_column == 0 &&
-        default_span.column_count == 3 &&
-        default_span.codepoint_offset == 0U &&
-        default_span.codepoint_count == 3U &&
-        frame.packed_graphic_codepoints[0] == 0x250cU &&
-        frame.packed_graphic_codepoints[1] == 0x2500U &&
-        frame.packed_graphic_codepoints[2] == 0x2588U,
-        "packed graphic source span follows sorted cell columns");
-
-    const term::terminal_packed_graphic_span_t& accent_span =
-        frame.packed_graphic_spans[1];
-    ok &= check(accent_span.first_column == 4 &&
-        accent_span.style_id == 1U &&
-        accent_span.foreground_rgba ==
-            static_cast<std::uint32_t>(QColor(32, 208, 240).rgba()) &&
-        frame.packed_graphic_codepoints[accent_span.codepoint_offset] == 0x2510U,
-        "packed graphic spans preserve style and source codepoints");
-    ok &= check(frame.stats.simple_content.route_graphic_geometry_cells ==
-        frame.stats.packed_graphic_cells,
-        "packed graphic cell count matches canonical graphic-route candidates");
-    return ok;
-}
-
-bool test_packed_graphics_exclude_unrepresented_cells()
-{
-    bool ok = true;
-
-    term::Terminal_render_snapshot semantic_snapshot = empty_snapshot({1, 8});
-    semantic_snapshot.cursor.visible = false;
-    term::Terminal_text_style decorated = term::make_default_terminal_text_style();
-    term::set_terminal_style_attribute(decorated, term::Terminal_style_attribute::UNDERLINE);
-    semantic_snapshot.styles.push_back(decorated);
-    semantic_snapshot.hyperlinks.push_back({17U, QByteArrayLiteral("uri:https://example.test"),
-        QByteArrayLiteral("https://example.test")});
-    semantic_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("\u250c")});
-    semantic_snapshot.cells.push_back({
-        .position     = {0, 1},
-        .text         = QStringLiteral("\u2500"),
-        .hyperlink_id = 17U,
-    });
-    semantic_snapshot.cells.push_back({
-        .position = {0, 2},
-        .text     = QStringLiteral("\u2510"),
-        .style_id = 1U,
-    });
-    semantic_snapshot.cells.push_back({
-        .position      = {0, 4},
-        .text          = QStringLiteral("\u2588"),
-        .display_width = 2,
-    });
-
-    const term::Terminal_render_frame semantic_frame = build(semantic_snapshot);
-    ok &= check(semantic_frame.stats.text_cells_rendered_as_graphic == 1,
-        "unrepresented graphic sidecar cases stay off direct graphic rendering");
-    ok &= check(semantic_frame.stats.packed_graphic_cells == 1 &&
-        semantic_frame.packed_graphic_codepoints.size() == 1U &&
-        semantic_frame.packed_graphic_codepoints.front() == 0x250cU,
-        "packed graphics exclude hyperlink, decorated, and width-mismatched graphics");
-    ok &= check(!has_graphic_rect(semantic_frame, QRectF(40.0, 0.0, 20.0, 20.0)),
-        "width-mismatched hard block stays on the text route");
-    ok &= check(semantic_frame.stats.simple_content.route_graphic_geometry_cells == 1 &&
-        semantic_frame.stats.simple_content.rejection_hyperlink_cells == 1 &&
-        semantic_frame.stats.simple_content.rejection_decoration_cells == 1 &&
-        semantic_frame.stats.simple_content.rejection_invalid_text_width_cells == 1,
-        "simple-content classifier rejects graphic cells with unrepresented semantics");
-
-    term::Terminal_render_snapshot cursor_snapshot = empty_snapshot({1, 4});
-    cursor_snapshot.cursor = {{0, 0}, term::Terminal_cursor_shape::BLOCK, true, false};
-    cursor_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("\u2588")});
-    cursor_snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("\u2500")});
-
-    const term::Terminal_render_frame cursor_frame = build(cursor_snapshot);
-    ok &= check(cursor_frame.stats.text_cells_rendered_as_graphic == 2 &&
-        !cursor_frame.cursor_graphic_rects.empty(),
-        "block cursor over packed-excluded graphic still emits canonical cursor graphics");
-    ok &= check(has_graphic_rect(cursor_frame, QRectF(0.0, 0.0, 10.0, 20.0)),
-        "block-cursor-covered hard block remains on the direct graphic route");
-    ok &= check(cursor_frame.stats.simple_content.route_graphic_geometry_cells == 2 &&
-        cursor_frame.stats.packed_graphic_cells == 1 &&
-        cursor_frame.packed_graphic_codepoints.size() == 1U &&
-        cursor_frame.packed_graphic_codepoints.front() == 0x2500U,
-        "packed graphics exclude block-cursor-covered graphics");
-
-    term::Terminal_render_snapshot ime_snapshot = empty_snapshot({1, 5});
-    ime_snapshot.cursor.visible     = false;
-    ime_snapshot.cursor.position    = {0, 0};
-    ime_snapshot.ime_preedit.active = true;
-    ime_snapshot.ime_preedit.text   = QStringLiteral("xy");
-    ime_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("\u2588")});
-    ime_snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("\u2500")});
-    ime_snapshot.cells.push_back({.position = {0, 2}, .text = QStringLiteral("\u2510")});
-
-    const term::Terminal_render_frame ime_frame = build(ime_snapshot);
-    ok &= check(ime_frame.stats.text_cells_rendered_as_graphic == 3 &&
-        !ime_frame.text_runs.empty() &&
-        ime_frame.text_runs.back().text == QStringLiteral("xy"),
-        "IME over packed-excluded graphics still emits canonical preedit text");
-    ok &= check(has_graphic_rect(ime_frame, QRectF(0.0, 0.0, 10.0, 20.0)),
-        "IME-covered hard block remains on the direct graphic route");
-    ok &= check(ime_frame.stats.simple_content.route_graphic_geometry_cells == 3 &&
-        ime_frame.stats.packed_graphic_cells == 1 &&
-        ime_frame.packed_graphic_codepoints.size() == 1U &&
-        ime_frame.packed_graphic_codepoints.front() == 0x2510U,
-        "packed graphics exclude IME-covered graphics");
-    return ok;
-}
-
-bool test_disabled_packed_text_sidecars_skip_scan_and_keep_graphics()
+bool test_disabled_packed_text_sidecars_skip_scan()
 {
     bool ok = true;
 
@@ -2447,6 +2284,9 @@ bool test_disabled_packed_text_sidecars_skip_scan_and_keep_graphics()
     text_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
     text_snapshot.cells.push_back({.position = {1, 0}, .text = QStringLiteral("B")});
     text_snapshot.cells.push_back({.position = {2, 0}, .text = QStringLiteral("\u03c0")});
+    text_snapshot.cells.push_back({.position = {2, 1}, .text = QStringLiteral("\u2500")});
+    text_snapshot.cells.push_back({.position = {2, 2}, .text = QStringLiteral("\u2588")});
+    text_snapshot.cells.push_back({.position = {2, 3}, .text = QStringLiteral("\u2801")});
 
     const term::Terminal_render_frame text_frame =
         build(text_snapshot, render_options);
@@ -2465,322 +2305,18 @@ bool test_disabled_packed_text_sidecars_skip_scan_and_keep_graphics()
         text_frame.packed_rows[1].viewport_row == 1 &&
         text_frame.packed_rows[2].viewport_row == 2 &&
         text_frame.packed_text_spans.empty() &&
-        text_frame.packed_graphic_spans.empty() &&
         text_frame.stats.packed_rows == 3 &&
         text_frame.stats.packed_text_cells == 0 &&
-        text_frame.stats.packed_graphic_cells == 0 &&
-        text_frame.text_runs.size() == 3U &&
+        text_frame.text_runs.size() == 4U &&
         text_frame.text_runs[0].text == QStringLiteral("A") &&
         text_frame.text_runs[1].text == QStringLiteral("B") &&
         text_frame.text_runs[2].text == QStringLiteral("\u03c0") &&
+        text_frame.text_runs[3].text == QStringLiteral("\u2801") &&
+        !text_frame.graphic_rects.empty() &&
+        text_frame.graphic_arcs.empty() &&
         text_frame.stats.packed_payload_bytes > 0U,
-        "text-only disabled-sidecar frames keep ordered packed row identity");
+        "disabled-sidecar frames keep row identity while grid graphics use primitives");
 
-    term::Terminal_render_snapshot graphics_snapshot = empty_snapshot({2, 8});
-    graphics_snapshot.cursor.visible = false;
-    graphics_snapshot.cells.push_back({.position = {0, 2}, .text = QStringLiteral("\u2598")});
-    graphics_snapshot.cells.push_back({.position = {1, 1}, .text = QStringLiteral("\u2588")});
-    graphics_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("\u2588")});
-    graphics_snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("\u2598")});
-
-    const term::Terminal_render_frame graphics_frame =
-        build(graphics_snapshot, render_options);
-    ok &= check(graphics_frame.stats.packed_pass_input_cells == 0 &&
-        graphics_frame.stats.packed_pass_cells_scanned == 0 &&
-        graphics_frame.stats.packed_pass_classification_calls == 0 &&
-        graphics_frame.stats.packed_text_cells == 0,
-        "disabled packed text sidecars keep graphics off the separate packed pass");
-    ok &= check(graphics_frame.packed_rows.size() == 2U &&
-        graphics_frame.stats.packed_rows == 2 &&
-        graphics_frame.packed_rows[0].viewport_row == 0 &&
-        graphics_frame.packed_rows[0].logical_row == 0 &&
-        graphics_frame.packed_rows[1].viewport_row == 1 &&
-        graphics_frame.packed_rows[1].logical_row == 1,
-        "disabled-sidecar packed rows are indexed by viewport row");
-    ok &= check(graphics_frame.stats.text_cells_rendered_as_graphic == 4 &&
-        graphics_frame.stats.packed_graphic_candidates_classified == 4 &&
-        graphics_frame.stats.packed_graphic_cells == 4 &&
-        has_packed_graphic_codepoint(graphics_frame, 0x2588U) &&
-        has_packed_graphic_codepoint(graphics_frame, 0x2598U) &&
-        graphics_frame.graphic_rects.empty(),
-        "hard block graphics remain packed for rendering with text sidecars disabled");
-    ok &= check(graphics_frame.stats.packed_payload_bytes > 0U,
-        "disabled-sidecar packed graphics report payload bytes");
-
-    const auto first_graphic_codepoint_for_row = [&](
-        const term::terminal_packed_render_row_t& row) {
-        if (row.graphic_span_count == 0U) {
-            return 0U;
-        }
-
-        const std::size_t span_index =
-            static_cast<std::size_t>(row.first_graphic_span);
-        if (span_index >= graphics_frame.packed_graphic_spans.size()) {
-            return 0U;
-        }
-
-        const term::terminal_packed_graphic_span_t& span =
-            graphics_frame.packed_graphic_spans[span_index];
-        const std::size_t codepoint_index =
-            static_cast<std::size_t>(span.codepoint_offset);
-        if (span.codepoint_count == 0U ||
-            codepoint_index >= graphics_frame.packed_graphic_codepoints.size())
-        {
-            return 0U;
-        }
-
-        return graphics_frame.packed_graphic_codepoints[codepoint_index];
-    };
-    const term::terminal_packed_render_row_t empty_graphics_row;
-    const term::terminal_packed_render_row_t& graphics_row_zero =
-        !graphics_frame.packed_rows.empty()
-            ? graphics_frame.packed_rows[0]
-            : empty_graphics_row;
-    const term::terminal_packed_render_row_t& graphics_row_one =
-        graphics_frame.packed_rows.size() > 1U
-            ? graphics_frame.packed_rows[1]
-            : empty_graphics_row;
-    ok &= check(graphics_row_zero.graphic_span_count == 1U &&
-        graphics_row_one.graphic_span_count == 1U &&
-        first_graphic_codepoint_for_row(graphics_row_zero) == 0x2588U &&
-        first_graphic_codepoint_for_row(graphics_row_one) == 0x2588U,
-        "indexed disabled-sidecar graphic rows reference their own codepoints");
-    if (graphics_row_zero.graphic_span_count > 0U &&
-        graphics_row_zero.first_graphic_span < graphics_frame.packed_graphic_spans.size())
-    {
-        const term::terminal_packed_graphic_span_t& row_zero_span =
-            graphics_frame.packed_graphic_spans[graphics_row_zero.first_graphic_span];
-        const std::size_t row_zero_codepoint_offset =
-            static_cast<std::size_t>(row_zero_span.codepoint_offset);
-        ok &= check(row_zero_span.first_column == 0 &&
-            row_zero_span.column_count == 3 &&
-            row_zero_span.codepoint_count == 3U &&
-            row_zero_codepoint_offset + 2U <
-                graphics_frame.packed_graphic_codepoints.size() &&
-            graphics_frame.packed_graphic_codepoints[row_zero_codepoint_offset] ==
-                0x2588U &&
-            graphics_frame.packed_graphic_codepoints[row_zero_codepoint_offset + 1U] ==
-                0x2598U &&
-            graphics_frame.packed_graphic_codepoints[row_zero_codepoint_offset + 2U] ==
-                0x2598U,
-            "disabled-sidecar graphic rows sort interleaved cells before coalescing");
-    }
-
-    term::Terminal_render_snapshot semantic_snapshot = empty_snapshot({1, 8});
-    semantic_snapshot.cursor.visible = false;
-    term::Terminal_text_style decorated = term::make_default_terminal_text_style();
-    term::set_terminal_style_attribute(decorated, term::Terminal_style_attribute::UNDERLINE);
-    semantic_snapshot.styles.push_back(decorated);
-    semantic_snapshot.hyperlinks.push_back({17U, QByteArrayLiteral("uri:https://example.test"),
-        QByteArrayLiteral("https://example.test")});
-    semantic_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("\u250c")});
-    semantic_snapshot.cells.push_back({
-        .position     = {0, 1},
-        .text         = QStringLiteral("\u2500"),
-        .hyperlink_id = 17U,
-    });
-    semantic_snapshot.cells.push_back({
-        .position = {0, 2},
-        .text     = QStringLiteral("\u2510"),
-        .style_id = 1U,
-    });
-    semantic_snapshot.cells.push_back({
-        .position      = {0, 4},
-        .text          = QStringLiteral("\u2588"),
-        .display_width = 2,
-    });
-
-    const term::Terminal_render_frame semantic_frame =
-        build(semantic_snapshot, render_options);
-    ok &= check(semantic_frame.stats.text_cells_rendered_as_graphic == 1 &&
-        semantic_frame.stats.packed_graphic_candidates_classified == 4 &&
-        semantic_frame.stats.packed_text_disabled_cells_skipped == 0 &&
-        semantic_frame.stats.packed_graphic_cells == 1 &&
-        semantic_frame.packed_graphic_codepoints.size() == 1U &&
-        semantic_frame.packed_graphic_codepoints.front() == 0x250cU,
-        "disabled-sidecar packed graphics reject hyperlink, decorated, and wide cells");
-
-    term::Terminal_render_snapshot style_snapshot = empty_snapshot({1, 4});
-    style_snapshot.cursor.visible = false;
-    term::Terminal_text_style accent = term::make_default_terminal_text_style();
-    accent.foreground = term::make_rgb_terminal_color_ref(0xff20d0f0U);
-    style_snapshot.styles.push_back(accent);
-    style_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("\u250c")});
-    style_snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("\u2500")});
-    style_snapshot.cells.push_back({
-        .position = {0, 2},
-        .text     = QStringLiteral("\u2510"),
-        .style_id = 1U,
-    });
-
-    const term::Terminal_render_frame style_frame =
-        build(style_snapshot, render_options);
-    ok &= check(style_frame.packed_graphic_spans.size() == 2U &&
-        style_frame.packed_graphic_codepoints.size() == 3U &&
-        style_frame.packed_graphic_spans[0].first_column == 0 &&
-        style_frame.packed_graphic_spans[0].column_count == 2 &&
-        style_frame.packed_graphic_spans[1].first_column == 2 &&
-        style_frame.packed_graphic_spans[1].style_id == 1U,
-        "disabled-sidecar packed graphics split adjacent spans at style boundaries");
-
-    const auto rects_match = [](
-        const std::vector<term::Terminal_render_rect>& left,
-        const std::vector<term::Terminal_render_rect>& right) {
-        if (left.size() != right.size()) {
-            return false;
-        }
-
-        for (std::size_t index = 0U; index < left.size(); ++index) {
-            if (left[index].rect      != right[index].rect      ||
-                left[index].color     != right[index].color     ||
-                left[index].antialias != right[index].antialias)
-            {
-                return false;
-            }
-        }
-
-        return true;
-    };
-    const auto arcs_match = [](
-        const std::vector<term::Terminal_render_arc>& left,
-        const std::vector<term::Terminal_render_arc>& right) {
-        if (left.size() != right.size()) {
-            return false;
-        }
-
-        for (std::size_t index = 0U; index < left.size(); ++index) {
-            if (left[index].kind   != right[index].kind  ||
-                left[index].rect   != right[index].rect  ||
-                left[index].color  != right[index].color ||
-                left[index].stroke != right[index].stroke)
-            {
-                return false;
-            }
-        }
-
-        return true;
-    };
-    const auto packed_graphics_match = [](
-        const term::Terminal_render_frame& left,
-        const term::Terminal_render_frame& right) {
-        if (left.packed_rows.size()              != right.packed_rows.size() ||
-            left.packed_graphic_spans.size()     != right.packed_graphic_spans.size() ||
-            left.packed_graphic_codepoints       != right.packed_graphic_codepoints)
-        {
-            return false;
-        }
-
-        for (std::size_t index = 0U; index < left.packed_rows.size(); ++index) {
-            const term::terminal_packed_render_row_t& left_row = left.packed_rows[index];
-            const term::terminal_packed_render_row_t& right_row = right.packed_rows[index];
-            if (left_row.active_buffer       != right_row.active_buffer      ||
-                left_row.viewport_row        != right_row.viewport_row       ||
-                left_row.logical_row         != right_row.logical_row        ||
-                left_row.first_graphic_span  != right_row.first_graphic_span ||
-                left_row.graphic_span_count  != right_row.graphic_span_count)
-            {
-                return false;
-            }
-        }
-
-        for (std::size_t index = 0U; index < left.packed_graphic_spans.size(); ++index) {
-            const term::terminal_packed_graphic_span_t& left_span =
-                left.packed_graphic_spans[index];
-            const term::terminal_packed_graphic_span_t& right_span =
-                right.packed_graphic_spans[index];
-            if (left_span.first_column     != right_span.first_column     ||
-                left_span.column_count     != right_span.column_count     ||
-                left_span.style_id         != right_span.style_id         ||
-                left_span.foreground_rgba  != right_span.foreground_rgba  ||
-                left_span.background_rgba  != right_span.background_rgba  ||
-                left_span.codepoint_offset != right_span.codepoint_offset ||
-                left_span.codepoint_count  != right_span.codepoint_count)
-            {
-                return false;
-            }
-        }
-
-        return true;
-    };
-
-    term::Terminal_render_snapshot parity_snapshot = empty_snapshot({3, 8});
-    parity_snapshot.cursor = {{2, 3}, term::Terminal_cursor_shape::BLOCK, true, false};
-    parity_snapshot.styles.push_back(accent);
-    parity_snapshot.cells.push_back({.position = {2, 3}, .text = QStringLiteral("\u2588")});
-    parity_snapshot.cells.push_back({.position = {2, 0}, .text = QStringLiteral("\u2598")});
-    parity_snapshot.cells.push_back({.position = {1, 1}, .text = QStringLiteral("\u256d")});
-    parity_snapshot.cells.push_back({
-        .position = {0, 2},
-        .text     = QStringLiteral("\u2588"),
-        .style_id = 1U,
-    });
-    parity_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("\u250c")});
-    parity_snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("\u2500")});
-
-    term::Terminal_render_options enabled_options = options();
-    enabled_options.packed_text_sidecars_enabled = true;
-    const term::Terminal_render_frame enabled_frame =
-        build(parity_snapshot, enabled_options);
-    const term::Terminal_render_frame disabled_frame =
-        build(parity_snapshot, render_options);
-    ok &= check(!snapshot_cells_are_row_major_column_sorted(parity_snapshot) &&
-        packed_graphics_match(enabled_frame, disabled_frame) &&
-        rects_match(enabled_frame.graphic_rects, disabled_frame.graphic_rects) &&
-        rects_match(
-            enabled_frame.cursor_graphic_rects,
-            disabled_frame.cursor_graphic_rects) &&
-        arcs_match(enabled_frame.graphic_arcs, disabled_frame.graphic_arcs) &&
-        enabled_frame.stats.text_cells_rendered_as_graphic ==
-            disabled_frame.stats.text_cells_rendered_as_graphic,
-        "disabled-sidecar graphic output matches enabled sidecars on unsorted input");
-
-    term::Terminal_render_snapshot cursor_snapshot = empty_snapshot({2, 8});
-    cursor_snapshot.cursor = {{0, 1}, term::Terminal_cursor_shape::BLOCK, true, false};
-    cursor_snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("\u2588")});
-    cursor_snapshot.cells.push_back({.position = {1, 1}, .text = QStringLiteral("\u2598")});
-
-    const term::Terminal_render_frame cursor_frame =
-        build(cursor_snapshot, render_options);
-    ok &= check(cursor_frame.stats.packed_pass_input_cells == 0 &&
-        cursor_frame.stats.packed_graphic_candidates_classified == 1 &&
-        cursor_frame.stats.packed_graphic_cells == 1 &&
-        !has_packed_graphic_codepoint(cursor_frame, 0x2588U) &&
-        has_packed_graphic_codepoint(cursor_frame, 0x2598U),
-        "disabled-sidecar packed graphics still exclude block-cursor-covered cells");
-    ok &= check(has_graphic_rect(cursor_frame, QRectF(10.0, 0.0, 10.0, 20.0)) &&
-        cursor_frame.cursor_graphic_rects.size() == 1U,
-        "block-cursor-covered hard graphics keep the direct and cursor overlay routes");
-
-    term::Terminal_render_snapshot mixed_graphics_snapshot = empty_snapshot({1, 4});
-    mixed_graphics_snapshot.cursor.visible = false;
-    mixed_graphics_snapshot.cells.push_back(
-        {.position = {0, 0}, .text = QStringLiteral("\u2500")});
-    mixed_graphics_snapshot.cells.push_back(
-        {.position = {0, 1}, .text = QStringLiteral("\u256d")});
-
-    const term::Terminal_render_frame mixed_graphics_frame =
-        build(mixed_graphics_snapshot, render_options);
-    ok &= check(!mixed_graphics_frame.graphic_rects.empty() &&
-        !mixed_graphics_frame.graphic_arcs.empty() &&
-        has_packed_graphic_codepoint(mixed_graphics_frame, 0x2500U) &&
-        has_packed_graphic_codepoint(mixed_graphics_frame, 0x256dU),
-        "box and arc graphics keep direct geometry plus packed source codepoints");
-
-    term::Terminal_render_snapshot ime_snapshot = empty_snapshot({1, 4});
-    ime_snapshot.cursor = {{0, 0}, term::Terminal_cursor_shape::BLOCK, true, false};
-    ime_snapshot.ime_preedit.active = true;
-    ime_snapshot.ime_preedit.text = QStringLiteral("ab");
-    ime_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("\u2588")});
-    ime_snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("\u2598")});
-    ime_snapshot.cells.push_back({.position = {0, 3}, .text = QStringLiteral("\u2588")});
-
-    const term::Terminal_render_frame ime_frame =
-        build(ime_snapshot, render_options);
-    ok &= check(ime_frame.stats.packed_graphic_cells == 1 &&
-        ime_frame.stats.packed_graphic_candidates_classified == 1 &&
-        !has_packed_graphic_codepoint(ime_frame, 0x2598U) &&
-        has_packed_graphic_codepoint(ime_frame, 0x2588U),
-        "disabled-sidecar packed graphics still exclude IME-covered cells");
     return ok;
 }
 
@@ -2909,16 +2445,17 @@ int main()
 {
     bool ok = true;
     ok &= test_plain_text_color_inverse_and_wide_skip();
-    ok &= test_terminal_graphics_use_grid_rects();
+    ok &= test_terminal_graphics_use_grid_primitives();
     ok &= test_stale_inline_bmp_category_uses_text_fallback();
     ok &= test_rejected_graphic_cells_stay_on_text_route();
     ok &= test_rounded_box_corners_use_arc_primitives();
-    ok &= test_block_cursor_over_graphic_has_overlay_rects();
+    ok &= test_block_cursor_over_text_like_symbol_uses_cursor_text();
+    ok &= test_terminal_graphics_use_geometry_with_selection_and_ime_text();
     ok &= test_mixed_unicode_row_geometry();
     ok &= test_single_cell_unicode_text_is_not_clipped_to_cell();
-    ok &= test_direct_ascii_text_runs_coalesce_contiguous_plain_cells();
-    ok &= test_direct_ascii_text_runs_split_at_guard_boundaries();
-    ok &= test_direct_ascii_text_runs_split_at_max_coalesced_length();
+    ok &= test_coalesced_ascii_text_runs_coalesce_contiguous_plain_cells();
+    ok &= test_coalesced_ascii_text_runs_split_at_guard_boundaries();
+    ok &= test_coalesced_ascii_text_runs_split_at_max_coalesced_length();
     ok &= test_inverse_and_reverse_video_xor();
     ok &= test_default_and_reverse_full_grid_background();
     ok &= test_styled_blank_cells_emit_background_rects();
@@ -2934,9 +2471,7 @@ int main()
     ok &= test_cell_pass_and_packed_pass_classification_agree();
     ok &= test_snapshot_cells_are_row_major_column_sorted();
     ok &= test_packed_text_rows_spans_and_order();
-    ok &= test_packed_graphic_source_codepoint_spans();
-    ok &= test_packed_graphics_exclude_unrepresented_cells();
-    ok &= test_disabled_packed_text_sidecars_skip_scan_and_keep_graphics();
+    ok &= test_disabled_packed_text_sidecars_skip_scan();
     ok &= test_packed_text_excludes_cursor_and_ime_cells();
     ok &= test_viewport_empty_and_dirty_ranges();
     return ok ? 0 : 1;

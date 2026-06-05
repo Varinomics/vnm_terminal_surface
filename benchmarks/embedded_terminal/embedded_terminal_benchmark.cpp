@@ -199,7 +199,6 @@ struct renderer_totals_t
     qint64                 simple_content_route_none_cells                      = 0;
     qint64                 simple_content_route_fast_text_cells                 = 0;
     qint64                 simple_content_route_qt_text_layout_cells            = 0;
-    qint64                 simple_content_route_graphic_geometry_cells          = 0;
     qint64                 simple_content_route_fallback_cells                  = 0;
     qint64                 simple_content_rejection_none_cells                  = 0;
     qint64                 simple_content_rejection_empty_text_cells            = 0;
@@ -215,10 +214,8 @@ struct renderer_totals_t
     qint64                 simple_content_rejection_non_ascii_text_cells        = 0;
     qint64                 simple_content_rejection_decoration_cells            = 0;
     qint64                 simple_content_rejection_hyperlink_cells             = 0;
-    qint64                 simple_content_rejection_terminal_graphic_cells      = 0;
     qint64                 route_fast_text_cells                                = 0;
     qint64                 route_qt_text_layout_runs                            = 0;
-    qint64                 route_graphic_geometry_cells                         = 0;
     qint64                 route_fallback_cells                                 = 0;
     qint64                 qt_text_layout_calls                                 = 0;
     qint64                 text_ascii_replacement_runs_screened                = 0;
@@ -268,8 +265,6 @@ struct renderer_totals_t
     qint64                 frame_cursor_text_runs                               = 0;
     qint64                 frame_decorations                                    = 0;
     qint64                 frame_cursors                                        = 0;
-    qint64                 frame_cursor_graphic_rects                           = 0;
-    qint64                 frame_cursor_graphic_arcs                            = 0;
     qint64                 frame_overlay_rects                                  = 0;
     qint64                 frame_dirty_row_ranges                               = 0;
     qint64                 frame_dirty_row_lookup_count                         = 0;
@@ -278,8 +273,6 @@ struct renderer_totals_t
     qint64                 frame_packed_rows                                    = 0;
     qint64                 frame_packed_text_spans                              = 0;
     qint64                 frame_packed_text_cells                              = 0;
-    qint64                 frame_packed_graphic_spans                           = 0;
-    qint64                 frame_packed_graphic_cells                           = 0;
     std::uint64_t          frame_packed_payload_bytes                           = 0U;
     qint64                 row_cache_hits                                       = 0;
     qint64                 row_cache_clean_skips                                = 0;
@@ -2283,7 +2276,6 @@ void add_simple_content_stats(
     totals.route_none_cells                 += stats.route_none_cells;
     totals.route_fast_text_cells            += stats.route_fast_text_cells;
     totals.route_qt_text_layout_cells       += stats.route_qt_text_layout_cells;
-    totals.route_graphic_geometry_cells     += stats.route_graphic_geometry_cells;
     totals.route_fallback_cells             += stats.route_fallback_cells;
     totals.rejection_none_cells             += stats.rejection_none_cells;
     totals.rejection_empty_text_cells       += stats.rejection_empty_text_cells;
@@ -2304,7 +2296,6 @@ void add_simple_content_stats(
     totals.rejection_non_ascii_text_cells   += stats.rejection_non_ascii_text_cells;
     totals.rejection_decoration_cells       += stats.rejection_decoration_cells;
     totals.rejection_hyperlink_cells        += stats.rejection_hyperlink_cells;
-    totals.rejection_terminal_graphic_cells += stats.rejection_terminal_graphic_cells;
 }
 
 void add_simple_content_stats(
@@ -2333,8 +2324,6 @@ void add_simple_content_stats(
     totals.simple_content_route_fast_text_cells += stats.route_fast_text_cells;
     totals.simple_content_route_qt_text_layout_cells          +=
         stats.route_qt_text_layout_cells;
-    totals.simple_content_route_graphic_geometry_cells        +=
-        stats.route_graphic_geometry_cells;
     totals.simple_content_route_fallback_cells += stats.route_fallback_cells;
     totals.simple_content_rejection_none_cells += stats.rejection_none_cells;
     totals.simple_content_rejection_empty_text_cells          +=
@@ -2363,8 +2352,6 @@ void add_simple_content_stats(
         stats.rejection_decoration_cells;
     totals.simple_content_rejection_hyperlink_cells           +=
         stats.rejection_hyperlink_cells;
-    totals.simple_content_rejection_terminal_graphic_cells    +=
-        stats.rejection_terminal_graphic_cells;
 }
 
 void add_renderer_stats(
@@ -2402,7 +2389,6 @@ void add_renderer_stats(
         stats.text_resource_runs_after_coalescing;
     totals.route_fast_text_cells          += stats.route_fast_text_cells;
     totals.route_qt_text_layout_runs      += stats.route_qt_text_layout_runs;
-    totals.route_graphic_geometry_cells   += stats.route_graphic_geometry_cells;
     totals.route_fallback_cells           += stats.route_fallback_cells;
     totals.qt_text_layout_calls           += stats.qt_text_layout_calls;
     totals.text_ascii_replacement_runs_screened +=
@@ -2476,15 +2462,11 @@ void add_renderer_stats(
     totals.frame_cursor_text_runs         += stats.frame_cursor_text_runs;
     totals.frame_decorations              += stats.frame_decorations;
     totals.frame_cursors                  += stats.frame_cursors;
-    totals.frame_cursor_graphic_rects     += stats.frame_cursor_graphic_rects;
-    totals.frame_cursor_graphic_arcs      += stats.frame_cursor_graphic_arcs;
     totals.frame_overlay_rects            += stats.frame_overlay_rects;
     totals.frame_dirty_row_ranges         += stats.frame_dirty_row_ranges;
     totals.frame_packed_rows              += stats.frame_packed_rows;
     totals.frame_packed_text_spans        += stats.frame_packed_text_spans;
     totals.frame_packed_text_cells        += stats.frame_packed_text_cells;
-    totals.frame_packed_graphic_spans     += stats.frame_packed_graphic_spans;
-    totals.frame_packed_graphic_cells     += stats.frame_packed_graphic_cells;
     totals.frame_packed_payload_bytes     += stats.frame_packed_payload_bytes;
     totals.row_cache_hits                 += stats.row_cache_hits;
     totals.row_cache_clean_skips          += stats.row_cache_clean_skips;
@@ -3014,7 +2996,6 @@ void add_renderer_stats(
         stats.text_resource_runs_after_coalescing;
     totals.route_fast_text_cells          += stats.route_fast_text_cells;
     totals.route_qt_text_layout_runs      += stats.route_qt_text_layout_runs;
-    totals.route_graphic_geometry_cells   += stats.route_graphic_geometry_cells;
     totals.route_fallback_cells           += stats.route_fallback_cells;
     totals.qt_text_layout_calls           += stats.qt_text_layout_calls;
     totals.text_ascii_replacement_runs_screened +=
@@ -3088,8 +3069,6 @@ void add_renderer_stats(
     totals.frame_cursor_text_runs         += stats.frame_cursor_text_runs;
     totals.frame_decorations              += stats.frame_decorations;
     totals.frame_cursors                  += stats.frame_cursors;
-    totals.frame_cursor_graphic_rects     += stats.frame_cursor_graphic_rects;
-    totals.frame_cursor_graphic_arcs      += stats.frame_cursor_graphic_arcs;
     totals.frame_overlay_rects            += stats.frame_overlay_rects;
     totals.frame_dirty_row_ranges         += stats.frame_dirty_row_ranges;
     totals.frame_dirty_row_lookup_count   += stats.frame.dirty_row_lookup_count;
@@ -3100,8 +3079,6 @@ void add_renderer_stats(
     totals.frame_packed_rows              += stats.frame_packed_rows;
     totals.frame_packed_text_spans        += stats.frame_packed_text_spans;
     totals.frame_packed_text_cells        += stats.frame_packed_text_cells;
-    totals.frame_packed_graphic_spans     += stats.frame_packed_graphic_spans;
-    totals.frame_packed_graphic_cells     += stats.frame_packed_graphic_cells;
     totals.frame_packed_payload_bytes     += stats.frame_packed_payload_bytes;
     totals.row_cache_hits                 += stats.row_cache_hits;
     totals.row_cache_clean_skips          += stats.row_cache_clean_skips;
@@ -3240,7 +3217,6 @@ bool text_work_observed_for_scenario(
         return
             stats.graphic_rect_rows_rebuilt > 0 ||
             stats.graphic_rect_rows_reused  > 0 ||
-            stats.frame_packed_graphic_cells > 0 ||
             stats.atlas_work_created         > 0 ||
             stats.atlas_work_reused          > 0 ||
             stats.frame_text_runs            > 0;
@@ -5460,9 +5436,6 @@ QJsonObject scenario_json(
         QStringLiteral("simple_content_route_qt_text_layout_cells"),
         result.renderer_totals.simple_content_route_qt_text_layout_cells);
     object.insert(
-        QStringLiteral("simple_content_route_graphic_geometry_cells"),
-        result.renderer_totals.simple_content_route_graphic_geometry_cells);
-    object.insert(
         QStringLiteral("simple_content_route_fallback_cells"),
         result.renderer_totals.simple_content_route_fallback_cells);
     object.insert(
@@ -5508,17 +5481,11 @@ QJsonObject scenario_json(
         QStringLiteral("simple_content_rejection_hyperlink_cells"),
         result.renderer_totals.simple_content_rejection_hyperlink_cells);
     object.insert(
-        QStringLiteral("simple_content_rejection_terminal_graphic_cells"),
-        result.renderer_totals.simple_content_rejection_terminal_graphic_cells);
-    object.insert(
         QStringLiteral("route_fast_text_cells"),
         result.renderer_totals.route_fast_text_cells);
     object.insert(
         QStringLiteral("route_qt_text_layout_runs"),
         result.renderer_totals.route_qt_text_layout_runs);
-    object.insert(
-        QStringLiteral("route_graphic_geometry_cells"),
-        result.renderer_totals.route_graphic_geometry_cells);
     object.insert(
         QStringLiteral("route_fallback_cells"),
         result.renderer_totals.route_fallback_cells);
@@ -5668,12 +5635,6 @@ QJsonObject scenario_json(
         QStringLiteral("frame_cursors"),
         result.renderer_totals.frame_cursors);
     object.insert(
-        QStringLiteral("frame_cursor_graphic_rects"),
-        result.renderer_totals.frame_cursor_graphic_rects);
-    object.insert(
-        QStringLiteral("frame_cursor_graphic_arcs"),
-        result.renderer_totals.frame_cursor_graphic_arcs);
-    object.insert(
         QStringLiteral("frame_overlay_rects"),
         result.renderer_totals.frame_overlay_rects);
     object.insert(
@@ -5697,12 +5658,6 @@ QJsonObject scenario_json(
     object.insert(
         QStringLiteral("frame_packed_text_cells"),
         result.renderer_totals.frame_packed_text_cells);
-    object.insert(
-        QStringLiteral("frame_packed_graphic_spans"),
-        result.renderer_totals.frame_packed_graphic_spans);
-    object.insert(
-        QStringLiteral("frame_packed_graphic_cells"),
-        result.renderer_totals.frame_packed_graphic_cells);
     object.insert(
         QStringLiteral("frame_packed_payload_bytes"),
         static_cast<qint64>(result.renderer_totals.frame_packed_payload_bytes));
@@ -6319,7 +6274,6 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
         QStringLiteral("simple_content_route_none_cells"),
         QStringLiteral("simple_content_route_fast_text_cells"),
         QStringLiteral("simple_content_route_qt_text_layout_cells"),
-        QStringLiteral("simple_content_route_graphic_geometry_cells"),
         QStringLiteral("simple_content_route_fallback_cells"),
         QStringLiteral("simple_content_rejection_none_cells"),
         QStringLiteral("simple_content_rejection_empty_text_cells"),
@@ -6335,10 +6289,8 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
         QStringLiteral("simple_content_rejection_non_ascii_text_cells"),
         QStringLiteral("simple_content_rejection_decoration_cells"),
         QStringLiteral("simple_content_rejection_hyperlink_cells"),
-        QStringLiteral("simple_content_rejection_terminal_graphic_cells"),
         QStringLiteral("route_fast_text_cells"),
         QStringLiteral("route_qt_text_layout_runs"),
-        QStringLiteral("route_graphic_geometry_cells"),
         QStringLiteral("route_fallback_cells"),
         QStringLiteral("qt_text_layout_calls"),
         QStringLiteral("text_ascii_replacement_runs_screened"),
@@ -6388,8 +6340,6 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
         QStringLiteral("frame_cursor_text_runs"),
         QStringLiteral("frame_decorations"),
         QStringLiteral("frame_cursors"),
-        QStringLiteral("frame_cursor_graphic_rects"),
-        QStringLiteral("frame_cursor_graphic_arcs"),
         QStringLiteral("frame_overlay_rects"),
         QStringLiteral("frame_dirty_row_ranges"),
         QStringLiteral("frame_dirty_row_lookup_count"),
@@ -6398,8 +6348,6 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
         QStringLiteral("frame_packed_rows"),
         QStringLiteral("frame_packed_text_spans"),
         QStringLiteral("frame_packed_text_cells"),
-        QStringLiteral("frame_packed_graphic_spans"),
-        QStringLiteral("frame_packed_graphic_cells"),
         QStringLiteral("frame_packed_payload_bytes"),
         QStringLiteral("row_cache_hits"),
         QStringLiteral("row_cache_clean_skips"),
@@ -6523,7 +6471,6 @@ bool validate_renderer_counter_invariants(
         json_counter(object, QStringLiteral("simple_content_route_none_cells")) +
         json_counter(object, QStringLiteral("simple_content_route_fast_text_cells")) +
         json_counter(object, QStringLiteral("simple_content_route_qt_text_layout_cells")) +
-        json_counter(object, QStringLiteral("simple_content_route_graphic_geometry_cells")) +
         json_counter(object, QStringLiteral("simple_content_route_fallback_cells"));
     const qint64 rejection_cells =
         json_counter(object, QStringLiteral("simple_content_rejection_none_cells")) +
@@ -6545,25 +6492,13 @@ bool validate_renderer_counter_invariants(
             QStringLiteral("simple_content_rejection_non_printable_ascii_cells")) +
         json_counter(object, QStringLiteral("simple_content_rejection_non_ascii_text_cells")) +
         json_counter(object, QStringLiteral("simple_content_rejection_decoration_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_hyperlink_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_terminal_graphic_cells"));
+        json_counter(object, QStringLiteral("simple_content_rejection_hyperlink_cells"));
 
     if (text_category_cells != simple_cells ||
         route_cells         != simple_cells ||
         rejection_cells     != simple_cells)
     {
         *out_error = QStringLiteral("simple-content classifier totals are inconsistent");
-        return false;
-    }
-
-    const qint64 simple_content_graphic_route_cells = json_counter(
-        object,
-        QStringLiteral("simple_content_route_graphic_geometry_cells"));
-    const qint64 simple_content_graphic_rejection_cells = json_counter(
-        object,
-        QStringLiteral("simple_content_rejection_terminal_graphic_cells"));
-    if (simple_content_graphic_route_cells != simple_content_graphic_rejection_cells) {
-        *out_error = QStringLiteral("simple-content graphic-route counters are inconsistent");
         return false;
     }
 
@@ -6591,8 +6526,6 @@ bool validate_renderer_counter_invariants(
 
     if (json_counter(object, QStringLiteral("route_fast_text_cells")) <
             candidate_fast_text_cells ||
-        json_counter(object, QStringLiteral("route_graphic_geometry_cells")) <
-            simple_content_graphic_route_cells ||
         json_counter(object, QStringLiteral("route_fallback_cells")) <
             json_counter(object, QStringLiteral("simple_content_route_fallback_cells")) ||
         json_counter(object, QStringLiteral("qt_text_layout_calls")) !=
@@ -6685,32 +6618,12 @@ bool validate_renderer_counter_invariants(
 
     const qint64 frame_packed_text_cells =
         json_counter(object, QStringLiteral("frame_packed_text_cells"));
-    const qint64 frame_packed_graphic_cells =
-        json_counter(object, QStringLiteral("frame_packed_graphic_cells"));
     const qint64 frame_packed_text_spans =
         json_counter(object, QStringLiteral("frame_packed_text_spans"));
-    const qint64 frame_packed_graphic_spans =
-        json_counter(object, QStringLiteral("frame_packed_graphic_spans"));
     if (frame_packed_text_cells != 0 ||
         frame_packed_text_spans != 0)
     {
         *out_error = QStringLiteral("packed text sidecars unexpectedly emitted");
-        return false;
-    }
-
-    if (frame_packed_graphic_cells > simple_content_graphic_route_cells      ||
-        frame_packed_graphic_spans > frame_packed_graphic_cells)
-    {
-        *out_error = QStringLiteral("packed span counters are inconsistent");
-        return false;
-    }
-
-    if ((frame_packed_graphic_cells > 0 ||
-        frame_packed_graphic_spans > 0)
-        &&
-        json_counter(object, QStringLiteral("frame_packed_payload_bytes")) <= 0)
-    {
-        *out_error = QStringLiteral("packed payload byte counter is inconsistent");
         return false;
     }
 
@@ -7721,7 +7634,6 @@ bool validate_scenario_json(
         QStringLiteral("simple_content_route_none_cells"),
         QStringLiteral("simple_content_route_fast_text_cells"),
         QStringLiteral("simple_content_route_qt_text_layout_cells"),
-        QStringLiteral("simple_content_route_graphic_geometry_cells"),
         QStringLiteral("simple_content_route_fallback_cells"),
         QStringLiteral("simple_content_rejection_none_cells"),
         QStringLiteral("simple_content_rejection_empty_text_cells"),
@@ -7737,10 +7649,8 @@ bool validate_scenario_json(
         QStringLiteral("simple_content_rejection_non_ascii_text_cells"),
         QStringLiteral("simple_content_rejection_decoration_cells"),
         QStringLiteral("simple_content_rejection_hyperlink_cells"),
-        QStringLiteral("simple_content_rejection_terminal_graphic_cells"),
         QStringLiteral("route_fast_text_cells"),
         QStringLiteral("route_qt_text_layout_runs"),
-        QStringLiteral("route_graphic_geometry_cells"),
         QStringLiteral("route_fallback_cells"),
         QStringLiteral("qt_text_layout_calls"),
         QStringLiteral("qsg_nodes_created"),
@@ -7766,8 +7676,6 @@ bool validate_scenario_json(
         QStringLiteral("frame_cursor_text_runs"),
         QStringLiteral("frame_decorations"),
         QStringLiteral("frame_cursors"),
-        QStringLiteral("frame_cursor_graphic_rects"),
-        QStringLiteral("frame_cursor_graphic_arcs"),
         QStringLiteral("frame_overlay_rects"),
         QStringLiteral("frame_dirty_row_ranges"),
         QStringLiteral("frame_dirty_row_lookup_count"),
@@ -7776,8 +7684,6 @@ bool validate_scenario_json(
         QStringLiteral("frame_packed_rows"),
         QStringLiteral("frame_packed_text_spans"),
         QStringLiteral("frame_packed_text_cells"),
-        QStringLiteral("frame_packed_graphic_spans"),
-        QStringLiteral("frame_packed_graphic_cells"),
         QStringLiteral("frame_packed_payload_bytes"),
         QStringLiteral("row_cache_hits"),
         QStringLiteral("row_cache_clean_skips"),
@@ -7988,8 +7894,7 @@ bool validate_scenario_json(
             object.value(QStringLiteral("bridge_consumed_updates_delta")).toInteger();
         const bool graphic_work_observed =
             json_counter(object, QStringLiteral("graphic_rect_rows_rebuilt")) > 0 ||
-            json_counter(object, QStringLiteral("graphic_rect_rows_reused"))  > 0 ||
-            json_counter(object, QStringLiteral("frame_packed_graphic_cells")) > 0;
+            json_counter(object, QStringLiteral("graphic_rect_rows_reused"))  > 0;
         const bool text_work_observed = is_measurement_reuse_only_scenario(scenario_name)
             ? json_counter(object, QStringLiteral("renderer_text_reused_total")) > 0 ||
                 json_counter(object, QStringLiteral("atlas_work_created")) > 0 ||
@@ -8136,8 +8041,7 @@ bool validate_scenario_json(
         json_counter(object, QStringLiteral("frame_text_runs"))            > 0 ||
         json_counter(object, QStringLiteral("frame_cursor_text_runs"))     > 0 ||
         json_counter(object, QStringLiteral("frame_decorations"))          > 0 ||
-        json_counter(object, QStringLiteral("frame_cursors"))              > 0 ||
-        json_counter(object, QStringLiteral("frame_packed_graphic_cells")) > 0;
+        json_counter(object, QStringLiteral("frame_cursors"))              > 0;
     const qint64 live_root_nodes =
         lifecycle.value(QStringLiteral("live_root_nodes")).toInteger();
     if (live_root_nodes > 1 ||

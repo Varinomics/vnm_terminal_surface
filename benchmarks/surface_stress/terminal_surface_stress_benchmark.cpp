@@ -59,7 +59,6 @@ struct Benchmark_totals
     std::uint64_t frame_packed_text_sidecars_enabled = 0U;
     std::uint64_t frame_packed_text_sidecars_disabled = 0U;
     std::uint64_t frame_packed_text_disabled_cells_skipped = 0U;
-    std::uint64_t frame_packed_graphic_candidates_classified = 0U;
     std::uint64_t frame_packed_cells_appended = 0U;
     std::uint64_t frame_compact_ascii_text_direct_appends = 0U;
     std::uint64_t frame_compact_ascii_qstring_materializations = 0U;
@@ -71,7 +70,6 @@ struct Benchmark_totals
     std::uint64_t frame_packed_text_utf8_cells = 0U;
     std::uint64_t frame_packed_text_utf8_input_units = 0U;
     std::uint64_t frame_packed_text_utf8_output_bytes = 0U;
-    std::uint64_t frame_packed_graphic_cells = 0U;
     std::uint64_t checksum = 0U;
 };
 
@@ -490,7 +488,6 @@ void accumulate_simple_content_stats(
     totals.route_none_cells                += stats.route_none_cells;
     totals.route_fast_text_cells           += stats.route_fast_text_cells;
     totals.route_qt_text_layout_cells      += stats.route_qt_text_layout_cells;
-    totals.route_graphic_geometry_cells    += stats.route_graphic_geometry_cells;
     totals.route_fallback_cells            += stats.route_fallback_cells;
     totals.rejection_none_cells            += stats.rejection_none_cells;
     totals.rejection_empty_text_cells      += stats.rejection_empty_text_cells;
@@ -513,8 +510,6 @@ void accumulate_simple_content_stats(
         stats.rejection_non_ascii_text_cells;
     totals.rejection_decoration_cells       += stats.rejection_decoration_cells;
     totals.rejection_hyperlink_cells        += stats.rejection_hyperlink_cells;
-    totals.rejection_terminal_graphic_cells +=
-        stats.rejection_terminal_graphic_cells;
 }
 
 void accumulate_frame_stats(
@@ -550,8 +545,6 @@ void accumulate_frame_stats(
         static_cast<std::uint64_t>(frame.stats.packed_text_sidecars_disabled);
     totals.frame_packed_text_disabled_cells_skipped +=
         static_cast<std::uint64_t>(frame.stats.packed_text_disabled_cells_skipped);
-    totals.frame_packed_graphic_candidates_classified +=
-        static_cast<std::uint64_t>(frame.stats.packed_graphic_candidates_classified);
     totals.frame_packed_cells_appended +=
         static_cast<std::uint64_t>(frame.stats.packed_cells_appended);
     totals.frame_compact_ascii_text_direct_appends +=
@@ -574,12 +567,9 @@ void accumulate_frame_stats(
         frame.stats.packed_text_utf8_input_units;
     totals.frame_packed_text_utf8_output_bytes +=
         frame.stats.packed_text_utf8_output_bytes;
-    totals.frame_packed_graphic_cells +=
-        static_cast<std::uint64_t>(frame.stats.packed_graphic_cells);
     totals.checksum +=
         static_cast<std::uint64_t>(frame.text_runs.size()) * 3U +
         static_cast<std::uint64_t>(frame.graphic_rects.size()) * 5U +
-        static_cast<std::uint64_t>(frame.packed_graphic_codepoints.size()) * 7U +
         static_cast<std::uint64_t>(snapshot.metadata.sequence);
 }
 
@@ -624,9 +614,6 @@ void print_simple_content_stats(
     print_metric(
         "simple_content.route_qt_text_layout_cells",
         stats.route_qt_text_layout_cells);
-    print_metric(
-        "simple_content.route_graphic_geometry_cells",
-        stats.route_graphic_geometry_cells);
     print_metric("simple_content.route_fallback_cells", stats.route_fallback_cells);
     print_metric("simple_content.rejection_none_cells", stats.rejection_none_cells);
     print_metric(
@@ -668,9 +655,6 @@ void print_simple_content_stats(
     print_metric(
         "simple_content.rejection_hyperlink_cells",
         stats.rejection_hyperlink_cells);
-    print_metric(
-        "simple_content.rejection_terminal_graphic_cells",
-        stats.rejection_terminal_graphic_cells);
 }
 
 void print_model_profile_stats(
@@ -844,9 +828,6 @@ int main(int argc, char** argv)
         static_cast<double>(totals.snapshot_dirty_rows_visible) / frames);
     print_simple_content_stats(totals.simple_content);
     print_metric(
-        "route_graphic_geometry_cells",
-        totals.simple_content.route_graphic_geometry_cells);
-    print_metric(
         "route_qt_text_layout_cells",
         totals.simple_content.route_qt_text_layout_cells);
     print_metric("frame_cell_pass_input_cells", totals.frame_cell_pass_input_cells);
@@ -874,9 +855,6 @@ int main(int argc, char** argv)
     print_metric(
         "frame_packed_text_disabled_cells_skipped",
         totals.frame_packed_text_disabled_cells_skipped);
-    print_metric(
-        "frame_packed_graphic_candidates_classified",
-        totals.frame_packed_graphic_candidates_classified);
     print_metric("frame_packed_cells_appended", totals.frame_packed_cells_appended);
     print_metric(
         "frame_compact_ascii_text_direct_appends",
@@ -900,7 +878,6 @@ int main(int argc, char** argv)
     print_metric(
         "frame_packed_text_utf8_output_bytes",
         totals.frame_packed_text_utf8_output_bytes);
-    print_metric("frame_packed_graphic_cells", totals.frame_packed_graphic_cells);
     if (model_profile_stats_available) {
         print_model_profile_stats(model_profile_stats);
     }

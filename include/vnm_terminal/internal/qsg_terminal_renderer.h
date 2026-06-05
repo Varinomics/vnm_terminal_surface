@@ -97,7 +97,6 @@ struct terminal_renderer_stats_t
     int            text_cache_entry_max_child_nodes_cleared             = 0;
     int            route_fast_text_cells                                = 0;
     int            route_qt_text_layout_runs                            = 0;
-    int            route_graphic_geometry_cells                         = 0;
     int            route_fallback_cells                                 = 0;
     int            qt_text_layout_calls                                 = 0;
     // Slow-path QTextLayout counters. ASCII replacement successes bypass these.
@@ -222,15 +221,11 @@ struct terminal_renderer_stats_t
     int            frame_cursor_text_runs                               = 0;
     int            frame_decorations                                    = 0;
     int            frame_cursors                                        = 0;
-    int            frame_cursor_graphic_rects                           = 0;
-    int            frame_cursor_graphic_arcs                            = 0;
     int            frame_overlay_rects                                  = 0;
     int            frame_dirty_row_ranges                               = 0;
     int            frame_packed_rows                                    = 0;
     int            frame_packed_text_spans                              = 0;
     int            frame_packed_text_cells                              = 0;
-    int            frame_packed_graphic_spans                           = 0;
-    int            frame_packed_graphic_cells                           = 0;
     std::uint64_t  frame_packed_payload_bytes                           = 0U;
     int            row_cache_hits                                       = 0;
     int            row_cache_clean_skips                                = 0;
@@ -240,7 +235,6 @@ struct terminal_renderer_stats_t
     bool           graphic_layer_rebuilt                                = false;
     bool           decoration_layer_rebuilt                             = false;
     bool           cursor_layer_rebuilt                                 = false;
-    bool           cursor_graphic_layer_rebuilt                         = false;
     bool           cursor_text_layer_rebuilt                            = false;
     bool           overlay_layer_rebuilt                                = false;
     int            background_rows_rebuilt                              = 0;
@@ -289,7 +283,6 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_cache_entry_max_child_nodes_cleared             = 0U;
     std::uint64_t  route_fast_text_cells                                = 0U;
     std::uint64_t  route_qt_text_layout_runs                            = 0U;
-    std::uint64_t  route_graphic_geometry_cells                         = 0U;
     std::uint64_t  route_fallback_cells                                 = 0U;
     std::uint64_t  qt_text_layout_calls                                 = 0U;
     // Slow-path QTextLayout counters. ASCII replacement successes bypass these.
@@ -414,15 +407,11 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  frame_cursor_text_runs                               = 0U;
     std::uint64_t  frame_decorations                                    = 0U;
     std::uint64_t  frame_cursors                                        = 0U;
-    std::uint64_t  frame_cursor_graphic_rects                           = 0U;
-    std::uint64_t  frame_cursor_graphic_arcs                            = 0U;
     std::uint64_t  frame_overlay_rects                                  = 0U;
     std::uint64_t  frame_dirty_row_ranges                               = 0U;
     std::uint64_t  frame_packed_rows                                    = 0U;
     std::uint64_t  frame_packed_text_spans                              = 0U;
     std::uint64_t  frame_packed_text_cells                              = 0U;
-    std::uint64_t  frame_packed_graphic_spans                           = 0U;
-    std::uint64_t  frame_packed_graphic_cells                           = 0U;
     std::uint64_t  frame_packed_payload_bytes                           = 0U;
     std::uint64_t  row_cache_hits                                       = 0U;
     std::uint64_t  row_cache_clean_skips                                = 0U;
@@ -432,7 +421,6 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  graphic_layer_rebuilds                               = 0U;
     std::uint64_t  decoration_layer_rebuilds                            = 0U;
     std::uint64_t  cursor_layer_rebuilds                                = 0U;
-    std::uint64_t  cursor_graphic_layer_rebuilds                        = 0U;
     std::uint64_t  cursor_text_layer_rebuilds                           = 0U;
     std::uint64_t  overlay_layer_rebuilds                               = 0U;
     std::uint64_t  background_rows_rebuilt                              = 0U;

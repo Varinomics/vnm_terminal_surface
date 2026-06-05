@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
+#include "vnm_terminal/internal/terminal_graphic_geometry.h"
 #include "vnm_terminal/internal/unicode_width.h"
 #include <QByteArray>
 #include <QFontInfo>
@@ -29,9 +30,7 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr qreal       k_no_wrap_text_line_width             = 1024.0 * 1024.0;
-constexpr qreal       k_pi                                  = 3.14159265358979323846;
 constexpr qreal       k_faint_foreground_alpha_factor       = 0.5;
-constexpr qreal       k_graphic_antialias_feather           = 0.5;
 constexpr qreal       k_ascii_advance_tolerance_floor       = 0.000001;
 constexpr qreal       k_ascii_advance_tolerance_ratio       = 0.0000001;
 constexpr qreal       k_text_geometry_tolerance             = k_ascii_advance_tolerance_floor;
@@ -46,8 +45,6 @@ constexpr qsizetype   k_max_cached_ascii_replacement_shape_length =
 constexpr std::size_t k_cached_ascii_replacement_shape_slot_count =
     static_cast<std::size_t>(k_max_cached_ascii_replacement_shape_length) + 1U;
 constexpr std::size_t k_eager_render_style_attribute_limit  = 256U;
-constexpr int         k_arc_geometry_segment_count          = 32;
-constexpr int         k_flat_rect_vertices_per_rect         = 6;
 
 std::size_t bounded_frame_reserve(
     std::size_t cell_count,
@@ -432,53 +429,6 @@ QRectF cursor_rect(
     return rect;
 }
 
-void append_positive_rect(std::vector<QRectF>& rects, QRectF rect)
-{
-    if (rect.width() > 0.0 && rect.height() > 0.0) {
-        rects.push_back(rect);
-    }
-}
-
-void append_rect_difference(
-    std::vector<QRectF>&   rects,
-    const QRectF&          source,
-    const QRectF&          cut)
-{
-    const QRectF clipped = source.intersected(cut);
-    if (clipped.width() <= 0.0 || clipped.height() <= 0.0) {
-        rects.push_back(source);
-        return;
-    }
-
-    append_positive_rect(
-        rects,
-        QRectF(source.left(), source.top(), source.width(), clipped.top() - source.top()));
-    append_positive_rect(
-        rects,
-        QRectF(source.left(), clipped.bottom(), source.width(), source.bottom() - clipped.bottom()));
-    append_positive_rect(
-        rects,
-        QRectF(source.left(), clipped.top(), clipped.left() - source.left(), clipped.height()));
-    append_positive_rect(
-        rects,
-        QRectF(clipped.right(), clipped.top(), source.right() - clipped.right(), clipped.height()));
-}
-
-std::vector<QRectF> cursor_rects_excluding_graphics(
-    const QRectF&                              cursor,
-    const std::vector<Terminal_render_rect>&   graphic_rects)
-{
-    std::vector<QRectF> remaining{cursor};
-    for (const Terminal_render_rect& graphic_rect : graphic_rects) {
-        std::vector<QRectF> next;
-        for (const QRectF& rect : remaining) {
-            append_rect_difference(next, rect, graphic_rect.rect);
-        }
-        remaining = std::move(next);
-    }
-    return remaining;
-}
-
 QRectF decoration_rect(
     const Terminal_render_text_run&            run,
     Terminal_render_decoration_kind            kind,
@@ -502,494 +452,6 @@ QRectF decoration_rect(
     }
 
     return rect;
-}
-
-qreal terminal_graphic_light_stroke(terminal_cell_metrics_t metrics)
-{
-    return std::max<qreal>(
-        1.0,
-        std::floor(std::min(metrics.width, metrics.height) * 0.12));
-}
-
-qreal terminal_graphic_heavy_stroke(terminal_cell_metrics_t metrics)
-{
-    return
-        std::max<qreal>(
-            terminal_graphic_light_stroke(metrics) + 1.0,
-            std::floor(std::min(metrics.width, metrics.height) * 0.20));
-}
-
-void append_terminal_graphic_rect(
-    std::vector<Terminal_render_rect>& rects,
-    QRectF                             rect,
-    const QColor&                      color,
-    bool                               antialias = false)
-{
-    if (rect.width() <= 0.0 || rect.height() <= 0.0) {
-        return;
-    }
-
-    rects.push_back({rect, color, antialias});
-}
-
-void append_terminal_graphic_arc(
-    std::vector<Terminal_render_arc>&  arcs,
-    Terminal_render_arc_kind           kind,
-    const QRectF&                      cell,
-    const QColor&                      color,
-    qreal                              stroke)
-{
-    if (cell.width() <= 0.0 || cell.height() <= 0.0 || stroke <= 0.0) {
-        return;
-    }
-
-    arcs.push_back({kind, cell, color, stroke});
-}
-
-QRectF centered_horizontal_rect(
-    const QRectF&  cell,
-    qreal          left,
-    qreal          right,
-    qreal          stroke)
-{
-    return QRectF(
-        left,
-        cell.center().y() - stroke * 0.5,
-        right - left,
-        stroke);
-}
-
-QRectF centered_vertical_rect(
-    const QRectF&  cell,
-    qreal          top,
-    qreal          bottom,
-    qreal          stroke)
-{
-    return QRectF(
-        cell.center().x() - stroke * 0.5,
-        top,
-        stroke,
-        bottom - top);
-}
-
-void append_terminal_box_drawing_rects(
-    std::vector<Terminal_render_rect>& rects,
-    const QRectF&                      cell,
-    const QColor&                      color,
-    bool                               connects_left,
-    bool                               connects_right,
-    bool                               connects_up,
-    bool                               connects_down,
-    qreal                              stroke)
-{
-    const qreal center_x = cell.center().x();
-    const qreal center_y = cell.center().y();
-
-    if (connects_left || connects_right) {
-        const qreal left  = connects_left ? cell.left() : center_x;
-        const qreal right = connects_right ? cell.right() : center_x;
-        append_terminal_graphic_rect(
-            rects,
-            centered_horizontal_rect(cell, left, right, stroke),
-            color,
-            true);
-    }
-    if (connects_up || connects_down) {
-        const qreal top    = connects_up ? cell.top() : center_y;
-        const qreal bottom = connects_down ? cell.bottom() : center_y;
-        append_terminal_graphic_rect(
-            rects,
-            centered_vertical_rect(cell, top, bottom, stroke),
-            color,
-            true);
-    }
-}
-
-constexpr unsigned int k_box_left  = 0x01U;
-constexpr unsigned int k_box_right = 0x02U;
-constexpr unsigned int k_box_up    = 0x04U;
-constexpr unsigned int k_box_down  = 0x08U;
-
-struct terminal_box_stroke_spec_t
-{
-    ushort                     codepoint;
-    unsigned int               connections;
-    bool                       heavy;
-};
-
-struct terminal_box_arc_spec_t
-{
-    ushort                     codepoint;
-    Terminal_render_arc_kind   kind;
-};
-
-constexpr terminal_box_stroke_spec_t k_terminal_box_stroke_specs[] = {
-    {0x2500, k_box_left | k_box_right, false}, // light horizontal
-    {0x2501, k_box_left | k_box_right, true},  // heavy horizontal
-    {0x2502, k_box_up | k_box_down, false},    // light vertical
-    {0x2503, k_box_up | k_box_down, true},     // heavy vertical
-    {0x250c, k_box_right | k_box_down, false}, // light down and right
-    {0x250f, k_box_right | k_box_down, true},  // heavy down and right
-    {0x2510, k_box_left | k_box_down, false},  // light down and left
-    {0x2513, k_box_left | k_box_down, true},   // heavy down and left
-    {0x2514, k_box_right | k_box_up, false},   // light up and right
-    {0x2517, k_box_right | k_box_up, true},    // heavy up and right
-    {0x2518, k_box_left | k_box_up, false},    // light up and left
-    {0x251b, k_box_left | k_box_up, true},     // heavy up and left
-    {0x251c, k_box_right | k_box_up | k_box_down, false}, // light vertical and right
-    {0x2523, k_box_right | k_box_up | k_box_down, true},  // heavy vertical and right
-    {0x2524, k_box_left | k_box_up | k_box_down, false},  // light vertical and left
-    {0x252b, k_box_left | k_box_up | k_box_down, true},   // heavy vertical and left
-    {0x252c, k_box_left | k_box_right | k_box_down, false}, // light down and horizontal
-    {0x2533, k_box_left | k_box_right | k_box_down, true},  // heavy down and horizontal
-    {0x2534, k_box_left | k_box_right | k_box_up, false},   // light up and horizontal
-    {0x253b, k_box_left | k_box_right | k_box_up, true},    // heavy up and horizontal
-    {0x253c, k_box_left | k_box_right | k_box_up | k_box_down, false}, // light vertical and horizontal
-    {0x254b, k_box_left | k_box_right | k_box_up | k_box_down, true},  // heavy vertical and horizontal
-    {0x2574, k_box_left, false},  // light left
-    {0x2575, k_box_up, false},    // light up
-    {0x2576, k_box_right, false}, // light right
-    {0x2577, k_box_down, false},  // light down
-};
-
-constexpr terminal_box_arc_spec_t k_terminal_box_arc_specs[] = {
-    {0x256d, Terminal_render_arc_kind::DOWN_RIGHT}, // light arc down and right
-    {0x256e, Terminal_render_arc_kind::DOWN_LEFT},  // light arc down and left
-    {0x256f, Terminal_render_arc_kind::UP_LEFT},    // light arc up and left
-    {0x2570, Terminal_render_arc_kind::UP_RIGHT},   // light arc up and right
-};
-
-constexpr bool terminal_box_connects(unsigned int connections, unsigned int connection)
-{
-    return (connections & connection) != 0U;
-}
-
-const terminal_box_stroke_spec_t* find_terminal_box_stroke_spec(ushort codepoint)
-{
-    for (const terminal_box_stroke_spec_t& spec : k_terminal_box_stroke_specs) {
-        if (spec.codepoint == codepoint) {
-            return &spec;
-        }
-    }
-
-    return nullptr;
-}
-
-const terminal_box_arc_spec_t* find_terminal_box_arc_spec(ushort codepoint)
-{
-    for (const terminal_box_arc_spec_t& spec : k_terminal_box_arc_specs) {
-        if (spec.codepoint == codepoint) {
-            return &spec;
-        }
-    }
-
-    return nullptr;
-}
-
-bool append_terminal_box_graphic_rects(
-    std::vector<Terminal_render_rect>& rects,
-    std::vector<Terminal_render_arc>&  arcs,
-    const QRectF&                      cell,
-    ushort                             codepoint,
-    const QColor&                      color,
-    terminal_cell_metrics_t            metrics)
-{
-    if (const terminal_box_stroke_spec_t* spec = find_terminal_box_stroke_spec(codepoint); spec != nullptr) {
-        const qreal stroke = spec->heavy
-            ? terminal_graphic_heavy_stroke(metrics)
-            : terminal_graphic_light_stroke(metrics);
-
-        append_terminal_box_drawing_rects(
-            rects,
-            cell,
-            color,
-            terminal_box_connects(spec->connections, k_box_left),
-            terminal_box_connects(spec->connections, k_box_right),
-            terminal_box_connects(spec->connections, k_box_up),
-            terminal_box_connects(spec->connections, k_box_down),
-            stroke);
-        return true;
-    }
-
-    if (const terminal_box_arc_spec_t* spec = find_terminal_box_arc_spec(codepoint); spec != nullptr) {
-        append_terminal_graphic_arc(
-            arcs,
-            spec->kind,
-            cell,
-            color,
-            terminal_graphic_light_stroke(metrics));
-        return true;
-    }
-
-    return false;
-}
-
-void append_terminal_quadrant_rect(
-    std::vector<Terminal_render_rect>& rects,
-    const QRectF&                      cell,
-    const QColor&                      color,
-    bool                               upper,
-    bool                               left)
-{
-    const qreal half_width  = cell.width() * 0.5;
-    const qreal half_height = cell.height() * 0.5;
-    append_terminal_graphic_rect(
-        rects,
-        QRectF(
-            left ? cell.left() : cell.left() + half_width,
-            upper ? cell.top() : cell.top() + half_height,
-            half_width,
-            half_height),
-        color);
-}
-
-bool append_terminal_block_graphic_rects(
-    std::vector<Terminal_render_rect>& rects,
-    const QRectF&                      cell,
-    ushort                             codepoint,
-    const QColor&                      color)
-{
-    switch (codepoint) {
-        case 0x2580: // upper half block
-            append_terminal_graphic_rect(
-                rects,
-                QRectF(cell.left(), cell.top(), cell.width(), cell.height() * 0.5),
-                color);
-            return true;
-        case 0x2581: // lower one eighth block
-        case 0x2582: // lower one quarter block
-        case 0x2583: // lower three eighths block
-        case 0x2584: // lower half block
-        case 0x2585: // lower five eighths block
-        case 0x2586: // lower three quarters block
-        case 0x2587: { // lower seven eighths block
-            const qreal eighth_count = static_cast<qreal>(codepoint - 0x2580);
-            const qreal height       = cell.height() * eighth_count / 8.0;
-            append_terminal_graphic_rect(
-                rects,
-                QRectF(cell.left(), cell.bottom() - height, cell.width(), height),
-                color);
-            return true;
-        }
-        case 0x2588: // full block
-            append_terminal_graphic_rect(rects, cell, color);
-            return true;
-        case 0x2589: // left seven eighths block
-        case 0x258a: // left three quarters block
-        case 0x258b: // left five eighths block
-        case 0x258c: // left half block
-        case 0x258d: // left three eighths block
-        case 0x258e: // left one quarter block
-        case 0x258f: { // left one eighth block
-            const qreal eighth_count = static_cast<qreal>(0x2590 - codepoint);
-            append_terminal_graphic_rect(
-                rects,
-                QRectF(cell.left(), cell.top(), cell.width() * eighth_count / 8.0, cell.height()),
-                color);
-            return true;
-        }
-        case 0x2590: // right half block
-            append_terminal_graphic_rect(
-                rects,
-                QRectF(cell.center().x(), cell.top(), cell.width() * 0.5, cell.height()),
-                color);
-            return true;
-        case 0x2596: // quadrant lower left
-            append_terminal_quadrant_rect(rects, cell, color, false, true);
-            return true;
-        case 0x2597: // quadrant lower right
-            append_terminal_quadrant_rect(rects, cell, color, false, false);
-            return true;
-        case 0x2598: // quadrant upper left
-            append_terminal_quadrant_rect(rects, cell, color, true, true);
-            return true;
-        case 0x2599: // quadrant upper left, lower left, and lower right
-            append_terminal_quadrant_rect(rects, cell, color, true,  true);
-            append_terminal_quadrant_rect(rects, cell, color, false, true);
-            append_terminal_quadrant_rect(rects, cell, color, false, false);
-            return true;
-        case 0x259a: // quadrant upper left and lower right
-            append_terminal_quadrant_rect(rects, cell, color, true,  true);
-            append_terminal_quadrant_rect(rects, cell, color, false, false);
-            return true;
-        case 0x259b: // quadrant upper left, upper right, and lower left
-            append_terminal_quadrant_rect(rects, cell, color, true,  true);
-            append_terminal_quadrant_rect(rects, cell, color, true,  false);
-            append_terminal_quadrant_rect(rects, cell, color, false, true);
-            return true;
-        case 0x259c: // quadrant upper left, upper right, and lower right
-            append_terminal_quadrant_rect(rects, cell, color, true,  true);
-            append_terminal_quadrant_rect(rects, cell, color, true,  false);
-            append_terminal_quadrant_rect(rects, cell, color, false, false);
-            return true;
-        case 0x259d: // quadrant upper right
-            append_terminal_quadrant_rect(rects, cell, color, true, false);
-            return true;
-        case 0x259e: // quadrant upper right and lower left
-            append_terminal_quadrant_rect(rects, cell, color, true,  false);
-            append_terminal_quadrant_rect(rects, cell, color, false, true);
-            return true;
-        case 0x259f: // quadrant upper right, lower left, and lower right
-            append_terminal_quadrant_rect(rects, cell, color, true,  false);
-            append_terminal_quadrant_rect(rects, cell, color, false, true);
-            append_terminal_quadrant_rect(rects, cell, color, false, false);
-            return true;
-        default:
-            return false;
-    }
-}
-
-bool append_terminal_graphic_codepoint_rects(
-    std::vector<Terminal_render_rect>& rects,
-    std::vector<Terminal_render_arc>&  arcs,
-    const QRectF&                      cell,
-    ushort                             codepoint,
-    const QColor&                      color,
-    terminal_cell_metrics_t            metrics)
-{
-    if (codepoint < 0x2500U || codepoint > 0x259fU) {
-        return false;
-    }
-
-    if (codepoint >= 0x2580U) {
-        return append_terminal_block_graphic_rects(rects, cell, codepoint, color);
-    }
-
-    return append_terminal_box_graphic_rects(rects, arcs, cell, codepoint, color, metrics);
-}
-
-bool append_terminal_graphic_rects(
-    std::vector<Terminal_render_rect>& rects,
-    std::vector<Terminal_render_arc>&  arcs,
-    const QRectF&                      cell,
-    const QString&                     text,
-    const QColor&                      color,
-    terminal_cell_metrics_t            metrics)
-{
-    if (text.size() != 1) {
-        return false;
-    }
-
-    return append_terminal_graphic_codepoint_rects(
-        rects,
-        arcs,
-        cell,
-        text.at(0).unicode(),
-        color,
-        metrics);
-}
-
-bool append_terminal_graphic_rects(
-    std::vector<Terminal_render_rect>& rects,
-    std::vector<Terminal_render_arc>&  arcs,
-    const QRectF&                      cell,
-    const Terminal_render_cell_text&   text,
-    const QColor&                      color,
-    terminal_cell_metrics_t            metrics)
-{
-    const std::optional<ushort> codepoint = text.single_code_unit();
-    if (!codepoint.has_value()) {
-        return false;
-    }
-
-    return append_terminal_graphic_codepoint_rects(
-        rects,
-        arcs,
-        cell,
-        *codepoint,
-        color,
-        metrics);
-}
-
-bool terminal_block_graphic_is_supported(ushort codepoint)
-{
-    std::vector<Terminal_render_rect> rects;
-    return append_terminal_block_graphic_rects(
-        rects,
-        QRectF(0.0, 0.0, 0.0, 0.0),
-        codepoint,
-        QColor());
-}
-
-bool terminal_hard_block_graphic_is_supported(ushort codepoint)
-{
-    return
-        codepoint >= 0x2580U &&
-        codepoint <= 0x259fU &&
-        terminal_block_graphic_is_supported(codepoint);
-}
-
-bool terminal_hard_block_graphic_text_is_supported(const QString& text)
-{
-    return
-        text.size() == 1 &&
-        terminal_hard_block_graphic_is_supported(text.at(0).unicode());
-}
-
-bool terminal_hard_block_graphic_text_is_supported(const Terminal_render_cell_text& text)
-{
-    const std::optional<ushort> codepoint = text.single_code_unit();
-    return codepoint.has_value() && terminal_hard_block_graphic_is_supported(*codepoint);
-}
-
-bool is_terminal_graphic_text(const QString& text)
-{
-    if (text.size() != 1) {
-        return false;
-    }
-
-    const ushort codepoint = text.at(0).unicode();
-    if (terminal_hard_block_graphic_is_supported(codepoint)) {
-        return true;
-    }
-
-    return
-        find_terminal_box_stroke_spec(codepoint) != nullptr ||
-        find_terminal_box_arc_spec(codepoint)    != nullptr;
-}
-
-bool is_terminal_graphic_text(const Terminal_render_cell_text& text)
-{
-    const std::optional<ushort> codepoint = text.single_code_unit();
-    if (!codepoint.has_value()) {
-        return false;
-    }
-
-    if (terminal_hard_block_graphic_is_supported(*codepoint)) {
-        return true;
-    }
-
-    return
-        find_terminal_box_stroke_spec(*codepoint) != nullptr ||
-        find_terminal_box_arc_spec(*codepoint)    != nullptr;
-}
-
-QColor cursor_graphic_overlay_color(QColor color)
-{
-    // Match cursor text ordering: a nearly-opaque color keeps the overlay in
-    // the blended pass so opaque cursor rectangles cannot batch over it.
-    if (color.alpha() == 255) {
-        color.setAlpha(254);
-    }
-    return color;
-}
-
-void clip_terminal_graphic_rects(
-    std::vector<Terminal_render_rect>& rects,
-    std::size_t                        first_index,
-    const QRectF&                      clip_rect)
-{
-    auto write = rects.begin() + static_cast<std::ptrdiff_t>(first_index);
-    for (auto read = write; read != rects.end(); ++read) {
-        read->rect = read->rect.intersected(clip_rect);
-        if (read->rect.width() <= 0.0 || read->rect.height() <= 0.0) {
-            continue;
-        }
-
-        *write = *read;
-        ++write;
-    }
-    rects.erase(write, rects.end());
 }
 
 
@@ -1138,7 +600,6 @@ void accumulate_simple_content_stats(
     X(packed_text_sidecars_enabled) \
     X(packed_text_sidecars_disabled) \
     X(packed_text_disabled_cells_skipped) \
-    X(packed_graphic_candidates_classified) \
     X(packed_cells_appended) \
     X(dirty_row_lookup_count) \
     X(cells_considered) \
@@ -1147,7 +608,6 @@ void accumulate_simple_content_stats(
     X(cells_rendered) \
     X(text_cells_empty) \
     X(text_cells_rendered_as_text) \
-    X(text_cells_rendered_as_graphic) \
     X(text_cells_printable_ascii) \
     X(text_cells_other_ascii) \
     X(text_cells_non_ascii) \
@@ -1169,8 +629,6 @@ void accumulate_simple_content_stats(
     X(cursor_text_runs_emitted) \
     X(decoration_rects_emitted) \
     X(cursor_rects_emitted) \
-    X(cursor_graphic_rects_emitted) \
-    X(cursor_graphic_arcs_emitted) \
     X(overlay_rects_emitted) \
     X(packed_rows) \
     X(packed_text_spans) \
@@ -1180,8 +638,6 @@ void accumulate_simple_content_stats(
     X(packed_text_utf8_cells) \
     X(packed_text_utf8_input_units) \
     X(packed_text_utf8_output_bytes) \
-    X(packed_graphic_spans) \
-    X(packed_graphic_cells) \
     X(packed_payload_bytes) \
     /**/
 
@@ -1212,7 +668,6 @@ void accumulate_frame_stats(
     X(text_cache_entry_child_nodes_cleared_for_removal) \
     X(route_fast_text_cells) \
     X(route_qt_text_layout_runs) \
-    X(route_graphic_geometry_cells) \
     X(route_fallback_cells) \
     X(qt_text_layout_calls) \
     X(text_layout_runs_single_code_unit) \
@@ -1331,15 +786,11 @@ void accumulate_frame_stats(
     X(frame_cursor_text_runs) \
     X(frame_decorations) \
     X(frame_cursors) \
-    X(frame_cursor_graphic_rects) \
-    X(frame_cursor_graphic_arcs) \
     X(frame_overlay_rects) \
     X(frame_dirty_row_ranges) \
     X(frame_packed_rows) \
     X(frame_packed_text_spans) \
     X(frame_packed_text_cells) \
-    X(frame_packed_graphic_spans) \
-    X(frame_packed_graphic_cells) \
     X(frame_packed_payload_bytes) \
     X(row_cache_hits) \
     X(row_cache_clean_skips) \
@@ -1395,7 +846,6 @@ void accumulate_renderer_stats(
     total.graphic_layer_rebuilds        += count_from_bool(stats.graphic_layer_rebuilt);
     total.decoration_layer_rebuilds     += count_from_bool(stats.decoration_layer_rebuilt);
     total.cursor_layer_rebuilds         += count_from_bool(stats.cursor_layer_rebuilt);
-    total.cursor_graphic_layer_rebuilds += count_from_bool(stats.cursor_graphic_layer_rebuilt);
     total.cursor_text_layer_rebuilds    += count_from_bool(stats.cursor_text_layer_rebuilt);
     total.overlay_layer_rebuilds        += count_from_bool(stats.overlay_layer_rebuilt);
 #define VNM_ACCUMULATE_FIELD(field) \
@@ -1562,15 +1012,6 @@ bool strict_printable_ascii_classifier_bypass_eligible(
         !has_decoration;
 }
 
-bool terminal_graphic_candidate_text(
-    Terminal_simple_content_text_category text_category,
-    const Terminal_render_cell_text&      text)
-{
-    return
-        text_category == Terminal_simple_content_text_category::NON_ASCII &&
-        is_terminal_graphic_text(text);
-}
-
 } // namespace
 
 terminal_simple_content_classification_t classify_terminal_simple_content_cell(
@@ -1670,24 +1111,6 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
     }
     else
     if (cell.text.is_inline_single_bmp()) {
-        if (is_terminal_graphic_text(cell.text)) {
-            if (cell.display_width != 1) {
-                return reject(
-                    Terminal_simple_content_route::QT_TEXT_LAYOUT,
-                    Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH);
-            }
-
-            if (semantics_rejection != Terminal_simple_content_rejection_reason::NONE) {
-                return reject(
-                    Terminal_simple_content_route::QT_TEXT_LAYOUT,
-                    semantics_rejection);
-            }
-
-            return reject(
-                Terminal_simple_content_route::GRAPHIC_GEOMETRY,
-                Terminal_simple_content_rejection_reason::TERMINAL_GRAPHIC);
-        }
-
         const std::optional<ushort> inline_code_unit = cell.text.single_bmp_code_unit();
         if (!inline_code_unit.has_value()) {
             return reject(
@@ -1767,17 +1190,10 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
                 Terminal_simple_content_rejection_reason::MULTI_CELL_TEXT);
     }
 
-    if (is_terminal_graphic_text(cell.text)) {
-        if (semantics_rejection != Terminal_simple_content_rejection_reason::NONE) {
-            return reject(
-                Terminal_simple_content_route::QT_TEXT_LAYOUT,
-                semantics_rejection);
-        }
-
-        return
-            reject(
-                Terminal_simple_content_route::GRAPHIC_GEOMETRY,
-                Terminal_simple_content_rejection_reason::TERMINAL_GRAPHIC);
+    if (semantics_rejection != Terminal_simple_content_rejection_reason::NONE) {
+        return reject(
+            Terminal_simple_content_route::QT_TEXT_LAYOUT,
+            semantics_rejection);
     }
 
     if (classification.text_category ==
@@ -1796,12 +1212,6 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
             reject(
                 Terminal_simple_content_route::QT_TEXT_LAYOUT,
                 Terminal_simple_content_rejection_reason::NON_PRINTABLE_ASCII);
-    }
-
-    if (semantics_rejection != Terminal_simple_content_rejection_reason::NONE) {
-        return reject(
-            Terminal_simple_content_route::QT_TEXT_LAYOUT,
-            semantics_rejection);
     }
 
     classification.route = Terminal_simple_content_route::FAST_TEXT;
@@ -1833,7 +1243,6 @@ namespace {
     X(route_none_cells) \
     X(route_fast_text_cells) \
     X(route_qt_text_layout_cells) \
-    X(route_graphic_geometry_cells) \
     X(route_fallback_cells) \
     X(rejection_none_cells) \
     X(rejection_empty_text_cells) \
@@ -1849,7 +1258,6 @@ namespace {
     X(rejection_non_ascii_text_cells) \
     X(rejection_decoration_cells) \
     X(rejection_hyperlink_cells) \
-    X(rejection_terminal_graphic_cells) \
     /**/
 
 void accumulate_simple_content_stats(
@@ -1897,9 +1305,6 @@ void record_simple_content_route(
             return;
         case Terminal_simple_content_route::QT_TEXT_LAYOUT:
             ++stats.route_qt_text_layout_cells;
-            return;
-        case Terminal_simple_content_route::GRAPHIC_GEOMETRY:
-            ++stats.route_graphic_geometry_cells;
             return;
         case Terminal_simple_content_route::FALLBACK:
             ++stats.route_fallback_cells;
@@ -1953,9 +1358,6 @@ void record_simple_content_rejection(
             return;
         case Terminal_simple_content_rejection_reason::HYPERLINK:
             ++stats.rejection_hyperlink_cells;
-            return;
-        case Terminal_simple_content_rejection_reason::TERMINAL_GRAPHIC:
-            ++stats.rejection_terminal_graphic_cells;
             return;
     }
 }
@@ -2289,73 +1691,18 @@ void append_packed_text_cell(
     ++frame.stats.packed_cells_appended;
 }
 
-void append_packed_graphic_cell(
-    Terminal_render_frame&             frame,
-    terminal_packed_render_row_t&      row,
-    const Terminal_render_cell&        cell,
-    const render_style_attributes_t&   style)
-{
-    const std::uint32_t foreground_rgba = packed_color_rgba(style.foreground);
-    const std::uint32_t background_rgba = packed_color_rgba(style.background);
-    if (row.graphic_span_count > 0U) {
-        terminal_packed_graphic_span_t& span =
-            frame.packed_graphic_spans[static_cast<std::size_t>(
-                row.first_graphic_span + row.graphic_span_count - 1U)];
-        if (span.first_column + span.column_count == cell.position.column &&
-            span.style_id                         == cell.style_id        &&
-            span.foreground_rgba                  == foreground_rgba      &&
-            span.background_rgba                  == background_rgba)
-        {
-            span.column_count += cell.display_width;
-            ++span.codepoint_count;
-            const std::optional<ushort> codepoint = cell.text.single_code_unit();
-            Q_ASSERT(codepoint.has_value());
-            frame.packed_graphic_codepoints.push_back(
-                static_cast<std::uint32_t>(*codepoint));
-            ++frame.stats.packed_graphic_cells;
-            ++frame.stats.packed_cells_appended;
-            return;
-        }
-    }
-
-    if (row.graphic_span_count == 0U) {
-        row.first_graphic_span =
-            static_cast<std::uint32_t>(frame.packed_graphic_spans.size());
-    }
-
-    terminal_packed_graphic_span_t span;
-    span.first_column    = cell.position.column;
-    span.column_count    = cell.display_width;
-    span.style_id        = cell.style_id;
-    span.foreground_rgba = foreground_rgba;
-    span.background_rgba = background_rgba;
-    span.codepoint_offset =
-        static_cast<std::uint32_t>(frame.packed_graphic_codepoints.size());
-    span.codepoint_count  = 1U;
-    const std::optional<ushort> codepoint = cell.text.single_code_unit();
-    Q_ASSERT(codepoint.has_value());
-    frame.packed_graphic_codepoints.push_back(static_cast<std::uint32_t>(*codepoint));
-    frame.packed_graphic_spans.push_back(span);
-    ++row.graphic_span_count;
-    ++frame.stats.packed_graphic_cells;
-    ++frame.stats.packed_cells_appended;
-}
-
 std::uint64_t packed_payload_byte_count(const Terminal_render_frame& frame)
 {
     return
         static_cast<std::uint64_t>(frame.packed_rows.size()) * sizeof(terminal_packed_render_row_t)            +
         static_cast<std::uint64_t>(frame.packed_text_spans.size()) * sizeof(terminal_packed_text_span_t)       +
-        static_cast<std::uint64_t>(frame.packed_text_bytes.size()) * sizeof(char)                              +
-        static_cast<std::uint64_t>(frame.packed_graphic_spans.size()) * sizeof(terminal_packed_graphic_span_t) +
-        static_cast<std::uint64_t>(frame.packed_graphic_codepoints.size()) * sizeof(std::uint32_t);
+        static_cast<std::uint64_t>(frame.packed_text_bytes.size()) * sizeof(char);
 }
 
 void finalize_packed_render_frame_stats(Terminal_render_frame& frame)
 {
     frame.stats.packed_rows          = static_cast<int>(frame.packed_rows.size());
     frame.stats.packed_text_spans    = static_cast<int>(frame.packed_text_spans.size());
-    frame.stats.packed_graphic_spans = static_cast<int>(frame.packed_graphic_spans.size());
     frame.stats.packed_payload_bytes = packed_payload_byte_count(frame);
 }
 
@@ -2385,8 +1732,6 @@ terminal_packed_render_row_t& append_packed_render_row(
     // Span offsets are placeholders until the first span append for each kind.
     row.first_text_span =
         static_cast<std::uint32_t>(frame.packed_text_spans.size());
-    row.first_graphic_span =
-        static_cast<std::uint32_t>(frame.packed_graphic_spans.size());
     frame.packed_rows.push_back(row);
     return frame.packed_rows.back();
 }
@@ -2401,18 +1746,6 @@ void initialize_disabled_sidecar_packed_rows(
     for (int row_index = 0; row_index < snapshot.grid_size.rows; ++row_index) {
         append_packed_render_row(frame, snapshot, row_index);
     }
-}
-
-void record_disabled_sidecar_packed_graphic_cell(
-    std::vector<std::vector<const Terminal_render_cell*>>& row_table,
-    const Terminal_render_cell&                            cell)
-{
-    const std::size_t row_index = static_cast<std::size_t>(cell.position.row);
-    if (row_index >= row_table.size()) {
-        return;
-    }
-
-    row_table[row_index].push_back(&cell);
 }
 
 void append_cell_text_to_text_run(
@@ -2431,30 +1764,6 @@ void append_cell_text_to_text_run(
     }
 
     text.append_to(run.text);
-}
-
-void append_disabled_sidecar_packed_graphic_cells(
-    Terminal_render_frame&             frame,
-    std::vector<std::vector<const Terminal_render_cell*>>& row_table,
-    Render_style_attribute_cache&      style_attributes)
-{
-    VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::disabled_sidecar_packed_graphics");
-
-    const std::size_t row_count =
-        std::min(row_table.size(), frame.packed_rows.size());
-    for (std::size_t row_index = 0U; row_index < row_count; ++row_index) {
-        std::vector<const Terminal_render_cell*>& row_cells = row_table[row_index];
-        stable_sort_terminal_render_cell_row_by_column(row_cells);
-
-        terminal_packed_render_row_t& row = frame.packed_rows[row_index];
-        for (const Terminal_render_cell* cell : row_cells) {
-            append_packed_graphic_cell(
-                frame,
-                row,
-                *cell,
-                style_attributes.attributes(cell->style_id));
-        }
-    }
 }
 
 void build_terminal_render_frame_packed_data(
@@ -2487,8 +1796,6 @@ void build_terminal_render_frame_packed_data(
         frame.packed_rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
         frame.packed_text_spans.reserve(snapshot.cells.size() / 2U);
         frame.packed_text_bytes.reserve(snapshot.cells.size());
-        frame.packed_graphic_spans.reserve(snapshot.cells.size() / 8U);
-        frame.packed_graphic_codepoints.reserve(snapshot.cells.size() / 8U);
     }
 
     {
@@ -2526,21 +1833,6 @@ void build_terminal_render_frame_packed_data(
                         snapshot.styles.size(),
                         has_decoration,
                         dirty_row);
-                const bool graphic_candidate = terminal_graphic_candidate_text(
-                    classification.text_category,
-                    cell->text);
-                if (graphic_candidate) {
-                    ++frame.stats.packed_graphic_candidates_classified;
-                }
-
-                if (classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY) {
-                    append_packed_graphic_cell(
-                        frame,
-                        packed_row,
-                        *cell,
-                        style_attributes.attributes(cell->style_id));
-                    continue;
-                }
 
                 if (!classification.fast_text_eligible) {
                     continue;
@@ -2662,7 +1954,6 @@ Terminal_render_frame build_terminal_render_frame(
             snapshot->grid_size.columns - ime_preedit_column)
         : 0;
     Render_style_attribute_cache style_attributes(*snapshot);
-    std::vector<std::vector<const Terminal_render_cell*>> disabled_sidecar_packed_graphic_cells;
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::reserve_outputs");
@@ -2678,18 +1969,10 @@ Terminal_render_frame build_terminal_render_frame(
         frame.decorations.reserve(
             bounded_frame_reserve(cell_count, snapshot->grid_size.rows, 4U, 64U));
         frame.cursors.reserve(2U);
-        frame.cursor_graphic_rects.reserve(4U);
-        frame.cursor_graphic_arcs.reserve(2U);
         frame.overlay_rects.reserve(1U);
         if (!options.packed_text_sidecars_enabled) {
-            frame.packed_graphic_spans.reserve(
-                bounded_frame_reserve(cell_count, snapshot->grid_size.rows, 8U, 64U));
-            frame.packed_graphic_codepoints.reserve(
-                bounded_frame_reserve(cell_count, snapshot->grid_size.rows, 8U, 64U));
             if (valid_grid) {
                 initialize_disabled_sidecar_packed_rows(frame, *snapshot);
-                disabled_sidecar_packed_graphic_cells.resize(
-                    static_cast<std::size_t>(snapshot->grid_size.rows));
             }
         }
     }
@@ -2815,17 +2098,6 @@ Terminal_render_frame build_terminal_render_frame(
                 eligible_after_all_gates,
                 simple_eligibility_flags);
 
-            if (!options.packed_text_sidecars_enabled &&
-                valid_render_row                     &&
-                !block_cursor_cell                   &&
-                !ime_preedit_cell                    &&
-                terminal_graphic_candidate_text(
-                    classification.text_category,
-                    cell.text))
-            {
-                ++frame.stats.packed_graphic_candidates_classified;
-            }
-
             if (cell.wide_continuation) {
                 ++frame.stats.cells_skipped_wide_continuation;
                 continue;
@@ -2916,51 +2188,22 @@ Terminal_render_frame build_terminal_render_frame(
             run.hyperlink_id       = cell.hyperlink_id;
             run.underline          = style.underline;
             run.strike             = style.strike;
-            const bool packed_hard_graphic_covered =
-                !text_is_empty                                                          &&
-                classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY &&
-                terminal_hard_block_graphic_text_is_supported(cell.text)                &&
-                !block_cursor_cell                                                      &&
-                !ime_preedit_cell;
-            if (!options.packed_text_sidecars_enabled                                  &&
-                classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY &&
-                !block_cursor_cell                                                      &&
-                !ime_preedit_cell)
-            {
-                record_disabled_sidecar_packed_graphic_cell(
-                    disabled_sidecar_packed_graphic_cells,
-                    cell);
-            }
-            const bool rendered_as_graphic = packed_hard_graphic_covered ||
-                (!text_is_empty &&
-                    classification.route == Terminal_simple_content_route::GRAPHIC_GEOMETRY &&
-                    append_terminal_graphic_rects(
-                        frame.graphic_rects,
-                        frame.graphic_arcs,
-                        rect,
-                        cell.text,
-                        foreground,
-                        cell_metrics));
-            if (rendered_as_graphic) {
-                if (block_cursor_visible &&
-                    cell.position.row    == snapshot->cursor.position.row &&
-                    cell.position.column == snapshot->cursor.position.column)
-                {
-                    const std::size_t first_cursor_graphic_rect =
-                        frame.cursor_graphic_rects.size();
-                    append_terminal_graphic_rects(
-                        frame.cursor_graphic_rects,
-                        frame.cursor_graphic_arcs,
-                        rect,
-                        cell.text,
-                        cursor_graphic_overlay_color(background),
-                        cell_metrics);
-                    clip_terminal_graphic_rects(
-                        frame.cursor_graphic_rects,
-                        first_cursor_graphic_rect,
-                        block_cursor_rect);
-                }
-                ++frame.stats.text_cells_rendered_as_graphic;
+            const bool render_as_terminal_graphic =
+                !text_is_empty &&
+                !block_cursor_cell &&
+                !ime_preedit_cell &&
+                classification.rejection_reason ==
+                    Terminal_simple_content_rejection_reason::NON_ASCII_TEXT &&
+                is_terminal_graphic_text(cell.text) &&
+                append_terminal_graphic_rects(
+                    frame.graphic_rects,
+                    frame.graphic_arcs,
+                    rect,
+                    cell.text,
+                    foreground,
+                    cell_metrics);
+            if (render_as_terminal_graphic) {
+                open_ascii_run.valid = false;
             }
             else
             if (!text_is_empty) {
@@ -3088,12 +2331,6 @@ Terminal_render_frame build_terminal_render_frame(
             ime_preedit_column,
             ime_preedit_columns);
     }
-    else {
-        append_disabled_sidecar_packed_graphic_cells(
-            frame,
-            disabled_sidecar_packed_graphic_cells,
-            style_attributes);
-    }
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::finalize");
@@ -3118,27 +2355,11 @@ Terminal_render_frame build_terminal_render_frame(
         if (cursor_visible) {
             const QRectF rendered_cursor_rect =
                 cursor_rect(snapshot->cursor, cursor_shape, cell_metrics);
-            if (cursor_shape == Terminal_cursor_shape::BLOCK &&
-                !frame.cursor_graphic_rects.empty())
-            {
-                for (const QRectF& rect : cursor_rects_excluding_graphics(
-                    rendered_cursor_rect,
-                    frame.cursor_graphic_rects))
-                {
-                    frame.cursors.push_back({
-                        cursor_shape,
-                        rect,
-                        options.cursor_color,
-                    });
-                }
-            }
-            else {
-                frame.cursors.push_back({
-                    cursor_shape,
-                    rendered_cursor_rect,
-                    options.cursor_color,
-                });
-            }
+            frame.cursors.push_back({
+                cursor_shape,
+                rendered_cursor_rect,
+                options.cursor_color,
+            });
             if (cursor_shape == Terminal_cursor_shape::BLOCK) {
                 const auto text_run = std::find_if(
                     frame.text_runs.begin(),
@@ -3223,10 +2444,6 @@ Terminal_render_frame build_terminal_render_frame(
     frame.stats.cursor_text_runs_emitted = static_cast<int>(frame.cursor_text_runs.size());
     frame.stats.decoration_rects_emitted = static_cast<int>(frame.decorations.size());
     frame.stats.cursor_rects_emitted     = static_cast<int>(frame.cursors.size());
-    frame.stats.cursor_graphic_rects_emitted =
-        static_cast<int>(frame.cursor_graphic_rects.size());
-    frame.stats.cursor_graphic_arcs_emitted  =
-        static_cast<int>(frame.cursor_graphic_arcs.size());
     frame.stats.overlay_rects_emitted        = static_cast<int>(frame.overlay_rects.size());
     return frame;
 }

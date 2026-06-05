@@ -24,10 +24,9 @@ inline qreal terminal_graphic_light_stroke(terminal_cell_metrics_t metrics)
 
 inline qreal terminal_graphic_heavy_stroke(terminal_cell_metrics_t metrics)
 {
-    return
-        std::max<qreal>(
-            terminal_graphic_light_stroke(metrics) + 1.0,
-            std::floor(std::min(metrics.width, metrics.height) * 0.20));
+    return std::max<qreal>(
+        terminal_graphic_light_stroke(metrics) + 1.0,
+        std::floor(std::min(metrics.width, metrics.height) * 0.20));
 }
 
 inline void append_terminal_graphic_rect(
@@ -36,7 +35,7 @@ inline void append_terminal_graphic_rect(
     const QColor&                      color,
     bool                               antialias = false)
 {
-    if (rect.width() <= 0.0 || rect.height() <= 0.0) {
+    if (rect.width() <= 0.0 || rect.height() <= 0.0 || color.alpha() <= 0) {
         return;
     }
 
@@ -50,7 +49,11 @@ inline void append_terminal_graphic_arc(
     const QColor&                      color,
     qreal                              stroke)
 {
-    if (cell.width() <= 0.0 || cell.height() <= 0.0 || stroke <= 0.0) {
+    if (cell.width() <= 0.0 ||
+        cell.height() <= 0.0 ||
+        stroke <= 0.0       ||
+        color.alpha() <= 0)
+    {
         return;
     }
 
@@ -58,10 +61,10 @@ inline void append_terminal_graphic_arc(
 }
 
 inline QRectF terminal_graphic_centered_horizontal_rect(
-    const QRectF&  cell,
-    qreal          left,
-    qreal          right,
-    qreal          stroke)
+    const QRectF& cell,
+    qreal         left,
+    qreal         right,
+    qreal         stroke)
 {
     return QRectF(
         left,
@@ -71,10 +74,10 @@ inline QRectF terminal_graphic_centered_horizontal_rect(
 }
 
 inline QRectF terminal_graphic_centered_vertical_rect(
-    const QRectF&  cell,
-    qreal          top,
-    qreal          bottom,
-    qreal          stroke)
+    const QRectF& cell,
+    qreal         top,
+    qreal         bottom,
+    qreal         stroke)
 {
     return QRectF(
         cell.center().x() - stroke * 0.5,
@@ -123,15 +126,15 @@ constexpr unsigned int k_terminal_box_down  = 0x08U;
 
 struct terminal_box_stroke_spec_t
 {
-    ushort                     codepoint;
-    unsigned int               connections;
-    bool                       heavy;
+    ushort       codepoint   = 0U;
+    unsigned int connections = 0U;
+    bool         heavy       = false;
 };
 
 struct terminal_box_arc_spec_t
 {
-    ushort                     codepoint;
-    Terminal_render_arc_kind   kind;
+    ushort                   codepoint = 0U;
+    Terminal_render_arc_kind kind      = Terminal_render_arc_kind::DOWN_RIGHT;
 };
 
 inline constexpr terminal_box_stroke_spec_t k_terminal_box_stroke_specs[] = {
@@ -155,8 +158,10 @@ inline constexpr terminal_box_stroke_spec_t k_terminal_box_stroke_specs[] = {
     {0x2533, k_terminal_box_left | k_terminal_box_right | k_terminal_box_down, true},
     {0x2534, k_terminal_box_left | k_terminal_box_right | k_terminal_box_up, false},
     {0x253b, k_terminal_box_left | k_terminal_box_right | k_terminal_box_up, true},
-    {0x253c, k_terminal_box_left | k_terminal_box_right | k_terminal_box_up | k_terminal_box_down, false},
-    {0x254b, k_terminal_box_left | k_terminal_box_right | k_terminal_box_up | k_terminal_box_down, true},
+    {0x253c, k_terminal_box_left | k_terminal_box_right | k_terminal_box_up |
+         k_terminal_box_down, false},
+    {0x254b, k_terminal_box_left | k_terminal_box_right | k_terminal_box_up |
+         k_terminal_box_down, true},
     {0x2574, k_terminal_box_left, false},
     {0x2575, k_terminal_box_up, false},
     {0x2576, k_terminal_box_right, false},
@@ -262,6 +267,15 @@ inline void append_terminal_quadrant_rect(
         color);
 }
 
+inline QColor terminal_shade_graphic_color(QColor color, qreal coverage)
+{
+    color.setAlpha(std::clamp(
+        static_cast<int>(std::round(static_cast<qreal>(color.alpha()) * coverage)),
+        0,
+        255));
+    return color;
+}
+
 inline bool append_terminal_block_graphic_rects(
     std::vector<Terminal_render_rect>& rects,
     const QRectF&                      cell,
@@ -315,6 +329,40 @@ inline bool append_terminal_block_graphic_rects(
             append_terminal_graphic_rect(
                 rects,
                 QRectF(cell.center().x(), cell.top(), cell.width() * 0.5, cell.height()),
+                color);
+            return true;
+        case 0x2591:
+            append_terminal_graphic_rect(
+                rects,
+                cell,
+                terminal_shade_graphic_color(color, 0.25));
+            return true;
+        case 0x2592:
+            append_terminal_graphic_rect(
+                rects,
+                cell,
+                terminal_shade_graphic_color(color, 0.50));
+            return true;
+        case 0x2593:
+            append_terminal_graphic_rect(
+                rects,
+                cell,
+                terminal_shade_graphic_color(color, 0.75));
+            return true;
+        case 0x2594:
+            append_terminal_graphic_rect(
+                rects,
+                QRectF(cell.left(), cell.top(), cell.width(), cell.height() / 8.0),
+                color);
+            return true;
+        case 0x2595:
+            append_terminal_graphic_rect(
+                rects,
+                QRectF(
+                    cell.right() - cell.width() / 8.0,
+                    cell.top(),
+                    cell.width() / 8.0,
+                    cell.height()),
                 color);
             return true;
         case 0x2596:
@@ -391,27 +439,6 @@ inline bool append_terminal_graphic_rects(
     std::vector<Terminal_render_rect>& rects,
     std::vector<Terminal_render_arc>&  arcs,
     const QRectF&                      cell,
-    const QString&                     text,
-    const QColor&                      color,
-    terminal_cell_metrics_t            metrics)
-{
-    if (text.size() != 1) {
-        return false;
-    }
-
-    return append_terminal_graphic_codepoint_rects(
-        rects,
-        arcs,
-        cell,
-        text.at(0).unicode(),
-        color,
-        metrics);
-}
-
-inline bool append_terminal_graphic_rects(
-    std::vector<Terminal_render_rect>& rects,
-    std::vector<Terminal_render_arc>&  arcs,
-    const QRectF&                      cell,
     const Terminal_render_cell_text&   text,
     const QColor&                      color,
     terminal_cell_metrics_t            metrics)
@@ -430,54 +457,6 @@ inline bool append_terminal_graphic_rects(
         metrics);
 }
 
-inline bool terminal_block_graphic_is_supported(ushort codepoint)
-{
-    std::vector<Terminal_render_rect> rects;
-    return append_terminal_block_graphic_rects(
-        rects,
-        QRectF(0.0, 0.0, 0.0, 0.0),
-        codepoint,
-        QColor(0, 0, 0, 0));
-}
-
-inline bool terminal_hard_block_graphic_is_supported(ushort codepoint)
-{
-    return
-        codepoint >= 0x2580U &&
-        codepoint <= 0x259fU &&
-        terminal_block_graphic_is_supported(codepoint);
-}
-
-inline bool terminal_hard_block_graphic_text_is_supported(const QString& text)
-{
-    return
-        text.size() == 1 &&
-        terminal_hard_block_graphic_is_supported(text.at(0).unicode());
-}
-
-inline bool terminal_hard_block_graphic_text_is_supported(
-    const Terminal_render_cell_text& text)
-{
-    const std::optional<ushort> codepoint = text.single_code_unit();
-    return codepoint.has_value() && terminal_hard_block_graphic_is_supported(*codepoint);
-}
-
-inline bool is_terminal_graphic_text(const QString& text)
-{
-    if (text.size() != 1) {
-        return false;
-    }
-
-    const ushort codepoint = text.at(0).unicode();
-    if (terminal_hard_block_graphic_is_supported(codepoint)) {
-        return true;
-    }
-
-    return
-        find_terminal_box_stroke_spec(codepoint) != nullptr ||
-        find_terminal_box_arc_spec(codepoint)    != nullptr;
-}
-
 inline bool is_terminal_graphic_text(const Terminal_render_cell_text& text)
 {
     const std::optional<ushort> codepoint = text.single_code_unit();
@@ -485,83 +464,13 @@ inline bool is_terminal_graphic_text(const Terminal_render_cell_text& text)
         return false;
     }
 
-    if (terminal_hard_block_graphic_is_supported(*codepoint)) {
+    if (*codepoint >= 0x2580U && *codepoint <= 0x259fU) {
         return true;
     }
 
     return
         find_terminal_box_stroke_spec(*codepoint) != nullptr ||
         find_terminal_box_arc_spec(*codepoint)    != nullptr;
-}
-
-inline QRectF terminal_graphic_cell_rect(
-    int                         row,
-    int                         column,
-    int                         column_count,
-    terminal_cell_metrics_t     metrics)
-{
-    return QRectF(
-        static_cast<qreal>(column) * metrics.width,
-        static_cast<qreal>(row) * metrics.height,
-        static_cast<qreal>(column_count) * metrics.width,
-        metrics.height);
-}
-
-inline std::vector<Terminal_render_rect> terminal_render_packed_hard_graphic_rects(
-    const Terminal_render_frame& frame)
-{
-    std::vector<Terminal_render_rect> rects;
-    rects.reserve(frame.packed_graphic_codepoints.size());
-
-    for (const terminal_packed_render_row_t& row : frame.packed_rows) {
-        const std::size_t first_span = static_cast<std::size_t>(row.first_graphic_span);
-        if (first_span >= frame.packed_graphic_spans.size()) {
-            continue;
-        }
-
-        const std::size_t span_count = std::min<std::size_t>(
-            row.graphic_span_count,
-            frame.packed_graphic_spans.size() - first_span);
-        for (std::size_t span_offset = 0U; span_offset < span_count; ++span_offset) {
-            const terminal_packed_graphic_span_t& span =
-                frame.packed_graphic_spans[first_span + span_offset];
-            const std::size_t first_codepoint =
-                static_cast<std::size_t>(span.codepoint_offset);
-            if (first_codepoint >= frame.packed_graphic_codepoints.size()) {
-                continue;
-            }
-
-            const std::size_t codepoint_count = std::min<std::size_t>(
-                std::min<std::size_t>(span.codepoint_count, span.column_count),
-                frame.packed_graphic_codepoints.size() - first_codepoint);
-            const QColor foreground = QColor::fromRgba(span.foreground_rgba);
-            for (std::size_t codepoint_offset = 0U;
-                codepoint_offset < codepoint_count;
-                ++codepoint_offset)
-            {
-                const std::uint32_t codepoint =
-                    frame.packed_graphic_codepoints[first_codepoint + codepoint_offset];
-                if (codepoint > 0xffffU ||
-                    !terminal_hard_block_graphic_is_supported(
-                        static_cast<ushort>(codepoint)))
-                {
-                    continue;
-                }
-
-                append_terminal_block_graphic_rects(
-                    rects,
-                    terminal_graphic_cell_rect(
-                        row.viewport_row,
-                        span.first_column + static_cast<int>(codepoint_offset),
-                        1,
-                        frame.cell_metrics),
-                    static_cast<ushort>(codepoint),
-                    foreground);
-            }
-        }
-    }
-
-    return rects;
 }
 
 struct terminal_render_arc_geometry_t

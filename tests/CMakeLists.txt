@@ -98,6 +98,31 @@ set_tests_properties(vnm_terminal_primary_backing_phase_0b_guard PROPERTIES
     LABELS "primary-backing;static"
 )
 
+add_test(
+    NAME vnm_terminal_qsg_atlas_warm_set_generator
+    COMMAND
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/tools/qsg_atlas_warm_set/generate_qsg_atlas_warm_set.py"
+        --self-test
+)
+
+add_test(
+    NAME vnm_terminal_qsg_atlas_warm_set_drift
+    COMMAND
+        "${Python3_EXECUTABLE}"
+        "${CMAKE_SOURCE_DIR}/tools/qsg_atlas_warm_set/generate_qsg_atlas_warm_set.py"
+        --check
+        "${CMAKE_SOURCE_DIR}/tools/qsg_atlas_warm_set/qsg_atlas_warm_set.toml"
+        "${CMAKE_SOURCE_DIR}/include/vnm_terminal/internal/qsg_atlas_warm_set.h"
+)
+
+set_tests_properties(
+    vnm_terminal_qsg_atlas_warm_set_generator
+    vnm_terminal_qsg_atlas_warm_set_drift
+    PROPERTIES
+        LABELS "qsg;atlas;warm-set;static"
+)
+
 set(vnm_terminal_default_capture_replay_dir "")
 if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/conformance/captures")
     set(vnm_terminal_default_capture_replay_dir
@@ -673,6 +698,32 @@ if(WIN32)
         vnm_terminal_qsg_atlas_lcd_capability_probe_d3d11
         PROPERTIES
             LABELS "qsg;hardware;atlas;lcd-probe"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 120
+    )
+
+    set(vnm_terminal_qsg_atlas_warm_lazy_environment
+        ${vnm_terminal_qt_windows_qpa_environment}
+        "QSG_RENDER_LOOP=threaded"
+        "QSG_RHI_BACKEND=d3d11"
+        ${vnm_terminal_qt_unscaled_environment}
+    )
+    add_test(
+        NAME vnm_terminal_qsg_atlas_warm_lazy_d3d11
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qsg_atlas_warm_lazy_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+            "--warm-lazy-smoke"
+            "--backend"
+            "d3d11"
+    )
+
+    set_tests_properties(
+        vnm_terminal_qsg_atlas_warm_lazy_d3d11
+        PROPERTIES
+            LABELS "qsg;hardware;atlas;warm-lazy"
             SKIP_RETURN_CODE 77
             TIMEOUT 120
     )
