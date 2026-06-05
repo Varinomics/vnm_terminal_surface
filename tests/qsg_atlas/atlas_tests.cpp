@@ -8064,6 +8064,79 @@ struct Raster_variant_probe_result
     std::vector<Raster_variant_probe_record> records;
 };
 
+struct Metrics_placement_font_metrics
+{
+    qreal m_advance          = 0.0;
+    qreal average_char_width = 0.0;
+    qreal ascent             = 0.0;
+    qreal descent            = 0.0;
+    qreal height             = 0.0;
+    qreal line_spacing       = 0.0;
+};
+
+struct Metrics_placement_delta
+{
+    qreal raw_logical      = 0.0;
+    qreal snapped_logical  = 0.0;
+    qreal delta_logical    = 0.0;
+    qreal delta_physical   = 0.0;
+};
+
+struct Metrics_placement_qt_glyph_record
+{
+    qsizetype source_string_start = 0;
+    quint32   glyph_index         = 0U;
+    QPointF   layout_origin;
+};
+
+struct Metrics_placement_glyph_record
+{
+    qsizetype source_string_start = 0;
+    qsizetype source_string_end   = 0;
+    quint32   glyph_index         = 0U;
+    QPointF   qt_layout_origin;
+    qreal     qt_advance          = 0.0;
+    QPointF   terminal_cell_origin;
+    QPointF   production_origin;
+    qreal     terminal_minus_qt_x = 0.0;
+    qreal     production_minus_terminal_x = 0.0;
+    int       owner_column        = 0;
+    int       owner_cell_span     = 1;
+    bool      production_origin_matches_terminal = false;
+    bool      terminal_origin_physical_snapped   = false;
+    bool      production_origin_physical_snapped = false;
+};
+
+struct Metrics_placement_probe_result
+{
+    QString sample_text;
+    qreal   device_pixel_ratio = 1.0;
+    Metrics_placement_font_metrics natural_metrics;
+    Metrics_placement_font_metrics cell_stable_metrics;
+    term::terminal_cell_metrics_t  snapped_metrics;
+    Metrics_placement_delta        width_delta;
+    Metrics_placement_delta        ascent_delta;
+    Metrics_placement_delta        descent_delta;
+    Metrics_placement_delta        height_delta;
+    Metrics_placement_delta        line_spacing_delta;
+    qreal                          qtext_layout_natural_width = 0.0;
+    qreal                          qfont_horizontal_advance   = 0.0;
+    int                            terminal_cell_count        = 0;
+    qreal                          terminal_run_width         = 0.0;
+    qreal                          terminal_minus_qtext_width = 0.0;
+    int                            matched_glyph_count        = 0;
+    qreal                          max_abs_x_delta           = 0.0;
+    qreal                          mean_abs_x_delta          = 0.0;
+    qreal                          first_x_delta             = 0.0;
+    qreal                          last_x_delta              = 0.0;
+    qreal                          mean_qt_advance           = 0.0;
+    qreal                          terminal_cell_advance     = 0.0;
+    bool                           qtext_line_valid          = false;
+    bool                           production_shape_valid    = false;
+    std::vector<Metrics_placement_glyph_record>
+                                   glyphs;
+};
+
 QString lcd_probe_printable_ascii_text()
 {
     QString text;
@@ -8923,6 +8996,322 @@ bool raster_variant_probe_records_are_usable(
     return true;
 }
 
+QString lcd_metrics_placement_probe_text()
+{
+    return QStringLiteral("OpenAI Codex (v0.137.0)");
+}
+
+Metrics_placement_font_metrics metrics_placement_font_metrics(const QFont& font)
+{
+    const QFontMetricsF metrics(font);
+    return {
+        metrics.horizontalAdvance(QLatin1Char('M')),
+        metrics.averageCharWidth(),
+        metrics.ascent(),
+        metrics.descent(),
+        metrics.height(),
+        metrics.lineSpacing(),
+    };
+}
+
+Metrics_placement_delta metrics_placement_delta(
+    qreal raw_logical,
+    qreal snapped_logical,
+    qreal device_pixel_ratio)
+{
+    return {
+        raw_logical,
+        snapped_logical,
+        snapped_logical - raw_logical,
+        (snapped_logical - raw_logical) *
+            pixel_normalized_device_pixel_ratio(device_pixel_ratio),
+    };
+}
+
+bool metrics_placement_point_is_finite(QPointF point)
+{
+    return std::isfinite(point.x()) && std::isfinite(point.y());
+}
+
+std::vector<Metrics_placement_qt_glyph_record>
+metrics_placement_qt_glyph_records(
+    const QList<QGlyphRun>& glyph_runs,
+    QPointF                 layout_origin,
+    qsizetype               text_size)
+{
+    std::vector<Metrics_placement_qt_glyph_record> records;
+    for (const QGlyphRun& glyph_run : glyph_runs) {
+        const QList<quint32>   glyph_indexes  = glyph_run.glyphIndexes();
+        const QList<QPointF>   positions      = glyph_run.positions();
+        const QList<qsizetype> string_indexes = glyph_run.stringIndexes();
+        const int glyph_count = std::min({
+            glyph_indexes.size(),
+            positions.size(),
+            string_indexes.size(),
+        });
+        for (int index = 0; index < glyph_count; ++index) {
+            const qsizetype source_start = string_indexes.at(index);
+            if (source_start < 0 || source_start >= text_size) {
+                continue;
+            }
+
+            records.push_back({
+                source_start,
+                glyph_indexes.at(index),
+                layout_origin + positions.at(index),
+            });
+        }
+    }
+
+    std::sort(
+        records.begin(),
+        records.end(),
+        [](const auto& left, const auto& right) {
+            if (left.source_string_start != right.source_string_start) {
+                return left.source_string_start < right.source_string_start;
+            }
+            if (left.layout_origin.x() != right.layout_origin.x()) {
+                return left.layout_origin.x() < right.layout_origin.x();
+            }
+            return left.glyph_index < right.glyph_index;
+        });
+
+    return records;
+}
+
+qsizetype metrics_placement_source_range_end(
+    const std::vector<Metrics_placement_qt_glyph_record>& records,
+    std::size_t                                           glyph_offset,
+    qsizetype                                             source_start,
+    qsizetype                                             text_size)
+{
+    for (std::size_t next = glyph_offset + 1; next < records.size(); ++next) {
+        const qsizetype next_index = records.at(next).source_string_start;
+        if (next_index > source_start && next_index <= text_size) {
+            return next_index;
+        }
+    }
+    return text_size;
+}
+
+const term::Qsg_atlas_shaped_glyph_record*
+metrics_placement_find_shaped_record(
+    const term::Qsg_atlas_shaped_text_run_result& shaped,
+    qsizetype                                     source_start)
+{
+    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
+        if (record.source_string_start == source_start) {
+            return &record;
+        }
+    }
+    return nullptr;
+}
+
+Metrics_placement_probe_result render_lcd_metrics_placement_probe(
+    qreal device_pixel_ratio)
+{
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const QString text = lcd_metrics_placement_probe_text();
+    const QFont font = term::vnm_terminal_font(QString(), 18.0);
+    const QFont ascii_font = term::qsg_atlas_cell_stable_ascii_layout_font(font);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+    const QColor background(13, 24, 31);
+    const QColor foreground(238, 244, 248);
+    const term::Terminal_render_text_run run =
+        raster_variant_sample_run(text, metrics, foreground, background);
+
+    Metrics_placement_probe_result result;
+    result.sample_text        = text;
+    result.device_pixel_ratio = dpr;
+    result.natural_metrics    = metrics_placement_font_metrics(font);
+    result.cell_stable_metrics = metrics_placement_font_metrics(ascii_font);
+    result.snapped_metrics    = metrics;
+    result.width_delta = metrics_placement_delta(
+        result.natural_metrics.m_advance,
+        metrics.width,
+        dpr);
+    result.ascent_delta = metrics_placement_delta(
+        result.natural_metrics.ascent,
+        metrics.ascent,
+        dpr);
+    result.descent_delta = metrics_placement_delta(
+        result.natural_metrics.descent,
+        metrics.descent,
+        dpr);
+    result.height_delta = metrics_placement_delta(
+        result.natural_metrics.height,
+        metrics.height,
+        dpr);
+    result.line_spacing_delta = metrics_placement_delta(
+        result.natural_metrics.line_spacing,
+        metrics.height,
+        dpr);
+    result.terminal_cell_count = raster_variant_text_cells(text);
+    result.terminal_run_width =
+        static_cast<qreal>(result.terminal_cell_count) * metrics.width;
+    result.terminal_cell_advance = metrics.width;
+
+    QTextLayout layout(text, font);
+    QTextOption option;
+    option.setWrapMode(QTextOption::NoWrap);
+    layout.setTextOption(option);
+    layout.setCacheEnabled(false);
+    layout.beginLayout();
+    QTextLine line = layout.createLine();
+    if (!line.isValid()) {
+        layout.endLayout();
+        return result;
+    }
+    line.setLineWidth(1024.0 * 1024.0);
+    line.setPosition(QPointF(0.0, 0.0));
+    result.qtext_line_valid = line.textStart() == 0 &&
+        line.textLength() == text.size();
+    result.qtext_layout_natural_width = line.naturalTextWidth();
+    result.qfont_horizontal_advance =
+        QFontMetricsF(font).horizontalAdvance(text);
+    result.terminal_minus_qtext_width =
+        result.terminal_run_width - result.qtext_layout_natural_width;
+    const qreal line_ascent = line.ascent();
+    const QList<QGlyphRun> glyph_runs = line.glyphRuns(
+        0,
+        text.size(),
+        QTextLayout::RetrieveGlyphIndexes   |
+            QTextLayout::RetrieveGlyphPositions |
+            QTextLayout::RetrieveStringIndexes);
+    layout.endLayout();
+
+    const term::Qsg_atlas_shaped_text_run_result shaped =
+        term::qsg_atlas_shape_text_run(
+            run,
+            ascii_font,
+            metrics,
+            dpr,
+            0,
+            false);
+    result.production_shape_valid =
+        shaped.missing_string_indexes == 0 &&
+        shaped.invalid_string_indexes == 0;
+
+    const QPointF layout_origin(
+        run.baseline_origin.x(),
+        run.baseline_origin.y() - line_ascent);
+    const std::vector<Metrics_placement_qt_glyph_record> qt_glyphs =
+        metrics_placement_qt_glyph_records(
+            glyph_runs,
+            layout_origin,
+            text.size());
+    double abs_x_delta_sum = 0.0;
+    double qt_advance_sum  = 0.0;
+    for (std::size_t index = 0; index < qt_glyphs.size(); ++index) {
+        const Metrics_placement_qt_glyph_record& qt_glyph = qt_glyphs.at(index);
+        const term::Qsg_atlas_shaped_glyph_record* const shaped_record =
+            metrics_placement_find_shaped_record(
+                shaped,
+                qt_glyph.source_string_start);
+        if (shaped_record == nullptr) {
+            continue;
+        }
+
+        Metrics_placement_glyph_record record;
+        record.source_string_start = qt_glyph.source_string_start;
+        record.source_string_end =
+            metrics_placement_source_range_end(
+                qt_glyphs,
+                index,
+                qt_glyph.source_string_start,
+                text.size());
+        record.glyph_index = qt_glyph.glyph_index;
+        record.qt_layout_origin = qt_glyph.layout_origin;
+        const qreal next_origin_x =
+            index + 1 < qt_glyphs.size()
+                ? qt_glyphs.at(index + 1).layout_origin.x()
+                : layout_origin.x() + result.qtext_layout_natural_width;
+        record.qt_advance = next_origin_x - record.qt_layout_origin.x();
+        record.production_origin = shaped_record->glyph_origin;
+        record.terminal_cell_origin = QPointF(
+            run.rect.left() +
+                static_cast<qreal>(qt_glyph.source_string_start) * metrics.width,
+            record.production_origin.y());
+        record.terminal_minus_qt_x =
+            record.terminal_cell_origin.x() - record.qt_layout_origin.x();
+        record.production_minus_terminal_x =
+            record.production_origin.x() -
+                record.terminal_cell_origin.x();
+        record.owner_column    = shaped_record->owner_column;
+        record.owner_cell_span = shaped_record->owner_cell_span;
+        record.production_origin_matches_terminal =
+            std::abs(record.production_minus_terminal_x) <= 0.001;
+        record.terminal_origin_physical_snapped =
+            point_is_physical_pixel_snapped(record.terminal_cell_origin, dpr);
+        record.production_origin_physical_snapped =
+            point_is_physical_pixel_snapped(record.production_origin, dpr);
+
+        result.max_abs_x_delta = std::max(
+            result.max_abs_x_delta,
+            std::abs(record.terminal_minus_qt_x));
+        abs_x_delta_sum += std::abs(record.terminal_minus_qt_x);
+        qt_advance_sum  += record.qt_advance;
+        if (result.glyphs.empty()) {
+            result.first_x_delta = record.terminal_minus_qt_x;
+        }
+        result.last_x_delta = record.terminal_minus_qt_x;
+        result.glyphs.push_back(record);
+    }
+
+    result.matched_glyph_count = static_cast<int>(result.glyphs.size());
+    if (result.matched_glyph_count > 0) {
+        result.mean_abs_x_delta =
+            abs_x_delta_sum / static_cast<double>(result.matched_glyph_count);
+        result.mean_qt_advance =
+            qt_advance_sum / static_cast<double>(result.matched_glyph_count);
+    }
+    return result;
+}
+
+bool metrics_placement_probe_is_usable(
+    const Metrics_placement_probe_result& result)
+{
+    const auto finite_positive = [](qreal value) {
+        return std::isfinite(value) && value > 0.0;
+    };
+
+    if (!result.qtext_line_valid ||
+        !result.production_shape_valid ||
+        result.terminal_cell_count <= 0 ||
+        result.matched_glyph_count != result.terminal_cell_count ||
+        result.glyphs.size() != static_cast<std::size_t>(result.terminal_cell_count) ||
+        !finite_positive(result.natural_metrics.m_advance) ||
+        !finite_positive(result.snapped_metrics.width) ||
+        !finite_positive(result.qtext_layout_natural_width) ||
+        !finite_positive(result.terminal_run_width))
+    {
+        return false;
+    }
+
+    qsizetype previous_source_start = -1;
+    for (const Metrics_placement_glyph_record& record : result.glyphs) {
+        if (record.source_string_start < 0 ||
+            record.source_string_start <= previous_source_start ||
+            record.source_string_end <= record.source_string_start ||
+            record.source_string_end > result.sample_text.size() ||
+            record.glyph_index == 0U ||
+            !metrics_placement_point_is_finite(record.qt_layout_origin) ||
+            !metrics_placement_point_is_finite(record.terminal_cell_origin) ||
+            !metrics_placement_point_is_finite(record.production_origin) ||
+            !std::isfinite(record.qt_advance) ||
+            !std::isfinite(record.terminal_minus_qt_x) ||
+            !std::isfinite(record.production_minus_terminal_x) ||
+            !record.production_origin_matches_terminal ||
+            !record.terminal_origin_physical_snapped ||
+            !record.production_origin_physical_snapped)
+        {
+            return false;
+        }
+        previous_source_start = record.source_string_start;
+    }
+    return true;
+}
+
 void print_lcd_probe_records(
     const std::vector<Lcd_glyph_probe_record>& records)
 {
@@ -9239,6 +9628,172 @@ QJsonObject raster_variant_probe_object(
         QStringLiteral("renderer_contract"),
         QStringLiteral(
             "diagnostic only: raster-size variants for glyph-quality classification"));
+    return object;
+}
+
+QJsonObject json_pointf_object(QPointF point)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("x"), point.x());
+    object.insert(QStringLiteral("y"), point.y());
+    return object;
+}
+
+QJsonObject terminal_cell_metrics_object(term::terminal_cell_metrics_t metrics)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("width"), metrics.width);
+    object.insert(QStringLiteral("height"), metrics.height);
+    object.insert(QStringLiteral("ascent"), metrics.ascent);
+    object.insert(QStringLiteral("descent"), metrics.descent);
+    return object;
+}
+
+QJsonObject metrics_placement_font_metrics_object(
+    const Metrics_placement_font_metrics& metrics)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("m_advance"), metrics.m_advance);
+    object.insert(
+        QStringLiteral("average_char_width"),
+        metrics.average_char_width);
+    object.insert(QStringLiteral("ascent"), metrics.ascent);
+    object.insert(QStringLiteral("descent"), metrics.descent);
+    object.insert(QStringLiteral("height"), metrics.height);
+    object.insert(QStringLiteral("line_spacing"), metrics.line_spacing);
+    return object;
+}
+
+QJsonObject metrics_placement_delta_object(
+    const Metrics_placement_delta& delta)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("raw_logical"), delta.raw_logical);
+    object.insert(QStringLiteral("snapped_logical"), delta.snapped_logical);
+    object.insert(QStringLiteral("delta_logical"), delta.delta_logical);
+    object.insert(QStringLiteral("delta_physical"), delta.delta_physical);
+    return object;
+}
+
+QJsonObject metrics_placement_glyph_record_object(
+    const Metrics_placement_glyph_record& record)
+{
+    QJsonObject object;
+    object.insert(
+        QStringLiteral("source_string_start"),
+        static_cast<int>(record.source_string_start));
+    object.insert(
+        QStringLiteral("source_string_end"),
+        static_cast<int>(record.source_string_end));
+    object.insert(
+        QStringLiteral("glyph_index"),
+        static_cast<int>(record.glyph_index));
+    object.insert(
+        QStringLiteral("qt_layout_origin"),
+        json_pointf_object(record.qt_layout_origin));
+    object.insert(QStringLiteral("qt_advance"), record.qt_advance);
+    object.insert(
+        QStringLiteral("terminal_cell_origin"),
+        json_pointf_object(record.terminal_cell_origin));
+    object.insert(
+        QStringLiteral("production_origin"),
+        json_pointf_object(record.production_origin));
+    object.insert(
+        QStringLiteral("terminal_minus_qt_x"),
+        record.terminal_minus_qt_x);
+    object.insert(
+        QStringLiteral("production_minus_terminal_x"),
+        record.production_minus_terminal_x);
+    object.insert(QStringLiteral("owner_column"), record.owner_column);
+    object.insert(QStringLiteral("owner_cell_span"), record.owner_cell_span);
+    object.insert(
+        QStringLiteral("production_origin_matches_terminal"),
+        record.production_origin_matches_terminal);
+    object.insert(
+        QStringLiteral("terminal_origin_physical_snapped"),
+        record.terminal_origin_physical_snapped);
+    object.insert(
+        QStringLiteral("production_origin_physical_snapped"),
+        record.production_origin_physical_snapped);
+    return object;
+}
+
+QJsonObject metrics_placement_probe_object(
+    const Metrics_placement_probe_result& result)
+{
+    QJsonArray glyphs;
+    for (const Metrics_placement_glyph_record& record : result.glyphs) {
+        glyphs.append(metrics_placement_glyph_record_object(record));
+    }
+
+    QJsonObject deltas;
+    deltas.insert(
+        QStringLiteral("width"),
+        metrics_placement_delta_object(result.width_delta));
+    deltas.insert(
+        QStringLiteral("ascent"),
+        metrics_placement_delta_object(result.ascent_delta));
+    deltas.insert(
+        QStringLiteral("descent"),
+        metrics_placement_delta_object(result.descent_delta));
+    deltas.insert(
+        QStringLiteral("height"),
+        metrics_placement_delta_object(result.height_delta));
+    deltas.insert(
+        QStringLiteral("line_spacing"),
+        metrics_placement_delta_object(result.line_spacing_delta));
+
+    QJsonObject summary;
+    summary.insert(
+        QStringLiteral("matched_glyph_count"),
+        result.matched_glyph_count);
+    summary.insert(QStringLiteral("max_abs_x_delta"), result.max_abs_x_delta);
+    summary.insert(QStringLiteral("mean_abs_x_delta"), result.mean_abs_x_delta);
+    summary.insert(QStringLiteral("first_x_delta"), result.first_x_delta);
+    summary.insert(QStringLiteral("last_x_delta"), result.last_x_delta);
+    summary.insert(QStringLiteral("mean_qt_advance"), result.mean_qt_advance);
+    summary.insert(
+        QStringLiteral("terminal_cell_advance"),
+        result.terminal_cell_advance);
+
+    QJsonObject object;
+    object.insert(
+        QStringLiteral("renderer_contract"),
+        QStringLiteral(
+            "diagnostic only: Qt natural layout measured against stable terminal cells"));
+    object.insert(QStringLiteral("sample_text"), result.sample_text);
+    object.insert(QStringLiteral("device_pixel_ratio"), result.device_pixel_ratio);
+    object.insert(
+        QStringLiteral("natural_font_metrics"),
+        metrics_placement_font_metrics_object(result.natural_metrics));
+    object.insert(
+        QStringLiteral("cell_stable_font_metrics"),
+        metrics_placement_font_metrics_object(result.cell_stable_metrics));
+    object.insert(
+        QStringLiteral("snapped_terminal_metrics"),
+        terminal_cell_metrics_object(result.snapped_metrics));
+    object.insert(QStringLiteral("metric_deltas"), deltas);
+    object.insert(
+        QStringLiteral("qtext_layout_natural_width"),
+        result.qtext_layout_natural_width);
+    object.insert(
+        QStringLiteral("qfont_horizontal_advance"),
+        result.qfont_horizontal_advance);
+    object.insert(
+        QStringLiteral("terminal_cell_count"),
+        result.terminal_cell_count);
+    object.insert(
+        QStringLiteral("terminal_run_width"),
+        result.terminal_run_width);
+    object.insert(
+        QStringLiteral("terminal_minus_qtext_width"),
+        result.terminal_minus_qtext_width);
+    object.insert(QStringLiteral("qtext_line_valid"), result.qtext_line_valid);
+    object.insert(
+        QStringLiteral("production_shape_valid"),
+        result.production_shape_valid);
+    object.insert(QStringLiteral("summary"), summary);
+    object.insert(QStringLiteral("glyphs"), glyphs);
     return object;
 }
 
@@ -9578,6 +10133,7 @@ QJsonObject make_lcd_probe_metadata(
     const Pixel_render_result&                   reference,
     const Pixel_render_result&                   qt_text_reference,
     const Raster_variant_probe_result&           raster_variants,
+    const Metrics_placement_probe_result&        metrics_placement,
     const std::vector<Lcd_glyph_probe_record>&   probe_records,
     const char*                                  backend)
 {
@@ -9700,6 +10256,9 @@ QJsonObject make_lcd_probe_metadata(
     object.insert(
         QStringLiteral("raster_variant_probe"),
         raster_variant_probe_object(raster_variants));
+    object.insert(
+        QStringLiteral("metrics_placement_probe"),
+        metrics_placement_probe_object(metrics_placement));
     object.insert(QStringLiteral("atlas_report"), lcd_probe_report_object(atlas.atlas_report));
     object.insert(
         QStringLiteral("capability_interpretation"),
@@ -9749,6 +10308,7 @@ bool write_lcd_probe_artifacts(
     const Pixel_render_result&                   reference,
     const Pixel_render_result&                   qt_text_reference,
     const Raster_variant_probe_result&           raster_variants,
+    const Metrics_placement_probe_result&        metrics_placement,
     const std::vector<Lcd_glyph_probe_record>&   probe_records,
     const char*                                  backend)
 {
@@ -9813,6 +10373,7 @@ bool write_lcd_probe_artifacts(
             reference,
             qt_text_reference,
             raster_variants,
+            metrics_placement,
             probe_records,
             backend);
         const QByteArray bytes =
@@ -9937,6 +10498,8 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         render_qsg_text_reference_fixture(app, fixture);
     const Raster_variant_probe_result raster_variants =
         render_lcd_raster_variant_probe(fixture.device_pixel_ratio);
+    const Metrics_placement_probe_result metrics_placement =
+        render_lcd_metrics_placement_probe(fixture.device_pixel_ratio);
     const QFont font = term::vnm_terminal_font(QString(), 18.0);
     const std::vector<Lcd_glyph_probe_record> probe_records =
         probe_lcd_subpixel_glyphs(font, atlas.device_pixel_ratio);
@@ -9994,6 +10557,9 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     ok &= check(
         raster_variant_probe_records_are_usable(raster_variants),
         "LCD atlas probe records complete raster variant diagnostics");
+    ok &= check(
+        metrics_placement_probe_is_usable(metrics_placement),
+        "LCD atlas probe records complete metrics placement diagnostics");
     ok &= check(
         qt_text_reference.image.size() == atlas.image.size(),
         "LCD atlas probe Qt text-node reference uses the atlas image size");
@@ -10074,6 +10640,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             reference,
             qt_text_reference,
             raster_variants,
+            metrics_placement,
             probe_records,
             backend),
         "LCD atlas probe writes requested artifacts");
