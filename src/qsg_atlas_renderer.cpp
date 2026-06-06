@@ -113,6 +113,7 @@ struct atlas_msdf_instance_t
     float uv_rect[4]   = {};
     float color[4]     = {};
     float uv_bounds[4] = {};
+    float frame_rect[4] = {};
 };
 
 struct atlas_uniform_t
@@ -419,6 +420,11 @@ QRhiVertexInputLayout atlas_msdf_text_vertex_input_layout()
             4,
             QRhiVertexInputAttribute::Float4,
             offsetof(atlas_msdf_instance_t, uv_bounds)),
+        QRhiVertexInputAttribute(
+            1,
+            5,
+            QRhiVertexInputAttribute::Float4,
+            offsetof(atlas_msdf_instance_t, frame_rect)),
     });
     return layout;
 }
@@ -3919,24 +3925,18 @@ private:
         const int physical_origin_y = atlas_snapped_physical_int(
             baseline_origin.y(),
             normalized_device_pixel_ratio);
-        const qreal physical_left = static_cast<qreal>(
-            std::lround(
-                static_cast<qreal>(physical_origin_x) +
-                    static_cast<qreal>(glyph.plane_left)));
-        const qreal physical_top = static_cast<qreal>(
-            std::lround(
-                static_cast<qreal>(physical_origin_y) +
-                    static_cast<qreal>(glyph.plane_bottom)));
-        const qreal physical_width =
-            static_cast<qreal>(glyph.plane_right) -
+        const qreal physical_left =
+            static_cast<qreal>(physical_origin_x) +
             static_cast<qreal>(glyph.plane_left);
-        const qreal physical_height =
-            static_cast<qreal>(glyph.plane_top) -
+        const qreal physical_top =
+            static_cast<qreal>(physical_origin_y) +
             static_cast<qreal>(glyph.plane_bottom);
         const qreal physical_right =
-            physical_left + physical_width;
+            static_cast<qreal>(physical_origin_x) +
+            static_cast<qreal>(glyph.plane_right);
         const qreal physical_bottom =
-            physical_top + physical_height;
+            static_cast<qreal>(physical_origin_y) +
+            static_cast<qreal>(glyph.plane_top);
         if (physical_right <= physical_left || physical_bottom <= physical_top) {
             return;
         }
@@ -3957,6 +3957,10 @@ private:
         {
             return;
         }
+        const qreal frame_left   = glyph_rect.left() * normalized_device_pixel_ratio;
+        const qreal frame_top    = glyph_rect.top() * normalized_device_pixel_ratio;
+        const qreal frame_width  = glyph_rect.width() * normalized_device_pixel_ratio;
+        const qreal frame_height = glyph_rect.height() * normalized_device_pixel_ratio;
 
         atlas_msdf_instance_t instance;
         store_rect(instance.rect, glyph_rect);
@@ -3969,6 +3973,10 @@ private:
             glyph.uv_right,
             glyph.uv_bottom,
             m_msdf_text_cache.atlas.atlas_size);
+        instance.frame_rect[0] = static_cast<float>(frame_left);
+        instance.frame_rect[1] = static_cast<float>(frame_top);
+        instance.frame_rect[2] = static_cast<float>(frame_width);
+        instance.frame_rect[3] = static_cast<float>(frame_height);
         m_msdf_text_instances.push_back(instance);
         m_msdf_text_instance_rows.push_back(
             run.row >= 0 && run.row < m_render_row_count

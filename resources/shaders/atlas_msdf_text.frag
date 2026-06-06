@@ -43,7 +43,7 @@ float glyph_alpha_from_texel(vec4 texel)
 
 void main()
 {
-    vec2 frame_origin = round(fragment_frame_rect.xy);
+    vec2 frame_origin = fragment_frame_rect.xy;
     vec2 frame_size = max(vec2(1.0), fragment_frame_rect.zw);
     vec2 glyph_pixel = gl_FragCoord.xy - frame_origin;
     vec2 glyph_ratio = vec2(
