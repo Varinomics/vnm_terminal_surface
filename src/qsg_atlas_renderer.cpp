@@ -12,6 +12,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QGlyphRun>
+#include <QLatin1Char>
 #include <QMatrix4x4>
 #include <QSGRenderNode>
 #include <QTextLayout>
@@ -717,17 +718,6 @@ QString qsg_atlas_printable_ascii_stability_probe_text()
     return text;
 }
 
-int qsg_atlas_printable_ascii_drawable_glyph_count(const QString& text)
-{
-    int count = 0;
-    for (QChar code_unit : text) {
-        if (code_unit.unicode() != 0x20U) {
-            ++count;
-        }
-    }
-    return count;
-}
-
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
 msdf_text::options_t atlas_msdf_text_options()
 {
@@ -740,20 +730,117 @@ msdf_text::options_t atlas_msdf_text_options()
     return options;
 }
 
+void atlas_msdf_text_append_codepoint_range(
+    std::vector<char32_t>& values,
+    ushort                 first,
+    ushort                 last)
+{
+    for (ushort value = first; value <= last; ++value) {
+        values.push_back(static_cast<char32_t>(value));
+    }
+}
+
+void atlas_msdf_text_append_codepoints(
+    std::vector<char32_t>&        values,
+    std::initializer_list<ushort> codepoints)
+{
+    for (ushort codepoint : codepoints) {
+        values.push_back(static_cast<char32_t>(codepoint));
+    }
+}
+
 const std::vector<char32_t>& atlas_msdf_text_codepoints()
 {
     static const std::vector<char32_t> codepoints = [] {
         std::vector<char32_t> values;
-        values.reserve(k_atlas_printable_ascii_count);
-        for (ushort value = k_atlas_printable_ascii_first;
-            value <= k_atlas_printable_ascii_last;
-            ++value)
-        {
-            values.push_back(static_cast<char32_t>(value));
-        }
+        values.reserve(256U);
+        atlas_msdf_text_append_codepoint_range(
+            values,
+            k_atlas_printable_ascii_first,
+            k_atlas_printable_ascii_last);
+        atlas_msdf_text_append_codepoints(values, {
+            0x00a1U, 0x00a2U, 0x00a3U, 0x00a4U, 0x00a5U, 0x00a7U,
+            0x00a9U, 0x00abU, 0x00aeU, 0x00b0U, 0x00b1U, 0x00b5U,
+            0x00b6U, 0x00bbU, 0x00bfU, 0x00c0U, 0x00c4U, 0x00c7U,
+            0x00c9U, 0x00d1U, 0x00d6U, 0x00dcU, 0x00dfU, 0x00e0U,
+            0x00e4U, 0x00e7U, 0x00e9U, 0x00f1U, 0x00f6U, 0x00fcU,
+            0x0100U, 0x0101U, 0x0104U, 0x0105U, 0x0106U, 0x0107U,
+            0x010cU, 0x010dU, 0x0112U, 0x0113U, 0x0118U, 0x0119U,
+            0x0141U, 0x0142U, 0x0143U, 0x0144U, 0x015aU, 0x015bU,
+            0x0160U, 0x0161U, 0x0179U, 0x017aU, 0x017dU, 0x017eU,
+            0x0391U, 0x0392U, 0x0393U, 0x0394U, 0x0395U, 0x03a0U,
+            0x03a3U, 0x03a9U, 0x03b1U, 0x03b2U, 0x03b3U, 0x03b4U,
+            0x03b5U, 0x03c0U, 0x03c3U, 0x03c9U, 0x0410U, 0x0411U,
+            0x0412U, 0x0413U, 0x0414U, 0x0416U, 0x0418U, 0x0419U,
+            0x041fU, 0x042fU, 0x0430U, 0x0431U, 0x0432U, 0x0433U,
+            0x0434U, 0x0436U, 0x0438U, 0x0439U, 0x043fU, 0x044fU,
+            0x20acU, 0x20b9U, 0x2202U, 0x2206U, 0x2211U, 0x221aU,
+            0x221eU, 0x222bU, 0x2248U, 0x2260U, 0x2264U, 0x2265U,
+            0x2500U, 0x2502U, 0x250cU, 0x2510U, 0x2514U, 0x2518U,
+            0x251cU, 0x2524U, 0x252cU, 0x2534U, 0x253cU, 0x2550U,
+            0x2551U, 0x2554U, 0x2557U, 0x255aU, 0x255dU, 0x2588U,
+            0x2591U, 0x2592U, 0x2593U, 0xe0a0U, 0xe0a1U, 0xe0a2U,
+            0xe0b0U, 0xe0b1U, 0xe0b2U, 0xe0b3U,
+        });
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
         return values;
     }();
     return codepoints;
+}
+
+bool atlas_msdf_text_codepoint_is_supported(char32_t codepoint)
+{
+    const std::vector<char32_t>& codepoints = atlas_msdf_text_codepoints();
+    return std::binary_search(
+        codepoints.begin(),
+        codepoints.end(),
+        codepoint);
+}
+
+bool atlas_msdf_text_codepoint_is_blank(char32_t codepoint)
+{
+    return codepoint == U' ';
+}
+
+char32_t qsg_atlas_msdf_text_codepoint(QChar code_unit)
+{
+    const ushort value = code_unit.unicode();
+    if (value >= 0xd800U && value <= 0xdfffU) {
+        return 0U;
+    }
+
+    const char32_t codepoint = static_cast<char32_t>(value);
+    return atlas_msdf_text_codepoint_is_supported(codepoint)
+        ? codepoint
+        : 0U;
+}
+
+bool qsg_atlas_msdf_text_is_supported(const QString& text)
+{
+    if (text.isEmpty()) {
+        return false;
+    }
+
+    for (QChar code_unit : text) {
+        if (qsg_atlas_msdf_text_codepoint(code_unit) == 0U) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+int atlas_msdf_text_drawable_glyph_count(QStringView text)
+{
+    int count = 0;
+    for (QChar code_unit : text) {
+        const char32_t codepoint = qsg_atlas_msdf_text_codepoint(code_unit);
+        if (codepoint != 0U && !atlas_msdf_text_codepoint_is_blank(codepoint)) {
+            ++count;
+        }
+    }
+    return count;
 }
 
 bool atlas_msdf_text_uv_is_valid(float value)
@@ -781,32 +868,36 @@ bool atlas_msdf_text_glyph_is_drawable(const msdf_text_glyph_t& glyph)
         glyph.uv_bottom >= glyph.uv_top;
 }
 
-bool atlas_msdf_text_atlas_has_printable_ascii(
+bool atlas_msdf_text_atlas_has_supported_codepoints(
     const msdf_text_atlas_t& atlas,
     QString*                 out_message)
 {
-    for (ushort value = k_atlas_printable_ascii_first;
-        value <= k_atlas_printable_ascii_last;
-        ++value)
-    {
-        const char32_t codepoint = static_cast<char32_t>(value);
+    for (char32_t codepoint : atlas_msdf_text_codepoints()) {
         const auto glyph = atlas.glyphs.find(codepoint);
         if (glyph == atlas.glyphs.end()) {
             if (out_message != nullptr) {
                 *out_message = QStringLiteral(
-                    "MSDF atlas is missing printable ASCII codepoint %1")
-                    .arg(static_cast<int>(value));
+                    "MSDF atlas is missing supported codepoint U+%1")
+                    .arg(
+                        static_cast<uint>(codepoint),
+                        4,
+                        16,
+                        QLatin1Char('0'));
             }
             return false;
         }
 
-        if (value != 0x20U &&
+        if (!atlas_msdf_text_codepoint_is_blank(codepoint) &&
             !atlas_msdf_text_glyph_is_drawable(glyph->second))
         {
             if (out_message != nullptr) {
                 *out_message = QStringLiteral(
-                    "MSDF atlas has an invalid drawable glyph for codepoint %1")
-                    .arg(static_cast<int>(value));
+                    "MSDF atlas has an invalid drawable glyph for codepoint U+%1")
+                    .arg(
+                        static_cast<uint>(codepoint),
+                        4,
+                        16,
+                        QLatin1Char('0'));
             }
             return false;
         }
@@ -937,7 +1028,7 @@ bool qsg_atlas_msdf_text_run_candidate(
     const Terminal_render_text_run& run,
     terminal_cell_metrics_t         cell_metrics)
 {
-    if (!qsg_atlas_text_is_printable_ascii(run.text) ||
+    if (!qsg_atlas_msdf_text_is_supported(run.text) ||
         !run.rect.isValid()                          ||
         !std::isfinite(cell_metrics.width)           ||
         cell_metrics.width <= 0.0                    ||
@@ -3887,7 +3978,7 @@ private:
 
         m_msdf_text_cache.atlas = std::move(build.atlas);
         m_msdf_text_cache.ready =
-            atlas_msdf_text_atlas_has_printable_ascii(
+            atlas_msdf_text_atlas_has_supported_codepoints(
                 m_msdf_text_cache.atlas,
                 &m_msdf_text_cache.message);
         if (m_msdf_text_cache.ready && m_msdf_text_cache.message.isEmpty()) {
@@ -3907,7 +3998,7 @@ private:
         result.render.msdf_text_missed_supported_glyphs +=
             missed_glyphs > 0
                 ? missed_glyphs
-                : qsg_atlas_printable_ascii_drawable_glyph_count(run.text);
+                : atlas_msdf_text_drawable_glyph_count(run.text);
     }
 
     void append_msdf_text_instance(
@@ -4001,24 +4092,23 @@ private:
             atlas_glyph_color_components(run.foreground, opacity);
         int missed_glyphs = 0;
         for (qsizetype source = 0; source < run.text.size(); ++source) {
-            const int index = qsg_atlas_printable_ascii_index(run.text.at(source));
-            if (index < 0) {
+            const char32_t codepoint =
+                qsg_atlas_msdf_text_codepoint(run.text.at(source));
+            if (codepoint == 0U) {
                 ++missed_glyphs;
                 continue;
             }
 
-            const char32_t codepoint = static_cast<char32_t>(
-                k_atlas_printable_ascii_first + index);
             const auto glyph = m_msdf_text_cache.atlas.glyphs.find(codepoint);
             if (glyph == m_msdf_text_cache.atlas.glyphs.end()) {
-                if (codepoint != U' ') {
+                if (!atlas_msdf_text_codepoint_is_blank(codepoint)) {
                     ++missed_glyphs;
                 }
                 continue;
             }
 
             if (!atlas_msdf_text_glyph_is_drawable(glyph->second)) {
-                if (codepoint != U' ') {
+                if (!atlas_msdf_text_codepoint_is_blank(codepoint)) {
                     ++missed_glyphs;
                 }
             }
@@ -4030,9 +4120,12 @@ private:
         }
 
         for (qsizetype source = 0; source < run.text.size(); ++source) {
-            const int index = qsg_atlas_printable_ascii_index(run.text.at(source));
-            const char32_t codepoint = static_cast<char32_t>(
-                k_atlas_printable_ascii_first + index);
+            const char32_t codepoint =
+                qsg_atlas_msdf_text_codepoint(run.text.at(source));
+            if (codepoint == 0U) {
+                continue;
+            }
+
             const auto glyph = m_msdf_text_cache.atlas.glyphs.find(codepoint);
             if (glyph == m_msdf_text_cache.atlas.glyphs.end() ||
                 !atlas_msdf_text_glyph_is_drawable(glyph->second))
