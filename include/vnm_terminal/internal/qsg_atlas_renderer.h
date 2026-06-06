@@ -1,5 +1,9 @@
 #pragma once
 
+#if !defined(VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT)
+#define VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT 0
+#endif
+
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
 
 #include <QByteArray>
@@ -24,6 +28,12 @@ class QSGNode;
 namespace vnm_terminal::internal {
 
 class Hierarchical_profiler;
+
+constexpr bool k_qsg_atlas_msdf_text_renderer_experiment_requested =
+    VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT != 0;
+constexpr bool k_qsg_atlas_msdf_text_renderer_experiment_compiled =
+    k_qsg_atlas_msdf_text_renderer_experiment_requested;
+constexpr bool k_qsg_atlas_msdf_text_renderer_production_active = false;
 
 enum class Glyph_coverage_kind
 {
@@ -393,6 +403,8 @@ struct Qsg_atlas_render_summary
                   rect_buffer;
     Qsg_atlas_buffer_update_summary
                   glyph_buffer;
+    Qsg_atlas_buffer_update_summary
+                  msdf_text_buffer;
     int           shaped_text_runs                  = 0;
     int           shaped_glyph_records              = 0;
     int           shaped_missing_string_indexes     = 0;
@@ -405,7 +417,17 @@ struct Qsg_atlas_render_summary
     int           background_rects_coalesced         = 0;
     int           rect_draw_calls                    = 0;
     int           glyph_draw_calls                   = 0;
+    int           msdf_text_draw_calls               = 0;
     int           draw_calls                         = 0;
+    int           msdf_text_supported_runs           = 0;
+    int           msdf_text_runs                     = 0;
+    int           msdf_text_glyph_instances          = 0;
+    int           msdf_text_missed_supported_runs    = 0;
+    int           msdf_text_missed_supported_glyphs  = 0;
+    int           msdf_text_font_data_bytes          = 0;
+    int           msdf_text_pixel_height             = 0;
+    int           msdf_text_atlas_size               = 0;
+    float         msdf_text_px_range                 = 0.0f;
     int           atlas_page_count                   = 0;
     int           atlas_page_budget                  = 0;
     std::uint64_t atlas_page_bytes                   = 0U;
@@ -416,13 +438,29 @@ struct Qsg_atlas_render_summary
     Qsg_atlas_sampler_mode
                   glyph_sampler_mode                 =
                       Qsg_atlas_sampler_mode::UNKNOWN;
+    Qsg_atlas_sampler_mode
+                  msdf_text_sampler_mode             =
+                      Qsg_atlas_sampler_mode::UNKNOWN;
     bool          coverage_texture_uploaded          = false;
     bool          coverage_texture_skipped           = false;
+    bool          msdf_text_texture_uploaded         = false;
+    bool          msdf_text_texture_ready            = false;
     bool          atlas_page_pressure                = false;
     bool          glyph_shader_package_available     = false;
+    bool          msdf_text_shader_package_available = false;
+    bool          msdf_text_atlas_built              = false;
+    bool          msdf_text_atlas_ready              = false;
     bool          dual_source_probe_shader_package_available = false;
     bool          dual_source_blend_factors_available = false;
     bool          dual_source_blend_factors_runtime_probe = false;
+    bool          msdf_text_renderer_experiment_requested =
+        k_qsg_atlas_msdf_text_renderer_experiment_requested;
+    bool          msdf_text_renderer_experiment_compiled =
+        k_qsg_atlas_msdf_text_renderer_experiment_compiled;
+    bool          msdf_text_renderer_production_active =
+        k_qsg_atlas_msdf_text_renderer_production_active;
+    bool          msdf_text_resources_ready          = false;
+    QString       msdf_text_message;
     bool          full_dirty_range_reupload          = false;
     bool          public_projection_full_reupload    = false;
     bool          scroll_full_reupload               = false;
@@ -566,6 +604,28 @@ struct Qsg_atlas_frame_report
     bool          command_buffer_non_null         = false;
     bool          render_target_non_null          = false;
     bool          rhi_non_null                    = false;
+    bool          msdf_text_renderer_experiment_requested =
+        k_qsg_atlas_msdf_text_renderer_experiment_requested;
+    bool          msdf_text_renderer_experiment_compiled =
+        k_qsg_atlas_msdf_text_renderer_experiment_compiled;
+    bool          msdf_text_renderer_production_active =
+        k_qsg_atlas_msdf_text_renderer_production_active;
+    bool          msdf_text_shader_package_available = false;
+    bool          msdf_text_atlas_built              = false;
+    bool          msdf_text_atlas_ready              = false;
+    bool          msdf_text_texture_ready            = false;
+    bool          msdf_text_resources_ready          = false;
+    int           msdf_text_supported_runs           = 0;
+    int           msdf_text_runs                     = 0;
+    int           msdf_text_glyph_instances          = 0;
+    int           msdf_text_draw_calls               = 0;
+    int           msdf_text_missed_supported_runs    = 0;
+    int           msdf_text_missed_supported_glyphs  = 0;
+    int           msdf_text_font_data_bytes          = 0;
+    int           msdf_text_pixel_height             = 0;
+    int           msdf_text_atlas_size               = 0;
+    float         msdf_text_px_range                 = 0.0f;
+    QString       msdf_text_message;
     bool          coverage_texture_created        = false;
     bool          coverage_upload_recorded        = false;
     bool          raw_font_rasterized             = false;

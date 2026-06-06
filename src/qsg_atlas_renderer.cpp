@@ -3,6 +3,11 @@
 #include "vnm_terminal/internal/qsg_atlas_warm_set.h"
 #include "vnm_terminal/internal/terminal_graphic_geometry.h"
 #include "vnm_terminal/internal/unicode_width.h"
+#include "vnm_terminal/internal/vnm_terminal_font.h"
+
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+#include <vnm_msdf_text/msdf_text.h>
+#endif
 
 #include <QElapsedTimer>
 #include <QFile>
@@ -26,6 +31,7 @@
 #include <limits>
 #include <numeric>
 #include <set>
+#include <span>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -44,6 +50,18 @@ constexpr const char* k_atlas_glyph_fragment_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_glyph.frag.qsb";
 constexpr const char* k_atlas_dual_source_probe_fragment_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_dual_source_probe.frag.qsb";
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+constexpr const char* k_atlas_msdf_text_vertex_shader_path =
+    ":/vnm_terminal_surface/shaders/atlas_msdf_text.vert.qsb";
+constexpr const char* k_atlas_msdf_text_fragment_shader_path =
+    ":/vnm_terminal_surface/shaders/atlas_msdf_text.frag.qsb";
+constexpr const char* k_atlas_msdf_terminal_font_resource =
+    ":/vnm_terminal_surface/fonts/vnm_framework_monospace.ttf";
+constexpr int k_atlas_msdf_text_texture_size = 2048;
+constexpr double k_atlas_msdf_text_min_atlas_font_size = 48.0;
+constexpr float k_atlas_msdf_text_atlas_px_range = 10.0f;
+constexpr float k_atlas_msdf_text_sharpness_bias = 2.5f;
+#endif
 constexpr qreal k_no_wrap_text_line_width = 1024.0 * 1024.0;
 constexpr int k_atlas_stencil_mask = 0xff;
 constexpr qreal k_atlas_physical_origin_snap_epsilon = 0.001;
@@ -57,6 +75,17 @@ constexpr ushort k_atlas_printable_ascii_last  = 0x7eU;
 constexpr int k_atlas_printable_ascii_count =
     static_cast<int>(k_atlas_printable_ascii_last -
         k_atlas_printable_ascii_first + 1U);
+
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+namespace msdf_text = vnm::msdf_text;
+using msdf_text_atlas_t  = msdf_text::atlas_t;
+using msdf_text_glyph_t  = msdf_text::glyph_t;
+using msdf_text_vertex_t = msdf_text::text_vertex_t;
+
+static_assert(sizeof(msdf_text_atlas_t) > 0);
+static_assert(sizeof(msdf_text_glyph_t) > 0);
+static_assert(sizeof(msdf_text_vertex_t) > 0);
+#endif
 
 struct atlas_vertex_t
 {
@@ -78,10 +107,33 @@ struct atlas_glyph_instance_t
     float atlas_info[4] = {};
 };
 
+struct atlas_msdf_instance_t
+{
+    float rect[4]      = {};
+    float uv_rect[4]   = {};
+    float color[4]     = {};
+    float uv_bounds[4] = {};
+};
+
 struct atlas_uniform_t
 {
     float matrix[16] = {};
 };
+
+struct atlas_msdf_uniform_t
+{
+    float matrix[16]    = {};
+    float px_range      = 0.0f;
+    float target_width  = 1.0f;
+    float target_height = 1.0f;
+    float reserved0     = 0.0f;
+};
+
+static_assert(offsetof(atlas_msdf_uniform_t, matrix)        == 0);
+static_assert(offsetof(atlas_msdf_uniform_t, px_range)      == 64);
+static_assert(offsetof(atlas_msdf_uniform_t, target_width)  == 68);
+static_assert(offsetof(atlas_msdf_uniform_t, target_height) == 72);
+static_assert(sizeof(atlas_msdf_uniform_t)                  == 80);
 
 struct atlas_pass_range_t
 {
@@ -89,6 +141,12 @@ struct atlas_pass_range_t
     quint32 count = 0U;
 
     bool has_instances() const { return count > 0U; }
+};
+
+struct atlas_text_pass_ranges_t
+{
+    atlas_pass_range_t glyph;
+    atlas_pass_range_t msdf;
 };
 
 struct Atlas_prepare_result
@@ -156,6 +214,24 @@ struct Simple_atlas_text_cache
                   glyphs;
 };
 
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+struct Msdf_terminal_text_cache
+{
+    std::uint64_t font_epoch = 0U;
+    std::uint64_t generation = 0U;
+    qreal         device_pixel_ratio = 1.0;
+    terminal_cell_metrics_t
+                  cell_metrics;
+    int           pixel_height = 0;
+    int           font_data_bytes = 0;
+    bool          initialized = false;
+    bool          atlas_built = false;
+    bool          ready       = false;
+    QString       message;
+    msdf_text_atlas_t atlas;
+};
+#endif
+
 struct Atlas_warm_key
 {
     std::uint64_t           font_epoch = 0U;
@@ -213,6 +289,17 @@ QRhiGraphicsPipeline::TargetBlend atlas_blend()
     QRhiGraphicsPipeline::TargetBlend blend;
     blend.enable   = true;
     blend.srcColor = QRhiGraphicsPipeline::One;
+    blend.dstColor = QRhiGraphicsPipeline::OneMinusSrcAlpha;
+    blend.srcAlpha = QRhiGraphicsPipeline::One;
+    blend.dstAlpha = QRhiGraphicsPipeline::OneMinusSrcAlpha;
+    return blend;
+}
+
+QRhiGraphicsPipeline::TargetBlend atlas_msdf_text_blend()
+{
+    QRhiGraphicsPipeline::TargetBlend blend;
+    blend.enable   = true;
+    blend.srcColor = QRhiGraphicsPipeline::SrcAlpha;
     blend.dstColor = QRhiGraphicsPipeline::OneMinusSrcAlpha;
     blend.srcAlpha = QRhiGraphicsPipeline::One;
     blend.dstAlpha = QRhiGraphicsPipeline::OneMinusSrcAlpha;
@@ -293,6 +380,45 @@ QRhiVertexInputLayout atlas_glyph_vertex_input_layout()
             4,
             QRhiVertexInputAttribute::Float4,
             offsetof(atlas_glyph_instance_t, atlas_info)),
+    });
+    return layout;
+}
+
+QRhiVertexInputLayout atlas_msdf_text_vertex_input_layout()
+{
+    QRhiVertexInputLayout layout;
+    layout.setBindings({
+        QRhiVertexInputBinding(sizeof(atlas_vertex_t)),
+        QRhiVertexInputBinding(
+            sizeof(atlas_msdf_instance_t),
+            QRhiVertexInputBinding::PerInstance),
+    });
+    layout.setAttributes({
+        QRhiVertexInputAttribute(
+            0,
+            0,
+            QRhiVertexInputAttribute::Float2,
+            offsetof(atlas_vertex_t, x)),
+        QRhiVertexInputAttribute(
+            1,
+            1,
+            QRhiVertexInputAttribute::Float4,
+            offsetof(atlas_msdf_instance_t, rect)),
+        QRhiVertexInputAttribute(
+            1,
+            2,
+            QRhiVertexInputAttribute::Float4,
+            offsetof(atlas_msdf_instance_t, uv_rect)),
+        QRhiVertexInputAttribute(
+            1,
+            3,
+            QRhiVertexInputAttribute::Float4,
+            offsetof(atlas_msdf_instance_t, color)),
+        QRhiVertexInputAttribute(
+            1,
+            4,
+            QRhiVertexInputAttribute::Float4,
+            offsetof(atlas_msdf_instance_t, uv_bounds)),
     });
     return layout;
 }
@@ -585,6 +711,106 @@ QString qsg_atlas_printable_ascii_stability_probe_text()
     return text;
 }
 
+int qsg_atlas_printable_ascii_drawable_glyph_count(const QString& text)
+{
+    int count = 0;
+    for (QChar code_unit : text) {
+        if (code_unit.unicode() != 0x20U) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+msdf_text::options_t atlas_msdf_text_options()
+{
+    msdf_text::options_t options;
+    options.atlas_size           = k_atlas_msdf_text_texture_size;
+    options.min_atlas_font_size  = k_atlas_msdf_text_min_atlas_font_size;
+    options.atlas_px_range       = k_atlas_msdf_text_atlas_px_range;
+    options.sharpness_bias       = k_atlas_msdf_text_sharpness_bias;
+    options.build_kerning_table  = false;
+    return options;
+}
+
+const std::vector<char32_t>& atlas_msdf_text_codepoints()
+{
+    static const std::vector<char32_t> codepoints = [] {
+        std::vector<char32_t> values;
+        values.reserve(k_atlas_printable_ascii_count);
+        for (ushort value = k_atlas_printable_ascii_first;
+            value <= k_atlas_printable_ascii_last;
+            ++value)
+        {
+            values.push_back(static_cast<char32_t>(value));
+        }
+        return values;
+    }();
+    return codepoints;
+}
+
+bool atlas_msdf_text_uv_is_valid(float value)
+{
+    constexpr float k_uv_slop = 0.001f;
+    return std::isfinite(value) &&
+        value >= -k_uv_slop &&
+        value <= 1.0f + k_uv_slop;
+}
+
+bool atlas_msdf_text_glyph_is_drawable(const msdf_text_glyph_t& glyph)
+{
+    return
+        std::isfinite(glyph.plane_left)   &&
+        std::isfinite(glyph.plane_right)  &&
+        std::isfinite(glyph.plane_top)    &&
+        std::isfinite(glyph.plane_bottom) &&
+        glyph.plane_right > glyph.plane_left &&
+        glyph.plane_top > glyph.plane_bottom &&
+        atlas_msdf_text_uv_is_valid(glyph.uv_left)   &&
+        atlas_msdf_text_uv_is_valid(glyph.uv_right)  &&
+        atlas_msdf_text_uv_is_valid(glyph.uv_top)    &&
+        atlas_msdf_text_uv_is_valid(glyph.uv_bottom) &&
+        glyph.uv_right >= glyph.uv_left &&
+        glyph.uv_bottom >= glyph.uv_top;
+}
+
+bool atlas_msdf_text_atlas_has_printable_ascii(
+    const msdf_text_atlas_t& atlas,
+    QString*                 out_message)
+{
+    for (ushort value = k_atlas_printable_ascii_first;
+        value <= k_atlas_printable_ascii_last;
+        ++value)
+    {
+        const char32_t codepoint = static_cast<char32_t>(value);
+        const auto glyph = atlas.glyphs.find(codepoint);
+        if (glyph == atlas.glyphs.end()) {
+            if (out_message != nullptr) {
+                *out_message = QStringLiteral(
+                    "MSDF atlas is missing printable ASCII codepoint %1")
+                    .arg(static_cast<int>(value));
+            }
+            return false;
+        }
+
+        if (value != 0x20U &&
+            !atlas_msdf_text_glyph_is_drawable(glyph->second))
+        {
+            if (out_message != nullptr) {
+                *out_message = QStringLiteral(
+                    "MSDF atlas has an invalid drawable glyph for codepoint %1")
+                    .arg(static_cast<int>(value));
+            }
+            return false;
+        }
+    }
+
+    return true;
+}
+
+#endif
+
 bool qsg_atlas_cell_metric_equal(qreal left, qreal right)
 {
     return std::abs(left - right) <= 0.001;
@@ -699,6 +925,49 @@ bool qsg_atlas_simple_text_run_candidate(
             0.001 &&
         std::abs(run.baseline_origin.x() - run.rect.left()) <= 0.001;
 }
+
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+bool qsg_atlas_msdf_text_run_candidate(
+    const Terminal_render_text_run& run,
+    terminal_cell_metrics_t         cell_metrics)
+{
+    if (!qsg_atlas_text_is_printable_ascii(run.text) ||
+        !run.rect.isValid()                          ||
+        !std::isfinite(cell_metrics.width)           ||
+        cell_metrics.width <= 0.0                    ||
+        !std::isfinite(cell_metrics.height)          ||
+        cell_metrics.height <= 0.0                   ||
+        !std::isfinite(cell_metrics.ascent)          ||
+        run.hyperlink_id != 0U                       ||
+        run.underline                                ||
+        run.strike                                   ||
+        !std::isfinite(run.baseline_origin.x())      ||
+        !std::isfinite(run.baseline_origin.y()))
+    {
+        return false;
+    }
+
+    const int rect_cell_span = static_cast<int>(
+        std::round(run.rect.width() / cell_metrics.width));
+    if (rect_cell_span <= 0 ||
+        run.text.size() != static_cast<qsizetype>(rect_cell_span))
+    {
+        return false;
+    }
+
+    return
+        std::abs(
+            run.rect.width() -
+            static_cast<qreal>(run.text.size()) * cell_metrics.width) <=
+            0.001 &&
+        std::abs(run.baseline_origin.x() - run.rect.left()) <= 0.001;
+}
+
+bool qsg_atlas_msdf_text_font_is_supported(const QFont& font)
+{
+    return font.family() == vnm_terminal_default_monospace_font_family();
+}
+#endif
 
 bool text_has_emoji_presentation(const QString& text);
 
@@ -1151,6 +1420,33 @@ void store_uv_rect(float* target, const QRectF& rect)
     target[3] = static_cast<float>(rect.height());
 }
 
+void store_uv_bounds(
+    float* target,
+    float  left,
+    float  top,
+    float  right,
+    float  bottom,
+    int    atlas_size)
+{
+    const float min_left   = std::min(left, right);
+    const float min_top    = std::min(top, bottom);
+    const float max_right  = std::max(left, right);
+    const float max_bottom = std::max(top, bottom);
+    const float half_texel = atlas_size > 0
+        ? 0.5f / static_cast<float>(atlas_size)
+        : 0.0f;
+    const float margin_x = std::min(
+        half_texel,
+        std::max(0.0f, max_right - min_left) * 0.499f);
+    const float margin_y = std::min(
+        half_texel,
+        std::max(0.0f, max_bottom - min_top) * 0.499f);
+    target[0] = min_left + margin_x;
+    target[1] = min_top + margin_y;
+    target[2] = max_right - margin_x;
+    target[3] = max_bottom - margin_y;
+}
+
 float qsg_atlas_gpu_coverage_kind(Glyph_coverage_kind kind)
 {
     switch (kind) {
@@ -1257,10 +1553,31 @@ public:
             const bool glyph_ready =
                 rect_ready &&
                 (!has_glyph_draw_passes() || ensure_glyph_resources(rhi, target));
+            const bool msdf_atlas_ready =
+                rect_ready &&
+                upload_msdf_text_atlas_texture(
+                    rhi,
+                    command_buffer,
+                    prepare_result.render);
+            const bool msdf_ready =
+                rect_ready &&
+                msdf_atlas_ready &&
+                ensure_msdf_text_resources(rhi, target);
+            if (has_msdf_text_draw_passes() && !msdf_ready) {
+                prepare_result.render.msdf_text_missed_supported_runs +=
+                    prepare_result.render.msdf_text_runs;
+                prepare_result.render.msdf_text_missed_supported_glyphs +=
+                prepare_result.render.msdf_text_glyph_instances;
+            }
             m_resources_ready = rect_ready &&
                 atlas_ready &&
                 glyph_ready &&
-                update_atlas_buffers(rhi, command_buffer, &prepare_result.render);
+                msdf_ready &&
+                update_atlas_buffers(
+                    rhi,
+                    command_buffer,
+                    target->pixelSize(),
+                    &prepare_result.render);
             prepare_result.render.coverage_texture_uploaded =
                 coverage_upload_recorded;
             prepare_result.render.coverage_texture_skipped =
@@ -1272,8 +1589,21 @@ public:
             m_resources_ready = false;
         }
         prepare_result.render.glyph_sampler_mode = m_glyph_sampler_mode;
+        prepare_result.render.msdf_text_sampler_mode = m_msdf_text_sampler_mode;
         prepare_result.render.glyph_shader_package_available =
             glyph_shader_package_available();
+        prepare_result.render.msdf_text_shader_package_available =
+            msdf_text_shader_package_available();
+        prepare_result.render.msdf_text_texture_ready =
+            m_msdf_text_atlas_texture != nullptr;
+        prepare_result.render.msdf_text_resources_ready =
+            msdf_text_resources_ready();
+        prepare_result.render.msdf_text_renderer_production_active =
+            k_qsg_atlas_msdf_text_renderer_experiment_compiled &&
+            prepare_result.render.msdf_text_supported_runs > 0 &&
+            prepare_result.render.msdf_text_missed_supported_runs == 0 &&
+            prepare_result.render.msdf_text_atlas_ready &&
+            prepare_result.render.msdf_text_resources_ready;
         prepare_result.render.dual_source_probe_shader_package_available =
             dual_source_probe_shader_package_available();
         prepare_result.render.dual_source_blend_factors_runtime_probe =
@@ -1343,9 +1673,14 @@ public:
                 draw_rect_pass(command_buffer, m_selection_pass, stencil_enabled);
                 draw_rect_pass(command_buffer, m_graphic_pass, stencil_enabled);
                 draw_glyph_pass(command_buffer, m_text_pass, stencil_enabled);
+                draw_msdf_text_pass(command_buffer, m_msdf_text_pass, stencil_enabled);
                 draw_rect_pass(command_buffer, m_decoration_pass, stencil_enabled);
                 draw_rect_pass(command_buffer, m_cursor_pass, stencil_enabled);
                 draw_glyph_pass(command_buffer, m_cursor_text_pass, stencil_enabled);
+                draw_msdf_text_pass(
+                    command_buffer,
+                    m_msdf_cursor_text_pass,
+                    stencil_enabled);
                 draw_rect_pass(command_buffer, m_overlay_pass, stencil_enabled);
                 drew = total_instance_count() > 0U;
             }
@@ -1361,33 +1696,47 @@ public:
 
     void releaseResources() override
     {
+        delete_resource(m_stencil_msdf_text_pipeline);
+        delete_resource(m_msdf_text_pipeline);
         delete_resource(m_stencil_glyph_pipeline);
         delete_resource(m_glyph_pipeline);
         delete_resource(m_stencil_rect_pipeline);
         delete_resource(m_rect_pipeline);
+        delete_resource(m_msdf_text_shader_resources);
         delete_resource(m_glyph_shader_resources);
         delete_resource(m_rect_shader_resources);
+        delete_resource(m_msdf_text_sampler);
         delete_resource(m_coverage_sampler);
+        delete_resource(m_msdf_text_uniform_buffer);
         delete_resource(m_uniform_buffer);
+        delete_resource(m_msdf_text_instance_buffer);
         delete_resource(m_glyph_instance_buffer);
         delete_resource(m_rect_instance_buffer);
         delete_resource(m_vertex_buffer);
+        delete_resource(m_msdf_text_atlas_texture);
         delete_resource(m_coverage_texture);
         m_resource_rhi                  = nullptr;
         m_render_pass_serialized_format.clear();
         m_render_target_samples         = 0;
-        m_rect_instance_buffer_size     = 0U;
-        m_glyph_instance_buffer_size    = 0U;
-        m_static_vertex_upload_needed   = true;
-        m_resources_ready               = false;
+        m_rect_instance_buffer_size      = 0U;
+        m_glyph_instance_buffer_size     = 0U;
+        m_msdf_text_instance_buffer_size = 0U;
+        m_static_vertex_upload_needed    = true;
+        m_resources_ready                = false;
         m_dual_source_blend_factors_probe_completed = false;
         m_dual_source_blend_factors_available       = false;
         m_rect_upload_planner.reset();
         m_glyph_upload_planner.reset();
-        m_glyph_sampler_mode = Qsg_atlas_sampler_mode::UNKNOWN;
+        m_msdf_text_upload_planner.reset();
+        m_glyph_sampler_mode     = Qsg_atlas_sampler_mode::UNKNOWN;
+        m_msdf_text_sampler_mode = Qsg_atlas_sampler_mode::UNKNOWN;
         m_render_glyph_text_row_capacities.clear();
         m_render_glyph_cursor_text_row_capacities.clear();
         m_glyph_buffer_row_stable_ranges.clear();
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        m_msdf_text_uploaded_generation = 0U;
+        m_msdf_text_resources_ready     = false;
+#endif
     }
 
 private:
@@ -1400,6 +1749,12 @@ private:
             m_glyph_fragment_shader      = load_shader(k_atlas_glyph_fragment_shader_path);
             m_dual_source_probe_fragment_shader =
                 load_shader(k_atlas_dual_source_probe_fragment_shader_path);
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+            m_msdf_text_vertex_shader =
+                load_shader(k_atlas_msdf_text_vertex_shader_path);
+            m_msdf_text_fragment_shader =
+                load_shader(k_atlas_msdf_text_fragment_shader_path);
+#endif
             m_shader_packages_checked = true;
         }
 
@@ -1418,6 +1773,59 @@ private:
     bool dual_source_probe_shader_package_available() const
     {
         return m_dual_source_probe_fragment_shader.isValid();
+    }
+
+    bool msdf_text_shader_package_available() const
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        return
+            m_msdf_text_vertex_shader.isValid() &&
+            m_msdf_text_fragment_shader.isValid();
+#else
+        return false;
+#endif
+    }
+
+    bool msdf_text_resources_ready() const
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        return m_msdf_text_resources_ready;
+#else
+        return false;
+#endif
+    }
+
+    bool msdf_text_atlas_built() const
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        return m_msdf_text_cache.atlas_built;
+#else
+        return false;
+#endif
+    }
+
+    bool msdf_text_atlas_ready() const
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        return m_msdf_text_cache.ready;
+#else
+        return false;
+#endif
+    }
+
+    void record_msdf_text_cache_summary(
+        Qsg_atlas_render_summary& summary) const
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        summary.msdf_text_font_data_bytes = m_msdf_text_cache.font_data_bytes;
+        summary.msdf_text_pixel_height    = m_msdf_text_cache.pixel_height;
+        summary.msdf_text_atlas_size      =
+            m_msdf_text_cache.atlas.atlas_size;
+        summary.msdf_text_px_range        = m_msdf_text_cache.atlas.px_range;
+        summary.msdf_text_message         = m_msdf_text_cache.message;
+#else
+        (void)summary;
+#endif
     }
 
     void configure_stencil_state(
@@ -1552,6 +1960,46 @@ private:
             QRhiShaderStage(QRhiShaderStage::Fragment, m_glyph_fragment_shader),
         });
         pipeline->setVertexInputLayout(atlas_glyph_vertex_input_layout());
+        pipeline->setShaderResourceBindings(shader_resources);
+        pipeline->setRenderPassDescriptor(render_pass_descriptor);
+        if (!pipeline->create()) {
+            delete pipeline;
+            return nullptr;
+        }
+
+        return pipeline;
+    }
+
+    QRhiGraphicsPipeline* create_msdf_text_pipeline(
+        QRhi*                         rhi,
+        QRhiRenderPassDescriptor*     render_pass_descriptor,
+        QRhiShaderResourceBindings*   shader_resources,
+        bool                          stencil_enabled)
+    {
+        QRhiGraphicsPipeline* pipeline = rhi->newGraphicsPipeline();
+        if (pipeline == nullptr) {
+            return nullptr;
+        }
+
+        QRhiGraphicsPipeline::Flags flags = QRhiGraphicsPipeline::UsesScissor;
+        if (stencil_enabled) {
+            flags |= QRhiGraphicsPipeline::UsesStencilRef;
+        }
+        pipeline->setFlags(flags);
+        pipeline->setTopology(QRhiGraphicsPipeline::Triangles);
+        pipeline->setCullMode(QRhiGraphicsPipeline::None);
+        pipeline->setTargetBlends({atlas_msdf_text_blend()});
+        pipeline->setDepthTest(false);
+        pipeline->setDepthWrite(false);
+        configure_stencil_state(pipeline, stencil_enabled);
+        pipeline->setSampleCount(m_render_target_samples);
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        pipeline->setShaderStages({
+            QRhiShaderStage(QRhiShaderStage::Vertex,   m_msdf_text_vertex_shader),
+            QRhiShaderStage(QRhiShaderStage::Fragment, m_msdf_text_fragment_shader),
+        });
+#endif
+        pipeline->setVertexInputLayout(atlas_msdf_text_vertex_input_layout());
         pipeline->setShaderResourceBindings(shader_resources);
         pipeline->setRenderPassDescriptor(render_pass_descriptor);
         if (!pipeline->create()) {
@@ -1759,6 +2207,213 @@ private:
         return true;
     }
 
+    bool ensure_msdf_text_atlas_texture(QRhi* rhi, bool* out_created = nullptr)
+    {
+        if (out_created != nullptr) {
+            *out_created = false;
+        }
+
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        if (!m_msdf_text_cache.ready || m_msdf_text_cache.atlas.atlas_size <= 0) {
+            return false;
+        }
+
+        const QSize atlas_size(
+            m_msdf_text_cache.atlas.atlas_size,
+            m_msdf_text_cache.atlas.atlas_size);
+        if (m_msdf_text_atlas_texture != nullptr &&
+            m_msdf_text_atlas_texture->format()    == QRhiTexture::RGBA8 &&
+            m_msdf_text_atlas_texture->pixelSize() == atlas_size)
+        {
+            return true;
+        }
+
+        delete_resource(m_stencil_msdf_text_pipeline);
+        delete_resource(m_msdf_text_pipeline);
+        delete_resource(m_msdf_text_shader_resources);
+        delete_resource(m_msdf_text_atlas_texture);
+
+        QRhiTexture* texture =
+            rhi->newTexture(QRhiTexture::RGBA8, atlas_size);
+        if (texture == nullptr || !texture->create()) {
+            delete_resource(texture);
+            return false;
+        }
+
+        m_msdf_text_atlas_texture = texture;
+        if (out_created != nullptr) {
+            *out_created = true;
+        }
+        return true;
+#else
+        (void)rhi;
+        return false;
+#endif
+    }
+
+    bool upload_msdf_text_atlas_texture(
+        QRhi*                       rhi,
+        QRhiCommandBuffer*          command_buffer,
+        Qsg_atlas_render_summary&   summary)
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        if (!has_msdf_text_draw_passes()) {
+            return true;
+        }
+
+        bool texture_created = false;
+        const bool texture_ready =
+            ensure_msdf_text_atlas_texture(rhi, &texture_created);
+        summary.msdf_text_texture_ready =
+            texture_ready && m_msdf_text_atlas_texture != nullptr;
+        if (!texture_ready) {
+            return false;
+        }
+
+        if (!texture_created &&
+            m_msdf_text_uploaded_generation == m_msdf_text_cache.generation)
+        {
+            return true;
+        }
+
+        QImage image(
+            m_msdf_text_cache.atlas.rgba.data(),
+            m_msdf_text_cache.atlas.atlas_size,
+            m_msdf_text_cache.atlas.atlas_size,
+            m_msdf_text_cache.atlas.atlas_size * 4,
+            QImage::Format_RGBA8888);
+        QRhiResourceUpdateBatch* updates = rhi->nextResourceUpdateBatch();
+        updates->uploadTexture(m_msdf_text_atlas_texture, image);
+        command_buffer->resourceUpdate(updates);
+        m_msdf_text_uploaded_generation = m_msdf_text_cache.generation;
+        summary.msdf_text_texture_uploaded = true;
+        return true;
+#else
+        (void)rhi;
+        (void)command_buffer;
+        (void)summary;
+        return true;
+#endif
+    }
+
+    bool ensure_msdf_text_resources(QRhi* rhi, QRhiRenderTarget* target)
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        if (!has_msdf_text_draw_passes()) {
+            m_msdf_text_resources_ready = false;
+            return true;
+        }
+
+        m_msdf_text_resources_ready = false;
+        if (!ensure_shaders()                         ||
+            !msdf_text_shader_package_available()     ||
+            !m_msdf_text_cache.ready                  ||
+            m_msdf_text_atlas_texture == nullptr)
+        {
+            return false;
+        }
+
+        if (m_msdf_text_uniform_buffer == nullptr) {
+            m_msdf_text_uniform_buffer = rhi->newBuffer(
+                QRhiBuffer::Dynamic,
+                QRhiBuffer::UniformBuffer,
+                static_cast<quint32>(
+                    rhi->ubufAligned(sizeof(atlas_msdf_uniform_t))));
+            if (m_msdf_text_uniform_buffer == nullptr ||
+                !m_msdf_text_uniform_buffer->create())
+            {
+                delete_resource(m_msdf_text_uniform_buffer);
+                return false;
+            }
+            delete_resource(m_stencil_msdf_text_pipeline);
+            delete_resource(m_msdf_text_pipeline);
+            delete_resource(m_msdf_text_shader_resources);
+        }
+
+        if (m_msdf_text_sampler == nullptr) {
+            QRhiSampler* sampler = rhi->newSampler(
+                QRhiSampler::Linear,
+                QRhiSampler::Linear,
+                QRhiSampler::None,
+                QRhiSampler::ClampToEdge,
+                QRhiSampler::ClampToEdge);
+            if (sampler == nullptr || !sampler->create()) {
+                delete_resource(sampler);
+                return false;
+            }
+
+            m_msdf_text_sampler = sampler;
+            m_msdf_text_sampler_mode = Qsg_atlas_sampler_mode::LINEAR;
+            delete_resource(m_stencil_msdf_text_pipeline);
+            delete_resource(m_msdf_text_pipeline);
+            delete_resource(m_msdf_text_shader_resources);
+        }
+
+        if (m_msdf_text_pipeline != nullptr &&
+            m_stencil_msdf_text_pipeline != nullptr)
+        {
+            m_msdf_text_resources_ready = true;
+            return true;
+        }
+
+        delete_resource(m_msdf_text_shader_resources);
+        QRhiShaderResourceBindings* shader_resources =
+            rhi->newShaderResourceBindings();
+        if (shader_resources == nullptr) {
+            delete_resource(shader_resources);
+            return false;
+        }
+
+        shader_resources->setBindings({
+            QRhiShaderResourceBinding::uniformBuffer(
+                0,
+                QRhiShaderResourceBinding::VertexStage |
+                    QRhiShaderResourceBinding::FragmentStage,
+                m_msdf_text_uniform_buffer),
+            QRhiShaderResourceBinding::sampledTexture(
+                1,
+                QRhiShaderResourceBinding::FragmentStage,
+                m_msdf_text_atlas_texture,
+                m_msdf_text_sampler),
+        });
+        if (!shader_resources->create()) {
+            delete_resource(shader_resources);
+            return false;
+        }
+
+        QRhiRenderPassDescriptor* const render_pass_descriptor =
+            target->renderPassDescriptor();
+        QRhiGraphicsPipeline* msdf_text_pipeline = create_msdf_text_pipeline(
+            rhi,
+            render_pass_descriptor,
+            shader_resources,
+            false);
+        QRhiGraphicsPipeline* stencil_msdf_text_pipeline = create_msdf_text_pipeline(
+            rhi,
+            render_pass_descriptor,
+            shader_resources,
+            true);
+        if (msdf_text_pipeline == nullptr ||
+            stencil_msdf_text_pipeline == nullptr)
+        {
+            delete_resource(msdf_text_pipeline);
+            delete_resource(stencil_msdf_text_pipeline);
+            delete_resource(shader_resources);
+            return false;
+        }
+
+        m_msdf_text_shader_resources         = shader_resources;
+        m_msdf_text_pipeline                 = msdf_text_pipeline;
+        m_stencil_msdf_text_pipeline         = stencil_msdf_text_pipeline;
+        m_msdf_text_resources_ready          = true;
+        return true;
+#else
+        (void)rhi;
+        (void)target;
+        return true;
+#endif
+    }
+
     atlas_pass_range_t append_rect_pass(
         const std::vector<Terminal_render_rect>& rects,
         qreal                                    opacity)
@@ -1819,7 +2474,7 @@ private:
         return range;
     }
 
-    atlas_pass_range_t append_text_pass(
+    atlas_text_pass_ranges_t append_text_pass(
         const std::vector<Terminal_render_text_run>& runs,
         qreal                                        opacity,
         Atlas_prepare_result&                       result,
@@ -1827,8 +2482,9 @@ private:
     {
         VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::append_text_pass");
 
-        atlas_pass_range_t range;
-        range.first = static_cast<quint32>(m_glyph_instances.size());
+        atlas_text_pass_ranges_t ranges;
+        ranges.glyph.first = static_cast<quint32>(m_glyph_instances.size());
+        ranges.msdf.first  = static_cast<quint32>(m_msdf_text_instances.size());
         for (std::size_t index = 0U; index < runs.size(); ++index) {
             append_text_run(
                 runs[index],
@@ -1837,9 +2493,13 @@ private:
                 static_cast<int>(index),
                 cursor_text_run);
         }
-        range.count =
-            static_cast<quint32>(m_glyph_instances.size()) - range.first;
-        return range;
+        ranges.glyph.count =
+            static_cast<quint32>(m_glyph_instances.size()) -
+            ranges.glyph.first;
+        ranges.msdf.count =
+            static_cast<quint32>(m_msdf_text_instances.size()) -
+            ranges.msdf.first;
+        return ranges;
     }
 
     std::vector<int> glyph_required_row_capacities(
@@ -1906,6 +2566,9 @@ private:
         atlas_pass_range_t buffer_pass;
         buffer_pass.first =
             static_cast<quint32>(m_glyph_buffer_instances.size());
+        if (!logical_pass.has_instances()) {
+            return buffer_pass;
+        }
 
         std::vector<int> row_write_offsets;
         std::vector<std::size_t> row_first_instances;
@@ -2165,17 +2828,21 @@ private:
         m_rect_instances.clear();
         m_glyph_instances.clear();
         m_glyph_buffer_instances.clear();
+        m_msdf_text_instances.clear();
         m_rect_instance_rows.clear();
         m_glyph_instance_rows.clear();
         m_glyph_buffer_instance_rows.clear();
+        m_msdf_text_instance_rows.clear();
         m_glyph_buffer_row_stable_ranges.clear();
         m_background_pass     = {};
         m_selection_pass      = {};
         m_graphic_pass        = {};
         m_text_pass           = {};
+        m_msdf_text_pass      = {};
         m_decoration_pass     = {};
         m_cursor_pass         = {};
         m_cursor_text_pass    = {};
+        m_msdf_cursor_text_pass = {};
         m_overlay_pass        = {};
 
         Atlas_prepare_result result;
@@ -2207,23 +2874,27 @@ private:
             result.render.background_rects_before_coalescing -
             result.render.background_rects_after_coalescing;
 
-        m_background_pass     = append_rect_pass(background_rects, opacity);
-        m_selection_pass      = append_rect_pass(render_frame.selection_rects, opacity);
-        m_graphic_pass        = append_graphic_pass(render_frame, opacity);
-        m_text_pass           = append_text_pass(
+        m_background_pass = append_rect_pass(background_rects, opacity);
+        m_selection_pass  = append_rect_pass(render_frame.selection_rects, opacity);
+        m_graphic_pass    = append_graphic_pass(render_frame, opacity);
+        const atlas_text_pass_ranges_t text_passes = append_text_pass(
             render_frame.text_runs,
             opacity,
             result,
             false);
-        m_decoration_pass     = append_decoration_pass(render_frame.decorations, opacity);
-        m_cursor_pass         = append_cursor_pass(render_frame.cursors, opacity);
-        m_cursor_text_pass    = append_text_pass(
+        m_text_pass      = text_passes.glyph;
+        m_msdf_text_pass = text_passes.msdf;
+        m_decoration_pass = append_decoration_pass(render_frame.decorations, opacity);
+        m_cursor_pass     = append_cursor_pass(render_frame.cursors, opacity);
+        const atlas_text_pass_ranges_t cursor_text_passes = append_text_pass(
             render_frame.cursor_text_runs,
             opacity,
             result,
             true);
+        m_cursor_text_pass      = cursor_text_passes.glyph;
+        m_msdf_cursor_text_pass = cursor_text_passes.msdf;
         prune_prepared_text_cache(result.producer);
-        m_overlay_pass        = append_rect_pass(render_frame.overlay_rects, opacity);
+        m_overlay_pass = append_rect_pass(render_frame.overlay_rects, opacity);
         build_render_glyph_buffer_layout(result);
         result.raw_font_rasterized = result.rasterized_glyphs > 0;
         finalize_frame_build_summary(render_frame, result);
@@ -2493,6 +3164,18 @@ private:
         Atlas_prepare_result&       result)
     {
         Qsg_atlas_render_summary& summary = result.render;
+        summary.msdf_text_renderer_experiment_requested =
+            k_qsg_atlas_msdf_text_renderer_experiment_requested;
+        summary.msdf_text_renderer_experiment_compiled =
+            k_qsg_atlas_msdf_text_renderer_experiment_compiled;
+        summary.msdf_text_renderer_production_active =
+            k_qsg_atlas_msdf_text_renderer_production_active;
+        summary.msdf_text_atlas_built = msdf_text_atlas_built();
+        summary.msdf_text_atlas_ready = msdf_text_atlas_ready();
+        record_msdf_text_cache_summary(summary);
+        summary.msdf_text_glyph_instances =
+            static_cast<int>(m_msdf_text_instances.size());
+
         const Atlas_frame_state_keys current_keys =
             render_state_keys(render_frame);
         const bool selection_changed =
@@ -2567,7 +3250,13 @@ private:
         summary.glyph_draw_calls =
             atlas_pass_draw_count(m_text_pass) +
             atlas_pass_draw_count(m_cursor_text_pass);
-        summary.draw_calls = summary.rect_draw_calls + summary.glyph_draw_calls;
+        summary.msdf_text_draw_calls =
+            atlas_pass_draw_count(m_msdf_text_pass) +
+            atlas_pass_draw_count(m_msdf_cursor_text_pass);
+        summary.draw_calls =
+            summary.rect_draw_calls       +
+            summary.glyph_draw_calls      +
+            summary.msdf_text_draw_calls;
 
         const Glyph_atlas_cache_stats cache = m_cache.stats();
         summary.atlas_page_count      = cache.page_count;
@@ -3109,6 +3798,254 @@ private:
         return m_simple_text_cache.usable;
     }
 
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+    bool msdf_text_cache_matches(
+        qreal normalized_device_pixel_ratio,
+        int   pixel_height) const
+    {
+        return
+            m_msdf_text_cache.initialized &&
+            m_msdf_text_cache.font_epoch == m_frame.font_epoch &&
+            m_msdf_text_cache.pixel_height == pixel_height &&
+            qsg_atlas_cell_metric_equal(
+                m_msdf_text_cache.device_pixel_ratio,
+                normalized_device_pixel_ratio) &&
+            qsg_atlas_cell_metrics_equal(
+                m_msdf_text_cache.cell_metrics,
+                m_frame.cell_metrics);
+    }
+
+    bool ensure_msdf_text_cache(Atlas_prepare_result& result)
+    {
+        const qreal normalized_device_pixel_ratio =
+            atlas_normalized_device_pixel_ratio(m_frame.device_pixel_ratio);
+        const int pixel_height = std::max(
+            1,
+            atlas_snapped_physical_int(
+                m_frame.cell_metrics.ascent,
+                normalized_device_pixel_ratio));
+        if (msdf_text_cache_matches(normalized_device_pixel_ratio, pixel_height)) {
+            result.render.msdf_text_atlas_built = m_msdf_text_cache.atlas_built;
+            result.render.msdf_text_atlas_ready = m_msdf_text_cache.ready;
+            return m_msdf_text_cache.ready;
+        }
+
+        const std::uint64_t next_generation = m_msdf_text_cache.generation + 1U;
+        m_msdf_text_cache = {};
+        m_msdf_text_cache.generation         = next_generation;
+        m_msdf_text_cache.initialized        = true;
+        m_msdf_text_cache.font_epoch         = m_frame.font_epoch;
+        m_msdf_text_cache.device_pixel_ratio = normalized_device_pixel_ratio;
+        m_msdf_text_cache.cell_metrics       = m_frame.cell_metrics;
+        m_msdf_text_cache.pixel_height       = pixel_height;
+        m_msdf_text_uploaded_generation      = 0U;
+        delete_resource(m_stencil_msdf_text_pipeline);
+        delete_resource(m_msdf_text_pipeline);
+        delete_resource(m_msdf_text_shader_resources);
+        delete_resource(m_msdf_text_atlas_texture);
+
+        QFile font_file(QString::fromLatin1(k_atlas_msdf_terminal_font_resource));
+        if (!font_file.open(QIODevice::ReadOnly)) {
+            m_msdf_text_cache.message = QStringLiteral(
+                "failed to open embedded terminal monospace font: %1")
+                .arg(font_file.errorString());
+            result.render.msdf_text_atlas_built = false;
+            result.render.msdf_text_atlas_ready = false;
+            return false;
+        }
+
+        const QByteArray font_data = font_file.readAll();
+        m_msdf_text_cache.font_data_bytes = static_cast<int>(font_data.size());
+        if (font_data.isEmpty()) {
+            m_msdf_text_cache.message =
+                QStringLiteral("embedded terminal monospace font resource is empty");
+            result.render.msdf_text_atlas_built = false;
+            result.render.msdf_text_atlas_ready = false;
+            return false;
+        }
+
+        const std::vector<char32_t>& codepoints = atlas_msdf_text_codepoints();
+        msdf_text::build_result_t build = msdf_text::build_font_atlas(
+            reinterpret_cast<const std::uint8_t*>(font_data.constData()),
+            static_cast<std::size_t>(font_data.size()),
+            pixel_height,
+            std::span<const char32_t>(codepoints.data(), codepoints.size()),
+            atlas_msdf_text_options());
+        m_msdf_text_cache.atlas_built = build.ok;
+        if (!build.ok) {
+            m_msdf_text_cache.message = QString::fromStdString(build.message);
+            result.render.msdf_text_atlas_built = false;
+            result.render.msdf_text_atlas_ready = false;
+            return false;
+        }
+
+        m_msdf_text_cache.atlas = std::move(build.atlas);
+        m_msdf_text_cache.ready =
+            atlas_msdf_text_atlas_has_printable_ascii(
+                m_msdf_text_cache.atlas,
+                &m_msdf_text_cache.message);
+        if (m_msdf_text_cache.ready && m_msdf_text_cache.message.isEmpty()) {
+            m_msdf_text_cache.message = QStringLiteral("ok");
+        }
+        result.render.msdf_text_atlas_built = m_msdf_text_cache.atlas_built;
+        result.render.msdf_text_atlas_ready = m_msdf_text_cache.ready;
+        return m_msdf_text_cache.ready;
+    }
+
+    void record_msdf_supported_text_miss(
+        const Terminal_render_text_run& run,
+        Atlas_prepare_result&           result,
+        int                             missed_glyphs)
+    {
+        ++result.render.msdf_text_missed_supported_runs;
+        result.render.msdf_text_missed_supported_glyphs +=
+            missed_glyphs > 0
+                ? missed_glyphs
+                : qsg_atlas_printable_ascii_drawable_glyph_count(run.text);
+    }
+
+    void append_msdf_text_instance(
+        const msdf_text_glyph_t&          glyph,
+        QPointF                           baseline_origin,
+        const Terminal_render_text_run&   run,
+        const std::array<float, 4>&       color,
+        qreal                             device_pixel_ratio)
+    {
+        const qreal normalized_device_pixel_ratio =
+            atlas_normalized_device_pixel_ratio(device_pixel_ratio);
+        const int physical_origin_x = atlas_snapped_physical_int(
+            baseline_origin.x(),
+            normalized_device_pixel_ratio);
+        const int physical_origin_y = atlas_snapped_physical_int(
+            baseline_origin.y(),
+            normalized_device_pixel_ratio);
+        const qreal physical_left = static_cast<qreal>(
+            std::lround(
+                static_cast<qreal>(physical_origin_x) +
+                    static_cast<qreal>(glyph.plane_left)));
+        const qreal physical_top = static_cast<qreal>(
+            std::lround(
+                static_cast<qreal>(physical_origin_y) +
+                    static_cast<qreal>(glyph.plane_bottom)));
+        const qreal physical_width =
+            static_cast<qreal>(glyph.plane_right) -
+            static_cast<qreal>(glyph.plane_left);
+        const qreal physical_height =
+            static_cast<qreal>(glyph.plane_top) -
+            static_cast<qreal>(glyph.plane_bottom);
+        const qreal physical_right =
+            physical_left + physical_width;
+        const qreal physical_bottom =
+            physical_top + physical_height;
+        if (physical_right <= physical_left || physical_bottom <= physical_top) {
+            return;
+        }
+        QRectF glyph_rect(
+            physical_left / normalized_device_pixel_ratio,
+            physical_top / normalized_device_pixel_ratio,
+            (physical_right - physical_left) /
+                normalized_device_pixel_ratio,
+            (physical_bottom - physical_top) /
+                normalized_device_pixel_ratio);
+        QRectF uv_rect(
+            glyph.uv_left,
+            glyph.uv_top,
+            glyph.uv_right - glyph.uv_left,
+            glyph.uv_bottom - glyph.uv_top);
+        if (run.clip_rect.isValid() &&
+            !clip_glyph_instance(glyph_rect, uv_rect, run.clip_rect))
+        {
+            return;
+        }
+
+        atlas_msdf_instance_t instance;
+        store_rect(instance.rect, glyph_rect);
+        store_uv_rect(instance.uv_rect, uv_rect);
+        store_color(instance.color, color);
+        store_uv_bounds(
+            instance.uv_bounds,
+            glyph.uv_left,
+            glyph.uv_top,
+            glyph.uv_right,
+            glyph.uv_bottom,
+            m_msdf_text_cache.atlas.atlas_size);
+        m_msdf_text_instances.push_back(instance);
+        m_msdf_text_instance_rows.push_back(
+            run.row >= 0 && run.row < m_render_row_count
+                ? run.row
+                : k_qsg_atlas_non_row);
+    }
+
+    void append_msdf_text_run(
+        const Terminal_render_text_run& run,
+        qreal                           opacity,
+        Atlas_prepare_result&           result)
+    {
+        ++result.render.msdf_text_supported_runs;
+        ++result.producer.presentation_fast_text_runs;
+
+        if (!ensure_msdf_text_cache(result)) {
+            record_msdf_supported_text_miss(run, result, 0);
+            return;
+        }
+
+        const std::array<float, 4> color =
+            atlas_glyph_color_components(run.foreground, opacity);
+        int missed_glyphs = 0;
+        for (qsizetype source = 0; source < run.text.size(); ++source) {
+            const int index = qsg_atlas_printable_ascii_index(run.text.at(source));
+            if (index < 0) {
+                ++missed_glyphs;
+                continue;
+            }
+
+            const char32_t codepoint = static_cast<char32_t>(
+                k_atlas_printable_ascii_first + index);
+            const auto glyph = m_msdf_text_cache.atlas.glyphs.find(codepoint);
+            if (glyph == m_msdf_text_cache.atlas.glyphs.end()) {
+                if (codepoint != U' ') {
+                    ++missed_glyphs;
+                }
+                continue;
+            }
+
+            if (!atlas_msdf_text_glyph_is_drawable(glyph->second)) {
+                if (codepoint != U' ') {
+                    ++missed_glyphs;
+                }
+            }
+        }
+
+        if (missed_glyphs > 0) {
+            record_msdf_supported_text_miss(run, result, missed_glyphs);
+            return;
+        }
+
+        for (qsizetype source = 0; source < run.text.size(); ++source) {
+            const int index = qsg_atlas_printable_ascii_index(run.text.at(source));
+            const char32_t codepoint = static_cast<char32_t>(
+                k_atlas_printable_ascii_first + index);
+            const auto glyph = m_msdf_text_cache.atlas.glyphs.find(codepoint);
+            if (glyph == m_msdf_text_cache.atlas.glyphs.end() ||
+                !atlas_msdf_text_glyph_is_drawable(glyph->second))
+            {
+                continue;
+            }
+            append_msdf_text_instance(
+                glyph->second,
+                QPointF(
+                    run.rect.left() +
+                        static_cast<qreal>(source) * m_frame.cell_metrics.width,
+                    run.baseline_origin.y()),
+                run,
+                color,
+                m_frame.device_pixel_ratio);
+        }
+
+        ++result.render.msdf_text_runs;
+    }
+#endif
+
     bool append_simple_text_run(
         const Terminal_render_text_run& run,
         qreal                           opacity,
@@ -3266,8 +4203,33 @@ private:
             return;
         }
 
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        if (qsg_atlas_msdf_text_run_candidate(run, m_frame.cell_metrics) &&
+            qsg_atlas_msdf_text_font_is_supported(m_frame.font))
+        {
+            (void)text_run_index;
+            (void)cursor_text_run;
+            append_msdf_text_run(
+                run,
+                opacity,
+                result);
+            return;
+        }
+#endif
+
         if (qsg_atlas_simple_text_run_candidate(run, m_frame.cell_metrics)) {
             ++result.producer.simple_path_attempts;
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+            if (qsg_atlas_msdf_text_font_is_supported(m_frame.font)) {
+                (void)text_run_index;
+                (void)cursor_text_run;
+                append_msdf_text_run(
+                    run,
+                    opacity,
+                    result);
+                return;
+            }
+#endif
             if (append_simple_text_run(
                     run,
                     opacity,
@@ -3528,9 +4490,18 @@ private:
         return key;
     }
 
+    QByteArray msdf_text_instance_layout_key() const
+    {
+        QByteArray key;
+        append_pass_key(key, m_msdf_text_pass);
+        append_pass_key(key, m_msdf_cursor_text_pass);
+        return key;
+    }
+
     bool update_atlas_buffers(
         QRhi*                             rhi,
         QRhiCommandBuffer*                command_buffer,
+        QSize                             render_target_size,
         Qsg_atlas_render_summary*         render_summary)
     {
         VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::update_atlas_buffers");
@@ -3542,6 +4513,12 @@ private:
                 sizeof(atlas_glyph_instance_t));
         bool rect_buffer_recreated  = false;
         bool glyph_buffer_recreated = false;
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        const quint32 msdf_text_buffer_size = static_cast<quint32>(
+            std::max<std::size_t>(1U, m_msdf_text_instances.size()) *
+                sizeof(atlas_msdf_instance_t));
+        bool msdf_text_buffer_recreated = false;
+#endif
         if (!ensure_dynamic_buffer(
                 rhi,
                 m_rect_instance_buffer,
@@ -3570,6 +4547,22 @@ private:
             m_glyph_upload_planner.reset();
         }
 
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        if (!ensure_dynamic_buffer(
+                rhi,
+                m_msdf_text_instance_buffer,
+                m_msdf_text_instance_buffer_size,
+                msdf_text_buffer_size,
+                QRhiBuffer::VertexBuffer,
+                &msdf_text_buffer_recreated))
+        {
+            return false;
+        }
+        if (msdf_text_buffer_recreated) {
+            m_msdf_text_upload_planner.reset();
+        }
+#endif
+
         const int frames_in_flight =
             std::max(1, rhi->resourceLimit(QRhi::FramesInFlight));
         const int frame_slot =
@@ -3578,6 +4571,10 @@ private:
             m_rect_instances.size() * sizeof(atlas_instance_t));
         const int glyph_byte_count = static_cast<int>(
             m_glyph_buffer_instances.size() * sizeof(atlas_glyph_instance_t));
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        const int msdf_text_byte_count = static_cast<int>(
+            m_msdf_text_instances.size() * sizeof(atlas_msdf_instance_t));
+#endif
         const Qsg_atlas_buffer_update_plan rect_plan =
             m_rect_upload_planner.plan({
                 frames_in_flight,
@@ -3617,9 +4614,31 @@ private:
                 !m_glyph_buffer_instances.empty(),
                 &m_glyph_buffer_row_stable_ranges,
             });
+        Qsg_atlas_buffer_update_plan msdf_text_plan;
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        msdf_text_plan = m_msdf_text_upload_planner.plan({
+                frames_in_flight,
+                frame_slot,
+                m_render_row_count,
+                static_cast<int>(sizeof(atlas_msdf_instance_t)),
+                !m_msdf_text_instances.empty()
+                    ? reinterpret_cast<const char*>(m_msdf_text_instances.data())
+                    : nullptr,
+                msdf_text_byte_count,
+                &m_msdf_text_instance_rows,
+                msdf_text_instance_layout_key(),
+                m_render_dirty_row_ranges,
+                msdf_text_buffer_recreated,
+                m_render_force_full_reupload,
+                m_render_non_dirty_state_invalidation,
+                static_cast<int>(m_msdf_text_instances.size()),
+                false,
+            });
+#endif
         if (render_summary != nullptr) {
-            render_summary->rect_buffer  = rect_plan.summary;
-            render_summary->glyph_buffer = glyph_plan.summary;
+            render_summary->rect_buffer      = rect_plan.summary;
+            render_summary->glyph_buffer     = glyph_plan.summary;
+            render_summary->msdf_text_buffer = msdf_text_plan.summary;
         }
 
         QRhiResourceUpdateBatch* updates = rhi->nextResourceUpdateBatch();
@@ -3645,6 +4664,25 @@ private:
             0U,
             sizeof(uniform),
             &uniform);
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        if (m_msdf_text_uniform_buffer != nullptr) {
+            atlas_msdf_uniform_t msdf_uniform;
+            std::copy(
+                mvp.constData(),
+                mvp.constData() + 16,
+                std::begin(msdf_uniform.matrix));
+            msdf_uniform.px_range      = m_msdf_text_cache.atlas.px_range;
+            msdf_uniform.target_width  = static_cast<float>(
+                std::max(1, render_target_size.width()));
+            msdf_uniform.target_height = static_cast<float>(
+                std::max(1, render_target_size.height()));
+            updates->updateDynamicBuffer(
+                m_msdf_text_uniform_buffer,
+                0U,
+                sizeof(msdf_uniform),
+                &msdf_uniform);
+        }
+#endif
         for (const Qsg_atlas_buffer_update_range& range : rect_plan.ranges) {
             updates->updateDynamicBuffer(
                 m_rect_instance_buffer,
@@ -3661,6 +4699,16 @@ private:
                 reinterpret_cast<const char*>(m_glyph_buffer_instances.data()) +
                     range.byte_offset);
         }
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+        for (const Qsg_atlas_buffer_update_range& range : msdf_text_plan.ranges) {
+            updates->updateDynamicBuffer(
+                m_msdf_text_instance_buffer,
+                static_cast<quint32>(range.byte_offset),
+                static_cast<quint32>(range.byte_count),
+                reinterpret_cast<const char*>(m_msdf_text_instances.data()) +
+                    range.byte_offset);
+        }
+#endif
 
         command_buffer->resourceUpdate(updates);
         return true;
@@ -3712,16 +4760,49 @@ private:
             pass.count);
     }
 
+    void draw_msdf_text_pass(
+        QRhiCommandBuffer*        command_buffer,
+        const atlas_pass_range_t&  pass,
+        bool                      stencil_enabled)
+    {
+        if (!pass.has_instances()) {
+            return;
+        }
+
+        command_buffer->setGraphicsPipeline(
+            stencil_enabled
+                ? m_stencil_msdf_text_pipeline
+                : m_msdf_text_pipeline);
+        command_buffer->setShaderResources(m_msdf_text_shader_resources);
+        const quint32 instance_offset = pass.first * sizeof(atlas_msdf_instance_t);
+        const QRhiCommandBuffer::VertexInput bindings[] = {
+            {m_vertex_buffer,               0U},
+            {m_msdf_text_instance_buffer,   instance_offset},
+        };
+        command_buffer->setVertexInput(0, 2, bindings);
+        command_buffer->draw(
+            static_cast<quint32>(k_atlas_quad_vertices.size()),
+            pass.count);
+    }
+
     bool has_glyph_draw_passes() const
     {
         return m_text_pass.has_instances() || m_cursor_text_pass.has_instances();
+    }
+
+    bool has_msdf_text_draw_passes() const
+    {
+        return
+            m_msdf_text_pass.has_instances() ||
+            m_msdf_cursor_text_pass.has_instances();
     }
 
     quint32 total_instance_count() const
     {
         return
             static_cast<quint32>(m_rect_instances.size()) +
-            static_cast<quint32>(m_glyph_instances.size());
+            static_cast<quint32>(m_glyph_instances.size()) +
+            static_cast<quint32>(m_msdf_text_instances.size());
     }
 
     Captured_atlas_frame                     m_frame;
@@ -3739,43 +4820,62 @@ private:
     QShader                                  m_glyph_vertex_shader;
     QShader                                  m_glyph_fragment_shader;
     QShader                                  m_dual_source_probe_fragment_shader;
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+    QShader                                  m_msdf_text_vertex_shader;
+    QShader                                  m_msdf_text_fragment_shader;
+#endif
     std::vector<atlas_instance_t>             m_rect_instances;
     std::vector<atlas_glyph_instance_t>       m_glyph_instances;
     std::vector<atlas_glyph_instance_t>       m_glyph_buffer_instances;
+    std::vector<atlas_msdf_instance_t>        m_msdf_text_instances;
     std::vector<int>                         m_rect_instance_rows;
     std::vector<int>                         m_glyph_instance_rows;
     std::vector<int>                         m_glyph_buffer_instance_rows;
+    std::vector<int>                         m_msdf_text_instance_rows;
     std::vector<Qsg_atlas_row_stable_range>
                                              m_glyph_buffer_row_stable_ranges;
     atlas_pass_range_t                        m_background_pass;
     atlas_pass_range_t                        m_selection_pass;
     atlas_pass_range_t                        m_graphic_pass;
     atlas_pass_range_t                        m_text_pass;
+    atlas_pass_range_t                        m_msdf_text_pass;
     atlas_pass_range_t                        m_decoration_pass;
     atlas_pass_range_t                        m_cursor_pass;
     atlas_pass_range_t                        m_cursor_text_pass;
+    atlas_pass_range_t                        m_msdf_cursor_text_pass;
     atlas_pass_range_t                        m_overlay_pass;
     QRhiBuffer*                              m_vertex_buffer = nullptr;
     QRhiBuffer*                              m_rect_instance_buffer = nullptr;
     QRhiBuffer*                              m_glyph_instance_buffer = nullptr;
+    QRhiBuffer*                              m_msdf_text_instance_buffer = nullptr;
     QRhiBuffer*                              m_uniform_buffer = nullptr;
+    QRhiBuffer*                              m_msdf_text_uniform_buffer = nullptr;
     QRhiShaderResourceBindings*              m_rect_shader_resources = nullptr;
     QRhiShaderResourceBindings*              m_glyph_shader_resources = nullptr;
+    QRhiShaderResourceBindings*              m_msdf_text_shader_resources = nullptr;
     QRhiGraphicsPipeline*                    m_rect_pipeline = nullptr;
     QRhiGraphicsPipeline*                    m_stencil_rect_pipeline = nullptr;
     QRhiGraphicsPipeline*                    m_glyph_pipeline = nullptr;
     QRhiGraphicsPipeline*                    m_stencil_glyph_pipeline = nullptr;
+    QRhiGraphicsPipeline*                    m_msdf_text_pipeline = nullptr;
+    QRhiGraphicsPipeline*                    m_stencil_msdf_text_pipeline = nullptr;
     QRhiTexture*                             m_coverage_texture = nullptr;
+    QRhiTexture*                             m_msdf_text_atlas_texture = nullptr;
     QRhiSampler*                             m_coverage_sampler = nullptr;
+    QRhiSampler*                             m_msdf_text_sampler = nullptr;
     Qsg_atlas_sampler_mode                   m_glyph_sampler_mode =
+        Qsg_atlas_sampler_mode::UNKNOWN;
+    Qsg_atlas_sampler_mode                   m_msdf_text_sampler_mode =
         Qsg_atlas_sampler_mode::UNKNOWN;
     bool                                     m_dual_source_blend_factors_probe_completed =
         false;
     bool                                     m_dual_source_blend_factors_available = false;
     quint32                                  m_rect_instance_buffer_size = 0U;
     quint32                                  m_glyph_instance_buffer_size = 0U;
+    quint32                                  m_msdf_text_instance_buffer_size = 0U;
     Qsg_atlas_buffer_upload_planner   m_rect_upload_planner;
     Qsg_atlas_buffer_upload_planner   m_glyph_upload_planner;
+    Qsg_atlas_buffer_upload_planner   m_msdf_text_upload_planner;
     int                                      m_render_row_count = 0;
     std::vector<int>                         m_render_glyph_text_row_capacities;
     std::vector<int>                         m_render_glyph_cursor_text_row_capacities;
@@ -3791,6 +4891,11 @@ private:
                                              m_prepared_text_cache;
     std::uint64_t                            m_prepared_text_cache_frame = 0U;
     Simple_atlas_text_cache                  m_simple_text_cache;
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT
+    Msdf_terminal_text_cache                 m_msdf_text_cache;
+    std::uint64_t                            m_msdf_text_uploaded_generation = 0U;
+    bool                                     m_msdf_text_resources_ready = false;
+#endif
     Atlas_warm_key                           m_warm_key;
     Qsg_atlas_warm_lazy_summary              m_warm_lazy;
     bool                                     m_current_prepare_had_lazy_insert =
@@ -4473,6 +5578,44 @@ void Qsg_atlas_recorder::record_prepare(
     m_report.command_buffer_non_null        = command_buffer_non_null;
     m_report.render_target_non_null         = render_target_non_null;
     m_report.rhi_non_null                   = rhi_non_null;
+    m_report.msdf_text_renderer_experiment_requested =
+        render_summary.msdf_text_renderer_experiment_requested;
+    m_report.msdf_text_renderer_experiment_compiled =
+        render_summary.msdf_text_renderer_experiment_compiled;
+    m_report.msdf_text_renderer_production_active =
+        render_summary.msdf_text_renderer_production_active;
+    m_report.msdf_text_shader_package_available =
+        render_summary.msdf_text_shader_package_available;
+    m_report.msdf_text_atlas_built =
+        render_summary.msdf_text_atlas_built;
+    m_report.msdf_text_atlas_ready =
+        render_summary.msdf_text_atlas_ready;
+    m_report.msdf_text_texture_ready =
+        render_summary.msdf_text_texture_ready;
+    m_report.msdf_text_resources_ready =
+        render_summary.msdf_text_resources_ready;
+    m_report.msdf_text_supported_runs =
+        render_summary.msdf_text_supported_runs;
+    m_report.msdf_text_runs =
+        render_summary.msdf_text_runs;
+    m_report.msdf_text_glyph_instances =
+        render_summary.msdf_text_glyph_instances;
+    m_report.msdf_text_draw_calls =
+        render_summary.msdf_text_draw_calls;
+    m_report.msdf_text_missed_supported_runs =
+        render_summary.msdf_text_missed_supported_runs;
+    m_report.msdf_text_missed_supported_glyphs =
+        render_summary.msdf_text_missed_supported_glyphs;
+    m_report.msdf_text_font_data_bytes =
+        render_summary.msdf_text_font_data_bytes;
+    m_report.msdf_text_pixel_height =
+        render_summary.msdf_text_pixel_height;
+    m_report.msdf_text_atlas_size =
+        render_summary.msdf_text_atlas_size;
+    m_report.msdf_text_px_range =
+        render_summary.msdf_text_px_range;
+    m_report.msdf_text_message =
+        render_summary.msdf_text_message;
     m_report.coverage_texture_created       = coverage_texture_created;
     m_report.coverage_upload_recorded       = coverage_upload_recorded;
     m_report.raw_font_rasterized            = raw_font_rasterized;
