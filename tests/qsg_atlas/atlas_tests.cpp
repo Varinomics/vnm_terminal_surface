@@ -9610,20 +9610,20 @@ struct Msdf_text_resource_identity
 
 QString atlas_msdf_resource_stability_row_0()
 {
-    return QStringLiteral("WMeaom#@|1.AZ09");
+    return QStringLiteral(
+        "WMeaom#@|1.\u00e9\u03a9\u0411\u20ac\u2211");
 }
 
 QString atlas_msdf_resource_stability_row_1()
 {
-    return QStringLiteral("[]{}<>/?+-=_pq");
+    return QStringLiteral("[]{}<>/?+-=_\u2500\u2588\ue0b0");
 }
 
 int atlas_msdf_resource_stability_drawable_glyphs(QStringView text)
 {
     int count = 0;
     for (QChar character : text) {
-        const ushort codepoint = character.unicode();
-        if (codepoint >= 0x21U && codepoint <= 0x7eU) {
+        if (!character.isSpace()) {
             ++count;
         }
     }
@@ -9783,7 +9783,7 @@ bool atlas_msdf_resource_stability_render_ok(
     ok &= check(
         render_summary.msdf_text_glyph_instances == expected_glyphs,
         std::string("atlas MSDF resource stability ") + label +
-            " reports the expected printable glyph instance count");
+            " reports the expected supported glyph instance count");
     ok &= check(
         render_summary.msdf_text_draw_calls > 0 &&
             render_summary.msdf_text_draw_calls <= 2,
@@ -9794,7 +9794,7 @@ bool atlas_msdf_resource_stability_render_ok(
             render_summary.msdf_text_runs >=
                 render_summary.msdf_text_supported_runs,
         std::string("atlas MSDF resource stability ") + label +
-            " reports supported printable MSDF runs");
+            " reports supported MSDF runs");
     return ok;
 }
 
@@ -15800,7 +15800,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                 atlas.atlas_report.render.msdf_text_runs > 0 &&
                 atlas.atlas_report.render.msdf_text_glyph_instances > 0 &&
                 atlas.atlas_report.render.msdf_text_draw_calls > 0,
-            "LCD atlas probe routes supported ASCII text through MSDF draw calls");
+            "LCD atlas probe routes supported text through MSDF draw calls");
         ok &= check(
             atlas.atlas_report.render.msdf_text_missed_supported_runs == 0 &&
                 atlas.atlas_report.render.msdf_text_missed_supported_glyphs == 0,
