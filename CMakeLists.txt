@@ -36,16 +36,16 @@ option(VNM_TERMINAL_ENABLE_PROFILING "Compile vnm_terminal_surface profile scope
 option(VNM_TERMINAL_ENABLE_SHADER_GENERATION
     "Require Qt ShaderTools for source-tree shader tooling"
     OFF)
-option(VNM_TERMINAL_BUILD_MSDF_TEXT_RENDERER_EXPERIMENT
-    "Compile the MSDF text renderer experiment"
-    OFF)
-set(VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT_USE_SYSTEM_LIBS OFF CACHE BOOL
-    "Prefer find_package dependencies for the MSDF text renderer experiment dependency.")
-set(VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT_SOURCE_DIR "" CACHE PATH
-    "Optional vnm_msdf_text source checkout used by the MSDF text renderer experiment.")
+option(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER
+    "Build the MSDF text renderer"
+    ON)
+set(VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS OFF CACHE BOOL
+    "Prefer find_package dependencies for the MSDF text renderer dependency.")
+set(VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR "" CACHE PATH
+    "Optional vnm_msdf_text source checkout used by the MSDF text renderer.")
 mark_as_advanced(
-    VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT_SOURCE_DIR
-    VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT_USE_SYSTEM_LIBS
+    VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
+    VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS
 )
 if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_BUILD_BENCHMARKS)
     set(VNM_TERMINAL_BUILD_BENCHMARKS ON)
@@ -188,19 +188,19 @@ target_compile_definitions(vnm_terminal_surface PUBLIC
 )
 
 target_compile_definitions(vnm_terminal_surface PRIVATE
-    VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT=$<BOOL:${VNM_TERMINAL_BUILD_MSDF_TEXT_RENDERER_EXPERIMENT}>
+    VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER}>
     VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY}>
 )
 
-if(VNM_TERMINAL_BUILD_MSDF_TEXT_RENDERER_EXPERIMENT)
+if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER)
     include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/vnm_terminal_msdf_text_dependency.cmake")
     vnm_terminal_msdf_text_make_available(
-        vnm_terminal_msdf_text_renderer_experiment_enabled
+        vnm_terminal_msdf_text_renderer_enabled
         CONTEXT "vnm_terminal_surface"
-        REQUIRED_BY "MSDF text renderer experiment"
-        SOURCE_DIR_VAR VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT_SOURCE_DIR
-        SOURCE_DIR_OPTION VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT_SOURCE_DIR
-        USE_SYSTEM_LIBS "${VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT_USE_SYSTEM_LIBS}")
+        REQUIRED_BY "MSDF text renderer"
+        SOURCE_DIR_VAR VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
+        SOURCE_DIR_OPTION VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
+        USE_SYSTEM_LIBS "${VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS}")
     target_link_libraries(vnm_terminal_surface PRIVATE
         "$<BUILD_INTERFACE:vnm_msdf_text::vnm_msdf_text>"
     )

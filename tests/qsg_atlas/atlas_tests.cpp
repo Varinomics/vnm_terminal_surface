@@ -8942,9 +8942,9 @@ Atlas_host_state_result test_atlas_transformed_host_state(
         "atlas transformed host renders through projectionMatrix() * matrix()");
     ok &= check(count_atlas_host_pixels(result.capture.image, origin_probe) == 0,
         "atlas transformed host does not draw at the untransformed origin");
-    if (result.capture.report.render.msdf_text_renderer_experiment_requested) {
+    if (result.capture.report.render.msdf_text_renderer_enabled) {
         ok &= check(
-            result.capture.report.render.msdf_text_renderer_production_active &&
+            result.capture.report.render.msdf_text_renderer_active &&
                 result.capture.report.render.msdf_text_runs > 0 &&
                 result.capture.report.render.msdf_text_draw_calls > 0,
             "atlas transformed host exercises the MSDF renderer path");
@@ -9706,8 +9706,8 @@ void print_atlas_msdf_resource_stability_report(
         << " prepare=" << report.prepare_count
         << " render=" << report.render_count
         << " requested="
-        << render_summary.msdf_text_renderer_experiment_requested
-        << " active=" << render_summary.msdf_text_renderer_production_active
+        << render_summary.msdf_text_renderer_enabled
+        << " active=" << render_summary.msdf_text_renderer_active
         << " resources_ready=" << render_summary.msdf_text_resources_ready
         << " atlas_built=" << render_summary.msdf_text_atlas_built
         << " atlas_ready=" << render_summary.msdf_text_atlas_ready
@@ -9759,7 +9759,7 @@ bool atlas_msdf_resource_stability_render_ok(
         std::string("atlas MSDF resource stability ") + label +
             " reaches usable QRhi render state");
     ok &= check(
-        render_summary.msdf_text_renderer_production_active,
+        render_summary.msdf_text_renderer_active,
         std::string("atlas MSDF resource stability ") + label +
             " keeps the MSDF renderer active");
     ok &= check(
@@ -9908,11 +9908,11 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
             if (!atlas_report_render_state_ready(report)) {
                 return false;
             }
-            if (!report.render.msdf_text_renderer_experiment_requested) {
+            if (!report.render.msdf_text_renderer_enabled) {
                 return true;
             }
             return
-                report.render.msdf_text_renderer_production_active &&
+                report.render.msdf_text_renderer_active &&
                 report.render.msdf_text_resources_ready &&
                 report.render.msdf_text_texture_ready &&
                 report.render.msdf_text_glyph_instances == expected_glyphs;
@@ -9928,10 +9928,10 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         return false;
     }
 
-    if (!baseline_report.render.msdf_text_renderer_experiment_requested) {
+    if (!baseline_report.render.msdf_text_renderer_enabled) {
         return check(
-            !baseline_report.render.msdf_text_renderer_production_active,
-            "atlas MSDF resource stability skips experiment gates when disabled");
+            !baseline_report.render.msdf_text_renderer_active,
+            "atlas MSDF resource stability skips renderer gates when disabled");
     }
 
     std::vector<term::Qsg_atlas_frame_report> reports;
@@ -13859,14 +13859,14 @@ QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
         report.render_target_non_null);
     capabilities.insert(QStringLiteral("rhi_non_null"), report.rhi_non_null);
     capabilities.insert(
-        QStringLiteral("msdf_text_renderer_experiment_requested"),
-        report.msdf_text_renderer_experiment_requested);
+        QStringLiteral("msdf_text_renderer_enabled"),
+        report.msdf_text_renderer_enabled);
     capabilities.insert(
-        QStringLiteral("msdf_text_renderer_experiment_compiled"),
-        report.msdf_text_renderer_experiment_compiled);
+        QStringLiteral("msdf_text_renderer_compiled"),
+        report.msdf_text_renderer_compiled);
     capabilities.insert(
-        QStringLiteral("msdf_text_renderer_production_active"),
-        report.msdf_text_renderer_production_active);
+        QStringLiteral("msdf_text_renderer_active"),
+        report.msdf_text_renderer_active);
     capabilities.insert(
         QStringLiteral("msdf_text_shader_package_available"),
         report.msdf_text_shader_package_available);
@@ -14113,14 +14113,14 @@ QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
         QStringLiteral("dual_source_blend_factors_runtime_probe"),
         report.render.dual_source_blend_factors_runtime_probe);
     render.insert(
-        QStringLiteral("msdf_text_renderer_experiment_requested"),
-        report.render.msdf_text_renderer_experiment_requested);
+        QStringLiteral("msdf_text_renderer_enabled"),
+        report.render.msdf_text_renderer_enabled);
     render.insert(
-        QStringLiteral("msdf_text_renderer_experiment_compiled"),
-        report.render.msdf_text_renderer_experiment_compiled);
+        QStringLiteral("msdf_text_renderer_compiled"),
+        report.render.msdf_text_renderer_compiled);
     render.insert(
-        QStringLiteral("msdf_text_renderer_production_active"),
-        report.render.msdf_text_renderer_production_active);
+        QStringLiteral("msdf_text_renderer_active"),
+        report.render.msdf_text_renderer_active);
 
     QJsonObject cache;
     json_insert_u64(cache, QStringLiteral("lookups"), report.cache.lookups);
@@ -14723,7 +14723,7 @@ void print_lcd_atlas_probe_report(
         << term::qsg_atlas_sampler_mode_name(
             render_summary.glyph_sampler_mode)
         << " msdf_active="
-        << render_summary.msdf_text_renderer_production_active
+        << render_summary.msdf_text_renderer_active
         << " msdf_runs=" << render_summary.msdf_text_runs
         << " msdf_instances=" << render_summary.msdf_text_glyph_instances
         << " msdf_draws=" << render_summary.msdf_text_draw_calls
@@ -15144,7 +15144,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         << " ready=" << repeated_w_atlas.ready
         << " image=" << repeated_w_atlas.image.width()
         << 'x' << repeated_w_atlas.image.height()
-        << " msdf_active=" << repeated_w_render.msdf_text_renderer_production_active
+        << " msdf_active=" << repeated_w_render.msdf_text_renderer_active
         << " msdf_instances=" << repeated_w_render.msdf_text_glyph_instances
         << " msdf_draws=" << repeated_w_render.msdf_text_draw_calls
         << " glyph_draws=" << repeated_w_render.glyph_draw_calls
@@ -15182,7 +15182,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         << " host_translation=" << repeated_w_translated_host.x()
         << ',' << repeated_w_translated_host.y()
         << " msdf_active="
-        << translated_repeated_w_render.msdf_text_renderer_production_active
+        << translated_repeated_w_render.msdf_text_renderer_active
         << " msdf_instances="
         << translated_repeated_w_render.msdf_text_glyph_instances
         << " msdf_draws="
@@ -15238,7 +15238,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         << " host_translation=" << repeated_on_fractional_host.x()
         << ',' << repeated_on_fractional_host.y()
         << " msdf_active="
-        << repeated_on_render.msdf_text_renderer_production_active
+        << repeated_on_render.msdf_text_renderer_active
         << " msdf_instances="
         << repeated_on_render.msdf_text_glyph_instances
         << " msdf_draws=" << repeated_on_render.msdf_text_draw_calls
@@ -15274,7 +15274,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         << " host_translation=" << repeated_on_app_font_fractional_host.x()
         << ',' << repeated_on_app_font_fractional_host.y()
         << " msdf_active="
-        << repeated_on_app_font_render.msdf_text_renderer_production_active
+        << repeated_on_app_font_render.msdf_text_renderer_active
         << " msdf_instances="
         << repeated_on_app_font_render.msdf_text_glyph_instances
         << " msdf_draws=" << repeated_on_app_font_render.msdf_text_draw_calls
@@ -15316,7 +15316,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         << " host_translation=" << repeated_on_live_app_host.x()
         << ',' << repeated_on_live_app_host.y()
         << " msdf_active="
-        << repeated_on_live_app_render.msdf_text_renderer_production_active
+        << repeated_on_live_app_render.msdf_text_renderer_active
         << " msdf_instances="
         << repeated_on_live_app_render.msdf_text_glyph_instances
         << " msdf_draws=" << repeated_on_live_app_render.msdf_text_draw_calls
@@ -15355,7 +15355,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         << " image=" << ascii_panel_atlas.image.width()
         << 'x' << ascii_panel_atlas.image.height()
         << " msdf_active="
-        << ascii_panel_render.msdf_text_renderer_production_active
+        << ascii_panel_render.msdf_text_renderer_active
         << " msdf_instances="
         << ascii_panel_render.msdf_text_glyph_instances
         << " expected_instances="
@@ -15530,10 +15530,10 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
 
     const term::Glyph_coverage_counts& production_coverage =
         atlas.atlas_report.frame_build.glyph_coverage;
-    const bool msdf_text_renderer_requested =
-        atlas.atlas_report.render.msdf_text_renderer_experiment_requested;
-    const bool msdf_text_production_active =
-        atlas.atlas_report.render.msdf_text_renderer_production_active;
+    const bool msdf_text_renderer_enabled =
+        atlas.atlas_report.render.msdf_text_renderer_enabled;
+    const bool msdf_text_renderer_active =
+        atlas.atlas_report.render.msdf_text_renderer_active;
 
     // Batch 1 targets the pinned Windows D3D11 hardware path; missing
     // dual-source probing or sample-family glyph images is a gate failure here.
@@ -15744,7 +15744,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         backend,
         rgba_reference_budget_for_coverage(production_coverage),
         "LCD atlas RGBA reference",
-        !msdf_text_production_active);
+        !msdf_text_renderer_active);
     ok &= check(
         !probe_records.empty(),
         "LCD atlas probe records glyph image capability details");
@@ -15780,10 +15780,10 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         atlas.atlas_report.render.glyph_sampler_mode ==
             term::Qsg_atlas_sampler_mode::NEAREST,
         "LCD atlas probe reports nearest glyph coverage sampling");
-    if (msdf_text_renderer_requested) {
+    if (msdf_text_renderer_enabled) {
         ok &= check(
-            msdf_text_production_active,
-            "LCD atlas probe activates the MSDF text renderer experiment");
+            msdf_text_renderer_active,
+            "LCD atlas probe activates the MSDF text renderer");
         ok &= check(
             atlas.atlas_report.render.msdf_text_shader_package_available &&
                 atlas.atlas_report.render.msdf_text_atlas_built &&
@@ -15806,7 +15806,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                 atlas.atlas_report.render.msdf_text_missed_supported_glyphs == 0,
             "LCD atlas probe reports no silent MSDF text misses");
         ok &= check(
-            single_w_atlas.atlas_report.render.msdf_text_renderer_production_active &&
+            single_w_atlas.atlas_report.render.msdf_text_renderer_active &&
                 single_w_atlas.atlas_report.render.msdf_text_glyph_instances > 0 &&
                 single_w_atlas.atlas_report.render.msdf_text_draw_calls > 0 &&
                 single_w_atlas.atlas_report.render.glyph_draw_calls == 0 &&
@@ -15872,7 +15872,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                 single_w_msdf_edges.max_transition_width + 1,
             "LCD atlas probe single-W MSDF edge width is not blurrier than CPU MSDF");
         ok &= check(
-            repeated_w_render.msdf_text_renderer_production_active &&
+            repeated_w_render.msdf_text_renderer_active &&
                 repeated_w_render.msdf_text_glyph_instances ==
                     k_lcd_repeated_w_cell_count &&
                 repeated_w_render.msdf_text_draw_calls > 0 &&
@@ -15908,7 +15908,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                 repeated_w_stability.max_relative_bbox_height_delta == 0,
             "LCD atlas probe repeated-W glyph ink geometry is identical across cells");
         ok &= check(
-            translated_repeated_w_render.msdf_text_renderer_production_active &&
+            translated_repeated_w_render.msdf_text_renderer_active &&
                 translated_repeated_w_render.msdf_text_glyph_instances ==
                     k_lcd_repeated_w_cell_count &&
                 translated_repeated_w_render.msdf_text_draw_calls > 0 &&
@@ -15968,7 +15968,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             translated_w_origin_geometry_exact,
             "LCD atlas probe translated repeated-W glyph ink geometry matches the origin cells");
         ok &= check(
-            repeated_on_render.msdf_text_renderer_production_active &&
+            repeated_on_render.msdf_text_renderer_active &&
                 repeated_on_render.msdf_text_glyph_instances == 4 &&
                 repeated_on_render.msdf_text_draw_calls > 0 &&
                 repeated_on_render.glyph_draw_calls == 0 &&
@@ -15993,7 +15993,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                     k_repeated_on_center_tolerance_pixels,
             "LCD atlas probe repeated-on glyphs and gutters are stable across columns");
         ok &= check(
-            repeated_on_app_font_render.msdf_text_renderer_production_active &&
+            repeated_on_app_font_render.msdf_text_renderer_active &&
                 repeated_on_app_font_render.msdf_text_glyph_instances == 4 &&
                 repeated_on_app_font_render.msdf_text_draw_calls > 0 &&
                 repeated_on_app_font_render.glyph_draw_calls == 0 &&
@@ -16017,7 +16017,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                     k_repeated_on_center_tolerance_pixels,
             "LCD atlas probe app-font repeated-on glyphs and gutters are stable across columns");
         ok &= check(
-            repeated_on_live_app_render.msdf_text_renderer_production_active &&
+            repeated_on_live_app_render.msdf_text_renderer_active &&
                 repeated_on_live_app_render.msdf_text_glyph_instances == 4 &&
                 repeated_on_live_app_render.msdf_text_draw_calls > 0 &&
                 repeated_on_live_app_render.glyph_draw_calls == 0 &&
@@ -16041,7 +16041,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                     k_repeated_on_center_tolerance_pixels,
             "LCD atlas probe live-app repeated-on glyphs and gutters are stable across columns");
         ok &= check(
-            ascii_panel_render.msdf_text_renderer_production_active &&
+            ascii_panel_render.msdf_text_renderer_active &&
                 ascii_panel_render.msdf_text_supported_runs > 0 &&
                 ascii_panel_render.msdf_text_runs > 0 &&
                 ascii_panel_render.msdf_text_draw_calls > 0 &&
@@ -16368,8 +16368,8 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
             render_summary.scroll_full_reupload,
         "atlas report marks PUBLIC_PROJECTION/SCROLL as full reupload");
     const bool public_scroll_msdf_active =
-        render_summary.msdf_text_renderer_experiment_requested &&
-        render_summary.msdf_text_renderer_production_active;
+        render_summary.msdf_text_renderer_enabled &&
+        render_summary.msdf_text_renderer_active;
     ok &= check(
         render_summary.rect_buffer.full_repaint_upload &&
             render_summary.rect_buffer.full_upload,
