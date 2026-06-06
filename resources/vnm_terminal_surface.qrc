@@ -6,5 +6,7 @@
     <file alias="shaders/atlas_dual_source_probe.frag.qsb">shaders/atlas_dual_source_probe.frag.qsb</file>
     <file alias="shaders/atlas_glyph.frag.qsb">shaders/atlas_glyph.frag.qsb</file>
     <file alias="shaders/atlas_glyph.vert.qsb">shaders/atlas_glyph.vert.qsb</file>
+    <file alias="shaders/atlas_msdf_text.frag.qsb">shaders/atlas_msdf_text.frag.qsb</file>
+    <file alias="shaders/atlas_msdf_text.vert.qsb">shaders/atlas_msdf_text.vert.qsb</file>
   </qresource>
 </RCC>

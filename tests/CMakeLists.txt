@@ -11,6 +11,7 @@ endif()
 
 find_package(Qt6Gui 6.7 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
 find_package(Threads REQUIRED)
+include("${PROJECT_SOURCE_DIR}/cmake/vnm_terminal_msdf_text_dependency.cmake")
 
 function(vnm_terminal_require_qt_plugin_file plugin_target purpose)
     if(NOT TARGET ${plugin_target})
@@ -163,6 +164,19 @@ set(VNM_TERMINAL_ENABLE_GPU_ATLAS_LAYOUT_PARITY OFF CACHE BOOL
     "Add the canonical atlas layout-parity hardware CTests.")
 set(VNM_TERMINAL_ENABLE_GPU_ATLAS_REPORT OFF CACHE BOOL
     "Add the canonical atlas hardware report CTests.")
+option(VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_TEXT
+    "Make vnm_msdf_text available only to the qsg atlas test executable."
+    ON)
+option(VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_USE_SYSTEM_LIBS
+    "Prefer find_package dependencies for the qsg atlas vnm_msdf_text test dependency."
+    OFF)
+set(VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_SOURCE_DIR "" CACHE PATH
+    "Optional vnm_msdf_text source checkout used only by the qsg atlas tests.")
+mark_as_advanced(
+    VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_TEXT
+    VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_SOURCE_DIR
+    VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_USE_SYSTEM_LIBS
+)
 
 function(vnm_terminal_configure_test_process target_name)
     target_include_directories(${target_name} PRIVATE
@@ -577,6 +591,17 @@ if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
     endif()
 endif()
 
+set(vnm_terminal_qsg_atlas_msdf_text_enabled OFF)
+if(VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_TEXT)
+    vnm_terminal_msdf_text_make_available(
+        vnm_terminal_qsg_atlas_msdf_text_enabled
+        CONTEXT "vnm_terminal_surface tests"
+        REQUIRED_BY "qsg atlas tests"
+        SOURCE_DIR_VAR VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_SOURCE_DIR
+        SOURCE_DIR_OPTION VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_SOURCE_DIR
+        USE_SYSTEM_LIBS "${VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_USE_SYSTEM_LIBS}")
+endif()
+
 add_executable(vnm_terminal_qsg_atlas
     qsg_atlas/atlas_tests.cpp
 )
@@ -586,9 +611,16 @@ target_link_libraries(vnm_terminal_qsg_atlas PRIVATE
     Qt6::QuickPrivate
 )
 
+if(vnm_terminal_qsg_atlas_msdf_text_enabled)
+    target_link_libraries(vnm_terminal_qsg_atlas PRIVATE
+        vnm_msdf_text::vnm_msdf_text
+    )
+endif()
+
 target_compile_definitions(vnm_terminal_qsg_atlas PRIVATE
     VNM_TERMINAL_QSG_ATLAS_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/qsg_atlas_renderer.cpp"
     VNM_TERMINAL_SURFACE_SOURCE_PATH="${PROJECT_SOURCE_DIR}/src/vnm_terminal_surface.cpp"
+    VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED=$<BOOL:${vnm_terminal_qsg_atlas_msdf_text_enabled}>
     VNM_TERMINAL_TEST_BUILD_TYPE="$<CONFIG>"
     VNM_TERMINAL_PROFILING_ENABLED=$<BOOL:${VNM_TERMINAL_ENABLE_PROFILING}>
 )

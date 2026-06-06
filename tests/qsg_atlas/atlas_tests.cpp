@@ -7,6 +7,7 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
 
+#include <QByteArray>
 #include <QColor>
 #include <QCoreApplication>
 #include <QDir>
@@ -18,6 +19,7 @@
 #include <QGlyphRun>
 #include <QImage>
 #include <QInputMethodEvent>
+#include <QIODevice>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -37,6 +39,28 @@
 #include <QThread>
 #include <private/qquickitem_p.h>
 #include <rhi/qrhi.h>
+
+#if !defined(VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED)
+#define VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED 0
+#endif
+
+#if defined(VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_DIAGNOSTIC) || \
+    VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED
+#if defined(__has_include)
+#if __has_include(<vnm_msdf_text/msdf_text.h>)
+#include <vnm_msdf_text/msdf_text.h>
+#define VNM_TERMINAL_QSG_ATLAS_MSDF_DIAGNOSTIC_AVAILABLE 1
+#else
+#error "MSDF diagnostic requires vnm_msdf_text headers and link target"
+#endif
+#else
+#include <vnm_msdf_text/msdf_text.h>
+#define VNM_TERMINAL_QSG_ATLAS_MSDF_DIAGNOSTIC_AVAILABLE 1
+#endif
+#else
+#define VNM_TERMINAL_QSG_ATLAS_MSDF_DIAGNOSTIC_AVAILABLE 0
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -48,6 +72,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <string_view>
 #include <string>
 #include <utility>
@@ -69,6 +94,24 @@ constexpr bool k_lcd_probe_debug_build = false;
 constexpr bool k_lcd_probe_debug_build = true;
 #endif
 
+constexpr int k_lcd_repeated_w_cell_count = 8;
+constexpr int k_lcd_repeated_w_row = 1;
+constexpr int k_lcd_repeated_w_first_column = 1;
+constexpr int k_lcd_repeated_w_column_stride = 2;
+constexpr qreal k_lcd_repeated_w_translated_host_x = 16.0;
+constexpr qreal k_lcd_repeated_w_translated_host_y = 8.0;
+constexpr int k_lcd_ascii_panel_representative_row = 1;
+constexpr int k_lcd_ascii_panel_representative_column = 1;
+constexpr int k_lcd_ascii_panel_representative_column_stride = 2;
+constexpr int k_lcd_ascii_panel_dense_row = 2;
+constexpr int k_lcd_ascii_panel_dense_column = 1;
+constexpr int k_lcd_ascii_panel_cursor_row = 3;
+constexpr int k_lcd_ascii_panel_cursor_column = 1;
+constexpr int k_lcd_ascii_panel_user_text_row = 4;
+constexpr int k_lcd_ascii_panel_user_text_column = 1;
+constexpr quint32 k_lcd_w_probe_foreground_rgba = 0xffe6edf3U;
+constexpr quint32 k_lcd_w_probe_background_rgba = 0xff101820U;
+
 #if defined(_MSC_VER)
 constexpr const char* k_lcd_probe_compiler = "msvc";
 #elif defined(__clang__)
@@ -79,6 +122,16 @@ constexpr const char* k_lcd_probe_compiler = "gcc";
 constexpr const char* k_lcd_probe_compiler = "unknown";
 #endif
 
+#if VNM_TERMINAL_QSG_ATLAS_MSDF_DIAGNOSTIC_AVAILABLE
+constexpr int k_msdf_single_w_atlas_texture_size = 2048;
+constexpr double k_msdf_single_w_min_atlas_font_size = 48.0;
+constexpr float k_msdf_single_w_atlas_px_range = 10.0f;
+constexpr float k_msdf_single_w_sharpness_bias = 2.5f;
+constexpr char32_t k_msdf_single_w_codepoint = U'W';
+constexpr const char* k_terminal_monospace_font_resource =
+    ":/vnm_terminal_surface/fonts/vnm_framework_monospace.ttf";
+#endif
+
 } // namespace
 
 namespace term = vnm_terminal::internal;
@@ -86,6 +139,10 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 using vnm_terminal::test_helpers::check;
+
+#if VNM_TERMINAL_QSG_ATLAS_MSDF_DIAGNOSTIC_AVAILABLE
+namespace msdf = vnm::msdf_text;
+#endif
 
 #ifndef VNM_TERMINAL_QSG_ATLAS_SOURCE_PATH
 #define VNM_TERMINAL_QSG_ATLAS_SOURCE_PATH ""
@@ -370,6 +427,26 @@ struct Pixel_image_ink_stats
     bool has_ink() const { return ink_pixels > 0; }
 };
 
+struct Lcd_first_ink_column_sample
+{
+    int    y = 0;
+    QColor color;
+};
+
+struct Lcd_first_ink_column_stats
+{
+    QRect                                    bbox;
+    int                                      ink_pixels = 0;
+    int                                      first_ink_x = -1;
+    int                                      first_column_rows = 0;
+    int                                      distinct_first_column_rgb_colors = 0;
+    int                                      adjacent_equal_first_column_pairs = 0;
+    int                                      longest_equal_first_column_run = 0;
+    std::vector<Lcd_first_ink_column_sample> first_column;
+
+    bool has_ink() const { return ink_pixels > 0; }
+};
+
 struct Pixel_aa_budget
 {
     int    base_compared_pixels       = 0;
@@ -390,6 +467,159 @@ struct Pixel_glyph_mask
     QRectF rect;
     QColor background;
     bool   require_ink = true;
+    QColor foreground;
+};
+
+struct Lcd_horizontal_edge_transition_stats
+{
+    QRect  bbox;
+    int    sampled_rows             = 0;
+    int    rows_with_transitions    = 0;
+    int    transition_count         = 0;
+    int    max_transition_width     = 0;
+    double average_transition_width = 0.0;
+};
+
+struct Lcd_repeated_w_cell_stats
+{
+    QRect cell_pixels;
+    QRect ink_bbox;
+    int   ink_pixels = 0;
+    int   first_ink_x = -1;
+    int   relative_first_ink_x = 0;
+    int   relative_bbox_x = 0;
+    int   relative_bbox_y = 0;
+    int   relative_bbox_width = 0;
+    int   relative_bbox_height = 0;
+};
+
+struct Lcd_repeated_w_stability_stats
+{
+    int    cell_count = 0;
+    double physical_cell_width = 0.0;
+    double physical_cell_height = 0.0;
+    double physical_cell_ascent = 0.0;
+    double cell_width_integer_delta = 0.0;
+    double cell_height_integer_delta = 0.0;
+    double cell_ascent_integer_delta = 0.0;
+    bool   cell_width_integer = false;
+    bool   cell_height_integer = false;
+    bool   cell_ascent_integer = false;
+    int    compared_cells = 0;
+    int    compared_pixels = 0;
+    int    diff_pixels = 0;
+    int    max_delta = 0;
+    int    max_diff_pixels_per_cell = 0;
+    int    ink_mask_diff_pixels = 0;
+    int    max_ink_mask_diff_pixels_per_cell = 0;
+    bool   all_cells_have_ink = false;
+    int    max_ink_pixels_delta = 0;
+    int    max_relative_first_ink_x_delta = 0;
+    int    max_relative_bbox_x_delta = 0;
+    int    max_relative_bbox_y_delta = 0;
+    int    max_relative_bbox_width_delta = 0;
+    int    max_relative_bbox_height_delta = 0;
+    std::vector<Lcd_repeated_w_cell_stats> cells;
+};
+
+struct Lcd_ascii_panel_cell_spec
+{
+    QString label;
+    QString text;
+    int     row = 0;
+    int     column = 0;
+    int     display_width = 1;
+    bool    cursor_text = false;
+};
+
+struct Lcd_ascii_panel_cell_stats
+{
+    QString                              label;
+    QString                              text;
+    int                                  row = 0;
+    int                                  column = 0;
+    int                                  display_width = 1;
+    bool                                 cursor_text = false;
+    QRect                                cell_pixels;
+    QRect                                ink_bbox;
+    int                                  ink_pixels = 0;
+    int                                  first_ink_x = -1;
+    int                                  relative_first_ink_x = 0;
+    int                                  relative_bbox_x = 0;
+    int                                  relative_bbox_y = 0;
+    int                                  relative_bbox_width = 0;
+    int                                  relative_bbox_height = 0;
+    double                               relative_bbox_center_x = 0.0;
+    double                               relative_bbox_center_y = 0.0;
+    int                                  left_half_ink_pixels = 0;
+    int                                  right_half_ink_pixels = 0;
+    int                                  top_half_ink_pixels = 0;
+    int                                  bottom_half_ink_pixels = 0;
+    Lcd_horizontal_edge_transition_stats edge_transitions;
+
+    bool has_ink() const { return ink_pixels > 0; }
+};
+
+struct Lcd_ascii_panel_probe_stats
+{
+    int    expected_drawable_glyphs = 0;
+    int    probed_cell_count = 0;
+    double physical_cell_width = 0.0;
+    double physical_cell_height = 0.0;
+    double physical_cell_ascent = 0.0;
+    double cell_width_integer_delta = 0.0;
+    double cell_height_integer_delta = 0.0;
+    double cell_ascent_integer_delta = 0.0;
+    bool   cell_width_integer = false;
+    bool   cell_height_integer = false;
+    bool   cell_ascent_integer = false;
+    bool   all_probe_cells_have_ink = false;
+    int    min_ink_pixels = 0;
+    int    key_glyph_transition_count = 0;
+    int    max_key_glyph_transition_width = 0;
+    double max_key_glyph_average_transition_width = 0.0;
+    std::vector<Lcd_ascii_panel_cell_stats> cells;
+};
+
+struct Lcd_ascii_panel_placement_delta
+{
+    QString label;
+    bool    reference_has_ink = false;
+    bool    candidate_has_ink = false;
+    int     left_delta = 0;
+    int     right_delta = 0;
+    int     top_delta = 0;
+    int     bottom_delta = 0;
+    int     first_ink_x_delta = 0;
+    double  center_x_delta = 0.0;
+    double  center_y_delta = 0.0;
+    int     signed_top_delta = 0;
+    int     signed_bottom_delta = 0;
+    double  signed_center_y_delta = 0.0;
+};
+
+struct Lcd_ascii_panel_placement_stats
+{
+    int    expected_cells = 0;
+    int    compared_cells = 0;
+    bool   all_cells_have_ink = false;
+    int    max_left_delta = 0;
+    int    max_right_delta = 0;
+    int    max_top_delta = 0;
+    int    max_bottom_delta = 0;
+    int    max_first_ink_x_delta = 0;
+    double max_center_x_delta = 0.0;
+    double max_center_y_delta = 0.0;
+    int    min_signed_top_delta = 0;
+    int    max_signed_top_delta = 0;
+    int    signed_top_delta_range = 0;
+    int    min_signed_bottom_delta = 0;
+    int    max_signed_bottom_delta = 0;
+    int    signed_bottom_delta_range = 0;
+    double min_signed_center_y_delta = 0.0;
+    double max_signed_center_y_delta = 0.0;
+    double signed_center_y_delta_range = 0.0;
+    std::vector<Lcd_ascii_panel_placement_delta> cells;
 };
 
 struct Pixel_decorative_primitive
@@ -430,6 +660,23 @@ struct Pixel_render_result
     QString                             driver_device_type;
     bool                                software_renderer = false;
     bool                                ready = false;
+};
+
+struct Msdf_single_w_probe_result
+{
+    Pixel_render_result render;
+    bool                compiled    = false;
+    bool                atlas_built = false;
+    QString             message;
+    QString             font_source;
+    int                 font_data_bytes    = 0;
+    int                 pixel_height       = 0;
+    int                 atlas_size         = 0;
+    float               px_range           = 0.0f;
+    float               advance_x          = 0.0f;
+    float               baseline_offset_px = 0.0f;
+    QRectF              plane_rect;
+    QRectF              draw_rect;
 };
 
 void capture_window_driver_info(
@@ -1315,6 +1562,7 @@ void append_text_glyph_masks(
             run.rect,
             background,
             pixel_delta(run.foreground, background) > 8,
+            run.foreground,
         });
     }
 }
@@ -2068,6 +2316,1199 @@ Pixel_image_ink_stats measure_image_ink(
     stats.bbox = QRect(QPoint(left, top), QPoint(right, bottom));
     stats.center_x = x_sum / static_cast<double>(stats.ink_pixels);
     stats.center_y = y_sum / static_cast<double>(stats.ink_pixels);
+    return stats;
+}
+
+Lcd_first_ink_column_stats measure_lcd_first_ink_column(
+    const QImage&                         image,
+    const std::vector<Pixel_glyph_mask>&  glyph_masks,
+    qreal                                 device_pixel_ratio)
+{
+    constexpr int k_ink_delta_threshold = 8;
+
+    Lcd_first_ink_column_stats stats;
+    if (image.isNull() || glyph_masks.empty()) {
+        return stats;
+    }
+
+    struct Pixel_region
+    {
+        QRect  rect;
+        QColor background;
+    };
+
+    std::vector<Pixel_region> regions;
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    for (const Pixel_glyph_mask& mask : glyph_masks) {
+        const QRect region = logical_rect_to_pixels(mask.rect, dpr)
+            .intersected(image.rect());
+        if (!region.isEmpty()) {
+            regions.push_back({region, mask.background});
+        }
+    }
+    if (regions.empty()) {
+        return stats;
+    }
+
+    auto is_ink = [&](int x, int y) {
+        for (const Pixel_region& region : regions) {
+            if (region.rect.contains(x, y) &&
+                pixel_delta(image.pixelColor(x, y), region.background) >
+                    k_ink_delta_threshold)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    int left   = std::numeric_limits<int>::max();
+    int top    = std::numeric_limits<int>::max();
+    int right  = std::numeric_limits<int>::min();
+    int bottom = std::numeric_limits<int>::min();
+    for (const Pixel_region& region : regions) {
+        for (int y = region.rect.top(); y <= region.rect.bottom(); ++y) {
+            for (int x = region.rect.left(); x <= region.rect.right(); ++x) {
+                if (!is_ink(x, y)) {
+                    continue;
+                }
+
+                left   = std::min(left, x);
+                top    = std::min(top, y);
+                right  = std::max(right, x);
+                bottom = std::max(bottom, y);
+                ++stats.ink_pixels;
+            }
+        }
+    }
+    if (stats.ink_pixels <= 0) {
+        return stats;
+    }
+
+    stats.bbox = QRect(QPoint(left, top), QPoint(right, bottom));
+    stats.first_ink_x = left;
+
+    std::set<QRgb> distinct_first_column_rgb_colors;
+    QRgb previous_rgb = 0U;
+    bool previous_was_ink = false;
+    int current_equal_run = 0;
+    for (int y = top; y <= bottom; ++y) {
+        if (!is_ink(left, y)) {
+            current_equal_run = 0;
+            previous_was_ink = false;
+            continue;
+        }
+
+        const QColor color = image.pixelColor(left, y);
+        const QRgb rgb = qRgb(color.red(), color.green(), color.blue());
+        distinct_first_column_rgb_colors.insert(rgb);
+        stats.first_column.push_back({y, color});
+        ++stats.first_column_rows;
+
+        if (!previous_was_ink || rgb != previous_rgb) {
+            current_equal_run = 1;
+        }
+        else {
+            ++stats.adjacent_equal_first_column_pairs;
+            ++current_equal_run;
+        }
+        stats.longest_equal_first_column_run = std::max(
+            stats.longest_equal_first_column_run,
+            current_equal_run);
+        previous_rgb = rgb;
+        previous_was_ink = true;
+    }
+
+    stats.distinct_first_column_rgb_colors =
+        static_cast<int>(distinct_first_column_rgb_colors.size());
+    return stats;
+}
+
+Lcd_first_ink_column_stats measure_lcd_first_ink_column_pixels(
+    const QImage& image,
+    QRect         region,
+    QColor        background)
+{
+    constexpr int k_ink_delta_threshold = 8;
+
+    Lcd_first_ink_column_stats stats;
+    region = region.intersected(image.rect());
+    if (image.isNull() || region.isEmpty()) {
+        return stats;
+    }
+
+    auto is_ink = [&](int x, int y) {
+        return pixel_delta(image.pixelColor(x, y), background) >
+            k_ink_delta_threshold;
+    };
+
+    int left   = std::numeric_limits<int>::max();
+    int top    = std::numeric_limits<int>::max();
+    int right  = std::numeric_limits<int>::min();
+    int bottom = std::numeric_limits<int>::min();
+    for (int y = region.top(); y <= region.bottom(); ++y) {
+        for (int x = region.left(); x <= region.right(); ++x) {
+            if (!is_ink(x, y)) {
+                continue;
+            }
+
+            left   = std::min(left, x);
+            top    = std::min(top, y);
+            right  = std::max(right, x);
+            bottom = std::max(bottom, y);
+            ++stats.ink_pixels;
+        }
+    }
+    if (stats.ink_pixels <= 0) {
+        return stats;
+    }
+
+    stats.bbox = QRect(QPoint(left, top), QPoint(right, bottom));
+    stats.first_ink_x = left;
+
+    std::set<QRgb> distinct_first_column_rgb_colors;
+    QRgb previous_rgb = 0U;
+    bool previous_was_ink = false;
+    int current_equal_run = 0;
+    for (int y = top; y <= bottom; ++y) {
+        if (!is_ink(left, y)) {
+            current_equal_run = 0;
+            previous_was_ink = false;
+            continue;
+        }
+
+        const QColor color = image.pixelColor(left, y);
+        const QRgb rgb = qRgb(color.red(), color.green(), color.blue());
+        distinct_first_column_rgb_colors.insert(rgb);
+        stats.first_column.push_back({y, color});
+        ++stats.first_column_rows;
+
+        if (!previous_was_ink || rgb != previous_rgb) {
+            current_equal_run = 1;
+        }
+        else {
+            ++stats.adjacent_equal_first_column_pairs;
+            ++current_equal_run;
+        }
+        stats.longest_equal_first_column_run = std::max(
+            stats.longest_equal_first_column_run,
+            current_equal_run);
+        previous_rgb = rgb;
+        previous_was_ink = true;
+    }
+
+    stats.distinct_first_column_rgb_colors =
+        static_cast<int>(distinct_first_column_rgb_colors.size());
+    return stats;
+}
+
+int lcd_edge_low_delta_threshold(const Pixel_glyph_mask& mask)
+{
+    const int foreground_delta = mask.foreground.isValid()
+        ? pixel_delta(mask.foreground, mask.background)
+        : 0;
+    if (foreground_delta <= 0) {
+        return 8;
+    }
+    return std::max(8, static_cast<int>(std::lround(
+        static_cast<double>(foreground_delta) * 0.08)));
+}
+
+int lcd_edge_strong_delta_threshold(const Pixel_glyph_mask& mask)
+{
+    const int foreground_delta = mask.foreground.isValid()
+        ? pixel_delta(mask.foreground, mask.background)
+        : 0;
+    if (foreground_delta <= 0) {
+        return 96;
+    }
+    const int low_threshold = lcd_edge_low_delta_threshold(mask);
+    return std::max(low_threshold + 1, static_cast<int>(std::lround(
+        static_cast<double>(foreground_delta) * 0.65)));
+}
+
+Lcd_horizontal_edge_transition_stats measure_lcd_horizontal_edge_transitions(
+    const QImage&                         image,
+    const std::vector<Pixel_glyph_mask>&  glyph_masks,
+    qreal                                 device_pixel_ratio,
+    const Lcd_first_ink_column_stats&     ink_stats)
+{
+    Lcd_horizontal_edge_transition_stats stats;
+    if (image.isNull() || glyph_masks.empty() || !ink_stats.has_ink()) {
+        return stats;
+    }
+
+    stats.bbox = ink_stats.bbox.intersected(image.rect());
+    if (stats.bbox.isEmpty()) {
+        return stats;
+    }
+
+    struct Pixel_region
+    {
+        QRect  rect;
+        QColor background;
+        int    low_delta = 0;
+        int    strong_delta = 0;
+    };
+
+    std::vector<Pixel_region> regions;
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    for (const Pixel_glyph_mask& mask : glyph_masks) {
+        if (!mask.require_ink) {
+            continue;
+        }
+        const QRect region = logical_rect_to_pixels(mask.rect, dpr)
+            .intersected(stats.bbox)
+            .intersected(image.rect());
+        if (!region.isEmpty()) {
+            regions.push_back({
+                region,
+                mask.background,
+                lcd_edge_low_delta_threshold(mask),
+                lcd_edge_strong_delta_threshold(mask),
+            });
+        }
+    }
+    if (regions.empty()) {
+        return stats;
+    }
+
+    int transition_width_sum = 0;
+    auto record_transition_width = [&](int width) {
+        const int clamped_width = std::max(0, width);
+        stats.max_transition_width =
+            std::max(stats.max_transition_width, clamped_width);
+        transition_width_sum += clamped_width;
+        ++stats.transition_count;
+    };
+
+    for (const Pixel_region& region : regions) {
+        for (int y = region.rect.top(); y <= region.rect.bottom(); ++y) {
+            bool row_has_ink = false;
+            bool row_has_transition = false;
+            int x = region.rect.left();
+            while (x <= region.rect.right()) {
+                const int delta = pixel_delta(
+                    image.pixelColor(x, y),
+                    region.background);
+                if (delta <= region.low_delta) {
+                    ++x;
+                    continue;
+                }
+
+                row_has_ink = true;
+                const int run_left = x;
+                int run_right = x;
+                int first_solid = -1;
+                int last_solid = -1;
+                while (x <= region.rect.right()) {
+                    const int run_delta = pixel_delta(
+                        image.pixelColor(x, y),
+                        region.background);
+                    if (run_delta <= region.low_delta) {
+                        break;
+                    }
+                    run_right = x;
+                    if (run_delta >= region.strong_delta) {
+                        if (first_solid < 0) {
+                            first_solid = x;
+                        }
+                        last_solid = x;
+                    }
+                    ++x;
+                }
+
+                if (first_solid >= 0 && last_solid >= first_solid) {
+                    record_transition_width(first_solid - run_left);
+                    record_transition_width(run_right - last_solid);
+                    row_has_transition = true;
+                }
+            }
+
+            if (row_has_ink) {
+                ++stats.sampled_rows;
+            }
+            if (row_has_transition) {
+                ++stats.rows_with_transitions;
+            }
+        }
+    }
+
+    if (stats.transition_count > 0) {
+        stats.average_transition_width =
+            static_cast<double>(transition_width_sum) /
+            static_cast<double>(stats.transition_count);
+    }
+    return stats;
+}
+
+Lcd_horizontal_edge_transition_stats
+measure_lcd_horizontal_edge_transitions_pixels(
+    const QImage&                      image,
+    QRect                              region,
+    QColor                             background,
+    QColor                             foreground,
+    const Lcd_first_ink_column_stats&  ink_stats)
+{
+    Lcd_horizontal_edge_transition_stats stats;
+    if (image.isNull() || !ink_stats.has_ink()) {
+        return stats;
+    }
+
+    stats.bbox = ink_stats.bbox
+        .intersected(region)
+        .intersected(image.rect());
+    if (stats.bbox.isEmpty()) {
+        return stats;
+    }
+
+    const Pixel_glyph_mask mask = {
+        QRectF(),
+        background,
+        true,
+        foreground,
+    };
+    const int low_delta = lcd_edge_low_delta_threshold(mask);
+    const int strong_delta = lcd_edge_strong_delta_threshold(mask);
+
+    int transition_width_sum = 0;
+    auto record_transition_width = [&](int width) {
+        const int clamped_width = std::max(0, width);
+        stats.max_transition_width =
+            std::max(stats.max_transition_width, clamped_width);
+        transition_width_sum += clamped_width;
+        ++stats.transition_count;
+    };
+
+    for (int y = stats.bbox.top(); y <= stats.bbox.bottom(); ++y) {
+        int first_ink = -1;
+        int last_ink = -1;
+        int first_solid = -1;
+        int last_solid = -1;
+        for (int x = stats.bbox.left(); x <= stats.bbox.right(); ++x) {
+            const int delta = pixel_delta(image.pixelColor(x, y), background);
+            if (delta <= low_delta) {
+                continue;
+            }
+
+            if (first_ink < 0) {
+                first_ink = x;
+            }
+            last_ink = x;
+            if (delta >= strong_delta) {
+                if (first_solid < 0) {
+                    first_solid = x;
+                }
+                last_solid = x;
+            }
+        }
+
+        if (first_ink >= 0) {
+            ++stats.sampled_rows;
+        }
+        if (first_solid >= 0 && last_solid >= first_solid) {
+            record_transition_width(first_solid - first_ink);
+            record_transition_width(last_ink - last_solid);
+            ++stats.rows_with_transitions;
+        }
+    }
+
+    if (stats.transition_count > 0) {
+        stats.average_transition_width =
+            static_cast<double>(transition_width_sum) /
+            static_cast<double>(stats.transition_count);
+    }
+    return stats;
+}
+
+bool lcd_rect_components_within(QRect actual, QRect expected, int tolerance)
+{
+    return
+        std::abs(actual.x()      - expected.x())      <= tolerance &&
+        std::abs(actual.y()      - expected.y())      <= tolerance &&
+        std::abs(actual.width()  - expected.width())  <= tolerance &&
+        std::abs(actual.height() - expected.height()) <= tolerance;
+}
+
+double lcd_ink_pixel_ratio(int actual_ink_pixels, int expected_ink_pixels)
+{
+    if (expected_ink_pixels <= 0) {
+        return 0.0;
+    }
+    return static_cast<double>(actual_ink_pixels) /
+        static_cast<double>(expected_ink_pixels);
+}
+
+double lcd_nearest_integer_delta(double value)
+{
+    if (!std::isfinite(value)) {
+        return std::numeric_limits<double>::infinity();
+    }
+    return std::abs(value - std::round(value));
+}
+
+bool lcd_is_near_integer(double value, double epsilon)
+{
+    return lcd_nearest_integer_delta(value) <= epsilon;
+}
+
+QString lcd_ascii_panel_representative_text()
+{
+    return QStringLiteral("WMeaom#@|1.LFPgjp");
+}
+
+QString lcd_ascii_panel_dense_text()
+{
+    return QStringLiteral("AaMmWwEeOo#@|1.[]{}+-=*/");
+}
+
+QString lcd_ascii_panel_cursor_text()
+{
+    return QStringLiteral("C");
+}
+
+QString lcd_ascii_panel_user_text()
+{
+    return QStringLiteral("build_msdf");
+}
+
+QString lcd_ascii_panel_user_text_cell_label(int index, QChar character)
+{
+    return QStringLiteral("user_%1_%2")
+        .arg(index, 2, 10, QLatin1Char('0'))
+        .arg(character);
+}
+
+int lcd_ascii_panel_drawable_glyph_count(const QString& text)
+{
+    int count = 0;
+    for (const QChar character : text) {
+        const ushort unicode = character.unicode();
+        if (unicode >= 0x21U && unicode <= 0x7eU) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int lcd_ascii_panel_expected_drawable_glyphs(
+    const Pixel_parity_fixture& fixture)
+{
+    const term::Terminal_render_frame frame = pixel_expected_frame(fixture);
+    int count = 0;
+    for (const term::Terminal_render_text_run& run : frame.text_runs) {
+        count += lcd_ascii_panel_drawable_glyph_count(run.text);
+    }
+    for (const term::Terminal_render_text_run& run : frame.cursor_text_runs) {
+        count += lcd_ascii_panel_drawable_glyph_count(run.text);
+    }
+    return count;
+}
+
+std::vector<Lcd_ascii_panel_cell_spec> lcd_ascii_panel_probe_cell_specs()
+{
+    const QString representative = lcd_ascii_panel_representative_text();
+    std::vector<Lcd_ascii_panel_cell_spec> specs;
+    specs.reserve(static_cast<std::size_t>(representative.size() + 1));
+
+    for (int index = 0; index < representative.size(); ++index) {
+        const QString text(representative.at(index));
+        specs.push_back({
+            text,
+            text,
+            k_lcd_ascii_panel_representative_row,
+            k_lcd_ascii_panel_representative_column +
+                index * k_lcd_ascii_panel_representative_column_stride,
+            1,
+            false,
+        });
+    }
+
+    specs.push_back({
+        QStringLiteral("cursor_text"),
+        lcd_ascii_panel_cursor_text(),
+        k_lcd_ascii_panel_cursor_row,
+        k_lcd_ascii_panel_cursor_column,
+        1,
+        true,
+    });
+
+    const QString user_text = lcd_ascii_panel_user_text();
+    for (int index = 0; index < user_text.size(); ++index) {
+        const QChar character = user_text.at(index);
+        specs.push_back({
+            lcd_ascii_panel_user_text_cell_label(index, character),
+            QString(character),
+            k_lcd_ascii_panel_user_text_row,
+            k_lcd_ascii_panel_user_text_column + index,
+            1,
+            false,
+        });
+    }
+    return specs;
+}
+
+QRect lcd_physical_cell_rect(
+    const Pixel_parity_fixture& fixture,
+    int                         row,
+    int                         column,
+    int                         display_width,
+    QPointF                     logical_origin = QPointF())
+{
+    const qreal dpr = pixel_normalized_device_pixel_ratio(
+        fixture.device_pixel_ratio);
+    const double physical_cell_width =
+        static_cast<double>(fixture.cell_metrics.width * dpr);
+    const double physical_cell_height =
+        static_cast<double>(fixture.cell_metrics.height * dpr);
+    const QPoint physical_origin(
+        static_cast<int>(std::lround(logical_origin.x() * dpr)),
+        static_cast<int>(std::lround(logical_origin.y() * dpr)));
+    return QRect(
+        QPoint(
+            physical_origin.x() +
+                static_cast<int>(std::lround(
+                    static_cast<double>(column) * physical_cell_width)),
+            physical_origin.y() +
+                static_cast<int>(std::lround(
+                    static_cast<double>(row) * physical_cell_height))),
+        QSize(
+            static_cast<int>(std::lround(
+                static_cast<double>(display_width) * physical_cell_width)),
+            static_cast<int>(std::lround(physical_cell_height))));
+}
+
+Lcd_ascii_panel_probe_stats measure_lcd_ascii_panel_probe(
+    const Pixel_parity_fixture& fixture,
+    const QImage&               image)
+{
+    constexpr double k_integer_metric_epsilon = 0.001;
+
+    Lcd_ascii_panel_probe_stats stats;
+    stats.expected_drawable_glyphs =
+        lcd_ascii_panel_expected_drawable_glyphs(fixture);
+    const qreal dpr = pixel_normalized_device_pixel_ratio(
+        fixture.device_pixel_ratio);
+    stats.physical_cell_width =
+        static_cast<double>(fixture.cell_metrics.width * dpr);
+    stats.physical_cell_height =
+        static_cast<double>(fixture.cell_metrics.height * dpr);
+    stats.physical_cell_ascent =
+        static_cast<double>(fixture.cell_metrics.ascent * dpr);
+    stats.cell_width_integer_delta =
+        lcd_nearest_integer_delta(stats.physical_cell_width);
+    stats.cell_height_integer_delta =
+        lcd_nearest_integer_delta(stats.physical_cell_height);
+    stats.cell_ascent_integer_delta =
+        lcd_nearest_integer_delta(stats.physical_cell_ascent);
+    stats.cell_width_integer =
+        lcd_is_near_integer(stats.physical_cell_width, k_integer_metric_epsilon);
+    stats.cell_height_integer =
+        lcd_is_near_integer(stats.physical_cell_height, k_integer_metric_epsilon);
+    stats.cell_ascent_integer =
+        lcd_is_near_integer(stats.physical_cell_ascent, k_integer_metric_epsilon);
+
+    const std::vector<Lcd_ascii_panel_cell_spec> specs =
+        lcd_ascii_panel_probe_cell_specs();
+    stats.probed_cell_count = static_cast<int>(specs.size());
+    stats.cells.reserve(specs.size());
+    if (image.isNull()) {
+        return stats;
+    }
+
+    const QColor normal_background =
+        QColor::fromRgba(k_lcd_w_probe_background_rgba);
+    const QColor normal_foreground =
+        QColor::fromRgba(k_lcd_w_probe_foreground_rgba);
+    const QColor cursor_background = pixel_render_options().cursor_color;
+    const QColor cursor_foreground =
+        QColor::fromRgba(k_lcd_w_probe_background_rgba);
+    bool all_cells_have_ink = true;
+    int min_ink_pixels = std::numeric_limits<int>::max();
+    for (const Lcd_ascii_panel_cell_spec& spec : specs) {
+        const QColor background =
+            spec.cursor_text ? cursor_background : normal_background;
+        const QColor foreground =
+            spec.cursor_text ? cursor_foreground : normal_foreground;
+        const QRect cell_pixels = lcd_physical_cell_rect(
+            fixture,
+            spec.row,
+            spec.column,
+            spec.display_width)
+            .intersected(image.rect());
+        const Lcd_first_ink_column_stats ink =
+            measure_lcd_first_ink_column_pixels(
+                image,
+                cell_pixels,
+                background);
+
+        Lcd_ascii_panel_cell_stats cell;
+        cell.label = spec.label;
+        cell.text = spec.text;
+        cell.row = spec.row;
+        cell.column = spec.column;
+        cell.display_width = spec.display_width;
+        cell.cursor_text = spec.cursor_text;
+        cell.cell_pixels = cell_pixels;
+        cell.ink_bbox = ink.bbox;
+        cell.ink_pixels = ink.ink_pixels;
+        cell.first_ink_x = ink.first_ink_x;
+        if (ink.has_ink()) {
+            cell.relative_first_ink_x = ink.first_ink_x - cell_pixels.left();
+            cell.relative_bbox_x = ink.bbox.x() - cell_pixels.left();
+            cell.relative_bbox_y = ink.bbox.y() - cell_pixels.top();
+            cell.relative_bbox_width = ink.bbox.width();
+            cell.relative_bbox_height = ink.bbox.height();
+            cell.relative_bbox_center_x =
+                static_cast<double>(
+                    ink.bbox.left() + ink.bbox.right()) * 0.5 -
+                static_cast<double>(cell_pixels.left());
+            cell.relative_bbox_center_y =
+                static_cast<double>(
+                    ink.bbox.top() + ink.bbox.bottom()) * 0.5 -
+                static_cast<double>(cell_pixels.top());
+            min_ink_pixels = std::min(min_ink_pixels, ink.ink_pixels);
+        }
+        else {
+            all_cells_have_ink = false;
+        }
+        const int half_x = cell_pixels.left() + cell_pixels.width() / 2;
+        const int half_y = cell_pixels.top() + cell_pixels.height() / 2;
+        for (int y = cell_pixels.top(); y <= cell_pixels.bottom(); ++y) {
+            for (int x = cell_pixels.left(); x <= cell_pixels.right(); ++x) {
+                if (pixel_delta(image.pixelColor(x, y), background) <= 8) {
+                    continue;
+                }
+                if (x < half_x) {
+                    ++cell.left_half_ink_pixels;
+                }
+                else {
+                    ++cell.right_half_ink_pixels;
+                }
+                if (y < half_y) {
+                    ++cell.top_half_ink_pixels;
+                }
+                else {
+                    ++cell.bottom_half_ink_pixels;
+                }
+            }
+        }
+        cell.edge_transitions =
+            measure_lcd_horizontal_edge_transitions_pixels(
+                image,
+                cell_pixels,
+                background,
+                foreground,
+                ink);
+        if (cell.label == QStringLiteral("M") ||
+            cell.label == QStringLiteral("e"))
+        {
+            stats.key_glyph_transition_count +=
+                cell.edge_transitions.transition_count;
+            stats.max_key_glyph_transition_width = std::max(
+                stats.max_key_glyph_transition_width,
+                cell.edge_transitions.max_transition_width);
+            stats.max_key_glyph_average_transition_width = std::max(
+                stats.max_key_glyph_average_transition_width,
+                cell.edge_transitions.average_transition_width);
+        }
+        stats.cells.push_back(cell);
+    }
+
+    stats.all_probe_cells_have_ink =
+        all_cells_have_ink &&
+        static_cast<int>(stats.cells.size()) == stats.probed_cell_count;
+    stats.min_ink_pixels =
+        min_ink_pixels == std::numeric_limits<int>::max()
+            ? 0
+            : min_ink_pixels;
+    return stats;
+}
+
+const Lcd_ascii_panel_cell_stats* lcd_ascii_panel_cell(
+    const Lcd_ascii_panel_probe_stats& stats,
+    const QString&                     label)
+{
+    const auto it = std::find_if(
+        stats.cells.begin(),
+        stats.cells.end(),
+        [&](const Lcd_ascii_panel_cell_stats& cell) {
+            return cell.label == label;
+    });
+    return it == stats.cells.end() ? nullptr : &*it;
+}
+
+std::vector<QString> lcd_ascii_panel_placement_probe_labels()
+{
+    const std::vector<Lcd_ascii_panel_cell_spec> specs =
+        lcd_ascii_panel_probe_cell_specs();
+    std::vector<QString> labels;
+    labels.reserve(specs.size());
+    for (const Lcd_ascii_panel_cell_spec& spec : specs) {
+        if (!spec.cursor_text) {
+            labels.push_back(spec.label);
+        }
+    }
+    return labels;
+}
+
+std::vector<QString> lcd_ascii_panel_user_text_placement_probe_labels()
+{
+    const QString user_text = lcd_ascii_panel_user_text();
+    std::vector<QString> labels;
+    labels.reserve(static_cast<std::size_t>(user_text.size()));
+    for (int index = 0; index < user_text.size(); ++index) {
+        labels.push_back(
+            lcd_ascii_panel_user_text_cell_label(
+                index,
+                user_text.at(index)));
+    }
+    return labels;
+}
+
+Lcd_ascii_panel_placement_stats compare_lcd_ascii_panel_cell_placement(
+    const Lcd_ascii_panel_probe_stats& reference,
+    const Lcd_ascii_panel_probe_stats& candidate,
+    const std::vector<QString>&        labels)
+{
+    Lcd_ascii_panel_placement_stats stats;
+    stats.expected_cells = static_cast<int>(labels.size());
+    stats.cells.reserve(labels.size());
+    bool all_cells_have_ink = true;
+    bool has_signed_delta = false;
+    for (const QString& label : labels) {
+        const Lcd_ascii_panel_cell_stats* const reference_cell =
+            lcd_ascii_panel_cell(reference, label);
+        const Lcd_ascii_panel_cell_stats* const candidate_cell =
+            lcd_ascii_panel_cell(candidate, label);
+        if (reference_cell == nullptr || candidate_cell == nullptr) {
+            all_cells_have_ink = false;
+            continue;
+        }
+
+        Lcd_ascii_panel_placement_delta delta;
+        delta.label = label;
+        delta.reference_has_ink = reference_cell->has_ink();
+        delta.candidate_has_ink = candidate_cell->has_ink();
+        if (!delta.reference_has_ink || !delta.candidate_has_ink) {
+            all_cells_have_ink = false;
+            stats.cells.push_back(delta);
+            continue;
+        }
+
+        delta.left_delta = std::abs(
+            candidate_cell->relative_bbox_x -
+            reference_cell->relative_bbox_x);
+        delta.right_delta = std::abs(
+            candidate_cell->relative_bbox_x +
+                candidate_cell->relative_bbox_width -
+            reference_cell->relative_bbox_x -
+                reference_cell->relative_bbox_width);
+        delta.top_delta = std::abs(
+            candidate_cell->relative_bbox_y -
+            reference_cell->relative_bbox_y);
+        delta.bottom_delta = std::abs(
+            candidate_cell->relative_bbox_y +
+                candidate_cell->relative_bbox_height -
+            reference_cell->relative_bbox_y -
+                reference_cell->relative_bbox_height);
+        delta.first_ink_x_delta = std::abs(
+            candidate_cell->relative_first_ink_x -
+            reference_cell->relative_first_ink_x);
+        delta.center_x_delta = std::abs(
+            candidate_cell->relative_bbox_center_x -
+            reference_cell->relative_bbox_center_x);
+        delta.center_y_delta = std::abs(
+            candidate_cell->relative_bbox_center_y -
+            reference_cell->relative_bbox_center_y);
+        delta.signed_top_delta =
+            candidate_cell->relative_bbox_y -
+            reference_cell->relative_bbox_y;
+        delta.signed_bottom_delta =
+            candidate_cell->relative_bbox_y +
+                candidate_cell->relative_bbox_height -
+            reference_cell->relative_bbox_y -
+                reference_cell->relative_bbox_height;
+        delta.signed_center_y_delta =
+            candidate_cell->relative_bbox_center_y -
+            reference_cell->relative_bbox_center_y;
+
+        stats.max_left_delta = std::max(
+            stats.max_left_delta,
+            delta.left_delta);
+        stats.max_right_delta = std::max(
+            stats.max_right_delta,
+            delta.right_delta);
+        stats.max_top_delta = std::max(
+            stats.max_top_delta,
+            delta.top_delta);
+        stats.max_bottom_delta = std::max(
+            stats.max_bottom_delta,
+            delta.bottom_delta);
+        stats.max_first_ink_x_delta = std::max(
+            stats.max_first_ink_x_delta,
+            delta.first_ink_x_delta);
+        stats.max_center_x_delta = std::max(
+            stats.max_center_x_delta,
+            delta.center_x_delta);
+        stats.max_center_y_delta = std::max(
+            stats.max_center_y_delta,
+            delta.center_y_delta);
+        if (!has_signed_delta) {
+            stats.min_signed_top_delta = delta.signed_top_delta;
+            stats.max_signed_top_delta = delta.signed_top_delta;
+            stats.min_signed_bottom_delta = delta.signed_bottom_delta;
+            stats.max_signed_bottom_delta = delta.signed_bottom_delta;
+            stats.min_signed_center_y_delta = delta.signed_center_y_delta;
+            stats.max_signed_center_y_delta = delta.signed_center_y_delta;
+            has_signed_delta = true;
+        }
+        else {
+            stats.min_signed_top_delta = std::min(
+                stats.min_signed_top_delta,
+                delta.signed_top_delta);
+            stats.max_signed_top_delta = std::max(
+                stats.max_signed_top_delta,
+                delta.signed_top_delta);
+            stats.min_signed_bottom_delta = std::min(
+                stats.min_signed_bottom_delta,
+                delta.signed_bottom_delta);
+            stats.max_signed_bottom_delta = std::max(
+                stats.max_signed_bottom_delta,
+                delta.signed_bottom_delta);
+            stats.min_signed_center_y_delta = std::min(
+                stats.min_signed_center_y_delta,
+                delta.signed_center_y_delta);
+            stats.max_signed_center_y_delta = std::max(
+                stats.max_signed_center_y_delta,
+                delta.signed_center_y_delta);
+        }
+        ++stats.compared_cells;
+        stats.cells.push_back(delta);
+    }
+
+    stats.signed_top_delta_range =
+        stats.max_signed_top_delta - stats.min_signed_top_delta;
+    stats.signed_bottom_delta_range =
+        stats.max_signed_bottom_delta - stats.min_signed_bottom_delta;
+    stats.signed_center_y_delta_range =
+        stats.max_signed_center_y_delta - stats.min_signed_center_y_delta;
+    stats.all_cells_have_ink =
+        all_cells_have_ink &&
+        stats.compared_cells == stats.expected_cells;
+    return stats;
+}
+
+QColor lcd_repeated_w_background(const Pixel_parity_fixture& fixture)
+{
+    if (!fixture.glyph_masks.empty()) {
+        return fixture.glyph_masks.front().background;
+    }
+    return QColor::fromRgba(k_lcd_w_probe_background_rgba);
+}
+
+Lcd_repeated_w_stability_stats measure_lcd_repeated_w_stability(
+    const Pixel_parity_fixture& fixture,
+    const QImage&               image,
+    int                         row,
+    int                         first_column,
+    int                         column_stride,
+    int                         cell_count,
+    QPointF                     logical_origin = QPointF())
+{
+    constexpr double k_integer_metric_epsilon = 0.001;
+
+    Lcd_repeated_w_stability_stats stats;
+    stats.cell_count = cell_count;
+    const qreal dpr = pixel_normalized_device_pixel_ratio(
+        fixture.device_pixel_ratio);
+    stats.physical_cell_width =
+        static_cast<double>(fixture.cell_metrics.width * dpr);
+    stats.physical_cell_height =
+        static_cast<double>(fixture.cell_metrics.height * dpr);
+    stats.physical_cell_ascent =
+        static_cast<double>(fixture.cell_metrics.ascent * dpr);
+    stats.cell_width_integer_delta =
+        lcd_nearest_integer_delta(stats.physical_cell_width);
+    stats.cell_height_integer_delta =
+        lcd_nearest_integer_delta(stats.physical_cell_height);
+    stats.cell_ascent_integer_delta =
+        lcd_nearest_integer_delta(stats.physical_cell_ascent);
+    stats.cell_width_integer =
+        lcd_is_near_integer(stats.physical_cell_width, k_integer_metric_epsilon);
+    stats.cell_height_integer =
+        lcd_is_near_integer(stats.physical_cell_height, k_integer_metric_epsilon);
+    stats.cell_ascent_integer =
+        lcd_is_near_integer(stats.physical_cell_ascent, k_integer_metric_epsilon);
+
+    if (image.isNull() || cell_count <= 0) {
+        return stats;
+    }
+
+    const QColor background = lcd_repeated_w_background(fixture);
+    stats.cells.reserve(static_cast<std::size_t>(cell_count));
+    const int cell_width_pixels = static_cast<int>(
+        std::lround(stats.physical_cell_width));
+    const int cell_height_pixels = static_cast<int>(
+        std::lround(stats.physical_cell_height));
+    const QPoint physical_origin(
+        static_cast<int>(std::lround(logical_origin.x() * dpr)),
+        static_cast<int>(std::lround(logical_origin.y() * dpr)));
+    bool all_cells_have_ink = true;
+    for (int cell_index = 0; cell_index < cell_count; ++cell_index) {
+        const int column = first_column + cell_index * column_stride;
+        const QRect cell_pixels = QRect(
+            QPoint(
+                physical_origin.x() +
+                static_cast<int>(std::lround(
+                    static_cast<double>(column) *
+                    stats.physical_cell_width)),
+                physical_origin.y() +
+                static_cast<int>(std::lround(
+                    static_cast<double>(row) *
+                    stats.physical_cell_height))),
+            QSize(cell_width_pixels, cell_height_pixels))
+            .intersected(image.rect());
+        const Lcd_first_ink_column_stats ink =
+            measure_lcd_first_ink_column_pixels(
+                image,
+                cell_pixels,
+                background);
+
+        Lcd_repeated_w_cell_stats cell;
+        cell.cell_pixels = cell_pixels;
+        cell.ink_bbox = ink.bbox;
+        cell.ink_pixels = ink.ink_pixels;
+        cell.first_ink_x = ink.first_ink_x;
+        if (ink.has_ink()) {
+            cell.relative_first_ink_x = ink.first_ink_x - cell_pixels.left();
+            cell.relative_bbox_x = ink.bbox.x() - cell_pixels.left();
+            cell.relative_bbox_y = ink.bbox.y() - cell_pixels.top();
+            cell.relative_bbox_width = ink.bbox.width();
+            cell.relative_bbox_height = ink.bbox.height();
+        }
+        else {
+            all_cells_have_ink = false;
+        }
+        stats.cells.push_back(cell);
+    }
+    stats.all_cells_have_ink =
+        all_cells_have_ink &&
+        static_cast<int>(stats.cells.size()) == cell_count;
+
+    if (stats.cells.empty()) {
+        return stats;
+    }
+
+    const Lcd_repeated_w_cell_stats& reference_cell = stats.cells.front();
+    for (std::size_t cell_index = 1; cell_index < stats.cells.size(); ++cell_index) {
+        const Lcd_repeated_w_cell_stats& cell = stats.cells[cell_index];
+        const int width = std::min(
+            reference_cell.cell_pixels.width(),
+            cell.cell_pixels.width());
+        const int height = std::min(
+            reference_cell.cell_pixels.height(),
+            cell.cell_pixels.height());
+        if (width <= 0 || height <= 0) {
+            continue;
+        }
+
+        int cell_diff_pixels = 0;
+        int cell_ink_mask_diff_pixels = 0;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                ++stats.compared_pixels;
+                const QColor reference_pixel = image.pixelColor(
+                    reference_cell.cell_pixels.left() + x,
+                    reference_cell.cell_pixels.top() + y);
+                const QColor cell_pixel = image.pixelColor(
+                    cell.cell_pixels.left() + x,
+                    cell.cell_pixels.top() + y);
+                const int delta = pixel_delta(
+                    reference_pixel,
+                    cell_pixel);
+                stats.max_delta = std::max(stats.max_delta, delta);
+                if (delta > 0) {
+                    ++stats.diff_pixels;
+                    ++cell_diff_pixels;
+                }
+                const bool reference_ink =
+                    pixel_delta(reference_pixel, background) > 8;
+                const bool cell_ink =
+                    pixel_delta(cell_pixel, background) > 8;
+                if (reference_ink != cell_ink) {
+                    ++stats.ink_mask_diff_pixels;
+                    ++cell_ink_mask_diff_pixels;
+                }
+            }
+        }
+        stats.max_diff_pixels_per_cell =
+            std::max(stats.max_diff_pixels_per_cell, cell_diff_pixels);
+        stats.max_ink_mask_diff_pixels_per_cell = std::max(
+            stats.max_ink_mask_diff_pixels_per_cell,
+            cell_ink_mask_diff_pixels);
+        ++stats.compared_cells;
+    }
+
+    if (stats.all_cells_have_ink) {
+        for (std::size_t cell_index = 1; cell_index < stats.cells.size(); ++cell_index) {
+            const Lcd_repeated_w_cell_stats& cell = stats.cells[cell_index];
+            stats.max_ink_pixels_delta = std::max(
+                stats.max_ink_pixels_delta,
+                std::abs(cell.ink_pixels - reference_cell.ink_pixels));
+            stats.max_relative_first_ink_x_delta = std::max(
+                stats.max_relative_first_ink_x_delta,
+                std::abs(
+                    cell.relative_first_ink_x -
+                    reference_cell.relative_first_ink_x));
+            stats.max_relative_bbox_x_delta = std::max(
+                stats.max_relative_bbox_x_delta,
+                std::abs(cell.relative_bbox_x - reference_cell.relative_bbox_x));
+            stats.max_relative_bbox_y_delta = std::max(
+                stats.max_relative_bbox_y_delta,
+                std::abs(cell.relative_bbox_y - reference_cell.relative_bbox_y));
+            stats.max_relative_bbox_width_delta = std::max(
+                stats.max_relative_bbox_width_delta,
+                std::abs(
+                    cell.relative_bbox_width -
+                    reference_cell.relative_bbox_width));
+            stats.max_relative_bbox_height_delta = std::max(
+                stats.max_relative_bbox_height_delta,
+                std::abs(
+                    cell.relative_bbox_height -
+                    reference_cell.relative_bbox_height));
+        }
+    }
+
+    return stats;
+}
+
+Lcd_repeated_w_stability_stats compare_lcd_repeated_w_corresponding_cells(
+    const Pixel_parity_fixture&            fixture,
+    const QImage&                          reference_image,
+    const Lcd_repeated_w_stability_stats&  reference_stats,
+    const QImage&                          candidate_image,
+    const Lcd_repeated_w_stability_stats&  candidate_stats)
+{
+    Lcd_repeated_w_stability_stats stats;
+    stats.cell_count = std::min(
+        static_cast<int>(reference_stats.cells.size()),
+        static_cast<int>(candidate_stats.cells.size()));
+    stats.physical_cell_width       = reference_stats.physical_cell_width;
+    stats.physical_cell_height      = reference_stats.physical_cell_height;
+    stats.physical_cell_ascent      = reference_stats.physical_cell_ascent;
+    stats.cell_width_integer_delta  = reference_stats.cell_width_integer_delta;
+    stats.cell_height_integer_delta = reference_stats.cell_height_integer_delta;
+    stats.cell_ascent_integer_delta = reference_stats.cell_ascent_integer_delta;
+    stats.cell_width_integer        = reference_stats.cell_width_integer;
+    stats.cell_height_integer       = reference_stats.cell_height_integer;
+    stats.cell_ascent_integer       = reference_stats.cell_ascent_integer;
+    stats.all_cells_have_ink        = stats.cell_count > 0;
+
+    if (reference_image.isNull() ||
+        candidate_image.isNull() ||
+        stats.cell_count <= 0)
+    {
+        stats.all_cells_have_ink = false;
+        return stats;
+    }
+
+    const QColor background = lcd_repeated_w_background(fixture);
+    stats.cells.reserve(static_cast<std::size_t>(stats.cell_count));
+    for (int cell_index = 0; cell_index < stats.cell_count; ++cell_index) {
+        const Lcd_repeated_w_cell_stats& reference_cell =
+            reference_stats.cells[static_cast<std::size_t>(cell_index)];
+        const Lcd_repeated_w_cell_stats& candidate_cell =
+            candidate_stats.cells[static_cast<std::size_t>(cell_index)];
+        stats.cells.push_back(candidate_cell);
+
+        const int width = std::min(
+            reference_cell.cell_pixels.width(),
+            candidate_cell.cell_pixels.width());
+        const int height = std::min(
+            reference_cell.cell_pixels.height(),
+            candidate_cell.cell_pixels.height());
+        if (width <= 0 || height <= 0) {
+            stats.all_cells_have_ink = false;
+            continue;
+        }
+
+        int cell_diff_pixels = 0;
+        int cell_ink_mask_diff_pixels = 0;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                ++stats.compared_pixels;
+                const QColor reference_pixel = reference_image.pixelColor(
+                    reference_cell.cell_pixels.left() + x,
+                    reference_cell.cell_pixels.top() + y);
+                const QColor candidate_pixel = candidate_image.pixelColor(
+                    candidate_cell.cell_pixels.left() + x,
+                    candidate_cell.cell_pixels.top() + y);
+                const int delta = pixel_delta(
+                    reference_pixel,
+                    candidate_pixel);
+                stats.max_delta = std::max(stats.max_delta, delta);
+                if (delta > 0) {
+                    ++stats.diff_pixels;
+                    ++cell_diff_pixels;
+                }
+
+                const bool reference_ink =
+                    pixel_delta(reference_pixel, background) > 8;
+                const bool candidate_ink =
+                    pixel_delta(candidate_pixel, background) > 8;
+                if (reference_ink != candidate_ink) {
+                    ++stats.ink_mask_diff_pixels;
+                    ++cell_ink_mask_diff_pixels;
+                }
+            }
+        }
+
+        stats.max_diff_pixels_per_cell =
+            std::max(stats.max_diff_pixels_per_cell, cell_diff_pixels);
+        stats.max_ink_mask_diff_pixels_per_cell = std::max(
+            stats.max_ink_mask_diff_pixels_per_cell,
+            cell_ink_mask_diff_pixels);
+        ++stats.compared_cells;
+
+        const bool cells_have_ink =
+            reference_cell.ink_pixels > 0 &&
+            candidate_cell.ink_pixels > 0;
+        stats.all_cells_have_ink = stats.all_cells_have_ink && cells_have_ink;
+        if (cells_have_ink) {
+            stats.max_ink_pixels_delta = std::max(
+                stats.max_ink_pixels_delta,
+                std::abs(
+                    candidate_cell.ink_pixels -
+                    reference_cell.ink_pixels));
+            stats.max_relative_first_ink_x_delta = std::max(
+                stats.max_relative_first_ink_x_delta,
+                std::abs(
+                    candidate_cell.relative_first_ink_x -
+                    reference_cell.relative_first_ink_x));
+            stats.max_relative_bbox_x_delta = std::max(
+                stats.max_relative_bbox_x_delta,
+                std::abs(
+                    candidate_cell.relative_bbox_x -
+                    reference_cell.relative_bbox_x));
+            stats.max_relative_bbox_y_delta = std::max(
+                stats.max_relative_bbox_y_delta,
+                std::abs(
+                    candidate_cell.relative_bbox_y -
+                    reference_cell.relative_bbox_y));
+            stats.max_relative_bbox_width_delta = std::max(
+                stats.max_relative_bbox_width_delta,
+                std::abs(
+                    candidate_cell.relative_bbox_width -
+                    reference_cell.relative_bbox_width));
+            stats.max_relative_bbox_height_delta = std::max(
+                stats.max_relative_bbox_height_delta,
+                std::abs(
+                    candidate_cell.relative_bbox_height -
+                    reference_cell.relative_bbox_height));
+        }
+    }
+
     return stats;
 }
 
@@ -3105,16 +4546,472 @@ Pixel_render_result render_atlas_rgba_reference_fixture(
     return result;
 }
 
+#if VNM_TERMINAL_QSG_ATLAS_MSDF_DIAGNOSTIC_AVAILABLE
+struct msdf_texel_sample_t
+{
+    float red   = 0.0f;
+    float green = 0.0f;
+    float blue  = 0.0f;
+    float alpha = 0.0f;
+};
+
+msdf::options_t msdf_single_w_options()
+{
+    msdf::options_t options;
+    options.atlas_size = k_msdf_single_w_atlas_texture_size;
+    options.min_atlas_font_size = k_msdf_single_w_min_atlas_font_size;
+    options.atlas_px_range = k_msdf_single_w_atlas_px_range;
+    options.sharpness_bias = k_msdf_single_w_sharpness_bias;
+    options.build_kerning_table = false;
+    return options;
+}
+
+QByteArray read_msdf_terminal_font_data(QString& error)
+{
+    QFile font_file(QString::fromLatin1(k_terminal_monospace_font_resource));
+    if (!font_file.open(QIODevice::ReadOnly)) {
+        error = QStringLiteral("failed to open terminal embedded monospace font: %1")
+            .arg(font_file.errorString());
+        return {};
+    }
+
+    QByteArray data = font_file.readAll();
+    if (data.isEmpty()) {
+        error = QStringLiteral("terminal embedded monospace font resource is empty");
+    }
+    return data;
+}
+
+QRectF scaled_rect(QRectF rect, qreal scale)
+{
+    return QRectF(
+        rect.left() * scale,
+        rect.top() * scale,
+        rect.width() * scale,
+        rect.height() * scale);
+}
+
+QRectF msdf_glyph_plane_rect(const msdf::glyph_t& glyph)
+{
+    return QRectF(
+        QPointF(glyph.plane_left, glyph.plane_bottom),
+        QPointF(glyph.plane_right, glyph.plane_top))
+        .normalized();
+}
+
+float msdf_median(float red, float green, float blue)
+{
+    return std::max(std::min(red, green), std::min(std::max(red, green), blue));
+}
+
+float msdf_texel_channel(
+    const msdf::atlas_t& atlas,
+    int                  x,
+    int                  y,
+    int                  channel)
+{
+    const int bounded_x = std::clamp(x, 0, atlas.atlas_size - 1);
+    const int bounded_y = std::clamp(y, 0, atlas.atlas_size - 1);
+    const std::size_t offset =
+        (static_cast<std::size_t>(bounded_y) *
+            static_cast<std::size_t>(atlas.atlas_size) +
+            static_cast<std::size_t>(bounded_x)) *
+            4U +
+        static_cast<std::size_t>(channel);
+    return static_cast<float>(atlas.rgba[offset]) / 255.0f;
+}
+
+float msdf_lerp(float left, float right, float ratio)
+{
+    return left + (right - left) * ratio;
+}
+
+msdf_texel_sample_t msdf_sample_atlas(
+    const msdf::atlas_t& atlas,
+    float                s,
+    float                t)
+{
+    if (atlas.atlas_size <= 0 ||
+        !std::isfinite(s) ||
+        !std::isfinite(t))
+    {
+        return {};
+    }
+
+    const std::size_t required_bytes =
+        static_cast<std::size_t>(atlas.atlas_size) *
+        static_cast<std::size_t>(atlas.atlas_size) * 4U;
+    if (atlas.rgba.size() < required_bytes) {
+        return {};
+    }
+
+    const float max_coord = static_cast<float>(atlas.atlas_size - 1);
+    const float sample_x = std::clamp(
+        s * static_cast<float>(atlas.atlas_size) - 0.5f,
+        0.0f,
+        max_coord);
+    const float sample_y = std::clamp(
+        t * static_cast<float>(atlas.atlas_size) - 0.5f,
+        0.0f,
+        max_coord);
+    const int x0 = static_cast<int>(std::floor(sample_x));
+    const int y0 = static_cast<int>(std::floor(sample_y));
+    const int x1 = std::min(x0 + 1, atlas.atlas_size - 1);
+    const int y1 = std::min(y0 + 1, atlas.atlas_size - 1);
+    const float x_ratio = sample_x - static_cast<float>(x0);
+    const float y_ratio = sample_y - static_cast<float>(y0);
+
+    auto bilinear = [&](int channel) {
+        const float top = msdf_lerp(
+            msdf_texel_channel(atlas, x0, y0, channel),
+            msdf_texel_channel(atlas, x1, y0, channel),
+            x_ratio);
+        const float bottom = msdf_lerp(
+            msdf_texel_channel(atlas, x0, y1, channel),
+            msdf_texel_channel(atlas, x1, y1, channel),
+            x_ratio);
+        return msdf_lerp(top, bottom, y_ratio);
+    };
+
+    return {
+        bilinear(0),
+        bilinear(1),
+        bilinear(2),
+        bilinear(3),
+    };
+}
+
+float msdf_glyph_alpha_from_texel(
+    const msdf_texel_sample_t& texel,
+    float                      px_range)
+{
+    const float distance =
+        (msdf_median(texel.red, texel.green, texel.blue) - 0.5f) * px_range;
+    float alpha = std::clamp(distance + 0.5f, 0.0f, 1.0f);
+    if (texel.alpha > 0.0f) {
+        const float sdf_distance = (texel.alpha - 0.5f) * px_range;
+        alpha = std::min(alpha, std::clamp(sdf_distance + 0.5f, 0.0f, 1.0f));
+    }
+    return alpha;
+}
+
+void blend_msdf_glyph_pixel(
+    QImage& image,
+    int     x,
+    int     y,
+    QColor  foreground,
+    float   alpha)
+{
+    if (alpha <= 0.0f) {
+        return;
+    }
+
+    const int source_alpha = std::clamp(
+        static_cast<int>(
+            std::lround(
+                static_cast<float>(foreground.alpha()) *
+                    std::clamp(alpha, 0.0f, 1.0f))),
+        0,
+        255);
+    foreground.setAlpha(source_alpha);
+    blend_pixel_reference_pixel(image, x, y, foreground);
+}
+
+void paint_msdf_quad(
+    QImage&                    image,
+    const msdf::atlas_t&       atlas,
+    const msdf::text_vertex_t& top_left,
+    const msdf::text_vertex_t& bottom_right,
+    QColor                     foreground,
+    QRectF                     clip_rect,
+    QRectF&                    draw_rect)
+{
+    if (atlas.atlas_size <= 0) {
+        return;
+    }
+
+    const float plane_left   = std::min(top_left.x, bottom_right.x);
+    const float plane_right  = std::max(top_left.x, bottom_right.x);
+    const float plane_top    = std::min(top_left.y, bottom_right.y);
+    const float plane_bottom = std::max(top_left.y, bottom_right.y);
+    const float left = static_cast<float>(
+        std::lround(plane_left));
+    const float top = static_cast<float>(
+        std::lround(plane_top));
+    const float right  = left + (plane_right - plane_left);
+    const float bottom = top + (plane_bottom - plane_top);
+    if (right <= left || bottom <= top) {
+        return;
+    }
+
+    QRectF glyph_rect(
+        QPointF(static_cast<qreal>(left), static_cast<qreal>(top)),
+        QPointF(static_cast<qreal>(right), static_cast<qreal>(bottom)));
+    if (clip_rect.isValid()) {
+        glyph_rect = glyph_rect.intersected(clip_rect);
+    }
+    if (!glyph_rect.isValid()) {
+        return;
+    }
+
+    const QRect pixels =
+        logical_rect_to_pixels(glyph_rect, 1.0).intersected(image.rect());
+    if (pixels.isEmpty()) {
+        return;
+    }
+
+    const float atlas_size = static_cast<float>(atlas.atlas_size);
+    const float half_texel = 0.5f / atlas_size;
+    const float s_min = top_left.s_min + std::min(
+        half_texel,
+        (top_left.s_max - top_left.s_min) * 0.499f);
+    const float s_max = top_left.s_max - std::min(
+        half_texel,
+        (top_left.s_max - top_left.s_min) * 0.499f);
+    const float t_min = top_left.t_min + std::min(
+        half_texel,
+        (top_left.t_max - top_left.t_min) * 0.499f);
+    const float t_max = top_left.t_max - std::min(
+        half_texel,
+        (top_left.t_max - top_left.t_min) * 0.499f);
+
+    for (int y = pixels.top(); y <= pixels.bottom(); ++y) {
+        for (int x = pixels.left(); x <= pixels.right(); ++x) {
+            const float sample_x = static_cast<float>(x) + 0.5f;
+            const float sample_y = static_cast<float>(y) + 0.5f;
+            const float x_ratio = std::clamp(
+                (sample_x - left) / (right - left),
+                0.0f,
+                1.0f);
+            const float y_ratio = std::clamp(
+                (sample_y - top) / (bottom - top),
+                0.0f,
+                1.0f);
+            const float s = std::clamp(
+                msdf_lerp(top_left.s, bottom_right.s, x_ratio),
+                s_min,
+                s_max);
+            const float t = std::clamp(
+                msdf_lerp(top_left.t, bottom_right.t, y_ratio),
+                t_min,
+                t_max);
+            const msdf_texel_sample_t texel = msdf_sample_atlas(atlas, s, t);
+            blend_msdf_glyph_pixel(
+                image,
+                x,
+                y,
+                foreground,
+                msdf_glyph_alpha_from_texel(texel, atlas.px_range));
+        }
+    }
+
+    draw_rect = draw_rect.isValid()
+        ? draw_rect.united(glyph_rect)
+        : glyph_rect;
+}
+
+void paint_msdf_text_run(
+    QImage&                              image,
+    const term::Terminal_render_text_run& run,
+    const msdf::atlas_t&                 atlas,
+    qreal                                device_pixel_ratio,
+    QRectF&                              draw_rect)
+{
+    if (run.text.isEmpty()) {
+        return;
+    }
+
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const QByteArray utf8 = run.text.toUtf8();
+    std::vector<msdf::text_vertex_t> vertices;
+    const int physical_origin_x = static_cast<int>(
+        std::lround(run.baseline_origin.x() * dpr));
+    const int physical_origin_y = static_cast<int>(
+        std::lround(run.baseline_origin.y() * dpr));
+    msdf::append_text_quads(
+        atlas,
+        std::string_view(
+            utf8.constData(),
+            static_cast<std::size_t>(utf8.size())),
+        static_cast<float>(physical_origin_x),
+        static_cast<float>(physical_origin_y),
+        vertices);
+    if (vertices.size() < 4U) {
+        return;
+    }
+
+    const QRectF clip_rect = run.clip_rect.isValid()
+        ? scaled_rect(run.clip_rect, dpr)
+        : QRectF();
+    for (std::size_t base = 0; base + 3U < vertices.size(); base += 4U) {
+        paint_msdf_quad(
+            image,
+            atlas,
+            vertices[base],
+            vertices[base + 2U],
+            run.foreground,
+            clip_rect,
+            draw_rect);
+    }
+}
+
+void paint_msdf_text_runs(
+    QImage&                                      image,
+    const std::vector<term::Terminal_render_text_run>& runs,
+    const msdf::atlas_t&                         atlas,
+    qreal                                        device_pixel_ratio,
+    QRectF&                                      draw_rect)
+{
+    for (const term::Terminal_render_text_run& run : runs) {
+        paint_msdf_text_run(
+            image,
+            run,
+            atlas,
+            device_pixel_ratio,
+            draw_rect);
+    }
+}
+#endif
+
+Msdf_single_w_probe_result render_msdf_single_w_probe_fixture(
+    const Pixel_parity_fixture& fixture,
+    std::optional<QSize>         physical_image_size = std::nullopt)
+{
+    Msdf_single_w_probe_result result;
+    result.render.device_pixel_ratio =
+        pixel_normalized_device_pixel_ratio(fixture.device_pixel_ratio);
+    result.render.image_device_pixel_ratio = result.render.device_pixel_ratio;
+
+#if VNM_TERMINAL_QSG_ATLAS_MSDF_DIAGNOSTIC_AVAILABLE
+    result.compiled = true;
+    result.font_source =
+        QString::fromLatin1(k_terminal_monospace_font_resource);
+
+    QString font_error;
+    const QByteArray font_data = read_msdf_terminal_font_data(font_error);
+    result.font_data_bytes = static_cast<int>(font_data.size());
+    if (!font_error.isEmpty()) {
+        result.message = font_error;
+        return result;
+    }
+
+    result.pixel_height = std::max(
+        1,
+        static_cast<int>(std::lround(
+            fixture.cell_metrics.ascent * result.render.device_pixel_ratio)));
+
+    const std::vector<char32_t> codepoints = {k_msdf_single_w_codepoint};
+    const msdf::build_result_t build = msdf::build_font_atlas(
+        reinterpret_cast<const std::uint8_t*>(font_data.constData()),
+        static_cast<std::size_t>(font_data.size()),
+        result.pixel_height,
+        std::span<const char32_t>(codepoints.data(), codepoints.size()),
+        msdf_single_w_options());
+    result.atlas_built = build.ok;
+    if (!build.ok) {
+        result.message = QString::fromStdString(build.message);
+        return result;
+    }
+
+    const auto glyph = build.atlas.glyphs.find(k_msdf_single_w_codepoint);
+    if (glyph == build.atlas.glyphs.end()) {
+        result.message = QStringLiteral("MSDF atlas did not contain the W glyph");
+        return result;
+    }
+
+    result.atlas_size         = build.atlas.atlas_size;
+    result.px_range           = build.atlas.px_range;
+    result.advance_x          = glyph->second.advance_x;
+    result.baseline_offset_px = build.atlas.baseline_offset_px;
+    result.plane_rect         = msdf_glyph_plane_rect(glyph->second);
+    result.render.image = QImage(
+        physical_image_size.value_or(
+            pixel_window_physical_pixel_size(
+                fixture.logical_size,
+                result.render.device_pixel_ratio)),
+        QImage::Format_ARGB32_Premultiplied);
+    result.render.image.setDevicePixelRatio(result.render.device_pixel_ratio);
+    result.render.image.fill(QColor(1, 2, 3));
+
+    const term::Terminal_render_frame frame = pixel_expected_frame(fixture);
+    paint_pixel_reference_rects(
+        result.render.image,
+        frame.background_rects,
+        result.render.device_pixel_ratio);
+    paint_pixel_reference_rects(
+        result.render.image,
+        frame.selection_rects,
+        result.render.device_pixel_ratio);
+    paint_pixel_reference_rects(
+        result.render.image,
+        frame.graphic_rects,
+        result.render.device_pixel_ratio);
+    paint_pixel_reference_arcs(
+        result.render.image,
+        frame.graphic_arcs,
+        result.render.device_pixel_ratio);
+    paint_msdf_text_runs(
+        result.render.image,
+        frame.text_runs,
+        build.atlas,
+        result.render.device_pixel_ratio,
+        result.draw_rect);
+    paint_pixel_reference_decorations(
+        result.render.image,
+        frame.decorations,
+        result.render.device_pixel_ratio);
+    paint_pixel_reference_cursors(
+        result.render.image,
+        frame.cursors,
+        result.render.device_pixel_ratio);
+    paint_msdf_text_runs(
+        result.render.image,
+        frame.cursor_text_runs,
+        build.atlas,
+        result.render.device_pixel_ratio,
+        result.draw_rect);
+    paint_pixel_reference_rects(
+        result.render.image,
+        frame.overlay_rects,
+        result.render.device_pixel_ratio);
+
+    result.render.ready = !result.render.image.isNull() && result.draw_rect.isValid();
+    result.message = result.render.ready
+        ? QStringLiteral("ok")
+        : QStringLiteral("MSDF diagnostic rendered no glyph ink");
+#else
+    Q_UNUSED(physical_image_size);
+    result.message = QStringLiteral(
+        "MSDF diagnostic not compiled; enable the qsg atlas MSDF text "
+        "test dependency or define VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_DIAGNOSTIC "
+        "and link "
+        "vnm_msdf_text::vnm_msdf_text to enable it");
+#endif
+
+    return result;
+}
+
 Pixel_render_result render_pixel_atlas_fixture(
     QGuiApplication&              app,
-    const Pixel_parity_fixture&  fixture)
+    const Pixel_parity_fixture&  fixture,
+    QPointF                      surface_position = QPointF())
 {
     QQuickWindow window;
     window.setColor(QColor(1, 2, 3));
-    window.resize(pixel_window_logical_pixel_size(fixture.logical_size));
+    const QSizeF window_logical_size(
+        fixture.logical_size.width() + std::max<qreal>(0.0, surface_position.x()),
+        fixture.logical_size.height() + std::max<qreal>(0.0, surface_position.y()));
+    window.resize(pixel_window_logical_pixel_size(window_logical_size));
+
+    QQuickItem host;
+    host.setParentItem(window.contentItem());
+    host.setPosition(surface_position);
+    host.setSize(fixture.logical_size);
 
     VNM_TerminalSurface surface;
-    surface.setParentItem(window.contentItem());
+    surface.setParentItem(surface_position.isNull()
+        ? window.contentItem()
+        : &host);
     surface.setSize(fixture.logical_size);
     surface.set_font_family(QString());
     surface.set_font_size(18.0);
@@ -3226,7 +5123,8 @@ bool compare_pixel_fixture(
     const Pixel_render_result&     atlas,
     const char*                    backend,
     std::optional<Pixel_aa_budget> budget_override = std::nullopt,
-    const char*                    parity_mode_override = nullptr)
+    const char*                    parity_mode_override = nullptr,
+    bool                           compare_glyph_regions_enabled = true)
 {
     const char* const parity_mode = parity_mode_override != nullptr
         ? parity_mode_override
@@ -3380,34 +5278,46 @@ bool compare_pixel_fixture(
 
     const Pixel_aa_budget budget =
         budget_override.value_or(pixel_budget_for_backend(backend, fixture.name));
-    const Pixel_glyph_stats glyphs = compare_glyph_regions(
-        reference.image,
-        atlas.image,
-        fixture.glyph_masks,
-        render_dpr);
-    const int budget_diff_pixels = scaled_pixel_budget_count(
-        budget.diff_pixels,
-        budget,
-        glyphs.compared_pixels);
+    Pixel_glyph_stats glyphs;
+    int budget_diff_pixels = 0;
+    if (compare_glyph_regions_enabled) {
+        glyphs = compare_glyph_regions(
+            reference.image,
+            atlas.image,
+            fixture.glyph_masks,
+            render_dpr);
+        budget_diff_pixels = scaled_pixel_budget_count(
+            budget.diff_pixels,
+            budget,
+            glyphs.compared_pixels);
+    }
     const int glyph_perimeter_pixels = glyphs.perimeter_pixels;
     int max_mask_ink_delta_pixels = 0;
     int max_mask_ink_budget_pixels = 0;
     int ink_checked_masks = 0;
-    if (!fixture.glyph_masks.empty() && budget.base_compared_pixels <= 0) {
+    if (compare_glyph_regions_enabled &&
+        !fixture.glyph_masks.empty()  &&
+        budget.base_compared_pixels <= 0)
+    {
         std::cerr << "FAIL: " << parity_mode << " fixture "
             << fixture.name
             << " has glyph masks but no DPR-aware budget on " << backend
             << '\n';
         ok = false;
     }
-    if (!fixture.glyph_masks.empty() && glyphs.compared_pixels == 0) {
+    if (compare_glyph_regions_enabled &&
+        !fixture.glyph_masks.empty()  &&
+        glyphs.compared_pixels == 0)
+    {
         std::cerr << "FAIL: " << parity_mode << " fixture "
             << fixture.name
             << " glyph masks compared zero pixels"
             << " render_dpr=" << render_dpr << '\n';
         ok = false;
     }
-    if (glyphs.masks.size() != fixture.glyph_masks.size()) {
+    if (compare_glyph_regions_enabled &&
+        glyphs.masks.size() != fixture.glyph_masks.size())
+    {
         std::cerr << "FAIL: " << parity_mode << " fixture "
             << fixture.name
             << " glyph mask stats count mismatch"
@@ -3416,7 +5326,8 @@ bool compare_pixel_fixture(
             << " render_dpr=" << render_dpr << '\n';
         ok = false;
     }
-    if (!fixture.glyph_masks.empty() &&
+    if (compare_glyph_regions_enabled &&
+        !fixture.glyph_masks.empty() &&
         (glyphs.max_delta > budget.max_delta ||
             glyphs.diff_pixels > budget_diff_pixels))
     {
@@ -3433,7 +5344,9 @@ bool compare_pixel_fixture(
         ok = false;
     }
     for (std::size_t mask_index = 0U;
-        mask_index < fixture.glyph_masks.size() && mask_index < glyphs.masks.size();
+        compare_glyph_regions_enabled &&
+            mask_index < fixture.glyph_masks.size() &&
+            mask_index < glyphs.masks.size();
         ++mask_index)
     {
         const Pixel_glyph_mask& mask = fixture.glyph_masks[mask_index];
@@ -7099,6 +9012,434 @@ bool pump_atlas_seeded_glyph_slots(
     return false;
 }
 
+struct Msdf_text_resource_identity
+{
+    int     font_data_bytes = 0;
+    int     pixel_height    = 0;
+    int     atlas_size      = 0;
+    float   px_range        = 0.0f;
+    QString message;
+};
+
+QString atlas_msdf_resource_stability_row_0()
+{
+    return QStringLiteral("WMeaom#@|1.AZ09");
+}
+
+QString atlas_msdf_resource_stability_row_1()
+{
+    return QStringLiteral("[]{}<>/?+-=_pq");
+}
+
+int atlas_msdf_resource_stability_drawable_glyphs(QStringView text)
+{
+    int count = 0;
+    for (QChar character : text) {
+        const ushort codepoint = character.unicode();
+        if (codepoint >= 0x21U && codepoint <= 0x7eU) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+int atlas_msdf_resource_stability_expected_glyphs()
+{
+    return
+        atlas_msdf_resource_stability_drawable_glyphs(
+            atlas_msdf_resource_stability_row_0()) +
+        atlas_msdf_resource_stability_drawable_glyphs(
+            atlas_msdf_resource_stability_row_1());
+}
+
+term::Terminal_render_snapshot make_atlas_msdf_resource_stability_snapshot(
+    std::uint64_t sequence,
+    bool          color_changed_row)
+{
+    const QString row_0 = atlas_msdf_resource_stability_row_0();
+    const QString row_1 = atlas_msdf_resource_stability_row_1();
+
+    term::Terminal_render_snapshot snapshot =
+        make_pixel_base_snapshot({2, 20}, sequence);
+    snapshot.cursor.visible = false;
+    snapshot.styles.push_back(rgb_style(0xffe6edf3U, 0xff101820U));
+    snapshot.styles.push_back(rgb_style(0xff8be9fdU, 0xff101820U));
+
+    const term::Terminal_style_id normal = 1U;
+    const term::Terminal_style_id accent = 2U;
+    snapshot.cells.push_back(
+        make_pixel_cell(0, 0, row_0, row_0.size(), normal));
+    snapshot.cells.push_back(
+        make_pixel_cell(
+            1,
+            0,
+            row_1,
+            row_1.size(),
+            color_changed_row ? accent : normal));
+    snapshot.dirty_row_ranges = color_changed_row
+        ? std::vector<term::Terminal_render_dirty_row_range>{{1, 1}}
+        : std::vector<term::Terminal_render_dirty_row_range>{{0, 2}};
+    return snapshot;
+}
+
+Msdf_text_resource_identity msdf_text_resource_identity(
+    const term::Qsg_atlas_render_summary& render_summary)
+{
+    return {
+        render_summary.msdf_text_font_data_bytes,
+        render_summary.msdf_text_pixel_height,
+        render_summary.msdf_text_atlas_size,
+        render_summary.msdf_text_px_range,
+        render_summary.msdf_text_message,
+    };
+}
+
+bool msdf_text_resource_identity_matches(
+    const Msdf_text_resource_identity&      expected,
+    const term::Qsg_atlas_render_summary&  render_summary)
+{
+    return
+        render_summary.msdf_text_font_data_bytes == expected.font_data_bytes &&
+        render_summary.msdf_text_pixel_height    == expected.pixel_height    &&
+        render_summary.msdf_text_atlas_size      == expected.atlas_size      &&
+        std::abs(render_summary.msdf_text_px_range - expected.px_range) <=
+            0.0001f &&
+        render_summary.msdf_text_message == expected.message;
+}
+
+void print_atlas_msdf_resource_stability_report(
+    const char*                         label,
+    const term::Qsg_atlas_frame_report& report)
+{
+    const term::Qsg_atlas_render_summary& render_summary = report.render;
+    const term::Qsg_atlas_buffer_update_summary& buffer =
+        render_summary.msdf_text_buffer;
+    const QByteArray message = render_summary.msdf_text_message.toUtf8();
+    std::cout << "atlas MSDF resource stability " << label
+        << " prepare=" << report.prepare_count
+        << " render=" << report.render_count
+        << " requested="
+        << render_summary.msdf_text_renderer_experiment_requested
+        << " active=" << render_summary.msdf_text_renderer_production_active
+        << " resources_ready=" << render_summary.msdf_text_resources_ready
+        << " atlas_built=" << render_summary.msdf_text_atlas_built
+        << " atlas_ready=" << render_summary.msdf_text_atlas_ready
+        << " texture_ready=" << render_summary.msdf_text_texture_ready
+        << " texture_uploaded="
+        << render_summary.msdf_text_texture_uploaded
+        << " font_bytes=" << render_summary.msdf_text_font_data_bytes
+        << " pixel_height=" << render_summary.msdf_text_pixel_height
+        << " atlas_size=" << render_summary.msdf_text_atlas_size
+        << " px_range=" << render_summary.msdf_text_px_range
+        << " message=" << message.constData()
+        << " msdf_runs=" << render_summary.msdf_text_runs
+        << " msdf_supported_runs="
+        << render_summary.msdf_text_supported_runs
+        << " msdf_instances="
+        << render_summary.msdf_text_glyph_instances
+        << " msdf_draws=" << render_summary.msdf_text_draw_calls
+        << " missed_runs="
+        << render_summary.msdf_text_missed_supported_runs
+        << " missed_glyphs="
+        << render_summary.msdf_text_missed_supported_glyphs
+        << " glyph_draws=" << render_summary.glyph_draw_calls
+        << " glyph_instances=" << render_summary.glyph_buffer_instances
+        << " buffer_full=" << buffer.full_upload
+        << " buffer_partial=" << buffer.partial_upload
+        << " buffer_skipped=" << buffer.skipped_upload
+        << " buffer_seed=" << buffer.rotating_slot_seed_upload
+        << " buffer_recreated=" << buffer.buffer_recreated_upload
+        << " buffer_layout_changed="
+        << buffer.instance_layout_changed_upload
+        << " buffer_full_repaint=" << buffer.full_repaint_upload
+        << " buffer_non_dirty=" << buffer.non_dirty_state_upload
+        << " buffer_uploaded=" << buffer.uploaded_bytes
+        << " buffer_bytes=" << buffer.buffer_bytes
+        << " seeded_slots=" << buffer.seeded_slots
+        << '/' << buffer.rhi_frames_in_flight
+        << '\n';
+}
+
+bool atlas_msdf_resource_stability_render_ok(
+    const char*                         label,
+    const term::Qsg_atlas_frame_report& report,
+    int                                 expected_glyphs)
+{
+    const term::Qsg_atlas_render_summary& render_summary = report.render;
+    bool ok = true;
+    ok &= check(
+        atlas_report_render_state_ready(report),
+        std::string("atlas MSDF resource stability ") + label +
+            " reaches usable QRhi render state");
+    ok &= check(
+        render_summary.msdf_text_renderer_production_active,
+        std::string("atlas MSDF resource stability ") + label +
+            " keeps the MSDF renderer active");
+    ok &= check(
+        render_summary.msdf_text_shader_package_available &&
+            render_summary.msdf_text_atlas_built &&
+            render_summary.msdf_text_atlas_ready &&
+            render_summary.msdf_text_texture_ready &&
+            render_summary.msdf_text_resources_ready,
+        std::string("atlas MSDF resource stability ") + label +
+            " reports ready MSDF resources");
+    ok &= check(
+        render_summary.msdf_text_missed_supported_runs == 0 &&
+            render_summary.msdf_text_missed_supported_glyphs == 0,
+        std::string("atlas MSDF resource stability ") + label +
+            " reports no supported MSDF misses");
+    ok &= check(
+        render_summary.glyph_draw_calls == 0 &&
+            render_summary.glyph_buffer_instances == 0,
+        std::string("atlas MSDF resource stability ") + label +
+            " does not use the old glyph path");
+    ok &= check(
+        render_summary.msdf_text_glyph_instances == expected_glyphs,
+        std::string("atlas MSDF resource stability ") + label +
+            " reports the expected printable glyph instance count");
+    ok &= check(
+        render_summary.msdf_text_draw_calls > 0 &&
+            render_summary.msdf_text_draw_calls <= 2,
+        std::string("atlas MSDF resource stability ") + label +
+            " keeps MSDF draw calls bounded");
+    ok &= check(
+        render_summary.msdf_text_supported_runs > 0 &&
+            render_summary.msdf_text_runs >=
+                render_summary.msdf_text_supported_runs,
+        std::string("atlas MSDF resource stability ") + label +
+            " reports supported printable MSDF runs");
+    return ok;
+}
+
+enum class Atlas_msdf_steady_buffer_expectation
+{
+    SKIPPED,
+    PARTIAL,
+};
+
+bool atlas_msdf_resource_stability_steady_buffer_ok(
+    const char*                         label,
+    const term::Qsg_atlas_frame_report& report,
+    Atlas_msdf_steady_buffer_expectation expectation)
+{
+    const term::Qsg_atlas_buffer_update_summary& buffer =
+        report.render.msdf_text_buffer;
+    bool ok = true;
+    ok &= check(
+        buffer.seeded_slots >= buffer.rhi_frames_in_flight,
+        std::string("atlas MSDF resource stability ") + label +
+            " runs after all MSDF rotating slots are seeded");
+    ok &= check(
+        !buffer.full_upload &&
+            !buffer.rotating_slot_seed_upload &&
+            !buffer.buffer_recreated_upload &&
+            !buffer.instance_layout_changed_upload &&
+            !buffer.full_repaint_upload &&
+            !buffer.non_dirty_state_upload,
+        std::string("atlas MSDF resource stability ") + label +
+            " avoids full or fallback MSDF instance-buffer uploads");
+    if (expectation == Atlas_msdf_steady_buffer_expectation::SKIPPED) {
+        ok &= check(
+            buffer.skipped_upload &&
+                !buffer.partial_upload &&
+                !buffer.full_upload &&
+                buffer.uploaded_bytes == 0,
+            std::string("atlas MSDF resource stability ") + label +
+                " skips the unchanged MSDF instance buffer");
+    }
+    else {
+        ok &= check(
+            buffer.partial_upload &&
+                !buffer.skipped_upload &&
+                !buffer.full_upload &&
+                buffer.uploaded_bytes > 0 &&
+                buffer.uploaded_bytes < buffer.buffer_bytes,
+            std::string("atlas MSDF resource stability ") + label +
+                " partially patches the dirty MSDF instance buffer");
+    }
+    return ok;
+}
+
+bool pump_atlas_seeded_msdf_text_slots(
+    QGuiApplication&    app,
+    QQuickWindow&       window,
+    VNM_TerminalSurface& surface,
+    term::Qsg_atlas_frame_report& report,
+    std::vector<term::Qsg_atlas_frame_report>& reports,
+    int                 attempts = 12)
+{
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        const term::Qsg_atlas_buffer_update_summary& buffer =
+            report.render.msdf_text_buffer;
+        if (buffer.seeded_slots >= buffer.rhi_frames_in_flight) {
+            return true;
+        }
+
+        const std::uint64_t previous_prepare_count = report.prepare_count;
+        if (!pump_next_atlas_report(
+                app,
+                window,
+                surface,
+                previous_prepare_count,
+                report))
+        {
+            return false;
+        }
+        reports.push_back(report);
+    }
+
+    return false;
+}
+
+bool test_atlas_msdf_resource_stability(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(420, 140);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(360.0, 90.0));
+    surface.set_font_family(QString());
+    surface.set_font_size(18.0);
+    surface.set_color_theme(QStringLiteral("default"));
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(970U, false)));
+    window.show();
+
+    const int expected_glyphs =
+        atlas_msdf_resource_stability_expected_glyphs();
+    term::Qsg_atlas_frame_report baseline_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool baseline_rendered = pump_until(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            if (!atlas_report_render_state_ready(report)) {
+                return false;
+            }
+            if (!report.render.msdf_text_renderer_experiment_requested) {
+                return true;
+            }
+            return
+                report.render.msdf_text_renderer_production_active &&
+                report.render.msdf_text_resources_ready &&
+                report.render.msdf_text_texture_ready &&
+                report.render.msdf_text_glyph_instances == expected_glyphs;
+        });
+    baseline_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    print_atlas_msdf_resource_stability_report(
+        "baseline",
+        baseline_report);
+    if (!baseline_rendered) {
+        std::cerr << "FAIL: atlas MSDF resource stability did not reach "
+            << "a usable baseline render state\n";
+        return false;
+    }
+
+    if (!baseline_report.render.msdf_text_renderer_experiment_requested) {
+        return check(
+            !baseline_report.render.msdf_text_renderer_production_active,
+            "atlas MSDF resource stability skips experiment gates when disabled");
+    }
+
+    std::vector<term::Qsg_atlas_frame_report> reports;
+    reports.push_back(baseline_report);
+    term::Qsg_atlas_frame_report seeded_report = baseline_report;
+    const bool seeded = pump_atlas_seeded_msdf_text_slots(
+        app,
+        window,
+        surface,
+        seeded_report,
+        reports);
+    print_atlas_msdf_resource_stability_report("seeded", seeded_report);
+
+    term::Terminal_render_snapshot unchanged_snapshot =
+        make_atlas_msdf_resource_stability_snapshot(971U, false);
+    unchanged_snapshot.dirty_row_ranges.clear();
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            unchanged_snapshot));
+    term::Qsg_atlas_frame_report unchanged_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool unchanged_prepared = pump_next_atlas_report(
+        app,
+        window,
+        surface,
+        seeded_report.prepare_count,
+        unchanged_report);
+    reports.push_back(unchanged_report);
+    print_atlas_msdf_resource_stability_report(
+        "unchanged",
+        unchanged_report);
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(972U, true)));
+    term::Qsg_atlas_frame_report color_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool color_prepared = pump_next_atlas_report(
+        app,
+        window,
+        surface,
+        unchanged_report.prepare_count,
+        color_report);
+    reports.push_back(color_report);
+    print_atlas_msdf_resource_stability_report(
+        "color-only",
+        color_report);
+
+    const Msdf_text_resource_identity identity =
+        msdf_text_resource_identity(baseline_report.render);
+    int texture_uploads = 0;
+    for (const term::Qsg_atlas_frame_report& report : reports) {
+        if (report.render.msdf_text_texture_uploaded) {
+            ++texture_uploads;
+        }
+    }
+
+    bool ok = true;
+    ok &= check(
+        seeded,
+        "atlas MSDF resource stability seeds all MSDF rotating slots");
+    ok &= check(
+        unchanged_prepared,
+        "atlas MSDF resource stability renders an unchanged steady frame");
+    ok &= check(
+        color_prepared,
+        "atlas MSDF resource stability renders a color-only dirty frame");
+    for (const term::Qsg_atlas_frame_report& report : reports) {
+        ok &= atlas_msdf_resource_stability_render_ok(
+            "frame",
+            report,
+            expected_glyphs);
+        ok &= check(
+            msdf_text_resource_identity_matches(identity, report.render),
+            "atlas MSDF resource stability keeps public atlas identity fields stable");
+    }
+    ok &= check(
+        baseline_report.render.msdf_text_texture_uploaded,
+        "atlas MSDF resource stability uploads the MSDF texture on initial generation");
+    ok &= check(
+        texture_uploads == 1,
+        "atlas MSDF resource stability does not reupload the MSDF texture after seeding");
+    ok &= atlas_msdf_resource_stability_steady_buffer_ok(
+        "unchanged",
+        unchanged_report,
+        Atlas_msdf_steady_buffer_expectation::SKIPPED);
+    ok &= atlas_msdf_resource_stability_steady_buffer_ok(
+        "color-only",
+        color_report,
+        Atlas_msdf_steady_buffer_expectation::PARTIAL);
+    return ok;
+}
+
 bool run_atlas_glyph_row_stable_report_case(
     QGuiApplication& app,
     const char*      name,
@@ -8442,6 +10783,131 @@ Pixel_parity_fixture make_lcd_capability_probe_fixture(qreal device_pixel_ratio)
     return fixture;
 }
 
+Pixel_parity_fixture make_lcd_single_w_probe_fixture(qreal device_pixel_ratio)
+{
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+
+    Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
+        "lcd_single_w_probe",
+        false,
+        {3, 3},
+        986U,
+        metrics,
+        dpr);
+    const term::Terminal_style_id normal = 1U;
+    fixture.snapshot.styles.push_back(rgb_style(
+        k_lcd_w_probe_foreground_rgba,
+        k_lcd_w_probe_background_rgba));
+    fixture.snapshot.cells.push_back(
+        make_pixel_cell(1, 1, QStringLiteral("W"), 1, normal));
+    append_text_glyph_masks(
+        fixture,
+        pixel_expected_frame(fixture).text_runs);
+    return fixture;
+}
+
+Pixel_parity_fixture make_lcd_repeated_w_probe_fixture(qreal device_pixel_ratio)
+{
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+
+    Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
+        "lcd_repeated_w_probe",
+        false,
+        {3, 18},
+        988U,
+        metrics,
+        dpr);
+    const term::Terminal_style_id normal = 1U;
+    fixture.snapshot.styles.push_back(rgb_style(
+        k_lcd_w_probe_foreground_rgba,
+        k_lcd_w_probe_background_rgba));
+    for (int index = 0; index < k_lcd_repeated_w_cell_count; ++index) {
+        fixture.snapshot.cells.push_back(
+            make_pixel_cell(
+                k_lcd_repeated_w_row,
+                k_lcd_repeated_w_first_column +
+                    index * k_lcd_repeated_w_column_stride,
+                QStringLiteral("W"),
+                1,
+                normal));
+    }
+    append_text_glyph_masks(
+        fixture,
+        pixel_expected_frame(fixture).text_runs);
+    return fixture;
+}
+
+Pixel_parity_fixture make_lcd_ascii_panel_probe_fixture(qreal device_pixel_ratio)
+{
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+
+    Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
+        "lcd_ascii_panel_probe",
+        false,
+        {6, 42},
+        989U,
+        metrics,
+        dpr);
+    const term::Terminal_style_id normal = 1U;
+    fixture.snapshot.styles.push_back(rgb_style(
+        k_lcd_w_probe_foreground_rgba,
+        k_lcd_w_probe_background_rgba));
+
+    const QString representative = lcd_ascii_panel_representative_text();
+    for (int index = 0; index < representative.size(); ++index) {
+        fixture.snapshot.cells.push_back(
+            make_pixel_cell(
+                k_lcd_ascii_panel_representative_row,
+                k_lcd_ascii_panel_representative_column +
+                    index * k_lcd_ascii_panel_representative_column_stride,
+                QString(representative.at(index)),
+                1,
+                normal));
+    }
+
+    const QString dense = lcd_ascii_panel_dense_text();
+    fixture.snapshot.cells.push_back(
+        make_pixel_cell(
+            k_lcd_ascii_panel_dense_row,
+            k_lcd_ascii_panel_dense_column,
+            dense,
+            dense.size(),
+            normal));
+    fixture.snapshot.cells.push_back(
+        make_pixel_cell(
+            k_lcd_ascii_panel_cursor_row,
+            k_lcd_ascii_panel_cursor_column,
+            lcd_ascii_panel_cursor_text(),
+            1,
+            normal));
+    const QString user_text = lcd_ascii_panel_user_text();
+    fixture.snapshot.cells.push_back(
+        make_pixel_cell(
+            k_lcd_ascii_panel_user_text_row,
+            k_lcd_ascii_panel_user_text_column,
+            user_text,
+            user_text.size(),
+            normal));
+    fixture.snapshot.cursor.position = {
+        k_lcd_ascii_panel_cursor_row,
+        k_lcd_ascii_panel_cursor_column,
+    };
+    fixture.snapshot.cursor.visible = true;
+    fixture.snapshot.cursor.shape = term::Terminal_cursor_shape::BLOCK;
+    fixture.snapshot.cursor.blink_enabled = false;
+
+    const term::Terminal_render_frame frame = pixel_expected_frame(fixture);
+    append_text_glyph_masks(fixture, frame.text_runs);
+    append_text_glyph_masks(
+        fixture,
+        frame.cursor_text_runs,
+        pixel_render_options().cursor_color);
+    return fixture;
+}
+
 std::vector<Lcd_glyph_probe_record> probe_lcd_subpixel_glyphs(
     const QFont& font,
     qreal        device_pixel_ratio)
@@ -9564,6 +12030,26 @@ QJsonObject json_rect_object(const QRect& rect)
     return object;
 }
 
+QJsonObject json_rectf_object(const QRectF& rect)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("x"), rect.x());
+    object.insert(QStringLiteral("y"), rect.y());
+    object.insert(QStringLiteral("width"), rect.width());
+    object.insert(QStringLiteral("height"), rect.height());
+    return object;
+}
+
+QJsonObject json_color_object(const QColor& color)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("red"), color.red());
+    object.insert(QStringLiteral("green"), color.green());
+    object.insert(QStringLiteral("blue"), color.blue());
+    object.insert(QStringLiteral("alpha"), color.alpha());
+    return object;
+}
+
 QJsonObject pixel_image_ink_stats_object(const Pixel_image_ink_stats& stats)
 {
     QJsonObject object;
@@ -9571,6 +12057,366 @@ QJsonObject pixel_image_ink_stats_object(const Pixel_image_ink_stats& stats)
     object.insert(QStringLiteral("bbox"), json_rect_object(stats.bbox));
     object.insert(QStringLiteral("center_x"), stats.center_x);
     object.insert(QStringLiteral("center_y"), stats.center_y);
+    return object;
+}
+
+QJsonObject lcd_first_ink_column_stats_object(
+    const Lcd_first_ink_column_stats& stats)
+{
+    QJsonArray first_column;
+    for (const Lcd_first_ink_column_sample& sample : stats.first_column) {
+        QJsonObject item;
+        item.insert(QStringLiteral("y"), sample.y);
+        item.insert(QStringLiteral("color"), json_color_object(sample.color));
+        first_column.append(item);
+    }
+
+    QJsonObject object;
+    object.insert(QStringLiteral("ink_pixels"), stats.ink_pixels);
+    object.insert(QStringLiteral("bbox"), json_rect_object(stats.bbox));
+    object.insert(QStringLiteral("first_ink_x"), stats.first_ink_x);
+    object.insert(
+        QStringLiteral("first_column_rows"),
+        stats.first_column_rows);
+    object.insert(
+        QStringLiteral("distinct_first_column_rgb_colors"),
+        stats.distinct_first_column_rgb_colors);
+    object.insert(
+        QStringLiteral("adjacent_equal_first_column_pairs"),
+        stats.adjacent_equal_first_column_pairs);
+    object.insert(
+        QStringLiteral("longest_equal_first_column_run"),
+        stats.longest_equal_first_column_run);
+    object.insert(QStringLiteral("first_column"), first_column);
+    return object;
+}
+
+QJsonObject lcd_horizontal_edge_transition_stats_object(
+    const Lcd_horizontal_edge_transition_stats& stats)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("bbox"), json_rect_object(stats.bbox));
+    object.insert(QStringLiteral("sampled_rows"), stats.sampled_rows);
+    object.insert(
+        QStringLiteral("rows_with_transitions"),
+        stats.rows_with_transitions);
+    object.insert(
+        QStringLiteral("transition_count"),
+        stats.transition_count);
+    object.insert(
+        QStringLiteral("max_transition_width"),
+        stats.max_transition_width);
+    object.insert(
+        QStringLiteral("average_transition_width"),
+        stats.average_transition_width);
+    return object;
+}
+
+QJsonObject lcd_repeated_w_cell_stats_object(
+    const Lcd_repeated_w_cell_stats& stats)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("cell_pixels"), json_rect_object(stats.cell_pixels));
+    object.insert(QStringLiteral("ink_bbox"), json_rect_object(stats.ink_bbox));
+    object.insert(QStringLiteral("ink_pixels"), stats.ink_pixels);
+    object.insert(QStringLiteral("first_ink_x"), stats.first_ink_x);
+    object.insert(
+        QStringLiteral("relative_first_ink_x"),
+        stats.relative_first_ink_x);
+    object.insert(QStringLiteral("relative_bbox_x"), stats.relative_bbox_x);
+    object.insert(QStringLiteral("relative_bbox_y"), stats.relative_bbox_y);
+    object.insert(
+        QStringLiteral("relative_bbox_width"),
+        stats.relative_bbox_width);
+    object.insert(
+        QStringLiteral("relative_bbox_height"),
+        stats.relative_bbox_height);
+    return object;
+}
+
+QJsonObject lcd_repeated_w_stability_stats_object(
+    const Lcd_repeated_w_stability_stats& stats)
+{
+    QJsonArray cells;
+    for (const Lcd_repeated_w_cell_stats& cell : stats.cells) {
+        cells.append(lcd_repeated_w_cell_stats_object(cell));
+    }
+
+    QJsonObject object;
+    object.insert(QStringLiteral("cell_count"), stats.cell_count);
+    object.insert(
+        QStringLiteral("row"),
+        k_lcd_repeated_w_row);
+    object.insert(
+        QStringLiteral("first_column"),
+        k_lcd_repeated_w_first_column);
+    object.insert(
+        QStringLiteral("column_stride"),
+        k_lcd_repeated_w_column_stride);
+    object.insert(
+        QStringLiteral("physical_cell_width"),
+        stats.physical_cell_width);
+    object.insert(
+        QStringLiteral("physical_cell_height"),
+        stats.physical_cell_height);
+    object.insert(
+        QStringLiteral("physical_cell_ascent"),
+        stats.physical_cell_ascent);
+    object.insert(
+        QStringLiteral("cell_width_integer_delta"),
+        stats.cell_width_integer_delta);
+    object.insert(
+        QStringLiteral("cell_height_integer_delta"),
+        stats.cell_height_integer_delta);
+    object.insert(
+        QStringLiteral("cell_ascent_integer_delta"),
+        stats.cell_ascent_integer_delta);
+    object.insert(
+        QStringLiteral("cell_width_integer"),
+        stats.cell_width_integer);
+    object.insert(
+        QStringLiteral("cell_height_integer"),
+        stats.cell_height_integer);
+    object.insert(
+        QStringLiteral("cell_ascent_integer"),
+        stats.cell_ascent_integer);
+    object.insert(QStringLiteral("compared_cells"), stats.compared_cells);
+    object.insert(QStringLiteral("compared_pixels"), stats.compared_pixels);
+    object.insert(QStringLiteral("diff_pixels"), stats.diff_pixels);
+    object.insert(QStringLiteral("max_delta"), stats.max_delta);
+    object.insert(
+        QStringLiteral("max_diff_pixels_per_cell"),
+        stats.max_diff_pixels_per_cell);
+    object.insert(
+        QStringLiteral("ink_mask_diff_pixels"),
+        stats.ink_mask_diff_pixels);
+    object.insert(
+        QStringLiteral("max_ink_mask_diff_pixels_per_cell"),
+        stats.max_ink_mask_diff_pixels_per_cell);
+    object.insert(QStringLiteral("all_cells_have_ink"), stats.all_cells_have_ink);
+    object.insert(
+        QStringLiteral("max_ink_pixels_delta"),
+        stats.max_ink_pixels_delta);
+    object.insert(
+        QStringLiteral("max_relative_first_ink_x_delta"),
+        stats.max_relative_first_ink_x_delta);
+    object.insert(
+        QStringLiteral("max_relative_bbox_x_delta"),
+        stats.max_relative_bbox_x_delta);
+    object.insert(
+        QStringLiteral("max_relative_bbox_y_delta"),
+        stats.max_relative_bbox_y_delta);
+    object.insert(
+        QStringLiteral("max_relative_bbox_width_delta"),
+        stats.max_relative_bbox_width_delta);
+    object.insert(
+        QStringLiteral("max_relative_bbox_height_delta"),
+        stats.max_relative_bbox_height_delta);
+    object.insert(QStringLiteral("cells"), cells);
+    return object;
+}
+
+QJsonObject lcd_ascii_panel_cell_stats_object(
+    const Lcd_ascii_panel_cell_stats& stats)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("label"), stats.label);
+    object.insert(QStringLiteral("text"), stats.text);
+    object.insert(QStringLiteral("row"), stats.row);
+    object.insert(QStringLiteral("column"), stats.column);
+    object.insert(QStringLiteral("display_width"), stats.display_width);
+    object.insert(QStringLiteral("cursor_text"), stats.cursor_text);
+    object.insert(QStringLiteral("cell_pixels"), json_rect_object(stats.cell_pixels));
+    object.insert(QStringLiteral("ink_bbox"), json_rect_object(stats.ink_bbox));
+    object.insert(QStringLiteral("ink_pixels"), stats.ink_pixels);
+    object.insert(QStringLiteral("first_ink_x"), stats.first_ink_x);
+    object.insert(
+        QStringLiteral("relative_first_ink_x"),
+        stats.relative_first_ink_x);
+    object.insert(QStringLiteral("relative_bbox_x"), stats.relative_bbox_x);
+    object.insert(QStringLiteral("relative_bbox_y"), stats.relative_bbox_y);
+    object.insert(
+        QStringLiteral("relative_bbox_width"),
+        stats.relative_bbox_width);
+    object.insert(
+        QStringLiteral("relative_bbox_height"),
+        stats.relative_bbox_height);
+    object.insert(
+        QStringLiteral("relative_bbox_center_x"),
+        stats.relative_bbox_center_x);
+    object.insert(
+        QStringLiteral("relative_bbox_center_y"),
+        stats.relative_bbox_center_y);
+    object.insert(
+        QStringLiteral("left_half_ink_pixels"),
+        stats.left_half_ink_pixels);
+    object.insert(
+        QStringLiteral("right_half_ink_pixels"),
+        stats.right_half_ink_pixels);
+    object.insert(
+        QStringLiteral("top_half_ink_pixels"),
+        stats.top_half_ink_pixels);
+    object.insert(
+        QStringLiteral("bottom_half_ink_pixels"),
+        stats.bottom_half_ink_pixels);
+    object.insert(
+        QStringLiteral("horizontal_edge_transitions"),
+        lcd_horizontal_edge_transition_stats_object(stats.edge_transitions));
+    return object;
+}
+
+QJsonObject lcd_ascii_panel_probe_stats_object(
+    const Lcd_ascii_panel_probe_stats& stats)
+{
+    QJsonArray cells;
+    for (const Lcd_ascii_panel_cell_stats& cell : stats.cells) {
+        cells.append(lcd_ascii_panel_cell_stats_object(cell));
+    }
+
+    QJsonObject object;
+    object.insert(
+        QStringLiteral("expected_drawable_glyphs"),
+        stats.expected_drawable_glyphs);
+    object.insert(QStringLiteral("probed_cell_count"), stats.probed_cell_count);
+    object.insert(
+        QStringLiteral("representative_text"),
+        lcd_ascii_panel_representative_text());
+    object.insert(QStringLiteral("dense_text"), lcd_ascii_panel_dense_text());
+    object.insert(
+        QStringLiteral("cursor_text"),
+        lcd_ascii_panel_cursor_text());
+    object.insert(QStringLiteral("user_text"), lcd_ascii_panel_user_text());
+    object.insert(
+        QStringLiteral("physical_cell_width"),
+        stats.physical_cell_width);
+    object.insert(
+        QStringLiteral("physical_cell_height"),
+        stats.physical_cell_height);
+    object.insert(
+        QStringLiteral("physical_cell_ascent"),
+        stats.physical_cell_ascent);
+    object.insert(
+        QStringLiteral("cell_width_integer_delta"),
+        stats.cell_width_integer_delta);
+    object.insert(
+        QStringLiteral("cell_height_integer_delta"),
+        stats.cell_height_integer_delta);
+    object.insert(
+        QStringLiteral("cell_ascent_integer_delta"),
+        stats.cell_ascent_integer_delta);
+    object.insert(
+        QStringLiteral("cell_width_integer"),
+        stats.cell_width_integer);
+    object.insert(
+        QStringLiteral("cell_height_integer"),
+        stats.cell_height_integer);
+    object.insert(
+        QStringLiteral("cell_ascent_integer"),
+        stats.cell_ascent_integer);
+    object.insert(
+        QStringLiteral("all_probe_cells_have_ink"),
+        stats.all_probe_cells_have_ink);
+    object.insert(QStringLiteral("min_ink_pixels"), stats.min_ink_pixels);
+    object.insert(
+        QStringLiteral("key_glyph_transition_count"),
+        stats.key_glyph_transition_count);
+    object.insert(
+        QStringLiteral("max_key_glyph_transition_width"),
+        stats.max_key_glyph_transition_width);
+    object.insert(
+        QStringLiteral("max_key_glyph_average_transition_width"),
+        stats.max_key_glyph_average_transition_width);
+    object.insert(QStringLiteral("cells"), cells);
+    return object;
+}
+
+QJsonObject lcd_ascii_panel_placement_delta_object(
+    const Lcd_ascii_panel_placement_delta& delta)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("label"), delta.label);
+    object.insert(
+        QStringLiteral("reference_has_ink"),
+        delta.reference_has_ink);
+    object.insert(
+        QStringLiteral("candidate_has_ink"),
+        delta.candidate_has_ink);
+    object.insert(QStringLiteral("left_delta"), delta.left_delta);
+    object.insert(QStringLiteral("right_delta"), delta.right_delta);
+    object.insert(QStringLiteral("top_delta"), delta.top_delta);
+    object.insert(QStringLiteral("bottom_delta"), delta.bottom_delta);
+    object.insert(
+        QStringLiteral("first_ink_x_delta"),
+        delta.first_ink_x_delta);
+    object.insert(QStringLiteral("center_x_delta"), delta.center_x_delta);
+    object.insert(QStringLiteral("center_y_delta"), delta.center_y_delta);
+    object.insert(
+        QStringLiteral("signed_top_delta"),
+        delta.signed_top_delta);
+    object.insert(
+        QStringLiteral("signed_bottom_delta"),
+        delta.signed_bottom_delta);
+    object.insert(
+        QStringLiteral("signed_center_y_delta"),
+        delta.signed_center_y_delta);
+    return object;
+}
+
+QJsonObject lcd_ascii_panel_placement_stats_object(
+    const Lcd_ascii_panel_placement_stats& stats)
+{
+    QJsonArray cells;
+    for (const Lcd_ascii_panel_placement_delta& cell : stats.cells) {
+        cells.append(lcd_ascii_panel_placement_delta_object(cell));
+    }
+
+    QJsonObject object;
+    object.insert(QStringLiteral("expected_cells"), stats.expected_cells);
+    object.insert(QStringLiteral("compared_cells"), stats.compared_cells);
+    object.insert(
+        QStringLiteral("all_cells_have_ink"),
+        stats.all_cells_have_ink);
+    object.insert(QStringLiteral("max_left_delta"), stats.max_left_delta);
+    object.insert(QStringLiteral("max_right_delta"), stats.max_right_delta);
+    object.insert(QStringLiteral("max_top_delta"), stats.max_top_delta);
+    object.insert(QStringLiteral("max_bottom_delta"), stats.max_bottom_delta);
+    object.insert(
+        QStringLiteral("max_first_ink_x_delta"),
+        stats.max_first_ink_x_delta);
+    object.insert(
+        QStringLiteral("max_center_x_delta"),
+        stats.max_center_x_delta);
+    object.insert(
+        QStringLiteral("max_center_y_delta"),
+        stats.max_center_y_delta);
+    object.insert(
+        QStringLiteral("min_signed_top_delta"),
+        stats.min_signed_top_delta);
+    object.insert(
+        QStringLiteral("max_signed_top_delta"),
+        stats.max_signed_top_delta);
+    object.insert(
+        QStringLiteral("signed_top_delta_range"),
+        stats.signed_top_delta_range);
+    object.insert(
+        QStringLiteral("min_signed_bottom_delta"),
+        stats.min_signed_bottom_delta);
+    object.insert(
+        QStringLiteral("max_signed_bottom_delta"),
+        stats.max_signed_bottom_delta);
+    object.insert(
+        QStringLiteral("signed_bottom_delta_range"),
+        stats.signed_bottom_delta_range);
+    object.insert(
+        QStringLiteral("min_signed_center_y_delta"),
+        stats.min_signed_center_y_delta);
+    object.insert(
+        QStringLiteral("max_signed_center_y_delta"),
+        stats.max_signed_center_y_delta);
+    object.insert(
+        QStringLiteral("signed_center_y_delta_range"),
+        stats.signed_center_y_delta_range);
+    object.insert(QStringLiteral("cells"), cells);
     return object;
 }
 
@@ -9631,11 +12477,270 @@ QJsonObject raster_variant_probe_object(
     return object;
 }
 
+QJsonObject msdf_single_w_probe_result_object(
+    const Pixel_parity_fixture&        fixture,
+    const Msdf_single_w_probe_result&  msdf_result,
+    const Pixel_render_result&         raw_atlas_reference,
+    const Pixel_render_result&         qt_text_reference)
+{
+    const Lcd_first_ink_column_stats first_ink_column =
+        measure_lcd_first_ink_column(
+            msdf_result.render.image,
+            fixture.glyph_masks,
+            fixture.device_pixel_ratio);
+
+    QJsonObject object;
+    object.insert(QStringLiteral("compiled"), msdf_result.compiled);
+    object.insert(QStringLiteral("atlas_built"), msdf_result.atlas_built);
+    object.insert(QStringLiteral("message"), msdf_result.message);
+    object.insert(QStringLiteral("font_source"), msdf_result.font_source);
+    object.insert(QStringLiteral("font_data_bytes"), msdf_result.font_data_bytes);
+    object.insert(QStringLiteral("pixel_height"), msdf_result.pixel_height);
+    object.insert(QStringLiteral("atlas_size"), msdf_result.atlas_size);
+    object.insert(QStringLiteral("px_range"), msdf_result.px_range);
+    object.insert(QStringLiteral("advance_x"), msdf_result.advance_x);
+    object.insert(
+        QStringLiteral("baseline_offset_px"),
+        msdf_result.baseline_offset_px);
+    object.insert(QStringLiteral("plane_rect"), json_rectf_object(msdf_result.plane_rect));
+    object.insert(QStringLiteral("draw_rect"), json_rectf_object(msdf_result.draw_rect));
+    object.insert(
+        QStringLiteral("render"),
+        lcd_probe_render_result_object(msdf_result.render));
+    object.insert(
+        QStringLiteral("first_ink_column"),
+        lcd_first_ink_column_stats_object(first_ink_column));
+    object.insert(
+        QStringLiteral("horizontal_edge_transitions"),
+        lcd_horizontal_edge_transition_stats_object(
+            measure_lcd_horizontal_edge_transitions(
+                msdf_result.render.image,
+                fixture.glyph_masks,
+                fixture.device_pixel_ratio,
+                first_ink_column)));
+    object.insert(
+        QStringLiteral("comparison_to_raw_atlas_reference"),
+        lcd_probe_glyph_stats_object(
+            compare_glyph_regions(
+                raw_atlas_reference.image,
+                msdf_result.render.image,
+                fixture.glyph_masks,
+                fixture.device_pixel_ratio)));
+    object.insert(
+        QStringLiteral("comparison_to_qt_text_node"),
+        lcd_probe_glyph_stats_object(
+            compare_glyph_regions(
+                qt_text_reference.image,
+                msdf_result.render.image,
+                fixture.glyph_masks,
+                fixture.device_pixel_ratio)));
+    object.insert(
+        QStringLiteral("renderer_contract"),
+        QStringLiteral(
+            "diagnostic only: CPU MSDF W render, not a terminal renderer path"));
+    return object;
+}
+
+QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report);
+
+QJsonObject lcd_single_w_probe_object(
+    const Pixel_parity_fixture& fixture,
+    const Pixel_render_result&  atlas,
+    const Pixel_render_result&  raw_atlas_reference,
+    const Pixel_render_result&  qt_text_reference,
+    const Msdf_single_w_probe_result& msdf_result)
+{
+    const Lcd_first_ink_column_stats atlas_first_ink_column =
+        measure_lcd_first_ink_column(
+            atlas.image,
+            fixture.glyph_masks,
+            fixture.device_pixel_ratio);
+    const Lcd_first_ink_column_stats raw_atlas_first_ink_column =
+        measure_lcd_first_ink_column(
+            raw_atlas_reference.image,
+            fixture.glyph_masks,
+            fixture.device_pixel_ratio);
+    const Lcd_first_ink_column_stats qt_text_first_ink_column =
+        measure_lcd_first_ink_column(
+            qt_text_reference.image,
+            fixture.glyph_masks,
+            fixture.device_pixel_ratio);
+
+    QJsonObject object;
+    object.insert(
+        QStringLiteral("fixture_logical_size"),
+        json_sizef_object(fixture.logical_size));
+    object.insert(
+        QStringLiteral("atlas"),
+        lcd_probe_render_result_object(atlas));
+    object.insert(
+        QStringLiteral("atlas_report"),
+        lcd_probe_report_object(atlas.atlas_report));
+    object.insert(
+        QStringLiteral("raw_atlas_reference"),
+        lcd_probe_render_result_object(raw_atlas_reference));
+    object.insert(
+        QStringLiteral("qt_text_node_reference"),
+        lcd_probe_render_result_object(qt_text_reference));
+    object.insert(
+        QStringLiteral("atlas_first_ink_column"),
+        lcd_first_ink_column_stats_object(atlas_first_ink_column));
+    object.insert(
+        QStringLiteral("atlas_horizontal_edge_transitions"),
+        lcd_horizontal_edge_transition_stats_object(
+            measure_lcd_horizontal_edge_transitions(
+                atlas.image,
+                fixture.glyph_masks,
+                fixture.device_pixel_ratio,
+                atlas_first_ink_column)));
+    object.insert(
+        QStringLiteral("raw_atlas_first_ink_column"),
+        lcd_first_ink_column_stats_object(raw_atlas_first_ink_column));
+    object.insert(
+        QStringLiteral("raw_atlas_horizontal_edge_transitions"),
+        lcd_horizontal_edge_transition_stats_object(
+            measure_lcd_horizontal_edge_transitions(
+                raw_atlas_reference.image,
+                fixture.glyph_masks,
+                fixture.device_pixel_ratio,
+                raw_atlas_first_ink_column)));
+    object.insert(
+        QStringLiteral("qt_text_node_first_ink_column"),
+        lcd_first_ink_column_stats_object(qt_text_first_ink_column));
+    object.insert(
+        QStringLiteral("qt_text_node_horizontal_edge_transitions"),
+        lcd_horizontal_edge_transition_stats_object(
+            measure_lcd_horizontal_edge_transitions(
+                qt_text_reference.image,
+                fixture.glyph_masks,
+                fixture.device_pixel_ratio,
+                qt_text_first_ink_column)));
+    object.insert(
+        QStringLiteral("msdf"),
+        msdf_single_w_probe_result_object(
+            fixture,
+            msdf_result,
+            raw_atlas_reference,
+            qt_text_reference));
+    object.insert(
+        QStringLiteral("renderer_contract"),
+        QStringLiteral(
+            "diagnostic only: isolates one W glyph for first-ink-column coverage inspection"));
+    return object;
+}
+
+QJsonObject lcd_repeated_w_probe_object(
+    const Pixel_parity_fixture& fixture,
+    const Pixel_render_result&  atlas)
+{
+    const Lcd_repeated_w_stability_stats stability =
+        measure_lcd_repeated_w_stability(
+            fixture,
+            atlas.image,
+            k_lcd_repeated_w_row,
+            k_lcd_repeated_w_first_column,
+            k_lcd_repeated_w_column_stride,
+            k_lcd_repeated_w_cell_count);
+
+    QJsonObject object;
+    object.insert(
+        QStringLiteral("fixture_logical_size"),
+        json_sizef_object(fixture.logical_size));
+    object.insert(
+        QStringLiteral("atlas"),
+        lcd_probe_render_result_object(atlas));
+    object.insert(
+        QStringLiteral("atlas_report"),
+        lcd_probe_report_object(atlas.atlas_report));
+    object.insert(
+        QStringLiteral("stability"),
+        lcd_repeated_w_stability_stats_object(stability));
+    object.insert(
+        QStringLiteral("renderer_contract"),
+        QStringLiteral(
+            "diagnostic gate: repeated W MSDF ownership, integer cells, stable crops, and no x drift"));
+    return object;
+}
+
+QJsonObject lcd_ascii_panel_probe_object(
+    const Pixel_parity_fixture&          fixture,
+    const Pixel_render_result&           atlas,
+    const Pixel_render_result&           raw_atlas_reference,
+    const Lcd_ascii_panel_probe_stats&   stats,
+    const Lcd_ascii_panel_probe_stats&   raw_atlas_reference_stats,
+    const Lcd_ascii_panel_placement_stats& raw_atlas_placement,
+    const Lcd_ascii_panel_placement_stats& user_text_raw_atlas_placement)
+{
+    QJsonObject object;
+    object.insert(
+        QStringLiteral("fixture_logical_size"),
+        json_sizef_object(fixture.logical_size));
+    object.insert(
+        QStringLiteral("atlas"),
+        lcd_probe_render_result_object(atlas));
+    object.insert(
+        QStringLiteral("atlas_report"),
+        lcd_probe_report_object(atlas.atlas_report));
+    object.insert(
+        QStringLiteral("raw_atlas_reference"),
+        lcd_probe_render_result_object(raw_atlas_reference));
+    object.insert(
+        QStringLiteral("stats"),
+        lcd_ascii_panel_probe_stats_object(stats));
+    object.insert(
+        QStringLiteral("raw_atlas_reference_stats"),
+        lcd_ascii_panel_probe_stats_object(raw_atlas_reference_stats));
+    object.insert(
+        QStringLiteral("raw_atlas_placement"),
+        lcd_ascii_panel_placement_stats_object(raw_atlas_placement));
+    object.insert(
+        QStringLiteral("user_text_raw_atlas_placement"),
+        lcd_ascii_panel_placement_stats_object(user_text_raw_atlas_placement));
+    object.insert(
+        QStringLiteral("renderer_contract"),
+        QStringLiteral(
+            "diagnostic gate: printable ASCII and cursor text MSDF ownership, integer cells, ink, conservative edge quality, and raw-atlas-relative cell placement"));
+    return object;
+}
+
 QJsonObject json_pointf_object(QPointF point)
 {
     QJsonObject object;
     object.insert(QStringLiteral("x"), point.x());
     object.insert(QStringLiteral("y"), point.y());
+    return object;
+}
+
+QJsonObject lcd_translated_repeated_w_probe_object(
+    const Pixel_parity_fixture&            fixture,
+    const Pixel_render_result&             atlas,
+    QPointF                                host_translation,
+    const Lcd_repeated_w_stability_stats&  stability,
+    const Lcd_repeated_w_stability_stats&  origin_match)
+{
+    QJsonObject object;
+    object.insert(
+        QStringLiteral("fixture_logical_size"),
+        json_sizef_object(fixture.logical_size));
+    object.insert(
+        QStringLiteral("host_translation"),
+        json_pointf_object(host_translation));
+    object.insert(
+        QStringLiteral("atlas"),
+        lcd_probe_render_result_object(atlas));
+    object.insert(
+        QStringLiteral("atlas_report"),
+        lcd_probe_report_object(atlas.atlas_report));
+    object.insert(
+        QStringLiteral("stability"),
+        lcd_repeated_w_stability_stats_object(stability));
+    object.insert(
+        QStringLiteral("origin_match"),
+        lcd_repeated_w_stability_stats_object(origin_match));
+    object.insert(
+        QStringLiteral("renderer_contract"),
+        QStringLiteral(
+            "diagnostic gate: translated repeated W MSDF ownership, stable crops, and exact origin correspondence"));
     return object;
 }
 
@@ -9921,6 +13026,63 @@ QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
         report.render_target_non_null);
     capabilities.insert(QStringLiteral("rhi_non_null"), report.rhi_non_null);
     capabilities.insert(
+        QStringLiteral("msdf_text_renderer_experiment_requested"),
+        report.msdf_text_renderer_experiment_requested);
+    capabilities.insert(
+        QStringLiteral("msdf_text_renderer_experiment_compiled"),
+        report.msdf_text_renderer_experiment_compiled);
+    capabilities.insert(
+        QStringLiteral("msdf_text_renderer_production_active"),
+        report.msdf_text_renderer_production_active);
+    capabilities.insert(
+        QStringLiteral("msdf_text_shader_package_available"),
+        report.msdf_text_shader_package_available);
+    capabilities.insert(
+        QStringLiteral("msdf_text_atlas_built"),
+        report.msdf_text_atlas_built);
+    capabilities.insert(
+        QStringLiteral("msdf_text_atlas_ready"),
+        report.msdf_text_atlas_ready);
+    capabilities.insert(
+        QStringLiteral("msdf_text_texture_ready"),
+        report.msdf_text_texture_ready);
+    capabilities.insert(
+        QStringLiteral("msdf_text_resources_ready"),
+        report.msdf_text_resources_ready);
+    capabilities.insert(
+        QStringLiteral("msdf_text_supported_runs"),
+        report.msdf_text_supported_runs);
+    capabilities.insert(
+        QStringLiteral("msdf_text_runs"),
+        report.msdf_text_runs);
+    capabilities.insert(
+        QStringLiteral("msdf_text_glyph_instances"),
+        report.msdf_text_glyph_instances);
+    capabilities.insert(
+        QStringLiteral("msdf_text_draw_calls"),
+        report.msdf_text_draw_calls);
+    capabilities.insert(
+        QStringLiteral("msdf_text_missed_supported_runs"),
+        report.msdf_text_missed_supported_runs);
+    capabilities.insert(
+        QStringLiteral("msdf_text_missed_supported_glyphs"),
+        report.msdf_text_missed_supported_glyphs);
+    capabilities.insert(
+        QStringLiteral("msdf_text_message"),
+        report.msdf_text_message);
+    capabilities.insert(
+        QStringLiteral("msdf_text_font_data_bytes"),
+        report.msdf_text_font_data_bytes);
+    capabilities.insert(
+        QStringLiteral("msdf_text_pixel_height"),
+        report.msdf_text_pixel_height);
+    capabilities.insert(
+        QStringLiteral("msdf_text_atlas_size"),
+        report.msdf_text_atlas_size);
+    capabilities.insert(
+        QStringLiteral("msdf_text_px_range"),
+        report.msdf_text_px_range);
+    capabilities.insert(
         QStringLiteral("coverage_texture_created"),
         report.coverage_texture_created);
     capabilities.insert(
@@ -9995,6 +13157,9 @@ QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
         QStringLiteral("glyph_draw_calls"),
         report.render.glyph_draw_calls);
     render.insert(
+        QStringLiteral("msdf_text_draw_calls"),
+        report.render.msdf_text_draw_calls);
+    render.insert(
         QStringLiteral("atlas_page_count"),
         report.render.atlas_page_count);
     render.insert(
@@ -10027,6 +13192,12 @@ QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
         QStringLiteral("coverage_texture_skipped"),
         report.render.coverage_texture_skipped);
     render.insert(
+        QStringLiteral("msdf_text_texture_uploaded"),
+        report.render.msdf_text_texture_uploaded);
+    render.insert(
+        QStringLiteral("msdf_text_texture_ready"),
+        report.render.msdf_text_texture_ready);
+    render.insert(
         QStringLiteral("atlas_page_pressure"),
         report.render.atlas_page_pressure);
     render.insert(
@@ -10042,13 +13213,63 @@ QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
         QStringLiteral("shaped_invalid_string_indexes"),
         report.render.shaped_invalid_string_indexes);
     render.insert(
+        QStringLiteral("glyph_buffer_instances"),
+        report.render.glyph_buffer_instances);
+    render.insert(
         QStringLiteral("sampler_mode"),
         QString::fromLatin1(
             term::qsg_atlas_sampler_mode_name(
                 report.render.glyph_sampler_mode)));
     render.insert(
+        QStringLiteral("msdf_text_sampler_mode"),
+        QString::fromLatin1(
+            term::qsg_atlas_sampler_mode_name(
+                report.render.msdf_text_sampler_mode)));
+    render.insert(
         QStringLiteral("glyph_shader_package_available"),
         report.render.glyph_shader_package_available);
+    render.insert(
+        QStringLiteral("msdf_text_shader_package_available"),
+        report.render.msdf_text_shader_package_available);
+    render.insert(
+        QStringLiteral("msdf_text_atlas_built"),
+        report.render.msdf_text_atlas_built);
+    render.insert(
+        QStringLiteral("msdf_text_atlas_ready"),
+        report.render.msdf_text_atlas_ready);
+    render.insert(
+        QStringLiteral("msdf_text_resources_ready"),
+        report.render.msdf_text_resources_ready);
+    render.insert(
+        QStringLiteral("msdf_text_supported_runs"),
+        report.render.msdf_text_supported_runs);
+    render.insert(
+        QStringLiteral("msdf_text_runs"),
+        report.render.msdf_text_runs);
+    render.insert(
+        QStringLiteral("msdf_text_glyph_instances"),
+        report.render.msdf_text_glyph_instances);
+    render.insert(
+        QStringLiteral("msdf_text_missed_supported_runs"),
+        report.render.msdf_text_missed_supported_runs);
+    render.insert(
+        QStringLiteral("msdf_text_missed_supported_glyphs"),
+        report.render.msdf_text_missed_supported_glyphs);
+    render.insert(
+        QStringLiteral("msdf_text_message"),
+        report.render.msdf_text_message);
+    render.insert(
+        QStringLiteral("msdf_text_font_data_bytes"),
+        report.render.msdf_text_font_data_bytes);
+    render.insert(
+        QStringLiteral("msdf_text_pixel_height"),
+        report.render.msdf_text_pixel_height);
+    render.insert(
+        QStringLiteral("msdf_text_atlas_size"),
+        report.render.msdf_text_atlas_size);
+    render.insert(
+        QStringLiteral("msdf_text_px_range"),
+        report.render.msdf_text_px_range);
     render.insert(
         QStringLiteral("dual_source_probe_shader_package_available"),
         report.render.dual_source_probe_shader_package_available);
@@ -10058,6 +13279,15 @@ QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
     render.insert(
         QStringLiteral("dual_source_blend_factors_runtime_probe"),
         report.render.dual_source_blend_factors_runtime_probe);
+    render.insert(
+        QStringLiteral("msdf_text_renderer_experiment_requested"),
+        report.render.msdf_text_renderer_experiment_requested);
+    render.insert(
+        QStringLiteral("msdf_text_renderer_experiment_compiled"),
+        report.render.msdf_text_renderer_experiment_compiled);
+    render.insert(
+        QStringLiteral("msdf_text_renderer_production_active"),
+        report.render.msdf_text_renderer_production_active);
 
     QJsonObject cache;
     json_insert_u64(cache, QStringLiteral("lookups"), report.cache.lookups);
@@ -10129,9 +13359,27 @@ QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
 
 QJsonObject make_lcd_probe_metadata(
     const Pixel_parity_fixture&                  fixture,
+    const Pixel_parity_fixture&                  single_w_fixture,
+    const Pixel_parity_fixture&                  repeated_w_fixture,
+    const Pixel_parity_fixture&                  ascii_panel_fixture,
     const Pixel_render_result&                   atlas,
     const Pixel_render_result&                   reference,
     const Pixel_render_result&                   qt_text_reference,
+    const Pixel_render_result&                   single_w_atlas,
+    const Pixel_render_result&                   single_w_raw_atlas_reference,
+    const Pixel_render_result&                   single_w_qt_text_reference,
+    const Pixel_render_result&                   repeated_w_atlas,
+    const Pixel_render_result&                   translated_repeated_w_atlas,
+    const Pixel_render_result&                   ascii_panel_atlas,
+    const Pixel_render_result&                   ascii_panel_raw_atlas_reference,
+    QPointF                                      repeated_w_translated_host,
+    const Lcd_repeated_w_stability_stats&        translated_repeated_w_stability,
+    const Lcd_repeated_w_stability_stats&        translated_w_origin_match,
+    const Lcd_ascii_panel_probe_stats&           ascii_panel_stats,
+    const Lcd_ascii_panel_probe_stats&           ascii_panel_raw_atlas_reference_stats,
+    const Lcd_ascii_panel_placement_stats&       ascii_panel_raw_atlas_placement,
+    const Lcd_ascii_panel_placement_stats&       ascii_panel_user_text_raw_atlas_placement,
+    const Msdf_single_w_probe_result&            single_w_msdf,
     const Raster_variant_probe_result&           raster_variants,
     const Metrics_placement_probe_result&        metrics_placement,
     const std::vector<Lcd_glyph_probe_record>&   probe_records,
@@ -10257,6 +13505,37 @@ QJsonObject make_lcd_probe_metadata(
         QStringLiteral("raster_variant_probe"),
         raster_variant_probe_object(raster_variants));
     object.insert(
+        QStringLiteral("single_w_probe"),
+        lcd_single_w_probe_object(
+            single_w_fixture,
+            single_w_atlas,
+            single_w_raw_atlas_reference,
+            single_w_qt_text_reference,
+            single_w_msdf));
+    object.insert(
+        QStringLiteral("repeated_w_probe"),
+        lcd_repeated_w_probe_object(
+            repeated_w_fixture,
+            repeated_w_atlas));
+    object.insert(
+        QStringLiteral("translated_repeated_w_probe"),
+        lcd_translated_repeated_w_probe_object(
+            repeated_w_fixture,
+            translated_repeated_w_atlas,
+            repeated_w_translated_host,
+            translated_repeated_w_stability,
+            translated_w_origin_match));
+    object.insert(
+        QStringLiteral("ascii_panel_probe"),
+        lcd_ascii_panel_probe_object(
+            ascii_panel_fixture,
+            ascii_panel_atlas,
+            ascii_panel_raw_atlas_reference,
+            ascii_panel_stats,
+            ascii_panel_raw_atlas_reference_stats,
+            ascii_panel_raw_atlas_placement,
+            ascii_panel_user_text_raw_atlas_placement));
+    object.insert(
         QStringLiteral("metrics_placement_probe"),
         metrics_placement_probe_object(metrics_placement));
     object.insert(QStringLiteral("atlas_report"), lcd_probe_report_object(atlas.atlas_report));
@@ -10304,9 +13583,27 @@ bool save_lcd_probe_image_artifact(
 
 bool write_lcd_probe_artifacts(
     const Pixel_parity_fixture&                  fixture,
+    const Pixel_parity_fixture&                  single_w_fixture,
+    const Pixel_parity_fixture&                  repeated_w_fixture,
+    const Pixel_parity_fixture&                  ascii_panel_fixture,
     const Pixel_render_result&                   atlas,
     const Pixel_render_result&                   reference,
     const Pixel_render_result&                   qt_text_reference,
+    const Pixel_render_result&                   single_w_atlas,
+    const Pixel_render_result&                   single_w_raw_atlas_reference,
+    const Pixel_render_result&                   single_w_qt_text_reference,
+    const Pixel_render_result&                   repeated_w_atlas,
+    const Pixel_render_result&                   translated_repeated_w_atlas,
+    const Pixel_render_result&                   ascii_panel_atlas,
+    const Pixel_render_result&                   ascii_panel_raw_atlas_reference,
+    QPointF                                      repeated_w_translated_host,
+    const Lcd_repeated_w_stability_stats&        translated_repeated_w_stability,
+    const Lcd_repeated_w_stability_stats&        translated_w_origin_match,
+    const Lcd_ascii_panel_probe_stats&           ascii_panel_stats,
+    const Lcd_ascii_panel_probe_stats&           ascii_panel_raw_atlas_reference_stats,
+    const Lcd_ascii_panel_placement_stats&       ascii_panel_raw_atlas_placement,
+    const Lcd_ascii_panel_placement_stats&       ascii_panel_user_text_raw_atlas_placement,
+    const Msdf_single_w_probe_result&            single_w_msdf,
     const Raster_variant_probe_result&           raster_variants,
     const Metrics_placement_probe_result&        metrics_placement,
     const std::vector<Lcd_glyph_probe_record>&   probe_records,
@@ -10334,6 +13631,31 @@ bool write_lcd_probe_artifacts(
     const QString qt_text_reference_path =
         artifact_dir.filePath(
             QStringLiteral("lcd_capability_probe_qt_text_reference.png"));
+    const QString single_w_atlas_path =
+        artifact_dir.filePath(
+            QStringLiteral("lcd_capability_probe_single_w_atlas.png"));
+    const QString single_w_raw_atlas_reference_path =
+        artifact_dir.filePath(
+            QStringLiteral("lcd_capability_probe_single_w_raw_atlas_reference.png"));
+    const QString single_w_qt_text_reference_path =
+        artifact_dir.filePath(
+            QStringLiteral("lcd_capability_probe_single_w_qt_text_reference.png"));
+    const QString single_w_msdf_path =
+        artifact_dir.filePath(
+            QStringLiteral("lcd_capability_probe_single_w_msdf.png"));
+    const QString repeated_w_atlas_path =
+        artifact_dir.filePath(
+            QStringLiteral("lcd_capability_probe_repeated_w_atlas.png"));
+    const QString translated_repeated_w_atlas_path =
+        artifact_dir.filePath(
+            QStringLiteral("lcd_capability_probe_translated_repeated_w_atlas.png"));
+    const QString ascii_panel_atlas_path =
+        artifact_dir.filePath(
+            QStringLiteral("lcd_capability_probe_ascii_panel_atlas.png"));
+    const QString ascii_panel_raw_atlas_reference_path =
+        artifact_dir.filePath(
+            QStringLiteral(
+                "lcd_capability_probe_ascii_panel_raw_atlas_reference.png"));
     const QString raster_variant_path =
         artifact_dir.filePath(
             QStringLiteral("lcd_capability_probe_raster_variants.png"));
@@ -10354,6 +13676,40 @@ bool write_lcd_probe_artifacts(
         qt_text_reference_path,
         "Qt text reference");
     ok &= save_lcd_probe_image_artifact(
+        single_w_atlas.image,
+        single_w_atlas_path,
+        "single-W atlas");
+    ok &= save_lcd_probe_image_artifact(
+        single_w_raw_atlas_reference.image,
+        single_w_raw_atlas_reference_path,
+        "single-W raw atlas reference");
+    ok &= save_lcd_probe_image_artifact(
+        single_w_qt_text_reference.image,
+        single_w_qt_text_reference_path,
+        "single-W Qt text reference");
+    if (single_w_msdf.render.ready) {
+        ok &= save_lcd_probe_image_artifact(
+            single_w_msdf.render.image,
+            single_w_msdf_path,
+            "single-W MSDF");
+    }
+    ok &= save_lcd_probe_image_artifact(
+        repeated_w_atlas.image,
+        repeated_w_atlas_path,
+        "repeated-W atlas");
+    ok &= save_lcd_probe_image_artifact(
+        translated_repeated_w_atlas.image,
+        translated_repeated_w_atlas_path,
+        "translated repeated-W atlas");
+    ok &= save_lcd_probe_image_artifact(
+        ascii_panel_atlas.image,
+        ascii_panel_atlas_path,
+        "ASCII panel atlas");
+    ok &= save_lcd_probe_image_artifact(
+        ascii_panel_raw_atlas_reference.image,
+        ascii_panel_raw_atlas_reference_path,
+        "ASCII panel raw atlas reference");
+    ok &= save_lcd_probe_image_artifact(
         raster_variants.sheet,
         raster_variant_path,
         "raster variant probe");
@@ -10369,9 +13725,27 @@ bool write_lcd_probe_artifacts(
     else {
         const QJsonObject metadata = make_lcd_probe_metadata(
             fixture,
+            single_w_fixture,
+            repeated_w_fixture,
+            ascii_panel_fixture,
             atlas,
             reference,
             qt_text_reference,
+            single_w_atlas,
+            single_w_raw_atlas_reference,
+            single_w_qt_text_reference,
+            repeated_w_atlas,
+            translated_repeated_w_atlas,
+            ascii_panel_atlas,
+            ascii_panel_raw_atlas_reference,
+            repeated_w_translated_host,
+            translated_repeated_w_stability,
+            translated_w_origin_match,
+            ascii_panel_stats,
+            ascii_panel_raw_atlas_reference_stats,
+            ascii_panel_raw_atlas_placement,
+            ascii_panel_user_text_raw_atlas_placement,
+            single_w_msdf,
             raster_variants,
             metrics_placement,
             probe_records,
@@ -10394,6 +13768,22 @@ bool write_lcd_probe_artifacts(
         const QByteArray reference_path_bytes = reference_path.toLocal8Bit();
         const QByteArray qt_text_reference_path_bytes =
             qt_text_reference_path.toLocal8Bit();
+        const QByteArray single_w_atlas_path_bytes =
+            single_w_atlas_path.toLocal8Bit();
+        const QByteArray single_w_raw_atlas_reference_path_bytes =
+            single_w_raw_atlas_reference_path.toLocal8Bit();
+        const QByteArray single_w_qt_text_reference_path_bytes =
+            single_w_qt_text_reference_path.toLocal8Bit();
+        const QByteArray single_w_msdf_path_bytes =
+            single_w_msdf_path.toLocal8Bit();
+        const QByteArray repeated_w_atlas_path_bytes =
+            repeated_w_atlas_path.toLocal8Bit();
+        const QByteArray translated_repeated_w_atlas_path_bytes =
+            translated_repeated_w_atlas_path.toLocal8Bit();
+        const QByteArray ascii_panel_atlas_path_bytes =
+            ascii_panel_atlas_path.toLocal8Bit();
+        const QByteArray ascii_panel_raw_atlas_reference_path_bytes =
+            ascii_panel_raw_atlas_reference_path.toLocal8Bit();
         const QByteArray raster_variant_path_bytes =
             raster_variant_path.toLocal8Bit();
         const QByteArray metadata_path_bytes = metadata_path.toLocal8Bit();
@@ -10402,6 +13792,24 @@ bool write_lcd_probe_artifacts(
             << " reference=" << reference_path_bytes.constData()
             << " qt_text_reference="
             << qt_text_reference_path_bytes.constData()
+            << " single_w_atlas="
+            << single_w_atlas_path_bytes.constData()
+            << " single_w_raw_atlas_reference="
+            << single_w_raw_atlas_reference_path_bytes.constData()
+            << " single_w_qt_text_reference="
+            << single_w_qt_text_reference_path_bytes.constData()
+            << " single_w_msdf="
+            << (single_w_msdf.render.ready
+                ? single_w_msdf_path_bytes.constData()
+                : "not-compiled-or-not-ready")
+            << " repeated_w_atlas="
+            << repeated_w_atlas_path_bytes.constData()
+            << " translated_repeated_w_atlas="
+            << translated_repeated_w_atlas_path_bytes.constData()
+            << " ascii_panel_atlas="
+            << ascii_panel_atlas_path_bytes.constData()
+            << " ascii_panel_raw_atlas_reference="
+            << ascii_panel_raw_atlas_reference_path_bytes.constData()
             << " raster_variants="
             << raster_variant_path_bytes.constData()
             << " metadata=" << metadata_path_bytes.constData()
@@ -10449,6 +13857,18 @@ void print_lcd_atlas_probe_report(
         << " sampler_mode="
         << term::qsg_atlas_sampler_mode_name(
             render_summary.glyph_sampler_mode)
+        << " msdf_active="
+        << render_summary.msdf_text_renderer_production_active
+        << " msdf_runs=" << render_summary.msdf_text_runs
+        << " msdf_instances=" << render_summary.msdf_text_glyph_instances
+        << " msdf_draws=" << render_summary.msdf_text_draw_calls
+        << " msdf_missed_runs="
+        << render_summary.msdf_text_missed_supported_runs
+        << " msdf_missed_glyphs="
+        << render_summary.msdf_text_missed_supported_glyphs
+        << " msdf_sampler_mode="
+        << term::qsg_atlas_sampler_mode_name(
+            render_summary.msdf_text_sampler_mode)
         << " snapped_origin_failures="
         << frame_build.snapped_origin_failures
         << " grayscale_masks="
@@ -10496,6 +13916,40 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         render_atlas_rgba_reference_fixture(fixture, reference_size);
     const Pixel_render_result qt_text_reference =
         render_qsg_text_reference_fixture(app, fixture);
+    const Pixel_parity_fixture single_w_fixture =
+        make_lcd_single_w_probe_fixture(device_pixel_ratio);
+    const Pixel_render_result single_w_atlas =
+        render_pixel_atlas_fixture(app, single_w_fixture);
+    const Pixel_render_result single_w_raw_atlas_reference =
+        render_atlas_rgba_reference_fixture(
+            single_w_fixture,
+            single_w_atlas.image.size());
+    const Pixel_render_result single_w_qt_text_reference =
+        render_qsg_text_reference_fixture(app, single_w_fixture);
+    const Msdf_single_w_probe_result single_w_msdf =
+        render_msdf_single_w_probe_fixture(
+            single_w_fixture,
+            single_w_atlas.image.size());
+    const Pixel_parity_fixture repeated_w_fixture =
+        make_lcd_repeated_w_probe_fixture(device_pixel_ratio);
+    const Pixel_render_result repeated_w_atlas =
+        render_pixel_atlas_fixture(app, repeated_w_fixture);
+    const QPointF repeated_w_translated_host(
+        k_lcd_repeated_w_translated_host_x,
+        k_lcd_repeated_w_translated_host_y);
+    const Pixel_render_result translated_repeated_w_atlas =
+        render_pixel_atlas_fixture(
+            app,
+            repeated_w_fixture,
+            repeated_w_translated_host);
+    const Pixel_parity_fixture ascii_panel_fixture =
+        make_lcd_ascii_panel_probe_fixture(device_pixel_ratio);
+    const Pixel_render_result ascii_panel_atlas =
+        render_pixel_atlas_fixture(app, ascii_panel_fixture);
+    const Pixel_render_result ascii_panel_raw_atlas_reference =
+        render_atlas_rgba_reference_fixture(
+            ascii_panel_fixture,
+            ascii_panel_atlas.image.size());
     const Raster_variant_probe_result raster_variants =
         render_lcd_raster_variant_probe(fixture.device_pixel_ratio);
     const Metrics_placement_probe_result metrics_placement =
@@ -10508,6 +13962,129 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         atlas.image,
         fixture.glyph_masks,
         fixture.device_pixel_ratio);
+    const Pixel_glyph_stats single_w_qt_text_glyphs = compare_glyph_regions(
+        single_w_qt_text_reference.image,
+        single_w_atlas.image,
+        single_w_fixture.glyph_masks,
+        single_w_fixture.device_pixel_ratio);
+    const Pixel_glyph_stats single_w_msdf_raw_glyphs = compare_glyph_regions(
+        single_w_raw_atlas_reference.image,
+        single_w_msdf.render.image,
+        single_w_fixture.glyph_masks,
+        single_w_fixture.device_pixel_ratio);
+    const Pixel_glyph_stats single_w_msdf_qt_text_glyphs = compare_glyph_regions(
+        single_w_qt_text_reference.image,
+        single_w_msdf.render.image,
+        single_w_fixture.glyph_masks,
+        single_w_fixture.device_pixel_ratio);
+    const Lcd_first_ink_column_stats single_w_atlas_first_column =
+        measure_lcd_first_ink_column(
+            single_w_atlas.image,
+            single_w_fixture.glyph_masks,
+            single_w_fixture.device_pixel_ratio);
+    const Lcd_first_ink_column_stats single_w_raw_atlas_first_column =
+        measure_lcd_first_ink_column(
+            single_w_raw_atlas_reference.image,
+            single_w_fixture.glyph_masks,
+            single_w_fixture.device_pixel_ratio);
+    const Lcd_first_ink_column_stats single_w_qt_text_first_column =
+        measure_lcd_first_ink_column(
+            single_w_qt_text_reference.image,
+            single_w_fixture.glyph_masks,
+            single_w_fixture.device_pixel_ratio);
+    const Lcd_first_ink_column_stats single_w_msdf_first_column =
+        measure_lcd_first_ink_column(
+            single_w_msdf.render.image,
+            single_w_fixture.glyph_masks,
+            single_w_fixture.device_pixel_ratio);
+    const Lcd_horizontal_edge_transition_stats single_w_atlas_edges =
+        measure_lcd_horizontal_edge_transitions(
+            single_w_atlas.image,
+            single_w_fixture.glyph_masks,
+            single_w_fixture.device_pixel_ratio,
+            single_w_atlas_first_column);
+    const Lcd_horizontal_edge_transition_stats single_w_raw_atlas_edges =
+        measure_lcd_horizontal_edge_transitions(
+            single_w_raw_atlas_reference.image,
+            single_w_fixture.glyph_masks,
+            single_w_fixture.device_pixel_ratio,
+            single_w_raw_atlas_first_column);
+    const Lcd_horizontal_edge_transition_stats single_w_qt_text_edges =
+        measure_lcd_horizontal_edge_transitions(
+            single_w_qt_text_reference.image,
+            single_w_fixture.glyph_masks,
+            single_w_fixture.device_pixel_ratio,
+            single_w_qt_text_first_column);
+    const Lcd_horizontal_edge_transition_stats single_w_msdf_edges =
+        measure_lcd_horizontal_edge_transitions(
+            single_w_msdf.render.image,
+            single_w_fixture.glyph_masks,
+            single_w_fixture.device_pixel_ratio,
+            single_w_msdf_first_column);
+    const double single_w_atlas_msdf_ink_ratio = lcd_ink_pixel_ratio(
+        single_w_atlas_first_column.ink_pixels,
+        single_w_msdf_first_column.ink_pixels);
+    const Lcd_repeated_w_stability_stats repeated_w_stability =
+        measure_lcd_repeated_w_stability(
+            repeated_w_fixture,
+            repeated_w_atlas.image,
+            k_lcd_repeated_w_row,
+            k_lcd_repeated_w_first_column,
+            k_lcd_repeated_w_column_stride,
+            k_lcd_repeated_w_cell_count);
+    const Lcd_repeated_w_stability_stats translated_repeated_w_stability =
+        measure_lcd_repeated_w_stability(
+            repeated_w_fixture,
+            translated_repeated_w_atlas.image,
+            k_lcd_repeated_w_row,
+            k_lcd_repeated_w_first_column,
+            k_lcd_repeated_w_column_stride,
+            k_lcd_repeated_w_cell_count,
+            repeated_w_translated_host);
+    const Lcd_repeated_w_stability_stats translated_w_origin_match =
+        compare_lcd_repeated_w_corresponding_cells(
+            repeated_w_fixture,
+            repeated_w_atlas.image,
+            repeated_w_stability,
+            translated_repeated_w_atlas.image,
+            translated_repeated_w_stability);
+    const Lcd_ascii_panel_probe_stats ascii_panel_stats =
+        measure_lcd_ascii_panel_probe(
+            ascii_panel_fixture,
+            ascii_panel_atlas.image);
+    const Lcd_ascii_panel_probe_stats ascii_panel_raw_atlas_reference_stats =
+        measure_lcd_ascii_panel_probe(
+            ascii_panel_fixture,
+            ascii_panel_raw_atlas_reference.image);
+    const Lcd_ascii_panel_placement_stats ascii_panel_raw_atlas_placement =
+        compare_lcd_ascii_panel_cell_placement(
+            ascii_panel_raw_atlas_reference_stats,
+            ascii_panel_stats,
+            lcd_ascii_panel_placement_probe_labels());
+    const Lcd_ascii_panel_placement_stats
+        ascii_panel_user_text_raw_atlas_placement =
+            compare_lcd_ascii_panel_cell_placement(
+                ascii_panel_raw_atlas_reference_stats,
+                ascii_panel_stats,
+                lcd_ascii_panel_user_text_placement_probe_labels());
+    const Lcd_ascii_panel_cell_stats* const ascii_panel_m_cell =
+        lcd_ascii_panel_cell(
+            ascii_panel_stats,
+            QStringLiteral("M"));
+    const Lcd_ascii_panel_cell_stats* const ascii_panel_e_cell =
+        lcd_ascii_panel_cell(
+            ascii_panel_stats,
+            QStringLiteral("e"));
+    const Lcd_ascii_panel_cell_stats* const ascii_panel_l_cell =
+        lcd_ascii_panel_cell(
+            ascii_panel_stats,
+            QStringLiteral("L"));
+    const auto& repeated_w_render =
+        repeated_w_atlas.atlas_report.render;
+    const auto& translated_repeated_w_render =
+        translated_repeated_w_atlas.atlas_report.render;
+    const auto& ascii_panel_render =
+        ascii_panel_atlas.atlas_report.render;
 
     print_lcd_atlas_probe_report(atlas, backend);
     std::cout << "LCD atlas Qt text-node reference"
@@ -10522,11 +14099,277 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         << " qt_text_ink_pixels=" << qt_text_glyphs.reference_ink_pixels
         << " atlas_ink_pixels=" << qt_text_glyphs.atlas_ink_pixels
         << '\n';
+    std::cout << "LCD atlas single-W Qt text-node reference"
+        << " atlas_ready=" << single_w_atlas.ready
+        << " raw_atlas_ready=" << single_w_raw_atlas_reference.ready
+        << " qt_text_ready=" << single_w_qt_text_reference.ready
+        << " atlas_image=" << single_w_atlas.image.width()
+        << 'x' << single_w_atlas.image.height()
+        << " raw_atlas_image=" << single_w_raw_atlas_reference.image.width()
+        << 'x' << single_w_raw_atlas_reference.image.height()
+        << " qt_text_image=" << single_w_qt_text_reference.image.width()
+        << 'x' << single_w_qt_text_reference.image.height()
+        << " glyph_compared_pixels=" << single_w_qt_text_glyphs.compared_pixels
+        << " glyph_diff_pixels=" << single_w_qt_text_glyphs.diff_pixels
+        << " glyph_max_delta=" << single_w_qt_text_glyphs.max_delta
+        << " qt_text_ink_pixels="
+        << single_w_qt_text_glyphs.reference_ink_pixels
+        << " atlas_ink_pixels=" << single_w_qt_text_glyphs.atlas_ink_pixels
+        << '\n';
+    std::cout << "LCD atlas single-W MSDF diagnostic"
+        << " compiled=" << single_w_msdf.compiled
+        << " atlas_built=" << single_w_msdf.atlas_built
+        << " ready=" << single_w_msdf.render.ready
+        << " image=" << single_w_msdf.render.image.width()
+        << 'x' << single_w_msdf.render.image.height()
+        << " raw_compared_pixels=" << single_w_msdf_raw_glyphs.compared_pixels
+        << " raw_diff_pixels=" << single_w_msdf_raw_glyphs.diff_pixels
+        << " raw_max_delta=" << single_w_msdf_raw_glyphs.max_delta
+        << " qt_text_compared_pixels="
+        << single_w_msdf_qt_text_glyphs.compared_pixels
+        << " qt_text_diff_pixels=" << single_w_msdf_qt_text_glyphs.diff_pixels
+        << " qt_text_max_delta=" << single_w_msdf_qt_text_glyphs.max_delta
+        << " message=" << single_w_msdf.message.toUtf8().constData()
+        << '\n';
+    std::cout << "LCD atlas single-W first-ink-column"
+        << " atlas_ink=" << single_w_atlas_first_column.ink_pixels
+        << " atlas_rows=" << single_w_atlas_first_column.first_column_rows
+        << " atlas_distinct="
+        << single_w_atlas_first_column.distinct_first_column_rgb_colors
+        << " atlas_adjacent_equal="
+        << single_w_atlas_first_column.adjacent_equal_first_column_pairs
+        << " atlas_longest_equal_run="
+        << single_w_atlas_first_column.longest_equal_first_column_run
+        << " raw_ink=" << single_w_raw_atlas_first_column.ink_pixels
+        << " raw_rows=" << single_w_raw_atlas_first_column.first_column_rows
+        << " raw_distinct="
+        << single_w_raw_atlas_first_column.distinct_first_column_rgb_colors
+        << " raw_adjacent_equal="
+        << single_w_raw_atlas_first_column.adjacent_equal_first_column_pairs
+        << " raw_longest_equal_run="
+        << single_w_raw_atlas_first_column.longest_equal_first_column_run
+        << " qt_rows=" << single_w_qt_text_first_column.first_column_rows
+        << " qt_distinct="
+        << single_w_qt_text_first_column.distinct_first_column_rgb_colors
+        << " qt_adjacent_equal="
+        << single_w_qt_text_first_column.adjacent_equal_first_column_pairs
+        << " qt_longest_equal_run="
+        << single_w_qt_text_first_column.longest_equal_first_column_run
+        << " cpu_msdf_rows="
+        << single_w_msdf_first_column.first_column_rows
+        << " cpu_msdf_distinct="
+        << single_w_msdf_first_column.distinct_first_column_rgb_colors
+        << " cpu_msdf_adjacent_equal="
+        << single_w_msdf_first_column.adjacent_equal_first_column_pairs
+        << " cpu_msdf_longest_equal_run="
+        << single_w_msdf_first_column.longest_equal_first_column_run
+        << '\n';
+    std::cout << "LCD atlas single-W MSDF edge quality"
+        << " atlas_bbox=" << single_w_atlas_first_column.bbox.x() << ','
+        << single_w_atlas_first_column.bbox.y() << ' '
+        << single_w_atlas_first_column.bbox.width() << 'x'
+        << single_w_atlas_first_column.bbox.height()
+        << " cpu_msdf_bbox=" << single_w_msdf_first_column.bbox.x() << ','
+        << single_w_msdf_first_column.bbox.y() << ' '
+        << single_w_msdf_first_column.bbox.width() << 'x'
+        << single_w_msdf_first_column.bbox.height()
+        << " atlas_msdf_ink_ratio=" << single_w_atlas_msdf_ink_ratio
+        << " atlas_edge_rows=" << single_w_atlas_edges.rows_with_transitions
+        << " atlas_edge_count=" << single_w_atlas_edges.transition_count
+        << " atlas_edge_max=" << single_w_atlas_edges.max_transition_width
+        << " atlas_edge_avg=" << single_w_atlas_edges.average_transition_width
+        << " raw_edge_max=" << single_w_raw_atlas_edges.max_transition_width
+        << " raw_edge_avg=" << single_w_raw_atlas_edges.average_transition_width
+        << " qt_edge_max=" << single_w_qt_text_edges.max_transition_width
+        << " qt_edge_avg=" << single_w_qt_text_edges.average_transition_width
+        << " cpu_msdf_edge_rows="
+        << single_w_msdf_edges.rows_with_transitions
+        << " cpu_msdf_edge_count=" << single_w_msdf_edges.transition_count
+        << " cpu_msdf_edge_max=" << single_w_msdf_edges.max_transition_width
+        << " cpu_msdf_edge_avg="
+        << single_w_msdf_edges.average_transition_width
+        << '\n';
+    std::cout << "LCD atlas repeated-W stability"
+        << " ready=" << repeated_w_atlas.ready
+        << " image=" << repeated_w_atlas.image.width()
+        << 'x' << repeated_w_atlas.image.height()
+        << " msdf_active=" << repeated_w_render.msdf_text_renderer_production_active
+        << " msdf_instances=" << repeated_w_render.msdf_text_glyph_instances
+        << " msdf_draws=" << repeated_w_render.msdf_text_draw_calls
+        << " glyph_draws=" << repeated_w_render.glyph_draw_calls
+        << " glyph_instances=" << repeated_w_render.glyph_buffer_instances
+        << " column_stride=" << k_lcd_repeated_w_column_stride
+        << " physical_cell=" << repeated_w_stability.physical_cell_width
+        << 'x' << repeated_w_stability.physical_cell_height
+        << " ascent=" << repeated_w_stability.physical_cell_ascent
+        << " integer_deltas="
+        << repeated_w_stability.cell_width_integer_delta
+        << ',' << repeated_w_stability.cell_height_integer_delta
+        << ',' << repeated_w_stability.cell_ascent_integer_delta
+        << " compared_cells=" << repeated_w_stability.compared_cells
+        << " compared_pixels=" << repeated_w_stability.compared_pixels
+        << " diff_pixels=" << repeated_w_stability.diff_pixels
+        << " max_delta=" << repeated_w_stability.max_delta
+        << " max_diff_per_cell="
+        << repeated_w_stability.max_diff_pixels_per_cell
+        << " ink_mask_diff_pixels="
+        << repeated_w_stability.ink_mask_diff_pixels
+        << " max_ink_mask_diff_per_cell="
+        << repeated_w_stability.max_ink_mask_diff_pixels_per_cell
+        << " all_ink=" << repeated_w_stability.all_cells_have_ink
+        << " max_ink_delta="
+        << repeated_w_stability.max_ink_pixels_delta
+        << " max_rel_first_x_delta="
+        << repeated_w_stability.max_relative_first_ink_x_delta
+        << " max_rel_bbox_x_delta="
+        << repeated_w_stability.max_relative_bbox_x_delta
+        << '\n';
+    std::cout << "LCD atlas translated repeated-W stability"
+        << " ready=" << translated_repeated_w_atlas.ready
+        << " image=" << translated_repeated_w_atlas.image.width()
+        << 'x' << translated_repeated_w_atlas.image.height()
+        << " host_translation=" << repeated_w_translated_host.x()
+        << ',' << repeated_w_translated_host.y()
+        << " msdf_active="
+        << translated_repeated_w_render.msdf_text_renderer_production_active
+        << " msdf_instances="
+        << translated_repeated_w_render.msdf_text_glyph_instances
+        << " msdf_draws="
+        << translated_repeated_w_render.msdf_text_draw_calls
+        << " glyph_draws=" << translated_repeated_w_render.glyph_draw_calls
+        << " glyph_instances=" << translated_repeated_w_render.glyph_buffer_instances
+        << " compared_cells="
+        << translated_repeated_w_stability.compared_cells
+        << " compared_pixels="
+        << translated_repeated_w_stability.compared_pixels
+        << " diff_pixels=" << translated_repeated_w_stability.diff_pixels
+        << " max_delta=" << translated_repeated_w_stability.max_delta
+        << " max_diff_per_cell="
+        << translated_repeated_w_stability.max_diff_pixels_per_cell
+        << " ink_mask_diff_pixels="
+        << translated_repeated_w_stability.ink_mask_diff_pixels
+        << " max_ink_mask_diff_per_cell="
+        << translated_repeated_w_stability.max_ink_mask_diff_pixels_per_cell
+        << " all_ink=" << translated_repeated_w_stability.all_cells_have_ink
+        << " max_ink_delta="
+        << translated_repeated_w_stability.max_ink_pixels_delta
+        << " max_rel_first_x_delta="
+        << translated_repeated_w_stability.max_relative_first_ink_x_delta
+        << " max_rel_bbox_x_delta="
+        << translated_repeated_w_stability.max_relative_bbox_x_delta
+        << '\n';
+    std::cout << "LCD atlas translated repeated-W origin match"
+        << " compared_cells="
+        << translated_w_origin_match.compared_cells
+        << " compared_pixels="
+        << translated_w_origin_match.compared_pixels
+        << " diff_pixels=" << translated_w_origin_match.diff_pixels
+        << " max_delta=" << translated_w_origin_match.max_delta
+        << " max_diff_per_cell="
+        << translated_w_origin_match.max_diff_pixels_per_cell
+        << " ink_mask_diff_pixels="
+        << translated_w_origin_match.ink_mask_diff_pixels
+        << " max_ink_mask_diff_per_cell="
+        << translated_w_origin_match.max_ink_mask_diff_pixels_per_cell
+        << " all_ink="
+        << translated_w_origin_match.all_cells_have_ink
+        << " max_ink_delta="
+        << translated_w_origin_match.max_ink_pixels_delta
+        << " max_rel_first_x_delta="
+        << translated_w_origin_match.max_relative_first_ink_x_delta
+        << " max_rel_bbox_x_delta="
+        << translated_w_origin_match.max_relative_bbox_x_delta
+        << '\n';
+    std::cout << "LCD atlas ASCII panel probe"
+        << " ready=" << ascii_panel_atlas.ready
+        << " image=" << ascii_panel_atlas.image.width()
+        << 'x' << ascii_panel_atlas.image.height()
+        << " msdf_active="
+        << ascii_panel_render.msdf_text_renderer_production_active
+        << " msdf_instances="
+        << ascii_panel_render.msdf_text_glyph_instances
+        << " expected_instances="
+        << ascii_panel_stats.expected_drawable_glyphs
+        << " msdf_draws=" << ascii_panel_render.msdf_text_draw_calls
+        << " glyph_draws=" << ascii_panel_render.glyph_draw_calls
+        << " glyph_instances="
+        << ascii_panel_render.glyph_buffer_instances
+        << " missed_runs="
+        << ascii_panel_render.msdf_text_missed_supported_runs
+        << " missed_glyphs="
+        << ascii_panel_render.msdf_text_missed_supported_glyphs
+        << " physical_cell=" << ascii_panel_stats.physical_cell_width
+        << 'x' << ascii_panel_stats.physical_cell_height
+        << " ascent=" << ascii_panel_stats.physical_cell_ascent
+        << " integer_deltas="
+        << ascii_panel_stats.cell_width_integer_delta
+        << ',' << ascii_panel_stats.cell_height_integer_delta
+        << ',' << ascii_panel_stats.cell_ascent_integer_delta
+        << " probed_cells=" << ascii_panel_stats.probed_cell_count
+        << " all_ink=" << ascii_panel_stats.all_probe_cells_have_ink
+        << " min_ink=" << ascii_panel_stats.min_ink_pixels
+        << " key_edge_count="
+        << ascii_panel_stats.key_glyph_transition_count
+        << " key_edge_max="
+        << ascii_panel_stats.max_key_glyph_transition_width
+        << " key_edge_avg_max="
+        << ascii_panel_stats.max_key_glyph_average_transition_width;
+    if (ascii_panel_l_cell != nullptr) {
+        std::cout
+            << " L_left=" << ascii_panel_l_cell->left_half_ink_pixels
+            << " L_right=" << ascii_panel_l_cell->right_half_ink_pixels
+            << " L_top=" << ascii_panel_l_cell->top_half_ink_pixels
+            << " L_bottom=" << ascii_panel_l_cell->bottom_half_ink_pixels;
+    }
+    std::cout << '\n';
+    std::cout << "LCD atlas ASCII panel raw placement"
+        << " raw_ready=" << ascii_panel_raw_atlas_reference.ready
+        << " raw_image=" << ascii_panel_raw_atlas_reference.image.width()
+        << 'x' << ascii_panel_raw_atlas_reference.image.height()
+        << " expected_cells="
+        << ascii_panel_raw_atlas_placement.expected_cells
+        << " compared_cells="
+        << ascii_panel_raw_atlas_placement.compared_cells
+        << " all_ink="
+        << ascii_panel_raw_atlas_placement.all_cells_have_ink
+        << " max_left_delta="
+        << ascii_panel_raw_atlas_placement.max_left_delta
+        << " max_right_delta="
+        << ascii_panel_raw_atlas_placement.max_right_delta
+        << " max_top_delta="
+        << ascii_panel_raw_atlas_placement.max_top_delta
+        << " max_bottom_delta="
+        << ascii_panel_raw_atlas_placement.max_bottom_delta
+        << " max_first_x_delta="
+        << ascii_panel_raw_atlas_placement.max_first_ink_x_delta
+        << " max_center_delta="
+        << ascii_panel_raw_atlas_placement.max_center_x_delta
+        << ',' << ascii_panel_raw_atlas_placement.max_center_y_delta
+        << '\n';
+    std::cout << "LCD atlas ASCII panel user-text jitter"
+        << " text=" << lcd_ascii_panel_user_text().toUtf8().constData()
+        << " expected_cells="
+        << ascii_panel_user_text_raw_atlas_placement.expected_cells
+        << " compared_cells="
+        << ascii_panel_user_text_raw_atlas_placement.compared_cells
+        << " all_ink="
+        << ascii_panel_user_text_raw_atlas_placement.all_cells_have_ink
+        << " signed_center_y_range="
+        << ascii_panel_user_text_raw_atlas_placement.signed_center_y_delta_range
+        << " signed_top_range="
+        << ascii_panel_user_text_raw_atlas_placement.signed_top_delta_range
+        << " signed_bottom_range="
+        << ascii_panel_user_text_raw_atlas_placement.signed_bottom_delta_range
+        << '\n';
     print_lcd_probe_records(probe_records);
     print_missing_lcd_probe_family_coverage_labels(probe_records);
 
     const term::Glyph_coverage_counts& production_coverage =
         atlas.atlas_report.frame_build.glyph_coverage;
+    const bool msdf_text_renderer_requested =
+        atlas.atlas_report.render.msdf_text_renderer_experiment_requested;
+    const bool msdf_text_production_active =
+        atlas.atlas_report.render.msdf_text_renderer_production_active;
 
     // Batch 1 targets the pinned Windows D3D11 hardware path; missing
     // dual-source probing or sample-family glyph images is a gate failure here.
@@ -10542,6 +14385,37 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             lcd_probe_image_has_pixels(qt_text_reference.image),
         "LCD atlas probe captures a non-empty Qt text-node reference image");
     ok &= check(
+        single_w_atlas.ready &&
+            atlas_report_render_state_ready(single_w_atlas.atlas_report) &&
+            lcd_probe_image_has_pixels(single_w_atlas.image),
+        "LCD atlas probe captures a non-empty single-W atlas image");
+    ok &= check(
+        lcd_probe_image_has_pixels(single_w_raw_atlas_reference.image),
+        "LCD atlas probe renders a non-empty single-W raw atlas reference image");
+    ok &= check(
+        single_w_qt_text_reference.ready &&
+            lcd_probe_image_has_pixels(single_w_qt_text_reference.image),
+        "LCD atlas probe captures a non-empty single-W Qt text-node reference image");
+    ok &= check(
+        repeated_w_atlas.ready &&
+            atlas_report_render_state_ready(repeated_w_atlas.atlas_report) &&
+            lcd_probe_image_has_pixels(repeated_w_atlas.image),
+        "LCD atlas probe captures a non-empty repeated-W atlas image");
+    ok &= check(
+        translated_repeated_w_atlas.ready &&
+            atlas_report_render_state_ready(
+                translated_repeated_w_atlas.atlas_report) &&
+            lcd_probe_image_has_pixels(translated_repeated_w_atlas.image),
+        "LCD atlas probe captures a non-empty translated repeated-W atlas image");
+    ok &= check(
+        ascii_panel_atlas.ready &&
+            atlas_report_render_state_ready(ascii_panel_atlas.atlas_report) &&
+            lcd_probe_image_has_pixels(ascii_panel_atlas.image),
+        "LCD atlas probe captures a non-empty ASCII panel atlas image");
+    ok &= check(
+        lcd_probe_image_has_pixels(ascii_panel_raw_atlas_reference.image),
+        "LCD atlas probe renders a non-empty ASCII panel raw atlas reference image");
+    ok &= check(
         lcd_probe_image_has_visible_variation(atlas.image),
         "LCD atlas probe atlas image contains visible fixture variation");
     ok &= check(
@@ -10550,6 +14424,37 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     ok &= check(
         lcd_probe_image_has_visible_variation(qt_text_reference.image),
         "LCD atlas probe Qt text-node reference contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(single_w_atlas.image),
+        "LCD atlas probe single-W atlas image contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(single_w_raw_atlas_reference.image),
+        "LCD atlas probe single-W raw atlas reference contains visible variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(single_w_qt_text_reference.image),
+        "LCD atlas probe single-W Qt text-node image contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(repeated_w_atlas.image),
+        "LCD atlas probe repeated-W atlas image contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(translated_repeated_w_atlas.image),
+        "LCD atlas probe translated repeated-W atlas image contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(ascii_panel_atlas.image),
+        "LCD atlas probe ASCII panel atlas image contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(
+            ascii_panel_raw_atlas_reference.image),
+        "LCD atlas probe ASCII panel raw atlas reference contains visible variation");
+    if (single_w_msdf.compiled) {
+        ok &= check(
+            single_w_msdf.render.ready &&
+                lcd_probe_image_has_pixels(single_w_msdf.render.image),
+            "LCD atlas probe captures a non-empty single-W MSDF image");
+        ok &= check(
+            lcd_probe_image_has_visible_variation(single_w_msdf.render.image),
+            "LCD atlas probe single-W MSDF image contains visible variation");
+    }
     ok &= check(
         lcd_probe_image_has_pixels(raster_variants.sheet) &&
             lcd_probe_image_has_visible_variation(raster_variants.sheet),
@@ -10564,6 +14469,16 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         qt_text_reference.image.size() == atlas.image.size(),
         "LCD atlas probe Qt text-node reference uses the atlas image size");
     ok &= check(
+        single_w_qt_text_reference.image.size() == single_w_atlas.image.size(),
+        "LCD atlas probe single-W Qt text-node reference uses the atlas image size");
+    ok &= check(
+        single_w_raw_atlas_reference.image.size() == single_w_atlas.image.size(),
+        "LCD atlas probe single-W raw atlas reference uses the atlas image size");
+    ok &= check(
+        ascii_panel_raw_atlas_reference.image.size() ==
+            ascii_panel_atlas.image.size(),
+        "LCD atlas probe ASCII panel raw atlas reference uses the atlas image size");
+    ok &= check(
         pixel_device_pixel_ratios_match(
             qt_text_reference.device_pixel_ratio,
             atlas.device_pixel_ratio) &&
@@ -10572,19 +14487,63 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                 atlas.image_device_pixel_ratio),
         "LCD atlas probe Qt text-node reference uses the atlas DPR");
     ok &= check(
+        pixel_device_pixel_ratios_match(
+            single_w_qt_text_reference.device_pixel_ratio,
+            single_w_atlas.device_pixel_ratio) &&
+            pixel_device_pixel_ratios_match(
+                single_w_qt_text_reference.image_device_pixel_ratio,
+                single_w_atlas.image_device_pixel_ratio),
+        "LCD atlas probe single-W Qt text-node reference uses the atlas DPR");
+    ok &= check(
+        pixel_device_pixel_ratios_match(
+            single_w_raw_atlas_reference.device_pixel_ratio,
+            single_w_atlas.device_pixel_ratio) &&
+            pixel_device_pixel_ratios_match(
+                single_w_raw_atlas_reference.image_device_pixel_ratio,
+                single_w_atlas.image_device_pixel_ratio),
+        "LCD atlas probe single-W raw atlas reference uses the atlas DPR");
+    ok &= check(
+        pixel_device_pixel_ratios_match(
+            ascii_panel_raw_atlas_reference.device_pixel_ratio,
+            ascii_panel_atlas.device_pixel_ratio) &&
+            pixel_device_pixel_ratios_match(
+                ascii_panel_raw_atlas_reference.image_device_pixel_ratio,
+                ascii_panel_atlas.image_device_pixel_ratio),
+        "LCD atlas probe ASCII panel raw atlas reference uses the atlas DPR");
+    ok &= check(
         qt_text_glyphs.compared_pixels > 0,
         "LCD atlas probe Qt text-node comparison covers glyph mask pixels");
     ok &= check(
         qt_text_glyphs.reference_ink_pixels > 0 &&
             qt_text_glyphs.atlas_ink_pixels > 0,
         "LCD atlas probe Qt text-node comparison sees glyph ink in both renderers");
+    ok &= check(
+        single_w_qt_text_glyphs.compared_pixels > 0,
+        "LCD atlas probe single-W comparison covers glyph mask pixels");
+    ok &= check(
+        single_w_qt_text_glyphs.reference_ink_pixels > 0 &&
+            single_w_qt_text_glyphs.atlas_ink_pixels > 0,
+        "LCD atlas probe single-W comparison sees glyph ink in both renderers");
+    if (single_w_msdf.compiled) {
+        ok &= check(
+            single_w_msdf_raw_glyphs.compared_pixels > 0 &&
+                single_w_msdf_qt_text_glyphs.compared_pixels > 0,
+            "LCD atlas probe single-W MSDF comparison covers glyph mask pixels");
+        ok &= check(
+            single_w_msdf_raw_glyphs.reference_ink_pixels > 0 &&
+                single_w_msdf_raw_glyphs.atlas_ink_pixels > 0 &&
+                single_w_msdf_qt_text_glyphs.reference_ink_pixels > 0 &&
+                single_w_msdf_qt_text_glyphs.atlas_ink_pixels > 0,
+            "LCD atlas probe single-W MSDF comparison sees glyph ink");
+    }
     ok &= compare_pixel_fixture(
         fixture,
         reference,
         atlas,
         backend,
         rgba_reference_budget_for_coverage(production_coverage),
-        "LCD atlas RGBA reference");
+        "LCD atlas RGBA reference",
+        !msdf_text_production_active);
     ok &= check(
         !probe_records.empty(),
         "LCD atlas probe records glyph image capability details");
@@ -10620,6 +14579,287 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         atlas.atlas_report.render.glyph_sampler_mode ==
             term::Qsg_atlas_sampler_mode::NEAREST,
         "LCD atlas probe reports nearest glyph coverage sampling");
+    if (msdf_text_renderer_requested) {
+        ok &= check(
+            msdf_text_production_active,
+            "LCD atlas probe activates the MSDF text renderer experiment");
+        ok &= check(
+            atlas.atlas_report.render.msdf_text_shader_package_available &&
+                atlas.atlas_report.render.msdf_text_atlas_built &&
+                atlas.atlas_report.render.msdf_text_atlas_ready &&
+                atlas.atlas_report.render.msdf_text_texture_ready &&
+                atlas.atlas_report.render.msdf_text_resources_ready,
+            "LCD atlas probe reports ready MSDF renderer resources");
+        ok &= check(
+            atlas.atlas_report.render.msdf_text_sampler_mode ==
+                term::Qsg_atlas_sampler_mode::LINEAR,
+            "LCD atlas probe reports linear MSDF atlas sampling");
+        ok &= check(
+            atlas.atlas_report.render.msdf_text_supported_runs > 0 &&
+                atlas.atlas_report.render.msdf_text_runs > 0 &&
+                atlas.atlas_report.render.msdf_text_glyph_instances > 0 &&
+                atlas.atlas_report.render.msdf_text_draw_calls > 0,
+            "LCD atlas probe routes supported ASCII text through MSDF draw calls");
+        ok &= check(
+            atlas.atlas_report.render.msdf_text_missed_supported_runs == 0 &&
+                atlas.atlas_report.render.msdf_text_missed_supported_glyphs == 0,
+            "LCD atlas probe reports no silent MSDF text misses");
+        ok &= check(
+            single_w_atlas.atlas_report.render.msdf_text_renderer_production_active &&
+                single_w_atlas.atlas_report.render.msdf_text_glyph_instances > 0 &&
+                single_w_atlas.atlas_report.render.msdf_text_draw_calls > 0 &&
+                single_w_atlas.atlas_report.render.glyph_draw_calls == 0 &&
+                single_w_atlas.atlas_report.render.glyph_buffer_instances == 0 &&
+                single_w_atlas.atlas_report.render.msdf_text_missed_supported_runs == 0 &&
+                single_w_atlas.atlas_report.render.msdf_text_missed_supported_glyphs == 0,
+            "LCD atlas probe single-W fixture uses the real MSDF renderer path");
+        constexpr int k_min_single_w_first_column_rows = 5;
+        ok &= check(
+            single_w_atlas_first_column.has_ink(),
+            "LCD atlas probe single-W MSDF first column contains ink");
+        ok &= check(
+            single_w_atlas_first_column.first_column_rows >=
+                k_min_single_w_first_column_rows,
+            "LCD atlas probe single-W MSDF first column has enough samples");
+        ok &= check(
+            single_w_atlas_first_column.adjacent_equal_first_column_pairs == 0,
+            "LCD atlas probe single-W MSDF first column has no adjacent equal samples");
+        ok &= check(
+            single_w_atlas_first_column.longest_equal_first_column_run <= 1,
+            "LCD atlas probe single-W MSDF first column has no repeated sample run");
+        ok &= check(
+            single_w_atlas_first_column.distinct_first_column_rgb_colors >=
+                single_w_atlas_first_column.first_column_rows - 1,
+            "LCD atlas probe single-W MSDF first column has a high distinct-color ratio");
+        ok &= check(
+            single_w_raw_atlas_first_column.has_ink() &&
+                single_w_raw_atlas_first_column.first_column_rows >=
+                    k_min_single_w_first_column_rows,
+            "LCD atlas probe single-W raw atlas first column is comparable");
+        ok &= check(
+            single_w_atlas_first_column.adjacent_equal_first_column_pairs <
+                single_w_raw_atlas_first_column.adjacent_equal_first_column_pairs,
+            "LCD atlas probe single-W MSDF has fewer repeated samples than the raw atlas");
+        ok &= check(
+            single_w_atlas_first_column.longest_equal_first_column_run <
+                single_w_raw_atlas_first_column.longest_equal_first_column_run,
+            "LCD atlas probe single-W MSDF has shorter repeated runs than the raw atlas");
+        ok &= check(
+            single_w_atlas_first_column.distinct_first_column_rgb_colors >
+                single_w_raw_atlas_first_column.distinct_first_column_rgb_colors,
+            "LCD atlas probe single-W MSDF has more first-column colors than the raw atlas");
+        constexpr int k_single_w_msdf_bbox_tolerance_pixels = 1;
+        ok &= check(
+            single_w_msdf_first_column.has_ink(),
+            "LCD atlas probe CPU MSDF single-W first column contains ink");
+        ok &= check(
+            lcd_rect_components_within(
+                single_w_atlas_first_column.bbox,
+                single_w_msdf_first_column.bbox,
+                k_single_w_msdf_bbox_tolerance_pixels),
+            "LCD atlas probe single-W MSDF bbox matches the CPU MSDF diagnostic");
+        ok &= check(
+            single_w_atlas_msdf_ink_ratio >= 0.80 &&
+                single_w_atlas_msdf_ink_ratio <= 1.25,
+            "LCD atlas probe single-W MSDF ink count matches the CPU MSDF diagnostic");
+        ok &= check(
+            single_w_atlas_edges.transition_count > 0 &&
+                single_w_msdf_edges.transition_count > 0,
+            "LCD atlas probe single-W MSDF edge metric captures transitions");
+        ok &= check(
+            single_w_atlas_edges.max_transition_width <=
+                single_w_msdf_edges.max_transition_width + 1,
+            "LCD atlas probe single-W MSDF edge width is not blurrier than CPU MSDF");
+        ok &= check(
+            repeated_w_render.msdf_text_renderer_production_active &&
+                repeated_w_render.msdf_text_glyph_instances ==
+                    k_lcd_repeated_w_cell_count &&
+                repeated_w_render.msdf_text_draw_calls > 0 &&
+                repeated_w_render.glyph_draw_calls == 0 &&
+                repeated_w_render.glyph_buffer_instances == 0 &&
+                repeated_w_render.msdf_text_missed_supported_runs == 0 &&
+                repeated_w_render.msdf_text_missed_supported_glyphs == 0,
+            "LCD atlas probe repeated-W fixture uses only the real MSDF renderer path");
+        ok &= check(
+            repeated_w_stability.cell_width_integer &&
+                repeated_w_stability.cell_height_integer &&
+                repeated_w_stability.cell_ascent_integer,
+            "LCD atlas probe repeated-W fixture uses integer physical cell metrics");
+        ok &= check(
+            repeated_w_stability.compared_cells ==
+                k_lcd_repeated_w_cell_count - 1 &&
+                repeated_w_stability.compared_pixels > 0,
+            "LCD atlas probe repeated-W stability comparison covers every repeated cell");
+        ok &= check(
+            repeated_w_stability.diff_pixels == 0 &&
+                repeated_w_stability.max_diff_pixels_per_cell == 0 &&
+                repeated_w_stability.max_delta == 0 &&
+                repeated_w_stability.ink_mask_diff_pixels == 0 &&
+                repeated_w_stability.max_ink_mask_diff_pixels_per_cell == 0,
+            "LCD atlas probe repeated-W RGB crops are identical across cells");
+        ok &= check(
+            repeated_w_stability.all_cells_have_ink &&
+                repeated_w_stability.max_ink_pixels_delta == 0 &&
+                repeated_w_stability.max_relative_first_ink_x_delta == 0 &&
+                repeated_w_stability.max_relative_bbox_x_delta == 0 &&
+                repeated_w_stability.max_relative_bbox_y_delta == 0 &&
+                repeated_w_stability.max_relative_bbox_width_delta == 0 &&
+                repeated_w_stability.max_relative_bbox_height_delta == 0,
+            "LCD atlas probe repeated-W glyph ink geometry is identical across cells");
+        ok &= check(
+            translated_repeated_w_render.msdf_text_renderer_production_active &&
+                translated_repeated_w_render.msdf_text_glyph_instances ==
+                    k_lcd_repeated_w_cell_count &&
+                translated_repeated_w_render.msdf_text_draw_calls > 0 &&
+                translated_repeated_w_render.glyph_draw_calls == 0 &&
+                translated_repeated_w_render.glyph_buffer_instances == 0 &&
+                translated_repeated_w_render.msdf_text_missed_supported_runs == 0 &&
+                translated_repeated_w_render.msdf_text_missed_supported_glyphs == 0,
+            "LCD atlas probe translated repeated-W fixture uses only the real MSDF renderer path");
+        ok &= check(
+            translated_repeated_w_stability.cell_width_integer &&
+                translated_repeated_w_stability.cell_height_integer &&
+                translated_repeated_w_stability.cell_ascent_integer,
+            "LCD atlas probe translated repeated-W fixture uses integer physical cell metrics");
+        ok &= check(
+            translated_repeated_w_stability.compared_cells ==
+                k_lcd_repeated_w_cell_count - 1 &&
+                translated_repeated_w_stability.compared_pixels > 0,
+            "LCD atlas probe translated repeated-W stability comparison covers every repeated cell");
+        constexpr int k_translated_repeated_w_rgb_delta_tolerance = 1;
+        ok &= check(
+            translated_repeated_w_stability.max_delta <=
+                    k_translated_repeated_w_rgb_delta_tolerance &&
+                translated_repeated_w_stability.ink_mask_diff_pixels == 0 &&
+                translated_repeated_w_stability.max_ink_mask_diff_pixels_per_cell == 0,
+            "LCD atlas probe translated repeated-W RGB crops remain visually stable across cells");
+        ok &= check(
+            translated_repeated_w_stability.all_cells_have_ink &&
+                translated_repeated_w_stability.max_ink_pixels_delta == 0 &&
+                translated_repeated_w_stability.max_relative_first_ink_x_delta == 0 &&
+                translated_repeated_w_stability.max_relative_bbox_x_delta == 0 &&
+                translated_repeated_w_stability.max_relative_bbox_y_delta == 0 &&
+                translated_repeated_w_stability.max_relative_bbox_width_delta == 0 &&
+                translated_repeated_w_stability.max_relative_bbox_height_delta == 0,
+            "LCD atlas probe translated repeated-W glyph ink geometry is identical across cells");
+        ok &= check(
+            translated_w_origin_match.compared_cells ==
+                k_lcd_repeated_w_cell_count &&
+                translated_w_origin_match.compared_pixels > 0,
+            "LCD atlas probe translated repeated-W comparison covers every origin cell");
+        const bool translated_w_origin_rgb_stable =
+            translated_w_origin_match.max_delta <=
+                k_translated_repeated_w_rgb_delta_tolerance &&
+            translated_w_origin_match.ink_mask_diff_pixels == 0 &&
+            translated_w_origin_match.max_ink_mask_diff_pixels_per_cell == 0;
+        ok &= check(
+            translated_w_origin_rgb_stable,
+            "LCD atlas probe translated repeated-W RGB crops remain visually stable against the origin cells");
+        const bool translated_w_origin_geometry_exact =
+            translated_w_origin_match.all_cells_have_ink &&
+            translated_w_origin_match.max_ink_pixels_delta == 0 &&
+            translated_w_origin_match.max_relative_first_ink_x_delta == 0 &&
+            translated_w_origin_match.max_relative_bbox_x_delta == 0 &&
+            translated_w_origin_match.max_relative_bbox_y_delta == 0 &&
+            translated_w_origin_match.max_relative_bbox_width_delta == 0 &&
+            translated_w_origin_match.max_relative_bbox_height_delta == 0;
+        ok &= check(
+            translated_w_origin_geometry_exact,
+            "LCD atlas probe translated repeated-W glyph ink geometry matches the origin cells");
+        ok &= check(
+            ascii_panel_render.msdf_text_renderer_production_active &&
+                ascii_panel_render.msdf_text_supported_runs > 0 &&
+                ascii_panel_render.msdf_text_runs > 0 &&
+                ascii_panel_render.msdf_text_draw_calls > 0 &&
+                ascii_panel_render.glyph_draw_calls == 0 &&
+                ascii_panel_render.glyph_buffer_instances == 0 &&
+                ascii_panel_render.msdf_text_missed_supported_runs == 0 &&
+                ascii_panel_render.msdf_text_missed_supported_glyphs == 0,
+            "LCD atlas probe ASCII panel fixture uses only the real MSDF renderer path");
+        ok &= check(
+            ascii_panel_stats.expected_drawable_glyphs > 0 &&
+                ascii_panel_render.msdf_text_glyph_instances ==
+                    ascii_panel_stats.expected_drawable_glyphs,
+            "LCD atlas probe ASCII panel MSDF glyph count matches printable cells and cursor text");
+        ok &= check(
+            ascii_panel_stats.cell_width_integer &&
+                ascii_panel_stats.cell_height_integer &&
+                ascii_panel_stats.cell_ascent_integer,
+            "LCD atlas probe ASCII panel fixture uses integer physical cell metrics");
+        ok &= check(
+            ascii_panel_stats.probed_cell_count ==
+                static_cast<int>(lcd_ascii_panel_probe_cell_specs().size()) &&
+                ascii_panel_stats.all_probe_cells_have_ink &&
+                ascii_panel_stats.min_ink_pixels > 0,
+            "LCD atlas probe ASCII panel representative cells and cursor text contain ink");
+        const int ascii_panel_key_edge_width_limit = std::max(
+            4,
+            static_cast<int>(std::lround(
+                ascii_panel_stats.physical_cell_width)));
+        const double ascii_panel_key_edge_average_limit = std::max(
+            single_w_atlas_edges.average_transition_width,
+            single_w_msdf_edges.average_transition_width) + 1.0;
+        ok &= check(
+            ascii_panel_m_cell != nullptr &&
+                ascii_panel_m_cell->has_ink() &&
+                ascii_panel_m_cell->edge_transitions.transition_count > 0 &&
+                ascii_panel_m_cell->edge_transitions.max_transition_width <=
+                    ascii_panel_key_edge_width_limit &&
+                ascii_panel_m_cell->edge_transitions.average_transition_width <=
+                    ascii_panel_key_edge_average_limit,
+            "LCD atlas probe ASCII panel M glyph has bounded edge transitions");
+        ok &= check(
+            ascii_panel_e_cell != nullptr &&
+                ascii_panel_e_cell->has_ink() &&
+                ascii_panel_e_cell->edge_transitions.transition_count > 0 &&
+                ascii_panel_e_cell->edge_transitions.max_transition_width <=
+                    ascii_panel_key_edge_width_limit &&
+                ascii_panel_e_cell->edge_transitions.average_transition_width <=
+                    ascii_panel_key_edge_average_limit,
+            "LCD atlas probe ASCII panel e glyph has bounded edge transitions");
+        ok &= check(
+            ascii_panel_l_cell != nullptr &&
+                ascii_panel_l_cell->has_ink() &&
+                ascii_panel_l_cell->left_half_ink_pixels >
+                    ascii_panel_l_cell->right_half_ink_pixels &&
+                ascii_panel_l_cell->bottom_half_ink_pixels >
+                    ascii_panel_l_cell->top_half_ink_pixels,
+            "LCD atlas probe ASCII panel L glyph is upright and not mirrored");
+        constexpr int k_ascii_panel_placement_edge_tolerance_pixels = 1;
+        constexpr double k_ascii_panel_placement_center_x_tolerance_pixels = 1.0;
+        constexpr double k_ascii_panel_placement_center_y_tolerance_pixels = 0.5;
+        ok &= check(
+            ascii_panel_raw_atlas_placement.expected_cells > 0 &&
+                ascii_panel_raw_atlas_placement.compared_cells ==
+                    ascii_panel_raw_atlas_placement.expected_cells &&
+                ascii_panel_raw_atlas_placement.all_cells_have_ink &&
+                ascii_panel_raw_atlas_placement.max_left_delta <=
+                    k_ascii_panel_placement_edge_tolerance_pixels &&
+                ascii_panel_raw_atlas_placement.max_right_delta <=
+                    k_ascii_panel_placement_edge_tolerance_pixels &&
+                ascii_panel_raw_atlas_placement.max_top_delta <=
+                    k_ascii_panel_placement_edge_tolerance_pixels &&
+                ascii_panel_raw_atlas_placement.max_bottom_delta <=
+                    k_ascii_panel_placement_edge_tolerance_pixels &&
+                ascii_panel_raw_atlas_placement.max_first_ink_x_delta <=
+                    k_ascii_panel_placement_edge_tolerance_pixels &&
+                ascii_panel_raw_atlas_placement.max_center_x_delta <=
+                    k_ascii_panel_placement_center_x_tolerance_pixels &&
+                ascii_panel_raw_atlas_placement.max_center_y_delta <=
+                    k_ascii_panel_placement_center_y_tolerance_pixels,
+            "LCD atlas probe ASCII panel MSDF cell placement matches the raw atlas reference");
+        constexpr double k_ascii_panel_user_text_jitter_tolerance_pixels = 0.5;
+        ok &= check(
+            ascii_panel_user_text_raw_atlas_placement.expected_cells ==
+                lcd_ascii_panel_user_text().size() &&
+                ascii_panel_user_text_raw_atlas_placement.compared_cells ==
+                    ascii_panel_user_text_raw_atlas_placement.expected_cells &&
+                ascii_panel_user_text_raw_atlas_placement.all_cells_have_ink &&
+                ascii_panel_user_text_raw_atlas_placement
+                    .signed_center_y_delta_range <=
+                    k_ascii_panel_user_text_jitter_tolerance_pixels,
+            "LCD atlas probe build_msdf MSDF vertical jitter matches the raw atlas reference");
+    }
     ok &= check(
         atlas.atlas_report.render.shaped_missing_string_indexes == 0 &&
             atlas.atlas_report.render.shaped_invalid_string_indexes == 0,
@@ -10636,9 +14876,27 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     ok &= check(
         write_lcd_probe_artifacts(
             fixture,
+            single_w_fixture,
+            repeated_w_fixture,
+            ascii_panel_fixture,
             atlas,
             reference,
             qt_text_reference,
+            single_w_atlas,
+            single_w_raw_atlas_reference,
+            single_w_qt_text_reference,
+            repeated_w_atlas,
+            translated_repeated_w_atlas,
+            ascii_panel_atlas,
+            ascii_panel_raw_atlas_reference,
+            repeated_w_translated_host,
+            translated_repeated_w_stability,
+            translated_w_origin_match,
+            ascii_panel_stats,
+            ascii_panel_raw_atlas_reference_stats,
+            ascii_panel_raw_atlas_placement,
+            ascii_panel_user_text_raw_atlas_placement,
+            single_w_msdf,
             raster_variants,
             metrics_placement,
             probe_records,
@@ -10728,6 +14986,7 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_glyph_row_stable_cursor_dirty_update(app);
     ok &= test_atlas_glyph_row_stable_cursor_clean_row_fallback(app);
     ok &= test_atlas_prepared_text_reuse(app);
+    ok &= test_atlas_msdf_resource_stability(app);
 
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
     const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
@@ -10761,21 +15020,36 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
             render_summary.public_projection_full_reupload &&
             render_summary.scroll_full_reupload,
         "atlas report marks PUBLIC_PROJECTION/SCROLL as full reupload");
-    ok &= check(render_summary.rect_buffer.full_repaint_upload ||
-            render_summary.glyph_buffer.full_repaint_upload,
-        "atlas report routes PUBLIC_PROJECTION/SCROLL through full buffer upload");
+    const bool public_scroll_msdf_active =
+        render_summary.msdf_text_renderer_experiment_requested &&
+        render_summary.msdf_text_renderer_production_active;
+    ok &= check(
+        render_summary.rect_buffer.full_repaint_upload &&
+            render_summary.rect_buffer.full_upload,
+        "atlas report routes PUBLIC_PROJECTION/SCROLL geometry through full rect upload");
+    ok &= check(
+        public_scroll_msdf_active
+            ? render_summary.msdf_text_buffer.full_repaint_upload &&
+                render_summary.msdf_text_buffer.full_upload
+            : render_summary.glyph_buffer.full_repaint_upload &&
+                render_summary.glyph_buffer.full_upload,
+        "atlas report routes PUBLIC_PROJECTION/SCROLL text through full text upload");
     ok &= check(render_summary.background_rects_before_coalescing >
             render_summary.background_rects_after_coalescing,
         "atlas report records background coalescing");
     ok &= check(render_summary.draw_calls > 0 &&
             render_summary.rect_draw_calls > 0 &&
-            render_summary.glyph_draw_calls > 0,
+            (public_scroll_msdf_active
+                ? render_summary.msdf_text_draw_calls > 0 &&
+                    render_summary.glyph_draw_calls == 0
+                : render_summary.glyph_draw_calls > 0),
         "atlas report records minimized non-empty draw calls");
     ok &= check(render_summary.atlas_page_budget >= 1 &&
             render_summary.atlas_page_bytes > 0U &&
             render_summary.atlas_budget_bytes >= render_summary.atlas_allocated_bytes,
         "atlas report records atlas memory and page budget counters");
-    ok &= check(atlas.atlas_report.frame_build.max_glyph_instance_page >= 0,
+    ok &= check(public_scroll_msdf_active ||
+            atlas.atlas_report.frame_build.max_glyph_instance_page >= 0,
         "atlas report records rendered glyph page usage");
     ok &= check(atlas.atlas_report.frame_build.glyph_missed_instances == 0 &&
             atlas.atlas_report.frame_build.glyph_coverage_failures == 0 &&
