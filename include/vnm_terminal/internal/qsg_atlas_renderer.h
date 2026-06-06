@@ -1,7 +1,7 @@
 #pragma once
 
-#if !defined(VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT)
-#define VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT 0
+#if !defined(VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED)
+#define VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED 0
 #endif
 
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
@@ -29,11 +29,11 @@ namespace vnm_terminal::internal {
 
 class Hierarchical_profiler;
 
-constexpr bool k_qsg_atlas_msdf_text_renderer_experiment_requested =
-    VNM_TERMINAL_MSDF_TEXT_RENDERER_EXPERIMENT != 0;
-constexpr bool k_qsg_atlas_msdf_text_renderer_experiment_compiled =
-    k_qsg_atlas_msdf_text_renderer_experiment_requested;
-constexpr bool k_qsg_atlas_msdf_text_renderer_production_active = false;
+constexpr bool k_qsg_atlas_msdf_text_renderer_enabled =
+    VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED != 0;
+constexpr bool k_qsg_atlas_msdf_text_renderer_compiled =
+    k_qsg_atlas_msdf_text_renderer_enabled;
+constexpr bool k_qsg_atlas_msdf_text_renderer_active = false;
 
 enum class Glyph_coverage_kind
 {
@@ -453,12 +453,12 @@ struct Qsg_atlas_render_summary
     bool          dual_source_probe_shader_package_available = false;
     bool          dual_source_blend_factors_available = false;
     bool          dual_source_blend_factors_runtime_probe = false;
-    bool          msdf_text_renderer_experiment_requested =
-        k_qsg_atlas_msdf_text_renderer_experiment_requested;
-    bool          msdf_text_renderer_experiment_compiled =
-        k_qsg_atlas_msdf_text_renderer_experiment_compiled;
-    bool          msdf_text_renderer_production_active =
-        k_qsg_atlas_msdf_text_renderer_production_active;
+    bool          msdf_text_renderer_enabled =
+        k_qsg_atlas_msdf_text_renderer_enabled;
+    bool          msdf_text_renderer_compiled =
+        k_qsg_atlas_msdf_text_renderer_compiled;
+    bool          msdf_text_renderer_active =
+        k_qsg_atlas_msdf_text_renderer_active;
     bool          msdf_text_resources_ready          = false;
     QString       msdf_text_message;
     bool          full_dirty_range_reupload          = false;
@@ -604,12 +604,12 @@ struct Qsg_atlas_frame_report
     bool          command_buffer_non_null         = false;
     bool          render_target_non_null          = false;
     bool          rhi_non_null                    = false;
-    bool          msdf_text_renderer_experiment_requested =
-        k_qsg_atlas_msdf_text_renderer_experiment_requested;
-    bool          msdf_text_renderer_experiment_compiled =
-        k_qsg_atlas_msdf_text_renderer_experiment_compiled;
-    bool          msdf_text_renderer_production_active =
-        k_qsg_atlas_msdf_text_renderer_production_active;
+    bool          msdf_text_renderer_enabled =
+        k_qsg_atlas_msdf_text_renderer_enabled;
+    bool          msdf_text_renderer_compiled =
+        k_qsg_atlas_msdf_text_renderer_compiled;
+    bool          msdf_text_renderer_active =
+        k_qsg_atlas_msdf_text_renderer_active;
     bool          msdf_text_shader_package_available = false;
     bool          msdf_text_atlas_built              = false;
     bool          msdf_text_atlas_ready              = false;
