@@ -4,8 +4,9 @@ layout(location = 0) in vec2 vertex_position;
 layout(location = 1) in vec4 instance_rect;
 layout(location = 2) in vec4 instance_uv_rect;
 layout(location = 3) in vec4 instance_color;
-layout(location = 4) in vec4 instance_uv_bounds;
-layout(location = 5) in vec4 instance_frame_rect;
+layout(location = 4) in vec4 instance_background_color;
+layout(location = 5) in vec4 instance_uv_bounds;
+layout(location = 6) in vec4 instance_frame_rect;
 
 layout(std140, binding = 0) uniform msdf_text_block
 {
@@ -13,13 +14,14 @@ layout(std140, binding = 0) uniform msdf_text_block
     float px_range;
     float target_width;
     float target_height;
-    float reserved0;
+    float lcd_subpixel_order;
 };
 
 layout(location = 0) smooth out vec4 fragment_uv_rect;
 layout(location = 1) smooth out vec4 fragment_color;
-layout(location = 2) smooth out vec4 fragment_uv_bounds;
-layout(location = 3) smooth out vec4 fragment_frame_rect;
+layout(location = 2) smooth out vec4 fragment_background_color;
+layout(location = 3) smooth out vec4 fragment_uv_bounds;
+layout(location = 4) smooth out vec4 fragment_frame_rect;
 
 vec2 frame_position(vec2 local_position)
 {
@@ -42,6 +44,7 @@ void main()
         round(frame_min - instance_frame_rect.xy);
     fragment_uv_rect = instance_uv_rect;
     fragment_color = instance_color;
+    fragment_background_color = instance_background_color;
     fragment_uv_bounds = instance_uv_bounds;
     fragment_frame_rect = vec4(
         instance_frame_rect.xy + transform_delta,

@@ -41,10 +41,25 @@ drivers reject. Regenerate those packages with explicit `--glsl
 "100 es,120,150,330"` targets, then replace `glsl,150` from the checked-in
 `.glsl150.frag` file before committing the `.qsb`.
 
-The dual-source glyph shader is a quality path, not a hard requirement. Drivers
-that fail the dual-source blend probe must use the alpha-blended glyph shader
-package and grayscale glyph coverage so a usable terminal remains available on
-Mesa/OpenGL VM desktops.
+The shaped glyph-atlas fallback uses alpha-blended grayscale glyph coverage.
+LCD/subpixel glyph masks are not used for the glyph-atlas fallback. Known
+software renderers use the shaped glyph-atlas path for MSDF text ownership.
+Hardware and vendor names are not denylisted for MSDF ownership.
+
+The MSDF path may use LCD subpixel sampling when the surface resolves an RGB,
+BGR, VRGB, or VBGR subpixel order for the current window screen. `AUTO` uses
+Qt's `QPlatformScreen` hint first; on Windows, if Qt reports no order, the
+surface falls back to the system ClearType orientation. The shader samples the
+MSDF at filtered horizontal or vertical subpixel positions. The LCD branch uses
+the text run background to derive straight-alpha output for normal blending, so
+distance-field padding from one glyph does not clear neighboring glyph ink.
+Unknown, none, or non-opaque foreground/background cases use grayscale MSDF
+coverage.
+
+`VNM_TerminalSurface::textRendererMode` controls text-path selection. `AUTO`
+selects MSDF text when available and permits shaped glyph-atlas fallback.
+`MSDF` and `GLYPH` force one text path for diagnostics; forced modes do not
+silently switch to the other text path.
 
 The project uses Qt through either a commercial Qt license held by the
 distributor or the LGPL-compatible dynamic-linking route recorded in

@@ -14,6 +14,8 @@
 #include <QGlyphRun>
 #include <QLatin1Char>
 #include <QMatrix4x4>
+#include <QPainter>
+#include <QPainterPath>
 #include <QSGRenderNode>
 #include <QTextLayout>
 #include <QTextOption>
@@ -78,6 +80,7 @@ constexpr ushort k_atlas_printable_ascii_last  = 0x7eU;
 constexpr int k_atlas_printable_ascii_count =
     static_cast<int>(k_atlas_printable_ascii_last -
         k_atlas_printable_ascii_first + 1U);
+constexpr int k_atlas_outline_glyph_margin = 1;
 
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
 namespace msdf_text = vnm::msdf_text;
@@ -112,11 +115,12 @@ struct atlas_glyph_instance_t
 
 struct atlas_msdf_instance_t
 {
-    float rect[4]      = {};
-    float uv_rect[4]   = {};
-    float color[4]     = {};
-    float uv_bounds[4] = {};
-    float frame_rect[4] = {};
+    float rect[4]             = {};
+    float uv_rect[4]          = {};
+    float color[4]            = {};
+    float background_color[4] = {};
+    float uv_bounds[4]        = {};
+    float frame_rect[4]       = {};
 };
 
 struct atlas_uniform_t
@@ -130,13 +134,14 @@ struct atlas_msdf_uniform_t
     float px_range      = 0.0f;
     float target_width  = 1.0f;
     float target_height = 1.0f;
-    float reserved0     = 0.0f;
+    float lcd_subpixel_order = 0.0f;
 };
 
 static_assert(offsetof(atlas_msdf_uniform_t, matrix)        == 0);
 static_assert(offsetof(atlas_msdf_uniform_t, px_range)      == 64);
 static_assert(offsetof(atlas_msdf_uniform_t, target_width)  == 68);
 static_assert(offsetof(atlas_msdf_uniform_t, target_height) == 72);
+static_assert(offsetof(atlas_msdf_uniform_t, lcd_subpixel_order) == 76);
 static_assert(sizeof(atlas_msdf_uniform_t)                  == 80);
 
 struct atlas_pass_range_t
@@ -180,6 +185,22 @@ struct Atlas_frame_state_keys
     QByteArray preedit;
     QByteArray options;
     QByteArray visual_bell;
+};
+
+struct Atlas_prepare_published_state
+{
+    Atlas_frame_state_keys previous_render_state_keys;
+    std::uint64_t          previous_render_font_epoch = 0U;
+    bool                   have_previous_render_state = false;
+    bool                   have_previous_render_font_epoch = false;
+    bool                   render_force_full_reupload = false;
+    bool                   render_non_dirty_state_invalidation = false;
+};
+
+struct Glyph_raster_image
+{
+    QImage image;
+    QPoint physical_offset;
 };
 
 struct Prepared_atlas_glyph
@@ -313,11 +334,8 @@ QRhiGraphicsPipeline::TargetBlend atlas_msdf_text_blend()
 
 bool qsg_atlas_rhi_supports_lcd_text_path(QRhi* rhi)
 {
-    if (rhi == nullptr) {
-        return false;
-    }
-
-    return !qsg_atlas_driver_info_is_known_software_renderer(rhi->driverInfo());
+    (void)rhi;
+    return false;
 }
 
 bool qsg_atlas_rhi_supports_msdf_text_ownership(QRhi* rhi)
@@ -450,10 +468,15 @@ QRhiVertexInputLayout atlas_msdf_text_vertex_input_layout()
             1,
             4,
             QRhiVertexInputAttribute::Float4,
-            offsetof(atlas_msdf_instance_t, uv_bounds)),
+            offsetof(atlas_msdf_instance_t, background_color)),
         QRhiVertexInputAttribute(
             1,
             5,
+            QRhiVertexInputAttribute::Float4,
+            offsetof(atlas_msdf_instance_t, uv_bounds)),
+        QRhiVertexInputAttribute(
+            1,
+            6,
             QRhiVertexInputAttribute::Float4,
             offsetof(atlas_msdf_instance_t, frame_rect)),
     });
@@ -1092,6 +1115,94 @@ bool qsg_atlas_msdf_text_run_candidate(
         std::abs(run.baseline_origin.x() - run.rect.left()) <= 0.001;
 }
 
+bool qsg_atlas_msdf_cursor_text_run_candidate(
+    const Terminal_render_text_run& run)
+{
+    return qsg_atlas_text_is_printable_ascii(run.text);
+}
+
+bool qsg_atlas_text_renderer_policy_allows_msdf(
+    Terminal_text_renderer_policy policy)
+{
+    return policy != Terminal_text_renderer_policy::GLYPH;
+}
+
+bool qsg_atlas_text_renderer_policy_requires_msdf(
+    Terminal_text_renderer_policy policy)
+{
+    return policy == Terminal_text_renderer_policy::MSDF;
+}
+
+bool qsg_atlas_text_renderer_policy_allows_fallback(
+    Terminal_text_renderer_policy policy)
+{
+    return policy == Terminal_text_renderer_policy::AUTO;
+}
+
+Terminal_text_renderer_kind qsg_atlas_effective_text_renderer(
+    const Qsg_atlas_render_summary& summary)
+{
+    const bool glyph_text_used = summary.glyph_draw_calls > 0;
+    const bool msdf_text_used =
+        summary.msdf_text_draw_calls > 0 &&
+        summary.msdf_text_resources_ready;
+
+    if (glyph_text_used && msdf_text_used) {
+        return Terminal_text_renderer_kind::MIXED;
+    }
+    if (msdf_text_used) {
+        return Terminal_text_renderer_kind::MSDF;
+    }
+    if (glyph_text_used) {
+        return Terminal_text_renderer_kind::GLYPH;
+    }
+    return Terminal_text_renderer_kind::NONE;
+}
+
+bool qsg_atlas_lcd_subpixel_order_uses_lcd_sampling(
+    Terminal_lcd_subpixel_order order)
+{
+    return order != Terminal_lcd_subpixel_order::NONE;
+}
+
+float qsg_atlas_lcd_subpixel_order_shader_value(
+    Terminal_lcd_subpixel_order order)
+{
+    switch (order) {
+        case Terminal_lcd_subpixel_order::RGB:
+            return 1.0f;
+        case Terminal_lcd_subpixel_order::BGR:
+            return 2.0f;
+        case Terminal_lcd_subpixel_order::VRGB:
+            return 3.0f;
+        case Terminal_lcd_subpixel_order::VBGR:
+            return 4.0f;
+        case Terminal_lcd_subpixel_order::NONE:
+            return 0.0f;
+    }
+
+    return 0.0f;
+}
+
+void qsg_atlas_update_text_renderer_summary(
+    Qsg_atlas_render_summary& summary)
+{
+    summary.effective_text_renderer =
+        qsg_atlas_effective_text_renderer(summary);
+    summary.text_renderer_fallback_allowed =
+        qsg_atlas_text_renderer_policy_allows_fallback(
+            summary.text_renderer_policy);
+    summary.text_renderer_fallback_used =
+        summary.text_renderer_fallback_allowed &&
+        (summary.effective_text_renderer == Terminal_text_renderer_kind::GLYPH ||
+            summary.effective_text_renderer == Terminal_text_renderer_kind::MIXED);
+    summary.msdf_lcd_text_enabled =
+        summary.msdf_lcd_text_enabled &&
+        summary.msdf_text_draw_calls > 0 &&
+        qsg_atlas_lcd_subpixel_order_uses_lcd_sampling(
+            summary.msdf_lcd_subpixel_order);
+}
+
 bool qsg_atlas_msdf_text_font_is_supported(const QFont& font)
 {
     return font.family() == vnm_terminal_default_monospace_font_family();
@@ -1364,6 +1475,66 @@ bool qsg_atlas_image_format_is_single_channel_coverage(QImage::Format format)
         default:
             return false;
     }
+}
+
+bool qsg_atlas_outline_rasterization_allowed(
+    Glyph_image_presentation presentation,
+    Glyph_coverage_kind      requested_coverage_kind)
+{
+    return
+        presentation == Glyph_image_presentation::TEXT &&
+        requested_coverage_kind == Glyph_coverage_kind::GRAYSCALE_MASK;
+}
+
+Glyph_raster_image qsg_atlas_outline_alpha_map_for_glyph(
+    const QRawFont& raw_font,
+    quint32         glyph_index)
+{
+    Glyph_raster_image raster;
+    const QPainterPath path = raw_font.pathForGlyph(glyph_index);
+    if (path.isEmpty()) {
+        return raster;
+    }
+
+    const QRectF bounds = path.controlPointRect();
+    if (!bounds.isValid() ||
+        bounds.width() <= 0.0 ||
+        bounds.height() <= 0.0)
+    {
+        return raster;
+    }
+
+    const int left =
+        static_cast<int>(std::floor(bounds.left())) -
+        k_atlas_outline_glyph_margin;
+    const int top =
+        static_cast<int>(std::floor(bounds.top())) -
+        k_atlas_outline_glyph_margin;
+    const int right =
+        static_cast<int>(std::ceil(bounds.right())) +
+        k_atlas_outline_glyph_margin;
+    const int bottom =
+        static_cast<int>(std::ceil(bounds.bottom())) +
+        k_atlas_outline_glyph_margin;
+    const QSize size(std::max(0, right - left), std::max(0, bottom - top));
+    if (size.width() <= 0 || size.height() <= 0) {
+        return raster;
+    }
+
+    QImage image(size, QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::transparent);
+
+    QPainter painter(&image);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(Qt::white);
+    painter.translate(-left, -top);
+    painter.drawPath(path);
+    painter.end();
+
+    raster.image = image.convertToFormat(QImage::Format_Alpha8);
+    raster.physical_offset = QPoint(left, top);
+    return raster;
 }
 
 template <typename Pipeline, typename = void>
@@ -1687,46 +1858,125 @@ public:
             rect_ready = ensure_rect_resources(rhi, target);
         }
 
+        const Atlas_prepare_published_state prepare_published_state =
+            capture_prepare_published_state();
         Atlas_prepare_result prepare_result = prepare_atlas_instances(rhi);
-        raw_font_rasterized = prepare_result.raw_font_rasterized;
-        raster_thread       = prepare_result.raster_thread;
-        rasterized_glyphs   = prepare_result.rasterized_glyphs;
+        const bool msdf_text_fallback_allowed =
+            qsg_atlas_text_renderer_policy_allows_fallback(
+                m_frame.options.text_renderer_policy);
+        const bool forced_msdf_text =
+            qsg_atlas_text_renderer_policy_requires_msdf(
+                m_frame.options.text_renderer_policy);
 
         if (rhi != nullptr && command_buffer != nullptr && target != nullptr) {
-            const bool atlas_ready = rect_ready && upload_coverage_texture(
-                rhi,
-                command_buffer,
-                prepare_result.rasterized_glyphs > 0,
-                &coverage_texture_created,
-                &coverage_upload_recorded);
-            const bool glyph_ready =
-                rect_ready &&
-                (!has_glyph_draw_passes() || ensure_glyph_resources(rhi, target));
-            const bool msdf_atlas_ready =
-                rect_ready &&
-                upload_msdf_text_atlas_texture(
-                    rhi,
-                    command_buffer,
+            bool atlas_ready = false;
+            bool glyph_ready = false;
+            bool msdf_ready  = true;
+            bool msdf_prepare_resource_attempted = false;
+            bool msdf_prepare_resource_failed    = false;
+
+            const auto prepare_gpu_resources =
+                [&](Atlas_prepare_result& result) {
+                    msdf_prepare_resource_attempted = false;
+                    msdf_prepare_resource_failed    = false;
+                    atlas_ready = rect_ready && upload_coverage_texture(
+                        rhi,
+                        command_buffer,
+                        result.rasterized_glyphs > 0,
+                        &coverage_texture_created,
+                        &coverage_upload_recorded);
+                    glyph_ready =
+                        rect_ready &&
+                        (!has_glyph_draw_passes() ||
+                            ensure_glyph_resources(rhi, target));
+                    msdf_ready = true;
+                    if (has_msdf_text_draw_passes()) {
+                        if (rect_ready) {
+                            msdf_prepare_resource_attempted = true;
+                            const bool msdf_atlas_ready =
+                                upload_msdf_text_atlas_texture(
+                                    rhi,
+                                    command_buffer,
+                                    result.render);
+                            msdf_ready =
+                                msdf_atlas_ready &&
+                                ensure_msdf_text_resources(rhi, target);
+                            msdf_prepare_resource_failed = !msdf_ready;
+                        }
+                        else {
+                            msdf_ready = false;
+                        }
+                    }
+                    else {
+                        m_msdf_text_resources_ready = false;
+                    }
+                    return
+                        atlas_ready &&
+                        glyph_ready &&
+                        (msdf_ready || forced_msdf_text);
+                };
+
+            bool retried_msdf_text_fallback = false;
+            bool gpu_resources_ready = prepare_gpu_resources(prepare_result);
+            const auto retry_without_msdf_text_ownership = [&]() {
+                record_msdf_text_resource_failure(prepare_result);
+                const Qsg_atlas_render_summary failed_msdf_render =
+                    prepare_result.render;
+                m_msdf_text_resource_failure_disabled = true;
+                retried_msdf_text_fallback = true;
+                restore_prepare_published_state(prepare_published_state);
+                prepare_result = prepare_atlas_instances(rhi);
+                carry_msdf_text_failure_diagnostics(
+                    failed_msdf_render,
                     prepare_result.render);
-            const bool msdf_ready =
-                rect_ready &&
-                msdf_atlas_ready &&
-                ensure_msdf_text_resources(rhi, target);
-            if (has_msdf_text_draw_passes() && !msdf_ready) {
-                prepare_result.render.msdf_text_missed_supported_runs +=
-                    prepare_result.render.msdf_text_runs;
-                prepare_result.render.msdf_text_missed_supported_glyphs +=
-                prepare_result.render.msdf_text_glyph_instances;
+                gpu_resources_ready = prepare_gpu_resources(prepare_result);
+            };
+
+            if (!gpu_resources_ready &&
+                msdf_text_fallback_allowed &&
+                qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
+                    retried_msdf_text_fallback,
+                    has_msdf_text_draw_passes(),
+                    msdf_prepare_resource_attempted,
+                    msdf_prepare_resource_failed))
+            {
+                retry_without_msdf_text_ownership();
             }
-            m_resources_ready = rect_ready &&
-                atlas_ready &&
-                glyph_ready &&
-                msdf_ready &&
-                update_atlas_buffers(
-                    rhi,
-                    command_buffer,
-                    target->pixelSize(),
-                    &prepare_result.render);
+
+            Qsg_atlas_buffer_update_result buffer_update_result =
+                Qsg_atlas_buffer_update_result::NOT_RUN;
+            if (gpu_resources_ready) {
+                buffer_update_result =
+                    update_atlas_buffers(
+                        rhi,
+                        command_buffer,
+                        target->pixelSize(),
+                        &prepare_result.render);
+            }
+            bool buffers_ready =
+                buffer_update_result == Qsg_atlas_buffer_update_result::READY;
+            if (!buffers_ready &&
+                msdf_text_fallback_allowed &&
+                qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
+                    retried_msdf_text_fallback,
+                    gpu_resources_ready,
+                    has_msdf_text_draw_passes(),
+                    buffer_update_result))
+            {
+                retry_without_msdf_text_ownership();
+                buffer_update_result =
+                    gpu_resources_ready
+                        ? update_atlas_buffers(
+                              rhi,
+                              command_buffer,
+                              target->pixelSize(),
+                              &prepare_result.render)
+                        : Qsg_atlas_buffer_update_result::NOT_RUN;
+                buffers_ready =
+                    buffer_update_result ==
+                    Qsg_atlas_buffer_update_result::READY;
+            }
+            m_resources_ready = rect_ready && gpu_resources_ready && buffers_ready;
             prepare_result.render.coverage_texture_uploaded =
                 coverage_upload_recorded;
             prepare_result.render.coverage_texture_skipped =
@@ -1737,6 +1987,10 @@ public:
         else {
             m_resources_ready = false;
         }
+
+        raw_font_rasterized = prepare_result.raw_font_rasterized;
+        raster_thread       = prepare_result.raster_thread;
+        rasterized_glyphs   = prepare_result.rasterized_glyphs;
         prepare_result.render.glyph_sampler_mode = m_glyph_sampler_mode;
         prepare_result.render.msdf_text_sampler_mode = m_msdf_text_sampler_mode;
         prepare_result.render.glyph_shader_package_available =
@@ -1753,6 +2007,7 @@ public:
             prepare_result.render.msdf_text_missed_supported_runs == 0 &&
             prepare_result.render.msdf_text_atlas_ready &&
             prepare_result.render.msdf_text_resources_ready;
+        qsg_atlas_update_text_renderer_summary(prepare_result.render);
         prepare_result.render.dual_source_probe_shader_package_available =
             dual_source_probe_shader_package_available();
         prepare_result.render.dual_source_blend_factors_runtime_probe =
@@ -1882,9 +2137,10 @@ public:
         m_render_glyph_text_row_capacities.clear();
         m_render_glyph_cursor_text_row_capacities.clear();
         m_glyph_buffer_row_stable_ranges.clear();
+        m_msdf_text_resources_ready            = false;
+        m_msdf_text_resource_failure_disabled = false;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         m_msdf_text_uploaded_generation = 0U;
-        m_msdf_text_resources_ready     = false;
 #endif
     }
 
@@ -2046,6 +2302,12 @@ private:
         }
 
         m_dual_source_blend_factors_available = false;
+        auto reject_dual_source_blend = [&] {
+            m_dual_source_blend_factors_probe_completed = true;
+            m_dual_source_blend_factors_available = false;
+            return false;
+        };
+
         if (!Qsg_atlas_dual_source_blend_api<QRhiGraphicsPipeline>::available ||
             rhi == nullptr                                             ||
             !qsg_atlas_rhi_supports_lcd_text_path(rhi)                 ||
@@ -2053,12 +2315,15 @@ private:
             m_rect_shader_resources == nullptr                         ||
             !m_dual_source_probe_fragment_shader.isValid())
         {
-            return false;
+            return reject_dual_source_blend();
+        }
+        if (rhi->backend() == QRhi::OpenGLES2) {
+            return reject_dual_source_blend();
         }
 
         QRhiGraphicsPipeline* pipeline = rhi->newGraphicsPipeline();
         if (pipeline == nullptr) {
-            return false;
+            return reject_dual_source_blend();
         }
 
         pipeline->setFlags(QRhiGraphicsPipeline::UsesScissor);
@@ -2984,7 +3249,7 @@ private:
         if (font_epoch_changed) {
             m_render_glyph_text_row_capacities.clear();
             m_render_glyph_cursor_text_row_capacities.clear();
-            m_rejected_glyph_raster_keys.clear();
+            m_failed_visible_lazy_glyph_raster_keys.clear();
         }
         begin_prepared_text_cache_frame(font_epoch_changed);
         m_cache.set_epoch(m_frame.font_epoch);
@@ -3298,6 +3563,8 @@ private:
         append_key_bool(key, options.visual_bell_enabled);
         append_key_bool(key, options.underline_hyperlinks);
         append_key_bool(key, options.packed_text_sidecars_enabled);
+        append_key_int(key, static_cast<int>(options.text_renderer_policy));
+        append_key_int(key, static_cast<int>(options.msdf_lcd_subpixel_order));
         return key;
     }
 
@@ -3339,12 +3606,129 @@ private:
         return keys;
     }
 
+    Atlas_prepare_published_state capture_prepare_published_state() const
+    {
+        Atlas_prepare_published_state state;
+        state.previous_render_state_keys = m_previous_render_state_keys;
+        state.previous_render_font_epoch = m_previous_render_font_epoch;
+        state.have_previous_render_state = m_have_previous_render_state;
+        state.have_previous_render_font_epoch =
+            m_have_previous_render_font_epoch;
+        state.render_force_full_reupload = m_render_force_full_reupload;
+        state.render_non_dirty_state_invalidation =
+            m_render_non_dirty_state_invalidation;
+        return state;
+    }
+
+    void restore_prepare_published_state(
+        const Atlas_prepare_published_state& state)
+    {
+        m_previous_render_state_keys = state.previous_render_state_keys;
+        m_previous_render_font_epoch = state.previous_render_font_epoch;
+        m_have_previous_render_state = state.have_previous_render_state;
+        m_have_previous_render_font_epoch =
+            state.have_previous_render_font_epoch;
+        m_render_force_full_reupload = state.render_force_full_reupload;
+        m_render_non_dirty_state_invalidation =
+            state.render_non_dirty_state_invalidation;
+    }
+
+    bool msdf_text_ownership_available() const
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+        if (!qsg_atlas_text_renderer_policy_allows_msdf(
+                m_frame.options.text_renderer_policy))
+        {
+            return false;
+        }
+        if (qsg_atlas_text_renderer_policy_requires_msdf(
+                m_frame.options.text_renderer_policy))
+        {
+            return true;
+        }
+        return
+            !m_msdf_text_resource_failure_disabled &&
+            qsg_atlas_rhi_supports_msdf_text_ownership(m_resource_rhi);
+#else
+        return false;
+#endif
+    }
+
+    void record_msdf_text_resource_failure(Atlas_prepare_result& result)
+    {
+        if (!has_msdf_text_draw_passes()) {
+            return;
+        }
+
+        result.render.msdf_text_missed_supported_runs +=
+            result.render.msdf_text_runs;
+        result.render.msdf_text_missed_supported_glyphs +=
+            result.render.msdf_text_glyph_instances;
+        result.render.msdf_text_resources_ready = false;
+        result.render.msdf_text_renderer_active = false;
+        if (result.render.msdf_text_message.isEmpty() ||
+            result.render.msdf_text_message == QStringLiteral("ok"))
+        {
+            result.render.msdf_text_message = QStringLiteral(
+                "MSDF text resources unavailable; using shaped glyph fallback");
+        }
+    }
+
+    void carry_msdf_text_failure_diagnostics(
+        const Qsg_atlas_render_summary& failed_msdf_render,
+        Qsg_atlas_render_summary&       fallback_render)
+    {
+        fallback_render.msdf_text_supported_runs = std::max(
+            fallback_render.msdf_text_supported_runs,
+            failed_msdf_render.msdf_text_supported_runs);
+        fallback_render.msdf_text_missed_supported_runs +=
+            failed_msdf_render.msdf_text_missed_supported_runs;
+        fallback_render.msdf_text_missed_supported_glyphs +=
+            failed_msdf_render.msdf_text_missed_supported_glyphs;
+        fallback_render.msdf_text_atlas_built =
+            fallback_render.msdf_text_atlas_built ||
+            failed_msdf_render.msdf_text_atlas_built;
+        fallback_render.msdf_text_atlas_ready =
+            fallback_render.msdf_text_atlas_ready ||
+            failed_msdf_render.msdf_text_atlas_ready;
+        fallback_render.msdf_text_texture_ready =
+            fallback_render.msdf_text_texture_ready ||
+            failed_msdf_render.msdf_text_texture_ready;
+        fallback_render.msdf_text_texture_uploaded =
+            fallback_render.msdf_text_texture_uploaded ||
+            failed_msdf_render.msdf_text_texture_uploaded;
+        fallback_render.msdf_text_resources_ready = false;
+        fallback_render.msdf_text_renderer_active = false;
+        fallback_render.msdf_text_font_data_bytes = std::max(
+            fallback_render.msdf_text_font_data_bytes,
+            failed_msdf_render.msdf_text_font_data_bytes);
+        fallback_render.msdf_text_pixel_height = std::max(
+            fallback_render.msdf_text_pixel_height,
+            failed_msdf_render.msdf_text_pixel_height);
+        fallback_render.msdf_text_atlas_size = std::max(
+            fallback_render.msdf_text_atlas_size,
+            failed_msdf_render.msdf_text_atlas_size);
+        fallback_render.msdf_text_px_range = std::max(
+            fallback_render.msdf_text_px_range,
+            failed_msdf_render.msdf_text_px_range);
+        if (!failed_msdf_render.msdf_text_message.isEmpty()) {
+            fallback_render.msdf_text_message =
+                failed_msdf_render.msdf_text_message;
+        }
+    }
+
     void finalize_render_summary(
         const Terminal_render_frame& render_frame,
         bool                         font_epoch_changed,
         Atlas_prepare_result&       result)
     {
         Qsg_atlas_render_summary& summary = result.render;
+        summary.text_renderer_policy = m_frame.options.text_renderer_policy;
+        summary.msdf_lcd_subpixel_order =
+            m_frame.options.msdf_lcd_subpixel_order;
+        summary.text_renderer_fallback_allowed =
+            qsg_atlas_text_renderer_policy_allows_fallback(
+                summary.text_renderer_policy);
         summary.msdf_text_renderer_enabled =
             k_qsg_atlas_msdf_text_renderer_enabled;
         summary.msdf_text_renderer_compiled =
@@ -3353,7 +3737,22 @@ private:
             k_qsg_atlas_msdf_text_renderer_active;
         summary.msdf_text_atlas_built = msdf_text_atlas_built();
         summary.msdf_text_atlas_ready = msdf_text_atlas_ready();
+        const QString frame_msdf_text_message = summary.msdf_text_message;
         record_msdf_text_cache_summary(summary);
+        if (!frame_msdf_text_message.isEmpty() &&
+            (summary.msdf_text_message.isEmpty() ||
+                summary.msdf_text_message == QStringLiteral("ok")))
+        {
+            summary.msdf_text_message = frame_msdf_text_message;
+        }
+        if (qsg_atlas_text_renderer_policy_requires_msdf(
+                summary.text_renderer_policy) &&
+            !summary.msdf_text_renderer_compiled &&
+            summary.msdf_text_message.isEmpty())
+        {
+            summary.msdf_text_message =
+                QStringLiteral("forced MSDF text renderer is not compiled");
+        }
         summary.msdf_text_glyph_instances =
             static_cast<int>(m_msdf_text_instances.size());
 
@@ -3438,6 +3837,7 @@ private:
             summary.rect_draw_calls       +
             summary.glyph_draw_calls      +
             summary.msdf_text_draw_calls;
+        qsg_atlas_update_text_renderer_summary(summary);
 
         const Glyph_atlas_cache_stats cache = m_cache.stats();
         summary.atlas_page_count      = cache.page_count;
@@ -3596,43 +3996,54 @@ private:
             }
         }
 
+        const Glyph_coverage_kind requested_coverage_kind =
+            qsg_atlas_raster_request_coverage_kind(
+                presentation,
+                m_dual_source_blend_factors_available);
         const Glyph_atlas_cache_key rejected_key = qsg_atlas_cache_key(
             record.glyph_index,
             record.fallback_face_id,
             record.physical_pixel_size,
             0,
-            qsg_atlas_raster_request_coverage_kind(
-                presentation,
-                m_dual_source_blend_factors_available),
+            requested_coverage_kind,
             presentation);
-        if (m_rejected_glyph_raster_keys.find(rejected_key) !=
-            m_rejected_glyph_raster_keys.end())
+        const bool visible_lazy_source =
+            source == Atlas_cache_insert_source::VISIBLE_LAZY;
+        if (visible_lazy_source &&
+            m_failed_visible_lazy_glyph_raster_keys.find(rejected_key) !=
+                m_failed_visible_lazy_glyph_raster_keys.end())
         {
-            if (source == Atlas_cache_insert_source::WARM) {
-                ++m_warm_lazy.warm_unsupported_images;
-                ++m_warm_lazy.warm_failed_glyph_records;
-            }
-            else {
-                record_rejected_glyph_image(
-                    result.frame_build.glyph_coverage,
-                    Glyph_coverage_kind::UNKNOWN);
-                const QImage rejected_image;
-                record_first_glyph_miss(
-                    result.frame_build,
-                    record,
-                    rejected_image,
-                    presentation,
-                    Qsg_atlas_glyph_miss_cause::REJECTED_RASTER_CACHE);
-                ++result.frame_build.glyph_coverage_failures;
-                ++result.frame_build.glyph_missed_instances;
-            }
+            record_rejected_glyph_image(
+                result.frame_build.glyph_coverage,
+                Glyph_coverage_kind::UNKNOWN);
+            const QImage rejected_image;
+            record_first_glyph_miss(
+                result.frame_build,
+                record,
+                rejected_image,
+                presentation,
+                Qsg_atlas_glyph_miss_cause::REJECTED_RASTER_CACHE);
+            ++result.frame_build.glyph_coverage_failures;
+            ++result.frame_build.glyph_missed_instances;
             return {};
         }
 
         QElapsedTimer insert_timer;
         insert_timer.start();
-        const QPoint physical_offset =
-            qsg_atlas_glyph_physical_offset_for_raster_font(
+        const bool outline_rasterization_allowed =
+            qsg_atlas_outline_rasterization_allowed(
+                presentation,
+                requested_coverage_kind);
+        const Glyph_raster_image outline_raster =
+            outline_rasterization_allowed
+                ? qsg_atlas_outline_alpha_map_for_glyph(
+                    raster_font,
+                    record.glyph_index)
+                : Glyph_raster_image();
+        const bool use_outline_raster = !outline_raster.image.isNull();
+        const QPoint physical_offset = use_outline_raster
+            ? outline_raster.physical_offset
+            : qsg_atlas_glyph_physical_offset_for_raster_font(
                 raster_font,
                 record.glyph_index,
                 presentation,
@@ -3645,18 +4056,22 @@ private:
                 m_dual_source_blend_factors_available
                 ? QRawFont::SubPixelAntialiasing
                 : QRawFont::PixelAntialiasing;
-        const QImage alpha_map = raster_font.alphaMapForGlyph(
-            record.glyph_index,
-            antialiasing);
-        const Glyph_rgba_tile tile =
-            qsg_atlas_rgba_tile_from_image(alpha_map, presentation);
+        const QImage alpha_map = use_outline_raster
+            ? outline_raster.image
+            : raster_font.alphaMapForGlyph(
+                record.glyph_index,
+                antialiasing);
+        const Glyph_rgba_tile tile = qsg_atlas_rgba_tile_from_image(
+            alpha_map,
+            presentation,
+            requested_coverage_kind);
         if (!tile.is_valid()) {
             if (source == Atlas_cache_insert_source::WARM) {
                 ++m_warm_lazy.warm_unsupported_images;
                 ++m_warm_lazy.warm_failed_glyph_records;
             }
             else {
-                m_rejected_glyph_raster_keys.insert(rejected_key);
+                m_failed_visible_lazy_glyph_raster_keys.insert(rejected_key);
                 record_rejected_glyph_image(
                     result.frame_build.glyph_coverage,
                     tile.coverage_kind);
@@ -4199,11 +4614,28 @@ private:
                 : atlas_msdf_text_drawable_glyph_count(run.text);
     }
 
+    void record_forced_msdf_text_miss(
+        const Terminal_render_text_run& run,
+        Atlas_prepare_result&           result,
+        const QString&                  message)
+    {
+        const int drawable_glyphs = atlas_msdf_text_drawable_glyph_count(run.text);
+        if (drawable_glyphs > 0) {
+            record_msdf_supported_text_miss(run, result, drawable_glyphs);
+        }
+        if (result.render.msdf_text_message.isEmpty() ||
+            result.render.msdf_text_message == QStringLiteral("ok"))
+        {
+            result.render.msdf_text_message = message;
+        }
+    }
+
     void append_msdf_text_instance(
         const msdf_text_glyph_t&          glyph,
         QPointF                           physical_baseline_origin,
         const Terminal_render_text_run&   run,
         const std::array<float, 4>&       color,
+        const std::array<float, 4>&       background_color,
         qreal                             normalized_device_pixel_ratio)
     {
         const qreal physical_origin_x = physical_baseline_origin.x();
@@ -4245,6 +4677,7 @@ private:
         store_rect(instance.rect, glyph_rect);
         store_uv_rect(instance.uv_rect, uv_rect);
         store_color(instance.color, color);
+        store_color(instance.background_color, background_color);
         store_uv_bounds(
             instance.uv_bounds,
             glyph.uv_left,
@@ -4287,6 +4720,13 @@ private:
 
         const std::array<float, 4> color =
             atlas_glyph_color_components(run.foreground, opacity);
+        const std::array<float, 4> background_color =
+            atlas_glyph_color_components(run.background, opacity);
+        const bool lcd_text_run_eligible =
+            qsg_atlas_lcd_subpixel_order_uses_lcd_sampling(
+                m_frame.options.msdf_lcd_subpixel_order) &&
+            color[3] >= 0.999f &&
+            background_color[3] >= 0.999f;
         int missed_glyphs = 0;
         for (qsizetype source = 0; source < run.text.size(); ++source) {
             const char32_t codepoint =
@@ -4359,12 +4799,16 @@ private:
                     physical_baseline_y),
                 run,
                 color,
+                background_color,
                 normalized_device_pixel_ratio);
         }
 
         if (m_msdf_text_instances.size() == instance_count_before) {
             record_msdf_supported_text_miss(run, result, drawable_glyphs);
             return false;
+        }
+        if (lcd_text_run_eligible) {
+            result.render.msdf_lcd_text_enabled = true;
         }
 
         ++result.producer.presentation_fast_text_runs;
@@ -4542,16 +4986,55 @@ private:
 
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         bool msdf_text_attempted = false;
+        const bool forced_msdf_text =
+            qsg_atlas_text_renderer_policy_requires_msdf(
+                m_frame.options.text_renderer_policy);
         const bool msdf_text_ownership_enabled =
-            qsg_atlas_rhi_supports_msdf_text_ownership(m_resource_rhi);
-        if (msdf_text_ownership_enabled &&
+            msdf_text_ownership_available();
+        const bool msdf_text_run_allowed =
+            !cursor_text_run ||
+            qsg_atlas_msdf_cursor_text_run_candidate(run);
+        const bool msdf_text_candidate =
+            msdf_text_ownership_enabled &&
+            msdf_text_run_allowed &&
             qsg_atlas_msdf_text_run_candidate(run, m_frame.cell_metrics) &&
-            qsg_atlas_msdf_text_font_is_supported(m_frame.font))
-        {
+            qsg_atlas_msdf_text_font_is_supported(m_frame.font);
+        if (forced_msdf_text) {
+            if (msdf_text_candidate) {
+                const int missed_runs_before =
+                    result.render.msdf_text_missed_supported_runs;
+                if (append_msdf_text_run(run, opacity, result)) {
+                    return;
+                }
+                if (result.render.msdf_text_missed_supported_runs ==
+                    missed_runs_before)
+                {
+                    record_forced_msdf_text_miss(
+                        run,
+                        result,
+                        QStringLiteral(
+                            "forced MSDF text renderer had no drawable MSDF path"));
+                }
+                return;
+            }
+
+            record_forced_msdf_text_miss(
+                run,
+                result,
+                QStringLiteral("forced MSDF text renderer had no drawable MSDF path"));
+            return;
+        }
+        if (msdf_text_candidate) {
             msdf_text_attempted = true;
             if (append_msdf_text_run(run, opacity, result)) {
                 return;
             }
+        }
+#else
+        if (qsg_atlas_text_renderer_policy_requires_msdf(
+                m_frame.options.text_renderer_policy))
+        {
+            return;
         }
 #endif
 
@@ -4559,6 +5042,7 @@ private:
             ++result.producer.simple_path_attempts;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
             if (msdf_text_ownership_enabled &&
+                msdf_text_run_allowed &&
                 !msdf_text_attempted &&
                 qsg_atlas_msdf_text_font_is_supported(m_frame.font))
             {
@@ -4840,7 +5324,7 @@ private:
         return key;
     }
 
-    bool update_atlas_buffers(
+    Qsg_atlas_buffer_update_result update_atlas_buffers(
         QRhi*                             rhi,
         QRhiCommandBuffer*                command_buffer,
         QSize                             render_target_size,
@@ -4856,10 +5340,12 @@ private:
         bool rect_buffer_recreated  = false;
         bool glyph_buffer_recreated = false;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+        const bool msdf_text_buffer_needed = has_msdf_text_draw_passes();
         const quint32 msdf_text_buffer_size = static_cast<quint32>(
             std::max<std::size_t>(1U, m_msdf_text_instances.size()) *
                 sizeof(atlas_msdf_instance_t));
         bool msdf_text_buffer_recreated = false;
+        bool msdf_text_buffer_ready = true;
 #endif
         if (!ensure_dynamic_buffer(
                 rhi,
@@ -4869,7 +5355,7 @@ private:
                 QRhiBuffer::VertexBuffer,
                 &rect_buffer_recreated))
         {
-            return false;
+            return Qsg_atlas_buffer_update_result::RECT_BUFFER_FAILED;
         }
         if (rect_buffer_recreated) {
             m_rect_upload_planner.reset();
@@ -4883,25 +5369,34 @@ private:
                 QRhiBuffer::VertexBuffer,
                 &glyph_buffer_recreated))
         {
-            return false;
+            return Qsg_atlas_buffer_update_result::GLYPH_BUFFER_FAILED;
         }
         if (glyph_buffer_recreated) {
             m_glyph_upload_planner.reset();
         }
 
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
-        if (!ensure_dynamic_buffer(
-                rhi,
-                m_msdf_text_instance_buffer,
-                m_msdf_text_instance_buffer_size,
-                msdf_text_buffer_size,
-                QRhiBuffer::VertexBuffer,
-                &msdf_text_buffer_recreated))
-        {
-            return false;
-        }
-        if (msdf_text_buffer_recreated) {
-            m_msdf_text_upload_planner.reset();
+        if (msdf_text_buffer_needed) {
+            if (!ensure_dynamic_buffer(
+                    rhi,
+                    m_msdf_text_instance_buffer,
+                    m_msdf_text_instance_buffer_size,
+                    msdf_text_buffer_size,
+                    QRhiBuffer::VertexBuffer,
+                    &msdf_text_buffer_recreated))
+            {
+                if (!qsg_atlas_text_renderer_policy_requires_msdf(
+                        m_frame.options.text_renderer_policy))
+                {
+                    return Qsg_atlas_buffer_update_result::MSDF_TEXT_BUFFER_FAILED;
+                }
+
+                msdf_text_buffer_ready      = false;
+                m_msdf_text_resources_ready = false;
+            }
+            if (msdf_text_buffer_recreated) {
+                m_msdf_text_upload_planner.reset();
+            }
         }
 #endif
 
@@ -4958,7 +5453,8 @@ private:
             });
         Qsg_atlas_buffer_update_plan msdf_text_plan;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
-        msdf_text_plan = m_msdf_text_upload_planner.plan({
+        if (msdf_text_buffer_needed && msdf_text_buffer_ready) {
+            msdf_text_plan = m_msdf_text_upload_planner.plan({
                 frames_in_flight,
                 frame_slot,
                 m_render_row_count,
@@ -4976,6 +5472,7 @@ private:
                 static_cast<int>(m_msdf_text_instances.size()),
                 false,
             });
+        }
 #endif
         if (render_summary != nullptr) {
             render_summary->rect_buffer      = rect_plan.summary;
@@ -5007,7 +5504,10 @@ private:
             sizeof(uniform),
             &uniform);
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
-        if (m_msdf_text_uniform_buffer != nullptr) {
+        if (msdf_text_buffer_needed &&
+            msdf_text_buffer_ready &&
+            m_msdf_text_uniform_buffer != nullptr)
+        {
             atlas_msdf_uniform_t msdf_uniform;
             std::copy(
                 mvp.constData(),
@@ -5018,6 +5518,9 @@ private:
                 std::max(1, render_target_size.width()));
             msdf_uniform.target_height = static_cast<float>(
                 std::max(1, render_target_size.height()));
+            msdf_uniform.lcd_subpixel_order =
+                qsg_atlas_lcd_subpixel_order_shader_value(
+                    m_frame.options.msdf_lcd_subpixel_order);
             updates->updateDynamicBuffer(
                 m_msdf_text_uniform_buffer,
                 0U,
@@ -5042,18 +5545,20 @@ private:
                     range.byte_offset);
         }
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
-        for (const Qsg_atlas_buffer_update_range& range : msdf_text_plan.ranges) {
-            updates->updateDynamicBuffer(
-                m_msdf_text_instance_buffer,
-                static_cast<quint32>(range.byte_offset),
-                static_cast<quint32>(range.byte_count),
-                reinterpret_cast<const char*>(m_msdf_text_instances.data()) +
-                    range.byte_offset);
+        if (msdf_text_buffer_needed && msdf_text_buffer_ready) {
+            for (const Qsg_atlas_buffer_update_range& range : msdf_text_plan.ranges) {
+                updates->updateDynamicBuffer(
+                    m_msdf_text_instance_buffer,
+                    static_cast<quint32>(range.byte_offset),
+                    static_cast<quint32>(range.byte_count),
+                    reinterpret_cast<const char*>(m_msdf_text_instances.data()) +
+                        range.byte_offset);
+            }
         }
 #endif
 
         command_buffer->resourceUpdate(updates);
-        return true;
+        return Qsg_atlas_buffer_update_result::READY;
     }
 
     void draw_rect_pass(
@@ -5107,7 +5612,13 @@ private:
         const atlas_pass_range_t&  pass,
         bool                      stencil_enabled)
     {
-        if (!pass.has_instances()) {
+        if (!pass.has_instances() ||
+            !m_msdf_text_resources_ready ||
+            m_msdf_text_shader_resources == nullptr ||
+            m_msdf_text_instance_buffer == nullptr ||
+            m_msdf_text_pipeline == nullptr ||
+            m_stencil_msdf_text_pipeline == nullptr)
+        {
             return;
         }
 
@@ -5234,14 +5745,16 @@ private:
                                              m_prepared_text_cache;
     std::uint64_t                            m_prepared_text_cache_frame = 0U;
     Simple_atlas_text_cache                  m_simple_text_cache;
+    bool                                     m_msdf_text_resources_ready = false;
+    bool                                     m_msdf_text_resource_failure_disabled =
+        false;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
     Msdf_terminal_text_cache                 m_msdf_text_cache;
     std::uint64_t                            m_msdf_text_uploaded_generation = 0U;
-    bool                                     m_msdf_text_resources_ready = false;
 #endif
     Atlas_warm_key                           m_warm_key;
     Qsg_atlas_warm_lazy_summary              m_warm_lazy;
-    std::set<Glyph_atlas_cache_key>           m_rejected_glyph_raster_keys;
+    std::set<Glyph_atlas_cache_key>           m_failed_visible_lazy_glyph_raster_keys;
     bool                                     m_current_prepare_had_lazy_insert =
         false;
 };
@@ -5264,6 +5777,33 @@ bool qsg_atlas_driver_info_is_known_software_renderer(
         device_name.contains("software rasterizer")           ||
         device_name.contains("gdi generic")                   ||
         device_name.contains("microsoft basic render driver");
+}
+
+bool qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
+    bool                            already_retried,
+    bool                            gpu_resources_ready,
+    bool                            has_msdf_text_draw_passes,
+    Qsg_atlas_buffer_update_result  buffer_update_result)
+{
+    return
+        !already_retried &&
+        gpu_resources_ready &&
+        has_msdf_text_draw_passes &&
+        buffer_update_result ==
+            Qsg_atlas_buffer_update_result::MSDF_TEXT_BUFFER_FAILED;
+}
+
+bool qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
+    bool already_retried,
+    bool has_msdf_text_draw_passes,
+    bool msdf_prepare_resource_attempted,
+    bool msdf_prepare_resource_failed)
+{
+    return
+        !already_retried &&
+        has_msdf_text_draw_passes &&
+        msdf_prepare_resource_attempted &&
+        msdf_prepare_resource_failed;
 }
 
 void Qsg_atlas_buffer_upload_planner::reset()
@@ -5940,6 +6480,18 @@ void Qsg_atlas_recorder::record_prepare(
     m_report.command_buffer_non_null        = command_buffer_non_null;
     m_report.render_target_non_null         = render_target_non_null;
     m_report.rhi_non_null                   = rhi_non_null;
+    m_report.text_renderer_policy =
+        render_summary.text_renderer_policy;
+    m_report.effective_text_renderer =
+        render_summary.effective_text_renderer;
+    m_report.text_renderer_fallback_allowed =
+        render_summary.text_renderer_fallback_allowed;
+    m_report.text_renderer_fallback_used =
+        render_summary.text_renderer_fallback_used;
+    m_report.msdf_lcd_subpixel_order =
+        render_summary.msdf_lcd_subpixel_order;
+    m_report.msdf_lcd_text_enabled =
+        render_summary.msdf_lcd_text_enabled;
     m_report.msdf_text_renderer_enabled =
         render_summary.msdf_text_renderer_enabled;
     m_report.msdf_text_renderer_compiled =
@@ -6098,13 +6650,22 @@ static void qsg_atlas_append_rgba_pixel(
 
 Glyph_rgba_tile qsg_atlas_rgba_tile_from_image(
     const QImage&             image,
-    Glyph_image_presentation  presentation)
+    Glyph_image_presentation  presentation,
+    Glyph_coverage_kind       requested_coverage_kind)
 {
     Glyph_rgba_tile tile;
     tile.source_format = image.format();
     tile.size          = image.size();
-    tile.coverage_kind =
+    const Glyph_coverage_kind classified_coverage =
         qsg_atlas_classify_glyph_image_candidate(image, presentation);
+    const bool requested_grayscale_lcd =
+        requested_coverage_kind == Glyph_coverage_kind::GRAYSCALE_MASK &&
+        (classified_coverage == Glyph_coverage_kind::LCD_RGB_MASK ||
+            classified_coverage == Glyph_coverage_kind::LCD_BGR_MASK);
+    tile.coverage_kind =
+        requested_grayscale_lcd
+            ? Glyph_coverage_kind::GRAYSCALE_MASK
+            : classified_coverage;
     tile.lcd_order = qsg_atlas_lcd_order_for_kind(tile.coverage_kind);
 
     if (image.isNull() || image.width() <= 0 || image.height() <= 0 ||
@@ -6350,6 +6911,57 @@ const char* qsg_atlas_sampler_mode_name(Qsg_atlas_sampler_mode mode)
     }
 
     return "unknown";
+}
+
+const char* qsg_atlas_text_renderer_policy_name(
+    Terminal_text_renderer_policy policy)
+{
+    switch (policy) {
+        case Terminal_text_renderer_policy::AUTO:
+            return "auto";
+        case Terminal_text_renderer_policy::MSDF:
+            return "msdf";
+        case Terminal_text_renderer_policy::GLYPH:
+            return "glyph";
+    }
+
+    return "auto";
+}
+
+const char* qsg_atlas_text_renderer_kind_name(
+    Terminal_text_renderer_kind kind)
+{
+    switch (kind) {
+        case Terminal_text_renderer_kind::NONE:
+            return "none";
+        case Terminal_text_renderer_kind::MSDF:
+            return "msdf";
+        case Terminal_text_renderer_kind::GLYPH:
+            return "glyph";
+        case Terminal_text_renderer_kind::MIXED:
+            return "mixed";
+    }
+
+    return "none";
+}
+
+const char* qsg_atlas_lcd_subpixel_order_name(
+    Terminal_lcd_subpixel_order order)
+{
+    switch (order) {
+        case Terminal_lcd_subpixel_order::NONE:
+            return "none";
+        case Terminal_lcd_subpixel_order::RGB:
+            return "rgb";
+        case Terminal_lcd_subpixel_order::BGR:
+            return "bgr";
+        case Terminal_lcd_subpixel_order::VRGB:
+            return "vrgb";
+        case Terminal_lcd_subpixel_order::VBGR:
+            return "vbgr";
+    }
+
+    return "none";
 }
 
 QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font)
