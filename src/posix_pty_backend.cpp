@@ -337,7 +337,7 @@ bool pipe_read_exact(int fd, int& value)
     return true;
 }
 
-void pipe_write_errno_and_exit(int fd, int code)
+[[noreturn]] void pipe_write_errno_and_exit(int fd, int code)
 {
     const char* bytes  = reinterpret_cast<const char*>(&code);
     std::size_t offset = 0U;
