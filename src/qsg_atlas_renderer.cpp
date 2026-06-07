@@ -49,6 +49,8 @@ constexpr const char* k_atlas_glyph_vertex_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_glyph.vert.qsb";
 constexpr const char* k_atlas_glyph_fragment_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_glyph.frag.qsb";
+constexpr const char* k_atlas_glyph_alpha_fragment_shader_path =
+    ":/vnm_terminal_surface/shaders/atlas_glyph_alpha.frag.qsb";
 constexpr const char* k_atlas_dual_source_probe_fragment_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_dual_source_probe.frag.qsb";
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
@@ -1634,13 +1636,17 @@ public:
         std::uint64_t raster_thread = 0U;
         int rasterized_glyphs       = 0;
 
+        bool rect_ready = false;
+        if (rhi != nullptr && command_buffer != nullptr && target != nullptr) {
+            rect_ready = ensure_rect_resources(rhi, target);
+        }
+
         Atlas_prepare_result prepare_result = prepare_atlas_instances();
         raw_font_rasterized = prepare_result.raw_font_rasterized;
         raster_thread       = prepare_result.raster_thread;
         rasterized_glyphs   = prepare_result.rasterized_glyphs;
 
         if (rhi != nullptr && command_buffer != nullptr && target != nullptr) {
-            const bool rect_ready = ensure_rect_resources(rhi, target);
             const bool atlas_ready = rect_ready && upload_coverage_texture(
                 rhi,
                 command_buffer,
@@ -1844,6 +1850,8 @@ private:
             m_fragment_shader            = load_shader(k_atlas_fragment_shader_path);
             m_glyph_vertex_shader        = load_shader(k_atlas_glyph_vertex_shader_path);
             m_glyph_fragment_shader      = load_shader(k_atlas_glyph_fragment_shader_path);
+            m_glyph_alpha_fragment_shader =
+                load_shader(k_atlas_glyph_alpha_fragment_shader_path);
             m_dual_source_probe_fragment_shader =
                 load_shader(k_atlas_dual_source_probe_fragment_shader_path);
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
@@ -1859,12 +1867,16 @@ private:
             m_vertex_shader.isValid()         &&
             m_fragment_shader.isValid()       &&
             m_glyph_vertex_shader.isValid()   &&
-            m_glyph_fragment_shader.isValid();
+            m_glyph_fragment_shader.isValid() &&
+            m_glyph_alpha_fragment_shader.isValid();
     }
 
     bool glyph_shader_package_available() const
     {
-        return m_glyph_vertex_shader.isValid() && m_glyph_fragment_shader.isValid();
+        return
+            m_glyph_vertex_shader.isValid()        &&
+            m_glyph_fragment_shader.isValid()      &&
+            m_glyph_alpha_fragment_shader.isValid();
     }
 
     bool dual_source_probe_shader_package_available() const
@@ -2045,8 +2057,11 @@ private:
         pipeline->setFlags(flags);
         pipeline->setTopology(QRhiGraphicsPipeline::Triangles);
         pipeline->setCullMode(QRhiGraphicsPipeline::None);
+        const bool dual_source_blend = m_dual_source_blend_factors_available;
         pipeline->setTargetBlends({
-            Qsg_atlas_dual_source_blend_api<QRhiGraphicsPipeline>::target_blend(),
+            dual_source_blend
+                ? Qsg_atlas_dual_source_blend_api<QRhiGraphicsPipeline>::target_blend()
+                : atlas_msdf_text_blend(),
         });
         pipeline->setDepthTest(false);
         pipeline->setDepthWrite(false);
@@ -2054,7 +2069,11 @@ private:
         pipeline->setSampleCount(m_render_target_samples);
         pipeline->setShaderStages({
             QRhiShaderStage(QRhiShaderStage::Vertex,   m_glyph_vertex_shader),
-            QRhiShaderStage(QRhiShaderStage::Fragment, m_glyph_fragment_shader),
+            QRhiShaderStage(
+                QRhiShaderStage::Fragment,
+                dual_source_blend
+                    ? m_glyph_fragment_shader
+                    : m_glyph_alpha_fragment_shader),
         });
         pipeline->setVertexInputLayout(atlas_glyph_vertex_input_layout());
         pipeline->setShaderResourceBindings(shader_resources);
@@ -3523,7 +3542,8 @@ private:
         VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::rasterize_glyph");
         result.raster_thread = current_thread_id();
         const QRawFont::AntialiasingType antialiasing =
-            presentation == Glyph_image_presentation::TEXT
+            presentation == Glyph_image_presentation::TEXT &&
+                m_dual_source_blend_factors_available
                 ? QRawFont::SubPixelAntialiasing
                 : QRawFont::PixelAntialiasing;
         const QImage alpha_map = raster_font.alphaMapForGlyph(
@@ -5022,6 +5042,7 @@ private:
     QShader                                  m_fragment_shader;
     QShader                                  m_glyph_vertex_shader;
     QShader                                  m_glyph_fragment_shader;
+    QShader                                  m_glyph_alpha_fragment_shader;
     QShader                                  m_dual_source_probe_fragment_shader;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
     QShader                                  m_msdf_text_vertex_shader;
