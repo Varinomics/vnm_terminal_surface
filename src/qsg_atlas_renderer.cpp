@@ -3652,6 +3652,83 @@ private:
         }
     }
 
+    bool glyph_record_has_terminal_cell_origin(
+        const Qsg_atlas_shaped_glyph_record& record,
+        const Terminal_render_text_run&      run) const
+    {
+        if (!run.rect.isValid()                         ||
+            !std::isfinite(m_frame.cell_metrics.width)  ||
+            m_frame.cell_metrics.width <= 0.0           ||
+            record.owner_cell_span != 1                 ||
+            record.source_string_start < 0              ||
+            record.source_string_end != record.source_string_start + 1 ||
+            record.source_string_start >= run.text.size())
+        {
+            return false;
+        }
+
+        const int run_cell_span = static_cast<int>(
+            std::round(run.rect.width() / m_frame.cell_metrics.width));
+        if (run_cell_span <= 0 ||
+            run.text.size() != static_cast<qsizetype>(run_cell_span))
+        {
+            return false;
+        }
+
+        const int expected_owner_column =
+            run.column + static_cast<int>(record.source_string_start);
+        return
+            record.owner_column == expected_owner_column &&
+            qsg_atlas_printable_ascii_index(
+                run.text.at(record.source_string_start)) >= 0;
+    }
+
+    QPointF terminal_cell_glyph_origin(
+        const Terminal_render_text_run& run,
+        int                             owner_column,
+        qreal                           normalized_device_pixel_ratio) const
+    {
+        const qreal logical_grid_left =
+            run.rect.left() -
+            static_cast<qreal>(run.column) * m_frame.cell_metrics.width;
+        const qreal physical_grid_left = static_cast<qreal>(
+            atlas_snapped_physical_int(
+                logical_grid_left,
+                normalized_device_pixel_ratio));
+        const qreal physical_baseline_y = static_cast<qreal>(
+            atlas_snapped_physical_int(
+                run.baseline_origin.y(),
+                normalized_device_pixel_ratio));
+        const qreal physical_cell_advance = std::max<qreal>(
+            1.0,
+            std::round(
+                m_frame.cell_metrics.width *
+                normalized_device_pixel_ratio));
+        const qreal physical_origin_x =
+            physical_grid_left +
+            static_cast<qreal>(owner_column) * physical_cell_advance;
+
+        return QPointF(
+            physical_origin_x / normalized_device_pixel_ratio,
+            physical_baseline_y / normalized_device_pixel_ratio);
+    }
+
+    QPointF snapped_terminal_cell_glyph_origin(
+        const Qsg_atlas_shaped_glyph_record& record,
+        const Terminal_render_text_run&      run,
+        QPointF                              glyph_origin,
+        qreal                                normalized_device_pixel_ratio) const
+    {
+        if (!glyph_record_has_terminal_cell_origin(record, run)) {
+            return glyph_origin;
+        }
+
+        return terminal_cell_glyph_origin(
+            run,
+            record.owner_column,
+            normalized_device_pixel_ratio);
+    }
+
     void begin_prepared_text_cache_frame(bool font_epoch_changed)
     {
         ++m_prepared_text_cache_frame;
@@ -4003,31 +4080,21 @@ private:
 
     void append_msdf_text_instance(
         const msdf_text_glyph_t&          glyph,
-        QPointF                           baseline_origin,
+        QPointF                           physical_baseline_origin,
         const Terminal_render_text_run&   run,
         const std::array<float, 4>&       color,
-        qreal                             device_pixel_ratio)
+        qreal                             normalized_device_pixel_ratio)
     {
-        const qreal normalized_device_pixel_ratio =
-            atlas_normalized_device_pixel_ratio(device_pixel_ratio);
-        const int physical_origin_x = atlas_snapped_physical_int(
-            baseline_origin.x(),
-            normalized_device_pixel_ratio);
-        const int physical_origin_y = atlas_snapped_physical_int(
-            baseline_origin.y(),
-            normalized_device_pixel_ratio);
+        const qreal physical_origin_x = physical_baseline_origin.x();
+        const qreal physical_origin_y = physical_baseline_origin.y();
         const qreal physical_left =
-            static_cast<qreal>(physical_origin_x) +
-            static_cast<qreal>(glyph.plane_left);
+            physical_origin_x + static_cast<qreal>(glyph.plane_left);
         const qreal physical_top =
-            static_cast<qreal>(physical_origin_y) +
-            static_cast<qreal>(glyph.plane_bottom);
+            physical_origin_y + static_cast<qreal>(glyph.plane_bottom);
         const qreal physical_right =
-            static_cast<qreal>(physical_origin_x) +
-            static_cast<qreal>(glyph.plane_right);
+            physical_origin_x + static_cast<qreal>(glyph.plane_right);
         const qreal physical_bottom =
-            static_cast<qreal>(physical_origin_y) +
-            static_cast<qreal>(glyph.plane_top);
+            physical_origin_y + static_cast<qreal>(glyph.plane_top);
         if (physical_right <= physical_left || physical_bottom <= physical_top) {
             return;
         }
@@ -4119,6 +4186,25 @@ private:
             return;
         }
 
+        const qreal normalized_device_pixel_ratio =
+            atlas_normalized_device_pixel_ratio(m_frame.device_pixel_ratio);
+        const qreal logical_grid_left =
+            run.rect.left() -
+            static_cast<qreal>(run.column) * m_frame.cell_metrics.width;
+        const qreal physical_grid_left = static_cast<qreal>(
+            atlas_snapped_physical_int(
+                logical_grid_left,
+                normalized_device_pixel_ratio));
+        const qreal physical_baseline_y = static_cast<qreal>(
+            atlas_snapped_physical_int(
+                run.baseline_origin.y(),
+                normalized_device_pixel_ratio));
+        const qreal physical_cell_advance = std::max<qreal>(
+            1.0,
+            std::round(
+                m_frame.cell_metrics.width *
+                normalized_device_pixel_ratio));
+
         for (qsizetype source = 0; source < run.text.size(); ++source) {
             const char32_t codepoint =
                 qsg_atlas_msdf_text_codepoint(run.text.at(source));
@@ -4135,12 +4221,14 @@ private:
             append_msdf_text_instance(
                 glyph->second,
                 QPointF(
-                    run.rect.left() +
-                        static_cast<qreal>(source) * m_frame.cell_metrics.width,
-                    run.baseline_origin.y()),
+                    physical_grid_left +
+                        static_cast<qreal>(
+                            run.column + static_cast<int>(source)) *
+                            physical_cell_advance,
+                    physical_baseline_y),
                 run,
                 color,
-                m_frame.device_pixel_ratio);
+                normalized_device_pixel_ratio);
         }
 
         ++result.render.msdf_text_runs;
@@ -4198,6 +4286,11 @@ private:
                 run.rect.left() +
                     static_cast<qreal>(source) * m_frame.cell_metrics.width,
                 run.baseline_origin.y());
+            const QPointF draw_origin = snapped_terminal_cell_glyph_origin(
+                record,
+                run,
+                record.glyph_origin,
+                device_pixel_ratio);
             record_glyph_face(record.fallback_face_id, result);
             if (!glyph.slot.is_valid()) {
                 QRawFont raster_font = record.raw_font;
@@ -4217,7 +4310,7 @@ private:
             }
             append_glyph_instance(
                 glyph.slot,
-                record.glyph_origin,
+                draw_origin,
                 run,
                 color,
                 device_pixel_ratio,
@@ -4272,11 +4365,16 @@ private:
             record.content_generation = run.content_generation;
             record.run_column         = run.column;
             record.glyph_origin      += origin_delta;
+            const QPointF draw_origin = snapped_terminal_cell_glyph_origin(
+                record,
+                run,
+                record.glyph_origin,
+                device_pixel_ratio);
             record_glyph_face(record.fallback_face_id, result);
             ++result.producer.slot_resolutions_reused;
             append_glyph_instance(
                 glyph.slot,
-                record.glyph_origin,
+                draw_origin,
                 run,
                 color,
                 device_pixel_ratio,
@@ -4447,7 +4545,11 @@ private:
 
             append_glyph_instance(
                 slot,
-                record.glyph_origin,
+                snapped_terminal_cell_glyph_origin(
+                    record,
+                    run,
+                    record.glyph_origin,
+                    device_pixel_ratio),
                 run,
                 color,
                 device_pixel_ratio,

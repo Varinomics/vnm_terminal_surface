@@ -101,6 +101,52 @@ constexpr int k_lcd_repeated_w_first_column = 1;
 constexpr int k_lcd_repeated_w_column_stride = 2;
 constexpr qreal k_lcd_repeated_w_translated_host_x = 16.0;
 constexpr qreal k_lcd_repeated_w_translated_host_y = 8.0;
+constexpr int k_lcd_contiguous_x_cell_count = 80;
+constexpr int k_lcd_contiguous_x_row = 1;
+constexpr int k_lcd_contiguous_x_first_column = 1;
+constexpr int k_lcd_contiguous_x_column_stride = 1;
+constexpr qreal k_lcd_contiguous_x_font_size =
+    static_cast<qreal>(
+        vnm_terminal::internal::k_vnm_terminal_default_font_pixel_size);
+constexpr int k_lcd_intensity_x_columns = 96;
+constexpr int k_lcd_intensity_x_first_row = 1;
+constexpr int k_lcd_intensity_x_first_column = 1;
+constexpr int k_lcd_intensity_x_column_stride = 1;
+constexpr int k_lcd_intensity_x_uppercase_rows = 6;
+constexpr int k_lcd_intensity_x_lowercase_rows = 5;
+constexpr int k_lcd_intensity_x_rows =
+    k_lcd_intensity_x_uppercase_rows +
+    k_lcd_intensity_x_lowercase_rows;
+constexpr qreal k_lcd_intensity_x_font_size = 10.0;
+constexpr std::array<quint32, k_lcd_intensity_x_rows>
+    k_lcd_intensity_x_foreground_rgba = {
+        0xfff0f0f0U,
+        0xffd8d8d8U,
+        0xffc0c0c0U,
+        0xffa8a8a8U,
+        0xff909090U,
+        0xff787878U,
+        0xff686868U,
+        0xff585858U,
+        0xff484848U,
+        0xff3f3f3fU,
+        0xff383838U,
+    };
+constexpr int k_lcd_fragmented_x_columns = 96;
+constexpr int k_lcd_fragmented_x_row = 1;
+constexpr int k_lcd_fragmented_x_first_column = 1;
+constexpr int k_lcd_fragmented_x_column_stride = 1;
+constexpr qreal k_lcd_fragmented_x_font_size = 10.0;
+constexpr std::array<quint32, 8> k_lcd_fragmented_x_foreground_rgba = {
+    0xfff0f0f0U,
+    0xffd8d8d8U,
+    0xffc0c0c0U,
+    0xffa8a8a8U,
+    0xff909090U,
+    0xff787878U,
+    0xff686868U,
+    0xff585858U,
+};
 constexpr int k_lcd_repeated_on_row = 1;
 constexpr int k_lcd_repeated_on_first_column = 1;
 constexpr int k_lcd_repeated_on_second_column = 96;
@@ -554,6 +600,15 @@ struct Lcd_repeated_w_stability_stats
     std::vector<Lcd_repeated_w_cell_stats> cells;
 };
 
+struct Lcd_intensity_x_row_stability
+{
+    int                            row_index = 0;
+    int                            row = 0;
+    char                           glyph = 'X';
+    quint32                        foreground_rgba = 0U;
+    Lcd_repeated_w_stability_stats stability;
+};
+
 struct Lcd_repeated_on_glyph_stats
 {
     QString                   label;
@@ -881,10 +936,11 @@ qreal pixel_probe_render_window_device_pixel_ratio(QGuiApplication& app)
 
 term::terminal_cell_metrics_t pixel_metrics(
     qreal device_pixel_ratio,
-    qreal font_size)
+    qreal font_size,
+    QString font_family = QString())
 {
     term::Qt_grid_metrics_provider provider(
-        term::vnm_terminal_font(QString(), font_size),
+        term::vnm_terminal_font(std::move(font_family), font_size),
         pixel_normalized_device_pixel_ratio(device_pixel_ratio));
     return provider.cell_metrics();
 }
@@ -3674,6 +3730,11 @@ QColor lcd_repeated_w_background(const Pixel_parity_fixture& fixture)
     return QColor::fromRgba(k_lcd_w_probe_background_rgba);
 }
 
+char lcd_intensity_x_row_glyph(int row_index)
+{
+    return row_index < k_lcd_intensity_x_uppercase_rows ? 'X' : 'x';
+}
+
 Lcd_repeated_on_stability_stats measure_lcd_repeated_on_stability(
     const Pixel_parity_fixture& fixture,
     const QImage&               image,
@@ -3954,6 +4015,33 @@ Lcd_repeated_w_stability_stats measure_lcd_repeated_w_stability(
     }
 
     return stats;
+}
+
+std::vector<Lcd_intensity_x_row_stability> measure_lcd_intensity_x_stability(
+    const Pixel_parity_fixture& fixture,
+    const QImage&               image)
+{
+    std::vector<Lcd_intensity_x_row_stability> rows;
+    rows.reserve(static_cast<std::size_t>(k_lcd_intensity_x_rows));
+    for (int row_index = 0; row_index < k_lcd_intensity_x_rows; ++row_index) {
+        const int row = k_lcd_intensity_x_first_row + row_index;
+
+        Lcd_intensity_x_row_stability item;
+        item.row_index       = row_index;
+        item.row             = row;
+        item.glyph           = lcd_intensity_x_row_glyph(row_index);
+        item.foreground_rgba = k_lcd_intensity_x_foreground_rgba[
+            static_cast<std::size_t>(row_index)];
+        item.stability = measure_lcd_repeated_w_stability(
+            fixture,
+            image,
+            row,
+            k_lcd_intensity_x_first_column,
+            k_lcd_intensity_x_column_stride,
+            k_lcd_intensity_x_columns);
+        rows.push_back(std::move(item));
+    }
+    return rows;
 }
 
 Lcd_repeated_w_stability_stats compare_lcd_repeated_w_corresponding_cells(
@@ -5566,7 +5654,8 @@ Pixel_render_result render_pixel_atlas_fixture(
     QGuiApplication&              app,
     const Pixel_parity_fixture&  fixture,
     QPointF                      surface_position = QPointF(),
-    qreal                        font_size = 18.0)
+    qreal                        font_size = 18.0,
+    QString                      font_family = QString())
 {
     QQuickWindow window;
     window.setColor(QColor(1, 2, 3));
@@ -5585,7 +5674,7 @@ Pixel_render_result render_pixel_atlas_fixture(
         ? window.contentItem()
         : &host);
     surface.setSize(fixture.logical_size);
-    surface.set_font_family(QString());
+    surface.set_font_family(std::move(font_family));
     surface.set_font_size(font_size);
     term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(surface, true);
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
@@ -11426,6 +11515,144 @@ Pixel_parity_fixture make_lcd_repeated_w_probe_fixture(qreal device_pixel_ratio)
     return fixture;
 }
 
+Pixel_parity_fixture make_lcd_contiguous_x_probe_fixture(
+    qreal device_pixel_ratio)
+{
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const term::terminal_cell_metrics_t metrics =
+        pixel_metrics(dpr, k_lcd_contiguous_x_font_size);
+
+    Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
+        "lcd_contiguous_x_probe",
+        false,
+        {3, k_lcd_contiguous_x_first_column +
+            k_lcd_contiguous_x_cell_count + 1},
+        992U,
+        metrics,
+        dpr);
+    const term::Terminal_style_id normal = 1U;
+    fixture.snapshot.styles.push_back(rgb_style(
+        k_lcd_w_probe_foreground_rgba,
+        k_lcd_w_probe_background_rgba));
+    fixture.snapshot.cells.push_back(
+        make_pixel_cell(
+            k_lcd_contiguous_x_row,
+            k_lcd_contiguous_x_first_column,
+            QString(
+                k_lcd_contiguous_x_cell_count,
+                QLatin1Char('X')),
+            k_lcd_contiguous_x_cell_count,
+            normal));
+    append_text_glyph_masks(
+        fixture,
+        pixel_expected_frame(fixture).text_runs);
+    return fixture;
+}
+
+Pixel_parity_fixture make_lcd_intensity_x_probe_fixture(
+    qreal device_pixel_ratio)
+{
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const term::terminal_cell_metrics_t metrics =
+        pixel_metrics(dpr, k_lcd_intensity_x_font_size);
+
+    Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
+        "lcd_intensity_x_probe",
+        false,
+        {k_lcd_intensity_x_first_row + k_lcd_intensity_x_rows + 1,
+            k_lcd_intensity_x_first_column + k_lcd_intensity_x_columns + 1},
+        994U,
+        metrics,
+        dpr);
+    for (int row_index = 0; row_index < k_lcd_intensity_x_rows; ++row_index) {
+        const term::Terminal_style_id style_id =
+            static_cast<term::Terminal_style_id>(row_index + 1);
+        fixture.snapshot.styles.push_back(rgb_style(
+            k_lcd_intensity_x_foreground_rgba[
+                static_cast<std::size_t>(row_index)],
+            k_lcd_w_probe_background_rgba));
+        fixture.snapshot.cells.push_back(
+            make_pixel_cell(
+                k_lcd_intensity_x_first_row + row_index,
+                k_lcd_intensity_x_first_column,
+                QString(
+                    k_lcd_intensity_x_columns,
+                    QLatin1Char(lcd_intensity_x_row_glyph(row_index))),
+                k_lcd_intensity_x_columns,
+                style_id));
+    }
+    append_text_glyph_masks(
+        fixture,
+        pixel_expected_frame(fixture).text_runs);
+    return fixture;
+}
+
+Pixel_parity_fixture make_lcd_fragmented_x_probe_fixture(
+    qreal device_pixel_ratio)
+{
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(
+        dpr,
+        k_lcd_fragmented_x_font_size,
+        QStringLiteral("monospace"));
+
+    Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
+        "lcd_fragmented_x_probe",
+        false,
+        {3, k_lcd_fragmented_x_first_column +
+            k_lcd_fragmented_x_columns + 1},
+        995U,
+        metrics,
+        dpr);
+    fixture.snapshot.styles.reserve(
+        static_cast<std::size_t>(k_lcd_fragmented_x_columns + 1));
+    fixture.snapshot.hyperlinks.reserve(
+        static_cast<std::size_t>(k_lcd_fragmented_x_columns));
+    fixture.snapshot.cells.reserve(
+        static_cast<std::size_t>(k_lcd_fragmented_x_columns));
+
+    for (int column_index = 0; column_index < k_lcd_fragmented_x_columns;
+        ++column_index)
+    {
+        const term::Terminal_style_id style_id =
+            static_cast<term::Terminal_style_id>(
+                fixture.snapshot.styles.size());
+        const quint32 foreground =
+            k_lcd_fragmented_x_foreground_rgba[
+                static_cast<std::size_t>(column_index) %
+                    k_lcd_fragmented_x_foreground_rgba.size()];
+        fixture.snapshot.styles.push_back(rgb_style(
+            foreground,
+            k_lcd_w_probe_background_rgba));
+
+        const std::uint64_t hyperlink_id =
+            1000U + static_cast<std::uint64_t>(column_index);
+        term::Terminal_render_hyperlink_metadata hyperlink;
+        hyperlink.hyperlink_id = hyperlink_id;
+        hyperlink.identity_key =
+            QByteArrayLiteral("fragmented-x-") +
+            QByteArray::number(static_cast<qlonglong>(column_index));
+        hyperlink.uri =
+            QByteArrayLiteral("vnm-terminal://fragmented-x/") +
+            QByteArray::number(static_cast<qlonglong>(column_index));
+        fixture.snapshot.hyperlinks.push_back(std::move(hyperlink));
+
+        term::Terminal_render_cell cell = make_pixel_cell(
+            k_lcd_fragmented_x_row,
+            k_lcd_fragmented_x_first_column + column_index,
+            QStringLiteral("X"),
+            1,
+            style_id);
+        cell.hyperlink_id = hyperlink_id;
+        fixture.snapshot.cells.push_back(std::move(cell));
+    }
+
+    append_text_glyph_masks(
+        fixture,
+        pixel_expected_frame(fixture).text_runs);
+    return fixture;
+}
+
 Pixel_parity_fixture make_lcd_repeated_on_probe_fixture(
     qreal device_pixel_ratio,
     qreal font_size = 18.0)
@@ -14807,6 +15034,31 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             app,
             repeated_w_fixture,
             repeated_w_translated_host);
+    const Pixel_parity_fixture contiguous_x_fixture =
+        make_lcd_contiguous_x_probe_fixture(device_pixel_ratio);
+    const Pixel_render_result contiguous_x_atlas =
+        render_pixel_atlas_fixture(
+            app,
+            contiguous_x_fixture,
+            QPointF(),
+            k_lcd_contiguous_x_font_size);
+    const Pixel_parity_fixture intensity_x_fixture =
+        make_lcd_intensity_x_probe_fixture(device_pixel_ratio);
+    const Pixel_render_result intensity_x_atlas =
+        render_pixel_atlas_fixture(
+            app,
+            intensity_x_fixture,
+            QPointF(),
+            k_lcd_intensity_x_font_size);
+    const Pixel_parity_fixture fragmented_x_fixture =
+        make_lcd_fragmented_x_probe_fixture(device_pixel_ratio);
+    const Pixel_render_result fragmented_x_atlas =
+        render_pixel_atlas_fixture(
+            app,
+            fragmented_x_fixture,
+            QPointF(),
+            k_lcd_fragmented_x_font_size,
+            QStringLiteral("monospace"));
     const Pixel_parity_fixture repeated_on_fixture =
         make_lcd_repeated_on_probe_fixture(device_pixel_ratio);
     const QPointF repeated_on_fractional_host =
@@ -14950,6 +15202,26 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             repeated_w_stability,
             translated_repeated_w_atlas.image,
             translated_repeated_w_stability);
+    const Lcd_repeated_w_stability_stats contiguous_x_stability =
+        measure_lcd_repeated_w_stability(
+            contiguous_x_fixture,
+            contiguous_x_atlas.image,
+            k_lcd_contiguous_x_row,
+            k_lcd_contiguous_x_first_column,
+            k_lcd_contiguous_x_column_stride,
+            k_lcd_contiguous_x_cell_count);
+    const std::vector<Lcd_intensity_x_row_stability> intensity_x_stability =
+        measure_lcd_intensity_x_stability(
+            intensity_x_fixture,
+            intensity_x_atlas.image);
+    const Lcd_repeated_w_stability_stats fragmented_x_stability =
+        measure_lcd_repeated_w_stability(
+            fragmented_x_fixture,
+            fragmented_x_atlas.image,
+            k_lcd_fragmented_x_row,
+            k_lcd_fragmented_x_first_column,
+            k_lcd_fragmented_x_column_stride,
+            k_lcd_fragmented_x_columns);
     const Lcd_repeated_on_stability_stats repeated_on_stability =
         measure_lcd_repeated_on_stability(
             repeated_on_fixture,
@@ -15028,6 +15300,12 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         repeated_w_atlas.atlas_report.render;
     const auto& translated_repeated_w_render =
         translated_repeated_w_atlas.atlas_report.render;
+    const auto& contiguous_x_render =
+        contiguous_x_atlas.atlas_report.render;
+    const auto& intensity_x_render =
+        intensity_x_atlas.atlas_report.render;
+    const auto& fragmented_x_render =
+        fragmented_x_atlas.atlas_report.render;
     const auto& repeated_on_render =
         repeated_on_atlas.atlas_report.render;
     const auto& repeated_on_app_font_render =
@@ -15230,6 +15508,129 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         << translated_w_origin_match.max_relative_first_ink_x_delta
         << " max_rel_bbox_x_delta="
         << translated_w_origin_match.max_relative_bbox_x_delta
+        << '\n';
+    std::cout << "LCD atlas contiguous-X stability"
+        << " ready=" << contiguous_x_atlas.ready
+        << " image=" << contiguous_x_atlas.image.width()
+        << 'x' << contiguous_x_atlas.image.height()
+        << " font_size=" << k_lcd_contiguous_x_font_size
+        << " msdf_active="
+        << contiguous_x_render.msdf_text_renderer_active
+        << " msdf_runs=" << contiguous_x_render.msdf_text_runs
+        << " msdf_instances="
+        << contiguous_x_render.msdf_text_glyph_instances
+        << " msdf_draws=" << contiguous_x_render.msdf_text_draw_calls
+        << " glyph_draws=" << contiguous_x_render.glyph_draw_calls
+        << " glyph_instances="
+        << contiguous_x_render.glyph_buffer_instances
+        << " column_stride=" << k_lcd_contiguous_x_column_stride
+        << " physical_cell=" << contiguous_x_stability.physical_cell_width
+        << 'x' << contiguous_x_stability.physical_cell_height
+        << " ascent=" << contiguous_x_stability.physical_cell_ascent
+        << " integer_deltas="
+        << contiguous_x_stability.cell_width_integer_delta
+        << ',' << contiguous_x_stability.cell_height_integer_delta
+        << ',' << contiguous_x_stability.cell_ascent_integer_delta
+        << " compared_cells=" << contiguous_x_stability.compared_cells
+        << " compared_pixels=" << contiguous_x_stability.compared_pixels
+        << " diff_pixels=" << contiguous_x_stability.diff_pixels
+        << " max_delta=" << contiguous_x_stability.max_delta
+        << " max_diff_per_cell="
+        << contiguous_x_stability.max_diff_pixels_per_cell
+        << " ink_mask_diff_pixels="
+        << contiguous_x_stability.ink_mask_diff_pixels
+        << " max_ink_mask_diff_per_cell="
+        << contiguous_x_stability.max_ink_mask_diff_pixels_per_cell
+        << " all_ink=" << contiguous_x_stability.all_cells_have_ink
+        << " max_ink_delta="
+        << contiguous_x_stability.max_ink_pixels_delta
+        << " max_rel_first_x_delta="
+        << contiguous_x_stability.max_relative_first_ink_x_delta
+        << " max_rel_bbox_x_delta="
+        << contiguous_x_stability.max_relative_bbox_x_delta
+        << '\n';
+    std::cout << "LCD atlas intensity-X stability"
+        << " ready=" << intensity_x_atlas.ready
+        << " image=" << intensity_x_atlas.image.width()
+        << 'x' << intensity_x_atlas.image.height()
+        << " font_size=" << k_lcd_intensity_x_font_size
+        << " msdf_active="
+        << intensity_x_render.msdf_text_renderer_active
+        << " msdf_runs=" << intensity_x_render.msdf_text_runs
+        << " msdf_instances="
+        << intensity_x_render.msdf_text_glyph_instances
+        << " msdf_draws=" << intensity_x_render.msdf_text_draw_calls
+        << " glyph_draws=" << intensity_x_render.glyph_draw_calls
+        << " glyph_instances="
+        << intensity_x_render.glyph_buffer_instances
+        << " rows=" << k_lcd_intensity_x_rows
+        << " columns=" << k_lcd_intensity_x_columns
+        << '\n';
+    for (const Lcd_intensity_x_row_stability& row : intensity_x_stability) {
+        const QColor foreground = QColor::fromRgba(row.foreground_rgba);
+        const Lcd_repeated_w_stability_stats& stability = row.stability;
+        std::cout << "LCD atlas intensity-X row"
+            << " row_index=" << row.row_index
+            << " row=" << row.row
+            << " glyph=" << row.glyph
+            << " foreground_rgb=" << foreground.red()
+            << ',' << foreground.green()
+            << ',' << foreground.blue()
+            << " compared_cells=" << stability.compared_cells
+            << " compared_pixels=" << stability.compared_pixels
+            << " diff_pixels=" << stability.diff_pixels
+            << " max_delta=" << stability.max_delta
+            << " max_diff_per_cell="
+            << stability.max_diff_pixels_per_cell
+            << " ink_mask_diff_pixels="
+            << stability.ink_mask_diff_pixels
+            << " max_ink_mask_diff_per_cell="
+            << stability.max_ink_mask_diff_pixels_per_cell
+            << " all_ink=" << stability.all_cells_have_ink
+            << " max_ink_delta=" << stability.max_ink_pixels_delta
+            << " max_rel_first_x_delta="
+            << stability.max_relative_first_ink_x_delta
+            << " max_rel_bbox_x_delta="
+            << stability.max_relative_bbox_x_delta
+            << '\n';
+    }
+    std::cout << "LCD atlas fragmented-X shaped stability"
+        << " ready=" << fragmented_x_atlas.ready
+        << " image=" << fragmented_x_atlas.image.width()
+        << 'x' << fragmented_x_atlas.image.height()
+        << " font_size=" << k_lcd_fragmented_x_font_size
+        << " msdf_active="
+        << fragmented_x_render.msdf_text_renderer_active
+        << " msdf_runs=" << fragmented_x_render.msdf_text_runs
+        << " msdf_instances="
+        << fragmented_x_render.msdf_text_glyph_instances
+        << " msdf_draws=" << fragmented_x_render.msdf_text_draw_calls
+        << " glyph_draws=" << fragmented_x_render.glyph_draw_calls
+        << " glyph_instances="
+        << fragmented_x_render.glyph_buffer_instances
+        << " shaped_runs="
+        << fragmented_x_atlas.atlas_report.producer.shaped_runs_built +
+            fragmented_x_atlas.atlas_report.producer.shaped_runs_reused
+        << " simple_used="
+        << fragmented_x_atlas.atlas_report.producer.simple_path_used
+        << " columns=" << k_lcd_fragmented_x_columns
+        << " compared_cells=" << fragmented_x_stability.compared_cells
+        << " compared_pixels=" << fragmented_x_stability.compared_pixels
+        << " diff_pixels=" << fragmented_x_stability.diff_pixels
+        << " max_delta=" << fragmented_x_stability.max_delta
+        << " max_diff_per_cell="
+        << fragmented_x_stability.max_diff_pixels_per_cell
+        << " ink_mask_diff_pixels="
+        << fragmented_x_stability.ink_mask_diff_pixels
+        << " max_ink_mask_diff_per_cell="
+        << fragmented_x_stability.max_ink_mask_diff_pixels_per_cell
+        << " all_ink=" << fragmented_x_stability.all_cells_have_ink
+        << " max_ink_delta="
+        << fragmented_x_stability.max_ink_pixels_delta
+        << " max_rel_first_x_delta="
+        << fragmented_x_stability.max_relative_first_ink_x_delta
+        << " max_rel_bbox_x_delta="
+        << fragmented_x_stability.max_relative_bbox_x_delta
         << '\n';
     std::cout << "LCD atlas repeated-on fractional-host stability"
         << " ready=" << repeated_on_atlas.ready
@@ -15572,6 +15973,21 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             lcd_probe_image_has_pixels(translated_repeated_w_atlas.image),
         "LCD atlas probe captures a non-empty translated repeated-W atlas image");
     ok &= check(
+        contiguous_x_atlas.ready &&
+            atlas_report_render_state_ready(contiguous_x_atlas.atlas_report) &&
+            lcd_probe_image_has_pixels(contiguous_x_atlas.image),
+        "LCD atlas probe captures a non-empty contiguous-X atlas image");
+    ok &= check(
+        intensity_x_atlas.ready &&
+            atlas_report_render_state_ready(intensity_x_atlas.atlas_report) &&
+            lcd_probe_image_has_pixels(intensity_x_atlas.image),
+        "LCD atlas probe captures a non-empty intensity-X atlas image");
+    ok &= check(
+        fragmented_x_atlas.ready &&
+            atlas_report_render_state_ready(fragmented_x_atlas.atlas_report) &&
+            lcd_probe_image_has_pixels(fragmented_x_atlas.image),
+        "LCD atlas probe captures a non-empty fragmented-X atlas image");
+    ok &= check(
         repeated_on_atlas.ready &&
             atlas_report_render_state_ready(repeated_on_atlas.atlas_report) &&
             lcd_probe_image_has_pixels(repeated_on_atlas.image),
@@ -15618,6 +16034,15 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     ok &= check(
         lcd_probe_image_has_visible_variation(translated_repeated_w_atlas.image),
         "LCD atlas probe translated repeated-W atlas image contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(contiguous_x_atlas.image),
+        "LCD atlas probe contiguous-X atlas image contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(intensity_x_atlas.image),
+        "LCD atlas probe intensity-X atlas image contains visible fixture variation");
+    ok &= check(
+        lcd_probe_image_has_visible_variation(fragmented_x_atlas.image),
+        "LCD atlas probe fragmented-X atlas image contains visible fixture variation");
     ok &= check(
         lcd_probe_image_has_visible_variation(repeated_on_atlas.image),
         "LCD atlas probe repeated-on atlas image contains visible fixture variation");
@@ -15967,6 +16392,134 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         ok &= check(
             translated_w_origin_geometry_exact,
             "LCD atlas probe translated repeated-W glyph ink geometry matches the origin cells");
+        ok &= check(
+            contiguous_x_render.msdf_text_renderer_active &&
+                contiguous_x_render.msdf_text_runs == 1 &&
+                contiguous_x_render.msdf_text_glyph_instances ==
+                    k_lcd_contiguous_x_cell_count &&
+                contiguous_x_render.msdf_text_draw_calls > 0 &&
+                contiguous_x_render.glyph_draw_calls == 0 &&
+                contiguous_x_render.glyph_buffer_instances == 0 &&
+                contiguous_x_render.msdf_text_missed_supported_runs == 0 &&
+                contiguous_x_render.msdf_text_missed_supported_glyphs == 0,
+            "LCD atlas probe contiguous-X fixture uses one real MSDF text run");
+        ok &= check(
+            contiguous_x_stability.cell_width_integer &&
+                contiguous_x_stability.cell_height_integer &&
+                contiguous_x_stability.cell_ascent_integer,
+            "LCD atlas probe contiguous-X fixture uses integer physical cell metrics");
+        ok &= check(
+            contiguous_x_stability.compared_cells ==
+                k_lcd_contiguous_x_cell_count - 1 &&
+                contiguous_x_stability.compared_pixels > 0,
+            "LCD atlas probe contiguous-X stability comparison covers every repeated cell");
+        ok &= check(
+            contiguous_x_stability.diff_pixels == 0 &&
+                contiguous_x_stability.max_diff_pixels_per_cell == 0 &&
+                contiguous_x_stability.max_delta == 0 &&
+                contiguous_x_stability.ink_mask_diff_pixels == 0 &&
+                contiguous_x_stability.max_ink_mask_diff_pixels_per_cell == 0,
+            "LCD atlas probe contiguous-X RGB crops are identical across cells");
+        ok &= check(
+            contiguous_x_stability.all_cells_have_ink &&
+                contiguous_x_stability.max_ink_pixels_delta == 0 &&
+                contiguous_x_stability.max_relative_first_ink_x_delta == 0 &&
+                contiguous_x_stability.max_relative_bbox_x_delta == 0 &&
+                contiguous_x_stability.max_relative_bbox_y_delta == 0 &&
+                contiguous_x_stability.max_relative_bbox_width_delta == 0 &&
+                contiguous_x_stability.max_relative_bbox_height_delta == 0,
+            "LCD atlas probe contiguous-X glyph ink geometry is identical across cells");
+        ok &= check(
+            intensity_x_render.msdf_text_renderer_active &&
+                intensity_x_render.msdf_text_runs == k_lcd_intensity_x_rows &&
+                intensity_x_render.msdf_text_glyph_instances ==
+                    k_lcd_intensity_x_rows * k_lcd_intensity_x_columns &&
+                intensity_x_render.msdf_text_draw_calls > 0 &&
+                intensity_x_render.glyph_draw_calls == 0 &&
+                intensity_x_render.glyph_buffer_instances == 0 &&
+                intensity_x_render.msdf_text_missed_supported_runs == 0 &&
+                intensity_x_render.msdf_text_missed_supported_glyphs == 0,
+            "LCD atlas probe intensity-X fixture uses real MSDF text runs");
+        ok &= check(
+            static_cast<int>(intensity_x_stability.size()) ==
+                k_lcd_intensity_x_rows,
+            "LCD atlas probe intensity-X stability covers every intensity row");
+        for (const Lcd_intensity_x_row_stability& row : intensity_x_stability) {
+            const std::string row_label =
+                "LCD atlas probe intensity-X row " +
+                std::to_string(row.row_index);
+            const Lcd_repeated_w_stability_stats& stability = row.stability;
+            const auto check_row = [&](bool condition, const char* suffix) {
+                const std::string message = row_label + suffix;
+                return check(
+                    condition,
+                    std::string_view(message.data(), message.size()));
+            };
+            ok &= check_row(
+                stability.cell_width_integer &&
+                    stability.cell_height_integer &&
+                    stability.cell_ascent_integer,
+                " uses integer physical cell metrics");
+            ok &= check_row(
+                stability.compared_cells ==
+                    k_lcd_intensity_x_columns - 1 &&
+                    stability.compared_pixels > 0,
+                " stability comparison covers every repeated cell");
+            ok &= check_row(
+                stability.diff_pixels == 0 &&
+                    stability.max_diff_pixels_per_cell == 0 &&
+                    stability.max_delta == 0 &&
+                    stability.ink_mask_diff_pixels == 0 &&
+                    stability.max_ink_mask_diff_pixels_per_cell == 0,
+                " RGB crops are identical across cells");
+            ok &= check_row(
+                stability.all_cells_have_ink &&
+                    stability.max_ink_pixels_delta == 0 &&
+                    stability.max_relative_first_ink_x_delta == 0 &&
+                    stability.max_relative_bbox_x_delta == 0 &&
+                    stability.max_relative_bbox_y_delta == 0 &&
+                    stability.max_relative_bbox_width_delta == 0 &&
+                    stability.max_relative_bbox_height_delta == 0,
+                " glyph ink geometry is identical across cells");
+        }
+        const int fragmented_x_shaped_runs =
+            fragmented_x_atlas.atlas_report.producer.shaped_runs_built +
+            fragmented_x_atlas.atlas_report.producer.shaped_runs_reused;
+        const int fragmented_x_shaped_glyph_records =
+            fragmented_x_atlas.atlas_report.producer.shaped_glyph_records_built +
+            fragmented_x_atlas.atlas_report.producer.shaped_glyph_records_reused;
+        ok &= check(
+            fragmented_x_render.msdf_text_runs == 0 &&
+                fragmented_x_render.msdf_text_glyph_instances == 0 &&
+                fragmented_x_render.msdf_text_draw_calls == 0 &&
+                fragmented_x_render.glyph_draw_calls > 0 &&
+                fragmented_x_atlas.atlas_report.frame_build.glyph_instances ==
+                    k_lcd_fragmented_x_columns &&
+                fragmented_x_atlas.atlas_report.producer.simple_path_used == 0 &&
+                fragmented_x_shaped_runs >= k_lcd_fragmented_x_columns &&
+                fragmented_x_shaped_glyph_records >= k_lcd_fragmented_x_columns,
+            "LCD atlas probe fragmented-X fixture uses the shaped glyph atlas path");
+        ok &= check(
+            fragmented_x_atlas.atlas_report.frame_build.snapped_origin_failures == 0,
+            "LCD atlas probe fragmented-X fixture submits snapped glyph origins");
+        ok &= check(
+            fragmented_x_stability.cell_width_integer &&
+                fragmented_x_stability.cell_height_integer &&
+                fragmented_x_stability.cell_ascent_integer,
+            "LCD atlas probe fragmented-X fixture uses integer physical cell metrics");
+        ok &= check(
+            fragmented_x_stability.compared_cells ==
+                k_lcd_fragmented_x_columns - 1 &&
+                fragmented_x_stability.compared_pixels > 0,
+            "LCD atlas probe fragmented-X stability comparison covers every repeated cell");
+        ok &= check(
+            fragmented_x_stability.all_cells_have_ink &&
+                fragmented_x_stability.max_relative_first_ink_x_delta == 0 &&
+                fragmented_x_stability.max_relative_bbox_x_delta == 0 &&
+                fragmented_x_stability.max_relative_bbox_y_delta == 0 &&
+                fragmented_x_stability.max_relative_bbox_width_delta == 0 &&
+                fragmented_x_stability.max_relative_bbox_height_delta == 0,
+            "LCD atlas probe fragmented-X glyph ink geometry is identical across cells");
         ok &= check(
             repeated_on_render.msdf_text_renderer_active &&
                 repeated_on_render.msdf_text_glyph_instances == 4 &&
