@@ -40,6 +40,13 @@ Writable Qt properties:
   The example accepts `default` and `light`.
 - `cursorStyle` is `BLOCK`, `BAR`, or `UNDERLINE`.
 - `cursorBlinkEnabled` enables the render-side blink override.
+- `textRendererMode` is `AUTO`, `MSDF`, or `GLYPH`. `AUTO` lets the atlas
+  renderer select MSDF text when available and fall back to shaped glyph-atlas
+  text. `MSDF` and `GLYPH` force that text path for diagnostic comparison.
+- `lcdSubpixelOrder` is `AUTO`, `NONE`, `RGB`, `BGR`, `VRGB`, or `VBGR`.
+  `AUTO` uses the window screen's Qt subpixel hint first and, on Windows, the
+  system ClearType orientation when Qt reports no order. Manual values force
+  the MSDF LCD sampling order; `NONE` keeps grayscale MSDF coverage.
 - `scrollbackLimit` clamps to zero or greater and is applied to a live session.
 - `synchronizedOutputStaleTimeoutMs` clamps to at least one millisecond and is
   used to release synchronized-output mode if the application leaves output

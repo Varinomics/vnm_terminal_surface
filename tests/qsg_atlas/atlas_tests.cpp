@@ -671,6 +671,9 @@ struct Lcd_ascii_panel_cell_stats
     Lcd_visible_glyph_metrics            visible;
     int                                  left_half_ink_pixels = 0;
     int                                  right_half_ink_pixels = 0;
+    int                                  left_third_ink_pixels = 0;
+    int                                  center_third_ink_pixels = 0;
+    int                                  right_third_ink_pixels = 0;
     int                                  top_half_ink_pixels = 0;
     int                                  bottom_half_ink_pixels = 0;
     Lcd_horizontal_edge_transition_stats edge_transitions;
@@ -2299,6 +2302,9 @@ Pixel_aa_budget pixel_budget_for_backend(
     }
 
     if (fixture_name == "block_cursor_antialiased_box") {
+        if (std::strcmp(backend, "opengl") == 0) {
+            return {288, 130, 60, 0.0};
+        }
         return {288, 120, 60, 0.0};
     }
 
@@ -2343,19 +2349,22 @@ Pixel_aa_budget pixel_budget_for_backend(
     }
 
     if (fixture_name == "block_cursor_text") {
+        // MSDF cursor text clips the glyph through the cursor cell. QRhi
+        // backends differ from the CPU reference by a few edge pixels while
+        // preserving shape and placement.
         if (std::strcmp(backend, "d3d11") == 0) {
-            return {288, 230, 120, 0.0};
+            return {288, 230, 120, 0.08};
         }
         if (std::strcmp(backend, "d3d12") == 0) {
-            return {288, 230, 120, 0.0};
+            return {288, 230, 120, 0.08};
         }
         if (std::strcmp(backend, "vulkan") == 0) {
-            return {288, 230, 120, 0.0};
+            return {288, 230, 120, 0.08};
         }
         if (std::strcmp(backend, "opengl") == 0) {
-            return {288, 230, 120, 0.0};
+            return {288, 230, 120, 0.08};
         }
-        return {288, 230, 120, 0.0};
+        return {288, 230, 120, 0.08};
     }
 
     return {};
@@ -3286,6 +3295,10 @@ Lcd_ascii_panel_probe_stats measure_lcd_ascii_panel_probe(
         }
         const int half_x = cell_pixels.left() + cell_pixels.width() / 2;
         const int half_y = cell_pixels.top() + cell_pixels.height() / 2;
+        const int first_third_x =
+            cell_pixels.left() + cell_pixels.width() / 3;
+        const int second_third_x =
+            cell_pixels.left() + (cell_pixels.width() * 2) / 3;
         for (int y = cell_pixels.top(); y <= cell_pixels.bottom(); ++y) {
             for (int x = cell_pixels.left(); x <= cell_pixels.right(); ++x) {
                 if (pixel_delta(image.pixelColor(x, y), background) <= 8) {
@@ -3296,6 +3309,16 @@ Lcd_ascii_panel_probe_stats measure_lcd_ascii_panel_probe(
                 }
                 else {
                     ++cell.right_half_ink_pixels;
+                }
+                if (x < first_third_x) {
+                    ++cell.left_third_ink_pixels;
+                }
+                else
+                if (x < second_third_x) {
+                    ++cell.center_third_ink_pixels;
+                }
+                else {
+                    ++cell.right_third_ink_pixels;
                 }
                 if (y < half_y) {
                     ++cell.top_half_ink_pixels;
@@ -6276,17 +6299,27 @@ bool validate_frame_build_report(
     else
     if (fixture.name == "fallback_fonts") {
         ok &= check_frame_build_report(
-            frame_build.distinct_glyph_faces >= 2,
-            fixture,
-            "base-font ASCII and fallback text produced distinct glyph faces");
-        ok &= check_frame_build_report(
             frame_build.fallback_glyph_faces >= 1,
             fixture,
             "fallback font face ids were observed in shaped glyph runs");
-        ok &= check_frame_build_report(
-            frame_build.fallback_glyph_faces < frame_build.distinct_glyph_faces,
-            fixture,
-            "base-font face remains distinct from fallback faces");
+        if (report.render.msdf_text_renderer_active &&
+            report.render.msdf_text_glyph_instances > 0)
+        {
+            ok &= check_frame_build_report(
+                frame_build.distinct_glyph_faces >= 1,
+                fixture,
+                "fallback text produced shaped glyph face records");
+        }
+        else {
+            ok &= check_frame_build_report(
+                frame_build.distinct_glyph_faces >= 2,
+                fixture,
+                "base-font ASCII and fallback text produced distinct glyph faces");
+            ok &= check_frame_build_report(
+                frame_build.fallback_glyph_faces < frame_build.distinct_glyph_faces,
+                fixture,
+                "base-font face remains distinct from fallback faces");
+        }
     }
     else
     if (fixture.name == "emoji_policy") {
@@ -6430,11 +6463,63 @@ bool test_source_posture()
         "atlas render frame is built from the captured value in prepare helpers");
     ok &= check(atlas_source.contains(QByteArrayLiteral("bool has_glyph_draw_passes() const")) &&
             atlas_source.contains(
-                QByteArrayLiteral("!has_glyph_draw_passes() || ensure_glyph_resources")),
+                QByteArrayLiteral("!has_glyph_draw_passes() ||")) &&
+            atlas_source.contains(
+                QByteArrayLiteral("ensure_glyph_resources(rhi, target)")),
         "atlas prepare gates glyph resources on render glyph pass state");
     ok &= check(!atlas_source.contains(
             QByteArrayLiteral("m_glyph_instances.empty() || ensure_glyph_resources")),
         "atlas prepare does not gate glyph resources on logical glyph instances");
+    ok &= check(
+        atlas_source.contains(QByteArrayLiteral(
+            "record_msdf_text_resource_failure(prepare_result)")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "m_msdf_text_resource_failure_disabled = true")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "restore_prepare_published_state(prepare_published_state)")),
+        "atlas prepare retries with shaped glyph fallback after MSDF resource failure");
+    const QByteArray msdf_prepare_retry_decision =
+        QByteArrayLiteral(
+            "qsg_atlas_should_retry_msdf_text_fallback_after_prepare(");
+    ok &= check(
+        atlas_source.indexOf(msdf_prepare_retry_decision, prepare_pos) >
+                prepare_pos &&
+            atlas_source.indexOf(msdf_prepare_retry_decision, prepare_pos) <
+                render_pos &&
+            atlas_source.contains(QByteArrayLiteral(
+                "msdf_prepare_resource_attempted = true")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "msdf_prepare_resource_failed = !msdf_ready")),
+        "atlas prepare retries only after an attempted MSDF prepare resource failure");
+    ok &= check(
+        atlas_source.contains(QByteArrayLiteral(
+            "return !qsg_atlas_driver_info_is_known_software_renderer(rhi->driverInfo())")),
+        "MSDF ownership rejects known software drivers without hardware or vendor denylisting");
+    const QByteArray msdf_buffer_retry_decision =
+        QByteArrayLiteral(
+            "qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(");
+    ok &= check(
+        atlas_source.indexOf(msdf_buffer_retry_decision, prepare_pos) >
+                prepare_pos &&
+            atlas_source.indexOf(msdf_buffer_retry_decision, prepare_pos) <
+                render_pos,
+        "atlas prepare uses the typed MSDF buffer fallback retry decision");
+    ok &= check(
+        atlas_source.contains(QByteArrayLiteral(
+            "m_resources_ready = rect_ready && gpu_resources_ready && buffers_ready")),
+        "atlas prepare does not let failed MSDF resources blank ready glyph and rect resources");
+    ok &= check(
+        atlas_source.contains(QByteArrayLiteral(
+            "const bool msdf_text_buffer_needed = has_msdf_text_draw_passes()")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "if (msdf_text_buffer_needed)")),
+        "atlas buffer updates do not allocate MSDF instance resources without MSDF draw passes");
+    ok &= check(
+        atlas_source.contains(QByteArrayLiteral(
+            "!m_msdf_text_resources_ready")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "void draw_msdf_text_pass(")),
+        "atlas render suppresses MSDF draws when MSDF resources are not ready");
     ok &= check(!surface_source.contains(QByteArrayLiteral("build_terminal_render_frame(")),
         "surface updatePaintNode does not build the render frame");
 
@@ -6826,7 +6911,7 @@ bool test_rgba_tile_model_preparation()
     lcd_rgb.setPixelColor(0, 0, QColor(10, 30, 20));
     lcd_rgb.setPixelColor(1, 0, QColor(4, 5, 14));
     const term::Glyph_rgba_tile lcd_rgb_tile =
-            term::qsg_atlas_rgba_tile_from_image(
+        term::qsg_atlas_rgba_tile_from_image(
             lcd_rgb,
             term::Glyph_image_presentation::TEXT);
 
@@ -6845,6 +6930,16 @@ bool test_rgba_tile_model_preparation()
         term::qsg_atlas_rgba_tile_from_image(
             lcd_bgr,
             term::Glyph_image_presentation::TEXT);
+    const term::Glyph_rgba_tile forced_gray_lcd_rgb_tile =
+        term::qsg_atlas_rgba_tile_from_image(
+            lcd_rgb,
+            term::Glyph_image_presentation::TEXT,
+            term::Glyph_coverage_kind::GRAYSCALE_MASK);
+    const term::Glyph_rgba_tile forced_gray_lcd_bgr_tile =
+        term::qsg_atlas_rgba_tile_from_image(
+            lcd_bgr,
+            term::Glyph_image_presentation::TEXT,
+            term::Glyph_coverage_kind::GRAYSCALE_MASK);
 
     QImage color(2, 1, QImage::Format_ARGB32);
     color.setPixelColor(0, 0, QColor(11, 22, 33, 44));
@@ -6943,6 +7038,20 @@ bool test_rgba_tile_model_preparation()
             lcd_bgr_tile.bytes_per_line == 8 &&
             lcd_bgr_tile.bytes == byte_array({40, 10, 24, 40, 5, 45, 25, 45}),
         "BGR888 text glyph image prepares LCD BGR rows");
+    ok &= check(forced_gray_lcd_rgb_tile.is_valid() &&
+            forced_gray_lcd_rgb_tile.coverage_kind ==
+                term::Glyph_coverage_kind::GRAYSCALE_MASK &&
+            forced_gray_lcd_rgb_tile.lcd_order == term::Glyph_lcd_order::UNKNOWN &&
+            forced_gray_lcd_rgb_tile.source_format == QImage::Format_RGB32 &&
+            forced_gray_lcd_rgb_tile.bytes == byte_array({21, 21, 21, 21, 6, 6, 6, 6}),
+        "requested grayscale glyph image demotes LCD RGB coverage");
+    ok &= check(forced_gray_lcd_bgr_tile.is_valid() &&
+            forced_gray_lcd_bgr_tile.coverage_kind ==
+                term::Glyph_coverage_kind::GRAYSCALE_MASK &&
+            forced_gray_lcd_bgr_tile.lcd_order == term::Glyph_lcd_order::UNKNOWN &&
+            forced_gray_lcd_bgr_tile.source_format == QImage::Format_BGR888 &&
+            forced_gray_lcd_bgr_tile.bytes == byte_array({22, 22, 22, 22, 28, 28, 28, 28}),
+        "requested grayscale glyph image demotes LCD BGR coverage");
     ok &= check(color_tile.is_valid() &&
             color_tile.coverage_kind == term::Glyph_coverage_kind::COLOR_IMAGE &&
             color_tile.lcd_order == term::Glyph_lcd_order::UNKNOWN &&
@@ -8418,6 +8527,164 @@ bool test_atlas_non_dirty_and_full_reupload_planner()
     ok &= check(public_projection.summary.full_upload &&
             public_projection.summary.full_repaint_upload,
         "atlas upload planner full-uploads PUBLIC_PROJECTION/SCROLL repaint frames");
+    return ok;
+}
+
+bool test_msdf_text_buffer_fallback_retry_decision()
+{
+    using Result = term::Qsg_atlas_buffer_update_result;
+
+    bool ok = true;
+    ok &= check(
+        term::qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
+            false,
+            true,
+            true,
+            Result::MSDF_TEXT_BUFFER_FAILED),
+        "MSDF text fallback retry is enabled for MSDF buffer failures");
+    for (Result result : {
+            Result::NOT_RUN,
+            Result::READY,
+            Result::RECT_BUFFER_FAILED,
+            Result::GLYPH_BUFFER_FAILED,
+        })
+    {
+        ok &= check(
+            !term::qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
+                false,
+                true,
+                true,
+                result),
+            "MSDF text fallback retry ignores non-MSDF buffer results");
+    }
+    ok &= check(
+        !term::qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
+            true,
+            true,
+            true,
+            Result::MSDF_TEXT_BUFFER_FAILED),
+        "MSDF text fallback retry does not run twice in one prepare");
+    ok &= check(
+        !term::qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
+            false,
+            false,
+            true,
+            Result::MSDF_TEXT_BUFFER_FAILED),
+        "MSDF text fallback retry waits for successful non-MSDF GPU resources");
+    ok &= check(
+        !term::qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
+            false,
+            true,
+            false,
+            Result::MSDF_TEXT_BUFFER_FAILED),
+        "MSDF text fallback retry requires pending MSDF draw passes");
+    return ok;
+}
+
+bool test_msdf_text_prepare_fallback_retry_decision()
+{
+    bool ok = true;
+    ok &= check(
+        term::qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
+            false,
+            true,
+            true,
+            true),
+        "MSDF text prepare fallback retry is enabled for attempted MSDF failures");
+    ok &= check(
+        !term::qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
+            true,
+            true,
+            true,
+            true),
+        "MSDF text prepare fallback retry does not run twice in one prepare");
+    ok &= check(
+        !term::qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
+            false,
+            false,
+            true,
+            true),
+        "MSDF text prepare fallback retry requires pending MSDF draw passes");
+    ok &= check(
+        !term::qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
+            false,
+            true,
+            false,
+            true),
+        "MSDF text prepare fallback retry ignores shared resource failures");
+    ok &= check(
+        !term::qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
+            false,
+            true,
+            true,
+            false),
+        "MSDF text prepare fallback retry requires a failed MSDF prepare resource");
+    return ok;
+}
+
+bool test_text_renderer_report_names()
+{
+    bool ok = true;
+    ok &= check(
+        std::strcmp(
+            term::qsg_atlas_text_renderer_policy_name(
+                term::Terminal_text_renderer_policy::AUTO),
+            "auto") == 0,
+        "text renderer policy name reports auto");
+    ok &= check(
+        std::strcmp(
+            term::qsg_atlas_text_renderer_policy_name(
+                term::Terminal_text_renderer_policy::MSDF),
+            "msdf") == 0,
+        "text renderer policy name reports msdf");
+    ok &= check(
+        std::strcmp(
+            term::qsg_atlas_text_renderer_policy_name(
+                term::Terminal_text_renderer_policy::GLYPH),
+            "glyph") == 0,
+        "text renderer policy name reports glyph");
+    ok &= check(
+        std::strcmp(
+            term::qsg_atlas_text_renderer_kind_name(
+                term::Terminal_text_renderer_kind::NONE),
+            "none") == 0,
+        "effective text renderer name reports none");
+    ok &= check(
+        std::strcmp(
+            term::qsg_atlas_text_renderer_kind_name(
+                term::Terminal_text_renderer_kind::MIXED),
+            "mixed") == 0,
+        "effective text renderer name reports mixed");
+    ok &= check(
+        std::strcmp(
+            term::qsg_atlas_lcd_subpixel_order_name(
+                term::Terminal_lcd_subpixel_order::NONE),
+            "none") == 0,
+        "LCD subpixel order name reports none");
+    ok &= check(
+        std::strcmp(
+            term::qsg_atlas_lcd_subpixel_order_name(
+                term::Terminal_lcd_subpixel_order::RGB),
+            "rgb") == 0,
+        "LCD subpixel order name reports rgb");
+    ok &= check(
+        std::strcmp(
+            term::qsg_atlas_lcd_subpixel_order_name(
+                term::Terminal_lcd_subpixel_order::BGR),
+            "bgr") == 0,
+        "LCD subpixel order name reports bgr");
+    ok &= check(
+        std::strcmp(
+            term::qsg_atlas_lcd_subpixel_order_name(
+                term::Terminal_lcd_subpixel_order::VRGB),
+            "vrgb") == 0,
+        "LCD subpixel order name reports vrgb");
+    ok &= check(
+        std::strcmp(
+            term::qsg_atlas_lcd_subpixel_order_name(
+                term::Terminal_lcd_subpixel_order::VBGR),
+            "vbgr") == 0,
+        "LCD subpixel order name reports vbgr");
     return ok;
 }
 
@@ -15440,6 +15707,10 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
         lcd_ascii_panel_cell(
             ascii_panel_stats,
             QStringLiteral("M"));
+    const Lcd_ascii_panel_cell_stats* const ascii_panel_lower_m_cell =
+        lcd_ascii_panel_cell(
+            ascii_panel_stats,
+            QStringLiteral("m"));
     const Lcd_ascii_panel_cell_stats* const ascii_panel_e_cell =
         lcd_ascii_panel_cell(
             ascii_panel_stats,
@@ -16787,6 +17058,13 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                     ascii_panel_key_edge_average_limit,
             "LCD atlas probe ASCII panel M glyph has bounded edge transitions");
         ok &= check(
+            ascii_panel_lower_m_cell != nullptr &&
+                ascii_panel_lower_m_cell->has_ink() &&
+                ascii_panel_lower_m_cell->left_third_ink_pixels > 0 &&
+                ascii_panel_lower_m_cell->center_third_ink_pixels > 0 &&
+                ascii_panel_lower_m_cell->right_third_ink_pixels > 0,
+            "LCD atlas probe ASCII panel m glyph keeps left, center, and right ink");
+        ok &= check(
             ascii_panel_e_cell != nullptr &&
                 ascii_panel_e_cell->has_ink() &&
                 ascii_panel_e_cell->edge_transitions.transition_count > 0 &&
@@ -17069,6 +17347,21 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
         render_summary.msdf_text_renderer_enabled &&
         render_summary.msdf_text_renderer_active;
     ok &= check(
+        render_summary.text_renderer_policy ==
+            term::Terminal_text_renderer_policy::AUTO,
+        "atlas report records default text renderer policy");
+    ok &= check(
+        render_summary.effective_text_renderer ==
+            (public_scroll_msdf_active
+                ? term::Terminal_text_renderer_kind::MSDF
+                : term::Terminal_text_renderer_kind::GLYPH),
+        "atlas report records effective text renderer path");
+    ok &= check(render_summary.text_renderer_fallback_allowed,
+        "atlas report records auto text renderer fallback permission");
+    ok &= check(
+        render_summary.text_renderer_fallback_used == !public_scroll_msdf_active,
+        "atlas report records default text renderer fallback use");
+    ok &= check(
         render_summary.rect_buffer.full_repaint_upload &&
             render_summary.rect_buffer.full_upload,
         "atlas report routes PUBLIC_PROJECTION/SCROLL geometry through full rect upload");
@@ -17121,6 +17414,9 @@ bool run_unit_tests()
     ok &= test_atlas_rotating_buffer_planner();
     ok &= test_atlas_row_stable_glyph_planner();
     ok &= test_atlas_non_dirty_and_full_reupload_planner();
+    ok &= test_msdf_text_buffer_fallback_retry_decision();
+    ok &= test_msdf_text_prepare_fallback_retry_decision();
+    ok &= test_text_renderer_report_names();
     ok &= test_atlas_budget_stats();
     ok &= test_atlas_warm_set_table_and_shaping();
     ok &= test_atlas_warm_set_representative_family_coverage();

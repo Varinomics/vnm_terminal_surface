@@ -293,6 +293,27 @@ struct Qsg_atlas_buffer_update_range
     int byte_count  = 0;
 };
 
+enum class Qsg_atlas_buffer_update_result
+{
+    NOT_RUN,
+    READY,
+    RECT_BUFFER_FAILED,
+    GLYPH_BUFFER_FAILED,
+    MSDF_TEXT_BUFFER_FAILED,
+};
+
+bool qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
+    bool                            already_retried,
+    bool                            gpu_resources_ready,
+    bool                            has_msdf_text_draw_passes,
+    Qsg_atlas_buffer_update_result  buffer_update_result);
+
+bool qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
+    bool already_retried,
+    bool has_msdf_text_draw_passes,
+    bool msdf_prepare_resource_attempted,
+    bool msdf_prepare_resource_failed);
+
 struct Qsg_atlas_buffer_update_summary
 {
     int  rhi_frames_in_flight          = 1;
@@ -424,6 +445,18 @@ struct Qsg_atlas_render_summary
     int           glyph_draw_calls                   = 0;
     int           msdf_text_draw_calls               = 0;
     int           draw_calls                         = 0;
+    Terminal_text_renderer_policy
+                  text_renderer_policy               =
+                      Terminal_text_renderer_policy::AUTO;
+    Terminal_text_renderer_kind
+                  effective_text_renderer            =
+                      Terminal_text_renderer_kind::NONE;
+    bool          text_renderer_fallback_allowed     = true;
+    bool          text_renderer_fallback_used        = false;
+    Terminal_lcd_subpixel_order
+                  msdf_lcd_subpixel_order            =
+                      Terminal_lcd_subpixel_order::NONE;
+    bool          msdf_lcd_text_enabled              = false;
     int           msdf_text_supported_runs           = 0;
     int           msdf_text_runs                     = 0;
     int           msdf_text_glyph_instances          = 0;
@@ -610,6 +643,18 @@ struct Qsg_atlas_frame_report
     bool          command_buffer_non_null         = false;
     bool          render_target_non_null          = false;
     bool          rhi_non_null                    = false;
+    Terminal_text_renderer_policy
+                  text_renderer_policy               =
+                      Terminal_text_renderer_policy::AUTO;
+    Terminal_text_renderer_kind
+                  effective_text_renderer            =
+                      Terminal_text_renderer_kind::NONE;
+    bool          text_renderer_fallback_allowed     = true;
+    bool          text_renderer_fallback_used        = false;
+    Terminal_lcd_subpixel_order
+                  msdf_lcd_subpixel_order            =
+                      Terminal_lcd_subpixel_order::NONE;
+    bool          msdf_lcd_text_enabled              = false;
     bool          msdf_text_renderer_enabled =
         k_qsg_atlas_msdf_text_renderer_enabled;
     bool          msdf_text_renderer_compiled =
@@ -694,7 +739,9 @@ Glyph_coverage_tile qsg_atlas_coverage_tile_from_image(const QImage& image);
 Glyph_rgba_tile qsg_atlas_rgba_tile_from_image(
     const QImage&             image,
     Glyph_image_presentation  presentation =
-        Glyph_image_presentation::UNKNOWN);
+        Glyph_image_presentation::UNKNOWN,
+    Glyph_coverage_kind       requested_coverage_kind =
+        Glyph_coverage_kind::UNKNOWN);
 
 std::uint64_t qsg_atlas_rgba_tile_byte_count(QSize size);
 
@@ -719,6 +766,15 @@ const char* qsg_atlas_glyph_image_presentation_name(
     Glyph_image_presentation presentation);
 
 const char* qsg_atlas_sampler_mode_name(Qsg_atlas_sampler_mode mode);
+
+const char* qsg_atlas_text_renderer_policy_name(
+    Terminal_text_renderer_policy policy);
+
+const char* qsg_atlas_text_renderer_kind_name(
+    Terminal_text_renderer_kind kind);
+
+const char* qsg_atlas_lcd_subpixel_order_name(
+    Terminal_lcd_subpixel_order order);
 
 QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font);
 

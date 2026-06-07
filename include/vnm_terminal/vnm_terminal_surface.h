@@ -73,6 +73,12 @@ class VNM_TerminalSurface : public QQuickItem
     Q_PROPERTY(Bell_policy visualBellPolicy
         READ visual_bell_policy WRITE set_visual_bell_policy
         NOTIFY visual_bell_policy_changed)
+    Q_PROPERTY(Text_renderer_mode textRendererMode
+        READ text_renderer_mode WRITE set_text_renderer_mode
+        NOTIFY text_renderer_mode_changed)
+    Q_PROPERTY(Lcd_subpixel_order lcdSubpixelOrder
+        READ lcd_subpixel_order WRITE set_lcd_subpixel_order
+        NOTIFY lcd_subpixel_order_changed)
     Q_PROPERTY(QString terminalTitle READ terminal_title NOTIFY terminal_title_changed)
     Q_PROPERTY(QString terminalIconName
         READ terminal_icon_name NOTIFY terminal_icon_name_changed)
@@ -149,6 +155,25 @@ public:
         ENABLED,
     };
     Q_ENUM(Bell_policy)
+
+    enum class Text_renderer_mode
+    {
+        AUTO,
+        MSDF,
+        GLYPH,
+    };
+    Q_ENUM(Text_renderer_mode)
+
+    enum class Lcd_subpixel_order
+    {
+        AUTO,
+        NONE,
+        RGB,
+        BGR,
+        VRGB,
+        VBGR,
+    };
+    Q_ENUM(Lcd_subpixel_order)
 
     enum class Process_state
     {
@@ -301,6 +326,12 @@ public:
     Bell_policy visual_bell_policy() const;
     void set_visual_bell_policy(Bell_policy policy);
 
+    Text_renderer_mode text_renderer_mode() const;
+    void set_text_renderer_mode(Text_renderer_mode mode);
+
+    Lcd_subpixel_order lcd_subpixel_order() const;
+    void set_lcd_subpixel_order(Lcd_subpixel_order order);
+
     QString terminal_title() const;
     QString terminal_icon_name() const;
     Process_state process_state() const;
@@ -366,6 +397,8 @@ signals:
     void bracketed_paste_policy_changed();
     void audible_bell_policy_changed();
     void visual_bell_policy_changed();
+    void text_renderer_mode_changed();
+    void lcd_subpixel_order_changed();
     void terminal_title_changed();
     void terminal_icon_name_changed();
     void process_state_changed();
@@ -500,6 +533,8 @@ private:
         Bracketed_paste_policy::APPLICATION_CONTROLLED;
     Bell_policy              m_audible_bell_policy       = Bell_policy::ENABLED;
     Bell_policy              m_visual_bell_policy        = Bell_policy::ENABLED;
+    Text_renderer_mode       m_text_renderer_mode        = Text_renderer_mode::AUTO;
+    Lcd_subpixel_order       m_lcd_subpixel_order        = Lcd_subpixel_order::AUTO;
     QString                  m_terminal_title;
     QString                  m_terminal_icon_name;
     Process_state            m_process_state             = Process_state::NOT_STARTED;

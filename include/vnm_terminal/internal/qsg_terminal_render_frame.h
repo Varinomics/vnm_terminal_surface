@@ -23,6 +23,30 @@ enum class Terminal_render_decoration_kind
     HYPERLINK_UNDERLINE,
 };
 
+enum class Terminal_text_renderer_policy
+{
+    AUTO,
+    MSDF,
+    GLYPH,
+};
+
+enum class Terminal_text_renderer_kind
+{
+    NONE,
+    MSDF,
+    GLYPH,
+    MIXED,
+};
+
+enum class Terminal_lcd_subpixel_order
+{
+    NONE,
+    RGB,
+    BGR,
+    VRGB,
+    VBGR,
+};
+
 enum class Terminal_render_arc_kind
 {
     DOWN_RIGHT,
@@ -45,6 +69,12 @@ struct Terminal_render_options
     bool                       visual_bell_enabled  = true;
     bool                       underline_hyperlinks = false;
     bool                       packed_text_sidecars_enabled = true;
+    Terminal_text_renderer_policy
+                               text_renderer_policy =
+                                   Terminal_text_renderer_policy::AUTO;
+    Terminal_lcd_subpixel_order
+                               msdf_lcd_subpixel_order =
+                                   Terminal_lcd_subpixel_order::NONE;
 };
 
 struct Terminal_render_rect

@@ -14,6 +14,7 @@
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
+
 #include <QColor>
 #include <QClipboard>
 #include <QFont>
@@ -34,6 +35,7 @@
 #include <QTimer>
 #include <QWheelEvent>
 #include <QWindow>
+#include <qpa/qplatformscreen.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -52,6 +54,14 @@
 
 namespace term = vnm_terminal::internal;
 
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) int __stdcall SystemParametersInfoW(
+    unsigned int action,
+    unsigned int parameter,
+    void*        value,
+    unsigned int update_flags);
+#endif
+
 namespace {
 
 // The trace remains diagnostic; public signal delivery drains the session's
@@ -64,6 +74,15 @@ constexpr qreal       k_angle_delta_per_wheel_step               = 120.0;
 constexpr int         k_plain_scroll_lines_per_angle_step        = 3;
 constexpr int         k_min_synchronized_output_stale_timeout_ms = 1;
 constexpr std::chrono::milliseconds k_backend_callback_drain_budget{4};
+
+#if defined(_WIN32)
+constexpr unsigned int k_win_spi_get_font_smoothing             = 0x004AU;
+constexpr unsigned int k_win_spi_get_font_smoothing_type        = 0x200AU;
+constexpr unsigned int k_win_spi_get_font_smoothing_orientation = 0x2012U;
+constexpr unsigned int k_win_font_smoothing_cleartype           = 0x0002U;
+constexpr unsigned int k_win_font_smoothing_orientation_bgr     = 0x0000U;
+constexpr unsigned int k_win_font_smoothing_orientation_rgb     = 0x0001U;
+#endif
 
 bool same_grid_size(term::terminal_grid_size_t left, term::terminal_grid_size_t right)
 {
@@ -994,6 +1013,133 @@ term::Terminal_cursor_shape terminal_cursor_shape(VNM_TerminalSurface::Cursor_st
     return term::Terminal_cursor_shape::BLOCK;
 }
 
+term::Terminal_text_renderer_policy terminal_text_renderer_policy(
+    VNM_TerminalSurface::Text_renderer_mode mode)
+{
+    switch (mode) {
+        case VNM_TerminalSurface::Text_renderer_mode::AUTO:
+            return term::Terminal_text_renderer_policy::AUTO;
+        case VNM_TerminalSurface::Text_renderer_mode::MSDF:
+            return term::Terminal_text_renderer_policy::MSDF;
+        case VNM_TerminalSurface::Text_renderer_mode::GLYPH:
+            return term::Terminal_text_renderer_policy::GLYPH;
+    }
+
+    return term::Terminal_text_renderer_policy::AUTO;
+}
+
+term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order_from_qt(
+    QQuickWindow* window)
+{
+    if (window == nullptr) {
+        return term::Terminal_lcd_subpixel_order::NONE;
+    }
+
+    const QPlatformScreen* const platform_screen =
+        QPlatformScreen::platformScreenForWindow(window);
+    if (platform_screen == nullptr) {
+        return term::Terminal_lcd_subpixel_order::NONE;
+    }
+
+    switch (platform_screen->subpixelAntialiasingTypeHint()) {
+        case QPlatformScreen::Subpixel_RGB:
+            return term::Terminal_lcd_subpixel_order::RGB;
+        case QPlatformScreen::Subpixel_BGR:
+            return term::Terminal_lcd_subpixel_order::BGR;
+        case QPlatformScreen::Subpixel_VRGB:
+            return term::Terminal_lcd_subpixel_order::VRGB;
+        case QPlatformScreen::Subpixel_VBGR:
+            return term::Terminal_lcd_subpixel_order::VBGR;
+        case QPlatformScreen::Subpixel_None:
+            return term::Terminal_lcd_subpixel_order::NONE;
+    }
+
+    return term::Terminal_lcd_subpixel_order::NONE;
+}
+
+term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order_from_windows()
+{
+#if defined(_WIN32)
+    int font_smoothing_enabled = 0;
+    if (SystemParametersInfoW(
+            k_win_spi_get_font_smoothing,
+            0U,
+            &font_smoothing_enabled,
+            0U) == 0 ||
+        font_smoothing_enabled == 0)
+    {
+        return term::Terminal_lcd_subpixel_order::NONE;
+    }
+
+    unsigned int font_smoothing_type = 0U;
+    if (SystemParametersInfoW(
+            k_win_spi_get_font_smoothing_type,
+            0U,
+            &font_smoothing_type,
+            0U) == 0 ||
+        font_smoothing_type != k_win_font_smoothing_cleartype)
+    {
+        return term::Terminal_lcd_subpixel_order::NONE;
+    }
+
+    unsigned int font_smoothing_orientation = 0U;
+    if (SystemParametersInfoW(
+            k_win_spi_get_font_smoothing_orientation,
+            0U,
+            &font_smoothing_orientation,
+            0U) == 0)
+    {
+        return term::Terminal_lcd_subpixel_order::NONE;
+    }
+
+    switch (font_smoothing_orientation) {
+        case k_win_font_smoothing_orientation_rgb:
+            return term::Terminal_lcd_subpixel_order::RGB;
+        case k_win_font_smoothing_orientation_bgr:
+            return term::Terminal_lcd_subpixel_order::BGR;
+    }
+#endif
+
+    return term::Terminal_lcd_subpixel_order::NONE;
+}
+
+term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order_from_mode(
+    VNM_TerminalSurface::Lcd_subpixel_order order)
+{
+    switch (order) {
+        case VNM_TerminalSurface::Lcd_subpixel_order::AUTO:
+        case VNM_TerminalSurface::Lcd_subpixel_order::NONE:
+            return term::Terminal_lcd_subpixel_order::NONE;
+        case VNM_TerminalSurface::Lcd_subpixel_order::RGB:
+            return term::Terminal_lcd_subpixel_order::RGB;
+        case VNM_TerminalSurface::Lcd_subpixel_order::BGR:
+            return term::Terminal_lcd_subpixel_order::BGR;
+        case VNM_TerminalSurface::Lcd_subpixel_order::VRGB:
+            return term::Terminal_lcd_subpixel_order::VRGB;
+        case VNM_TerminalSurface::Lcd_subpixel_order::VBGR:
+            return term::Terminal_lcd_subpixel_order::VBGR;
+    }
+
+    return term::Terminal_lcd_subpixel_order::NONE;
+}
+
+term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order(
+    VNM_TerminalSurface::Lcd_subpixel_order order,
+    QQuickWindow*                           window)
+{
+    if (order != VNM_TerminalSurface::Lcd_subpixel_order::AUTO) {
+        return terminal_lcd_subpixel_order_from_mode(order);
+    }
+
+    const term::Terminal_lcd_subpixel_order qt_order =
+        terminal_lcd_subpixel_order_from_qt(window);
+    if (qt_order != term::Terminal_lcd_subpixel_order::NONE) {
+        return qt_order;
+    }
+
+    return terminal_lcd_subpixel_order_from_windows();
+}
+
 term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurface& surface)
 {
     term::Terminal_render_options options;
@@ -1012,6 +1158,12 @@ term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurfa
     options.visual_bell_enabled =
         surface.visual_bell_policy() == VNM_TerminalSurface::Bell_policy::ENABLED;
     options.packed_text_sidecars_enabled = false;
+    options.text_renderer_policy =
+        terminal_text_renderer_policy(surface.text_renderer_mode());
+    options.msdf_lcd_subpixel_order =
+        terminal_lcd_subpixel_order(
+            surface.lcd_subpixel_order(),
+            surface.window());
     return options;
 }
 
@@ -2496,6 +2648,38 @@ void VNM_TerminalSurface::set_visual_bell_policy(Bell_policy policy)
 
     m_visual_bell_policy = policy;
     emit visual_bell_policy_changed();
+    m_private->request_render_update(*this);
+}
+
+VNM_TerminalSurface::Text_renderer_mode VNM_TerminalSurface::text_renderer_mode() const
+{
+    return m_text_renderer_mode;
+}
+
+void VNM_TerminalSurface::set_text_renderer_mode(Text_renderer_mode mode)
+{
+    if (m_text_renderer_mode == mode) {
+        return;
+    }
+
+    m_text_renderer_mode = mode;
+    emit text_renderer_mode_changed();
+    m_private->request_render_update(*this);
+}
+
+VNM_TerminalSurface::Lcd_subpixel_order VNM_TerminalSurface::lcd_subpixel_order() const
+{
+    return m_lcd_subpixel_order;
+}
+
+void VNM_TerminalSurface::set_lcd_subpixel_order(Lcd_subpixel_order order)
+{
+    if (m_lcd_subpixel_order == order) {
+        return;
+    }
+
+    m_lcd_subpixel_order = order;
+    emit lcd_subpixel_order_changed();
     m_private->request_render_update(*this);
 }
 
@@ -4881,6 +5065,7 @@ void VNM_TerminalSurface::bind_window_signals(QQuickWindow* window)
         [this](QScreen* screen) {
             bind_screen_signals(screen);
             refresh_grid_metrics();
+            m_private->request_render_update(*this);
         });
     m_private->window_scene_graph_invalidated_connection = QObject::connect(
         window,
