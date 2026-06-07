@@ -729,7 +729,8 @@ qreal qsg_atlas_physical_pixel_size(
 QPoint qsg_atlas_glyph_physical_offset_for_raster_font(
     const QRawFont&           raster_font,
     quint32                   glyph_index,
-    Glyph_image_presentation  presentation);
+    Glyph_image_presentation  presentation,
+    bool                      lcd_text_path_enabled = true);
 
 QPointF qsg_atlas_snapped_physical_point(
     QPointF point,
