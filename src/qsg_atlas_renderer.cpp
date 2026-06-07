@@ -4108,8 +4108,9 @@ private:
             pixel_height,
             std::span<const char32_t>(codepoints.data(), codepoints.size()),
             atlas_msdf_text_options());
-        m_msdf_text_cache.atlas_built = build.ok;
-        if (!build.ok) {
+        m_msdf_text_cache.atlas_built =
+            build.status != msdf_text::Build_status::FAILURE;
+        if (!m_msdf_text_cache.atlas_built) {
             m_msdf_text_cache.message = QString::fromStdString(build.message);
             result.render.msdf_text_atlas_built = false;
             result.render.msdf_text_atlas_ready = false;

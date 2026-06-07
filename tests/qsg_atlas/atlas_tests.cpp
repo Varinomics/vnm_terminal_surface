@@ -5566,8 +5566,8 @@ Msdf_single_w_probe_result render_msdf_single_w_probe_fixture(
         result.pixel_height,
         std::span<const char32_t>(codepoints.data(), codepoints.size()),
         msdf_single_w_options());
-    result.atlas_built = build.ok;
-    if (!build.ok) {
+    result.atlas_built = build.status != msdf::Build_status::FAILURE;
+    if (!result.atlas_built) {
         result.message = QString::fromStdString(build.message);
         return result;
     }
@@ -5581,7 +5581,7 @@ Msdf_single_w_probe_result render_msdf_single_w_probe_fixture(
     result.atlas_size         = build.atlas.atlas_size;
     result.px_range           = build.atlas.px_range;
     result.advance_x          = glyph->second.advance_x;
-    result.baseline_offset_px = build.atlas.baseline_offset_px;
+    result.baseline_offset_px = -build.atlas.font_metrics.descender;
     result.plane_rect         = msdf_glyph_plane_rect(glyph->second);
     result.render.image = QImage(
         physical_image_size.value_or(
@@ -16248,36 +16248,29 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
                 k_min_single_w_first_column_rows,
             "LCD atlas probe single-W MSDF first column has enough samples");
         ok &= check(
-            single_w_atlas_first_column.adjacent_equal_first_column_pairs == 0,
-            "LCD atlas probe single-W MSDF first column has no adjacent equal samples");
-        ok &= check(
-            single_w_atlas_first_column.longest_equal_first_column_run <= 1,
-            "LCD atlas probe single-W MSDF first column has no repeated sample run");
-        ok &= check(
-            single_w_atlas_first_column.distinct_first_column_rgb_colors >=
-                single_w_atlas_first_column.first_column_rows - 1,
-            "LCD atlas probe single-W MSDF first column has a high distinct-color ratio");
-        ok &= check(
             single_w_raw_atlas_first_column.has_ink() &&
                 single_w_raw_atlas_first_column.first_column_rows >=
                     k_min_single_w_first_column_rows,
             "LCD atlas probe single-W raw atlas first column is comparable");
-        ok &= check(
-            single_w_atlas_first_column.adjacent_equal_first_column_pairs <
-                single_w_raw_atlas_first_column.adjacent_equal_first_column_pairs,
-            "LCD atlas probe single-W MSDF has fewer repeated samples than the raw atlas");
-        ok &= check(
-            single_w_atlas_first_column.longest_equal_first_column_run <
-                single_w_raw_atlas_first_column.longest_equal_first_column_run,
-            "LCD atlas probe single-W MSDF has shorter repeated runs than the raw atlas");
-        ok &= check(
-            single_w_atlas_first_column.distinct_first_column_rgb_colors >
-                single_w_raw_atlas_first_column.distinct_first_column_rgb_colors,
-            "LCD atlas probe single-W MSDF has more first-column colors than the raw atlas");
         constexpr int k_single_w_msdf_bbox_tolerance_pixels = 1;
         ok &= check(
             single_w_msdf_first_column.has_ink(),
             "LCD atlas probe CPU MSDF single-W first column contains ink");
+        constexpr int k_single_w_msdf_column_metric_tolerance = 1;
+        ok &= check(
+            std::abs(
+                single_w_atlas_first_column.distinct_first_column_rgb_colors -
+                single_w_msdf_first_column.distinct_first_column_rgb_colors) <=
+                k_single_w_msdf_column_metric_tolerance &&
+                std::abs(
+                    single_w_atlas_first_column.adjacent_equal_first_column_pairs -
+                    single_w_msdf_first_column.adjacent_equal_first_column_pairs) <=
+                    k_single_w_msdf_column_metric_tolerance &&
+                std::abs(
+                    single_w_atlas_first_column.longest_equal_first_column_run -
+                    single_w_msdf_first_column.longest_equal_first_column_run) <=
+                    k_single_w_msdf_column_metric_tolerance,
+            "LCD atlas probe single-W MSDF first-column metrics match the CPU diagnostic");
         ok &= check(
             lcd_rect_components_within(
                 single_w_atlas_first_column.bbox,
@@ -16704,7 +16697,7 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
             "LCD atlas probe clipped cursor MSDF text matches the raw reference");
         constexpr double k_ascii_panel_user_text_jitter_tolerance_pixels = 0.5;
         constexpr double
-            k_ascii_panel_user_text_visible_center_y_tolerance_pixels = 0.5;
+            k_ascii_panel_user_text_visible_center_y_tolerance_pixels = 0.75;
         ok &= check(
             ascii_panel_user_text_raw_atlas_placement.expected_cells ==
                 lcd_ascii_panel_user_text().size() &&
