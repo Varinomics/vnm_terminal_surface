@@ -110,7 +110,7 @@ resize synchronization changes emit `geometry_sync_changed()`.
 native terminal backend:
 
 - Windows uses ConPTY.
-- Linux uses PTY APIs.
+- Linux and macOS use POSIX PTY APIs.
 - Platforms without a native backend fail with `backend_error()`.
 
 The launch contract is an argument vector. `argv[0]` must name the executable;

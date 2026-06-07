@@ -1,6 +1,6 @@
 #include "helpers/decode_hex.h"
 #include "helpers/test_check.h"
-#include "vnm_terminal/internal/linux_pty_backend.h"
+#include "vnm_terminal/internal/posix_pty_backend.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 
 #include <QByteArray>
@@ -68,7 +68,7 @@ bool wait_for_file(const QString& path)
     return false;
 }
 
-std::optional<QByteArray> linux_pty_observable_output_payload(
+std::optional<QByteArray> posix_pty_observable_output_payload(
     const term::terminal_canvas_fixture_record_t& record)
 {
     if (record.kind == term::Terminal_canvas_fixture_record_kind::OUTPUT ||
@@ -102,7 +102,7 @@ bool scripted_output_is_ordered(const QByteArray& output)
         term::terminal_canvas_fixture_contract_script())
     {
         const std::optional<QByteArray> payload =
-            linux_pty_observable_output_payload(record);
+            posix_pty_observable_output_payload(record);
         if (!payload.has_value()) {
             continue;
         }
@@ -334,12 +334,12 @@ bool test_launch_output(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     const term::Terminal_backend_result start_result =
         backend->start(launch_config(fixture_path, {QStringLiteral("--list")}),
             capture.callbacks());
     ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY backend starts list fixture");
+        "POSIX PTY backend starts list fixture");
     ok &= check(capture.wait_for_output(QByteArrayLiteral("terminal-canvas")),
         "list fixture output reaches backend output");
     ok &= check(capture.wait_for_exit(), "list fixture exits");
@@ -353,7 +353,7 @@ bool test_launch_output(const QString& fixture_path)
         "list fixture produces no backend errors");
     ok &= check(backend->write(QByteArrayLiteral("after")).code ==
         term::Terminal_backend_result_code::REJECTED,
-        "Linux PTY write after list exit rejects");
+        "POSIX PTY write after list exit rejects");
 
     return ok;
 }
@@ -372,7 +372,7 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
         checkpoint_dir.filePath(QStringLiteral("enable-input-modes.checkpoint"));
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     term::Terminal_launch_config config = launch_config(
         fixture_path,
         {
@@ -391,13 +391,13 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
     const term::Terminal_backend_result start_result =
         backend->start(config, capture.callbacks());
     ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY backend starts interactive fixture");
+        "POSIX PTY backend starts interactive fixture");
     ok &= check(capture.wait_for_output(QByteArrayLiteral("term>")),
         "interactive fixture prompt reaches backend output");
 
     const term::Terminal_backend_result pause_result = backend->set_output_paused(true);
     ok &= check(pause_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY backend accepts output pause");
+        "POSIX PTY backend accepts output pause");
 
     std::uint64_t resize_id             = 1U;
     bool          output_pause_released = false;
@@ -408,7 +408,7 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
             const term::Terminal_backend_result write_result =
                 backend->write(decode_hex(record.payload_hex));
             ok &= check(write_result.code == term::Terminal_backend_result_code::ACCEPTED,
-                "Linux PTY backend accepts scripted input write");
+                "POSIX PTY backend accepts scripted input write");
             if (write_result.code != term::Terminal_backend_result_code::ACCEPTED) {
                 return false;
             }
@@ -420,7 +420,7 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
                 term::terminal_grid_size_t{record.rows, record.columns},
             });
             ok &= check(resize_result.code == term::Terminal_backend_result_code::ACCEPTED,
-                "Linux PTY backend accepts scripted resize");
+                "POSIX PTY backend accepts scripted resize");
             if (resize_result.code != term::Terminal_backend_result_code::ACCEPTED) {
                 return false;
             }
@@ -435,14 +435,14 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
                 capture.wait_for_output_to_stay_absent(
                     enable_modes_payload,
                     std::chrono::milliseconds(1000)),
-                "paused Linux PTY output holds post-resize fixture output");
+                "paused POSIX PTY output holds post-resize fixture output");
 
             const term::Terminal_backend_result resume_result =
                 backend->set_output_paused(false);
             ok                    &= check(resume_result.code == term::Terminal_backend_result_code::ACCEPTED,
-                "Linux PTY backend accepts output resume");
+                "POSIX PTY backend accepts output resume");
             ok                    &= check(capture.wait_for_output(enable_modes_payload),
-                "resumed Linux PTY output delivers buffered fixture output");
+                "resumed POSIX PTY output delivers buffered fixture output");
             output_pause_released  = true;
         }
     }
@@ -457,13 +457,13 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
 
     const QByteArray output = capture.output_snapshot();
     ok &= check(output.contains(decode_hex("1b5b3f3230303468")),
-        "Linux PTY output includes bracketed paste enable");
+        "POSIX PTY output includes bracketed paste enable");
     ok &= check(output.contains(decode_hex("1b5b3f323030342470")),
-        "Linux PTY output includes bracketed paste query");
+        "POSIX PTY output includes bracketed paste query");
     ok &= check(count_occurrences(output, QByteArrayLiteral("stream-row")) == 4096U,
-        "Linux PTY output preserves high-volume stream rows");
+        "POSIX PTY output preserves high-volume stream rows");
     ok &= check(scripted_output_is_ordered(output),
-        "Linux PTY output contains the scripted fixture output in order");
+        "POSIX PTY output contains the scripted fixture output in order");
     ok &= check(capture.errors_snapshot().empty(),
         "interactive fixture produces no backend errors");
 
@@ -475,7 +475,7 @@ bool test_missing_working_directory(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     term::Terminal_launch_config config =
         launch_config(fixture_path, {QStringLiteral("--hold-open")});
     config.working_directory = QFileInfo(fixture_path).absolutePath() +
@@ -498,7 +498,7 @@ bool test_missing_working_directory(const QString& fixture_path)
     const term::Terminal_backend_result retry_result =
         backend->start(config, capture.callbacks());
     ok &= check(retry_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY start can retry after preflight working-directory rejection");
+        "POSIX PTY start can retry after preflight working-directory rejection");
     ok &= check(capture.wait_for_output(QByteArrayLiteral("hold-open")),
         "retried working-directory fixture starts");
     ok &= check(backend->terminate().code == term::Terminal_backend_result_code::ACCEPTED,
@@ -513,7 +513,7 @@ bool test_failed_executable(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     term::Terminal_launch_config config = launch_config(
         QFileInfo(fixture_path).absolutePath() + QStringLiteral("/missing-fixture"),
         {});
@@ -535,7 +535,7 @@ bool test_failed_executable(const QString& fixture_path)
     const term::Terminal_backend_result retry_result =
         backend->start(config, capture.callbacks());
     ok &= check(retry_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY start can retry after missing-executable rejection");
+        "POSIX PTY start can retry after missing-executable rejection");
     ok &= check(capture.wait_for_output(QByteArrayLiteral("hold-open")),
         "retried missing-executable fixture starts");
     ok &= check(backend->terminate().code == term::Terminal_backend_result_code::ACCEPTED,
@@ -551,33 +551,33 @@ bool test_rejection_paths(const QString& fixture_path)
 
     {
         Backend_capture capture;
-        std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
         const term::Terminal_backend_result callback_result =
             backend->start(launch_config(fixture_path, {QStringLiteral("--hold-open")}), {});
         ok &= check(callback_result.code == term::Terminal_backend_result_code::REJECTED &&
             callback_result.error.has_value() &&
             callback_result.error->code ==
                 term::Terminal_backend_error_code::CALLBACK_MISSING,
-            "Linux PTY start rejects missing callbacks");
+            "POSIX PTY start rejects missing callbacks");
     }
 
     {
-        std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
         ok &= check(backend->write(QByteArrayLiteral("x")).code ==
             term::Terminal_backend_result_code::REJECTED,
-            "Linux PTY write before start rejects");
+            "POSIX PTY write before start rejects");
         ok &= check(backend->resize({1U, {24, 80}}).code ==
             term::Terminal_backend_result_code::REJECTED,
-            "Linux PTY resize before start rejects");
+            "POSIX PTY resize before start rejects");
         ok &= check(backend->interrupt().code == term::Terminal_backend_result_code::REJECTED,
-            "Linux PTY interrupt before start rejects");
+            "POSIX PTY interrupt before start rejects");
         ok &= check(backend->terminate().code == term::Terminal_backend_result_code::REJECTED,
-            "Linux PTY terminate before start rejects");
+            "POSIX PTY terminate before start rejects");
     }
 
     {
         Backend_capture capture;
-        std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
         term::Terminal_launch_config config =
             launch_config(fixture_path, {QStringLiteral("--hold-open")});
         config.initial_grid_size = term::terminal_grid_size_t{70000, 80};
@@ -587,12 +587,12 @@ bool test_rejection_paths(const QString& fixture_path)
             start_result.error.has_value() &&
             start_result.error->code ==
                 term::Terminal_backend_error_code::INVALID_INITIAL_GRID_SIZE,
-            "Linux PTY start rejects out-of-range initial grid");
+            "POSIX PTY start rejects out-of-range initial grid");
     }
 
     {
         Backend_capture capture;
-        std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
         const term::Terminal_backend_result start_result =
             backend->start(
                 launch_config(fixture_path, {QStringLiteral("--hold-open")}),
@@ -609,25 +609,25 @@ bool test_rejection_paths(const QString& fixture_path)
         ok &= check(second_start.code == term::Terminal_backend_result_code::REJECTED &&
             second_start.error.has_value() &&
             second_start.error->code == term::Terminal_backend_error_code::START_FAILED,
-            "Linux PTY second start rejects");
+            "POSIX PTY second start rejects");
         ok &= check(backend->resize({1U, {0, 80}}).code ==
             term::Terminal_backend_result_code::REJECTED,
-            "Linux PTY invalid resize rejects");
+            "POSIX PTY invalid resize rejects");
         ok &= check(backend->resize({2U, {24, 70000}}).code ==
             term::Terminal_backend_result_code::REJECTED,
-            "Linux PTY out-of-range resize rejects");
+            "POSIX PTY out-of-range resize rejects");
         ok &= check(backend->write(QByteArray()).code ==
             term::Terminal_backend_result_code::REJECTED,
-            "Linux PTY empty write while running rejects");
+            "POSIX PTY empty write while running rejects");
         ok &= check(backend->write(QByteArray(1024 * 1024 + 1, 'x')).code ==
             term::Terminal_backend_result_code::REJECTED,
-            "Linux PTY oversized write rejects");
+            "POSIX PTY oversized write rejects");
         ok &= check(backend->terminate().code == term::Terminal_backend_result_code::ACCEPTED,
             "rejection-path fixture terminates");
         ok &= check(capture.wait_for_exit(), "rejection-path fixture exits");
         ok &= check(backend->write(QByteArrayLiteral("after")).code ==
             term::Terminal_backend_result_code::REJECTED,
-            "Linux PTY write after exit rejects");
+            "POSIX PTY write after exit rejects");
     }
 
     return ok;
@@ -638,7 +638,7 @@ bool test_interrupt(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     const term::Terminal_backend_result start_result =
         backend->start(
             launch_config(fixture_path, {QStringLiteral("--hold-open")}),
@@ -650,7 +650,7 @@ bool test_interrupt(const QString& fixture_path)
 
     const term::Terminal_backend_result interrupt_result = backend->interrupt();
     ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY backend accepts interrupt");
+        "POSIX PTY backend accepts interrupt");
     ok &= check(capture.wait_for_exit(), "interrupt fixture exits");
 
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
@@ -662,7 +662,7 @@ bool test_interrupt(const QString& fixture_path)
         "interrupt fixture produces no backend errors");
     ok &= check(backend->write(QByteArrayLiteral("after")).code ==
         term::Terminal_backend_result_code::REJECTED,
-        "Linux PTY write after interrupt exit rejects");
+        "POSIX PTY write after interrupt exit rejects");
 
     return ok;
 }
@@ -672,7 +672,7 @@ bool test_interrupt_without_stdin_reader(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     const term::Terminal_backend_result start_result =
         backend->start(
             launch_config(fixture_path, {QStringLiteral("--hold-open-no-read")}),
@@ -684,7 +684,7 @@ bool test_interrupt_without_stdin_reader(const QString& fixture_path)
 
     const term::Terminal_backend_result interrupt_result = backend->interrupt();
     ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY backend accepts no-read interrupt");
+        "POSIX PTY backend accepts no-read interrupt");
     ok &= check(capture.wait_for_exit(), "no-read interrupt fixture exits");
 
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
@@ -703,7 +703,7 @@ bool test_interrupt_ignored_child_exits_normally()
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     const term::Terminal_backend_result start_result = backend->start(
         shell_launch_config(
             QStringLiteral(
@@ -718,7 +718,7 @@ bool test_interrupt_ignored_child_exits_normally()
 
     const term::Terminal_backend_result interrupt_result = backend->interrupt();
     ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY backend accepts ignored interrupt");
+        "POSIX PTY backend accepts ignored interrupt");
     ok &= check(capture.wait_for_output(QByteArrayLiteral("caught-int")),
         "interrupt-ignored shell observes delivered SIGINT");
     ok &= check(capture.wait_for_exit(), "interrupt-ignored shell exits");
@@ -749,7 +749,7 @@ bool test_process_exit_reports_with_descendant_slave_open()
     std::optional<pid_t> descendant_pid;
     {
         Backend_capture capture;
-        std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
         const term::Terminal_backend_result start_result = backend->start(
             shell_launch_config(
                 QStringLiteral(
@@ -808,7 +808,7 @@ bool test_exit_drain_ignores_repause_and_delivers_buffered_output()
     std::atomic_bool repause_accepted  = false;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend     = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend     = term::make_posix_pty_backend();
     term::Terminal_backend*                 backend_ptr = backend.get();
     const term::Terminal_backend_result start_result = backend->start(
         shell_launch_config(
@@ -833,7 +833,7 @@ bool test_exit_drain_ignores_repause_and_delivers_buffered_output()
 
     const term::Terminal_backend_result pause_result = backend->set_output_paused(true);
     ok &= check(pause_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY backend accepts pre-exit output pause");
+        "POSIX PTY backend accepts pre-exit output pause");
     ok &= check(backend->write(QByteArrayLiteral("go\r")).code ==
         term::Terminal_backend_result_code::ACCEPTED,
         "paused exit-drain shell receives release input");
@@ -872,7 +872,7 @@ bool test_destructor_from_output_callback_returns()
     std::atomic_bool callback_timed_out = false;
 
     // The raw pointer keeps ownership on the callback thread for this destruction test.
-    term::Terminal_backend* backend = term::make_linux_pty_backend().release();
+    term::Terminal_backend* backend = term::make_posix_pty_backend().release();
     term::Terminal_backend_callbacks callbacks;
     callbacks.output_received = [&](QByteArray bytes) {
         if (callback_timed_out) {
@@ -938,7 +938,7 @@ bool test_terminate_kills_descendant_in_target_group()
     std::optional<pid_t> descendant_pid;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     const term::Terminal_backend_result start_result = backend->start(
         shell_launch_config(
             QStringLiteral(
@@ -965,7 +965,7 @@ bool test_terminate_kills_descendant_in_target_group()
 
     const term::Terminal_backend_result terminate_result = backend->terminate();
     ok &= check(terminate_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY backend accepts descendant-target terminate");
+        "POSIX PTY backend accepts descendant-target terminate");
     ok &= check(capture.wait_for_exit(),
         "terminate-descendant shell exits");
 
@@ -987,7 +987,7 @@ bool test_terminate(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     term::Terminal_launch_config config =
         launch_config(fixture_path, {QStringLiteral("--hold-open")});
     const term::Terminal_backend_result start_result =
@@ -999,7 +999,7 @@ bool test_terminate(const QString& fixture_path)
 
     const term::Terminal_backend_result terminate_result = backend->terminate();
     ok &= check(terminate_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY backend accepts terminate");
+        "POSIX PTY backend accepts terminate");
     ok &= check(capture.wait_for_exit(), "terminate fixture exits");
 
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
@@ -1010,7 +1010,7 @@ bool test_terminate(const QString& fixture_path)
         "terminate fixture produces no backend errors");
     ok &= check(backend->resize({1U, {24, 80}}).code ==
         term::Terminal_backend_result_code::REJECTED,
-        "Linux PTY resize after terminate exit rejects");
+        "POSIX PTY resize after terminate exit rejects");
 
     return ok;
 }
@@ -1020,7 +1020,7 @@ bool test_terminate_accepts_zero_grace_policy(const QString& fixture_path)
     bool ok = true;
 
     Backend_capture capture;
-    std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     term::Terminal_launch_config config =
         launch_config(fixture_path, {QStringLiteral("--hold-open-no-read")});
     config.termination_policy.graceful_interval = std::chrono::milliseconds(0);
@@ -1035,7 +1035,7 @@ bool test_terminate_accepts_zero_grace_policy(const QString& fixture_path)
 
     const term::Terminal_backend_result terminate_result = backend->terminate();
     ok &= check(terminate_result.code == term::Terminal_backend_result_code::ACCEPTED,
-        "Linux PTY backend accepts zero-grace terminate");
+        "POSIX PTY backend accepts zero-grace terminate");
     ok &= check(capture.wait_for_exit(), "zero-grace terminate fixture exits");
 
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
@@ -1054,7 +1054,7 @@ bool test_destructor_returns_with_running_process(const QString& fixture_path)
 
     Backend_capture capture;
     {
-        std::unique_ptr<term::Terminal_backend> backend = term::make_linux_pty_backend();
+        std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
         const term::Terminal_backend_result start_result =
             backend->start(
                 launch_config(fixture_path, {QStringLiteral("--hold-open")}),
@@ -1073,7 +1073,7 @@ bool test_destructor_returns_with_running_process(const QString& fixture_path)
 int main(int argc, char** argv)
 {
     if (argc != 2) {
-        std::cerr << "usage: linux_pty_backend_tests <fixture-executable>\n";
+        std::cerr << "usage: posix_pty_backend_tests <fixture-executable>\n";
         return 2;
     }
 

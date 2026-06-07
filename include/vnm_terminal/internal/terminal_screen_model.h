@@ -621,6 +621,18 @@ private:
         bool                           alternate_scroll_mode_changed = false;
     };
 
+    struct result_change_overrides_t
+    {
+        std::optional<bool>            dirty_rows_have_stable_mutation_identity;
+        std::optional<bool>            terminal_content_changed;
+        std::optional<bool>            active_buffer_changed;
+        std::optional<bool>            grid_reflow_changed;
+        std::optional<bool>            viewport_changed;
+        std::optional<bool>            mode_state_changed;
+        std::optional<bool>            mouse_reporting_mode_changed;
+        std::optional<bool>            alternate_scroll_mode_changed;
+    };
+
     struct primary_repaint_recovery_candidate_t
     {
         std::vector<Terminal_screen_row> rows;
@@ -951,6 +963,10 @@ private:
     void clear_dirty();
     void clear_backing_deltas();
     void clear_recovery_proposals();
+    void adopt_publication_changes(ingest_publication_t&& publication);
+    Terminal_screen_model_result finalize_result(
+        Terminal_screen_model_result   result,
+        result_change_overrides_t      overrides = {}) const;
     int compatibility_evicted_scrollback_rows() const;
     void record_backing_delta(terminal_backing_delta_t delta);
     void record_active_grid_delta(

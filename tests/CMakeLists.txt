@@ -1603,33 +1603,34 @@ if(WIN32)
     )
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL Linux)
-    add_executable(vnm_terminal_linux_pty_backend
-        linux_pty_backend/linux_pty_backend_tests.cpp
+if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
+    add_executable(vnm_terminal_posix_pty_backend
+        posix_pty_backend/posix_pty_backend_tests.cpp
     )
 
-    add_dependencies(vnm_terminal_linux_pty_backend
+    add_dependencies(vnm_terminal_posix_pty_backend
         vnm_terminal_canvas_fixture
     )
 
-    target_link_libraries(vnm_terminal_linux_pty_backend PRIVATE
+    target_link_libraries(vnm_terminal_posix_pty_backend PRIVATE
         vnm_terminal_surface::vnm_terminal_surface
     )
 
-    set_target_properties(vnm_terminal_linux_pty_backend PROPERTIES
+    set_target_properties(vnm_terminal_posix_pty_backend PROPERTIES
         AUTOMOC OFF
     )
 
     add_test(
-        NAME vnm_terminal_linux_pty_backend
+        NAME vnm_terminal_posix_pty_backend
         COMMAND
             "${CMAKE_COMMAND}" -E env
             "${vnm_terminal_qt_runtime_path}"
-            "$<TARGET_FILE:vnm_terminal_linux_pty_backend>"
+            "$<TARGET_FILE:vnm_terminal_posix_pty_backend>"
             "$<TARGET_FILE:vnm_terminal_canvas_fixture>"
     )
 
-    set_tests_properties(vnm_terminal_linux_pty_backend PROPERTIES
+    set_tests_properties(vnm_terminal_posix_pty_backend PROPERTIES
+        LABELS "conformance;posix;pty"
         TIMEOUT 120
     )
 endif()
@@ -1680,9 +1681,9 @@ if(WIN32)
     )
 endif()
 
-if(CMAKE_SYSTEM_NAME STREQUAL Linux)
+if(TARGET vnm_terminal_posix_pty_backend)
     list(APPEND vnm_terminal_test_process_targets
-        vnm_terminal_linux_pty_backend
+        vnm_terminal_posix_pty_backend
     )
 endif()
 

@@ -42,6 +42,22 @@ if(vnm_terminal_surface_interface MATCHES "ShaderTools")
         "vnm_terminal_surface package must not export Qt6::ShaderTools")
 endif()
 
+get_target_property(vnm_terminal_surface_include_dirs
+    vnm_terminal_surface::vnm_terminal_surface
+    INTERFACE_INCLUDE_DIRECTORIES)
+
+if(NOT vnm_terminal_surface_include_dirs)
+    message(FATAL_ERROR
+        "vnm_terminal_surface package must export an include directory")
+endif()
+
+foreach(vnm_terminal_surface_include_dir IN LISTS vnm_terminal_surface_include_dirs)
+    if(EXISTS "${vnm_terminal_surface_include_dir}/vnm_terminal/internal")
+        message(FATAL_ERROR
+            "vnm_terminal_surface package must not install internal headers")
+    endif()
+endforeach()
+
 add_executable(vnm_terminal_surface_package_smoke
     main.cpp
 )

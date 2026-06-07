@@ -17,6 +17,7 @@ project(vnm_terminal_surface LANGUAGES CXX VERSION 0.1.0)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
+include(CTest)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,6 +53,17 @@ if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_BUILD_BENCHMARKS)
 endif()
 if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_ENABLE_PROFILING)
     set(VNM_TERMINAL_ENABLE_PROFILING ON)
+endif()
+
+set(vnm_terminal_surface_testing_enabled OFF)
+if(BUILD_TESTING AND VNM_TERMINAL_SURFACE_BUILD_TESTING)
+    set(vnm_terminal_surface_testing_enabled ON)
+endif()
+
+if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT vnm_terminal_surface_testing_enabled)
+    message(FATAL_ERROR
+        "VNM_TERMINAL_BUILD_REQUIRED_READINESS requires BUILD_TESTING=ON and "
+        "VNM_TERMINAL_SURFACE_BUILD_TESTING=ON")
 endif()
 
 set(vnm_terminal_qt_components
@@ -114,7 +126,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/vnm_terminal_font.h
     include/vnm_terminal/internal/viewport_contract.h
     include/vnm_terminal/internal/vnm_terminal_surface_render_bridge.h
-    include/vnm_terminal/internal/linux_pty_backend.h
+    include/vnm_terminal/internal/posix_pty_backend.h
     include/vnm_terminal/internal/windows_conpty_backend.h
     include/vnm_terminal/vnm_terminal_surface.h
     src/terminal_history_ring.cpp
@@ -165,7 +177,7 @@ endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
     target_sources(vnm_terminal_surface PRIVATE
-        src/linux_pty_backend.cpp
+        src/posix_pty_backend.cpp
     )
 endif()
 
@@ -233,8 +245,9 @@ install(TARGETS
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )
 
-install(DIRECTORY include/
-    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+install(FILES
+    include/vnm_terminal/vnm_terminal_surface.h
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"
 )
 
 install(EXPORT vnm_terminal_surfaceTargets
@@ -295,20 +308,11 @@ if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
     endif()
 endif()
 
-if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_SURFACE_BUILD_TESTING)
-    message(FATAL_ERROR
-        "VNM_TERMINAL_BUILD_REQUIRED_READINESS requires VNM_TERMINAL_SURFACE_BUILD_TESTING=ON")
-endif()
-
-if(VNM_TERMINAL_SURFACE_BUILD_TESTING)
-    include(CTest)
-endif()
-
 if(VNM_TERMINAL_BUILD_BENCHMARKS)
     add_subdirectory(benchmarks)
 endif()
 
-if(VNM_TERMINAL_SURFACE_BUILD_TESTING)
+if(vnm_terminal_surface_testing_enabled)
     add_subdirectory(tests)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/more_tests/CMakeLists.txt")
         add_subdirectory(more_tests)

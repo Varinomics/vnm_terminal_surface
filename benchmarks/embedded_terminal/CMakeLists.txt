@@ -110,7 +110,7 @@ function(vnm_terminal_benchmark_add_readback_test test_name)
     )
 endfunction()
 
-if(BUILD_TESTING AND TARGET vnm_terminal_embedded_benchmark)
+if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_embedded_benchmark)
     vnm_terminal_benchmark_add_readback_test(
         vnm_terminal_embedded_benchmark_validate
         "--iterations" "7"

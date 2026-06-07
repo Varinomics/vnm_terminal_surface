@@ -7,8 +7,9 @@ It is the quick operational reference after `docs/developer_orientation.md`,
 ## Top-Level Layout
 
 - `include/vnm_terminal/vnm_terminal_surface.h` is the public Qt Quick item.
-- `include/vnm_terminal/internal` contains internal contracts shared by the
-  session, backend, model, input, renderer, fixture, and generated table code.
+- `include/vnm_terminal/internal` contains source-tree internal contracts shared
+  by the session, backend, model, input, renderer, fixture, and generated table
+  code. It is not installed API.
 - `src` contains the implementation for the surface, ordered terminal session,
   screen model, input encoder, renderer, Unicode width tables, and platform
   backends.
@@ -42,15 +43,17 @@ The atlas renderer uses Qt private modules for QRhi integration
 Installed binary packages are tied to the Qt major/minor used to build the
 surface; source-tree consumers rebuild the surface against their own Qt.
 
-- `BUILD_TESTING` is the standard CTest switch. Leave it on for normal
-  development when `VNM_TERMINAL_SURFACE_BUILD_TESTING=ON`.
-- `VNM_TERMINAL_SURFACE_BUILD_TESTING` is `ON` when the surface is the top-level
-  project and `OFF` when it is included as a subproject.
+- `BUILD_TESTING` is the standard CTest switch. It controls whether CTest tests
+  are enabled at all.
+- `VNM_TERMINAL_SURFACE_BUILD_TESTING` is the project-specific test gate. It is
+  `ON` when the surface is the top-level project and `OFF` when it is included
+  as a subproject. Test executables are configured only when both this option
+  and `BUILD_TESTING` are `ON`.
 - `VNM_TERMINAL_BUILD_BENCHMARKS` is `OFF` by default. It adds the embedded
-  benchmark target and benchmark CTest validation tests when testing is enabled.
-- `VNM_TERMINAL_BUILD_REQUIRED_READINESS` is `OFF` by default. It requires
-  `VNM_TERMINAL_SURFACE_BUILD_TESTING=ON` and also enables benchmarks and
-  profiling validation.
+  benchmark target and adds benchmark CTest validation tests when both test
+  gates are enabled.
+- `VNM_TERMINAL_BUILD_REQUIRED_READINESS` is `OFF` by default. It requires both
+  test gates to be `ON` and also enables benchmarks and profiling validation.
 - `VNM_TERMINAL_ENABLE_PROFILING` is `OFF` by default. Turning it on compiles
   profile-scope instrumentation into the library and enables profile-output
   validation paths.
@@ -77,10 +80,11 @@ cmake -S . -B build-transcript -DVNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=O
 
 The native product targets are:
 
-| Platform | Architecture | Backend |
+| Platform | Native backend scope | Backend |
 | --- | --- | --- |
 | Windows | x64 | ConPTY |
-| Linux | x86_64 | PTY |
+| Linux | x86_64 | POSIX PTY |
+| macOS | Darwin builds | POSIX PTY |
 
 Other platforms have no native backend support claim. A platform without a
 native backend reports an unavailable-backend error for process launch.
@@ -96,7 +100,7 @@ The root CMake project builds:
 - `vnm_terminal_transcript_replay`, only when
   `VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON`;
 - `vnm_terminal_embedded_benchmark`, when benchmarks are enabled;
-- test executables named after their CTest entries when `BUILD_TESTING` is on;
+- test executables named after their CTest entries when both test gates are on;
 - optional conformance targets created by CMake cache variables under
   `tests/CMakeLists.txt`;
 - optional `vnm_terminal_parser_libfuzzer`, when
@@ -128,7 +132,7 @@ CTest names are the stable way to find a test. The main families are:
   `vnm_terminal_viewport`: screen model behavior, SGR, model operations,
   alternate screen, private modes, and viewport control.
 - `vnm_terminal_backend_session`, `vnm_terminal_windows_conpty_backend`, and
-  `vnm_terminal_linux_pty_backend`: session and platform backend behavior.
+  `vnm_terminal_posix_pty_backend`: session and platform backend behavior.
 - `vnm_terminal_qt_*`, `vnm_terminal_render_*`,
   `vnm_terminal_qsg_*`, and `vnm_terminal_shaping_contract`: metrics, render
   snapshots, render frames, atlas QSG rendering, and shaping checks.
@@ -159,7 +163,7 @@ Focused examples:
 ```powershell
 ctest --test-dir build -C Release -R "^vnm_terminal_(parser|sequence_matrix|unicode)" --output-on-failure
 ctest --test-dir build -C Release -R "^vnm_terminal_(screen|terminal_modes|viewport)" --output-on-failure
-ctest --test-dir build -C Release -R "^vnm_terminal_(backend_session|windows_conpty_backend|linux_pty_backend)$" --output-on-failure
+ctest --test-dir build -C Release -R "^vnm_terminal_(backend_session|windows_conpty_backend|posix_pty_backend)$" --output-on-failure
 ctest --test-dir build -C Release -R "^vnm_terminal_(qt|render|qsg|shaping)" --output-on-failure
 ctest --test-dir build -C Release -R "^vnm_terminal_(surface_host|input_encoder|behavior_smoke)$" --output-on-failure
 ```
@@ -270,6 +274,11 @@ find_package(vnm_terminal_surface CONFIG REQUIRED)
 target_link_libraries(my_terminal PRIVATE
     vnm_terminal_surface::vnm_terminal_surface)
 ```
+
+The installed package exports the public host header
+`include/vnm_terminal/vnm_terminal_surface.h`. Source-tree headers under
+`include/vnm_terminal/internal` are implementation and test contracts, not
+installed consumer API.
 
 ## Generated And Provenance Artifacts
 
