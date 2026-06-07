@@ -33,6 +33,14 @@ wire shader package regeneration into the target build. ShaderTools is not
 linked to `vnm_terminal_surface`, not part of the Qt posture link allowlist, and
 not an installed package dependency.
 
+Dual-source atlas fragment shader packages must carry OpenGL GLSL 330 targets
+and patched GLSL 150 replacements from the corresponding `.glsl150.frag`
+source files. Qt Shader Baker's generated GLSL 150 output drops the explicit
+fragment-output location while keeping `index = 1`, which some Mesa/OpenGL
+drivers reject. Regenerate those packages with explicit `--glsl
+"100 es,120,150,330"` targets, then replace `glsl,150` from the checked-in
+`.glsl150.frag` file before committing the `.qsb`.
+
 The project uses Qt through either a commercial Qt license held by the
 distributor or the LGPL-compatible dynamic-linking route recorded in
 `THIRD_PARTY_NOTICES.md` and `THIRD_PARTY/`. The default
