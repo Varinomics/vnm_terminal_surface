@@ -34,7 +34,7 @@ else()
         "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:Qt6::Core>:$ENV{LD_LIBRARY_PATH}")
 endif()
 
-if(BUILD_TESTING AND TARGET vnm_terminal_phase7_public_scroll_benchmark)
+if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_phase7_public_scroll_benchmark)
     add_test(
         NAME vnm_terminal_phase7_public_scroll_benchmark_validate
         COMMAND

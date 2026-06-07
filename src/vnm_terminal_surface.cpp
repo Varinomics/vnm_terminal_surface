@@ -2,7 +2,7 @@
 
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
-#include "vnm_terminal/internal/linux_pty_backend.h"
+#include "vnm_terminal/internal/posix_pty_backend.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
@@ -329,7 +329,7 @@ std::unique_ptr<term::Terminal_backend> make_native_backend()
 #if defined(_WIN32)
     return term::make_windows_conpty_backend();
 #elif defined(__linux__) || defined(__APPLE__)
-    return term::make_linux_pty_backend();
+    return term::make_posix_pty_backend();
 #else
     return nullptr;
 #endif

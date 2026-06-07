@@ -28,7 +28,7 @@ part of the product shape.
 - Backend selection happens in `src/vnm_terminal_surface.cpp`; the selected
   backend implementation then hosts the child process.
 - `src/windows_conpty_backend.cpp` implements Windows ConPTY hosting.
-- `src/linux_pty_backend.cpp` implements Linux PTY hosting.
+- `src/posix_pty_backend.cpp` implements POSIX PTY hosting.
 - `src/native_backend_io_core.*` holds platform-neutral native-backend helpers
   such as start preparation, write-queue accounting, callback forwarding,
   paused-output buffering, and worker-thread join behavior.
@@ -47,7 +47,7 @@ part of the product shape.
 
 The root `CMakeLists.txt` is also a useful map: it lists the surface library
 headers and sources together, then conditionally adds the Windows ConPTY backend,
-Linux PTY backend, tests, and benchmarks.
+POSIX PTY backend, tests, and benchmarks.
 
 ## Level 2: How The Runtime Fits Together
 
@@ -99,7 +99,7 @@ exit notifications pass through one ordered session pipeline.
 - To change process hosting, start with `include/vnm_terminal/internal/backend_contract.h`,
   then `src/native_backend_io_core.*` for shared backend mechanics, and finally
   the platform backend in `src/windows_conpty_backend.cpp` or
-  `src/linux_pty_backend.cpp`.
+  `src/posix_pty_backend.cpp`.
 - To change terminal parsing or screen behavior, start with
   `include/vnm_terminal/internal/parser_action.h`,
   `include/vnm_terminal/internal/terminal_screen_model.h`, and

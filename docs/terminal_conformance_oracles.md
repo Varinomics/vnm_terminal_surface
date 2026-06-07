@@ -45,8 +45,8 @@ checked_in_output_allowed: yes
 allowed_use: platform support and exclusion decisions for vnm_terminal
 forbidden_use: no implicit support claims outside the listed matrix
 inventory_ref: none
-notes: Windows x64 and Linux x86_64 are supported native targets. Other
-platforms have no native backend support claim.
+notes: Windows x64, Linux x86_64, and macOS Darwin builds are supported native
+targets. Other platforms have no native backend support claim.
 
 ## independent-vnm-fixture
 

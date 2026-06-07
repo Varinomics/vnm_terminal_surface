@@ -2172,32 +2172,15 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
         }
     }
 
-    m_dirty_rows                    = std::move(publication.dirty_rows);
-    m_terminal_content_changed      = publication.terminal_content_changed;
-    m_active_buffer_changed         = publication.active_buffer_changed;
-    m_grid_reflow_changed           = publication.grid_reflow_changed;
-    m_viewport_changed              = publication.viewport_changed;
-    m_mode_state_changed            = publication.mode_state_changed;
-    m_mouse_reporting_mode_changed  = publication.mouse_reporting_mode_changed;
-    m_alternate_scroll_mode_changed = publication.alternate_scroll_mode_changed;
+    result_change_overrides_t overrides;
+    overrides.dirty_rows_have_stable_mutation_identity =
+        publication.dirty_rows_have_stable_mutation_identity;
+    adopt_publication_changes(std::move(publication));
     retain_referenced_active_hyperlink_ids();
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::finalize_ingest_result");
-        result.dirty_rows = dirty_rows();
-        result.dirty_rows_have_stable_mutation_identity =
-            publication.dirty_rows_have_stable_mutation_identity;
-        result.terminal_content_changed      = m_terminal_content_changed;
-        result.active_buffer_changed         = m_active_buffer_changed;
-        result.grid_reflow_changed           = m_grid_reflow_changed;
-        result.viewport_changed              = m_viewport_changed;
-        result.mode_state_changed            = m_mode_state_changed;
-        result.mouse_reporting_mode_changed  = m_mouse_reporting_mode_changed;
-        result.alternate_scroll_mode_changed = m_alternate_scroll_mode_changed;
-        result.scrollback_rows               = scrollback_size();
-        result.backing_deltas                = m_backing_deltas;
-        result.recovery_proposals            = m_recovery_proposals;
-        result.evicted_scrollback_rows       = compatibility_evicted_scrollback_rows();
+        result = finalize_result(std::move(result), overrides);
     }
     return result;
 }
@@ -2213,31 +2196,13 @@ Terminal_screen_model_result Terminal_screen_model::force_release_synchronized_o
     ingest_publication_t publication;
     set_synchronized_output_mode(false, &publication);
 
-    m_dirty_rows                    = std::move(publication.dirty_rows);
-    m_terminal_content_changed      = publication.terminal_content_changed;
-    m_active_buffer_changed         = publication.active_buffer_changed;
-    m_grid_reflow_changed           = publication.grid_reflow_changed;
-    m_viewport_changed              = publication.viewport_changed;
-    m_mode_state_changed            = publication.mode_state_changed;
-    m_mouse_reporting_mode_changed  = publication.mouse_reporting_mode_changed;
-    m_alternate_scroll_mode_changed = publication.alternate_scroll_mode_changed;
+    result_change_overrides_t overrides;
+    overrides.dirty_rows_have_stable_mutation_identity =
+        publication.dirty_rows_have_stable_mutation_identity;
+    adopt_publication_changes(std::move(publication));
     retain_referenced_active_hyperlink_ids();
 
-    result.dirty_rows = dirty_rows();
-    result.dirty_rows_have_stable_mutation_identity =
-        publication.dirty_rows_have_stable_mutation_identity;
-    result.terminal_content_changed      = m_terminal_content_changed;
-    result.active_buffer_changed         = m_active_buffer_changed;
-    result.grid_reflow_changed           = m_grid_reflow_changed;
-    result.viewport_changed              = m_viewport_changed;
-    result.mode_state_changed            = m_mode_state_changed;
-    result.mouse_reporting_mode_changed  = m_mouse_reporting_mode_changed;
-    result.alternate_scroll_mode_changed = m_alternate_scroll_mode_changed;
-    result.scrollback_rows               = scrollback_size();
-    result.backing_deltas                = m_backing_deltas;
-    result.recovery_proposals            = m_recovery_proposals;
-    result.evicted_scrollback_rows       = compatibility_evicted_scrollback_rows();
-    return result;
+    return finalize_result(std::move(result), overrides);
 }
 
 void Terminal_screen_model::apply_action(const Parser_action& action)
@@ -4750,20 +4715,12 @@ Terminal_screen_model_result Terminal_screen_model::resize(terminal_grid_size_t 
     const bool resize_terminal_content_changed = m_terminal_content_changed;
     const bool resize_active_buffer_changed    = m_active_buffer_changed;
     const bool resize_grid_reflow_changed      = m_grid_reflow_changed;
+    result_change_overrides_t resize_overrides;
+    resize_overrides.terminal_content_changed = resize_terminal_content_changed;
+    resize_overrides.active_buffer_changed    = resize_active_buffer_changed;
+    resize_overrides.grid_reflow_changed      = resize_grid_reflow_changed;
     if (!grid_resized) {
-        result.dirty_rows                    = dirty_rows();
-        result.terminal_content_changed      = resize_terminal_content_changed;
-        result.active_buffer_changed         = resize_active_buffer_changed;
-        result.grid_reflow_changed           = resize_grid_reflow_changed;
-        result.viewport_changed              = m_viewport_changed;
-        result.mode_state_changed            = m_mode_state_changed;
-        result.mouse_reporting_mode_changed  = m_mouse_reporting_mode_changed;
-        result.alternate_scroll_mode_changed = m_alternate_scroll_mode_changed;
-        result.scrollback_rows               = scrollback_size();
-        result.backing_deltas                = m_backing_deltas;
-        result.recovery_proposals            = m_recovery_proposals;
-        result.evicted_scrollback_rows       = compatibility_evicted_scrollback_rows();
-        return result;
+        return finalize_result(std::move(result), resize_overrides);
     }
 
     if (m_modes.synchronized_output) {
@@ -4774,19 +4731,7 @@ Terminal_screen_model_result Terminal_screen_model::resize(terminal_grid_size_t 
     }
     retain_referenced_active_hyperlink_ids();
 
-    result.dirty_rows                    = dirty_rows();
-    result.terminal_content_changed      = resize_terminal_content_changed;
-    result.active_buffer_changed         = resize_active_buffer_changed;
-    result.grid_reflow_changed           = resize_grid_reflow_changed;
-    result.viewport_changed              = m_viewport_changed;
-    result.mode_state_changed            = m_mode_state_changed;
-    result.mouse_reporting_mode_changed  = m_mouse_reporting_mode_changed;
-    result.alternate_scroll_mode_changed = m_alternate_scroll_mode_changed;
-    result.scrollback_rows               = scrollback_size();
-    result.backing_deltas                = m_backing_deltas;
-    result.recovery_proposals            = m_recovery_proposals;
-    result.evicted_scrollback_rows       = compatibility_evicted_scrollback_rows();
-    return result;
+    return finalize_result(std::move(result), resize_overrides);
 }
 
 Terminal_screen_model_result Terminal_screen_model::set_scrollback_limit(int limit)
@@ -4806,19 +4751,7 @@ Terminal_screen_model_result Terminal_screen_model::set_scrollback_limit(int lim
             0,
             0,
             0);
-        result.dirty_rows                    = dirty_rows();
-        result.terminal_content_changed      = m_terminal_content_changed;
-        result.active_buffer_changed         = m_active_buffer_changed;
-        result.grid_reflow_changed           = m_grid_reflow_changed;
-        result.viewport_changed              = m_viewport_changed;
-        result.mode_state_changed            = m_mode_state_changed;
-        result.mouse_reporting_mode_changed  = m_mouse_reporting_mode_changed;
-        result.alternate_scroll_mode_changed = m_alternate_scroll_mode_changed;
-        result.scrollback_rows               = scrollback_size();
-        result.backing_deltas                = m_backing_deltas;
-        result.recovery_proposals            = m_recovery_proposals;
-        result.evicted_scrollback_rows       = compatibility_evicted_scrollback_rows();
-        return result;
+        return finalize_result(std::move(result));
     }
 
     m_config.scrollback_limit = bounded_limit;
@@ -4849,19 +4782,7 @@ Terminal_screen_model_result Terminal_screen_model::set_scrollback_limit(int lim
     }
     retain_referenced_active_hyperlink_ids();
 
-    result.dirty_rows                    = dirty_rows();
-    result.terminal_content_changed      = m_terminal_content_changed;
-    result.active_buffer_changed         = m_active_buffer_changed;
-    result.grid_reflow_changed           = m_grid_reflow_changed;
-    result.viewport_changed              = m_viewport_changed;
-    result.mode_state_changed            = m_mode_state_changed;
-    result.mouse_reporting_mode_changed  = m_mouse_reporting_mode_changed;
-    result.alternate_scroll_mode_changed = m_alternate_scroll_mode_changed;
-    result.scrollback_rows               = scrollback_size();
-    result.backing_deltas                = m_backing_deltas;
-    result.recovery_proposals            = m_recovery_proposals;
-    result.evicted_scrollback_rows       = compatibility_evicted_scrollback_rows();
-    return result;
+    return finalize_result(std::move(result));
 }
 
 void Terminal_screen_model::set_primary_repaint_recovery_enabled(bool enabled)
@@ -6679,6 +6600,47 @@ void Terminal_screen_model::clear_backing_deltas()
 void Terminal_screen_model::clear_recovery_proposals()
 {
     m_recovery_proposals.clear();
+}
+
+void Terminal_screen_model::adopt_publication_changes(ingest_publication_t&& publication)
+{
+    m_dirty_rows                    = std::move(publication.dirty_rows);
+    m_terminal_content_changed      = publication.terminal_content_changed;
+    m_active_buffer_changed         = publication.active_buffer_changed;
+    m_grid_reflow_changed           = publication.grid_reflow_changed;
+    m_viewport_changed              = publication.viewport_changed;
+    m_mode_state_changed            = publication.mode_state_changed;
+    m_mouse_reporting_mode_changed  = publication.mouse_reporting_mode_changed;
+    m_alternate_scroll_mode_changed = publication.alternate_scroll_mode_changed;
+}
+
+Terminal_screen_model_result Terminal_screen_model::finalize_result(
+    Terminal_screen_model_result result,
+    result_change_overrides_t overrides) const
+{
+    result.dirty_rows = dirty_rows();
+    result.dirty_rows_have_stable_mutation_identity =
+        overrides.dirty_rows_have_stable_mutation_identity.value_or(true);
+    result.terminal_content_changed =
+        overrides.terminal_content_changed.value_or(m_terminal_content_changed);
+    result.active_buffer_changed =
+        overrides.active_buffer_changed.value_or(m_active_buffer_changed);
+    result.grid_reflow_changed =
+        overrides.grid_reflow_changed.value_or(m_grid_reflow_changed);
+    result.viewport_changed =
+        overrides.viewport_changed.value_or(m_viewport_changed);
+    result.mode_state_changed =
+        overrides.mode_state_changed.value_or(m_mode_state_changed);
+    result.mouse_reporting_mode_changed =
+        overrides.mouse_reporting_mode_changed.value_or(m_mouse_reporting_mode_changed);
+    result.alternate_scroll_mode_changed =
+        overrides.alternate_scroll_mode_changed.value_or(
+            m_alternate_scroll_mode_changed);
+    result.scrollback_rows               = scrollback_size();
+    result.backing_deltas                = m_backing_deltas;
+    result.recovery_proposals            = m_recovery_proposals;
+    result.evicted_scrollback_rows       = compatibility_evicted_scrollback_rows();
+    return result;
 }
 
 int Terminal_screen_model::compatibility_evicted_scrollback_rows() const

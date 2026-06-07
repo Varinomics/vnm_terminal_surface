@@ -6607,9 +6607,12 @@ bool validate_renderer_counter_invariants(
     const qint64 frame_packed_rows =
         json_counter(object, QStringLiteral("frame_packed_rows"));
     if (object.value(QStringLiteral("render_expected")).toBool()) {
+        const qint64 packed_row_frame_count =
+            object.value(QStringLiteral("source_mode")).toString() == k_surface_session_source_mode
+                ? object.value(QStringLiteral("completed_frames")).toInteger()
+                : json_counter(object, QStringLiteral("bridge_consumed_updates_delta"));
         const qint64 expected_packed_rows =
-            json_counter(object, QStringLiteral("rows")) *
-            json_counter(object, QStringLiteral("bridge_consumed_updates_delta"));
+            json_counter(object, QStringLiteral("rows")) * packed_row_frame_count;
         if (frame_packed_rows != expected_packed_rows) {
             *out_error = QStringLiteral("packed row counters are inconsistent");
             return false;

@@ -32,6 +32,10 @@ Configure once:
 cmake -S . -B build -DBUILD_TESTING=ON
 ```
 
+Project tests are configured only when both CTest's `BUILD_TESTING` switch and
+`VNM_TERMINAL_SURFACE_BUILD_TESTING` are `ON`. The project-specific gate defaults
+to `ON` for a top-level checkout and `OFF` when embedded as a subproject.
+
 Diagnostic transcript capture/replay is compiled out by default. Enable it only
 for local diagnostic builds with
 `-DVNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON`; distribution builds must
@@ -51,8 +55,8 @@ Run the configured test suite:
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-On Linux, use the same configure step and the normal generated build command for
-the selected generator.
+On Linux and macOS, use the same configure step and the normal generated build
+command for the selected generator.
 
 Use the [repository guide](docs/repository_guide.md) for test families,
 conformance controls, benchmarks, and focused validation commands.

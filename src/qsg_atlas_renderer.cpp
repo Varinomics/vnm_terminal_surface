@@ -6539,12 +6539,12 @@ Qsg_atlas_shaped_text_run_result qsg_atlas_shape_text_run(
             record.content_generation = run.content_generation;
             record.run_column         = run.column;
 
-            const qsizetype fallback_source =
+            const qsizetype default_source_index =
                 glyph_index_in_run < text_size ? glyph_index_in_run : 0;
             const qsizetype source_start =
                 glyph_index_in_run < string_indexes.size()
                     ? string_indexes.at(glyph_index_in_run)
-                    : fallback_source;
+                    : default_source_index;
             record.source_string_start =
                 qsg_atlas_clamped_source_string_index(
                     source_start,

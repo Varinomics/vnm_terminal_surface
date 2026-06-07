@@ -48,7 +48,7 @@ objects to hosts.
 
 `include/vnm_terminal/internal` contains implementation contracts and test
 contracts. `VNM_TerminalSurface_render_bridge` is an internal render/test
-handoff, not a public host extension point.
+handoff, not installed API or a public host extension point.
 
 Look at:
 
@@ -108,13 +108,13 @@ Native backend selection happens in `make_native_backend()` in
 `src/vnm_terminal_surface.cpp`.
 
 - Windows uses ConPTY in `src/windows_conpty_backend.cpp`.
-- Linux uses PTY APIs in `src/linux_pty_backend.cpp`.
+- Linux and macOS use POSIX PTY APIs in `src/posix_pty_backend.cpp`.
 - Shared native-backend mechanics live in `src/native_backend_io_core.*`.
 
-The supported native product targets are Windows x64 and Linux x86_64. A build
-on a platform without a native backend may still compile library code, but
-process launch reports an unavailable-backend error instead of claiming terminal
-support.
+The supported native product targets are Windows x64, Linux x86_64, and macOS
+Darwin builds. A build on a platform without a native backend may still compile
+library code, but process launch reports an unavailable-backend error instead
+of claiming terminal support.
 
 Platform backends own OS handles, process lifetime, worker threads, write
 queues, resize calls, output pause/resume behavior, interrupt delivery, and
@@ -134,7 +134,7 @@ Look at:
 - `include/vnm_terminal/internal/backend_contract.h` for the backend API.
 - `src/native_backend_io_core.*` for shared native-backend mechanics.
 - `src/windows_conpty_backend.cpp` for ConPTY process hosting.
-- `src/linux_pty_backend.cpp` for PTY process hosting.
+- `src/posix_pty_backend.cpp` for PTY process hosting.
 
 ## Parser And Model Boundary
 
@@ -288,7 +288,7 @@ Look at:
 - `src/vnm_terminal_surface.cpp` for GUI-thread assertions and scene graph
   integration.
 - `src/terminal_session.cpp` for backend callback lifetime and session ingress.
-- `src/windows_conpty_backend.cpp` and `src/linux_pty_backend.cpp` for backend
+- `src/windows_conpty_backend.cpp` and `src/posix_pty_backend.cpp` for backend
   worker-thread setup.
 - `src/qsg_terminal_renderer.cpp` for renderer diagnostics and lifecycle
   publishing.

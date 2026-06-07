@@ -1,4 +1,4 @@
-#include "vnm_terminal/internal/linux_pty_backend.h"
+#include "vnm_terminal/internal/posix_pty_backend.h"
 
 #if defined(__linux__) || defined(__APPLE__)
 
@@ -539,7 +539,7 @@ std::optional<int> send_signal_to_targets(const Signal_targets& targets, int sig
 
 }
 
-class Linux_pty_backend::Impl
+class Posix_pty_backend::Impl
 {
 public:
     ~Impl()
@@ -561,7 +561,7 @@ public:
             config,
             callbacks,
             start_gate,
-            QStringLiteral("Linux PTY"));
+            QStringLiteral("POSIX PTY"));
         if (is_backend_rejection(precheck.result)) {
             return precheck.result;
         }
@@ -708,7 +708,7 @@ public:
             m_wait_thread   = std::thread([this] { wait_loop(); });
         }
         catch (const std::system_error& error) {
-            const QString message = QStringLiteral("Linux PTY worker thread startup failed: %1")
+            const QString message = QStringLiteral("POSIX PTY worker thread startup failed: %1")
                 .arg(QString::fromLocal8Bit(error.what()));
             report_error(Terminal_backend_error_code::START_FAILED, message);
             shutdown();
@@ -724,7 +724,7 @@ public:
             return
                 backend_reject(
                     Terminal_backend_error_code::WRITE_FAILED,
-                    QStringLiteral("Linux PTY write requires bytes"));
+                    QStringLiteral("POSIX PTY write requires bytes"));
         }
 
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -732,7 +732,7 @@ public:
             return
                 backend_reject(
                     Terminal_backend_error_code::WRITE_FAILED,
-                    QStringLiteral("Linux PTY backend is not writable"));
+                    QStringLiteral("POSIX PTY backend is not writable"));
         }
 
         const std::size_t byte_count = static_cast<std::size_t>(bytes.size());
@@ -740,7 +740,7 @@ public:
             return
                 backend_reject(
                     Terminal_backend_error_code::WRITE_FAILED,
-                    QStringLiteral("Linux PTY write queue limit reached"));
+                    QStringLiteral("POSIX PTY write queue limit reached"));
         }
 
         add_native_backend_queued_write_bytes(m_queued_write_bytes, byte_count);
@@ -755,7 +755,7 @@ public:
             return
                 backend_reject(
                     Terminal_backend_error_code::RESIZE_FAILED,
-                    QStringLiteral("Linux PTY resize requires a positive unsigned-short grid"));
+                    QStringLiteral("POSIX PTY resize requires a positive unsigned-short grid"));
         }
 
         int master = -1;
@@ -765,7 +765,7 @@ public:
                 return
                     backend_reject(
                         Terminal_backend_error_code::RESIZE_FAILED,
-                        QStringLiteral("Linux PTY resize requires a running process"));
+                        QStringLiteral("POSIX PTY resize requires a running process"));
             }
 
             master = m_master.get();
@@ -826,7 +826,7 @@ public:
                 return
                     backend_reject(
                         Terminal_backend_error_code::INTERRUPT_FAILED,
-                        QStringLiteral("Linux PTY interrupt requires a running process"));
+                        QStringLiteral("POSIX PTY interrupt requires a running process"));
             }
 
             master = m_master.get();
@@ -843,7 +843,7 @@ public:
             return
                 backend_reject(
                     Terminal_backend_error_code::INTERRUPT_FAILED,
-                    QStringLiteral("Linux PTY has no foreground process group"));
+                    QStringLiteral("POSIX PTY has no foreground process group"));
         }
 
         int interrupt_error = 0;
@@ -853,7 +853,7 @@ public:
                 return
                     backend_reject(
                         Terminal_backend_error_code::INTERRUPT_FAILED,
-                        QStringLiteral("Linux PTY interrupt requires a running process"));
+                        QStringLiteral("POSIX PTY interrupt requires a running process"));
             }
 
             if (::kill(-foreground_pgid, SIGINT) < 0) {
@@ -885,7 +885,7 @@ public:
                 return
                     backend_reject(
                         Terminal_backend_error_code::TERMINATE_FAILED,
-                        QStringLiteral("Linux PTY terminate requires a running process"));
+                        QStringLiteral("POSIX PTY terminate requires a running process"));
             }
 
             child_pid           = m_child_pid;
@@ -930,7 +930,7 @@ public:
         }
         catch (const std::system_error& error) {
             const QString message =
-                QStringLiteral("Linux PTY termination escalation worker failed: %1")
+                QStringLiteral("POSIX PTY termination escalation worker failed: %1")
                     .arg(QString::fromLocal8Bit(error.what()));
             const std::optional<int> kill_error = send_signal_to_targets(targets, SIGKILL);
             if (kill_error.has_value()) {
@@ -1662,7 +1662,7 @@ private:
 
         report_error(
             Terminal_backend_error_code::TERMINATE_FAILED,
-            QStringLiteral("Linux PTY process remained active after forced termination"));
+            QStringLiteral("POSIX PTY process remained active after forced termination"));
     }
 
     void join_threads()
@@ -1709,12 +1709,12 @@ private:
     bool                                m_child_reaped = false;
 };
 
-Linux_pty_backend::Linux_pty_backend()
+Posix_pty_backend::Posix_pty_backend()
 :
     m_impl(std::make_unique<Impl>())
 {}
 
-Linux_pty_backend::~Linux_pty_backend()
+Posix_pty_backend::~Posix_pty_backend()
 {
     if (m_impl && m_impl->is_worker_thread()) {
         Impl* impl = m_impl.release();
@@ -1722,42 +1722,42 @@ Linux_pty_backend::~Linux_pty_backend()
     }
 }
 
-Terminal_backend_result Linux_pty_backend::start(
+Terminal_backend_result Posix_pty_backend::start(
     const Terminal_launch_config&  config,
     Terminal_backend_callbacks     callbacks)
 {
     return m_impl->start(config, std::move(callbacks));
 }
 
-Terminal_backend_result Linux_pty_backend::write(QByteArray bytes)
+Terminal_backend_result Posix_pty_backend::write(QByteArray bytes)
 {
     return m_impl->write(std::move(bytes));
 }
 
-Terminal_backend_result Linux_pty_backend::resize(
+Terminal_backend_result Posix_pty_backend::resize(
     Terminal_backend_resize_request request)
 {
     return m_impl->resize(request);
 }
 
-Terminal_backend_result Linux_pty_backend::set_output_paused(bool paused)
+Terminal_backend_result Posix_pty_backend::set_output_paused(bool paused)
 {
     return m_impl->set_output_paused(paused);
 }
 
-Terminal_backend_result Linux_pty_backend::interrupt()
+Terminal_backend_result Posix_pty_backend::interrupt()
 {
     return m_impl->interrupt();
 }
 
-Terminal_backend_result Linux_pty_backend::terminate()
+Terminal_backend_result Posix_pty_backend::terminate()
 {
     return m_impl->terminate();
 }
 
-std::unique_ptr<Terminal_backend> make_linux_pty_backend()
+std::unique_ptr<Terminal_backend> make_posix_pty_backend()
 {
-    return std::make_unique<Linux_pty_backend>();
+    return std::make_unique<Posix_pty_backend>();
 }
 
 }
