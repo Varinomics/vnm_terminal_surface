@@ -41,6 +41,11 @@ drivers reject. Regenerate those packages with explicit `--glsl
 "100 es,120,150,330"` targets, then replace `glsl,150` from the checked-in
 `.glsl150.frag` file before committing the `.qsb`.
 
+The dual-source glyph shader is a quality path, not a hard requirement. Drivers
+that fail the dual-source blend probe must use the alpha-blended glyph shader
+package and grayscale glyph coverage so a usable terminal remains available on
+Mesa/OpenGL VM desktops.
+
 The project uses Qt through either a commercial Qt license held by the
 distributor or the LGPL-compatible dynamic-linking route recorded in
 `THIRD_PARTY_NOTICES.md` and `THIRD_PARTY/`. The default
