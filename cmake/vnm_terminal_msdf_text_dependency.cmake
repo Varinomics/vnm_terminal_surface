@@ -4,7 +4,7 @@ include(FetchContent)
 
 set(VNM_TERMINAL_MSDF_TEXT_VERSION 0.2.0)
 set(VNM_TERMINAL_MSDF_TEXT_GIT_TAG
-    075b61724deea23ca4e661852a22cce8ba8b4023)
+    04b6989483c280e862633489bda318f34dca05ec)
 
 function(vnm_terminal_msdf_text_set_fetchcontent_build_dir name dir_name)
     string(TOLOWER "${CMAKE_CXX_COMPILER_ID}" _fc_compiler_tag)
@@ -65,8 +65,14 @@ function(vnm_terminal_msdf_text_make_available out_var)
         return()
     endif()
 
-    set(VNM_MSDF_TEXT_USE_SYSTEM_LIBS
-        "${_vnm_terminal_msdf_text_USE_SYSTEM_LIBS}"
+    if(_vnm_terminal_msdf_text_USE_SYSTEM_LIBS)
+        set(_vnm_terminal_msdf_text_fetch_deps OFF)
+    else()
+        set(_vnm_terminal_msdf_text_fetch_deps ON)
+    endif()
+    unset(VNM_MSDF_TEXT_USE_SYSTEM_LIBS CACHE)
+    set(VNM_MSDF_TEXT_FETCH_DEPS
+        "${_vnm_terminal_msdf_text_fetch_deps}"
         CACHE BOOL "" FORCE)
 
     if(_vnm_terminal_msdf_text_USE_SYSTEM_LIBS)
