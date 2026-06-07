@@ -6414,12 +6414,12 @@ bool test_source_posture()
     const qsizetype render_pos = atlas_source.indexOf(
         QByteArrayLiteral("void render(const RenderState* state) override"));
     const QByteArray prepare_atlas_instances_call =
-        QByteArrayLiteral("prepare_atlas_instances()");
+        QByteArrayLiteral("prepare_atlas_instances(rhi)");
     const qsizetype prepare_instances_call_pos = atlas_source.indexOf(
         prepare_atlas_instances_call,
         prepare_pos);
     const qsizetype prepare_instances_def_pos = atlas_source.indexOf(
-        QByteArrayLiteral("Atlas_prepare_result prepare_atlas_instances()"));
+        QByteArrayLiteral("Atlas_prepare_result prepare_atlas_instances(QRhi* rhi)"));
     const qsizetype frame_build_pos = atlas_source.indexOf(
         QByteArrayLiteral("build_terminal_render_frame("));
     ok &= check(
@@ -6602,6 +6602,69 @@ bool test_cache_key_includes_physical_size_and_face()
         "atlas cache stores distinct coverage and presentation variants independently");
     ok &= check(std::abs(raw_physical_pixel_size - raw_font.pixelSize() * 2.0) < 0.001,
         "raw-font physical pixel size is derived from the run font");
+    return ok;
+}
+
+QRhiDriverInfo test_driver_info(
+    QByteArray                  device_name,
+    QRhiDriverInfo::DeviceType  device_type)
+{
+    QRhiDriverInfo driver_info;
+    driver_info.deviceName = std::move(device_name);
+    driver_info.deviceType = device_type;
+    return driver_info;
+}
+
+bool test_software_renderer_driver_classifier()
+{
+    bool ok = true;
+    ok &= check(term::qsg_atlas_driver_info_is_known_software_renderer(
+            test_driver_info(
+                QByteArrayLiteral("llvmpipe (LLVM 19.1.7, 256 bits)"),
+                QRhiDriverInfo::UnknownDevice)),
+        "llvmpipe driver name is classified as software rendering");
+    ok &= check(term::qsg_atlas_driver_info_is_known_software_renderer(
+            test_driver_info(
+                QByteArrayLiteral("Google SwiftShader"),
+                QRhiDriverInfo::UnknownDevice)),
+        "SwiftShader driver name is classified as software rendering");
+    ok &= check(term::qsg_atlas_driver_info_is_known_software_renderer(
+            test_driver_info(
+                QByteArrayLiteral("Microsoft Basic Render Driver"),
+                QRhiDriverInfo::UnknownDevice)),
+        "Microsoft Basic Render Driver name is classified as software rendering");
+    ok &= check(term::qsg_atlas_driver_info_is_known_software_renderer(
+            test_driver_info(QByteArray(), QRhiDriverInfo::CpuDevice)),
+        "CPU QRhi device type is classified as software rendering");
+    ok &= check(term::qsg_atlas_driver_info_is_known_software_renderer(
+            test_driver_info(
+                QByteArrayLiteral("llvmpipe (LLVM 19.1.7, 256 bits)"),
+                QRhiDriverInfo::VirtualDevice)),
+        "virtual llvmpipe device is classified as software rendering");
+
+    ok &= check(!term::qsg_atlas_driver_info_is_known_software_renderer(
+            test_driver_info(QByteArray(), QRhiDriverInfo::VirtualDevice)),
+        "unnamed virtual QRhi device is not classified as software rendering");
+    ok &= check(!term::qsg_atlas_driver_info_is_known_software_renderer(
+            test_driver_info(
+                QByteArrayLiteral("Mesa virgl"),
+                QRhiDriverInfo::VirtualDevice)),
+        "virtual accelerated OpenGL device is not classified as software rendering");
+    ok &= check(!term::qsg_atlas_driver_info_is_known_software_renderer(
+            test_driver_info(
+                QByteArrayLiteral("NVIDIA GeForce RTX 4070"),
+                QRhiDriverInfo::DiscreteDevice)),
+        "discrete NVIDIA device is not classified as software rendering");
+    ok &= check(!term::qsg_atlas_driver_info_is_known_software_renderer(
+            test_driver_info(
+                QByteArrayLiteral("AMD Radeon RX 7800 XT"),
+                QRhiDriverInfo::DiscreteDevice)),
+        "discrete AMD device is not classified as software rendering");
+    ok &= check(!term::qsg_atlas_driver_info_is_known_software_renderer(
+            test_driver_info(
+                QByteArrayLiteral("Mesa Intel(R) Arc Graphics"),
+                QRhiDriverInfo::IntegratedDevice)),
+        "Mesa Intel hardware OpenGL device is not classified as software rendering");
     return ok;
 }
 
@@ -10873,6 +10936,7 @@ void print_warm_lazy_summary(
 {
     std::cerr << "warm/lazy " << label
         << " completed=" << summary.warm_completed
+        << " broad_seed_skipped=" << summary.warm_broad_seed_skipped
         << " seed_strings=" << summary.warm_seed_strings
         << " shaped=" << summary.warm_shaped_glyph_records
         << " covered=" << summary.warm_covered_glyph_records
@@ -10936,6 +11000,32 @@ int test_atlas_warm_lazy_smoke(QGuiApplication& app, const char* backend)
         return 1;
     }
 
+    const term::Qsg_atlas_warm_lazy_summary& seed = seed_report.warm_lazy;
+    if (seed.warm_broad_seed_skipped) {
+        bool ok = true;
+        ok &= check(!seed.warm_completed,
+            "software warm/lazy smoke does not report completed prewarm");
+        ok &= check(
+            seed.warm_seed_strings ==
+                static_cast<int>(term::k_qsg_atlas_warm_seed_strings.size()),
+            "software warm/lazy smoke preserves the source-controlled seed count");
+        ok &= check(seed.warm_shaped_glyph_records == 0 &&
+                seed.warm_covered_glyph_records == 0    &&
+                seed.warm_insert_attempts == 0          &&
+                seed.warm_inserts == 0                  &&
+                seed.warm_failed_inserts == 0           &&
+                seed.warm_failed_glyph_records == 0     &&
+                seed.warm_unsupported_images == 0,
+            "software warm/lazy smoke skips broad prewarm without hidden warm failures");
+        if (!ok) {
+            print_warm_lazy_summary("seed", seed);
+            return 1;
+        }
+        std::cerr << "SKIP: atlas warm/lazy smoke broad prewarm is disabled "
+            << "on this software renderer\n";
+        return k_unsupported_backend_skip_return_code;
+    }
+
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
         std::make_shared<const term::Terminal_render_snapshot>(
@@ -10952,7 +11042,6 @@ int test_atlas_warm_lazy_smoke(QGuiApplication& app, const char* backend)
         return 1;
     }
 
-    const term::Qsg_atlas_warm_lazy_summary& seed = seed_report.warm_lazy;
     const term::Qsg_atlas_warm_lazy_summary& lazy = lazy_report.warm_lazy;
     bool ok = true;
     ok &= check(seed.warm_completed, "warm/lazy smoke completes atlas prewarm");
@@ -14075,6 +14164,66 @@ QJsonObject glyph_miss_diagnostic_object(
     return object;
 }
 
+QJsonObject warm_lazy_summary_object(
+    const term::Qsg_atlas_warm_lazy_summary& summary)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("warm_completed"), summary.warm_completed);
+    object.insert(
+        QStringLiteral("warm_broad_seed_skipped"),
+        summary.warm_broad_seed_skipped);
+    json_insert_u64(object, QStringLiteral("warm_epoch"), summary.warm_epoch);
+    object.insert(QStringLiteral("warm_seed_strings"), summary.warm_seed_strings);
+    object.insert(
+        QStringLiteral("warm_shaped_glyph_records"),
+        summary.warm_shaped_glyph_records);
+    object.insert(
+        QStringLiteral("warm_covered_glyph_records"),
+        summary.warm_covered_glyph_records);
+    object.insert(
+        QStringLiteral("warm_skipped_glyph_records"),
+        summary.warm_skipped_glyph_records);
+    object.insert(
+        QStringLiteral("warm_environment_skipped_glyph_records"),
+        summary.warm_environment_skipped_glyph_records);
+    object.insert(
+        QStringLiteral("warm_failed_glyph_records"),
+        summary.warm_failed_glyph_records);
+    object.insert(
+        QStringLiteral("warm_missing_string_indexes"),
+        summary.warm_missing_string_indexes);
+    object.insert(
+        QStringLiteral("warm_invalid_string_indexes"),
+        summary.warm_invalid_string_indexes);
+    object.insert(
+        QStringLiteral("warm_unsupported_images"),
+        summary.warm_unsupported_images);
+    object.insert(QStringLiteral("warm_cache_hits"), summary.warm_cache_hits);
+    object.insert(
+        QStringLiteral("warm_insert_attempts"),
+        summary.warm_insert_attempts);
+    object.insert(QStringLiteral("warm_inserts"), summary.warm_inserts);
+    object.insert(
+        QStringLiteral("warm_failed_inserts"),
+        summary.warm_failed_inserts);
+    object.insert(QStringLiteral("warm_elapsed_ms"), summary.warm_elapsed_ms);
+    object.insert(
+        QStringLiteral("warm_page_pressure"),
+        summary.warm_page_pressure);
+    object.insert(
+        QStringLiteral("lazy_insert_attempts"),
+        summary.lazy_insert_attempts);
+    object.insert(QStringLiteral("lazy_inserts"), summary.lazy_inserts);
+    object.insert(
+        QStringLiteral("lazy_failed_inserts"),
+        summary.lazy_failed_inserts);
+    object.insert(QStringLiteral("lazy_elapsed_ms"), summary.lazy_elapsed_ms);
+    object.insert(QStringLiteral("lazy_max_insert_us"), summary.lazy_max_insert_us);
+    object.insert(QStringLiteral("lazy_frames"), summary.lazy_frames);
+    object.insert(QStringLiteral("incomplete_frames"), summary.incomplete_frames);
+    return object;
+}
+
 QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
 {
     QJsonObject capabilities;
@@ -14413,6 +14562,9 @@ QJsonObject lcd_probe_report_object(const term::Qsg_atlas_frame_report& report)
     object.insert(QStringLiteral("frame_build"), frame_build);
     object.insert(QStringLiteral("render"), render);
     object.insert(QStringLiteral("cache"), cache);
+    object.insert(
+        QStringLiteral("warm_lazy"),
+        warm_lazy_summary_object(report.warm_lazy));
     object.insert(QStringLiteral("page_pressure"), page_pressure);
     return object;
 }
@@ -16956,6 +17108,7 @@ bool run_unit_tests()
     bool ok = true;
     ok &= test_source_posture();
     ok &= test_cache_key_includes_physical_size_and_face();
+    ok &= test_software_renderer_driver_classifier();
     ok &= test_packing_and_stride_copy();
     ok &= test_indexed8_and_grayscale_conversion();
     ok &= test_rgba_tile_model_preparation();
