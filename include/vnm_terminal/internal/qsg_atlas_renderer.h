@@ -23,6 +23,7 @@
 #include <optional>
 #include <vector>
 
+struct QRhiDriverInfo;
 class QSGNode;
 
 namespace vnm_terminal::internal {
@@ -34,6 +35,9 @@ constexpr bool k_qsg_atlas_msdf_text_renderer_enabled =
 constexpr bool k_qsg_atlas_msdf_text_renderer_compiled =
     k_qsg_atlas_msdf_text_renderer_enabled;
 constexpr bool k_qsg_atlas_msdf_text_renderer_active = false;
+
+bool qsg_atlas_driver_info_is_known_software_renderer(
+    const QRhiDriverInfo& driver_info);
 
 enum class Glyph_coverage_kind
 {
@@ -154,6 +158,7 @@ enum class Qsg_atlas_glyph_miss_cause
     NONE,
     UNSUPPORTED_IMAGE,
     ATLAS_INSERT_FAILED,
+    REJECTED_RASTER_CACHE,
 };
 
 struct Qsg_atlas_glyph_miss_diagnostic
@@ -500,6 +505,7 @@ struct Qsg_atlas_producer_summary
 struct Qsg_atlas_warm_lazy_summary
 {
     bool          warm_completed           = false;
+    bool          warm_broad_seed_skipped  = false;
     std::uint64_t warm_epoch               = 0U;
     int           warm_seed_strings        = 0;
     int           warm_shaped_glyph_records = 0;
