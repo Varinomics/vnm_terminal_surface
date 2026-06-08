@@ -21,7 +21,6 @@
 #include <vector>
 #include <cerrno>
 #include <csignal>
-#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
@@ -35,29 +34,11 @@
 #include <pty.h>
 #endif
 
-// TEMP diagnostic: trace the PTY exit/shutdown path to locate the macOS
-// posix_pty_backend exit-drain hang. Remove once the deadlock is fixed.
-#define PTYDIAG(...)                                  \
-    do {                                              \
-        ::fprintf(stderr, "PTYDIAG " __VA_ARGS__);    \
-        ::fprintf(stderr, "\n");                      \
-        ::fflush(stderr);                             \
-    } while (0)
-
 namespace vnm_terminal::internal {
 
 namespace {
 
 constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
-// Upper bound on how long the output reader parks in poll() while no drain
-// deadline is armed. The reader must re-evaluate m_stopping / m_child_reaped
-// periodically so the exit path can make progress even if the wake-pipe write
-// fails to interrupt a parked poll(): macOS does not reliably break a poll()
-// that is simultaneously watching a PTY master fd, which otherwise deadlocks
-// the exit path (the reader never finishes, so the child exit is never
-// reported and ctest kills the process at its timeout). The cost is a single
-// idle wake-up per interval when the terminal is silent.
-constexpr std::chrono::milliseconds k_reader_poll_heartbeat(1000);
 constexpr int k_waitpid_failure_exit_code = -1;
 
 QString posix_error_message(QStringView context, int code)
@@ -457,6 +438,24 @@ std::chrono::milliseconds bounded_sleep_interval(
 {
     constexpr std::chrono::milliseconds k_poll_interval(10);
     return std::min(k_poll_interval, remaining);
+}
+
+int poll_timeout_until(std::optional<std::chrono::steady_clock::time_point> deadline)
+{
+    if (!deadline.has_value()) {
+        return -1;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= *deadline) {
+        return 0;
+    }
+
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now);
+    return static_cast<int>(std::min<std::int64_t>(
+        remaining.count(),
+        std::numeric_limits<int>::max()));
 }
 
 void add_signal_target(Signal_targets& targets, pid_t process_group)
@@ -973,8 +972,6 @@ public:
             reader_finished                      = m_reader_finished;
         }
 
-        PTYDIAG("shutdown begin child_reaped=%d reader_finished=%d",
-            child_reaped ? 1 : 0, reader_finished ? 1 : 0);
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
@@ -987,10 +984,21 @@ public:
                 reader_finished),
             SIGKILL);
 
-        PTYDIAG("shutdown signaled, joining");
+        // The signal above targets process groups (kill(-pgid)). During the
+        // brief window after forkpty() but before the child has established its
+        // own session/process group, kill(-pgid) fails with ESRCH -- which
+        // send_signal_to_targets() ignores -- so the still-running child is not
+        // killed. The wait thread is then stuck forever in its blocking
+        // waitpid(child_pid) and join_threads() below deadlocks, hanging
+        // teardown. (The race is timing-dependent and was observed on macOS.)
+        // Signal the child PID directly, which always reaches it, so waitpid()
+        // returns and the wait thread can be joined.
+        if (!child_reaped && child_pid > 0) {
+            ::kill(child_pid, SIGKILL);
+        }
+
         join_threads();
         reap_child_if_unreaped(child_pid);
-        PTYDIAG("shutdown reaped, done");
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_master.reset();
@@ -1326,20 +1334,10 @@ private:
                 if (m_child_reaped && !final_drain_deadline.has_value()) {
                     final_drain_deadline =
                         std::chrono::steady_clock::now() + k_exit_output_drain_timeout;
-                    PTYDIAG("read_loop drain armed");
                 }
 
                 master = m_master.get();
                 wake_read = m_read_wake_read.get();
-            }
-
-            const bool draining = final_drain_deadline.has_value();
-
-            if (draining &&
-                std::chrono::steady_clock::now() >= *final_drain_deadline)
-            {
-                timed_out_after_child_reap = true;
-                break;
             }
 
             pollfd fds[2] = {
@@ -1347,23 +1345,18 @@ private:
                 { wake_read, POLLIN, 0 },
             };
 
-            // During the exit drain the PTY master is non-blocking and macOS
-            // does not reliably honor poll() timeouts on a master whose slave is
-            // still held open by a descendant; polling it there wedges the
-            // reader and deadlocks exit reporting. So in the drain phase wait
-            // only on the wake pipe (a regular pipe, which polls correctly) for
-            // a short interval and read whatever the child buffered directly
-            // below -- the drain deadline checked at the top of the loop bounds
-            // it. Outside the drain, watch the master too, bounded by the
-            // heartbeat so the reader re-checks shutdown state without relying
-            // on the wake pipe to interrupt poll().
-            constexpr int k_drain_poll_interval_ms = 10;
-            pollfd* const poll_fds   = draining ? &fds[1] : &fds[0];
-            const nfds_t  poll_count = draining ? 1U : 2U;
-            const int     poll_timeout = draining
-                ? k_drain_poll_interval_ms
-                : static_cast<int>(k_reader_poll_heartbeat.count());
-            const int poll_result = ::poll(poll_fds, poll_count, poll_timeout);
+            if (final_drain_deadline.has_value() &&
+                std::chrono::steady_clock::now() >= *final_drain_deadline)
+            {
+                timed_out_after_child_reap = true;
+                break;
+            }
+
+            const int poll_result = ::poll(fds, 2, poll_timeout_until(final_drain_deadline));
+            if (poll_result == 0) {
+                timed_out_after_child_reap = final_drain_deadline.has_value();
+                break;
+            }
 
             if (poll_result < 0) {
                 if (errno == EINTR) {
@@ -1385,18 +1378,8 @@ private:
                 }
             }
 
-            if (!draining) {
-                // No drain deadline armed: a heartbeat tick (poll_result == 0)
-                // or a wake-only wake-up means the master has nothing pending,
-                // so loop back and re-check shutdown state. In the drain phase
-                // fall through unconditionally and let the non-blocking read
-                // below deliver buffered output (EAGAIN simply loops back to
-                // re-check the deadline).
-                if (poll_result == 0 ||
-                    (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) == 0)
-                {
-                    continue;
-                }
+            if ((fds[0].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+                continue;
             }
 
             const ssize_t bytes_read = ::read(master, buffer.data(), buffer.size());
@@ -1422,7 +1405,6 @@ private:
                 static_cast<qsizetype>(bytes_read)));
         }
 
-        PTYDIAG("read_loop finished timed_out=%d", timed_out_after_child_reap ? 1 : 0);
         mark_reader_finished(timed_out_after_child_reap);
     }
 
@@ -1464,7 +1446,6 @@ private:
 
     bool wait_until_master_writable(int master, int wake_read)
     {
-        PTYDIAG("writer wait_until_master_writable enter");
         for (;;) {
             pollfd fds[2] = {
                 { master, POLLOUT | POLLHUP | POLLERR, 0 },
@@ -1569,13 +1550,9 @@ private:
             return;
         }
 
-        PTYDIAG("wait_loop waitpid begin child_pid=%d", child_pid);
         int status = 0;
-        const pid_t reaped = waitpid_nointr(child_pid, &status, 0);
-        const int waitpid_errno = errno;
-        PTYDIAG("wait_loop waitpid returned ret=%d", static_cast<int>(reaped));
-        if (reaped != child_pid) {
-            const int wait_error = waitpid_errno;
+        if (waitpid_nointr(child_pid, &status, 0) != child_pid) {
+            const int wait_error = errno;
             QByteArray paused_output;
             bool paused_output_delivery_started = false;
             {
@@ -1629,17 +1606,12 @@ private:
             deliver_output(std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
-        PTYDIAG("wait_loop reaped child status=%d", status);
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
-        PTYDIAG("wait_loop wait_for_reader begin");
         wait_for_reader_finished();
-        PTYDIAG("wait_loop wait_for_reader end");
         kill_child_process_group_after_exit_timeout();
-        PTYDIAG("wait_loop kill_group end");
         report_exit_once(status);
-        PTYDIAG("wait_loop report_exit end");
     }
 
     void kill_child_process_group_after_exit_timeout()
@@ -1708,15 +1680,10 @@ private:
 
     void join_threads()
     {
-        PTYDIAG("join reader begin");
         join_or_detach_native_backend_thread(m_reader_thread);
-        PTYDIAG("join writer begin");
         join_or_detach_native_backend_thread(m_writer_thread);
-        PTYDIAG("join wait begin");
         join_or_detach_native_backend_thread(m_wait_thread);
-        PTYDIAG("join termination begin");
         join_or_detach_native_backend_thread(m_termination_thread);
-        PTYDIAG("join threads end");
     }
 
     std::mutex                          m_mutex;
