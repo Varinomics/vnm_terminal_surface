@@ -918,13 +918,17 @@ bool atlas_msdf_text_uv_is_valid(float value)
 
 bool atlas_msdf_text_glyph_is_drawable(const msdf_text_glyph_t& glyph)
 {
+    // Drawability is a property of the unscaled baked glyph: a visible glyph
+    // with finite, non-degenerate font-unit bounds and valid UVs. Advance-only
+    // glyphs (e.g. U+0020) are not visible and are not drawable.
     return
-        std::isfinite(glyph.plane_left)   &&
-        std::isfinite(glyph.plane_right)  &&
-        std::isfinite(glyph.plane_top)    &&
-        std::isfinite(glyph.plane_bottom) &&
-        glyph.plane_right > glyph.plane_left &&
-        glyph.plane_top > glyph.plane_bottom &&
+        glyph.visible &&
+        std::isfinite(glyph.bounds_left_units)   &&
+        std::isfinite(glyph.bounds_right_units)  &&
+        std::isfinite(glyph.bounds_top_units)    &&
+        std::isfinite(glyph.bounds_bottom_units) &&
+        glyph.bounds_right_units > glyph.bounds_left_units &&
+        glyph.bounds_top_units > glyph.bounds_bottom_units &&
         atlas_msdf_text_uv_is_valid(glyph.uv_left)   &&
         atlas_msdf_text_uv_is_valid(glyph.uv_right)  &&
         atlas_msdf_text_uv_is_valid(glyph.uv_top)    &&
@@ -2282,14 +2286,17 @@ private:
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         summary.msdf_text_font_data_bytes = m_msdf_text_cache.font_data_bytes;
         summary.msdf_text_pixel_height    = m_msdf_text_cache.pixel_height;
-        // Batch 1: the baked atlas is built at the draw pixel height, so the
-        // baked and draw pixel heights are identical here. Batch 3 introduces a
-        // distinct bake bucket that can differ from the draw pixel height.
-        summary.msdf_text_baked_pixel_height = m_msdf_text_cache.pixel_height;
+        // Batch 2: the library bakes at max(draw_pixel_height,
+        // ceil(min_atlas_font_size)), so the baked height can exceed the draw
+        // height for small font sizes. Report the height the atlas was baked at.
+        summary.msdf_text_baked_pixel_height =
+            m_msdf_text_cache.atlas.baked_pixel_height;
         summary.msdf_text_atlas_generation   = m_msdf_text_cache.generation;
         summary.msdf_text_atlas_size      =
             m_msdf_text_cache.atlas.atlas_size;
-        summary.msdf_text_px_range        = m_msdf_text_cache.atlas.px_range;
+        summary.msdf_text_px_range        =
+            msdf_text::px_range_for_pixel_height(
+                m_msdf_text_cache.atlas, m_msdf_text_cache.pixel_height);
         summary.msdf_text_message         = m_msdf_text_cache.message;
         // A frame whose first run rebuilt the atlas but whose later runs reused
         // it is a miss, not a reuse, for diagnostic purposes.
@@ -4721,16 +4728,22 @@ private:
         const std::array<float, 4>&       background_color,
         qreal                             normalized_device_pixel_ratio)
     {
+        // Batch 2: derive draw-size plane/UV data from the scale-independent
+        // baked glyph at the current draw pixel height. Batch 3 will precompute
+        // this scaled glyph once per draw-layout state instead of per cell.
+        const msdf_text::scaled_glyph_t scaled =
+            msdf_text::scaled_glyph(
+                m_msdf_text_cache.atlas, glyph, m_msdf_text_cache.pixel_height);
         const qreal physical_origin_x = physical_baseline_origin.x();
         const qreal physical_origin_y = physical_baseline_origin.y();
         const qreal physical_left =
-            physical_origin_x + static_cast<qreal>(glyph.plane_left);
+            physical_origin_x + static_cast<qreal>(scaled.plane_left);
         const qreal physical_top =
-            physical_origin_y + static_cast<qreal>(glyph.plane_bottom);
+            physical_origin_y + static_cast<qreal>(scaled.plane_bottom);
         const qreal physical_right =
-            physical_origin_x + static_cast<qreal>(glyph.plane_right);
+            physical_origin_x + static_cast<qreal>(scaled.plane_right);
         const qreal physical_bottom =
-            physical_origin_y + static_cast<qreal>(glyph.plane_top);
+            physical_origin_y + static_cast<qreal>(scaled.plane_top);
         if (physical_right <= physical_left || physical_bottom <= physical_top) {
             return;
         }
@@ -4742,10 +4755,10 @@ private:
             (physical_bottom - physical_top) /
                 normalized_device_pixel_ratio);
         QRectF uv_rect(
-            glyph.uv_left,
-            glyph.uv_top,
-            glyph.uv_right - glyph.uv_left,
-            glyph.uv_bottom - glyph.uv_top);
+            scaled.uv_left,
+            scaled.uv_top,
+            scaled.uv_right - scaled.uv_left,
+            scaled.uv_bottom - scaled.uv_top);
         if (run.clip_rect.isValid() &&
             !clip_glyph_instance(glyph_rect, uv_rect, run.clip_rect))
         {
@@ -4763,10 +4776,10 @@ private:
         store_color(instance.background_color, background_color);
         store_uv_bounds(
             instance.uv_bounds,
-            glyph.uv_left,
-            glyph.uv_top,
-            glyph.uv_right,
-            glyph.uv_bottom,
+            scaled.uv_left,
+            scaled.uv_top,
+            scaled.uv_right,
+            scaled.uv_bottom,
             m_msdf_text_cache.atlas.atlas_size);
         instance.frame_rect[0] = static_cast<float>(frame_left);
         instance.frame_rect[1] = static_cast<float>(frame_top);
@@ -5596,7 +5609,9 @@ private:
                 mvp.constData(),
                 mvp.constData() + 16,
                 std::begin(msdf_uniform.matrix));
-            msdf_uniform.px_range      = m_msdf_text_cache.atlas.px_range;
+            msdf_uniform.px_range      =
+                msdf_text::px_range_for_pixel_height(
+                    m_msdf_text_cache.atlas, m_msdf_text_cache.pixel_height);
             msdf_uniform.target_width  = static_cast<float>(
                 std::max(1, render_target_size.width()));
             msdf_uniform.target_height = static_cast<float>(
