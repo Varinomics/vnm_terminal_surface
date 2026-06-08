@@ -433,6 +433,7 @@ add_executable(vnm_terminal_qt_render_smoke
 
 target_link_libraries(vnm_terminal_qt_render_smoke PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
+    Qt6::QuickPrivate
 )
 
 set_target_properties(vnm_terminal_qt_render_smoke PROPERTIES
@@ -446,6 +447,15 @@ add_test(
         ${vnm_terminal_qt_readback_environment}
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_qt_render_smoke>"
+)
+
+# The smoke test compares accelerated-atlas rasterization against a hardware GPU
+# reference and reports return code 77 to skip on software/headless RHI backends
+# (CI runners' llvmpipe/WARP devices, or an offscreen platform with no GPU).
+set_tests_properties(
+    vnm_terminal_qt_render_smoke
+    PROPERTIES
+        SKIP_RETURN_CODE 77
 )
 
 add_executable(vnm_terminal_qt_metrics

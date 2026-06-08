@@ -1,4 +1,5 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
+#include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 
@@ -8,6 +9,7 @@
 #include <QQuickWindow>
 #include <QSGRendererInterface>
 #include <QThread>
+#include <rhi/qrhi.h>
 
 #include <cstdint>
 #include <iostream>
@@ -22,6 +24,61 @@ int fail(const char* message)
 {
     std::cerr << "FAIL: " << message << '\n';
     return 1;
+}
+
+constexpr int k_unsupported_backend_skip_return_code = 77;
+
+int skip(const char* message)
+{
+    std::cerr << "SKIP: " << message << '\n';
+    return k_unsupported_backend_skip_return_code;
+}
+
+// The accelerated-atlas pixel assertions below compare against a hardware GPU
+// reference. Software and headless RHI backends (the llvmpipe/WARP devices on
+// CI runners, or an offscreen platform with no usable GPU context) do not
+// produce byte-identical rasterization, so the smoke test classifies the active
+// backend and skips the pixel-content checks there. A null renderer interface
+// or RHI means no usable accelerated context, which is treated the same way.
+bool renderer_is_software_or_headless(QQuickWindow& window)
+{
+    QSGRendererInterface* const renderer_interface = window.rendererInterface();
+    if (renderer_interface == nullptr) {
+        return true;
+    }
+
+    QRhi* const rhi = static_cast<QRhi*>(
+        renderer_interface->getResource(
+            &window,
+            QSGRendererInterface::RhiResource));
+    if (rhi == nullptr) {
+        return true;
+    }
+
+    return term::qsg_atlas_driver_info_is_known_software_renderer(rhi->driverInfo());
+}
+
+// Pump the event loop until the scene graph brings up its RHI so the backend
+// can be classified, or give up after a bounded number of iterations (which
+// itself indicates a headless/unusable context).
+bool wait_for_renderer_interface(QGuiApplication& app, QQuickWindow& window)
+{
+    for (int i = 0; i < 20; ++i) {
+        QSGRendererInterface* const renderer_interface =
+            window.rendererInterface();
+        if (renderer_interface != nullptr &&
+            renderer_interface->getResource(
+                &window,
+                QSGRendererInterface::RhiResource) != nullptr)
+        {
+            return true;
+        }
+
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+    }
+
+    return false;
 }
 
 int count_dark_background_pixels(const QImage& image, const QRect& area)
@@ -201,6 +258,15 @@ int main(int argc, char** argv)
         make_smoke_snapshot(1U, 0xffffffffU, 0xff090c10U));
 
     window.show();
+
+    if (!wait_for_renderer_interface(app, window) ||
+        renderer_is_software_or_headless(window))
+    {
+        return skip(
+            "accelerated atlas render smoke requires a hardware GPU; the active "
+            "RHI backend is software or headless and does not reproduce the "
+            "accelerated rasterization the pixel checks compare against");
+    }
 
     QImage rendered;
     if (!pump_until_rendered(app, window, rendered, false)) {
