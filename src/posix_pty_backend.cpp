@@ -495,20 +495,6 @@ void add_signal_target(Signal_targets& targets, pid_t process_group)
     }
 }
 
-pid_t process_group_for_child(pid_t child_pid)
-{
-    if (child_pid <= 0) {
-        return -1;
-    }
-
-    const pid_t process_group = ::getpgid(child_pid);
-    if (process_group > 0) {
-        return process_group;
-    }
-
-    return child_pid;
-}
-
 Signal_targets process_signal_targets(pid_t child_process_group, int master)
 {
     Signal_targets targets;
@@ -539,9 +525,20 @@ Signal_targets shutdown_signal_targets(
 
 std::optional<int> send_signal_to_targets(const Signal_targets& targets, int signal_number)
 {
+    const pid_t own_process_group = ::getpgrp();
     int first_error = 0;
     for (std::size_t i = 0U; i < targets.count; ++i) {
-        if (::kill(-targets.process_groups[i], signal_number) == 0) {
+        const pid_t process_group = targets.process_groups[i];
+        // Never signal our own process group: if the child's process group was
+        // captured before the child established its own session/group (a forkpty
+        // + setsid race), it could equal the parent's group, and kill(-pgid)
+        // would deliver SIGKILL to this process too. Such a target is never a
+        // descendant we need to reap.
+        if (process_group <= 1 || process_group == own_process_group) {
+            continue;
+        }
+
+        if (::kill(-process_group, signal_number) == 0) {
             continue;
         }
 
@@ -703,7 +700,12 @@ public:
             m_write_wake_read                    = std::move(write_wake_read);
             m_write_wake_write                   = std::move(write_wake_write);
             m_child_pid                          = child_pid;
-            m_child_process_group                = process_group_for_child(child_pid);
+            // The child makes itself a session/process-group leader (forkpty's
+            // login_tty -> setsid, plus the explicit setpgid(0, 0) above), so
+            // its process group is its own pid. Use that rather than a racy
+            // getpgid(child_pid) read, which can observe the parent's group
+            // before the child has run setsid.
+            m_child_process_group                = child_pid;
             m_running                            = true;
             m_start_attempted                    = true;
             m_start_in_progress                  = false;
@@ -1168,6 +1170,7 @@ private:
         wake_io_threads();
 
         callbacks = callbacks_for_delivery();
+        PTYDIAG("report_exit reason=%d code=%d", static_cast<int>(reason), exit_code);
         report_native_backend_exit(callbacks, reason, exit_code);
     }
 
@@ -1448,6 +1451,13 @@ private:
             }
 
             const ssize_t bytes_read = ::read(master, buffer.data(), buffer.size());
+            if (final_drain_deadline.has_value() &&
+                !(bytes_read < 0 &&
+                    (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)))
+            {
+                PTYDIAG("RL drain read bytes=%zd errno=%d", bytes_read,
+                    bytes_read < 0 ? errno : 0);
+            }
             if (bytes_read < 0) {
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                     continue;
@@ -1701,14 +1711,20 @@ private:
 
     void kill_child_process_group_after_exit_timeout()
     {
+        // Kill any leftover members of the child's process group (e.g. a
+        // backgrounded descendant still holding the PTY slave open) once the
+        // direct child has exited and the exit drain has finished. This must NOT
+        // be gated on the reader having timed out: that gate was a proxy for
+        // "a descendant kept the slave open so the master never EOFed", which
+        // holds on Linux but not on macOS, where the master EOFs as soon as the
+        // session-leader child exits even with a descendant alive. So the reader
+        // finishes via EOF (timed_out == false) and the descendant would leak.
+        // kill(-pgid) is best effort and ignores ESRCH, so a clean exit with no
+        // descendants is a harmless no-op.
         pid_t child_process_group = -1;
         int master = -1;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            if (!m_reader_timed_out_after_child_reap) {
-                return;
-            }
-
             child_process_group = m_child_process_group;
             master = m_master.get();
         }
