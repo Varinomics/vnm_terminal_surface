@@ -69,14 +69,6 @@ QFont vnm_terminal_font(QString family, qreal pixel_size)
     QFont font(family);
     font.setStyleHint(QFont::Monospace);
     font.setFixedPitch(true);
-    // The terminal renders primary text through MSDF (distance fields derived from
-    // glyph outlines, which are inherently unhinted). The bundled monospace font
-    // ships FontForge TrueType bytecode that FreeType builds without the bytecode
-    // interpreter (such as the Qt binaries on the CI runners) reject with a
-    // load-glyph error, breaking the Qt glyph-atlas fallback path. Request no
-    // native hinting so glyph rasterization never depends on the interpreter; this
-    // keeps the fallback path consistent with the unhinted MSDF path.
-    font.setHintingPreference(QFont::PreferNoHinting);
     if (std::isfinite(pixel_size) && pixel_size > 0.0) {
         font.setPixelSize(std::max(1, static_cast<int>(std::round(pixel_size))));
     }
