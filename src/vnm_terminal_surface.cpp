@@ -1421,20 +1421,18 @@ QString surface_synchronized_output_scroll_policy_name(
     return QStringLiteral("unknown");
 }
 
-QString wheel_trace_scroll_action_name(term::Terminal_viewport_scroll_action action)
+VNM_TerminalSurface::Scroll_action public_scroll_action(
+    term::Terminal_viewport_scroll_action action)
 {
+    using Public = VNM_TerminalSurface::Scroll_action;
     switch (action) {
-        case term::Terminal_viewport_scroll_action::VIEWPORT_MOVED:
-            return QStringLiteral("viewport_moved");
-        case term::Terminal_viewport_scroll_action::AT_BOUNDARY:
-            return QStringLiteral("at_boundary");
-        case term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED:
-            return QStringLiteral("deferred_intent_recorded");
-        case term::Terminal_viewport_scroll_action::TERMINAL_INPUT:
-            return QStringLiteral("terminal_input");
+        case term::Terminal_viewport_scroll_action::VIEWPORT_MOVED:           return Public::VIEWPORT_MOVED;
+        case term::Terminal_viewport_scroll_action::AT_BOUNDARY:              return Public::AT_BOUNDARY;
+        case term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED: return Public::DEFERRED_INTENT_RECORDED;
+        case term::Terminal_viewport_scroll_action::TERMINAL_INPUT:           return Public::TERMINAL_INPUT;
     }
 
-    return QStringLiteral("unknown");
+    return Public::NONE;
 }
 
 QJsonObject wheel_trace_viewport_object(const term::Terminal_viewport_state& viewport)
@@ -2137,6 +2135,35 @@ struct VNM_TerminalSurface::Private
     std::atomic_bool                                       session_drain_queued                  = false;
     std::atomic_bool                                       shutting_down                         = false;
 };
+
+QString VNM_TerminalSurface::scroll_noop_cause_name(Scroll_noop_cause cause)
+{
+    switch (cause) {
+        case Scroll_noop_cause::NONE:                          return QString();
+        case Scroll_noop_cause::ZERO_LINE_DELTA:               return QStringLiteral("zero_line_delta");
+        case Scroll_noop_cause::NO_SESSION:                    return QStringLiteral("no_session");
+        case Scroll_noop_cause::SYNCHRONIZED_OUTPUT_DEFERRED:  return QStringLiteral("synchronized_output_deferred");
+        case Scroll_noop_cause::SYNCHRONIZED_OUTPUT_PUBLISHED: return QStringLiteral("synchronized_output_published");
+        case Scroll_noop_cause::ALTERNATE_SCREEN:              return QStringLiteral("alternate_screen");
+        case Scroll_noop_cause::BOUNDARY_OR_CLAMP:             return QStringLiteral("boundary_or_clamp");
+        case Scroll_noop_cause::NO_PUBLICATION:                return QStringLiteral("no_publication");
+    }
+
+    return QString();
+}
+
+QString VNM_TerminalSurface::scroll_action_name(Scroll_action action)
+{
+    switch (action) {
+        case Scroll_action::NONE:                     return QString();
+        case Scroll_action::VIEWPORT_MOVED:           return QStringLiteral("viewport_moved");
+        case Scroll_action::AT_BOUNDARY:              return QStringLiteral("at_boundary");
+        case Scroll_action::DEFERRED_INTENT_RECORDED: return QStringLiteral("deferred_intent_recorded");
+        case Scroll_action::TERMINAL_INPUT:           return QStringLiteral("terminal_input");
+    }
+
+    return QString();
+}
 
 VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
 :
@@ -2908,12 +2935,12 @@ VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(
     wheel_scroll_diagnostic_result_t diagnostic;
     diagnostic.session_present = m_private->session != nullptr;
     if (line_delta == 0) {
-        diagnostic.no_op_cause = QStringLiteral("zero_line_delta");
+        diagnostic.no_op_cause = Scroll_noop_cause::ZERO_LINE_DELTA;
         return diagnostic;
     }
 
     if (!diagnostic.session_present) {
-        diagnostic.no_op_cause = QStringLiteral("no_session");
+        diagnostic.no_op_cause = Scroll_noop_cause::NO_SESSION;
         return diagnostic;
     }
 
@@ -2941,8 +2968,7 @@ VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(
     diagnostic.local_scroll_intent_recorded = true;
     const term::Terminal_viewport_scroll_result scroll_result =
         m_private->session->scroll_published_viewport_lines(line_delta);
-    diagnostic.scroll_action =
-        wheel_trace_scroll_action_name(scroll_result.action);
+    diagnostic.scroll_action = public_scroll_action(scroll_result.action);
     diagnostic.applied_line_delta = scroll_result.applied_line_delta;
     sync_from_session();
     diagnostic.local_scroll_applied =
@@ -2984,22 +3010,22 @@ VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(
     }
 
     if (diagnostic.render_publication_blocked) {
-        diagnostic.no_op_cause = QStringLiteral("synchronized_output_deferred");
+        diagnostic.no_op_cause = Scroll_noop_cause::SYNCHRONIZED_OUTPUT_DEFERRED;
     }
     else
     if (diagnostic.published_synchronized_output) {
-        diagnostic.no_op_cause = QStringLiteral("synchronized_output_published");
+        diagnostic.no_op_cause = Scroll_noop_cause::SYNCHRONIZED_OUTPUT_PUBLISHED;
     }
     else
     if (diagnostic.alternate_screen) {
-        diagnostic.no_op_cause = QStringLiteral("alternate_screen");
+        diagnostic.no_op_cause = Scroll_noop_cause::ALTERNATE_SCREEN;
     }
     else
     if (scroll_result.action == term::Terminal_viewport_scroll_action::AT_BOUNDARY) {
-        diagnostic.no_op_cause = QStringLiteral("boundary_or_clamp");
+        diagnostic.no_op_cause = Scroll_noop_cause::BOUNDARY_OR_CLAMP;
     }
     else {
-        diagnostic.no_op_cause = QStringLiteral("no_publication");
+        diagnostic.no_op_cause = Scroll_noop_cause::NO_PUBLICATION;
     }
 
     return diagnostic;
@@ -3030,7 +3056,7 @@ VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
     wheel_scroll_diagnostic_result_t diagnostic;
     diagnostic.session_present = m_private->session != nullptr;
     if (m_private->session == nullptr) {
-        diagnostic.no_op_cause = QStringLiteral("no_session");
+        diagnostic.no_op_cause = Scroll_noop_cause::NO_SESSION;
         return diagnostic;
     }
 
@@ -3059,8 +3085,7 @@ VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
     diagnostic.local_scroll_intent_recorded = true;
     const term::Terminal_viewport_scroll_result scroll_result =
         m_private->session->scroll_published_viewport_to_offset_from_tail(offset_from_tail);
-    diagnostic.scroll_action =
-        wheel_trace_scroll_action_name(scroll_result.action);
+    diagnostic.scroll_action = public_scroll_action(scroll_result.action);
     diagnostic.applied_line_delta = scroll_result.applied_line_delta;
     sync_from_session();
     diagnostic.local_scroll_applied =
@@ -3102,22 +3127,22 @@ VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
     }
 
     if (diagnostic.render_publication_blocked) {
-        diagnostic.no_op_cause = QStringLiteral("synchronized_output_deferred");
+        diagnostic.no_op_cause = Scroll_noop_cause::SYNCHRONIZED_OUTPUT_DEFERRED;
     }
     else
     if (diagnostic.published_synchronized_output) {
-        diagnostic.no_op_cause = QStringLiteral("synchronized_output_published");
+        diagnostic.no_op_cause = Scroll_noop_cause::SYNCHRONIZED_OUTPUT_PUBLISHED;
     }
     else
     if (diagnostic.alternate_screen) {
-        diagnostic.no_op_cause = QStringLiteral("alternate_screen");
+        diagnostic.no_op_cause = Scroll_noop_cause::ALTERNATE_SCREEN;
     }
     else
     if (scroll_result.action == term::Terminal_viewport_scroll_action::AT_BOUNDARY) {
-        diagnostic.no_op_cause = QStringLiteral("boundary_or_clamp");
+        diagnostic.no_op_cause = Scroll_noop_cause::BOUNDARY_OR_CLAMP;
     }
     else {
-        diagnostic.no_op_cause = QStringLiteral("no_publication");
+        diagnostic.no_op_cause = Scroll_noop_cause::NO_PUBLICATION;
     }
 
     return diagnostic;
@@ -4348,7 +4373,8 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
             if (has_scroll_result) {
                 object.insert(
                     QStringLiteral("scroll_action"),
-                    wheel_trace_scroll_action_name(trace_scroll_result.action));
+                    VNM_TerminalSurface::scroll_action_name(
+                        public_scroll_action(trace_scroll_result.action)));
                 object.insert(
                     QStringLiteral("applied_line_delta"),
                     trace_scroll_result.applied_line_delta);
