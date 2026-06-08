@@ -21,7 +21,6 @@
 #include <vector>
 #include <cerrno>
 #include <csignal>
-#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
@@ -35,19 +34,19 @@
 #include <pty.h>
 #endif
 
-// TEMP diagnostic: locate the residual macOS posix_pty_backend teardown hang.
-#define PTYDIAG(...)                                  \
-    do {                                              \
-        ::fprintf(stderr, "PTYDIAG " __VA_ARGS__);    \
-        ::fprintf(stderr, "\n");                      \
-        ::fflush(stderr);                             \
-    } while (0)
-
 namespace vnm_terminal::internal {
 
 namespace {
 
 constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
+// Interval at which the writer re-checks the stop flags while waiting for the
+// PTY master to become writable. The wake pipe does not reliably interrupt a
+// POLLOUT poll on a PTY master on macOS (e.g. once the child has exited but a
+// descendant still holds the slave open, leaving the master neither writable
+// nor hung up), so the writer must not block on poll() indefinitely or teardown
+// deadlocks joining it. The reader's poll is already bounded by the exit drain
+// deadline; the writer had no equivalent bound.
+constexpr std::chrono::milliseconds k_master_writable_poll_interval(100);
 constexpr int k_waitpid_failure_exit_code = -1;
 
 QString posix_error_message(QStringView context, int code)
@@ -981,8 +980,6 @@ public:
             reader_finished                      = m_reader_finished;
         }
 
-        PTYDIAG("shutdown begin child_pid=%d pgrp=%d child_reaped=%d reader_finished=%d",
-            child_pid, child_process_group, child_reaped ? 1 : 0, reader_finished ? 1 : 0);
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
@@ -1005,16 +1002,11 @@ public:
         // Signal the child PID directly, which always reaches it, so waitpid()
         // returns and the wait thread can be joined.
         if (!child_reaped && child_pid > 0) {
-            const int kill_ret = ::kill(child_pid, SIGKILL);
-            PTYDIAG("shutdown direct-kill child_pid=%d ret=%d errno=%d",
-                child_pid, kill_ret, kill_ret == 0 ? 0 : errno);
+            ::kill(child_pid, SIGKILL);
         }
 
-        PTYDIAG("shutdown joining");
         join_threads();
-        PTYDIAG("shutdown joined, reaping");
         reap_child_if_unreaped(child_pid);
-        PTYDIAG("shutdown reap done");
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_master.reset();
@@ -1222,9 +1214,7 @@ private:
             }
         }
 
-        PTYDIAG("reap_if_unreaped waitpid begin child_pid=%d", child_pid);
         const int result = waitpid_nointr(child_pid, nullptr, 0);
-        PTYDIAG("reap_if_unreaped waitpid returned ret=%d", result);
         if (result == child_pid || (result < 0 && errno == ECHILD)) {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_child_reaped = true;
@@ -1423,7 +1413,6 @@ private:
                 static_cast<qsizetype>(bytes_read)));
         }
 
-        PTYDIAG("read_loop finished timed_out=%d", timed_out_after_child_reap ? 1 : 0);
         mark_reader_finished(timed_out_after_child_reap);
     }
 
@@ -1465,14 +1454,28 @@ private:
 
     bool wait_until_master_writable(int master, int wake_read)
     {
-        PTYDIAG("writer wait_until_master_writable enter");
         for (;;) {
             pollfd fds[2] = {
                 { master, POLLOUT | POLLHUP | POLLERR, 0 },
                 { wake_read, POLLIN, 0 },
             };
 
-            const int poll_result = ::poll(fds, 2, -1);
+            const int poll_result = ::poll(
+                fds,
+                2,
+                static_cast<int>(k_master_writable_poll_interval.count()));
+            if (poll_result == 0) {
+                // Heartbeat tick: no writability or wake event arrived. Re-check
+                // the stop flags directly rather than trusting the wake pipe to
+                // break this POLLOUT poll (unreliable on macOS); on shutdown
+                // this lets the writer thread exit so it can be joined. Outside
+                // shutdown, keep waiting for the master to become writable.
+                if (write_stopping()) {
+                    return false;
+                }
+                continue;
+            }
+
             if (poll_result < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -1570,13 +1573,9 @@ private:
             return;
         }
 
-        PTYDIAG("wait_loop waitpid begin child_pid=%d", child_pid);
         int status = 0;
-        const pid_t reaped = waitpid_nointr(child_pid, &status, 0);
-        const int reaped_errno = errno;
-        PTYDIAG("wait_loop waitpid returned ret=%d", static_cast<int>(reaped));
-        if (reaped != child_pid) {
-            const int wait_error = reaped_errno;
+        if (waitpid_nointr(child_pid, &status, 0) != child_pid) {
+            const int wait_error = errno;
             QByteArray paused_output;
             bool paused_output_delivery_started = false;
             {
@@ -1704,15 +1703,10 @@ private:
 
     void join_threads()
     {
-        PTYDIAG("join reader");
         join_or_detach_native_backend_thread(m_reader_thread);
-        PTYDIAG("join writer");
         join_or_detach_native_backend_thread(m_writer_thread);
-        PTYDIAG("join wait");
         join_or_detach_native_backend_thread(m_wait_thread);
-        PTYDIAG("join termination");
         join_or_detach_native_backend_thread(m_termination_thread);
-        PTYDIAG("join done");
     }
 
     std::mutex                          m_mutex;
