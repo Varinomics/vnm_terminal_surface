@@ -59,6 +59,16 @@ constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
 // wake pipe with this bound (see wait_for_write_capacity). The cost is one idle
 // wake-up per interval per thread when the terminal is silent.
 constexpr std::chrono::milliseconds k_native_master_poll_interval(100);
+// While output is paused the reader keeps draining the PTY master and buffers
+// the output application-side (m_paused_output) instead of leaving it in the
+// kernel and parking. It only parks for backpressure once the buffer reaches
+// this high-water mark. macOS flow-controls a slave write almost immediately
+// when the master is not being read (a ~19-byte write blocks), so a child that
+// emits a final line and exits while output is paused would otherwise block in
+// write() forever and never exit -- breaking exit-drain delivery. Buffering
+// app-side lets small output through (the child exits, the drain delivers it)
+// while still applying backpressure for genuinely high-volume output.
+constexpr qsizetype k_paused_output_high_watermark_bytes = 1 << 20; // 1 MiB
 constexpr int k_waitpid_failure_exit_code = -1;
 
 QString posix_error_message(QStringView context, int code)
@@ -1380,21 +1390,28 @@ private:
             int wake_read = -1;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
-                if (!(m_stopping ||
-                        ((m_process_stopping || !m_output_paused) &&
-                            !m_paused_output_delivery_in_progress)))
-                {
-                    PTYDIAG("RL cv-block stopping=%d proc=%d paused=%d deliv=%d reaped=%d",
+                // Keep draining the master while output is paused (buffering
+                // app-side) until the paused buffer reaches the high-water mark;
+                // only then park for backpressure. This stops a child that emits
+                // a final line and exits while paused from blocking forever in
+                // write() on macOS (see k_paused_output_high_watermark_bytes).
+                const auto reader_can_proceed = [&] {
+                    return m_stopping ||
+                        (!m_paused_output_delivery_in_progress &&
+                            (m_process_stopping ||
+                             !m_output_paused ||
+                             m_paused_output.size() <
+                                 k_paused_output_high_watermark_bytes));
+                };
+                if (!reader_can_proceed()) {
+                    PTYDIAG("RL cv-block stopping=%d proc=%d paused=%d deliv=%d reaped=%d buf=%lld",
                         m_stopping ? 1 : 0, m_process_stopping ? 1 : 0,
                         m_output_paused ? 1 : 0,
                         m_paused_output_delivery_in_progress ? 1 : 0,
-                        m_child_reaped ? 1 : 0);
+                        m_child_reaped ? 1 : 0,
+                        static_cast<long long>(m_paused_output.size()));
                 }
-                m_output_cv.wait(lock, [&] {
-                    return m_stopping ||
-                        ((m_process_stopping || !m_output_paused) &&
-                            !m_paused_output_delivery_in_progress);
-                });
+                m_output_cv.wait(lock, reader_can_proceed);
 
                 if (m_stopping) {
                     break;
