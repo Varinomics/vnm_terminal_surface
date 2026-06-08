@@ -39,13 +39,15 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
-// Upper bound on how long the reader and writer threads block in a single
-// poll() on the PTY master. The wake pipe does not reliably interrupt a poll on
-// a PTY master on macOS (e.g. once the child has exited but a descendant still
-// holds the slave open, leaving the master neither readable/writable nor hung
-// up), so the I/O threads must re-check their stop flags on a bounded interval
-// or teardown deadlocks joining them. The cost is one idle wake-up per interval
-// per thread when the terminal is silent.
+// Upper bound on how long an I/O thread blocks in a single poll() before it
+// re-checks its stop flags. poll() on a PTY master is unreliable on macOS once
+// the child has exited while a descendant still holds the slave open (the
+// master is neither readable/writable nor hung up, and the wake-pipe write may
+// not interrupt the poll), so the I/O threads must not wait on it indefinitely
+// or teardown deadlocks joining them. The reader bounds its master POLLIN poll
+// with this; the writer never polls the master at all and instead waits on its
+// wake pipe with this bound (see wait_for_write_capacity). The cost is one idle
+// wake-up per interval per thread when the terminal is silent.
 constexpr std::chrono::milliseconds k_native_master_poll_interval(100);
 constexpr int k_waitpid_failure_exit_code = -1;
 
@@ -1463,58 +1465,43 @@ private:
         }
     }
 
-    bool wait_until_master_writable(int master, int wake_read)
+    // Wait, bounded by a heartbeat, before retrying a write that returned
+    // EAGAIN. This deliberately polls ONLY the wake pipe (an ordinary pipe) and
+    // never the PTY master: poll() on a PTY master is unreliable on macOS -- a
+    // POLLOUT poll there could be wedged neither by the wake-pipe write nor by a
+    // finite timeout once the child has exited while a descendant still holds
+    // the slave open, deadlocking the writer thread and teardown. The retried
+    // non-blocking write() is itself the authoritative writability test, so we
+    // only need a bounded, reliably-interruptible wait here. Returns false when
+    // the writer should stop.
+    bool wait_for_write_capacity(int wake_read)
     {
-        for (;;) {
-            pollfd fds[2] = {
-                { master, POLLOUT | POLLHUP | POLLERR, 0 },
-                { wake_read, POLLIN, 0 },
-            };
+        pollfd fds[1] = {
+            { wake_read, POLLIN, 0 },
+        };
 
-            const int poll_result = ::poll(
-                fds,
-                2,
-                static_cast<int>(k_native_master_poll_interval.count()));
-            if (poll_result == 0) {
-                // Heartbeat tick: no writability or wake event arrived. Re-check
-                // the stop flags directly rather than trusting the wake pipe to
-                // break this POLLOUT poll (unreliable on macOS); on shutdown
-                // this lets the writer thread exit so it can be joined. Outside
-                // shutdown, keep waiting for the master to become writable.
-                if (write_stopping()) {
-                    return false;
-                }
-                continue;
+        const int poll_result = ::poll(
+            fds,
+            1,
+            static_cast<int>(k_native_master_poll_interval.count()));
+        if (poll_result < 0) {
+            if (errno == EINTR) {
+                return !write_stopping();
             }
 
-            if (poll_result < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-
-                if (!write_stopping()) {
-                    report_error(
-                        Terminal_backend_error_code::WRITE_FAILED,
-                        posix_error_message(QStringLiteral("poll PTY input"), errno));
-                }
-                return false;
+            if (!write_stopping()) {
+                report_error(
+                    Terminal_backend_error_code::WRITE_FAILED,
+                    posix_error_message(QStringLiteral("poll PTY write wake"), errno));
             }
-
-            if ((fds[1].revents & POLLIN) != 0) {
-                drain_wake_pipe(wake_read);
-                if (write_stopping()) {
-                    return false;
-                }
-            }
-
-            if ((fds[0].revents & POLLOUT) != 0) {
-                return true;
-            }
-
-            if ((fds[0].revents & (POLLHUP | POLLERR)) != 0) {
-                return false;
-            }
+            return false;
         }
+
+        if ((fds[0].revents & POLLIN) != 0) {
+            drain_wake_pipe(wake_read);
+        }
+
+        return !write_stopping();
     }
 
     bool write_all(const QByteArray& bytes)
@@ -1533,24 +1520,33 @@ private:
                 wake_read = m_write_wake_read.get();
             }
 
-            if (!wait_until_master_writable(master, wake_read)) {
-                return false;
-            }
-
-            if (write_stopping()) {
-                return false;
-            }
-
+            // Write first: the PTY master is non-blocking, so write() is itself
+            // the writability test. Only wait when it reports EAGAIN, and wait
+            // on the wake pipe rather than polling the master for POLLOUT (see
+            // wait_for_write_capacity). This keeps the writer off the unreliable
+            // macOS PTY-master POLLOUT path entirely.
             const qsizetype remaining = bytes.size() - offset;
             const ssize_t count = ::write(
                 master,
                 bytes.constData() + offset,
                 static_cast<std::size_t>(remaining));
-            if (count < 0) {
-                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
-                    continue;
-                }
+            if (count > 0) {
+                offset += static_cast<qsizetype>(count);
+                continue;
+            }
 
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+
+            if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                if (!wait_for_write_capacity(wake_read)) {
+                    return false;
+                }
+                continue;
+            }
+
+            if (count < 0) {
                 if (errno != EIO && !write_stopping()) {
                     report_error(
                         Terminal_backend_error_code::WRITE_FAILED,
@@ -1559,14 +1555,11 @@ private:
                 return false;
             }
 
-            if (count == 0) {
-                report_error(
-                    Terminal_backend_error_code::WRITE_FAILED,
-                    QStringLiteral("PTY input write made no progress"));
-                return false;
-            }
-
-            offset += static_cast<qsizetype>(count);
+            // count == 0: the write made no progress.
+            report_error(
+                Terminal_backend_error_code::WRITE_FAILED,
+                QStringLiteral("PTY input write made no progress"));
+            return false;
         }
 
         return true;
