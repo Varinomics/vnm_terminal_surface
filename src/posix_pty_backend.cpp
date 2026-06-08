@@ -39,14 +39,14 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
-// Interval at which the writer re-checks the stop flags while waiting for the
-// PTY master to become writable. The wake pipe does not reliably interrupt a
-// POLLOUT poll on a PTY master on macOS (e.g. once the child has exited but a
-// descendant still holds the slave open, leaving the master neither writable
-// nor hung up), so the writer must not block on poll() indefinitely or teardown
-// deadlocks joining it. The reader's poll is already bounded by the exit drain
-// deadline; the writer had no equivalent bound.
-constexpr std::chrono::milliseconds k_master_writable_poll_interval(100);
+// Upper bound on how long the reader and writer threads block in a single
+// poll() on the PTY master. The wake pipe does not reliably interrupt a poll on
+// a PTY master on macOS (e.g. once the child has exited but a descendant still
+// holds the slave open, leaving the master neither readable/writable nor hung
+// up), so the I/O threads must re-check their stop flags on a bounded interval
+// or teardown deadlocks joining them. The cost is one idle wake-up per interval
+// per thread when the terminal is silent.
+constexpr std::chrono::milliseconds k_native_master_poll_interval(100);
 constexpr int k_waitpid_failure_exit_code = -1;
 
 QString posix_error_message(QStringView context, int code)
@@ -1360,9 +1360,20 @@ private:
                 break;
             }
 
-            const int poll_result = ::poll(fds, 2, poll_timeout_until(final_drain_deadline));
+            // Bound the wait: when a drain deadline is armed it caps the poll;
+            // otherwise fall back to the heartbeat so the reader re-checks its
+            // stop flags rather than trusting the wake pipe to interrupt a poll
+            // on the PTY master (unreliable on macOS). A heartbeat tick with no
+            // deadline just means no master/wake activity yet -- keep waiting.
+            const int poll_timeout = final_drain_deadline.has_value()
+                ? poll_timeout_until(final_drain_deadline)
+                : static_cast<int>(k_native_master_poll_interval.count());
+            const int poll_result = ::poll(fds, 2, poll_timeout);
             if (poll_result == 0) {
-                timed_out_after_child_reap = final_drain_deadline.has_value();
+                if (!final_drain_deadline.has_value()) {
+                    continue;
+                }
+                timed_out_after_child_reap = true;
                 break;
             }
 
@@ -1463,7 +1474,7 @@ private:
             const int poll_result = ::poll(
                 fds,
                 2,
-                static_cast<int>(k_master_writable_poll_interval.count()));
+                static_cast<int>(k_native_master_poll_interval.count()));
             if (poll_result == 0) {
                 // Heartbeat tick: no writability or wake event arrived. Re-check
                 // the stop flags directly rather than trusting the wake pipe to
