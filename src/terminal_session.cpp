@@ -4143,10 +4143,22 @@ void Terminal_session::record_backend_output_capture_chunk(QByteArrayView bytes)
     }
 
     std::lock_guard<std::mutex> lock(m_backend_output_capture_mutex);
-    QFile capture_file(m_config.backend_output_capture_path);
-    if (capture_file.open(QIODevice::WriteOnly | QIODevice::Append)) {
-        capture_file.write(bytes.data(), bytes.size());
+
+    // Open the capture file once and keep it for the session lifetime instead of
+    // reopening per chunk. Flush after every write so a concurrent reader and the
+    // crash-safety expectation see the same byte stream the per-chunk
+    // open/append/close path produced. A failed open is retried on the next chunk,
+    // matching the prior behaviour.
+    if (!m_backend_output_capture_file) {
+        auto capture_file = std::make_unique<QFile>(m_config.backend_output_capture_path);
+        if (!capture_file->open(QIODevice::WriteOnly | QIODevice::Append)) {
+            return;
+        }
+        m_backend_output_capture_file = std::move(capture_file);
     }
+
+    m_backend_output_capture_file->write(bytes.data(), bytes.size());
+    m_backend_output_capture_file->flush();
 }
 
 void Terminal_session::record_output_chunk(QByteArray bytes)
