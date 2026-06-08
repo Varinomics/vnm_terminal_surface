@@ -3353,6 +3353,12 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
         return;
     }
 
+    // No active session: there is no backend to deliver input to, but the surface still
+    // owns keyboard focus. Encode the key to decide whether it is terminal input: if it
+    // would produce bytes, accept (swallow) it so Qt does not fall back to default item
+    // navigation or a system beep; if it encodes to nothing, ignore it so ordinary
+    // shortcut/navigation handling still runs. The encoded bytes are intentionally
+    // discarded because no session exists to receive them.
     const QByteArray bytes =
         term::encode_terminal_key_event(*event, term::Terminal_input_mode_state{});
     if (bytes.isEmpty()) {
