@@ -1239,6 +1239,18 @@ private:
         });
     }
 
+    // Block until the exit-drain window (reap_time + k_exit_output_drain_timeout)
+    // elapses, returning early if shutdown begins. Uses m_output_cv, which
+    // shutdown notifies after setting m_stopping, so teardown is never delayed.
+    void wait_out_exit_drain_window(std::chrono::steady_clock::time_point reap_time)
+    {
+        const auto deadline = reap_time + k_exit_output_drain_timeout;
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_output_cv.wait_until(lock, deadline, [&] {
+            return m_stopping;
+        });
+    }
+
     void reap_child_if_unreaped(pid_t child_pid)
     {
         if (child_pid <= 0) {
@@ -1641,6 +1653,7 @@ private:
         int status = 0;
         const pid_t reaped = waitpid_nointr(child_pid, &status, 0);
         const int reaped_errno = errno;
+        const auto reap_time = std::chrono::steady_clock::now();
         PTYDIAG("WT waitpid end ret=%d", static_cast<int>(reaped));
         if (reaped != child_pid) {
             const int wait_error = reaped_errno;
@@ -1703,6 +1716,16 @@ private:
         PTYDIAG("WT reader-wait begin");
         wait_for_reader_finished();
         PTYDIAG("WT reader-wait end");
+        // Honor a consistent exit-drain window before finalizing the exit, even
+        // when the reader finished early. On Linux the master stays open while a
+        // descendant holds the slave, so the reader drains for the full
+        // k_exit_output_drain_timeout; on macOS the master EOFs the instant the
+        // session-leader child exits, so the reader finishes immediately. Without
+        // this wait the exit would be reported and leftover descendants reaped
+        // within microseconds on macOS -- before a consumer could observe the
+        // descendant alive -- diverging from Linux. Wait out the remainder of the
+        // drain window (interruptibly, so shutdown is not delayed).
+        wait_out_exit_drain_window(reap_time);
         // Report the child's exit BEFORE reaping leftover descendants. The
         // descendant must remain observable as alive until the backend reports
         // the direct child's exit (the contract a consumer relies on); the
