@@ -217,22 +217,52 @@ public:
     };
     Q_ENUM(Clipboard_response_decision)
 
+    enum class Scroll_noop_cause
+    {
+        NONE,
+        ZERO_LINE_DELTA,
+        NO_SESSION,
+        SYNCHRONIZED_OUTPUT_DEFERRED,
+        SYNCHRONIZED_OUTPUT_PUBLISHED,
+        ALTERNATE_SCREEN,
+        BOUNDARY_OR_CLAMP,
+        NO_PUBLICATION,
+    };
+    Q_ENUM(Scroll_noop_cause)
+
+    enum class Scroll_action
+    {
+        NONE,
+        VIEWPORT_MOVED,
+        AT_BOUNDARY,
+        DEFERRED_INTENT_RECORDED,
+        TERMINAL_INPUT,
+    };
+    Q_ENUM(Scroll_action)
+
+    // Diagnostic schema strings for the scroll-diagnostic enums. NONE maps to an
+    // empty string, matching the unset QString these fields previously held, so
+    // transcript and wheel-trace output is byte-for-byte unchanged. Hosts should
+    // branch on the enum values, not on these strings.
+    static QString scroll_noop_cause_name(Scroll_noop_cause cause);
+    static QString scroll_action_name(Scroll_action action);
+
     struct wheel_scroll_diagnostic_result_t
     {
-        QString no_op_cause;
-        QString scroll_action;
-        qint64  backend_drain_elapsed_ns      = 0;
-        int     backend_drain_calls           = 0;
-        int     applied_line_delta            = 0;
-        bool    session_present               = false;
-        bool    render_publication_blocked    = false;
-        bool    published_synchronized_output = false;
-        bool    alternate_screen              = false;
-        bool    local_scroll_intent_recorded  = false;
-        bool    local_scroll_applied          = false;
-        bool    visible_scroll_applied        = false;
-        bool    deferred_intent_recorded      = false;
-        bool    event_accepted                = false;
+        Scroll_noop_cause no_op_cause                   = Scroll_noop_cause::NONE;
+        Scroll_action     scroll_action                 = Scroll_action::NONE;
+        qint64            backend_drain_elapsed_ns      = 0;
+        int               backend_drain_calls           = 0;
+        int               applied_line_delta            = 0;
+        bool              session_present               = false;
+        bool              render_publication_blocked    = false;
+        bool              published_synchronized_output = false;
+        bool              alternate_screen              = false;
+        bool              local_scroll_intent_recorded  = false;
+        bool              local_scroll_applied          = false;
+        bool              visible_scroll_applied        = false;
+        bool              deferred_intent_recorded      = false;
+        bool              event_accepted                = false;
     };
 
     enum class Selection_state
