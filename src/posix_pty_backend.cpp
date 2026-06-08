@@ -39,6 +39,15 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
+// Upper bound on how long the output reader parks in poll() while no drain
+// deadline is armed. The reader must re-evaluate m_stopping / m_child_reaped
+// periodically so the exit path can make progress even if the wake-pipe write
+// fails to interrupt a parked poll(): macOS does not reliably break a poll()
+// that is simultaneously watching a PTY master fd, which otherwise deadlocks
+// the exit path (the reader never finishes, so the child exit is never
+// reported and ctest kills the process at its timeout). The cost is a single
+// idle wake-up per interval when the terminal is silent.
+constexpr std::chrono::milliseconds k_reader_poll_heartbeat(1000);
 constexpr int k_waitpid_failure_exit_code = -1;
 
 QString posix_error_message(QStringView context, int code)
@@ -1339,9 +1348,20 @@ private:
                 break;
             }
 
-            const int poll_result = ::poll(fds, 2, poll_timeout_until(final_drain_deadline));
+            // Never block in poll() without an upper bound. Once a drain
+            // deadline is armed it caps the wait; otherwise fall back to the
+            // heartbeat so the reader re-checks shutdown state on its own rather
+            // than depending on the wake-pipe to interrupt the poll (see
+            // k_reader_poll_heartbeat).
+            const int poll_timeout = final_drain_deadline.has_value()
+                ? poll_timeout_until(final_drain_deadline)
+                : static_cast<int>(k_reader_poll_heartbeat.count());
+            const int poll_result = ::poll(fds, 2, poll_timeout);
             if (poll_result == 0) {
-                timed_out_after_child_reap = final_drain_deadline.has_value();
+                if (!final_drain_deadline.has_value()) {
+                    continue;
+                }
+                timed_out_after_child_reap = true;
                 break;
             }
 
