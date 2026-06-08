@@ -5965,6 +5965,14 @@ term::VNM_TerminalSurface_render_bridge::render_snapshot(
     return surface.m_private->render_snapshot;
 }
 
+term::terminal_cell_metrics_t
+term::VNM_TerminalSurface_render_bridge::cell_metrics(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->cell_metrics;
+}
+
 term::Ime_preedit_state term::VNM_TerminalSurface_render_bridge::ime_preedit_state(
     const VNM_TerminalSurface& surface)
 {
