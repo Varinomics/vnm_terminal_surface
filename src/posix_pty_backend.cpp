@@ -1703,10 +1703,17 @@ private:
         PTYDIAG("WT reader-wait begin");
         wait_for_reader_finished();
         PTYDIAG("WT reader-wait end");
-        kill_child_process_group_after_exit_timeout();
-        PTYDIAG("WT kill-group done");
+        // Report the child's exit BEFORE reaping leftover descendants. The
+        // descendant must remain observable as alive until the backend reports
+        // the direct child's exit (the contract a consumer relies on); the
+        // process-absent check that follows exit reporting tolerates the kill
+        // landing slightly later. Killing first would race the descendant dead
+        // before the exit is reported -- which on macOS (immediate EOF, no drain
+        // wait) happens fast enough to be observed.
         report_exit_once(status);
         PTYDIAG("WT report-exit done");
+        kill_child_process_group_after_exit_timeout();
+        PTYDIAG("WT kill-group done");
     }
 
     void kill_child_process_group_after_exit_timeout()
