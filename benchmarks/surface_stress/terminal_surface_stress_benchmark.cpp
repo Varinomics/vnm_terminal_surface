@@ -39,7 +39,6 @@ struct Benchmark_options
     int graphics_every   = 11;
     int style_period     = 8;
     Text_pattern text_pattern = Text_pattern::LEGACY_ASCII_BLOCK;
-    bool packed_text_sidecars_enabled = false;
     bool model_profile_stats_enabled  = false;
 };
 
@@ -50,26 +49,13 @@ struct Benchmark_totals
     term::terminal_simple_content_cumulative_stats_t simple_content;
     std::uint64_t frame_cell_pass_input_cells = 0U;
     std::uint64_t frame_cell_pass_classification_calls = 0U;
-    std::uint64_t frame_packed_pass_input_cells = 0U;
     std::uint64_t frame_dirty_row_lookup_count = 0U;
     std::uint64_t frame_dirty_row_range_lookup_count = 0U;
     std::uint64_t frame_dirty_row_range_scan_steps = 0U;
-    std::uint64_t frame_packed_pass_cells_scanned = 0U;
-    std::uint64_t frame_packed_pass_classification_calls = 0U;
-    std::uint64_t frame_packed_text_sidecars_enabled = 0U;
-    std::uint64_t frame_packed_text_sidecars_disabled = 0U;
-    std::uint64_t frame_packed_text_disabled_cells_skipped = 0U;
-    std::uint64_t frame_packed_cells_appended = 0U;
     std::uint64_t frame_compact_ascii_text_direct_appends = 0U;
     std::uint64_t frame_compact_ascii_qstring_materializations = 0U;
     std::uint64_t frame_text_runs_emitted = 0U;
     std::uint64_t frame_graphic_rects_emitted = 0U;
-    std::uint64_t frame_packed_text_cells = 0U;
-    std::uint64_t frame_packed_text_ascii_direct_cells = 0U;
-    std::uint64_t frame_packed_text_ascii_direct_bytes = 0U;
-    std::uint64_t frame_packed_text_utf8_cells = 0U;
-    std::uint64_t frame_packed_text_utf8_input_units = 0U;
-    std::uint64_t frame_packed_text_utf8_output_bytes = 0U;
     std::uint64_t checksum = 0U;
 };
 
@@ -183,11 +169,6 @@ Benchmark_options parse_options(int argc, char** argv)
         }
 
         const std::string argument = argv[index];
-        if (argument == "--packed-text-sidecars") {
-            options.packed_text_sidecars_enabled = true;
-            ++index;
-            continue;
-        }
         if (argument == "--model-profile-stats") {
             options.model_profile_stats_enabled = true;
             ++index;
@@ -224,7 +205,6 @@ Benchmark_options parse_options(int argc, char** argv)
                 << "  --graphics-every <n>         emit U+2588 every N cells, 0 disables\n"
                 << "  --style-period <n>           ANSI color variation period, 0 disables\n"
                 << "  --text-pattern <name>        ascii|block|box|cjk|mixed_non_ascii|emoji; default preserves old mixed ASCII+U+2588 via --graphics-every\n"
-                << "  --packed-text-sidecars       enable packed text sidecars\n"
                 << "  --model-profile-stats        reset/enable model profile counters after warmup in profiling builds\n";
             std::exit(0);
         }
@@ -527,26 +507,12 @@ void accumulate_frame_stats(
         static_cast<std::uint64_t>(frame.stats.cell_pass_input_cells);
     totals.frame_cell_pass_classification_calls +=
         static_cast<std::uint64_t>(frame.stats.cell_pass_classification_calls);
-    totals.frame_packed_pass_input_cells +=
-        static_cast<std::uint64_t>(frame.stats.packed_pass_input_cells);
     totals.frame_dirty_row_lookup_count +=
         static_cast<std::uint64_t>(frame.stats.dirty_row_lookup_count);
     totals.frame_dirty_row_range_lookup_count +=
         static_cast<std::uint64_t>(dirty_row_range_lookup_count(frame.stats));
     totals.frame_dirty_row_range_scan_steps +=
         static_cast<std::uint64_t>(dirty_row_range_scan_steps(frame.stats));
-    totals.frame_packed_pass_cells_scanned +=
-        static_cast<std::uint64_t>(frame.stats.packed_pass_cells_scanned);
-    totals.frame_packed_pass_classification_calls +=
-        static_cast<std::uint64_t>(frame.stats.packed_pass_classification_calls);
-    totals.frame_packed_text_sidecars_enabled +=
-        static_cast<std::uint64_t>(frame.stats.packed_text_sidecars_enabled);
-    totals.frame_packed_text_sidecars_disabled +=
-        static_cast<std::uint64_t>(frame.stats.packed_text_sidecars_disabled);
-    totals.frame_packed_text_disabled_cells_skipped +=
-        static_cast<std::uint64_t>(frame.stats.packed_text_disabled_cells_skipped);
-    totals.frame_packed_cells_appended +=
-        static_cast<std::uint64_t>(frame.stats.packed_cells_appended);
     totals.frame_compact_ascii_text_direct_appends +=
         static_cast<std::uint64_t>(frame.stats.compact_ascii_text_direct_appends);
     totals.frame_compact_ascii_qstring_materializations +=
@@ -555,18 +521,6 @@ void accumulate_frame_stats(
         static_cast<std::uint64_t>(frame.stats.text_runs_emitted);
     totals.frame_graphic_rects_emitted +=
         static_cast<std::uint64_t>(frame.stats.graphic_rects_emitted);
-    totals.frame_packed_text_cells +=
-        static_cast<std::uint64_t>(frame.stats.packed_text_cells);
-    totals.frame_packed_text_ascii_direct_cells +=
-        static_cast<std::uint64_t>(frame.stats.packed_text_ascii_direct_cells);
-    totals.frame_packed_text_ascii_direct_bytes +=
-        frame.stats.packed_text_ascii_direct_bytes;
-    totals.frame_packed_text_utf8_cells +=
-        frame.stats.packed_text_utf8_cells;
-    totals.frame_packed_text_utf8_input_units +=
-        frame.stats.packed_text_utf8_input_units;
-    totals.frame_packed_text_utf8_output_bytes +=
-        frame.stats.packed_text_utf8_output_bytes;
     totals.checksum +=
         static_cast<std::uint64_t>(frame.text_runs.size()) * 3U +
         static_cast<std::uint64_t>(frame.graphic_rects.size()) * 5U +
@@ -716,9 +670,7 @@ int main(int argc, char** argv)
     const term::terminal_grid_size_t grid_size{options.rows, options.columns};
 
     term::Terminal_screen_model model({grid_size, 0, 8});
-    term::Terminal_render_options render_options;
-    render_options.packed_text_sidecars_enabled =
-        options.packed_text_sidecars_enabled;
+    const term::Terminal_render_options render_options;
 
     const term::terminal_cell_metrics_t metrics = benchmark_cell_metrics();
     const QSizeF logical_size(
@@ -799,8 +751,6 @@ int main(int argc, char** argv)
     print_metric("style_period", static_cast<std::uint64_t>(options.style_period));
     std::cout << "text_pattern=" << text_pattern_name(options.text_pattern).toUtf8().constData()
         << '\n';
-    std::cout << "packed_text_sidecars_enabled="
-        << (options.packed_text_sidecars_enabled ? "true" : "false") << '\n';
     std::cout << "model_profile_stats_requested="
         << (options.model_profile_stats_enabled ? "true" : "false") << '\n';
 #if VNM_TERMINAL_PROFILING_ENABLED
@@ -834,7 +784,6 @@ int main(int argc, char** argv)
     print_metric(
         "frame_cell_pass_classification_calls",
         totals.frame_cell_pass_classification_calls);
-    print_metric("frame_packed_pass_input_cells", totals.frame_packed_pass_input_cells);
     print_metric("frame_dirty_row_lookup_count", totals.frame_dirty_row_lookup_count);
     print_metric(
         "frame_dirty_row_range_lookup_count",
@@ -842,20 +791,6 @@ int main(int argc, char** argv)
     print_metric(
         "frame_dirty_row_range_scan_steps",
         totals.frame_dirty_row_range_scan_steps);
-    print_metric("frame_packed_pass_cells_scanned", totals.frame_packed_pass_cells_scanned);
-    print_metric(
-        "frame_packed_pass_classification_calls",
-        totals.frame_packed_pass_classification_calls);
-    print_metric(
-        "frame_packed_text_sidecars_enabled",
-        totals.frame_packed_text_sidecars_enabled);
-    print_metric(
-        "frame_packed_text_sidecars_disabled",
-        totals.frame_packed_text_sidecars_disabled);
-    print_metric(
-        "frame_packed_text_disabled_cells_skipped",
-        totals.frame_packed_text_disabled_cells_skipped);
-    print_metric("frame_packed_cells_appended", totals.frame_packed_cells_appended);
     print_metric(
         "frame_compact_ascii_text_direct_appends",
         totals.frame_compact_ascii_text_direct_appends);
@@ -864,20 +799,6 @@ int main(int argc, char** argv)
         totals.frame_compact_ascii_qstring_materializations);
     print_metric("frame_text_runs_emitted", totals.frame_text_runs_emitted);
     print_metric("frame_graphic_rects_emitted", totals.frame_graphic_rects_emitted);
-    print_metric("frame_packed_text_cells", totals.frame_packed_text_cells);
-    print_metric(
-        "frame_packed_text_ascii_direct_cells",
-        totals.frame_packed_text_ascii_direct_cells);
-    print_metric(
-        "frame_packed_text_ascii_direct_bytes",
-        totals.frame_packed_text_ascii_direct_bytes);
-    print_metric("frame_packed_text_utf8_cells", totals.frame_packed_text_utf8_cells);
-    print_metric(
-        "frame_packed_text_utf8_input_units",
-        totals.frame_packed_text_utf8_input_units);
-    print_metric(
-        "frame_packed_text_utf8_output_bytes",
-        totals.frame_packed_text_utf8_output_bytes);
     if (model_profile_stats_available) {
         print_model_profile_stats(model_profile_stats);
     }

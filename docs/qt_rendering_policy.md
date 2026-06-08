@@ -103,11 +103,6 @@ prohibited; shaping, rasterization, and fallback stay with Qt's font engine.
 `QGlyphRun` may be used only for validation around Qt font behavior; it does not
 move text ownership away from `frame.text_runs`.
 
-Packed row and text sidecars are owned by `Terminal_render_frame`. They are
-auxiliary classification, diagnostics, accounting, cache-key, and row identity
-inputs. Packed text sidecars do not own terminal text and do not retire or
-replace `frame.text_runs`.
-
 The atlas render node may keep reusable QRhi resources and row/layer upload
 state keyed by active buffer, logical row, and exact content or layer
 descriptors. Clean-row reuse is internal and must respect dirty rows, viewport

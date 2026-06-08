@@ -223,10 +223,6 @@ struct terminal_renderer_stats_t
     int            frame_cursors                                        = 0;
     int            frame_overlay_rects                                  = 0;
     int            frame_dirty_row_ranges                               = 0;
-    int            frame_packed_rows                                    = 0;
-    int            frame_packed_text_spans                              = 0;
-    int            frame_packed_text_cells                              = 0;
-    std::uint64_t  frame_packed_payload_bytes                           = 0U;
     int            row_cache_hits                                       = 0;
     int            row_cache_clean_skips                                = 0;
     bool           text_wrapper_order_rebuilt                           = false;
@@ -409,10 +405,6 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  frame_cursors                                        = 0U;
     std::uint64_t  frame_overlay_rects                                  = 0U;
     std::uint64_t  frame_dirty_row_ranges                               = 0U;
-    std::uint64_t  frame_packed_rows                                    = 0U;
-    std::uint64_t  frame_packed_text_spans                              = 0U;
-    std::uint64_t  frame_packed_text_cells                              = 0U;
-    std::uint64_t  frame_packed_payload_bytes                           = 0U;
     std::uint64_t  row_cache_hits                                       = 0U;
     std::uint64_t  row_cache_clean_skips                                = 0U;
     std::uint64_t  text_wrapper_order_rebuilds                          = 0U;

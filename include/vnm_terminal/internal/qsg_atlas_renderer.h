@@ -258,7 +258,6 @@ struct Qsg_atlas_frame_build_summary
     int                              frame_graphic_arcs        = 0;
     int                              frame_text_runs           = 0;
     int                              frame_overlay_rects       = 0;
-    int                              packed_rows               = 0;
     int                              rect_instances            = 0;
     int                              glyph_instances           = 0;
     int                              max_glyph_instance_page   = -1;
@@ -271,9 +270,6 @@ struct Qsg_atlas_frame_build_summary
     Glyph_coverage_counts            glyph_coverage;
     Qsg_atlas_glyph_miss_diagnostic  first_glyph_miss;
     int                              snapped_origin_failures   = 0;
-    int                              first_packed_logical_row  = 0;
-    Terminal_buffer_id               first_packed_active_buffer =
-        Terminal_buffer_id::PRIMARY;
     int                              first_text_logical_row = 0;
     std::uint64_t                    first_text_retained_line_id = 0U;
     std::uint64_t                    first_text_content_generation = 0U;

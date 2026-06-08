@@ -104,22 +104,6 @@ std::vector<const term::Terminal_render_text_run*> text_runs_for_row(
     return runs;
 }
 
-QString packed_text(
-    const term::Terminal_render_frame&         frame,
-    const term::terminal_packed_text_span_t&   span)
-{
-    return QString::fromUtf8(
-        frame.packed_text_bytes.data() + span.text_offset,
-        static_cast<int>(span.text_length));
-}
-
-QString packed_text_payload(const term::Terminal_render_frame& frame)
-{
-    return QString::fromUtf8(
-        frame.packed_text_bytes.data(),
-        static_cast<int>(frame.packed_text_bytes.size()));
-}
-
 bool has_graphic_rect(
     const term::Terminal_render_frame& frame,
     const QRectF&                      rect)
@@ -1900,9 +1884,7 @@ bool test_fragmented_dirty_ranges_drive_simple_content_membership()
     snapshot.cells.push_back({.position = {2, 0}, .text = QStringLiteral("C")});
     snapshot.cells.push_back({.position = {3, 0}, .text = QStringLiteral("D")});
 
-    term::Terminal_render_options render_options = options();
-    render_options.packed_text_sidecars_enabled = true;
-    const term::Terminal_render_frame frame = build(snapshot, render_options);
+    const term::Terminal_render_frame frame = build(snapshot, options());
     const term::terminal_simple_content_stats_t& simple_stats =
         frame.stats.simple_content;
 
@@ -1917,22 +1899,15 @@ bool test_fragmented_dirty_ranges_drive_simple_content_membership()
         simple_stats.dirty_eligible_cells == 2 &&
         simple_stats.clean_eligible_cells == 2,
         "fragmented dirty ranges classify selected rows dirty and gaps clean");
-    ok &= check(frame.stats.dirty_row_lookup_count == 8,
+    ok &= check(frame.stats.dirty_row_lookup_count == 4,
         "fragmented dirty row membership preserves logical lookup probe count");
-    ok &= check(frame.stats.cell_pass_classification_calls == 4 &&
-        frame.stats.packed_pass_classification_calls == 4,
-        "fragmented dirty row membership exposes cell-pass and packed-pass classification calls");
-    ok &= check(frame.stats.packed_text_cells == 4,
-        "fragmented dirty row membership also feeds packed text sidecar classification");
-    ok &= check(frame.stats.packed_text_ascii_direct_cells == 4 &&
-        frame.stats.packed_text_ascii_direct_bytes == 4U &&
-        frame.stats.packed_text_utf8_cells == 0U,
-        "printable ASCII packed text cells use the direct byte-copy path");
+    ok &= check(frame.stats.cell_pass_classification_calls == 4,
+        "fragmented dirty row membership exposes cell-pass classification calls");
 
     return ok;
 }
 
-bool test_cell_pass_and_packed_pass_classification_agree()
+bool test_cell_pass_simple_content_classification()
 {
     bool ok = true;
 
@@ -1955,38 +1930,35 @@ bool test_cell_pass_and_packed_pass_classification_agree()
         term::Terminal_simple_content_rejection_reason
                        expected_reason       =
                            term::Terminal_simple_content_rejection_reason::NONE;
-        QString        expected_packed_text;
         int            expected_dirty_fast   = 0;
         int            expected_clean_fast   = 0;
     };
 
     const std::vector<agreement_case_t> cases = {
         {
-            "dirty ASCII fast-text cell agrees across passes",
+            "dirty ASCII fast-text cell classifies as fast text",
             QStringLiteral("A"),
             decoration_t::NONE,
             0U,
             true,
             term::Terminal_simple_content_route::FAST_TEXT,
             term::Terminal_simple_content_rejection_reason::NONE,
-            QStringLiteral("A"),
             1,
             0,
         },
         {
-            "clean ASCII fast-text cell agrees across passes",
+            "clean ASCII fast-text cell classifies as fast text",
             QStringLiteral("B"),
             decoration_t::NONE,
             0U,
             false,
             term::Terminal_simple_content_route::FAST_TEXT,
             term::Terminal_simple_content_rejection_reason::NONE,
-            QStringLiteral("B"),
             0,
             1,
         },
         {
-            "non-ASCII text cell stays off packed fast text",
+            "non-ASCII text cell stays off the fast-text route",
             QStringLiteral("\u03c0"),
             decoration_t::NONE,
             0U,
@@ -2004,7 +1976,7 @@ bool test_cell_pass_and_packed_pass_classification_agree()
             term::Terminal_simple_content_rejection_reason::NON_ASCII_TEXT,
         },
         {
-            "underlined ASCII cell stays off packed fast text",
+            "underlined ASCII cell stays off the fast-text route",
             QStringLiteral("D"),
             decoration_t::UNDERLINE,
             0U,
@@ -2013,7 +1985,7 @@ bool test_cell_pass_and_packed_pass_classification_agree()
             term::Terminal_simple_content_rejection_reason::DECORATION,
         },
         {
-            "strike-only ASCII cell stays off packed fast text",
+            "strike-only ASCII cell stays off the fast-text route",
             QStringLiteral("E"),
             decoration_t::STRIKE,
             0U,
@@ -2022,7 +1994,7 @@ bool test_cell_pass_and_packed_pass_classification_agree()
             term::Terminal_simple_content_rejection_reason::DECORATION,
         },
         {
-            "hyperlink ASCII cell stays off packed fast text",
+            "hyperlink ASCII cell stays off the fast-text route",
             QStringLiteral("F"),
             decoration_t::NONE,
             17U,
@@ -2149,28 +2121,17 @@ bool test_cell_pass_and_packed_pass_classification_agree()
             classification.rejection_reason == entry.expected_reason &&
             classification.dirty_row == entry.dirty_row,
             entry.message);
-        ok &= check(frame.stats.cell_pass_classification_calls == 1 &&
-            frame.stats.packed_pass_classification_calls == 1,
-            "single-cell agreement case classifies once in each pass");
+        ok &= check(frame.stats.cell_pass_classification_calls == 1,
+            "single-cell case classifies once in the cell pass");
         ok &= check(simple_stats.cells_considered == 1 &&
             route_total(simple_stats) == 1 &&
             route_count(simple_stats, classification.route) == 1 &&
             rejection_total(simple_stats) == 1 &&
             rejection_count(simple_stats, classification.rejection_reason) == 1,
-            "single-cell agreement case records the direct route and rejection");
+            "single-cell case records the direct route and rejection");
         ok &= check(simple_stats.dirty_eligible_cells == entry.expected_dirty_fast &&
             simple_stats.clean_eligible_cells == entry.expected_clean_fast,
-            "single-cell agreement case preserves dirty-row eligibility");
-
-        if (entry.expected_route == term::Terminal_simple_content_route::FAST_TEXT) {
-            ok &= check(frame.stats.packed_text_cells == 1 &&
-                packed_text_payload(frame) == entry.expected_packed_text,
-                "packed text output agrees with the fast-text classification");
-        }
-        else {
-            ok &= check(frame.stats.packed_text_cells == 0,
-                "packed output excludes cells rejected from packed fast routes");
-        }
+            "single-cell case preserves dirty-row eligibility");
     }
 
     return ok;
@@ -2197,200 +2158,12 @@ bool test_snapshot_cells_are_row_major_column_sorted()
         frame.text_runs[2].row == 1 && frame.text_runs[2].column == 0 &&
         frame.text_runs[3].row == 2 && frame.text_runs[3].column == 2,
         "cell pass observes the row-major snapshot ordering invariant");
-    ok &= check(frame.stats.packed_text_cells == 4 &&
-        packed_text_payload(frame) == QStringLiteral("ADBC"),
-        "packed pass output matches row-major column order for sorted snapshots");
 
     term::Terminal_render_snapshot unsorted_snapshot = snapshot;
     std::swap(unsorted_snapshot.cells[0], unsorted_snapshot.cells[1]);
     ok &= check(!snapshot_cells_are_row_major_column_sorted(unsorted_snapshot),
         "snapshot cell order fixture detects unsorted columns");
 
-    return ok;
-}
-
-bool test_packed_text_rows_spans_and_order()
-{
-    bool ok = true;
-    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 8});
-    snapshot.cursor.visible                 = false;
-    snapshot.viewport.scrollback_rows       = 9;
-    snapshot.viewport.offset_from_tail      = 4;
-
-    term::Terminal_text_style accent = term::make_default_terminal_text_style();
-    accent.foreground = term::make_rgb_terminal_color_ref(0xffcc1010U);
-    accent.background = term::make_rgb_terminal_color_ref(0xff1030ccU);
-    snapshot.styles.push_back(accent);
-
-    snapshot.cells.push_back({.position = {0, 4}, .text = QStringLiteral("E"), .style_id = 1U});
-    snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("B")});
-    snapshot.cells.push_back({.position = {2, 2}, .text = QStringLiteral("C")});
-    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
-    snapshot.cells.push_back({.position = {0, 3}, .text = QStringLiteral("D")});
-    snapshot.cells.push_back({.position = {0, 5}, .text = QStringLiteral("F"), .style_id = 1U});
-    snapshot.cells.push_back({.position = {1, 0}, .text = QStringLiteral("\u03c0")});
-
-    const term::Terminal_render_frame frame = build(snapshot);
-    ok &= check(frame.packed_rows.size() == 3U &&
-        frame.stats.packed_rows == 3 &&
-        frame.packed_rows[0].active_buffer == term::Terminal_buffer_id::PRIMARY &&
-        frame.packed_rows[0].viewport_row == 0 &&
-        frame.packed_rows[0].logical_row == 5 &&
-        frame.packed_rows[2].logical_row == 7,
-        "packed rows preserve active-buffer, viewport-row, and logical-row identity");
-    ok &= check(frame.packed_text_spans.size() == 4U &&
-        frame.stats.packed_text_spans == 4 &&
-        frame.stats.packed_text_cells == 6,
-        "packed text spans count coalesced simple text cells");
-    ok &= check(frame.stats.packed_text_ascii_direct_cells == 6 &&
-        frame.stats.packed_text_ascii_direct_bytes == 6U &&
-        frame.stats.packed_text_utf8_cells == 0U,
-        "packed text byte-path counters match the accepted ASCII cells");
-
-    const term::terminal_packed_render_row_t& row_zero = frame.packed_rows[0];
-    ok &= check(row_zero.first_text_span == 0U && row_zero.text_span_count == 3U,
-        "packed row records its local text span range");
-    ok &= check(packed_text(frame, frame.packed_text_spans[0]) == QStringLiteral("AB") &&
-        frame.packed_text_spans[0].first_column == 0 &&
-        frame.packed_text_spans[0].column_count == 2,
-        "packed text coalesces out-of-order adjacent cells by column");
-    ok &= check(packed_text(frame, frame.packed_text_spans[1]) == QStringLiteral("D") &&
-        frame.packed_text_spans[1].first_column == 3,
-        "packed text starts a new span across a column gap");
-    ok &= check(packed_text(frame, frame.packed_text_spans[2]) == QStringLiteral("EF") &&
-        frame.packed_text_spans[2].style_id == 1U &&
-        frame.packed_text_spans[2].foreground_rgba ==
-            static_cast<std::uint32_t>(QColor(204, 16, 16).rgba()) &&
-        frame.packed_text_spans[2].background_rgba ==
-            static_cast<std::uint32_t>(QColor(16, 48, 204).rgba()),
-        "packed text starts a new span at style and color boundaries");
-    ok &= check(frame.packed_rows[1].text_span_count == 0U &&
-        frame.stats.simple_content.rejection_non_ascii_text_cells == 1,
-        "packed text excludes complex non-ASCII text while stats keep the rejection reason");
-    ok &= check(frame.stats.packed_payload_bytes > 0U,
-        "packed text frame reports payload bytes");
-    return ok;
-}
-
-bool test_disabled_packed_text_sidecars_skip_scan()
-{
-    bool ok = true;
-
-    term::Terminal_render_options render_options = options();
-    render_options.packed_text_sidecars_enabled = false;
-
-    term::Terminal_render_snapshot text_snapshot = empty_snapshot({3, 8});
-    text_snapshot.cursor.visible = false;
-    text_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
-    text_snapshot.cells.push_back({.position = {1, 0}, .text = QStringLiteral("B")});
-    text_snapshot.cells.push_back({.position = {2, 0}, .text = QStringLiteral("\u03c0")});
-    text_snapshot.cells.push_back({.position = {2, 1}, .text = QStringLiteral("\u2500")});
-    text_snapshot.cells.push_back({.position = {2, 2}, .text = QStringLiteral("\u2588")});
-    text_snapshot.cells.push_back({.position = {2, 3}, .text = QStringLiteral("\u2801")});
-
-    const term::Terminal_render_frame text_frame =
-        build(text_snapshot, render_options);
-    ok &= check(text_frame.stats.packed_text_sidecars_enabled == 0 &&
-        text_frame.stats.packed_text_sidecars_disabled == 1,
-        "disabled packed text sidecars are reported on the frame");
-    ok &= check(text_frame.stats.packed_pass_input_cells == 0 &&
-        text_frame.stats.packed_pass_cells_scanned == 0 &&
-        text_frame.stats.packed_pass_classification_calls == 0 &&
-        text_frame.stats.packed_text_disabled_cells_skipped ==
-            text_frame.stats.simple_content.eligible_after_all_gates_cells &&
-        text_frame.stats.packed_text_disabled_cells_skipped == 2,
-        "disabled packed text sidecars skip the separate packed-data scan");
-    ok &= check(text_frame.packed_rows.size() == 3U &&
-        text_frame.packed_rows[0].viewport_row == 0 &&
-        text_frame.packed_rows[1].viewport_row == 1 &&
-        text_frame.packed_rows[2].viewport_row == 2 &&
-        text_frame.packed_text_spans.empty() &&
-        text_frame.stats.packed_rows == 3 &&
-        text_frame.stats.packed_text_cells == 0 &&
-        text_frame.text_runs.size() == 4U &&
-        text_frame.text_runs[0].text == QStringLiteral("A") &&
-        text_frame.text_runs[1].text == QStringLiteral("B") &&
-        text_frame.text_runs[2].text == QStringLiteral("\u03c0") &&
-        text_frame.text_runs[3].text == QStringLiteral("\u2801") &&
-        !text_frame.graphic_rects.empty() &&
-        text_frame.graphic_arcs.empty() &&
-        text_frame.stats.packed_payload_bytes > 0U,
-        "disabled-sidecar frames keep row identity while grid graphics use primitives");
-
-    return ok;
-}
-
-bool test_packed_text_excludes_cursor_and_ime_cells()
-{
-    bool ok = true;
-    term::Terminal_render_snapshot cursor_snapshot = empty_snapshot({1, 5});
-    cursor_snapshot.cursor = {{0, 1}, term::Terminal_cursor_shape::BLOCK, true, false};
-    cursor_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
-    cursor_snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("B")});
-    cursor_snapshot.cells.push_back({.position = {0, 2}, .text = QStringLiteral("C")});
-
-    const term::Terminal_render_frame cursor_frame = build(cursor_snapshot);
-    ok &= check(cursor_frame.stats.simple_content.eligible_cells == 3 &&
-        cursor_frame.stats.simple_content.eligible_after_all_gates_cells == 2 &&
-        cursor_frame.stats.simple_content.route_fast_text_cells == 3 &&
-        cursor_frame.stats.packed_text_cells == 2 &&
-        packed_text_payload(cursor_frame) == QStringLiteral("AC"),
-        "packed text excludes one otherwise-strict ASCII cell covered by block cursor");
-    ok &= check(cursor_frame.stats.cell_pass_classification_calls == 3 &&
-        cursor_frame.stats.packed_pass_classification_calls == 2,
-        "block cursor coverage is visible as a packed-pass classification skip");
-    ok &= check(cursor_frame.cursor_text_runs.size() == 1U &&
-        cursor_frame.cursor_text_runs.front().text == QStringLiteral("B"),
-        "block cursor inverse text still comes from visual text runs");
-
-    term::Terminal_render_snapshot ime_snapshot = empty_snapshot({1, 5});
-    ime_snapshot.cursor.visible     = false;
-    ime_snapshot.cursor.position    = {0, 1};
-    ime_snapshot.ime_preedit.active = true;
-    ime_snapshot.ime_preedit.text   = QStringLiteral("xy");
-    ime_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
-    ime_snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("B")});
-    ime_snapshot.cells.push_back({.position = {0, 2}, .text = QStringLiteral("C")});
-    ime_snapshot.cells.push_back({.position = {0, 3}, .text = QStringLiteral("D")});
-
-    const term::Terminal_render_frame ime_frame = build(ime_snapshot);
-    ok &= check(ime_frame.stats.simple_content.eligible_cells == 4 &&
-        ime_frame.stats.simple_content.eligible_after_all_gates_cells == 2 &&
-        ime_frame.stats.simple_content.route_fast_text_cells == 4 &&
-        ime_frame.stats.packed_text_cells == 2 &&
-        packed_text_payload(ime_frame) == QStringLiteral("AD"),
-        "packed text excludes otherwise-strict ASCII cells covered by IME preedit");
-    ok &= check(ime_frame.stats.cell_pass_classification_calls == 4 &&
-        ime_frame.stats.packed_pass_classification_calls == 2,
-        "IME coverage is visible as packed-pass classification skips");
-    ok &= check(!ime_frame.text_runs.empty() &&
-        ime_frame.text_runs.back().text == QStringLiteral("xy"),
-        "IME visual text still uses the existing text-run route");
-
-    term::Terminal_render_snapshot cjk_ime_snapshot = empty_snapshot({1, 5});
-    cjk_ime_snapshot.cursor.visible     = false;
-    cjk_ime_snapshot.cursor.position    = {0, 1};
-    cjk_ime_snapshot.ime_preedit.active = true;
-    cjk_ime_snapshot.ime_preedit.text   = QStringLiteral("\u754c");
-    cjk_ime_snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
-    cjk_ime_snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("B")});
-    cjk_ime_snapshot.cells.push_back({.position = {0, 2}, .text = QStringLiteral("C")});
-    cjk_ime_snapshot.cells.push_back({.position = {0, 3}, .text = QStringLiteral("D")});
-
-    const term::Terminal_render_frame cjk_ime_frame = build(cjk_ime_snapshot);
-    ok &= check(cjk_ime_frame.stats.simple_content.eligible_cells == 4 &&
-        cjk_ime_frame.stats.simple_content.eligible_after_all_gates_cells == 2 &&
-        cjk_ime_frame.stats.simple_content.route_fast_text_cells == 4 &&
-        cjk_ime_frame.stats.packed_text_cells == 2 &&
-        packed_text_payload(cjk_ime_frame) == QStringLiteral("AD"),
-        "packed text excludes cells covered by CJK preedit over ASCII content");
-    ok &= check(cjk_ime_frame.stats.cell_pass_classification_calls == 4 &&
-        cjk_ime_frame.stats.packed_pass_classification_calls == 2,
-        "CJK IME coverage is visible as packed-pass classification skips");
-    ok &= check(!cjk_ime_frame.text_runs.empty() &&
-        cjk_ime_frame.text_runs.back().text == QStringLiteral("\u754c") &&
-        cjk_ime_frame.text_runs.back().rect.width() == metrics().width * 2.0,
-        "CJK preedit remains canonical overlay text instead of packed text ownership");
     return ok;
 }
 
@@ -2416,10 +2189,6 @@ bool test_viewport_empty_and_dirty_ranges()
     ok                                 &= check(frame.viewport.scrollback_rows == 5 &&
         frame.viewport.offset_from_tail == 2,
         "frame preserves scrolled viewport metadata");
-    ok                                 &= check(frame.packed_rows.size() == 3U &&
-        frame.packed_rows[0].active_buffer == term::Terminal_buffer_id::PRIMARY &&
-        frame.packed_rows[0].logical_row == 3,
-        "packed row identity follows primary scrollback viewport state");
     ok                                 &= check(frame.dirty_row_ranges.size() == 1U &&
         frame.dirty_row_ranges.front().first_row == 1 &&
         frame.dirty_row_ranges.front().row_count == 2,
@@ -2431,11 +2200,6 @@ bool test_viewport_empty_and_dirty_ranges()
     const term::Terminal_render_frame alternate_frame = build(snapshot);
     ok &= check(alternate_frame.viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
         "frame preserves alternate-screen viewport metadata");
-    ok &= check(alternate_frame.packed_rows.size() == 3U &&
-        alternate_frame.packed_rows[0].active_buffer ==
-            term::Terminal_buffer_id::ALTERNATE &&
-        alternate_frame.packed_rows[0].logical_row == 0,
-        "packed row identity separates alternate-screen rows from primary rows");
     return ok;
 }
 
@@ -2468,11 +2232,8 @@ int main()
     ok &= test_frame_stats_count_distinct_rows_and_styles_by_identity();
     ok &= test_classify_terminal_simple_content_cell_unicode_property();
     ok &= test_fragmented_dirty_ranges_drive_simple_content_membership();
-    ok &= test_cell_pass_and_packed_pass_classification_agree();
+    ok &= test_cell_pass_simple_content_classification();
     ok &= test_snapshot_cells_are_row_major_column_sorted();
-    ok &= test_packed_text_rows_spans_and_order();
-    ok &= test_disabled_packed_text_sidecars_skip_scan();
-    ok &= test_packed_text_excludes_cursor_and_ime_cells();
     ok &= test_viewport_empty_and_dirty_ranges();
     return ok ? 0 : 1;
 }

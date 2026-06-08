@@ -982,9 +982,7 @@ QRectF inset_rect(QRectF rect, qreal dx, qreal dy)
 
 term::Terminal_render_options pixel_render_options()
 {
-    term::Terminal_render_options options;
-    options.packed_text_sidecars_enabled = false;
-    return options;
+    return term::Terminal_render_options{};
 }
 
 term::Terminal_render_frame pixel_expected_frame(
@@ -6199,10 +6197,6 @@ bool validate_frame_build_report(
     const term::Qsg_atlas_frame_build_summary& frame_build = report.frame_build;
     bool ok = true;
     ok &= check_frame_build_report(
-        frame_build.packed_rows == fixture.snapshot.grid_size.rows,
-        fixture,
-        "packed row count matches the viewport");
-    ok &= check_frame_build_report(
         frame_build.rect_instances + frame_build.glyph_instances > 0,
         fixture,
         "atlas emitted at least one render instance");
@@ -6262,11 +6256,6 @@ bool validate_frame_build_report(
             fixture,
             "valid provenance allowed the selection span to render");
         ok &= check_frame_build_report(
-            frame_build.first_packed_logical_row == 6 &&
-                frame_build.first_packed_active_buffer == term::Terminal_buffer_id::PRIMARY,
-            fixture,
-            "packed row identity follows primary scrollback position");
-        ok &= check_frame_build_report(
             frame_build.first_text_logical_row == 6 &&
                 frame_build.first_text_retained_line_id == 900U &&
                 frame_build.first_text_content_generation == 77U,
@@ -6279,11 +6268,6 @@ bool validate_frame_build_report(
             frame_build.viewport_active_buffer == term::Terminal_buffer_id::ALTERNATE,
             fixture,
             "alternate-screen viewport metadata was preserved");
-        ok &= check_frame_build_report(
-            frame_build.first_packed_active_buffer == term::Terminal_buffer_id::ALTERNATE &&
-                frame_build.first_packed_logical_row == 0,
-            fixture,
-            "packed row identity separates alternate rows from primary scrollback");
     }
     else
     if (fixture.name == "public_projection_scroll_full_repaint") {
@@ -6349,13 +6333,11 @@ bool validate_frame_build_report(
 
     if (ok) {
         std::cout << "PASS: atlas layout report " << fixture.name
-            << " packed_rows=" << frame_build.packed_rows
             << " selection_rects=" << frame_build.frame_selection_rects
             << " distinct_faces=" << frame_build.distinct_glyph_faces
             << " fallback_faces=" << frame_build.fallback_glyph_faces
             << " emoji_runs=" << frame_build.emoji_presentation_runs
             << " glyph_misses=" << frame_build.glyph_missed_instances
-            << " first_packed_row=" << frame_build.first_packed_logical_row
             << " rect_instances=" << frame_build.rect_instances
             << " glyph_instances=" << frame_build.glyph_instances << '\n';
     }

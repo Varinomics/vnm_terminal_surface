@@ -594,13 +594,6 @@ void accumulate_simple_content_stats(
     X(full_dirty_rows) \
     X(cell_pass_input_cells) \
     X(cell_pass_classification_calls) \
-    X(packed_pass_input_cells) \
-    X(packed_pass_cells_scanned) \
-    X(packed_pass_classification_calls) \
-    X(packed_text_sidecars_enabled) \
-    X(packed_text_sidecars_disabled) \
-    X(packed_text_disabled_cells_skipped) \
-    X(packed_cells_appended) \
     X(dirty_row_lookup_count) \
     X(cells_considered) \
     X(cells_skipped_invalid) \
@@ -630,15 +623,6 @@ void accumulate_simple_content_stats(
     X(decoration_rects_emitted) \
     X(cursor_rects_emitted) \
     X(overlay_rects_emitted) \
-    X(packed_rows) \
-    X(packed_text_spans) \
-    X(packed_text_cells) \
-    X(packed_text_ascii_direct_cells) \
-    X(packed_text_ascii_direct_bytes) \
-    X(packed_text_utf8_cells) \
-    X(packed_text_utf8_input_units) \
-    X(packed_text_utf8_output_bytes) \
-    X(packed_payload_bytes) \
     /**/
 
 void accumulate_frame_stats(
@@ -788,10 +772,6 @@ void accumulate_frame_stats(
     X(frame_cursors) \
     X(frame_overlay_rects) \
     X(frame_dirty_row_ranges) \
-    X(frame_packed_rows) \
-    X(frame_packed_text_spans) \
-    X(frame_packed_text_cells) \
-    X(frame_packed_payload_bytes) \
     X(row_cache_hits) \
     X(row_cache_clean_skips) \
     X(background_rows_rebuilt) \
@@ -1553,201 +1533,6 @@ bool snapshot_row_is_dirty(
         dirty_row_flags.row_flags[row_index] != 0U;
 }
 
-bool terminal_render_cell_column_less(
-    const Terminal_render_cell*    left,
-    const Terminal_render_cell*    right)
-{
-    return left->position.column < right->position.column;
-}
-
-void stable_sort_terminal_render_cell_row_by_column(
-    std::vector<const Terminal_render_cell*>& row_cells)
-{
-    if (row_cells.size() <= 1U) {
-        return;
-    }
-
-    std::stable_sort(
-        row_cells.begin(),
-        row_cells.end(),
-        terminal_render_cell_column_less);
-}
-
-std::vector<std::vector<const Terminal_render_cell*>> build_explicit_snapshot_row_table(
-    const Terminal_render_snapshot& snapshot)
-{
-    if (snapshot.grid_size.rows <= 0) {
-        return {};
-    }
-
-    std::vector<std::vector<const Terminal_render_cell*>> row_table(
-        static_cast<std::size_t>(snapshot.grid_size.rows));
-    for (const Terminal_render_cell& cell : snapshot.cells) {
-        if (cell.position.row < 0 || cell.position.row >= snapshot.grid_size.rows) {
-            continue;
-        }
-        row_table[static_cast<std::size_t>(cell.position.row)].push_back(&cell);
-    }
-
-    for (std::vector<const Terminal_render_cell*>& row_cells : row_table) {
-        stable_sort_terminal_render_cell_row_by_column(row_cells);
-    }
-
-    return row_table;
-}
-
-std::uint32_t packed_color_rgba(const QColor& color)
-{
-    return static_cast<std::uint32_t>(color.rgba());
-}
-
-void append_packed_text_bytes(
-    Terminal_render_frame&                   frame,
-    terminal_packed_text_span_t&             span,
-    const Terminal_render_cell_text&         text,
-    Terminal_simple_content_text_category    text_category)
-{
-    if (text_category == Terminal_simple_content_text_category::PRINTABLE_ASCII) {
-        const std::size_t byte_offset = frame.packed_text_bytes.size();
-        const qsizetype text_size     = text.code_unit_count();
-        frame.packed_text_bytes.resize(byte_offset + static_cast<std::size_t>(text_size));
-
-        ++frame.stats.packed_text_ascii_direct_cells;
-        frame.stats.packed_text_ascii_direct_bytes += static_cast<std::uint64_t>(text_size);
-        char* bytes = frame.packed_text_bytes.data() + byte_offset;
-        const std::optional<ushort> inline_code_unit =
-            text.single_printable_ascii_code_unit();
-        if (inline_code_unit.has_value()) {
-            bytes[0] = static_cast<char>(*inline_code_unit);
-        }
-        else {
-            const QString* fallback_text = text.fallback_qstring_or_null();
-            Q_ASSERT(fallback_text != nullptr);
-            const ushort* code_units = fallback_text->utf16();
-            for (qsizetype index = 0; index < text_size; ++index) {
-                bytes[index] = static_cast<char>(code_units[index]);
-            }
-        }
-        span.text_length += static_cast<std::uint32_t>(text_size);
-        return;
-    }
-
-    const QString* fallback_text = text.fallback_qstring_or_null();
-    Q_ASSERT(fallback_text != nullptr);
-    const QByteArray bytes = fallback_text->toUtf8();
-    ++frame.stats.packed_text_utf8_cells;
-    frame.stats.packed_text_utf8_input_units  +=
-        static_cast<std::uint64_t>(fallback_text->size());
-    frame.stats.packed_text_utf8_output_bytes += static_cast<std::uint64_t>(bytes.size());
-    frame.packed_text_bytes.insert(
-        frame.packed_text_bytes.end(),
-        bytes.constData(),
-        bytes.constData() + bytes.size());
-    span.text_length += static_cast<std::uint32_t>(bytes.size());
-}
-
-void append_packed_text_cell(
-    Terminal_render_frame&                   frame,
-    terminal_packed_render_row_t&            row,
-    const Terminal_render_cell&              cell,
-    const render_style_attributes_t&         style,
-    Terminal_simple_content_text_category    text_category)
-{
-    const std::uint32_t foreground_rgba = packed_color_rgba(style.foreground);
-    const std::uint32_t background_rgba = packed_color_rgba(style.background);
-    if (row.text_span_count > 0U) {
-        terminal_packed_text_span_t& span =
-            frame.packed_text_spans[static_cast<std::size_t>(
-                row.first_text_span + row.text_span_count - 1U)];
-        if (span.first_column + span.column_count == cell.position.column &&
-            span.style_id                         == cell.style_id        &&
-            span.foreground_rgba                  == foreground_rgba      &&
-            span.background_rgba                  == background_rgba)
-        {
-            span.column_count += cell.display_width;
-            append_packed_text_bytes(frame, span, cell.text, text_category);
-            ++frame.stats.packed_text_cells;
-            ++frame.stats.packed_cells_appended;
-            return;
-        }
-    }
-
-    if (row.text_span_count == 0U) {
-        row.first_text_span =
-            static_cast<std::uint32_t>(frame.packed_text_spans.size());
-    }
-
-    terminal_packed_text_span_t span;
-    span.first_column    = cell.position.column;
-    span.column_count    = cell.display_width;
-    span.style_id        = cell.style_id;
-    span.foreground_rgba = foreground_rgba;
-    span.background_rgba = background_rgba;
-    span.text_offset     = static_cast<std::uint32_t>(frame.packed_text_bytes.size());
-    append_packed_text_bytes(frame, span, cell.text, text_category);
-    frame.packed_text_spans.push_back(span);
-    ++row.text_span_count;
-    ++frame.stats.packed_text_cells;
-    ++frame.stats.packed_cells_appended;
-}
-
-std::uint64_t packed_payload_byte_count(const Terminal_render_frame& frame)
-{
-    return
-        static_cast<std::uint64_t>(frame.packed_rows.size()) * sizeof(terminal_packed_render_row_t)            +
-        static_cast<std::uint64_t>(frame.packed_text_spans.size()) * sizeof(terminal_packed_text_span_t)       +
-        static_cast<std::uint64_t>(frame.packed_text_bytes.size()) * sizeof(char);
-}
-
-void finalize_packed_render_frame_stats(Terminal_render_frame& frame)
-{
-    frame.stats.packed_rows          = static_cast<int>(frame.packed_rows.size());
-    frame.stats.packed_text_spans    = static_cast<int>(frame.packed_text_spans.size());
-    frame.stats.packed_payload_bytes = packed_payload_byte_count(frame);
-}
-
-void initialize_packed_render_frame_stats(
-    Terminal_render_frame&             frame,
-    const Terminal_render_snapshot&    snapshot,
-    bool                               packed_text_sidecars_enabled)
-{
-    frame.stats.packed_pass_input_cells = packed_text_sidecars_enabled
-        ? static_cast<int>(snapshot.cells.size())
-        : 0;
-    frame.stats.packed_text_sidecars_enabled =
-        packed_text_sidecars_enabled ? 1 : 0;
-    frame.stats.packed_text_sidecars_disabled =
-        packed_text_sidecars_enabled ? 0 : 1;
-}
-
-terminal_packed_render_row_t& append_packed_render_row(
-    Terminal_render_frame&             frame,
-    const Terminal_render_snapshot&    snapshot,
-    int                                row_index)
-{
-    terminal_packed_render_row_t row;
-    row.active_buffer = snapshot.viewport.active_buffer;
-    row.viewport_row  = row_index;
-    row.logical_row   = logical_row_for_viewport_row(snapshot.viewport, row_index);
-    // Span offsets are placeholders until the first span append for each kind.
-    row.first_text_span =
-        static_cast<std::uint32_t>(frame.packed_text_spans.size());
-    frame.packed_rows.push_back(row);
-    return frame.packed_rows.back();
-}
-
-void initialize_disabled_sidecar_packed_rows(
-    Terminal_render_frame&             frame,
-    const Terminal_render_snapshot&    snapshot)
-{
-    VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::disabled_sidecar_packed_rows");
-
-    frame.packed_rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
-    for (int row_index = 0; row_index < snapshot.grid_size.rows; ++row_index) {
-        append_packed_render_row(frame, snapshot, row_index);
-    }
-}
-
 void append_cell_text_to_text_run(
     Terminal_render_frame&           frame,
     Terminal_render_text_run&        run,
@@ -1764,89 +1549,6 @@ void append_cell_text_to_text_run(
     }
 
     text.append_to(run.text);
-}
-
-void build_terminal_render_frame_packed_data(
-    Terminal_render_frame&             frame,
-    const Terminal_render_snapshot&    snapshot,
-    const Snapshot_dirty_row_flags&    dirty_row_flags,
-    Render_style_attribute_cache&      style_attributes,
-    bool                               block_cursor_visible,
-    bool                               ime_preedit_visible,
-    int                                ime_preedit_row,
-    int                                ime_preedit_column,
-    int                                ime_preedit_columns)
-{
-    VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data");
-
-    if (snapshot.grid_size.rows <= 0 || snapshot.grid_size.columns <= 0) {
-        return;
-    }
-
-    std::vector<std::vector<const Terminal_render_cell*>> row_table;
-    {
-        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::row_table");
-
-        row_table = build_explicit_snapshot_row_table(snapshot);
-    }
-
-    {
-        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::reserve");
-
-        frame.packed_rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
-        frame.packed_text_spans.reserve(snapshot.cells.size() / 2U);
-        frame.packed_text_bytes.reserve(snapshot.cells.size());
-    }
-
-    {
-        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::scan");
-
-        for (int row_index = 0; row_index < snapshot.grid_size.rows; ++row_index) {
-            terminal_packed_render_row_t& packed_row =
-                append_packed_render_row(frame, snapshot, row_index);
-            for (const Terminal_render_cell* cell : row_table[static_cast<std::size_t>(row_index)]) {
-                ++frame.stats.packed_pass_cells_scanned;
-                if (block_cursor_covers_cell(*cell, snapshot.cursor, block_cursor_visible) ||
-                    ime_preedit_covers_cell(
-                        *cell,
-                        ime_preedit_visible,
-                        ime_preedit_row,
-                        ime_preedit_column,
-                        ime_preedit_columns))
-                {
-                    continue;
-                }
-
-                ++frame.stats.dirty_row_lookup_count;
-                const bool dirty_row = snapshot_row_is_dirty(
-                    dirty_row_flags,
-                    cell->position.row);
-                const bool has_decoration = cell_text_decoration_enabled(
-                    *cell,
-                    snapshot.styles.size(),
-                    style_attributes);
-                ++frame.stats.packed_pass_classification_calls;
-                const terminal_simple_content_classification_t classification =
-                    classify_terminal_simple_content_cell(
-                        *cell,
-                        snapshot.grid_size,
-                        snapshot.styles.size(),
-                        has_decoration,
-                        dirty_row);
-
-                if (!classification.fast_text_eligible) {
-                    continue;
-                }
-
-                append_packed_text_cell(
-                    frame,
-                    packed_row,
-                    *cell,
-                    style_attributes.attributes(cell->style_id),
-                    classification.text_category);
-            }
-        }
-    }
 }
 
 } // namespace
@@ -1905,10 +1607,6 @@ Terminal_render_frame build_terminal_render_frame(
         if (frame.stats.dirty_rows == snapshot->grid_size.rows) {
             frame.stats.full_dirty_rows = frame.stats.dirty_rows;
         }
-        initialize_packed_render_frame_stats(
-            frame,
-            *snapshot,
-            options.packed_text_sidecars_enabled);
     }
     const bool valid_grid = snapshot->grid_size.rows > 0 && snapshot->grid_size.columns > 0;
     Snapshot_dirty_row_flags dirty_row_flags;
@@ -1970,11 +1668,6 @@ Terminal_render_frame build_terminal_render_frame(
             bounded_frame_reserve(cell_count, snapshot->grid_size.rows, 4U, 64U));
         frame.cursors.reserve(2U);
         frame.overlay_rects.reserve(1U);
-        if (!options.packed_text_sidecars_enabled) {
-            if (valid_grid) {
-                initialize_disabled_sidecar_packed_rows(frame, *snapshot);
-            }
-        }
     }
 
     {
@@ -2310,32 +2003,6 @@ Terminal_render_frame build_terminal_render_frame(
                 });
             }
         }
-        if (!options.packed_text_sidecars_enabled) {
-            VNM_TERMINAL_PROFILE_SCOPE(
-                "build_terminal_render_frame::cells::finalize_disabled_sidecars");
-
-            frame.stats.packed_text_disabled_cells_skipped =
-                frame.stats.simple_content.eligible_after_all_gates_cells;
-        }
-    }
-
-    if (options.packed_text_sidecars_enabled) {
-        build_terminal_render_frame_packed_data(
-            frame,
-            *snapshot,
-            dirty_row_flags,
-            style_attributes,
-            block_cursor_visible,
-            ime_preedit_visible,
-            ime_preedit_row,
-            ime_preedit_column,
-            ime_preedit_columns);
-    }
-
-    {
-        VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::packed_data::finalize");
-
-        finalize_packed_render_frame_stats(frame);
     }
 
     {

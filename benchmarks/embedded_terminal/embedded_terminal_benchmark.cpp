@@ -270,10 +270,6 @@ struct renderer_totals_t
     qint64                 frame_dirty_row_lookup_count                         = 0;
     qint64                 frame_dirty_row_range_lookup_count                   = 0;
     qint64                 frame_dirty_row_range_scan_steps                     = 0;
-    qint64                 frame_packed_rows                                    = 0;
-    qint64                 frame_packed_text_spans                              = 0;
-    qint64                 frame_packed_text_cells                              = 0;
-    std::uint64_t          frame_packed_payload_bytes                           = 0U;
     qint64                 row_cache_hits                                       = 0;
     qint64                 row_cache_clean_skips                                = 0;
     qint64                 background_row_rects_before_coalescing               = 0;
@@ -2464,10 +2460,6 @@ void add_renderer_stats(
     totals.frame_cursors                  += stats.frame_cursors;
     totals.frame_overlay_rects            += stats.frame_overlay_rects;
     totals.frame_dirty_row_ranges         += stats.frame_dirty_row_ranges;
-    totals.frame_packed_rows              += stats.frame_packed_rows;
-    totals.frame_packed_text_spans        += stats.frame_packed_text_spans;
-    totals.frame_packed_text_cells        += stats.frame_packed_text_cells;
-    totals.frame_packed_payload_bytes     += stats.frame_packed_payload_bytes;
     totals.row_cache_hits                 += stats.row_cache_hits;
     totals.row_cache_clean_skips          += stats.row_cache_clean_skips;
     totals.background_row_rects_before_coalescing +=
@@ -3076,10 +3068,6 @@ void add_renderer_stats(
         dirty_row_range_lookup_count(stats.frame);
     totals.frame_dirty_row_range_scan_steps +=
         dirty_row_range_scan_steps(stats.frame);
-    totals.frame_packed_rows              += stats.frame_packed_rows;
-    totals.frame_packed_text_spans        += stats.frame_packed_text_spans;
-    totals.frame_packed_text_cells        += stats.frame_packed_text_cells;
-    totals.frame_packed_payload_bytes     += stats.frame_packed_payload_bytes;
     totals.row_cache_hits                 += stats.row_cache_hits;
     totals.row_cache_clean_skips          += stats.row_cache_clean_skips;
     totals.background_row_rects_before_coalescing +=
@@ -5650,18 +5638,6 @@ QJsonObject scenario_json(
         QStringLiteral("frame_dirty_row_range_scan_steps"),
         result.renderer_totals.frame_dirty_row_range_scan_steps);
     object.insert(
-        QStringLiteral("frame_packed_rows"),
-        result.renderer_totals.frame_packed_rows);
-    object.insert(
-        QStringLiteral("frame_packed_text_spans"),
-        result.renderer_totals.frame_packed_text_spans);
-    object.insert(
-        QStringLiteral("frame_packed_text_cells"),
-        result.renderer_totals.frame_packed_text_cells);
-    object.insert(
-        QStringLiteral("frame_packed_payload_bytes"),
-        static_cast<qint64>(result.renderer_totals.frame_packed_payload_bytes));
-    object.insert(
         QStringLiteral("row_cache_hits"),
         result.renderer_totals.row_cache_hits);
     object.insert(
@@ -6345,10 +6321,6 @@ bool validate_renderer_counter_json(const QJsonObject& object, QString* out_erro
         QStringLiteral("frame_dirty_row_lookup_count"),
         QStringLiteral("frame_dirty_row_range_lookup_count"),
         QStringLiteral("frame_dirty_row_range_scan_steps"),
-        QStringLiteral("frame_packed_rows"),
-        QStringLiteral("frame_packed_text_spans"),
-        QStringLiteral("frame_packed_text_cells"),
-        QStringLiteral("frame_packed_payload_bytes"),
         QStringLiteral("row_cache_hits"),
         QStringLiteral("row_cache_clean_skips"),
         QStringLiteral("background_row_rects_before_coalescing"),
@@ -6601,32 +6573,6 @@ bool validate_renderer_counter_invariants(
             k_flat_rect_vertices_per_rect)
     {
         *out_error = QStringLiteral("decoration batched-geometry counters are inconsistent");
-        return false;
-    }
-
-    const qint64 frame_packed_rows =
-        json_counter(object, QStringLiteral("frame_packed_rows"));
-    if (object.value(QStringLiteral("render_expected")).toBool()) {
-        const qint64 packed_row_frame_count =
-            object.value(QStringLiteral("source_mode")).toString() == k_surface_session_source_mode
-                ? object.value(QStringLiteral("completed_frames")).toInteger()
-                : json_counter(object, QStringLiteral("bridge_consumed_updates_delta"));
-        const qint64 expected_packed_rows =
-            json_counter(object, QStringLiteral("rows")) * packed_row_frame_count;
-        if (frame_packed_rows != expected_packed_rows) {
-            *out_error = QStringLiteral("packed row counters are inconsistent");
-            return false;
-        }
-    }
-
-    const qint64 frame_packed_text_cells =
-        json_counter(object, QStringLiteral("frame_packed_text_cells"));
-    const qint64 frame_packed_text_spans =
-        json_counter(object, QStringLiteral("frame_packed_text_spans"));
-    if (frame_packed_text_cells != 0 ||
-        frame_packed_text_spans != 0)
-    {
-        *out_error = QStringLiteral("packed text sidecars unexpectedly emitted");
         return false;
     }
 
@@ -7377,7 +7323,6 @@ bool validate_scenario_profile_value(
     bool profile_has_atlas_instances_scope    = false;
     bool profile_has_render_frame_scope       = false;
     bool profile_has_render_frame_cells_scope = false;
-    bool profile_has_packed_data_scope        = false;
     for (int index = 0; index < threads.size(); ++index) {
         if (!threads[index].isObject()) {
             *out_error = QStringLiteral("scenario profile thread is not an object: %1[%2]")
@@ -7442,11 +7387,6 @@ bool validate_scenario_profile_value(
             profile_node_has_descendant(
                 root.toObject(),
                 QStringLiteral("Qsg_atlas_render_node::prepare_atlas_instances"));
-        profile_has_packed_data_scope =
-            profile_has_packed_data_scope ||
-            profile_node_has_descendant_in_scope(
-                root.toObject(),
-                QStringLiteral("build_terminal_render_frame::packed_data"));
         profile_has_render_frame_scope =
             profile_has_render_frame_scope ||
             profile_node_has_descendant(
@@ -7474,8 +7414,7 @@ bool validate_scenario_profile_value(
         !profile_has_atlas_prepare_scope ||
         !profile_has_atlas_instances_scope ||
         !profile_has_render_frame_scope ||
-        !profile_has_render_frame_cells_scope ||
-        !profile_has_packed_data_scope)
+        !profile_has_render_frame_cells_scope)
     {
         *out_error = QStringLiteral("scenario profile required scopes are missing: %1")
             .arg(label);
@@ -7684,10 +7623,6 @@ bool validate_scenario_json(
         QStringLiteral("frame_dirty_row_lookup_count"),
         QStringLiteral("frame_dirty_row_range_lookup_count"),
         QStringLiteral("frame_dirty_row_range_scan_steps"),
-        QStringLiteral("frame_packed_rows"),
-        QStringLiteral("frame_packed_text_spans"),
-        QStringLiteral("frame_packed_text_cells"),
-        QStringLiteral("frame_packed_payload_bytes"),
         QStringLiteral("row_cache_hits"),
         QStringLiteral("row_cache_clean_skips"),
         QStringLiteral("background_row_rects_before_coalescing"),
