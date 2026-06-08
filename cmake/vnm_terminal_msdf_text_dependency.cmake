@@ -3,8 +3,11 @@ include_guard(GLOBAL)
 include(FetchContent)
 
 set(VNM_TERMINAL_MSDF_TEXT_VERSION 0.2.0)
-set(VNM_TERMINAL_MSDF_TEXT_GIT_TAG
-    04b6989483c280e862633489bda318f34dca05ec)
+
+# vnm_terminal_surface tracks vnm_msdf_text master; it does not pin a revision.
+# Remote fetches follow this branch, and an implicit sibling checkout must be on
+# this branch (use the *_SOURCE_DIR override to build a development branch).
+set(VNM_TERMINAL_MSDF_TEXT_GIT_BRANCH master)
 
 function(vnm_terminal_msdf_text_set_fetchcontent_build_dir name dir_name)
     string(TOLOWER "${CMAKE_CXX_COMPILER_ID}" _fc_compiler_tag)
@@ -125,9 +128,9 @@ function(vnm_terminal_msdf_text_make_available out_var)
             execute_process(
                 COMMAND
                     "${GIT_EXECUTABLE}" -C "${_vnm_terminal_msdf_text_source}"
-                    rev-parse HEAD
+                    rev-parse --abbrev-ref HEAD
                 RESULT_VARIABLE _vnm_terminal_msdf_text_git_result
-                OUTPUT_VARIABLE _vnm_terminal_msdf_text_git_head
+                OUTPUT_VARIABLE _vnm_terminal_msdf_text_git_branch
                 ERROR_VARIABLE _vnm_terminal_msdf_text_git_error
                 OUTPUT_STRIP_TRAILING_WHITESPACE
                 ERROR_STRIP_TRAILING_WHITESPACE)
@@ -138,12 +141,12 @@ function(vnm_terminal_msdf_text_make_available out_var)
                     "${_vnm_terminal_msdf_text_git_error}")
             endif()
 
-            if(NOT "${_vnm_terminal_msdf_text_git_head}" STREQUAL
-                "${VNM_TERMINAL_MSDF_TEXT_GIT_TAG}")
+            if(NOT "${_vnm_terminal_msdf_text_git_branch}" STREQUAL
+                "${VNM_TERMINAL_MSDF_TEXT_GIT_BRANCH}")
                 message(FATAL_ERROR
-                    "Implicit vnm_msdf_text source checkout is at "
-                    "${_vnm_terminal_msdf_text_git_head}; expected "
-                    "${VNM_TERMINAL_MSDF_TEXT_GIT_TAG}. Set "
+                    "Implicit vnm_msdf_text source checkout is on branch "
+                    "${_vnm_terminal_msdf_text_git_branch}; expected "
+                    "${VNM_TERMINAL_MSDF_TEXT_GIT_BRANCH}. Set "
                     "${_vnm_terminal_msdf_text_SOURCE_DIR_OPTION} explicitly to "
                     "use a development checkout.")
             endif()
@@ -181,7 +184,7 @@ function(vnm_terminal_msdf_text_make_available out_var)
         message(STATUS "${_vnm_terminal_msdf_text_CONTEXT}: Fetching vnm_msdf_text")
         FetchContent_Declare(vnm_msdf_text
             GIT_REPOSITORY https://github.com/imakris/vnm_msdf_text.git
-            GIT_TAG "${VNM_TERMINAL_MSDF_TEXT_GIT_TAG}"
+            GIT_TAG "${VNM_TERMINAL_MSDF_TEXT_GIT_BRANCH}"
             GIT_SHALLOW FALSE
             BINARY_DIR "${FETCHCONTENT_BINARY_DIR_vnm_msdf_text}"
         )
