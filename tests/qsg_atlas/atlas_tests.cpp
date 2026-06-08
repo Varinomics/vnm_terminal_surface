@@ -10443,6 +10443,68 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         "color-only",
         color_report,
         Atlas_msdf_steady_buffer_expectation::PARTIAL);
+
+    // Batch 1 instrumentation assertions. The baseline frame builds and uploads
+    // exactly one MSDF atlas; the steady same-size frames reuse it with no extra
+    // build or upload. Cross-size reuse is not enabled until Batch 3.
+    ok &= check(
+        baseline_report.render.msdf_text_cache_miss &&
+            baseline_report.render.msdf_text_atlas_build_attempted &&
+            baseline_report.render.msdf_text_atlas_build_succeeded,
+        "atlas MSDF resource stability records the initial baked-atlas build");
+    ok &= check(
+        baseline_report.render.msdf_text_atlas_build_attempts_total == 1U &&
+            baseline_report.render.msdf_text_atlas_texture_uploads_total == 1U,
+        "atlas MSDF resource stability builds and uploads the atlas exactly once at baseline");
+    ok &= check(
+        baseline_report.render.msdf_text_baked_pixel_height ==
+            baseline_report.render.msdf_text_pixel_height,
+        "atlas MSDF resource stability reports baked height equal to draw height in Batch 1");
+    ok &= check(
+        color_report.render.msdf_text_cache_hit &&
+            color_report.render.msdf_text_baked_atlas_reused &&
+            !color_report.render.msdf_text_cache_miss,
+        "atlas MSDF resource stability reuses the baked atlas on steady same-size frames");
+    ok &= check(
+        color_report.render.msdf_text_atlas_build_attempts_total == 1U &&
+            color_report.render.msdf_text_atlas_texture_uploads_total == 1U,
+        "atlas MSDF resource stability does not rebuild or re-upload for steady same-size frames");
+
+    // Batch 1 cache-identity check: a font-size change advances the font epoch,
+    // which is still a baked-atlas miss in Batch 1 and rebuilds/re-uploads once
+    // more. This also exercises the Batch 1 resource-lifetime split: the MSDF
+    // pipelines and shader-resource bindings survive the rebuild (they are no
+    // longer deleted on a cache miss), so the frame still reaches an active,
+    // resources-ready state after the new atlas is uploaded into the retained
+    // texture. Batch 3 reuses the baked atlas across draw sizes in the same bake
+    // bucket and must replace the rebuild-count assertion below.
+    surface.set_font_size(30.0);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(973U, false)));
+    const bool resized_prepared = pump_until(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return atlas_report_render_state_ready(report) &&
+                report.render.msdf_text_renderer_active &&
+                report.render.msdf_text_resources_ready &&
+                report.render.msdf_text_texture_ready;
+        });
+    const term::Qsg_atlas_frame_report resized_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    print_atlas_msdf_resource_stability_report("resized", resized_report);
+    ok &= check(
+        resized_prepared,
+        "atlas MSDF resource stability re-renders after a font-size change");
+    ok &= check(
+        resized_report.render.msdf_text_cache_miss &&
+            resized_report.render.msdf_text_atlas_build_attempts_total == 2U &&
+            resized_report.render.msdf_text_atlas_texture_uploads_total == 2U,
+        "atlas MSDF resource stability rebuilds and re-uploads once for a new font size (Batch 1)");
+
     return ok;
 }
 

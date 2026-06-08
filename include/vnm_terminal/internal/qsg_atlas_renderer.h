@@ -466,6 +466,22 @@ struct Qsg_atlas_render_summary
     int           msdf_text_pixel_height             = 0;
     int           msdf_text_atlas_size               = 0;
     float         msdf_text_px_range                 = 0.0f;
+    // Zoom-validation instrumentation (Batch 1). In Batch 1 the baked pixel
+    // height equals the draw pixel height; baked/draw separation arrives in
+    // Batch 3. Cross-size atlas reuse is not yet enabled, so
+    // msdf_text_baked_atlas_reused is diagnostic-only until then.
+    int           msdf_text_baked_pixel_height       = 0;
+    std::uint64_t msdf_text_atlas_generation         = 0U;
+    bool          msdf_text_cache_hit                = false;
+    bool          msdf_text_cache_miss               = false;
+    bool          msdf_text_baked_atlas_reused       = false;
+    bool          msdf_text_atlas_build_attempted    = false;
+    bool          msdf_text_atlas_build_succeeded    = false;
+    std::uint64_t msdf_text_atlas_build_attempts_total  = 0U;
+    std::uint64_t msdf_text_atlas_build_successes_total = 0U;
+    std::uint64_t msdf_text_atlas_texture_uploads_total = 0U;
+    std::uint64_t msdf_text_baked_cache_hits_total      = 0U;
+    std::uint64_t msdf_text_baked_cache_misses_total    = 0U;
     int           atlas_page_count                   = 0;
     int           atlas_page_budget                  = 0;
     std::uint64_t atlas_page_bytes                   = 0U;
