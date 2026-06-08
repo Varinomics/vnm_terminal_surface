@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <vector>
 
+class QFile;
 class QKeyEvent;
 
 namespace vnm_terminal::internal {
@@ -573,6 +574,7 @@ private:
     QByteArray                                             m_backend_output_prescan_pending;
     Terminal_utf8_scan_state                               m_backend_output_prescan_utf8_state;
     std::mutex                                             m_backend_output_capture_mutex;
+    std::unique_ptr<QFile>                                 m_backend_output_capture_file;
     std::optional<Terminal_screen_model>                   m_screen_model;
     std::shared_ptr<const Terminal_render_snapshot>        m_latest_render_snapshot;
     std::shared_ptr<const Terminal_render_snapshot>        m_latest_content_render_snapshot;
