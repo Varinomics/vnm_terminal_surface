@@ -206,6 +206,59 @@ int main()
         }
     }
 
+    // E8: does a child blocking on a small write to the slave fail to exit when
+    // the master is NOT drained, and does draining the master then unblock it?
+    // This is the exact exit-drain-with-paused-output scenario: the reader stops
+    // draining the master, the child writes its final line, and on macOS the
+    // slave write may block so the child never reaches exit().
+    {
+        int m = -1;
+        const pid_t p = spawn_pty(&m, "echo paused-exit-drain; (sleep 30) & exit 0");
+        if (p > 0) {
+            // Deliberately do NOT read the master.
+            int st = 0;
+            bool reaped_undrained = false;
+            const long long t0 = now_ms();
+            for (int i = 0; i < 300 && now_ms() - t0 < 2000; ++i) {
+                const pid_t r = waitpid(p, &st, WNOHANG);
+                if (r == p) { reaped_undrained = true; break; }
+                if (r < 0) break;
+                usleep(10 * 1000);
+            }
+            LOG("E8 child-exits-with-undrained-master=%d elapsed_ms=%lld "
+                "(0 => child blocked on write)",
+                reaped_undrained ? 1 : 0, now_ms() - t0);
+
+            if (!reaped_undrained) {
+                // Drain the master; the child's blocked write should complete.
+                ssize_t drained = 0;
+                for (int i = 0; i < 64; ++i) {
+                    char rb[4096];
+                    const ssize_t n = read(m, rb, sizeof rb);
+                    if (n > 0) { drained += n; continue; }
+                    break; // EAGAIN or EOF
+                }
+                LOG("E8 drained bytes=%zd; waiting for child after drain", drained);
+
+                bool reaped_after = false;
+                const long long t1 = now_ms();
+                for (int i = 0; i < 300 && now_ms() - t1 < 2000; ++i) {
+                    const pid_t r = waitpid(p, &st, WNOHANG);
+                    if (r == p) { reaped_after = true; break; }
+                    if (r < 0) break;
+                    usleep(10 * 1000);
+                }
+                LOG("E8 child-exits-after-drain=%d elapsed_ms=%lld "
+                    "(1 => draining the master unblocked the child)",
+                    reaped_after ? 1 : 0, now_ms() - t1);
+            }
+
+            kill(-p, SIGKILL);
+            kill(p, SIGKILL);
+            if (m >= 0) close(m);
+        }
+    }
+
     LOG("done");
     return 0;
 }
