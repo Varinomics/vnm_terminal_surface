@@ -5275,7 +5275,7 @@ QRectF scaled_rect(QRectF rect, qreal scale)
         rect.height() * scale);
 }
 
-QRectF msdf_glyph_plane_rect(const msdf::glyph_t& glyph)
+QRectF msdf_glyph_plane_rect(const msdf::scaled_glyph_t& glyph)
 {
     return QRectF(
         QPointF(glyph.plane_left, glyph.plane_bottom),
@@ -5404,6 +5404,7 @@ void blend_msdf_glyph_pixel(
 void paint_msdf_quad(
     QImage&                    image,
     const msdf::atlas_t&       atlas,
+    int                        draw_pixel_height,
     const msdf::text_vertex_t& top_left,
     const msdf::text_vertex_t& bottom_right,
     QColor                     foreground,
@@ -5413,6 +5414,8 @@ void paint_msdf_quad(
     if (atlas.atlas_size <= 0) {
         return;
     }
+    const float px_range =
+        msdf::px_range_for_pixel_height(atlas, draw_pixel_height);
 
     const float plane_left   = std::min(top_left.x, bottom_right.x);
     const float plane_right  = std::max(top_left.x, bottom_right.x);
@@ -5483,7 +5486,7 @@ void paint_msdf_quad(
                 x,
                 y,
                 foreground,
-                msdf_glyph_alpha_from_texel(texel, atlas.px_range));
+                msdf_glyph_alpha_from_texel(texel, px_range));
         }
     }
 
@@ -5496,6 +5499,7 @@ void paint_msdf_text_run(
     QImage&                              image,
     const term::Terminal_render_text_run& run,
     const msdf::atlas_t&                 atlas,
+    int                                  draw_pixel_height,
     qreal                                device_pixel_ratio,
     QRectF&                              draw_rect)
 {
@@ -5512,6 +5516,7 @@ void paint_msdf_text_run(
         std::lround(run.baseline_origin.y() * dpr));
     msdf::append_text_quads(
         atlas,
+        draw_pixel_height,
         std::string_view(
             utf8.constData(),
             static_cast<std::size_t>(utf8.size())),
@@ -5529,6 +5534,7 @@ void paint_msdf_text_run(
         paint_msdf_quad(
             image,
             atlas,
+            draw_pixel_height,
             vertices[base],
             vertices[base + 2U],
             run.foreground,
@@ -5541,6 +5547,7 @@ void paint_msdf_text_runs(
     QImage&                                      image,
     const std::vector<term::Terminal_render_text_run>& runs,
     const msdf::atlas_t&                         atlas,
+    int                                          draw_pixel_height,
     qreal                                        device_pixel_ratio,
     QRectF&                                      draw_rect)
 {
@@ -5549,6 +5556,7 @@ void paint_msdf_text_runs(
             image,
             run,
             atlas,
+            draw_pixel_height,
             device_pixel_ratio,
             draw_rect);
     }
@@ -5602,10 +5610,14 @@ Msdf_single_w_probe_result render_msdf_single_w_probe_fixture(
     }
 
     result.atlas_size         = build.atlas.atlas_size;
-    result.px_range           = build.atlas.px_range;
-    result.advance_x          = glyph->second.advance_x;
-    result.baseline_offset_px = -build.atlas.font_metrics.descender;
-    result.plane_rect         = msdf_glyph_plane_rect(glyph->second);
+    result.px_range           =
+        msdf::px_range_for_pixel_height(build.atlas, result.pixel_height);
+    const msdf::scaled_glyph_t scaled_w =
+        msdf::scaled_glyph(build.atlas, glyph->second, result.pixel_height);
+    result.advance_x          = scaled_w.advance_x;
+    result.baseline_offset_px =
+        -msdf::scaled_font_metrics(build.atlas, result.pixel_height).descender;
+    result.plane_rect         = msdf_glyph_plane_rect(scaled_w);
     result.render.image = QImage(
         physical_image_size.value_or(
             pixel_window_physical_pixel_size(
@@ -5636,6 +5648,7 @@ Msdf_single_w_probe_result render_msdf_single_w_probe_fixture(
         result.render.image,
         frame.text_runs,
         build.atlas,
+        result.pixel_height,
         result.render.device_pixel_ratio,
         result.draw_rect);
     paint_pixel_reference_decorations(
@@ -5650,6 +5663,7 @@ Msdf_single_w_probe_result render_msdf_single_w_probe_fixture(
         result.render.image,
         frame.cursor_text_runs,
         build.atlas,
+        result.pixel_height,
         result.render.device_pixel_ratio,
         result.draw_rect);
     paint_pixel_reference_rects(
@@ -10456,10 +10470,17 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         baseline_report.render.msdf_text_atlas_build_attempts_total == 1U &&
             baseline_report.render.msdf_text_atlas_texture_uploads_total == 1U,
         "atlas MSDF resource stability builds and uploads the atlas exactly once at baseline");
+    // Batch 2: the library bakes at max(draw_pixel_height,
+    // ceil(min_atlas_font_size)). The renderer's min_atlas_font_size is 48 and the
+    // 18px test font draws below it, so the baked height is the 48px floor and is
+    // deliberately distinct from the draw height.
+    constexpr int k_msdf_min_bake_pixel_height = 48;
     ok &= check(
         baseline_report.render.msdf_text_baked_pixel_height ==
-            baseline_report.render.msdf_text_pixel_height,
-        "atlas MSDF resource stability reports baked height equal to draw height in Batch 1");
+            std::max(
+                baseline_report.render.msdf_text_pixel_height,
+                k_msdf_min_bake_pixel_height),
+        "atlas MSDF resource stability reports the baked height as the bake-bucket floor");
     ok &= check(
         color_report.render.msdf_text_cache_hit &&
             color_report.render.msdf_text_baked_atlas_reused &&
