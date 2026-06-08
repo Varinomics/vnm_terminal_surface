@@ -993,14 +993,12 @@ QByteArray framed_paste(QByteArray body)
 
 term::terminal_cell_metrics_t current_cell_metrics(const VNM_TerminalSurface& surface)
 {
-    const QFont font = term::vnm_terminal_font(surface.font_family(), surface.font_size());
-    const QFontMetricsF metrics(font);
-    return {
-        metrics.horizontalAdvance(QLatin1Char('M')),
-        metrics.lineSpacing(),
-        metrics.ascent(),
-        metrics.descent(),
-    };
+    // Mirror the surface exactly: production snaps each font metric up to the
+    // device pixel grid (see Qt_grid_metrics_provider) and clamps the cell
+    // height to ascent + descent. Recomputing raw QFontMetricsF values here
+    // would diverge whenever ceil(ascent) + ceil(descent) exceeds lineSpacing,
+    // sending too-short pixel-wheel fragments and mis-placing pointer hit-tests.
+    return term::VNM_TerminalSurface_render_bridge::cell_metrics(surface);
 }
 
 QPointF point_in_grid_cell(

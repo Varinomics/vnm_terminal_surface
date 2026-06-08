@@ -107,6 +107,13 @@ public:
     static std::shared_ptr<const Terminal_render_snapshot> render_snapshot(
         const VNM_TerminalSurface& surface);
 
+    // Device-pixel-snapped cell metrics the surface currently uses for grid
+    // sizing, pixel-wheel accumulation, and selection/pointer hit-testing.
+    // Tests must read these rather than recomputing raw QFontMetricsF values,
+    // which omit the device-pixel snapping production applies.
+    static terminal_cell_metrics_t cell_metrics(
+        const VNM_TerminalSurface& surface);
+
     static Ime_preedit_state ime_preedit_state(
         const VNM_TerminalSurface& surface);
 
