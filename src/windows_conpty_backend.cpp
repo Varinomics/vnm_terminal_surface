@@ -792,6 +792,13 @@ private:
 
     void deliver_or_buffer_output(QByteArray bytes)
     {
+        // Always allow buffering. Unlike the POSIX backend -- which deliberately
+        // keeps draining a paused master up to a high-water mark so a child blocked
+        // in write() on macOS can still exit -- the ConPTY read_loop parks on
+        // m_output_cv while output is paused and does not read. So m_paused_output
+        // holds at most the single in-flight chunk captured when a pause raced an
+        // already-issued ReadFile, and that is drained on resume. It cannot grow
+        // unbounded, so no byte cap (and no can-buffer predicate) is needed here.
         deliver_or_buffer_native_backend_output(
             m_mutex,
             m_callbacks,
