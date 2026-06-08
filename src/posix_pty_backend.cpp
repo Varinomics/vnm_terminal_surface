@@ -21,6 +21,7 @@
 #include <vector>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
@@ -33,6 +34,15 @@
 #else
 #include <pty.h>
 #endif
+
+// TEMP diagnostic: trace the PTY exit/shutdown path to locate the macOS
+// posix_pty_backend exit-drain hang. Remove once the deadlock is fixed.
+#define PTYDIAG(...)                                  \
+    do {                                              \
+        ::fprintf(stderr, "PTYDIAG " __VA_ARGS__);    \
+        ::fprintf(stderr, "\n");                      \
+        ::fflush(stderr);                             \
+    } while (0)
 
 namespace vnm_terminal::internal {
 
@@ -963,6 +973,8 @@ public:
             reader_finished                      = m_reader_finished;
         }
 
+        PTYDIAG("shutdown begin child_reaped=%d reader_finished=%d",
+            child_reaped ? 1 : 0, reader_finished ? 1 : 0);
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
@@ -975,8 +987,10 @@ public:
                 reader_finished),
             SIGKILL);
 
+        PTYDIAG("shutdown signaled, joining");
         join_threads();
         reap_child_if_unreaped(child_pid);
+        PTYDIAG("shutdown reaped, done");
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_master.reset();
@@ -1312,6 +1326,7 @@ private:
                 if (m_child_reaped && !final_drain_deadline.has_value()) {
                     final_drain_deadline =
                         std::chrono::steady_clock::now() + k_exit_output_drain_timeout;
+                    PTYDIAG("read_loop drain armed");
                 }
 
                 master = m_master.get();
@@ -1407,6 +1422,7 @@ private:
                 static_cast<qsizetype>(bytes_read)));
         }
 
+        PTYDIAG("read_loop finished timed_out=%d", timed_out_after_child_reap ? 1 : 0);
         mark_reader_finished(timed_out_after_child_reap);
     }
 
@@ -1448,6 +1464,7 @@ private:
 
     bool wait_until_master_writable(int master, int wake_read)
     {
+        PTYDIAG("writer wait_until_master_writable enter");
         for (;;) {
             pollfd fds[2] = {
                 { master, POLLOUT | POLLHUP | POLLERR, 0 },
@@ -1552,9 +1569,13 @@ private:
             return;
         }
 
+        PTYDIAG("wait_loop waitpid begin child_pid=%d", child_pid);
         int status = 0;
-        if (waitpid_nointr(child_pid, &status, 0) != child_pid) {
-            const int wait_error = errno;
+        const pid_t reaped = waitpid_nointr(child_pid, &status, 0);
+        const int waitpid_errno = errno;
+        PTYDIAG("wait_loop waitpid returned ret=%d", static_cast<int>(reaped));
+        if (reaped != child_pid) {
+            const int wait_error = waitpid_errno;
             QByteArray paused_output;
             bool paused_output_delivery_started = false;
             {
@@ -1608,12 +1629,17 @@ private:
             deliver_output(std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
+        PTYDIAG("wait_loop reaped child status=%d", status);
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
+        PTYDIAG("wait_loop wait_for_reader begin");
         wait_for_reader_finished();
+        PTYDIAG("wait_loop wait_for_reader end");
         kill_child_process_group_after_exit_timeout();
+        PTYDIAG("wait_loop kill_group end");
         report_exit_once(status);
+        PTYDIAG("wait_loop report_exit end");
     }
 
     void kill_child_process_group_after_exit_timeout()
@@ -1682,10 +1708,15 @@ private:
 
     void join_threads()
     {
+        PTYDIAG("join reader begin");
         join_or_detach_native_backend_thread(m_reader_thread);
+        PTYDIAG("join writer begin");
         join_or_detach_native_backend_thread(m_writer_thread);
+        PTYDIAG("join wait begin");
         join_or_detach_native_backend_thread(m_wait_thread);
+        PTYDIAG("join termination begin");
         join_or_detach_native_backend_thread(m_termination_thread);
+        PTYDIAG("join threads end");
     }
 
     std::mutex                          m_mutex;
