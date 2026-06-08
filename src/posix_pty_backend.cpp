@@ -453,6 +453,20 @@ int waitpid_nointr(pid_t pid, int* status, int options)
     }
 }
 
+// Reap a child that failed PTY setup before the session became live. The signal
+// target depends on the child's lifecycle stage, which is why the two call sites
+// differ: before exec is confirmed the child may not yet have run forkpty's
+// login_tty -> setsid (or the explicit setpgid in the child branch), so its
+// process group is not reliably its own pid -- signal the single child pid. Once
+// exec is confirmed the child is its own session/process-group leader, so signal
+// the whole group (-pid) to also reap any descendants it spawned.
+void terminate_unstarted_child(pid_t child_pid, bool process_group_established)
+{
+    const pid_t signal_target = process_group_established ? -child_pid : child_pid;
+    ::kill(signal_target, SIGKILL);
+    waitpid_nointr(child_pid, nullptr, 0);
+}
+
 std::chrono::milliseconds bounded_sleep_interval(
     std::chrono::milliseconds remaining)
 {
@@ -654,6 +668,13 @@ public:
 
         if (child_pid == 0) {
             startup_error_read.reset();
+            // POSIX session/process-group setup: the child always becomes its own
+            // session/process-group leader. forkpty's login_tty already calls
+            // setsid(); this setpgid(0, 0) defensively reasserts the child's own
+            // process group so signal targeting (e.g. kill(-pgid, SIGINT) for the
+            // foreground group) stays reliable. The result is intentionally
+            // unchecked: setsid has already established the group and the child is
+            // about to exec.
             (void)::setpgid(0, 0);
             exec_child(*native_launch, startup_error_write.get());
         }
@@ -663,8 +684,8 @@ public:
 
         const int cloexec_result = set_fd_cloexec(master.get());
         if (cloexec_result != 0) {
-            ::kill(child_pid, SIGKILL);
-            waitpid_nointr(child_pid, nullptr, 0);
+            // Exec not yet confirmed: the child's own process group may not exist.
+            terminate_unstarted_child(child_pid, /*process_group_established=*/false);
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
@@ -683,8 +704,9 @@ public:
 
         const int nonblocking_result = set_fd_nonblocking(master.get());
         if (nonblocking_result != 0) {
-            ::kill(-child_pid, SIGKILL);
-            waitpid_nointr(child_pid, nullptr, 0);
+            // Exec confirmed (startup-error pipe closed): the child is its own
+            // process-group leader, so reap the whole group.
+            terminate_unstarted_child(child_pid, /*process_group_established=*/true);
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
