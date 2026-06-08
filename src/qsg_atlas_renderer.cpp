@@ -4188,19 +4188,29 @@ private:
                     record.glyph_index)
                 : Glyph_raster_image();
         const bool use_outline_raster = !outline_raster.image.isNull();
+        // Subpixel (LCD) glyph rasterization needs both the GPU dual-source blend
+        // capability and a real subpixel layout. On headless/offscreen platforms
+        // the resolved subpixel order is NONE, and requesting an A32 subpixel alpha
+        // map there fails with a FreeType "unimplemented feature" error and yields
+        // no glyph pixels. Gate on the subpixel order too (matching the MSDF LCD
+        // eligibility) so those platforms fall back to grayscale.
+        const bool lcd_glyph_text_enabled =
+            m_dual_source_blend_factors_available &&
+            qsg_atlas_lcd_subpixel_order_uses_lcd_sampling(
+                m_frame.options.msdf_lcd_subpixel_order);
         const QPoint physical_offset = use_outline_raster
             ? outline_raster.physical_offset
             : qsg_atlas_glyph_physical_offset_for_raster_font(
                 raster_font,
                 record.glyph_index,
                 presentation,
-                m_dual_source_blend_factors_available);
+                lcd_glyph_text_enabled);
 
         VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::rasterize_glyph");
         result.raster_thread = current_thread_id();
         const QRawFont::AntialiasingType antialiasing =
             presentation == Glyph_image_presentation::TEXT &&
-                m_dual_source_blend_factors_available
+                lcd_glyph_text_enabled
                 ? QRawFont::SubPixelAntialiasing
                 : QRawFont::PixelAntialiasing;
         const QImage alpha_map = use_outline_raster
