@@ -41,6 +41,13 @@ jobs:
       - name: Build
         run: cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel
 
+      - name: TEMP PTY poll probe
+        run: |
+          clang++ -std=c++17 -O0 tools/diagnostics/macos_pty_poll_probe.cpp -o pty_poll_probe
+          # 60s wall clock cap so a poll() that ignores its timeout cannot stall
+          # the job; the last flushed "begin" line then names the stuck poll.
+          ( /usr/bin/perl -e 'alarm 60; exec @ARGV' ./pty_poll_probe ) 2>&1 || true
+
       - name: Run tests
         working-directory: build
         env:
