@@ -9,6 +9,7 @@
 #include <vnm_msdf_text/msdf_text.h>
 #endif
 
+#include <QCryptographicHash>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QGlyphRun>
@@ -37,6 +38,7 @@
 #include <span>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 
 namespace vnm_terminal::internal {
@@ -240,20 +242,70 @@ struct Simple_atlas_text_cache
 };
 
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+// Identity of the baked MSDF atlas. The bitmap and font-space glyph data depend
+// only on the font, the requested codepoint inventory, the atlas-pixel options,
+// and the bake pixel-height bucket -- never on the draw pixel height within a
+// bucket. Keyed separately from the draw layout so ordinary font-size zoom that
+// stays inside one bake bucket reuses the baked atlas with no rebuild or upload.
+// font_epoch is deliberately excluded because it advances on every font-size
+// change; the font identity is the embedded-font fingerprint instead.
+struct Msdf_terminal_baked_atlas_key
+{
+    QByteArray    font_fingerprint;
+    QByteArray    codepoint_inventory_hash;
+    int           baked_pixel_height   = 0;
+    int           atlas_size           = 0;
+    double        min_atlas_font_size  = 0.0;
+    float         atlas_px_range       = 0.0f;
+    int           atlas_gutter_px      = 0;
+    bool          build_kerning_table  = false;
+    int           missing_glyph_policy = 0;
+    bool          valid                = false;
+};
+
+bool msdf_baked_atlas_key_equal(
+    const Msdf_terminal_baked_atlas_key& left,
+    const Msdf_terminal_baked_atlas_key& right)
+{
+    return
+        left.valid                == right.valid &&
+        left.baked_pixel_height   == right.baked_pixel_height &&
+        left.atlas_size           == right.atlas_size &&
+        left.min_atlas_font_size  == right.min_atlas_font_size &&
+        left.atlas_px_range       == right.atlas_px_range &&
+        left.atlas_gutter_px      == right.atlas_gutter_px &&
+        left.build_kerning_table  == right.build_kerning_table &&
+        left.missing_glyph_policy == right.missing_glyph_policy &&
+        left.font_fingerprint         == right.font_fingerprint &&
+        left.codepoint_inventory_hash == right.codepoint_inventory_hash;
+}
+
 struct Msdf_terminal_text_cache
 {
-    std::uint64_t font_epoch = 0U;
+    Msdf_terminal_baked_atlas_key baked_key;
     std::uint64_t generation = 0U;
-    qreal         device_pixel_ratio = 1.0;
-    terminal_cell_metrics_t
-                  cell_metrics;
-    int           pixel_height = 0;
     int           font_data_bytes = 0;
     bool          initialized = false;
     bool          atlas_built = false;
     bool          ready       = false;
     QString       message;
     msdf_text_atlas_t atlas;
+};
+
+// Draw-size layout derived from one baked atlas for the current terminal size.
+// Recomputed cheaply whenever the draw pixel height, device-pixel ratio, snapped
+// cell metrics, or baked atlas generation change, without touching the baked
+// atlas texture. scaled_glyphs caches the draw-size plane and UV data once per
+// layout so the per-cell append loop performs no per-glyph division.
+struct Msdf_terminal_draw_layout_state
+{
+    std::uint64_t generation         = 0U;
+    qreal         device_pixel_ratio = 1.0;
+    terminal_cell_metrics_t cell_metrics;
+    int           draw_pixel_height  = 0;
+    float         px_range           = 0.0f;
+    bool          valid              = false;
+    std::unordered_map<char32_t, msdf_text::scaled_glyph_t> scaled_glyphs;
 };
 
 // Lifetime-cumulative MSDF instrumentation counters (Batch 1). These persist
@@ -2285,18 +2337,19 @@ private:
     {
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         summary.msdf_text_font_data_bytes = m_msdf_text_cache.font_data_bytes;
-        summary.msdf_text_pixel_height    = m_msdf_text_cache.pixel_height;
-        // Batch 2: the library bakes at max(draw_pixel_height,
+        // Draw-layer values: the draw pixel height and shader range vary with the
+        // font size even when the baked atlas is reused across a zoom step.
+        summary.msdf_text_pixel_height    = m_msdf_draw_layout.draw_pixel_height;
+        summary.msdf_text_px_range        = m_msdf_draw_layout.px_range;
+        // Baked-layer values: the library bakes at max(draw_pixel_height,
         // ceil(min_atlas_font_size)), so the baked height can exceed the draw
-        // height for small font sizes. Report the height the atlas was baked at.
+        // height for small font sizes. The generation only advances on a baked
+        // rebuild, so it is stable across same-bucket zoom.
         summary.msdf_text_baked_pixel_height =
             m_msdf_text_cache.atlas.baked_pixel_height;
         summary.msdf_text_atlas_generation   = m_msdf_text_cache.generation;
         summary.msdf_text_atlas_size      =
             m_msdf_text_cache.atlas.atlas_size;
-        summary.msdf_text_px_range        =
-            msdf_text::px_range_for_pixel_height(
-                m_msdf_text_cache.atlas, m_msdf_text_cache.pixel_height);
         summary.msdf_text_message         = m_msdf_text_cache.message;
         // A frame whose first run rebuilt the atlas but whose later runs reused
         // it is a miss, not a reuse, for diagnostic purposes.
@@ -3771,6 +3824,26 @@ private:
         fallback_render.msdf_text_texture_uploaded =
             fallback_render.msdf_text_texture_uploaded ||
             failed_msdf_render.msdf_text_texture_uploaded;
+        // Carry the per-frame baked-cache event flags so a fallback frame still
+        // reports the MSDF build/miss it attempted before falling back. The
+        // cumulative *_total counters are re-snapshotted from the persistent
+        // counters and need no carry; a fallback frame is a miss, so the cache-hit
+        // and baked-atlas-reused flags are intentionally not propagated.
+        fallback_render.msdf_text_cache_miss =
+            fallback_render.msdf_text_cache_miss ||
+            failed_msdf_render.msdf_text_cache_miss;
+        fallback_render.msdf_text_atlas_build_attempted =
+            fallback_render.msdf_text_atlas_build_attempted ||
+            failed_msdf_render.msdf_text_atlas_build_attempted;
+        fallback_render.msdf_text_atlas_build_succeeded =
+            fallback_render.msdf_text_atlas_build_succeeded ||
+            failed_msdf_render.msdf_text_atlas_build_succeeded;
+        fallback_render.msdf_text_baked_pixel_height = std::max(
+            fallback_render.msdf_text_baked_pixel_height,
+            failed_msdf_render.msdf_text_baked_pixel_height);
+        fallback_render.msdf_text_atlas_generation = std::max(
+            fallback_render.msdf_text_atlas_generation,
+            failed_msdf_render.msdf_text_atlas_generation);
         fallback_render.msdf_text_resources_ready = false;
         fallback_render.msdf_text_renderer_active = false;
         fallback_render.msdf_text_font_data_bytes = std::max(
@@ -4582,37 +4655,118 @@ private:
     }
 
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
-    bool msdf_text_cache_matches(
-        qreal normalized_device_pixel_ratio,
-        int   pixel_height) const
+    Msdf_terminal_baked_atlas_key make_msdf_baked_atlas_key(int baked_pixel_height)
     {
-        return
-            m_msdf_text_cache.initialized &&
-            m_msdf_text_cache.font_epoch == m_frame.font_epoch &&
-            m_msdf_text_cache.pixel_height == pixel_height &&
+        const msdf_text::options_t options = atlas_msdf_text_options();
+        Msdf_terminal_baked_atlas_key key;
+        key.font_fingerprint         = m_msdf_embedded_font_fingerprint;
+        key.codepoint_inventory_hash = msdf_codepoint_inventory_hash();
+        key.baked_pixel_height       = baked_pixel_height;
+        key.atlas_size               = options.atlas_size;
+        key.min_atlas_font_size      = options.min_atlas_font_size;
+        key.atlas_px_range           = options.atlas_px_range;
+        key.atlas_gutter_px          = options.atlas_gutter_px;
+        key.build_kerning_table      = options.build_kerning_table;
+        key.missing_glyph_policy     =
+            static_cast<int>(options.missing_glyph_policy);
+        key.valid                    = true;
+        return key;
+    }
+
+    const QByteArray& msdf_codepoint_inventory_hash()
+    {
+        if (m_msdf_codepoint_inventory_hash.isEmpty()) {
+            const std::vector<char32_t>& codepoints = atlas_msdf_text_codepoints();
+            m_msdf_codepoint_inventory_hash = QCryptographicHash::hash(
+                QByteArray(
+                    reinterpret_cast<const char*>(codepoints.data()),
+                    static_cast<qsizetype>(
+                        codepoints.size() * sizeof(char32_t))),
+                QCryptographicHash::Sha256);
+        }
+        return m_msdf_codepoint_inventory_hash;
+    }
+
+    void update_msdf_draw_layout_state(
+        qreal normalized_device_pixel_ratio,
+        int   draw_pixel_height)
+    {
+        const msdf_text::atlas_t& atlas = m_msdf_text_cache.atlas;
+        m_msdf_draw_layout.generation         = m_msdf_text_cache.generation;
+        m_msdf_draw_layout.device_pixel_ratio = normalized_device_pixel_ratio;
+        m_msdf_draw_layout.cell_metrics       = m_frame.cell_metrics;
+        m_msdf_draw_layout.draw_pixel_height  = draw_pixel_height;
+        // px_range_for_pixel_height already folds the draw scale, the
+        // screen-to-atlas ratio, and the atlas sharpness bias into the shader
+        // range, so the draw layout only needs to cache that one derived value.
+        m_msdf_draw_layout.px_range =
+            msdf_text::px_range_for_pixel_height(atlas, draw_pixel_height);
+        m_msdf_draw_layout.scaled_glyphs.clear();
+        m_msdf_draw_layout.scaled_glyphs.reserve(atlas.glyphs.size());
+        for (const auto& entry : atlas.glyphs) {
+            m_msdf_draw_layout.scaled_glyphs.emplace(
+                entry.first,
+                msdf_text::scaled_glyph(
+                    atlas, entry.second, draw_pixel_height));
+        }
+        m_msdf_draw_layout.valid = true;
+    }
+
+    // Refresh the draw layout only when the draw pixel height, device-pixel
+    // ratio, snapped cell metrics, or baked atlas generation changed. This is the
+    // cheap per-zoom-step work that must never rebuild or re-upload the atlas.
+    void ensure_msdf_draw_layout_state(
+        qreal normalized_device_pixel_ratio,
+        int   draw_pixel_height)
+    {
+        if (m_msdf_draw_layout.valid &&
+            m_msdf_draw_layout.generation == m_msdf_text_cache.generation &&
+            m_msdf_draw_layout.draw_pixel_height == draw_pixel_height &&
             qsg_atlas_cell_metric_equal(
-                m_msdf_text_cache.device_pixel_ratio,
+                m_msdf_draw_layout.device_pixel_ratio,
                 normalized_device_pixel_ratio) &&
             qsg_atlas_cell_metrics_equal(
-                m_msdf_text_cache.cell_metrics,
-                m_frame.cell_metrics);
+                m_msdf_draw_layout.cell_metrics,
+                m_frame.cell_metrics))
+        {
+            return;
+        }
+        update_msdf_draw_layout_state(
+            normalized_device_pixel_ratio, draw_pixel_height);
     }
 
     bool ensure_msdf_text_cache(Atlas_prepare_result& result)
     {
         const qreal normalized_device_pixel_ratio =
             atlas_normalized_device_pixel_ratio(m_frame.device_pixel_ratio);
-        const int pixel_height = std::max(
+        const int draw_pixel_height = std::max(
             1,
             atlas_snapped_physical_int(
                 m_frame.cell_metrics.ascent,
                 normalized_device_pixel_ratio));
         m_msdf_text_used_this_frame = true;
-        if (msdf_text_cache_matches(normalized_device_pixel_ratio, pixel_height)) {
+
+        const msdf_text::options_t options = atlas_msdf_text_options();
+        const int baked_pixel_height =
+            msdf_text::msdf_bake_pixel_height(draw_pixel_height, options);
+        const Msdf_terminal_baked_atlas_key baked_key =
+            make_msdf_baked_atlas_key(baked_pixel_height);
+
+        if (m_msdf_text_cache.initialized &&
+            msdf_baked_atlas_key_equal(m_msdf_text_cache.baked_key, baked_key))
+        {
+            // Baked-atlas hit: the bitmap and font-space glyph data are reused. A
+            // font-size change inside one bake bucket only refreshes the cheap
+            // draw layout; it does not rebuild the atlas, advance the generation,
+            // or re-upload the texture.
             result.render.msdf_text_atlas_built = m_msdf_text_cache.atlas_built;
             result.render.msdf_text_atlas_ready = m_msdf_text_cache.ready;
             result.render.msdf_text_cache_hit   = true;
             result.render.msdf_text_baked_atlas_reused = m_msdf_text_cache.ready;
+            if (m_msdf_text_cache.ready) {
+                ensure_msdf_draw_layout_state(
+                    normalized_device_pixel_ratio, draw_pixel_height);
+            }
             return m_msdf_text_cache.ready;
         }
 
@@ -4621,27 +4775,29 @@ private:
 
         const std::uint64_t next_generation = m_msdf_text_cache.generation + 1U;
         m_msdf_text_cache = {};
-        m_msdf_text_cache.generation         = next_generation;
-        m_msdf_text_cache.initialized        = true;
-        m_msdf_text_cache.font_epoch         = m_frame.font_epoch;
-        m_msdf_text_cache.device_pixel_ratio = normalized_device_pixel_ratio;
-        m_msdf_text_cache.cell_metrics       = m_frame.cell_metrics;
-        m_msdf_text_cache.pixel_height       = pixel_height;
-        m_msdf_text_uploaded_generation      = 0U;
-        // Batch 1 resource-lifetime split: a baked-atlas rebuild no longer
-        // deletes the MSDF pipelines, shader-resource bindings, or atlas
-        // texture here. ensure_msdf_text_atlas_texture() keeps the texture
-        // object when its format and size are unchanged (and rebuilds the
-        // texture plus the dependent SRB/pipeline only when the texture size
-        // actually changes). The new atlas content is re-uploaded into the
-        // existing texture because the generation advanced, so a font-size
-        // change no longer discards pipelines/SRBs that did not depend on it.
+        m_msdf_text_cache.generation    = next_generation;
+        m_msdf_text_cache.initialized   = true;
+        m_msdf_text_cache.baked_key     = baked_key;
+        m_msdf_text_uploaded_generation = 0U;
+        m_msdf_draw_layout              = {};
+        // Resource-lifetime split: a baked-atlas rebuild does not delete the MSDF
+        // pipelines, shader-resource bindings, or atlas texture here.
+        // ensure_msdf_text_atlas_texture() keeps the texture object when its
+        // format and size are unchanged, and only the new bitmap is re-uploaded
+        // because the generation advanced. A font-size change that stays in the
+        // same bake bucket never reaches this branch, so it neither rebuilds nor
+        // re-uploads the atlas.
 
         QFile font_file(QString::fromLatin1(k_atlas_msdf_terminal_font_resource));
         if (!font_file.open(QIODevice::ReadOnly)) {
             m_msdf_text_cache.message = QStringLiteral(
                 "failed to open embedded terminal monospace font: %1")
                 .arg(font_file.errorString());
+            // Leave the cache uninitialized so the next frame retries this cheap
+            // resource read instead of treating the failed key as a hit. A real
+            // build failure below keeps the key, because re-running the expensive
+            // build every frame for a deterministic failure is worse.
+            m_msdf_text_cache.initialized = false;
             result.render.msdf_text_atlas_built = false;
             result.render.msdf_text_atlas_ready = false;
             return false;
@@ -4652,9 +4808,20 @@ private:
         if (font_data.isEmpty()) {
             m_msdf_text_cache.message =
                 QStringLiteral("embedded terminal monospace font resource is empty");
+            m_msdf_text_cache.initialized = false;
             result.render.msdf_text_atlas_built = false;
             result.render.msdf_text_atlas_ready = false;
             return false;
+        }
+
+        // Fingerprint the embedded font bytes once so the baked key has a stable
+        // font identity that does not depend on the resource path, and backfill
+        // the freshly stored key so later frames match without re-reading the font.
+        if (m_msdf_embedded_font_fingerprint.isEmpty()) {
+            m_msdf_embedded_font_fingerprint =
+                QCryptographicHash::hash(font_data, QCryptographicHash::Sha256);
+            m_msdf_text_cache.baked_key.font_fingerprint =
+                m_msdf_embedded_font_fingerprint;
         }
 
         const std::vector<char32_t>& codepoints = atlas_msdf_text_codepoints();
@@ -4663,9 +4830,9 @@ private:
         msdf_text::build_result_t build = msdf_text::build_font_atlas(
             reinterpret_cast<const std::uint8_t*>(font_data.constData()),
             static_cast<std::size_t>(font_data.size()),
-            pixel_height,
+            baked_pixel_height,
             std::span<const char32_t>(codepoints.data(), codepoints.size()),
-            atlas_msdf_text_options());
+            options);
         m_msdf_text_cache.atlas_built =
             build.status != msdf_text::Build_status::FAILURE;
         if (m_msdf_text_cache.atlas_built) {
@@ -4689,6 +4856,10 @@ private:
         }
         result.render.msdf_text_atlas_built = m_msdf_text_cache.atlas_built;
         result.render.msdf_text_atlas_ready = m_msdf_text_cache.ready;
+        if (m_msdf_text_cache.ready) {
+            ensure_msdf_draw_layout_state(
+                normalized_device_pixel_ratio, draw_pixel_height);
+        }
         return m_msdf_text_cache.ready;
     }
 
@@ -4721,19 +4892,16 @@ private:
     }
 
     void append_msdf_text_instance(
-        const msdf_text_glyph_t&          glyph,
+        const msdf_text::scaled_glyph_t&  scaled,
         QPointF                           physical_baseline_origin,
         const Terminal_render_text_run&   run,
         const std::array<float, 4>&       color,
         const std::array<float, 4>&       background_color,
         qreal                             normalized_device_pixel_ratio)
     {
-        // Batch 2: derive draw-size plane/UV data from the scale-independent
-        // baked glyph at the current draw pixel height. Batch 3 will precompute
-        // this scaled glyph once per draw-layout state instead of per cell.
-        const msdf_text::scaled_glyph_t scaled =
-            msdf_text::scaled_glyph(
-                m_msdf_text_cache.atlas, glyph, m_msdf_text_cache.pixel_height);
+        // Batch 3: the scaled glyph is precomputed once per draw-layout state in
+        // m_msdf_draw_layout.scaled_glyphs, so the per-cell path does no scaling
+        // division here.
         const qreal physical_origin_x = physical_baseline_origin.x();
         const qreal physical_origin_y = physical_baseline_origin.y();
         const qreal physical_left =
@@ -4885,8 +5053,12 @@ private:
             {
                 continue;
             }
+            const auto scaled = m_msdf_draw_layout.scaled_glyphs.find(codepoint);
+            if (scaled == m_msdf_draw_layout.scaled_glyphs.end()) {
+                continue;
+            }
             append_msdf_text_instance(
-                glyph->second,
+                scaled->second,
                 QPointF(
                     physical_grid_left +
                         static_cast<qreal>(
@@ -5609,9 +5781,7 @@ private:
                 mvp.constData(),
                 mvp.constData() + 16,
                 std::begin(msdf_uniform.matrix));
-            msdf_uniform.px_range      =
-                msdf_text::px_range_for_pixel_height(
-                    m_msdf_text_cache.atlas, m_msdf_text_cache.pixel_height);
+            msdf_uniform.px_range      = m_msdf_draw_layout.px_range;
             msdf_uniform.target_width  = static_cast<float>(
                 std::max(1, render_target_size.width()));
             msdf_uniform.target_height = static_cast<float>(
@@ -5848,6 +6018,11 @@ private:
         false;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
     Msdf_terminal_text_cache                 m_msdf_text_cache;
+    Msdf_terminal_draw_layout_state          m_msdf_draw_layout;
+    // Stable identity of the embedded font and codepoint inventory, computed once
+    // and reused so the baked-atlas key never re-reads the font on a cache hit.
+    QByteArray                               m_msdf_embedded_font_fingerprint;
+    QByteArray                               m_msdf_codepoint_inventory_hash;
     std::uint64_t                            m_msdf_text_uploaded_generation = 0U;
     Msdf_text_zoom_counters                  m_msdf_text_counters;
     // Per-frame accumulators for the baked-cache hit/miss tally. They are reset
