@@ -21,6 +21,7 @@
 #include <vector>
 #include <cerrno>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
@@ -33,6 +34,15 @@
 #else
 #include <pty.h>
 #endif
+
+// TEMP diagnostic: identify which worker thread wedges teardown on macOS now
+// that the OS primitives are known good. Remove once the logic bug is found.
+#define PTYDIAG(...)                                  \
+    do {                                              \
+        ::fprintf(stderr, "PTYDIAG " __VA_ARGS__);    \
+        ::fprintf(stderr, "\n");                      \
+        ::fflush(stderr);                             \
+    } while (0)
 
 namespace vnm_terminal::internal {
 
@@ -982,6 +992,8 @@ public:
             reader_finished                      = m_reader_finished;
         }
 
+        PTYDIAG("SD begin child_pid=%d reaped=%d reader_finished=%d",
+            child_pid, child_reaped ? 1 : 0, reader_finished ? 1 : 0);
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
@@ -1004,11 +1016,18 @@ public:
         // Signal the child PID directly, which always reaches it, so waitpid()
         // returns and the wait thread can be joined.
         if (!child_reaped && child_pid > 0) {
-            ::kill(child_pid, SIGKILL);
+            const int kill_ret = ::kill(child_pid, SIGKILL);
+            PTYDIAG("SD direct-kill child_pid=%d ret=%d", child_pid, kill_ret);
+        }
+        else {
+            PTYDIAG("SD direct-kill skipped reaped=%d", child_reaped ? 1 : 0);
         }
 
+        PTYDIAG("SD join begin");
         join_threads();
+        PTYDIAG("SD reap-if-unreaped begin");
         reap_child_if_unreaped(child_pid);
+        PTYDIAG("SD shutdown done");
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_master.reset();
@@ -1322,6 +1341,7 @@ private:
 
     void read_loop()
     {
+        PTYDIAG("RL entry");
         std::vector<char> buffer(k_native_backend_output_read_chunk_bytes);
         std::optional<std::chrono::steady_clock::time_point> final_drain_deadline;
         bool timed_out_after_child_reap = false;
@@ -1331,6 +1351,16 @@ private:
             int wake_read = -1;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
+                if (!(m_stopping ||
+                        ((m_process_stopping || !m_output_paused) &&
+                            !m_paused_output_delivery_in_progress)))
+                {
+                    PTYDIAG("RL cv-block stopping=%d proc=%d paused=%d deliv=%d reaped=%d",
+                        m_stopping ? 1 : 0, m_process_stopping ? 1 : 0,
+                        m_output_paused ? 1 : 0,
+                        m_paused_output_delivery_in_progress ? 1 : 0,
+                        m_child_reaped ? 1 : 0);
+                }
                 m_output_cv.wait(lock, [&] {
                     return m_stopping ||
                         ((m_process_stopping || !m_output_paused) &&
@@ -1426,11 +1456,13 @@ private:
                 static_cast<qsizetype>(bytes_read)));
         }
 
+        PTYDIAG("RL finished timed_out=%d", timed_out_after_child_reap ? 1 : 0);
         mark_reader_finished(timed_out_after_child_reap);
     }
 
     void write_loop()
     {
+        PTYDIAG("WL entry");
         for (;;) {
             Queued_write write;
             {
@@ -1440,6 +1472,7 @@ private:
                 });
 
                 if (m_stopping || m_process_stopping) {
+                    PTYDIAG("WL exit stopping");
                     return;
                 }
 
@@ -1451,6 +1484,7 @@ private:
             }
 
             if (!write_all(write.bytes)) {
+                PTYDIAG("WL exit write-failed");
                 mark_writer_failed();
                 return;
             }
@@ -1567,6 +1601,7 @@ private:
 
     void wait_loop()
     {
+        PTYDIAG("WT entry");
         pid_t child_pid = -1;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -1574,12 +1609,17 @@ private:
         }
 
         if (child_pid <= 0) {
+            PTYDIAG("WT exit no-child");
             return;
         }
 
+        PTYDIAG("WT waitpid begin pid=%d", child_pid);
         int status = 0;
-        if (waitpid_nointr(child_pid, &status, 0) != child_pid) {
-            const int wait_error = errno;
+        const pid_t reaped = waitpid_nointr(child_pid, &status, 0);
+        const int reaped_errno = errno;
+        PTYDIAG("WT waitpid end ret=%d", static_cast<int>(reaped));
+        if (reaped != child_pid) {
+            const int wait_error = reaped_errno;
             QByteArray paused_output;
             bool paused_output_delivery_started = false;
             {
@@ -1636,9 +1676,13 @@ private:
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
+        PTYDIAG("WT reader-wait begin");
         wait_for_reader_finished();
+        PTYDIAG("WT reader-wait end");
         kill_child_process_group_after_exit_timeout();
+        PTYDIAG("WT kill-group done");
         report_exit_once(status);
+        PTYDIAG("WT report-exit done");
     }
 
     void kill_child_process_group_after_exit_timeout()
@@ -1707,10 +1751,15 @@ private:
 
     void join_threads()
     {
+        PTYDIAG("JT reader-begin");
         join_or_detach_native_backend_thread(m_reader_thread);
+        PTYDIAG("JT writer-begin");
         join_or_detach_native_backend_thread(m_writer_thread);
+        PTYDIAG("JT wait-begin");
         join_or_detach_native_backend_thread(m_wait_thread);
+        PTYDIAG("JT term-begin");
         join_or_detach_native_backend_thread(m_termination_thread);
+        PTYDIAG("JT done");
     }
 
     std::mutex                          m_mutex;
