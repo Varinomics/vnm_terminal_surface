@@ -449,24 +449,6 @@ std::chrono::milliseconds bounded_sleep_interval(
     return std::min(k_poll_interval, remaining);
 }
 
-int poll_timeout_until(std::optional<std::chrono::steady_clock::time_point> deadline)
-{
-    if (!deadline.has_value()) {
-        return -1;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now >= *deadline) {
-        return 0;
-    }
-
-    const auto remaining =
-        std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now);
-    return static_cast<int>(std::min<std::int64_t>(
-        remaining.count(),
-        std::numeric_limits<int>::max()));
-}
-
 void add_signal_target(Signal_targets& targets, pid_t process_group)
 {
     if (process_group <= 0) {
@@ -1336,34 +1318,37 @@ private:
                 wake_read = m_read_wake_read.get();
             }
 
-            pollfd fds[2] = {
-                { master, POLLIN | POLLHUP | POLLERR, 0 },
-                { wake_read, POLLIN, 0 },
-            };
+            const bool draining = final_drain_deadline.has_value();
 
-            if (final_drain_deadline.has_value() &&
+            if (draining &&
                 std::chrono::steady_clock::now() >= *final_drain_deadline)
             {
                 timed_out_after_child_reap = true;
                 break;
             }
 
-            // Never block in poll() without an upper bound. Once a drain
-            // deadline is armed it caps the wait; otherwise fall back to the
-            // heartbeat so the reader re-checks shutdown state on its own rather
-            // than depending on the wake-pipe to interrupt the poll (see
-            // k_reader_poll_heartbeat).
-            const int poll_timeout = final_drain_deadline.has_value()
-                ? poll_timeout_until(final_drain_deadline)
+            pollfd fds[2] = {
+                { master, POLLIN | POLLHUP | POLLERR, 0 },
+                { wake_read, POLLIN, 0 },
+            };
+
+            // During the exit drain the PTY master is non-blocking and macOS
+            // does not reliably honor poll() timeouts on a master whose slave is
+            // still held open by a descendant; polling it there wedges the
+            // reader and deadlocks exit reporting. So in the drain phase wait
+            // only on the wake pipe (a regular pipe, which polls correctly) for
+            // a short interval and read whatever the child buffered directly
+            // below -- the drain deadline checked at the top of the loop bounds
+            // it. Outside the drain, watch the master too, bounded by the
+            // heartbeat so the reader re-checks shutdown state without relying
+            // on the wake pipe to interrupt poll().
+            constexpr int k_drain_poll_interval_ms = 10;
+            pollfd* const poll_fds   = draining ? &fds[1] : &fds[0];
+            const nfds_t  poll_count = draining ? 1U : 2U;
+            const int     poll_timeout = draining
+                ? k_drain_poll_interval_ms
                 : static_cast<int>(k_reader_poll_heartbeat.count());
-            const int poll_result = ::poll(fds, 2, poll_timeout);
-            if (poll_result == 0) {
-                if (!final_drain_deadline.has_value()) {
-                    continue;
-                }
-                timed_out_after_child_reap = true;
-                break;
-            }
+            const int poll_result = ::poll(poll_fds, poll_count, poll_timeout);
 
             if (poll_result < 0) {
                 if (errno == EINTR) {
@@ -1385,8 +1370,18 @@ private:
                 }
             }
 
-            if ((fds[0].revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
-                continue;
+            if (!draining) {
+                // No drain deadline armed: a heartbeat tick (poll_result == 0)
+                // or a wake-only wake-up means the master has nothing pending,
+                // so loop back and re-check shutdown state. In the drain phase
+                // fall through unconditionally and let the non-blocking read
+                // below deliver buffered output (EAGAIN simply loops back to
+                // re-check the deadline).
+                if (poll_result == 0 ||
+                    (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) == 0)
+                {
+                    continue;
+                }
             }
 
             const ssize_t bytes_read = ::read(master, buffer.data(), buffer.size());
