@@ -639,9 +639,12 @@ public:
         }
 
         add_native_backend_queued_write_bytes(m_queued_write_bytes, 1U);
-        // Once accepted, interrupt is the user's requested exit cause. The
-        // writer thread still performs the byte delivery, but the wait thread
-        // can observe process exit before that delivery callback returns.
+        // Optimistically record interrupt as the requested exit cause: the wait
+        // thread can observe process exit before the writer's delivery callback
+        // returns, and that exit should still classify as interrupted. If delivery
+        // instead fails while the process is still running,
+        // note_interrupt_delivery_failed() drops this override and surfaces the
+        // failure so a later natural exit is not misreported as interrupted.
         m_exit_reason_override = Terminal_exit_reason::INTERRUPTED;
         m_write_queue.push_back({QByteArray(1, '\x03'), true});
         m_write_cv.notify_one();
@@ -908,6 +911,9 @@ private:
 
             if (!write_all(write.bytes)) {
                 mark_writer_failed();
+                if (write.marks_interrupted_exit) {
+                    note_interrupt_delivery_failed();
+                }
                 return;
             }
 
@@ -931,6 +937,31 @@ private:
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_stopping) {
             m_exit_reason_override = Terminal_exit_reason::INTERRUPTED;
+        }
+    }
+
+    void note_interrupt_delivery_failed()
+    {
+        bool delivery_failed_unresolved = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            // The interrupt byte never reached the child. Drop the optimistic
+            // INTERRUPTED override taken at request time so a later natural exit is
+            // not misreported as interrupted -- but only while the process is still
+            // running. If it has already exited and been classified, that
+            // classification stands (the exit may well have been the interrupt).
+            if (!m_exit_reported &&
+                m_exit_reason_override == Terminal_exit_reason::INTERRUPTED)
+            {
+                m_exit_reason_override.reset();
+                delivery_failed_unresolved = true;
+            }
+        }
+
+        if (delivery_failed_unresolved) {
+            report_error(
+                Terminal_backend_error_code::INTERRUPT_FAILED,
+                QStringLiteral("ConPTY interrupt byte could not be delivered to the child"));
         }
     }
 
