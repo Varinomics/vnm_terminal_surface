@@ -50,6 +50,15 @@ jobs:
       - name: Build
         run: cmake --build build --config ${CMAKE_BUILD_TYPE} --parallel
 
+      - name: FreeType symbol diagnostic
+        run: |
+          bin=$(find build -type f -name 'vnm_terminal_qt_render_smoke' | head -1)
+          echo "binary: ${bin}"
+          echo "exported FT_ symbols (expect 0 once bundled FreeType is hidden):"
+          nm -D --defined-only "${bin}" 2>/dev/null | grep -c ' FT_' || true
+          echo "dynamic libfreetype linkage:"
+          ldd "${bin}" 2>/dev/null | grep -i freetype || echo "(no dynamic libfreetype)"
+
       - name: Run tests
         working-directory: build
         env:
