@@ -987,7 +987,10 @@ public:
             m_callbacks                          = {};
             child_pid                            = m_child_pid;
             child_process_group                  = m_child_process_group;
-            master                               = m_master.get();
+            // Take ownership of the master fd so we can close it before joining
+            // the workers (see below). m_master is now empty; its later reset()
+            // is a no-op.
+            master                               = m_master.release();
             child_reaped                         = m_child_reaped;
             reader_finished                      = m_reader_finished;
         }
@@ -1021,6 +1024,17 @@ public:
         }
         else {
             PTYDIAG("SD direct-kill skipped reaped=%d", child_reaped ? 1 : 0);
+        }
+
+        // Close the master now -- before join_threads(), not after -- so a child
+        // blocked writing to the slave is released. With output paused the master
+        // is not drained, so the child fills the slave's output buffer and blocks
+        // in write(); it then cannot act on the pending SIGKILL, so waitpid()
+        // never returns and join_threads() deadlocks. Closing the master delivers
+        // EIO/SIGHUP to that write, unblocking the child so the SIGKILL lands.
+        if (master >= 0) {
+            ::close(master);
+            PTYDIAG("SD master closed fd=%d", master);
         }
 
         PTYDIAG("SD join begin");
