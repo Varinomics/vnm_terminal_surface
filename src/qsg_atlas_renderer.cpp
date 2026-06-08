@@ -255,6 +255,18 @@ struct Msdf_terminal_text_cache
     QString       message;
     msdf_text_atlas_t atlas;
 };
+
+// Lifetime-cumulative MSDF instrumentation counters (Batch 1). These persist
+// across frames so a zoom gesture's atlas build/upload churn cannot be hidden
+// by a later clean frame before metrics are captured.
+struct Msdf_text_zoom_counters
+{
+    std::uint64_t atlas_build_attempts  = 0U;
+    std::uint64_t atlas_build_successes = 0U;
+    std::uint64_t atlas_texture_uploads = 0U;
+    std::uint64_t baked_cache_hits      = 0U;
+    std::uint64_t baked_cache_misses    = 0U;
+};
 #endif
 
 struct Atlas_warm_key
@@ -1860,6 +1872,10 @@ public:
 
         const Atlas_prepare_published_state prepare_published_state =
             capture_prepare_published_state();
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+        m_msdf_text_used_this_frame   = false;
+        m_msdf_text_missed_this_frame = false;
+#endif
         Atlas_prepare_result prepare_result = prepare_atlas_instances(rhi);
         const bool msdf_text_fallback_allowed =
             qsg_atlas_text_renderer_policy_allows_fallback(
@@ -2014,6 +2030,23 @@ public:
             m_dual_source_blend_factors_probe_completed;
         prepare_result.render.dual_source_blend_factors_available =
             m_dual_source_blend_factors_available;
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+        // Tally exactly one baked-cache outcome per frame: a miss if the baked
+        // atlas had to be rebuilt this frame (the flag is set at the rebuild site
+        // so a later fallback retry cannot erase it), otherwise a hit if MSDF was
+        // evaluated at all. Both accumulators were reset at the top of prepare.
+        if (m_msdf_text_missed_this_frame) {
+            ++m_msdf_text_counters.baked_cache_misses;
+        }
+        else if (m_msdf_text_used_this_frame) {
+            ++m_msdf_text_counters.baked_cache_hits;
+        }
+#endif
+        // Re-snapshot lifetime-cumulative MSDF counters at the last point before
+        // the frame summary is recorded. The texture upload earlier in this same
+        // pass advanced atlas_texture_uploads after the prepare-time finalize,
+        // so this keeps the recorder/metrics from missing this frame's upload.
+        snapshot_msdf_text_counter_totals(prepare_result.render);
 
         if (m_recorder != nullptr) {
             m_recorder->record_prepare(
@@ -2224,16 +2257,49 @@ private:
 #endif
     }
 
-    void record_msdf_text_cache_summary(
+    void snapshot_msdf_text_counter_totals(
         Qsg_atlas_render_summary& summary) const
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+        summary.msdf_text_atlas_build_attempts_total =
+            m_msdf_text_counters.atlas_build_attempts;
+        summary.msdf_text_atlas_build_successes_total =
+            m_msdf_text_counters.atlas_build_successes;
+        summary.msdf_text_atlas_texture_uploads_total =
+            m_msdf_text_counters.atlas_texture_uploads;
+        summary.msdf_text_baked_cache_hits_total =
+            m_msdf_text_counters.baked_cache_hits;
+        summary.msdf_text_baked_cache_misses_total =
+            m_msdf_text_counters.baked_cache_misses;
+#else
+        (void)summary;
+#endif
+    }
+
+    void record_msdf_text_cache_summary(
+        Qsg_atlas_render_summary& summary)
     {
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         summary.msdf_text_font_data_bytes = m_msdf_text_cache.font_data_bytes;
         summary.msdf_text_pixel_height    = m_msdf_text_cache.pixel_height;
+        // Batch 1: the baked atlas is built at the draw pixel height, so the
+        // baked and draw pixel heights are identical here. Batch 3 introduces a
+        // distinct bake bucket that can differ from the draw pixel height.
+        summary.msdf_text_baked_pixel_height = m_msdf_text_cache.pixel_height;
+        summary.msdf_text_atlas_generation   = m_msdf_text_cache.generation;
         summary.msdf_text_atlas_size      =
             m_msdf_text_cache.atlas.atlas_size;
         summary.msdf_text_px_range        = m_msdf_text_cache.atlas.px_range;
         summary.msdf_text_message         = m_msdf_text_cache.message;
+        // A frame whose first run rebuilt the atlas but whose later runs reused
+        // it is a miss, not a reuse, for diagnostic purposes.
+        summary.msdf_text_baked_atlas_reused =
+            summary.msdf_text_baked_atlas_reused &&
+            !summary.msdf_text_cache_miss;
+        // The baked-cache hit/miss totals are tallied once per frame at the
+        // record boundary (see prepare), not here, because this finalize can run
+        // twice in one frame on the MSDF resource-failure fallback retry.
+        snapshot_msdf_text_counter_totals(summary);
 #else
         (void)summary;
 #endif
@@ -2715,6 +2781,7 @@ private:
         command_buffer->resourceUpdate(updates);
         m_msdf_text_uploaded_generation = m_msdf_text_cache.generation;
         summary.msdf_text_texture_uploaded = true;
+        ++m_msdf_text_counters.atlas_texture_uploads;
         return true;
 #else
         (void)rhi;
@@ -4533,11 +4600,17 @@ private:
             atlas_snapped_physical_int(
                 m_frame.cell_metrics.ascent,
                 normalized_device_pixel_ratio));
+        m_msdf_text_used_this_frame = true;
         if (msdf_text_cache_matches(normalized_device_pixel_ratio, pixel_height)) {
             result.render.msdf_text_atlas_built = m_msdf_text_cache.atlas_built;
             result.render.msdf_text_atlas_ready = m_msdf_text_cache.ready;
+            result.render.msdf_text_cache_hit   = true;
+            result.render.msdf_text_baked_atlas_reused = m_msdf_text_cache.ready;
             return m_msdf_text_cache.ready;
         }
+
+        result.render.msdf_text_cache_miss = true;
+        m_msdf_text_missed_this_frame      = true;
 
         const std::uint64_t next_generation = m_msdf_text_cache.generation + 1U;
         m_msdf_text_cache = {};
@@ -4548,10 +4621,14 @@ private:
         m_msdf_text_cache.cell_metrics       = m_frame.cell_metrics;
         m_msdf_text_cache.pixel_height       = pixel_height;
         m_msdf_text_uploaded_generation      = 0U;
-        delete_resource(m_stencil_msdf_text_pipeline);
-        delete_resource(m_msdf_text_pipeline);
-        delete_resource(m_msdf_text_shader_resources);
-        delete_resource(m_msdf_text_atlas_texture);
+        // Batch 1 resource-lifetime split: a baked-atlas rebuild no longer
+        // deletes the MSDF pipelines, shader-resource bindings, or atlas
+        // texture here. ensure_msdf_text_atlas_texture() keeps the texture
+        // object when its format and size are unchanged (and rebuilds the
+        // texture plus the dependent SRB/pipeline only when the texture size
+        // actually changes). The new atlas content is re-uploaded into the
+        // existing texture because the generation advanced, so a font-size
+        // change no longer discards pipelines/SRBs that did not depend on it.
 
         QFile font_file(QString::fromLatin1(k_atlas_msdf_terminal_font_resource));
         if (!font_file.open(QIODevice::ReadOnly)) {
@@ -4574,6 +4651,8 @@ private:
         }
 
         const std::vector<char32_t>& codepoints = atlas_msdf_text_codepoints();
+        result.render.msdf_text_atlas_build_attempted = true;
+        ++m_msdf_text_counters.atlas_build_attempts;
         msdf_text::build_result_t build = msdf_text::build_font_atlas(
             reinterpret_cast<const std::uint8_t*>(font_data.constData()),
             static_cast<std::size_t>(font_data.size()),
@@ -4582,6 +4661,10 @@ private:
             atlas_msdf_text_options());
         m_msdf_text_cache.atlas_built =
             build.status != msdf_text::Build_status::FAILURE;
+        if (m_msdf_text_cache.atlas_built) {
+            result.render.msdf_text_atlas_build_succeeded = true;
+            ++m_msdf_text_counters.atlas_build_successes;
+        }
         if (!m_msdf_text_cache.atlas_built) {
             m_msdf_text_cache.message = QString::fromStdString(build.message);
             result.render.msdf_text_atlas_built = false;
@@ -5751,6 +5834,14 @@ private:
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
     Msdf_terminal_text_cache                 m_msdf_text_cache;
     std::uint64_t                            m_msdf_text_uploaded_generation = 0U;
+    Msdf_text_zoom_counters                  m_msdf_text_counters;
+    // Per-frame accumulators for the baked-cache hit/miss tally. They are reset
+    // once at the top of prepare and read once at the record boundary, so the
+    // MSDF resource-failure fallback retry (which re-runs prepare_atlas_instances
+    // and therefore record_msdf_text_cache_summary) cannot double-count, nor
+    // count a rebuilt frame as both a miss and a hit.
+    bool                                     m_msdf_text_used_this_frame   = false;
+    bool                                     m_msdf_text_missed_this_frame = false;
 #endif
     Atlas_warm_key                           m_warm_key;
     Qsg_atlas_warm_lazy_summary              m_warm_lazy;
