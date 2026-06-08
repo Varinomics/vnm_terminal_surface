@@ -1157,7 +1157,6 @@ term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurfa
     options.cursor_blink_enabled_override = surface.cursor_blink_enabled();
     options.visual_bell_enabled =
         surface.visual_bell_policy() == VNM_TerminalSurface::Bell_policy::ENABLED;
-    options.packed_text_sidecars_enabled = false;
     options.text_renderer_policy =
         terminal_text_renderer_policy(surface.text_renderer_mode());
     options.msdf_lcd_subpixel_order =
@@ -1218,12 +1217,6 @@ term::terminal_renderer_stats_t atlas_renderer_stats_for_capture(
         atlas_capture_has_full_dirty_range(snapshot) ? visible_rows : 0;
     stats.frame_dirty_row_ranges =
         static_cast<int>(snapshot.dirty_row_ranges.size());
-    stats.frame.packed_text_sidecars_disabled = 1;
-    stats.frame.packed_rows = visible_rows;
-    stats.frame_packed_rows = visible_rows;
-    stats.frame_packed_payload_bytes =
-        static_cast<std::uint64_t>(visible_rows) *
-        sizeof(term::terminal_packed_render_row_t);
     stats.frame_background_rects = 1;
     stats.frame.cell_pass_input_cells =
         dirty_rows * columns;

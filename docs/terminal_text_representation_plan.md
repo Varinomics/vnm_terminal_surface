@@ -48,10 +48,8 @@ cell. Current source already includes two important optimizations:
   those values. The common single-cell ASCII path therefore pays `QString`
   handle assignment/refcount traffic, not a fresh heap allocation per cell.
 - Renderer-side ASCII fast paths already exist. The frame collects printable
-  ASCII/simple-ASCII counters, and packed text sidecars copy printable ASCII
-  UTF-16 code units directly to bytes for representation and accounting. Atlas
-  glyph production shapes printable ASCII into the same glyph records as other
-  text.
+  ASCII/simple-ASCII counters. Atlas glyph production shapes printable ASCII
+  into the same glyph records as other text.
 
 The remaining plausible costs are narrower:
 
@@ -234,7 +232,7 @@ records rather than using a separate ASCII glyph producer. Paths that need Qt
 text APIs should materialize `QString` at the boundary that consumes them.
 
 This stage is explicitly conditional. Current renderer code already has
-printable-ASCII classification, packed ASCII byte copying, batching, resource
+printable-ASCII classification, batching, resource
 prefiltering, and shaped atlas glyph production. Stage 4 should run only if
 Stage 1 and Stage 3 show that the remaining renderer/frame boundary still costs
 enough to justify another representation crossing.

@@ -3407,13 +3407,11 @@ private:
             ? qsg_atlas_face_id_for_raw_font(base_raw_font)
             : QString();
         ensure_atlas_warm_set(result, rhi);
-        Terminal_render_options options = m_frame.options;
-        options.packed_text_sidecars_enabled = false;
         const Terminal_render_frame render_frame = build_terminal_render_frame(
             m_frame.snapshot.get(),
             m_frame.logical_size,
             m_frame.cell_metrics,
-            options,
+            m_frame.options,
             m_frame.cursor_blink_visible,
             &m_frame.ime_preedit);
         m_render_row_count = render_frame.grid_size.rows;
@@ -3631,8 +3629,6 @@ private:
             static_cast<int>(render_frame.text_runs.size());
         summary.frame_overlay_rects       =
             static_cast<int>(render_frame.overlay_rects.size());
-        summary.packed_rows               =
-            static_cast<int>(render_frame.packed_rows.size());
         summary.rect_instances            =
             static_cast<int>(m_rect_instances.size());
         summary.glyph_instances           =
@@ -3653,12 +3649,6 @@ private:
             summary.scroll_full_repaint            ||
             summary.full_dirty_range;
 
-        if (!render_frame.packed_rows.empty()) {
-            const terminal_packed_render_row_t& first_row =
-                render_frame.packed_rows.front();
-            summary.first_packed_logical_row   = first_row.logical_row;
-            summary.first_packed_active_buffer = first_row.active_buffer;
-        }
         if (!render_frame.text_runs.empty()) {
             const Terminal_render_text_run& first_run = render_frame.text_runs.front();
             summary.first_text_logical_row        = first_run.logical_row;
@@ -3689,7 +3679,6 @@ private:
                 *options.cursor_blink_enabled_override);
         append_key_bool(key, options.visual_bell_enabled);
         append_key_bool(key, options.underline_hyperlinks);
-        append_key_bool(key, options.packed_text_sidecars_enabled);
         append_key_int(key, static_cast<int>(options.text_renderer_policy));
         append_key_int(key, static_cast<int>(options.msdf_lcd_subpixel_order));
         return key;
@@ -3925,7 +3914,6 @@ private:
         default_options.cursor_shape_override =
             Terminal_cursor_shape::BLOCK;
         default_options.cursor_blink_enabled_override = true;
-        default_options.packed_text_sidecars_enabled  = false;
         const bool selection_present =
             !render_frame.selection_rects.empty();
         const bool cursor_present =

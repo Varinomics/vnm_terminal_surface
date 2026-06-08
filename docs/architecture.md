@@ -230,13 +230,11 @@ render node builds the `Terminal_render_frame` in `QSGRenderNode::prepare()`
 using the frame-building path in `src/qsg_terminal_renderer.cpp`, prepares atlas
 pages and instance buffers, then submits QRhi draws in `render()`. The frame
 owns per-frame vectors of rects, arcs, text runs, cursor primitives,
-decorations, overlays, dirty row ranges, and packed row/text sidecars.
+decorations, overlays, and dirty row ranges.
 
 `Terminal_render_frame::text_runs` is the canonical renderer input for terminal
 text. `Terminal_render_frame::cursor_text_runs` carries cursor inverse-text
-overlay input. Packed text sidecars are auxiliary diagnostics, accounting,
-classification, cache data, and row identity; they do not own text and do not
-replace `frame.text_runs`.
+overlay input.
 
 The atlas render node owns renderer-local QRhi resources, glyph-atlas pages,
 instance buffers, and reusable row/layer upload state keyed by active buffer,
