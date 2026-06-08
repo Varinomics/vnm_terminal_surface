@@ -237,6 +237,16 @@ cmake_language(DEFER CALL vnm_terminal_validate_qt_link_interface vnm_terminal_s
 
 add_library(vnm_terminal_surface::vnm_terminal_surface ALIAS vnm_terminal_surface)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # FreeType is statically linked into consumers through vnm_msdf_text/msdfgen.
+    # Without this, a consumer executable exports those FreeType symbols from its
+    # dynamic symbol table and interposes Qt's system FreeType (Qt's font engine on
+    # X11/Wayland), corrupting Qt glyph loading (FT_Load_Glyph err=7) and breaking
+    # glyph rasterization. Exclude static-archive symbols from consumers' dynamic
+    # exports so Qt keeps using its own FreeType.
+    target_link_options(vnm_terminal_surface INTERFACE "-Wl,--exclude-libs,ALL")
+endif()
+
 install(TARGETS
     vnm_terminal_surface
     EXPORT vnm_terminal_surfaceTargets
