@@ -10032,13 +10032,24 @@ bool pump_atlas_seeded_glyph_slots(
     return false;
 }
 
-struct Msdf_text_resource_identity
+// Baked-atlas identity: the fields that must stay stable while the baked atlas
+// is reused across a same-bucket zoom step. atlas_generation only advances on a
+// real baked rebuild, so it discriminates a baked miss from a draw-only change.
+struct Msdf_text_baked_identity
 {
-    int     font_data_bytes = 0;
-    int     pixel_height    = 0;
-    int     atlas_size      = 0;
-    float   px_range        = 0.0f;
-    QString message;
+    int           font_data_bytes    = 0;
+    int           atlas_size         = 0;
+    int           baked_pixel_height = 0;
+    std::uint64_t atlas_generation   = 0U;
+    QString       message;
+};
+
+// Draw-layout identity: the fields that legitimately change with the font size
+// even when the baked atlas is reused.
+struct Msdf_text_draw_identity
+{
+    int   pixel_height = 0;
+    float px_range     = 0.0f;
 };
 
 QString atlas_msdf_resource_stability_row_0()
@@ -10102,29 +10113,48 @@ term::Terminal_render_snapshot make_atlas_msdf_resource_stability_snapshot(
     return snapshot;
 }
 
-Msdf_text_resource_identity msdf_text_resource_identity(
+Msdf_text_baked_identity msdf_text_baked_identity(
     const term::Qsg_atlas_render_summary& render_summary)
 {
     return {
         render_summary.msdf_text_font_data_bytes,
-        render_summary.msdf_text_pixel_height,
         render_summary.msdf_text_atlas_size,
-        render_summary.msdf_text_px_range,
+        render_summary.msdf_text_baked_pixel_height,
+        render_summary.msdf_text_atlas_generation,
         render_summary.msdf_text_message,
     };
 }
 
-bool msdf_text_resource_identity_matches(
-    const Msdf_text_resource_identity&      expected,
+bool msdf_text_baked_identity_matches(
+    const Msdf_text_baked_identity&        expected,
     const term::Qsg_atlas_render_summary&  render_summary)
 {
     return
-        render_summary.msdf_text_font_data_bytes == expected.font_data_bytes &&
-        render_summary.msdf_text_pixel_height    == expected.pixel_height    &&
-        render_summary.msdf_text_atlas_size      == expected.atlas_size      &&
+        render_summary.msdf_text_font_data_bytes  == expected.font_data_bytes &&
+        render_summary.msdf_text_atlas_size       == expected.atlas_size      &&
+        render_summary.msdf_text_baked_pixel_height ==
+            expected.baked_pixel_height &&
+        render_summary.msdf_text_atlas_generation == expected.atlas_generation &&
+        render_summary.msdf_text_message          == expected.message;
+}
+
+Msdf_text_draw_identity msdf_text_draw_identity(
+    const term::Qsg_atlas_render_summary& render_summary)
+{
+    return {
+        render_summary.msdf_text_pixel_height,
+        render_summary.msdf_text_px_range,
+    };
+}
+
+bool msdf_text_draw_identity_matches(
+    const Msdf_text_draw_identity&         expected,
+    const term::Qsg_atlas_render_summary&  render_summary)
+{
+    return
+        render_summary.msdf_text_pixel_height == expected.pixel_height &&
         std::abs(render_summary.msdf_text_px_range - expected.px_range) <=
-            0.0001f &&
-        render_summary.msdf_text_message == expected.message;
+            0.0001f;
 }
 
 void print_atlas_msdf_resource_stability_report(
@@ -10415,8 +10445,10 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         "color-only",
         color_report);
 
-    const Msdf_text_resource_identity identity =
-        msdf_text_resource_identity(baseline_report.render);
+    const Msdf_text_baked_identity baked_identity =
+        msdf_text_baked_identity(baseline_report.render);
+    const Msdf_text_draw_identity draw_identity =
+        msdf_text_draw_identity(baseline_report.render);
     int texture_uploads = 0;
     for (const term::Qsg_atlas_frame_report& report : reports) {
         if (report.render.msdf_text_texture_uploaded) {
@@ -10440,8 +10472,11 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
             report,
             expected_glyphs);
         ok &= check(
-            msdf_text_resource_identity_matches(identity, report.render),
-            "atlas MSDF resource stability keeps public atlas identity fields stable");
+            msdf_text_baked_identity_matches(baked_identity, report.render),
+            "atlas MSDF resource stability keeps baked atlas identity stable");
+        ok &= check(
+            msdf_text_draw_identity_matches(draw_identity, report.render),
+            "atlas MSDF resource stability keeps draw layout identity stable at one size");
     }
     ok &= check(
         baseline_report.render.msdf_text_texture_uploaded,
@@ -10491,14 +10526,15 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
             color_report.render.msdf_text_atlas_texture_uploads_total == 1U,
         "atlas MSDF resource stability does not rebuild or re-upload for steady same-size frames");
 
-    // Batch 1 cache-identity check: a font-size change advances the font epoch,
-    // which is still a baked-atlas miss in Batch 1 and rebuilds/re-uploads once
-    // more. This also exercises the Batch 1 resource-lifetime split: the MSDF
-    // pipelines and shader-resource bindings survive the rebuild (they are no
-    // longer deleted on a cache miss), so the frame still reaches an active,
-    // resources-ready state after the new atlas is uploaded into the retained
-    // texture. Batch 3 reuses the baked atlas across draw sizes in the same bake
-    // bucket and must replace the rebuild-count assertion below.
+    // Batch 3 cache-identity check: a font-size change that stays in the same
+    // bake bucket (the 18px and 30px draw heights both fall at or below the 48px
+    // floor) reuses the baked atlas. The draw layout changes, but there is no
+    // rebuild and no re-upload, so the cumulative build/upload counts stay at one
+    // and the baked generation is stable. This also exercises the resource-
+    // lifetime split: the MSDF pipelines, shader-resource bindings, and atlas
+    // texture all survive the font-size change.
+    const Msdf_text_draw_identity baseline_draw_identity =
+        msdf_text_draw_identity(baseline_report.render);
     surface.set_font_size(30.0);
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
@@ -10512,7 +10548,9 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
             return atlas_report_render_state_ready(report) &&
                 report.render.msdf_text_renderer_active &&
                 report.render.msdf_text_resources_ready &&
-                report.render.msdf_text_texture_ready;
+                report.render.msdf_text_texture_ready &&
+                report.render.msdf_text_pixel_height !=
+                    baseline_draw_identity.pixel_height;
         });
     const term::Qsg_atlas_frame_report resized_report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
@@ -10521,11 +10559,227 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         resized_prepared,
         "atlas MSDF resource stability re-renders after a font-size change");
     ok &= check(
-        resized_report.render.msdf_text_cache_miss &&
-            resized_report.render.msdf_text_atlas_build_attempts_total == 2U &&
-            resized_report.render.msdf_text_atlas_texture_uploads_total == 2U,
-        "atlas MSDF resource stability rebuilds and re-uploads once for a new font size (Batch 1)");
+        resized_report.render.msdf_text_cache_hit &&
+            resized_report.render.msdf_text_baked_atlas_reused &&
+            !resized_report.render.msdf_text_cache_miss,
+        "atlas MSDF resource stability reuses the baked atlas across a same-bucket font-size change");
+    ok &= check(
+        resized_report.render.msdf_text_atlas_build_attempts_total == 1U &&
+            resized_report.render.msdf_text_atlas_texture_uploads_total == 1U &&
+            !resized_report.render.msdf_text_texture_uploaded,
+        "atlas MSDF resource stability does not rebuild or re-upload for a same-bucket font-size change");
+    ok &= check(
+        msdf_text_baked_identity_matches(baked_identity, resized_report.render),
+        "atlas MSDF resource stability keeps baked identity across a same-bucket font-size change");
+    ok &= check(
+        !msdf_text_draw_identity_matches(
+            baseline_draw_identity, resized_report.render),
+        "atlas MSDF resource stability changes the draw layout across a font-size change");
 
+    return ok;
+}
+
+// Shared readiness predicate for the zoom tests: render state usable and, when
+// MSDF is enabled on this backend, the MSDF resources and texture are ready.
+bool atlas_msdf_zoom_report_ready(const term::Qsg_atlas_frame_report& report)
+{
+    if (!atlas_report_render_state_ready(report)) {
+        return false;
+    }
+    if (!report.render.msdf_text_renderer_enabled) {
+        return true;
+    }
+    return
+        report.render.msdf_text_renderer_active &&
+        report.render.msdf_text_resources_ready &&
+        report.render.msdf_text_texture_ready;
+}
+
+// Two font sizes that both fall at or below min_atlas_font_size share one bake
+// bucket. The baked atlas (bitmap, UVs, generation) must be reused across the
+// size change while the draw layout (draw pixel height, shader px_range) changes.
+bool test_atlas_msdf_zoom_reuses_baked_atlas(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(480, 200);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(420.0, 150.0));
+    surface.set_font_family(QString());
+    surface.set_font_size(12.0);
+    surface.set_color_theme(QStringLiteral("default"));
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(980U, false)));
+    window.show();
+
+    const bool ready_small =
+        pump_until(app, window, surface, atlas_msdf_zoom_report_ready);
+    const term::Qsg_atlas_frame_report small_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    if (!ready_small) {
+        std::cerr << "FAIL: msdf zoom reuse did not reach a usable render "
+            << "state at the first size\n";
+        return false;
+    }
+    if (!small_report.render.msdf_text_renderer_enabled) {
+        return check(
+            !small_report.render.msdf_text_renderer_active,
+            "msdf zoom reuse skips renderer gates when MSDF is disabled");
+    }
+
+    bool ok = true;
+    ok &= check(
+        small_report.render.msdf_text_cache_miss &&
+            small_report.render.msdf_text_atlas_build_succeeded &&
+            small_report.render.msdf_text_atlas_build_attempts_total == 1U &&
+            small_report.render.msdf_text_atlas_texture_uploads_total == 1U,
+        "msdf zoom reuse builds and uploads exactly one atlas at the first size");
+
+    const int small_pixel_height = small_report.render.msdf_text_pixel_height;
+    surface.set_font_size(24.0);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(981U, false)));
+    const bool ready_large = pump_until(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return atlas_msdf_zoom_report_ready(report) &&
+                report.render.msdf_text_pixel_height != small_pixel_height;
+        });
+    const term::Qsg_atlas_frame_report large_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    ok &= check(
+        ready_large,
+        "msdf zoom reuse renders a second font size in the same bake bucket");
+
+    // Precondition: the two sizes share one bake bucket but differ in draw height.
+    ok &= check(
+        small_report.render.msdf_text_baked_pixel_height ==
+            large_report.render.msdf_text_baked_pixel_height,
+        "msdf zoom reuse keeps both sizes in one bake bucket");
+    ok &= check(
+        small_report.render.msdf_text_pixel_height !=
+            large_report.render.msdf_text_pixel_height,
+        "msdf zoom reuse actually changes the draw pixel height");
+
+    // The second size reuses the baked atlas: no rebuild, no re-upload, stable
+    // generation, but a changed draw-size shader range. Unlike the cross-bucket
+    // case, a same-bucket transition never produces a miss-then-hit sequence, so
+    // every ready frame after the draw-height change is a cache hit and the
+    // per-frame hit flags below are stable regardless of which frame is captured.
+    ok &= check(
+        large_report.render.msdf_text_cache_hit &&
+            large_report.render.msdf_text_baked_atlas_reused &&
+            !large_report.render.msdf_text_cache_miss,
+        "msdf zoom reuse reports a baked-atlas hit at the second size");
+    ok &= check(
+        large_report.render.msdf_text_atlas_build_attempts_total == 1U &&
+            large_report.render.msdf_text_atlas_texture_uploads_total == 1U &&
+            !large_report.render.msdf_text_texture_uploaded,
+        "msdf zoom reuse does not rebuild or re-upload the atlas for the second size");
+    ok &= check(
+        small_report.render.msdf_text_atlas_generation ==
+            large_report.render.msdf_text_atlas_generation,
+        "msdf zoom reuse keeps a stable baked atlas generation");
+    ok &= check(
+        std::abs(small_report.render.msdf_text_px_range -
+                 large_report.render.msdf_text_px_range) > 0.0001f,
+        "msdf zoom reuse changes the draw-size shader range with font size");
+    return ok;
+}
+
+// A font size whose draw height exceeds min_atlas_font_size bakes at the draw
+// size, a different bake bucket. Crossing the bucket must rebuild and re-upload
+// the atlas exactly once and advance the baked generation by one.
+bool test_atlas_msdf_zoom_crosses_bake_bucket(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(720, 540);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(640.0, 460.0));
+    surface.set_font_family(QString());
+    surface.set_font_size(18.0);
+    surface.set_color_theme(QStringLiteral("default"));
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(990U, false)));
+    window.show();
+
+    const bool ready_small =
+        pump_until(app, window, surface, atlas_msdf_zoom_report_ready);
+    const term::Qsg_atlas_frame_report small_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    if (!ready_small) {
+        std::cerr << "FAIL: msdf zoom bucket-cross did not reach a usable "
+            << "render state at the small size\n";
+        return false;
+    }
+    if (!small_report.render.msdf_text_renderer_enabled) {
+        return check(
+            !small_report.render.msdf_text_renderer_active,
+            "msdf zoom bucket-cross skips renderer gates when MSDF is disabled");
+    }
+
+    bool ok = true;
+    ok &= check(
+        small_report.render.msdf_text_atlas_build_attempts_total == 1U &&
+            small_report.render.msdf_text_atlas_texture_uploads_total == 1U,
+        "msdf zoom bucket-cross builds and uploads exactly one atlas at the small size");
+
+    const int small_baked = small_report.render.msdf_text_baked_pixel_height;
+    surface.set_font_size(96.0);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(991U, false)));
+    const bool ready_large = pump_until(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& report) {
+            return atlas_msdf_zoom_report_ready(report) &&
+                report.render.msdf_text_baked_pixel_height != small_baked;
+        });
+    const term::Qsg_atlas_frame_report large_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    ok &= check(
+        ready_large,
+        "msdf zoom bucket-cross renders a font size in a new bake bucket");
+
+    // Precondition: the large size genuinely crosses into a different bucket.
+    ok &= check(
+        small_report.render.msdf_text_baked_pixel_height !=
+            large_report.render.msdf_text_baked_pixel_height,
+        "msdf zoom bucket-cross moves to a different baked pixel height");
+
+    // The per-frame cache_miss flag is transient (true only on the single rebuild
+    // frame), and a warm event pump can land the captured report on a later steady
+    // hit frame. Assert the rebuild through the monotonic cumulative counters and
+    // the baked generation instead, which are stable on whatever frame is caught.
+    ok &= check(
+        large_report.render.msdf_text_atlas_build_attempts_total == 2U &&
+            large_report.render.msdf_text_atlas_build_successes_total == 2U &&
+            large_report.render.msdf_text_atlas_texture_uploads_total == 2U,
+        "msdf zoom bucket-cross rebuilds and re-uploads exactly once for the new bucket");
+    ok &= check(
+        large_report.render.msdf_text_baked_cache_misses_total ==
+            small_report.render.msdf_text_baked_cache_misses_total + 1U,
+        "msdf zoom bucket-cross records exactly one additional baked-cache miss");
+    ok &= check(
+        large_report.render.msdf_text_atlas_generation ==
+            small_report.render.msdf_text_atlas_generation + 1U,
+        "msdf zoom bucket-cross advances the baked atlas generation by one");
     return ok;
 }
 
@@ -17393,6 +17647,8 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_glyph_row_stable_cursor_clean_row_fallback(app);
     ok &= test_atlas_prepared_text_reuse(app);
     ok &= test_atlas_msdf_resource_stability(app);
+    ok &= test_atlas_msdf_zoom_reuses_baked_atlas(app);
+    ok &= test_atlas_msdf_zoom_crosses_bake_bucket(app);
 
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
     const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
