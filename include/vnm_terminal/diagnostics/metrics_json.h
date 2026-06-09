@@ -1,0 +1,19 @@
+#pragma once
+
+#include <QJsonObject>
+
+class VNM_TerminalSurface;
+
+namespace vnm_terminal::diagnostics {
+
+// Fill `out` with the renderer cumulative-counter metrics for `surface`. The
+// caller owns the surrounding object: production places this content under the
+// "renderer" key of the runtime metrics document.
+void append_renderer_metrics_json(const VNM_TerminalSurface& surface, QJsonObject& out);
+
+// Fill `out` with the QSG atlas frame-report metrics for `surface`. The caller
+// owns the surrounding object: production places this content under the
+// "qsg_atlas" key of the runtime metrics document.
+void append_atlas_metrics_json(const VNM_TerminalSurface& surface, QJsonObject& out);
+
+}

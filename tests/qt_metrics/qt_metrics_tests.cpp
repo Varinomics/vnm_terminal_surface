@@ -2,12 +2,14 @@
 #include "vnm_terminal/internal/terminal_resize_controller.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
+#include "vnm_terminal/diagnostics/metrics_json.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
 
 #include <QColor>
 #include <QFont>
 #include <QGuiApplication>
+#include <QJsonObject>
 #include <QQuickWindow>
 #include <QThread>
 #include <cmath>
@@ -610,6 +612,46 @@ bool test_dpr_expectation(const QStringList& arguments, qreal observed_dpr)
     return true;
 }
 
+bool test_diagnostics_metrics_json(QGuiApplication& app)
+{
+    bool ok = true;
+
+    QQuickWindow window;
+    window.setColor(QColor(32, 32, 32));
+    window.resize(360, 180);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(360.0, 180.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(14.0);
+
+    window.show();
+    pump_events(app);
+
+    QJsonObject renderer;
+    vnm_terminal::diagnostics::append_renderer_metrics_json(surface, renderer);
+    ok &= check(!renderer.isEmpty(),
+        "append_renderer_metrics_json fills the renderer object");
+    ok &= check(renderer.contains(QStringLiteral("frames_published")),
+        "renderer metrics include frames_published");
+    ok &= check(renderer.contains(QStringLiteral("paint_completed_frames")),
+        "renderer metrics include paint_completed_frames");
+    ok &= check(renderer.contains(QStringLiteral("frame")),
+        "renderer metrics include the nested frame object");
+
+    QJsonObject atlas;
+    vnm_terminal::diagnostics::append_atlas_metrics_json(surface, atlas);
+    ok &= check(!atlas.isEmpty(),
+        "append_atlas_metrics_json fills the qsg_atlas object");
+    ok &= check(atlas.contains(QStringLiteral("render_count")),
+        "atlas metrics include render_count");
+    ok &= check(atlas.value(QStringLiteral("renderer")).toString() == QStringLiteral("atlas"),
+        "atlas metrics tag the renderer as atlas");
+
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -627,5 +669,6 @@ int main(int argc, char** argv)
     ok &= test_provider_metrics(observed_dpr);
     ok &= test_surface_publication(app, observed_dpr);
     ok &= test_controller_with_real_provider(app, observed_dpr);
+    ok &= test_diagnostics_metrics_json(app);
     return ok ? 0 : 1;
 }
