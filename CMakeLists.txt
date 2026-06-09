@@ -148,6 +148,7 @@ add_library(vnm_terminal_surface STATIC
     src/terminal_resize_controller.cpp
     src/terminal_session.cpp
     src/terminal_byte_stream_parser.cpp
+    src/terminal_color_scheme.cpp
     src/terminal_screen_model.cpp
     src/terminal_screen_model_snapshot.cpp
     src/metrics_contract.cpp
