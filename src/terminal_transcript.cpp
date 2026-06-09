@@ -1542,269 +1542,432 @@ bool validate_snapshot_basis_purpose_biconditional(
     return true;
 }
 
-bool validate_event_object(
+// Per-kind transcript event validation.
+//
+// The validator is structured as a data-driven schema table: each event kind
+// maps to a descriptor that lists the leading run of required scalar fields
+// (string / non-negative integer / bool) shared with the composable field
+// helpers, plus an optional named predicate for the irregular per-kind logic.
+//
+// The leading-field list captures only the contiguous run of plain required
+// scalar fields at the start of a kind's validation, in source order. The
+// helpers short-circuit on the first failure, so running the descriptor's
+// fields in order before the predicate reproduces the exact accept/reject
+// decision and error string of a hand-written `&&` chain. Anything that does
+// not fit that plain shape - enums with a value set, signed integers, numbers,
+// nested objects, optional fields, base64/argv/resize/viewport composites, and
+// cross-field rules such as the basis/purpose biconditional or the shared
+// backend.output/host.write payload - stays in the named predicate, which
+// continues exactly where the leading-field run left off.
+
+enum class Event_field_kind
+{
+    STRING,
+    NONNEGATIVE_INTEGRAL,
+    BOOL,
+};
+
+struct event_field_t {
+    Event_field_kind kind;
+    const char*      name;
+};
+
+using Event_post_validator = bool (*)(
     const QJsonObject& object,
-    const QString&     kind,
+    int                line_number,
+    QString*           out_error);
+
+struct Event_schema
+{
+    const char*                    kind;
+    std::initializer_list<event_field_t> leading_fields;
+    Event_post_validator           post_validate;
+};
+
+bool validate_leading_event_fields(
+    const QJsonObject&                          object,
+    std::initializer_list<event_field_t>        fields,
+    int                                         line_number,
+    QString*                                    out_error)
+{
+    for (const event_field_t& field : fields) {
+        const QString name = QString::fromLatin1(field.name);
+        bool ok = true;
+        switch (field.kind) {
+            case Event_field_kind::STRING:
+                ok = require_string_field(object, name, line_number, out_error);
+                break;
+            case Event_field_kind::NONNEGATIVE_INTEGRAL:
+                ok = require_nonnegative_integral_field(object, name, line_number, out_error);
+                break;
+            case Event_field_kind::BOOL:
+                ok = require_bool_field(object, name, line_number, out_error);
+                break;
+            default:
+                ok = false;
+                break;
+        }
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool post_validate_header(
+    const QJsonObject& object,
     int                line_number,
     QString*           out_error)
 {
-    if (kind == QStringLiteral("header")) {
-        qint64 schema_version = 0;
-        QString schema;
-        QString byte_encoding;
-        if (!require_string_field(
-                object,
-                QStringLiteral("schema"),
-                line_number,
-                out_error,
-                &schema) ||
-            !require_nonnegative_integral_field(
-                object,
-                QStringLiteral("schema_version"),
-                line_number,
-                out_error,
-                &schema_version) ||
-            !require_string_field(
-                object,
-                QStringLiteral("byte_encoding"),
-                line_number,
-                out_error,
-                &byte_encoding) ||
-            !require_bool_field(
-                object,
-                QStringLiteral("snapshot_diagnostics"),
-                line_number,
-                out_error) ||
-            (object.contains(QStringLiteral("timing_diagnostics")) &&
-                !require_bool_field(
-                    object,
-                    QStringLiteral("timing_diagnostics"),
-                    line_number,
-                    out_error)))
-        {
-            return false;
-        }
+    // schema, schema_version, byte_encoding are read again here for their
+    // bespoke value checks; the leading-field run already proved their types.
+    const QString schema        = object.value(QStringLiteral("schema")).toString();
+    const qint64 schema_version = object.value(QStringLiteral("schema_version")).toInteger();
+    const QString byte_encoding = object.value(QStringLiteral("byte_encoding")).toString();
 
-        if (schema != QStringLiteral("vnm_terminal.session_surface_transcript")) {
-            return fail_read(
-                out_error,
-                QStringLiteral("transcript line %1 has unsupported schema %2")
-                    .arg(line_number)
-                    .arg(schema));
-        }
-        if (schema_version != k_transcript_schema_version) {
-            return fail_read(
-                out_error,
-                QStringLiteral("transcript line %1 has unsupported schema_version %2")
-                    .arg(line_number)
-                    .arg(schema_version));
-        }
-        if (byte_encoding != QStringLiteral("base64")) {
-            return fail_read(
-                out_error,
-                QStringLiteral("transcript line %1 has unsupported byte_encoding %2")
-                    .arg(line_number)
-                    .arg(byte_encoding));
-        }
-        return true;
-    }
-
-    if (kind == QStringLiteral("session.start")) {
-        return
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("session_sequence"),
-                line_number,
-                out_error) &&
-            validate_launch_argv(object, line_number, out_error) &&
-            require_string_field(
-                object,
-                QStringLiteral("working_directory"),
-                line_number,
-                out_error) &&
-            validate_optional_session_config_object(object, line_number, out_error) &&
-            (!object.contains(QStringLiteral("initial_grid_size")) ||
-                validate_grid_size_object(
-                    object,
-                    QStringLiteral("initial_grid_size"),
-                    line_number,
-                    out_error));
-    }
-
-    if (kind == QStringLiteral("backend.output") ||
-        kind == QStringLiteral("host.write"))
+    if (object.contains(QStringLiteral("timing_diagnostics")) &&
+        !require_bool_field(object, QStringLiteral("timing_diagnostics"), line_number, out_error))
     {
-        if (!require_nonnegative_integral_field(
-                object,
-                QStringLiteral("session_sequence"),
-                line_number,
-                out_error) ||
-            !validate_base64_payload(object, line_number, out_error))
-        {
-            return false;
-        }
-        if (kind == QStringLiteral("host.write")) {
-            return require_string_enum_field(
-                object,
-                QStringLiteral("source"),
-                {
-                    QStringLiteral("user"),
-                    QStringLiteral("paste"),
-                    QStringLiteral("terminal_reply"),
-                },
-                line_number,
-                out_error);
-        }
-        return true;
+        return false;
     }
 
-    if (kind == QStringLiteral("session.resize_request")) {
-        return
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("session_sequence"),
-                line_number,
-                out_error) &&
-            validate_resize_request_fields(object, line_number, out_error);
+    if (schema != QStringLiteral("vnm_terminal.session_surface_transcript")) {
+        return fail_read(
+            out_error,
+            QStringLiteral("transcript line %1 has unsupported schema %2")
+                .arg(line_number)
+                .arg(schema));
     }
+    if (schema_version != k_transcript_schema_version) {
+        return fail_read(
+            out_error,
+            QStringLiteral("transcript line %1 has unsupported schema_version %2")
+                .arg(line_number)
+                .arg(schema_version));
+    }
+    if (byte_encoding != QStringLiteral("base64")) {
+        return fail_read(
+            out_error,
+            QStringLiteral("transcript line %1 has unsupported byte_encoding %2")
+                .arg(line_number)
+                .arg(byte_encoding));
+    }
+    return true;
+}
 
-    if (kind == QStringLiteral("session.resize")) {
-        return
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("session_sequence"),
-                line_number,
-                out_error) &&
-            validate_resize_request_fields(object, line_number, out_error) &&
+bool post_validate_session_start(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        validate_launch_argv(object, line_number, out_error) &&
+        require_string_field(
+            object,
+            QStringLiteral("working_directory"),
+            line_number,
+            out_error) &&
+        validate_optional_session_config_object(object, line_number, out_error) &&
+        (!object.contains(QStringLiteral("initial_grid_size")) ||
             validate_grid_size_object(
                 object,
-                QStringLiteral("snapshot_grid_size"),
+                QStringLiteral("initial_grid_size"),
                 line_number,
-                out_error) &&
-            require_string_enum_field(
-                object,
-                QStringLiteral("model_result"),
-                {
-                    QStringLiteral("applied"),
-                    QStringLiteral("invalid_grid_size"),
-                    QStringLiteral("not_applied"),
-                },
-                line_number,
-                out_error) &&
-            require_string_enum_field(
-                object,
-                QStringLiteral("backend_result"),
-                {QStringLiteral("applied"), QStringLiteral("failed")},
-                line_number,
-                out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("backend_geometry_in_sync"),
-                line_number,
-                out_error);
-    }
+                out_error));
+}
 
-    if (kind == QStringLiteral("session.process_exit")) {
-        return
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("session_sequence"),
-                line_number,
-                out_error) &&
-            require_string_enum_field(
-                object,
-                QStringLiteral("reason"),
-                {
-                    QStringLiteral("exited"),
-                    QStringLiteral("interrupted"),
-                    QStringLiteral("terminated"),
-                    QStringLiteral("failed_to_start"),
-                },
-                line_number,
-                out_error) &&
-            require_integral_field(object, QStringLiteral("exit_code"), line_number, out_error);
-    }
+bool post_validate_backend_output(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return validate_base64_payload(object, line_number, out_error);
+}
 
-    if (kind == QStringLiteral("session.backend_error")) {
-        return
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("session_sequence"),
-                line_number,
-                out_error) &&
-            require_string_enum_field(
-                object,
-                QStringLiteral("code"),
-                {
-                    QStringLiteral("invalid_launch_config"),
-                    QStringLiteral("invalid_initial_grid_size"),
-                    QStringLiteral("working_directory_unavailable"),
-                    QStringLiteral("start_failed"),
-                    QStringLiteral("write_failed"),
-                    QStringLiteral("resize_failed"),
-                    QStringLiteral("interrupt_failed"),
-                    QStringLiteral("terminate_failed"),
-                    QStringLiteral("output_overflow"),
-                    QStringLiteral("callback_missing"),
-                    QStringLiteral("read_failed"),
-                },
-                line_number,
-                out_error) &&
-            require_string_field(object, QStringLiteral("message"), line_number, out_error);
-    }
+bool post_validate_host_write(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        validate_base64_payload(object, line_number, out_error) &&
+        require_string_enum_field(
+            object,
+            QStringLiteral("source"),
+            {
+                QStringLiteral("user"),
+                QStringLiteral("paste"),
+                QStringLiteral("terminal_reply"),
+            },
+            line_number,
+            out_error);
+}
 
-    if (kind == QStringLiteral("session.text_area_resize_request")) {
-        return
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("session_sequence"),
-                line_number,
-                out_error) &&
-            validate_grid_size_object(
-                object,
-                QStringLiteral("grid_size"),
-                line_number,
-                out_error);
-    }
+bool post_validate_session_resize_request(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return validate_resize_request_fields(object, line_number, out_error);
+}
 
-    if (kind == QStringLiteral("surface.scroll_intent")) {
-        return
-            require_string_field(object, QStringLiteral("source"), line_number, out_error) &&
+bool post_validate_session_resize(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        validate_resize_request_fields(object, line_number, out_error) &&
+        validate_grid_size_object(
+            object,
+            QStringLiteral("snapshot_grid_size"),
+            line_number,
+            out_error) &&
+        require_string_enum_field(
+            object,
+            QStringLiteral("model_result"),
+            {
+                QStringLiteral("applied"),
+                QStringLiteral("invalid_grid_size"),
+                QStringLiteral("not_applied"),
+            },
+            line_number,
+            out_error) &&
+        require_string_enum_field(
+            object,
+            QStringLiteral("backend_result"),
+            {QStringLiteral("applied"), QStringLiteral("failed")},
+            line_number,
+            out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("backend_geometry_in_sync"),
+            line_number,
+            out_error);
+}
+
+bool post_validate_session_process_exit(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        require_string_enum_field(
+            object,
+            QStringLiteral("reason"),
+            {
+                QStringLiteral("exited"),
+                QStringLiteral("interrupted"),
+                QStringLiteral("terminated"),
+                QStringLiteral("failed_to_start"),
+            },
+            line_number,
+            out_error) &&
+        require_integral_field(object, QStringLiteral("exit_code"), line_number, out_error);
+}
+
+bool post_validate_session_backend_error(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        require_string_enum_field(
+            object,
+            QStringLiteral("code"),
+            {
+                QStringLiteral("invalid_launch_config"),
+                QStringLiteral("invalid_initial_grid_size"),
+                QStringLiteral("working_directory_unavailable"),
+                QStringLiteral("start_failed"),
+                QStringLiteral("write_failed"),
+                QStringLiteral("resize_failed"),
+                QStringLiteral("interrupt_failed"),
+                QStringLiteral("terminate_failed"),
+                QStringLiteral("output_overflow"),
+                QStringLiteral("callback_missing"),
+                QStringLiteral("read_failed"),
+            },
+            line_number,
+            out_error) &&
+        require_string_field(object, QStringLiteral("message"), line_number, out_error);
+}
+
+bool post_validate_session_text_area_resize_request(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return validate_grid_size_object(
+        object,
+        QStringLiteral("grid_size"),
+        line_number,
+        out_error);
+}
+
+bool post_validate_surface_scroll_intent(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        require_integral_field(
+            object,
+            QStringLiteral("requested_line_delta"),
+            line_number,
+            out_error) &&
+        validate_viewport_object(
+            object,
+            QStringLiteral("viewport_before"),
+            line_number,
+            out_error) &&
+        (!object.contains(QStringLiteral("requested_offset_from_tail")) ||
             require_integral_field(
                 object,
-                QStringLiteral("requested_line_delta"),
+                QStringLiteral("requested_offset_from_tail"),
                 line_number,
-                out_error) &&
+                out_error)) &&
+        validate_optional_public_scroll_policy_fields(object, line_number, out_error);
+}
+
+bool post_validate_surface_scroll(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        require_integral_field(
+            object,
+            QStringLiteral("requested_line_delta"),
+            line_number,
+            out_error) &&
+        require_integral_field(
+            object,
+            QStringLiteral("applied_line_delta"),
+            line_number,
+            out_error) &&
+        require_string_enum_field(
+            object,
+            QStringLiteral("action"),
+            {
+                QStringLiteral("viewport_moved"),
+                QStringLiteral("at_boundary"),
+                QStringLiteral("deferred_intent_recorded"),
+                QStringLiteral("terminal_input"),
+            },
+            line_number,
+            out_error) &&
+        validate_viewport_object(
+            object,
+            QStringLiteral("viewport_before"),
+            line_number,
+            out_error) &&
+        validate_viewport_object(
+            object,
+            QStringLiteral("viewport_after"),
+            line_number,
+            out_error) &&
+        (!object.contains(QStringLiteral("requested_offset_from_tail")) ||
+            require_integral_field(
+                object,
+                QStringLiteral("requested_offset_from_tail"),
+                line_number,
+                out_error)) &&
+        (!object.contains(QStringLiteral("viewport")) ||
             validate_viewport_object(
                 object,
-                QStringLiteral("viewport_before"),
+                QStringLiteral("viewport"),
                 line_number,
-                out_error) &&
-            (!object.contains(QStringLiteral("requested_offset_from_tail")) ||
-                require_integral_field(
-                    object,
-                    QStringLiteral("requested_offset_from_tail"),
-                    line_number,
-                    out_error)) &&
-            validate_optional_public_scroll_policy_fields(object, line_number, out_error);
-    }
+                out_error)) &&
+        validate_optional_public_scroll_policy_fields(object, line_number, out_error);
+}
 
-    if (kind == QStringLiteral("surface.scroll")) {
-        return
-            require_string_field(object, QStringLiteral("source"), line_number, out_error) &&
-            require_integral_field(
+bool post_validate_surface_wheel_trace(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        require_integral_field(object, QStringLiteral("angle_delta_x"), line_number, out_error) &&
+        require_integral_field(object, QStringLiteral("angle_delta_y"), line_number, out_error) &&
+        require_integral_field(object, QStringLiteral("pixel_delta_x"), line_number, out_error) &&
+        require_integral_field(object, QStringLiteral("pixel_delta_y"), line_number, out_error) &&
+        require_integral_field(object, QStringLiteral("modifiers"), line_number, out_error) &&
+        require_integral_field(object, QStringLiteral("wheel_steps"), line_number, out_error) &&
+        require_integral_field(
+            object,
+            QStringLiteral("effective_line_delta"),
+            line_number,
+            out_error) &&
+        require_number_field(object, QStringLiteral("angle_remainder"), line_number, out_error) &&
+        require_number_field(object, QStringLiteral("pixel_remainder"), line_number, out_error) &&
+        require_bool_field(object, QStringLiteral("session_present"), line_number, out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("render_publication_blocked"),
+            line_number,
+            out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("published_synchronized_output"),
+            line_number,
+            out_error) &&
+        require_bool_field(object, QStringLiteral("alternate_screen"), line_number, out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("local_scroll_attempted"),
+            line_number,
+            out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("local_scroll_intent_recorded"),
+            line_number,
+            out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("local_scroll_applied"),
+            line_number,
+            out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("visible_scroll_applied"),
+            line_number,
+            out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("live_sgr_mouse_reporting"),
+            line_number,
+            out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("published_sgr_mouse_reporting"),
+            line_number,
+            out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("published_mouse_tracking"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("backend_drain_calls"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("backend_drain_elapsed_ns"),
+            line_number,
+            out_error) &&
+        (!object.contains(QStringLiteral("local_scroll_block_reason")) ||
+            require_string_field(
                 object,
-                QStringLiteral("requested_line_delta"),
+                QStringLiteral("local_scroll_block_reason"),
                 line_number,
-                out_error) &&
-            require_integral_field(
-                object,
-                QStringLiteral("applied_line_delta"),
-                line_number,
-                out_error) &&
+                out_error)) &&
+        (!object.contains(QStringLiteral("scroll_action")) ||
             require_string_enum_field(
                 object,
-                QStringLiteral("action"),
+                QStringLiteral("scroll_action"),
                 {
                     QStringLiteral("viewport_moved"),
                     QStringLiteral("at_boundary"),
@@ -1812,364 +1975,376 @@ bool validate_event_object(
                     QStringLiteral("terminal_input"),
                 },
                 line_number,
-                out_error) &&
+                out_error)) &&
+        (!object.contains(QStringLiteral("applied_line_delta")) ||
+            require_integral_field(
+                object,
+                QStringLiteral("applied_line_delta"),
+                line_number,
+                out_error)) &&
+        (!object.contains(QStringLiteral("published_viewport")) ||
+            validate_viewport_object(
+                object,
+                QStringLiteral("published_viewport"),
+                line_number,
+                out_error)) &&
+        (!object.contains(QStringLiteral("live_viewport")) ||
+            validate_viewport_object(
+                object,
+                QStringLiteral("live_viewport"),
+                line_number,
+                out_error)) &&
+        (!object.contains(QStringLiteral("viewport_before")) ||
             validate_viewport_object(
                 object,
                 QStringLiteral("viewport_before"),
                 line_number,
-                out_error) &&
+                out_error)) &&
+        (!object.contains(QStringLiteral("viewport_after")) ||
             validate_viewport_object(
                 object,
                 QStringLiteral("viewport_after"),
                 line_number,
-                out_error) &&
-            (!object.contains(QStringLiteral("requested_offset_from_tail")) ||
-                require_integral_field(
-                    object,
-                    QStringLiteral("requested_offset_from_tail"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("viewport")) ||
-                validate_viewport_object(
-                    object,
-                    QStringLiteral("viewport"),
-                    line_number,
-                    out_error)) &&
-            validate_optional_public_scroll_policy_fields(object, line_number, out_error);
-    }
+                out_error)) &&
+        validate_optional_public_scroll_policy_fields(object, line_number, out_error);
+}
 
-    if (kind == QStringLiteral("surface.wheel_trace")) {
-        return
-            require_string_field(object, QStringLiteral("source"), line_number, out_error) &&
-            require_string_field(object, QStringLiteral("route"), line_number, out_error) &&
-            require_string_field(object, QStringLiteral("outcome"), line_number, out_error) &&
-            require_bool_field(object, QStringLiteral("accepted"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("angle_delta_x"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("angle_delta_y"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("pixel_delta_x"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("pixel_delta_y"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("modifiers"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("wheel_steps"), line_number, out_error) &&
-            require_integral_field(
-                object,
-                QStringLiteral("effective_line_delta"),
-                line_number,
-                out_error) &&
-            require_number_field(object, QStringLiteral("angle_remainder"), line_number, out_error) &&
-            require_number_field(object, QStringLiteral("pixel_remainder"), line_number, out_error) &&
-            require_bool_field(object, QStringLiteral("session_present"), line_number, out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("render_publication_blocked"),
-                line_number,
-                out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("published_synchronized_output"),
-                line_number,
-                out_error) &&
-            require_bool_field(object, QStringLiteral("alternate_screen"), line_number, out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("local_scroll_attempted"),
-                line_number,
-                out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("local_scroll_intent_recorded"),
-                line_number,
-                out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("local_scroll_applied"),
-                line_number,
-                out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("visible_scroll_applied"),
-                line_number,
-                out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("live_sgr_mouse_reporting"),
-                line_number,
-                out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("published_sgr_mouse_reporting"),
-                line_number,
-                out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("published_mouse_tracking"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("backend_drain_calls"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("backend_drain_elapsed_ns"),
-                line_number,
-                out_error) &&
-            (!object.contains(QStringLiteral("local_scroll_block_reason")) ||
-                require_string_field(
-                    object,
-                    QStringLiteral("local_scroll_block_reason"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("scroll_action")) ||
-                require_string_enum_field(
-                    object,
-                    QStringLiteral("scroll_action"),
-                    {
-                        QStringLiteral("viewport_moved"),
-                        QStringLiteral("at_boundary"),
-                        QStringLiteral("deferred_intent_recorded"),
-                        QStringLiteral("terminal_input"),
-                    },
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("applied_line_delta")) ||
-                require_integral_field(
-                    object,
-                    QStringLiteral("applied_line_delta"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("published_viewport")) ||
-                validate_viewport_object(
-                    object,
-                    QStringLiteral("published_viewport"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("live_viewport")) ||
-                validate_viewport_object(
-                    object,
-                    QStringLiteral("live_viewport"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("viewport_before")) ||
-                validate_viewport_object(
-                    object,
-                    QStringLiteral("viewport_before"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("viewport_after")) ||
-                validate_viewport_object(
-                    object,
-                    QStringLiteral("viewport_after"),
-                    line_number,
-                    out_error)) &&
-            validate_optional_public_scroll_policy_fields(object, line_number, out_error);
-    }
+bool post_validate_surface_wheel_ingress(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        require_string_enum_field(
+            object,
+            QStringLiteral("phase"),
+            {QStringLiteral("ingress")},
+            line_number,
+            out_error) &&
+        require_bool_field(object, QStringLiteral("accepted_on_entry"), line_number, out_error) &&
+        require_integral_field(object, QStringLiteral("angle_delta_x"), line_number, out_error) &&
+        require_integral_field(object, QStringLiteral("angle_delta_y"), line_number, out_error) &&
+        require_integral_field(object, QStringLiteral("pixel_delta_x"), line_number, out_error) &&
+        require_integral_field(object, QStringLiteral("pixel_delta_y"), line_number, out_error) &&
+        require_integral_field(object, QStringLiteral("modifiers"), line_number, out_error) &&
+        require_number_field(object, QStringLiteral("position_x"), line_number, out_error) &&
+        require_number_field(object, QStringLiteral("position_y"), line_number, out_error);
+}
 
-    if (kind == QStringLiteral("surface.wheel_ingress")) {
-        return
-            require_string_field(object, QStringLiteral("source"), line_number, out_error) &&
-            require_string_enum_field(
+bool post_validate_transcript_timing(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        require_string_enum_field(
+            object,
+            QStringLiteral("operation"),
+            {
+                QStringLiteral("event_write"),
+                QStringLiteral("snapshot_diagnostic_emit"),
+            },
+            line_number,
+            out_error) &&
+        require_string_field(object, QStringLiteral("record_kind"), line_number, out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("record_event_index"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("object_construction_elapsed_ns"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("json_serialization_elapsed_ns"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("ndjson_append_elapsed_ns"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("file_write_elapsed_ns"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("file_flush_elapsed_ns"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("write_event_elapsed_ns"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("total_elapsed_ns"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("ndjson_byte_count"),
+            line_number,
+            out_error) &&
+        (!object.contains(QStringLiteral("payload_byte_count")) ||
+            require_nonnegative_integral_field(
                 object,
-                QStringLiteral("phase"),
-                {QStringLiteral("ingress")},
+                QStringLiteral("payload_byte_count"),
                 line_number,
-                out_error) &&
-            require_bool_field(object, QStringLiteral("accepted_on_entry"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("angle_delta_x"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("angle_delta_y"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("pixel_delta_x"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("pixel_delta_y"), line_number, out_error) &&
-            require_integral_field(object, QStringLiteral("modifiers"), line_number, out_error) &&
-            require_number_field(object, QStringLiteral("position_x"), line_number, out_error) &&
-            require_number_field(object, QStringLiteral("position_y"), line_number, out_error);
-    }
+                out_error)) &&
+        (!object.contains(QStringLiteral("source")) ||
+            require_string_field(object, QStringLiteral("source"), line_number, out_error)) &&
+        (!object.contains(QStringLiteral("route")) ||
+            require_string_field(object, QStringLiteral("route"), line_number, out_error)) &&
+        (!object.contains(QStringLiteral("outcome")) ||
+            require_string_field(object, QStringLiteral("outcome"), line_number, out_error)) &&
+        (!object.contains(QStringLiteral("snapshot_reason")) ||
+            require_string_field(
+                object,
+                QStringLiteral("snapshot_reason"),
+                line_number,
+                out_error)) &&
+        (!object.contains(QStringLiteral("snapshot_sequence")) ||
+            require_nonnegative_integral_field(
+                object,
+                QStringLiteral("snapshot_sequence"),
+                line_number,
+                out_error)) &&
+        (!object.contains(QStringLiteral("viewport_cell_count")) ||
+            require_nonnegative_integral_field(
+                object,
+                QStringLiteral("viewport_cell_count"),
+                line_number,
+                out_error)) &&
+        (!object.contains(QStringLiteral("snapshot_cell_count")) ||
+            require_nonnegative_integral_field(
+                object,
+                QStringLiteral("snapshot_cell_count"),
+                line_number,
+                out_error));
+}
 
-    if (kind == QStringLiteral("transcript.timing")) {
-        return
-            require_string_enum_field(
-                object,
-                QStringLiteral("operation"),
-                {
-                    QStringLiteral("event_write"),
-                    QStringLiteral("snapshot_diagnostic_emit"),
-                },
-                line_number,
-                out_error) &&
-            require_string_field(object, QStringLiteral("record_kind"), line_number, out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("record_event_index"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("object_construction_elapsed_ns"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("json_serialization_elapsed_ns"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("ndjson_append_elapsed_ns"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("file_write_elapsed_ns"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("file_flush_elapsed_ns"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("write_event_elapsed_ns"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("total_elapsed_ns"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("ndjson_byte_count"),
-                line_number,
-                out_error) &&
-            (!object.contains(QStringLiteral("payload_byte_count")) ||
-                require_nonnegative_integral_field(
-                    object,
-                    QStringLiteral("payload_byte_count"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("source")) ||
-                require_string_field(object, QStringLiteral("source"), line_number, out_error)) &&
-            (!object.contains(QStringLiteral("route")) ||
-                require_string_field(object, QStringLiteral("route"), line_number, out_error)) &&
-            (!object.contains(QStringLiteral("outcome")) ||
-                require_string_field(object, QStringLiteral("outcome"), line_number, out_error)) &&
-            (!object.contains(QStringLiteral("snapshot_reason")) ||
-                require_string_field(
-                    object,
-                    QStringLiteral("snapshot_reason"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("snapshot_sequence")) ||
-                require_nonnegative_integral_field(
-                    object,
-                    QStringLiteral("snapshot_sequence"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("viewport_cell_count")) ||
-                require_nonnegative_integral_field(
-                    object,
-                    QStringLiteral("viewport_cell_count"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("snapshot_cell_count")) ||
-                require_nonnegative_integral_field(
-                    object,
-                    QStringLiteral("snapshot_cell_count"),
-                    line_number,
-                    out_error));
-    }
+bool post_validate_surface_selection_drag(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    return
+        require_string_enum_field(
+            object,
+            QStringLiteral("phase"),
+            {
+                QStringLiteral("start"),
+                QStringLiteral("update"),
+                QStringLiteral("finish"),
+                QStringLiteral("clear"),
+                QStringLiteral("cancel"),
+            },
+            line_number,
+            out_error) &&
+        require_bool_field(object, QStringLiteral("moved"), line_number, out_error) &&
+        validate_optional_position_object(
+            object,
+            QStringLiteral("anchor"),
+            line_number,
+            out_error) &&
+        validate_optional_position_object(
+            object,
+            QStringLiteral("focus"),
+            line_number,
+            out_error) &&
+        validate_optional_selection_range_object(
+            object,
+            QStringLiteral("range"),
+            line_number,
+            out_error);
+}
 
-    if (kind == QStringLiteral("surface.selection_drag")) {
-        return
-            require_string_enum_field(
+bool post_validate_snapshot(
+    const QJsonObject& object,
+    int                line_number,
+    QString*           out_error)
+{
+    QJsonObject cursor;
+    return
+        require_string_enum_field(
+            object,
+            QStringLiteral("mode"),
+            {QStringLiteral("compact")},
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("session_sequence"),
+            line_number,
+            out_error) &&
+        require_string_field(object, QStringLiteral("reason"), line_number, out_error) &&
+        validate_grid_size_object(object, QStringLiteral("grid_size"), line_number, out_error) &&
+        validate_viewport_object(object, QStringLiteral("viewport"), line_number, out_error) &&
+        require_object_field(object, QStringLiteral("cursor"), line_number, out_error, &cursor) &&
+        require_bool_field(cursor, QStringLiteral("visible"), line_number, out_error) &&
+        validate_position_object(cursor, QStringLiteral("position"), line_number, out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("cell_count"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("dirty_row_range_count"),
+            line_number,
+            out_error) &&
+        require_nonnegative_integral_field(
+            object,
+            QStringLiteral("selection_span_count"),
+            line_number,
+            out_error) &&
+        require_bool_field(
+            object,
+            QStringLiteral("backend_geometry_in_sync"),
+            line_number,
+            out_error) &&
+        (!object.contains(QStringLiteral("snapshot_sequence")) ||
+            require_nonnegative_integral_field(
                 object,
-                QStringLiteral("phase"),
-                {
-                    QStringLiteral("start"),
-                    QStringLiteral("update"),
-                    QStringLiteral("finish"),
-                    QStringLiteral("clear"),
-                    QStringLiteral("cancel"),
-                },
+                QStringLiteral("snapshot_sequence"),
                 line_number,
-                out_error) &&
-            require_bool_field(object, QStringLiteral("moved"), line_number, out_error) &&
-            validate_optional_position_object(
+                out_error)) &&
+        (!object.contains(QStringLiteral("row_origin_generation")) ||
+            require_nonnegative_integral_field(
                 object,
-                QStringLiteral("anchor"),
+                QStringLiteral("row_origin_generation"),
                 line_number,
-                out_error) &&
-            validate_optional_position_object(
-                object,
-                QStringLiteral("focus"),
-                line_number,
-                out_error) &&
-            validate_optional_selection_range_object(
-                object,
-                QStringLiteral("range"),
-                line_number,
-                out_error);
-    }
+                out_error)) &&
+        validate_optional_snapshot_public_scroll_fields(object, line_number, out_error) &&
+        validate_snapshot_basis_purpose_biconditional(object, line_number, out_error) &&
+        validate_visible_rows_array(object, line_number, out_error) &&
+        validate_row_provenance_array(object, line_number, out_error) &&
+        validate_dirty_row_ranges_array(object, line_number, out_error) &&
+        validate_selection_spans_array(object, line_number, out_error) &&
+        validate_selected_text_object(object, line_number, out_error);
+}
 
-    if (kind == QStringLiteral("snapshot")) {
-        QJsonObject cursor;
-        return
-            require_string_enum_field(
-                object,
-                QStringLiteral("mode"),
-                {QStringLiteral("compact")},
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("session_sequence"),
-                line_number,
-                out_error) &&
-            require_string_field(object, QStringLiteral("reason"), line_number, out_error) &&
-            validate_grid_size_object(object, QStringLiteral("grid_size"), line_number, out_error) &&
-            validate_viewport_object(object, QStringLiteral("viewport"), line_number, out_error) &&
-            require_object_field(object, QStringLiteral("cursor"), line_number, out_error, &cursor) &&
-            require_bool_field(cursor, QStringLiteral("visible"), line_number, out_error) &&
-            validate_position_object(cursor, QStringLiteral("position"), line_number, out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("cell_count"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("dirty_row_range_count"),
-                line_number,
-                out_error) &&
-            require_nonnegative_integral_field(
-                object,
-                QStringLiteral("selection_span_count"),
-                line_number,
-                out_error) &&
-            require_bool_field(
-                object,
-                QStringLiteral("backend_geometry_in_sync"),
-                line_number,
-                out_error) &&
-            (!object.contains(QStringLiteral("snapshot_sequence")) ||
-                require_nonnegative_integral_field(
-                    object,
-                    QStringLiteral("snapshot_sequence"),
-                    line_number,
-                    out_error)) &&
-            (!object.contains(QStringLiteral("row_origin_generation")) ||
-                require_nonnegative_integral_field(
-                    object,
-                    QStringLiteral("row_origin_generation"),
-                    line_number,
-                    out_error)) &&
-            validate_optional_snapshot_public_scroll_fields(object, line_number, out_error) &&
-            validate_snapshot_basis_purpose_biconditional(object, line_number, out_error) &&
-            validate_visible_rows_array(object, line_number, out_error) &&
-            validate_row_provenance_array(object, line_number, out_error) &&
-            validate_dirty_row_ranges_array(object, line_number, out_error) &&
-            validate_selection_spans_array(object, line_number, out_error) &&
-            validate_selected_text_object(object, line_number, out_error);
+// Schema table: one descriptor per event kind. backend.output and host.write
+// share the session_sequence leading field but diverge in their predicate, so
+// they appear as two entries pointing at sibling predicates over a common base.
+constexpr Event_field_kind k_str    = Event_field_kind::STRING;
+constexpr Event_field_kind k_nnint  = Event_field_kind::NONNEGATIVE_INTEGRAL;
+constexpr Event_field_kind k_bool   = Event_field_kind::BOOL;
+
+const Event_schema k_event_schemas[] = {
+    {
+        "header",
+        {
+            {k_str,   "schema"},
+            {k_nnint, "schema_version"},
+            {k_str,   "byte_encoding"},
+            {k_bool,  "snapshot_diagnostics"},
+        },
+        post_validate_header,
+    },
+    {
+        "session.start",
+        {{k_nnint, "session_sequence"}},
+        post_validate_session_start,
+    },
+    {
+        "backend.output",
+        {{k_nnint, "session_sequence"}},
+        post_validate_backend_output,
+    },
+    {
+        "host.write",
+        {{k_nnint, "session_sequence"}},
+        post_validate_host_write,
+    },
+    {
+        "session.resize_request",
+        {{k_nnint, "session_sequence"}},
+        post_validate_session_resize_request,
+    },
+    {
+        "session.resize",
+        {{k_nnint, "session_sequence"}},
+        post_validate_session_resize,
+    },
+    {
+        "session.process_exit",
+        {{k_nnint, "session_sequence"}},
+        post_validate_session_process_exit,
+    },
+    {
+        "session.backend_error",
+        {{k_nnint, "session_sequence"}},
+        post_validate_session_backend_error,
+    },
+    {
+        "session.text_area_resize_request",
+        {{k_nnint, "session_sequence"}},
+        post_validate_session_text_area_resize_request,
+    },
+    {
+        "surface.scroll_intent",
+        {{k_str, "source"}},
+        post_validate_surface_scroll_intent,
+    },
+    {
+        "surface.scroll",
+        {{k_str, "source"}},
+        post_validate_surface_scroll,
+    },
+    {
+        "surface.wheel_trace",
+        {
+            {k_str,  "source"},
+            {k_str,  "route"},
+            {k_str,  "outcome"},
+            {k_bool, "accepted"},
+        },
+        post_validate_surface_wheel_trace,
+    },
+    {
+        "surface.wheel_ingress",
+        {{k_str, "source"}},
+        post_validate_surface_wheel_ingress,
+    },
+    {
+        "transcript.timing",
+        {},
+        post_validate_transcript_timing,
+    },
+    {
+        "surface.selection_drag",
+        {},
+        post_validate_surface_selection_drag,
+    },
+    {
+        "snapshot",
+        {},
+        post_validate_snapshot,
+    },
+};
+
+bool validate_event_object(
+    const QJsonObject& object,
+    const QString&     kind,
+    int                line_number,
+    QString*           out_error)
+{
+    for (const Event_schema& schema : k_event_schemas) {
+        if (kind != QLatin1String(schema.kind)) {
+            continue;
+        }
+        if (!validate_leading_event_fields(object, schema.leading_fields, line_number, out_error)) {
+            return false;
+        }
+        return schema.post_validate(object, line_number, out_error);
     }
 
     return fail_read(
