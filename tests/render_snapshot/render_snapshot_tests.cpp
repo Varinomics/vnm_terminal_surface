@@ -1217,6 +1217,115 @@ bool test_synthetic_snapshots_preserve_or_suppress_line_provenance()
     return ok;
 }
 
+term::Terminal_render_snapshot coalescing_snapshot(
+    int                            rows,
+    int                            columns,
+    std::uint64_t                  row_origin_generation,
+    std::vector<term::Terminal_render_dirty_row_range> dirty_row_ranges)
+{
+    term::Terminal_render_snapshot snapshot;
+    snapshot.grid_size.rows                  = rows;
+    snapshot.grid_size.columns               = columns;
+    snapshot.viewport.active_buffer          = term::Terminal_buffer_id::PRIMARY;
+    snapshot.viewport.visible_rows           = rows;
+    snapshot.viewport.scrollback_rows        = 0;
+    snapshot.viewport.offset_from_tail       = 0;
+    snapshot.metadata.row_origin_generation  = row_origin_generation;
+    snapshot.dirty_row_ranges                = std::move(dirty_row_ranges);
+    return snapshot;
+}
+
+bool dirty_ranges_equal(
+    const std::vector<term::Terminal_render_dirty_row_range>& left,
+    const std::vector<term::Terminal_render_dirty_row_range>& right)
+{
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        if (left[i].first_row != right[i].first_row ||
+            left[i].row_count != right[i].row_count)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool test_dirty_row_coalescing_unifies_on_stricter_row_identity()
+{
+    bool ok = true;
+
+    // AGREE case: matching grid + viewport + row_origin_generation with distinct
+    // dirty ranges coalesces to the union of both range sets.
+    const term::Terminal_render_snapshot agree_previous =
+        coalescing_snapshot(10, 80, 7U, {{1, 1}, {5, 1}});
+    const term::Terminal_render_snapshot agree_current =
+        coalescing_snapshot(10, 80, 7U, {{2, 1}, {8, 1}});
+    const term::Terminal_render_snapshot agree_result =
+        term::snapshot_with_coalesced_dirty_rows(agree_previous, agree_current);
+    ok &= check(
+        dirty_ranges_equal(agree_result.dirty_row_ranges, {{1, 2}, {5, 1}, {8, 1}}),
+        "matching identity space coalesces dirty rows into their union");
+
+    // DIVERGENT case (the behavior the unification changes): identical grid +
+    // viewport but a different row_origin_generation now falls back to a single
+    // full-viewport range under the stricter canonical predicate.
+    const term::Terminal_render_snapshot diverging_previous =
+        coalescing_snapshot(10, 80, 7U, {{1, 1}});
+    const term::Terminal_render_snapshot diverging_current =
+        coalescing_snapshot(10, 80, 8U, {{2, 1}});
+    const term::Terminal_render_snapshot diverging_result =
+        term::snapshot_with_coalesced_dirty_rows(diverging_previous, diverging_current);
+    ok &= check(
+        dirty_ranges_equal(diverging_result.dirty_row_ranges, {{0, 10}}),
+        "differing row_origin_generation forces a full-viewport repaint");
+
+    // Existing fallbacks remain: differing grid size and differing viewport each
+    // still produce a full repaint.
+    const term::Terminal_render_snapshot grid_previous =
+        coalescing_snapshot(10, 80, 7U, {{1, 1}});
+    const term::Terminal_render_snapshot grid_current =
+        coalescing_snapshot(12, 80, 7U, {{2, 1}});
+    const term::Terminal_render_snapshot grid_result =
+        term::snapshot_with_coalesced_dirty_rows(grid_previous, grid_current);
+    ok &= check(
+        dirty_ranges_equal(grid_result.dirty_row_ranges, {{0, 12}}),
+        "differing grid size forces a full-viewport repaint");
+
+    term::Terminal_render_snapshot viewport_previous =
+        coalescing_snapshot(10, 80, 7U, {{1, 1}});
+    viewport_previous.viewport.offset_from_tail = 4;
+    const term::Terminal_render_snapshot viewport_current =
+        coalescing_snapshot(10, 80, 7U, {{2, 1}});
+    const term::Terminal_render_snapshot viewport_result =
+        term::snapshot_with_coalesced_dirty_rows(viewport_previous, viewport_current);
+    ok &= check(
+        dirty_ranges_equal(viewport_result.dirty_row_ranges, {{0, 10}}),
+        "differing viewport mapping forces a full-viewport repaint");
+
+    // coalesced_dirty_row_snapshot_handle parity: the shared_ptr wrapper yields
+    // the same coalesced dirty-row ranges as the value core for both the agree
+    // and the divergent inputs.
+    const std::shared_ptr<const term::Terminal_render_snapshot> agree_handle =
+        term::coalesced_dirty_row_snapshot_handle(agree_previous, agree_current);
+    ok &= check(
+        agree_handle != nullptr &&
+        dirty_ranges_equal(agree_handle->dirty_row_ranges, agree_result.dirty_row_ranges),
+        "handle wrapper matches the value core on the agree case");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> diverging_handle =
+        term::coalesced_dirty_row_snapshot_handle(diverging_previous, diverging_current);
+    ok &= check(
+        diverging_handle != nullptr &&
+        dirty_ranges_equal(diverging_handle->dirty_row_ranges, diverging_result.dirty_row_ranges),
+        "handle wrapper matches the value core on the divergent case");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -1239,5 +1348,6 @@ int main()
     ok &= test_backend_sync_metadata_publishes_after_same_grid_retry();
     ok &= test_resize_metadata_publication_respects_synchronized_output();
     ok &= test_synthetic_snapshots_preserve_or_suppress_line_provenance();
+    ok &= test_dirty_row_coalescing_unifies_on_stricter_row_identity();
     return ok ? 0 : 1;
 }

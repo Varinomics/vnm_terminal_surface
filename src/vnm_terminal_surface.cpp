@@ -100,66 +100,6 @@ bool same_viewport_mapping(
         left.offset_from_tail == right.offset_from_tail;
 }
 
-int first_visible_logical_row_for_viewport(
-    const term::Terminal_viewport_state& viewport)
-{
-    return viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE
-        ? 0
-        : viewport.scrollback_rows - viewport.offset_from_tail;
-}
-
-bool same_visible_row_identity(
-    const term::Terminal_viewport_state& left,
-    const term::Terminal_viewport_state& right)
-{
-    return
-        left.active_buffer == right.active_buffer &&
-        left.visible_rows  == right.visible_rows  &&
-        first_visible_logical_row_for_viewport(left) ==
-            first_visible_logical_row_for_viewport(right);
-}
-
-bool same_viewport_row_identity_space(
-    const term::Terminal_render_snapshot&  left,
-    const term::Terminal_render_snapshot&  right)
-{
-    return
-        same_grid_size(left.grid_size, right.grid_size)                  &&
-        same_viewport_mapping(left.viewport, right.viewport);
-}
-
-void append_dirty_range_rows(
-    std::vector<int>&      rows,
-    const std::vector<term::Terminal_render_dirty_row_range>&
-                           ranges)
-{
-    for (const term::Terminal_render_dirty_row_range& range : ranges) {
-        for (int row = range.first_row; row < range.first_row + range.row_count; ++row) {
-            rows.push_back(row);
-        }
-    }
-}
-
-std::shared_ptr<const term::Terminal_render_snapshot> snapshot_with_coalesced_dirty_rows(
-    const term::Terminal_render_snapshot&  pending_snapshot,
-    const term::Terminal_render_snapshot&  current_snapshot)
-{
-    term::Terminal_render_snapshot snapshot = current_snapshot;
-
-    if (!same_viewport_row_identity_space(pending_snapshot, current_snapshot)) {
-        snapshot.dirty_row_ranges =
-            term::compact_dirty_row_ranges({}, snapshot.grid_size.rows, true);
-        return std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot));
-    }
-
-    std::vector<int> dirty_rows;
-    append_dirty_range_rows(dirty_rows, pending_snapshot.dirty_row_ranges);
-    append_dirty_range_rows(dirty_rows, current_snapshot.dirty_row_ranges);
-    snapshot.dirty_row_ranges =
-        term::compact_dirty_row_ranges(std::move(dirty_rows), snapshot.grid_size.rows, false);
-    return std::make_shared<const term::Terminal_render_snapshot>(std::move(snapshot));
-}
-
 bool same_property_value(qreal lhs, qreal rhs)
 {
     return lhs == rhs || (std::isnan(lhs) && std::isnan(rhs));
@@ -5855,7 +5795,7 @@ void term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface.m_private->render_snapshot != nullptr &&
         snapshot                           != nullptr)
     {
-        snapshot = snapshot_with_coalesced_dirty_rows(
+        snapshot = term::coalesced_dirty_row_snapshot_handle(
             *surface.m_private->render_snapshot,
             *snapshot);
     }
