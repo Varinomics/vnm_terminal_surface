@@ -85,7 +85,12 @@ Writable Qt properties:
 
 `backend_output_capture_path()` and `set_backend_output_capture_path()` are C++
 diagnostic accessors rather than Qt properties. When set before process start,
-the session appends raw backend output bytes to that path.
+the session appends raw backend output bytes to that path. The capture file is
+opened once and held for the session lifetime, and each output chunk is flushed
+to disk as it is written. The per-chunk flush is a deliberate tradeoff that
+favors crash-safety and external-reader visibility over write throughput, so a
+concurrent reader and a post-crash inspection both observe every chunk the
+session has delivered.
 
 ## Published State
 

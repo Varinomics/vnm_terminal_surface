@@ -643,8 +643,9 @@ public:
         // thread can observe process exit before the writer's delivery callback
         // returns, and that exit should still classify as interrupted. If delivery
         // instead fails while the process is still running,
-        // note_interrupt_delivery_failed() drops this override and surfaces the
-        // failure so a later natural exit is not misreported as interrupted.
+        // mark_writer_failed_after_write_failure() drops this override (in the same
+        // critical section that marks the writer failed) and surfaces the failure so
+        // a later natural exit is not misreported as interrupted.
         m_exit_reason_override = Terminal_exit_reason::INTERRUPTED;
         m_write_queue.push_back({QByteArray(1, '\x03'), true});
         m_write_cv.notify_one();
@@ -917,10 +918,7 @@ private:
             }
 
             if (!write_all(write.bytes)) {
-                mark_writer_failed();
-                if (write.marks_interrupted_exit) {
-                    note_interrupt_delivery_failed();
-                }
+                mark_writer_failed_after_write_failure(write.marks_interrupted_exit);
                 return;
             }
 
@@ -930,12 +928,50 @@ private:
         }
     }
 
-    void mark_writer_failed()
+    void mark_writer_failed_after_write_failure(bool failed_write_was_interrupt)
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_stopping) {
-            m_writer_failed = true;
-            m_input_write.reset();
+        bool should_report_interrupt_failed = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            // Mark the writer failed and drop the optimistic INTERRUPTED override in
+            // the SAME critical section. The wait thread classifies exit by reading
+            // m_exit_reason_override (report_exit_once). If the failed-writer mark
+            // and the override clear were two separate locked steps, the wait thread
+            // could observe a stale INTERRUPTED override between them and misclassify
+            // a natural exit as interrupted even though the Ctrl+C byte was never
+            // delivered. One critical section closes that window.
+            //
+            // This race has no deterministic regression test: the backend test
+            // harness drives a real ConPTY child through the public interface and
+            // has no seam to force write_all() to fail while simultaneously driving a
+            // natural child exit. The fix is correct by construction -- the override
+            // clear and the writer-failed mark are atomic under m_mutex, so no other
+            // thread can observe a stale INTERRUPTED override after a failed
+            // interrupt write -- and a deterministic test would require a
+            // write-failure injection seam that does not currently exist.
+            if (!m_stopping) {
+                m_writer_failed = true;
+                m_input_write.reset();
+            }
+
+            // The interrupt byte never reached the child. Drop the optimistic
+            // INTERRUPTED override taken at request time so a later natural exit is
+            // not misreported as interrupted -- but only while the process is still
+            // running. If it has already exited and been classified, that
+            // classification stands (the exit may well have been the interrupt).
+            if (failed_write_was_interrupt &&
+                !m_exit_reported &&
+                m_exit_reason_override == Terminal_exit_reason::INTERRUPTED)
+            {
+                m_exit_reason_override.reset();
+                should_report_interrupt_failed = true;
+            }
+        }
+
+        if (should_report_interrupt_failed) {
+            report_error(
+                Terminal_backend_error_code::INTERRUPT_FAILED,
+                QStringLiteral("ConPTY interrupt byte could not be delivered to the child"));
         }
     }
 
@@ -944,31 +980,6 @@ private:
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_stopping) {
             m_exit_reason_override = Terminal_exit_reason::INTERRUPTED;
-        }
-    }
-
-    void note_interrupt_delivery_failed()
-    {
-        bool delivery_failed_unresolved = false;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            // The interrupt byte never reached the child. Drop the optimistic
-            // INTERRUPTED override taken at request time so a later natural exit is
-            // not misreported as interrupted -- but only while the process is still
-            // running. If it has already exited and been classified, that
-            // classification stands (the exit may well have been the interrupt).
-            if (!m_exit_reported &&
-                m_exit_reason_override == Terminal_exit_reason::INTERRUPTED)
-            {
-                m_exit_reason_override.reset();
-                delivery_failed_unresolved = true;
-            }
-        }
-
-        if (delivery_failed_unresolved) {
-            report_error(
-                Terminal_backend_error_code::INTERRUPT_FAILED,
-                QStringLiteral("ConPTY interrupt byte could not be delivered to the child"));
         }
     }
 

@@ -670,11 +670,13 @@ public:
             startup_error_read.reset();
             // POSIX session/process-group setup: the child always becomes its own
             // session/process-group leader. forkpty's login_tty already calls
-            // setsid(); this setpgid(0, 0) defensively reasserts the child's own
-            // process group so signal targeting (e.g. kill(-pgid, SIGINT) for the
-            // foreground group) stays reliable. The result is intentionally
-            // unchecked: setsid has already established the group and the child is
-            // about to exec.
+            // setsid(), which creates a new session and a new process group with the
+            // child as leader. This setpgid(0, 0) is therefore best-effort and
+            // non-essential: it is a defensive no-op-or-reassert of the group setsid
+            // just established, kept only to make signal targeting (e.g.
+            // kill(-pgid, SIGINT) for the foreground group) obviously correct to a
+            // reader. The result is intentionally unchecked and is harmless if it
+            // fails, since the group already exists and the child is about to exec.
             (void)::setpgid(0, 0);
             exec_child(*native_launch, startup_error_write.get());
         }
