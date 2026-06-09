@@ -992,12 +992,22 @@ bool atlas_msdf_text_atlas_has_supported_codepoints(
     const msdf_text_atlas_t& atlas,
     QString*                 out_message)
 {
-    for (char32_t codepoint : atlas_msdf_text_codepoints()) {
+    // Require only the printable-ASCII core to be present and drawable. The rest
+    // of the inventory (Latin-extended, Greek, Cyrillic, box drawing, powerline
+    // Private-Use glyphs, ...) is optional: an arbitrary selected font may not
+    // cover it, and runs that use a codepoint the built atlas lacks fall back to
+    // the glyph renderer per run (see append_msdf_text_run). Gating the whole
+    // atlas on the full inventory would disable MSDF for every font except the
+    // bundled powerline-patched one, which is not what we want.
+    for (char32_t codepoint = k_atlas_printable_ascii_first;
+         codepoint <= k_atlas_printable_ascii_last;
+         ++codepoint)
+    {
         const auto glyph = atlas.glyphs.find(codepoint);
         if (glyph == atlas.glyphs.end()) {
             if (out_message != nullptr) {
                 *out_message = QStringLiteral(
-                    "MSDF atlas is missing supported codepoint U+%1")
+                    "MSDF atlas is missing core codepoint U+%1")
                     .arg(
                         static_cast<uint>(codepoint),
                         4,
@@ -1012,7 +1022,7 @@ bool atlas_msdf_text_atlas_has_supported_codepoints(
         {
             if (out_message != nullptr) {
                 *out_message = QStringLiteral(
-                    "MSDF atlas has an invalid drawable glyph for codepoint U+%1")
+                    "MSDF atlas has an invalid drawable glyph for core codepoint U+%1")
                     .arg(
                         static_cast<uint>(codepoint),
                         4,

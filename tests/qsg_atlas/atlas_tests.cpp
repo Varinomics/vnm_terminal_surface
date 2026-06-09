@@ -17806,7 +17806,15 @@ bool test_font_file_bytes_for_font()
             "a non-bundled family resolves to bytes distinct from the bundled font");
     }
     if (system_bytes.has_value() && !system_bytes->isEmpty()) {
-        const std::vector<char32_t> codepoints = {k_msdf_single_w_codepoint};
+        // Build with an ASCII-core sample plus a powerline Private-Use glyph.
+        // A standard font covers the core but not the powerline glyph; that is
+        // precisely why the old full-inventory ready check disabled MSDF for
+        // every font except the bundled powerline-patched one. The relaxed check
+        // needs only the ASCII core, so MSDF now activates and powerline-bearing
+        // runs fall back to the glyph renderer per run.
+        constexpr char32_t k_powerline_codepoint = 0xe0a0U;
+        const std::vector<char32_t> codepoints = {
+            k_msdf_single_w_codepoint, k_powerline_codepoint};
         const msdf::build_result_t build = msdf::build_font_atlas(
             reinterpret_cast<const std::uint8_t*>(system_bytes->constData()),
             static_cast<std::size_t>(system_bytes->size()),
@@ -17818,7 +17826,11 @@ bool test_font_file_bytes_for_font()
         ok &= check(
             build.atlas.glyphs.find(k_msdf_single_w_codepoint) !=
                 build.atlas.glyphs.end(),
-            "system-font MSDF atlas contains the W glyph");
+            "system-font MSDF atlas contains the ASCII core (W) glyph");
+        ok &= check(
+            build.atlas.glyphs.find(k_powerline_codepoint) ==
+                build.atlas.glyphs.end(),
+            "a standard font lacks the powerline glyph the strict ready check required");
     }
 #else
     (void)system_bytes;
