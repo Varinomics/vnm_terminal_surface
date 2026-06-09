@@ -37,6 +37,7 @@
 #include <QVariant>
 #include <QWheelEvent>
 #include <QWindow>
+#include <QtGlobal>
 #include <qpa/qplatformscreen.h>
 #include <algorithm>
 #include <atomic>
@@ -269,7 +270,8 @@ bool viewport_state_can_scroll_locally(
 bool color_is_light(quint32 rgba)
 {
     const QColor color = QColor::fromRgba(rgba);
-    // Rec. 601 luma, matching the renderer's background-luminance heuristic.
+    // Rec. 601 luma; drives only the light/dark preedit and visual-bell overlays
+    // chosen for the active scheme.
     const double luma =
         0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue();
     return luma > 127.5;
@@ -2232,7 +2234,13 @@ QString VNM_TerminalSurface::color_scheme() const
 void VNM_TerminalSurface::set_color_scheme(const QString& color_scheme)
 {
     const term::Terminal_color_scheme* scheme = term::find_color_scheme(color_scheme);
-    if (scheme == nullptr || m_color_scheme == scheme->name) {
+    if (scheme == nullptr) {
+        qWarning(
+            "VNM_TerminalSurface: ignoring unknown color scheme \"%s\"",
+            qPrintable(color_scheme));
+        return;
+    }
+    if (m_color_scheme == scheme->name) {
         return;
     }
 

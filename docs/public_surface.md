@@ -35,9 +35,14 @@ Writable Qt properties:
 - `fontFamily` and `fontSize` select the terminal font. Positive font sizes are
   rounded to an integer pixel size. Font, device-pixel-ratio, and item geometry
   changes recompute terminal grid metrics.
-- `colorTheme` selects the render theme. The renderer treats `light`
-  case-insensitively as the light palette; other names use the default palette.
-  The example accepts `default` and `light`.
+- `colorScheme` selects a bundled color scheme by name (the Windows Terminal
+  built-in set; `Campbell` is the default). The scheme drives the 16 ANSI colors
+  plus the default foreground, background, cursor, and selection colors, and is
+  switchable at runtime. The light-vs-dark rendering decision derives from the
+  scheme background luminance. `available_color_schemes()` lists the scheme names
+  and `color_scheme_preview(name)` returns a scheme's swatch colors (background,
+  foreground, cursor, selection, and the 16 ANSI colors) for a picker UI. An
+  unknown name is ignored and the current scheme is kept.
 - `cursorStyle` is `BLOCK`, `BAR`, or `UNDERLINE`.
 - `cursorBlinkEnabled` enables the render-side blink override.
 - `textRendererMode` is `AUTO`, `MSDF`, or `GLYPH`. `AUTO` lets the atlas
