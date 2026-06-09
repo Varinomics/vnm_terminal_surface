@@ -1260,6 +1260,87 @@ bool test_surface_session_single_drain_coalesces_dirty_rows(QGuiApplication& app
     return ok;
 }
 
+std::shared_ptr<const term::Terminal_render_snapshot> seam_coalescing_snapshot(
+    std::uint64_t                                       sequence,
+    std::uint64_t                                       row_origin_generation,
+    std::vector<term::Terminal_render_dirty_row_range>  dirty_row_ranges)
+{
+    auto snapshot = std::make_shared<term::Terminal_render_snapshot>();
+    snapshot->grid_size.rows                 = 10;
+    snapshot->grid_size.columns              = 80;
+    snapshot->viewport.active_buffer         = term::Terminal_buffer_id::PRIMARY;
+    snapshot->viewport.visible_rows          = 10;
+    snapshot->viewport.scrollback_rows       = 0;
+    snapshot->viewport.offset_from_tail      = 0;
+    snapshot->metadata.sequence              = sequence;
+    snapshot->metadata.row_origin_generation = row_origin_generation;
+    snapshot->dirty_row_ranges               = std::move(dirty_row_ranges);
+    return snapshot;
+}
+
+bool test_surface_set_render_snapshot_seam_coalesces_on_row_identity(QGuiApplication& app)
+{
+    bool ok = true;
+
+    // The coalescing branch in set_render_snapshot fires when a render update is
+    // already pending and both the stored and the incoming snapshot are non-null.
+    // The first seam call stores a snapshot and (the fixture window is non-null)
+    // marks render_update_pending; the second seam call exercises the branch with
+    // no intervening event pump.
+
+    // Divergent row_origin_generation -> stricter canonical predicate -> full
+    // viewport repaint.
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            fixture.surface,
+            seam_coalescing_snapshot(1U, 3U, {{1, 1}}));
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            fixture.surface,
+            seam_coalescing_snapshot(2U, 4U, {{4, 1}}));
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> coalesced =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(coalesced != nullptr,
+            "seam divergent row-origin path publishes a coalesced snapshot");
+        if (coalesced != nullptr) {
+            ok &= check(coalesced->dirty_row_ranges.size() == 1U &&
+                coalesced->dirty_row_ranges.front().first_row == 0 &&
+                coalesced->dirty_row_ranges.front().row_count == 10,
+                "seam divergent row-origin path forces a full-viewport dirty range");
+        }
+    }
+
+    // Matching row_origin_generation -> normal coalescing -> union of dirty rows.
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            fixture.surface,
+            seam_coalescing_snapshot(1U, 3U, {{1, 1}}));
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            fixture.surface,
+            seam_coalescing_snapshot(2U, 3U, {{4, 1}}));
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> coalesced =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(coalesced != nullptr,
+            "seam matching row-origin path publishes a coalesced snapshot");
+        if (coalesced != nullptr) {
+            ok &= check(snapshot_dirty_ranges_contain_row(*coalesced, 1) &&
+                snapshot_dirty_ranges_contain_row(*coalesced, 4) &&
+                !snapshot_dirty_ranges_contain_row(*coalesced, 0) &&
+                !snapshot_dirty_ranges_contain_row(*coalesced, 2),
+                "seam matching row-origin path coalesces to the union of dirty rows");
+        }
+    }
+
+    return ok;
+}
+
 bool test_osc52_clipboard_write_signal_and_deny(QGuiApplication& app)
 {
     bool ok = true;
@@ -11388,6 +11469,7 @@ int main(int argc, char** argv)
     ok &= test_start_maps_output_to_snapshot(app);
     ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
     ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
+    ok &= test_surface_set_render_snapshot_seam_coalesces_on_row_identity(app);
     ok &= test_osc52_clipboard_write_signal_and_deny(app);
     ok &= test_osc52_clipboard_wrong_duplicate_and_replacement(app);
     ok &= test_osc52_clipboard_late_exit_restart_and_targets(app);

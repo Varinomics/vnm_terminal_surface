@@ -851,49 +851,6 @@ bool active_model_matches_published_selection_source(
         viewport_mappings_match(source.viewport_mapping, viewport);
 }
 
-bool snapshots_share_row_identity_space(
-    const Terminal_render_snapshot&    left,
-    const Terminal_render_snapshot&    right)
-{
-    return
-        grid_sizes_match(left.grid_size, right.grid_size)                &&
-        left.metadata.row_origin_generation == right.metadata.row_origin_generation &&
-        left.viewport.active_buffer    == right.viewport.active_buffer   &&
-        left.viewport.visible_rows     == right.viewport.visible_rows    &&
-        left.viewport.scrollback_rows  == right.viewport.scrollback_rows &&
-        left.viewport.offset_from_tail == right.viewport.offset_from_tail;
-}
-
-void append_dirty_range_rows(
-    std::vector<int>&      rows,
-    const std::vector<Terminal_render_dirty_row_range>&
-                           ranges)
-{
-    for (const Terminal_render_dirty_row_range& range : ranges) {
-        for (int row = range.first_row; row < range.first_row + range.row_count; ++row) {
-            rows.push_back(row);
-        }
-    }
-}
-
-Terminal_render_snapshot snapshot_with_coalesced_dirty_rows(
-    const Terminal_render_snapshot&        previous_snapshot,
-    Terminal_render_snapshot               snapshot)
-{
-    if (!snapshots_share_row_identity_space(previous_snapshot, snapshot)) {
-        snapshot.dirty_row_ranges =
-            compact_dirty_row_ranges({}, snapshot.grid_size.rows, true);
-        return snapshot;
-    }
-
-    std::vector<int> dirty_rows;
-    append_dirty_range_rows(dirty_rows, previous_snapshot.dirty_row_ranges);
-    append_dirty_range_rows(dirty_rows, snapshot.dirty_row_ranges);
-    snapshot.dirty_row_ranges =
-        compact_dirty_row_ranges(std::move(dirty_rows), snapshot.grid_size.rows, false);
-    return snapshot;
-}
-
 bool model_should_publish_render_snapshot(
     const Terminal_screen_model&           model,
     const Terminal_screen_model_result&    result)

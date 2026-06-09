@@ -12,6 +12,7 @@
 #include <QStringView>
 #include <QtGlobal>
 #include <algorithm>
+#include <memory>
 #include <set>
 #include <vector>
 #include <cstddef>
@@ -504,6 +505,69 @@ inline std::vector<Terminal_render_dirty_row_range> compact_dirty_row_ranges(
     }
 
     return ranges;
+}
+
+// Two snapshots coalesce their dirty rows by physical row index only when they
+// describe the same physical row-identity space: same grid, same viewport
+// mapping, and the same row-origin generation. A scrollback-eviction row-origin
+// change shifts which logical line each physical index names, so coalescing
+// across it would carry a stale or missing row; the row-origin guard forces a
+// full repaint instead.
+inline bool snapshots_share_row_identity_space(
+    const Terminal_render_snapshot&    left,
+    const Terminal_render_snapshot&    right)
+{
+    return
+        left.grid_size.rows    == right.grid_size.rows                  &&
+        left.grid_size.columns == right.grid_size.columns               &&
+        left.metadata.row_origin_generation == right.metadata.row_origin_generation &&
+        left.viewport.active_buffer    == right.viewport.active_buffer   &&
+        left.viewport.visible_rows     == right.viewport.visible_rows    &&
+        left.viewport.scrollback_rows  == right.viewport.scrollback_rows &&
+        left.viewport.offset_from_tail == right.viewport.offset_from_tail;
+}
+
+inline void append_dirty_range_rows(
+    std::vector<int>&                                   rows,
+    const std::vector<Terminal_render_dirty_row_range>& ranges)
+{
+    for (const Terminal_render_dirty_row_range& range : ranges) {
+        for (int row = range.first_row; row < range.first_row + range.row_count; ++row) {
+            rows.push_back(row);
+        }
+    }
+}
+
+// Merge the dirty rows of a previously published snapshot into a newer one when
+// both share a physical row-identity space, returning the newer snapshot with a
+// coalesced dirty-row range set. Diverging grid, viewport, or row-origin yields
+// a full-viewport repaint range.
+inline Terminal_render_snapshot snapshot_with_coalesced_dirty_rows(
+    const Terminal_render_snapshot&        previous_snapshot,
+    Terminal_render_snapshot               snapshot)
+{
+    if (!snapshots_share_row_identity_space(previous_snapshot, snapshot)) {
+        snapshot.dirty_row_ranges =
+            compact_dirty_row_ranges({}, snapshot.grid_size.rows, true);
+        return snapshot;
+    }
+
+    std::vector<int> dirty_rows;
+    append_dirty_range_rows(dirty_rows, previous_snapshot.dirty_row_ranges);
+    append_dirty_range_rows(dirty_rows, snapshot.dirty_row_ranges);
+    snapshot.dirty_row_ranges =
+        compact_dirty_row_ranges(std::move(dirty_rows), snapshot.grid_size.rows, false);
+    return snapshot;
+}
+
+// Shared-pointer wrapper over snapshot_with_coalesced_dirty_rows for callers
+// that publish the coalesced snapshot through a shared_ptr<const> channel.
+inline std::shared_ptr<const Terminal_render_snapshot> coalesced_dirty_row_snapshot_handle(
+    const Terminal_render_snapshot&    previous,
+    const Terminal_render_snapshot&    current)
+{
+    Terminal_render_snapshot coalesced = snapshot_with_coalesced_dirty_rows(previous, current);
+    return std::make_shared<const Terminal_render_snapshot>(std::move(coalesced));
 }
 
 inline terminal_grid_position_t normalized_selection_start(
