@@ -87,6 +87,28 @@ const term::Terminal_render_cell* cell_at(
     return nullptr;
 }
 
+// Mirrors the row-major/column-ascending contract that validate_render_snapshot
+// enforces (INVALID_CELL_ORDER): every cell after the first comes strictly after
+// the previous one in row-major order, i.e. its row is greater, or the row is
+// equal and the column is strictly greater.
+bool snapshot_cells_are_row_major_column_ascending(
+    const term::Terminal_render_snapshot& snapshot)
+{
+    for (std::size_t index = 1U; index < snapshot.cells.size(); ++index) {
+        const term::Terminal_render_cell& previous = snapshot.cells[index - 1U];
+        const term::Terminal_render_cell& current  = snapshot.cells[index];
+        const bool strictly_after =
+            current.position.row > previous.position.row ||
+            (current.position.row    == previous.position.row &&
+             current.position.column >  previous.position.column);
+        if (!strictly_after) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 const term::Terminal_render_hyperlink_metadata* hyperlink_by_id(
     const term::Terminal_render_snapshot&  snapshot,
     std::uint64_t                          hyperlink_id)
@@ -1326,6 +1348,143 @@ bool test_dirty_row_coalescing_unifies_on_stricter_row_identity()
     return ok;
 }
 
+// Step 1 (reproduce-before-fix): drive the real live-content model producer over
+// representative content and assert that snapshot.cells genuinely satisfy the
+// row-major / column-ascending contract the frame builder relies on, before that
+// contract is enforced by the validator. Each case both validates OK and passes
+// the standalone ordering predicate.
+bool test_real_model_snapshot_cells_are_row_major_column_ascending()
+{
+    bool ok = true;
+
+    // Multi-row plain ASCII with wide (double-width) characters and sparse rows
+    // that leave column gaps. The cursor address sequences create occupied cells
+    // at non-contiguous columns so the snapshot exercises mid-row gaps.
+    term::Terminal_screen_model ascii_model = make_model({4, 16});
+    ascii_model.ingest(
+        QByteArrayLiteral("alpha\r\n")
+        + QByteArrayLiteral("\x1b[2;4Hbeta\r\n")
+        + QStringLiteral("界世gamma").toUtf8()
+        + QByteArrayLiteral("\r\n")
+        + QByteArrayLiteral("\x1b[4;10Hx"));
+    const term::Terminal_render_snapshot ascii_snapshot =
+        ascii_model.render_snapshot(request_for_model(ascii_model, 200U));
+    ok &= check(term::validate_render_snapshot(ascii_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "real model ASCII+wide+gap snapshot validates");
+    ok &= check(snapshot_cells_are_row_major_column_ascending(ascii_snapshot),
+        "real model ASCII+wide+gap snapshot cells are row-major and column-ascending");
+    ok &= check(ascii_snapshot.cells.size() > 1U,
+        "real model ASCII+wide+gap snapshot emits multiple cells to order");
+
+    // Scrollback offset: content tall enough to push rows into history, viewed at
+    // a non-zero offset_from_tail so the snapshot mixes retained and resident rows.
+    term::Terminal_screen_model scroll_model = make_model({3, 12});
+    scroll_model.ingest(
+        QByteArrayLiteral("one\r\ntwo\r\nthree\r\nfour\r\nfive"));
+    ok &= check(scroll_model.scrollback_size() > 0,
+        "scrollback ordering fixture has retained history");
+    const term::Terminal_render_snapshot scroll_snapshot =
+        scroll_model.render_snapshot(request_for_model(scroll_model, 201U, 1));
+    ok &= check(term::validate_render_snapshot(scroll_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "real model scrollback-offset snapshot validates");
+    ok &= check(snapshot_cells_are_row_major_column_ascending(scroll_snapshot),
+        "real model scrollback-offset snapshot cells are row-major and column-ascending");
+
+    // Alternate buffer: switching to the alternate screen produces its own
+    // resident-row snapshot, which must satisfy the same ordering contract.
+    term::Terminal_screen_model alternate_model = make_model({3, 12});
+    alternate_model.ingest(QByteArrayLiteral("PRIMARY\r\nROW2"));
+    alternate_model.ingest(QByteArrayLiteral("\x1b[?1049h\x1b[2;3HALT"));
+    const term::Terminal_render_snapshot alternate_snapshot =
+        alternate_model.render_snapshot(request_for_model(alternate_model, 202U));
+    ok &= check(alternate_snapshot.viewport.active_buffer ==
+        term::Terminal_buffer_id::ALTERNATE,
+        "alternate ordering fixture reports the alternate buffer");
+    ok &= check(term::validate_render_snapshot(alternate_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "real model alternate-buffer snapshot validates");
+    ok &= check(snapshot_cells_are_row_major_column_ascending(alternate_snapshot),
+        "real model alternate-buffer snapshot cells are row-major and column-ascending");
+
+    return ok;
+}
+
+// Step 3: the validator rejects an out-of-order snapshot with the distinct
+// INVALID_CELL_ORDER status, while a real producer snapshot and the existing
+// valid fixtures are not falsely rejected.
+bool test_validate_render_snapshot_rejects_out_of_order_cells()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model({3, 12});
+    model.ingest(QByteArrayLiteral("abcd\r\nefgh\r\nijkl"));
+    const term::Terminal_render_snapshot valid =
+        model.render_snapshot(request_for_model(model, 210U));
+    ok &= check(term::validate_render_snapshot(valid).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "real model snapshot validates before order mutation");
+    ok &= check(valid.cells.size() >= 4U,
+        "order-rejection fixture has enough cells to reorder");
+
+    // Swap two adjacent cells within the same row so columns decrease across the
+    // boundary: a strict-order violation that is not a same-position overlap.
+    term::Terminal_render_snapshot swapped_columns = valid;
+    bool swapped_in_row = false;
+    for (std::size_t i = 1U; i < swapped_columns.cells.size(); ++i) {
+        if (swapped_columns.cells[i].position.row ==
+                swapped_columns.cells[i - 1U].position.row &&
+            swapped_columns.cells[i].position.column >
+                swapped_columns.cells[i - 1U].position.column)
+        {
+            std::swap(swapped_columns.cells[i], swapped_columns.cells[i - 1U]);
+            swapped_in_row = true;
+            break;
+        }
+    }
+    ok &= check(swapped_in_row,
+        "order-rejection fixture found an adjacent same-row column pair to swap");
+    ok &= check(term::validate_render_snapshot(swapped_columns).status ==
+        term::Terminal_render_snapshot_status::INVALID_CELL_ORDER,
+        "validator rejects a column-decreasing cell pair as INVALID_CELL_ORDER");
+
+    // Move a later row's first cell ahead of an earlier row's cell so the row
+    // index decreases across the boundary.
+    term::Terminal_render_snapshot row_decrease = valid;
+    bool moved_row = false;
+    for (std::size_t i = 1U; i < row_decrease.cells.size(); ++i) {
+        if (row_decrease.cells[i].position.row >
+            row_decrease.cells[0].position.row)
+        {
+            const term::Terminal_render_cell later_row_cell = row_decrease.cells[i];
+            row_decrease.cells.insert(row_decrease.cells.begin(), later_row_cell);
+            moved_row = true;
+            break;
+        }
+    }
+    ok &= check(moved_row,
+        "order-rejection fixture found a later-row cell to hoist");
+    ok &= check(term::validate_render_snapshot(row_decrease).status ==
+        term::Terminal_render_snapshot_status::INVALID_CELL_ORDER,
+        "validator rejects a row-decreasing cell sequence as INVALID_CELL_ORDER");
+
+    // The new status must be distinct from existing ones, and the unmutated
+    // real-model snapshot must remain OK (no false rejection).
+    ok &= check(term::Terminal_render_snapshot_status::INVALID_CELL_ORDER !=
+            term::Terminal_render_snapshot_status::OK &&
+        term::Terminal_render_snapshot_status::INVALID_CELL_ORDER !=
+            term::Terminal_render_snapshot_status::INVALID_CELL_OVERLAP &&
+        term::Terminal_render_snapshot_status::INVALID_CELL_ORDER !=
+            term::Terminal_render_snapshot_status::INVALID_CELL_POSITION,
+        "INVALID_CELL_ORDER is distinct from OK, overlap, and position statuses");
+    ok &= check(term::validate_render_snapshot(valid).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "validator does not falsely reject the in-order real-model snapshot");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -1349,5 +1508,7 @@ int main()
     ok &= test_resize_metadata_publication_respects_synchronized_output();
     ok &= test_synthetic_snapshots_preserve_or_suppress_line_provenance();
     ok &= test_dirty_row_coalescing_unifies_on_stricter_row_identity();
+    ok &= test_real_model_snapshot_cells_are_row_major_column_ascending();
+    ok &= test_validate_render_snapshot_rejects_out_of_order_cells();
     return ok ? 0 : 1;
 }

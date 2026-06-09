@@ -305,9 +305,13 @@ installed/binary packages consume already-embedded shader resources.
 
 ## The instanced renderer
 
-Per frame, from the captured snapshot/frame. The renderer indexes cells via the
-positional index (`render_snapshot_cells_by_position`), not by assuming `snapshot.cells`
-is row-major (the snapshot does not guarantee production order).
+Per frame, from the captured snapshot/frame. The frame builder iterates
+`snapshot.cells` directly, relying on the snapshot's row-major /
+column-ascending cell-order contract (validated by `validate_render_snapshot`,
+which returns `INVALID_CELL_ORDER` on violation). The positional index
+(`render_snapshot_cells_by_position`) is built only by the consumers that need
+O(1) random access — selection/anchor and transcript — not by the frame
+builder.
 
 Passes are emitted in the **reference's exact back-to-front paint order** (from the
 scene-node child order: background → selection → graphic → text → decoration → cursor →

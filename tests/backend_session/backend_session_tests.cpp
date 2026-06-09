@@ -735,6 +735,27 @@ bool snapshot_cells_fit_grid(const term::Terminal_render_snapshot& snapshot)
     return true;
 }
 
+// Mirrors the row-major / column-ascending contract enforced by
+// validate_render_snapshot (INVALID_CELL_ORDER): each cell after the first comes
+// strictly after the previous one in row-major order.
+bool snapshot_cells_are_row_major_column_ascending(
+    const term::Terminal_render_snapshot& snapshot)
+{
+    for (std::size_t index = 1U; index < snapshot.cells.size(); ++index) {
+        const term::Terminal_render_cell& previous = snapshot.cells[index - 1U];
+        const term::Terminal_render_cell& current  = snapshot.cells[index];
+        const bool strictly_after =
+            current.position.row > previous.position.row ||
+            (current.position.row    == previous.position.row &&
+             current.position.column >  previous.position.column);
+        if (!strictly_after) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 QByteArray numbered_scroll_lines(int count)
 {
     QByteArray bytes;
@@ -6017,6 +6038,7 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
         public_scroll->dirty_row_ranges.size() == 1U &&
         public_scroll->dirty_row_ranges.front().first_row == 0 &&
         public_scroll->dirty_row_ranges.front().row_count == public_scroll->grid_size.rows &&
+        snapshot_cells_are_row_major_column_ascending(*public_scroll) &&
         term::validate_render_snapshot(*public_scroll).status ==
             term::Terminal_render_snapshot_status::OK,
         "Phase 4 natural full-row public scroll publishes a valid PUBLIC_PROJECTION/SCROLL snapshot");
