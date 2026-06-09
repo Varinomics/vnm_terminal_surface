@@ -518,6 +518,46 @@ set_tests_properties(vnm_terminal_profile_text PROPERTIES
     TIMEOUT 60
 )
 
+# Golden characterization test for the shared text-layout diagnostics block.
+# Feeds a fabricated stats fixture through the detail emitters and asserts the
+# TEXT output byte-for-byte and the JSON output key/value-string-exact. The
+# emitters live in src/diagnostics/metric_descriptor.h, so the test reaches into
+# the source tree for that internal header.
+add_executable(vnm_terminal_diagnostics_text_layout
+    diagnostics_text_layout/diagnostics_text_layout_tests.cpp
+)
+
+target_include_directories(vnm_terminal_diagnostics_text_layout PRIVATE
+    "${CMAKE_SOURCE_DIR}/include"
+    "${CMAKE_SOURCE_DIR}/src"
+)
+
+target_compile_definitions(vnm_terminal_diagnostics_text_layout PRIVATE
+    VNM_TERMINAL_PROFILING_ENABLED=1
+)
+
+target_link_libraries(vnm_terminal_diagnostics_text_layout PRIVATE
+    Qt6::Core
+    Qt6::Gui
+)
+
+set_target_properties(vnm_terminal_diagnostics_text_layout PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_diagnostics_text_layout
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_diagnostics_text_layout>"
+)
+
+set_tests_properties(vnm_terminal_diagnostics_text_layout PROPERTIES
+    LABELS "diagnostics;metrics;golden"
+    TIMEOUT 30
+)
+
 add_executable(vnm_terminal_render_cell_text
     render_cell_text/render_cell_text_tests.cpp
 )
@@ -1686,6 +1726,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_qt_render_smoke
     vnm_terminal_qt_metrics
     vnm_terminal_profile_text
+    vnm_terminal_diagnostics_text_layout
     vnm_terminal_render_cell_text
     vnm_terminal_render_snapshot
     vnm_terminal_render_frame
