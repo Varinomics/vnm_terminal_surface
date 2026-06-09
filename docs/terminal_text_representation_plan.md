@@ -138,6 +138,14 @@ Internal byte-backed text can be used where the code only needs:
 - renderer-side classification and packing paths;
 - byte-preserving backend-to-model-to-frame transit for simple text.
 
+> Status note (2026): the earlier packed-text-*sidecar* render path — a parallel,
+> production-disabled sidecar that defined, measured, and reported packed bytes —
+> was REMOVED in the dead-code cleanup (Batch 2). The "packed render-frame
+> payloads" above and the packed-payload ideas below are a *future* direction,
+> not a description of current code. Any future packed-text work should be
+> designed from the current `Terminal_render_cell_text` representation, not by
+> reviving the removed sidecar.
+
 Any call site that needs locale-sensitive, shaped, or UTF-16-indexed behavior
 must materialize or retain `QString`.
 
