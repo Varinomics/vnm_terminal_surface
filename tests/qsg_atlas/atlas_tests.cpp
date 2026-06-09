@@ -17797,6 +17797,14 @@ bool test_font_file_bytes_for_font()
 #if defined(Q_OS_WIN)
     ok &= check(system_bytes.has_value() && !system_bytes->isEmpty(),
         "font_file_bytes_for_font resolves an installed system family");
+    if (system_bytes.has_value() && !system_bytes->isEmpty() &&
+        bundled_bytes.has_value())
+    {
+        // Distinct families must produce distinct bytes, hence distinct atlas
+        // fingerprints, so their baked atlases never collide in the cache.
+        ok &= check(*system_bytes != *bundled_bytes,
+            "a non-bundled family resolves to bytes distinct from the bundled font");
+    }
     if (system_bytes.has_value() && !system_bytes->isEmpty()) {
         const std::vector<char32_t> codepoints = {k_msdf_single_w_codepoint};
         const msdf::build_result_t build = msdf::build_font_atlas(

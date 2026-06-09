@@ -1269,11 +1269,6 @@ void qsg_atlas_update_text_renderer_summary(
         qsg_atlas_lcd_subpixel_order_uses_lcd_sampling(
             summary.msdf_lcd_subpixel_order);
 }
-
-bool qsg_atlas_msdf_text_font_is_supported(const QFont& font)
-{
-    return font.family() == vnm_terminal_default_monospace_font_family();
-}
 #endif
 
 bool text_has_emoji_presentation(const QString& text);
@@ -4652,11 +4647,56 @@ private:
     }
 
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+    struct Msdf_font_resolution
+    {
+        bool       supported = false;
+        QByteArray bytes;
+        QByteArray fingerprint;
+    };
+
+    // Resolve a font to its full sfnt bytes and a stable fingerprint, caching
+    // the last result so the per-run support gate, the baked-atlas key, and the
+    // atlas build share a single file read. Keyed on what actually selects the
+    // font file (family, bold, italic); the draw size does not change the file.
+    // Render-thread only.
+    const Msdf_font_resolution& resolve_msdf_font(const QFont& font)
+    {
+        if (m_msdf_font_resolution_valid &&
+            m_msdf_font_resolution_family == font.family() &&
+            m_msdf_font_resolution_bold   == font.bold()   &&
+            m_msdf_font_resolution_italic == font.italic())
+        {
+            return m_msdf_font_resolution;
+        }
+
+        Msdf_font_resolution resolution;
+        std::optional<QByteArray> bytes = font_file_bytes_for_font(font);
+        if (bytes.has_value() && !bytes->isEmpty()) {
+            resolution.supported   = true;
+            resolution.fingerprint =
+                QCryptographicHash::hash(*bytes, QCryptographicHash::Sha256);
+            resolution.bytes       = std::move(*bytes);
+        }
+
+        m_msdf_font_resolution_family = font.family();
+        m_msdf_font_resolution_bold   = font.bold();
+        m_msdf_font_resolution_italic = font.italic();
+        m_msdf_font_resolution        = std::move(resolution);
+        m_msdf_font_resolution_valid  = true;
+        return m_msdf_font_resolution;
+    }
+
+    // A font is MSDF-supported when a full sfnt blob can be obtained for it.
+    bool msdf_text_font_supported(const QFont& font)
+    {
+        return resolve_msdf_font(font).supported;
+    }
+
     Msdf_terminal_baked_atlas_key make_msdf_baked_atlas_key(int baked_pixel_height)
     {
         const msdf_text::options_t options = atlas_msdf_text_options();
         Msdf_terminal_baked_atlas_key key;
-        key.font_fingerprint         = m_msdf_embedded_font_fingerprint;
+        key.font_fingerprint         = resolve_msdf_font(m_frame.font).fingerprint;
         key.codepoint_inventory_hash = msdf_codepoint_inventory_hash();
         key.baked_pixel_height       = baked_pixel_height;
         key.atlas_size               = options.atlas_size;
@@ -4785,13 +4825,13 @@ private:
         // same bake bucket never reaches this branch, so it neither rebuilds nor
         // re-uploads the atlas.
 
-        // Single byte source for both the bundled font (its Qt resource) and any
-        // other selected family (resolved to its installed font file). A null
-        // result means we cannot feed msdfgen, so leave the cache uninitialized
-        // and fall back to the glyph renderer instead of claiming MSDF.
-        const std::optional<QByteArray> font_bytes =
-            font_file_bytes_for_font(m_frame.font);
-        if (!font_bytes.has_value() || font_bytes->isEmpty()) {
+        // One resolution feeds the support gate, the baked key, and this build.
+        // A null result means we cannot feed msdfgen, so leave the cache
+        // uninitialized and fall back to the glyph renderer instead of MSDF.
+        // The baked key already carries this font's fingerprint (set when the
+        // key was built above), so no backfill is needed.
+        const Msdf_font_resolution& resolution = resolve_msdf_font(m_frame.font);
+        if (!resolution.supported || resolution.bytes.isEmpty()) {
             m_msdf_text_cache.message = QStringLiteral(
                 "failed to obtain font file bytes for MSDF atlas (family: %1)")
                 .arg(m_frame.font.family());
@@ -4803,18 +4843,8 @@ private:
             return false;
         }
 
-        const QByteArray& font_data = *font_bytes;
+        const QByteArray& font_data = resolution.bytes;
         m_msdf_text_cache.font_data_bytes = static_cast<int>(font_data.size());
-
-        // Fingerprint the embedded font bytes once so the baked key has a stable
-        // font identity that does not depend on the resource path, and backfill
-        // the freshly stored key so later frames match without re-reading the font.
-        if (m_msdf_embedded_font_fingerprint.isEmpty()) {
-            m_msdf_embedded_font_fingerprint =
-                QCryptographicHash::hash(font_data, QCryptographicHash::Sha256);
-            m_msdf_text_cache.baked_key.font_fingerprint =
-                m_msdf_embedded_font_fingerprint;
-        }
 
         const std::vector<char32_t>& codepoints = atlas_msdf_text_codepoints();
         result.render.msdf_text_atlas_build_attempted = true;
@@ -5258,7 +5288,7 @@ private:
             msdf_text_ownership_enabled &&
             msdf_text_run_allowed &&
             qsg_atlas_msdf_text_run_candidate(run, m_frame.cell_metrics) &&
-            qsg_atlas_msdf_text_font_is_supported(m_frame.font);
+            msdf_text_font_supported(m_frame.font);
         if (forced_msdf_text) {
             if (msdf_text_candidate) {
                 const int missed_runs_before =
@@ -5304,7 +5334,7 @@ private:
             if (msdf_text_ownership_enabled &&
                 msdf_text_run_allowed &&
                 !msdf_text_attempted &&
-                qsg_atlas_msdf_text_font_is_supported(m_frame.font))
+                msdf_text_font_supported(m_frame.font))
             {
                 msdf_text_attempted = true;
                 if (append_msdf_text_run(run, opacity, result)) {
@@ -6011,9 +6041,13 @@ private:
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
     Msdf_terminal_text_cache                 m_msdf_text_cache;
     Msdf_terminal_draw_layout_state          m_msdf_draw_layout;
-    // Stable identity of the embedded font and codepoint inventory, computed once
-    // and reused so the baked-atlas key never re-reads the font on a cache hit.
-    QByteArray                               m_msdf_embedded_font_fingerprint;
+    // Last MSDF font resolution (bytes + fingerprint), cached so the per-run
+    // support gate, the baked-atlas key, and the atlas build share one file read.
+    QString                                  m_msdf_font_resolution_family;
+    bool                                     m_msdf_font_resolution_bold   = false;
+    bool                                     m_msdf_font_resolution_italic = false;
+    bool                                     m_msdf_font_resolution_valid  = false;
+    Msdf_font_resolution                     m_msdf_font_resolution;
     QByteArray                               m_msdf_codepoint_inventory_hash;
     std::uint64_t                            m_msdf_text_uploaded_generation = 0U;
     Msdf_text_zoom_counters                  m_msdf_text_counters;
