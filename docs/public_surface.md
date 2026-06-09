@@ -321,7 +321,7 @@ without notice.
 The first-party Varinomics terminal application (`vnm_terminal`) is a
 deliberately privileged consumer. It builds this surface from source in-tree
 (via `add_subdirectory`), not against the install interface, so it may include
-`vnm_terminal/internal/*` for first-party development tooling — notably
+`vnm_terminal/internal/*` for first-party development tooling, notably
 render-profiler attachment (`VNM_TerminalSurface_render_bridge::set_render_profiler`)
 and the app's own GUI-thread profiler (`Hierarchical_profiler`), both compiled
 only under `VNM_TERMINAL_PROFILING_ENABLED`, plus the test/render handoff used by
@@ -329,4 +329,4 @@ the app's integration tests. This privilege is intentional and is not extended t
 installed embedders; the app accepts that these internal types may change and
 migrates in lockstep with the surface (build breaks are an accepted migration
 tool). Profiling read-back and metrics/profile serialization do NOT use this
-privilege — they go through the public `vnm_terminal/diagnostics/` serializers.
+privilege; they go through the public `vnm_terminal/diagnostics/` serializers.
