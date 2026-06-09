@@ -39,13 +39,10 @@ int primary_repaint_recovery_shift_rows(
     int best_matched_prefix     = 0;
 
     for (int shift = 1; shift < row_count; ++shift) {
-        bool displaced_visible = false;
+        bool displaced_has_text = false;
         for (int row = 0; row < shift; ++row) {
-            displaced_visible = displaced_visible ||
+            displaced_has_text = displaced_has_text ||
                 row_has_visible_text(input.candidate_rows[static_cast<std::size_t>(row)]);
-        }
-        if (!displaced_visible) {
-            continue;
         }
 
         int available_meaningful_matches = 0;
@@ -91,6 +88,17 @@ int primary_repaint_recovery_shift_rows(
         if (meaningful_matches < required_meaningful_matches ||
             static_cast<int>(distinct_matched_texts.size()) < k_min_meaningful_matches)
         {
+            continue;
+        }
+
+        // The rows that prove an upward shift are the surviving rows that
+        // matched after the shift, not the displaced payload itself, so a blank
+        // displaced row is still recoverable - dropping it is what makes blank
+        // separator lines vanish from reconstructed scrollback. A blank payload
+        // is weaker evidence than a text-bearing one, so recover it only when
+        // the entire surviving suffix matched; a partial prefix match is enough
+        // only when the displaced payload carries its own text.
+        if (!displaced_has_text && matched_prefix != row_count - shift) {
             continue;
         }
 
