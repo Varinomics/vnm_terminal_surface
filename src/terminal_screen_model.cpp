@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/csi_parameter_parsing.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/terminal_color_scheme.h"
 #include "vnm_terminal/internal/terminal_history_row_record_codec.h"
 #include "vnm_terminal/internal/terminal_history_row_traversal.h"
 #include "vnm_terminal/internal/terminal_repaint_recovery.h"
@@ -33,17 +34,6 @@ constexpr std::size_t k_retained_history_ring_capacity_bytes = 64U * 1024U * 102
 
 template <typename T>
 constexpr bool k_unhandled_screen_mutation = false;
-
-constexpr std::array<quint32, 16> k_ansi_16_palette_rgba = {
-    0xff000000U, 0xffcd0000U, 0xff00cd00U, 0xffcdcd00U,
-    0xff0000eeU, 0xffcd00cdU, 0xff00cdcdU, 0xffe5e5e5U,
-    0xff7f7f7fU, 0xffff0000U, 0xff00ff00U, 0xffffff00U,
-    0xff5c5cffU, 0xffff00ffU, 0xff00ffffU, 0xffffffffU,
-};
-
-constexpr std::array<int, 6> k_256_cube_components = {
-    0, 95, 135, 175, 215, 255,
-};
 
 enum class Dec_private_mode_notify
 {
@@ -310,37 +300,6 @@ const QString& printable_ascii_cell_text(QChar character)
         character.unicode() - k_printable_ascii_first)];
 }
 
-quint32 terminal_palette_rgba(int index)
-{
-    if (index >= 0 && index < static_cast<int>(k_ansi_16_palette_rgba.size())) {
-        return k_ansi_16_palette_rgba[static_cast<std::size_t>(index)];
-    }
-
-    if (index >= 16 && index <= 231) {
-        const int cube_index = index - 16;
-        const int red        = k_256_cube_components[static_cast<std::size_t>(cube_index / 36)];
-        const int green      = k_256_cube_components[static_cast<std::size_t>((cube_index / 6) % 6)];
-        const int blue       = k_256_cube_components[static_cast<std::size_t>(cube_index % 6)];
-        return rgba_from_components(red, green, blue);
-    }
-
-    if (index >= 232 && index <= 255) {
-        const int component = 8 + ((index - 232) * 10);
-        return rgba_from_components(component, component, component);
-    }
-
-    return k_terminal_default_foreground_rgba;
-}
-
-Terminal_color_state make_default_terminal_color_state()
-{
-    Terminal_color_state state;
-    for (std::size_t i = 0; i < state.palette_rgba.size(); ++i) {
-        state.palette_rgba[i] = terminal_palette_rgba(static_cast<int>(i));
-    }
-    return state;
-}
-
 bool action_is_session_visible(const Parser_action& action)
 {
     switch (parser_action_kind(action)) {
@@ -461,7 +420,7 @@ Terminal_screen_model_config_status validate_terminal_screen_model_config(
 Terminal_screen_model::Terminal_screen_model(Terminal_screen_model_config config)
 :
     m_config(config),
-    m_color_state(make_default_terminal_color_state()),
+    m_color_state(make_terminal_color_state(default_color_scheme())),
     m_current_style(make_default_terminal_text_style()),
     m_styles{make_default_terminal_text_style()}
 {
@@ -2786,6 +2745,23 @@ Terminal_screen_model_result Terminal_screen_model::set_scrollback_limit(int lim
         collect_synchronized_changes();
     }
     retain_referenced_active_hyperlink_ids();
+
+    return finalize_result(std::move(result));
+}
+
+Terminal_screen_model_result Terminal_screen_model::set_color_state(Terminal_color_state state)
+{
+    Terminal_screen_model_result result;
+    clear_backing_deltas();
+    clear_recovery_proposals();
+    clear_dirty();
+
+    m_color_state = std::move(state);
+    mark_all_dirty();
+    mark_viewport_changed();
+    if (m_modes.synchronized_output) {
+        collect_synchronized_changes();
+    }
 
     return finalize_result(std::move(result));
 }

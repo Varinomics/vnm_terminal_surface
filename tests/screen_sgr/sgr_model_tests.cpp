@@ -11,10 +11,15 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
-constexpr quint32 k_red_rgba          = 0xffcd0000U;
-constexpr quint32 k_green_rgba        = 0xff00cd00U;
-constexpr quint32 k_blue_rgba         = 0xff0000eeU;
-constexpr quint32 k_magenta_rgba      = 0xffcd00cdU;
+// The model seeds its color state from the default (Campbell) scheme, so the
+// basic-16 SGR colors and the default foreground/background resolve to Campbell
+// palette values rather than the Terminal_color_state struct fallbacks.
+constexpr quint32 k_default_foreground_rgba = 0xffccccccU; // Campbell foreground
+constexpr quint32 k_default_background_rgba = 0xff0c0c0cU; // Campbell background
+constexpr quint32 k_red_rgba          = 0xffc50f1fU; // Campbell palette slot 1
+constexpr quint32 k_green_rgba        = 0xff13a10eU; // Campbell palette slot 2
+constexpr quint32 k_blue_rgba         = 0xff0037daU; // Campbell palette slot 4
+constexpr quint32 k_magenta_rgba      = 0xff881798U; // Campbell palette slot 5
 constexpr quint32 k_bright_red_rgba   = 0xffff0000U;
 constexpr quint32 k_bright_green_rgba = 0xff00ff00U;
 constexpr quint32 k_bright_blue_rgba  = 0xff0000ffU;
@@ -209,7 +214,7 @@ bool test_nested_sgr_and_resets()
         snapshot,
         cell_a,
         k_red_rgba,
-        term::k_terminal_default_background_rgba,
+        k_default_background_rgba,
         "A captures red foreground");
     ok &= check(!has_attribute(style_a, term::Terminal_style_attribute::BOLD),
         "A is not retroactively bold");
@@ -224,8 +229,8 @@ bool test_nested_sgr_and_resets()
     ok &= check_cell_colors(
         snapshot,
         cell_e,
-        term::k_terminal_default_foreground_rgba,
-        term::k_terminal_default_background_rgba,
+        k_default_foreground_rgba,
+        k_default_background_rgba,
         "39 resets foreground");
     ok &= check(has_attribute(style_e, term::Terminal_style_attribute::UNDERLINE),
         "39 keeps underline");
@@ -233,8 +238,8 @@ bool test_nested_sgr_and_resets()
     ok &= check_cell_colors(
         snapshot,
         cell_f,
-        term::k_terminal_default_foreground_rgba,
-        term::k_terminal_default_background_rgba,
+        k_default_foreground_rgba,
+        k_default_background_rgba,
         "0 resets colors");
     return ok;
 }
@@ -388,9 +393,9 @@ bool test_style_persistence_and_style_ids()
     ok &= check(snapshot.cells.size() == 4U, "tab movement does not materialize styled blanks");
     ok &= check(style_d.attributes == 0U &&
         foreground_rgba_for_cell(snapshot, cell_at(snapshot, 1, 5)) ==
-            term::k_terminal_default_foreground_rgba &&
+            k_default_foreground_rgba &&
         background_rgba_for_cell(snapshot, cell_at(snapshot, 1, 5)) ==
-            term::k_terminal_default_background_rgba,
+            k_default_background_rgba,
         "reset style applies to D");
 
     term::Terminal_screen_model reuse_model = make_model();
@@ -512,10 +517,10 @@ bool test_osc_color_queries()
     ok &= check(terminal_reply_count(result) == 4, "OSC color queries emit replies");
 
     ok &= check(terminal_reply_at(result, 0).wire_bytes ==
-        QByteArrayLiteral("\x1b]10;rgb:ffff/ffff/ffff\x1b\\"),
+        QByteArrayLiteral("\x1b]10;rgb:cccc/cccc/cccc\x1b\\"),
         "OSC 10 reply bytes");
     ok &= check(terminal_reply_at(result, 1).wire_bytes ==
-        QByteArrayLiteral("\x1b]11;rgb:0000/0000/0000\x1b\\"),
+        QByteArrayLiteral("\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\"),
         "OSC 11 reply bytes");
     ok &= check(terminal_reply_at(result, 2).wire_bytes ==
         QByteArrayLiteral("\x1b]12;rgb:ffff/ffff/ffff\x1b\\"),

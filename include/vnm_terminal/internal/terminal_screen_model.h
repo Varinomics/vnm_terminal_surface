@@ -289,6 +289,7 @@ public:
     Terminal_screen_model_result ingest(QByteArrayView bytes);
     Terminal_screen_model_result resize(terminal_grid_size_t grid_size);
     Terminal_screen_model_result set_scrollback_limit(int limit);
+    Terminal_screen_model_result set_color_state(Terminal_color_state state);
     void set_primary_repaint_recovery_enabled(bool enabled);
     Terminal_screen_model_result force_release_synchronized_output();
 

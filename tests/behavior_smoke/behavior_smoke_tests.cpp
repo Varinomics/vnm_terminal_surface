@@ -29,7 +29,12 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
-constexpr quint32 k_red_rgba = 0xffcd0000U;
+// The screen model seeds its color state from the default (Campbell) scheme, so
+// the basic-16 SGR colors and the default foreground/background resolve to the
+// Campbell palette values rather than the Terminal_color_state struct fallbacks.
+constexpr quint32 k_red_rgba                = 0xffc50f1fU; // Campbell palette slot 1 (SGR 31m)
+constexpr quint32 k_default_foreground_rgba = 0xffccccccU; // Campbell foreground
+constexpr quint32 k_default_background_rgba = 0xff0c0c0cU; // Campbell background
 
 struct command_result_t
 {
@@ -846,7 +851,7 @@ bool test_sgr_reset_interactions_smoke(const QByteArray& bytes)
         0,
         0,
         k_red_rgba,
-        term::k_terminal_default_background_rgba,
+        k_default_background_rgba,
         "SGR smoke A captures red foreground");
     ok &= check_cell_attribute(
         snapshot,
@@ -873,8 +878,8 @@ bool test_sgr_reset_interactions_smoke(const QByteArray& bytes)
         snapshot,
         0,
         4,
-        term::k_terminal_default_foreground_rgba,
-        term::k_terminal_default_background_rgba,
+        k_default_foreground_rgba,
+        k_default_background_rgba,
         "SGR smoke E has foreground reset");
     ok &= check_cell_attribute(
         snapshot,
@@ -887,8 +892,8 @@ bool test_sgr_reset_interactions_smoke(const QByteArray& bytes)
         snapshot,
         0,
         5,
-        term::k_terminal_default_foreground_rgba,
-        term::k_terminal_default_background_rgba,
+        k_default_foreground_rgba,
+        k_default_background_rgba,
         "SGR smoke F has full reset colors");
     ok &= check_cell_attribute(
         snapshot,
@@ -1085,7 +1090,7 @@ bool check_surface_snapshot_for_smoke(
             0,
             0,
             k_red_rgba,
-            term::k_terminal_default_background_rgba,
+            k_default_background_rgba,
             "surface SGR smoke A captures red foreground");
         ok &= check_cell_attribute(
             snapshot,

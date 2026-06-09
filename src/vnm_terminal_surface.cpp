@@ -6,6 +6,7 @@
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
+#include "vnm_terminal/internal/terminal_color_scheme.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_resize_controller.h"
 #include "vnm_terminal/internal/terminal_session.h"
@@ -33,6 +34,7 @@
 #include <QTextLayout>
 #include <QTextOption>
 #include <QTimer>
+#include <QVariant>
 #include <QWheelEvent>
 #include <QWindow>
 #include <qpa/qplatformscreen.h>
@@ -264,9 +266,30 @@ bool viewport_state_can_scroll_locally(
     return false;
 }
 
-bool is_light_theme(const QString& color_theme)
+bool color_is_light(quint32 rgba)
 {
-    return color_theme.compare(QStringLiteral("light"), Qt::CaseInsensitive) == 0;
+    const QColor color = QColor::fromRgba(rgba);
+    // Rec. 601 luma, matching the renderer's background-luminance heuristic.
+    const double luma =
+        0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue();
+    return luma > 127.5;
+}
+
+QColor scheme_selection_color(quint32 selection_rgba)
+{
+    // The scheme selection color is opaque; render it as a translucent overlay
+    // so selected text stays legible regardless of the scheme.
+    QColor color = QColor::fromRgba(selection_rgba);
+    color.setAlpha(150);
+    return color;
+}
+
+const term::Terminal_color_scheme& resolve_surface_color_scheme(
+    const VNM_TerminalSurface& surface)
+{
+    const term::Terminal_color_scheme* scheme =
+        term::find_color_scheme(surface.color_scheme());
+    return scheme != nullptr ? *scheme : term::default_color_scheme();
 }
 
 qreal current_device_pixel_ratio(const QQuickWindow* window)
@@ -1083,15 +1106,20 @@ term::Terminal_lcd_subpixel_order terminal_lcd_subpixel_order(
 term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurface& surface)
 {
     term::Terminal_render_options options;
-    const bool light_theme = is_light_theme(surface.color_theme());
-    if (light_theme) {
-        options.default_background   = QColor(246, 247, 242);
-        options.default_foreground   = QColor(31,  44,  38);
-        options.selection_background = QColor(95, 145, 190, 150);
-        options.cursor_color         = QColor(30, 46, 38);
-        options.preedit_background   = QColor(220, 220, 205, 170);
-        options.visual_bell_color    = QColor(255, 255, 255, 96);
-    }
+
+    const term::Terminal_color_scheme& scheme = resolve_surface_color_scheme(surface);
+    options.default_background   = QColor::fromRgba(scheme.background_rgba);
+    options.default_foreground   = QColor::fromRgba(scheme.foreground_rgba);
+    options.cursor_color         = QColor::fromRgba(scheme.cursor_rgba);
+    options.selection_background = scheme_selection_color(scheme.selection_rgba);
+
+    const bool light_scheme = color_is_light(scheme.background_rgba);
+    options.preedit_background = light_scheme
+        ? QColor(220, 220, 205, 170)
+        : QColor(96,  96,  96,  120);
+    options.visual_bell_color = light_scheme
+        ? QColor(255, 255, 255, 96)
+        : QColor(255, 255, 255, 70);
 
     options.cursor_shape_override         = terminal_cursor_shape(surface.cursor_style());
     options.cursor_blink_enabled_override = surface.cursor_blink_enabled();
@@ -1991,7 +2019,6 @@ struct VNM_TerminalSurface::Private
     term::terminal_cell_metrics_t                          cell_metrics;
     QFont                                                  render_font;
     qreal                                                  render_device_pixel_ratio             = 1.0;
-    bool                                                   render_light_theme                    = false;
     std::shared_ptr<const term::Terminal_render_snapshot>  render_snapshot;
     term::Ime_preedit_state                                ime_preedit;
     bool                                                   cursor_blink_visible                  = true;
@@ -2197,21 +2224,59 @@ void VNM_TerminalSurface::set_font_size(qreal font_size)
     refresh_grid_metrics();
 }
 
-QString VNM_TerminalSurface::color_theme() const
+QString VNM_TerminalSurface::color_scheme() const
 {
-    return m_color_theme;
+    return m_color_scheme;
 }
 
-void VNM_TerminalSurface::set_color_theme(const QString& color_theme)
+void VNM_TerminalSurface::set_color_scheme(const QString& color_scheme)
 {
-    if (m_color_theme == color_theme) {
+    const term::Terminal_color_scheme* scheme = term::find_color_scheme(color_scheme);
+    if (scheme == nullptr || m_color_scheme == scheme->name) {
         return;
     }
 
-    m_color_theme = color_theme;
-    m_private->render_light_theme = is_light_theme(m_color_theme);
-    emit color_theme_changed();
+    m_color_scheme = scheme->name;
+    emit color_scheme_changed();
+    if (m_private->session != nullptr) {
+        m_private->session->set_color_state(term::make_terminal_color_state(*scheme));
+        sync_from_session();
+    }
     m_private->request_render_update(*this);
+}
+
+QStringList VNM_TerminalSurface::available_color_schemes() const
+{
+    const std::vector<term::Terminal_color_scheme>& schemes = term::builtin_color_schemes();
+    QStringList names;
+    names.reserve(static_cast<int>(schemes.size()));
+    for (const term::Terminal_color_scheme& scheme : schemes) {
+        names.push_back(scheme.name);
+    }
+    return names;
+}
+
+QVariantMap VNM_TerminalSurface::color_scheme_preview(const QString& color_scheme) const
+{
+    const term::Terminal_color_scheme* scheme = term::find_color_scheme(color_scheme);
+    if (scheme == nullptr) {
+        return {};
+    }
+
+    QVariantList ansi;
+    ansi.reserve(static_cast<int>(scheme->ansi_palette_rgba.size()));
+    for (quint32 rgba : scheme->ansi_palette_rgba) {
+        ansi.push_back(QColor::fromRgba(rgba));
+    }
+
+    QVariantMap preview;
+    preview.insert(QStringLiteral("name"),       scheme->name);
+    preview.insert(QStringLiteral("background"), QColor::fromRgba(scheme->background_rgba));
+    preview.insert(QStringLiteral("foreground"), QColor::fromRgba(scheme->foreground_rgba));
+    preview.insert(QStringLiteral("cursor"),     QColor::fromRgba(scheme->cursor_rgba));
+    preview.insert(QStringLiteral("selection"),  QColor::fromRgba(scheme->selection_rgba));
+    preview.insert(QStringLiteral("ansi"),       ansi);
+    return preview;
 }
 
 VNM_TerminalSurface::Cursor_style VNM_TerminalSurface::cursor_style() const
@@ -4917,7 +4982,6 @@ void VNM_TerminalSurface::refresh_grid_metrics()
 {
     m_private->render_font               = term::vnm_terminal_font(m_font_family, m_font_size);
     m_private->render_device_pixel_ratio = current_device_pixel_ratio(window());
-    m_private->render_light_theme        = is_light_theme(m_color_theme);
     const QString atlas_font_epoch_key = QStringLiteral("%1|%2")
         .arg(m_private->render_font.toString())
         .arg(m_private->render_device_pixel_ratio, 0, 'g', 17);
@@ -5209,6 +5273,8 @@ bool VNM_TerminalSurface::start_process_with_backend(
 
     m_private->session =
         std::make_unique<term::Terminal_session>(std::move(backend), session_config);
+    m_private->session->set_color_state(
+        term::make_terminal_color_state(resolve_surface_color_scheme(*this)));
     m_private->resize_controller = std::make_unique<term::Terminal_resize_controller>(
         *m_private->session,
         m_private->grid_metrics_provider);
