@@ -47,6 +47,14 @@ if(NOT EXISTS "${installed_diagnostics_header}")
         "${installed_diagnostics_header}")
 endif()
 
+set(installed_font_metrics_header
+    "${install_dir}/include/vnm_terminal/font_metrics.h")
+if(NOT EXISTS "${installed_font_metrics_header}")
+    message(FATAL_ERROR
+        "Package smoke expected installed font metrics header at "
+        "${installed_font_metrics_header}")
+endif()
+
 set(configure_args)
 if(DEFINED generator AND NOT "${generator}" STREQUAL "")
     list(APPEND configure_args -G "${generator}")
