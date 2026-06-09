@@ -1,4 +1,5 @@
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
+#include "vnm_terminal/internal/qsg_atlas_font_bytes.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
 #include "vnm_terminal/internal/qsg_atlas_warm_set.h"
 #include "vnm_terminal/internal/terminal_graphic_geometry.h"
@@ -13,6 +14,7 @@
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
+#include <QFont>
 #include <QFontInfo>
 #include <QFontMetricsF>
 #include <QGuiApplication>
@@ -17762,10 +17764,67 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     return ok ? 0 : 1;
 }
 
+bool test_font_file_bytes_for_font()
+{
+    bool ok = true;
+
+    // The bundled monospace family resolves to the embedded resource bytes.
+    const QString bundled_family =
+        term::vnm_terminal_default_monospace_font_family();
+    const QFont bundled_font(bundled_family);
+    const std::optional<QByteArray> bundled_bytes =
+        term::font_file_bytes_for_font(bundled_font);
+    ok &= check(bundled_bytes.has_value() && !bundled_bytes->isEmpty(),
+        "font_file_bytes_for_font returns bytes for the bundled family");
+
+#if VNM_TERMINAL_QSG_ATLAS_MSDF_DIAGNOSTIC_AVAILABLE
+    QString font_error;
+    const QByteArray resource_bytes = read_msdf_terminal_font_data(font_error);
+    ok &= check(font_error.isEmpty(),
+        "embedded terminal monospace font resource reads cleanly");
+    if (bundled_bytes.has_value()) {
+        ok &= check(*bundled_bytes == resource_bytes,
+            "bundled font bytes match the embedded resource");
+    }
+
+    // An arbitrary installed family must resolve to a full sfnt blob that
+    // msdfgen accepts. Resolution of a non-bundled family is Windows-only today
+    // (GetFontData); on other platforms the producer returns nullopt and MSDF
+    // stays bundled-only, so only assert the build path where we can resolve.
+    const QFont system_font(QStringLiteral("Consolas"));
+    const std::optional<QByteArray> system_bytes =
+        term::font_file_bytes_for_font(system_font);
+#if defined(Q_OS_WIN)
+    ok &= check(system_bytes.has_value() && !system_bytes->isEmpty(),
+        "font_file_bytes_for_font resolves an installed system family");
+    if (system_bytes.has_value() && !system_bytes->isEmpty()) {
+        const std::vector<char32_t> codepoints = {k_msdf_single_w_codepoint};
+        const msdf::build_result_t build = msdf::build_font_atlas(
+            reinterpret_cast<const std::uint8_t*>(system_bytes->constData()),
+            static_cast<std::size_t>(system_bytes->size()),
+            48,
+            std::span<const char32_t>(codepoints.data(), codepoints.size()),
+            msdf_single_w_options());
+        ok &= check(build.status != msdf::Build_status::FAILURE,
+            "msdfgen builds an atlas from resolved system-font bytes");
+        ok &= check(
+            build.atlas.glyphs.find(k_msdf_single_w_codepoint) !=
+                build.atlas.glyphs.end(),
+            "system-font MSDF atlas contains the W glyph");
+    }
+#else
+    (void)system_bytes;
+#endif
+#endif
+
+    return ok;
+}
+
 bool run_unit_tests()
 {
     bool ok = true;
     ok &= test_source_posture();
+    ok &= test_font_file_bytes_for_font();
     ok &= test_cache_key_includes_physical_size_and_face();
     ok &= test_software_renderer_driver_classifier();
     ok &= test_packing_and_stride_copy();

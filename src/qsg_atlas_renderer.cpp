@@ -1,5 +1,6 @@
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/qsg_atlas_font_bytes.h"
 #include "vnm_terminal/internal/qsg_atlas_warm_set.h"
 #include "vnm_terminal/internal/terminal_graphic_geometry.h"
 #include "vnm_terminal/internal/unicode_width.h"
@@ -62,8 +63,6 @@ constexpr const char* k_atlas_msdf_text_vertex_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_msdf_text.vert.qsb";
 constexpr const char* k_atlas_msdf_text_fragment_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_msdf_text.frag.qsb";
-constexpr const char* k_atlas_msdf_terminal_font_resource =
-    ":/vnm_terminal_surface/fonts/vnm_framework_monospace.ttf";
 constexpr int k_atlas_msdf_text_texture_size = 2048;
 constexpr double k_atlas_msdf_text_min_atlas_font_size = 48.0;
 constexpr float k_atlas_msdf_text_atlas_px_range = 10.0f;
@@ -4786,31 +4785,26 @@ private:
         // same bake bucket never reaches this branch, so it neither rebuilds nor
         // re-uploads the atlas.
 
-        QFile font_file(QString::fromLatin1(k_atlas_msdf_terminal_font_resource));
-        if (!font_file.open(QIODevice::ReadOnly)) {
+        // Single byte source for both the bundled font (its Qt resource) and any
+        // other selected family (resolved to its installed font file). A null
+        // result means we cannot feed msdfgen, so leave the cache uninitialized
+        // and fall back to the glyph renderer instead of claiming MSDF.
+        const std::optional<QByteArray> font_bytes =
+            font_file_bytes_for_font(m_frame.font);
+        if (!font_bytes.has_value() || font_bytes->isEmpty()) {
             m_msdf_text_cache.message = QStringLiteral(
-                "failed to open embedded terminal monospace font: %1")
-                .arg(font_file.errorString());
+                "failed to obtain font file bytes for MSDF atlas (family: %1)")
+                .arg(m_frame.font.family());
             // Leave the cache uninitialized so the next frame retries this cheap
-            // resource read instead of treating the failed key as a hit. A real
-            // build failure below keeps the key, because re-running the expensive
-            // build every frame for a deterministic failure is worse.
+            // resolution instead of treating the failed key as a hit.
             m_msdf_text_cache.initialized = false;
             result.render.msdf_text_atlas_built = false;
             result.render.msdf_text_atlas_ready = false;
             return false;
         }
 
-        const QByteArray font_data = font_file.readAll();
+        const QByteArray& font_data = *font_bytes;
         m_msdf_text_cache.font_data_bytes = static_cast<int>(font_data.size());
-        if (font_data.isEmpty()) {
-            m_msdf_text_cache.message =
-                QStringLiteral("embedded terminal monospace font resource is empty");
-            m_msdf_text_cache.initialized = false;
-            result.render.msdf_text_atlas_built = false;
-            result.render.msdf_text_atlas_ready = false;
-            return false;
-        }
 
         // Fingerprint the embedded font bytes once so the baked key has a stable
         // font identity that does not depend on the resource path, and backfill
