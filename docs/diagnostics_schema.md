@@ -1,11 +1,12 @@
 # Diagnostics Schema
 
 This document describes the renderer diagnostics counters that the surface
-serializes for inspection. It is kept in sync with the descriptor table in
-`src/diagnostics/metric_descriptor.h`; that table is the single source of truth
-for the field list, and the byte-golden test
+serializes for inspection. It is kept in sync with the descriptor tables in
+`src/diagnostics/metric_descriptor.h` (the text-layout block) and
+`src/diagnostics/atlas_metric_descriptors.h` (the atlas blocks); those tables
+are the single source of truth for the field lists, and the byte-golden test
 `tests/diagnostics_text_layout/diagnostics_text_layout_tests.cpp` pins the
-output against it.
+output against them.
 
 ## Two serializations, one field list
 
@@ -23,10 +24,18 @@ Every counter block is emitted in two forms:
 
 Historically each serializer hand-wrote its own copy of the field list, so the
 two could drift (a counter added to JSON but not TEXT, or reordered). The
-text-layout block now flows through one shared descriptor table
-(`metric_descriptor.h`) consumed by both `emit_metrics_json` and
-`emit_metrics_text`, so the field set and order cannot diverge. For the
-text-layout block the JSON key and the TEXT label are identical strings.
+text-layout block and several atlas blocks now flow through one shared
+descriptor table each, consumed by both `emit_metrics_json` and
+`emit_metrics_text`, so the field set and order cannot diverge. For every
+table-driven block the JSON key and the TEXT label are identical strings.
+
+A few atlas fields are deliberately left hand-written rather than table-driven
+because they are not plain counter/bool field reads: the `warm_elapsed_ms` and
+`lazy_elapsed_ms` durations (emitted as raw `double` values), the top-level
+`max_glyph_instance_page` (a `std::max(0, ...)` clamp), the enum-string fields
+(text-renderer policy, sampler mode, LCD order), the nested `first_glyph_miss`
+diagnostic, and the `msdf_text` doubles. These stay in the serializers, around
+the shared tables.
 
 ## Descriptor model
 
@@ -126,6 +135,113 @@ table loop.
 | `text_ascii_replacement_code_units_trusted_fast_path` | Counter | Count | Unstable |
 | `text_ascii_replacement_code_units_succeeded` | Counter | Count | Unstable |
 | `text_ascii_replacement_code_units_fallback` | Counter | Count | Unstable |
+
+## Atlas blocks
+
+These blocks come from the QSG atlas renderer's per-frame report
+(`Qsg_atlas_frame_report` and its sub-summaries). JSON nests each block under a
+key (e.g. `"producer"`); TEXT emits the field run under a header line (e.g.
+`  producer`). Only the flat field run is table-driven, in
+`src/diagnostics/atlas_metric_descriptors.h`; the surrounding nesting/header is
+hand-written in the serializers. All atlas diagnostics here are `UNSTABLE`.
+
+### Atlas producer block (JSON key `producer`, TEXT header `producer`)
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `text_runs_considered` | Counter | Count | Unstable |
+| `text_runs_empty` | Counter | Count | Unstable |
+| `shape_cache_lookups` | Counter | Count | Unstable |
+| `shape_cache_hits` | Counter | Count | Unstable |
+| `shape_cache_misses` | Counter | Count | Unstable |
+| `shape_cache_inserts` | Counter | Count | Unstable |
+| `shape_cache_pruned` | Counter | Count | Unstable |
+| `shape_cache_entries` | Counter | Count | Unstable |
+| `shaped_runs_built` | Counter | Count | Unstable |
+| `shaped_runs_reused` | Counter | Count | Unstable |
+| `shaped_glyph_records_built` | Counter | Count | Unstable |
+| `shaped_glyph_records_reused` | Counter | Count | Unstable |
+| `presentation_run_scans` | Counter | Count | Unstable |
+| `presentation_source_scans` | Counter | Count | Unstable |
+| `presentation_fast_text_runs` | Counter | Count | Unstable |
+| `presentation_emoji_runs` | Counter | Count | Unstable |
+| `slot_resolutions_built` | Counter | Count | Unstable |
+| `slot_resolutions_reused` | Counter | Count | Unstable |
+| `simple_path_attempts` | Counter | Count | Unstable |
+| `simple_path_used` | Counter | Count | Unstable |
+| `simple_path_fallbacks` | Counter | Count | Unstable |
+
+### Atlas warm-lazy block (JSON key `warm_lazy`, TEXT header `warm_lazy`)
+
+Emitted in field order; the two `*_elapsed_ms` durations are `double` values
+emitted outside the shared table (so they are not table rows below).
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `warm_completed` | Bool | None | Unstable |
+| `warm_epoch` | Counter | Count | Unstable |
+| `warm_seed_strings` | Counter | Count | Unstable |
+| `warm_shaped_glyph_records` | Counter | Count | Unstable |
+| `warm_covered_glyph_records` | Counter | Count | Unstable |
+| `warm_skipped_glyph_records` | Counter | Count | Unstable |
+| `warm_environment_skipped_glyph_records` | Counter | Count | Unstable |
+| `warm_failed_glyph_records` | Counter | Count | Unstable |
+| `warm_missing_string_indexes` | Counter | Count | Unstable |
+| `warm_invalid_string_indexes` | Counter | Count | Unstable |
+| `warm_unsupported_images` | Counter | Count | Unstable |
+| `warm_cache_hits` | Counter | Count | Unstable |
+| `warm_insert_attempts` | Counter | Count | Unstable |
+| `warm_inserts` | Counter | Count | Unstable |
+| `warm_failed_inserts` | Counter | Count | Unstable |
+| `warm_elapsed_ms` (hand-written, `double`) | — | Milliseconds | Unstable |
+| `warm_page_pressure` | Bool | None | Unstable |
+| `lazy_insert_attempts` | Counter | Count | Unstable |
+| `lazy_inserts` | Counter | Count | Unstable |
+| `lazy_failed_inserts` | Counter | Count | Unstable |
+| `lazy_elapsed_ms` (hand-written, `double`) | — | Milliseconds | Unstable |
+| `lazy_max_insert_us` | Counter | Microseconds | Unstable |
+| `lazy_frames` | Counter | Count | Unstable |
+| `incomplete_frames` | Counter | Count | Unstable |
+
+### Glyph coverage block (JSON key `coverage`, TEXT header `coverage`)
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `grayscale_masks` | Counter | Count | Unstable |
+| `lcd_rgb_masks` | Counter | Count | Unstable |
+| `lcd_bgr_masks` | Counter | Count | Unstable |
+| `color_images` | Counter | Count | Unstable |
+| `ambiguous_images` | Counter | Count | Unstable |
+| `unsupported_images` | Counter | Count | Unstable |
+| `missed_images` | Counter | Count | Unstable |
+
+### Atlas capabilities block (JSON key `capabilities`, TEXT header `capabilities`)
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `glyph_shader_package_available` | Bool | None | Unstable |
+| `dual_source_probe_shader_package_available` | Bool | None | Unstable |
+| `dual_source_blend_factors_available` | Bool | None | Unstable |
+| `dual_source_blend_factors_runtime_probe` | Bool | None | Unstable |
+
+### Atlas top-level overlap (`qsg_atlas` TEXT section / top-level JSON object)
+
+The frame-report counter fields that overlap between the top-level JSON object
+and the TEXT `qsg_atlas` section, with the same name and a plain field read.
+They are emitted as two contiguous runs in each serializer (separated there by
+hand-written enum-string and boolean flags, and by the hand-written
+`max_glyph_instance_page` clamp, which are not table rows).
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `capture_count` | Counter | Count | Unstable |
+| `prepare_count` | Counter | Count | Unstable |
+| `render_count` | Counter | Count | Unstable |
+| `capture_sequence` | Counter | Count | Unstable |
+| `captured_snapshot_sequence` | Counter | Count | Unstable |
+| `captured_font_epoch` | Counter | Count | Unstable |
+| `rasterized_glyphs` | Counter | Count | Unstable |
+| `atlas_page_count` | Counter | Count | Unstable |
 
 ## Adding or changing a counter
 

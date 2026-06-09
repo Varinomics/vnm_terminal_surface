@@ -1,5 +1,6 @@
 #include "vnm_terminal/diagnostics/metrics_json.h"
 
+#include "atlas_metric_descriptors.h"
 #include "metric_descriptor.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
@@ -88,16 +89,8 @@ QJsonObject atlas_buffer_summary_json(
 QJsonObject glyph_coverage_counts_json(
     const internal::Qsg_atlas_frame_build_summary& summary)
 {
-    const internal::Glyph_coverage_counts& counts = summary.glyph_coverage;
-
     QJsonObject object;
-    insert_json_counter(object, "grayscale_masks", counts.grayscale_masks);
-    insert_json_counter(object, "lcd_rgb_masks", counts.lcd_rgb_masks);
-    insert_json_counter(object, "lcd_bgr_masks", counts.lcd_bgr_masks);
-    insert_json_counter(object, "color_images", counts.color_images);
-    insert_json_counter(object, "ambiguous_images", counts.ambiguous_images);
-    insert_json_counter(object, "unsupported_images", counts.unsupported_images);
-    insert_json_counter(object, "missed_images", counts.missed_images);
+    detail::emit_metrics_json(object, summary.glyph_coverage, detail::glyph_coverage_metrics());
     return object;
 }
 
@@ -152,18 +145,7 @@ QJsonObject atlas_first_glyph_miss_json(
 QJsonObject atlas_capabilities_json(const internal::Qsg_atlas_render_summary& summary)
 {
     QJsonObject object;
-    object.insert(
-        QStringLiteral("glyph_shader_package_available"),
-        summary.glyph_shader_package_available);
-    object.insert(
-        QStringLiteral("dual_source_probe_shader_package_available"),
-        summary.dual_source_probe_shader_package_available);
-    object.insert(
-        QStringLiteral("dual_source_blend_factors_available"),
-        summary.dual_source_blend_factors_available);
-    object.insert(
-        QStringLiteral("dual_source_blend_factors_runtime_probe"),
-        summary.dual_source_blend_factors_runtime_probe);
+    detail::emit_metrics_json(object, summary, detail::atlas_capabilities_metrics());
     return object;
 }
 
@@ -292,45 +274,7 @@ QJsonObject atlas_producer_summary_json(
     const internal::Qsg_atlas_producer_summary& summary)
 {
     QJsonObject object;
-    insert_json_counter(object, "text_runs_considered", summary.text_runs_considered);
-    insert_json_counter(object, "text_runs_empty", summary.text_runs_empty);
-    insert_json_counter(object, "shape_cache_lookups", summary.shape_cache_lookups);
-    insert_json_counter(object, "shape_cache_hits", summary.shape_cache_hits);
-    insert_json_counter(object, "shape_cache_misses", summary.shape_cache_misses);
-    insert_json_counter(object, "shape_cache_inserts", summary.shape_cache_inserts);
-    insert_json_counter(object, "shape_cache_pruned", summary.shape_cache_pruned);
-    insert_json_counter(object, "shape_cache_entries", summary.shape_cache_entries);
-    insert_json_counter(object, "shaped_runs_built", summary.shaped_runs_built);
-    insert_json_counter(object, "shaped_runs_reused", summary.shaped_runs_reused);
-    insert_json_counter(
-        object,
-        "shaped_glyph_records_built",
-        summary.shaped_glyph_records_built);
-    insert_json_counter(
-        object,
-        "shaped_glyph_records_reused",
-        summary.shaped_glyph_records_reused);
-    insert_json_counter(
-        object,
-        "presentation_run_scans",
-        summary.presentation_run_scans);
-    insert_json_counter(
-        object,
-        "presentation_source_scans",
-        summary.presentation_source_scans);
-    insert_json_counter(
-        object,
-        "presentation_fast_text_runs",
-        summary.presentation_fast_text_runs);
-    insert_json_counter(
-        object,
-        "presentation_emoji_runs",
-        summary.presentation_emoji_runs);
-    insert_json_counter(object, "slot_resolutions_built", summary.slot_resolutions_built);
-    insert_json_counter(object, "slot_resolutions_reused", summary.slot_resolutions_reused);
-    insert_json_counter(object, "simple_path_attempts", summary.simple_path_attempts);
-    insert_json_counter(object, "simple_path_used", summary.simple_path_used);
-    insert_json_counter(object, "simple_path_fallbacks", summary.simple_path_fallbacks);
+    detail::emit_metrics_json(object, summary, detail::atlas_producer_metrics());
     return object;
 }
 
@@ -338,69 +282,14 @@ QJsonObject atlas_warm_lazy_summary_json(
     const internal::Qsg_atlas_warm_lazy_summary& summary)
 {
     QJsonObject object;
-    object.insert(QStringLiteral("warm_completed"), summary.warm_completed);
-    insert_json_counter(object, "warm_epoch", summary.warm_epoch);
-    insert_json_counter(object, "warm_seed_strings", summary.warm_seed_strings);
-    insert_json_counter(
-        object,
-        "warm_shaped_glyph_records",
-        summary.warm_shaped_glyph_records);
-    insert_json_counter(
-        object,
-        "warm_covered_glyph_records",
-        summary.warm_covered_glyph_records);
-    insert_json_counter(
-        object,
-        "warm_skipped_glyph_records",
-        summary.warm_skipped_glyph_records);
-    insert_json_counter(
-        object,
-        "warm_environment_skipped_glyph_records",
-        summary.warm_environment_skipped_glyph_records);
-    insert_json_counter(
-        object,
-        "warm_failed_glyph_records",
-        summary.warm_failed_glyph_records);
-    insert_json_counter(
-        object,
-        "warm_missing_string_indexes",
-        summary.warm_missing_string_indexes);
-    insert_json_counter(
-        object,
-        "warm_invalid_string_indexes",
-        summary.warm_invalid_string_indexes);
-    insert_json_counter(
-        object,
-        "warm_unsupported_images",
-        summary.warm_unsupported_images);
-    insert_json_counter(object, "warm_cache_hits", summary.warm_cache_hits);
-    insert_json_counter(
-        object,
-        "warm_insert_attempts",
-        summary.warm_insert_attempts);
-    insert_json_counter(object, "warm_inserts", summary.warm_inserts);
-    insert_json_counter(
-        object,
-        "warm_failed_inserts",
-        summary.warm_failed_inserts);
+    detail::emit_metrics_json(
+        object, summary, detail::atlas_warm_lazy_metrics_before_warm_elapsed());
     object.insert(QStringLiteral("warm_elapsed_ms"), summary.warm_elapsed_ms);
-    object.insert(QStringLiteral("warm_page_pressure"), summary.warm_page_pressure);
-    insert_json_counter(
-        object,
-        "lazy_insert_attempts",
-        summary.lazy_insert_attempts);
-    insert_json_counter(object, "lazy_inserts", summary.lazy_inserts);
-    insert_json_counter(
-        object,
-        "lazy_failed_inserts",
-        summary.lazy_failed_inserts);
+    detail::emit_metrics_json(
+        object, summary, detail::atlas_warm_lazy_metrics_before_lazy_elapsed());
     object.insert(QStringLiteral("lazy_elapsed_ms"), summary.lazy_elapsed_ms);
-    insert_json_counter(
-        object,
-        "lazy_max_insert_us",
-        summary.lazy_max_insert_us);
-    insert_json_counter(object, "lazy_frames", summary.lazy_frames);
-    insert_json_counter(object, "incomplete_frames", summary.incomplete_frames);
+    detail::emit_metrics_json(
+        object, summary, detail::atlas_warm_lazy_metrics_after_lazy_elapsed());
     return object;
 }
 
@@ -647,15 +536,7 @@ QJsonObject qsg_atlas_metrics_json(const internal::Qsg_atlas_frame_report& repor
         QStringLiteral("msdf_lcd_text_enabled"),
         report.msdf_lcd_text_enabled);
 
-    insert_json_counter(object, "capture_count", report.capture_count);
-    insert_json_counter(object, "prepare_count", report.prepare_count);
-    insert_json_counter(object, "render_count", report.render_count);
-    insert_json_counter(object, "capture_sequence", report.capture_sequence);
-    insert_json_counter(
-        object,
-        "captured_snapshot_sequence",
-        report.captured_snapshot_sequence);
-    insert_json_counter(object, "captured_font_epoch", report.captured_font_epoch);
+    detail::emit_metrics_json(object, report, detail::atlas_report_sequence_metrics());
     object.insert(QStringLiteral("command_buffer_non_null"), report.command_buffer_non_null);
     object.insert(QStringLiteral("render_target_non_null"), report.render_target_non_null);
     object.insert(QStringLiteral("rhi_non_null"), report.rhi_non_null);
@@ -663,8 +544,7 @@ QJsonObject qsg_atlas_metrics_json(const internal::Qsg_atlas_frame_report& repor
     object.insert(QStringLiteral("coverage_texture_created"), report.coverage_texture_created);
     object.insert(QStringLiteral("coverage_upload_recorded"), report.coverage_upload_recorded);
     object.insert(QStringLiteral("raw_font_rasterized"), report.raw_font_rasterized);
-    insert_json_counter(object, "rasterized_glyphs", report.rasterized_glyphs);
-    insert_json_counter(object, "atlas_page_count", report.atlas_page_count);
+    detail::emit_metrics_json(object, report, detail::atlas_report_rasterization_metrics());
     insert_json_counter(
         object,
         "max_glyph_instance_page",

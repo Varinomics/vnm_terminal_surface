@@ -2,6 +2,7 @@
 
 #if VNM_TERMINAL_PROFILING_ENABLED
 
+#include "atlas_metric_descriptors.h"
 #include "metric_descriptor.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
@@ -1257,15 +1258,7 @@ void append_qsg_atlas_profile_section(
         << QString::fromLatin1(
             term::qsg_atlas_sampler_mode_name(report.render.glyph_sampler_mode))
         << '\n';
-    append_profile_counter(stream, "capture_count", report.capture_count);
-    append_profile_counter(stream, "prepare_count", report.prepare_count);
-    append_profile_counter(stream, "render_count", report.render_count);
-    append_profile_counter(stream, "capture_sequence", report.capture_sequence);
-    append_profile_counter(
-        stream,
-        "captured_snapshot_sequence",
-        report.captured_snapshot_sequence);
-    append_profile_counter(stream, "captured_font_epoch", report.captured_font_epoch);
+    detail::emit_metrics_text(stream, report, detail::atlas_report_sequence_metrics());
     stream
         << "  command_buffer_non_null="
         << (report.command_buffer_non_null ? "true" : "false") << '\n';
@@ -1282,8 +1275,7 @@ void append_qsg_atlas_profile_section(
         stream,
         "coverage_upload_recorded",
         report.coverage_upload_recorded);
-    append_profile_counter(stream, "rasterized_glyphs", report.rasterized_glyphs);
-    append_profile_counter(stream, "atlas_page_count", report.atlas_page_count);
+    detail::emit_metrics_text(stream, report, detail::atlas_report_rasterization_metrics());
     append_profile_counter(
         stream,
         "max_glyph_instance_page",
@@ -1292,137 +1284,17 @@ void append_qsg_atlas_profile_section(
             report.frame_build.max_glyph_instance_page)));
     const term::Qsg_atlas_producer_summary& producer = report.producer;
     stream << "  producer\n";
-    append_profile_counter(
-        stream,
-        "text_runs_considered",
-        producer.text_runs_considered);
-    append_profile_counter(stream, "text_runs_empty", producer.text_runs_empty);
-    append_profile_counter(
-        stream,
-        "shape_cache_lookups",
-        producer.shape_cache_lookups);
-    append_profile_counter(stream, "shape_cache_hits", producer.shape_cache_hits);
-    append_profile_counter(
-        stream,
-        "shape_cache_misses",
-        producer.shape_cache_misses);
-    append_profile_counter(
-        stream,
-        "shape_cache_inserts",
-        producer.shape_cache_inserts);
-    append_profile_counter(stream, "shape_cache_pruned", producer.shape_cache_pruned);
-    append_profile_counter(
-        stream,
-        "shape_cache_entries",
-        producer.shape_cache_entries);
-    append_profile_counter(stream, "shaped_runs_built", producer.shaped_runs_built);
-    append_profile_counter(
-        stream,
-        "shaped_runs_reused",
-        producer.shaped_runs_reused);
-    append_profile_counter(
-        stream,
-        "shaped_glyph_records_built",
-        producer.shaped_glyph_records_built);
-    append_profile_counter(
-        stream,
-        "shaped_glyph_records_reused",
-        producer.shaped_glyph_records_reused);
-    append_profile_counter(
-        stream,
-        "presentation_run_scans",
-        producer.presentation_run_scans);
-    append_profile_counter(
-        stream,
-        "presentation_source_scans",
-        producer.presentation_source_scans);
-    append_profile_counter(
-        stream,
-        "presentation_fast_text_runs",
-        producer.presentation_fast_text_runs);
-    append_profile_counter(
-        stream,
-        "presentation_emoji_runs",
-        producer.presentation_emoji_runs);
-    append_profile_counter(
-        stream,
-        "slot_resolutions_built",
-        producer.slot_resolutions_built);
-    append_profile_counter(
-        stream,
-        "slot_resolutions_reused",
-        producer.slot_resolutions_reused);
-    append_profile_counter(stream, "simple_path_attempts", producer.simple_path_attempts);
-    append_profile_counter(stream, "simple_path_used", producer.simple_path_used);
-    append_profile_counter(stream, "simple_path_fallbacks", producer.simple_path_fallbacks);
+    detail::emit_metrics_text(stream, producer, detail::atlas_producer_metrics());
     const term::Qsg_atlas_warm_lazy_summary& warm_lazy = report.warm_lazy;
     stream << "  warm_lazy\n";
-    append_profile_bool(stream, "warm_completed", warm_lazy.warm_completed);
-    append_profile_counter(stream, "warm_epoch", warm_lazy.warm_epoch);
-    append_profile_counter(stream, "warm_seed_strings", warm_lazy.warm_seed_strings);
-    append_profile_counter(
-        stream,
-        "warm_shaped_glyph_records",
-        warm_lazy.warm_shaped_glyph_records);
-    append_profile_counter(
-        stream,
-        "warm_covered_glyph_records",
-        warm_lazy.warm_covered_glyph_records);
-    append_profile_counter(
-        stream,
-        "warm_skipped_glyph_records",
-        warm_lazy.warm_skipped_glyph_records);
-    append_profile_counter(
-        stream,
-        "warm_environment_skipped_glyph_records",
-        warm_lazy.warm_environment_skipped_glyph_records);
-    append_profile_counter(
-        stream,
-        "warm_failed_glyph_records",
-        warm_lazy.warm_failed_glyph_records);
-    append_profile_counter(
-        stream,
-        "warm_missing_string_indexes",
-        warm_lazy.warm_missing_string_indexes);
-    append_profile_counter(
-        stream,
-        "warm_invalid_string_indexes",
-        warm_lazy.warm_invalid_string_indexes);
-    append_profile_counter(
-        stream,
-        "warm_unsupported_images",
-        warm_lazy.warm_unsupported_images);
-    append_profile_counter(stream, "warm_cache_hits", warm_lazy.warm_cache_hits);
-    append_profile_counter(
-        stream,
-        "warm_insert_attempts",
-        warm_lazy.warm_insert_attempts);
-    append_profile_counter(stream, "warm_inserts", warm_lazy.warm_inserts);
-    append_profile_counter(
-        stream,
-        "warm_failed_inserts",
-        warm_lazy.warm_failed_inserts);
+    detail::emit_metrics_text(
+        stream, warm_lazy, detail::atlas_warm_lazy_metrics_before_warm_elapsed());
     stream << "  warm_elapsed_ms=" << warm_lazy.warm_elapsed_ms << '\n';
-    append_profile_bool(stream, "warm_page_pressure", warm_lazy.warm_page_pressure);
-    append_profile_counter(
-        stream,
-        "lazy_insert_attempts",
-        warm_lazy.lazy_insert_attempts);
-    append_profile_counter(stream, "lazy_inserts", warm_lazy.lazy_inserts);
-    append_profile_counter(
-        stream,
-        "lazy_failed_inserts",
-        warm_lazy.lazy_failed_inserts);
+    detail::emit_metrics_text(
+        stream, warm_lazy, detail::atlas_warm_lazy_metrics_before_lazy_elapsed());
     stream << "  lazy_elapsed_ms=" << warm_lazy.lazy_elapsed_ms << '\n';
-    append_profile_counter(
-        stream,
-        "lazy_max_insert_us",
-        warm_lazy.lazy_max_insert_us);
-    append_profile_counter(stream, "lazy_frames", warm_lazy.lazy_frames);
-    append_profile_counter(
-        stream,
-        "incomplete_frames",
-        warm_lazy.incomplete_frames);
+    detail::emit_metrics_text(
+        stream, warm_lazy, detail::atlas_warm_lazy_metrics_after_lazy_elapsed());
     stream << "  placement\n";
     append_profile_counter(
         stream,
@@ -1488,34 +1360,7 @@ void append_qsg_atlas_profile_section(
             static_cast<std::uint64_t>(miss.atlas_page_budget));
     }
     stream << "  coverage\n";
-    append_profile_counter(
-        stream,
-        "grayscale_masks",
-        static_cast<std::uint64_t>(coverage.grayscale_masks));
-    append_profile_counter(
-        stream,
-        "lcd_rgb_masks",
-        static_cast<std::uint64_t>(coverage.lcd_rgb_masks));
-    append_profile_counter(
-        stream,
-        "lcd_bgr_masks",
-        static_cast<std::uint64_t>(coverage.lcd_bgr_masks));
-    append_profile_counter(
-        stream,
-        "color_images",
-        static_cast<std::uint64_t>(coverage.color_images));
-    append_profile_counter(
-        stream,
-        "ambiguous_images",
-        static_cast<std::uint64_t>(coverage.ambiguous_images));
-    append_profile_counter(
-        stream,
-        "unsupported_images",
-        static_cast<std::uint64_t>(coverage.unsupported_images));
-    append_profile_counter(
-        stream,
-        "missed_images",
-        static_cast<std::uint64_t>(coverage.missed_images));
+    detail::emit_metrics_text(stream, coverage, detail::glyph_coverage_metrics());
     stream << "  buffer_upload\n";
     append_profile_counter(
         stream,
@@ -1565,22 +1410,7 @@ void append_qsg_atlas_profile_section(
         "glyph_buffer_uploaded_bytes",
         report.render.glyph_buffer.uploaded_bytes);
     stream << "  capabilities\n";
-    append_profile_bool(
-        stream,
-        "glyph_shader_package_available",
-        report.render.glyph_shader_package_available);
-    append_profile_bool(
-        stream,
-        "dual_source_probe_shader_package_available",
-        report.render.dual_source_probe_shader_package_available);
-    append_profile_bool(
-        stream,
-        "dual_source_blend_factors_available",
-        report.render.dual_source_blend_factors_available);
-    append_profile_bool(
-        stream,
-        "dual_source_blend_factors_runtime_probe",
-        report.render.dual_source_blend_factors_runtime_probe);
+    detail::emit_metrics_text(stream, report.render, detail::atlas_capabilities_metrics());
 }
 
 }
