@@ -207,6 +207,18 @@ invalidated-projection fallback names, are diagnostic schema values rather than
 stable public API enum names. Hosts should branch on the documented surface
 policy and method return values, not on diagnostic string spelling.
 
+The C++ diagnostic scroll overloads (`scroll_viewport_lines_with_diagnostics()`,
+`scroll_to_offset_from_tail_with_diagnostics()`) return a
+`wheel_scroll_diagnostic_result_t` carrying the TYPED enums
+`Scroll_noop_cause no_op_cause` and `Scroll_action scroll_action` alongside
+`event_accepted`/`session_present`. Hosts that need to react to a scroll outcome
+(for example, the bundled scrollbar distinguishing a `BOUNDARY_OR_CLAMP` no-op
+from a real movement) MUST branch on these enum values. `scroll_noop_cause_name()`
+and `scroll_action_name()` exist ONLY to format those enums for transcript/debug
+output (`NONE` maps to an empty string, matching the unset field these diagnostics
+formerly carried); they are not control-flow API, and their string spellings are
+diagnostic schema, not a stability contract.
+
 ## Clipboard Policy
 
 There are three clipboard paths:
