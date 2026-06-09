@@ -287,3 +287,29 @@ window chrome, titlebar policy, clipboard policy decisions, and packaging.
 
 The standalone Varinomics terminal application lives in the `vnm_terminal`
 repository and uses this surface as its terminal engine.
+
+## Internal Headers And Privileged First-Party Consumers
+
+Headers under `include/vnm_terminal/internal/` are implementation detail, not
+consumer API. They are never installed: the package smoke test
+(`tests/package_smoke`) hard-fails if any `vnm_terminal/internal` header reaches
+the install tree, and the public install interface exposes only
+`vnm_terminal/vnm_terminal_surface.h`, `vnm_terminal/font_metrics.h`, and the
+`vnm_terminal/diagnostics/` subtree. Embedders that consume the installed
+package therefore cannot include internal headers and must rely on the public
+surface, the public `diagnostics/` serializers, and the public font/metrics API.
+Internal headers carry no source- or binary-stability guarantee and may change
+without notice.
+
+The first-party Varinomics terminal application (`vnm_terminal`) is a
+deliberately privileged consumer. It builds this surface from source in-tree
+(via `add_subdirectory`), not against the install interface, so it may include
+`vnm_terminal/internal/*` for first-party development tooling — notably
+render-profiler attachment (`VNM_TerminalSurface_render_bridge::set_render_profiler`)
+and the app's own GUI-thread profiler (`Hierarchical_profiler`), both compiled
+only under `VNM_TERMINAL_PROFILING_ENABLED`, plus the test/render handoff used by
+the app's integration tests. This privilege is intentional and is not extended to
+installed embedders; the app accepts that these internal types may change and
+migrates in lockstep with the surface (build breaks are an accepted migration
+tool). Profiling read-back and metrics/profile serialization do NOT use this
+privilege — they go through the public `vnm_terminal/diagnostics/` serializers.
