@@ -134,6 +134,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/diagnostics/profile_text.h
     include/vnm_terminal/font_metrics.h
     include/vnm_terminal/vnm_terminal_surface.h
+    src/diagnostics/metric_descriptor.h
     src/diagnostics/metrics_json.cpp
     src/diagnostics/profile_text.cpp
     src/font_metrics.cpp

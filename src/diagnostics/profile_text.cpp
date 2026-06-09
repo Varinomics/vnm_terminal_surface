@@ -2,6 +2,7 @@
 
 #if VNM_TERMINAL_PROFILING_ENABLED
 
+#include "metric_descriptor.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
@@ -552,269 +553,6 @@ void append_session_profile_stats_section(
 }
 
 template<typename Renderer_stats>
-void append_text_layout_stats_text(
-    QTextStream&           stream,
-    const Renderer_stats&  stats)
-{
-    append_profile_counter(
-        stream,
-        "qt_text_layout_calls",
-        static_cast<std::uint64_t>(stats.qt_text_layout_calls));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_single_code_unit",
-        static_cast<std::uint64_t>(stats.text_layout_runs_single_code_unit));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_multi_code_unit",
-        static_cast<std::uint64_t>(stats.text_layout_runs_multi_code_unit));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_all_space",
-        static_cast<std::uint64_t>(stats.text_layout_runs_all_space));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_printable_ascii",
-        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_printable_ascii_with_space",
-        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii_with_space));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_other_ascii",
-        static_cast<std::uint64_t>(stats.text_layout_runs_other_ascii));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_non_ascii",
-        static_cast<std::uint64_t>(stats.text_layout_runs_non_ascii));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_clipped",
-        static_cast<std::uint64_t>(stats.text_layout_runs_clipped));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_ascii_layout_font",
-        static_cast<std::uint64_t>(stats.text_layout_runs_ascii_layout_font));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_force_blended_order",
-        static_cast<std::uint64_t>(stats.text_layout_runs_force_blended_order));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_with_hyperlink",
-        static_cast<std::uint64_t>(stats.text_layout_runs_with_hyperlink));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_with_decoration",
-        static_cast<std::uint64_t>(stats.text_layout_runs_with_decoration));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_mixed_ascii_non_ascii",
-        static_cast<std::uint64_t>(stats.text_layout_runs_mixed_ascii_non_ascii));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_pure_non_ascii",
-        static_cast<std::uint64_t>(stats.text_layout_runs_pure_non_ascii));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_plain_unclipped",
-        static_cast<std::uint64_t>(stats.text_layout_runs_plain_unclipped));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_plain_unclipped_ascii_font",
-        static_cast<std::uint64_t>(stats.text_layout_runs_plain_unclipped_ascii_font));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_all_space_plain_unclipped",
-        static_cast<std::uint64_t>(stats.text_layout_runs_all_space_plain_unclipped));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_printable_ascii_plain_unclipped",
-        static_cast<std::uint64_t>(stats.text_layout_runs_printable_ascii_plain_unclipped));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_non_ascii_plain_unclipped",
-        static_cast<std::uint64_t>(stats.text_layout_runs_non_ascii_plain_unclipped));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_mixed_ascii_non_ascii_plain_unclipped",
-        static_cast<std::uint64_t>(
-            stats.text_layout_runs_mixed_ascii_non_ascii_plain_unclipped));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_pure_non_ascii_plain_unclipped",
-        static_cast<std::uint64_t>(stats.text_layout_runs_pure_non_ascii_plain_unclipped));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_fast_space_candidate",
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_space_candidate));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_fast_ascii_candidate",
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_candidate));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_fast_ascii_no_space_candidate",
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_no_space_candidate));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_fast_ascii_single_candidate",
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_single_candidate));
-    append_profile_counter(
-        stream,
-        "text_layout_runs_fast_ascii_multi_candidate",
-        static_cast<std::uint64_t>(stats.text_layout_runs_fast_ascii_multi_candidate));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_screened",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_screened));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_eligible",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_eligible));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_attempted",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_attempted));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_trusted_fast_path",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_trusted_fast_path));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_succeeded",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_succeeded));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_all_space_succeeded",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_all_space_succeeded));
-    if constexpr (requires { stats.text_ascii_replacement_add_glyphs_calls; }) {
-        append_profile_counter(
-            stream,
-            "text_ascii_replacement_add_glyphs_calls",
-            static_cast<std::uint64_t>(stats.text_ascii_replacement_add_glyphs_calls));
-    }
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_fallback",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_fallback));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_rejected_clipped",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_clipped));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_rejected_force_blended_order",
-        static_cast<std::uint64_t>(
-            stats.text_ascii_replacement_runs_rejected_force_blended_order));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_rejected_decoration",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_decoration));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_rejected_hyperlink",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_hyperlink));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_rejected_non_printable_ascii",
-        static_cast<std::uint64_t>(
-            stats.text_ascii_replacement_runs_rejected_non_printable_ascii));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_rejected_non_ascii",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_non_ascii));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_rejected_geometry",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_geometry));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_rejected_unsupported_font",
-        static_cast<std::uint64_t>(
-            stats.text_ascii_replacement_runs_rejected_unsupported_font));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_rejected_internal_node",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_internal_node));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_runs_rejected_glyph_mapping",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_runs_rejected_glyph_mapping));
-    append_profile_counter(
-        stream,
-        "text_layout_code_units",
-        static_cast<std::uint64_t>(stats.text_layout_code_units));
-    append_profile_counter(
-        stream,
-        "text_layout_space_code_units",
-        static_cast<std::uint64_t>(stats.text_layout_space_code_units));
-    append_profile_counter(
-        stream,
-        "text_layout_printable_ascii_code_units",
-        static_cast<std::uint64_t>(stats.text_layout_printable_ascii_code_units));
-    append_profile_counter(
-        stream,
-        "text_layout_other_ascii_code_units",
-        static_cast<std::uint64_t>(stats.text_layout_other_ascii_code_units));
-    append_profile_counter(
-        stream,
-        "text_layout_non_ascii_code_units",
-        static_cast<std::uint64_t>(stats.text_layout_non_ascii_code_units));
-    append_profile_counter(
-        stream,
-        "text_layout_plain_unclipped_code_units",
-        static_cast<std::uint64_t>(stats.text_layout_plain_unclipped_code_units));
-    append_profile_counter(
-        stream,
-        "text_layout_all_space_plain_unclipped_code_units",
-        static_cast<std::uint64_t>(stats.text_layout_all_space_plain_unclipped_code_units));
-    append_profile_counter(
-        stream,
-        "text_layout_printable_ascii_plain_unclipped_code_units",
-        static_cast<std::uint64_t>(
-            stats.text_layout_printable_ascii_plain_unclipped_code_units));
-    append_profile_counter(
-        stream,
-        "text_layout_non_ascii_plain_unclipped_code_units",
-        static_cast<std::uint64_t>(stats.text_layout_non_ascii_plain_unclipped_code_units));
-    append_profile_counter(
-        stream,
-        "text_layout_fast_space_candidate_code_units",
-        static_cast<std::uint64_t>(stats.text_layout_fast_space_candidate_code_units));
-    append_profile_counter(
-        stream,
-        "text_layout_fast_ascii_candidate_code_units",
-        static_cast<std::uint64_t>(stats.text_layout_fast_ascii_candidate_code_units));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_code_units_screened",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_code_units_screened));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_code_units_eligible",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_code_units_eligible));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_code_units_attempted",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_code_units_attempted));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_code_units_trusted_fast_path",
-        static_cast<std::uint64_t>(
-            stats.text_ascii_replacement_code_units_trusted_fast_path));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_code_units_succeeded",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_code_units_succeeded));
-    append_profile_counter(
-        stream,
-        "text_ascii_replacement_code_units_fallback",
-        static_cast<std::uint64_t>(stats.text_ascii_replacement_code_units_fallback));
-}
-
-template<typename Renderer_stats>
 void append_renderer_stats_section(
     QTextStream&                 stream,
     const Renderer_stats&        stats)
@@ -862,7 +600,7 @@ void append_renderer_stats_section(
         stream,
         "text_cache_entry_max_child_nodes_cleared",
         static_cast<std::uint64_t>(stats.text_cache_entry_max_child_nodes_cleared));
-    append_text_layout_stats_text(stream, stats);
+    detail::append_text_layout_stats_text(stream, stats);
     append_profile_counter(
         stream,
         "text_groups_considered",
@@ -1196,7 +934,7 @@ void append_cumulative_renderer_stats_section(
         stream,
         "text_cache_entry_max_child_nodes_cleared",
         stats.text_cache_entry_max_child_nodes_cleared);
-    append_text_layout_stats_text(stream, stats);
+    detail::append_text_layout_stats_text(stream, stats);
     append_profile_counter(stream, "text_groups_considered", stats.text_groups_considered);
     append_profile_counter(stream, "text_groups_dirty",      stats.text_groups_dirty);
     append_profile_counter(stream, "text_groups_clean",      stats.text_groups_clean);
