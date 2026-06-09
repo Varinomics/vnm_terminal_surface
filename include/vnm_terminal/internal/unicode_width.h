@@ -14,6 +14,12 @@ constexpr int k_unicode_width_version_major = 16;
 constexpr int k_unicode_width_version_minor = 0;
 constexpr int k_unicode_width_version_patch = 0;
 
+// Inclusive byte/code-unit range of the printable ASCII subset (SP..~). Shared
+// by the byte-stream parser's fast ASCII run scanning and the screen model's
+// cell-text classification, so it lives in the byte-vocabulary header.
+constexpr ushort k_printable_ascii_first = 0x20U;
+constexpr ushort k_printable_ascii_last  = 0x7eU;
+
 enum class Terminal_unicode_width_status
 {
     OK,

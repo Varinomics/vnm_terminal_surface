@@ -727,6 +727,25 @@ inline Parser_action make_malformed_recovery_diagnostic(
     };
 }
 
+inline Parser_action make_unsupported_sequence_diagnostic(
+    QString                    source_sequence,
+    Parser_sequence_family     family,
+    std::size_t                raw_payload_size,
+    std::size_t                limit_bytes,
+    Parser_recovery_strategy   recovery)
+{
+    return {
+        Parser_payload_diagnostic{
+            Parser_diagnostic_code::UNSUPPORTED_SEQUENCE,
+            std::move(source_sequence),
+            raw_payload_size,
+            limit_bytes,
+            family,
+            recovery,
+        },
+    };
+}
+
 inline bool is_diagnostic_action(const Parser_action& action)
 {
     return parser_action_kind(action) == Parser_action_kind::DIAGNOSTIC;
