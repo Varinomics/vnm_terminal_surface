@@ -215,9 +215,11 @@ The model creates `Terminal_render_snapshot` objects defined in
 `include/vnm_terminal/internal/render_snapshot.h`. A snapshot owns grid size,
 viewport, color metadata, style table, cells, dirty row ranges, hyperlink
 metadata, cursor, IME preedit, selection spans, metadata, and terminal modes.
-Snapshot cell vector entries are positioned. The producer currently emits them
-in row-major order, but row-major production order is not the architecture
-contract.
+Snapshot cell vector entries are positioned and ordered: the cell vector is
+row-major with strictly ascending columns within each row. This ordering is the
+architecture contract, not an incidental production detail. The frame builder
+iterates `snapshot.cells` directly and relies on it, so `validate_render_snapshot`
+enforces it and returns `INVALID_CELL_ORDER` for any snapshot that violates it.
 
 The session stores the latest snapshot as a
 `std::shared_ptr<const Terminal_render_snapshot>` and increments the snapshot

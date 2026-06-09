@@ -2145,6 +2145,8 @@ QString render_snapshot_status_name(term::Terminal_render_snapshot_status status
             return QStringLiteral("INVALID_HYPERLINK_METADATA");
         case term::Terminal_render_snapshot_status::INVALID_SNAPSHOT_BASIS_PURPOSE:
             return QStringLiteral("INVALID_SNAPSHOT_BASIS_PURPOSE");
+        case term::Terminal_render_snapshot_status::INVALID_CELL_ORDER:
+            return QStringLiteral("INVALID_CELL_ORDER");
     }
 
     return QStringLiteral("UNKNOWN");

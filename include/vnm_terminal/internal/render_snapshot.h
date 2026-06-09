@@ -68,6 +68,7 @@ enum class Terminal_render_snapshot_status
     INVALID_LINE_PROVENANCE,
     INVALID_HYPERLINK_METADATA,
     INVALID_SNAPSHOT_BASIS_PURPOSE,
+    INVALID_CELL_ORDER,
 };
 
 enum class Terminal_render_snapshot_basis
@@ -904,6 +905,23 @@ inline Terminal_render_snapshot_validation validate_render_snapshot(
             cell.position.column < 0  || cell.position.column >= snapshot.grid_size.columns)
         {
             return {Terminal_render_snapshot_status::INVALID_CELL_POSITION};
+        }
+
+        // Snapshot cells are stored row-major with strictly ascending columns
+        // within each row. Both producers (the live-content model row loop and
+        // the public-projection scroll assembly) emit cells in this order, and
+        // the frame builder iterates snapshot.cells directly relying on it.
+        // Enforce the contract here so a violating snapshot fails loudly instead
+        // of mis-rendering.
+        if (i > 0) {
+            const Terminal_render_cell& previous = snapshot.cells[i - 1];
+            const bool strictly_after =
+                cell.position.row > previous.position.row ||
+                (cell.position.row    == previous.position.row &&
+                 cell.position.column >  previous.position.column);
+            if (!strictly_after) {
+                return {Terminal_render_snapshot_status::INVALID_CELL_ORDER};
+            }
         }
 
         if (static_cast<std::size_t>(cell.style_id) >= snapshot.styles.size()) {

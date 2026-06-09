@@ -850,9 +850,14 @@ bool test_utf8_replacement_and_snapshot()
         { 0, 0 },
         QStringLiteral("B"),
     });
+    // Two cells at the same position violate the row-major / column-ascending
+    // cell-order contract first: the second cell is not strictly after the
+    // first, so validation reports INVALID_CELL_ORDER. The distinct base-cell
+    // overlap case below (ascending columns, overlapping widths) still exercises
+    // INVALID_CELL_OVERLAP.
     ok &= check(term::validate_render_snapshot(duplicate_position).status ==
-        term::Terminal_render_snapshot_status::INVALID_CELL_OVERLAP,
-        "snapshot rejects duplicate explicit positions");
+        term::Terminal_render_snapshot_status::INVALID_CELL_ORDER,
+        "snapshot rejects duplicate explicit positions as out-of-order");
 
     term::Terminal_render_snapshot overlapping_base = term::make_empty_render_snapshot(
         term::terminal_grid_size_t{1, 3},
