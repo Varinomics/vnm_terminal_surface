@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/diagnostics/metrics_json.h"
+#include "vnm_terminal/font_metrics.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
 
@@ -652,6 +653,62 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
     return ok;
 }
 
+// Prove the public font/metrics API replicates the internal Qt_grid_metrics_provider
+// computation exactly, so a consumer that drops the internal includes sees no
+// behavior change. Equality is exact (not tolerance-based): the public path must
+// produce byte-identical width/height to the internal provider.
+bool test_public_font_metrics_replicates_internal()
+{
+    bool ok = true;
+
+    ok &= check(
+        vnm_terminal::default_monospace_font_family() ==
+            term::vnm_terminal_default_monospace_font_family(),
+        "public default family equals internal default family");
+
+    struct font_case_t {
+        const char* family;
+        qreal       pixel_size;
+        qreal       device_pixel_ratio;
+    };
+    const font_case_t cases[] = {
+        {"monospace", 12.0, 1.0},
+        {"monospace", 18.0, 2.0},
+        {"monospace", 13.0, 1.5},
+    };
+
+    for (const font_case_t& font_case : cases) {
+        const QString family = QString::fromLatin1(font_case.family);
+
+        const term::Qt_grid_metrics_provider provider(
+            terminal_font(family, font_case.pixel_size),
+            font_case.device_pixel_ratio);
+        const term::terminal_cell_metrics_t internal_metrics = provider.cell_metrics();
+
+        const vnm_terminal::Cell_metrics public_metrics =
+            vnm_terminal::cell_metrics_for_font(
+                family,
+                font_case.pixel_size,
+                font_case.device_pixel_ratio);
+
+        ok &= check(public_metrics.width == internal_metrics.width,
+            "public cell width equals internal provider cell width");
+        ok &= check(public_metrics.height == internal_metrics.height,
+            "public cell height equals internal provider cell height");
+
+        ok &= check(
+            vnm_terminal::cell_metrics_valid(public_metrics) ==
+                term::is_valid_cell_metrics(internal_metrics),
+            "public cell_metrics_valid agrees with internal is_valid_cell_metrics");
+    }
+
+    const vnm_terminal::Cell_metrics zero_metrics;
+    ok &= check(!vnm_terminal::cell_metrics_valid(zero_metrics),
+        "public cell_metrics_valid rejects zero-sized metrics");
+
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -670,5 +727,6 @@ int main(int argc, char** argv)
     ok &= test_surface_publication(app, observed_dpr);
     ok &= test_controller_with_real_provider(app, observed_dpr);
     ok &= test_diagnostics_metrics_json(app);
+    ok &= test_public_font_metrics_replicates_internal();
     return ok ? 0 : 1;
 }
