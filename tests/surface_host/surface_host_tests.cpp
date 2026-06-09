@@ -6586,6 +6586,82 @@ bool test_synchronized_output_scroll_policy_property(QGuiApplication& app)
     return ok;
 }
 
+bool test_scroll_diagnostic_enum_name_table(QGuiApplication& app)
+{
+    using Surface = VNM_TerminalSurface;
+    bool ok = true;
+
+    // Lock the Batch 1.2 converter contract: NONE maps to an empty QString
+    // (byte-compatible with the unset QString these diagnostic fields formerly
+    // held) and every other enumerator maps to its stable diagnostic spelling.
+    ok &= check(Surface::scroll_noop_cause_name(Surface::Scroll_noop_cause::NONE).isEmpty(),
+        "scroll_noop_cause_name(NONE) is empty");
+    ok &= check(Surface::scroll_noop_cause_name(Surface::Scroll_noop_cause::ZERO_LINE_DELTA) ==
+        QStringLiteral("zero_line_delta"),
+        "scroll_noop_cause_name(ZERO_LINE_DELTA) is zero_line_delta");
+    ok &= check(Surface::scroll_noop_cause_name(Surface::Scroll_noop_cause::NO_SESSION) ==
+        QStringLiteral("no_session"),
+        "scroll_noop_cause_name(NO_SESSION) is no_session");
+    ok &= check(Surface::scroll_noop_cause_name(
+            Surface::Scroll_noop_cause::SYNCHRONIZED_OUTPUT_DEFERRED) ==
+        QStringLiteral("synchronized_output_deferred"),
+        "scroll_noop_cause_name(SYNCHRONIZED_OUTPUT_DEFERRED) is synchronized_output_deferred");
+    ok &= check(Surface::scroll_noop_cause_name(
+            Surface::Scroll_noop_cause::SYNCHRONIZED_OUTPUT_PUBLISHED) ==
+        QStringLiteral("synchronized_output_published"),
+        "scroll_noop_cause_name(SYNCHRONIZED_OUTPUT_PUBLISHED) is synchronized_output_published");
+    ok &= check(Surface::scroll_noop_cause_name(Surface::Scroll_noop_cause::ALTERNATE_SCREEN) ==
+        QStringLiteral("alternate_screen"),
+        "scroll_noop_cause_name(ALTERNATE_SCREEN) is alternate_screen");
+    ok &= check(Surface::scroll_noop_cause_name(Surface::Scroll_noop_cause::BOUNDARY_OR_CLAMP) ==
+        QStringLiteral("boundary_or_clamp"),
+        "scroll_noop_cause_name(BOUNDARY_OR_CLAMP) is boundary_or_clamp");
+    ok &= check(Surface::scroll_noop_cause_name(Surface::Scroll_noop_cause::NO_PUBLICATION) ==
+        QStringLiteral("no_publication"),
+        "scroll_noop_cause_name(NO_PUBLICATION) is no_publication");
+
+    ok &= check(Surface::scroll_action_name(Surface::Scroll_action::NONE).isEmpty(),
+        "scroll_action_name(NONE) is empty");
+    ok &= check(Surface::scroll_action_name(Surface::Scroll_action::VIEWPORT_MOVED) ==
+        QStringLiteral("viewport_moved"),
+        "scroll_action_name(VIEWPORT_MOVED) is viewport_moved");
+    ok &= check(Surface::scroll_action_name(Surface::Scroll_action::AT_BOUNDARY) ==
+        QStringLiteral("at_boundary"),
+        "scroll_action_name(AT_BOUNDARY) is at_boundary");
+    ok &= check(Surface::scroll_action_name(Surface::Scroll_action::DEFERRED_INTENT_RECORDED) ==
+        QStringLiteral("deferred_intent_recorded"),
+        "scroll_action_name(DEFERRED_INTENT_RECORDED) is deferred_intent_recorded");
+    ok &= check(Surface::scroll_action_name(Surface::Scroll_action::TERMINAL_INPUT) ==
+        QStringLiteral("terminal_input"),
+        "scroll_action_name(TERMINAL_INPUT) is terminal_input");
+
+    // Drive real no-op scrolls through the public diagnostics API and confirm
+    // the resulting Scroll_noop_cause, so the converter contract is anchored to
+    // an actual producer of the enum and not just the table above. A fresh
+    // surface has no session, so a unit line delta is a no-op for NO_SESSION,
+    // and a zero line delta is a no-op for ZERO_LINE_DELTA regardless of session.
+    Surface_fixture fixture;
+    pump_events(app);
+
+    const Surface::wheel_scroll_diagnostic_result_t zero_delta =
+        fixture.surface.scroll_viewport_lines_with_diagnostics(0, QStringLiteral("api.lines"));
+    ok &= check(zero_delta.no_op_cause == Surface::Scroll_noop_cause::ZERO_LINE_DELTA,
+        "zero line delta no-op reports ZERO_LINE_DELTA cause");
+    ok &= check(!zero_delta.event_accepted,
+        "zero line delta no-op is not accepted");
+
+    const Surface::wheel_scroll_diagnostic_result_t no_session =
+        fixture.surface.scroll_viewport_lines_with_diagnostics(1, QStringLiteral("api.lines"));
+    ok &= check(no_session.no_op_cause == Surface::Scroll_noop_cause::NO_SESSION,
+        "session-less line scroll no-op reports NO_SESSION cause");
+    ok &= check(!no_session.session_present,
+        "session-less line scroll no-op marks no session present");
+    ok &= check(!no_session.event_accepted,
+        "session-less line scroll no-op is not accepted");
+
+    return ok;
+}
+
 bool test_no_payload_copy_fallback_states(QGuiApplication& app)
 {
     bool ok = true;
@@ -11477,6 +11553,7 @@ int main(int argc, char** argv)
     ok &= test_keyboard_printable_controls_and_prompt_path(app);
     ok &= test_copy_shortcut_policy(app);
     ok &= test_synchronized_output_scroll_policy_property(app);
+    ok &= test_scroll_diagnostic_enum_name_table(app);
     ok &= test_no_payload_copy_fallback_states(app);
     ok &= test_control_wheel_font_zoom(app);
     ok &= test_plain_wheel_scrolls_primary_scrollback(app);
