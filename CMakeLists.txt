@@ -153,6 +153,7 @@ add_library(vnm_terminal_surface STATIC
     src/terminal_screen_model_snapshot.cpp
     src/metrics_contract.cpp
     src/native_backend_io_core.cpp
+    src/qsg_atlas_font_bytes.cpp
     src/qsg_atlas_renderer.cpp
     src/qsg_terminal_renderer.cpp
     src/qt_grid_metrics_provider.cpp
@@ -186,6 +187,8 @@ if(WIN32)
     target_sources(vnm_terminal_surface PRIVATE
         src/windows_conpty_backend.cpp
     )
+    # GetFontData (resolve an installed font family to its sfnt bytes for MSDF).
+    target_link_libraries(vnm_terminal_surface PRIVATE gdi32)
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
