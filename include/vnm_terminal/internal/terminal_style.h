@@ -77,6 +77,15 @@ constexpr Terminal_color_ref make_rgb_terminal_color_ref(quint32 rgba)
     return {Terminal_color_ref_kind::RGB, 0U, rgba};
 }
 
+constexpr quint32 rgba_from_components(int red, int green, int blue)
+{
+    return
+         0xff000000U                        |
+        (static_cast<quint32>(red) << 16U)  |
+        (static_cast<quint32>(green) << 8U) |
+         static_cast<quint32>(blue);
+}
+
 constexpr Terminal_text_style make_default_terminal_text_style()
 {
     return {

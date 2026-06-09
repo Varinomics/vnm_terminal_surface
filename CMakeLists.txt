@@ -96,6 +96,7 @@ set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR "${Qt6_VERSION_MINOR}")
 
 add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/backend_contract.h
+    include/vnm_terminal/internal/csi_parameter_parsing.h
     include/vnm_terminal/internal/ime_contract.h
     include/vnm_terminal/internal/metrics_contract.h
     include/vnm_terminal/internal/parser_action.h
@@ -110,6 +111,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/terminal_history_ring.h
     include/vnm_terminal/internal/terminal_history_row_record_codec.h
     include/vnm_terminal/internal/terminal_history_row_traversal.h
+    include/vnm_terminal/internal/terminal_byte_stream_parser.h
     include/vnm_terminal/internal/terminal_input_mode.h
     include/vnm_terminal/internal/terminal_input_encoder.h
     include/vnm_terminal/internal/terminal_public_projection.h
@@ -143,6 +145,7 @@ add_library(vnm_terminal_surface STATIC
     src/terminal_repaint_recovery.cpp
     src/terminal_resize_controller.cpp
     src/terminal_session.cpp
+    src/terminal_byte_stream_parser.cpp
     src/terminal_screen_model.cpp
     src/metrics_contract.cpp
     src/native_backend_io_core.cpp
