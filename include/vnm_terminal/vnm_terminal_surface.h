@@ -375,6 +375,17 @@ public:
     bool viewport_at_tail() const;
     Selection_state selection_state() const;
 
+    // Cumulative renderer/atlas frame counts the diagnostics metrics builder
+    // pairs with host-side timing to derive frame rate. These mirror the
+    // counters in vnm_terminal::diagnostics::append_renderer_metrics_json and
+    // append_atlas_metrics_json so a host can read the counts without including
+    // surface internal headers.
+    quint64 paint_completed_frame_count() const;
+    quint64 qsg_atlas_render_frame_count() const;
+
+    void set_selection_trace_enabled(bool enabled);
+    void set_dirty_row_stats_enabled(bool enabled);
+
     Q_INVOKABLE bool respond_clipboard_write(
         quint64                        request_id,
         Clipboard_response_decision    decision);

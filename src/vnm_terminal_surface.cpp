@@ -2738,6 +2738,35 @@ int VNM_TerminalSurface::columns() const
     return m_columns;
 }
 
+quint64 VNM_TerminalSurface::paint_completed_frame_count() const
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    return m_private->renderer_stats_publisher.cumulative_snapshot().paint_completed_frames;
+}
+
+quint64 VNM_TerminalSurface::qsg_atlas_render_frame_count() const
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    return m_private->qsg_atlas_recorder != nullptr
+        ? m_private->qsg_atlas_recorder->snapshot().render_count
+        : term::Qsg_atlas_frame_report{}.render_count;
+}
+
+void VNM_TerminalSurface::set_selection_trace_enabled(bool enabled)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    m_selection_trace_enabled = enabled;
+}
+
+void VNM_TerminalSurface::set_dirty_row_stats_enabled(bool enabled)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    m_private->dirty_row_stats_enabled = enabled;
+    if (m_private->session != nullptr) {
+        m_private->session->set_dirty_row_stats_enabled(enabled);
+    }
+}
+
 int VNM_TerminalSurface::scrollback_rows() const
 {
     return m_scrollback_rows;
@@ -5855,19 +5884,14 @@ void term::VNM_TerminalSurface_render_bridge::set_dirty_row_stats_enabled(
     VNM_TerminalSurface&   surface,
     bool                   enabled)
 {
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    surface.m_private->dirty_row_stats_enabled = enabled;
-    if (surface.m_private->session != nullptr) {
-        surface.m_private->session->set_dirty_row_stats_enabled(enabled);
-    }
+    surface.set_dirty_row_stats_enabled(enabled);
 }
 
 void term::VNM_TerminalSurface_render_bridge::set_selection_trace_enabled(
     VNM_TerminalSurface&   surface,
     bool                   enabled)
 {
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    surface.m_selection_trace_enabled = enabled;
+    surface.set_selection_trace_enabled(enabled);
 }
 
 term::Qsg_atlas_frame_report

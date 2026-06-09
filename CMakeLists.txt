@@ -128,7 +128,9 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/vnm_terminal_surface_render_bridge.h
     include/vnm_terminal/internal/posix_pty_backend.h
     include/vnm_terminal/internal/windows_conpty_backend.h
+    include/vnm_terminal/diagnostics/metrics_json.h
     include/vnm_terminal/vnm_terminal_surface.h
+    src/diagnostics/metrics_json.cpp
     src/terminal_history_ring.cpp
     src/terminal_history_row_record_codec.cpp
     src/terminal_history_row_traversal.cpp
@@ -258,6 +260,11 @@ install(TARGETS
 install(FILES
     include/vnm_terminal/vnm_terminal_surface.h
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"
+)
+
+install(FILES
+    include/vnm_terminal/diagnostics/metrics_json.h
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal/diagnostics"
 )
 
 install(EXPORT vnm_terminal_surfaceTargets

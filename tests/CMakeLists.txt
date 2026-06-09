@@ -1751,6 +1751,28 @@ set_tests_properties(vnm_terminal_surface_rejects_distribution_transcript_build 
 )
 
 add_test(
+    NAME vnm_terminal_surface_package_consumer_builds
+    COMMAND
+        "${CMAKE_COMMAND}"
+        "-Dgenerator=${CMAKE_GENERATOR}"
+        "-Dgenerator_platform=${CMAKE_GENERATOR_PLATFORM}"
+        "-Dgenerator_toolset=${CMAKE_GENERATOR_TOOLSET}"
+        "-Dmake_program=${CMAKE_MAKE_PROGRAM}"
+        "-Dpackage_binary_dir=${CMAKE_BINARY_DIR}"
+        "-Dinstall_config=$<CONFIG>"
+        "-Dinstall_dir=${CMAKE_CURRENT_BINARY_DIR}/package_smoke_consumer/install"
+        "-Dconsumer_source_dir=${PROJECT_SOURCE_DIR}/tests/package_smoke"
+        "-Dconsumer_binary_dir=${CMAKE_CURRENT_BINARY_DIR}/package_smoke_consumer/consumer_build"
+        "-Dqt6_dir=${Qt6_DIR}"
+        -P "${PROJECT_SOURCE_DIR}/tests/package_smoke/expect_consumer_builds.cmake"
+)
+
+set_tests_properties(vnm_terminal_surface_package_consumer_builds PROPERTIES
+    LABELS "package;posture"
+    TIMEOUT 180
+)
+
+add_test(
     NAME vnm_terminal_surface_package_rejects_qt_private_api_minor_mismatch
     COMMAND
         "${CMAKE_COMMAND}"
