@@ -64,7 +64,7 @@ struct Metric_descriptor
 
 // Build a COUNTER row. The reader casts the field to uint64 so int-typed and
 // uint64-typed stats structs share one table. unit/stability default to the
-// common case for the text-layout block (raw debug counts, unstable across
+// common case for the debug counter blocks (raw counts, unstable across
 // versions).
 template<typename Stats>
 constexpr Metric_descriptor<Stats> counter_metric(
@@ -75,6 +75,20 @@ constexpr Metric_descriptor<Stats> counter_metric(
 {
     return Metric_descriptor<Stats>{
         key, key, Metric_kind::COUNTER, unit, stability, reader, nullptr};
+}
+
+// Build a BOOL row. The reader returns the field as a native bool; JSON emits a
+// native JSON bool and TEXT emits the literal `true`/`false`. A boolean flag has
+// no count/byte unit, so the unit defaults to NONE; like the counters these are
+// debug diagnostics and default to UNSTABLE.
+template<typename Stats>
+constexpr Metric_descriptor<Stats> bool_metric(
+    const char*        key,
+    bool             (*reader)(const Stats&),
+    Metric_stability   stability = Metric_stability::UNSTABLE)
+{
+    return Metric_descriptor<Stats>{
+        key, key, Metric_kind::BOOL, Metric_unit::NONE, stability, nullptr, reader};
 }
 
 // JSON: COUNTER -> decimal string (QString::number); BOOL -> native bool. This
@@ -132,95 +146,99 @@ void emit_metrics_text(
 // Splitting at that point keeps the field list a single ordered array while
 // preserving the original per-field optionality and emit order exactly.
 //
-// `READ` builds a COUNTER row whose reader casts the named field to uint64.
-template<typename Stats>
-constexpr std::span<const Metric_descriptor<Stats>> text_layout_metrics_before_optional()
-{
+// The two table segments are namespace-scope `inline constexpr` variable
+// templates (static storage duration), so the spans returned by the accessors
+// below stay valid. A `static` local in a `constexpr` function is C++23-only;
+// hoisting the storage keeps the field list valid under C++20.
+//
+// `VNM_TL_COUNTER` builds a COUNTER row whose reader casts the named field to
+// uint64.
 #define VNM_TL_COUNTER(field) \
     counter_metric<Stats>(#field, [](const Stats& s) -> std::uint64_t { \
         return static_cast<std::uint64_t>(s.field); })
 
-    static constexpr Metric_descriptor<Stats> table[] = {
-        VNM_TL_COUNTER(qt_text_layout_calls),
-        VNM_TL_COUNTER(text_layout_runs_single_code_unit),
-        VNM_TL_COUNTER(text_layout_runs_multi_code_unit),
-        VNM_TL_COUNTER(text_layout_runs_all_space),
-        VNM_TL_COUNTER(text_layout_runs_printable_ascii),
-        VNM_TL_COUNTER(text_layout_runs_printable_ascii_with_space),
-        VNM_TL_COUNTER(text_layout_runs_other_ascii),
-        VNM_TL_COUNTER(text_layout_runs_non_ascii),
-        VNM_TL_COUNTER(text_layout_runs_clipped),
-        VNM_TL_COUNTER(text_layout_runs_ascii_layout_font),
-        VNM_TL_COUNTER(text_layout_runs_force_blended_order),
-        VNM_TL_COUNTER(text_layout_runs_with_hyperlink),
-        VNM_TL_COUNTER(text_layout_runs_with_decoration),
-        VNM_TL_COUNTER(text_layout_runs_mixed_ascii_non_ascii),
-        VNM_TL_COUNTER(text_layout_runs_pure_non_ascii),
-        VNM_TL_COUNTER(text_layout_runs_plain_unclipped),
-        VNM_TL_COUNTER(text_layout_runs_plain_unclipped_ascii_font),
-        VNM_TL_COUNTER(text_layout_runs_all_space_plain_unclipped),
-        VNM_TL_COUNTER(text_layout_runs_printable_ascii_plain_unclipped),
-        VNM_TL_COUNTER(text_layout_runs_non_ascii_plain_unclipped),
-        VNM_TL_COUNTER(text_layout_runs_mixed_ascii_non_ascii_plain_unclipped),
-        VNM_TL_COUNTER(text_layout_runs_pure_non_ascii_plain_unclipped),
-        VNM_TL_COUNTER(text_layout_runs_fast_space_candidate),
-        VNM_TL_COUNTER(text_layout_runs_fast_ascii_candidate),
-        VNM_TL_COUNTER(text_layout_runs_fast_ascii_no_space_candidate),
-        VNM_TL_COUNTER(text_layout_runs_fast_ascii_single_candidate),
-        VNM_TL_COUNTER(text_layout_runs_fast_ascii_multi_candidate),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_screened),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_eligible),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_attempted),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_trusted_fast_path),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_succeeded),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_all_space_succeeded),
-        // -- optional field text_ascii_replacement_add_glyphs_calls here --
-    };
-    return std::span<const Metric_descriptor<Stats>>(table);
+template<typename Stats>
+inline constexpr Metric_descriptor<Stats> k_text_layout_before_optional[] = {
+    VNM_TL_COUNTER(qt_text_layout_calls),
+    VNM_TL_COUNTER(text_layout_runs_single_code_unit),
+    VNM_TL_COUNTER(text_layout_runs_multi_code_unit),
+    VNM_TL_COUNTER(text_layout_runs_all_space),
+    VNM_TL_COUNTER(text_layout_runs_printable_ascii),
+    VNM_TL_COUNTER(text_layout_runs_printable_ascii_with_space),
+    VNM_TL_COUNTER(text_layout_runs_other_ascii),
+    VNM_TL_COUNTER(text_layout_runs_non_ascii),
+    VNM_TL_COUNTER(text_layout_runs_clipped),
+    VNM_TL_COUNTER(text_layout_runs_ascii_layout_font),
+    VNM_TL_COUNTER(text_layout_runs_force_blended_order),
+    VNM_TL_COUNTER(text_layout_runs_with_hyperlink),
+    VNM_TL_COUNTER(text_layout_runs_with_decoration),
+    VNM_TL_COUNTER(text_layout_runs_mixed_ascii_non_ascii),
+    VNM_TL_COUNTER(text_layout_runs_pure_non_ascii),
+    VNM_TL_COUNTER(text_layout_runs_plain_unclipped),
+    VNM_TL_COUNTER(text_layout_runs_plain_unclipped_ascii_font),
+    VNM_TL_COUNTER(text_layout_runs_all_space_plain_unclipped),
+    VNM_TL_COUNTER(text_layout_runs_printable_ascii_plain_unclipped),
+    VNM_TL_COUNTER(text_layout_runs_non_ascii_plain_unclipped),
+    VNM_TL_COUNTER(text_layout_runs_mixed_ascii_non_ascii_plain_unclipped),
+    VNM_TL_COUNTER(text_layout_runs_pure_non_ascii_plain_unclipped),
+    VNM_TL_COUNTER(text_layout_runs_fast_space_candidate),
+    VNM_TL_COUNTER(text_layout_runs_fast_ascii_candidate),
+    VNM_TL_COUNTER(text_layout_runs_fast_ascii_no_space_candidate),
+    VNM_TL_COUNTER(text_layout_runs_fast_ascii_single_candidate),
+    VNM_TL_COUNTER(text_layout_runs_fast_ascii_multi_candidate),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_screened),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_eligible),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_attempted),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_trusted_fast_path),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_succeeded),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_all_space_succeeded),
+    // -- optional field text_ascii_replacement_add_glyphs_calls here --
+};
+
+template<typename Stats>
+inline constexpr Metric_descriptor<Stats> k_text_layout_after_optional[] = {
+    VNM_TL_COUNTER(text_ascii_replacement_runs_fallback),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_clipped),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_force_blended_order),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_decoration),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_hyperlink),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_non_printable_ascii),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_non_ascii),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_geometry),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_unsupported_font),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_internal_node),
+    VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_glyph_mapping),
+    VNM_TL_COUNTER(text_layout_code_units),
+    VNM_TL_COUNTER(text_layout_space_code_units),
+    VNM_TL_COUNTER(text_layout_printable_ascii_code_units),
+    VNM_TL_COUNTER(text_layout_other_ascii_code_units),
+    VNM_TL_COUNTER(text_layout_non_ascii_code_units),
+    VNM_TL_COUNTER(text_layout_plain_unclipped_code_units),
+    VNM_TL_COUNTER(text_layout_all_space_plain_unclipped_code_units),
+    VNM_TL_COUNTER(text_layout_printable_ascii_plain_unclipped_code_units),
+    VNM_TL_COUNTER(text_layout_non_ascii_plain_unclipped_code_units),
+    VNM_TL_COUNTER(text_layout_fast_space_candidate_code_units),
+    VNM_TL_COUNTER(text_layout_fast_ascii_candidate_code_units),
+    VNM_TL_COUNTER(text_ascii_replacement_code_units_screened),
+    VNM_TL_COUNTER(text_ascii_replacement_code_units_eligible),
+    VNM_TL_COUNTER(text_ascii_replacement_code_units_attempted),
+    VNM_TL_COUNTER(text_ascii_replacement_code_units_trusted_fast_path),
+    VNM_TL_COUNTER(text_ascii_replacement_code_units_succeeded),
+    VNM_TL_COUNTER(text_ascii_replacement_code_units_fallback),
+};
 
 #undef VNM_TL_COUNTER
+
+template<typename Stats>
+constexpr std::span<const Metric_descriptor<Stats>> text_layout_metrics_before_optional()
+{
+    return std::span<const Metric_descriptor<Stats>>(k_text_layout_before_optional<Stats>);
 }
 
 template<typename Stats>
 constexpr std::span<const Metric_descriptor<Stats>> text_layout_metrics_after_optional()
 {
-#define VNM_TL_COUNTER(field) \
-    counter_metric<Stats>(#field, [](const Stats& s) -> std::uint64_t { \
-        return static_cast<std::uint64_t>(s.field); })
-
-    static constexpr Metric_descriptor<Stats> table[] = {
-        VNM_TL_COUNTER(text_ascii_replacement_runs_fallback),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_clipped),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_force_blended_order),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_decoration),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_hyperlink),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_non_printable_ascii),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_non_ascii),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_geometry),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_unsupported_font),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_internal_node),
-        VNM_TL_COUNTER(text_ascii_replacement_runs_rejected_glyph_mapping),
-        VNM_TL_COUNTER(text_layout_code_units),
-        VNM_TL_COUNTER(text_layout_space_code_units),
-        VNM_TL_COUNTER(text_layout_printable_ascii_code_units),
-        VNM_TL_COUNTER(text_layout_other_ascii_code_units),
-        VNM_TL_COUNTER(text_layout_non_ascii_code_units),
-        VNM_TL_COUNTER(text_layout_plain_unclipped_code_units),
-        VNM_TL_COUNTER(text_layout_all_space_plain_unclipped_code_units),
-        VNM_TL_COUNTER(text_layout_printable_ascii_plain_unclipped_code_units),
-        VNM_TL_COUNTER(text_layout_non_ascii_plain_unclipped_code_units),
-        VNM_TL_COUNTER(text_layout_fast_space_candidate_code_units),
-        VNM_TL_COUNTER(text_layout_fast_ascii_candidate_code_units),
-        VNM_TL_COUNTER(text_ascii_replacement_code_units_screened),
-        VNM_TL_COUNTER(text_ascii_replacement_code_units_eligible),
-        VNM_TL_COUNTER(text_ascii_replacement_code_units_attempted),
-        VNM_TL_COUNTER(text_ascii_replacement_code_units_trusted_fast_path),
-        VNM_TL_COUNTER(text_ascii_replacement_code_units_succeeded),
-        VNM_TL_COUNTER(text_ascii_replacement_code_units_fallback),
-    };
-    return std::span<const Metric_descriptor<Stats>>(table);
-
-#undef VNM_TL_COUNTER
+    return std::span<const Metric_descriptor<Stats>>(k_text_layout_after_optional<Stats>);
 }
 
 // Emit the JSON text-layout block: the shared table, then the one optional

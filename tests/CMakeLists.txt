@@ -521,8 +521,9 @@ set_tests_properties(vnm_terminal_profile_text PROPERTIES
 # Golden characterization test for the shared text-layout diagnostics block.
 # Feeds a fabricated stats fixture through the detail emitters and asserts the
 # TEXT output byte-for-byte and the JSON output key/value-string-exact. The
-# emitters live in src/diagnostics/metric_descriptor.h, so the test reaches into
-# the source tree for that internal header.
+# emitters live in src/diagnostics/metric_descriptor.h (+ the atlas tables in
+# src/diagnostics/atlas_metric_descriptors.h), so the test reaches into
+# the source tree for those internal headers.
 add_executable(vnm_terminal_diagnostics_text_layout
     diagnostics_text_layout/diagnostics_text_layout_tests.cpp
 )
