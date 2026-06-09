@@ -2,6 +2,7 @@
 #include "helpers/primary_backing_test_config.h"
 #include "helpers/test_check.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
+#include "vnm_terminal/internal/terminal_color_scheme.h"
 #include "vnm_terminal/internal/terminal_resize_controller.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
@@ -4515,6 +4516,10 @@ bool test_public_projection_phase1_copy_is_immutable_after_hidden_mutation()
     const term::Terminal_render_cursor pre_hidden_cursor = captured->cursor();
     const term::Terminal_mode_state    pre_hidden_modes  = captured->modes();
     const term::Terminal_color_state   pre_hidden_colors = captured->color_state();
+    // The projection seeds its color state from the default (Campbell) scheme,
+    // so the captured defaults match that scheme, not the struct fallbacks.
+    const term::Terminal_color_state   default_scheme_colors =
+        term::make_terminal_color_state(term::default_color_scheme());
     ok &= check(pre_hidden_link_style_is_valid &&
         pre_hidden_cursor.position.row    == 3 &&
         pre_hidden_cursor.position.column == 7 &&
@@ -4522,10 +4527,10 @@ bool test_public_projection_phase1_copy_is_immutable_after_hidden_mutation()
         pre_hidden_modes.autowrap &&
         pre_hidden_modes.cursor_visible &&
         pre_hidden_colors.default_foreground_rgba ==
-            term::k_terminal_default_foreground_rgba &&
+            default_scheme_colors.default_foreground_rgba &&
         pre_hidden_colors.default_background_rgba ==
-            term::k_terminal_default_background_rgba &&
-        pre_hidden_colors.cursor_rgba == term::k_terminal_default_cursor_rgba,
+            default_scheme_colors.default_background_rgba &&
+        pre_hidden_colors.cursor_rgba == default_scheme_colors.cursor_rgba,
         "Phase 1 projection immutability captures known pre-hidden cursor, mode, color, and style state");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\r\nPUBLIC-MUTATION")),

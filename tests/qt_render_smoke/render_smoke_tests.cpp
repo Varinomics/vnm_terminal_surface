@@ -289,7 +289,7 @@ int main(int argc, char** argv)
         return fail("grabbed render target is unexpectedly small");
     }
 
-    surface.set_color_theme(QStringLiteral("light"));
+    surface.set_color_scheme(QStringLiteral("Solarized Light"));
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
         make_smoke_snapshot(2U, 0xff1f2c26U, 0xfff6f7f2U));

@@ -9184,7 +9184,7 @@ void configure_atlas_host_state_surface(
     surface.set_font_family(
         use_default_terminal_font ? QString() : QStringLiteral("monospace"));
     surface.set_font_size(18.0);
-    surface.set_color_theme(QStringLiteral("default"));
+    surface.set_color_scheme(QStringLiteral("Campbell"));
     term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(
         surface,
         true);
@@ -9693,7 +9693,7 @@ int test_atlas_host_state_smoke(QGuiApplication& app, const char* backend)
 
 void mutate_surface_after_sync(VNM_TerminalSurface& surface)
 {
-    surface.set_color_theme(QStringLiteral("default"));
+    surface.set_color_scheme(QStringLiteral("Campbell"));
     surface.set_font_size(surface.font_size() + 1.0);
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
@@ -9722,7 +9722,7 @@ int test_render_smoke(QGuiApplication& app, const char* backend)
     surface.setSize(QSizeF(180.0, 96.0));
     surface.set_font_family(QStringLiteral("monospace"));
     surface.set_font_size(18.0);
-    surface.set_color_theme(QStringLiteral("light"));
+    surface.set_color_scheme(QStringLiteral("Solarized Light"));
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
         std::make_shared<const term::Terminal_render_snapshot>(
@@ -10364,7 +10364,7 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
     surface.setSize(QSizeF(360.0, 90.0));
     surface.set_font_family(QString());
     surface.set_font_size(18.0);
-    surface.set_color_theme(QStringLiteral("default"));
+    surface.set_color_scheme(QStringLiteral("Campbell"));
 
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
@@ -10621,7 +10621,7 @@ bool test_atlas_msdf_zoom_reuses_baked_atlas(QGuiApplication& app)
     surface.setSize(QSizeF(420.0, 150.0));
     surface.set_font_family(QString());
     surface.set_font_size(12.0);
-    surface.set_color_theme(QStringLiteral("default"));
+    surface.set_color_scheme(QStringLiteral("Campbell"));
 
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
@@ -10721,7 +10721,7 @@ bool test_atlas_msdf_zoom_crosses_bake_bucket(QGuiApplication& app)
     surface.setSize(QSizeF(640.0, 460.0));
     surface.set_font_family(QString());
     surface.set_font_size(18.0);
-    surface.set_color_theme(QStringLiteral("default"));
+    surface.set_color_scheme(QStringLiteral("Campbell"));
 
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
@@ -10813,7 +10813,7 @@ bool run_atlas_glyph_row_stable_report_case(
     surface.setSize(QSizeF(220.0, 110.0));
     surface.set_font_family(QStringLiteral("monospace"));
     surface.set_font_size(18.0);
-    surface.set_color_theme(QStringLiteral("default"));
+    surface.set_color_scheme(QStringLiteral("Campbell"));
 
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
@@ -10914,7 +10914,7 @@ bool test_atlas_glyph_row_stable_dirty_update(QGuiApplication& app)
     surface.setSize(QSizeF(220.0, 110.0));
     surface.set_font_family(QStringLiteral("monospace"));
     surface.set_font_size(18.0);
-    surface.set_color_theme(QStringLiteral("default"));
+    surface.set_color_scheme(QStringLiteral("Campbell"));
 
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
@@ -11249,7 +11249,7 @@ bool test_atlas_prepared_text_reuse(QGuiApplication& app)
     surface.setSize(QSizeF(220.0, 110.0));
     surface.set_font_family(QStringLiteral("monospace"));
     surface.set_font_size(18.0);
-    surface.set_color_theme(QStringLiteral("default"));
+    surface.set_color_scheme(QStringLiteral("Campbell"));
 
     const term::Terminal_render_snapshot baseline =
         make_atlas_prepared_text_reuse_snapshot(
@@ -11380,7 +11380,7 @@ bool run_atlas_report_case(
     surface.setSize(QSizeF(220.0, 110.0));
     surface.set_font_family(QStringLiteral("monospace"));
     surface.set_font_size(18.0);
-    surface.set_color_theme(QStringLiteral("default"));
+    surface.set_color_scheme(QStringLiteral("Campbell"));
 
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,

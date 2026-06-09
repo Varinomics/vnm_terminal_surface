@@ -28,6 +28,6 @@ expected_diagnostic_1_recovery = 2
 expected_reply_count = 1
 expected_reply_0_kind = 5
 expected_reply_0_source_family = 4
-expected_reply_0_wire_bytes_hex = "1B 5D 31 30 3B 72 67 62 3A 66 66 66 66 2F 66 66 66 66 2F 66 66 66 66 1B 5C"
+expected_reply_0_wire_bytes_hex = "1B 5D 31 30 3B 72 67 62 3A 63 63 63 63 2F 63 63 63 63 2F 63 63 63 63 1B 5C"
 expected_reply_0_source_sequence_utf8_hex = "4F 53 43 20 31 30"
 compare_actions = 1

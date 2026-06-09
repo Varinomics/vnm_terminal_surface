@@ -12,7 +12,7 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
-constexpr quint32 k_red_rgba = 0xffcd0000U;
+constexpr quint32 k_red_rgba = 0xffc50f1fU; // Campbell palette slot 1 (SGR 31m)
 
 using vnm_terminal::test_helpers::check;
 

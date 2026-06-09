@@ -32,8 +32,8 @@ class VNM_TerminalSurface : public QQuickItem
         READ font_family WRITE set_font_family NOTIFY font_family_changed)
     Q_PROPERTY(qreal fontSize
         READ font_size WRITE set_font_size NOTIFY font_size_changed)
-    Q_PROPERTY(QString colorTheme
-        READ color_theme WRITE set_color_theme NOTIFY color_theme_changed)
+    Q_PROPERTY(QString colorScheme
+        READ color_scheme WRITE set_color_scheme NOTIFY color_scheme_changed)
     Q_PROPERTY(Cursor_style cursorStyle
         READ cursor_style WRITE set_cursor_style NOTIFY cursor_style_changed)
     Q_PROPERTY(bool cursorBlinkEnabled
@@ -281,8 +281,11 @@ public:
     qreal font_size() const;
     void set_font_size(qreal font_size);
 
-    QString color_theme() const;
-    void set_color_theme(const QString& color_theme);
+    QString color_scheme() const;
+    void set_color_scheme(const QString& color_scheme);
+
+    Q_INVOKABLE QStringList available_color_schemes() const;
+    Q_INVOKABLE QVariantMap color_scheme_preview(const QString& color_scheme) const;
 
     Cursor_style cursor_style() const;
     void set_cursor_style(Cursor_style cursor_style);
@@ -424,7 +427,7 @@ signals:
     void font_family_changed();
 
     void font_size_changed();
-    void color_theme_changed();
+    void color_scheme_changed();
     void cursor_style_changed();
     void cursor_blink_enabled_changed();
     void scrollback_limit_changed();
@@ -544,7 +547,7 @@ private:
 
     QString                  m_font_family;
     qreal                    m_font_size                            = 13.0;
-    QString                  m_color_theme                          = QStringLiteral("default");
+    QString                  m_color_scheme                         = QStringLiteral("Campbell");
     Cursor_style             m_cursor_style                         = Cursor_style::BLOCK;
     bool                     m_cursor_blink_enabled                 = true;
     int                      m_scrollback_limit                     = 10000;
