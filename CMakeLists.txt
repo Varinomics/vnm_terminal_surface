@@ -129,8 +129,10 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/posix_pty_backend.h
     include/vnm_terminal/internal/windows_conpty_backend.h
     include/vnm_terminal/diagnostics/metrics_json.h
+    include/vnm_terminal/diagnostics/profile_text.h
     include/vnm_terminal/vnm_terminal_surface.h
     src/diagnostics/metrics_json.cpp
+    src/diagnostics/profile_text.cpp
     src/terminal_history_ring.cpp
     src/terminal_history_row_record_codec.cpp
     src/terminal_history_row_traversal.cpp
@@ -264,6 +266,7 @@ install(FILES
 
 install(FILES
     include/vnm_terminal/diagnostics/metrics_json.h
+    include/vnm_terminal/diagnostics/profile_text.h
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal/diagnostics"
 )
 
