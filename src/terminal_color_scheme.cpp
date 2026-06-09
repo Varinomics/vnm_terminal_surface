@@ -59,6 +59,17 @@ std::vector<Terminal_color_scheme> build_builtin_color_schemes()
         c(0xCCCCCC), c(0x0C0C0C), c(0xFFFFFF), c(0xFFFFFF),
     });
 
+    // The terminal's appearance before color schemes were introduced: pure
+    // white-on-black with the classic xterm 16-color palette.
+    schemes.push_back({
+        QStringLiteral("Classic"),
+        { c(0x000000), c(0xCD0000), c(0x00CD00), c(0xCDCD00),
+          c(0x0000EE), c(0xCD00CD), c(0x00CDCD), c(0xE5E5E5),
+          c(0x7F7F7F), c(0xFF0000), c(0x00FF00), c(0xFFFF00),
+          c(0x5C5CFF), c(0xFF00FF), c(0x00FFFF), c(0xFFFFFF) },
+        c(0xFFFFFF), c(0x000000), c(0xFFFFFF), c(0x3060A0),
+    });
+
     schemes.push_back({
         QStringLiteral("Campbell Powershell"),
         { c(0x0C0C0C), c(0xC50F1F), c(0x13A10E), c(0xC19C00),
