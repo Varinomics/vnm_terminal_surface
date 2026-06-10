@@ -66,7 +66,11 @@ constexpr const char* k_atlas_msdf_text_fragment_shader_path =
 constexpr int k_atlas_msdf_text_texture_size = 2048;
 constexpr double k_atlas_msdf_text_min_atlas_font_size = 48.0;
 constexpr float k_atlas_msdf_text_atlas_px_range = 10.0f;
-constexpr float k_atlas_msdf_text_sharpness_bias = 2.5f;
+// 1.0 is a one-device-pixel anti-aliasing ramp at every draw size (see
+// options_t::sharpness_bias). The previous 2.5 compensated for the shallow
+// font-dependent distance encode that msdf_text produced before it converted
+// atlas_px_range into msdfgen shape units.
+constexpr float k_atlas_msdf_text_sharpness_bias = 1.0f;
 #endif
 constexpr qreal k_no_wrap_text_line_width = 1024.0 * 1024.0;
 constexpr int k_atlas_stencil_mask = 0xff;
