@@ -27,6 +27,7 @@
 #include <QMetaObject>
 #include <QMouseEvent>
 #include <QPointer>
+#include <QThreadPool>
 #include <QQuickWindow>
 #include <QScreen>
 #include <QStringList>
@@ -2206,6 +2207,62 @@ void VNM_TerminalSurface::set_font_family(const QString& font_family)
     m_font_family = font_family;
     emit font_family_changed();
     refresh_grid_metrics();
+    start_msdf_availability_check();
+}
+
+bool VNM_TerminalSurface::msdf_text_available() const
+{
+    return m_msdf_text_available;
+}
+
+bool VNM_TerminalSurface::msdf_text_checking() const
+{
+    return m_msdf_text_checking;
+}
+
+void VNM_TerminalSurface::start_msdf_availability_check()
+{
+    // Bake the font's MSDF atlas on a worker thread to learn, truthfully,
+    // whether MSDF can render this font. Coverage is size-independent, so the
+    // family alone determines availability. A generation counter discards stale
+    // results when the font changes again before a check finishes.
+    const QFont font(m_font_family);
+    const unsigned long long generation = ++m_msdf_availability_generation;
+
+    if (!m_msdf_text_checking) {
+        m_msdf_text_checking = true;
+        emit msdf_text_checking_changed();
+    }
+
+    QPointer<VNM_TerminalSurface> self = this;
+    QThreadPool::globalInstance()->start([self, font, generation]() {
+        const bool available = term::qsg_atlas_msdf_text_available_for_font(font);
+        QMetaObject::invokeMethod(
+            qApp,
+            [self, available, generation]() {
+                if (self) {
+                    self->apply_msdf_availability_result(available, generation);
+                }
+            },
+            Qt::QueuedConnection);
+    });
+}
+
+void VNM_TerminalSurface::apply_msdf_availability_result(
+    bool available, unsigned long long generation)
+{
+    if (generation != m_msdf_availability_generation) {
+        return; // superseded by a newer font change
+    }
+
+    if (m_msdf_text_checking) {
+        m_msdf_text_checking = false;
+        emit msdf_text_checking_changed();
+    }
+    if (m_msdf_text_available != available) {
+        m_msdf_text_available = available;
+        emit msdf_text_available_changed();
+    }
 }
 
 qreal VNM_TerminalSurface::font_size() const
