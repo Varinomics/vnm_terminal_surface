@@ -90,22 +90,6 @@ constexpr unsigned int k_win_font_smoothing_orientation_bgr     = 0x0000U;
 constexpr unsigned int k_win_font_smoothing_orientation_rgb     = 0x0001U;
 #endif
 
-bool same_grid_size(term::terminal_grid_size_t left, term::terminal_grid_size_t right)
-{
-    return left.rows == right.rows && left.columns == right.columns;
-}
-
-bool same_viewport_mapping(
-    const term::Terminal_viewport_state&    left,
-    const term::Terminal_viewport_state&    right)
-{
-    return
-        left.active_buffer    == right.active_buffer    &&
-        left.visible_rows     == right.visible_rows     &&
-        left.scrollback_rows  == right.scrollback_rows  &&
-        left.offset_from_tail == right.offset_from_tail;
-}
-
 bool same_property_value(qreal lhs, qreal rhs)
 {
     return lhs == rhs || (std::isnan(lhs) && std::isnan(rhs));
@@ -541,7 +525,7 @@ bool selection_drag_sources_have_compatible_coordinates(
         left.session_epoch     == right.session_epoch            &&
         left.buffer_id         == right.buffer_id                &&
         left.grid_reflow_basis == right.grid_reflow_basis        &&
-        same_grid_size(left.grid_size, right.grid_size);
+        term::grid_sizes_match(left.grid_size, right.grid_size);
 }
 
 bool selection_drag_sources_have_same_content_generation(
@@ -559,8 +543,8 @@ bool selection_source_matches_snapshot(
     return
         source.buffer_id == snapshot.viewport.active_buffer     &&
         source.row_origin_generation == snapshot.metadata.row_origin_generation &&
-        same_grid_size(source.grid_size, snapshot.grid_size)    &&
-        same_viewport_mapping(source.viewport_mapping, snapshot.viewport);
+        term::grid_sizes_match(source.grid_size, snapshot.grid_size)    &&
+        term::viewport_mappings_match(source.viewport_mapping, snapshot.viewport);
 }
 
 void write_selection_trace(bool enabled, const QString& message)
@@ -706,7 +690,7 @@ QString selection_trace_drag_coordinate_mismatch_reason(
     if (left.grid_reflow_basis != right.grid_reflow_basis) {
         append_selection_trace_reason(reasons, QStringLiteral("grid-reflow"));
     }
-    if (!same_grid_size(left.grid_size, right.grid_size)) {
+    if (!term::grid_sizes_match(left.grid_size, right.grid_size)) {
         append_selection_trace_reason(reasons, QStringLiteral("grid-size"));
     }
     return reasons.isEmpty() ? QStringLiteral("none") : reasons;
@@ -730,10 +714,10 @@ QString selection_trace_source_snapshot_mismatch_reason(
     if (source->row_origin_generation != snapshot->metadata.row_origin_generation) {
         append_selection_trace_reason(reasons, QStringLiteral("row-origin"));
     }
-    if (!same_grid_size(source->grid_size, snapshot->grid_size)) {
+    if (!term::grid_sizes_match(source->grid_size, snapshot->grid_size)) {
         append_selection_trace_reason(reasons, QStringLiteral("grid-size"));
     }
-    if (!same_viewport_mapping(source->viewport_mapping, snapshot->viewport)) {
+    if (!term::viewport_mappings_match(source->viewport_mapping, snapshot->viewport)) {
         append_selection_trace_reason(reasons, QStringLiteral("viewport-mapping"));
     }
     return reasons.isEmpty() ? QStringLiteral("none") : reasons;
@@ -847,7 +831,7 @@ Selection_drag_content_validation_status validate_selection_drag_content_drift(
         return Selection_drag_content_validation_status::ACCEPTED;
     }
 
-    if (!same_grid_size(anchor_snapshot->grid_size, current_snapshot->grid_size)) {
+    if (!term::grid_sizes_match(anchor_snapshot->grid_size, current_snapshot->grid_size)) {
         return Selection_drag_content_validation_status::ROW_ORIGIN_CHANGED;
     }
 

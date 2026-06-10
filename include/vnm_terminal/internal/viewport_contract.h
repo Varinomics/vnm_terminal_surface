@@ -45,6 +45,20 @@ struct Terminal_viewport_state
         Terminal_alternate_screen_scroll_policy::KEEP_AT_TAIL;
 };
 
+// The mapping fields decide which logical rows the physical viewport rows
+// name; the remaining fields (follow_tail, alternate-screen scroll policy)
+// are scroll behavior, not row identity.
+inline bool viewport_mappings_match(
+    const Terminal_viewport_state& left,
+    const Terminal_viewport_state& right)
+{
+    return
+        left.active_buffer    == right.active_buffer    &&
+        left.visible_rows     == right.visible_rows     &&
+        left.scrollback_rows  == right.scrollback_rows  &&
+        left.offset_from_tail == right.offset_from_tail;
+}
+
 struct Terminal_viewport_result
 {
     Terminal_viewport_result_code code = Terminal_viewport_result_code::ACCEPTED;

@@ -8,11 +8,6 @@ namespace vnm_terminal::internal {
 
 namespace {
 
-bool same_grid_size(terminal_grid_size_t lhs, terminal_grid_size_t rhs)
-{
-    return lhs.rows == rhs.rows && lhs.columns == rhs.columns;
-}
-
 QString metrics_failure_message(Terminal_metrics_status status)
 {
     switch (status) {
@@ -101,7 +96,7 @@ Terminal_session_result Terminal_resize_controller::resize_or_refresh_from_geome
     if (m_session.process_state() == Terminal_process_state::RUNNING &&
         m_session.backend_ready() &&
         m_session.backend_geometry_in_sync() &&
-        same_grid_size(metrics_result.grid_size, m_session.grid_size()))
+        grid_sizes_match(metrics_result.grid_size, m_session.grid_size()))
     {
         return make_controller_accept();
     }
