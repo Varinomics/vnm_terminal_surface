@@ -852,20 +852,40 @@ struct Msdf_single_w_probe_result
     QRectF              draw_rect;
 };
 
-void capture_window_driver_info(
-    QQuickWindow&         window,
-    Pixel_render_result&  result)
+QRhi* window_rhi(QQuickWindow& window)
 {
     QSGRendererInterface* const renderer_interface =
         window.rendererInterface();
     if (renderer_interface == nullptr) {
-        return;
+        return nullptr;
     }
 
-    QRhi* const rhi = static_cast<QRhi*>(
+    return static_cast<QRhi*>(
         renderer_interface->getResource(
             &window,
             QSGRendererInterface::RhiResource));
+}
+
+// The renderer refuses MSDF text ownership on known software adapters (see
+// qsg_atlas_rhi_supports_msdf_text_ownership), so tests that assert on the
+// MSDF path must treat such adapters (e.g. the WARP D3D11 device on
+// GitHub-hosted Windows runners) as unsupported backends instead of failing.
+bool window_uses_known_software_adapter(QQuickWindow& window)
+{
+    QRhi* const rhi = window_rhi(window);
+    if (rhi == nullptr) {
+        return false;
+    }
+
+    return term::qsg_atlas_driver_info_is_known_software_renderer(
+        rhi->driverInfo());
+}
+
+void capture_window_driver_info(
+    QQuickWindow&         window,
+    Pixel_render_result&  result)
+{
+    QRhi* const rhi = window_rhi(window);
     if (rhi == nullptr) {
         return;
     }
@@ -9985,6 +10005,7 @@ struct Cursor_descender_capture
     term::terminal_cell_metrics_t metrics{};
     qreal                         dpr = 1.0;
     term::Qsg_atlas_frame_report  report;
+    bool                          software_adapter = false;
 };
 
 int render_cursor_descender_capture(
@@ -10060,9 +10081,10 @@ int render_cursor_descender_capture(
 
     out_capture.report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-    out_capture.image   = window.grabWindow();
-    out_capture.metrics = metrics;
-    out_capture.dpr     = dpr;
+    out_capture.image            = window.grabWindow();
+    out_capture.metrics          = metrics;
+    out_capture.dpr              = dpr;
+    out_capture.software_adapter = window_uses_known_software_adapter(window);
     return 0;
 }
 
@@ -10099,6 +10121,19 @@ int test_cursor_descender_clip(QGuiApplication& app, const char* backend)
         const QString prefix = QString::fromLocal8Bit(image_prefix);
         cursor_capture.image.save(prefix + QStringLiteral(".cursor.png"));
         plain_capture.image.save(prefix + QStringLiteral(".plain.png"));
+    }
+
+    // The renderer never grants MSDF text ownership to known software
+    // adapters, so on devices like the GitHub-hosted Windows runner's WARP
+    // D3D11 adapter the MSDF-dependent ink measurements below cannot run.
+    // Mirror the LCD capability probe and report the backend as unsupported.
+    // The skip is strictly adapter-based: on real hardware the msdf_text_runs
+    // assertion below stays hard, so a genuine MSDF regression still fails.
+    if (cursor_capture.software_adapter || plain_capture.software_adapter) {
+        std::cerr << "SKIP: cursor descender clip runs on a software "
+            << "adapter, where the MSDF text path stays inactive on "
+            << backend << '\n';
+        return k_unsupported_backend_skip_return_code;
     }
 
     bool ok = true;
