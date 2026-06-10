@@ -2419,12 +2419,21 @@ bool Terminal_screen_model::rows_have_same_selection_content(
     const std::vector<Cell>&   left,
     const std::vector<Cell>&   right) const
 {
-    if (left.size() != right.size()) {
-        return false;
+    const std::size_t common_size = std::min(left.size(), right.size());
+    for (std::size_t index = 0; index < common_size; ++index) {
+        if (!cells_have_same_selection_content(left[index], right[index])) {
+            return false;
+        }
     }
 
-    for (std::size_t index = 0; index < left.size(); ++index) {
-        if (!cells_have_same_selection_content(left[index], right[index])) {
+    // A grid resize pads or trims a row around the same written content.
+    // Compare the width overhang against the never-written default cell, so a
+    // resize that only adds or drops blank fill is not a content change: it
+    // must not advance the row generation or refresh the content stamp.
+    const std::vector<Cell>& longer = left.size() >= right.size() ? left : right;
+    const Cell never_written_cell;
+    for (std::size_t index = common_size; index < longer.size(); ++index) {
+        if (!cells_have_same_selection_content(longer[index], never_written_cell)) {
             return false;
         }
     }

@@ -7,6 +7,7 @@
 #include <QSizeF>
 #include <QString>
 #include <QtGlobal>
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -830,6 +831,88 @@ bool test_row_content_stamps_track_writes_and_survive_scrollback()
     return ok;
 }
 
+// Busy-waits across the next wall-clock millisecond boundary so a follow-up
+// write provably lands at a later stamp than `reference_ms`. Stamps have
+// millisecond resolution, so without this a write in the same millisecond
+// would be indistinguishable from the original one.
+qint64 wait_for_wall_clock_after_ms(qint64 reference_ms)
+{
+    qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
+    while (now_ms <= reference_ms) {
+        now_ms = QDateTime::currentMSecsSinceEpoch();
+    }
+    return now_ms;
+}
+
+qint64 active_row_stamp_ms(const term::Terminal_screen_model& model, int logical_row)
+{
+    return model.retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        logical_row).content_stamp_ms;
+}
+
+bool test_row_content_stamps_survive_grid_resize()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model({3, 8});
+    model.ingest(QByteArrayLiteral("one\r\ntwo"));
+    const qint64 first_stamp_ms  = active_row_stamp_ms(model, 0);
+    const qint64 second_stamp_ms = active_row_stamp_ms(model, 1);
+    ok &= check(first_stamp_ms > 0 && second_stamp_ms > 0,
+        "resize stamp fixture rows carry write stamps");
+
+    // Every step below first crosses a wall-clock millisecond boundary so an
+    // unwanted restamp cannot hide behind the original stamp value.
+    wait_for_wall_clock_after_ms(std::max(first_stamp_ms, second_stamp_ms));
+
+    // The stamp means "when this content arrived as terminal output". A
+    // same-width height change leaves every surviving row untouched.
+    model.resize({4, 8});
+    ok &= check(active_row_stamp_ms(model, 0) == first_stamp_ms &&
+        active_row_stamp_ms(model, 1) == second_stamp_ms,
+        "same-width height change keeps row content stamps");
+
+    // A width change pads or trims rows with never-written blank cells; the
+    // written content is unchanged, so the stamps must not refresh.
+    model.resize({4, 12});
+    ok &= check(active_row_stamp_ms(model, 0) == first_stamp_ms &&
+        active_row_stamp_ms(model, 1) == second_stamp_ms,
+        "width growth keeps row content stamps");
+
+    model.resize({4, 8});
+    ok &= check(active_row_stamp_ms(model, 0) == first_stamp_ms &&
+        active_row_stamp_ms(model, 1) == second_stamp_ms,
+        "blank-only width shrink keeps row content stamps");
+
+    // Rewriting rows with identical cells is not new output. This is the
+    // overwrite-style repaint a real ConPTY emits after every resize: hide
+    // cursor, home, per row the text followed by erase-to-end-of-line, then
+    // reposition and show the cursor.
+    model.ingest(QByteArrayLiteral(
+        "\x1b[?25l\x1b[Hone\x1b[K\r\ntwo\x1b[K\x1b[3;1H\x1b[?25h"));
+    ok &= check(active_row_stamp_ms(model, 0) == first_stamp_ms &&
+        active_row_stamp_ms(model, 1) == second_stamp_ms,
+        "resize-style repaint of identical cells keeps the row content stamps");
+
+    // Genuinely new output after the resizes gets a fresh stamp; neighbors
+    // keep theirs.
+    model.ingest(QByteArrayLiteral("\x1b[2;1HTWO"));
+    const qint64 rewritten_stamp_ms = active_row_stamp_ms(model, 1);
+    ok &= check(rewritten_stamp_ms > second_stamp_ms,
+        "new output after resize carries a fresh content stamp");
+    ok &= check(active_row_stamp_ms(model, 0) == first_stamp_ms,
+        "new output on one row leaves sibling row stamps untouched");
+
+    // A width shrink that truncates written cells is a real content change.
+    wait_for_wall_clock_after_ms(rewritten_stamp_ms);
+    model.resize({4, 2});
+    ok &= check(active_row_stamp_ms(model, 0) > first_stamp_ms,
+        "width shrink that truncates written cells refreshes the stamp");
+
+    return ok;
+}
+
 bool test_visible_line_provenance_validation()
 {
     bool ok = true;
@@ -1544,6 +1627,7 @@ int main()
     ok &= test_dirty_rows_are_viewport_relative();
     ok &= test_model_snapshots_publish_visible_line_provenance();
     ok &= test_row_content_stamps_track_writes_and_survive_scrollback();
+    ok &= test_row_content_stamps_survive_grid_resize();
     ok &= test_visible_line_provenance_validation();
     ok &= test_public_projection_scroll_snapshot_structural_validation();
     ok &= test_session_snapshot_handles_and_synchronized_release();
