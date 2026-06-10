@@ -293,22 +293,6 @@ std::optional<Terminal_render_snapshot> public_projection_scroll_snapshot_from_p
     return snapshot;
 }
 
-bool grid_sizes_match(terminal_grid_size_t left, terminal_grid_size_t right)
-{
-    return left.rows == right.rows && left.columns == right.columns;
-}
-
-bool viewport_mappings_match(
-    const Terminal_viewport_state& left,
-    const Terminal_viewport_state& right)
-{
-    return
-        left.active_buffer    == right.active_buffer    &&
-        left.visible_rows     == right.visible_rows     &&
-        left.scrollback_rows  == right.scrollback_rows  &&
-        left.offset_from_tail == right.offset_from_tail;
-}
-
 bool viewport_states_match(
     const Terminal_viewport_state& left,
     const Terminal_viewport_state& right)

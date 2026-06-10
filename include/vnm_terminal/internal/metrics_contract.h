@@ -41,6 +41,11 @@ struct terminal_grid_size_t
     int                        columns = 0;
 };
 
+inline bool grid_sizes_match(terminal_grid_size_t left, terminal_grid_size_t right)
+{
+    return left.rows == right.rows && left.columns == right.columns;
+}
+
 struct terminal_cell_metrics_t
 {
     qreal                      width   = 0.0;

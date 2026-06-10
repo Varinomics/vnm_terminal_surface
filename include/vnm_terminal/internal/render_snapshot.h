@@ -524,13 +524,9 @@ inline bool snapshots_share_row_identity_space(
     const Terminal_render_snapshot&    right)
 {
     return
-        left.grid_size.rows    == right.grid_size.rows                  &&
-        left.grid_size.columns == right.grid_size.columns               &&
+        grid_sizes_match(left.grid_size, right.grid_size)                           &&
         left.metadata.row_origin_generation == right.metadata.row_origin_generation &&
-        left.viewport.active_buffer    == right.viewport.active_buffer   &&
-        left.viewport.visible_rows     == right.viewport.visible_rows    &&
-        left.viewport.scrollback_rows  == right.viewport.scrollback_rows &&
-        left.viewport.offset_from_tail == right.viewport.offset_from_tail;
+        viewport_mappings_match(left.viewport, right.viewport);
 }
 
 inline void append_dirty_range_rows(

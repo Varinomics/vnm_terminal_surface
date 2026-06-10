@@ -59,11 +59,6 @@ terminal_history_handle_t projection_history_handle_from_provenance(
         provenance.content_generation);
 }
 
-bool grid_sizes_match(terminal_grid_size_t left, terminal_grid_size_t right)
-{
-    return left.rows == right.rows && left.columns == right.columns;
-}
-
 bool render_cells_match(
     const Terminal_render_cell& left,
     const Terminal_render_cell& right)
