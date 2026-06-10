@@ -9957,6 +9957,207 @@ int test_dense_grid_smoke(QGuiApplication& app, const char* backend)
     return ok ? 0 : 1;
 }
 
+term::Terminal_render_snapshot make_cursor_descender_snapshot(
+    std::uint64_t sequence,
+    bool          cursor_visible)
+{
+    term::Terminal_render_snapshot snapshot =
+        make_pixel_base_snapshot({2, 6}, sequence);
+    snapshot.color_state.default_foreground_rgba = 0xffffffffU;
+    snapshot.color_state.default_background_rgba = 0xff000000U;
+    snapshot.color_state.cursor_rgba             = 0xffffffffU;
+    snapshot.cells.push_back(make_pixel_cell(
+        0, 0, QStringLiteral("P"), 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(make_pixel_cell(
+        0, 1, QStringLiteral("Q"), 1, term::k_default_terminal_style_id));
+    snapshot.cells.push_back(make_pixel_cell(
+        0, 2, QStringLiteral("R"), 1, term::k_default_terminal_style_id));
+    snapshot.cursor.position      = {0, 1};
+    snapshot.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    snapshot.cursor.visible       = cursor_visible;
+    snapshot.cursor.blink_enabled = false;
+    return snapshot;
+}
+
+struct Cursor_descender_capture
+{
+    QImage                        image;
+    term::terminal_cell_metrics_t metrics{};
+    qreal                         dpr = 1.0;
+    term::Qsg_atlas_frame_report  report;
+};
+
+int render_cursor_descender_capture(
+    QGuiApplication&          app,
+    const char*               backend,
+    bool                      cursor_visible,
+    Cursor_descender_capture& out_capture)
+{
+    constexpr qreal k_font_size = 16.0;
+    const QColor    background(0, 0, 0);
+
+    QQuickWindow window;
+    window.setColor(background);
+    window.resize(320, 160);
+    window.show();
+    app.processEvents(QEventLoop::AllEvents, 50);
+    QThread::msleep(20);
+
+    const qreal dpr = std::max<qreal>(1.0, window.effectiveDevicePixelRatio());
+    const QString bundled_family =
+        term::vnm_terminal_default_monospace_font_family();
+    term::Qt_grid_metrics_provider provider(
+        term::vnm_terminal_font(bundled_family, k_font_size),
+        dpr);
+    const term::terminal_cell_metrics_t metrics = provider.cell_metrics();
+    const QSizeF logical_size(metrics.width * 6.0, metrics.height * 2.0);
+    window.resize(
+        static_cast<int>(std::ceil(logical_size.width())),
+        static_cast<int>(std::ceil(logical_size.height())));
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(logical_size);
+    surface.set_font_family(bundled_family);
+    surface.set_font_size(k_font_size);
+    surface.set_text_renderer_mode(
+        VNM_TerminalSurface::Text_renderer_mode::AUTO);
+    term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(
+        surface,
+        true);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_cursor_descender_snapshot(
+                cursor_visible ? 911U : 910U,
+                cursor_visible)));
+
+    const bool rendered = pump_until(
+        app,
+        window,
+        surface,
+        atlas_report_render_state_ready);
+    if (!rendered) {
+        std::cerr << "SKIP: cursor descender clip did not reach usable QRhi "
+            << "render state on " << backend << '\n';
+        return k_unsupported_backend_skip_return_code;
+    }
+
+    pump_until(
+        app,
+        window,
+        surface,
+        [](const term::Qsg_atlas_frame_report& report) {
+            return report.render.msdf_text_runs > 0;
+        },
+        60);
+    for (int extra = 0; extra < 6; ++extra) {
+        surface.update();
+        window.requestUpdate();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+    }
+
+    out_capture.report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    out_capture.image   = window.grabWindow();
+    out_capture.metrics = metrics;
+    out_capture.dpr     = dpr;
+    return 0;
+}
+
+// Regression coverage for the MSDF caret-clip displacement: the BLOCK caret
+// clips the Q quad at the cell bottom (descender plus SDF pad extend past
+// it), and a top-down UV crop on the V-flipped MSDF quad used to lift the
+// glyph image by the cropped amount. The caret Q ink must stay on the same
+// rows as the unobscured Q ink.
+int test_cursor_descender_clip(QGuiApplication& app, const char* backend)
+{
+    const int backend_status =
+        verify_requested_backend(app, backend, "cursor descender clip");
+    if (backend_status != 0) {
+        return backend_status;
+    }
+
+    Cursor_descender_capture cursor_capture;
+    const int cursor_status = render_cursor_descender_capture(
+        app, backend, /*cursor_visible=*/true, cursor_capture);
+    if (cursor_status != 0) {
+        return cursor_status;
+    }
+
+    Cursor_descender_capture plain_capture;
+    const int plain_status = render_cursor_descender_capture(
+        app, backend, /*cursor_visible=*/false, plain_capture);
+    if (plain_status != 0) {
+        return plain_status;
+    }
+
+    const QByteArray image_prefix =
+        qgetenv("VNM_TERMINAL_CURSOR_DESCENDER_IMAGE");
+    if (!image_prefix.isEmpty()) {
+        const QString prefix = QString::fromLocal8Bit(image_prefix);
+        cursor_capture.image.save(prefix + QStringLiteral(".cursor.png"));
+        plain_capture.image.save(prefix + QStringLiteral(".plain.png"));
+    }
+
+    bool ok = true;
+    ok &= check(!cursor_capture.image.isNull() && !plain_capture.image.isNull(),
+        "cursor descender clip captures both window images");
+    ok &= check(cursor_capture.report.render.msdf_text_runs > 0 &&
+            plain_capture.report.render.msdf_text_runs > 0,
+        "cursor descender clip renders text through the MSDF path");
+    if (!ok) {
+        return 1;
+    }
+
+    // Measure inside the caret cell, inset to stay clear of neighbor-cell
+    // antialiasing fringes and of edge blending on the caret block borders.
+    const QRectF q_cell_band = inset_rect(
+        pixel_cell_rect(0, 1, 1, cursor_capture.metrics), 2.0, 1.0);
+    const qreal dpr = cursor_capture.dpr;
+
+    // Under the BLOCK caret the Q is drawn background-on-cursor-fill; sample
+    // the fill from the band's ink-free top-left corner instead of assuming
+    // the exact cursor color.
+    const QRect band_pixels = logical_rect_to_pixels(q_cell_band, dpr)
+        .intersected(cursor_capture.image.rect());
+    const QColor cursor_fill =
+        cursor_capture.image.pixelColor(band_pixels.topLeft());
+    const QColor background(0, 0, 0);
+    ok &= check(pixel_delta(cursor_fill, background) > 64,
+        "cursor descender clip sees the block caret fill in the caret cell");
+
+    const Pixel_image_ink_stats cursor_ink = measure_image_ink(
+        cursor_capture.image, cursor_fill, q_cell_band, dpr);
+    const Pixel_image_ink_stats plain_ink = measure_image_ink(
+        plain_capture.image, background, q_cell_band, dpr);
+    ok &= check(cursor_ink.has_ink(),
+        "cursor descender clip finds dark Q ink inside the block caret");
+    ok &= check(plain_ink.has_ink(),
+        "cursor descender clip finds light Q ink without the caret");
+    if (!ok) {
+        return 1;
+    }
+
+    std::cerr << "cursor descender clip ink rows:"
+        << " caret_top=" << cursor_ink.bbox.top()
+        << " plain_top=" << plain_ink.bbox.top()
+        << " caret_bottom=" << cursor_ink.bbox.bottom()
+        << " plain_bottom=" << plain_ink.bbox.bottom()
+        << '\n';
+    constexpr int k_ink_row_tolerance_pixels = 1;
+    ok &= check(
+        std::abs(cursor_ink.bbox.top() - plain_ink.bbox.top()) <=
+            k_ink_row_tolerance_pixels,
+        "block caret keeps the clipped Q ink top row in place");
+    ok &= check(
+        std::abs(cursor_ink.bbox.bottom() - plain_ink.bbox.bottom()) <=
+            k_ink_row_tolerance_pixels,
+        "block caret keeps the clipped Q ink bottom row in place");
+    return ok ? 0 : 1;
+}
+
 term::Terminal_render_snapshot make_atlas_report_snapshot(std::uint64_t sequence)
 {
     term::Terminal_render_snapshot snapshot =
@@ -17942,10 +18143,12 @@ int main(int argc, char** argv)
     const bool lcd_capability_probe =
         has_argument(argc, argv, "--lcd-capability-probe");
     const bool host_state_smoke = has_argument(argc, argv, "--host-state-smoke");
+    const bool cursor_descender_smoke =
+        has_argument(argc, argv, "--cursor-descender-smoke");
     const char* backend = argument_value(argc, argv, "--backend", "d3d11");
     if (render_smoke || dense_grid_smoke || pixel_parity || layout_parity ||
         atlas_report || warm_lazy_smoke || lcd_capability_probe ||
-        host_state_smoke)
+        host_state_smoke || cursor_descender_smoke)
     {
         configure_graphics_api(backend);
     }
@@ -17953,6 +18156,9 @@ int main(int argc, char** argv)
     QGuiApplication app(argc, argv);
     if (dense_grid_smoke) {
         return test_dense_grid_smoke(app, backend);
+    }
+    if (cursor_descender_smoke) {
+        return test_cursor_descender_clip(app, backend);
     }
     if (atlas_report) {
         return test_atlas_report(app, backend);
