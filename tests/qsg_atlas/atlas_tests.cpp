@@ -15,6 +15,7 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QFont>
+#include <QFontDatabase>
 #include <QFontInfo>
 #include <QFontMetricsF>
 #include <QGuiApplication>
@@ -17787,16 +17788,39 @@ bool test_font_file_bytes_for_font()
             "bundled font bytes match the embedded resource");
     }
 
+    // An unknown family must resolve to nothing. The GDI resolver that
+    // DirectWrite replaced let the font mapper substitute Arial for any family
+    // it could not match, so MSDF baked a proportional font into monospace
+    // cells (user-visible with "OCR A", whose DirectWrite family name differs
+    // from its GDI face name "OCR A Extended").
+    const QFont unknown_font(QStringLiteral("VNM No Such Family"));
+    ok &= check(!term::font_file_bytes_for_font(unknown_font).has_value(),
+        "an unknown family resolves to no bytes instead of a substitute font");
+
     // An arbitrary installed family must resolve to a full sfnt blob that
-    // msdfgen accepts. Resolution of a non-bundled family is Windows-only today
-    // (GetFontData); on other platforms the producer returns nullopt and MSDF
-    // stays bundled-only, so only assert the build path where we can resolve.
+    // msdfgen accepts. Non-bundled resolution exists only on Windows
+    // (DirectWrite); the other platforms return nullopt and MSDF stays
+    // bundled-only there, so only assert the build path where we can resolve.
     const QFont system_font(QStringLiteral("Consolas"));
     const std::optional<QByteArray> system_bytes =
         term::font_file_bytes_for_font(system_font);
 #if defined(Q_OS_WIN)
-    ok &= check(system_bytes.has_value() && !system_bytes->isEmpty(),
-        "font_file_bytes_for_font resolves an installed system family");
+    // The producer must resolve bytes exactly when the platform font database
+    // renders the requested family. When the platform resolves the family to
+    // something else (the offscreen platform's database does not see installed
+    // system fonts), the producer must refuse: MSDF would otherwise bake a
+    // font the glyph path is not drawing.
+    const QRawFont system_rendered = QRawFont::fromFont(system_font);
+    const bool system_family_rendered = system_rendered.isValid() &&
+        system_rendered.familyName() == system_font.family();
+    if (system_family_rendered) {
+        ok &= check(system_bytes.has_value() && !system_bytes->isEmpty(),
+            "font_file_bytes_for_font resolves an installed system family");
+    }
+    else {
+        ok &= check(!system_bytes.has_value(),
+            "the producer refuses a family the platform is not rendering");
+    }
     if (system_bytes.has_value() && !system_bytes->isEmpty() &&
         bundled_bytes.has_value())
     {
@@ -17804,6 +17828,43 @@ bool test_font_file_bytes_for_font()
         // fingerprints, so their baked atlases never collide in the cache.
         ok &= check(*system_bytes != *bundled_bytes,
             "a non-bundled family resolves to bytes distinct from the bundled font");
+    }
+    if (system_bytes.has_value() && !system_bytes->isEmpty()) {
+        // The resolved blob must be the same physical font Qt's glyph path
+        // renders; a substituted file would bake one font while the glyph path
+        // draws another.
+        QRawFont resolved_raw;
+        resolved_raw.loadFromData(*system_bytes, 16.0, QFont::PreferDefaultHinting);
+        const QRawFont rendered_raw = QRawFont::fromFont(system_font);
+        ok &= check(resolved_raw.isValid() && rendered_raw.isValid() &&
+                resolved_raw.fontTable("head") == rendered_raw.fontTable("head"),
+            "resolved system-font bytes are the same physical font Qt renders");
+    }
+
+    // Families whose DirectWrite name differs from their GDI face name were
+    // the substitution victims; when such a family is installed and rendered
+    // (OCR A is the reported case), its bytes must resolve and be the rendered
+    // font's file.
+    const QString decomposed_family = QStringLiteral("OCR A");
+    if (QFontDatabase::families().contains(decomposed_family) &&
+        QRawFont::fromFont(QFont(decomposed_family)).familyName() ==
+            decomposed_family)
+    {
+        const QFont decomposed_font(decomposed_family);
+        const std::optional<QByteArray> decomposed_bytes =
+            term::font_file_bytes_for_font(decomposed_font);
+        ok &= check(decomposed_bytes.has_value() && !decomposed_bytes->isEmpty(),
+            "a DirectWrite-decomposed family name resolves to font bytes");
+        if (decomposed_bytes.has_value() && !decomposed_bytes->isEmpty()) {
+            QRawFont decomposed_raw;
+            decomposed_raw.loadFromData(
+                *decomposed_bytes, 16.0, QFont::PreferDefaultHinting);
+            const QRawFont decomposed_rendered = QRawFont::fromFont(decomposed_font);
+            ok &= check(decomposed_raw.isValid() && decomposed_rendered.isValid() &&
+                    decomposed_raw.fontTable("head") ==
+                        decomposed_rendered.fontTable("head"),
+                "decomposed-family bytes are the same physical font Qt renders");
+        }
     }
     if (system_bytes.has_value() && !system_bytes->isEmpty()) {
         // Build with an ASCII-core sample plus a powerline Private-Use glyph.
