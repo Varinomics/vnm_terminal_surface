@@ -30,6 +30,10 @@ the repository without reading every implementation detail.
   [Unicode width policy](unicode_width_policy.md).
 - Before changing Qt rendering dependencies or text rendering: read
   [Qt rendering policy](qt_rendering_policy.md).
+- Before changing snapshot producers, the frame builder, or dirty-row
+  handling: read [Render snapshot contract](render_snapshot_contract.md).
+- Before changing backend process hosting or lifecycle signals: read
+  [Backend lifecycle and signals](backend_lifecycle_and_signals.md).
 
 ## Reference Material
 
@@ -45,6 +49,15 @@ the repository without reading every implementation detail.
   public API, and Scene Graph constraints.
 - [Repository guide](repository_guide.md) records supported platforms, build
   options, fixture formats, generated artifacts, and operational entry points.
+- [Render snapshot contract](render_snapshot_contract.md) records the
+  validated shape of `Terminal_render_snapshot`: cell order, wide cells,
+  dirty-row semantics, basis/purpose, provenance, and lifetime.
+- [Backend lifecycle and signals](backend_lifecycle_and_signals.md) records
+  backend start/stop ordering, signal semantics, and process-group policy.
+- [Change-to-test matrix](change_to_test_matrix.md) maps subsystems to the
+  test suites that gate changes to them.
+- [Diagnostics schema](diagnostics_schema.md) records the diagnostics
+  field-descriptor schema shared by the JSON and profile-text serializers.
 
 ## Maintenance Rule
 
