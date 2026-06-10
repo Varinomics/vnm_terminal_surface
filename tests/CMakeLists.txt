@@ -624,7 +624,6 @@ add_executable(vnm_terminal_diagnostics_schema_sync
 )
 
 target_include_directories(vnm_terminal_diagnostics_schema_sync PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}"
     "${CMAKE_SOURCE_DIR}/src"
 )
 
@@ -1779,6 +1778,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_qt_metrics
     vnm_terminal_profile_text
     vnm_terminal_diagnostics_text_layout
+    vnm_terminal_diagnostics_schema_sync
     vnm_terminal_render_cell_text
     vnm_terminal_render_snapshot
     vnm_terminal_render_frame
