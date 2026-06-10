@@ -23,10 +23,12 @@ stale-hold recovery path.
 `Terminal_session` does not publish render snapshots while the model holds
 (`src/terminal_session.cpp`; the publication predicate checks
 `mode_state().synchronized_output`). The session also scans incoming backend
-bytes for the next mode 2026 set/reset sequence
-(`next_synchronized_output_set_sequence` /
-`next_synchronized_output_reset_sequence`) so command processing chunks at
-hold boundaries, and it latches the scroll policy when a hold begins
+bytes for mode 2026 boundaries so command processing chunks at them: the next
+set sequence is scanned unconditionally
+(`next_synchronized_output_set_sequence`), and the next reset sequence is
+scanned only while a hold is active under the immediate-public-projection
+policy (`next_synchronized_output_reset_sequence`). The session latches the
+scroll policy when a hold begins
 (`latch_synchronized_output_scroll_policy_for_new_hold`).
 
 ## Scroll Policies During A Hold

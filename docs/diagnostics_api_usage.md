@@ -4,7 +4,8 @@ This document describes how a host application consumes the public
 diagnostics and font/metrics APIs without touching `internal/` headers. The
 installed public header set is `vnm_terminal/vnm_terminal_surface.h`,
 `vnm_terminal/font_metrics.h`, and the `vnm_terminal/diagnostics/` subtree;
-`tests/package_smoke` hard-fails if anything else reaches the install tree
+`tests/package_smoke` hard-fails if an `internal/` header reaches the
+exported include directories and asserts the public headers are present
 (see "Internal Headers And Privileged First-Party Consumers" in
 `public_surface.md`).
 
@@ -36,8 +37,8 @@ installed public header set is `vnm_terminal/vnm_terminal_surface.h`,
 
 The caller owns the surrounding document and chooses the enclosing keys; the
 first-party app nests these under `"renderer"` and `"qsg_atlas"` in its
-runtime metrics document. The key sets and their units, scopes, and stability
-classes are recorded in `diagnostics_schema.md`; the structural expectations
+runtime metrics document. The key sets and their units and stability classes
+are recorded in `diagnostics_schema.md`; the structural expectations
 are pinned by the app's `metrics_json_smoke` test.
 
 Frame counters pair with the serialized metrics for host-level framing (FPS,
