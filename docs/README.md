@@ -58,6 +58,9 @@ the repository without reading every implementation detail.
   test suites that gate changes to them.
 - [Diagnostics schema](diagnostics_schema.md) records the diagnostics
   field-descriptor schema shared by the JSON and profile-text serializers.
+- [Diagnostics API usage](diagnostics_api_usage.md) records how a host
+  consumes the public diagnostics serializers, toggles, and font/cell-metrics
+  helpers, including stability tiers and runtime preconditions.
 
 ## Maintenance Rule
 
