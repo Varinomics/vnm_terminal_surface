@@ -6,6 +6,7 @@
 
 #include <QClipboard>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QEventLoop>
 #include <QFontMetricsF>
 #include <QGuiApplication>
@@ -337,6 +338,18 @@ bool pump_until(QGuiApplication& app, Predicate predicate, int rounds = 20)
     }
 
     return predicate();
+}
+
+// Keep the event loop alive for a wall-clock duration. Negative checks on the
+// hover-idle tooltip timer need real elapsed time, not a round count, because
+// processEvents returns immediately when the queue is empty.
+void pump_for(QGuiApplication& app, int duration_ms)
+{
+    const qint64 deadline_ms = QDateTime::currentMSecsSinceEpoch() + duration_ms;
+    while (QDateTime::currentMSecsSinceEpoch() < deadline_ms) {
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(10);
+    }
 }
 
 bool window_render_matches(
@@ -4968,6 +4981,162 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
         ok &= check(backend_ptr->writes.size() == wheel_index,
             "wheel reporting does not use hidden synchronized-output mouse mode");
     }
+
+    return ok;
+}
+
+bool test_row_timestamp_tooltip_signal_contract(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    ok &= check(fixture.surface.row_timestamp_tooltip_enabled(),
+        "row timestamp tooltip is enabled by default");
+
+    int       requested_count     = 0;
+    int       dismissed_count     = 0;
+    int       enabled_change_count = 0;
+    qreal     requested_x         = -1.0;
+    qreal     requested_y         = -1.0;
+    QDateTime requested_timestamp;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::row_timestamp_tooltip_requested,
+        &fixture.surface,
+        [&](qreal x, qreal y, const QDateTime& timestamp) {
+            ++requested_count;
+            requested_x         = x;
+            requested_y         = y;
+            requested_timestamp = timestamp;
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::row_timestamp_tooltip_dismissed,
+        &fixture.surface,
+        [&dismissed_count] {
+            ++dismissed_count;
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::row_timestamp_tooltip_enabled_changed,
+        &fixture.surface,
+        [&enabled_change_count] {
+            ++enabled_change_count;
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("stamped output")};
+
+    const qint64 before_output_ms = QDateTime::currentMSecsSinceEpoch();
+    bool started = false;
+    start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "row timestamp tooltip fixture starts scripted backend");
+    pump_events(app);
+
+    const QPointF stamped_point = point_in_grid_cell(fixture.surface, 0, 2);
+    ok &= send_hover_move(fixture.surface, stamped_point, Qt::NoModifier, false,
+        "hover move over the stamped row is not consumed");
+    ok &= check(
+        pump_until(app, [&requested_count] { return requested_count == 1; }, 300),
+        "hover idle over a stamped row requests the timestamp tooltip");
+    const qint64 after_request_ms = QDateTime::currentMSecsSinceEpoch();
+    ok &= check(dismissed_count == 0,
+        "tooltip request alone emits no dismissal");
+    ok &= check(
+        nearly_equal(requested_x, stamped_point.x()) &&
+        nearly_equal(requested_y, stamped_point.y()),
+        "tooltip request reports the resting pointer position");
+    ok &= check(
+        requested_timestamp.isValid()                              &&
+        requested_timestamp.toMSecsSinceEpoch() >= before_output_ms &&
+        requested_timestamp.toMSecsSinceEpoch() <= after_request_ms,
+        "tooltip request carries the row's output wall-clock timestamp");
+
+    // The dismissal must arrive synchronously with the next pointer motion,
+    // and a press must both stay silent (nothing shown anymore) and stop the
+    // re-armed idle timer.
+    ok &= send_hover_move(
+        fixture.surface,
+        point_in_grid_cell(fixture.surface, 0, 3),
+        Qt::NoModifier,
+        false,
+        "hover move after a shown tooltip is not consumed");
+    ok &= check(dismissed_count == 1,
+        "pointer motion dismisses the shown tooltip");
+    {
+        const QPointF press_point = point_in_grid_cell(fixture.surface, 0, 3);
+        QMouseEvent press(
+            QEvent::MouseButtonPress,
+            press_point, press_point, press_point,
+            Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(&fixture.surface, &press);
+        QMouseEvent release(
+            QEvent::MouseButtonRelease,
+            press_point, press_point, press_point,
+            Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QCoreApplication::sendEvent(&fixture.surface, &release);
+    }
+    ok &= check(dismissed_count == 1,
+        "press and release after a dismissal stay silent");
+    pump_for(app, 1300);
+    ok &= check(requested_count == 1,
+        "press cancels the re-armed hover idle timer");
+
+    ok &= send_hover_move(
+        fixture.surface,
+        point_in_grid_cell(fixture.surface, 3, 2),
+        Qt::NoModifier,
+        false,
+        "hover move over a blank row is not consumed");
+    pump_for(app, 1300);
+    ok &= check(requested_count == 1,
+        "hover idle over a never-written row requests no tooltip");
+
+    ok &= send_hover_move(fixture.surface, stamped_point, Qt::NoModifier, false,
+        "hover move back to the stamped row is not consumed");
+    ok &= check(
+        pump_until(app, [&requested_count] { return requested_count == 2; }, 300),
+        "hover idle re-requests the tooltip after activity");
+    {
+        QWheelEvent wheel(
+            stamped_point,
+            stamped_point,
+            QPoint(0, 0),
+            QPoint(0, -120),
+            Qt::NoButton,
+            Qt::NoModifier,
+            Qt::NoScrollPhase,
+            false);
+        QCoreApplication::sendEvent(&fixture.surface, &wheel);
+    }
+    ok &= check(dismissed_count == 2,
+        "wheel input dismisses the shown tooltip");
+
+    ok &= send_hover_move(fixture.surface, stamped_point, Qt::NoModifier, false,
+        "hover move before disabling the tooltip is not consumed");
+    ok &= check(
+        pump_until(app, [&requested_count] { return requested_count == 3; }, 300),
+        "hover idle requests the tooltip before the property turns off");
+    fixture.surface.set_row_timestamp_tooltip_enabled(false);
+    ok &= check(dismissed_count == 3 && enabled_change_count == 1,
+        "disabling the property dismisses the shown tooltip and notifies");
+    ok &= check(!fixture.surface.row_timestamp_tooltip_enabled(),
+        "property reads back as disabled");
+
+    ok &= send_hover_move(fixture.surface, stamped_point, Qt::NoModifier, false,
+        "hover move while disabled is not consumed");
+    pump_for(app, 1300);
+    ok &= check(requested_count == 3,
+        "hover idle requests no tooltip while disabled");
+
+    fixture.surface.set_row_timestamp_tooltip_enabled(true);
+    ok &= check(enabled_change_count == 2 && dismissed_count == 3,
+        "re-enabling notifies without a spurious dismissal");
 
     return ok;
 }
@@ -11576,6 +11745,7 @@ int main(int argc, char** argv)
     ok &= test_mid_hold_policy_flip_keeps_text_area_wheel_boundary_input(app);
     ok &= test_transcript_timing_diagnostics_records_hot_paths();
     ok &= test_mouse_reporting_surface_events(app);
+    ok &= test_row_timestamp_tooltip_signal_contract(app);
     ok &= test_selection_drag_and_selected_text(app);
     ok &= test_selection_visual_detach_after_row_mutation(app);
     ok &= test_selection_drag_remaps_live_scrollback_viewport_spans(app);

@@ -10,6 +10,7 @@
 
 #include <QByteArray>
 #include <QChar>
+#include <QDateTime>
 #include <QStringList>
 #include <algorithm>
 #include <array>
@@ -2594,6 +2595,10 @@ void Terminal_screen_model::advance_row_content_generation_with_change_flag(
     }
 
     ++row.retained_line_provenance.content_generation;
+    // Every content mutation funnels through this generation advance, so this
+    // is the single place that records when the line last changed for the
+    // row-timestamp tooltip.
+    row.retained_line_provenance.content_stamp_ms = QDateTime::currentMSecsSinceEpoch();
 }
 
 std::vector<bool> Terminal_screen_model::default_tab_stops(int column_count) const

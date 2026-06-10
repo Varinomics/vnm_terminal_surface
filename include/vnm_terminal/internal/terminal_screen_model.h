@@ -81,6 +81,11 @@ struct Terminal_retained_line_provenance
     std::uint64_t                            content_generation = 0U;
     Terminal_retained_line_provenance_source source =
         Terminal_retained_line_provenance_source::TERMINAL_STORAGE;
+    // Wall-clock time of the last content change (ms since epoch). Zero means
+    // the line was never written, so hosts can distinguish real output from
+    // blank fill. Stamped wherever content_generation advances and reset with
+    // the retained-line identity, so it travels with the line into scrollback.
+    qint64                                   content_stamp_ms   = 0;
 };
 
 enum class Terminal_retained_row_style_lifetime

@@ -15,9 +15,9 @@ namespace {
 
 using vnm_terminal::test_helpers::check;
 
-constexpr std::size_t k_test_row_record_cell_count_offset = 92U;
-constexpr std::size_t k_test_row_record_hyperlink_count_offset = 96U;
-constexpr std::size_t k_test_row_record_cell_hyperlink_offset = 108U + 16U;
+constexpr std::size_t k_test_row_record_cell_count_offset = 100U;
+constexpr std::size_t k_test_row_record_hyperlink_count_offset = 104U;
+constexpr std::size_t k_test_row_record_cell_hyperlink_offset = 116U + 16U;
 
 void write_le_u32(
     std::vector<std::byte>& bytes,
@@ -456,7 +456,11 @@ bool test_materialized_decode_owns_data_after_read_scope_and_eviction()
 {
     bool ok = true;
 
-    term::Terminal_history_ring ring({2048U, 2048U});
+    // The capacity bounds the largest admissible record at capacity / 8; the
+    // 116-byte row-record header plus this fixture's cell and hyperlink
+    // payload needs a 288-byte record budget, while twelve filler rows must
+    // still overrun the ring so the original record is evicted.
+    term::Terminal_history_ring ring({2304U, 2304U});
     ok &= check(ring.status() == term::Terminal_history_ring_status::OK,
         "Phase 4B bounded ownership fixture ring initializes");
 

@@ -356,6 +356,11 @@ struct Terminal_render_line_provenance
     std::int64_t               logical_row        = 0;
     std::uint64_t              retained_line_id   = 0U;
     std::uint64_t              content_generation = 0U;
+    // Wall-clock time of the last content change (ms since epoch); zero means
+    // the line was never written. Not part of row identity: the stamp only
+    // moves when content_generation advances, so equality stays decided by the
+    // generation and the field rides along for GUI-thread timestamp lookups.
+    qint64                     content_stamp_ms   = 0;
 };
 
 struct Terminal_render_selection_request

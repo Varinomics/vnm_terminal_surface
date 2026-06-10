@@ -258,6 +258,7 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                         static_cast<std::int64_t>(logical_row),
                         provenance->retained_line_id,
                         provenance->content_generation,
+                        provenance->content_stamp_ms,
                     });
                 }
             }

@@ -2,6 +2,7 @@
 
 #include <QQuickItem>
 #include <QByteArray>
+#include <QDateTime>
 #include <QString>
 #include <QStringList>
 #include <QVariant>
@@ -73,6 +74,9 @@ class VNM_TerminalSurface : public QQuickItem
     Q_PROPERTY(Bell_policy visualBellPolicy
         READ visual_bell_policy WRITE set_visual_bell_policy
         NOTIFY visual_bell_policy_changed)
+    Q_PROPERTY(bool rowTimestampTooltipEnabled
+        READ row_timestamp_tooltip_enabled WRITE set_row_timestamp_tooltip_enabled
+        NOTIFY row_timestamp_tooltip_enabled_changed)
     Q_PROPERTY(Text_renderer_mode textRendererMode
         READ text_renderer_mode WRITE set_text_renderer_mode
         NOTIFY text_renderer_mode_changed)
@@ -363,6 +367,9 @@ public:
     Bell_policy visual_bell_policy() const;
     void set_visual_bell_policy(Bell_policy policy);
 
+    bool row_timestamp_tooltip_enabled() const;
+    void set_row_timestamp_tooltip_enabled(bool enabled);
+
     Text_renderer_mode text_renderer_mode() const;
     void set_text_renderer_mode(Text_renderer_mode mode);
 
@@ -448,6 +455,7 @@ signals:
     void bracketed_paste_policy_changed();
     void audible_bell_policy_changed();
     void visual_bell_policy_changed();
+    void row_timestamp_tooltip_enabled_changed();
     void text_renderer_mode_changed();
     void msdf_text_available_changed();
     void msdf_text_checking_changed();
@@ -477,6 +485,17 @@ signals:
         QString                target_selection,
         QByteArray             payload);
 
+    // Hover-idle row timestamp tooltip contract: requested fires after the
+    // pointer rests over a stamped row, dismissed fires once per shown tooltip
+    // on the first subsequent pointer activity, viewport scroll, or disable.
+    // x and y are the pointer position in item coordinates so the host can
+    // place the tooltip.
+    void row_timestamp_tooltip_requested(
+        qreal                  x,
+        qreal                  y,
+        QDateTime              timestamp);
+    void row_timestamp_tooltip_dismissed();
+
 private:
     friend class vnm_terminal::internal::VNM_TerminalSurface_render_bridge;
 
@@ -487,6 +506,7 @@ private:
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void hoverMoveEvent(QHoverEvent* event) override;
+    void hoverLeaveEvent(QHoverEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
     void inputMethodEvent(QInputMethodEvent* event) override;
     void geometryChange(const QRectF& new_geometry, const QRectF& old_geometry) override;
@@ -553,6 +573,8 @@ private:
     void reset_session();
     bool copy_selected_text_to_clipboard();
     void set_selection_state(Selection_state state);
+    void dismiss_row_timestamp_tooltip();
+    void handle_row_timestamp_tooltip_timeout();
 
     QString                  m_font_family;
     qreal                    m_font_size                            = 13.0;
@@ -586,6 +608,7 @@ private:
         Bracketed_paste_policy::APPLICATION_CONTROLLED;
     Bell_policy              m_audible_bell_policy       = Bell_policy::ENABLED;
     Bell_policy              m_visual_bell_policy        = Bell_policy::ENABLED;
+    bool                     m_row_timestamp_tooltip_enabled = true;
     Text_renderer_mode       m_text_renderer_mode        = Text_renderer_mode::AUTO;
     Lcd_subpixel_order       m_lcd_subpixel_order        = Lcd_subpixel_order::AUTO;
     bool                     m_msdf_text_available       = true;
