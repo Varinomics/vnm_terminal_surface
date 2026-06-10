@@ -7299,6 +7299,41 @@ QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font)
     return layout_font;
 }
 
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+// Whether the MSDF text renderer can actually render `font`: its sfnt bytes
+// resolve and msdfgen bakes a ready atlas covering the printable-ASCII core.
+// Pure CPU and thread-safe, so it can run on a worker thread to drive a truthful
+// "MSDF available for this font" signal without blocking the GUI. Coverage is
+// size-independent, so a single representative bake height answers it.
+bool qsg_atlas_msdf_text_available_for_font(const QFont& font)
+{
+    const std::optional<QByteArray> bytes = font_file_bytes_for_font(font);
+    if (!bytes.has_value() || bytes->isEmpty()) {
+        return false;
+    }
+
+    const msdf_text::options_t options = atlas_msdf_text_options();
+    const int baked_pixel_height = msdf_text::msdf_bake_pixel_height(
+        static_cast<int>(k_atlas_msdf_text_min_atlas_font_size), options);
+    const std::vector<char32_t>& codepoints = atlas_msdf_text_codepoints();
+    const msdf_text::build_result_t build = msdf_text::build_font_atlas(
+        reinterpret_cast<const std::uint8_t*>(bytes->constData()),
+        static_cast<std::size_t>(bytes->size()),
+        baked_pixel_height,
+        std::span<const char32_t>(codepoints.data(), codepoints.size()),
+        options);
+    if (build.status == msdf_text::Build_status::FAILURE) {
+        return false;
+    }
+    return atlas_msdf_text_atlas_has_supported_codepoints(build.atlas, nullptr);
+}
+#else
+bool qsg_atlas_msdf_text_available_for_font(const QFont&)
+{
+    return false;
+}
+#endif
+
 QString qsg_atlas_face_id_for_raw_font(const QRawFont& raw_font)
 {
     const QByteArray name_table = raw_font.fontTable("name");

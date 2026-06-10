@@ -790,6 +790,11 @@ const char* qsg_atlas_lcd_subpixel_order_name(
 
 QFont qsg_atlas_cell_stable_ascii_layout_font(const QFont& font);
 
+// True when the MSDF text renderer can actually render the given font (its bytes
+// resolve and a ready atlas bakes). Thread-safe; used to gate the MSDF option in
+// the UI so it is never offered for a font MSDF cannot render.
+bool qsg_atlas_msdf_text_available_for_font(const QFont& font);
+
 QString qsg_atlas_face_id_for_raw_font(const QRawFont& raw_font);
 
 qreal qsg_atlas_physical_pixel_size(

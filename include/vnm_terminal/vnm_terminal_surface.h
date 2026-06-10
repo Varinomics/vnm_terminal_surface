@@ -79,6 +79,10 @@ class VNM_TerminalSurface : public QQuickItem
     Q_PROPERTY(Lcd_subpixel_order lcdSubpixelOrder
         READ lcd_subpixel_order WRITE set_lcd_subpixel_order
         NOTIFY lcd_subpixel_order_changed)
+    Q_PROPERTY(bool msdfTextAvailable
+        READ msdf_text_available NOTIFY msdf_text_available_changed)
+    Q_PROPERTY(bool msdfTextChecking
+        READ msdf_text_checking NOTIFY msdf_text_checking_changed)
     Q_PROPERTY(QString terminalTitle READ terminal_title NOTIFY terminal_title_changed)
     Q_PROPERTY(QString terminalIconName
         READ terminal_icon_name NOTIFY terminal_icon_name_changed)
@@ -362,6 +366,9 @@ public:
     Text_renderer_mode text_renderer_mode() const;
     void set_text_renderer_mode(Text_renderer_mode mode);
 
+    bool msdf_text_available() const;
+    bool msdf_text_checking() const;
+
     Lcd_subpixel_order lcd_subpixel_order() const;
     void set_lcd_subpixel_order(Lcd_subpixel_order order);
 
@@ -442,6 +449,8 @@ signals:
     void audible_bell_policy_changed();
     void visual_bell_policy_changed();
     void text_renderer_mode_changed();
+    void msdf_text_available_changed();
+    void msdf_text_checking_changed();
     void lcd_subpixel_order_changed();
     void terminal_title_changed();
     void terminal_icon_name_changed();
@@ -579,6 +588,11 @@ private:
     Bell_policy              m_visual_bell_policy        = Bell_policy::ENABLED;
     Text_renderer_mode       m_text_renderer_mode        = Text_renderer_mode::AUTO;
     Lcd_subpixel_order       m_lcd_subpixel_order        = Lcd_subpixel_order::AUTO;
+    bool                     m_msdf_text_available       = true;
+    bool                     m_msdf_text_checking        = false;
+    unsigned long long       m_msdf_availability_generation = 0;
+    void start_msdf_availability_check();
+    void apply_msdf_availability_result(bool available, unsigned long long generation);
     QString                  m_terminal_title;
     QString                  m_terminal_icon_name;
     Process_state            m_process_state             = Process_state::NOT_STARTED;
