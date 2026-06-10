@@ -2124,6 +2124,10 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
 {
     m_font_family = term::vnm_terminal_default_monospace_font_family();
     m_font_size = term::k_vnm_terminal_default_font_pixel_size;
+    // The header default claims MSDF optimistically; start from the compiled
+    // truth so a build without the MSDF renderer never reports it available.
+    // The first set_font_family() refines this with the per-font async check.
+    m_msdf_text_available = term::k_qsg_atlas_msdf_text_renderer_compiled;
     setFlag(ItemHasContents,        true);
     setFlag(ItemAcceptsInputMethod, true);
     setClip(true);

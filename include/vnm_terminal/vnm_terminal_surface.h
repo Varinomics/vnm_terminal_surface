@@ -488,6 +488,8 @@ signals:
     // Hover-idle row timestamp tooltip contract: requested fires after the
     // pointer rests over a stamped row, dismissed fires once per shown tooltip
     // on the first subsequent pointer activity, viewport scroll, or disable.
+    // The timestamp is the wall-clock time the row's content last changed,
+    // not when the line first appeared; never-written rows request nothing.
     // x and y are the pointer position in item coordinates so the host can
     // place the tooltip.
     void row_timestamp_tooltip_requested(
