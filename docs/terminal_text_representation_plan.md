@@ -9,6 +9,12 @@ The intent is not to replace `QString` globally. The intent is to make
 APIs, and to keep common terminal text in cheaper internal forms for as long as
 possible.
 
+## Status (2026-06-10)
+
+Stage 1 (churn instrumentation) landed on 2026-06-03 (commit 7456d53). The
+decision-gate measurements have not been run or recorded yet; Stages 2-6 are
+unstarted and remain conditional on that evidence.
+
 ## Goals
 
 - Reduce `QString` copy/refcount traffic, text-object footprint, UTF-16
@@ -151,7 +157,7 @@ must materialize or retain `QString`.
 
 ## Migration Stages
 
-### Stage 1: Instrument Text Churn
+### Stage 1: Instrument Text Churn (completed 2026-06-03, commit 7456d53)
 
 Add focused counters before changing storage:
 
