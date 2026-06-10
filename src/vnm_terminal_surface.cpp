@@ -541,9 +541,9 @@ bool selection_source_matches_snapshot(
     const term::Terminal_render_snapshot&             snapshot)
 {
     return
-        source.buffer_id == snapshot.viewport.active_buffer     &&
+        source.buffer_id == snapshot.viewport.active_buffer &&
         source.row_origin_generation == snapshot.metadata.row_origin_generation &&
-        term::grid_sizes_match(source.grid_size, snapshot.grid_size)    &&
+        term::grid_sizes_match(source.grid_size, snapshot.grid_size) &&
         term::viewport_mappings_match(source.viewport_mapping, snapshot.viewport);
 }
 
