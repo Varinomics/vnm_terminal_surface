@@ -2,11 +2,31 @@
 
 [![CI Linux](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-linux.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-linux.yml) [![CI Windows](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-windows.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-windows.yml) [![CI macOS](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-macos.yml/badge.svg?branch=master)](https://github.com/Varinomics/vnm_terminal_surface/actions/workflows/ci-macos.yml)
 
-`vnm_terminal_surface` is the home of the Qt Quick terminal surface used to embed
-interactive PTY and ConPTY-backed command-line applications in Varinomics
-products.
+`vnm_terminal_surface` is a BSD-licensed Qt Quick terminal component. It embeds
+a real interactive terminal, backed by a ConPTY (Windows) or PTY (Linux, macOS)
+child process, in a Qt Quick application as a single C++ `QQuickItem`:
+`VNM_TerminalSurface`. It was built for and ships in Varinomics products, and
+the same component is usable by any Qt Quick host.
 
-The primary visual component is `VNM_TerminalSurface`, a C++ `QQuickItem`.
+## Highlights
+
+- Real terminal behavior, not a log viewer: alternate screen, cursor
+  addressing, scrollback, keyboard and mouse reporting modes, bracketed paste,
+  selection, clipboard policy, and terminal replies.
+- Native process hosting per platform: ConPTY on Windows and PTY on Linux and
+  macOS, with resize propagation and process lifecycle signals.
+- GPU text rendering through the Qt Scene Graph: a glyph-atlas render node
+  with MSDF and glyph raster paths and LCD subpixel modes.
+- A documented public API (`docs/public_surface.md`), typed scroll
+  diagnostics, and a public diagnostics serialization API.
+- Continuously tested on Windows, Linux, and macOS: contract, model, backend,
+  renderer, conformance, randomized-parser, and lifecycle test families.
+
+## Requirements
+
+- Qt 6.7 or newer
+- A C++20 compiler
+- CMake 3.21 or newer
 
 ## Start Here
 
@@ -60,3 +80,7 @@ command for the selected generator.
 
 Use the [repository guide](docs/repository_guide.md) for test families,
 conformance controls, benchmarks, and focused validation commands.
+
+## License
+
+BSD 2-Clause. See [LICENSE](LICENSE).
