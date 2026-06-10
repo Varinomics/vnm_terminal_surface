@@ -2075,7 +2075,7 @@ struct VNM_TerminalSurface::Private
     QString                                                warmed_prompt_text_layout_font_key;
     QTimer                                                 synchronized_output_recovery_timer;
     QTimer                                                 row_timestamp_tooltip_timer;
-    QPointF                                                row_timestamp_tooltip_pointer_position;
+    std::optional<QPointF>                                 row_timestamp_tooltip_pointer_position;
     bool                                                   row_timestamp_tooltip_request_active  = false;
     bool                                                   selection_drag_active                 = false;
     bool                                                   selection_drag_moved                  = false;
@@ -2784,9 +2784,29 @@ void VNM_TerminalSurface::dismiss_row_timestamp_tooltip()
     emit row_timestamp_tooltip_dismissed();
 }
 
+bool VNM_TerminalSurface::row_timestamp_tooltip_pointer_moved(const QPointF& position)
+{
+    // Records the pointer position and reports whether it moved at least one
+    // logical pixel. Qt Quick re-delivers pointer-move events at the unchanged
+    // cursor position whenever scene content changes under a stationary
+    // pointer, and the tooltip appearing in the host's chrome is exactly such
+    // a change, so a same-position event is not user activity: it must neither
+    // dismiss a shown tooltip nor restart the hover-idle timer.
+    std::optional<QPointF>& last_position =
+        m_private->row_timestamp_tooltip_pointer_position;
+    if (last_position.has_value() &&
+        (position - *last_position).manhattanLength() < 1.0)
+    {
+        return false;
+    }
+
+    last_position = position;
+    return true;
+}
+
 void VNM_TerminalSurface::handle_row_timestamp_tooltip_timeout()
 {
-    const QPointF pointer_position = m_private->row_timestamp_tooltip_pointer_position;
+    const QPointF pointer_position = *m_private->row_timestamp_tooltip_pointer_position;
     const std::optional<term::terminal_grid_position_t> position =
         grid_position_for_local_point(
             m_private->render_snapshot,
@@ -3739,7 +3759,11 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
     event->ignore();
-    dismiss_row_timestamp_tooltip();
+    // Same positional guard as hover moves: a move event repeated at an
+    // unchanged position is not user motion and must not dismiss.
+    if (row_timestamp_tooltip_pointer_moved(event->position())) {
+        dismiss_row_timestamp_tooltip();
+    }
     drain_backend_callback_events();
 
     const std::optional<term::terminal_grid_position_t> position = grid_position_for_local_point(
@@ -4369,13 +4393,16 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
     event->ignore();
-    // Any pointer motion hides a shown tooltip; a fresh idle period over the
-    // new position re-requests it. This runs before the mouse-reporting early
-    // returns below so the tooltip works regardless of reporting policy.
-    dismiss_row_timestamp_tooltip();
-    if (m_row_timestamp_tooltip_enabled) {
-        m_private->row_timestamp_tooltip_pointer_position = event->position();
-        m_private->row_timestamp_tooltip_timer.start();
+    // Actual pointer motion hides a shown tooltip; a fresh idle period over
+    // the new position re-requests it. Same-position hover events are scene
+    // redeliveries, not motion, and pass through without touching the tooltip
+    // state. This runs before the mouse-reporting early returns below so the
+    // tooltip works regardless of reporting policy.
+    if (row_timestamp_tooltip_pointer_moved(event->position())) {
+        dismiss_row_timestamp_tooltip();
+        if (m_row_timestamp_tooltip_enabled) {
+            m_private->row_timestamp_tooltip_timer.start();
+        }
     }
     drain_backend_callback_events();
 
@@ -5219,13 +5246,21 @@ void VNM_TerminalSurface::set_viewport_state(
         return;
     }
 
+    // A viewport scroll moves different rows under the resting pointer, so a
+    // shown tooltip no longer describes the hovered row. Snapshot publication
+    // also lands here when only the scrollback row count grew (streaming
+    // output at the tail); that is not user activity and must not dismiss.
+    const bool scroll_position_changed =
+        m_viewport_visible_rows     != visible_rows ||
+        m_viewport_offset_from_tail != offset_from_tail;
+
     m_scrollback_rows           = scrollback_rows;
     m_viewport_visible_rows     = visible_rows;
     m_viewport_offset_from_tail = offset_from_tail;
     m_viewport_at_tail          = at_tail;
-    // A viewport scroll moves different rows under the resting pointer, so a
-    // shown tooltip no longer describes the hovered row.
-    dismiss_row_timestamp_tooltip();
+    if (scroll_position_changed) {
+        dismiss_row_timestamp_tooltip();
+    }
     emit viewport_changed();
 }
 

@@ -574,6 +574,7 @@ private:
     bool copy_selected_text_to_clipboard();
     void set_selection_state(Selection_state state);
     void dismiss_row_timestamp_tooltip();
+    bool row_timestamp_tooltip_pointer_moved(const QPointF& position);
     void handle_row_timestamp_tooltip_timeout();
 
     QString                  m_font_family;

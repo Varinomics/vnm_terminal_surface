@@ -6,6 +6,7 @@
 
 #include <QClipboard>
 #include <QCoreApplication>
+#include <QCursor>
 #include <QDateTime>
 #include <QEventLoop>
 #include <QFontMetricsF>
@@ -20,6 +21,7 @@
 #include <QPointer>
 #include <QQuickItem>
 #include <QQuickWindow>
+#include <QScreen>
 #include <QThread>
 #include <QTemporaryDir>
 #include <QVariant>
@@ -4989,6 +4991,28 @@ bool test_row_timestamp_tooltip_signal_contract(QGuiApplication& app)
 {
     bool ok = true;
     Surface_fixture fixture;
+    // A stationary pointer can poison this test from outside: the window can
+    // spawn under the desktop cursor, and the offscreen platform latches a
+    // virtual-cursor enter near the window origin no matter where the window
+    // sits. Qt Quick then re-delivers synthetic hover moves at the latched
+    // position on every frame with dirty items. The contract under test must
+    // ignore exactly that heartbeat, but here it would interleave a second
+    // pointer stream with the synthesized one. Flush the spawn-time hover
+    // state, park the window away from the cursor, and inset the surface so
+    // a latched origin-area point cannot land on it.
+    fixture.window.hide();
+    pump_events(app);
+    const QRect  screen_geometry = fixture.window.screen()->geometry();
+    const QPoint cursor_position = QCursor::pos();
+    fixture.window.setPosition(
+        cursor_position.x() < screen_geometry.center().x()
+            ? screen_geometry.right() - fixture.window.width()
+            : screen_geometry.left(),
+        cursor_position.y() < screen_geometry.center().y()
+            ? screen_geometry.bottom() - fixture.window.height()
+            : screen_geometry.top());
+    fixture.surface.setPosition(QPointF(64.0, 64.0));
+    fixture.window.show();
     pump_events(app);
 
     ok &= check(fixture.surface.row_timestamp_tooltip_enabled(),
@@ -5030,7 +5054,7 @@ bool test_row_timestamp_tooltip_signal_contract(QGuiApplication& app)
 
     const qint64 before_output_ms = QDateTime::currentMSecsSinceEpoch();
     bool started = false;
-    start_surface_with_backend(
+    Scripted_backend* backend_ptr = start_surface_with_backend(
         fixture.surface,
         std::move(backend),
         { QStringLiteral("scripted-terminal") },
@@ -5057,27 +5081,49 @@ bool test_row_timestamp_tooltip_signal_contract(QGuiApplication& app)
         requested_timestamp.toMSecsSinceEpoch() <= after_request_ms,
         "tooltip request carries the row's output wall-clock timestamp");
 
-    // The dismissal must arrive synchronously with the next pointer motion,
-    // and a press must both stay silent (nothing shown anymore) and stop the
-    // re-armed idle timer.
-    ok &= send_hover_move(
-        fixture.surface,
-        point_in_grid_cell(fixture.surface, 0, 3),
-        Qt::NoModifier,
-        false,
-        "hover move after a shown tooltip is not consumed");
+    // Qt Quick re-delivers a hover move at the unchanged cursor position
+    // whenever scene content changes under a stationary pointer, and the
+    // shown tooltip itself causes such a change. The redelivery is not user
+    // activity: it must neither dismiss the tooltip nor restart the idle
+    // timer (a restart would re-fire the request without a dismissal).
+    ok &= send_hover_move(fixture.surface, stamped_point, Qt::NoModifier, false,
+        "same-position hover redelivery is not consumed");
+    ok &= check(dismissed_count == 0,
+        "same-position hover redelivery does not dismiss the shown tooltip");
+    pump_for(app, 1300);
+    ok &= check(requested_count == 1 && dismissed_count == 0,
+        "same-position hover redelivery does not restart the idle timer");
+
+    // Snapshot publication with an unchanged viewport is the per-frame sync
+    // path while output overwrites the current row; it is not user activity.
+    const std::shared_ptr<const term::Terminal_render_snapshot> pre_publication_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    backend_ptr->emit_output(QByteArrayLiteral(" overwritten in place"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface) !=
+            pre_publication_snapshot,
+        "unchanged-viewport output publishes a fresh snapshot");
+    ok &= check(dismissed_count == 0,
+        "snapshot publication with an unchanged viewport does not dismiss");
+
+    // The dismissal must arrive synchronously with the next real pointer
+    // motion (one logical pixel is enough), and a press must both stay silent
+    // (nothing shown anymore) and stop the re-armed idle timer.
+    const QPointF nudged_point = stamped_point + QPointF(1.0, 0.0);
+    ok &= send_hover_move(fixture.surface, nudged_point, Qt::NoModifier, false,
+        "one-pixel hover move is not consumed");
     ok &= check(dismissed_count == 1,
-        "pointer motion dismisses the shown tooltip");
+        "one-pixel pointer motion dismisses the shown tooltip");
     {
-        const QPointF press_point = point_in_grid_cell(fixture.surface, 0, 3);
         QMouseEvent press(
             QEvent::MouseButtonPress,
-            press_point, press_point, press_point,
+            nudged_point, nudged_point, nudged_point,
             Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
         QCoreApplication::sendEvent(&fixture.surface, &press);
         QMouseEvent release(
             QEvent::MouseButtonRelease,
-            press_point, press_point, press_point,
+            nudged_point, nudged_point, nudged_point,
             Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
         QCoreApplication::sendEvent(&fixture.surface, &release);
     }
@@ -5102,10 +5148,34 @@ bool test_row_timestamp_tooltip_signal_contract(QGuiApplication& app)
     ok &= check(
         pump_until(app, [&requested_count] { return requested_count == 2; }, 300),
         "hover idle re-requests the tooltip after activity");
+
+    // Streaming output that only grows the scrollback row count publishes a
+    // changed viewport without any user activity; the tooltip must survive
+    // it. A real scroll then moves different rows under the resting pointer
+    // and must dismiss through the same viewport publication path.
+    backend_ptr->emit_output(numbered_scroll_lines(40));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+    ok &= check(fixture.surface.scrollback_rows() > 0,
+        "streaming output grows the scrollback row count");
+    ok &= check(dismissed_count == 1,
+        "scrollback growth at the tail does not dismiss the shown tooltip");
+
+    ok &= check(fixture.surface.scroll_viewport_lines(3),
+        "viewport scroll request is accepted");
+    ok &= check(
+        pump_until(app, [&dismissed_count] { return dismissed_count == 2; }, 300),
+        "a real viewport scroll dismisses the shown tooltip");
+
+    const QPointF scrolled_point = point_in_grid_cell(fixture.surface, 2, 2);
+    ok &= send_hover_move(fixture.surface, scrolled_point, Qt::NoModifier, false,
+        "hover move over a scrolled stamped row is not consumed");
+    ok &= check(
+        pump_until(app, [&requested_count] { return requested_count == 3; }, 300),
+        "hover idle re-requests the tooltip after the scroll");
     {
         QWheelEvent wheel(
-            stamped_point,
-            stamped_point,
+            scrolled_point,
+            scrolled_point,
             QPoint(0, 0),
             QPoint(0, -120),
             Qt::NoButton,
@@ -5114,28 +5184,36 @@ bool test_row_timestamp_tooltip_signal_contract(QGuiApplication& app)
             false);
         QCoreApplication::sendEvent(&fixture.surface, &wheel);
     }
-    ok &= check(dismissed_count == 2,
+    ok &= check(dismissed_count == 3,
         "wheel input dismisses the shown tooltip");
 
-    ok &= send_hover_move(fixture.surface, stamped_point, Qt::NoModifier, false,
+    ok &= send_hover_move(
+        fixture.surface,
+        point_in_grid_cell(fixture.surface, 1, 2),
+        Qt::NoModifier,
+        false,
         "hover move before disabling the tooltip is not consumed");
     ok &= check(
-        pump_until(app, [&requested_count] { return requested_count == 3; }, 300),
+        pump_until(app, [&requested_count] { return requested_count == 4; }, 300),
         "hover idle requests the tooltip before the property turns off");
     fixture.surface.set_row_timestamp_tooltip_enabled(false);
-    ok &= check(dismissed_count == 3 && enabled_change_count == 1,
+    ok &= check(dismissed_count == 4 && enabled_change_count == 1,
         "disabling the property dismisses the shown tooltip and notifies");
     ok &= check(!fixture.surface.row_timestamp_tooltip_enabled(),
         "property reads back as disabled");
 
-    ok &= send_hover_move(fixture.surface, stamped_point, Qt::NoModifier, false,
+    ok &= send_hover_move(
+        fixture.surface,
+        point_in_grid_cell(fixture.surface, 1, 4),
+        Qt::NoModifier,
+        false,
         "hover move while disabled is not consumed");
     pump_for(app, 1300);
-    ok &= check(requested_count == 3,
+    ok &= check(requested_count == 4,
         "hover idle requests no tooltip while disabled");
 
     fixture.surface.set_row_timestamp_tooltip_enabled(true);
-    ok &= check(enabled_change_count == 2 && dismissed_count == 3,
+    ok &= check(enabled_change_count == 2 && dismissed_count == 4,
         "re-enabling notifies without a spurious dismissal");
 
     return ok;
