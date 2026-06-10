@@ -2410,6 +2410,12 @@ void Terminal_session::set_color_state(Terminal_color_state state)
     drain_backend_callback_commands();
     process_pending_commands();
 
+    // Remember the requested color state so it survives a screen-model
+    // (re)creation. At startup this runs before the model exists (the model is
+    // created lazily on the first resize), so without remembering it the chosen
+    // color scheme would be lost and the model would keep its defaults.
+    m_color_state = state;
+
     if (!m_screen_model.has_value()) {
         return;
     }
@@ -4202,6 +4208,9 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     screen_config.recover_scrollback_from_primary_repaints =
         m_config.recover_scrollback_from_primary_repaints;
     m_screen_model.emplace(screen_config);
+    if (m_color_state.has_value()) {
+        m_screen_model->set_color_state(*m_color_state);
+    }
     m_screen_model->set_dirty_row_stats_enabled(m_config.capture_dirty_row_stats);
     if (m_config.capture_dirty_row_stats) {
         m_profile_stats.enabled = true;

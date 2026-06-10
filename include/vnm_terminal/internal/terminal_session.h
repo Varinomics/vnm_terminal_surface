@@ -577,6 +577,9 @@ private:
     std::mutex                                             m_backend_output_capture_mutex;
     std::unique_ptr<QFile>                                 m_backend_output_capture_file;
     std::optional<Terminal_screen_model>                   m_screen_model;
+    // Last color state requested via set_color_state, remembered so it can be
+    // reapplied when the screen model is (re)created on the first resize.
+    std::optional<Terminal_color_state>                    m_color_state;
     std::shared_ptr<const Terminal_render_snapshot>        m_latest_render_snapshot;
     std::shared_ptr<const Terminal_render_snapshot>        m_latest_content_render_snapshot;
     terminal_selection_content_basis_t                     m_latest_content_render_snapshot_content_basis;
