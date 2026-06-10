@@ -3,8 +3,10 @@
 #include "vnm_terminal/internal/terminal_session.h"
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QSizeF>
 #include <QString>
+#include <QtGlobal>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -787,6 +789,47 @@ bool test_model_snapshots_publish_visible_line_provenance()
     return ok;
 }
 
+bool test_row_content_stamps_track_writes_and_survive_scrollback()
+{
+    bool ok = true;
+
+    const qint64 ingest_start_ms = QDateTime::currentMSecsSinceEpoch();
+    term::Terminal_screen_model model = make_model({3, 8});
+    model.ingest(QByteArrayLiteral("one\r\ntwo"));
+    const qint64 ingest_end_ms = QDateTime::currentMSecsSinceEpoch();
+
+    const term::Terminal_render_snapshot written =
+        model.render_snapshot(request_for_model(model, 130U));
+    const qint64 written_stamp_ms = written.visible_line_provenance[0].content_stamp_ms;
+    ok &= check(
+        written_stamp_ms >= ingest_start_ms &&
+        written_stamp_ms <= ingest_end_ms,
+        "written row carries a wall-clock stamp from the ingest window");
+    ok &= check(written.visible_line_provenance[2].content_stamp_ms == 0,
+        "never-written blank row carries the zero no-timestamp stamp");
+
+    // Scroll the first row into retained history; reading it back from the
+    // history ring must reproduce the original stamp byte for byte, proving
+    // the stamp survives the row-record codec round trip.
+    model.ingest(QByteArrayLiteral("\r\nthree\r\nfour"));
+    ok &= check(model.scrollback_size() > 0,
+        "row stamp scrollback fixture has retained history");
+
+    const term::Terminal_render_snapshot scrollback = model.render_snapshot(
+        request_for_model(model, 131U, model.scrollback_size()));
+    ok &= check(row_text(scrollback, 0) == QStringLiteral("one"),
+        "row stamp scrollback snapshot shows the retained first row");
+    ok &= check(
+        scrollback.visible_line_provenance[0].retained_line_id ==
+            written.visible_line_provenance[0].retained_line_id,
+        "retained first row keeps its retained line id in scrollback");
+    ok &= check(
+        scrollback.visible_line_provenance[0].content_stamp_ms == written_stamp_ms,
+        "retained first row keeps its content stamp in scrollback");
+
+    return ok;
+}
+
 bool test_visible_line_provenance_validation()
 {
     bool ok = true;
@@ -1500,6 +1543,7 @@ int main()
     ok &= test_selection_request_rejects_retained_line_row_reorder();
     ok &= test_dirty_rows_are_viewport_relative();
     ok &= test_model_snapshots_publish_visible_line_provenance();
+    ok &= test_row_content_stamps_track_writes_and_survive_scrollback();
     ok &= test_visible_line_provenance_validation();
     ok &= test_public_projection_scroll_snapshot_structural_validation();
     ok &= test_session_snapshot_handles_and_synchronized_release();

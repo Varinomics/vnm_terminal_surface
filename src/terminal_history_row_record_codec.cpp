@@ -14,7 +14,7 @@ constexpr std::uint32_t k_row_record_magic = 0x56524852U;
 constexpr std::uint32_t k_row_footer_magic = 0x56524652U;
 constexpr std::uint16_t k_row_record_version = 1U;
 constexpr std::uint16_t k_row_record_kind_row = 1U;
-constexpr std::uint32_t k_row_record_header_bytes = 108U;
+constexpr std::uint32_t k_row_record_header_bytes = 116U;
 constexpr std::uint32_t k_row_record_footer_bytes = 32U;
 constexpr std::uint32_t k_row_record_cell_bytes = 24U;
 constexpr std::uint32_t k_row_record_hyperlink_bytes = 12U;
@@ -46,6 +46,7 @@ struct row_record_header_t
     std::uint64_t                 content_generation = 0U;
     std::uint64_t                 retained_line_id = 0U;
     std::uint64_t                 retained_line_content_generation = 0U;
+    std::uint64_t                 content_stamp_ms = 0U;
     std::uint32_t                 source_width = 0U;
     std::uint32_t                 cell_count = 0U;
     std::uint32_t                 hyperlink_count = 0U;
@@ -486,6 +487,7 @@ bool write_header(Byte_writer& writer, const row_record_header_t& header)
         writer.write_u64(header.content_generation) &&
         writer.write_u64(header.retained_line_id) &&
         writer.write_u64(header.retained_line_content_generation) &&
+        writer.write_u64(header.content_stamp_ms) &&
         writer.write_u32(header.source_width) &&
         writer.write_u32(header.cell_count) &&
         writer.write_u32(header.hyperlink_count) &&
@@ -513,6 +515,7 @@ bool read_header(Byte_reader& reader, row_record_header_t& header)
         reader.read_u64(header.content_generation) &&
         reader.read_u64(header.retained_line_id) &&
         reader.read_u64(header.retained_line_content_generation) &&
+        reader.read_u64(header.content_stamp_ms) &&
         reader.read_u32(header.source_width) &&
         reader.read_u32(header.cell_count) &&
         reader.read_u32(header.hyperlink_count) &&
@@ -591,6 +594,7 @@ Terminal_history_row_record_codec_status write_row_record_payload(
     header.content_generation = record.provenance.content_generation;
     header.retained_line_id = record.provenance.retained_line_id;
     header.retained_line_content_generation = record.provenance.content_generation;
+    header.content_stamp_ms = static_cast<std::uint64_t>(record.provenance.content_stamp_ms);
     header.source_width = *source_width;
     header.cell_count = static_cast<std::uint32_t>(record.cells.size());
     header.hyperlink_count = static_cast<std::uint32_t>(
@@ -881,6 +885,7 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record_pay
         header.retained_line_id,
         header.retained_line_content_generation,
         *provenance,
+        static_cast<qint64>(header.content_stamp_ms),
     };
     record.metadata.source_width = static_cast<int>(header.source_width);
     record.metadata.style_lifetime = *style;

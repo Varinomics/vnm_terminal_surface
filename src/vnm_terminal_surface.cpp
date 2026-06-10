@@ -18,6 +18,7 @@
 
 #include <QColor>
 #include <QClipboard>
+#include <QDateTime>
 #include <QFont>
 #include <QGuiApplication>
 #include <QHoverEvent>
@@ -77,6 +78,7 @@ constexpr qreal       k_font_zoom_wheel_step                     = 1.0;
 constexpr qreal       k_angle_delta_per_wheel_step               = 120.0;
 constexpr int         k_plain_scroll_lines_per_angle_step        = 3;
 constexpr int         k_min_synchronized_output_stale_timeout_ms = 1;
+constexpr int         k_row_timestamp_tooltip_delay_ms           = 1000;
 constexpr std::chrono::milliseconds k_backend_callback_drain_budget{4};
 
 #if defined(_WIN32)
@@ -2072,6 +2074,9 @@ struct VNM_TerminalSurface::Private
     std::optional<term::Terminal_osc52_write_request>      pending_clipboard_write;
     QString                                                warmed_prompt_text_layout_font_key;
     QTimer                                                 synchronized_output_recovery_timer;
+    QTimer                                                 row_timestamp_tooltip_timer;
+    QPointF                                                row_timestamp_tooltip_pointer_position;
+    bool                                                   row_timestamp_tooltip_request_active  = false;
     bool                                                   selection_drag_active                 = false;
     bool                                                   selection_drag_moved                  = false;
     bool                                                   selection_drag_cancelled              = false;
@@ -2148,6 +2153,15 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
         this,
         [this] {
             handle_synchronized_output_recovery_timeout();
+        });
+    m_private->row_timestamp_tooltip_timer.setSingleShot(true);
+    m_private->row_timestamp_tooltip_timer.setInterval(k_row_timestamp_tooltip_delay_ms);
+    QObject::connect(
+        &m_private->row_timestamp_tooltip_timer,
+        &QTimer::timeout,
+        this,
+        [this] {
+            handle_row_timestamp_tooltip_timeout();
         });
     refresh_grid_metrics();
 }
@@ -2739,6 +2753,72 @@ void VNM_TerminalSurface::set_visual_bell_policy(Bell_policy policy)
     m_visual_bell_policy = policy;
     emit visual_bell_policy_changed();
     m_private->request_render_update(*this);
+}
+
+bool VNM_TerminalSurface::row_timestamp_tooltip_enabled() const
+{
+    return m_row_timestamp_tooltip_enabled;
+}
+
+void VNM_TerminalSurface::set_row_timestamp_tooltip_enabled(bool enabled)
+{
+    if (m_row_timestamp_tooltip_enabled == enabled) {
+        return;
+    }
+
+    m_row_timestamp_tooltip_enabled = enabled;
+    if (!enabled) {
+        dismiss_row_timestamp_tooltip();
+    }
+    emit row_timestamp_tooltip_enabled_changed();
+}
+
+void VNM_TerminalSurface::dismiss_row_timestamp_tooltip()
+{
+    m_private->row_timestamp_tooltip_timer.stop();
+    if (!m_private->row_timestamp_tooltip_request_active) {
+        return;
+    }
+
+    m_private->row_timestamp_tooltip_request_active = false;
+    emit row_timestamp_tooltip_dismissed();
+}
+
+void VNM_TerminalSurface::handle_row_timestamp_tooltip_timeout()
+{
+    const QPointF pointer_position = m_private->row_timestamp_tooltip_pointer_position;
+    const std::optional<term::terminal_grid_position_t> position =
+        grid_position_for_local_point(
+            m_private->render_snapshot,
+            m_private->cell_metrics,
+            pointer_position);
+    if (!position.has_value()) {
+        return;
+    }
+
+    // Synthetic and suppressed-provenance snapshots publish an empty
+    // visible_line_provenance vector, so the row may have no provenance entry.
+    const term::Terminal_render_snapshot& snapshot = *m_private->render_snapshot;
+    if (static_cast<std::size_t>(position->row) >=
+        snapshot.visible_line_provenance.size())
+    {
+        return;
+    }
+
+    const qint64 stamp_ms = snapshot
+        .visible_line_provenance[static_cast<std::size_t>(position->row)]
+        .content_stamp_ms;
+    if (stamp_ms == 0) {
+        // Never-written rows carry no stamp and request no tooltip; that is
+        // the contract, not a degradation.
+        return;
+    }
+
+    m_private->row_timestamp_tooltip_request_active = true;
+    emit row_timestamp_tooltip_requested(
+        pointer_position.x(),
+        pointer_position.y(),
+        QDateTime::fromMSecsSinceEpoch(stamp_ms));
 }
 
 VNM_TerminalSurface::Text_renderer_mode VNM_TerminalSurface::text_renderer_mode() const
@@ -3490,6 +3570,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
     event->ignore();
+    dismiss_row_timestamp_tooltip();
 
     forceActiveFocus(Qt::MouseFocusReason);
     drain_backend_callback_events();
@@ -3658,6 +3739,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
     event->ignore();
+    dismiss_row_timestamp_tooltip();
     drain_backend_callback_events();
 
     const std::optional<term::terminal_grid_position_t> position = grid_position_for_local_point(
@@ -3928,6 +4010,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
     event->ignore();
+    dismiss_row_timestamp_tooltip();
     drain_backend_callback_events();
 
     std::optional<term::terminal_grid_position_t> viewport_position;
@@ -4286,6 +4369,14 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
     event->ignore();
+    // Any pointer motion hides a shown tooltip; a fresh idle period over the
+    // new position re-requests it. This runs before the mouse-reporting early
+    // returns below so the tooltip works regardless of reporting policy.
+    dismiss_row_timestamp_tooltip();
+    if (m_row_timestamp_tooltip_enabled) {
+        m_private->row_timestamp_tooltip_pointer_position = event->position();
+        m_private->row_timestamp_tooltip_timer.start();
+    }
     drain_backend_callback_events();
 
     if (m_mouse_reporting_policy == Mouse_reporting_policy::DISABLED ||
@@ -4327,9 +4418,17 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
     }
 }
 
+void VNM_TerminalSurface::hoverLeaveEvent(QHoverEvent* event)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    dismiss_row_timestamp_tooltip();
+    QQuickItem::hoverLeaveEvent(event);
+}
+
 void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    dismiss_row_timestamp_tooltip();
 
     if (m_wheel_trace_enabled) {
         record_surface_wheel_ingress_transcript(
@@ -5124,6 +5223,9 @@ void VNM_TerminalSurface::set_viewport_state(
     m_viewport_visible_rows     = visible_rows;
     m_viewport_offset_from_tail = offset_from_tail;
     m_viewport_at_tail          = at_tail;
+    // A viewport scroll moves different rows under the resting pointer, so a
+    // shown tooltip no longer describes the hovered row.
+    dismiss_row_timestamp_tooltip();
     emit viewport_changed();
 }
 

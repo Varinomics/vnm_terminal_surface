@@ -25,7 +25,7 @@ constexpr std::size_t k_phase8_retained_history_ring_capacity_bytes =
 constexpr int k_phase8_columns = 120;
 constexpr int k_phase8_row_count = 2000;
 
-constexpr std::uint64_t k_codec_header_bytes = 108U;
+constexpr std::uint64_t k_codec_header_bytes = 116U;
 constexpr std::uint64_t k_codec_footer_bytes = 32U;
 constexpr std::uint64_t k_dense_cell_base_bytes = 24U;
 constexpr std::uint64_t k_hyperlink_base_bytes = 12U;
