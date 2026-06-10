@@ -82,9 +82,12 @@ struct Terminal_retained_line_provenance
     Terminal_retained_line_provenance_source source =
         Terminal_retained_line_provenance_source::TERMINAL_STORAGE;
     // Wall-clock time of the last content change (ms since epoch). Zero means
-    // the line was never written, so hosts can distinguish real output from
-    // blank fill. Stamped wherever content_generation advances and reset with
-    // the retained-line identity, so it travels with the line into scrollback.
+    // the line has never carried written content, so hosts can distinguish
+    // real output from blank fill. Stamped wherever content_generation
+    // advances; reset only when a row becomes fresh blank fill
+    // (replace_retained_line_id). Identity-only rebases must preserve it
+    // (rebase_retained_line_id_preserving_content): renaming a line does not
+    // make its content never-written.
     qint64                                   content_stamp_ms   = 0;
 };
 
@@ -592,7 +595,12 @@ private:
         Terminal_screen_row&                    row,
         Terminal_retained_line_provenance_source source =
             Terminal_retained_line_provenance_source::TERMINAL_STORAGE);
+    void rebase_retained_line_id_preserving_content(
+        Terminal_screen_row&                    row,
+        Terminal_retained_line_provenance_source source =
+            Terminal_retained_line_provenance_source::TERMINAL_STORAGE);
     void replace_visible_retained_line_ids();
+    void rebase_visible_retained_line_ids_preserving_content();
     void replace_row_with_erased_retained_line(Terminal_screen_row& row);
 
     bool cells_have_same_selection_content(

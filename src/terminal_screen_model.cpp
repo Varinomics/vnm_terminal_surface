@@ -2381,10 +2381,34 @@ void Terminal_screen_model::replace_retained_line_id(
     };
 }
 
+// Identity-only rebase: the row keeps its cells, so its content metadata
+// (generation and wall-clock stamp) must survive. Renaming a line for
+// provenance disambiguation does not make its content never-written; only
+// fresh blank fill (replace_retained_line_id) resets the stamp.
+void Terminal_screen_model::rebase_retained_line_id_preserving_content(
+    Terminal_screen_row&                    row,
+    Terminal_retained_line_provenance_source source)
+{
+    invalidate_retained_lookup_caches();
+    row.retained_line_provenance = {
+        .retained_line_id   = next_retained_line_id(),
+        .content_generation = row.retained_line_provenance.content_generation,
+        .source             = source,
+        .content_stamp_ms   = row.retained_line_provenance.content_stamp_ms,
+    };
+}
+
 void Terminal_screen_model::replace_visible_retained_line_ids()
 {
     for (Terminal_screen_row& row : active_grid_rows()) {
         replace_retained_line_id(row);
+    }
+}
+
+void Terminal_screen_model::rebase_visible_retained_line_ids_preserving_content()
+{
+    for (Terminal_screen_row& row : active_grid_rows()) {
+        rebase_retained_line_id_preserving_content(row);
     }
 }
 
@@ -4231,7 +4255,7 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
 
     if (candidate.visible_row_identity_ambiguous) {
         for (Terminal_screen_row& row : candidate.rows) {
-            replace_retained_line_id(row);
+            rebase_retained_line_id_preserving_content(row);
         }
     }
 
@@ -4239,7 +4263,7 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
         primary_repaint_recovery_proposal(candidate);
     if (!proposal.has_value()) {
         if (candidate.visible_row_identity_ambiguous) {
-            replace_visible_retained_line_ids();
+            rebase_visible_retained_line_ids_preserving_content();
             mark_all_dirty();
             candidate.visible_row_identity_ambiguous = false;
         }
@@ -4252,7 +4276,7 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
 
     accept_primary_repaint_recovery_proposal(*proposal);
     for (Terminal_screen_row& row : active_grid_rows()) {
-        replace_retained_line_id(row);
+        rebase_retained_line_id_preserving_content(row);
     }
     mark_all_dirty();
 }
@@ -4262,7 +4286,7 @@ void Terminal_screen_model::cancel_primary_repaint_recovery_candidate()
     if (m_primary_repaint_recovery_candidate.active &&
         m_primary_repaint_recovery_candidate.visible_row_identity_ambiguous)
     {
-        replace_visible_retained_line_ids();
+        rebase_visible_retained_line_ids_preserving_content();
         mark_all_dirty();
     }
     m_primary_repaint_recovery_candidate = {};
@@ -5009,7 +5033,7 @@ Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retaine
     record.row                   = screen_row;
     record.metadata.source_width = m_config.grid_size.columns;
     if (source != Terminal_retained_line_provenance_source::TERMINAL_STORAGE) {
-        replace_retained_line_id(record.row, source);
+        rebase_retained_line_id_preserving_content(record.row, source);
     }
     materialize_retained_row_hyperlinks(record, hyperlink_identity_keys);
     return record;

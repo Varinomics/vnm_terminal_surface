@@ -5,6 +5,7 @@
 #include "helpers/test_check.h"
 
 #include <QByteArray>
+#include <QDateTime>
 #include <QString>
 #include <algorithm>
 #include <cstdint>
@@ -1004,6 +1005,80 @@ bool test_phase_r_primary_repaint_recovery_accepts_distinct_shift()
         model.ingest(QByteArrayLiteral("z"));
     ok &= check(non_recovery_result.recovery_proposals.empty(),
         "Phase R recovery proposal metadata clears on later non-recovery ingest");
+
+    return ok;
+}
+
+// Busy-waits across the next wall-clock millisecond boundary so a follow-up
+// stamp provably differs from `reference_ms`. Stamps have millisecond
+// resolution, so without this an unwanted restamp in the same millisecond
+// would be indistinguishable from a preserved stamp.
+void wait_for_wall_clock_after_ms(qint64 reference_ms)
+{
+    while (QDateTime::currentMSecsSinceEpoch() <= reference_ms) {
+    }
+}
+
+bool test_phase_r_primary_repaint_recovery_preserves_row_content_stamps()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+
+    std::vector<qint64> written_stamps;
+    for (int row = 0; row < 4; ++row) {
+        written_stamps.push_back(
+            primary_retained_line_provenance(model, row).content_stamp_ms);
+    }
+    ok &= check(
+        std::all_of(
+            written_stamps.begin(),
+            written_stamps.end(),
+            [](qint64 stamp) { return stamp > 0; }),
+        "Phase R stamp fixture rows carry write stamps");
+
+    wait_for_wall_clock_after_ms(
+        *std::max_element(written_stamps.begin(), written_stamps.end()));
+
+    const qint64 repaint_start_ms = QDateTime::currentMSecsSinceEpoch();
+    model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+    }, true));
+    const qint64 repaint_end_ms = QDateTime::currentMSecsSinceEpoch();
+
+    ok &= check(model.scrollback_size() == 1,
+        "Phase R stamp fixture accepts the shifted repaint");
+
+    // The recovered scrollback row ("aa") was rekeyed onto recovered
+    // provenance; the rekey renames the line, but the content is the same
+    // output that was written at written_stamps[0], so the stamp must ride
+    // along unchanged.
+    ok &= check(
+        primary_retained_line_provenance(model, 0).content_stamp_ms ==
+            written_stamps[0],
+        "recovered scrollback row preserves its original content stamp");
+
+    // The repainted active rows were rebased onto fresh retained ids after
+    // the accepted recovery. Each still shows real output written during the
+    // repaint, so each must keep a stamp from the repaint ingest window;
+    // zero would suppress the row-timestamp tooltip for the whole viewport.
+    for (int row = 0; row < 4; ++row) {
+        const qint64 stamp_ms =
+            primary_retained_line_provenance(model, 1 + row).content_stamp_ms;
+        ok &= check(
+            stamp_ms >= repaint_start_ms && stamp_ms <= repaint_end_ms,
+            "rebased active row keeps its repaint-window content stamp");
+    }
 
     return ok;
 }
@@ -3643,6 +3718,7 @@ int main()
     ok &= test_scrollback_growth_observer_seam();
     ok &= test_phase_r_repaint_recovery_shift_helper_matches_policy();
     ok &= test_phase_r_primary_repaint_recovery_accepts_distinct_shift();
+    ok &= test_phase_r_primary_repaint_recovery_preserves_row_content_stamps();
     ok &= test_phase_r_primary_repaint_recovery_recovers_blank_separator_row();
     ok &= test_flat_ring_phase3_retained_record_producer_contract();
     ok &= test_flat_ring_phase7_recovery_shared_producer_boundary();
