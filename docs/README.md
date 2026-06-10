@@ -61,6 +61,12 @@ the repository without reading every implementation detail.
 - [Diagnostics API usage](diagnostics_api_usage.md) records how a host
   consumes the public diagnostics serializers, toggles, and font/cell-metrics
   helpers, including stability tiers and runtime preconditions.
+- [Synchronized output](synchronized_output.md) records the DEC mode 2026
+  hold/release machine, the scroll policies during a hold, and the
+  stale-hold recovery path.
+- [Selection and provenance](selection_and_provenance.md) records the
+  selection state machine, row-identity leases, snapshot projection, and
+  text extraction.
 
 ## Maintenance Rule
 
