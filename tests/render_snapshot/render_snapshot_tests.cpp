@@ -835,13 +835,10 @@ bool test_row_content_stamps_track_writes_and_survive_scrollback()
 // write provably lands at a later stamp than `reference_ms`. Stamps have
 // millisecond resolution, so without this a write in the same millisecond
 // would be indistinguishable from the original one.
-qint64 wait_for_wall_clock_after_ms(qint64 reference_ms)
+void wait_for_wall_clock_after_ms(qint64 reference_ms)
 {
-    qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
-    while (now_ms <= reference_ms) {
-        now_ms = QDateTime::currentMSecsSinceEpoch();
+    while (QDateTime::currentMSecsSinceEpoch() <= reference_ms) {
     }
-    return now_ms;
 }
 
 qint64 active_row_stamp_ms(const term::Terminal_screen_model& model, int logical_row)
