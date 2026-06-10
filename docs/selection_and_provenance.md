@@ -49,8 +49,9 @@ Rows are identified independently of their physical position:
   content-generation mismatch, and so on); a failed resolution means the
   selection must not silently attach to different content.
 
-The anchor also records its domain (`Terminal_selection_anchor_domain`):
-primary backing rows, alternate-screen active-grid rows, or payload-only.
+The anchor also records its domain (`Terminal_selection_anchor_domain`): an
+active-grid anchor not yet resolved to backing rows, primary backing rows,
+alternate-screen active-grid rows, or payload-only.
 Alternate-screen selections cannot survive into scrollback because the
 alternate buffer has none.
 
