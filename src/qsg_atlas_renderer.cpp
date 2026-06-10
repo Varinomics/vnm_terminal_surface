@@ -4317,7 +4317,8 @@ private:
             static_cast<qreal>(slot.rect.width())  * inverse_page_width,
             static_cast<qreal>(slot.rect.height()) * inverse_page_height);
         if (run.clip_rect.isValid() &&
-            !clip_glyph_instance(glyph_rect, uv_rect, run.clip_rect))
+            !clip_glyph_instance(
+                glyph_rect, uv_rect, run.clip_rect, /*v_flipped=*/false))
         {
             return;
         }
@@ -4964,7 +4965,8 @@ private:
             scaled.uv_right - scaled.uv_left,
             scaled.uv_bottom - scaled.uv_top);
         if (run.clip_rect.isValid() &&
-            !clip_glyph_instance(glyph_rect, uv_rect, run.clip_rect))
+            !clip_glyph_instance(
+                glyph_rect, uv_rect, run.clip_rect, /*v_flipped=*/true))
         {
             return;
         }
@@ -5493,10 +5495,17 @@ private:
         }
     }
 
+    // The two callers sample V in opposite directions: the glyph-atlas vertex
+    // stage maps UVs top-down (UV top row = quad top edge), while the MSDF
+    // fragment stage flips V (atlas_msdf_text.frag), so the UV top row lands
+    // on the quad's BOTTOM edge. The UV-top crop must therefore follow the
+    // quad edge that carries the UV top row, or the clipped glyph image
+    // re-anchors on the wrong edge and visibly shifts vertically.
     bool clip_glyph_instance(
         QRectF&       glyph_rect,
         QRectF&       uv_rect,
-        const QRectF& clip_rect) const
+        const QRectF& clip_rect,
+        bool          v_flipped) const
     {
         const QRectF clipped = glyph_rect.intersected(clip_rect);
         if (clipped.width() <= 0.0 || clipped.height() <= 0.0) {
@@ -5504,8 +5513,11 @@ private:
         }
         const qreal x_ratio = uv_rect.width()  / glyph_rect.width();
         const qreal y_ratio = uv_rect.height() / glyph_rect.height();
+        const qreal uv_top_crop = v_flipped
+            ? glyph_rect.bottom() - clipped.bottom()
+            : clipped.top() - glyph_rect.top();
         uv_rect.setLeft(uv_rect.left() + (clipped.left() - glyph_rect.left()) * x_ratio);
-        uv_rect.setTop(uv_rect.top() + (clipped.top() - glyph_rect.top()) * y_ratio);
+        uv_rect.setTop(uv_rect.top() + uv_top_crop * y_ratio);
         uv_rect.setWidth(clipped.width() * x_ratio);
         uv_rect.setHeight(clipped.height() * y_ratio);
         glyph_rect = clipped;
