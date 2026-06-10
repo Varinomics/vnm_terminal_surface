@@ -2801,11 +2801,11 @@ void VNM_TerminalSurface::handle_row_timestamp_tooltip_timeout()
     }
 
     // Synthetic and suppressed-provenance snapshots publish an empty
-    // visible_line_provenance vector, so the row may have no provenance entry.
+    // visible_line_provenance vector. The contract is full-and-valid or
+    // absent, so require the validated per-row vector instead of a bare size
+    // check; a partial vector must not yield a wrong-row timestamp.
     const term::Terminal_render_snapshot& snapshot = *m_private->render_snapshot;
-    if (static_cast<std::size_t>(position->row) >=
-        snapshot.visible_line_provenance.size())
-    {
+    if (!term::render_snapshot_visible_line_provenance_is_valid(snapshot)) {
         return;
     }
 
