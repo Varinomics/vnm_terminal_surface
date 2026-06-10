@@ -619,6 +619,32 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_render_frame>"
 )
 
+add_executable(vnm_terminal_diagnostics_schema_sync
+    diagnostics_schema/schema_sync_tests.cpp
+)
+
+target_include_directories(vnm_terminal_diagnostics_schema_sync PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_SOURCE_DIR}/src"
+)
+
+target_link_libraries(vnm_terminal_diagnostics_schema_sync PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_diagnostics_schema_sync PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_diagnostics_schema_sync
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_diagnostics_schema_sync>"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../docs/diagnostics_schema.md"
+)
+
 if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
     add_executable(vnm_terminal_transcript
         transcript/transcript_tests.cpp
