@@ -72,17 +72,6 @@ bool is_printable_ascii(QChar character)
     return codepoint >= k_printable_ascii_first && codepoint <= k_printable_ascii_last;
 }
 
-bool is_printable_ascii_text(QStringView text)
-{
-    for (QChar character : text) {
-        if (!is_printable_ascii(character)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 Terminal_render_cell_text_category render_cell_text_category(QStringView text)
 {
     if (text.isEmpty()) {

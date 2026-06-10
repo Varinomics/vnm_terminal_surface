@@ -2033,6 +2033,64 @@ bool test_reader_rejects_malformed_transcripts()
     return ok;
 }
 
+bool test_reader_rejects_invalid_leading_event_fields()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary leading-field malformed directory is valid")) {
+        return false;
+    }
+
+    bool ok = true;
+
+    QJsonObject header_bool_mistyped = valid_header_object();
+    header_bool_mistyped.insert(
+        QStringLiteral("snapshot_diagnostics"), QStringLiteral("false"));
+    ok &= expect_reader_failure(
+        temp_dir,
+        QStringLiteral("header-bool-mistyped.ndjson"),
+        {json_line(header_bool_mistyped)},
+        QStringLiteral("missing or invalid bool field snapshot_diagnostics"));
+
+    QJsonObject start_missing_sequence = valid_session_start_object(1U);
+    start_missing_sequence.remove(QStringLiteral("session_sequence"));
+    ok &= expect_reader_failure(
+        temp_dir,
+        QStringLiteral("start-missing-sequence.ndjson"),
+        {json_line(valid_header_object()), json_line(start_missing_sequence)},
+        QStringLiteral("missing or invalid integer field session_sequence"));
+
+    QJsonObject start_negative_sequence = valid_session_start_object(1U);
+    start_negative_sequence.insert(QStringLiteral("session_sequence"), -1);
+    ok &= expect_reader_failure(
+        temp_dir,
+        QStringLiteral("start-negative-sequence.ndjson"),
+        {json_line(valid_header_object()), json_line(start_negative_sequence)},
+        QStringLiteral("negative integer field session_sequence"));
+
+    QJsonObject wheel_trace_missing_route;
+    wheel_trace_missing_route.insert(
+        QStringLiteral("kind"), QStringLiteral("surface.wheel_trace"));
+    insert_u64(wheel_trace_missing_route, QStringLiteral("event_index"), 1U);
+    wheel_trace_missing_route.insert(QStringLiteral("source"), QStringLiteral("wheel"));
+    ok &= expect_reader_failure(
+        temp_dir,
+        QStringLiteral("wheel-trace-missing-route.ndjson"),
+        {json_line(valid_header_object()), json_line(wheel_trace_missing_route)},
+        QStringLiteral("missing or invalid string field route"));
+
+    QJsonObject wheel_trace_accepted_mistyped = wheel_trace_missing_route;
+    wheel_trace_accepted_mistyped.insert(QStringLiteral("route"), QStringLiteral("local"));
+    wheel_trace_accepted_mistyped.insert(QStringLiteral("outcome"), QStringLiteral("scrolled"));
+    wheel_trace_accepted_mistyped.insert(QStringLiteral("accepted"), 1);
+    ok &= expect_reader_failure(
+        temp_dir,
+        QStringLiteral("wheel-trace-accepted-mistyped.ndjson"),
+        {json_line(valid_header_object()), json_line(wheel_trace_accepted_mistyped)},
+        QStringLiteral("missing or invalid bool field accepted"));
+
+    return ok;
+}
+
 bool test_reader_accepts_session_config_without_recovery_flag()
 {
     QTemporaryDir temp_dir;
@@ -3473,6 +3531,7 @@ int main(int argc, char** argv)
     ok &= test_snapshot_diagnostics_flag_controls_snapshot_event();
     ok &= test_snapshot_timing_diagnostics_include_snapshot_metadata();
     ok &= test_reader_rejects_malformed_transcripts();
+    ok &= test_reader_rejects_invalid_leading_event_fields();
     ok &= test_reader_accepts_session_config_without_recovery_flag();
     ok &= test_reader_rejects_compact_snapshots_missing_required_diagnostics();
     ok &= test_reader_rejects_invalid_snapshot_public_scroll_enum_values();
