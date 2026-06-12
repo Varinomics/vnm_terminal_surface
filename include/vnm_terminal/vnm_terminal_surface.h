@@ -7,7 +7,9 @@
 #include <QStringList>
 #include <QVariant>
 #include <chrono>
+#include <functional>
 #include <memory>
+#include <optional>
 
 class QQuickWindow;
 class QScreen;
@@ -402,6 +404,7 @@ public:
 
     void set_selection_trace_enabled(bool enabled);
     void set_dirty_row_stats_enabled(bool enabled);
+    void set_clipboard_text_reader(std::function<std::optional<QString>()> reader);
 
     Q_INVOKABLE bool respond_clipboard_write(
         quint64                        request_id,
@@ -410,6 +413,7 @@ public:
     Q_INVOKABLE QString selected_text();
     Q_INVOKABLE void    clear_selection();
     Q_INVOKABLE bool    paste_text(QString text);
+    Q_INVOKABLE bool    paste_clipboard_text();
     // Scrolls only when the published public viewport is primary-screen
     // scrollback and can be updated immediately. Under the default synchronized
     // output policy, hidden synchronized output remains deferred and returns
@@ -574,6 +578,7 @@ private:
 
     void reset_session();
     bool copy_selected_text_to_clipboard();
+    std::optional<QString> read_clipboard_text_for_paste();
     void set_selection_state(Selection_state state);
     void dismiss_row_timestamp_tooltip();
     bool row_timestamp_tooltip_pointer_moved(const QPointF& position);

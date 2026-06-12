@@ -9500,6 +9500,25 @@ bool test_paste_text_public_method_and_policy(QGuiApplication& app)
             "surface paste_text sends no frame for sanitized-empty paste");
         ok &= check(error_codes.empty(),
             "surface paste success path emits no backend_error");
+
+        fixture.surface.set_clipboard_text_reader([]() -> std::optional<QString> {
+            return QStringLiteral("reader-paste");
+        });
+        const std::size_t reader_write_index = backend_ptr->writes.size();
+        ok &= check(fixture.surface.paste_clipboard_text(),
+            "surface paste_clipboard_text returns true when the reader supplies text");
+        ok &= check(joined_writes_since(backend_ptr->writes, reader_write_index) ==
+            framed_paste(QByteArrayLiteral("reader-paste")),
+            "surface paste_clipboard_text writes injected clipboard text");
+
+        fixture.surface.set_clipboard_text_reader([]() -> std::optional<QString> {
+            return std::nullopt;
+        });
+        const std::size_t blocked_reader_write_count = backend_ptr->writes.size();
+        ok &= check(!fixture.surface.paste_clipboard_text(),
+            "surface paste_clipboard_text returns false when the reader has no text");
+        ok &= check(backend_ptr->writes.size() == blocked_reader_write_count,
+            "surface paste_clipboard_text writes nothing when the reader has no text");
     }
 
     {
@@ -9597,6 +9616,9 @@ bool test_right_click_paste_and_mouse_reporting_precedence(QGuiApplication& app)
             &started);
         ok &= check(started, "right-click paste surface starts");
 
+        fixture.surface.set_clipboard_text_reader([]() -> std::optional<QString> {
+            return QStringLiteral("reader-right-paste");
+        });
         fixture.surface.set_bracketed_paste_policy(
             VNM_TerminalSurface::Bracketed_paste_policy::DISABLED);
         const std::size_t write_count = backend_ptr->writes.size();
@@ -9614,8 +9636,8 @@ bool test_right_click_paste_and_mouse_reporting_precedence(QGuiApplication& app)
         if (backend_ptr->writes.size() > write_count) {
             ok &= check_bytes_equal(
                 backend_ptr->writes.back(),
-                QByteArrayLiteral("right-paste"),
-                "right-click paste writes unframed clipboard text");
+                QByteArrayLiteral("reader-right-paste"),
+                "right-click paste writes injected unframed clipboard text");
         }
     }
 
