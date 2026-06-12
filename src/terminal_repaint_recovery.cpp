@@ -30,8 +30,9 @@ int primary_repaint_recovery_shift_rows(
         return 0;
     }
 
-    constexpr int k_min_meaningful_matches       = 2;
-    constexpr int k_preferred_meaningful_matches = 3;
+    constexpr int k_min_meaningful_matches                 = 2;
+    constexpr int k_preferred_meaningful_matches           = 3;
+    constexpr int k_min_partial_blank_rewritten_tail_rows  = 2;
 
     const int row_count = static_cast<int>(input.candidate_rows.size());
     int best_shift              = 0;
@@ -95,10 +96,25 @@ int primary_repaint_recovery_shift_rows(
         // matched after the shift, not the displaced payload itself, so a blank
         // displaced row is still recoverable - dropping it is what makes blank
         // separator lines vanish from reconstructed scrollback. A blank payload
-        // is weaker evidence than a text-bearing one, so recover it only when
-        // the entire surviving suffix matched; a partial prefix match is enough
-        // only when the displaced payload carries its own text.
-        if (!displaced_has_text && matched_prefix != row_count - shift) {
+        // is weaker evidence than a text-bearing one, so accept either a full
+        // surviving-suffix match or a preferred-strength partial match. The
+        // latter is still limited to a bounded rewritten tail so broad layout
+        // repaints, such as a startup banner moving upward, do not manufacture
+        // scrollback from a top spacer.
+        const bool full_surviving_suffix_matched =
+            matched_prefix == row_count - shift;
+        const int unmatched_tail_rows = row_count - shift - matched_prefix;
+        const int max_partial_blank_rewritten_tail_rows =
+            std::max(k_min_partial_blank_rewritten_tail_rows, row_count / 4);
+        const bool strong_partial_blank_shift =
+            meaningful_matches >= k_preferred_meaningful_matches &&
+            static_cast<int>(distinct_matched_texts.size()) >=
+                k_preferred_meaningful_matches &&
+            unmatched_tail_rows <= max_partial_blank_rewritten_tail_rows;
+        if (!displaced_has_text &&
+            !full_surviving_suffix_matched &&
+            !strong_partial_blank_shift)
+        {
             continue;
         }
 

@@ -1151,6 +1151,127 @@ bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row()
     return ok;
 }
 
+bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_tail()
+{
+    bool ok = true;
+
+    // TUI primary-screen repaints can shift the stable body upward while
+    // rewriting the newly exposed/status tail rows in the same frame. The blank
+    // top row is still proven by the three distinct surviving body rows and
+    // must be appended to reconstructed scrollback.
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(6, 12, 12);
+    model.ingest(visible_row_write_stream({
+        QByteArray(),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+        QByteArrayLiteral("old"),
+        QByteArrayLiteral("tail"),
+    }, false));
+
+    const term::Terminal_screen_model_result result =
+        model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("new"),
+            QByteArrayLiteral("tail2"),
+            QByteArrayLiteral("tail3"),
+        }, true));
+
+    ok &= check(model.scrollback_size() == 1,
+        "Phase R recovery recovers a blank separator row when the shifted tail is rewritten");
+    ok &= check(result.scrollback_rows == 1,
+        "Phase R recovery result reports the partial-match recovered blank retained row");
+    ok &= check(result.backing_deltas.size() == 1U &&
+            primary_backing_delta_matches(
+                result.backing_deltas[0],
+                term::Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
+                0,
+                1,
+                1,
+                0),
+        "Phase R recovery emits a primary-history append delta for the partial-match blank row");
+    ok &= check(result.recovery_proposals.size() == 1U &&
+            result.recovery_proposals[0].reason ==
+                term::Terminal_recovery_proposal_reason::PRIMARY_REPAINT_SHIFTED_VISIBLE_ROWS &&
+            result.recovery_proposals[0].status ==
+                term::Terminal_recovery_proposal_status::ACCEPTED &&
+            result.recovery_proposals[0].recovered_row_count == 1,
+        "Phase R recovery accepts the strong partial blank-shift proposal");
+    ok &= check(model.row_text(0) == QStringLiteral("bb") &&
+            model.row_text(1) == QStringLiteral("cc") &&
+            model.row_text(2) == QStringLiteral("dd") &&
+            model.row_text(3) == QStringLiteral("new") &&
+            model.row_text(4) == QStringLiteral("tail2") &&
+            model.row_text(5) == QStringLiteral("tail3"),
+        "Phase R recovery keeps the rewritten active tail after accepting the blank shift");
+
+    const term::Terminal_render_snapshot scrollback_snapshot =
+        model.render_snapshot(request_for_model(model, 81U, 1));
+    ok &= check(snapshot_row_text(scrollback_snapshot, 0).isEmpty() &&
+            snapshot_row_text(scrollback_snapshot, 1) == QStringLiteral("bb") &&
+            snapshot_row_text(scrollback_snapshot, 2) == QStringLiteral("cc") &&
+            snapshot_row_text(scrollback_snapshot, 3) == QStringLiteral("dd"),
+        "Phase R recovery exposes the partial-match recovered blank through primary backing");
+
+    return ok;
+}
+
+bool test_phase_r_primary_repaint_recovery_suppresses_broad_blank_layout_repaint()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(16, 32, 16);
+    model.ingest(visible_row_write_stream({
+        QByteArray(),
+        QByteArrayLiteral("frame-top"),
+        QByteArrayLiteral("title"),
+        QByteArrayLiteral("gap"),
+        QByteArrayLiteral("model"),
+        QByteArrayLiteral("dir"),
+        QByteArrayLiteral("perms"),
+        QByteArrayLiteral("frame-bottom"),
+        QByteArray(),
+        QByteArray(),
+        QByteArray(),
+        QByteArray(),
+        QByteArray(),
+        QByteArray(),
+        QByteArray(),
+        QByteArray(),
+    }, false));
+
+    const term::Terminal_screen_model_result result =
+        model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("frame-top"),
+            QByteArrayLiteral("title"),
+            QByteArrayLiteral("gap"),
+            QByteArrayLiteral("model"),
+            QByteArrayLiteral("dir"),
+            QByteArrayLiteral("perms"),
+            QByteArrayLiteral("frame-bottom"),
+            QByteArray(),
+            QByteArrayLiteral("tip"),
+            QByteArray(),
+            QByteArrayLiteral("boot"),
+            QByteArray(),
+            QByteArray(),
+            QByteArrayLiteral("prompt"),
+            QByteArray(),
+            QByteArrayLiteral("footer"),
+        }, true));
+
+    ok &= check(model.scrollback_size() == 0 &&
+            result.backing_deltas.empty() &&
+            result.recovery_proposals.empty(),
+        "Phase R recovery suppresses broad blank-spacer layout repaints");
+
+    return ok;
+}
+
 bool test_flat_ring_phase3_retained_record_producer_contract()
 {
     bool ok = true;
@@ -1689,7 +1810,65 @@ bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("yy"),
     };
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
-        "Phase R recovery helper rejects a blank displaced row on a partial-suffix match");
+        "Phase R recovery helper rejects a blank displaced row on a weak partial-suffix match");
+
+    input.candidate_rows = {
+        QString(),
+        QStringLiteral("bb"),
+        QStringLiteral("cc"),
+        QStringLiteral("dd"),
+        QStringLiteral("old"),
+        QStringLiteral("tail"),
+    };
+    input.current_rows = {
+        QStringLiteral("bb"),
+        QStringLiteral("cc"),
+        QStringLiteral("dd"),
+        QStringLiteral("new"),
+        QStringLiteral("tail2"),
+        QStringLiteral("tail3"),
+    };
+    ok &= check(term::primary_repaint_recovery_shift_rows(input) == 1,
+        "Phase R recovery helper accepts a blank displaced row on a strong partial-suffix match");
+
+    input.candidate_rows = {
+        QString(),
+        QStringLiteral("frame-top"),
+        QStringLiteral("title"),
+        QStringLiteral("gap"),
+        QStringLiteral("model"),
+        QStringLiteral("dir"),
+        QStringLiteral("perms"),
+        QStringLiteral("frame-bottom"),
+        QString(),
+        QString(),
+        QString(),
+        QString(),
+        QString(),
+        QString(),
+        QString(),
+        QString(),
+    };
+    input.current_rows = {
+        QStringLiteral("frame-top"),
+        QStringLiteral("title"),
+        QStringLiteral("gap"),
+        QStringLiteral("model"),
+        QStringLiteral("dir"),
+        QStringLiteral("perms"),
+        QStringLiteral("frame-bottom"),
+        QString(),
+        QStringLiteral("tip"),
+        QString(),
+        QStringLiteral("boot"),
+        QString(),
+        QString(),
+        QStringLiteral("prompt"),
+        QString(),
+        QStringLiteral("footer"),
+    };
+    ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
+        "Phase R recovery helper suppresses broad blank-spacer layout repaints");
 
     input.candidate_rows = {
         QStringLiteral("aa"),
@@ -3720,6 +3899,8 @@ int main()
     ok &= test_phase_r_primary_repaint_recovery_accepts_distinct_shift();
     ok &= test_phase_r_primary_repaint_recovery_preserves_row_content_stamps();
     ok &= test_phase_r_primary_repaint_recovery_recovers_blank_separator_row();
+    ok &= test_phase_r_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_tail();
+    ok &= test_phase_r_primary_repaint_recovery_suppresses_broad_blank_layout_repaint();
     ok &= test_flat_ring_phase3_retained_record_producer_contract();
     ok &= test_flat_ring_phase7_recovery_shared_producer_boundary();
     ok &= test_flat_ring_phase5a_resize_projects_retained_history_without_mutation();
