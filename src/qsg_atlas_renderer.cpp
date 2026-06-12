@@ -187,6 +187,7 @@ struct Atlas_frame_state_keys
 {
     QByteArray selection;
     QByteArray cursor;
+    QByteArray cursor_rect;
     QByteArray preedit;
     QByteArray options;
     QByteArray visual_bell;
@@ -195,11 +196,13 @@ struct Atlas_frame_state_keys
 struct Atlas_prepare_published_state
 {
     Atlas_frame_state_keys previous_render_state_keys;
+    std::vector<int>       previous_cursor_layer_rows;
     std::uint64_t          previous_render_font_epoch = 0U;
     bool                   have_previous_render_state = false;
     bool                   have_previous_render_font_epoch = false;
     bool                   render_force_full_reupload = false;
     bool                   render_non_dirty_state_invalidation = false;
+    bool                   render_cursor_rect_state_invalidation = false;
 };
 
 struct Glyph_raster_image
@@ -3423,7 +3426,14 @@ private:
             m_frame.cursor_blink_visible,
             &m_frame.ime_preedit);
         m_render_row_count = render_frame.grid_size.rows;
-        m_render_dirty_row_ranges = render_frame.dirty_row_ranges;
+        const QByteArray current_cursor_key =
+            render_cursor_state_key(render_frame);
+        const std::vector<int> current_cursor_layer_rows =
+            cursor_layer_rows(render_frame);
+        m_render_dirty_row_ranges = dirty_ranges_with_cursor_layer_rows(
+            render_frame.dirty_row_ranges,
+            current_cursor_key,
+            current_cursor_layer_rows);
 
         const qreal opacity = std::clamp(inheritedOpacity(), 0.0, 1.0);
         const std::vector<Terminal_render_rect> background_rects =
@@ -3461,6 +3471,7 @@ private:
         result.raw_font_rasterized = result.rasterized_glyphs > 0;
         finalize_frame_build_summary(render_frame, result);
         finalize_render_summary(render_frame, font_epoch_changed, result);
+        m_previous_cursor_layer_rows = current_cursor_layer_rows;
         finalize_warm_lazy_summary(result);
         return result;
     }
@@ -3665,6 +3676,96 @@ private:
         }
     }
 
+    QByteArray render_cursor_rect_state_key(
+        const Terminal_render_frame& render_frame) const
+    {
+        QByteArray key;
+        append_key_vector(
+            key,
+            render_frame.cursors,
+            [](QByteArray& key, const Terminal_render_cursor_primitive& cursor) {
+                append_key_int(key, static_cast<int>(cursor.kind));
+                append_key_rect(key, cursor.rect);
+                append_key_color(key, cursor.color);
+            });
+        return key;
+    }
+
+    QByteArray render_cursor_state_key(
+        const Terminal_render_frame& render_frame) const
+    {
+        QByteArray key = render_cursor_rect_state_key(render_frame);
+        append_key_vector(key, render_frame.cursor_text_runs, append_key_text_run);
+        return key;
+    }
+
+    std::vector<int> cursor_layer_rows(
+        const Terminal_render_frame& render_frame) const
+    {
+        std::vector<int> rows;
+        rows.reserve(render_frame.cursors.size() +
+            render_frame.cursor_text_runs.size());
+        for (const Terminal_render_cursor_primitive& cursor :
+            render_frame.cursors)
+        {
+            const int row = atlas_rect_row(
+                cursor.rect,
+                render_frame.cell_metrics,
+                render_frame.grid_size.rows);
+            if (row == k_qsg_atlas_all_rows) {
+                for (int visible_row = 0;
+                    visible_row < render_frame.grid_size.rows;
+                    ++visible_row)
+                {
+                    rows.push_back(visible_row);
+                }
+            }
+            else if (row >= 0 && row < render_frame.grid_size.rows) {
+                rows.push_back(row);
+            }
+        }
+        for (const Terminal_render_text_run& run :
+            render_frame.cursor_text_runs)
+        {
+            if (run.row >= 0 && run.row < render_frame.grid_size.rows) {
+                rows.push_back(run.row);
+            }
+        }
+        std::sort(rows.begin(), rows.end());
+        rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+        return rows;
+    }
+
+    std::vector<Terminal_render_dirty_row_range>
+    dirty_ranges_with_cursor_layer_rows(
+        const std::vector<Terminal_render_dirty_row_range>& dirty_row_ranges,
+        const QByteArray&                                  current_cursor_key,
+        const std::vector<int>&                            current_cursor_layer_rows) const
+    {
+        if (m_render_row_count <= 0               ||
+            !m_have_previous_render_state         ||
+            current_cursor_key ==
+                m_previous_render_state_keys.cursor)
+        {
+            return dirty_row_ranges;
+        }
+
+        std::vector<int> dirty_rows;
+        append_dirty_range_rows(dirty_rows, dirty_row_ranges);
+        dirty_rows.insert(
+            dirty_rows.end(),
+            m_previous_cursor_layer_rows.begin(),
+            m_previous_cursor_layer_rows.end());
+        dirty_rows.insert(
+            dirty_rows.end(),
+            current_cursor_layer_rows.begin(),
+            current_cursor_layer_rows.end());
+        return compact_dirty_row_ranges(
+            std::move(dirty_rows),
+            m_render_row_count,
+            false);
+    }
+
     QByteArray render_options_key(const Terminal_render_options& options) const
     {
         QByteArray key;
@@ -3701,14 +3802,8 @@ private:
             render_frame.selection_rects,
             append_key_render_rect);
 
-        append_key_vector(
-            keys.cursor,
-            render_frame.cursors,
-            [](QByteArray& key, const Terminal_render_cursor_primitive& cursor) {
-                append_key_int(key, static_cast<int>(cursor.kind));
-                append_key_rect(key, cursor.rect);
-                append_key_color(key, cursor.color);
-            });
+        keys.cursor_rect = render_cursor_rect_state_key(render_frame);
+        keys.cursor      = keys.cursor_rect;
         append_key_vector(keys.cursor, render_frame.cursor_text_runs, append_key_text_run);
 
         append_key_string(keys.preedit, m_frame.ime_preedit.text);
@@ -3734,6 +3829,7 @@ private:
     {
         Atlas_prepare_published_state state;
         state.previous_render_state_keys = m_previous_render_state_keys;
+        state.previous_cursor_layer_rows = m_previous_cursor_layer_rows;
         state.previous_render_font_epoch = m_previous_render_font_epoch;
         state.have_previous_render_state = m_have_previous_render_state;
         state.have_previous_render_font_epoch =
@@ -3741,6 +3837,8 @@ private:
         state.render_force_full_reupload = m_render_force_full_reupload;
         state.render_non_dirty_state_invalidation =
             m_render_non_dirty_state_invalidation;
+        state.render_cursor_rect_state_invalidation =
+            m_render_cursor_rect_state_invalidation;
         return state;
     }
 
@@ -3748,6 +3846,7 @@ private:
         const Atlas_prepare_published_state& state)
     {
         m_previous_render_state_keys = state.previous_render_state_keys;
+        m_previous_cursor_layer_rows = state.previous_cursor_layer_rows;
         m_previous_render_font_epoch = state.previous_render_font_epoch;
         m_have_previous_render_state = state.have_previous_render_state;
         m_have_previous_render_font_epoch =
@@ -3755,6 +3854,8 @@ private:
         m_render_force_full_reupload = state.render_force_full_reupload;
         m_render_non_dirty_state_invalidation =
             state.render_non_dirty_state_invalidation;
+        m_render_cursor_rect_state_invalidation =
+            state.render_cursor_rect_state_invalidation;
     }
 
     bool msdf_text_ownership_available() const
@@ -3908,6 +4009,10 @@ private:
         const bool cursor_changed =
             m_have_previous_render_state &&
             current_keys.cursor != m_previous_render_state_keys.cursor;
+        const bool cursor_rect_changed =
+            m_have_previous_render_state &&
+            current_keys.cursor_rect !=
+                m_previous_render_state_keys.cursor_rect;
         const bool preedit_changed =
             m_have_previous_render_state &&
             current_keys.preedit != m_previous_render_state_keys.preedit;
@@ -3927,6 +4032,8 @@ private:
         const bool cursor_present =
             !render_frame.cursors.empty()              ||
             !render_frame.cursor_text_runs.empty();
+        const bool cursor_rect_present =
+            !render_frame.cursors.empty();
         const bool preedit_present =
             m_frame.ime_preedit.active &&
             !m_frame.ime_preedit.text.isEmpty();
@@ -4013,6 +4120,18 @@ private:
             summary.non_dirty_preedit_invalidation     ||
             summary.non_dirty_options_invalidation     ||
             summary.non_dirty_visual_bell_invalidation ||
+            font_epoch_changed;
+
+        // The visible caret rectangle is a tiny non-row-stable rect-buffer
+        // primitive.  Text/glyph layers may legitimately use dirty-row partial
+        // uploads while typing, but a missed cursor-rect update is highly
+        // visible: one frame can show the new text with the old caret column.
+        // Keep the larger glyph/MSDF buffers on their existing partial-update
+        // path and make only the rect buffer conservative whenever the cursor
+        // primitive itself changed.
+        m_render_cursor_rect_state_invalidation =
+            cursor_rect_changed ||
+            (!m_have_previous_render_state && cursor_rect_present) ||
             font_epoch_changed;
         m_previous_render_state_keys      = current_keys;
         m_have_previous_render_state      = true;
@@ -5743,7 +5862,8 @@ private:
                 m_render_dirty_row_ranges,
                 rect_buffer_recreated,
                 m_render_force_full_reupload,
-                m_render_non_dirty_state_invalidation,
+                m_render_non_dirty_state_invalidation ||
+                    m_render_cursor_rect_state_invalidation,
                 -1,
                 false,
             });
@@ -6053,8 +6173,10 @@ private:
                                              m_render_dirty_row_ranges;
     bool                                     m_render_force_full_reupload = false;
     bool                                     m_render_non_dirty_state_invalidation = false;
+    bool                                     m_render_cursor_rect_state_invalidation = false;
     bool                                     m_have_previous_render_state = false;
     Atlas_frame_state_keys                  m_previous_render_state_keys;
+    std::vector<int>                         m_previous_cursor_layer_rows;
     bool                                     m_have_previous_render_font_epoch = false;
     std::uint64_t                            m_previous_render_font_epoch = 0U;
     std::map<QByteArray, Prepared_atlas_text_run>

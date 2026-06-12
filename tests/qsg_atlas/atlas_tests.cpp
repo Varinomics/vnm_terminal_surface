@@ -11113,6 +11113,11 @@ bool run_atlas_glyph_row_stable_report_case(
     if (!prepared || !expected_upload || !extra) {
         std::cerr << "atlas glyph row-stable " << name
             << " prepared=" << prepared
+            << " rect_full=" << render_summary.rect_buffer.full_upload
+            << " rect_partial=" << render_summary.rect_buffer.partial_upload
+            << " rect_non_dirty=" << render_summary.rect_buffer.non_dirty_state_upload
+            << " rect_uploaded=" << render_summary.rect_buffer.uploaded_bytes
+            << " rect_buffer_bytes=" << render_summary.rect_buffer.buffer_bytes
             << " glyph_full=" << glyph_buffer.full_upload
             << " glyph_partial=" << glyph_buffer.partial_upload
             << " glyph_non_dirty=" << glyph_buffer.non_dirty_state_upload
@@ -11324,7 +11329,7 @@ bool test_atlas_glyph_row_stable_cursor_dirty_update(QGuiApplication& app)
         });
 }
 
-bool test_atlas_glyph_row_stable_cursor_clean_row_fallback(QGuiApplication& app)
+bool test_atlas_glyph_row_stable_cursor_clean_row_promoted(QGuiApplication& app)
 {
     term::Terminal_render_snapshot baseline =
         make_atlas_row_stable_text_snapshot(
@@ -11369,10 +11374,15 @@ bool test_atlas_glyph_row_stable_cursor_clean_row_fallback(QGuiApplication& app)
         baseline,
         mutated,
         [](const term::Qsg_atlas_render_summary& render_summary) {
-            return render_summary.glyph_cursor_text_row_capacity > 0 &&
+            const term::Qsg_atlas_buffer_update_summary& rect_buffer =
+                render_summary.rect_buffer;
+            return rect_buffer.full_upload &&
+                !rect_buffer.partial_upload &&
+                rect_buffer.non_dirty_state_upload &&
+                rect_buffer.uploaded_bytes == rect_buffer.buffer_bytes &&
+                render_summary.glyph_cursor_text_row_capacity > 0 &&
                 !render_summary.non_dirty_cursor_invalidation;
-        },
-        true);
+        });
 }
 
 term::Terminal_render_snapshot make_atlas_prepared_text_reuse_snapshot(
@@ -17910,7 +17920,7 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_glyph_row_stable_wide_update(app);
     ok &= test_atlas_glyph_row_stable_combining_update(app);
     ok &= test_atlas_glyph_row_stable_cursor_dirty_update(app);
-    ok &= test_atlas_glyph_row_stable_cursor_clean_row_fallback(app);
+    ok &= test_atlas_glyph_row_stable_cursor_clean_row_promoted(app);
     ok &= test_atlas_prepared_text_reuse(app);
     ok &= test_atlas_msdf_resource_stability(app);
     ok &= test_atlas_msdf_zoom_reuses_baked_atlas(app);
