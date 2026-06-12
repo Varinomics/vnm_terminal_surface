@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -65,6 +66,7 @@ extern "C" __declspec(dllimport) int __stdcall SystemParametersInfoW(
     unsigned int parameter,
     void*        value,
     unsigned int update_flags);
+extern "C" __declspec(dllimport) long __stdcall OleFlushClipboard();
 #endif
 
 namespace {
@@ -89,6 +91,34 @@ constexpr unsigned int k_win_font_smoothing_cleartype           = 0x0002U;
 constexpr unsigned int k_win_font_smoothing_orientation_bgr     = 0x0000U;
 constexpr unsigned int k_win_font_smoothing_orientation_rgb     = 0x0001U;
 #endif
+
+bool flush_clipboard_after_terminal_write()
+{
+#if defined(_WIN32)
+    const long result = OleFlushClipboard();
+    if (result != 0L) {
+        qWarning(
+            "VNM_TerminalSurface: OleFlushClipboard failed after clipboard write; "
+            "data may not outlive the process: 0x%08lx",
+            static_cast<unsigned long>(result));
+        return false;
+    }
+#endif
+    return true;
+}
+
+bool set_terminal_clipboard_text(const QString& text)
+{
+    QClipboard* clipboard = QGuiApplication::clipboard();
+    if (clipboard == nullptr) {
+        qWarning("VNM_TerminalSurface: no application clipboard is available");
+        return false;
+    }
+
+    clipboard->setText(text, QClipboard::Clipboard);
+    (void)flush_clipboard_after_terminal_write();
+    return true;
+}
 
 bool same_property_value(qreal lhs, qreal rhs)
 {
@@ -2056,6 +2086,7 @@ struct VNM_TerminalSurface::Private
                                                            selection_anchor_source;
     std::shared_ptr<const term::Terminal_render_snapshot>  selection_anchor_snapshot;
     std::optional<term::Terminal_osc52_write_request>      pending_clipboard_write;
+    std::function<std::optional<QString>()>                clipboard_text_reader;
     QString                                                warmed_prompt_text_layout_font_key;
     QTimer                                                 synchronized_output_recovery_timer;
     QTimer                                                 row_timestamp_tooltip_timer;
@@ -2925,6 +2956,13 @@ void VNM_TerminalSurface::set_dirty_row_stats_enabled(bool enabled)
     }
 }
 
+void VNM_TerminalSurface::set_clipboard_text_reader(
+    std::function<std::optional<QString>()> reader)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    m_private->clipboard_text_reader = std::move(reader);
+}
+
 int VNM_TerminalSurface::scrollback_rows() const
 {
     return m_scrollback_rows;
@@ -2982,10 +3020,7 @@ bool VNM_TerminalSurface::respond_clipboard_write(
         return false;
     }
 
-    QGuiApplication::clipboard()->setText(
-        QString::fromUtf8(request.decoded_payload),
-        QClipboard::Clipboard);
-    return true;
+    return set_terminal_clipboard_text(QString::fromUtf8(request.decoded_payload));
 }
 
 QString VNM_TerminalSurface::selected_text()
@@ -3032,18 +3067,15 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard()
         return false;
     }
 
-    QClipboard* clipboard = QGuiApplication::clipboard();
-    if (clipboard != nullptr) {
-        clipboard->setText(result.text, QClipboard::Clipboard);
-    }
+    const bool clipboard_write_persisted = set_terminal_clipboard_text(result.text);
     if (m_selection_trace_enabled) {
         write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface copy-selected-text result=%1 size=%2 clipboard=%3")
                 .arg(static_cast<int>(result.code))
                 .arg(result.text.size())
-                .arg(selection_trace_bool(clipboard != nullptr)));
+                .arg(selection_trace_bool(clipboard_write_persisted)));
     }
-    return true;
+    return clipboard_write_persisted;
 }
 
 void VNM_TerminalSurface::clear_selection()
@@ -3090,6 +3122,34 @@ bool VNM_TerminalSurface::paste_text(QString text)
     }
 
     return true;
+}
+
+std::optional<QString> VNM_TerminalSurface::read_clipboard_text_for_paste()
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    if (m_private->clipboard_text_reader) {
+        return m_private->clipboard_text_reader();
+    }
+
+    QClipboard* clipboard = QGuiApplication::clipboard();
+    if (clipboard == nullptr) {
+        return std::nullopt;
+    }
+
+    return clipboard->text(QClipboard::Clipboard);
+}
+
+bool VNM_TerminalSurface::paste_clipboard_text()
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    const std::optional<QString> text = read_clipboard_text_for_paste();
+    if (!text.has_value()) {
+        return false;
+    }
+
+    return paste_text(*text);
 }
 
 bool VNM_TerminalSurface::scroll_viewport_lines(int line_delta)
@@ -3666,8 +3726,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
     }
 
     if (event->button() == Qt::RightButton) {
-        QClipboard* clipboard = QGuiApplication::clipboard();
-        if (clipboard != nullptr && paste_text(clipboard->text())) {
+        if (paste_clipboard_text()) {
             event->accept();
             trace_decision(QStringLiteral("right-paste"));
             return;

@@ -230,9 +230,14 @@ There are three clipboard paths:
 
 - Local copy uses the host clipboard directly when `copyShortcutPolicy` chooses
   to copy a local selection.
-- Host paste calls `paste_text()` directly. The example maps Ctrl+V and
-  Ctrl+Shift+V to clipboard paste through this method; the surface also handles
-  right-click paste when a session accepts the paste.
+- Host paste can call `paste_text()` when the host already has text to paste, or
+  `paste_clipboard_text()` to ask the surface to read paste text and route it
+  through the normal paste path. `paste_clipboard_text()` uses the reader
+  installed by `set_clipboard_text_reader()`; if no reader is installed, it falls
+  back to `QClipboard::text(QClipboard::Clipboard)`. Hosts that need a bounded
+  or policy-aware clipboard read should install a reader before exposing
+  clipboard paste shortcuts. The bundled app uses this hook for both keyboard
+  paste and right-click paste.
 - OSC 52 clipboard writes are mediated by the host. The parser decodes the
   payload and the surface emits
   `clipboard_write_requested(request_id, target_selection, payload)`. The host

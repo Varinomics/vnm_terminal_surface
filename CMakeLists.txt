@@ -189,7 +189,10 @@ if(WIN32)
     )
     # DirectWrite (resolve an installed font family to its font file for MSDF;
     # see src/qsg_atlas_font_bytes.cpp).
-    target_link_libraries(vnm_terminal_surface PRIVATE dwrite)
+    target_link_libraries(vnm_terminal_surface PRIVATE
+        dwrite
+        ole32
+    )
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
