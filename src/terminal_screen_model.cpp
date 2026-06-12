@@ -1573,6 +1573,19 @@ void Terminal_screen_model::discard_retained_lookup_cache_for_testing() const
     invalidate_retained_lookup_caches();
 }
 
+void Terminal_screen_model::reset_retained_history_decode_live_row_call_count_for_testing() const
+{
+    m_primary_backing.retained_history.traversal->
+        reset_decode_live_row_call_count_for_testing();
+}
+
+std::uint64_t
+Terminal_screen_model::retained_history_decode_live_row_call_count_for_testing() const
+{
+    return m_primary_backing.retained_history.traversal->
+        decode_live_row_call_count_for_testing();
+}
+
 void Terminal_screen_model::invalidate_retained_lookup_caches() const
 {
     if (m_primary_retained_lookup_cache.invalidated() &&
@@ -1656,7 +1669,7 @@ Terminal_screen_model::retained_lookup_cache_live_handle(
 
     if (buffer_id == Terminal_buffer_id::PRIMARY) {
         if (logical_row < scrollback_size()) {
-            return m_primary_backing.retained_history_handle(
+            return m_primary_backing.retained_history_handle_at_index(
                 static_cast<std::size_t>(logical_row));
         }
 
@@ -2057,33 +2070,17 @@ Terminal_screen_model::Primary_backing_buffer::materialize_retained_history_reco
 }
 
 std::optional<terminal_history_handle_t>
-Terminal_screen_model::Primary_backing_buffer::retained_history_handle(
+Terminal_screen_model::Primary_backing_buffer::retained_history_handle_at_index(
     std::size_t index) const
 {
     VNM_TERMINAL_PROFILE_SCOPE(
-        "Terminal_screen_model::Primary_backing_buffer::retained_history_handle");
+        "Terminal_screen_model::Primary_backing_buffer::retained_history_handle_at_index");
 
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        if (index >= retained_history.logical_rows.size()) {
-            return std::nullopt;
-        }
-
-        Terminal_history_row_traversal_result row =
-            retained_history.traversal->resolve_cached_row(
-                retained_history.logical_rows[index]);
-        if (row.status == Terminal_history_row_traversal_status::OK) {
-            return row.row.history_handle;
-        }
-
-        if (row.status == Terminal_history_row_traversal_status::CACHE_ENTRY_INVALID) {
-            rebuild_retained_history_rows();
-            continue;
-        }
-
-        throw_retained_history_storage_failure();
+    if (index >= retained_history.logical_rows.size()) {
+        return std::nullopt;
     }
 
-    return std::nullopt;
+    return retained_history.logical_rows[index];
 }
 
 Terminal_screen_model::retained_history_append_result_t

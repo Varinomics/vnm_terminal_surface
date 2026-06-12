@@ -344,6 +344,8 @@ public:
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
     void discard_retained_lookup_cache_for_testing() const;
+    void reset_retained_history_decode_live_row_call_count_for_testing() const;
+    std::uint64_t retained_history_decode_live_row_call_count_for_testing() const;
     Terminal_retained_line_provenance retained_line_provenance_for_testing(
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
@@ -510,7 +512,7 @@ private:
         int retained_history_size() const;
         std::optional<retained_row_record_t> materialize_retained_history_record(
             std::size_t index) const;
-        std::optional<terminal_history_handle_t> retained_history_handle(
+        std::optional<terminal_history_handle_t> retained_history_handle_at_index(
             std::size_t index) const;
 
         retained_history_append_result_t append_retained_history_record(
