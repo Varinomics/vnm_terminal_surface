@@ -12702,8 +12702,11 @@ bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
         "flat-ring Phase 5C cache hit validates retained-line generation mismatch");
 
     model.discard_retained_lookup_cache_for_testing();
+    model.reset_retained_history_decode_live_row_call_count_for_testing();
     const term::Terminal_retained_line_lookup_result rebuilt_lookup =
         model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, middle_handle);
+    const std::uint64_t cold_lookup_decode_count =
+        model.retained_history_decode_live_row_call_count_for_testing();
     const std::optional<term::terminal_history_handle_t> rebuilt_ordinal_handle =
         model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, 1);
     ok &= check(rebuilt_lookup.exact_match &&
@@ -12714,6 +12717,8 @@ bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
         rebuilt_ordinal_handle->record_bytes >
             term::k_terminal_history_retained_identity_record_bytes,
         "flat-ring Phase 5C dropped lookup caches rebuild without losing retained rows");
+    ok &= check(cold_lookup_decode_count == 0U,
+        "flat-ring Phase 5C retained lookup-cache rebuild does not decode retained rows");
 
     const int scrollback_before_evict = model.scrollback_size();
     model.set_scrollback_limit(scrollback_before_evict - 1);

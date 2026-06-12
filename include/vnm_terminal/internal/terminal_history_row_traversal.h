@@ -56,6 +56,14 @@ public:
 
     void discard_directory_cache();
     std::size_t directory_cache_size() const { return m_directory.size(); }
+    void reset_decode_live_row_call_count_for_testing()
+    {
+        m_decode_live_row_call_count_for_testing = 0U;
+    }
+    std::uint64_t decode_live_row_call_count_for_testing() const
+    {
+        return m_decode_live_row_call_count_for_testing;
+    }
 
     Terminal_history_row_traversal_rebuild_result rebuild_directory();
 
@@ -85,6 +93,7 @@ private:
     bool                                     m_directory_valid = false;
     std::uint64_t                            m_cached_oldest_live_byte_sequence = 0U;
     std::uint64_t                            m_cached_head_byte_sequence = 0U;
+    std::uint64_t                            m_decode_live_row_call_count_for_testing = 0U;
 };
 
 }

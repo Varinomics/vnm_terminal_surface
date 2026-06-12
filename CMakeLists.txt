@@ -13,7 +13,7 @@ if(VNM_TERMINAL_DISTRIBUTION_BUILD AND VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_RE
         "VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=OFF")
 endif()
 
-project(vnm_terminal_surface LANGUAGES CXX VERSION 1.3.0)
+project(vnm_terminal_surface LANGUAGES CXX VERSION 1.3.1)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

@@ -359,6 +359,8 @@ Terminal_history_row_traversal_result Terminal_history_row_traversal::decode_liv
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_row_traversal::decode_live_row");
 
+    ++m_decode_live_row_call_count_for_testing;
+
     const Terminal_history_ring_read_scope read = m_ring.read_record(byte_sequence);
     if (!read.ok()) {
         return make_ring_failure_result(read.status(), expected_handle.has_value());
