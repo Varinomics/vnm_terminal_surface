@@ -267,6 +267,8 @@ struct Terminal_screen_model_profile_stats
     std::uint64_t              render_snapshot_rows_materialized        = 0U;
     std::uint64_t              render_snapshot_rows_borrowed            = 0U;
     std::uint64_t              render_snapshot_rows_owned               = 0U;
+    std::uint64_t              render_snapshot_rows_built_from_model_storage = 0U;
+    std::uint64_t              render_snapshot_model_row_accessor_borrows = 0U;
     std::uint64_t              render_snapshot_cells_scanned            = 0U;
     std::uint64_t              render_snapshot_cells_emitted            = 0U;
     std::uint64_t              render_snapshot_compact_empty_text_cells  = 0U;

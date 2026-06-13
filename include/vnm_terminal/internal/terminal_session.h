@@ -43,6 +43,7 @@ struct Terminal_session_profile_stats
     std::uint64_t              render_snapshot_requests              = 0U;
     std::uint64_t              render_snapshots_constructed          = 0U;
     std::uint64_t              render_snapshot_publications          = 0U;
+    std::uint64_t              full_snapshot_publications            = 0U;
     std::uint64_t              content_snapshot_publications         = 0U;
     std::uint64_t              selection_snapshot_publications       = 0U;
     std::uint64_t              geometry_snapshot_publications        = 0U;
@@ -53,7 +54,12 @@ struct Terminal_session_profile_stats
     std::uint64_t              zero_dirty_snapshot_publications      = 0U;
     std::uint64_t              snapshots_superseded_before_render    = 0U;
     std::uint64_t              snapshots_marked_rendered            = 0U;
+    std::uint64_t              snapshots_consumed_by_bridge          = 0U;
     std::uint64_t              max_unrendered_snapshot_generations   = 0U;
+    std::uint64_t              retained_snapshot_payload_bytes       = 0U;
+    std::uint64_t              retained_snapshot_generation_count    = 0U;
+    std::uint64_t              max_retained_snapshot_payload_bytes   = 0U;
+    std::uint64_t              max_retained_snapshot_generation_count = 0U;
 };
 
 class Terminal_session
@@ -447,6 +453,8 @@ private:
         std::uint64_t                      sequence,
         Terminal_render_snapshot_purpose   purpose,
         Terminal_public_scroll_diagnostics public_scroll_diagnostics = {}) const;
+
+    void record_snapshot_publication_queued_for_bridge();
 
     void publish_render_snapshot(
         std::uint64_t              sequence,

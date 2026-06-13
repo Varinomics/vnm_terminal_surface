@@ -17,6 +17,9 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
+constexpr const char* k_frame_descriptor_counter_semantics =
+    "unavailable_until_batch_7_descriptor_reuse";
+
 enum class Text_pattern
 {
     LEGACY_ASCII_BLOCK,
@@ -47,7 +50,11 @@ struct Benchmark_totals
     std::uint64_t snapshot_cells = 0U;
     std::uint64_t snapshot_dirty_rows_visible = 0U;
     term::terminal_simple_content_cumulative_stats_t simple_content;
+    std::uint64_t frame_visible_rows = 0U;
+    std::uint64_t frame_dirty_rows = 0U;
+    std::uint64_t frame_full_dirty_rows = 0U;
     std::uint64_t frame_cell_pass_input_cells = 0U;
+    std::uint64_t frame_cells_considered = 0U;
     std::uint64_t frame_cell_pass_classification_calls = 0U;
     std::uint64_t frame_dirty_row_lookup_count = 0U;
     std::uint64_t frame_dirty_row_range_lookup_count = 0U;
@@ -224,14 +231,19 @@ Benchmark_options parse_options(int argc, char** argv)
     return options;
 }
 
+std::vector<int> all_rows(int row_count)
+{
+    std::vector<int> rows(static_cast<std::size_t>(row_count));
+    for (int row = 0; row < row_count; ++row) {
+        rows[static_cast<std::size_t>(row)] = row;
+    }
+    return rows;
+}
+
 std::vector<int> dirty_rows_for_frame(const Benchmark_options& options, int frame_index)
 {
     if (options.dirty_rows >= options.rows) {
-        std::vector<int> rows(static_cast<std::size_t>(options.rows));
-        for (int row = 0; row < options.rows; ++row) {
-            rows[static_cast<std::size_t>(row)] = row;
-        }
-        return rows;
+        return all_rows(options.rows);
     }
 
     std::vector<bool> used(static_cast<std::size_t>(options.rows), false);
@@ -503,8 +515,16 @@ void accumulate_frame_stats(
     }
 
     accumulate_simple_content_stats(totals.simple_content, frame.stats.simple_content);
+    totals.frame_visible_rows +=
+        static_cast<std::uint64_t>(frame.stats.visible_rows);
+    totals.frame_dirty_rows +=
+        static_cast<std::uint64_t>(frame.stats.dirty_rows);
+    totals.frame_full_dirty_rows +=
+        static_cast<std::uint64_t>(frame.stats.full_dirty_rows);
     totals.frame_cell_pass_input_cells +=
         static_cast<std::uint64_t>(frame.stats.cell_pass_input_cells);
+    totals.frame_cells_considered +=
+        static_cast<std::uint64_t>(frame.stats.cells_considered);
     totals.frame_cell_pass_classification_calls +=
         static_cast<std::uint64_t>(frame.stats.cell_pass_classification_calls);
     totals.frame_dirty_row_lookup_count +=
@@ -631,6 +651,12 @@ void print_model_profile_stats(
         "model_profile.render_snapshot_cells_emitted",
         stats.render_snapshot_cells_emitted);
     print_metric(
+        "model_profile.render_snapshot_rows_built_from_model_storage",
+        stats.render_snapshot_rows_built_from_model_storage);
+    print_metric(
+        "model_profile.render_snapshot_model_row_accessor_borrows",
+        stats.render_snapshot_model_row_accessor_borrows);
+    print_metric(
         "model_profile.render_snapshot_compact_empty_text_cells",
         stats.render_snapshot_compact_empty_text_cells);
     print_metric(
@@ -662,6 +688,94 @@ void print_model_profile_stats(
         stats.max_render_snapshot_fallback_text_units_per_cell);
 }
 
+bool validate_observed_dirty_rows(
+    const Benchmark_options&                              options,
+    const Benchmark_totals&                               totals,
+    const term::Terminal_screen_model_profile_stats*      model_profile_stats)
+{
+    const std::uint64_t requested_dirty_rows =
+        static_cast<std::uint64_t>(options.frames) *
+        static_cast<std::uint64_t>(options.dirty_rows);
+    if (options.dirty_rows >= options.rows) {
+        if (totals.snapshot_dirty_rows_visible != requested_dirty_rows ||
+            totals.frame_dirty_rows            != requested_dirty_rows ||
+            totals.frame_full_dirty_rows       != requested_dirty_rows)
+        {
+            std::cerr << "full dirty-row validation failed: expected "
+                << requested_dirty_rows
+                << " rows, observed snapshot="
+                << totals.snapshot_dirty_rows_visible
+                << " frame=" << totals.frame_dirty_rows
+                << " full=" << totals.frame_full_dirty_rows << '\n';
+            return false;
+        }
+
+        if (model_profile_stats != nullptr) {
+            const std::uint64_t profile_dirty_rows =
+                model_profile_stats->render_snapshot_dirty_rows_visible;
+            const std::uint64_t profile_full_repaint_fallbacks =
+                model_profile_stats->render_snapshot_full_repaint_fallbacks;
+            if (profile_dirty_rows != requested_dirty_rows ||
+                profile_full_repaint_fallbacks != 0U)
+            {
+                std::cerr << "full model-profile dirty-row validation failed: expected "
+                    << requested_dirty_rows
+                    << " visible rows and no full repaint fallbacks, observed "
+                    << "model_profile.render_snapshot_dirty_rows_visible="
+                    << profile_dirty_rows
+                    << " model_profile.render_snapshot_full_repaint_fallbacks="
+                    << profile_full_repaint_fallbacks
+                    << '\n';
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    const std::uint64_t accounted_cursor_rows =
+        static_cast<std::uint64_t>(options.frames);
+    const std::uint64_t maximum_accounted_dirty_rows =
+        requested_dirty_rows + accounted_cursor_rows;
+    if (totals.snapshot_dirty_rows_visible < requested_dirty_rows ||
+        totals.snapshot_dirty_rows_visible > maximum_accounted_dirty_rows ||
+        totals.frame_dirty_rows            < requested_dirty_rows ||
+        totals.frame_dirty_rows            > maximum_accounted_dirty_rows ||
+        totals.frame_full_dirty_rows       != 0U)
+    {
+        std::cerr << "sparse dirty-row validation failed: expected "
+            << requested_dirty_rows << ".." << maximum_accounted_dirty_rows
+            << " rows, observed snapshot="
+            << totals.snapshot_dirty_rows_visible
+            << " frame=" << totals.frame_dirty_rows
+            << " full=" << totals.frame_full_dirty_rows << '\n';
+        return false;
+    }
+
+    if (model_profile_stats != nullptr) {
+        const std::uint64_t profile_dirty_rows =
+            model_profile_stats->render_snapshot_dirty_rows_visible;
+        const std::uint64_t profile_full_repaint_fallbacks =
+            model_profile_stats->render_snapshot_full_repaint_fallbacks;
+        if (profile_dirty_rows < requested_dirty_rows ||
+            profile_dirty_rows > maximum_accounted_dirty_rows ||
+            profile_full_repaint_fallbacks != 0U)
+        {
+            std::cerr << "sparse model-profile dirty-row validation failed: expected "
+                << requested_dirty_rows << ".." << maximum_accounted_dirty_rows
+                << " visible rows and no full repaint fallbacks, observed "
+                << "model_profile.render_snapshot_dirty_rows_visible="
+                << profile_dirty_rows
+                << " model_profile.render_snapshot_full_repaint_fallbacks="
+                << profile_full_repaint_fallbacks
+                << '\n';
+            return false;
+        }
+    }
+
+    return true;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -688,6 +802,11 @@ int main(int argc, char** argv)
         model.set_profile_stats_enabled(false);
     }
 #endif
+
+    if (options.dirty_rows < options.rows) {
+        const std::vector<int> baseline_rows = all_rows(options.rows);
+        (void)model.ingest(payload_for_frame(options, 0, baseline_rows));
+    }
 
     const int total_frames = options.warmup_frames + options.frames;
     for (int frame_index = 0; frame_index < total_frames; ++frame_index) {
@@ -739,6 +858,24 @@ int main(int argc, char** argv)
         }
     }
 
+#if VNM_TERMINAL_PROFILING_ENABLED
+    const term::Terminal_screen_model_profile_stats model_profile_stats =
+        model.profile_stats();
+    const bool model_profile_stats_available =
+        options.model_profile_stats_enabled && model_profile_stats.enabled;
+#else
+    const term::Terminal_screen_model_profile_stats model_profile_stats;
+    const bool model_profile_stats_available = false;
+#endif
+
+    if (!validate_observed_dirty_rows(
+            options,
+            totals,
+            model_profile_stats_available ? &model_profile_stats : nullptr))
+    {
+        return 3;
+    }
+
     const double frames = static_cast<double>(options.frames);
     std::cout << "scenario=nelostie_like_model_snapshot_frame\n";
     print_metric("frames", static_cast<std::uint64_t>(options.frames));
@@ -753,15 +890,6 @@ int main(int argc, char** argv)
         << '\n';
     std::cout << "model_profile_stats_requested="
         << (options.model_profile_stats_enabled ? "true" : "false") << '\n';
-#if VNM_TERMINAL_PROFILING_ENABLED
-    const term::Terminal_screen_model_profile_stats model_profile_stats =
-        model.profile_stats();
-    const bool model_profile_stats_available =
-        options.model_profile_stats_enabled && model_profile_stats.enabled;
-#else
-    const term::Terminal_screen_model_profile_stats model_profile_stats;
-    const bool model_profile_stats_available = false;
-#endif
     std::cout << "model_profile_stats_available="
         << (model_profile_stats_available ? "true" : "false") << '\n';
     print_metric("total_ms", total_ms);
@@ -780,10 +908,18 @@ int main(int argc, char** argv)
     print_metric(
         "route_qt_text_layout_cells",
         totals.simple_content.route_qt_text_layout_cells);
+    print_metric("frame_visible_rows", totals.frame_visible_rows);
+    print_metric("frame_dirty_rows", totals.frame_dirty_rows);
+    print_metric("frame_full_dirty_rows", totals.frame_full_dirty_rows);
     print_metric("frame_cell_pass_input_cells", totals.frame_cell_pass_input_cells);
+    print_metric("frame_cells_considered", totals.frame_cells_considered);
+    print_metric("frame_input_cells_considered", totals.frame_cell_pass_input_cells);
     print_metric(
         "frame_cell_pass_classification_calls",
         totals.frame_cell_pass_classification_calls);
+    std::cout << "frame_row_descriptor_counters_available=false\n";
+    std::cout << "frame_row_descriptor_counter_semantics="
+        << k_frame_descriptor_counter_semantics << '\n';
     print_metric("frame_dirty_row_lookup_count", totals.frame_dirty_row_lookup_count);
     print_metric(
         "frame_dirty_row_range_lookup_count",

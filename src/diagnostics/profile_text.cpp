@@ -443,6 +443,14 @@ void append_model_profile_stats_section(
         stats.render_snapshot_rows_materialized);
     append_profile_counter(stream, "render_snapshot_rows_borrowed", stats.render_snapshot_rows_borrowed);
     append_profile_counter(stream, "render_snapshot_rows_owned", stats.render_snapshot_rows_owned);
+    append_profile_counter(
+        stream,
+        "render_snapshot_rows_built_from_model_storage",
+        stats.render_snapshot_rows_built_from_model_storage);
+    append_profile_counter(
+        stream,
+        "render_snapshot_model_row_accessor_borrows",
+        stats.render_snapshot_model_row_accessor_borrows);
     append_profile_counter(stream, "render_snapshot_cells_scanned", stats.render_snapshot_cells_scanned);
     append_profile_counter(stream, "render_snapshot_cells_emitted", stats.render_snapshot_cells_emitted);
     append_profile_counter(
@@ -528,6 +536,7 @@ void append_session_profile_stats_section(
     append_profile_counter(stream, "render_snapshot_requests", stats.render_snapshot_requests);
     append_profile_counter(stream, "render_snapshots_constructed", stats.render_snapshots_constructed);
     append_profile_counter(stream, "render_snapshot_publications", stats.render_snapshot_publications);
+    append_profile_counter(stream, "full_snapshot_publications", stats.full_snapshot_publications);
     append_profile_counter(stream, "content_snapshot_publications", stats.content_snapshot_publications);
     append_profile_counter(stream, "selection_snapshot_publications", stats.selection_snapshot_publications);
     append_profile_counter(stream, "geometry_snapshot_publications", stats.geometry_snapshot_publications);
@@ -547,10 +556,35 @@ void append_session_profile_stats_section(
         "snapshots_superseded_before_render",
         stats.snapshots_superseded_before_render);
     append_profile_counter(stream, "snapshots_marked_rendered", stats.snapshots_marked_rendered);
+    append_profile_counter(stream, "snapshots_consumed_by_bridge", stats.snapshots_consumed_by_bridge);
     append_profile_counter(
         stream,
         "max_unrendered_snapshot_generations",
         stats.max_unrendered_snapshot_generations);
+    stream << "  consumer_materialization_counters_available=false\n";
+    stream << "  consumer_materialization_counters_schema_semantics="
+        << "unavailable_until_batch_3_materialization_boundaries\n";
+    stream << "  consumer_materialization_counters_owner_batch=Batch 3\n";
+    stream << "  consumer_materialization_counters_frame_builder_rows=unavailable\n";
+    stream << "  consumer_materialization_counters_public_projection_rows=unavailable\n";
+    stream << "  consumer_materialization_counters_transcript_rows=unavailable\n";
+    stream << "  consumer_materialization_counters_selection_rows=unavailable\n";
+    append_profile_counter(
+        stream,
+        "retained_snapshot_payload_bytes",
+        stats.retained_snapshot_payload_bytes);
+    append_profile_counter(
+        stream,
+        "retained_snapshot_generation_count",
+        stats.retained_snapshot_generation_count);
+    append_profile_counter(
+        stream,
+        "max_retained_snapshot_payload_bytes",
+        stats.max_retained_snapshot_payload_bytes);
+    append_profile_counter(
+        stream,
+        "max_retained_snapshot_generation_count",
+        stats.max_retained_snapshot_generation_count);
 }
 
 template<typename Renderer_stats>

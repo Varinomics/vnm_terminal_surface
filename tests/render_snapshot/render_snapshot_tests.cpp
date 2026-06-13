@@ -414,6 +414,9 @@ bool test_snapshot_rows_cover_primary_retained_and_alternate_sources()
     ok &= check(stats.render_snapshot_rows_borrowed == 5U &&
         stats.render_snapshot_rows_owned == 1U,
         "row-source snapshots split borrowed and owned row-cell sources");
+    ok &= check(stats.render_snapshot_rows_built_from_model_storage == 6U &&
+        stats.render_snapshot_model_row_accessor_borrows == 5U,
+        "row-source snapshots expose explicit Batch 1 row-source counters");
     ok &= check(stats.render_snapshot_compact_ascii_text_cells == 17U &&
         stats.render_snapshot_compact_empty_text_cells == 0U &&
         stats.render_snapshot_fallback_qstring_copies == 0U,
@@ -1362,6 +1365,143 @@ bool test_synthetic_snapshots_preserve_or_suppress_line_provenance()
     return ok;
 }
 
+bool test_session_profile_snapshot_publication_counters()
+{
+    bool ok = true;
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    Recording_backend* backend = nullptr;
+    std::unique_ptr<term::Terminal_session> session = make_session(backend);
+    session->set_profile_stats_enabled(true);
+
+    ok &= check(session->start(launch_config({3, 12})).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "profile counter session starts");
+    ok &= check(backend != nullptr &&
+        backend->emit_output(QByteArrayLiteral("one")),
+        "profile counter session publishes first snapshot");
+    ok &= check(backend->emit_output(QByteArrayLiteral("two")),
+        "profile counter session publishes second snapshot");
+    ok &= check(backend->emit_output(QByteArrayLiteral("three")),
+        "profile counter session publishes third snapshot");
+
+    const term::Terminal_session_profile_stats before_sync = session->profile_stats();
+    ok &= check(before_sync.render_snapshot_publications == 3U,
+        "profile counter session counted three publications");
+    ok &= check(before_sync.snapshots_superseded_before_render == 2U,
+        "profile counter session counted each unsynced replacement once");
+    ok &= check(before_sync.max_unrendered_snapshot_generations == 3U,
+        "profile counter session tracked the maximum unsynced backlog");
+    ok &= check(before_sync.snapshots_consumed_by_bridge == 0U,
+        "profile counter session has no bridge consumption before sync");
+
+    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+    const term::Terminal_session_profile_stats after_sync = session->profile_stats();
+    ok &= check(after_sync.snapshots_consumed_by_bridge == 1U,
+        "profile counter session consumed only the latest installed snapshot");
+    ok &= check(after_sync.snapshots_marked_rendered == 1U,
+        "profile counter session counted the first render sync mark");
+
+    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+    const term::Terminal_session_profile_stats after_repeat_sync =
+        session->profile_stats();
+    ok &= check(after_repeat_sync.snapshots_consumed_by_bridge == 1U,
+        "profile counter session repeat sync does not consume another snapshot");
+    ok &= check(after_repeat_sync.snapshots_marked_rendered == 2U,
+        "profile counter session still records repeated render sync marks");
+
+    Recording_backend* late_backend = nullptr;
+    std::unique_ptr<term::Terminal_session> late_profile_session =
+        make_session(late_backend);
+    ok &= check(late_profile_session->start(launch_config({3, 12})).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "late profile counter session starts");
+    ok &= check(late_backend != nullptr &&
+        late_backend->emit_output(QByteArray::fromHex(QByteArrayLiteral("f09f9982"))),
+        "late profile counter session publishes fallback text content");
+    const std::shared_ptr<const term::Terminal_render_snapshot> late_snapshot =
+        late_profile_session->latest_render_snapshot_handle();
+    ok &= check(late_snapshot != nullptr,
+        "late profile counter session retained a snapshot before profiling");
+    late_profile_session->set_profile_stats_enabled(true);
+    const term::Terminal_session_profile_stats late_stats =
+        late_profile_session->profile_stats();
+    const std::uint64_t retained_cell_capacity_bytes =
+        late_snapshot != nullptr
+            ? static_cast<std::uint64_t>(late_snapshot->cells.capacity()) *
+                static_cast<std::uint64_t>(sizeof(term::Terminal_render_cell))
+            : 0U;
+    std::uint64_t fallback_qstring_payload_bytes = 0U;
+    if (late_snapshot != nullptr) {
+        for (const term::Terminal_render_cell& cell : late_snapshot->cells) {
+            const QString* fallback = cell.text.fallback_qstring_or_null();
+            if (fallback != nullptr) {
+                fallback_qstring_payload_bytes +=
+                    static_cast<std::uint64_t>(sizeof(QString)) +
+                    static_cast<std::uint64_t>(fallback->capacity()) *
+                        static_cast<std::uint64_t>(sizeof(QChar));
+            }
+        }
+    }
+    ok &= check(late_stats.retained_snapshot_generation_count > 0U,
+        "late profile enable refreshes retained snapshot generation count");
+    ok &= check(fallback_qstring_payload_bytes > 0U,
+        "late profile counter session retained fallback QString payload");
+    ok &= check(late_stats.retained_snapshot_payload_bytes >=
+            retained_cell_capacity_bytes + fallback_qstring_payload_bytes,
+        "late profile enable refreshes retained snapshot payload bytes including fallback text");
+    ok &= check(late_stats.max_retained_snapshot_payload_bytes >=
+            late_stats.retained_snapshot_payload_bytes &&
+        late_stats.max_retained_snapshot_generation_count >=
+            late_stats.retained_snapshot_generation_count,
+        "late profile enable refreshes retained snapshot max gauges");
+
+    Recording_backend* selection_backend = nullptr;
+    std::unique_ptr<term::Terminal_session> selection_session =
+        make_session(selection_backend);
+    selection_session->set_profile_stats_enabled(true);
+    ok &= check(selection_session->start(launch_config({3, 12})).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "selection profile counter session starts");
+    ok &= check(selection_backend != nullptr &&
+        selection_backend->emit_output(QByteArrayLiteral("select")),
+        "selection profile counter session publishes content");
+    selection_session->set_selection_range({
+        {0, 0},
+        {0, 6},
+        term::Terminal_selection_mode::NORMAL,
+    });
+
+    const term::Terminal_session_profile_stats before_detach =
+        selection_session->profile_stats();
+    ok &= check(selection_backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
+        "selection profile counter session enters synchronized output");
+    selection_session->detach_selection_visual_attachment();
+    const term::Terminal_session_profile_stats after_detach =
+        selection_session->profile_stats();
+
+    ok &= check(after_detach.render_snapshot_requests ==
+            before_detach.render_snapshot_requests + 1U,
+        "selection-derived blocked snapshot counted a render snapshot request");
+    ok &= check(after_detach.render_snapshots_constructed ==
+            before_detach.render_snapshots_constructed + 1U,
+        "selection-derived blocked snapshot counted a constructed snapshot");
+    ok &= check(after_detach.render_snapshot_publications ==
+            before_detach.render_snapshot_publications + 1U,
+        "selection-derived blocked snapshot counted a publication");
+    ok &= check(after_detach.full_snapshot_publications ==
+            before_detach.full_snapshot_publications + 1U,
+        "selection-derived blocked snapshot counted a full publication");
+    ok &= check(after_detach.selection_snapshot_publications ==
+            before_detach.selection_snapshot_publications + 1U,
+        "selection-derived blocked snapshot counted a selection publication");
+    ok &= check(after_detach.retained_snapshot_generation_count > 0U,
+        "selection-derived blocked snapshot refreshed retained snapshot counters");
+#endif
+
+    return ok;
+}
+
 term::Terminal_render_snapshot coalescing_snapshot(
     int                            rows,
     int                            columns,
@@ -1632,6 +1772,7 @@ int main()
     ok &= test_backend_sync_metadata_publishes_after_same_grid_retry();
     ok &= test_resize_metadata_publication_respects_synchronized_output();
     ok &= test_synthetic_snapshots_preserve_or_suppress_line_provenance();
+    ok &= test_session_profile_snapshot_publication_counters();
     ok &= test_dirty_row_coalescing_unifies_on_stricter_row_identity();
     ok &= test_real_model_snapshot_cells_are_row_major_column_ascending();
     ok &= test_validate_render_snapshot_rejects_out_of_order_cells();

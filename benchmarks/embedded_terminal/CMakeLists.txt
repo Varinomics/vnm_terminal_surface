@@ -115,6 +115,10 @@ if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_embedded_benchma
         vnm_terminal_embedded_benchmark_validate
         "--iterations" "7"
         "--warmup" "3"
+        "--grid" "48x160"
+        "--window-size" "1280x768"
+        "--dirty-rows" "5"
+        "--dirty-row-stride" "3"
         "--scenario" "dense_repaint"
         "--scenario" "ascii_full_dirty_reuse_only"
         "--scenario" "ascii_full_dirty_same_content"
@@ -133,12 +137,22 @@ if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_embedded_benchma
         "--scenario" "surface_session_paste_write"
         "--scenario" "surface_session_output_high_water"
         "--scenario" "surface_session_write_high_water"
+        "--scenario" "surface_session_sparse_ascii_output"
+        "--scenario" "surface_session_sparse_block_graphics_output"
+        "--scenario" "surface_session_cursor_overlay"
+        "--scenario" "surface_session_selection_snapshot"
+        "--scenario" "surface_session_resize_smoke_boundary"
+        "--scenario" "surface_session_viewport_change_smoke_boundary"
+        "--scenario" "surface_session_alternate_buffer_smoke_boundary"
+        "--scenario" "surface_session_style_color_mode_smoke_boundary"
+        "--scenario" "surface_session_hyperlink_smoke_boundary"
+        "--scenario" "surface_session_public_projection_boundary"
         "--validate-json"
     )
 
     set_tests_properties(vnm_terminal_embedded_benchmark_validate PROPERTIES
         LABELS "readiness;benchmark"
-        TIMEOUT 180
+        TIMEOUT 240
     )
 
     vnm_terminal_benchmark_add_readback_test(
@@ -189,7 +203,20 @@ if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_embedded_benchma
             vnm_terminal_embedded_benchmark_profile_validate
             "--iterations" "1"
             "--warmup" "0"
-            "--scenario" "single_row_geometry_update"
+            "--grid" "48x160"
+            "--window-size" "1280x768"
+            "--dirty-rows" "5"
+            "--dirty-row-stride" "3"
+            "--scenario" "surface_session_sparse_ascii_output"
+            "--scenario" "surface_session_sparse_block_graphics_output"
+            "--scenario" "surface_session_cursor_overlay"
+            "--scenario" "surface_session_selection_snapshot"
+            "--scenario" "surface_session_resize_smoke_boundary"
+            "--scenario" "surface_session_viewport_change_smoke_boundary"
+            "--scenario" "surface_session_alternate_buffer_smoke_boundary"
+            "--scenario" "surface_session_style_color_mode_smoke_boundary"
+            "--scenario" "surface_session_hyperlink_smoke_boundary"
+            "--scenario" "surface_session_public_projection_boundary"
             "--profile"
             "--profile-json" "${CMAKE_CURRENT_BINARY_DIR}/profile_validate_profile.json"
             "--profile-text" "${CMAKE_CURRENT_BINARY_DIR}/profile_validate_profile.txt"
@@ -200,7 +227,7 @@ if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_embedded_benchma
 
         set_tests_properties(vnm_terminal_embedded_benchmark_profile_validate PROPERTIES
             LABELS "readiness;benchmark;profile"
-            TIMEOUT 60
+            TIMEOUT 180
         )
     endif()
 endif()

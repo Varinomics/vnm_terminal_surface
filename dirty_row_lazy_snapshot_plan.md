@@ -345,16 +345,27 @@ Batch 0 record, captured 2026-06-13:
   - Batch 1 must add end-to-end embedded scenarios before using QSG/paint
     evidence for this refactor. Required new scenarios are sparse-dirty ASCII,
     sparse-dirty dense U+2588 block graphics, cursor-only overlay, selection
-    overlay, resize fallback, viewport-change fallback, alternate-buffer
-    fallback, style/color/mode fallback, hyperlink fallback, public-projection
-    boundary, and transcript/replay boundary when transcript evidence is
-    claimed.
-  - The first end-to-end decision-grade sparse-dirty embedded runs must use
+    snapshot contract, resize fallback, viewport-change fallback,
+    alternate-buffer fallback, style/color/mode fallback, hyperlink fallback,
+    public-projection boundary, and transcript/replay boundary when transcript
+    evidence is claimed.
+  - The full-size end-to-end decision-grade sparse-dirty embedded matrix uses
     Direct3D 11 RHI, the default/bundled monospace font at 13 px, grid
-    `235x873`, and window size `6984x3760`, extending the benchmark's current
-    grid limit if needed. If that grid cannot run on the machine, the batch
-    must amend this plan under review instead of silently substituting a smaller
-    matrix.
+  `235x873`, and window size `6984x3760`, extending the benchmark's current
+  grid limit if needed. On this Windows workstation that requested window is
+  clamped by the desktop/window manager and cannot close Batch 1. Batch 1's
+  executable local D3D11 gate is therefore `--grid 48x160 --window-size
+  1280x768`, matching the benchmark's 8x16 cell assumption while staying
+  runnable on this machine. The full-size matrix is deferred to the Batch 8
+  pre-enable end-to-end performance gate, after Batches 2-7 satisfy the
+  row-view, materialization-boundary, lazy-composer, and QSG descriptor-reuse
+  predecessor gates. Its file list is
+  `benchmarks/embedded_terminal/CMakeLists.txt`,
+  `benchmarks/embedded_terminal/embedded_terminal_benchmark.cpp`,
+  `docs/repository_guide.md`, and this plan. The predecessor blocker for Batch
+  1 is the Windows desktop/window-manager clamp; Batch 8 must run on a
+  machine/desktop setup that can actually create the requested window instead
+  of silently substituting a smaller grid.
   - Transcript-enabled correctness is required whenever transcript/replay
     behavior is claimed as evidence.
 
@@ -416,16 +427,20 @@ Work:
   - cells scanned by snapshot construction;
   - cells emitted into flat storage;
   - rows built from model storage;
-  - rows borrowed from previous published snapshots;
+  - previous-snapshot borrowed rows unavailable in Batch 1; the live numeric
+    counter is future-owned by the borrowed-row/lazy-payload work;
   - rows borrowed from model row accessors inside the full builder;
   - rows materialized by consumers;
   - explicit materialization reason by caller;
   - fallback reason by eligibility check;
+    Batch 1 records unavailable placeholder reason fields only; true lazy
+    eligibility reason counters are owned by Batch 5.
   - snapshots constructed but superseded before render;
   - snapshots consumed by the bridge/renderer;
   - frame input cells considered;
-  - frame row descriptors built/reused;
-  - QSG layer descriptors built/reused;
+  - frame row/layer descriptor counter schema boundaries. Batch 1 must not
+    invent descriptor counters from visible rows or unowned layer booleans;
+    true row/layer descriptor build and reuse counters are owned by Batch 7.
   - retained snapshot payload bytes;
   - retained snapshot generation count.
 - Add profiling scopes for snapshot construction, row materialization, frame
@@ -448,12 +463,23 @@ Work:
   `--dirty-rows` in `{1, 8, 32, 235}`, `--dirty-row-stride` in `{1, 7}`,
   column sweeps in `{160, 320, 873}`, `--style-period 8`, and
   `--model-profile-stats` in the profiling-on lane.
-- For `vnm_terminal_embedded_benchmark`, the required first QSG lane is:
+- For `vnm_terminal_embedded_benchmark`, the required local Batch 1 QSG gate is:
   Windows Direct3D 11 RHI, threaded render loop, atlas renderer, default
-  bundled monospace font at 13 px, `--grid 235x873`,
-  `--window-size 6984x3760`, and the new sparse-dirty/fallback scenarios named
-  in Batch 0. Existing full-dirty or snapshot-bridge scenarios may supplement
-  this lane, but cannot replace it.
+  bundled monospace font at 13 px, `--grid 48x160`,
+  `--window-size 1280x768`, and the new sparse-dirty/smoke-boundary scenarios
+  named in Batch 0. This is the executable baseline for this workstation because the
+  previously planned `--grid 235x873 --window-size 6984x3760` lane is clamped by
+  Windows here and cannot close. Existing full-dirty or snapshot-bridge
+  scenarios may supplement this lane, but cannot replace it. The full-size
+  `235x873` / `6984x3760` matrix is deferred to the Batch 8 pre-enable
+  end-to-end performance gate, after Batches 2-7 satisfy the row-view,
+  materialization-boundary, lazy-composer, and QSG descriptor-reuse predecessor
+  gates. The concrete successor file list is
+  `benchmarks/embedded_terminal/CMakeLists.txt`,
+  `benchmarks/embedded_terminal/embedded_terminal_benchmark.cpp`,
+  `docs/repository_guide.md`, and this plan. The predecessor blocker for this
+  workstation is the Windows desktop/window-manager clamp that prevents creating
+  the requested top-level `6984x3760` window.
 - Define the benchmark decision rule before later batches use it:
   - at least two warmup runs per variant;
   - at least ten measured runs per variant;
@@ -465,13 +491,243 @@ Work:
 
 Gates:
 
-- Release profiling-off runs for FPS/timing.
-- Profiling-on runs for counters and stage timings.
-- Repeated interleaved A/B runs with the decision rule above.
+- Release profiling-off validation runs for runnable local FPS/timing lanes.
+- Profiling-on validation runs for counters and stage timings across the Batch
+  1 sparse, selection, public projection, resize, viewport, alternate-buffer,
+  style/color/mode, and hyperlink smoke-boundary scenario set.
+- The interleaved A/B decision rule above is recorded in Batch 1 but not run as
+  a Batch 1 closure gate. Decision-grade repeated A/B runs are owned by the
+  Batch 8 pre-enable end-to-end performance gate named above.
 - Diagnostics/profile schema and JSON key validation updated for every
   diagnostic, profile, or counter key added, renamed, removed, or behaviorally
   changed, including per-consumed-update normalization where applicable.
 - No production optimization enabled by this batch.
+
+Batch 1 amendment record, 2026-06-13:
+
+- Scope: review amendment only. No row-view, lazy payload, lazy composer, or
+  production optimization was enabled.
+- Build/source evidence:
+  - HEAD during amendment: `eb992ef`.
+  - Profile-off lane: `build_codex_renderer_graphics_probe`, Ninja, `Release`,
+    `VNM_TERMINAL_BUILD_BENCHMARKS=ON`,
+    `VNM_TERMINAL_ENABLE_PROFILING=OFF`,
+    `Qt6_DIR=C:/Qt/6.10.1/msvc2022_64/lib/cmake/Qt6`, source
+    `C:/plms/varinomics/vnm_terminal_surface`.
+  - Profile-on lane: `build_codex_batch1_profile_on`, Ninja, `Release`,
+    `VNM_TERMINAL_BUILD_BENCHMARKS=ON`,
+    `VNM_TERMINAL_ENABLE_PROFILING=ON`,
+    `Qt6_DIR=C:/Qt/6.10.1/msvc2022_64/lib/cmake/Qt6`, source
+    `C:/plms/varinomics/vnm_terminal_surface`.
+  - The first fresh profile-on configure without `Qt6_DIR` failed to find Qt6;
+    the recorded profile-on lane is the corrected configure with the explicit
+    Qt path above.
+- Counter/schema amendments:
+  - `snapshots_consumed_by_bridge` now counts one actual advancing bridge sync,
+    not skipped generation deltas.
+  - `snapshots_superseded_before_render` now counts the latest unsynced
+    publication superseded by a new publication, not the whole backlog on each
+    publish.
+  - Selection-derived blocked publications update the same request,
+    constructed, full publication, selection publication, and retained snapshot
+    counters as other published snapshots.
+  - Embedded benchmark schema 21 removes misleading numeric
+    `frame_row_descriptors_*` and `qsg_layer_descriptors_*` counters and
+    exposes `descriptor_counters.available=false` with semantics
+    `unavailable_until_batch_7_descriptor_reuse`.
+  - Surface-stress output removes `frame_row_descriptors_*` and emits
+    `frame_row_descriptor_counters_available=false` with the same Batch 7
+    ownership semantics.
+  - Lazy fallback/decision-boundary labels are smoke boundaries in Batch 1.
+    Schema 21 exposes unavailable placeholder reason fields under
+    `lazy_snapshot_fallback_reason_counters`; true lazy eligibility/fallback
+    reason counters are owned by Batch 5.
+- Benchmark amendments:
+  - `surface_session_public_projection_boundary` sets
+    `IMMEDIATE_PUBLIC_PROJECTION`, enters DECSET 2026, and scrolls while live
+    publication is blocked. The profile gate requires nonzero
+    `public_projection_scroll_requests` and
+    `public_projection_scroll_publications`; the recorded profile output had
+    both counters equal to 1.
+  - Sparse embedded surface/session workloads accept `--dirty-rows` and
+    `--dirty-row-stride`.
+  - Surface-stress sparse runs seed an unmeasured full-grid baseline before
+    warmup/measured sparse frames.
+- Observed embedded benchmark failure provenance:
+  - The review-observed `vnm_terminal_embedded_benchmark_validate` /
+    `single_row_geometry_update` `INVALID_CELL_ORDER` failure belonged to the
+    Batch 1 benchmark fixture. `make_single_row_geometry_update_snapshot()`
+    appended synthetic cells in free-column discovery order, which could be
+    non-row-major. The fixture now sorts cells by row and column before
+    publishing the synthetic snapshot. Owner: Batch 1 benchmark fixture, not a
+    production renderer optimization.
+- Commands and results:
+  - `git diff --check` passed.
+  - `cmd.exe /d /c "call \"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat\" x64 && cmake -S . -B build_codex_batch1_profile_on -G Ninja -DCMAKE_BUILD_TYPE=Release -DVNM_TERMINAL_BUILD_BENCHMARKS=ON -DVNM_TERMINAL_ENABLE_PROFILING=ON -DBUILD_TESTING=ON -DQt6_DIR=C:/Qt/6.10.1/msvc2022_64/lib/cmake/Qt6"` passed.
+  - `cmd.exe /d /c "call \"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat\" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_embedded_benchmark vnm_terminal_surface_stress_benchmark vnm_terminal_render_snapshot vnm_terminal_profile_text"` passed.
+  - `cmd.exe /d /c "call \"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat\" x64 && cmake --build build_codex_batch1_profile_on --target vnm_terminal_embedded_benchmark vnm_terminal_surface_stress_benchmark vnm_terminal_render_snapshot vnm_terminal_profile_text"` passed.
+  - `ctest --test-dir build_codex_renderer_graphics_probe -R "^(vnm_terminal_render_snapshot|vnm_terminal_profile_text|vnm_terminal_embedded_benchmark_validate)$" --output-on-failure` passed: 3/3.
+  - `ctest --test-dir build_codex_batch1_profile_on -R "^(vnm_terminal_render_snapshot|vnm_terminal_profile_text|vnm_terminal_embedded_benchmark_profile_validate)$" --output-on-failure` passed: 3/3.
+  - `cmake -E env "PATH=C:\Qt\6.10.1\msvc2022_64\bin;$env:PATH" build_codex_renderer_graphics_probe\benchmarks\surface_stress\vnm_terminal_surface_stress_benchmark.exe --frames 5 --warmup-frames 2 --rows 24 --cols 80 --dirty-rows 4 --dirty-row-stride 7 --text-pattern block --graphics-every 0` passed and printed `frame_row_descriptor_counters_available=false`.
+  - `cmake -E env "PATH=C:\Qt\6.10.1\msvc2022_64\bin;$env:PATH" build_codex_batch1_profile_on\benchmarks\surface_stress\vnm_terminal_surface_stress_benchmark.exe --frames 5 --warmup-frames 2 --rows 24 --cols 80 --dirty-rows 4 --dirty-row-stride 7 --text-pattern ascii --graphics-every 0 --model-profile-stats` passed and printed model profile counters.
+  - `cmd.exe /d /c "call \"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat\" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_diagnostics_schema_sync && ctest --test-dir build_codex_renderer_graphics_probe -R \"^vnm_terminal_diagnostics_schema_sync$\" --output-on-failure"` passed.
+
+Batch 1 second-amendment record, 2026-06-13:
+
+- Scope: second-round review amendment only. No row-view, lazy payload, lazy
+  composer, or production optimization was enabled.
+- Decision-grade gate amendment:
+  - The `235x873` / `6984x3760` embedded Direct3D 11 matrix is not closeable on
+    this Windows workstation because the requested top-level window is clamped.
+    The Batch 1 local executable gate is `--grid 48x160 --window-size
+    1280x768`; the full-size matrix is owned by the Batch 8 pre-enable
+    end-to-end performance gate on a setup that can create that window, with
+    Windows clamp as the Batch 1 predecessor blocker.
+  - Embedded benchmark schema 21 validates `requested_rows`,
+    `requested_columns`, actual `rows`/`columns`,
+    `actual_grid_matches_request`, and `grid_semantics`. Surface/session
+    scenarios may report `surface_session_actual_grid_from_qquick_surface_metrics`;
+    snapshot-bridge scenarios may not silently substitute a different grid.
+- Benchmark semantics amendments:
+  - CTest embedded gates now run the Batch 1 scenarios at `48x160` and
+    `1280x768`, with `--dirty-rows 5 --dirty-row-stride 3`.
+  - `surface_session_selection_overlay` was reclassified as
+    `surface_session_selection_snapshot`. It validates
+    `selection_snapshot_spans_observed`; renderer overlay counters are no
+    longer claimed as its evidence.
+  - The fallback-labeled Batch 1 scenarios were reclassified as smoke-boundary
+    scenarios because Batch 1 has no lazy composer or fallback producer:
+    `surface_session_resize_smoke_boundary`,
+    `surface_session_viewport_change_smoke_boundary`,
+    `surface_session_alternate_buffer_smoke_boundary`,
+    `surface_session_style_color_mode_smoke_boundary`, and
+    `surface_session_hyperlink_smoke_boundary`.
+  - `surface_session_style_color_mode_smoke_boundary` now emits reverse-video
+    mode transitions in addition to style/color changes.
+  - Sparse dirty-row payload generation fails validation if the requested dirty
+    row count cannot be touched exactly for the actual grid and stride.
+  - Surface-stress descriptor-unavailable semantics are checked by
+    `vnm_terminal_surface_stress_descriptor_unavailable_contract`.
+- Schema/profile amendments:
+  - Descriptor and lazy fallback placeholder objects now validate exact key
+    sets and unavailable semantics, so stale numeric descriptor fields cannot
+    pass.
+  - Consumer materialization counters remain unavailable until Batch 3 owns real
+    materialization-boundary producers; live zero counters were removed from
+    exported profile evidence.
+  - The future previous-snapshot borrowed-row counter is not emitted as a live
+    numeric Batch 1 profile counter. Profile text tests assert the
+    materialization unavailable keys, owner batch, retained max, and generation
+    counter keys.
+- Retained-memory amendments:
+  - Retained payload accounting includes vector capacity and
+    `Terminal_render_cell_text` fallback `QString` object/capacity payload.
+  - Enabling profile/dirty-row stats refreshes retained snapshot gauges from
+    the current retained snapshot state.
+- Direct invocation provenance:
+  - Plain PowerShell direct launch from the repository root:
+    `.\build_codex_renderer_graphics_probe\benchmarks\embedded_terminal\vnm_terminal_embedded_benchmark.exe --scenario surface_session_selection_snapshot --iterations 1 --warmup 0 --grid 48x160 --window-size 1280x768 --quiet --validate-json`
+    exited `-1073741511` before benchmark output. This is not a supported
+    Windows benchmark gate.
+  - The supported Windows invocation is the CTest wrapper or this equivalent
+    PowerShell command from the repository root:
+    `cmake -E env "QT_QPA_PLATFORM=windows" "QSG_RENDER_LOOP=threaded" "QSG_RHI_BACKEND=d3d11" "QT_SCALE_FACTOR=1" "QT_SCREEN_SCALE_FACTORS=" "QT_AUTO_SCREEN_SCALE_FACTOR=0" "QT_DEVICE_PIXEL_RATIO=" "QT_SCALE_FACTOR_ROUNDING_POLICY=PassThrough" "PATH=C:\Qt\6.10.1\msvc2022_64\bin;$env:PATH" cmd.exe /d /c call ".\build_codex_renderer_graphics_probe\benchmarks\embedded_terminal\vnm_terminal_embedded_benchmark.exe" --scenario surface_session_selection_snapshot --iterations 1 --warmup 0 --grid 48x160 --window-size 1280x768 --quiet --validate-json`.
+    The CTest-equivalent single-scenario command for
+    `surface_session_selection_snapshot` exited `0`, reported requested
+    `48x160`, actual surface grid `56x177`, semantics
+    `surface_session_actual_grid_from_qquick_surface_metrics`, and
+    `selection_snapshot_spans_observed=2`.
+- Commands and results:
+  - `git diff --check` passed.
+  - `cmd.exe /d /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_embedded_benchmark'` passed.
+  - `cmd.exe /d /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64 && cmake --build build_codex_batch1_profile_on --target vnm_terminal_embedded_benchmark'` passed.
+  - `ctest --test-dir build_codex_renderer_graphics_probe -R "^(vnm_terminal_render_snapshot|vnm_terminal_profile_text|vnm_terminal_embedded_benchmark_validate|vnm_terminal_surface_stress_descriptor_unavailable_contract)$" --output-on-failure` passed: 4/4.
+  - `ctest --test-dir build_codex_batch1_profile_on -R "^(vnm_terminal_render_snapshot|vnm_terminal_profile_text|vnm_terminal_embedded_benchmark_profile_validate|vnm_terminal_surface_stress_descriptor_unavailable_contract)$" --output-on-failure` passed: 4/4.
+  - `cmd.exe /d /c 'call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_diagnostics_schema_sync vnm_terminal_diagnostics_text_layout'` passed.
+  - `ctest --test-dir build_codex_renderer_graphics_probe -R "^(vnm_terminal_diagnostics_schema_sync|vnm_terminal_diagnostics_text_layout)$" --output-on-failure` passed: 2/2.
+
+Batch 1 third-amendment record, 2026-06-13:
+
+- Scope: third-round review blocker amendment only. No row-view, lazy payload,
+  lazy composer, or production optimization was enabled.
+- Source/build provenance:
+  - HEAD during amendment: `eb992ef`.
+  - Relevant status remained dirty with the Batch 1 files and pre-existing
+    baseline hunks; no staging or commit was performed. `git status --short
+    --branch` reported `master...origin/master [ahead 1]`, the Batch 1 dirty
+    files, pre-existing mitigation hunks in
+    `include/vnm_terminal/internal/terminal_render_cell_text.h`,
+    `src/qsg_terminal_renderer.cpp`, `tests/render_frame/render_frame_tests.cpp`,
+    and untracked `vnm_terminal_review_roadmap.md`.
+  - Profile-off lane: `build_codex_renderer_graphics_probe`, Ninja, `Release`,
+    source `C:/plms/varinomics/vnm_terminal_surface`, existing
+    `Qt6_DIR=C:/Qt/6.10.1/msvc2022_64/lib/cmake/Qt6`,
+    `VNM_TERMINAL_BUILD_BENCHMARKS=ON`,
+    `VNM_TERMINAL_ENABLE_PROFILING=OFF`.
+  - Profile-on lane: `build_codex_batch1_profile_on`, Ninja, `Release`, same
+    source and Qt path, `VNM_TERMINAL_BUILD_BENCHMARKS=ON`,
+    `VNM_TERMINAL_ENABLE_PROFILING=ON`.
+  - Both selected build lanes re-ran CMake during the target rebuild after the
+    CMake scenario-list changes, so the generated CTest commands match this
+    source tree rather than stale build metadata.
+- Governance amendments:
+  - The full-size `235x873` / `6984x3760` Direct3D 11 matrix is assigned to the
+    Batch 8 pre-enable end-to-end performance gate. The concrete file list is
+    `benchmarks/embedded_terminal/CMakeLists.txt`,
+    `benchmarks/embedded_terminal/embedded_terminal_benchmark.cpp`,
+    `docs/repository_guide.md`, and this plan. The predecessor blocker for
+    Batch 1 is the Windows desktop/window-manager clamp on this workstation.
+  - Batch 1 does not claim interleaved A/B decision-rule runs. It establishes
+    lanes, schema, counters, sparse observed-counter validation, and local
+    smoke/profile CTest gates. Repeated interleaved A/B decision runs are owned
+    by the named Batch 8 performance gate.
+- Benchmark/schema amendments:
+  - Profile-on CTest now covers the Batch 1 sparse ASCII, sparse block, cursor
+    overlay, selection snapshot, public projection, resize, viewport,
+    alternate-buffer, style/color/mode, and hyperlink smoke-boundary scenarios.
+  - Fallback-labeled scenarios were renamed to smoke-boundary scenarios because
+    Batch 1 has no lazy fallback producer:
+    `surface_session_resize_smoke_boundary`,
+    `surface_session_viewport_change_smoke_boundary`,
+    `surface_session_alternate_buffer_smoke_boundary`,
+    `surface_session_style_color_mode_smoke_boundary`, and
+    `surface_session_hyperlink_smoke_boundary`.
+  - Resize, alternate-buffer, style/color/mode, and hyperlink smoke-boundary
+    scenarios now emit observed boundary counters and validation fails if the
+    named boundary is not observed. Viewport smoke continues to use the existing
+    viewport offset/content structural checks.
+  - Sparse dirty-row validation now checks observed frame counters and, when
+    profiling is enabled, model profile counters. It rejects full repaint and
+    extra dirty rows beyond the explicit Batch 1 allowance of one cursor
+    carry-over row per measured frame.
+  - `render_snapshot_rows_borrowed_from_previous_snapshot` was removed from
+    live numeric model profile output and tests. Previous-snapshot borrowing is
+    owned by a future lazy-payload/lazy-publication batch, not Batch 1.
+  - `session_profile_stats` validation now rejects extra top-level profile keys,
+    including stale numeric consumer materialization counters. Schema v21 docs
+    now spell out exact shapes for `descriptor_counters`,
+    `lazy_snapshot_fallback_reason_counters`, and
+    `session_profile_stats.consumer_materialization_counters`.
+  - Profile text now emits and tests every unavailable consumer materialization
+    key plus `owner_batch=Batch 3`.
+  - `benchmarks/surface_stress/validate_surface_stress_descriptor_contract.cmake`
+    is part of the intended Batch 1 tracked file set and is referenced by
+    `benchmarks/surface_stress/CMakeLists.txt`.
+- Direct invocation provenance:
+  - The exact CTest-equivalent PowerShell command recorded above for
+    `surface_session_selection_snapshot` exited `0`, reported requested
+    `48x160`, actual surface grid `56x177`, semantics
+    `surface_session_actual_grid_from_qquick_surface_metrics`, and
+    `selection_snapshot_spans_observed=1`.
+- Commands and results:
+  - `git diff --check` passed before rebuild and after the final plan update.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_embedded_benchmark vnm_terminal_surface_stress_benchmark vnm_terminal_render_snapshot vnm_terminal_profile_text"` passed.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_batch1_profile_on --target vnm_terminal_embedded_benchmark vnm_terminal_surface_stress_benchmark vnm_terminal_render_snapshot vnm_terminal_profile_text"` passed.
+  - `ctest --test-dir build_codex_renderer_graphics_probe -R "^(vnm_terminal_render_snapshot|vnm_terminal_profile_text|vnm_terminal_embedded_benchmark_validate|vnm_terminal_surface_stress_descriptor_unavailable_contract)$" --output-on-failure` passed: 4/4.
+  - `ctest --test-dir build_codex_batch1_profile_on -R "^(vnm_terminal_render_snapshot|vnm_terminal_profile_text|vnm_terminal_embedded_benchmark_profile_validate|vnm_terminal_surface_stress_descriptor_unavailable_contract)$" --output-on-failure` passed: 4/4.
+  - `cmake -E env "PATH=C:\Qt\6.10.1\msvc2022_64\bin;$env:PATH" build_codex_renderer_graphics_probe\benchmarks\surface_stress\vnm_terminal_surface_stress_benchmark.exe --frames 5 --warmup-frames 2 --rows 24 --cols 80 --dirty-rows 4 --dirty-row-stride 7 --text-pattern block --graphics-every 0` passed, printed `snapshot_dirty_rows_visible_per_frame=5`, `frame_dirty_rows=25`, and `frame_full_dirty_rows=0`.
+  - `cmake -E env "PATH=C:\Qt\6.10.1\msvc2022_64\bin;$env:PATH" build_codex_batch1_profile_on\benchmarks\surface_stress\vnm_terminal_surface_stress_benchmark.exe --frames 5 --warmup-frames 2 --rows 24 --cols 80 --dirty-rows 4 --dirty-row-stride 7 --text-pattern ascii --graphics-every 0 --model-profile-stats` passed, printed `snapshot_dirty_rows_visible_per_frame=5`, `frame_dirty_rows=25`, `frame_full_dirty_rows=0`, and no previous-snapshot borrowed-row counter.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_diagnostics_schema_sync vnm_terminal_diagnostics_text_layout && ctest --test-dir build_codex_renderer_graphics_probe -R ""^(vnm_terminal_diagnostics_schema_sync|vnm_terminal_diagnostics_text_layout)$"" --output-on-failure"` passed: 2/2.
 
 ## 8. Batch 2: Private Row-Content View
 
