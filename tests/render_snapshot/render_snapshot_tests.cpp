@@ -251,6 +251,100 @@ const term::Terminal_render_hyperlink_metadata* hyperlink_by_id(
     return nullptr;
 }
 
+term::Terminal_render_cell render_cell(
+    int                         row,
+    int                         column,
+    QString                     text,
+    term::Terminal_style_id     style_id = term::k_default_terminal_style_id,
+    std::uint64_t               hyperlink_id = 0U)
+{
+    term::Terminal_render_cell cell;
+    cell.position      = {row, column};
+    cell.text          = term::Terminal_render_cell_text::from_source_cell(text, 1, false);
+    cell.hyperlink_id  = hyperlink_id;
+    cell.display_width = 1;
+    cell.style_id      = style_id;
+    cell.text_category = cell.text.category();
+    return cell;
+}
+
+bool render_cells_match(
+    const std::vector<term::Terminal_render_cell>& left,
+    const std::vector<term::Terminal_render_cell>& right)
+{
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    for (std::size_t i = 0U; i < left.size(); ++i) {
+        if (!term::render_snapshot_cells_equal(left[i], right[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+term::Terminal_render_snapshot_row_payload_ref row_payload_ref(
+    std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> owner,
+    std::size_t                                                            row)
+{
+    term::Terminal_render_snapshot_row_payload_ref ref;
+    ref.owner         = std::move(owner);
+    ref.payload_index = row;
+    return ref;
+}
+
+bool append_lazy_row_payload(
+    term::Terminal_render_snapshot_lazy_payloads&                       payloads,
+    term::Terminal_render_snapshot_row_payload_ref                      source,
+    const std::vector<term::Terminal_render_snapshot_style_id_remap>&   style_id_remaps,
+    const std::vector<term::Terminal_render_snapshot_hyperlink_id_remap>&
+                                                                        hyperlink_id_remaps,
+    const char*                                                         label)
+{
+    const std::optional<term::Terminal_render_snapshot_lazy_row_payload> row =
+        term::borrowed_render_snapshot_lazy_row_payload(
+            std::move(source),
+            payloads.receiving_namespace,
+            style_id_remaps,
+            hyperlink_id_remaps);
+    if (!check(row.has_value(), label)) {
+        return false;
+    }
+
+    payloads.rows.push_back(*row);
+    return true;
+}
+
+term::Terminal_render_snapshot manual_payload_snapshot_base(
+    term::terminal_grid_size_t grid_size,
+    std::uint64_t              sequence,
+    std::uint64_t              row_origin_generation)
+{
+    term::Terminal_viewport_state viewport;
+    viewport.active_buffer    = term::Terminal_buffer_id::PRIMARY;
+    viewport.visible_rows     = grid_size.rows;
+    viewport.scrollback_rows  = 0;
+    viewport.offset_from_tail = 0;
+    viewport.follow_tail      = true;
+
+    term::Terminal_render_snapshot snapshot =
+        term::make_empty_render_snapshot(grid_size, viewport, sequence);
+    snapshot.metadata.row_origin_generation = row_origin_generation;
+    snapshot.dirty_row_ranges =
+        term::compact_dirty_row_ranges({}, grid_size.rows, true);
+    snapshot.visible_line_provenance.reserve(static_cast<std::size_t>(grid_size.rows));
+    for (int row = 0; row < grid_size.rows; ++row) {
+        snapshot.visible_line_provenance.push_back({
+            row,
+            1000U + static_cast<std::uint64_t>(row),
+            2000U + static_cast<std::uint64_t>(row),
+            3000 + row,
+        });
+    }
+    return snapshot;
+}
+
 bool check_visible_line_provenance_matches_model(
     const term::Terminal_screen_model&     model,
     const term::Terminal_render_snapshot&  snapshot,
@@ -2004,6 +2098,507 @@ bool test_row_content_view_matches_flat_snapshot_representation()
     return ok;
 }
 
+bool test_lazy_row_payload_materialization_matches_full_snapshot()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model({3, 12});
+    model.ingest(QByteArrayLiteral("\x1b[1;1HAAAA\x1b[2;1HBBBB\x1b[3;1HCCCC"));
+
+    const term::Terminal_render_snapshot source_snapshot =
+        model.render_snapshot(request_for_model(model, 300U));
+    model.ingest(QByteArrayLiteral("\x1b[2;1HDDDD"));
+    const term::Terminal_render_snapshot expected_snapshot =
+        model.render_snapshot(request_for_model(model, 301U));
+    ok &= check(term::validate_render_snapshot(expected_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "full materialized snapshot keeps flat-cell validation behavior");
+
+    const term::Terminal_render_snapshot_row_payload_namespace metadata_namespace = {
+        10U,
+        20U,
+    };
+    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner>
+        source_owner =
+            term::render_snapshot_row_payload_owner_from_snapshot(
+                source_snapshot,
+                metadata_namespace,
+                300U);
+    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner>
+        current_owner =
+            term::render_snapshot_row_payload_owner_from_snapshot(
+                expected_snapshot,
+                metadata_namespace,
+                301U);
+
+    auto payloads = std::make_shared<term::Terminal_render_snapshot_lazy_payloads>();
+    payloads->receiving_namespace = metadata_namespace;
+    ok &= append_lazy_row_payload(
+        *payloads,
+        row_payload_ref(source_owner, 0U),
+        {},
+        {},
+        "lazy parity fixture borrows unchanged first row");
+    ok &= append_lazy_row_payload(
+        *payloads,
+        row_payload_ref(current_owner, 1U),
+        {},
+        {},
+        "lazy parity fixture owns changed middle row");
+    ok &= append_lazy_row_payload(
+        *payloads,
+        row_payload_ref(source_owner, 2U),
+        {},
+        {},
+        "lazy parity fixture borrows unchanged last row");
+
+    term::Terminal_render_snapshot lazy_snapshot = expected_snapshot;
+    lazy_snapshot.cells.clear();
+    lazy_snapshot.lazy_row_payloads = payloads;
+
+    const term::Terminal_render_snapshot_row_content_view rows(lazy_snapshot);
+    const std::vector<term::Terminal_render_cell> materialized =
+        rows.materialize_flat_cells(
+            term::Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST);
+    ok &= check(lazy_snapshot.cells.empty(),
+        "lazy parity fixture carries no flat cell backing");
+    ok &= check(render_cells_match(materialized, expected_snapshot.cells) &&
+            rows.materialized_flat_cells_match(
+                expected_snapshot.cells,
+                term::Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST),
+        "mixed owned/borrowed lazy rows materialize to the full producer cells");
+    ok &= check(term::validate_render_snapshot(lazy_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "mixed owned/borrowed lazy snapshot validates through row view");
+    ok &= check(rows.row_text(1, 0, 4, true) == QStringLiteral("DDDD"),
+        "lazy row view exposes the owned changed row content");
+
+    term::Terminal_render_snapshot lazy_with_flat_backing = lazy_snapshot;
+    lazy_with_flat_backing.cells = expected_snapshot.cells;
+    ok &= check(term::validate_render_snapshot(lazy_with_flat_backing).status !=
+            term::Terminal_render_snapshot_status::OK,
+        "lazy snapshots with nonempty flat cells fail validation");
+
+    return ok;
+}
+
+bool test_lazy_borrowed_row_payloads_remap_metadata_namespace()
+{
+    bool ok = true;
+
+    term::Terminal_render_snapshot source =
+        manual_payload_snapshot_base({2, 8}, 310U, 77U);
+    term::Terminal_text_style red_style = term::make_default_terminal_text_style();
+    red_style.foreground = term::make_rgb_terminal_color_ref(0xff2200U);
+    source.styles.push_back(red_style);
+    source.hyperlinks.push_back({
+        7U,
+        QByteArrayLiteral("source-link"),
+        QByteArrayLiteral("https://source.example.test"),
+    });
+    source.cells = {
+        render_cell(0, 0, QStringLiteral("L"), 1U, 7U),
+        render_cell(1, 0, QStringLiteral("T")),
+    };
+    ok &= check(term::validate_render_snapshot(source).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "lazy remap source snapshot validates");
+
+    term::Terminal_render_snapshot expected = source;
+    expected.metadata.sequence = 311U;
+    term::Terminal_text_style spacer_style = term::make_default_terminal_text_style();
+    term::set_terminal_style_attribute(spacer_style, term::Terminal_style_attribute::BOLD);
+    expected.styles = {
+        term::make_default_terminal_text_style(),
+        spacer_style,
+        red_style,
+    };
+    expected.hyperlinks = {{
+        99U,
+        QByteArrayLiteral("source-link"),
+        QByteArrayLiteral("https://source.example.test"),
+    }};
+    expected.cells = {
+        render_cell(0, 0, QStringLiteral("L"), 2U, 99U),
+        render_cell(1, 0, QStringLiteral("T")),
+    };
+    ok &= check(term::validate_render_snapshot(expected).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "lazy remap expected receiving snapshot validates");
+
+    const term::Terminal_render_snapshot_row_payload_namespace source_namespace = {
+        100U,
+        200U,
+    };
+    const term::Terminal_render_snapshot_row_payload_namespace receiving_namespace = {
+        101U,
+        201U,
+    };
+    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner>
+        source_owner =
+            term::render_snapshot_row_payload_owner_from_snapshot(
+                source,
+                source_namespace,
+                310U);
+
+    const std::vector<term::Terminal_render_snapshot_style_id_remap> style_remaps = {
+        {0U, 0U},
+        {1U, 2U},
+    };
+    const std::vector<term::Terminal_render_snapshot_hyperlink_id_remap>
+        hyperlink_remaps = {
+            {7U, 99U},
+        };
+    const std::vector<term::Terminal_render_snapshot_hyperlink_id_remap>
+        collapsed_hyperlink_remaps = {
+            {7U, 0U},
+        };
+    const std::optional<term::Terminal_render_snapshot_lazy_row_payload>
+        collapsed_helper_row =
+            term::borrowed_render_snapshot_lazy_row_payload(
+                row_payload_ref(source_owner, 0U),
+                receiving_namespace,
+                style_remaps,
+                collapsed_hyperlink_remaps);
+    ok &= check(!collapsed_helper_row.has_value(),
+        "lazy remap helper rejects nonzero source hyperlink ids mapped to zero");
+
+    auto payloads = std::make_shared<term::Terminal_render_snapshot_lazy_payloads>();
+    payloads->receiving_namespace = receiving_namespace;
+    ok &= append_lazy_row_payload(
+        *payloads,
+        row_payload_ref(source_owner, 0U),
+        style_remaps,
+        hyperlink_remaps,
+        "lazy remap fixture borrows and remaps linked row");
+    ok &= append_lazy_row_payload(
+        *payloads,
+        row_payload_ref(source_owner, 1U),
+        style_remaps,
+        hyperlink_remaps,
+        "lazy remap fixture borrows and remaps plain row");
+
+    term::Terminal_render_snapshot lazy = expected;
+    lazy.cells.clear();
+    lazy.lazy_row_payloads = payloads;
+
+    const term::Terminal_render_snapshot_row_content_view rows(lazy);
+    const term::Terminal_render_cell* linked_cell = rows.cell_at(0, 0);
+    ok &= check(linked_cell != nullptr &&
+            linked_cell->style_id == 2U &&
+            linked_cell->hyperlink_id == 99U,
+        "borrowed row exposes style and hyperlink ids remapped into receiving metadata");
+    if (linked_cell != nullptr) {
+        ok &= check(lazy.styles[linked_cell->style_id] == red_style &&
+                hyperlink_by_id(lazy, linked_cell->hyperlink_id) != nullptr,
+            "remapped borrowed ids resolve through receiving snapshot metadata arrays");
+    }
+    const term::Terminal_render_cell* plain_cell = rows.cell_at(1, 0);
+    ok &= check(plain_cell != nullptr && plain_cell->hyperlink_id == 0U,
+        "source hyperlink id zero remains no hyperlink after remap");
+    ok &= check(rows.materialized_flat_cells_match(
+            expected.cells,
+            term::Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST),
+        "remapped borrowed rows materialize to the receiving full snapshot");
+    ok &= check(term::validate_render_snapshot(lazy).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "remapped lazy borrowed rows validate through receiving metadata");
+
+    auto altered_content_payloads =
+        std::make_shared<term::Terminal_render_snapshot_lazy_payloads>(*payloads);
+    std::vector<term::Terminal_render_cell> altered_content_cells =
+        *altered_content_payloads->rows[0].cells_in_receiving_namespace;
+    altered_content_cells[0].text = term::Terminal_render_cell_text(QStringLiteral("X"));
+    altered_content_cells[0].text_category = altered_content_cells[0].text.category();
+    altered_content_payloads->rows[0].cells_in_receiving_namespace =
+        std::make_shared<const std::vector<term::Terminal_render_cell>>(
+            std::move(altered_content_cells));
+    term::Terminal_render_snapshot altered_content = lazy;
+    altered_content.lazy_row_payloads = altered_content_payloads;
+    ok &= check(term::validate_render_snapshot(altered_content).status ==
+            term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE,
+        "lazy validation rejects remapped row cells with altered text content");
+
+    auto collapsed_hyperlink_payloads =
+        std::make_shared<term::Terminal_render_snapshot_lazy_payloads>(*payloads);
+    std::vector<term::Terminal_render_cell> collapsed_hyperlink_cells =
+        *collapsed_hyperlink_payloads->rows[0].cells_in_receiving_namespace;
+    collapsed_hyperlink_cells[0].hyperlink_id = 0U;
+    collapsed_hyperlink_payloads->rows[0].cells_in_receiving_namespace =
+        std::make_shared<const std::vector<term::Terminal_render_cell>>(
+            std::move(collapsed_hyperlink_cells));
+    term::Terminal_render_snapshot collapsed_hyperlink = lazy;
+    collapsed_hyperlink.lazy_row_payloads = collapsed_hyperlink_payloads;
+    ok &= check(term::validate_render_snapshot(collapsed_hyperlink).status ==
+            term::Terminal_render_snapshot_status::INVALID_HYPERLINK_METADATA,
+        "lazy validation rejects nonzero source hyperlink ids remapped to zero");
+
+    auto unresolved_style_payloads =
+        std::make_shared<term::Terminal_render_snapshot_lazy_payloads>(*payloads);
+    std::vector<term::Terminal_render_cell> unresolved_style_cells =
+        *unresolved_style_payloads->rows[0].cells_in_receiving_namespace;
+    unresolved_style_cells[0].style_id =
+        static_cast<term::Terminal_style_id>(lazy.styles.size());
+    unresolved_style_payloads->rows[0].cells_in_receiving_namespace =
+        std::make_shared<const std::vector<term::Terminal_render_cell>>(
+            std::move(unresolved_style_cells));
+    term::Terminal_render_snapshot unresolved_style = lazy;
+    unresolved_style.lazy_row_payloads = unresolved_style_payloads;
+    ok &= check(term::validate_render_snapshot(unresolved_style).status ==
+            term::Terminal_render_snapshot_status::INVALID_STYLE_ID,
+        "lazy row-view validation rejects unresolved remapped style ids");
+
+    auto unresolved_hyperlink_payloads =
+        std::make_shared<term::Terminal_render_snapshot_lazy_payloads>(*payloads);
+    std::vector<term::Terminal_render_cell> unresolved_hyperlink_cells =
+        *unresolved_hyperlink_payloads->rows[0].cells_in_receiving_namespace;
+    unresolved_hyperlink_cells[0].hyperlink_id = 12345U;
+    unresolved_hyperlink_payloads->rows[0].cells_in_receiving_namespace =
+        std::make_shared<const std::vector<term::Terminal_render_cell>>(
+            std::move(unresolved_hyperlink_cells));
+    term::Terminal_render_snapshot unresolved_hyperlink = lazy;
+    unresolved_hyperlink.lazy_row_payloads = unresolved_hyperlink_payloads;
+    ok &= check(term::validate_render_snapshot(unresolved_hyperlink).status ==
+            term::Terminal_render_snapshot_status::INVALID_HYPERLINK_METADATA,
+        "lazy row-view validation rejects unresolved remapped hyperlink ids");
+
+    auto mismatched_style_namespace =
+        std::make_shared<term::Terminal_render_snapshot_lazy_payloads>(*payloads);
+    mismatched_style_namespace->rows[0].receiving_namespace.style_table_generation = 999U;
+    term::Terminal_render_snapshot mismatched_style = lazy;
+    mismatched_style.lazy_row_payloads = mismatched_style_namespace;
+    ok &= check(term::validate_render_snapshot(mismatched_style).status ==
+            term::Terminal_render_snapshot_status::INVALID_STYLE_ID,
+        "lazy validation rejects row style namespace mismatch");
+
+    auto mismatched_hyperlink_namespace =
+        std::make_shared<term::Terminal_render_snapshot_lazy_payloads>(*payloads);
+    mismatched_hyperlink_namespace->rows[0].
+        receiving_namespace.hyperlink_namespace_generation = 999U;
+    term::Terminal_render_snapshot mismatched_hyperlink = lazy;
+    mismatched_hyperlink.lazy_row_payloads = mismatched_hyperlink_namespace;
+    ok &= check(term::validate_render_snapshot(mismatched_hyperlink).status ==
+            term::Terminal_render_snapshot_status::INVALID_HYPERLINK_METADATA,
+        "lazy validation rejects row hyperlink namespace mismatch");
+
+    return ok;
+}
+
+bool test_lazy_row_payload_lifetime_survives_source_release_and_snapshot_copy_move()
+{
+    bool ok = true;
+
+    const term::Terminal_render_snapshot_row_payload_namespace metadata_namespace = {
+        500U,
+        600U,
+    };
+    std::weak_ptr<const term::Terminal_render_snapshot_row_payload_owner> source_weak;
+    std::vector<term::Terminal_render_cell> expected_cells;
+    term::Terminal_render_snapshot lazy_snapshot;
+
+    {
+        auto model = std::make_unique<term::Terminal_screen_model>(
+            make_model({2, 10}));
+        model->ingest(QByteArrayLiteral("\x1b[1;1HKEEP\x1b[2;1HROW"));
+        std::optional<term::Terminal_render_snapshot> source_snapshot =
+            model->render_snapshot(request_for_model(*model, 320U));
+        expected_cells = source_snapshot->cells;
+
+        std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner>
+            source_owner =
+                term::render_snapshot_row_payload_owner_from_snapshot(
+                    *source_snapshot,
+                    metadata_namespace,
+                    320U);
+        source_weak = source_owner;
+
+        std::vector<term::Terminal_render_snapshot_immutable_row_payload> temporary_payloads = {
+            source_owner->payload_at(0U),
+        };
+        const term::Terminal_render_cell_text original_temporary_text =
+            temporary_payloads[0].cells[0].text;
+        const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner>
+            temporary_owner =
+                std::make_shared<const term::Terminal_render_snapshot_row_payload_owner>(
+                    321U,
+                    temporary_payloads);
+        temporary_payloads[0].cells[0].text =
+            term::Terminal_render_cell_text(QStringLiteral("X"));
+        ok &= check(temporary_owner->payload_at(0U).cells[0].text ==
+                original_temporary_text,
+            "row payload owner copies temporary builder buffers");
+
+        auto payloads = std::make_shared<term::Terminal_render_snapshot_lazy_payloads>();
+        payloads->receiving_namespace = metadata_namespace;
+        ok &= append_lazy_row_payload(
+            *payloads,
+            row_payload_ref(source_owner, 0U),
+            {},
+            {},
+            "lazy lifetime fixture borrows first source row");
+        ok &= append_lazy_row_payload(
+            *payloads,
+            row_payload_ref(source_owner, 1U),
+            {},
+            {},
+            "lazy lifetime fixture borrows second source row");
+
+        lazy_snapshot = *source_snapshot;
+        lazy_snapshot.cells.clear();
+        lazy_snapshot.lazy_row_payloads = payloads;
+        payloads.reset();
+        source_owner.reset();
+        source_snapshot.reset();
+
+        model->ingest(QByteArrayLiteral("\x1b[2Jmutated"));
+        model.reset();
+    }
+
+    ok &= check(!source_weak.expired(),
+        "borrowed lazy snapshot keeps source row-payload owner alive after source release");
+
+    term::Terminal_render_snapshot copied_snapshot = lazy_snapshot;
+    lazy_snapshot = {};
+    ok &= check(!source_weak.expired(),
+        "copied lazy snapshot keeps borrowed source row-payload owner alive");
+
+    term::Terminal_render_snapshot moved_snapshot = std::move(copied_snapshot);
+    ok &= check(!source_weak.expired(),
+        "moved lazy snapshot keeps borrowed source row-payload owner alive");
+
+    const term::Terminal_render_snapshot_row_content_view moved_rows(moved_snapshot);
+    ok &= check(moved_rows.materialized_flat_cells_match(
+            expected_cells,
+            term::Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST),
+        "copied and moved lazy snapshot materializes after model destruction");
+
+    moved_snapshot = {};
+    ok &= check(source_weak.expired(),
+        "borrowed row-payload owner releases after last lazy snapshot copy is destroyed");
+
+    return ok;
+}
+
+bool test_lazy_row_payload_retention_policy_evicts_superseded_backlog()
+{
+    bool ok = true;
+
+    const term::Terminal_render_snapshot_row_payload_namespace metadata_namespace = {
+        700U,
+        800U,
+    };
+    const auto make_owner =
+        [metadata_namespace](
+            std::uint64_t generation,
+            QString       text) {
+            term::Terminal_render_snapshot snapshot =
+                manual_payload_snapshot_base({1, 4}, generation, 11U);
+            snapshot.cells = {
+                render_cell(0, 0, std::move(text)),
+            };
+            return term::render_snapshot_row_payload_owner_from_snapshot(
+                snapshot,
+                metadata_namespace,
+                generation);
+        };
+
+    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> owner_1 =
+        make_owner(1U, QStringLiteral("A"));
+    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> owner_2 =
+        make_owner(2U, QStringLiteral("B"));
+    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> owner_3 =
+        make_owner(3U, QStringLiteral("C"));
+
+    term::Terminal_render_snapshot_row_payload_retention generation_retention({
+        2U,
+        owner_1->retained_bytes() + owner_2->retained_bytes() +
+            owner_3->retained_bytes(),
+    });
+    generation_retention.retain(owner_1);
+    generation_retention.retain(owner_2);
+    generation_retention.retain(owner_3);
+    ok &= check(generation_retention.owner_count() == 2U &&
+            !generation_retention.contains_generation(1U) &&
+            generation_retention.contains_generation(2U) &&
+            generation_retention.contains_generation(3U),
+        "retention generation policy evicts the oldest superseded backlog owner");
+
+    term::Terminal_render_snapshot_row_payload_retention superseded_retention({
+        2U,
+        owner_1->retained_bytes() + owner_2->retained_bytes(),
+    });
+    std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> old_generation =
+        make_owner(20U, QStringLiteral("O"));
+    std::weak_ptr<const term::Terminal_render_snapshot_row_payload_owner> old_generation_weak =
+        old_generation;
+    superseded_retention.retain(old_generation);
+    old_generation.reset();
+    superseded_retention.retain(make_owner(20U, QStringLiteral("N")));
+    ok &= check(old_generation_weak.expired() &&
+            superseded_retention.owner_count() == 1U &&
+            superseded_retention.contains_generation(20U),
+        "retention replaces a superseded owner with the same retained generation");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner>
+        large_owner_1 = make_owner(40U, QString(256, QLatin1Char('F')));
+    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner>
+        large_owner_2 = make_owner(41U, QString(512, QLatin1Char('G')));
+    ok &= check(large_owner_1->retained_bytes() > owner_1->retained_bytes() &&
+            large_owner_2->retained_bytes() > owner_2->retained_bytes(),
+        "retained row payload bytes include fallback QString payloads");
+
+    const std::size_t fallback_owner_budget = large_owner_2->retained_bytes();
+    term::Terminal_render_snapshot_row_payload_retention byte_retention({
+        4U,
+        fallback_owner_budget,
+    });
+    byte_retention.retain(large_owner_1);
+    byte_retention.retain(large_owner_2);
+    ok &= check(!byte_retention.contains_generation(40U) &&
+            byte_retention.contains_generation(41U) &&
+            byte_retention.retained_bytes() <= fallback_owner_budget,
+        "retention byte policy evicts oldest fallback-text owners until the byte "
+        "budget is satisfied");
+
+    std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> borrowed_owner =
+        make_owner(30U, QStringLiteral("S"));
+    std::weak_ptr<const term::Terminal_render_snapshot_row_payload_owner> borrowed_weak =
+        borrowed_owner;
+    term::Terminal_render_snapshot borrowed_snapshot =
+        manual_payload_snapshot_base({1, 4}, 30U, 11U);
+    borrowed_snapshot.cells.clear();
+    auto borrowed_payloads = std::make_shared<term::Terminal_render_snapshot_lazy_payloads>();
+    borrowed_payloads->receiving_namespace = metadata_namespace;
+    ok &= append_lazy_row_payload(
+        *borrowed_payloads,
+        row_payload_ref(borrowed_owner, 0U),
+        {},
+        {},
+        "retention fixture builds borrowed row before backlog eviction");
+    borrowed_snapshot.lazy_row_payloads = borrowed_payloads;
+    borrowed_payloads.reset();
+
+    term::Terminal_render_snapshot_row_payload_retention borrowed_retention({
+        1U,
+        borrowed_owner->retained_bytes() + owner_3->retained_bytes(),
+    });
+    borrowed_retention.retain(borrowed_owner);
+    borrowed_owner.reset();
+    borrowed_retention.retain(make_owner(31U, QStringLiteral("T")));
+    ok &= check(!borrowed_retention.contains_generation(30U) &&
+            !borrowed_weak.expired(),
+        "borrowed row keeps its source owner alive after retention evicts the backlog");
+
+    const term::Terminal_render_snapshot_row_content_view borrowed_rows(borrowed_snapshot);
+    ok &= check(borrowed_rows.row_text(0, 0, 1, true) == QStringLiteral("S"),
+        "borrowed row materializes after its source owner is evicted from retention");
+    borrowed_snapshot = {};
+    ok &= check(borrowed_weak.expired(),
+        "evicted borrowed source owner releases after the borrowing snapshot is destroyed");
+
+    return ok;
+}
+
 bool test_row_content_view_malformed_lookup_behavior()
 {
     bool ok = true;
@@ -2355,6 +2950,10 @@ int main()
     ok &= test_session_profile_snapshot_publication_counters();
     ok &= test_dirty_row_coalescing_unifies_on_stricter_row_identity();
     ok &= test_row_content_view_matches_flat_snapshot_representation();
+    ok &= test_lazy_row_payload_materialization_matches_full_snapshot();
+    ok &= test_lazy_borrowed_row_payloads_remap_metadata_namespace();
+    ok &= test_lazy_row_payload_lifetime_survives_source_release_and_snapshot_copy_move();
+    ok &= test_lazy_row_payload_retention_policy_evicts_superseded_backlog();
     ok &= test_row_content_view_malformed_lookup_behavior();
     ok &= test_validate_render_snapshot_reports_wide_overlap_before_missing_continuation();
     ok &= test_validate_render_snapshot_reports_wide_structure_before_style_mismatch();
