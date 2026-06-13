@@ -1517,6 +1517,8 @@ struct lazy_snapshot_composer_input_t
     std::shared_ptr<const Terminal_render_snapshot> previous_content_snapshot_handle;
     const Terminal_render_snapshot* previous_content_snapshot = nullptr;
     const Terminal_render_snapshot* full_snapshot             = nullptr;
+    Terminal_lazy_snapshot_evidence_mode evidence_mode =
+        Terminal_lazy_snapshot_evidence_mode::ROW_VIEW_PARITY_TEST;
     bool dirty_rows_have_stable_mutation_identity             = true;
     bool unsupported_geometry_or_detached_snapshot_path       = false;
 };
@@ -2017,17 +2019,35 @@ Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_
     lazy_snapshot.cells.clear();
     lazy_snapshot.lazy_row_payloads = payloads;
 
-    const Terminal_render_snapshot_row_content_view rows(lazy_snapshot);
-    const std::uint64_t materialized_rows =
-        static_cast<std::uint64_t>(rows.row_count());
-    const std::vector<Terminal_render_cell> materialized_cells =
-        rows.materialize_flat_cells(
-            Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST);
-    const std::uint64_t materialized_cell_count =
-        static_cast<std::uint64_t>(materialized_cells.size());
+    const bool row_view_parity_materialization =
+        input.evidence_mode ==
+        Terminal_lazy_snapshot_evidence_mode::ROW_VIEW_PARITY_TEST;
+
+    std::uint64_t materialized_rows       = 0U;
+    std::uint64_t materialized_cell_count = 0U;
+    std::vector<Terminal_render_cell> materialized_cells;
+    bool materialization_matches_full_snapshot = false;
+    if (row_view_parity_materialization) {
+        const Terminal_render_snapshot_row_content_view rows(lazy_snapshot);
+        materialized_rows = static_cast<std::uint64_t>(rows.row_count());
+        materialized_cells =
+            rows.materialize_flat_cells(
+                Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST);
+        materialized_cell_count =
+            static_cast<std::uint64_t>(materialized_cells.size());
+    }
 
     if (validate_render_snapshot(lazy_snapshot).status !=
         Terminal_render_snapshot_status::OK)
+    {
+        return lazy_snapshot_materialization_mismatch_for_testing_result(
+            row_view_parity_materialization ? 1U : 0U,
+            materialized_rows,
+            materialized_cell_count);
+    }
+
+    if (row_view_parity_materialization &&
+        !render_snapshot_cells_match(materialized_cells, current.cells))
     {
         return lazy_snapshot_materialization_mismatch_for_testing_result(
             1U,
@@ -2035,17 +2055,13 @@ Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_
             materialized_cell_count);
     }
 
-    if (!render_snapshot_cells_match(materialized_cells, current.cells)) {
-        return lazy_snapshot_materialization_mismatch_for_testing_result(
-            1U,
-            materialized_rows,
-            materialized_cell_count);
-    }
+    materialization_matches_full_snapshot = row_view_parity_materialization;
 
     Terminal_session_lazy_snapshot_composer_result result;
     result.eligible                              = true;
     result.lazy_snapshot                         = std::move(lazy_snapshot);
-    result.materialization_matches_full_snapshot = true;
+    result.materialization_matches_full_snapshot =
+        materialization_matches_full_snapshot;
     result.dirty_rows_visible                    = dirty_rows_visible;
     result.previous_snapshot_borrowed_rows =
         static_cast<std::uint64_t>(current.grid_size.rows) - dirty_rows_visible;
@@ -2053,7 +2069,8 @@ Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_
     result.producer_materialized_rows = current_dirty_owner.materialized_rows;
     result.producer_cells_scanned     = current_dirty_owner.cells_scanned;
     result.producer_cells_emitted     = current_dirty_owner.cells_emitted;
-    result.consumer_materialization_calls = 1U;
+    result.consumer_materialization_calls =
+        materialization_matches_full_snapshot ? 1U : 0U;
     result.consumer_materialization_rows  = materialized_rows;
     result.consumer_materialization_cells = materialized_cell_count;
     return result;
@@ -2075,6 +2092,50 @@ void record_lazy_snapshot_fallback_reason(
     }
 
     increment_terminal_lazy_snapshot_fallback_reason_counter(counters, *descriptor);
+}
+
+void record_lazy_snapshot_composer_profile_stats(
+    Terminal_session_profile_stats&                     profile_stats,
+    const Terminal_session_lazy_snapshot_composer_result& result)
+{
+    ++profile_stats.lazy_snapshot_eligibility_checks;
+    if (result.materialization_mismatch_for_testing) {
+        ++profile_stats.lazy_snapshot_materialization_mismatches_for_testing;
+    }
+    if (result.consumer_materialization_calls > 0U) {
+        for (std::uint64_t call = 0U;
+            call < result.consumer_materialization_calls;
+            ++call)
+        {
+            record_consumer_materialization(
+                &profile_stats,
+                Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST,
+                result.consumer_materialization_rows,
+                result.consumer_materialization_cells);
+        }
+    }
+    if (result.eligible) {
+        ++profile_stats.lazy_snapshot_eligible_checks;
+        profile_stats.lazy_snapshot_dirty_rows_visible +=
+            result.dirty_rows_visible;
+        profile_stats.lazy_snapshot_previous_snapshot_borrowed_rows +=
+            result.previous_snapshot_borrowed_rows;
+        profile_stats.lazy_snapshot_producer_owned_rows +=
+            result.producer_owned_rows;
+        profile_stats.lazy_snapshot_producer_materialized_rows +=
+            result.producer_materialized_rows;
+        profile_stats.lazy_snapshot_producer_cells_scanned +=
+            result.producer_cells_scanned;
+        profile_stats.lazy_snapshot_producer_cells_emitted +=
+            result.producer_cells_emitted;
+    }
+    else
+    if (!result.materialization_mismatch_for_testing) {
+        ++profile_stats.lazy_snapshot_full_fallbacks;
+        record_lazy_snapshot_fallback_reason(
+            profile_stats.lazy_snapshot_fallback_reasons,
+            result.fallback_reason);
+    }
 }
 
 class Backend_callback_invocation
@@ -3676,17 +3737,19 @@ Terminal_session_profile_stats Terminal_session::profile_stats() const
 }
 
 Terminal_session_lazy_snapshot_composer_result
-Terminal_session::compose_lazy_render_snapshot_for_testing(
+Terminal_session::compose_lazy_render_snapshot_for_benchmark_evidence(
     std::shared_ptr<const Terminal_render_snapshot> previous_content_snapshot,
-    const Terminal_render_snapshot& full_snapshot,
-    bool                            unsupported_geometry_or_detached_snapshot_path)
+    const Terminal_render_snapshot&                 full_snapshot,
+    Terminal_lazy_snapshot_evidence_mode            evidence_mode,
+    bool                                            unsupported_geometry_or_detached_snapshot_path)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     lazy_snapshot_composer_input_t input;
     input.previous_content_snapshot_handle = std::move(previous_content_snapshot);
-    input.previous_content_snapshot = input.previous_content_snapshot_handle.get();
-    input.full_snapshot             = &full_snapshot;
+    input.previous_content_snapshot        = input.previous_content_snapshot_handle.get();
+    input.full_snapshot                    = &full_snapshot;
+    input.evidence_mode                    = evidence_mode;
     input.unsupported_geometry_or_detached_snapshot_path =
         unsupported_geometry_or_detached_snapshot_path;
     if (m_render_snapshot_model_result.has_value()) {
@@ -3699,45 +3762,38 @@ Terminal_session::compose_lazy_render_snapshot_for_testing(
 
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled) {
-        ++m_profile_stats.lazy_snapshot_eligibility_checks;
-        if (result.materialization_mismatch_for_testing) {
-            ++m_profile_stats
-                .lazy_snapshot_materialization_mismatches_for_testing;
-        }
-        if (result.consumer_materialization_calls > 0U) {
-            for (std::uint64_t call = 0U;
-                call < result.consumer_materialization_calls;
-                ++call)
-            {
-                record_consumer_materialization(
-                    &m_profile_stats,
-                    Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST,
-                    result.consumer_materialization_rows,
-                    result.consumer_materialization_cells);
-            }
-        }
-        if (result.eligible) {
-            ++m_profile_stats.lazy_snapshot_eligible_checks;
-            m_profile_stats.lazy_snapshot_dirty_rows_visible +=
-                result.dirty_rows_visible;
-            m_profile_stats.lazy_snapshot_previous_snapshot_borrowed_rows +=
-                result.previous_snapshot_borrowed_rows;
-            m_profile_stats.lazy_snapshot_producer_owned_rows +=
-                result.producer_owned_rows;
-            m_profile_stats.lazy_snapshot_producer_materialized_rows +=
-                result.producer_materialized_rows;
-            m_profile_stats.lazy_snapshot_producer_cells_scanned +=
-                result.producer_cells_scanned;
-            m_profile_stats.lazy_snapshot_producer_cells_emitted +=
-                result.producer_cells_emitted;
-        }
-        else
-        if (!result.materialization_mismatch_for_testing) {
-            ++m_profile_stats.lazy_snapshot_full_fallbacks;
-            record_lazy_snapshot_fallback_reason(
-                m_profile_stats.lazy_snapshot_fallback_reasons,
-                result.fallback_reason);
-        }
+        record_lazy_snapshot_composer_profile_stats(m_profile_stats, result);
+    }
+#endif
+
+    return result;
+}
+
+Terminal_session_lazy_snapshot_composer_result
+Terminal_session::compose_lazy_render_snapshot_for_testing(
+    std::shared_ptr<const Terminal_render_snapshot> previous_content_snapshot,
+    const Terminal_render_snapshot& full_snapshot,
+    bool                            unsupported_geometry_or_detached_snapshot_path)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    lazy_snapshot_composer_input_t input;
+    input.previous_content_snapshot_handle = std::move(previous_content_snapshot);
+    input.previous_content_snapshot        = input.previous_content_snapshot_handle.get();
+    input.full_snapshot                    = &full_snapshot;
+    input.unsupported_geometry_or_detached_snapshot_path =
+        unsupported_geometry_or_detached_snapshot_path;
+    if (m_render_snapshot_model_result.has_value()) {
+        input.dirty_rows_have_stable_mutation_identity =
+            m_render_snapshot_model_result->dirty_rows_have_stable_mutation_identity;
+    }
+
+    Terminal_session_lazy_snapshot_composer_result result =
+        compose_lazy_render_snapshot_for_input(input);
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    if (m_profile_stats.enabled) {
+        record_lazy_snapshot_composer_profile_stats(m_profile_stats, result);
     }
 #endif
 
@@ -3767,45 +3823,7 @@ Terminal_session::compose_lazy_render_snapshot_for_testing(
 
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled) {
-        ++m_profile_stats.lazy_snapshot_eligibility_checks;
-        if (result.materialization_mismatch_for_testing) {
-            ++m_profile_stats
-                .lazy_snapshot_materialization_mismatches_for_testing;
-        }
-        if (result.consumer_materialization_calls > 0U) {
-            for (std::uint64_t call = 0U;
-                call < result.consumer_materialization_calls;
-                ++call)
-            {
-                record_consumer_materialization(
-                    &m_profile_stats,
-                    Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST,
-                    result.consumer_materialization_rows,
-                    result.consumer_materialization_cells);
-            }
-        }
-        if (result.eligible) {
-            ++m_profile_stats.lazy_snapshot_eligible_checks;
-            m_profile_stats.lazy_snapshot_dirty_rows_visible +=
-                result.dirty_rows_visible;
-            m_profile_stats.lazy_snapshot_previous_snapshot_borrowed_rows +=
-                result.previous_snapshot_borrowed_rows;
-            m_profile_stats.lazy_snapshot_producer_owned_rows +=
-                result.producer_owned_rows;
-            m_profile_stats.lazy_snapshot_producer_materialized_rows +=
-                result.producer_materialized_rows;
-            m_profile_stats.lazy_snapshot_producer_cells_scanned +=
-                result.producer_cells_scanned;
-            m_profile_stats.lazy_snapshot_producer_cells_emitted +=
-                result.producer_cells_emitted;
-        }
-        else
-        if (!result.materialization_mismatch_for_testing) {
-            ++m_profile_stats.lazy_snapshot_full_fallbacks;
-            record_lazy_snapshot_fallback_reason(
-                m_profile_stats.lazy_snapshot_fallback_reasons,
-                result.fallback_reason);
-        }
+        record_lazy_snapshot_composer_profile_stats(m_profile_stats, result);
     }
 #endif
 
