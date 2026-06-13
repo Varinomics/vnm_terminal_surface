@@ -18,10 +18,10 @@ Two producers build snapshots:
   `src/terminal_public_projection.cpp` (`capture_from_safe_model` records the
   basis snapshot's validation status).
 
-Consumers are the frame builder (`src/qsg_terminal_renderer.cpp`), which
-iterates `snapshot.cells` directly, the selection-extraction helpers in
-`render_snapshot.h`, and the session publication channel toward
-`VNM_TerminalSurface`.
+Consumers are the frame builder (`src/qsg_terminal_renderer.cpp`), which reads
+snapshots through `Terminal_render_snapshot_row_content_view`, the
+selection-extraction helpers in `render_snapshot.h`, and the session publication
+channel toward `VNM_TerminalSurface`.
 
 ## Immutability And Lifetime
 
@@ -45,10 +45,11 @@ publications.
 - No two cells share a position (`INVALID_CELL_OVERLAP`).
 
 This ordering is an architecture contract, not an incidental production
-detail: the frame builder relies on it instead of rebuilding a position
-table. Both producers emit in this order, and the validator rejects any
-snapshot that violates it. The contract governs the cells that are present;
-it does not require a cell for every grid position.
+detail: row-content views rely on it to expose row ranges without rebuilding a
+position table. The frame builder uses the row-content view, both producers emit
+in this order, and the validator rejects any snapshot that violates it. The
+contract governs the cells that are present; it does not require a cell for
+every grid position.
 
 ## Wide Cells
 

@@ -141,27 +141,24 @@ bool test_profile_text_sections(QGuiApplication& app)
         "session_profile_stats reports full_snapshot_publications");
     ok &= check(text.contains(QStringLiteral("  snapshots_consumed_by_bridge=")),
         "session_profile_stats reports snapshots_consumed_by_bridge");
-    ok &= check(text.contains(QStringLiteral("  consumer_materialization_counters_available=false")),
-        "session_profile_stats reports unavailable consumer materialization counters");
+    ok &= check(text.contains(QStringLiteral("  consumer_materialization_counters_available=true")),
+        "session_profile_stats reports available consumer materialization counters");
     ok &= check(text.contains(QStringLiteral(
             "  consumer_materialization_counters_schema_semantics="
-            "unavailable_until_batch_3_materialization_boundaries")),
+            "batch_3_materialization_boundaries")),
         "session_profile_stats reports consumer materialization counter owner semantics");
     ok &= check(text.contains(QStringLiteral(
             "  consumer_materialization_counters_owner_batch=Batch 3")),
         "session_profile_stats reports consumer materialization counter owner batch");
     ok &= check(text.contains(QStringLiteral(
-            "  consumer_materialization_counters_frame_builder_rows=unavailable")),
-        "session_profile_stats reports unavailable frame-builder materialization rows");
+            "  consumer_materialization_counters_geometry_derived_snapshot_calls=")),
+        "session_profile_stats reports geometry-derived materialization calls");
     ok &= check(text.contains(QStringLiteral(
-            "  consumer_materialization_counters_public_projection_rows=unavailable")),
-        "session_profile_stats reports unavailable public-projection materialization rows");
+            "  consumer_materialization_counters_geometry_derived_snapshot_rows=")),
+        "session_profile_stats reports geometry-derived materialization rows");
     ok &= check(text.contains(QStringLiteral(
-            "  consumer_materialization_counters_transcript_rows=unavailable")),
-        "session_profile_stats reports unavailable transcript materialization rows");
-    ok &= check(text.contains(QStringLiteral(
-            "  consumer_materialization_counters_selection_rows=unavailable")),
-        "session_profile_stats reports unavailable selection materialization rows");
+            "  consumer_materialization_counters_geometry_derived_snapshot_cells=")),
+        "session_profile_stats reports geometry-derived materialization cells");
     ok &= check(text.contains(QStringLiteral("  retained_snapshot_payload_bytes=")),
         "session_profile_stats reports retained_snapshot_payload_bytes");
     ok &= check(text.contains(QStringLiteral("  retained_snapshot_generation_count=")),

@@ -88,6 +88,8 @@ constexpr int k_surface_session_sparse_dirty_row_stride       = 7;
 constexpr int k_surface_session_output_high_water_chunks      = 64;
 constexpr int k_surface_session_output_high_water_chunk_bytes = 1024;
 constexpr int k_surface_session_write_high_water_bytes        = 64 * 1024;
+constexpr int k_surface_session_resize_boundary_width_delta   = 16;
+constexpr int k_surface_session_geometry_boundary_height_delta = 16;
 
 constexpr int k_schema_version              = 21;
 constexpr int k_profile_schema_version      = 2;
@@ -111,6 +113,8 @@ const QString k_surface_session_selection_snapshot_execution_mode =
     QStringLiteral("surface_session_selection_snapshot");
 const QString k_surface_session_resize_smoke_boundary_execution_mode =
     QStringLiteral("surface_session_resize_smoke_boundary");
+const QString k_surface_session_geometry_derived_boundary_execution_mode =
+    QStringLiteral("surface_session_geometry_derived_boundary");
 const QString k_surface_session_decision_boundary_execution_mode =
     QStringLiteral("surface_session_batch1_smoke_boundary");
 const QString k_surface_session_public_projection_boundary_execution_mode =
@@ -132,7 +136,7 @@ const QString k_descriptor_counter_schema_semantics = QStringLiteral(
 const QString k_lazy_snapshot_reason_counter_schema_semantics = QStringLiteral(
     "unavailable_until_batch_5_lazy_eligibility");
 const QString k_consumer_materialization_counter_schema_semantics = QStringLiteral(
-    "unavailable_until_batch_3_materialization_boundaries");
+    "batch_3_materialization_boundaries");
 const QString k_requested_grid_semantics = QStringLiteral("requested_grid_validated");
 const QString k_surface_session_actual_grid_semantics = QStringLiteral(
     "surface_session_actual_grid_from_qquick_surface_metrics");
@@ -467,6 +471,12 @@ struct Attempt_result
     int                                               selection_snapshot_spans_observed
                                                                                      = 0;
     bool                                              resize_boundary_observed       = false;
+    bool                                              resize_boundary_row_change_observed
+                                                                                     = false;
+    int                                               geometry_derived_boundary_adapted_rows
+                                                                                     = 0;
+    qint64                                            geometry_derived_boundary_adapted_cells
+                                                                                     = 0;
     bool                                              alternate_buffer_boundary_observed
                                                                                      = false;
     bool                                              style_color_mode_boundary_observed
@@ -567,6 +577,9 @@ struct Scenario_result
     int                    session_snapshots_observed         = 0;
     int                    selection_snapshot_spans_observed = 0;
     int                    resize_boundary_changes_observed  = 0;
+    int                    resize_boundary_row_changes_observed = 0;
+    qint64                 geometry_derived_boundary_adapted_rows_observed = 0;
+    qint64                 geometry_derived_boundary_adapted_cells_observed = 0;
     int                    alternate_buffer_boundaries_observed = 0;
     int                    style_color_mode_boundaries_observed = 0;
     int                    hyperlink_boundaries_observed     = 0;
@@ -640,6 +653,7 @@ QStringList scenario_names()
         QStringLiteral("surface_session_cursor_overlay"),
         QStringLiteral("surface_session_selection_snapshot"),
         QStringLiteral("surface_session_resize_smoke_boundary"),
+        QStringLiteral("surface_session_geometry_derived_boundary"),
         QStringLiteral("surface_session_viewport_change_smoke_boundary"),
         QStringLiteral("surface_session_alternate_buffer_smoke_boundary"),
         QStringLiteral("surface_session_style_color_mode_smoke_boundary"),
@@ -681,6 +695,7 @@ bool is_surface_session_scenario(const QString& scenario_name)
         scenario_name == QStringLiteral("surface_session_cursor_overlay")    ||
         scenario_name == QStringLiteral("surface_session_selection_snapshot") ||
         scenario_name == QStringLiteral("surface_session_resize_smoke_boundary") ||
+        scenario_name == QStringLiteral("surface_session_geometry_derived_boundary") ||
         scenario_name == QStringLiteral("surface_session_viewport_change_smoke_boundary") ||
         scenario_name == QStringLiteral("surface_session_alternate_buffer_smoke_boundary") ||
         scenario_name == QStringLiteral("surface_session_style_color_mode_smoke_boundary") ||
@@ -715,6 +730,10 @@ QString scenario_execution_mode(const QString& scenario_name)
 
     if (scenario_name == QStringLiteral("surface_session_public_projection_boundary")) {
         return k_surface_session_public_projection_boundary_execution_mode;
+    }
+
+    if (scenario_name == QStringLiteral("surface_session_geometry_derived_boundary")) {
+        return k_surface_session_geometry_derived_boundary_execution_mode;
     }
 
     if (scenario_name == QStringLiteral("surface_session_sustained_output")) {
@@ -1479,13 +1498,78 @@ bool snapshot_contains_hyperlink(const term::Terminal_render_snapshot& snapshot)
         return true;
     }
 
-    for (const term::Terminal_render_cell& cell : snapshot.cells) {
-        if (cell.hyperlink_id != 0U) {
-            return true;
+    const term::Terminal_render_snapshot_row_content_view rows(snapshot);
+    for (const term::Terminal_render_snapshot_row_content row : rows) {
+        for (const term::Terminal_render_cell& cell : row) {
+            if (cell.hyperlink_id != 0U) {
+                return true;
+            }
         }
     }
 
     return false;
+}
+
+bool geometry_derived_cell_fits_grid(
+    const term::Terminal_render_cell& cell,
+    term::terminal_grid_size_t        grid_size)
+{
+    return
+        cell.position.row    >= 0              &&
+        cell.position.row    <  grid_size.rows &&
+        cell.position.column >= 0              &&
+        cell.position.column <  grid_size.columns;
+}
+
+bool geometry_derived_continuation_matches_base(
+    const term::Terminal_render_cell& continuation,
+    const term::Terminal_render_cell& base)
+{
+    return
+        continuation.wide_continuation         &&
+        continuation.style_id == base.style_id &&
+        continuation.hyperlink_id == base.hyperlink_id;
+}
+
+qint64 geometry_derived_adapted_cell_count(
+    const term::Terminal_render_snapshot& snapshot,
+    term::terminal_grid_size_t            grid_size)
+{
+    qint64 adapted_cells = 0;
+    const term::Terminal_render_snapshot_row_content_view rows(snapshot);
+    for (const term::Terminal_render_snapshot_row_content row : rows) {
+        for (auto cell_it = row.begin(); cell_it != row.end(); ++cell_it) {
+            const term::Terminal_render_cell& cell = *cell_it;
+            if (!geometry_derived_cell_fits_grid(cell, grid_size) || cell.wide_continuation) {
+                continue;
+            }
+
+            if (cell.display_width <= 0 ||
+                cell.display_width >  grid_size.columns - cell.position.column)
+            {
+                continue;
+            }
+
+            auto continuation_it       = cell_it;
+            bool complete_cell_span    = true;
+            for (int column_delta = 1; column_delta < cell.display_width; ++column_delta) {
+                ++continuation_it;
+                if (continuation_it == row.end() ||
+                    continuation_it->position.column != cell.position.column + column_delta ||
+                    !geometry_derived_continuation_matches_base(*continuation_it, cell))
+                {
+                    complete_cell_span = false;
+                    break;
+                }
+            }
+
+            if (complete_cell_span) {
+                adapted_cells += cell.display_width;
+            }
+        }
+    }
+
+    return adapted_cells;
 }
 
 bool snapshot_style_or_mode_boundary_changed(
@@ -2991,22 +3075,8 @@ QString snapshot_row_text(
     const term::Terminal_render_snapshot&  snapshot,
     int                                    row)
 {
-    QString text;
-    for (int column = 0; column < snapshot.grid_size.columns; ++column) {
-        QString cell_text = QStringLiteral(" ");
-        for (const term::Terminal_render_cell& cell : snapshot.cells) {
-            if (cell.position.row == row && cell.position.column == column) {
-                cell_text = cell.text.to_qstring();
-                break;
-            }
-        }
-        text += cell_text;
-    }
-
-    while (!text.isEmpty() && text.back() == QChar(u' ')) {
-        text.chop(1);
-    }
-    return text;
+    const term::Terminal_render_snapshot_row_content_view rows(snapshot);
+    return rows.row_text(row, 0, snapshot.grid_size.columns, true);
 }
 
 QString scripted_surface_scroll_line_text(int line_index)
@@ -4391,6 +4461,7 @@ struct surface_session_action_profile_t
     bool   render_expected            = true;
     bool   resize_surface             = false;
     bool   selection_snapshot         = false;
+    bool   synchronized_output_hold   = false;
 };
 
 surface_session_action_profile_t surface_session_action_profile(const QString& scenario_name)
@@ -4414,6 +4485,14 @@ surface_session_action_profile_t surface_session_action_profile(const QString& s
         surface_session_action_profile_t profile;
         profile.initial_output_lines = 8;
         profile.resize_surface       = true;
+        return profile;
+    }
+
+    if (scenario_name == QStringLiteral("surface_session_geometry_derived_boundary")) {
+        surface_session_action_profile_t profile;
+        profile.initial_output_lines     = 8;
+        profile.resize_surface           = true;
+        profile.synchronized_output_hold = true;
         return profile;
     }
 
@@ -4571,8 +4650,16 @@ Attempt_result run_surface_session_action_attempt(
     else
     if (profile.resize_surface) {
         QSize next_size = context.window.size();
-        next_size.rwidth() += (phase % 2 == 0) ? 16 : -16;
-        next_size.rwidth() = std::max(64, next_size.width());
+        if (scenario_name == QStringLiteral("surface_session_geometry_derived_boundary")) {
+            next_size.rheight() += k_surface_session_geometry_boundary_height_delta;
+            next_size.rheight() = std::min(k_max_window_axis, next_size.height());
+        }
+        else {
+            next_size.rwidth() += (phase % 2 == 0)
+                ? k_surface_session_resize_boundary_width_delta
+                : -k_surface_session_resize_boundary_width_delta;
+            next_size.rwidth() = std::max(64, next_size.width());
+        }
         context.window.resize(next_size);
         context.surface.setSize(QSizeF(
             static_cast<qreal>(next_size.width()),
@@ -4636,6 +4723,16 @@ Attempt_result run_surface_session_action_attempt(
         attempt.resize_boundary_observed =
             profile.resize_surface &&
             !term::grid_sizes_match(before_snapshot->grid_size, after_snapshot->grid_size);
+        attempt.resize_boundary_row_change_observed =
+            profile.resize_surface &&
+            before_snapshot->grid_size.rows != after_snapshot->grid_size.rows;
+        if (scenario_name == QStringLiteral("surface_session_geometry_derived_boundary") &&
+            attempt.resize_boundary_observed)
+        {
+            attempt.geometry_derived_boundary_adapted_rows = after_snapshot->grid_size.rows;
+            attempt.geometry_derived_boundary_adapted_cells =
+                geometry_derived_adapted_cell_count(*before_snapshot, after_snapshot->grid_size);
+        }
         attempt.alternate_buffer_boundary_observed =
             scenario_name == QStringLiteral("surface_session_alternate_buffer_smoke_boundary") &&
             before_snapshot->viewport.active_buffer != after_snapshot->viewport.active_buffer;
@@ -4767,6 +4864,17 @@ Scenario_result run_surface_session_action_scenario(
         return result;
     }
 
+    if (profile.synchronized_output_hold) {
+        const bool entered_hold =
+            backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hgeometry-derived-boundary"));
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(context.surface);
+        if (!entered_hold) {
+            result.structural_checks.workload_actions_accepted = false;
+            finish_scenario_status(result);
+            return result;
+        }
+    }
+
     result.rows    = initial_snapshot != nullptr ? initial_snapshot->grid_size.rows : 0;
     result.columns = initial_snapshot != nullptr ? initial_snapshot->grid_size.columns : 0;
 
@@ -4847,6 +4955,15 @@ Scenario_result run_surface_session_action_scenario(
             attempt.selection_snapshot_spans_observed;
         if (attempt.resize_boundary_observed) {
             ++result.resize_boundary_changes_observed;
+        }
+        if (attempt.resize_boundary_row_change_observed) {
+            ++result.resize_boundary_row_changes_observed;
+        }
+        if (attempt.geometry_derived_boundary_adapted_rows > 0) {
+            result.geometry_derived_boundary_adapted_rows_observed +=
+                attempt.geometry_derived_boundary_adapted_rows;
+            result.geometry_derived_boundary_adapted_cells_observed +=
+                attempt.geometry_derived_boundary_adapted_cells;
         }
         if (attempt.alternate_buffer_boundary_observed) {
             ++result.alternate_buffer_boundaries_observed;
@@ -5600,18 +5717,27 @@ QJsonObject model_profile_stats_json(
     return object;
 }
 
-QJsonObject consumer_materialization_counters_json()
+QJsonObject consumer_materialization_counters_json(
+    const term::Terminal_session_profile_stats& stats)
 {
     QJsonObject object;
-    object.insert(QStringLiteral("available"), false);
+    object.insert(QStringLiteral("available"), true);
     object.insert(
         QStringLiteral("schema_semantics"),
         k_consumer_materialization_counter_schema_semantics);
     object.insert(QStringLiteral("owner_batch"), QStringLiteral("Batch 3"));
-    object.insert(QStringLiteral("frame_builder_rows"), QStringLiteral("unavailable"));
-    object.insert(QStringLiteral("public_projection_rows"), QStringLiteral("unavailable"));
-    object.insert(QStringLiteral("transcript_rows"), QStringLiteral("unavailable"));
-    object.insert(QStringLiteral("selection_rows"), QStringLiteral("unavailable"));
+    insert_profile_counter(
+        object,
+        QStringLiteral("geometry_derived_snapshot_calls"),
+        stats.geometry_derived_materialization_calls);
+    insert_profile_counter(
+        object,
+        QStringLiteral("geometry_derived_snapshot_rows"),
+        stats.geometry_derived_materialization_rows);
+    insert_profile_counter(
+        object,
+        QStringLiteral("geometry_derived_snapshot_cells"),
+        stats.geometry_derived_materialization_cells);
     return object;
 }
 
@@ -5688,7 +5814,7 @@ QJsonObject session_profile_stats_json(
         stats.max_unrendered_snapshot_generations);
     object.insert(
         QStringLiteral("consumer_materialization_counters"),
-        consumer_materialization_counters_json());
+        consumer_materialization_counters_json(stats));
     insert_profile_counter(
         object,
         QStringLiteral("retained_snapshot_payload_bytes"),
@@ -5863,6 +5989,15 @@ QJsonObject scenario_profile_summary_json(const Scenario_result& result)
     object.insert(QStringLiteral("name"),           result.name);
     object.insert(QStringLiteral("source_mode"),    result.source_mode);
     object.insert(QStringLiteral("execution_mode"), result.execution_mode);
+    object.insert(
+        QStringLiteral("resize_boundary_row_changes_observed"),
+        result.resize_boundary_row_changes_observed);
+    object.insert(
+        QStringLiteral("geometry_derived_boundary_adapted_rows_observed"),
+        result.geometry_derived_boundary_adapted_rows_observed);
+    object.insert(
+        QStringLiteral("geometry_derived_boundary_adapted_cells_observed"),
+        result.geometry_derived_boundary_adapted_cells_observed);
     object.insert(
         QStringLiteral("background_batched_rects"),
         result.renderer_totals.background_batched_rects);
@@ -6524,6 +6659,15 @@ QJsonObject scenario_json(
     object.insert(
         QStringLiteral("resize_boundary_changes_observed"),
         result.resize_boundary_changes_observed);
+    object.insert(
+        QStringLiteral("resize_boundary_row_changes_observed"),
+        result.resize_boundary_row_changes_observed);
+    object.insert(
+        QStringLiteral("geometry_derived_boundary_adapted_rows_observed"),
+        result.geometry_derived_boundary_adapted_rows_observed);
+    object.insert(
+        QStringLiteral("geometry_derived_boundary_adapted_cells_observed"),
+        result.geometry_derived_boundary_adapted_cells_observed);
     object.insert(
         QStringLiteral("alternate_buffer_boundaries_observed"),
         result.alternate_buffer_boundaries_observed);
@@ -8388,10 +8532,9 @@ bool validate_consumer_materialization_counters_json(
                 QStringLiteral("available"),
                 QStringLiteral("schema_semantics"),
                 QStringLiteral("owner_batch"),
-                QStringLiteral("frame_builder_rows"),
-                QStringLiteral("public_projection_rows"),
-                QStringLiteral("transcript_rows"),
-                QStringLiteral("selection_rows"),
+                QStringLiteral("geometry_derived_snapshot_calls"),
+                QStringLiteral("geometry_derived_snapshot_rows"),
+                QStringLiteral("geometry_derived_snapshot_cells"),
             },
             QStringLiteral("consumer_materialization_counters"),
             out_error))
@@ -8400,20 +8543,112 @@ bool validate_consumer_materialization_counters_json(
     }
 
     if (!counters.value(QStringLiteral("available")).isBool() ||
-        counters.value(QStringLiteral("available")).toBool()  ||
+        !counters.value(QStringLiteral("available")).toBool() ||
         counters.value(QStringLiteral("schema_semantics")).toString() !=
             k_consumer_materialization_counter_schema_semantics ||
-        counters.value(QStringLiteral("owner_batch")).toString() != QStringLiteral("Batch 3") ||
-        counters.value(QStringLiteral("frame_builder_rows")).toString() !=
-            QStringLiteral("unavailable") ||
-        counters.value(QStringLiteral("public_projection_rows")).toString() !=
-            QStringLiteral("unavailable") ||
-        counters.value(QStringLiteral("transcript_rows")).toString() !=
-            QStringLiteral("unavailable") ||
-        counters.value(QStringLiteral("selection_rows")).toString() !=
-            QStringLiteral("unavailable"))
+        counters.value(QStringLiteral("owner_batch")).toString() != QStringLiteral("Batch 3"))
     {
         *out_error = QStringLiteral("consumer materialization counter schema changed");
+        return false;
+    }
+
+    qint64 geometry_derived_snapshot_calls = 0;
+    qint64 geometry_derived_snapshot_rows  = 0;
+    qint64 geometry_derived_snapshot_cells = 0;
+    if (!profile_nonnegative_integer_field(
+            counters,
+            QStringLiteral("geometry_derived_snapshot_calls"),
+            QStringLiteral("consumer_materialization_counters"),
+            &geometry_derived_snapshot_calls,
+            out_error) ||
+        !profile_nonnegative_integer_field(
+            counters,
+            QStringLiteral("geometry_derived_snapshot_rows"),
+            QStringLiteral("consumer_materialization_counters"),
+            &geometry_derived_snapshot_rows,
+            out_error) ||
+        !profile_nonnegative_integer_field(
+            counters,
+            QStringLiteral("geometry_derived_snapshot_cells"),
+            QStringLiteral("consumer_materialization_counters"),
+            &geometry_derived_snapshot_cells,
+            out_error))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+bool validate_geometry_derived_materialization_observed(
+    const QJsonObject& session_profile,
+    qint64             expected_boundary_count,
+    qint64             expected_adapted_rows,
+    qint64             expected_adapted_cells,
+    const QString&     label,
+    QString*           out_error)
+{
+    const QJsonObject counters =
+        session_profile.value(QStringLiteral("consumer_materialization_counters")).toObject();
+    const qint64 calls = json_counter(counters, QStringLiteral("geometry_derived_snapshot_calls"));
+    const qint64 rows  = json_counter(counters, QStringLiteral("geometry_derived_snapshot_rows"));
+    const qint64 cells = json_counter(counters, QStringLiteral("geometry_derived_snapshot_cells"));
+    if (calls <= 0 || rows <= 0 || cells <= 0)
+    {
+        *out_error = QStringLiteral(
+            "geometry-derived materialization counters were not observed: %1")
+            .arg(label);
+        return false;
+    }
+
+    if (expected_boundary_count <= 0) {
+        *out_error = QStringLiteral(
+            "geometry-derived boundary count was not observed: %1")
+            .arg(label);
+        return false;
+    }
+
+    if (expected_adapted_rows <= 0) {
+        *out_error = QStringLiteral(
+            "geometry-derived adapted output rows were not observed: %1")
+            .arg(label);
+        return false;
+    }
+
+    if (expected_adapted_cells <= 0) {
+        *out_error = QStringLiteral(
+            "geometry-derived adapted output cells were not observed: %1")
+            .arg(label);
+        return false;
+    }
+
+    if (calls != expected_boundary_count) {
+        *out_error = QStringLiteral(
+            "geometry-derived materialization calls do not match observed boundary count: "
+            "%1 expected=%2 observed=%3")
+            .arg(label)
+            .arg(expected_boundary_count)
+            .arg(calls);
+        return false;
+    }
+
+    if (rows != expected_adapted_rows) {
+        *out_error = QStringLiteral(
+            "geometry-derived materialization rows do not match adapted output rows: "
+            "%1 expected=%2 observed=%3")
+            .arg(label)
+            .arg(expected_adapted_rows)
+            .arg(rows);
+        return false;
+    }
+
+    if (cells != expected_adapted_cells) {
+        *out_error = QStringLiteral(
+            "geometry-derived materialization cells do not match adapted output cells: "
+            "%1 expected=%2 observed=%3")
+            .arg(label)
+            .arg(expected_adapted_cells)
+            .arg(cells);
         return false;
     }
 
@@ -8625,6 +8860,9 @@ bool validate_scenario_json(
         QStringLiteral("session_snapshots_observed"),
         QStringLiteral("selection_snapshot_spans_observed"),
         QStringLiteral("resize_boundary_changes_observed"),
+        QStringLiteral("resize_boundary_row_changes_observed"),
+        QStringLiteral("geometry_derived_boundary_adapted_rows_observed"),
+        QStringLiteral("geometry_derived_boundary_adapted_cells_observed"),
         QStringLiteral("alternate_buffer_boundaries_observed"),
         QStringLiteral("style_color_mode_boundaries_observed"),
         QStringLiteral("hyperlink_boundaries_observed"),
@@ -8815,12 +9053,42 @@ bool validate_scenario_json(
         }
     }
 
-    if (scenario_name == QStringLiteral("surface_session_resize_smoke_boundary") &&
+    if ((scenario_name == QStringLiteral("surface_session_resize_smoke_boundary") ||
+         scenario_name == QStringLiteral("surface_session_geometry_derived_boundary")) &&
         json_counter(object, QStringLiteral("resize_boundary_changes_observed")) <= 0)
     {
-        *out_error = QStringLiteral("resize smoke boundary was not observed: %1")
+        *out_error = QStringLiteral("resize boundary was not observed: %1")
             .arg(scenario_name);
         return false;
+    }
+    if (scenario_name == QStringLiteral("surface_session_geometry_derived_boundary") &&
+        json_counter(object, QStringLiteral("resize_boundary_row_changes_observed")) <= 0)
+    {
+        *out_error = QStringLiteral("geometry-derived height-changing resize was not observed: %1")
+            .arg(scenario_name);
+        return false;
+    }
+    if (options.profile &&
+        scenario_name == QStringLiteral("surface_session_geometry_derived_boundary"))
+    {
+        const QJsonObject session_profile =
+            object.value(QStringLiteral("session_profile_stats")).toObject();
+        if (!validate_geometry_derived_materialization_observed(
+                session_profile,
+                json_counter(
+                    object,
+                    QStringLiteral("resize_boundary_row_changes_observed")),
+                json_counter(
+                    object,
+                    QStringLiteral("geometry_derived_boundary_adapted_rows_observed")),
+                json_counter(
+                    object,
+                    QStringLiteral("geometry_derived_boundary_adapted_cells_observed")),
+                scenario_name,
+                out_error))
+        {
+            return false;
+        }
     }
 
     if (scenario_name == QStringLiteral("surface_session_alternate_buffer_smoke_boundary") &&
@@ -9549,6 +9817,54 @@ bool validate_profile_json_output(
                 *out_error = QStringLiteral(
                     "profile public projection boundary counters were not observed: %1")
                     .arg(name);
+                return false;
+            }
+        }
+
+        if (options.profile &&
+            name == QStringLiteral("surface_session_geometry_derived_boundary"))
+        {
+            qint64 row_changes_observed    = 0;
+            qint64 adapted_rows_observed   = 0;
+            qint64 adapted_cells_observed  = 0;
+            if (!profile_nonnegative_integer_field(
+                    scenario,
+                    QStringLiteral("resize_boundary_row_changes_observed"),
+                    QStringLiteral("profile.scenarios[%1]").arg(index),
+                    &row_changes_observed,
+                    out_error) ||
+                !profile_nonnegative_integer_field(
+                    scenario,
+                    QStringLiteral("geometry_derived_boundary_adapted_rows_observed"),
+                    QStringLiteral("profile.scenarios[%1]").arg(index),
+                    &adapted_rows_observed,
+                    out_error) ||
+                !profile_nonnegative_integer_field(
+                    scenario,
+                    QStringLiteral("geometry_derived_boundary_adapted_cells_observed"),
+                    QStringLiteral("profile.scenarios[%1]").arg(index),
+                    &adapted_cells_observed,
+                    out_error))
+            {
+                return false;
+            }
+            if (row_changes_observed <= 0) {
+                *out_error = QStringLiteral(
+                    "profile geometry-derived height-changing resize was not observed: %1")
+                    .arg(name);
+                return false;
+            }
+
+            const QJsonObject session_profile =
+                scenario.value(QStringLiteral("session_profile_stats")).toObject();
+            if (!validate_geometry_derived_materialization_observed(
+                    session_profile,
+                    row_changes_observed,
+                    adapted_rows_observed,
+                    adapted_cells_observed,
+                    name,
+                    out_error))
+            {
                 return false;
             }
         }

@@ -216,8 +216,10 @@ Batch 0 record, captured 2026-06-13:
     `src/qsg_terminal_renderer.cpp`, and
     `tests/render_frame/render_frame_tests.cpp`, with pre-existing diff stat
     of 135 insertions and 19 deletions across those three files. These files
-    are the current block-character mitigation baseline under test; Batch 0
-    does not change them.
+    were captured as the block-character mitigation baseline. Batch 3 second
+    amendment now explicitly owns and integrates these three-file hunks as part
+    of the Batch 3 implementation diff, using the stable patch-id below as the
+    inherited-hunk identity.
   - Aggregate dirty source patch identity:
     - Stable patch-id command:
 
@@ -245,30 +247,33 @@ Batch 0 record, captured 2026-06-13:
       adds `is_terminal_graphic_source_cell_code_unit()` at current line 367
       and changes `is_single_bmp_source_cell_code_unit()` at current lines
       376-377 so box/block graphic BMP code units bypass the combining-class
-      rejection. Owner: prior-session block-character mitigation.
+      rejection. Owner after Batch 3 second amendment: Batch 3 integration of
+      the prior block-character mitigation.
     - `qsg_terminal_renderer.cpp`, `classify_terminal_simple_content_cell()`:
       adds current lines 1084-1093, routing inline single-BMP terminal graphics
       to the `NON_ASCII_TEXT` path after the strict printable-ASCII bypass and
-      before inline-BMP width/shaping validation. Owner: prior-session
-      block-character mitigation.
+      before inline-BMP width/shaping validation. Owner after Batch 3 second
+      amendment: Batch 3 integration of the prior block-character mitigation.
     - `qsg_terminal_renderer.cpp`, `build_terminal_render_frame()`:
       adds `Open_full_block_graphic_run` state at current lines 1751-1759 and
       replaces the old immediate terminal-graphic branch at current lines
       `src/qsg_terminal_renderer.cpp:1889-1953` with full-block U+2588
-      graphic-rect coalescing before text-run construction. Owner:
-      prior-session block-character mitigation.
+      graphic-rect coalescing before text-run construction. Owner after
+      Batch 3 second amendment: Batch 3 integration of the prior
+      block-character mitigation.
     - `render_frame_tests.cpp`: adds
       `test_full_block_graphic_rects_coalesce_contiguous_cells()` at current
-      lines 267-308 and wires it into `main()` at current line 2255. Owner:
-      prior-session block-character mitigation test coverage.
-  - Later workers must preserve the prior-session mitigation hunks above unless
-    a reviewed batch intentionally owns and changes them. This is especially
-    important for `src/qsg_terminal_renderer.cpp` and
-    `tests/render_frame/render_frame_tests.cpp`, which later frame/QSG batches
-    are likely to touch.
+      lines 267-308 and wires it into `main()` at current line 2255. Owner
+      after Batch 3 second amendment: Batch 3 integration of the prior
+      block-character mitigation test coverage.
+  - Later workers must treat the mitigation hunks above as Batch 3-owned
+    integrated changes unless a reviewed batch intentionally changes them. This
+    includes `include/vnm_terminal/internal/terminal_render_cell_text.h`,
+    `src/qsg_terminal_renderer.cpp`, and `tests/render_frame/render_frame_tests.cpp`.
   - Existing untracked artifact baseline:
-    - `dirty_row_lazy_snapshot_plan.md` is this approved control artifact, but
-      remains untracked until the selected-path durability commit happens.
+    - `dirty_row_lazy_snapshot_plan.md` was the approved local control artifact
+      before Batch 0; it became tracked by the Batch 0 selected-path durability
+      commit. Later amendments are staged only when owned by the active batch.
     - `vnm_terminal_review_roadmap.md` is pre-existing untracked scratch for a
       separate review-remediation roadmap. Future dirty-row workers must not
       stage, commit, delete, or `.gitignore` it as part of this refactor unless
@@ -283,15 +288,19 @@ Batch 0 record, captured 2026-06-13:
     snapshot refactor because it already contains the batch sequence, gates,
     risks, and review focus. A separate Batch 0 file would duplicate control
     state and weaken the single-plan handoff.
-  - Batch 0 durability is not active yet because this file is still untracked.
-    The precise closure condition is a selected-path commit of only
+  - Batch 0 durability is active in commit `eb992ef`, which selected only
     `dirty_row_lazy_snapshot_plan.md` after clean independent review and the
-    lightweight checks. That commit must not stage the three dirty mitigation
-    source/test files or `vnm_terminal_review_roadmap.md`.
+    lightweight checks. That historical Batch 0 commit did not stage the three
+    dirty mitigation source/test files or `vnm_terminal_review_roadmap.md`.
+  - Batch 3 second amendment supersedes that historical no-stage restriction
+    for `include/vnm_terminal/internal/terminal_render_cell_text.h`,
+    `src/qsg_terminal_renderer.cpp`, and
+    `tests/render_frame/render_frame_tests.cpp` by explicitly owning and
+    integrating the inherited block-character mitigation hunks in the Batch 3
+    implementation diff. `vnm_terminal_review_roadmap.md` remains unowned
+    scratch and must stay unstaged.
   - If review requires another material amendment, repeat the review and checks
-    before the selected-path durability commit. Until then, the plan is a local
-    untracked artifact and cannot by itself satisfy the repository-control-plane
-    requirement from change governance.
+    before the selected-path commit for the active batch.
   - Every later batch must start by reconstructing state from `git status`,
     this plan's latest committed/tracked form, and the previous batch record.
     If those sources disagree, the batch stops for orchestration direction
@@ -549,6 +558,9 @@ Batch 1 amendment record, 2026-06-13:
     `public_projection_scroll_requests` and
     `public_projection_scroll_publications`; the recorded profile output had
     both counters equal to 1.
+  - `surface_session_geometry_derived_boundary` enters DECSET 2026 and resizes
+    under synchronized-output hold so the geometry-derived direct-output
+    counters are proven without using the public-projection scenario as evidence.
   - Sparse embedded surface/session workloads accept `--dirty-rows` and
     `--dirty-row-stride`.
   - Surface-stress sparse runs seed an unmeasured full-grid baseline before
@@ -612,12 +624,12 @@ Batch 1 second-amendment record, 2026-06-13:
   - Descriptor and lazy fallback placeholder objects now validate exact key
     sets and unavailable semantics, so stale numeric descriptor fields cannot
     pass.
-  - Consumer materialization counters remain unavailable until Batch 3 owns real
-    materialization-boundary producers; live zero counters were removed from
-    exported profile evidence.
+  - Consumer materialization counters are available under the Batch 3 schema
+    once real materialization-boundary producers exist. The exported counter
+    set is the geometry-derived snapshot direct-output calls, rows, and cells.
   - The future previous-snapshot borrowed-row counter is not emitted as a live
-    numeric Batch 1 profile counter. Profile text tests assert the
-    materialization unavailable keys, owner batch, retained max, and generation
+    numeric Batch 1 profile counter. Profile text tests assert the available
+    materialization schema keys, owner batch, retained max, and generation
     counter keys.
 - Retained-memory amendments:
   - Retained payload accounting includes vector capacity and
@@ -696,6 +708,11 @@ Batch 1 third-amendment record, 2026-06-13:
     scenarios now emit observed boundary counters and validation fails if the
     named boundary is not observed. Viewport smoke continues to use the existing
     viewport offset/content structural checks.
+  - Public-projection profile validation requires nonzero public-projection
+    boundary counters. Geometry-derived snapshot materialization calls, rows,
+    and cells are validated by `surface_session_geometry_derived_boundary`, a
+    synchronized-output geometry-boundary scenario, so the two evidence
+    boundaries are not conflated.
   - Sparse dirty-row validation now checks observed frame counters and, when
     profiling is enabled, model profile counters. It rejects full repaint and
     extra dirty rows beyond the explicit Batch 1 allowance of one cursor
@@ -708,8 +725,8 @@ Batch 1 third-amendment record, 2026-06-13:
     now spell out exact shapes for `descriptor_counters`,
     `lazy_snapshot_fallback_reason_counters`, and
     `session_profile_stats.consumer_materialization_counters`.
-  - Profile text now emits and tests every unavailable consumer materialization
-    key plus `owner_batch=Batch 3`.
+  - Profile text now emits and tests every available geometry-derived
+    consumer materialization key plus `owner_batch=Batch 3`.
   - `benchmarks/surface_stress/validate_surface_stress_descriptor_contract.cmake`
     is part of the intended Batch 1 tracked file set and is referenced by
     `benchmarks/surface_stress/CMakeLists.txt`.
@@ -738,8 +755,7 @@ Work:
 
 - Add a private row-content view over existing full snapshots.
 - Provide row iteration, row cell lookup, row text extraction, row cell count,
-  provenance access, dirty-range access, style/hyperlink validation hooks, and
-  explicit flat materialization.
+  provenance access, dirty-range access, and explicit flat materialization.
 - Keep `snapshot.cells` complete and row-major.
 - Add row-view equivalence tests against the current flat representation.
 
@@ -747,9 +763,10 @@ Gates:
 
 - Render snapshot tests pass.
 - Selection text extraction tests pass through both row view and flat helpers.
-- Row-view validation proves parity for text, styles, hyperlinks, wide-cell
-  continuations, missing-cell-as-space semantics, provenance, dirty ranges,
-  cursor metadata, selection metadata, and IME metadata.
+- Row-view validation proves parity for text, cell metadata including style and
+  hyperlink ids, wide-cell continuations, missing-cell-as-space semantics,
+  provenance, dirty ranges, cursor metadata, selection metadata, and IME
+  metadata.
 - No production caller is forced to use the row view yet.
 
 ## 9. Batch 3: Consumer Migration Or Materialization Boundaries
@@ -763,9 +780,9 @@ Work:
 - Add explicit `materialize_flat_cells(reason)` boundaries where full row-major
   storage remains the correct contract.
 - Treat public projection as a detached full-viewport publication boundary.
-- Treat transcript/replay as either a counted full logical materialization
-  boundary or a reviewed schema change. The first implementation should prefer
-  counted materialization.
+- Treat transcript/replay diagnostics as row-view full logical extraction unless
+  a later reviewed batch intentionally adds a counted transcript materialization
+  boundary.
 - Make row-view text extraction canonical for selection and copy.
 
 Named paths:
@@ -791,8 +808,10 @@ Gates:
   public-projection copy.
 - Public projection tests prove that projection snapshots remain detached,
   full-viewport publications with unchanged output.
-- Geometry-derived and selection-derived snapshot tests prove those paths cross
-  explicit full materialization boundaries with unchanged output.
+- Geometry-derived snapshot tests prove the explicit counted direct-cell
+  adaptation/output boundary with unchanged output. Selection-derived snapshot
+  tests prove the row-view/copy contract with unchanged output unless a later
+  reviewed batch intentionally adds a counted selection materialization boundary.
 - Surface selection and drag-content validation tests prove the row-view or
   materialization migration validates the same content as the flat-cell path.
 - Transcript/replay tests run in a transcript-enabled configuration and prove
@@ -800,6 +819,63 @@ Gates:
   replay comparison output remain semantically unchanged. Counter checks are
   additional evidence, not the only proof.
 - Independent review verifies there is no silent partial-snapshot consumer.
+
+Batch 3 second-amendment record, 2026-06-13:
+
+- Scope: second-round blocker amendment only. No lazy payload representation,
+  lazy producer, default enablement, or frame/QSG descriptor contract work is
+  added here.
+- Inherited block-character mitigation ownership:
+  - Batch 3 explicitly owns and integrates the inherited mitigation hunks
+    identified by stable patch-id
+    `86b130e7d4f22cad4e88986ffcca17d6d853f805`.
+  - The integrated file set is
+    `include/vnm_terminal/internal/terminal_render_cell_text.h`,
+    `src/qsg_terminal_renderer.cpp`, and
+    `tests/render_frame/render_frame_tests.cpp`.
+- Direct-cell and materialization audit:
+  - `src/qsg_terminal_renderer.cpp` consumes render snapshot content through
+    `Terminal_render_snapshot_row_content_view`; the direct
+    `snapshot->cells`/`snapshot.cells` audit for that file must stay empty.
+  - `src/terminal_session.cpp` keeps public projection as a detached full
+    publication boundary and keeps geometry-derived snapshots as a counted
+    direct-cell adaptation/output boundary. Geometry adaptation reads
+    `Terminal_render_snapshot_row_content_view` and writes the final
+    `snapshot.cells` directly; it does not materialize an intermediate flat
+    public-cell vector or build a rows*columns pointer table.
+  - Transcript and replay diagnostics are row-view full logical extraction
+    boundaries. They are not counted materialization boundaries unless a later
+    reviewed batch intentionally adds that contract.
+  - Selection/copy uses the row-view/copy contract. It must not require a full
+    materialization boundary unless a later reviewed batch intentionally adds
+    one.
+  - Remaining direct `snapshot.cells`/`.cells` hits are intentional producers,
+    detached publication outputs, validation over the canonical flat producer
+    contract, codecs/model row storage, fixture construction, parity baselines,
+    and benchmark/test accounting.
+- No-orphan sweep:
+  - Removed orphan row-view validation hook helpers
+    `render_snapshot_cell_style_ids_resolve()` and
+    `render_snapshot_cell_hyperlink_ids_resolve()`.
+  - Removed now-dead row-view hook tests and renamed the malformed row-view
+    lookup test so it no longer claims hook coverage.
+- Commands and results:
+  - `git diff --check` passed.
+  - `rg "render_snapshot_cell_style_ids_resolve|render_snapshot_cell_hyperlink_ids_resolve" include src tools benchmarks tests docs` returned no matches.
+  - `rg "snapshot_cells_support_row_content_view_order|snapshot->cells|snapshot\.cells" src/qsg_terminal_renderer.cpp` returned no matches.
+  - `rg "\.cells\b|->cells\b" include src tools benchmarks tests` was run. Remaining hits are intentional: model row storage and history-row codecs; render-snapshot producers and detached output builders; `render_snapshot.h` validation, row-view, and parity materialization internals; public-projection row storage; width-result `.cells` fields; fixture/data construction; benchmark/test accounting; and parity baselines.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_render_snapshot vnm_terminal_render_frame vnm_terminal_profile_text vnm_terminal_embedded_benchmark"` passed.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_batch1_profile_on --target vnm_terminal_render_snapshot vnm_terminal_render_frame vnm_terminal_profile_text vnm_terminal_embedded_benchmark"` passed.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_batch3_transcript --target vnm_terminal_render_snapshot vnm_terminal_render_frame vnm_terminal_profile_text vnm_terminal_transcript vnm_terminal_transcript_replay"` passed.
+  - `ctest --test-dir build_codex_renderer_graphics_probe -R "^(vnm_terminal_render_snapshot|vnm_terminal_render_frame|vnm_terminal_profile_text|vnm_terminal_embedded_benchmark_validate)$" --output-on-failure` passed: 4/4.
+  - `ctest --test-dir build_codex_batch1_profile_on -R "^(vnm_terminal_render_snapshot|vnm_terminal_render_frame|vnm_terminal_profile_text|vnm_terminal_embedded_benchmark_profile_validate)$" --output-on-failure` passed: 4/4.
+  - `ctest --test-dir build_codex_batch3_transcript -R "^(vnm_terminal_render_snapshot|vnm_terminal_render_frame|vnm_terminal_profile_text|vnm_terminal_transcript)$" --output-on-failure` passed: 4/4.
+  - The profile JSON for `surface_session_geometry_derived_boundary` reported
+    `geometry_derived_snapshot_calls=1`, `geometry_derived_snapshot_rows=57`,
+    `geometry_derived_snapshot_cells=184`, with
+    `resize_boundary_row_changes_observed=1` and
+    `geometry_derived_boundary_adapted_rows_observed=57`,
+    `geometry_derived_boundary_adapted_cells_observed=184`.
 
 ## 10. Batch 4: Lazy Payload Representation, Test-Only
 
@@ -885,9 +961,11 @@ Work:
 - Exercise the lazy composer for eligible `LIVE_CONTENT` / `CONTENT` snapshots
   in tests and benchmarks: same grid, same viewport, stable mutation identity,
   compatible metadata, and previous published content snapshot available.
-- Public projection, geometry-derived snapshots, transcript/replay boundaries,
-  and detached projections remain explicit materialization boundaries unless
-  separately reviewed.
+- Public projection and detached projections remain explicit full-output
+  boundaries. Geometry-derived snapshots remain counted direct-cell
+  adaptation/output boundaries. Transcript/replay remain row-view full logical
+  extraction boundaries unless a later reviewed batch intentionally adds counted
+  materialization.
 - Count every full fallback and every consumer materialization.
 - Keep the default external snapshot contract fully materialized.
 - Collect downstream frame/QSG counters even if their optimization lands in the
@@ -922,7 +1000,8 @@ cell walk.
 
 Work:
 
-- Make the frame builder consume the row-content view and produce the canonical
+- Keep row-content-view input to the frame builder as the canonical frame path
+  while extending downstream QSG descriptor/reuse from the produced
   `Terminal_render_frame`.
 - Any row/layer descriptors must be fields or implementation details of the
   canonical frame path, or strictly derived from `Terminal_render_frame` before
@@ -973,9 +1052,11 @@ Work:
 
 - Enable lazy publication by default only for the eligible `LIVE_CONTENT` /
   `CONTENT` case proven in Batches 6 and 7.
-- Keep public projection, geometry-derived snapshots, transcript/replay
-  boundaries, and detached projections on their explicit full materialization
-  contracts unless a separate reviewed batch changes them.
+- Keep public projection and detached projections on their explicit full-output
+  contracts. Keep geometry-derived snapshots on their counted direct-cell
+  adaptation/output contract. Keep transcript/replay on row-view full logical
+  extraction unless a separate reviewed batch intentionally adds counted
+  materialization.
 - Keep all fallback and materialization counters active.
 
 Gates:
@@ -1002,8 +1083,8 @@ remove superseded code as it becomes unused.
 
 Work:
 
-- Consider removing materialization from transcript/replay only if a reviewed
-  row-payload schema is worth the added contract surface.
+- Consider adding transcript/replay materialization only if a reviewed
+  row-payload schema or counter boundary is worth the added contract surface.
 - Consider optimizing geometry-derived snapshots only after the base content
   path is stable.
 - Keep public projection full unless a separate public-projection contract
@@ -1076,7 +1157,10 @@ Primary risks:
   snapshot metadata.
 - Moving cost from snapshot construction into frame building or QSG prepare.
 - Allowing public projection, transcript/replay, or selection/copy to compare
-  partial content without an explicit materialization boundary.
+  partial content outside their current full-output contracts: detached
+  full-viewport publication for public projection, row-view full logical
+  extraction for transcript/replay, and row-view full-range copy for
+  selection/copy. A later materialization boundary must be reviewed and counted.
 - Keeping abandoned helper paths after migration.
 
 Reviewers should classify findings as:
@@ -1088,7 +1172,8 @@ Reviewers should classify findings as:
 
 ## 18. Immediate Next Step
 
-Start with Batch 0 and Batch 1 only. Do not implement lazy publication until
-the consumer migration, materialization boundary work, and downstream
-frame/QSG proof path have passed independent review. Do not enable lazy
-publication by default before Batch 8 gates pass.
+Close the reviewed Batch 3 consumer-migration/materialization-boundary commit,
+then proceed to Batch 4. Do not implement lazy publication until the consumer
+migration, materialization boundary work, and downstream frame/QSG proof path
+have passed independent review. Do not enable lazy publication by default
+before Batch 8 gates pass.

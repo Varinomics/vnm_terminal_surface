@@ -212,6 +212,7 @@ if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_embedded_benchma
             "--scenario" "surface_session_cursor_overlay"
             "--scenario" "surface_session_selection_snapshot"
             "--scenario" "surface_session_resize_smoke_boundary"
+            "--scenario" "surface_session_geometry_derived_boundary"
             "--scenario" "surface_session_viewport_change_smoke_boundary"
             "--scenario" "surface_session_alternate_buffer_smoke_boundary"
             "--scenario" "surface_session_style_color_mode_smoke_boundary"

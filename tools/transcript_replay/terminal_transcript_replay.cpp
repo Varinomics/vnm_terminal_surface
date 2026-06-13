@@ -214,12 +214,9 @@ QSizeF source_geometry_from_event(const term::Terminal_transcript_event& event)
 
 QString snapshot_row_text(const term::Terminal_render_snapshot& snapshot, int row)
 {
-    const std::vector<const term::Terminal_render_cell*> cells_by_position =
-        term::render_snapshot_cells_by_position(snapshot);
+    const term::Terminal_render_snapshot_row_content_view rows(snapshot);
     return term::selected_text_from_render_snapshot_row(
-        snapshot,
-        cells_by_position,
-        row,
+        rows.row_at(row),
         0,
         snapshot.grid_size.columns,
         true);
@@ -378,6 +375,20 @@ QJsonArray selection_spans_array(const term::Terminal_render_snapshot& snapshot)
     return spans;
 }
 
+QString selection_result_code_name(term::Terminal_selection_result_code code)
+{
+    switch (code) {
+        case term::Terminal_selection_result_code::OK:
+            return QStringLiteral("ok");
+        case term::Terminal_selection_result_code::NO_SELECTION:
+            return QStringLiteral("no_selection");
+        case term::Terminal_selection_result_code::INVALID_RANGE:
+            return QStringLiteral("invalid_range");
+    }
+
+    return QStringLiteral("unknown");
+}
+
 QJsonObject selected_text_object(const term::Terminal_render_snapshot& snapshot)
 {
     QJsonObject object;
@@ -391,14 +402,11 @@ QJsonObject selected_text_object(const term::Terminal_render_snapshot& snapshot)
     const term::Terminal_selection_result result =
         term::selected_text_from_render_snapshot(snapshot, range);
     object.insert(QStringLiteral("available"), result.code == term::Terminal_selection_result_code::OK);
+    object.insert(QStringLiteral("result"), selection_result_code_name(result.code));
     object.insert(QStringLiteral("source_range"), selection_range_object(range));
     if (result.code == term::Terminal_selection_result_code::OK) {
-        object.insert(QStringLiteral("result"), QStringLiteral("ok"));
         object.insert(QStringLiteral("text"), result.text);
         object.insert(QStringLiteral("hash64"), text_hash64(result.text));
-    }
-    else {
-        object.insert(QStringLiteral("result"), QString::number(static_cast<int>(result.code)));
     }
     return object;
 }
@@ -408,6 +416,7 @@ QJsonObject snapshot_diagnostics_object(const term::Terminal_render_snapshot& sn
     QJsonObject cursor;
     cursor.insert(QStringLiteral("visible"), snapshot.cursor.visible);
     cursor.insert(QStringLiteral("position"), position_object(snapshot.cursor.position));
+    const term::Terminal_render_snapshot_row_content_view rows(snapshot);
 
     QJsonObject object;
     object.insert(QStringLiteral("mode"), QStringLiteral("compact"));
@@ -481,7 +490,7 @@ QJsonObject snapshot_diagnostics_object(const term::Terminal_render_snapshot& sn
     object.insert(
         QStringLiteral("row_origin_generation"),
         static_cast<qint64>(snapshot.metadata.row_origin_generation));
-    object.insert(QStringLiteral("cell_count"), static_cast<int>(snapshot.cells.size()));
+    object.insert(QStringLiteral("cell_count"), static_cast<int>(rows.cell_count()));
     object.insert(
         QStringLiteral("dirty_row_range_count"),
         static_cast<int>(snapshot.dirty_row_ranges.size()));
@@ -766,6 +775,8 @@ struct Replay_result
     std::optional<std::uint64_t> first_divergent_recorded_snapshot_sequence;
     std::optional<std::uint64_t> first_divergent_replayed_snapshot_sequence;
     std::vector<QString> first_divergent_fields;
+    QString first_divergent_recorded_selected_text_result;
+    QString first_divergent_replayed_selected_text_result;
     std::optional<std::uint64_t> first_dirty_mismatch_event_index;
     std::vector<QString> first_dirty_mismatch_fields;
     std::vector<QByteArray> host_writes;
@@ -773,6 +784,14 @@ struct Replay_result
     term::Terminal_viewport_state viewport;
     term::Terminal_selection_result selected_text;
 };
+
+QString selected_text_result_from_snapshot_object(const QJsonObject& object)
+{
+    return object.value(QStringLiteral("selected_text"))
+        .toObject()
+        .value(QStringLiteral("result"))
+        .toString(QStringLiteral("missing"));
+}
 
 std::optional<std::uint64_t> snapshot_sequence_from_object(const QJsonObject& object)
 {
@@ -793,16 +812,21 @@ void record_first_snapshot_divergence(
     }
 
     replay.first_divergent_event_index = event.event_index;
+    replay.first_divergent_recorded_selected_text_result =
+        selected_text_result_from_snapshot_object(event.object);
     replay.first_divergent_recorded_snapshot_sequence =
         snapshot_sequence_from_object(event.object);
     if (replayed.has_value()) {
         replay.first_divergent_replayed_snapshot_sequence =
             snapshot_sequence_from_object(*replayed);
+        replay.first_divergent_replayed_selected_text_result =
+            selected_text_result_from_snapshot_object(*replayed);
         replay.first_divergent_fields = differing_top_level_fields(
             comparable_model_snapshot_object(event.object),
             comparable_model_snapshot_object(*replayed));
     }
     else {
+        replay.first_divergent_replayed_selected_text_result = QStringLiteral("missing");
         replay.first_divergent_fields = {QStringLiteral("snapshot")};
     }
 }
@@ -1157,6 +1181,7 @@ Replay_result replay_events(const std::vector<term::Terminal_transcript_event>& 
 
 void print_snapshot_diagnostics(const term::Terminal_render_snapshot& snapshot)
 {
+    const term::Terminal_render_snapshot_row_content_view rows(snapshot);
     std::cout
         << "grid=" << snapshot.grid_size.rows << "x" << snapshot.grid_size.columns << '\n'
         << "viewport.active_buffer=" << buffer_name(snapshot.viewport.active_buffer).toStdString()
@@ -1170,7 +1195,7 @@ void print_snapshot_diagnostics(const term::Terminal_render_snapshot& snapshot)
         << "snapshot.basis=" << term::render_snapshot_basis_name(snapshot.basis).toStdString()
         << " snapshot.purpose=" << term::render_snapshot_purpose_name(snapshot.purpose).toStdString()
         << '\n'
-        << "cell_count=" << snapshot.cells.size()
+        << "cell_count=" << rows.cell_count()
         << " dirty_row_range_count=" << snapshot.dirty_row_ranges.size()
         << " selection_span_count=" << snapshot.selection_spans.size() << '\n';
 
@@ -1283,6 +1308,10 @@ int main(int argc, char** argv)
         std::cout
             << " fields="
             << join_fields(replay.first_divergent_fields).toStdString()
+            << " recorded_selected_text.result="
+            << replay.first_divergent_recorded_selected_text_result.toStdString()
+            << " replayed_selected_text.result="
+            << replay.first_divergent_replayed_selected_text_result.toStdString()
             << '\n';
     }
 
@@ -1300,7 +1329,7 @@ int main(int argc, char** argv)
     }
 
     std::cout
-        << "selected_text.result=" << static_cast<int>(replay.selected_text.code)
+        << "selected_text.result=" << selection_result_code_name(replay.selected_text.code).toStdString()
         << " selected_text=\""
         << escaped_text(replay.selected_text.text).toStdString() << "\""
         << " selected_text.hash64=" << text_hash64(replay.selected_text.text).toStdString()

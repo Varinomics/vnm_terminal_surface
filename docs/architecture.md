@@ -217,9 +217,11 @@ viewport, color metadata, style table, cells, dirty row ranges, hyperlink
 metadata, cursor, IME preedit, selection spans, metadata, and terminal modes.
 Snapshot cell vector entries are positioned and ordered: the cell vector is
 row-major with strictly ascending columns within each row. This ordering is the
-architecture contract, not an incidental production detail. The frame builder
-iterates `snapshot.cells` directly and relies on it, so `validate_render_snapshot`
-enforces it and returns `INVALID_CELL_ORDER` for any snapshot that violates it.
+architecture contract, not an incidental production detail. Row-content views
+use it to expose row ranges without rebuilding a position table; the frame
+builder consumes that row-content view. `validate_render_snapshot` enforces the
+producer contract and returns `INVALID_CELL_ORDER` for any snapshot that
+violates it.
 
 The session stores the latest snapshot as a
 `std::shared_ptr<const Terminal_render_snapshot>` and increments the snapshot

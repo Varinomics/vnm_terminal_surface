@@ -262,12 +262,13 @@ object whose keys are `missing_previous_content_snapshot`, `grid_mismatch`,
 null until Batch 5 owns real producers.
 
 The schema 21 `session_profile_stats.consumer_materialization_counters` object
-has exactly `available=false`,
-`schema_semantics="unavailable_until_batch_3_materialization_boundaries"`,
-`owner_batch="Batch 3"`, and unavailable string fields `frame_builder_rows`,
-`public_projection_rows`, `transcript_rows`, and `selection_rows`. Stale
-top-level materialization numeric counters are rejected by exact key
-validation.
+has exactly `available=true`,
+`schema_semantics="batch_3_materialization_boundaries"`,
+`owner_batch="Batch 3"`, and numeric counters
+`geometry_derived_snapshot_calls`, `geometry_derived_snapshot_rows`, and
+`geometry_derived_snapshot_cells`. These counters are currently produced by
+geometry-derived snapshot direct-output boundaries. Stale top-level
+materialization numeric counters are rejected by exact key validation.
 
 The `surface_session_selection_snapshot` scenario is a session snapshot contract
 and validates `selection_snapshot_spans_observed`, not renderer overlay
@@ -285,7 +286,13 @@ counters:
 `text_resource_runs_after_coalescing <= text_resource_runs_before_coalescing`.
 The public-projection boundary scenario is validated in profiling builds by
 requiring nonzero `public_projection_scroll_requests` and
-`public_projection_scroll_publications`.
+`public_projection_scroll_publications`. Geometry-derived direct-output
+counting is validated separately by the
+`surface_session_geometry_derived_boundary` scenario, which requires a
+height-changing resize boundary, `geometry_derived_snapshot_calls` matching the
+observed geometry boundary count, `geometry_derived_snapshot_rows` matching the
+adapted output rows, and `geometry_derived_snapshot_cells` matching the adapted
+output cells observed at the boundary.
 On Windows, the supported readback benchmark invocation is the CTest wrapper or
 an equivalent `cmake -E env ... cmd.exe /d /c call <benchmark>.exe` command
 from the benchmark working directory that supplies the Qt runtime path, the

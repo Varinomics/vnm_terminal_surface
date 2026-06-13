@@ -87,6 +87,24 @@ enum class Terminal_render_snapshot_purpose
     SCROLL,
 };
 
+enum class Terminal_render_snapshot_materialization_reason
+{
+    GEOMETRY_DERIVED_SNAPSHOT,
+    ROW_VIEW_PARITY_TEST,
+};
+
+inline bool render_snapshot_materialization_reason_is_valid(
+    Terminal_render_snapshot_materialization_reason reason)
+{
+    switch (reason) {
+        case Terminal_render_snapshot_materialization_reason::GEOMETRY_DERIVED_SNAPSHOT:
+        case Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST:
+            return true;
+    }
+
+    return false;
+}
+
 enum class Terminal_synchronized_output_scroll_policy
 {
     DEFER_UNTIL_CONTENT_PUBLICATION,
@@ -734,21 +752,6 @@ inline bool render_snapshot_row_is_dirty(
         static_cast<std::int64_t>(row) <  end_row;
 }
 
-inline bool render_snapshot_cell_style_ids_resolve(
-    const Terminal_render_snapshot& snapshot)
-{
-    if (snapshot.styles.empty()) {
-        return false;
-    }
-
-    for (const Terminal_render_cell& cell : snapshot.cells) {
-        if (static_cast<std::size_t>(cell.style_id) >= snapshot.styles.size()) {
-            return false;
-        }
-    }
-    return true;
-}
-
 inline bool collect_render_snapshot_hyperlink_ids(
     const Terminal_render_snapshot& snapshot,
     std::set<std::uint64_t>&        hyperlink_ids)
@@ -761,24 +764,6 @@ inline bool collect_render_snapshot_hyperlink_ids(
             return false;
         }
         hyperlink_ids.insert(hyperlink.hyperlink_id);
-    }
-    return true;
-}
-
-inline bool render_snapshot_cell_hyperlink_ids_resolve(
-    const Terminal_render_snapshot& snapshot)
-{
-    std::set<std::uint64_t> hyperlink_ids;
-    if (!collect_render_snapshot_hyperlink_ids(snapshot, hyperlink_ids)) {
-        return false;
-    }
-
-    for (const Terminal_render_cell& cell : snapshot.cells) {
-        if (cell.hyperlink_id                     != 0U &&
-            hyperlink_ids.find(cell.hyperlink_id) == hyperlink_ids.end())
-        {
-            return false;
-        }
     }
     return true;
 }
@@ -991,6 +976,7 @@ public:
     const Ime_preedit_state& ime_preedit() const { return m_snapshot.ime_preedit; }
     const Terminal_render_metadata& metadata() const { return m_snapshot.metadata; }
     const Terminal_mode_state& modes() const { return m_snapshot.modes; }
+    std::size_t cell_count() const { return m_snapshot.cells.size(); }
 
     Terminal_render_snapshot_row_content row_at(int row) const
     {
@@ -1035,29 +1021,24 @@ public:
     const_iterator begin() const { return const_iterator(*this, 0); }
     const_iterator end() const { return const_iterator(*this, row_count()); }
 
-    bool cell_style_ids_resolve() const
+    std::vector<Terminal_render_cell> materialize_flat_cells(
+        Terminal_render_snapshot_materialization_reason reason) const
     {
-        return render_snapshot_cell_style_ids_resolve(m_snapshot);
-    }
+        Q_ASSERT(render_snapshot_materialization_reason_is_valid(reason));
+        (void)reason;
 
-    bool cell_hyperlink_ids_resolve() const
-    {
-        return render_snapshot_cell_hyperlink_ids_resolve(m_snapshot);
-    }
-
-    std::vector<Terminal_render_cell> materialize_flat_cells() const
-    {
         std::vector<Terminal_render_cell> cells;
-        cells.reserve(m_snapshot.cells.size());
+        cells.reserve(cell_count());
         for (const Terminal_render_snapshot_row_content row : *this) {
             cells.insert(cells.end(), row.begin(), row.end());
         }
         return cells;
     }
 
-    bool materialized_flat_cells_match_snapshot() const
+    bool materialized_flat_cells_match_snapshot(
+        Terminal_render_snapshot_materialization_reason reason) const
     {
-        const std::vector<Terminal_render_cell> materialized = materialize_flat_cells();
+        const std::vector<Terminal_render_cell> materialized = materialize_flat_cells(reason);
         if (materialized.size() != m_snapshot.cells.size()) {
             return false;
         }
@@ -1102,44 +1083,6 @@ private:
     const Terminal_render_snapshot& m_snapshot;
 };
 
-inline std::vector<const Terminal_render_cell*> render_snapshot_cells_by_position(
-    const Terminal_render_snapshot& snapshot)
-{
-    std::vector<const Terminal_render_cell*> cells_by_position(
-        static_cast<std::size_t>(snapshot.grid_size.rows) *
-            static_cast<std::size_t>(snapshot.grid_size.columns),
-        nullptr);
-    for (const Terminal_render_cell& cell : snapshot.cells) {
-        if (cell.position.row    <  0                          ||
-            cell.position.row    >= snapshot.grid_size.rows     ||
-            cell.position.column <  0                          ||
-            cell.position.column >= snapshot.grid_size.columns)
-        {
-            continue;
-        }
-
-        const std::size_t index =
-            static_cast<std::size_t>(cell.position.row) *
-                static_cast<std::size_t>(snapshot.grid_size.columns) +
-            static_cast<std::size_t>(cell.position.column);
-        cells_by_position[index] = &cell;
-    }
-    return cells_by_position;
-}
-
-inline const Terminal_render_cell* render_snapshot_cell_at(
-    const std::vector<const Terminal_render_cell*>& cells_by_position,
-    terminal_grid_size_t                            grid_size,
-    int                                             row,
-    int                                             column)
-{
-    const std::size_t index =
-        static_cast<std::size_t>(row) *
-            static_cast<std::size_t>(grid_size.columns) +
-        static_cast<std::size_t>(column);
-    return cells_by_position[index];
-}
-
 inline QString selected_text_from_render_snapshot_row(
     const Terminal_render_snapshot_row_content& row,
     int                                         first_column,
@@ -1149,95 +1092,7 @@ inline QString selected_text_from_render_snapshot_row(
     return row.text(first_column, end_column, trim_trailing_spaces);
 }
 
-inline QString selected_text_from_render_snapshot_row(
-    const Terminal_render_snapshot& snapshot,
-    const std::vector<const Terminal_render_cell*>&
-                                    cells_by_position,
-    int                             viewport_row,
-    int                             first_column,
-    int                             end_column,
-    bool                            trim_trailing_spaces)
-{
-    QString text;
-    for (int column = first_column; column < end_column; ++column) {
-        const Terminal_render_cell* cell =
-            render_snapshot_cell_at(
-                cells_by_position,
-                snapshot.grid_size,
-                viewport_row,
-                column);
-        if (cell == nullptr) {
-            text += QLatin1Char(' ');
-            continue;
-        }
-
-        if (cell->wide_continuation) {
-            continue;
-        }
-
-        cell->text.append_to(text);
-    }
-
-    if (trim_trailing_spaces) {
-        while (text.endsWith(QLatin1Char(' '))) {
-            text.chop(1);
-        }
-    }
-    return text;
-}
-
 inline Terminal_selection_result selected_text_from_render_snapshot(
-    const Terminal_render_snapshot& snapshot,
-    const Terminal_selection_range& selection)
-{
-    if (snapshot.grid_size.rows <= 0 || snapshot.grid_size.columns <= 0 ||
-        selection.mode == Terminal_selection_mode::NONE)
-    {
-        return {Terminal_selection_result_code::INVALID_RANGE, {}};
-    }
-
-    const terminal_grid_position_t start = normalized_selection_start(selection);
-    const terminal_grid_position_t end   = normalized_selection_end(selection);
-    const int first_visible_logical_row  = render_snapshot_first_visible_logical_row(snapshot);
-
-    if (start.row    < first_visible_logical_row                            ||
-        end.row      >= first_visible_logical_row + snapshot.grid_size.rows ||
-        start.column < 0                                                    ||
-        start.column > snapshot.grid_size.columns                           ||
-        end.column   < 0                                                    ||
-        end.column   > snapshot.grid_size.columns)
-    {
-        return {Terminal_selection_result_code::INVALID_RANGE, {}};
-    }
-
-    const std::vector<const Terminal_render_cell*> cells_by_position =
-        render_snapshot_cells_by_position(snapshot);
-    QString text;
-    for (int logical_row = start.row; logical_row <= end.row; ++logical_row) {
-        const int first_column = logical_row == start.row ? start.column : 0;
-        const int end_column =
-            logical_row == end.row ? end.column : snapshot.grid_size.columns;
-        if (end_column < first_column) {
-            return {Terminal_selection_result_code::INVALID_RANGE, {}};
-        }
-
-        if (logical_row > start.row) {
-            text += QLatin1Char('\n');
-        }
-
-        text += selected_text_from_render_snapshot_row(
-            snapshot,
-            cells_by_position,
-            logical_row - first_visible_logical_row,
-            first_column,
-            end_column,
-            end_column == snapshot.grid_size.columns);
-    }
-
-    return {Terminal_selection_result_code::OK, text};
-}
-
-inline Terminal_selection_result selected_text_from_render_snapshot_row_view(
     const Terminal_render_snapshot& snapshot,
     const Terminal_selection_range& selection)
 {
@@ -1421,11 +1276,9 @@ inline Terminal_render_snapshot_validation validate_render_snapshot_flat_cells(
         }
 
         // Snapshot cells are stored row-major with strictly ascending columns
-        // within each row. Both producers (the live-content model row loop and
-        // the public-projection scroll assembly) emit cells in this order, and
-        // the frame builder iterates snapshot.cells directly relying on it.
-        // Enforce the contract here so a violating snapshot fails loudly instead
-        // of mis-rendering.
+        // within each row. Producers emit cells in this order, and flat
+        // materialization boundaries rely on it. Enforce the contract here so a
+        // violating snapshot fails loudly instead of mis-rendering.
         if (i > 0 &&
             !render_snapshot_cell_is_strictly_after(cell, snapshot.cells[i - 1]))
         {
@@ -1602,14 +1455,6 @@ inline Terminal_render_snapshot_validation validate_render_snapshot(
     }
 
     return {};
-}
-
-inline Terminal_render_snapshot_validation validate_render_snapshot_row_content_view(
-    const Terminal_render_snapshot& snapshot)
-{
-    // Keep one status-order owner; the canonical validator owns all structural
-    // checks after flat row-major preconditions have been proven.
-    return validate_render_snapshot(snapshot);
 }
 
 }

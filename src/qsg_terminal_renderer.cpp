@@ -1081,6 +1081,16 @@ terminal_simple_content_classification_t classify_terminal_simple_content_cell(
     const Terminal_simple_content_rejection_reason semantics_rejection =
         unrepresented_simple_cell_semantics_rejection(cell, has_decoration);
 
+    if (semantics_rejection == Terminal_simple_content_rejection_reason::NONE &&
+        cell.display_width == 1                                             &&
+        cell.text.is_inline_single_bmp()                                     &&
+        is_terminal_graphic_text(cell.text))
+    {
+        return reject(
+            Terminal_simple_content_route::QT_TEXT_LAYOUT,
+            Terminal_simple_content_rejection_reason::NON_ASCII_TEXT);
+    }
+
     if (cell.text.single_printable_ascii_code_unit().has_value()) {
         if (cell.display_width != 1) {
             return
@@ -1551,6 +1561,32 @@ void append_cell_text_to_text_run(
     text.append_to(run.text);
 }
 
+bool terminal_graphic_classification_allows_primitive(
+    Terminal_simple_content_rejection_reason reason)
+{
+    switch (reason) {
+        case Terminal_simple_content_rejection_reason::NON_ASCII_TEXT:
+        case Terminal_simple_content_rejection_reason::DECORATION:
+        case Terminal_simple_content_rejection_reason::HYPERLINK:
+            return true;
+
+        case Terminal_simple_content_rejection_reason::NONE:
+        case Terminal_simple_content_rejection_reason::EMPTY_TEXT:
+        case Terminal_simple_content_rejection_reason::INVALID_GRID:
+        case Terminal_simple_content_rejection_reason::INVALID_POSITION:
+        case Terminal_simple_content_rejection_reason::INVALID_STYLE_ID:
+        case Terminal_simple_content_rejection_reason::WIDE_CONTINUATION:
+        case Terminal_simple_content_rejection_reason::INVALID_DISPLAY_WIDTH:
+        case Terminal_simple_content_rejection_reason::INVALID_TEXT_ENCODING:
+        case Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH:
+        case Terminal_simple_content_rejection_reason::MULTI_CELL_TEXT:
+        case Terminal_simple_content_rejection_reason::NON_PRINTABLE_ASCII:
+            return false;
+    }
+
+    return false;
+}
+
 } // namespace
 
 Terminal_render_frame build_terminal_render_frame(
@@ -1573,7 +1609,7 @@ Terminal_render_frame build_terminal_render_frame(
         frame.background_rects.reserve(
             snapshot != nullptr && metrics_valid
                 ? bounded_frame_reserve(
-                    snapshot->cells.size() + 1U,
+                    Terminal_render_snapshot_row_content_view(*snapshot).cell_count() + 1U,
                     snapshot->grid_size.rows,
                     8U,
                     64U)
@@ -1590,6 +1626,7 @@ Terminal_render_frame build_terminal_render_frame(
         return frame;
     }
 
+    const Terminal_render_snapshot_row_content_view rows(*snapshot);
     QColor grid_background;
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::snapshot_setup");
@@ -1600,7 +1637,7 @@ Terminal_render_frame build_terminal_render_frame(
         frame.viewport         = snapshot->viewport;
         frame.dirty_row_ranges = snapshot->dirty_row_ranges;
         frame.stats.visible_rows          = snapshot->grid_size.rows;
-        frame.stats.cell_pass_input_cells = static_cast<int>(snapshot->cells.size());
+        frame.stats.cell_pass_input_cells = static_cast<int>(rows.cell_count());
         for (const Terminal_render_dirty_row_range& range : snapshot->dirty_row_ranges) {
             frame.stats.dirty_rows += range.row_count;
         }
@@ -1656,7 +1693,7 @@ Terminal_render_frame build_terminal_render_frame(
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::reserve_outputs");
 
-        const std::size_t cell_count = snapshot->cells.size();
+        const std::size_t cell_count = rows.cell_count();
         frame.selection_rects.reserve(snapshot->selection_spans.size() + 1U);
         frame.graphic_rects.reserve(
             bounded_frame_reserve(cell_count, snapshot->grid_size.rows, 8U, 64U));
@@ -1738,269 +1775,349 @@ Terminal_render_frame build_terminal_render_frame(
             int               length             = 0;
         };
         Open_ascii_coalesce_run open_ascii_run;
-        for (const Terminal_render_cell& cell : snapshot->cells) {
-            ++frame.stats.cells_considered;
-            if (cell.position.row != cached_row) {
-                VNM_TERMINAL_PROFILE_SCOPE(
-                    "build_terminal_render_frame::cells::row_bookkeeping");
+        struct Open_full_block_graphic_run
+        {
+            bool          valid           = false;
+            std::size_t   index           = 0U;
+            int           row             = 0;
+            int           end_column      = 0;
+            QRgb          foreground_rgba = 0U;
+        };
+        Open_full_block_graphic_run open_full_block_graphic_run;
+        auto process_cell = [&](const Terminal_render_cell& cell) {
+                ++frame.stats.cells_considered;
+                if (cell.position.row != cached_row) {
+                    VNM_TERMINAL_PROFILE_SCOPE(
+                        "build_terminal_render_frame::cells::row_bookkeeping");
 
-                update_cached_row_bookkeeping(cell);
-            }
-
-            const bool valid_style_id =
-                static_cast<std::size_t>(cell.style_id) < snapshot->styles.size();
-            const bool valid_render_row = cached_valid_render_row;
-            const bool valid_render_cell =
-                !cell.wide_continuation                                                  &&
-                valid_render_row                                                          &&
-                cell.position.column                    >= 0                              &&
-                cell.position.column                    <  snapshot->grid_size.columns    &&
-                cell.display_width                      >  0                              &&
-                cell.display_width                      <= snapshot->grid_size.columns -
-                                                           cell.position.column            &&
-                valid_style_id;
-            const render_style_attributes_t* style_or_null = valid_render_cell
-                ? &style_attributes.attributes(cell.style_id)
-                : nullptr;
-            const bool classification_has_decoration =
-                style_or_null != nullptr &&
-                (style_or_null->underline || style_or_null->strike);
-            // This legacy counter is intentionally per-cell for profile
-            // comparability; the actual dirty-row lookup is cached per row.
-            ++frame.stats.dirty_row_lookup_count;
-            ++frame.stats.cell_pass_classification_calls;
-            const terminal_simple_content_classification_t classification = classify_terminal_simple_content_cell(
-                cell,
-                snapshot->grid_size,
-                snapshot->styles.size(),
-                classification_has_decoration,
-                cached_dirty_row);
-            const bool block_cursor_cell =
-                cached_block_cursor_row &&
-                cell_intersects_grid_columns(cell, snapshot->cursor.position.column, 1);
-            const bool ime_preedit_cell =
-                cached_ime_preedit_row &&
-                cell_intersects_grid_columns(cell, ime_preedit_column, ime_preedit_columns);
-            const bool eligible_after_all_gates =
-                classification.fast_text_eligible &&
-                !block_cursor_cell                &&
-                !ime_preedit_cell;
-            record_simple_content_classification(
-                frame.stats.simple_content,
-                classification,
-                eligible_after_all_gates,
-                simple_eligibility_flags);
-
-            if (cell.wide_continuation) {
-                ++frame.stats.cells_skipped_wide_continuation;
-                continue;
-            }
-
-            if (!valid_render_cell) {
-                ++frame.stats.cells_skipped_invalid;
-                continue;
-            }
-
-            ++frame.stats.cells_rendered;
-            if (has_previous_style_id && previous_style_id != cell.style_id) {
-                ++frame.stats.text_style_changes;
-            }
-            previous_style_id = cell.style_id;
-            has_previous_style_id = true;
-
-            const std::size_t style_index = static_cast<std::size_t>(cell.style_id);
-            if (seen_style_ids[style_index] == 0U) {
-                seen_style_ids[style_index] = 1U;
-                ++frame.stats.text_distinct_styles;
-            }
-
-            const render_style_attributes_t& style = *style_or_null;
-            const QColor foreground = style.foreground;
-            const QColor background = style.background;
-
-            const QRectF rect = cell_rect(
-                cell.position.row,
-                cell.position.column,
-                cell.display_width,
-                cell_metrics);
-            if (background != grid_background) {
-                frame.background_rects.push_back({rect, background});
-            }
-
-            const Terminal_render_line_provenance& line_provenance = cached_line_provenance;
-            const bool text_is_empty = cell.text.is_empty();
-            if (text_is_empty) {
-                ++frame.stats.text_cells_empty;
-            }
-            else {
-                if (cell.text.is_inline_printable_ascii()) {
-                    ++frame.stats.compact_ascii_cells_seen;
+                    update_cached_row_bookkeeping(cell);
                 }
 
-                if (cell.display_width == 1) {
-                    ++frame.stats.text_cells_single_width;
-                }
-                else {
-                    ++frame.stats.text_cells_multi_width;
-                }
-
-                if (classification.text_category ==
-                    Terminal_simple_content_text_category::PRINTABLE_ASCII)
-                {
-                    ++frame.stats.text_cells_printable_ascii;
-                    if (cell.display_width == 1) {
-                        ++frame.stats.text_cells_simple_ascii;
-                    }
-                }
-                else
-                if (classification.text_category ==
-                    Terminal_simple_content_text_category::NON_ASCII)
-                {
-                    ++frame.stats.text_cells_non_ascii;
-                }
-                else {
-                    ++frame.stats.text_cells_other_ascii;
-                }
-
-                if (cell.hyperlink_id != 0U) {
-                    ++frame.stats.text_cells_with_hyperlink;
-                }
-            }
-
-            Terminal_render_text_run run;
-            run.row                = cell.position.row;
-            run.logical_row        = static_cast<int>(line_provenance.logical_row);
-            run.retained_line_id   = line_provenance.retained_line_id;
-            run.content_generation = line_provenance.content_generation;
-            run.column             = cell.position.column;
-            run.rect               = rect;
-            run.baseline_origin    = QPointF(rect.left(), rect.top() + cell_metrics.ascent);
-            run.foreground         = foreground;
-            run.background         = background;
-            run.style_id           = cell.style_id;
-            run.hyperlink_id       = cell.hyperlink_id;
-            run.underline          = style.underline;
-            run.strike             = style.strike;
-            const bool render_as_terminal_graphic =
-                !text_is_empty &&
-                !block_cursor_cell &&
-                !ime_preedit_cell &&
-                classification.rejection_reason ==
-                    Terminal_simple_content_rejection_reason::NON_ASCII_TEXT &&
-                is_terminal_graphic_text(cell.text) &&
-                append_terminal_graphic_rects(
-                    frame.graphic_rects,
-                    frame.graphic_arcs,
-                    rect,
-                    cell.text,
-                    foreground,
-                    cell_metrics);
-            if (render_as_terminal_graphic) {
-                open_ascii_run.valid = false;
-            }
-            else
-            if (!text_is_empty) {
-                // Direct coalescing of printable-ASCII text runs. Merge this cell
-                // into the open run when it is a contiguous, single-width, plain
-                // (no decoration/hyperlink) printable-ASCII cell that shares the
-                // open run's paint, style, and line provenance, capped at the
-                // same maximum length the downstream coalescer uses. Cursor/IME
-                // cells are kept standalone so block-cursor inverted text and
-                // preedit overlays still copy a single protected cell.
-                const std::optional<ushort> printable_ascii_code_unit =
-                    cell.text.single_printable_ascii_code_unit();
-                const bool coalescable_ascii_cell =
-                    cell.display_width == 1                                    &&
-                    classification.text_category ==
-                        Terminal_simple_content_text_category::PRINTABLE_ASCII &&
-                    printable_ascii_code_unit.has_value()                      &&
-                    !run.underline                                            &&
-                    !run.strike                                               &&
-                    run.hyperlink_id == 0U                                    &&
-                    !block_cursor_cell                                        &&
+                const bool valid_style_id =
+                    static_cast<std::size_t>(cell.style_id) < snapshot->styles.size();
+                const bool valid_render_row = cached_valid_render_row;
+                const bool valid_render_cell =
+                    !cell.wide_continuation                                                  &&
+                    valid_render_row                                                          &&
+                    cell.position.column                    >= 0                              &&
+                    cell.position.column                    <  snapshot->grid_size.columns    &&
+                    cell.display_width                      >  0                              &&
+                    cell.display_width                      <= snapshot->grid_size.columns -
+                                                               cell.position.column            &&
+                    valid_style_id;
+                const render_style_attributes_t* style_or_null = valid_render_cell
+                    ? &style_attributes.attributes(cell.style_id)
+                    : nullptr;
+                const bool classification_has_decoration =
+                    style_or_null != nullptr &&
+                    (style_or_null->underline || style_or_null->strike);
+                // This legacy counter is intentionally per-cell for profile
+                // comparability; the actual dirty-row lookup is cached per row.
+                ++frame.stats.dirty_row_lookup_count;
+                ++frame.stats.cell_pass_classification_calls;
+                const terminal_simple_content_classification_t classification = classify_terminal_simple_content_cell(
+                    cell,
+                    snapshot->grid_size,
+                    snapshot->styles.size(),
+                    classification_has_decoration,
+                    cached_dirty_row);
+                const bool block_cursor_cell =
+                    cached_block_cursor_row &&
+                    cell_intersects_grid_columns(cell, snapshot->cursor.position.column, 1);
+                const bool ime_preedit_cell =
+                    cached_ime_preedit_row &&
+                    cell_intersects_grid_columns(cell, ime_preedit_column, ime_preedit_columns);
+                const bool eligible_after_all_gates =
+                    classification.fast_text_eligible &&
+                    !block_cursor_cell                &&
                     !ime_preedit_cell;
-                const QRgb foreground_rgba = foreground.rgba();
-                const QRgb background_rgba = background.rgba();
-                if (coalescable_ascii_cell                                    &&
-                    open_ascii_run.valid                                     &&
-                    open_ascii_run.row                == cell.position.row    &&
-                    open_ascii_run.logical_row        == run.logical_row      &&
-                    open_ascii_run.retained_line_id   == run.retained_line_id &&
-                    open_ascii_run.content_generation == run.content_generation &&
-                    open_ascii_run.end_column         == cell.position.column &&
-                    open_ascii_run.foreground_rgba    == foreground_rgba      &&
-                    open_ascii_run.background_rgba    == background_rgba      &&
-                    open_ascii_run.style_id           == cell.style_id        &&
-                    open_ascii_run.length             <
-                        static_cast<int>(k_max_coalesced_ascii_text_run_length))
-                {
-                    Terminal_render_text_run& open_run =
-                        frame.text_runs[open_ascii_run.index];
-                    open_run.text += QChar(*printable_ascii_code_unit);
-                    if (cell.text.is_inline_printable_ascii()) {
-                        ++frame.stats.compact_ascii_text_direct_appends;
-                    }
-                    open_run.rect.setWidth(
-                        rect.left() + rect.width() - open_run.rect.left());
-                    open_ascii_run.end_column += 1;
-                    ++open_ascii_run.length;
+                record_simple_content_classification(
+                    frame.stats.simple_content,
+                    classification,
+                    eligible_after_all_gates,
+                    simple_eligibility_flags);
+
+                if (cell.wide_continuation) {
+                    ++frame.stats.cells_skipped_wide_continuation;
+                    return;
+                }
+
+                if (!valid_render_cell) {
+                    ++frame.stats.cells_skipped_invalid;
+                    return;
+                }
+
+                ++frame.stats.cells_rendered;
+                if (has_previous_style_id && previous_style_id != cell.style_id) {
+                    ++frame.stats.text_style_changes;
+                }
+                previous_style_id = cell.style_id;
+                has_previous_style_id = true;
+
+                const std::size_t style_index = static_cast<std::size_t>(cell.style_id);
+                if (seen_style_ids[style_index] == 0U) {
+                    seen_style_ids[style_index] = 1U;
+                    ++frame.stats.text_distinct_styles;
+                }
+
+                const render_style_attributes_t& style = *style_or_null;
+                const QColor foreground = style.foreground;
+                const QColor background = style.background;
+
+                const QRectF rect = cell_rect(
+                    cell.position.row,
+                    cell.position.column,
+                    cell.display_width,
+                    cell_metrics);
+                if (background != grid_background) {
+                    frame.background_rects.push_back({rect, background});
+                }
+
+                const Terminal_render_line_provenance& line_provenance = cached_line_provenance;
+                const bool text_is_empty = cell.text.is_empty();
+                if (text_is_empty) {
+                    ++frame.stats.text_cells_empty;
                 }
                 else {
-                    Terminal_render_text_run emitted_run = run;
-                    emitted_run.text.reserve(
-                        static_cast<qsizetype>(cell.text.code_unit_count()));
-                    append_cell_text_to_text_run(frame, emitted_run, cell.text);
-                    frame.text_runs.push_back(std::move(emitted_run));
-                    if (coalescable_ascii_cell) {
-                        open_ascii_run.valid              = true;
-                        open_ascii_run.index              = frame.text_runs.size() - 1U;
-                        open_ascii_run.row                = cell.position.row;
-                        open_ascii_run.logical_row        = run.logical_row;
-                        open_ascii_run.retained_line_id   = run.retained_line_id;
-                        open_ascii_run.content_generation = run.content_generation;
-                        open_ascii_run.end_column         = cell.position.column + 1;
-                        open_ascii_run.foreground_rgba    = foreground_rgba;
-                        open_ascii_run.background_rgba    = background_rgba;
-                        open_ascii_run.style_id           = cell.style_id;
-                        open_ascii_run.length             = 1;
+                    if (cell.text.is_inline_printable_ascii()) {
+                        ++frame.stats.compact_ascii_cells_seen;
+                    }
+
+                    if (cell.display_width == 1) {
+                        ++frame.stats.text_cells_single_width;
                     }
                     else {
-                        open_ascii_run.valid = false;
+                        ++frame.stats.text_cells_multi_width;
+                    }
+
+                    if (classification.text_category ==
+                        Terminal_simple_content_text_category::PRINTABLE_ASCII)
+                    {
+                        ++frame.stats.text_cells_printable_ascii;
+                        if (cell.display_width == 1) {
+                            ++frame.stats.text_cells_simple_ascii;
+                        }
+                    }
+                    else
+                    if (classification.text_category ==
+                        Terminal_simple_content_text_category::NON_ASCII)
+                    {
+                        ++frame.stats.text_cells_non_ascii;
+                    }
+                    else {
+                        ++frame.stats.text_cells_other_ascii;
+                    }
+
+                    if (cell.hyperlink_id != 0U) {
+                        ++frame.stats.text_cells_with_hyperlink;
                     }
                 }
-                ++frame.stats.text_cells_rendered_as_text;
-            }
 
-            const bool has_decoration =
-                run.underline                                           ||
-                run.strike                                              ||
-                (options.underline_hyperlinks && run.hyperlink_id != 0U);
-            if (has_decoration) {
-                ++frame.stats.text_cells_with_decorations;
-            }
-            if (run.underline) {
-                frame.decorations.push_back({
-                    Terminal_render_decoration_kind::UNDERLINE,
-                    decoration_rect(run, Terminal_render_decoration_kind::UNDERLINE, cell_metrics),
-                    foreground,
-                });
-            }
-            if (run.strike) {
-                frame.decorations.push_back({
-                    Terminal_render_decoration_kind::STRIKE,
-                    decoration_rect(run, Terminal_render_decoration_kind::STRIKE, cell_metrics),
-                    foreground,
-                });
-            }
-            if (options.underline_hyperlinks && run.hyperlink_id != 0U) {
-                frame.decorations.push_back({
-                    Terminal_render_decoration_kind::HYPERLINK_UNDERLINE,
-                    decoration_rect(
-                        run,
-                        Terminal_render_decoration_kind::HYPERLINK_UNDERLINE,
-                        cell_metrics),
-                    foreground,
-                });
+                Terminal_render_text_run run;
+                run.row                = cell.position.row;
+                run.logical_row        = static_cast<int>(line_provenance.logical_row);
+                run.retained_line_id   = line_provenance.retained_line_id;
+                run.content_generation = line_provenance.content_generation;
+                run.column             = cell.position.column;
+                run.rect               = rect;
+                run.baseline_origin    = QPointF(rect.left(), rect.top() + cell_metrics.ascent);
+                run.foreground         = foreground;
+                run.background         = background;
+                run.style_id           = cell.style_id;
+                run.hyperlink_id       = cell.hyperlink_id;
+                run.underline          = style.underline;
+                run.strike             = style.strike;
+
+                const auto append_decorations_for_run =
+                    [&](const Terminal_render_text_run& decoration_run) {
+                        const bool has_decoration =
+                            decoration_run.underline ||
+                            decoration_run.strike    ||
+                            (options.underline_hyperlinks &&
+                                decoration_run.hyperlink_id != 0U);
+                        if (has_decoration) {
+                            ++frame.stats.text_cells_with_decorations;
+                        }
+                        if (decoration_run.underline) {
+                            frame.decorations.push_back({
+                                Terminal_render_decoration_kind::UNDERLINE,
+                                decoration_rect(
+                                    decoration_run,
+                                    Terminal_render_decoration_kind::UNDERLINE,
+                                    cell_metrics),
+                                foreground,
+                            });
+                        }
+                        if (decoration_run.strike) {
+                            frame.decorations.push_back({
+                                Terminal_render_decoration_kind::STRIKE,
+                                decoration_rect(
+                                    decoration_run,
+                                    Terminal_render_decoration_kind::STRIKE,
+                                    cell_metrics),
+                                foreground,
+                            });
+                        }
+                        if (options.underline_hyperlinks &&
+                            decoration_run.hyperlink_id != 0U)
+                        {
+                            frame.decorations.push_back({
+                                Terminal_render_decoration_kind::HYPERLINK_UNDERLINE,
+                                decoration_rect(
+                                    decoration_run,
+                                    Terminal_render_decoration_kind::HYPERLINK_UNDERLINE,
+                                    cell_metrics),
+                                foreground,
+                            });
+                        }
+                    };
+
+                bool render_as_terminal_graphic = false;
+                if (!text_is_empty &&
+                    !block_cursor_cell &&
+                    !ime_preedit_cell &&
+                    terminal_graphic_classification_allows_primitive(
+                        classification.rejection_reason) &&
+                    is_terminal_graphic_text(cell.text))
+                {
+                    const std::optional<ushort> graphic_codepoint =
+                        cell.text.single_code_unit();
+                    if (graphic_codepoint == 0x2588U) {
+                        render_as_terminal_graphic = true;
+                        if (rect.width() <= 0.0 ||
+                            rect.height() <= 0.0 ||
+                            foreground.alpha() <= 0)
+                        {
+                            open_full_block_graphic_run.valid = false;
+                        }
+                        else {
+                            const QRgb foreground_rgba = foreground.rgba();
+                            if (open_full_block_graphic_run.valid                      &&
+                                open_full_block_graphic_run.row ==
+                                    cell.position.row                                  &&
+                                open_full_block_graphic_run.end_column ==
+                                    cell.position.column                               &&
+                                open_full_block_graphic_run.foreground_rgba ==
+                                    foreground_rgba)
+                            {
+                                Terminal_render_rect& open_rect =
+                                    frame.graphic_rects[open_full_block_graphic_run.index];
+                                open_rect.rect.setWidth(
+                                    rect.left() + rect.width() -
+                                    open_rect.rect.left());
+                                open_full_block_graphic_run.end_column +=
+                                    cell.display_width;
+                            }
+                            else {
+                                frame.graphic_rects.push_back({rect, foreground, false});
+                                open_full_block_graphic_run.valid           = true;
+                                open_full_block_graphic_run.index =
+                                    frame.graphic_rects.size() - 1U;
+                                open_full_block_graphic_run.row             =
+                                    cell.position.row;
+                                open_full_block_graphic_run.end_column      =
+                                    cell.position.column + cell.display_width;
+                                open_full_block_graphic_run.foreground_rgba =
+                                    foreground_rgba;
+                            }
+                        }
+                    }
+                    else {
+                        render_as_terminal_graphic = append_terminal_graphic_rects(
+                            frame.graphic_rects,
+                            frame.graphic_arcs,
+                            rect,
+                            cell.text,
+                            foreground,
+                            cell_metrics);
+                        open_full_block_graphic_run.valid = false;
+                    }
+                }
+                if (render_as_terminal_graphic) {
+                    open_ascii_run.valid = false;
+                    append_decorations_for_run(run);
+                    return;
+                }
+                open_full_block_graphic_run.valid = false;
+
+                if (!text_is_empty) {
+                    // Direct coalescing of printable-ASCII text runs. Merge this cell
+                    // into the open run when it is a contiguous, single-width, plain
+                    // (no decoration/hyperlink) printable-ASCII cell that shares the
+                    // open run's paint, style, and line provenance, capped at the
+                    // same maximum length the downstream coalescer uses. Cursor/IME
+                    // cells are kept standalone so block-cursor inverted text and
+                    // preedit overlays still copy a single protected cell.
+                    const std::optional<ushort> printable_ascii_code_unit =
+                        cell.text.single_printable_ascii_code_unit();
+                    const bool coalescable_ascii_cell =
+                        cell.display_width == 1                                    &&
+                        classification.text_category ==
+                            Terminal_simple_content_text_category::PRINTABLE_ASCII &&
+                        printable_ascii_code_unit.has_value()                      &&
+                        !run.underline                                            &&
+                        !run.strike                                               &&
+                        run.hyperlink_id == 0U                                    &&
+                        !block_cursor_cell                                        &&
+                        !ime_preedit_cell;
+                    const QRgb foreground_rgba = foreground.rgba();
+                    const QRgb background_rgba = background.rgba();
+                    if (coalescable_ascii_cell                                    &&
+                        open_ascii_run.valid                                     &&
+                        open_ascii_run.row                == cell.position.row    &&
+                        open_ascii_run.logical_row        == run.logical_row      &&
+                        open_ascii_run.retained_line_id   == run.retained_line_id &&
+                        open_ascii_run.content_generation == run.content_generation &&
+                        open_ascii_run.end_column         == cell.position.column &&
+                        open_ascii_run.foreground_rgba    == foreground_rgba      &&
+                        open_ascii_run.background_rgba    == background_rgba      &&
+                        open_ascii_run.style_id           == cell.style_id        &&
+                        open_ascii_run.length             <
+                            static_cast<int>(k_max_coalesced_ascii_text_run_length))
+                    {
+                        Terminal_render_text_run& open_run =
+                            frame.text_runs[open_ascii_run.index];
+                        open_run.text += QChar(*printable_ascii_code_unit);
+                        if (cell.text.is_inline_printable_ascii()) {
+                            ++frame.stats.compact_ascii_text_direct_appends;
+                        }
+                        open_run.rect.setWidth(
+                            rect.left() + rect.width() - open_run.rect.left());
+                        open_ascii_run.end_column += 1;
+                        ++open_ascii_run.length;
+                    }
+                    else {
+                        Terminal_render_text_run emitted_run = run;
+                        emitted_run.text.reserve(
+                            static_cast<qsizetype>(cell.text.code_unit_count()));
+                        append_cell_text_to_text_run(frame, emitted_run, cell.text);
+                        frame.text_runs.push_back(std::move(emitted_run));
+                        if (coalescable_ascii_cell) {
+                            open_ascii_run.valid              = true;
+                            open_ascii_run.index              = frame.text_runs.size() - 1U;
+                            open_ascii_run.row                = cell.position.row;
+                            open_ascii_run.logical_row        = run.logical_row;
+                            open_ascii_run.retained_line_id   = run.retained_line_id;
+                            open_ascii_run.content_generation = run.content_generation;
+                            open_ascii_run.end_column         = cell.position.column + 1;
+                            open_ascii_run.foreground_rgba    = foreground_rgba;
+                            open_ascii_run.background_rgba    = background_rgba;
+                            open_ascii_run.style_id           = cell.style_id;
+                            open_ascii_run.length             = 1;
+                        }
+                        else {
+                            open_ascii_run.valid = false;
+                        }
+                    }
+                    ++frame.stats.text_cells_rendered_as_text;
+                }
+
+                append_decorations_for_run(run);
+        };
+
+        for (const Terminal_render_snapshot_row_content row : rows) {
+            for (const Terminal_render_cell& cell : row) {
+                process_cell(cell);
             }
         }
     }

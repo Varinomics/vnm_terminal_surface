@@ -364,11 +364,17 @@ private:
         }
     }
 
+    static bool is_terminal_graphic_source_cell_code_unit(ushort code_unit) noexcept
+    {
+        return code_unit >= 0x2500U && code_unit <= 0x259fU;
+    }
+
     static bool is_single_bmp_source_cell_code_unit(ushort code_unit) noexcept
     {
         return
             is_single_bmp_code_unit(code_unit) &&
-            !is_standalone_combining_code_unit(code_unit);
+            (is_terminal_graphic_source_cell_code_unit(code_unit) ||
+             !is_standalone_combining_code_unit(code_unit));
     }
 
     static Terminal_render_cell_text inline_single_bmp(ushort code_unit) noexcept

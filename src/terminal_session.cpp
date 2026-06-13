@@ -109,8 +109,11 @@ std::uint64_t render_snapshot_payload_bytes(const Terminal_render_snapshot& snap
         bytes += byte_array_payload_bytes(hyperlink.identity_key);
         bytes += byte_array_payload_bytes(hyperlink.uri);
     }
-    for (const Terminal_render_cell& cell : snapshot.cells) {
-        bytes += render_cell_text_payload_bytes(cell.text);
+    const Terminal_render_snapshot_row_content_view rows(snapshot);
+    for (const Terminal_render_snapshot_row_content row : rows) {
+        for (const Terminal_render_cell& cell : row) {
+            bytes += render_cell_text_payload_bytes(cell.text);
+        }
     }
     return bytes;
 }
@@ -154,6 +157,27 @@ void update_retained_render_snapshot_profile_stats(
         std::max(
             profile_stats.max_retained_snapshot_generation_count,
             retained.generation_count);
+}
+
+void record_consumer_materialization(
+    Terminal_session_profile_stats*                 profile_stats,
+    Terminal_render_snapshot_materialization_reason reason,
+    std::uint64_t                                   rows,
+    std::uint64_t                                   cells)
+{
+    if (profile_stats == nullptr || !profile_stats->enabled) {
+        return;
+    }
+
+    switch (reason) {
+        case Terminal_render_snapshot_materialization_reason::GEOMETRY_DERIVED_SNAPSHOT:
+            ++profile_stats->geometry_derived_materialization_calls;
+            profile_stats->geometry_derived_materialization_rows  += rows;
+            profile_stats->geometry_derived_materialization_cells += cells;
+            break;
+        case Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST:
+            break;
+    }
 }
 
 bool snapshot_is_public_projection_scroll(const Terminal_render_snapshot& snapshot)
@@ -351,6 +375,13 @@ std::optional<Terminal_render_snapshot> public_projection_scroll_snapshot_from_p
     snapshot.dirty_row_ranges          = {{0, viewport.visible_rows}};
 
     snapshot.visible_line_provenance.reserve(static_cast<std::size_t>(viewport.visible_rows));
+    std::size_t projected_cell_count = 0U;
+    for (int viewport_row = 0; viewport_row < viewport.visible_rows; ++viewport_row) {
+        const Terminal_public_projection_row& projection_row =
+            projection.rows()[static_cast<std::size_t>(first_copied_index + viewport_row)];
+        projected_cell_count += projection_row.cells.size();
+    }
+    snapshot.cells.reserve(projected_cell_count);
     for (int viewport_row = 0; viewport_row < viewport.visible_rows; ++viewport_row) {
         const Terminal_public_projection_row& projection_row =
             projection.rows()[static_cast<std::size_t>(first_copied_index + viewport_row)];
@@ -979,15 +1010,6 @@ bool cell_position_fits_grid(
         cell.position.column <  grid_size.columns;
 }
 
-std::size_t cell_position_index(
-    terminal_grid_position_t       position,
-    terminal_grid_size_t           grid_size)
-{
-    return
-        static_cast<std::size_t>(position.row) * static_cast<std::size_t>(grid_size.columns) +
-        static_cast<std::size_t>(position.column);
-}
-
 bool continuation_matches_base(
     const Terminal_render_cell&    continuation,
     const Terminal_render_cell&    base)
@@ -999,60 +1021,47 @@ bool continuation_matches_base(
 }
 
 std::vector<Terminal_render_cell> cells_adapted_to_grid(
-    const std::vector<Terminal_render_cell>&   cells,
-    terminal_grid_size_t                       grid_size)
+    const Terminal_render_snapshot_row_content_view& rows,
+    terminal_grid_size_t                            grid_size)
 {
-    const std::size_t cell_count =
-        static_cast<std::size_t>(grid_size.rows) *
-        static_cast<std::size_t>(grid_size.columns);
-    std::vector<const Terminal_render_cell*> cells_by_position(cell_count, nullptr);
-    for (const Terminal_render_cell& cell : cells) {
-        if (cell_position_fits_grid(cell, grid_size)) {
-            cells_by_position[cell_position_index(cell.position, grid_size)] = &cell;
-        }
-    }
-
     std::vector<Terminal_render_cell> adapted_cells;
-    adapted_cells.reserve(cells.size());
-    for (const Terminal_render_cell& cell : cells) {
-        if (!cell_position_fits_grid(cell, grid_size) || cell.wide_continuation) {
-            continue;
-        }
-
-        if (cell.display_width <= 0 ||
-            cell.display_width >  grid_size.columns - cell.position.column)
-        {
-            continue;
-        }
-
-        bool complete_cell_span = true;
-        for (int column_delta = 1; column_delta < cell.display_width; ++column_delta) {
-            const terminal_grid_position_t continuation_position = {
-                cell.position.row,
-                cell.position.column + column_delta,
-            };
-            const Terminal_render_cell* continuation =
-                cells_by_position[cell_position_index(continuation_position, grid_size)];
-            if (continuation == nullptr ||
-                !continuation_matches_base(*continuation, cell))
-            {
-                complete_cell_span = false;
-                break;
+    adapted_cells.reserve(rows.cell_count());
+    for (const Terminal_render_snapshot_row_content row : rows) {
+        for (auto cell_it = row.begin(); cell_it != row.end(); ++cell_it) {
+            const Terminal_render_cell& cell = *cell_it;
+            if (!cell_position_fits_grid(cell, grid_size) || cell.wide_continuation) {
+                continue;
             }
-        }
 
-        if (!complete_cell_span) {
-            continue;
-        }
+            if (cell.display_width <= 0 ||
+                cell.display_width >  grid_size.columns - cell.position.column)
+            {
+                continue;
+            }
 
-        adapted_cells.push_back(cell);
-        for (int column_delta = 1; column_delta < cell.display_width; ++column_delta) {
-            const terminal_grid_position_t continuation_position = {
-                cell.position.row,
-                cell.position.column + column_delta,
-            };
-            adapted_cells.push_back(
-                *cells_by_position[cell_position_index(continuation_position, grid_size)]);
+            auto continuation_it = cell_it;
+            bool complete_cell_span = true;
+            for (int column_delta = 1; column_delta < cell.display_width; ++column_delta) {
+                ++continuation_it;
+                if (continuation_it == row.end() ||
+                    continuation_it->position.column != cell.position.column + column_delta ||
+                    !continuation_matches_base(*continuation_it, cell))
+                {
+                    complete_cell_span = false;
+                    break;
+                }
+            }
+
+            if (!complete_cell_span) {
+                continue;
+            }
+
+            adapted_cells.push_back(cell);
+            continuation_it = cell_it;
+            for (int column_delta = 1; column_delta < cell.display_width; ++column_delta) {
+                ++continuation_it;
+                adapted_cells.push_back(*continuation_it);
+            }
         }
     }
 
@@ -1109,17 +1118,31 @@ Terminal_render_snapshot geometry_snapshot_from_public_snapshot(
     const Terminal_render_snapshot&    public_snapshot,
     terminal_grid_size_t               grid_size,
     std::uint64_t                      sequence,
-    bool                               backend_geometry_in_sync)
+    bool                               backend_geometry_in_sync,
+    Terminal_session_profile_stats*    profile_stats)
 {
     const bool content_preserved = grid_sizes_match(public_snapshot.grid_size, grid_size);
 
-    Terminal_render_snapshot snapshot = public_snapshot;
-    snapshot.basis                     = Terminal_render_snapshot_basis::LIVE_CONTENT;
-    snapshot.purpose                   = Terminal_render_snapshot_purpose::GEOMETRY_DERIVED;
-    snapshot.public_scroll_diagnostics = {};
-    snapshot.grid_size                 = grid_size;
-    snapshot.viewport                  = viewport_adapted_to_grid(snapshot.viewport, grid_size);
-    snapshot.cells                     = cells_adapted_to_grid(snapshot.cells, grid_size);
+    Terminal_render_snapshot snapshot;
+    snapshot.basis                   = Terminal_render_snapshot_basis::LIVE_CONTENT;
+    snapshot.purpose                 = Terminal_render_snapshot_purpose::GEOMETRY_DERIVED;
+    snapshot.grid_size               = grid_size;
+    snapshot.viewport                = viewport_adapted_to_grid(public_snapshot.viewport, grid_size);
+    snapshot.color_state             = public_snapshot.color_state;
+    snapshot.styles                  = public_snapshot.styles;
+    snapshot.visible_line_provenance = public_snapshot.visible_line_provenance;
+    snapshot.hyperlinks              = public_snapshot.hyperlinks;
+    snapshot.cursor                  = public_snapshot.cursor;
+    snapshot.ime_preedit             = public_snapshot.ime_preedit;
+    snapshot.metadata                = public_snapshot.metadata;
+    snapshot.modes                   = public_snapshot.modes;
+    const Terminal_render_snapshot_row_content_view public_rows(public_snapshot);
+    snapshot.cells = cells_adapted_to_grid(public_rows, grid_size);
+    record_consumer_materialization(
+        profile_stats,
+        Terminal_render_snapshot_materialization_reason::GEOMETRY_DERIVED_SNAPSHOT,
+        static_cast<std::uint64_t>(snapshot.grid_size.rows),
+        static_cast<std::uint64_t>(snapshot.cells.size()));
     snapshot.hyperlinks = hyperlinks_referenced_by_cells(snapshot.hyperlinks, snapshot.cells);
     if (!content_preserved || !render_snapshot_visible_line_provenance_is_valid(snapshot)) {
         snapshot.visible_line_provenance.clear();
@@ -4833,7 +4856,8 @@ void Terminal_session::publish_selection_snapshot(
                     *m_latest_content_render_snapshot,
                     m_grid_size,
                     sequence,
-                    m_backend_geometry_in_sync)
+                    m_backend_geometry_in_sync,
+                    &m_profile_stats)
                 : make_empty_render_snapshot(
                     m_grid_size,
                     viewport_adapted_to_grid(m_viewport_controller.state(), m_grid_size),
@@ -6172,7 +6196,8 @@ void Terminal_session::publish_synchronized_resize_snapshot(
             *public_snapshot,
             m_grid_size,
             sequence,
-            m_backend_geometry_in_sync);
+            m_backend_geometry_in_sync,
+            &m_profile_stats);
     snapshot.metadata.row_origin_generation = m_row_origin_generation;
     m_latest_render_snapshot =
         std::make_shared<const Terminal_render_snapshot>(std::move(snapshot));
