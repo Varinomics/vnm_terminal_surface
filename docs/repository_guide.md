@@ -231,37 +231,44 @@ output, hierarchical profile output, and `--validate-json`.
 Profile flags such as `--profile`, `--profile-json`, and `--profile-text`
 require a `VNM_TERMINAL_ENABLE_PROFILING=ON` build.
 
-Benchmark JSON uses `schema_version` 21. Profile JSON uses
+Benchmark JSON uses `schema_version` 22. Profile JSON uses
 `profile_schema_version` 2, `time_unit` `ns`, and
 `thread_semantics` `separate_thread_trees`, with separate GUI and render thread
-trees. Schema 21 includes sparse dirty-row sweep metadata
+trees. Schema 22 includes sparse dirty-row sweep metadata
 `sparse_dirty_row_sweep_applicable`, `configured_sparse_dirty_rows`, and
 `configured_sparse_dirty_row_stride`; per-scenario requested and actual grid
 metadata through `requested_rows`, `requested_columns`, `rows`, `columns`,
-`actual_grid_matches_request`, and `grid_semantics`; and exact unavailable
-objects for future-owned counters. Sparse dirty-row validation requires the
+`actual_grid_matches_request`, and `grid_semantics`; and the exact unavailable
+descriptor counter object. Sparse dirty-row validation requires the
 observed frame and profile dirty-row counts to cover the requested dirty rows,
 rejects full repaint, and allows at most one cursor carry-over row per measured
 frame.
 
-The schema 21 `descriptor_counters` object has exactly
+The schema 22 `descriptor_counters` object has exactly
 `available=false`,
 `schema_semantics="unavailable_until_batch_7_descriptor_reuse"`,
 `frame_row_descriptors="unavailable"`, and
 `qsg_layer_descriptors="unavailable"`.
 
-The schema 21 `lazy_snapshot_fallback_reason_counters` object has exactly
-`available=false`,
-`schema_semantics="unavailable_until_batch_5_lazy_eligibility"`, and a `reasons`
+The schema 22 `lazy_snapshot_fallback_reason_counters` object has exactly
+`available=true`,
+`schema_semantics="batch_5_lazy_eligibility"`, and a `reasons`
 object whose keys are `missing_previous_content_snapshot`, `grid_mismatch`,
 `viewport_mismatch`, `active_buffer_mismatch`, `public_projection`,
 `row_origin_generation_mismatch`, `style_color_mode_incompatibility`,
 `hyperlink_namespace_incompatibility`,
 `unstable_dirty_row_mutation_identity`, and
-`unsupported_geometry_or_detached_snapshot_path`; every reason value is JSON
-null until Batch 5 owns real producers.
+`unsupported_geometry_or_detached_snapshot_path`; every reason value is a
+nonnegative integer counter.
 
-The schema 21 `session_profile_stats.consumer_materialization_counters` object
+The schema 22 `session_profile_stats` object also exposes the scalar lazy
+snapshot counters `lazy_snapshot_eligibility_checks`,
+`lazy_snapshot_eligible_checks`, and
+`lazy_snapshot_materialization_mismatches_for_testing`. Test-only
+materialization mismatches are counted only by that mismatch counter; they do
+not increment explicit fallback reason counters.
+
+The schema 22 `session_profile_stats.consumer_materialization_counters` object
 has exactly `available=true`,
 `schema_semantics="batch_3_materialization_boundaries"`,
 `owner_batch="Batch 3"`, and numeric counters
@@ -277,7 +284,7 @@ counters. The `surface_session_resize_smoke_boundary`,
 `surface_session_alternate_buffer_smoke_boundary`,
 `surface_session_style_color_mode_smoke_boundary`, and
 `surface_session_hyperlink_smoke_boundary` scenarios are Batch 1 smoke
-boundaries, not lazy fallback decision runs. Schema 21 includes text coalescing
+boundaries, not lazy fallback decision runs. Schema 22 includes text coalescing
 counters:
 `text_coalescing_candidate_groups`, `text_coalescing_enabled_groups`,
 `text_resource_runs_before_coalescing`, and

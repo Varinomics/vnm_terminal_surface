@@ -6,6 +6,7 @@
 #include <QFile>
 #include <QKeyEvent>
 #include <QString>
+#include <QtGlobal>
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -1504,6 +1505,418 @@ bool backend_output_is_plain_ascii_without_prescan_intro(QByteArrayView bytes)
 bool uses_deferred_backend_callbacks(const Terminal_session_config& config)
 {
     return static_cast<bool>(config.backend_event_notifier);
+}
+
+// Lazy snapshot composition stays separate from the production publication
+// path in Terminal_session::publish_render_snapshot().
+struct lazy_snapshot_composer_input_t
+{
+    const Terminal_render_snapshot* previous_content_snapshot = nullptr;
+    const Terminal_render_snapshot* full_snapshot             = nullptr;
+    bool dirty_rows_have_stable_mutation_identity             = true;
+    bool unsupported_geometry_or_detached_snapshot_path       = false;
+};
+
+Terminal_render_snapshot_row_payload_namespace receiving_lazy_payload_namespace_for_snapshot(
+    const Terminal_render_snapshot& snapshot)
+{
+    return {
+        snapshot.metadata.sequence,
+        snapshot.metadata.sequence,
+    };
+}
+
+std::uint64_t namespace_generation_distinct_from(
+    std::uint64_t candidate,
+    std::uint64_t receiving)
+{
+    if (candidate != receiving) {
+        return candidate;
+    }
+
+    return receiving == std::numeric_limits<std::uint64_t>::max()
+        ? receiving - 1U
+        : receiving + 1U;
+}
+
+bool style_id_remaps_are_identity(
+    const std::vector<Terminal_render_snapshot_style_id_remap>& style_id_remaps)
+{
+    for (const Terminal_render_snapshot_style_id_remap& remap : style_id_remaps) {
+        if (remap.source_id != remap.target_id) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool hyperlink_id_remaps_are_identity(
+    const std::vector<Terminal_render_snapshot_hyperlink_id_remap>&
+        hyperlink_id_remaps)
+{
+    for (const Terminal_render_snapshot_hyperlink_id_remap& remap :
+        hyperlink_id_remaps)
+    {
+        if (remap.source_id != remap.target_id) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+Terminal_render_snapshot_row_payload_namespace source_lazy_payload_namespace_for_snapshot(
+    const Terminal_render_snapshot&                            source,
+    Terminal_render_snapshot_row_payload_namespace             receiving_namespace,
+    const std::vector<Terminal_render_snapshot_style_id_remap>& style_id_remaps,
+    const std::vector<Terminal_render_snapshot_hyperlink_id_remap>&
+        hyperlink_id_remaps)
+{
+    Terminal_render_snapshot_row_payload_namespace source_namespace =
+        receiving_namespace;
+
+    if (!style_id_remaps_are_identity(style_id_remaps)) {
+        source_namespace.style_table_generation =
+            namespace_generation_distinct_from(
+                source.metadata.sequence,
+                receiving_namespace.style_table_generation);
+    }
+
+    if (!hyperlink_id_remaps_are_identity(hyperlink_id_remaps)) {
+        source_namespace.hyperlink_namespace_generation =
+            namespace_generation_distinct_from(
+                source.metadata.sequence,
+                receiving_namespace.hyperlink_namespace_generation);
+    }
+
+    return source_namespace;
+}
+
+bool terminal_color_states_match(
+    const Terminal_color_state& left,
+    const Terminal_color_state& right)
+{
+    return
+        left.default_foreground_rgba == right.default_foreground_rgba &&
+        left.default_background_rgba == right.default_background_rgba &&
+        left.cursor_rgba             == right.cursor_rgba             &&
+        left.palette_rgba            == right.palette_rgba;
+}
+
+bool terminal_mode_states_match(
+    const Terminal_mode_state& left,
+    const Terminal_mode_state& right)
+{
+    return
+        left.application_cursor_keys == right.application_cursor_keys &&
+        left.reverse_video           == right.reverse_video           &&
+        left.origin_mode             == right.origin_mode             &&
+        left.autowrap                == right.autowrap                &&
+        left.cursor_visible          == right.cursor_visible          &&
+        left.mouse_tracking          == right.mouse_tracking          &&
+        left.focus_reporting         == right.focus_reporting         &&
+        left.sgr_mouse_encoding      == right.sgr_mouse_encoding      &&
+        left.alternate_scroll        == right.alternate_scroll        &&
+        left.bracketed_paste         == right.bracketed_paste         &&
+        left.synchronized_output     == right.synchronized_output;
+}
+
+bool style_color_mode_metadata_compatible(
+    const Terminal_render_snapshot&                       previous,
+    const Terminal_render_snapshot&                       current,
+    std::vector<Terminal_render_snapshot_style_id_remap>& style_id_remaps)
+{
+    if (!terminal_color_states_match(previous.color_state, current.color_state) ||
+        !terminal_mode_states_match(previous.modes, current.modes))
+    {
+        return false;
+    }
+
+    style_id_remaps.clear();
+    style_id_remaps.reserve(previous.styles.size());
+    for (std::size_t source_index = 0U; source_index < previous.styles.size(); ++source_index) {
+        const Terminal_text_style& source_style = previous.styles[source_index];
+        const auto found =
+            std::find(current.styles.begin(), current.styles.end(), source_style);
+        if (found == current.styles.end()) {
+            return false;
+        }
+
+        style_id_remaps.push_back({
+            static_cast<Terminal_style_id>(source_index),
+            static_cast<Terminal_style_id>(
+                std::distance(current.styles.begin(), found)),
+        });
+    }
+
+    return true;
+}
+
+bool hyperlink_metadata_matches(
+    const Terminal_render_hyperlink_metadata& left,
+    const Terminal_render_hyperlink_metadata& right)
+{
+    return left.identity_key == right.identity_key && left.uri == right.uri;
+}
+
+bool hyperlink_namespace_compatible(
+    const Terminal_render_snapshot&                           previous,
+    const Terminal_render_snapshot&                           current,
+    std::vector<Terminal_render_snapshot_hyperlink_id_remap>& hyperlink_id_remaps)
+{
+    hyperlink_id_remaps.clear();
+    hyperlink_id_remaps.reserve(previous.hyperlinks.size());
+    for (const Terminal_render_hyperlink_metadata& source_hyperlink : previous.hyperlinks) {
+        if (source_hyperlink.hyperlink_id == 0U) {
+            return false;
+        }
+
+        const auto found = std::find_if(
+            current.hyperlinks.begin(),
+            current.hyperlinks.end(),
+            [&source_hyperlink](const Terminal_render_hyperlink_metadata& candidate) {
+                return hyperlink_metadata_matches(source_hyperlink, candidate);
+            });
+        if (found == current.hyperlinks.end() || found->hyperlink_id == 0U) {
+            return false;
+        }
+
+        hyperlink_id_remaps.push_back({
+            source_hyperlink.hyperlink_id,
+            found->hyperlink_id,
+        });
+    }
+
+    return true;
+}
+
+Terminal_session_lazy_snapshot_composer_result lazy_snapshot_ineligible_result(
+    Terminal_lazy_snapshot_fallback_reason reason)
+{
+    Terminal_session_lazy_snapshot_composer_result result;
+    result.fallback_reason = reason;
+    return result;
+}
+
+Terminal_session_lazy_snapshot_composer_result
+lazy_snapshot_materialization_mismatch_for_testing_result()
+{
+    Terminal_session_lazy_snapshot_composer_result result;
+    result.materialization_mismatch_for_testing = true;
+    return result;
+}
+
+const terminal_lazy_snapshot_fallback_reason_descriptor_t*
+find_terminal_lazy_snapshot_fallback_reason_descriptor(
+    Terminal_lazy_snapshot_fallback_reason reason)
+{
+    for (const terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
+        terminal_lazy_snapshot_fallback_reason_descriptors())
+    {
+        if (descriptor.reason == reason) {
+            return &descriptor;
+        }
+    }
+
+    return nullptr;
+}
+
+void increment_terminal_lazy_snapshot_fallback_reason_counter(
+    Terminal_lazy_snapshot_fallback_reason_counters&             counters,
+    const terminal_lazy_snapshot_fallback_reason_descriptor_t&   descriptor)
+{
+    ++(counters.*descriptor.counter);
+}
+
+Terminal_lazy_snapshot_fallback_reason evaluate_lazy_snapshot_eligibility(
+    const lazy_snapshot_composer_input_t& input,
+    std::vector<Terminal_render_snapshot_style_id_remap>& style_id_remaps,
+    std::vector<Terminal_render_snapshot_hyperlink_id_remap>& hyperlink_id_remaps)
+{
+    const Terminal_render_snapshot* const current = input.full_snapshot;
+    if (current == nullptr ||
+        current->grid_size.rows <= 0 ||
+        current->grid_size.columns <= 0 ||
+        current->lazy_row_payloads != nullptr)
+    {
+        return
+            Terminal_lazy_snapshot_fallback_reason::
+                UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH;
+    }
+
+    if (current->basis == Terminal_render_snapshot_basis::PUBLIC_PROJECTION) {
+        return Terminal_lazy_snapshot_fallback_reason::PUBLIC_PROJECTION;
+    }
+
+    if (input.unsupported_geometry_or_detached_snapshot_path ||
+        current->purpose != Terminal_render_snapshot_purpose::CONTENT)
+    {
+        return
+            Terminal_lazy_snapshot_fallback_reason::
+                UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH;
+    }
+
+    const Terminal_render_snapshot* const previous = input.previous_content_snapshot;
+    if (previous == nullptr ||
+        previous->basis != Terminal_render_snapshot_basis::LIVE_CONTENT ||
+        previous->purpose != Terminal_render_snapshot_purpose::CONTENT)
+    {
+        return Terminal_lazy_snapshot_fallback_reason::MISSING_PREVIOUS_CONTENT_SNAPSHOT;
+    }
+
+    if (!grid_sizes_match(previous->grid_size, current->grid_size)) {
+        return Terminal_lazy_snapshot_fallback_reason::GRID_MISMATCH;
+    }
+
+    if (previous->viewport.active_buffer != current->viewport.active_buffer) {
+        return Terminal_lazy_snapshot_fallback_reason::ACTIVE_BUFFER_MISMATCH;
+    }
+
+    if (!viewport_mappings_match(previous->viewport, current->viewport)) {
+        return Terminal_lazy_snapshot_fallback_reason::VIEWPORT_MISMATCH;
+    }
+
+    if (previous->metadata.row_origin_generation != current->metadata.row_origin_generation) {
+        return Terminal_lazy_snapshot_fallback_reason::ROW_ORIGIN_GENERATION_MISMATCH;
+    }
+
+    if (!input.dirty_rows_have_stable_mutation_identity) {
+        return
+            Terminal_lazy_snapshot_fallback_reason::
+                UNSTABLE_DIRTY_ROW_MUTATION_IDENTITY;
+    }
+
+    if (!style_color_mode_metadata_compatible(*previous, *current, style_id_remaps)) {
+        return
+            Terminal_lazy_snapshot_fallback_reason::STYLE_COLOR_MODE_INCOMPATIBILITY;
+    }
+
+    if (!hyperlink_namespace_compatible(*previous, *current, hyperlink_id_remaps)) {
+        return
+            Terminal_lazy_snapshot_fallback_reason::HYPERLINK_NAMESPACE_INCOMPATIBILITY;
+    }
+
+    return Terminal_lazy_snapshot_fallback_reason::NONE;
+}
+
+Terminal_render_snapshot_row_payload_ref lazy_row_payload_ref(
+    std::shared_ptr<const Terminal_render_snapshot_row_payload_owner> owner,
+    std::size_t                                                       row)
+{
+    Terminal_render_snapshot_row_payload_ref ref;
+    ref.owner         = std::move(owner);
+    ref.payload_index = row;
+    return ref;
+}
+
+Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_input(
+    const lazy_snapshot_composer_input_t& input)
+{
+    std::vector<Terminal_render_snapshot_style_id_remap> style_id_remaps;
+    std::vector<Terminal_render_snapshot_hyperlink_id_remap> hyperlink_id_remaps;
+    const Terminal_lazy_snapshot_fallback_reason fallback_reason =
+        evaluate_lazy_snapshot_eligibility(
+            input,
+            style_id_remaps,
+            hyperlink_id_remaps);
+    if (fallback_reason != Terminal_lazy_snapshot_fallback_reason::NONE) {
+        return lazy_snapshot_ineligible_result(fallback_reason);
+    }
+
+    const Terminal_render_snapshot& previous = *input.previous_content_snapshot;
+    const Terminal_render_snapshot& current  = *input.full_snapshot;
+    const Terminal_render_snapshot_row_payload_namespace receiving_namespace =
+        receiving_lazy_payload_namespace_for_snapshot(current);
+    const Terminal_render_snapshot_row_payload_namespace previous_namespace =
+        source_lazy_payload_namespace_for_snapshot(
+            previous,
+            receiving_namespace,
+            style_id_remaps,
+            hyperlink_id_remaps);
+    const std::shared_ptr<const Terminal_render_snapshot_row_payload_owner>
+        previous_owner =
+            render_snapshot_row_payload_owner_from_snapshot(
+                previous,
+                previous_namespace,
+                previous.metadata.sequence);
+    const std::shared_ptr<const Terminal_render_snapshot_row_payload_owner>
+        current_owner =
+            render_snapshot_row_payload_owner_from_snapshot(
+                current,
+                receiving_namespace,
+                current.metadata.sequence);
+
+    auto payloads = std::make_shared<Terminal_render_snapshot_lazy_payloads>();
+    payloads->receiving_namespace = receiving_namespace;
+    payloads->rows.reserve(static_cast<std::size_t>(current.grid_size.rows));
+    for (int row = 0; row < current.grid_size.rows; ++row) {
+        const bool dirty = render_snapshot_row_is_dirty(current, row);
+        const std::optional<Terminal_render_snapshot_lazy_row_payload> payload =
+            dirty
+                ? borrowed_render_snapshot_lazy_row_payload(
+                    lazy_row_payload_ref(current_owner, static_cast<std::size_t>(row)),
+                    receiving_namespace,
+                    {},
+                    {})
+                : borrowed_render_snapshot_lazy_row_payload(
+                    lazy_row_payload_ref(previous_owner, static_cast<std::size_t>(row)),
+                    receiving_namespace,
+                    style_id_remaps,
+                    hyperlink_id_remaps);
+        if (!payload.has_value()) {
+            return lazy_snapshot_ineligible_result(
+                dirty
+                    ? Terminal_lazy_snapshot_fallback_reason::
+                        STYLE_COLOR_MODE_INCOMPATIBILITY
+                    : Terminal_lazy_snapshot_fallback_reason::
+                        HYPERLINK_NAMESPACE_INCOMPATIBILITY);
+        }
+
+        payloads->rows.push_back(*payload);
+    }
+
+    Terminal_render_snapshot lazy_snapshot = current;
+    lazy_snapshot.cells.clear();
+    lazy_snapshot.lazy_row_payloads = payloads;
+
+    if (validate_render_snapshot(lazy_snapshot).status !=
+        Terminal_render_snapshot_status::OK)
+    {
+        return lazy_snapshot_materialization_mismatch_for_testing_result();
+    }
+
+    const Terminal_render_snapshot_row_content_view rows(lazy_snapshot);
+    if (!rows.materialized_flat_cells_match(
+            current.cells,
+            Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST))
+    {
+        return lazy_snapshot_materialization_mismatch_for_testing_result();
+    }
+
+    Terminal_session_lazy_snapshot_composer_result result;
+    result.eligible                              = true;
+    result.lazy_snapshot                         = std::move(lazy_snapshot);
+    result.materialization_matches_full_snapshot = true;
+    return result;
+}
+
+void record_lazy_snapshot_fallback_reason(
+    Terminal_lazy_snapshot_fallback_reason_counters& counters,
+    Terminal_lazy_snapshot_fallback_reason           reason)
+{
+    if (reason == Terminal_lazy_snapshot_fallback_reason::NONE) {
+        return;
+    }
+
+    const terminal_lazy_snapshot_fallback_reason_descriptor_t* const descriptor =
+        find_terminal_lazy_snapshot_fallback_reason_descriptor(reason);
+    if (descriptor == nullptr) {
+        Q_UNREACHABLE();
+        return;
+    }
+
+    increment_terminal_lazy_snapshot_fallback_reason_counter(counters, *descriptor);
 }
 
 class Backend_callback_invocation
@@ -3102,6 +3515,49 @@ Terminal_session_profile_stats Terminal_session::profile_stats() const
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     return m_profile_stats;
+}
+
+Terminal_session_lazy_snapshot_composer_result
+Terminal_session::compose_lazy_render_snapshot_for_testing(
+    const Terminal_render_snapshot* previous_content_snapshot,
+    const Terminal_render_snapshot& full_snapshot,
+    bool                            unsupported_geometry_or_detached_snapshot_path)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    lazy_snapshot_composer_input_t input;
+    input.previous_content_snapshot = previous_content_snapshot;
+    input.full_snapshot             = &full_snapshot;
+    input.unsupported_geometry_or_detached_snapshot_path =
+        unsupported_geometry_or_detached_snapshot_path;
+    if (m_render_snapshot_model_result.has_value()) {
+        input.dirty_rows_have_stable_mutation_identity =
+            m_render_snapshot_model_result->dirty_rows_have_stable_mutation_identity;
+    }
+
+    Terminal_session_lazy_snapshot_composer_result result =
+        compose_lazy_render_snapshot_for_input(input);
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    if (m_profile_stats.enabled) {
+        ++m_profile_stats.lazy_snapshot_eligibility_checks;
+        if (result.materialization_mismatch_for_testing) {
+            ++m_profile_stats
+                .lazy_snapshot_materialization_mismatches_for_testing;
+        }
+        if (result.eligible) {
+            ++m_profile_stats.lazy_snapshot_eligible_checks;
+        }
+        else
+        if (!result.materialization_mismatch_for_testing) {
+            record_lazy_snapshot_fallback_reason(
+                m_profile_stats.lazy_snapshot_fallback_reasons,
+                result.fallback_reason);
+        }
+    }
+#endif
+
+    return result;
 }
 
 std::optional<Terminal_backend_exit> Terminal_session::exit_status() const
