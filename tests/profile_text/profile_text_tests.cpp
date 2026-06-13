@@ -127,10 +127,57 @@ bool test_profile_text_sections(QGuiApplication& app)
         "append_dirty_row_timeline_text emits the dirty_row_timeline header");
     ok &= check(text.contains(QStringLiteral("model_profile_stats\n")),
         "append_model_profile_stats_text emits the model_profile_stats header");
+    ok &= check(text.contains(QStringLiteral("  render_snapshot_cells_scanned=")),
+        "model_profile_stats reports render_snapshot_cells_scanned");
+    ok &= check(text.contains(QStringLiteral("  render_snapshot_rows_built_from_model_storage=")),
+        "model_profile_stats reports render_snapshot_rows_built_from_model_storage");
+    ok &= check(text.contains(QStringLiteral("  render_snapshot_model_row_accessor_borrows=")),
+        "model_profile_stats reports render_snapshot_model_row_accessor_borrows");
+    ok &= check(text.contains(QStringLiteral("  render_snapshot_inline_single_bmp_text_cells=")),
+        "model_profile_stats reports render_snapshot_inline_single_bmp_text_cells");
     ok &= check(text.contains(QStringLiteral("session_profile_stats\n")),
         "append_session_profile_stats_text emits the session_profile_stats header");
+    ok &= check(text.contains(QStringLiteral("  full_snapshot_publications=")),
+        "session_profile_stats reports full_snapshot_publications");
+    ok &= check(text.contains(QStringLiteral("  snapshots_consumed_by_bridge=")),
+        "session_profile_stats reports snapshots_consumed_by_bridge");
+    ok &= check(text.contains(QStringLiteral("  consumer_materialization_counters_available=false")),
+        "session_profile_stats reports unavailable consumer materialization counters");
+    ok &= check(text.contains(QStringLiteral(
+            "  consumer_materialization_counters_schema_semantics="
+            "unavailable_until_batch_3_materialization_boundaries")),
+        "session_profile_stats reports consumer materialization counter owner semantics");
+    ok &= check(text.contains(QStringLiteral(
+            "  consumer_materialization_counters_owner_batch=Batch 3")),
+        "session_profile_stats reports consumer materialization counter owner batch");
+    ok &= check(text.contains(QStringLiteral(
+            "  consumer_materialization_counters_frame_builder_rows=unavailable")),
+        "session_profile_stats reports unavailable frame-builder materialization rows");
+    ok &= check(text.contains(QStringLiteral(
+            "  consumer_materialization_counters_public_projection_rows=unavailable")),
+        "session_profile_stats reports unavailable public-projection materialization rows");
+    ok &= check(text.contains(QStringLiteral(
+            "  consumer_materialization_counters_transcript_rows=unavailable")),
+        "session_profile_stats reports unavailable transcript materialization rows");
+    ok &= check(text.contains(QStringLiteral(
+            "  consumer_materialization_counters_selection_rows=unavailable")),
+        "session_profile_stats reports unavailable selection materialization rows");
+    ok &= check(text.contains(QStringLiteral("  retained_snapshot_payload_bytes=")),
+        "session_profile_stats reports retained_snapshot_payload_bytes");
+    ok &= check(text.contains(QStringLiteral("  retained_snapshot_generation_count=")),
+        "session_profile_stats reports retained_snapshot_generation_count");
+    ok &= check(text.contains(QStringLiteral("  max_retained_snapshot_payload_bytes=")),
+        "session_profile_stats reports max_retained_snapshot_payload_bytes");
+    ok &= check(text.contains(QStringLiteral("  max_retained_snapshot_generation_count=")),
+        "session_profile_stats reports max_retained_snapshot_generation_count");
+    ok &= check(text.contains(QStringLiteral("  public_projection_scroll_publications=")),
+        "session_profile_stats reports public_projection_scroll_publications");
     ok &= check(text.contains(QStringLiteral("last_renderer_stats\n")),
         "append_renderer_stats_text emits the last_renderer_stats header");
+    ok &= check(text.contains(QStringLiteral("  frame_visible_rows=")),
+        "last_renderer_stats reports frame_visible_rows");
+    ok &= check(text.contains(QStringLiteral("  frame_dirty_row_lookup_count=")),
+        "last_renderer_stats reports frame_dirty_row_lookup_count");
     ok &= check(text.contains(QStringLiteral("cumulative_renderer_stats\n")),
         "append_cumulative_renderer_stats_text emits the cumulative_renderer_stats header");
     ok &= check(text.contains(QStringLiteral("qsg_atlas\n")),

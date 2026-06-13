@@ -272,6 +272,10 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
             m_profile_stats.render_snapshot_rows_materialized += rows_with_cells;
             m_profile_stats.render_snapshot_rows_borrowed     += rows_borrowed;
             m_profile_stats.render_snapshot_rows_owned        += rows_owned;
+            m_profile_stats.render_snapshot_rows_built_from_model_storage +=
+                rows_with_cells;
+            m_profile_stats.render_snapshot_model_row_accessor_borrows +=
+                rows_borrowed;
             m_profile_stats.render_snapshot_cells_scanned     +=
                 rows_with_cells *
                 static_cast<std::uint64_t>(m_config.grid_size.columns);

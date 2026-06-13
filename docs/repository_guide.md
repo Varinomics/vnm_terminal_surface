@@ -225,20 +225,73 @@ ctest --test-dir build-profile -C Release -R "^vnm_terminal_embedded_benchmark_p
 ```
 
 The benchmark supports `--list-scenarios`, repeated `--scenario <name>`,
-`--iterations`, `--warmup`, `--grid`, `--window-size`, JSON output,
-hierarchical profile output, and `--validate-json`.
+`--iterations`, `--warmup`, `--grid`, `--window-size`, sparse
+surface-session sweep controls `--dirty-rows` and `--dirty-row-stride`, JSON
+output, hierarchical profile output, and `--validate-json`.
 Profile flags such as `--profile`, `--profile-json`, and `--profile-text`
 require a `VNM_TERMINAL_ENABLE_PROFILING=ON` build.
 
-Benchmark JSON uses `schema_version` 20. Profile JSON uses
+Benchmark JSON uses `schema_version` 21. Profile JSON uses
 `profile_schema_version` 2, `time_unit` `ns`, and
 `thread_semantics` `separate_thread_trees`, with separate GUI and render thread
-trees. Schema 20 includes text coalescing counters:
+trees. Schema 21 includes sparse dirty-row sweep metadata
+`sparse_dirty_row_sweep_applicable`, `configured_sparse_dirty_rows`, and
+`configured_sparse_dirty_row_stride`; per-scenario requested and actual grid
+metadata through `requested_rows`, `requested_columns`, `rows`, `columns`,
+`actual_grid_matches_request`, and `grid_semantics`; and exact unavailable
+objects for future-owned counters. Sparse dirty-row validation requires the
+observed frame and profile dirty-row counts to cover the requested dirty rows,
+rejects full repaint, and allows at most one cursor carry-over row per measured
+frame.
+
+The schema 21 `descriptor_counters` object has exactly
+`available=false`,
+`schema_semantics="unavailable_until_batch_7_descriptor_reuse"`,
+`frame_row_descriptors="unavailable"`, and
+`qsg_layer_descriptors="unavailable"`.
+
+The schema 21 `lazy_snapshot_fallback_reason_counters` object has exactly
+`available=false`,
+`schema_semantics="unavailable_until_batch_5_lazy_eligibility"`, and a `reasons`
+object whose keys are `missing_previous_content_snapshot`, `grid_mismatch`,
+`viewport_mismatch`, `active_buffer_mismatch`, `public_projection`,
+`row_origin_generation_mismatch`, `style_color_mode_incompatibility`,
+`hyperlink_namespace_incompatibility`,
+`unstable_dirty_row_mutation_identity`, and
+`unsupported_geometry_or_detached_snapshot_path`; every reason value is JSON
+null until Batch 5 owns real producers.
+
+The schema 21 `session_profile_stats.consumer_materialization_counters` object
+has exactly `available=false`,
+`schema_semantics="unavailable_until_batch_3_materialization_boundaries"`,
+`owner_batch="Batch 3"`, and unavailable string fields `frame_builder_rows`,
+`public_projection_rows`, `transcript_rows`, and `selection_rows`. Stale
+top-level materialization numeric counters are rejected by exact key
+validation.
+
+The `surface_session_selection_snapshot` scenario is a session snapshot contract
+and validates `selection_snapshot_spans_observed`, not renderer overlay
+counters. The `surface_session_resize_smoke_boundary`,
+`surface_session_viewport_change_smoke_boundary`,
+`surface_session_alternate_buffer_smoke_boundary`,
+`surface_session_style_color_mode_smoke_boundary`, and
+`surface_session_hyperlink_smoke_boundary` scenarios are Batch 1 smoke
+boundaries, not lazy fallback decision runs. Schema 21 includes text coalescing
+counters:
 `text_coalescing_candidate_groups`, `text_coalescing_enabled_groups`,
 `text_resource_runs_before_coalescing`, and
 `text_resource_runs_after_coalescing`. Validation enforces
 `text_coalescing_enabled_groups <= text_coalescing_candidate_groups` and
 `text_resource_runs_after_coalescing <= text_resource_runs_before_coalescing`.
+The public-projection boundary scenario is validated in profiling builds by
+requiring nonzero `public_projection_scroll_requests` and
+`public_projection_scroll_publications`.
+On Windows, the supported readback benchmark invocation is the CTest wrapper or
+an equivalent `cmake -E env ... cmd.exe /d /c call <benchmark>.exe` command
+from the benchmark working directory that supplies the Qt runtime path, the
+`windows` QPA platform, D3D11 RHI, and scale-factor environment. Launching the
+benchmark executable directly from PowerShell without that wrapper/environment
+is not a supported benchmark lane.
 Readback readiness validation also requires visible pixels and atlas render
 signals (`atlas_frame_observed`, `atlas_render_observed`,
 `atlas_instances_observed`, `atlas_budget_valid`, and
@@ -248,9 +301,14 @@ sequence and requires `Qsg_atlas_render_node::prepare`,
 `Qsg_atlas_render_node::render` scopes before accepting a scenario profile.
 
 `vnm_terminal_embedded_benchmark_validate` is structural validation under the
-configured Qt runtime path, not a performance comparison. Use no-profile Release
-benchmark runs for user-visible timing. Use profiling-enabled Release runs only
-for attribution, route counts, and scope timing.
+configured Qt runtime path, not a performance comparison.
+`vnm_terminal_embedded_benchmark_profile_validate` covers the Batch 1 sparse,
+selection, public projection, resize, viewport, alternate-buffer,
+style/color/mode, and hyperlink smoke-boundary scenarios for schema, profile,
+route-count, and scope-timing validation. It is not an interleaved A/B
+performance decision run. Use no-profile Release benchmark runs for
+user-visible timing. Use profiling-enabled Release runs only for attribution,
+route counts, and scope timing.
 
 Benchmark comparisons should record the build directory, profiling state,
 renderer backend, scenario list, grid, window size, warmup count, iteration
