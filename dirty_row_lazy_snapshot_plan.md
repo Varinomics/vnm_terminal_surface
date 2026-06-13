@@ -1345,7 +1345,8 @@ Reviewers should classify findings as:
 
 ## 18. Current Handoff
 
-Batch 9 is ready for review. It did not enable default lazy publication.
+Batch 10 completed the local final evidence gate and is blocked only on
+decision-grade full-size evidence that this workstation cannot produce.
 Production publication remains fully materialized:
 `Terminal_session::publish_render_snapshot()` still builds and publishes the
 full `Terminal_screen_model::render_snapshot()` result. The lazy path remains an
@@ -1446,8 +1447,220 @@ Batch 9 audit results:
 - Alias check for `safe_basis.cells` and `public_snapshot.cells` found no
   current code call sites.
 
-Batch 10 final evidence gate is next. It consumes this Batch 9 plumbing and
-must run matched profiling-off and profiling-on full-size evidence with
-`--require-requested-grid`, including the
-`publication_candidate_no_materialization` lane, before any reviewed default
-lazy publication decision.
+Batch 10 final validation record, 2026-06-13:
+
+- Default lazy publication remains disabled. Batch 10 did not enable, stage, or
+  commit a default-production lazy path.
+- Direct production audit passed:
+  `Terminal_session::publish_render_snapshot()` still constructs
+  `Terminal_render_snapshot snapshot = m_screen_model->render_snapshot(request)`,
+  publishes that full snapshot handle, and increments
+  `full_snapshot_publications`. The only `lazy_snapshot.lazy_row_payloads =`
+  assignment remains in the explicit lazy composer used by test and benchmark
+  evidence bridges.
+- Direct flat-cell production audit stayed within the named boundaries:
+  `rg "render_snapshot_cells_by_position" include src tools benchmarks tests
+  docs dirty_row_lazy_snapshot_plan.md` found no current code call sites;
+  `rg "selected_text_from_render_snapshot" include src tools benchmarks tests
+  docs dirty_row_lazy_snapshot_plan.md` still resolves to the canonical
+  selection helper and its surface, transcript, replay, session, and test call
+  sites; `safe_basis.cells` and `public_snapshot.cells` had no current code
+  hits. The broad `.cells` audit still resolves to intentional producers,
+  explicit materialization/parity boundaries, public-projection rows, model and
+  history-row storage, unicode-width result fields, fixtures, tests, and
+  benchmark accounting.
+
+Batch 10 correctness validation:
+
+- Profiling-off Release build
+  `build_codex_renderer_graphics_probe`: selected render snapshot, render
+  frame, QSG atlas, backend session, capture/replay, surface/session behavior,
+  render-cell-text, Qt metrics, input, screen-basic, SGR, screen-operations,
+  and terminal-mode gates passed. CTest result: 24 selected tests, 22 passed,
+  0 failed, 2 skipped (`vnm_terminal_qt_render_smoke`,
+  `vnm_terminal_qsg_atlas_lcd_capability_probe_d3d11`).
+- Profiling-on Release build `build_codex_batch1_profile_on`: corresponding
+  selected correctness gates passed. CTest result: 22 selected tests, 22
+  passed, 0 failed, 0 skipped.
+- Transcript-enabled Release build `build_codex_batch3_transcript`: selected
+  transcript, render snapshot, render frame, QSG atlas, backend session,
+  capture/replay, surface/session behavior, render-cell-text, Qt metrics,
+  input, screen-basic, SGR, screen-operations, and terminal-mode gates passed.
+  CTest result: 18 selected tests, 18 passed, 0 failed, 0 skipped.
+
+Batch 10 local benchmark/evidence validation:
+
+- Profiling-off Release benchmark CTest lanes passed:
+  `vnm_terminal_embedded_benchmark_validate`,
+  `vnm_terminal_embedded_benchmark_publication_candidate_validate`,
+  `vnm_terminal_embedded_benchmark_require_requested_grid_rejects_mismatch`,
+  `vnm_terminal_embedded_benchmark_renderer_gate`,
+  `vnm_terminal_embedded_benchmark_single_bmp_render_cell_gate`,
+  `vnm_terminal_phase7_public_scroll_benchmark_validate`, and
+  `vnm_terminal_surface_stress_descriptor_contract`. CTest result: 7 selected
+  tests, 7 passed, 0 failed.
+- Profiling-on Release benchmark CTest lanes passed:
+  `vnm_terminal_embedded_benchmark_validate`,
+  `vnm_terminal_embedded_benchmark_publication_candidate_validate`,
+  `vnm_terminal_embedded_benchmark_profile_validate`,
+  `vnm_terminal_embedded_benchmark_profile_publication_candidate_validate`,
+  `vnm_terminal_phase7_public_scroll_benchmark_validate`, and
+  `vnm_terminal_surface_stress_descriptor_contract`. CTest result: 6 selected
+  tests, 6 passed, 0 failed.
+- The local `48x160` candidate CTest-sized lane is structural only and remains
+  non-decision-grade. Its actual surface/session grid on this workstation was
+  `56x177` because that lane does not require the requested grid. In
+  `publication_candidate_no_materialization`, both sparse ASCII and sparse
+  block-graphics scenarios reported schema 24, `status=ok`, one completed
+  measured frame, one eligible lazy exercise attempt, zero lazy full fallbacks,
+  zero lazy materialization mismatches, and zero consumer materialization calls,
+  rows, or cells. Each scenario reported 6 dirty visible rows, 50 borrowed
+  previous rows, 6 producer-owned/materialized dirty rows, and 1062 producer
+  cells scanned/emitted.
+- Profiling-on candidate evidence also reported production publication as full:
+  `full_snapshot_publications=1`, `render_snapshots_constructed=1`, and
+  retained snapshot policy bounded at generation count 1 with max payload bytes
+  477644 for the sparse scenarios. Candidate consumer materialization remained
+  zero. The row-view parity profile lane intentionally reported one parity
+  materialization call, 56 rows, and 9912 cells per sparse scenario.
+- Local profile output reported the requested stages. In the profiling-on
+  candidate sparse ASCII scenario, `Terminal_screen_model::render_snapshot`
+  samples were 275400 ns and 634400 ns, `build_terminal_render_frame` mean was
+  2029575 ns across 4 calls, `Qsg_atlas_render_node::prepare` mean was
+  4078225 ns across 4 calls, and `Qsg_atlas_render_node::render` mean was
+  190475 ns across 4 calls. In the profiling-on candidate sparse
+  block-graphics scenario, `Terminal_screen_model::render_snapshot` samples
+  were 697000 ns and 1790200 ns, `build_terminal_render_frame` mean was
+  2735750 ns across 4 calls, `Qsg_atlas_render_node::prepare` mean was
+  3318300 ns across 4 calls, and `Qsg_atlas_render_node::render` mean was
+  170950 ns across 4 calls.
+
+Batch 10 full-size decision gate:
+
+- The profiling-off full-size default command was run with the Batch 1 decision
+  rule substituted for the placeholders:
+  `--iterations 10 --warmup 2 --grid 235x873 --window-size 6984x3760
+  --dirty-rows 8 --dirty-row-stride 7 --require-requested-grid
+  --validate-json` for `surface_session_sparse_ascii_output` and
+  `surface_session_sparse_block_graphics_output`. It failed before producing
+  decision-grade samples with `requested_grid_required=true`, root
+  `status=failed`, and zero completed frames. The benchmark requested
+  `235x873`, but the surface produced `276x970` after Windows clamped the
+  requested `6984x3760` window.
+- The same full-size command with
+  `--lazy-snapshot-evidence-mode publication_candidate_no_materialization`
+  failed the same requested-grid gate: `requested_grid_required=true`, root
+  `status=failed`, zero completed frames, requested `235x873`, actual
+  `276x970`.
+- Because the full-size default and candidate lanes could not create the
+  requested grid on this workstation, Batch 10 did not produce decision-grade
+  evidence for sparse dirty-row proportionality, ASCII regression/noise, dense
+  block-character publication/frame improvement, full-size QSG prepare reuse,
+  or full-size memory/FPS acceptance. The local CTest-sized lanes are useful
+  structural validation only and must not be used as the default-enable
+  decision.
+
+Batch 10 CMDG / Assembly 2025 supplemental scope:
+
+- Local `vnm_terminal_surface` discovery found no configured CMDG or Assembly
+  2025 benchmark/demo target in this repo. Commands run from
+  `C:/plms/varinomics/vnm_terminal_surface`:
+
+  ```powershell
+  $cmdgPattern = (
+    "CMDG|cmdg|Assembly 2025|assembly 2025|" +
+    "assembly2025|assembly_2025|assembly-demo|" +
+    "assembly demo|demo"
+  )
+  rg -n $cmdgPattern -S .
+  rg --files | rg -i "cmdg|assembly|demo|benchmark"
+  $cmakePattern = (
+    "add_executable|add_custom_target|add_test|" +
+    "NAME .*cmdg|cmdg|assembly|demo"
+  )
+  rg -n $cmakePattern -S CMakeLists.txt cmake benchmarks tests tools docs
+  ```
+
+  The hits were documentation references, the excluded untracked review
+  roadmap, generic backend test strings containing `demo`, and existing
+  non-CMDG benchmark paths under `benchmarks/embedded_terminal`,
+  `benchmarks/phase7_public_scroll`, and `benchmarks/surface_stress`.
+- Local configured build discovery also found no CMDG or Assembly target:
+  `ctest -N | Select-String -Pattern "CMDG|cmdg|Assembly|assembly|demo"`
+  and `cmake --build . --target help | Select-String -Pattern
+  "CMDG|cmdg|Assembly|assembly|demo"` returned no matches in
+  `build_codex_renderer_graphics_probe`, `build_codex_batch1_profile_on`, and
+  `build_codex_batch3_transcript`.
+- Sibling discovery found an opt-in CMDG harness in
+  `C:/plms/varinomics/vnm_terminal`, not in this repo. Relevant paths:
+  `benchmarks/cmdg_nelostie/CMakeLists.txt`,
+  `benchmarks/cmdg_nelostie/README.md`, and `THIRD_PARTY/CMDG`. The CMake
+  harness registers `AssemblyWinter2025` as
+  `vnm_terminal_cmdg_nelostie_benchmark` with labels
+  `benchmark;cmdg;cmdg_suite;nelostie;AssemblyWinter2025`. Sibling build-dir
+  discovery with `ctest -N -L cmdg_suite` found CMDG tests in
+  `build_codex_cmdg_assembly_4k_long_20260612_232008_terminal_canonical_atlas`,
+  `build_codex_cmdg_assembly_raster620x150_long_20260612_232533_terminal`,
+  `build_codex_cmdg_long_assembly_particle_20260612_231046_terminal_canonical_atlas`,
+  `build_codex_cmdg_phase_probe_620x150_profile_terminal`,
+  `build_codex_cmdg_phase_probe_620x150_terminal`, and
+  `build_codex_cmdg_block_regression_20260612_230526_terminal_canonical_atlas`.
+- Supplemental sibling AssemblyWinter2025 profiling-off command:
+  from
+  `C:/plms/varinomics/vnm_terminal/build_codex_cmdg_phase_probe_620x150_terminal`,
+  `ctest --output-on-failure -R '^vnm_terminal_cmdg_nelostie_benchmark$'`.
+  Result: 1 selected test, 1 passed, 0 failed, elapsed 173.69 s. The CTest
+  wrapper ran `run_cmdg_nelostie.cmake` with terminal executable
+  `build_codex_cmdg_phase_probe_620x150_terminal/vnm_terminal.exe`, CMDG
+  executable
+  `_scratch_benchmarks/cmdg_raster_620x150_block_only_phase_probe/CMDG/bin/Release/net8.0/CMDG.exe`,
+  scene `AssemblyWinter2025`, frame limit 3000, window size `3840x2160`,
+  font size 10, hidden cursor, and offscreen mode disabled.
+- Supplemental sibling AssemblyWinter2025 profiling-off metrics:
+  `app_result=0`, `process_exit_code=0`, `backend_error_count=0`,
+  `timeout_expired=false`, `output_seen=true`, terminal elapsed 172775 ms,
+  profiling compiled/requested false, actual grid `189x681`, DPR 1.25,
+  `qsg_atlas.render_count=1999`, renderer FPS 11.56996093184778,
+  `qsg_atlas.prepare_count=1999`, failed atlas inserts 0, glyph misses 0,
+  coverage failures 0, atlas page count 1, warm lazy completed true, and warm
+  lazy failures 0. CMDG metrics reported `exit_reason=frame_limit`,
+  `exit_code=0`, 3000 scene frames, scene FPS 17.515, draw FPS 21.678,
+  564688262 draw-output bytes, 371329 changed rows, and 180597716 changed
+  cells.
+- Supplemental sibling AssemblyWinter2025 profiling-on command:
+  from
+  `C:/plms/varinomics/vnm_terminal/build_codex_cmdg_phase_probe_620x150_profile_terminal`,
+  `ctest --output-on-failure -R '^vnm_terminal_cmdg_nelostie_benchmark$'`.
+  Result: 1 selected test, 1 passed, 0 failed, elapsed 174.91 s. The CTest
+  wrapper used the profile-on terminal executable, the same CMDG executable,
+  scene `AssemblyWinter2025`, frame limit 3000, window size `3840x2160`, font
+  size 10, hidden cursor, offscreen mode disabled, and wrote
+  `vnm_terminal_cmdg_AssemblyWinter2025_r1_profile.txt`.
+- Supplemental sibling AssemblyWinter2025 profiling-on metrics:
+  `app_result=0`, `process_exit_code=0`, `backend_error_count=0`,
+  `timeout_expired=false`, `output_seen=true`, terminal elapsed 173866 ms,
+  profiling compiled/requested true, profile write elapsed 207 ms, actual grid
+  `189x681`, DPR 1.25, `qsg_atlas.render_count=1524`, renderer FPS
+  8.76537103286439, `qsg_atlas.prepare_count=1524`, failed atlas inserts 0,
+  glyph misses 0, coverage failures 0, atlas page count 1, warm lazy completed
+  true, and warm lazy failures 0. CMDG metrics reported
+  `exit_reason=frame_limit`, `exit_code=0`, 3000 scene frames, scene FPS
+  17.282, draw FPS 16.948, 474175402 draw-output bytes, 307334 changed rows,
+  and 151672844 changed cells.
+- The sibling CMDG/AssemblyWinter2025 runs are supplemental demo evidence only.
+  They do not replace the `vnm_terminal_surface` Batch 10 full-size
+  `--require-requested-grid` decision gate, and they do not justify enabling
+  default lazy publication.
+
+Batch 10 final handoff:
+
+- Remaining blocker owner: the next default-enable reviewer or release owner
+  must run the matched profiling-off and profiling-on full-size `235x873` /
+  `6984x3760` default and `publication_candidate_no_materialization` evidence
+  lanes on a reviewed machine or desktop setup that can satisfy
+  `--require-requested-grid`, or land a reviewed matrix amendment before
+  considering default lazy publication.
+- Until that blocker is closed by decision-grade evidence and review, default
+  lazy publication remains disabled.
+- Status: BLOCKED for default lazy publication enablement on this workstation;
+  local structural validation is ready for review.
