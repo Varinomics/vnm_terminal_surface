@@ -1200,6 +1200,93 @@ bool test_surface_session_snapshot_burst_coalesces_to_latest_render(QGuiApplicat
     return ok;
 }
 
+bool test_surface_polish_drains_queued_backend_output_before_render_capture(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("polish-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface polish drain starts");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("polish-baseline")),
+        "surface polish drain publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "surface polish drain captures baseline before delayed output");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\r\npolish-pending-frame"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> pending_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(pending_snapshot != nullptr &&
+        pending_snapshot->metadata.sequence > baseline_snapshot->metadata.sequence &&
+        snapshot_contains_text(*pending_snapshot, QStringLiteral("polish-pending-frame")),
+        "surface polish drain creates an older pending render snapshot");
+    const term::Terminal_surface_render_invalidation_stats_t pending_stats =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+    ok &= check(pending_stats.pending_update,
+        "surface polish drain leaves the older snapshot pending for capture");
+    if (pending_snapshot == nullptr) {
+        return ok;
+    }
+
+    backend_ptr->emit_output_from_worker(QByteArrayLiteral("\r\npolish-worker-echo"));
+    backend_ptr->join_worker();
+    ok &= check(term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
+        fixture.surface),
+        "surface polish drain has queued worker output before polish");
+    const std::shared_ptr<const term::Terminal_render_snapshot> before_polish_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(before_polish_snapshot != nullptr &&
+        before_polish_snapshot->metadata.sequence == pending_snapshot->metadata.sequence &&
+        !snapshot_contains_text(*before_polish_snapshot, QStringLiteral("polish-worker-echo")),
+        "surface polish drain leaves queued worker output unsynced before polish");
+
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> polished_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(polished_snapshot != nullptr &&
+        polished_snapshot->metadata.sequence > pending_snapshot->metadata.sequence &&
+        snapshot_contains_text(*polished_snapshot, QStringLiteral("polish-worker-echo")),
+        "surface polish drain syncs queued backend output before capture");
+    const term::Terminal_surface_render_invalidation_stats_t polished_stats =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+    ok &= check(polished_stats.pending_update,
+        "surface polish drain keeps the coalesced render update pending");
+    if (polished_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        polished_snapshot->metadata.sequence),
+        "surface polish drain captures the polished snapshot");
+
+    return ok;
+}
+
 bool test_surface_session_single_drain_coalesces_dirty_rows(QGuiApplication& app)
 {
     bool ok = true;
@@ -11813,6 +11900,7 @@ int main(int argc, char** argv)
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
     ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
+    ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
     ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
     ok &= test_surface_set_render_snapshot_seam_coalesces_on_row_identity(app);
     ok &= test_osc52_clipboard_write_signal_and_deny(app);

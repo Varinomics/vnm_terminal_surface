@@ -506,6 +506,7 @@ private:
     friend class vnm_terminal::internal::VNM_TerminalSurface_render_bridge;
 
     QSGNode* updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*) override;
+    void updatePolish() override;
     void releaseResources() override;
     void keyPressEvent(QKeyEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
@@ -554,9 +555,12 @@ private:
 
     void drain_backend_callback_events();
     void drain_backend_callback_events(bool budgeted);
+    void drain_backend_callback_events_for(std::chrono::steady_clock::duration budget);
+    void drain_backend_callback_events_with_budget(std::optional<std::chrono::steady_clock::duration> budget);
     void drain_backend_callback_events_for_posted_work();
     void queue_backend_callback_drain();
     void refresh_active_session_geometry();
+    void sync_after_user_input(bool input_accepted);
     void sync_from_session();
     void sync_synchronized_output_recovery_timer();
     void handle_synchronized_output_recovery_timeout();
