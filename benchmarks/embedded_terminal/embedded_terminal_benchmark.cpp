@@ -92,7 +92,7 @@ constexpr int k_surface_session_write_high_water_bytes        = 64 * 1024;
 constexpr int k_surface_session_resize_boundary_width_delta   = 16;
 constexpr int k_surface_session_geometry_boundary_height_delta = 16;
 
-constexpr int k_schema_version              = 23;
+constexpr int k_schema_version              = 24;
 constexpr int k_profile_schema_version      = 2;
 constexpr int k_profile_text_format         = 2;
 constexpr int k_flat_rect_vertices_per_rect = 6;
@@ -138,6 +138,10 @@ const QString k_lazy_snapshot_reason_counter_schema_semantics = QStringLiteral(
     "batch_5_lazy_eligibility");
 const QString k_consumer_materialization_counter_schema_semantics = QStringLiteral(
     "batch_6_materialization_boundaries");
+const QString k_lazy_snapshot_evidence_row_view_parity = QStringLiteral(
+    "row_view_parity_test");
+const QString k_lazy_snapshot_evidence_publication_candidate = QStringLiteral(
+    "publication_candidate_no_materialization");
 const QString k_requested_grid_semantics = QStringLiteral("requested_grid_validated");
 const QString k_surface_session_actual_grid_semantics = QStringLiteral(
     "surface_session_actual_grid_from_qquick_surface_metrics");
@@ -384,10 +388,13 @@ struct App_options
     QString                profile_text_path;
     int                    sparse_dirty_rows = k_surface_session_sparse_dirty_rows;
     int                    sparse_dirty_row_stride = k_surface_session_sparse_dirty_row_stride;
+    term::Terminal_lazy_snapshot_evidence_mode lazy_snapshot_evidence_mode =
+        term::Terminal_lazy_snapshot_evidence_mode::ROW_VIEW_PARITY_TEST;
     bool                   quiet             = false;
     bool                   validate_json     = false;
     bool                   include_attempts  = false;
     bool                   profile           = false;
+    bool                   require_requested_grid = false;
     bool                   help_requested    = false;
     bool                   list_scenarios    = false;
 };
@@ -646,6 +653,8 @@ struct Scenario_result
     std::uint64_t          lazy_snapshot_exercise_consumer_materialization_calls = 0U;
     std::uint64_t          lazy_snapshot_exercise_consumer_materialization_rows = 0U;
     std::uint64_t          lazy_snapshot_exercise_consumer_materialization_cells = 0U;
+    QString                lazy_snapshot_evidence_mode =
+        k_lazy_snapshot_evidence_row_view_parity;
     QString                dominant_latency_component         = QStringLiteral("no_completed_samples");
     QString                primary_pressure                   = QStringLiteral("no_completed_samples");
     std::vector<profile_thread_snapshot_t>
@@ -852,6 +861,9 @@ void print_usage()
         << "  --grid <ROWSxCOLS>        terminal grid size\n"
         << "  --dirty-rows <n>          sparse surface/session rows touched per update\n"
         << "  --dirty-row-stride <n>    sparse surface/session row stride\n"
+        << "  --lazy-snapshot-evidence-mode <mode>\n"
+        << "                            row_view_parity_test or publication_candidate_no_materialization\n"
+        << "  --require-requested-grid  fail validation if the surface grid differs from --grid\n"
         << "  --output <path>           write JSON to a file\n"
 #if VNM_TERMINAL_PROFILING_ENABLED
         << "  --profile                 collect hierarchical GUI/render profile data\n"
@@ -882,6 +894,43 @@ QStringList raw_arguments(int argc, char** argv)
 bool argument_is(const QString& argument, const char* expected)
 {
     return argument == QLatin1String(expected);
+}
+
+QString lazy_snapshot_evidence_mode_name(
+    term::Terminal_lazy_snapshot_evidence_mode mode)
+{
+    switch (mode) {
+        case term::Terminal_lazy_snapshot_evidence_mode::ROW_VIEW_PARITY_TEST:
+            return k_lazy_snapshot_evidence_row_view_parity;
+        case term::Terminal_lazy_snapshot_evidence_mode::
+            PUBLICATION_CANDIDATE_NO_MATERIALIZATION:
+            return k_lazy_snapshot_evidence_publication_candidate;
+    }
+
+    return QStringLiteral("unknown");
+}
+
+std::optional<term::Terminal_lazy_snapshot_evidence_mode>
+parse_lazy_snapshot_evidence_mode(const QString& value)
+{
+    if (value == k_lazy_snapshot_evidence_row_view_parity) {
+        return term::Terminal_lazy_snapshot_evidence_mode::ROW_VIEW_PARITY_TEST;
+    }
+
+    if (value == k_lazy_snapshot_evidence_publication_candidate) {
+        return
+            term::Terminal_lazy_snapshot_evidence_mode::
+                PUBLICATION_CANDIDATE_NO_MATERIALIZATION;
+    }
+
+    return std::nullopt;
+}
+
+bool lazy_snapshot_evidence_uses_row_view_parity_materialization(
+    const App_options& options)
+{
+    return options.lazy_snapshot_evidence_mode ==
+        term::Terminal_lazy_snapshot_evidence_mode::ROW_VIEW_PARITY_TEST;
 }
 
 bool take_option_value(
@@ -1141,6 +1190,12 @@ Parse_result parse_arguments(const QStringList& arguments)
             continue;
         }
 
+        if (argument_is(argument, "--require-requested-grid")) {
+            result.options.require_requested_grid = true;
+            ++index;
+            continue;
+        }
+
         if (argument_is(argument, "--profile")) {
 #if VNM_TERMINAL_PROFILING_ENABLED
             result.options.profile = true;
@@ -1253,6 +1308,25 @@ Parse_result parse_arguments(const QStringList& arguments)
             continue;
         }
 
+        if (argument_is(argument, "--lazy-snapshot-evidence-mode")) {
+            if (!take_option_value(arguments, index, &value, &result.error)) {
+                return result;
+            }
+
+            const std::optional<term::Terminal_lazy_snapshot_evidence_mode> parsed =
+                parse_lazy_snapshot_evidence_mode(value);
+            if (!parsed.has_value()) {
+                result.error = QStringLiteral(
+                    "--lazy-snapshot-evidence-mode must be %1 or %2")
+                    .arg(k_lazy_snapshot_evidence_row_view_parity)
+                    .arg(k_lazy_snapshot_evidence_publication_candidate);
+                return result;
+            }
+
+            result.options.lazy_snapshot_evidence_mode = *parsed;
+            continue;
+        }
+
         if (argument_is(argument, "--output")) {
             if (!take_option_value(arguments, index, &value, &result.error)) {
                 return result;
@@ -1343,6 +1417,29 @@ grid_size_t current_surface_grid(
         rows    > 0 ? rows    : options.grid.rows,
         columns > 0 ? columns : options.grid.columns,
     };
+}
+
+bool actual_grid_matches_request(
+    grid_size_t        actual_grid,
+    const App_options& options)
+{
+    return
+        actual_grid.rows    == options.grid.rows &&
+        actual_grid.columns == options.grid.columns;
+}
+
+void mark_requested_grid_mismatch(
+    Scenario_result&   result,
+    grid_size_t        actual_grid,
+    const App_options& options)
+{
+    result.status = QStringLiteral("failed");
+    result.structural_checks.backend_errors_zero = true;
+    std::cerr
+        << "vnm_terminal_embedded_benchmark: requested grid "
+        << options.grid.rows << "x" << options.grid.columns
+        << " but surface produced " << actual_grid.rows << "x"
+        << actual_grid.columns << '\n';
 }
 
 bool validate_sparse_dirty_row_drive(
@@ -4346,6 +4443,8 @@ Scenario_result run_surface_session_scroll_scenario(
     result.viewport_metrics_applicable = true;
     result.wheel_burst_size            = scroll_profile.wheel_event_count;
     result.wheel_steps_per_event       = scroll_profile.wheel_steps_per_event;
+    result.lazy_snapshot_evidence_mode =
+        lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode);
 
     const bool public_projection_boundary =
         scenario_name == QStringLiteral("surface_session_public_projection_boundary");
@@ -4416,6 +4515,12 @@ Scenario_result run_surface_session_scroll_scenario(
 
     result.rows    = initial_snapshot != nullptr ? initial_snapshot->grid_size.rows : 0;
     result.columns = initial_snapshot != nullptr ? initial_snapshot->grid_size.columns : 0;
+    if (options.require_requested_grid &&
+        !actual_grid_matches_request({result.rows, result.columns}, options))
+    {
+        mark_requested_grid_mismatch(result, {result.rows, result.columns}, options);
+        return result;
+    }
     result.viewport_scrollback_rows =
         initial_snapshot != nullptr ? initial_snapshot->viewport.scrollback_rows : 0;
     result.viewport_initial_offset_from_tail =
@@ -4813,10 +4918,11 @@ Attempt_result run_surface_session_action_attempt(
     {
         const term::Terminal_session_lazy_snapshot_composer_result lazy_result =
             term::VNM_TerminalSurface_render_bridge
-                ::compose_lazy_render_snapshot_for_testing(
+                ::compose_lazy_render_snapshot_for_benchmark_evidence(
                     context.surface,
                     before_snapshot,
-                    *after_snapshot);
+                    *after_snapshot,
+                    options.lazy_snapshot_evidence_mode);
         attempt.lazy_snapshot_exercise_attempted = true;
         attempt.lazy_snapshot_exercise_eligible  = lazy_result.eligible;
         attempt.lazy_snapshot_exercise_full_fallbacks =
@@ -4890,6 +4996,8 @@ Scenario_result run_surface_session_action_scenario(
     result.lazy_snapshot_exercise_applicable =
         is_surface_session_sparse_text_output_scenario(scenario_name);
     result.lazy_snapshot_exercise_promoted_non_content_rows = 0;
+    result.lazy_snapshot_evidence_mode =
+        lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode);
     result.render_measurement_semantics = profile.render_expected
         ? k_render_expected_semantics
         : k_no_render_expected_semantics;
@@ -4910,6 +5018,12 @@ Scenario_result run_surface_session_action_scenario(
     const grid_size_t surface_grid = current_surface_grid(context, options);
     result.rows    = surface_grid.rows;
     result.columns = surface_grid.columns;
+    if (options.require_requested_grid &&
+        !actual_grid_matches_request(surface_grid, options))
+    {
+        mark_requested_grid_mismatch(result, surface_grid, options);
+        return result;
+    }
     if (is_surface_session_sparse_text_output_scenario(scenario_name)) {
         QString sparse_error;
         if (!validate_sparse_dirty_row_drive(
@@ -5198,6 +5312,8 @@ Scenario_result run_scenario_impl(
     result.rows           = options.grid.rows;
     result.columns        = options.grid.columns;
     result.window_size    = options.window_size;
+    result.lazy_snapshot_evidence_mode =
+        lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode);
 
     for (int warmup_index = 0; warmup_index < options.warmup; ++warmup_index) {
         Attempt_result attempt =
@@ -6183,6 +6299,9 @@ QJsonObject scenario_profile_summary_json(const Scenario_result& result)
     object.insert(QStringLiteral("source_mode"),    result.source_mode);
     object.insert(QStringLiteral("execution_mode"), result.execution_mode);
     object.insert(
+        QStringLiteral("lazy_snapshot_evidence_mode"),
+        result.lazy_snapshot_evidence_mode);
+    object.insert(
         QStringLiteral("resize_boundary_row_changes_observed"),
         result.resize_boundary_row_changes_observed);
     object.insert(
@@ -6257,6 +6376,9 @@ QJsonObject scenario_json(
     object.insert(QStringLiteral("status"),            result.status);
     object.insert(QStringLiteral("iterations"),        result.iterations);
     object.insert(QStringLiteral("warmup"),            result.warmup);
+    object.insert(
+        QStringLiteral("lazy_snapshot_evidence_mode"),
+        result.lazy_snapshot_evidence_mode);
     object.insert(
         QStringLiteral("sparse_dirty_row_sweep_applicable"),
         is_surface_session_sparse_text_output_scenario(result.name));
@@ -9031,6 +9153,7 @@ bool validate_scenario_json(
         QStringLiteral("status"),
         QStringLiteral("iterations"),
         QStringLiteral("warmup"),
+        QStringLiteral("lazy_snapshot_evidence_mode"),
         QStringLiteral("sparse_dirty_row_sweep_applicable"),
         QStringLiteral("configured_sparse_dirty_rows"),
         QStringLiteral("configured_sparse_dirty_row_stride"),
@@ -9319,7 +9442,9 @@ bool validate_scenario_json(
     if (object.value(QStringLiteral("source_mode")).toString()       != scenario_source_mode(scenario_name)    ||
         object.value(QStringLiteral("execution_mode")).toString()    != scenario_execution_mode(scenario_name) ||
         object.value(QStringLiteral("latency_semantics")).toString() != k_latency_semantics                    ||
-        object.value(QStringLiteral("elapsed_semantics")).toString() != k_elapsed_semantics)
+        object.value(QStringLiteral("elapsed_semantics")).toString() != k_elapsed_semantics                    ||
+        object.value(QStringLiteral("lazy_snapshot_evidence_mode")).toString() !=
+            lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode))
     {
         *out_error = QStringLiteral("scenario metadata is inconsistent: %1")
             .arg(scenario_name);
@@ -9397,7 +9522,8 @@ bool validate_scenario_json(
             grid_matches_request                                        ||
         object.value(QStringLiteral("grid_semantics")).toString() !=
             expected_grid_semantics                                     ||
-        (!is_surface_session_scenario(scenario_name) && !grid_matches_request))
+        (!is_surface_session_scenario(scenario_name) && !grid_matches_request) ||
+        (options.require_requested_grid && !grid_matches_request))
     {
         *out_error = QStringLiteral("scenario grid metadata is inconsistent: %1")
             .arg(scenario_name);
@@ -9463,8 +9589,18 @@ bool validate_scenario_json(
             lazy_exercise_attempts * lazy_exercise_promoted_rows;
         const qint64 producer_row_budget =
             lazy_exercise_dirty_rows + promoted_dirty_rows;
+        const bool row_view_parity_materialization =
+            lazy_snapshot_evidence_uses_row_view_parity_materialization(options);
+        const qint64 consumer_materialization_calls_expected =
+            row_view_parity_materialization ? lazy_exercise_attempts : 0;
+        const qint64 consumer_materialization_rows_expected =
+            row_view_parity_materialization
+                ? lazy_exercise_attempts * actual_rows
+                : 0;
         const qint64 consumer_materialization_cells_expected =
-            lazy_exercise_attempts * actual_rows * actual_columns;
+            row_view_parity_materialization
+                ? lazy_exercise_attempts * actual_rows * actual_columns
+                : 0;
         const qint64 observed_frame_dirty_rows =
             json_counter(object, QStringLiteral("frame_dirty_rows"));
         const qint64 observed_frame_full_dirty_rows =
@@ -9496,14 +9632,15 @@ bool validate_scenario_json(
                 producer_row_budget * actual_columns ||
             lazy_exercise_cells_emitted > producer_row_budget * actual_columns ||
             lazy_exercise_cells_emitted > lazy_exercise_cells_scanned ||
-            lazy_exercise_consumer_materialization_calls != lazy_exercise_attempts ||
+            lazy_exercise_consumer_materialization_calls !=
+                consumer_materialization_calls_expected ||
             lazy_exercise_consumer_materialization_rows !=
-                lazy_exercise_attempts * actual_rows ||
+                consumer_materialization_rows_expected ||
             lazy_exercise_consumer_materialization_cells !=
                 consumer_materialization_cells_expected)
         {
             *out_error = QStringLiteral(
-                "lazy snapshot sparse K=0 exercise counters violated Batch 6 bounds: %1")
+                "lazy snapshot sparse K=0 evidence counters violated Batch 9 bounds: %1")
                 .arg(scenario_name);
             return false;
         }
@@ -10150,6 +10287,16 @@ bool validate_json_output(
         return false;
     }
 
+    if (root.value(QStringLiteral("lazy_snapshot_evidence_mode")).toString() !=
+            lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode) ||
+        !root.value(QStringLiteral("requested_grid_required")).isBool()           ||
+        root.value(QStringLiteral("requested_grid_required")).toBool() !=
+            options.require_requested_grid)
+    {
+        *out_error = QStringLiteral("benchmark root evidence metadata changed");
+        return false;
+    }
+
     if (!validate_profiling_metadata_json(root, options, out_error)) {
         return false;
     }
@@ -10250,6 +10397,12 @@ QJsonObject make_profile_root_json(
     root.insert(QStringLiteral("profile_format"),    QStringLiteral("hierarchical_profiler"));
     root.insert(QStringLiteral("renderer"),          QStringLiteral("atlas"));
     root.insert(QStringLiteral("profiling"),         profiling_metadata_json(options));
+    root.insert(
+        QStringLiteral("lazy_snapshot_evidence_mode"),
+        lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode));
+    root.insert(
+        QStringLiteral("requested_grid_required"),
+        options.require_requested_grid);
     root.insert(QStringLiteral("status"),            ok ? QStringLiteral("ok") : QStringLiteral("failed"));
     root.insert(QStringLiteral("scenarios"),         scenarios);
     if (!error.isEmpty()) {
@@ -10280,6 +10433,16 @@ bool validate_profile_json_output(
         root.value(QStringLiteral("renderer")).toString() != QStringLiteral("atlas"))
     {
         *out_error = QStringLiteral("profile root metadata changed");
+        return false;
+    }
+
+    if (root.value(QStringLiteral("lazy_snapshot_evidence_mode")).toString() !=
+            lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode) ||
+        !root.value(QStringLiteral("requested_grid_required")).isBool()           ||
+        root.value(QStringLiteral("requested_grid_required")).toBool() !=
+            options.require_requested_grid)
+    {
+        *out_error = QStringLiteral("profile root evidence metadata changed");
         return false;
     }
 
@@ -10336,6 +10499,8 @@ bool validate_profile_json_output(
             scenario.value(QStringLiteral("source_mode")).toString() != scenario_source_mode(name) ||
             scenario.value(QStringLiteral("execution_mode")).toString() !=
                 scenario_execution_mode(name) ||
+            scenario.value(QStringLiteral("lazy_snapshot_evidence_mode")).toString() !=
+                lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode) ||
             !scenario.value(QStringLiteral("profile")).isObject())
         {
             *out_error = QStringLiteral("profile scenario metadata is inconsistent: %1")
@@ -10585,6 +10750,12 @@ QJsonObject make_root_json(
     root.insert(QStringLiteral("warmup"), options.warmup);
     root.insert(QStringLiteral("rows"), options.grid.rows);
     root.insert(QStringLiteral("columns"), options.grid.columns);
+    root.insert(
+        QStringLiteral("lazy_snapshot_evidence_mode"),
+        lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode));
+    root.insert(
+        QStringLiteral("requested_grid_required"),
+        options.require_requested_grid);
     root.insert(QStringLiteral("configured_sparse_dirty_rows"), options.sparse_dirty_rows);
     root.insert(
         QStringLiteral("configured_sparse_dirty_row_stride"),

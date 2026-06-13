@@ -227,25 +227,32 @@ ctest --test-dir build-profile -C Release -R "^vnm_terminal_embedded_benchmark_p
 The benchmark supports `--list-scenarios`, repeated `--scenario <name>`,
 `--iterations`, `--warmup`, `--grid`, `--window-size`, sparse
 surface-session sweep controls `--dirty-rows` and `--dirty-row-stride`, JSON
-output, hierarchical profile output, and `--validate-json`.
+output, hierarchical profile output, `--validate-json`,
+`--lazy-snapshot-evidence-mode`, and `--require-requested-grid`.
 Profile flags such as `--profile`, `--profile-json`, and `--profile-text`
 require a `VNM_TERMINAL_ENABLE_PROFILING=ON` build.
 
-Benchmark JSON uses `schema_version` 23. Profile JSON uses
+Benchmark JSON uses `schema_version` 24. Profile JSON uses
 `profile_schema_version` 2, `time_unit` `ns`, and
 `thread_semantics` `separate_thread_trees`, with separate GUI and render thread
-trees. Schema 23 includes sparse dirty-row sweep metadata
+trees. Schema 24 includes sparse dirty-row sweep metadata
 `sparse_dirty_row_sweep_applicable`, `configured_sparse_dirty_rows`, and
 `configured_sparse_dirty_row_stride`; per-scenario requested and actual grid
 metadata through `requested_rows`, `requested_columns`, `rows`, `columns`,
-`actual_grid_matches_request`, and `grid_semantics`; and the exact Batch 7
-descriptor counter object. Sparse dirty-row validation requires the
+`actual_grid_matches_request`, and `grid_semantics`; root and per-scenario
+`lazy_snapshot_evidence_mode`; root `requested_grid_required`; and the exact
+Batch 7 descriptor counter object. Sparse dirty-row validation requires the
 observed frame and profile dirty-row counts to cover the requested dirty rows,
 rejects full repaint, and allows at most one cursor carry-over row per measured
 frame.
 
-Schema 23 also exposes the opt-in Batch 6 lazy snapshot exercise counters for
-eligible sparse content session scenarios. The scenario-level keys are
+Schema 24 also exposes lazy snapshot evidence counters for eligible sparse
+content session scenarios. The default evidence mode is
+`row_view_parity_test`, which keeps the Batch 6 row-view materialization parity
+check. `publication_candidate_no_materialization` exercises the same lazy
+candidate composer without publishing it and without the row-view parity
+materialization; it is evidence plumbing only and does not enable lazy
+publication by default. The scenario-level keys are
 `lazy_snapshot_exercise_applicable`,
 `lazy_snapshot_exercise_promoted_non_content_rows`,
 `lazy_snapshot_exercise_attempts`,
@@ -265,16 +272,19 @@ validation declares K=0 through
 `lazy_snapshot_exercise_promoted_non_content_rows`, requires zero full
 fallbacks and zero materialization mismatches, and bounds producer owned rows,
 producer materialized rows, and producer cells scanned by the observed dirty
-rows times columns.
+rows times columns. In `row_view_parity_test` mode, consumer materialization
+calls, rows, and cells must match the full visible grid parity check. In
+`publication_candidate_no_materialization` mode, those consumer materialization
+counters must remain zero.
 
-The schema 23 `descriptor_counters` object has exactly
+The schema 24 `descriptor_counters` object has exactly
 `available=true`,
 `schema_semantics="batch_7_frame_qsg_descriptor_reuse"`,
 numeric `frame_row_descriptors`, numeric `frame_layer_descriptors`, and
 numeric `qsg_layer_descriptors`. `qsg_layer_descriptors` is zero until QSG
 layer descriptor-key work is wired back in.
 
-The schema 23 `lazy_snapshot_fallback_reason_counters` object has exactly
+The schema 24 `lazy_snapshot_fallback_reason_counters` object has exactly
 `available=true`,
 `schema_semantics="batch_5_lazy_eligibility"`, and a `reasons`
 object whose keys are `missing_previous_content_snapshot`, `grid_mismatch`,
@@ -285,7 +295,7 @@ object whose keys are `missing_previous_content_snapshot`, `grid_mismatch`,
 `unsupported_geometry_or_detached_snapshot_path`; every reason value is a
 nonnegative integer counter.
 
-The schema 23 `session_profile_stats` object also exposes the scalar lazy
+The schema 24 `session_profile_stats` object also exposes the scalar lazy
 snapshot counters `lazy_snapshot_eligibility_checks`,
 `lazy_snapshot_eligible_checks`, `lazy_snapshot_full_fallbacks`,
 `lazy_snapshot_dirty_rows_visible`,
@@ -298,7 +308,7 @@ snapshot counters `lazy_snapshot_eligibility_checks`,
 materialization mismatches are counted only by that mismatch counter; they do
 not increment explicit fallback reason counters.
 
-The schema 23 `session_profile_stats.consumer_materialization_counters` object
+The schema 24 `session_profile_stats.consumer_materialization_counters` object
 has exactly `available=true`,
 `schema_semantics="batch_6_materialization_boundaries"`,
 `owner_batch="Batch 6"`, and numeric counters
@@ -317,7 +327,7 @@ counters. The `surface_session_resize_smoke_boundary`,
 `surface_session_alternate_buffer_smoke_boundary`,
 `surface_session_style_color_mode_smoke_boundary`, and
 `surface_session_hyperlink_smoke_boundary` scenarios are Batch 1 smoke
-boundaries, not lazy fallback decision runs. Schema 23 includes text coalescing
+boundaries, not lazy fallback decision runs. Schema 24 includes text coalescing
 counters:
 `text_coalescing_candidate_groups`, `text_coalescing_enabled_groups`,
 `text_resource_runs_before_coalescing`, and
@@ -349,6 +359,13 @@ sequence and requires `Qsg_atlas_render_node::prepare`,
 
 `vnm_terminal_embedded_benchmark_validate` is structural validation under the
 configured Qt runtime path, not a performance comparison.
+`vnm_terminal_embedded_benchmark_publication_candidate_validate` is the
+profiling-off structural lane for
+`publication_candidate_no_materialization`; validation requires zero consumer
+materialization counters for the sparse surface-session evidence scenarios.
+`vnm_terminal_embedded_benchmark_require_requested_grid_rejects_mismatch`
+expects a deliberate requested-grid mismatch to fail and validates the emitted
+schema fields and diagnostic.
 `vnm_terminal_embedded_benchmark_profile_validate` covers the Batch 1 sparse,
 selection, public projection, resize, viewport, alternate-buffer,
 style/color/mode, and hyperlink smoke-boundary scenarios for schema, profile,
@@ -356,10 +373,30 @@ route-count, and scope-timing validation. It is not an interleaved A/B
 performance decision run. Use no-profile Release benchmark runs for
 user-visible timing. Use profiling-enabled Release runs only for attribution,
 route counts, and scope timing.
+`vnm_terminal_embedded_benchmark_profile_publication_candidate_validate` is the
+profiling-on companion for the candidate no-materialization evidence lane.
 
 Benchmark comparisons should record the build directory, profiling state,
 renderer backend, scenario list, grid, window size, warmup count, iteration
 count, command line, output JSON, and any profile artifacts.
+
+Batch 10 lazy-publication decision evidence must use the sparse surface-session
+scenarios with `--require-requested-grid` so a window-manager clamp cannot
+silently substitute another grid. The full-size matrix remains
+`--grid 235x873 --window-size 6984x3760 --dirty-rows 8 --dirty-row-stride 7`
+for both `surface_session_sparse_ascii_output` and
+`surface_session_sparse_block_graphics_output`. If the machine cannot create
+that requested grid, the run must fail validation and move to a reviewed
+machine requirement or matrix amendment instead of being treated as substitute
+evidence. The local `48x160` CTest lanes are structural validation, not
+decision-grade performance evidence.
+
+Use the default `row_view_parity_test` mode when the run is proving row-view
+equivalence. Use `--lazy-snapshot-evidence-mode` with
+`publication_candidate_no_materialization` for the Batch 9/10 candidate
+evidence lane; it measures the normal full-output production publication path
+and then exercises the candidate lazy composer without publishing it or
+materializing the row view for parity.
 
 ## CMake Consumers
 

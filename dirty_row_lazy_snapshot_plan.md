@@ -1345,90 +1345,109 @@ Reviewers should classify findings as:
 
 ## 18. Current Handoff
 
-Batch 8 reviewed the default production enablement gate on 2026-06-13 and
-intentionally deferred default lazy publication. Production publication remains
-fully materialized: `Terminal_session::publish_render_snapshot()` still builds
-and publishes the full `Terminal_screen_model::render_snapshot()` result. The
-only lazy publication path remains the explicit test/benchmark exercise bridge.
+Batch 9 is ready for review. It did not enable default lazy publication.
+Production publication remains fully materialized:
+`Terminal_session::publish_render_snapshot()` still builds and publishes the
+full `Terminal_screen_model::render_snapshot()` result. The lazy path remains an
+explicit internal test/benchmark evidence bridge.
 
-The blocker is missing decision-grade end-to-end evidence, not a correctness
-failure in the predecessor batches:
+Batch 9 implementation record, 2026-06-13:
 
-- The required full-size D3D11 surface/session benchmark invocation failed on
-  this workstation before measurement. Command:
+- Embedded benchmark schema 24 adds `lazy_snapshot_evidence_mode` metadata to
+  root, scenario, and profile output. The default remains
+  `row_view_parity_test`, preserving the Batch 6 parity materialization and
+  counters.
+- `publication_candidate_no_materialization` exercises the candidate lazy
+  composer after the normal full-output production publication/render wait and
+  validates zero consumer row-view materialization calls, rows, and cells. This
+  is evidence plumbing only; it does not publish lazy snapshots by default.
+- `--require-requested-grid` records and validates the workstation-size
+  boundary. Validation fails if a surface/session scenario's actual grid differs
+  from `--grid`, so a clamped desktop cannot silently substitute another matrix.
+- `compose_lazy_render_snapshot_for_benchmark_evidence()` is the only new
+  internal surface/session hook. Existing testing entry points keep
+  `row_view_parity_test` behavior.
+- Transcript/replay materialization, geometry-derived snapshot optimization,
+  and public projection expansion were intentionally not done. They remain on
+  the existing row-view extraction, counted direct-cell output, and full public
+  projection contracts.
+- No ownerless Batch 9 diagnostics, counters, or benchmark-only switches were
+  found. Existing counters remain active because they are still part of the
+  Batch 10 evidence contract.
 
-  ```powershell
-  vnm_terminal_embedded_benchmark.exe `
-      --scenario surface_session_sparse_ascii_output `
-      --scenario surface_session_sparse_block_graphics_output `
-      --iterations 1 `
-      --warmup 0 `
-      --grid 235x873 `
-      --window-size 6984x3760 `
-      --dirty-rows 8 `
-      --dirty-row-stride 7 `
-      --quiet `
-      --validate-json
-  ```
+The full-size decision matrix is still the Batch 8 matrix:
 
-  Result: exit code 1, both sparse scenarios `status=failed`,
-  requested grid `235x873`, actual grid `276x970`,
-  `actual_grid_matches_request=false`; Qt reported the requested
-  `8730x4700` window was clamped to `3844x2135`. The Batch 1 decision matrix
-  requires a machine/desktop setup that can create the requested window instead
-  of silently substituting another grid.
-- The current embedded benchmark can validate schema and counters, but it does
-  not provide an interleaved default-lazy versus full-output production A/B
-  switch. Its lazy path is an opt-in exercise after the production snapshot and
-  render wait.
-- The existing composer result is intentionally test/benchmark-oriented: it
-  performs a `ROW_VIEW_PARITY_TEST` materialization to prove equivalence and
-  count the materialization boundary. That is useful evidence for Batches 6 and
-  7, but it is not a zero-materialization production publication path.
-- Local supported-size runs remain non-decision evidence. A profiling-on
-  `surface_session_sparse_ascii_output` run at `--grid 48x160 --window-size
-  1280x768 --dirty-rows 8 --dirty-row-stride 7 --iterations 3 --warmup 1`
-  passed and reported zero lazy full fallbacks, but production still reported
-  full snapshot publications and the opt-in exercise reported row-view parity
-  materialization. The same size also reported
-  `actual_grid_matches_request=false`, so it cannot substitute for the
-  full-size Batch 8 matrix.
+```powershell
+vnm_terminal_embedded_benchmark.exe `
+    --scenario surface_session_sparse_ascii_output `
+    --scenario surface_session_sparse_block_graphics_output `
+    --iterations <decision-count> `
+    --warmup <decision-warmup> `
+    --grid 235x873 `
+    --window-size 6984x3760 `
+    --dirty-rows 8 `
+    --dirty-row-stride 7 `
+    --require-requested-grid `
+    --validate-json
+```
 
-The Batch 8 reviewer blocker for this handoff is the defer-trap in this
-section: an unnamed "later batch" deferral would cancel the default-lazy
-publication evidence work. Batch 9 is the concrete successor owner for the
-deferred evidence plumbing and the workstation-size benchmark decision because
-it is the remaining implementation/cleanup batch. Batch 10 remains final
-validation and handoff; it consumes accepted Batch 9 evidence and must not be
-the first owner of missing benchmark plumbing.
+The candidate evidence lane adds:
 
-Batch 9 owns the relevant file and area list for this evidence decision:
+```powershell
+--lazy-snapshot-evidence-mode publication_candidate_no_materialization
+```
 
-- `benchmarks/embedded_terminal/CMakeLists.txt` and
-  `benchmarks/embedded_terminal/embedded_terminal_benchmark.cpp` for any
-  reviewed production A/B benchmark switch, scenario plumbing,
-  schema/counter validation, or workstation-size matrix amendment.
-- `src/terminal_session.cpp`,
-  `include/vnm_terminal/internal/terminal_session.h`,
-  `src/vnm_terminal_surface.cpp`, and
-  `include/vnm_terminal/internal/vnm_terminal_surface_render_bridge.h` only for
-  the minimal reviewed evidence hook needed to compare full-output production
-  publication with the candidate lazy publication path without enabling it by
-  default.
-- `docs/repository_guide.md` and this plan for schema/command/matrix
-  documentation, the accepted workstation or amended-size decision, and the
-  handoff into Batch 10 final validation.
+If the workstation cannot create the requested grid, validation must fail and
+the run must move to a reviewed machine requirement or reviewed matrix
+amendment. Local `48x160` CTest-sized lanes are structural validation only, not
+decision-grade performance evidence.
 
-Do not enable default lazy publication until Batch 9 supplies comparable
-profiling-off and profiling-on evidence that reports snapshot construction,
-frame building, QSG prepare, memory retention, renderer FPS/paint latency,
-fallback counts, and materialization counts in the same comparison, with ASCII
-median/p95 non-regression, user-visible dense block-character improvement, zero
-eligible-workload full fallback, zero unexpected production consumer
-materialization, and retained snapshot memory within the Batch 4 policy.
+Batch 9 validation:
 
-Until that evidence exists, public projection and detached projections stay on
-their explicit full-output contracts, geometry-derived snapshots stay on their
-counted direct-cell adaptation/output contract, transcript/replay stays on
-row-view full logical extraction, and all fallback/materialization counters
-remain active.
+- `git diff --check` passed.
+- Profiling-off build passed for `vnm_terminal_render_snapshot`,
+  `vnm_terminal_render_frame`, `vnm_terminal_profile_text`,
+  `vnm_terminal_embedded_benchmark`, `vnm_terminal_backend_session`, and
+  `vnm_terminal_surface_host`.
+- Profiling-on build passed for the same targets.
+- Profiling-off CTest passed: `vnm_terminal_embedded_benchmark_validate`,
+  `vnm_terminal_profile_text`, `vnm_terminal_render_snapshot`,
+  `vnm_terminal_render_frame`, `vnm_terminal_surface_host`, and
+  `vnm_terminal_backend_session`.
+- Profiling-on CTest passed: `vnm_terminal_embedded_benchmark_profile_validate`,
+  `vnm_terminal_profile_text`, `vnm_terminal_render_snapshot`,
+  `vnm_terminal_render_frame`, `vnm_terminal_surface_host`, and
+  `vnm_terminal_backend_session`.
+- Structural candidate smoke passed with schema 24 and
+  `publication_candidate_no_materialization`; both sparse surface/session
+  scenarios had seven lazy exercise attempts and zero consumer materialization
+  calls, rows, and cells.
+- Profiling-on candidate smoke also passed with
+  `publication_candidate_no_materialization`; profile output reported
+  `status=ok`, and both sparse surface/session scenarios had one eligible lazy
+  exercise attempt with zero consumer materialization calls, rows, and cells.
+
+Batch 9 audit results:
+
+- `rg "\.cells\b|->cells\b" include src tools benchmarks tests docs
+  dirty_row_lazy_snapshot_plan.md` still resolves to intentional producers,
+  explicit materialization/parity boundaries, public-projection rows, model and
+  history-row storage, unicode-width result fields, fixtures, tests, and
+  benchmark accounting. The touched lazy composer only clears flat cells for the
+  candidate lazy snapshot and compares the optional parity materialization
+  against the full production snapshot.
+- `rg "render_snapshot_cells_by_position" include src tools benchmarks tests
+  docs dirty_row_lazy_snapshot_plan.md` has no current code call sites; only
+  this plan names the audit.
+- `rg "selected_text_from_render_snapshot" include src tools benchmarks tests
+  docs dirty_row_lazy_snapshot_plan.md` confirms the canonical helper in
+  `render_snapshot.h` and its surface, transcript, replay, session, and test
+  call sites. No alternate selection path was added.
+- Alias check for `safe_basis.cells` and `public_snapshot.cells` found no
+  current code call sites.
+
+Batch 10 final evidence gate is next. It consumes this Batch 9 plumbing and
+must run matched profiling-off and profiling-on full-size evidence with
+`--require-requested-grid`, including the
+`publication_candidate_no_materialization` lane, before any reviewed default
+lazy publication decision.

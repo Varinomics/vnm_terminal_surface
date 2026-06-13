@@ -53,6 +53,12 @@ enum class Terminal_lazy_snapshot_fallback_reason
     UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH,
 };
 
+enum class Terminal_lazy_snapshot_evidence_mode
+{
+    ROW_VIEW_PARITY_TEST,
+    PUBLICATION_CANDIDATE_NO_MATERIALIZATION,
+};
+
 struct Terminal_lazy_snapshot_fallback_reason_counters
 {
     std::uint64_t missing_previous_content_snapshot        = 0U;
@@ -391,6 +397,12 @@ public:
     void set_profile_stats_enabled(bool enabled);
     Terminal_screen_model_profile_stats model_profile_stats() const;
     Terminal_session_profile_stats profile_stats() const;
+    Terminal_session_lazy_snapshot_composer_result
+        compose_lazy_render_snapshot_for_benchmark_evidence(
+            std::shared_ptr<const Terminal_render_snapshot> previous_content_snapshot,
+            const Terminal_render_snapshot& full_snapshot,
+            Terminal_lazy_snapshot_evidence_mode evidence_mode,
+            bool unsupported_geometry_or_detached_snapshot_path = false);
     Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_testing(
         std::shared_ptr<const Terminal_render_snapshot> previous_content_snapshot,
         const Terminal_render_snapshot& full_snapshot,
