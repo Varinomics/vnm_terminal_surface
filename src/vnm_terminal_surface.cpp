@@ -1173,6 +1173,84 @@ bool atlas_capture_has_full_dirty_range(const term::Terminal_render_snapshot& sn
         snapshot.dirty_row_ranges.front().row_count >= visible_rows;
 }
 
+void append_atlas_capture_dirty_rows(
+    std::vector<int>& rows,
+    const std::vector<term::Terminal_render_dirty_row_range>& ranges,
+    int row_count)
+{
+    for (const term::Terminal_render_dirty_row_range& range : ranges) {
+        const int first_row = std::clamp(range.first_row, 0, row_count);
+        const int end_row   = std::clamp(
+            range.first_row + range.row_count,
+            first_row,
+            row_count);
+        for (int row = first_row; row < end_row; ++row) {
+            rows.push_back(row);
+        }
+    }
+}
+
+int atlas_capture_sparse_descriptor_row_count(
+    const term::Captured_atlas_frame& frame)
+{
+    if (frame.snapshot == nullptr) {
+        return 0;
+    }
+
+    const term::Terminal_render_snapshot& snapshot = *frame.snapshot;
+    const int visible_rows = std::max(0, snapshot.grid_size.rows);
+    if (snapshot.lazy_row_payloads == nullptr ||
+        snapshot.grid_size.rows    <= 0       ||
+        snapshot.grid_size.columns <= 0       ||
+        snapshot.dirty_row_ranges.empty()     ||
+        atlas_capture_has_full_dirty_range(snapshot) ||
+        frame.options.underline_hyperlinks)
+    {
+        return visible_rows;
+    }
+
+    std::vector<int> rows;
+    append_atlas_capture_dirty_rows(
+        rows,
+        snapshot.dirty_row_ranges,
+        snapshot.grid_size.rows);
+
+    const bool cursor_in_grid =
+        snapshot.cursor.position.row    >= 0 &&
+        snapshot.cursor.position.column >= 0 &&
+        snapshot.cursor.position.row    < snapshot.grid_size.rows &&
+        snapshot.cursor.position.column < snapshot.grid_size.columns;
+    const bool cursor_blink_enabled =
+        frame.options.cursor_blink_enabled_override.value_or(
+            snapshot.cursor.blink_enabled);
+    const bool cursor_visible =
+        cursor_in_grid &&
+        snapshot.cursor.visible &&
+        (!cursor_blink_enabled || frame.cursor_blink_visible);
+    if (cursor_visible) {
+        rows.push_back(snapshot.cursor.position.row);
+    }
+
+    if (frame.ime_preedit.active && !frame.ime_preedit.text.isEmpty()) {
+        rows.push_back(std::clamp(
+            snapshot.cursor.position.row,
+            0,
+            snapshot.grid_size.rows - 1));
+    }
+
+    rows.erase(
+        std::remove_if(
+            rows.begin(),
+            rows.end(),
+            [&](int row) {
+                return row < 0 || row >= snapshot.grid_size.rows;
+            }),
+        rows.end());
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    return static_cast<int>(rows.size());
+}
+
 std::uint64_t atlas_frame_snapshot_sequence(const term::Captured_atlas_frame& frame)
 {
     return frame.snapshot != nullptr
@@ -1192,6 +1270,8 @@ term::terminal_renderer_stats_t atlas_renderer_stats_for_capture(
     const int visible_rows = std::max(0, snapshot.grid_size.rows);
     const int columns      = std::max(0, snapshot.grid_size.columns);
     const int dirty_rows   = atlas_capture_dirty_row_count(snapshot);
+    const int frame_descriptor_rows =
+        atlas_capture_sparse_descriptor_row_count(frame);
 
     stats.frame.visible_rows    = visible_rows;
     stats.frame.dirty_rows      = dirty_rows;
@@ -1201,24 +1281,28 @@ term::terminal_renderer_stats_t atlas_renderer_stats_for_capture(
         static_cast<int>(snapshot.dirty_row_ranges.size());
     stats.frame_background_rects = 1;
     stats.frame.cell_pass_input_cells =
-        dirty_rows * columns;
+        frame_descriptor_rows * columns;
     stats.frame.cells_considered =
         stats.frame.cell_pass_input_cells;
     stats.frame.dirty_row_lookup_count =
         stats.frame.cell_pass_input_cells;
     stats.frame.cells_rendered =
         stats.frame.cell_pass_input_cells;
+    stats.frame.row_descriptors_built =
+        frame_descriptor_rows;
+    stats.frame.layer_descriptors_built = 13;
+    stats.qsg_layer_descriptors         = 0;
 
-    stats.text_content_rebuilds = dirty_rows;
-    stats.atlas_work_created    = dirty_rows;
-    stats.text_runs_considered  = dirty_rows;
-    stats.text_key_builds       = dirty_rows;
+    stats.text_content_rebuilds = frame_descriptor_rows;
+    stats.atlas_work_created    = frame_descriptor_rows;
+    stats.text_runs_considered  = frame_descriptor_rows;
+    stats.text_key_builds       = frame_descriptor_rows;
     stats.text_key_bytes        = static_cast<std::uint64_t>(
         stats.frame.cell_pass_input_cells);
     stats.cache_key_builds        = stats.text_key_builds;
     stats.cache_key_bytes         = stats.text_key_bytes;
 
-    stats.background_rows_rebuilt = dirty_rows;
+    stats.background_rows_rebuilt = frame_descriptor_rows;
     return stats;
 }
 

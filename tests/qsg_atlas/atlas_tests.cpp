@@ -27,6 +27,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLatin1Char>
+#include <QLibraryInfo>
 #include <QMetaObject>
 #include <QPainter>
 #include <QSaveFile>
@@ -221,6 +222,97 @@ bool has_argument(int argc, char** argv, const char* expected)
     }
 
     return false;
+}
+
+void set_test_environment_if_empty(const char* name, const QByteArray& value)
+{
+    if (qEnvironmentVariableIsEmpty(name)) {
+        qputenv(name, value);
+    }
+}
+
+bool platform_plugins_support_offscreen(const QString& path)
+{
+    const QDir platforms(path);
+    if (!platforms.exists()) {
+        return false;
+    }
+
+#if defined(Q_OS_WIN)
+    return
+        platforms.exists(QStringLiteral("qoffscreen.dll")) ||
+        platforms.exists(QStringLiteral("qoffscreend.dll"));
+#elif defined(Q_OS_MACOS)
+    return
+        platforms.exists(QStringLiteral("libqoffscreen.dylib")) ||
+        platforms.exists(QStringLiteral("libqoffscreend.dylib"));
+#else
+    return
+        platforms.exists(QStringLiteral("libqoffscreen.so")) ||
+        platforms.exists(QStringLiteral("libqoffscreend.so"));
+#endif
+}
+
+void append_platform_plugin_candidate(
+    std::vector<QString>& candidates,
+    const QString&        path)
+{
+    if (!path.isEmpty()) {
+        candidates.push_back(QDir::cleanPath(path));
+    }
+}
+
+QString offscreen_platform_plugin_path()
+{
+    std::vector<QString> candidates;
+    const QDir plugin_root(QLibraryInfo::path(QLibraryInfo::PluginsPath));
+    append_platform_plugin_candidate(
+        candidates,
+        plugin_root.filePath(QStringLiteral("platforms")));
+
+    const QByteArray qt_dir_value = qgetenv("QTDIR");
+    if (!qt_dir_value.isEmpty()) {
+        const QDir qt_dir(QString::fromLocal8Bit(qt_dir_value));
+        append_platform_plugin_candidate(
+            candidates,
+            qt_dir.filePath(QStringLiteral("plugins/platforms")));
+#if defined(Q_OS_WIN) && defined(_MSC_VER)
+        append_platform_plugin_candidate(
+            candidates,
+            qt_dir.filePath(QStringLiteral("msvc2022_64/plugins/platforms")));
+        append_platform_plugin_candidate(
+            candidates,
+            qt_dir.filePath(QStringLiteral("msvc2019_64/plugins/platforms")));
+#endif
+    }
+
+    for (const QString& path : candidates) {
+        if (platform_plugins_support_offscreen(path)) {
+            return path;
+        }
+    }
+
+    return QString();
+}
+
+void configure_unit_test_qt_environment()
+{
+    set_test_environment_if_empty("QT_QPA_PLATFORM", QByteArrayLiteral("offscreen"));
+    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM_PLUGIN_PATH")) {
+        const QString platform_plugins = offscreen_platform_plugin_path();
+        if (!platform_plugins.isEmpty()) {
+            qputenv(
+                "QT_QPA_PLATFORM_PLUGIN_PATH",
+                QFile::encodeName(platform_plugins));
+        }
+    }
+    set_test_environment_if_empty("QT_SCALE_FACTOR", QByteArrayLiteral("1"));
+    set_test_environment_if_empty("QT_SCREEN_SCALE_FACTORS", QByteArray());
+    set_test_environment_if_empty("QT_AUTO_SCREEN_SCALE_FACTOR", QByteArrayLiteral("0"));
+    set_test_environment_if_empty("QT_DEVICE_PIXEL_RATIO", QByteArray());
+    set_test_environment_if_empty(
+        "QT_SCALE_FACTOR_ROUNDING_POLICY",
+        QByteArrayLiteral("PassThrough"));
 }
 
 QByteArray byte_array(std::initializer_list<int> values)
@@ -6471,7 +6563,7 @@ bool test_source_posture()
         prepare_atlas_instances_call,
         prepare_pos);
     const qsizetype prepare_instances_def_pos = atlas_source.indexOf(
-        QByteArrayLiteral("Atlas_prepare_result prepare_atlas_instances(QRhi* rhi)"));
+        QByteArrayLiteral("Atlas_prepare_result prepare_atlas_instances("));
     const qsizetype frame_build_pos = atlas_source.indexOf(
         QByteArrayLiteral("build_terminal_render_frame("));
     ok &= check(
@@ -6523,6 +6615,30 @@ bool test_source_posture()
             atlas_source.indexOf(msdf_buffer_retry_decision, prepare_pos) <
                 render_pos,
         "atlas prepare uses the typed MSDF buffer fallback retry decision");
+    ok &= check(
+        atlas_source.contains(QByteArrayLiteral("while (!buffers_ready)")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "std::optional<Qsg_atlas_render_summary> msdf_failure_render")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "qsg_atlas_merge_msdf_text_failure_diagnostics(")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "retry_with_populated_frame_upload();")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "retry_without_msdf_text_ownership();")),
+        "atlas buffer update retry loop preserves MSDF diagnostics across populated-frame retries");
+    ok &= check(
+        atlas_source.contains(QByteArrayLiteral(
+            "sparse_msdf_text_requires_full_cell_walk(render_frame)")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "source_snapshot_uses_lazy_row_payloads()")) &&
+            atlas_source.contains(QByteArrayLiteral(
+                "qsg_atlas_text_renderer_policy_allows_msdf(")),
+        "atlas prepare forces full cell walks for sparse/lazy frames that can route through MSDF");
+    ok &= check(
+        !atlas_source.contains(QByteArrayLiteral(
+            "QByteArray qsg_layer_descriptor_key(")) &&
+            !atlas_source.contains(QByteArrayLiteral("keys.qsg_layers")),
+        "atlas source does not build unused qsg layer descriptor keys");
     ok &= check(
         atlas_source.contains(QByteArrayLiteral(
             "m_resources_ready = rect_ready && gpu_resources_ready && buffers_ready")),
@@ -8307,6 +8423,26 @@ bool test_atlas_row_stable_glyph_planner()
         {1, 2, row_capacity},
         {2, 4, row_capacity},
     };
+    term::Qsg_atlas_buffer_upload_planner no_source_planner;
+    const term::Qsg_atlas_buffer_update_plan unseeded_preserve =
+        no_source_planner.plan({
+            1,
+            0,
+            row_count,
+            static_cast<int>(sizeof(Buffer_update_test_instance)),
+            dirty_row_grown_bytes.constData(),
+            static_cast<int>(dirty_row_grown_bytes.size()),
+            &rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+            6,
+            true,
+            nullptr,
+            true,
+        });
     (void)planner.plan({
         1,
         0,
@@ -8411,6 +8547,43 @@ bool test_atlas_row_stable_glyph_planner()
             true,
         });
 
+    term::Qsg_atlas_buffer_upload_planner preserve_planner;
+    (void)preserve_planner.plan({
+        1,
+        0,
+        row_count,
+        static_cast<int>(sizeof(Buffer_update_test_instance)),
+        base_bytes.constData(),
+        static_cast<int>(base_bytes.size()),
+        &rows,
+        layout_key,
+        {},
+        false,
+        false,
+        false,
+        5,
+        true,
+    });
+    const term::Qsg_atlas_buffer_update_plan clean_slot_preserved =
+        preserve_planner.plan({
+            1,
+            0,
+            row_count,
+            static_cast<int>(sizeof(Buffer_update_test_instance)),
+            clean_row_and_dirty_row_changed_bytes.constData(),
+            static_cast<int>(clean_row_and_dirty_row_changed_bytes.size()),
+            &rows,
+            layout_key,
+            dirty_row_1,
+            false,
+            false,
+            false,
+            6,
+            true,
+            nullptr,
+            true,
+        });
+
     term::Qsg_atlas_buffer_upload_planner row_span_planner;
     (void)row_span_planner.plan({
         1,
@@ -8449,6 +8622,14 @@ bool test_atlas_row_stable_glyph_planner()
         });
 
     bool ok = true;
+    ok &= check(unseeded_preserve.summary.row_stable_layout &&
+            unseeded_preserve.summary.rotating_slot_seed_upload &&
+            unseeded_preserve.summary.full_upload_requires_populated_frame &&
+            unseeded_preserve.summary.skipped_upload &&
+            !unseeded_preserve.summary.full_upload &&
+            unseeded_preserve.ranges.empty(),
+        "atlas row-stable glyph planner refuses unseeded sparse full uploads "
+        "when no clean-row source exists");
     ok &= check(dirty.summary.row_stable_layout &&
             dirty.summary.active_instance_count == 6 &&
             dirty.summary.instance_count == row_count * row_capacity,
@@ -8495,6 +8676,145 @@ bool test_atlas_row_stable_glyph_planner()
                 static_cast<int>(clean_row_and_dirty_row_changed_bytes.size()),
         "atlas row-stable glyph planner full-uploads when a clean-row slot "
         "changes beside dirty-row content");
+    ok &= check(clean_slot_preserved.summary.row_stable_layout &&
+            clean_slot_preserved.summary.partial_upload &&
+            !clean_slot_preserved.summary.full_upload &&
+            !clean_slot_preserved.summary.non_dirty_state_upload &&
+            clean_slot_preserved.ranges.size() == 1U &&
+            clean_slot_preserved.ranges.front().byte_offset ==
+                static_cast<int>(3U * sizeof(Buffer_update_test_instance)) &&
+            clean_slot_preserved.ranges.front().byte_count ==
+                static_cast<int>(sizeof(Buffer_update_test_instance)),
+        "atlas row-stable glyph planner preserves borrowed clean-row slots "
+        "instead of full-uploading sparse default bytes");
+    return ok;
+}
+
+bool test_atlas_populated_frame_retry_planner_transaction()
+{
+    constexpr int row_count    = 3;
+    constexpr int row_capacity = 2;
+    const std::vector<int> rows = {
+        0, 0,
+        1, 1,
+        2, 2,
+    };
+    const std::vector<term::Qsg_atlas_row_stable_range> row_stable_ranges = {
+        {0, 0, row_capacity},
+        {1, 2, row_capacity},
+        {2, 4, row_capacity},
+    };
+    const QByteArray layout_key = QByteArrayLiteral("populated-frame-retry-layout");
+    const std::vector<term::Terminal_render_dirty_row_range> dirty_row_1 = {{1, 1}};
+
+    std::vector<Buffer_update_test_instance> base = {
+        {0, 10}, {0, 11},
+        {1, 20}, {1, 0},
+        {2, 30}, {2, 31},
+    };
+    std::vector<Buffer_update_test_instance> dirty_row_changed = base;
+    dirty_row_changed[2] = {1, 21};
+    dirty_row_changed[3] = {1, 23};
+    const QByteArray base_bytes = buffer_update_instance_bytes(base);
+    const QByteArray dirty_row_changed_bytes =
+        buffer_update_instance_bytes(dirty_row_changed);
+
+    const auto make_input = [&](
+            const QByteArray& bytes,
+            const std::vector<term::Terminal_render_dirty_row_range>& dirty_rows,
+            bool preserve_clean_row_slots)
+        {
+            term::Qsg_atlas_buffer_update_input input;
+            input.frames_in_flight          = 1;
+            input.frame_slot                = 0;
+            input.row_count                 = row_count;
+            input.instance_size             =
+                static_cast<int>(sizeof(Buffer_update_test_instance));
+            input.bytes                     = bytes.constData();
+            input.byte_count                = static_cast<int>(bytes.size());
+            input.instance_rows             = &rows;
+            input.layout_key                = layout_key;
+            input.dirty_row_ranges          = dirty_rows;
+            input.active_instance_count     =
+                static_cast<int>(dirty_row_changed.size());
+            input.row_stable_layout         = true;
+            input.row_stable_ranges         = &row_stable_ranges;
+            input.preserve_clean_row_slots  = preserve_clean_row_slots;
+            return input;
+        };
+
+    term::Qsg_atlas_buffer_upload_planner rect_planner;
+    term::Qsg_atlas_buffer_upload_planner glyph_planner;
+    term::Qsg_atlas_buffer_upload_planner msdf_text_planner;
+    (void)rect_planner.plan(make_input(base_bytes, {}, false));
+    (void)glyph_planner.plan(make_input(base_bytes, {}, false));
+
+    const term::Qsg_atlas_buffer_upload_planner_state rect_state =
+        rect_planner.snapshot();
+    const term::Qsg_atlas_buffer_upload_planner_state glyph_state =
+        glyph_planner.snapshot();
+    const term::Qsg_atlas_buffer_upload_planner_state msdf_text_state =
+        msdf_text_planner.snapshot();
+
+    const term::Qsg_atlas_buffer_update_plan abandoned_rect =
+        rect_planner.plan(make_input(dirty_row_changed_bytes, dirty_row_1, false));
+    const term::Qsg_atlas_buffer_update_plan abandoned_glyph =
+        glyph_planner.plan(make_input(dirty_row_changed_bytes, dirty_row_1, false));
+    const term::Qsg_atlas_buffer_update_plan abandoned_msdf_text =
+        msdf_text_planner.plan(
+            make_input(dirty_row_changed_bytes, dirty_row_1, true));
+
+    if (abandoned_rect.summary.full_upload_requires_populated_frame ||
+        abandoned_glyph.summary.full_upload_requires_populated_frame ||
+        abandoned_msdf_text.summary.full_upload_requires_populated_frame)
+    {
+        rect_planner.restore(rect_state);
+        glyph_planner.restore(glyph_state);
+        msdf_text_planner.restore(msdf_text_state);
+    }
+
+    const term::Qsg_atlas_buffer_update_plan retry_rect =
+        rect_planner.plan(make_input(dirty_row_changed_bytes, dirty_row_1, false));
+    const term::Qsg_atlas_buffer_update_plan retry_glyph =
+        glyph_planner.plan(make_input(dirty_row_changed_bytes, dirty_row_1, false));
+    const term::Qsg_atlas_buffer_update_plan retry_msdf_text =
+        msdf_text_planner.plan(
+            make_input(dirty_row_changed_bytes, dirty_row_1, false));
+
+    term::Qsg_atlas_buffer_upload_planner recreated_planner;
+    (void)recreated_planner.plan(make_input(base_bytes, {}, false));
+    recreated_planner.reset();
+    const term::Qsg_atlas_buffer_upload_planner_state recreated_state =
+        recreated_planner.snapshot();
+    const term::Qsg_atlas_buffer_update_plan abandoned_recreated =
+        recreated_planner.plan(
+            make_input(dirty_row_changed_bytes, dirty_row_1, true));
+    if (abandoned_recreated.summary.full_upload_requires_populated_frame) {
+        recreated_planner.restore(recreated_state);
+    }
+    const term::Qsg_atlas_buffer_update_plan recreated_retry =
+        recreated_planner.plan(
+            make_input(dirty_row_changed_bytes, dirty_row_1, false));
+
+    bool ok = true;
+    ok &= check(abandoned_rect.summary.partial_upload &&
+            abandoned_glyph.summary.partial_upload &&
+            abandoned_msdf_text.summary.full_upload_requires_populated_frame,
+        "atlas populated-frame retry transaction reproduces sibling side effects");
+    ok &= check(retry_rect.summary.partial_upload &&
+            retry_rect.summary.uploaded_bytes > 0,
+        "atlas populated-frame retry transaction restores rect planner state");
+    ok &= check(retry_glyph.summary.partial_upload &&
+            retry_glyph.summary.uploaded_bytes > 0,
+        "atlas populated-frame retry transaction restores glyph planner state");
+    ok &= check(retry_msdf_text.summary.full_upload &&
+            retry_msdf_text.summary.uploaded_bytes ==
+                retry_msdf_text.summary.buffer_bytes,
+        "atlas populated-frame retry transaction seeds MSDF planner on retry");
+    ok &= check(abandoned_recreated.summary.full_upload_requires_populated_frame &&
+            recreated_retry.summary.full_upload &&
+            recreated_retry.summary.rotating_slot_seed_upload,
+        "atlas populated-frame retry transaction treats recreated buffers as unseeded");
     return ok;
 }
 
@@ -8663,6 +8983,69 @@ bool test_msdf_text_prepare_fallback_retry_decision()
             true,
             false),
         "MSDF text prepare fallback retry requires a failed MSDF prepare resource");
+    return ok;
+}
+
+bool test_msdf_text_failure_diagnostics_merge()
+{
+    term::Qsg_atlas_render_summary failed;
+    failed.msdf_text_supported_runs          = 3;
+    failed.msdf_text_missed_supported_runs   = 2;
+    failed.msdf_text_missed_supported_glyphs = 7;
+    failed.msdf_text_atlas_built             = true;
+    failed.msdf_text_atlas_ready             = true;
+    failed.msdf_text_texture_ready           = true;
+    failed.msdf_text_texture_uploaded        = true;
+    failed.msdf_text_cache_miss              = true;
+    failed.msdf_text_atlas_build_attempted   = true;
+    failed.msdf_text_atlas_build_succeeded   = true;
+    failed.msdf_text_baked_pixel_height      = 48;
+    failed.msdf_text_atlas_generation        = 5U;
+    failed.msdf_text_resources_ready         = true;
+    failed.msdf_text_renderer_active         = true;
+    failed.msdf_text_font_data_bytes         = 8192;
+    failed.msdf_text_pixel_height            = 21;
+    failed.msdf_text_atlas_size              = 2048;
+    failed.msdf_text_px_range                = 10.0f;
+    failed.msdf_text_message = QStringLiteral(
+        "MSDF text resources unavailable; using shaped glyph fallback");
+
+    term::Qsg_atlas_render_summary populated_retry;
+    populated_retry.msdf_text_supported_runs          = 1;
+    populated_retry.msdf_text_missed_supported_runs   = 1;
+    populated_retry.msdf_text_missed_supported_glyphs = 1;
+    populated_retry.msdf_text_message                 = QStringLiteral("ok");
+
+    term::qsg_atlas_merge_msdf_text_failure_diagnostics(
+        failed,
+        populated_retry);
+
+    bool ok = true;
+    ok &= check(populated_retry.msdf_text_supported_runs == 3 &&
+            populated_retry.msdf_text_missed_supported_runs == 3 &&
+            populated_retry.msdf_text_missed_supported_glyphs == 8,
+        "MSDF diagnostics merge preserves failure counters across populated retry");
+    ok &= check(populated_retry.msdf_text_atlas_built &&
+            populated_retry.msdf_text_atlas_ready &&
+            populated_retry.msdf_text_texture_ready &&
+            populated_retry.msdf_text_texture_uploaded &&
+            populated_retry.msdf_text_cache_miss &&
+            populated_retry.msdf_text_atlas_build_attempted &&
+            populated_retry.msdf_text_atlas_build_succeeded,
+        "MSDF diagnostics merge preserves resource and baked-cache evidence");
+    ok &= check(!populated_retry.msdf_text_resources_ready &&
+            !populated_retry.msdf_text_renderer_active,
+        "MSDF diagnostics merge keeps fallback resource state inactive");
+    ok &= check(populated_retry.msdf_text_baked_pixel_height == 48 &&
+            populated_retry.msdf_text_atlas_generation == 5U &&
+            populated_retry.msdf_text_font_data_bytes == 8192 &&
+            populated_retry.msdf_text_pixel_height == 21 &&
+            populated_retry.msdf_text_atlas_size == 2048 &&
+            std::abs(populated_retry.msdf_text_px_range - 10.0f) <= 0.0001f,
+        "MSDF diagnostics merge preserves sizing diagnostics");
+    ok &= check(
+        populated_retry.msdf_text_message == failed.msdf_text_message,
+        "MSDF diagnostics merge preserves failure message across populated retry");
     return ok;
 }
 
@@ -10255,6 +10638,125 @@ term::Terminal_render_snapshot make_atlas_row_stable_text_snapshot(
         std::move(dirty_row_ranges));
 }
 
+term::Terminal_render_snapshot_row_payload_ref row_payload_ref(
+    std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> owner,
+    std::size_t                                                            row)
+{
+    term::Terminal_render_snapshot_row_payload_ref ref;
+    ref.owner         = std::move(owner);
+    ref.payload_index = row;
+    return ref;
+}
+
+term::Terminal_render_snapshot lazy_snapshot_from_flat(
+    const term::Terminal_render_snapshot& snapshot)
+{
+    const term::Terminal_render_snapshot_row_payload_namespace metadata_namespace = {
+        97U,
+        131U,
+    };
+    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> owner =
+        term::render_snapshot_row_payload_owner_from_snapshot(
+            snapshot,
+            metadata_namespace,
+            snapshot.metadata.sequence);
+
+    auto payloads = std::make_shared<term::Terminal_render_snapshot_lazy_payloads>();
+    payloads->receiving_namespace = metadata_namespace;
+    payloads->rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
+    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
+        const std::optional<term::Terminal_render_snapshot_lazy_row_payload> payload =
+            term::borrowed_render_snapshot_lazy_row_payload(
+                row_payload_ref(owner, static_cast<std::size_t>(row)),
+                metadata_namespace,
+                {},
+                {});
+        if (payload.has_value()) {
+            payloads->rows.push_back(*payload);
+        }
+    }
+
+    term::Terminal_render_snapshot lazy = snapshot;
+    lazy.cells.clear();
+    lazy.lazy_row_payloads = std::move(payloads);
+    return lazy;
+}
+
+term::Terminal_render_snapshot make_atlas_row_stable_graphic_snapshot(
+    std::uint64_t sequence,
+    term::Terminal_style_id middle_style,
+    std::vector<term::Terminal_render_dirty_row_range>
+                  dirty_row_ranges)
+{
+    term::Terminal_render_snapshot snapshot =
+        make_pixel_base_snapshot({3, 8}, sequence);
+    snapshot.cursor.visible   = false;
+    snapshot.dirty_row_ranges = std::move(dirty_row_ranges);
+    snapshot.styles.push_back(rgb_style(0xff55e6c1U, 0xff101820U));
+    snapshot.styles.push_back(rgb_style(0xffffd166U, 0xff101820U));
+
+    const auto append_block_row =
+        [&](int row, term::Terminal_style_id style_id) {
+            for (int column = 0; column < snapshot.grid_size.columns; ++column) {
+                snapshot.cells.push_back(
+                    make_pixel_cell(
+                        row,
+                        column,
+                        QStringLiteral("\u2588"),
+                        1,
+                        style_id));
+            }
+        };
+    append_block_row(0, 1U);
+    append_block_row(1, middle_style);
+    append_block_row(2, 1U);
+    return snapshot;
+}
+
+term::Terminal_render_snapshot make_atlas_row_stable_graphic_arc_snapshot(
+    std::uint64_t sequence,
+    term::Terminal_style_id middle_style,
+    std::vector<term::Terminal_render_dirty_row_range>
+                  dirty_row_ranges)
+{
+    term::Terminal_render_snapshot snapshot =
+        make_pixel_base_snapshot({3, 8}, sequence);
+    snapshot.cursor.visible   = false;
+    snapshot.dirty_row_ranges = std::move(dirty_row_ranges);
+    snapshot.styles.push_back(rgb_style(0xff55e6c1U, 0xff101820U));
+    snapshot.styles.push_back(rgb_style(0xffffd166U, 0xff101820U));
+
+    const auto append_arc_row =
+        [&](int row, term::Terminal_style_id style_id) {
+            snapshot.cells.push_back(
+                make_pixel_cell(row, 0, QStringLiteral("\u256d"), 1, style_id));
+            snapshot.cells.push_back(
+                make_pixel_cell(row, 1, QStringLiteral("\u256e"), 1, style_id));
+            snapshot.cells.push_back(
+                make_pixel_cell(row, 2, QStringLiteral("\u256f"), 1, style_id));
+            snapshot.cells.push_back(
+                make_pixel_cell(row, 3, QStringLiteral("\u2570"), 1, style_id));
+        };
+    append_arc_row(0, 1U);
+    append_arc_row(1, middle_style);
+    append_arc_row(2, 1U);
+    return snapshot;
+}
+
+void remove_atlas_snapshot_row_cells(
+    term::Terminal_render_snapshot& snapshot,
+    int                             row)
+{
+    snapshot.cells.erase(
+        std::remove_if(
+            snapshot.cells.begin(),
+            snapshot.cells.end(),
+            [row](const term::Terminal_render_cell& cell) {
+                return cell.position.row == row;
+            }),
+        snapshot.cells.end());
+}
+
 bool pump_atlas_seeded_glyph_slots(
     QGuiApplication& app,
     QQuickWindow&    window,
@@ -10266,6 +10768,35 @@ bool pump_atlas_seeded_glyph_slots(
         const term::Qsg_atlas_buffer_update_summary& glyph_buffer =
             report.render.glyph_buffer;
         if (glyph_buffer.seeded_slots >= glyph_buffer.rhi_frames_in_flight) {
+            return true;
+        }
+
+        const std::uint64_t previous_prepare_count = report.prepare_count;
+        if (!pump_next_atlas_report(
+                app,
+                window,
+                surface,
+                previous_prepare_count,
+                report))
+        {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+bool pump_atlas_seeded_rect_slots(
+    QGuiApplication& app,
+    QQuickWindow&    window,
+    VNM_TerminalSurface& surface,
+    term::Qsg_atlas_frame_report& report,
+    int              attempts = 12)
+{
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        const term::Qsg_atlas_buffer_update_summary& rect_buffer =
+            report.render.rect_buffer;
+        if (rect_buffer.seeded_slots >= rect_buffer.rhi_frames_in_flight) {
             return true;
         }
 
@@ -11124,6 +11655,10 @@ bool run_atlas_glyph_row_stable_report_case(
             << " glyph_uploaded=" << glyph_buffer.uploaded_bytes
             << " glyph_buffer_bytes=" << glyph_buffer.buffer_bytes
             << " row_stable=" << glyph_buffer.row_stable_layout
+            << " glyph_active=" << glyph_buffer.active_instance_count
+            << " glyph_instances=" << glyph_buffer.instance_count
+            << " glyph_draw_calls=" << render_summary.glyph_draw_calls
+            << " msdf_draw_calls=" << render_summary.msdf_text_draw_calls
             << " glyph_text_capacity=" << render_summary.glyph_text_row_capacity
             << " glyph_cursor_text_capacity="
             << render_summary.glyph_cursor_text_row_capacity
@@ -11239,18 +11774,436 @@ bool test_atlas_glyph_row_stable_dirty_update(QGuiApplication& app)
     return ok;
 }
 
-bool test_atlas_glyph_row_stable_wide_update(QGuiApplication& app)
+bool test_atlas_rect_row_stable_dense_graphic_update(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_scheme(QStringLiteral("Campbell"));
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_row_stable_graphic_snapshot(
+                936U,
+                1U,
+                {{0, 3}})));
+    window.show();
+    const bool baseline_rendered = pump_until(
+        app,
+        window,
+        surface,
+        atlas_report_render_state_ready);
+    term::Qsg_atlas_frame_report baseline_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    if (!baseline_rendered ||
+        !pump_atlas_seeded_rect_slots(app, window, surface, baseline_report))
+    {
+        std::cerr << "FAIL: atlas rect row-stable dense graphic update could not "
+            << "seed all rect buffer slots"
+            << " prepare_count=" << baseline_report.prepare_count
+            << " seeded_slots=" << baseline_report.render.rect_buffer.seeded_slots
+            << " frames_in_flight="
+            << baseline_report.render.rect_buffer.rhi_frames_in_flight
+            << '\n';
+        return false;
+    }
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_row_stable_graphic_snapshot(
+                937U,
+                2U,
+                {{1, 1}})));
+
+    term::Qsg_atlas_frame_report report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool prepared = pump_next_atlas_report(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        report);
+    const term::Qsg_atlas_buffer_update_summary& rect_buffer =
+        report.render.rect_buffer;
+
+    if (!prepared ||
+        !rect_buffer.partial_upload ||
+        rect_buffer.full_upload ||
+        rect_buffer.non_dirty_state_upload)
+    {
+        std::cerr << "atlas rect row-stable dense graphic update"
+            << " prepared=" << prepared
+            << " rect_full=" << rect_buffer.full_upload
+            << " rect_partial=" << rect_buffer.partial_upload
+            << " rect_non_dirty=" << rect_buffer.non_dirty_state_upload
+            << " rect_uploaded=" << rect_buffer.uploaded_bytes
+            << " rect_buffer_bytes=" << rect_buffer.buffer_bytes
+            << " row_stable=" << rect_buffer.row_stable_layout
+            << " active=" << rect_buffer.active_instance_count
+            << " instances=" << rect_buffer.instance_count
+            << " rect_row_capacity=" << report.render.rect_row_capacity
+            << '\n';
+    }
+
+    bool ok = true;
+    ok &= check(prepared,
+        "atlas rect row-stable dense graphic update reaches a prepared frame");
+    ok &= check(rect_buffer.row_stable_layout &&
+            rect_buffer.active_instance_count < rect_buffer.instance_count &&
+            report.render.rect_row_capacity >= 8,
+        "atlas rect row-stable dense graphic update reserves stable row slots");
+    ok &= check(report.frame_build.rect_instances ==
+            rect_buffer.active_instance_count,
+        "atlas rect row-stable dense graphic update reports active logical rect instances");
+    ok &= check(rect_buffer.partial_upload &&
+            !rect_buffer.full_upload &&
+            !rect_buffer.non_dirty_state_upload &&
+            rect_buffer.uploaded_bytes > 0 &&
+            rect_buffer.uploaded_bytes < rect_buffer.buffer_bytes,
+        "atlas rect row-stable dense graphic update patches dirty-row rect bytes");
+    ok &= check(report.frame_build.frame_row_descriptors > 0 &&
+            report.frame_build.qsg_layer_descriptors == 0,
+        "atlas rect row-stable dense graphic update reports honest descriptor evidence");
+    return ok;
+}
+
+bool test_atlas_rect_row_stable_graphic_arc_update(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_scheme(QStringLiteral("Campbell"));
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_row_stable_graphic_arc_snapshot(
+                938U,
+                1U,
+                {{0, 3}})));
+    window.show();
+    const bool baseline_rendered = pump_until(
+        app,
+        window,
+        surface,
+        atlas_report_render_state_ready);
+    term::Qsg_atlas_frame_report baseline_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    if (!baseline_rendered ||
+        !pump_atlas_seeded_rect_slots(app, window, surface, baseline_report))
+    {
+        std::cerr << "FAIL: atlas rect row-stable graphic arc update could not "
+            << "seed all rect buffer slots"
+            << " prepare_count=" << baseline_report.prepare_count
+            << " seeded_slots=" << baseline_report.render.rect_buffer.seeded_slots
+            << " frames_in_flight="
+            << baseline_report.render.rect_buffer.rhi_frames_in_flight
+            << '\n';
+        return false;
+    }
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_row_stable_graphic_arc_snapshot(
+                939U,
+                2U,
+                {{1, 1}})));
+
+    term::Qsg_atlas_frame_report report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool prepared = pump_next_atlas_report(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        report);
+    const term::Qsg_atlas_buffer_update_summary& rect_buffer =
+        report.render.rect_buffer;
+
+    if (!prepared ||
+        !rect_buffer.partial_upload ||
+        rect_buffer.full_upload ||
+        rect_buffer.non_dirty_state_upload)
+    {
+        std::cerr << "atlas rect row-stable graphic arc update"
+            << " prepared=" << prepared
+            << " rect_full=" << rect_buffer.full_upload
+            << " rect_partial=" << rect_buffer.partial_upload
+            << " rect_non_dirty=" << rect_buffer.non_dirty_state_upload
+            << " rect_uploaded=" << rect_buffer.uploaded_bytes
+            << " rect_buffer_bytes=" << rect_buffer.buffer_bytes
+            << " row_stable=" << rect_buffer.row_stable_layout
+            << " active=" << rect_buffer.active_instance_count
+            << " instances=" << rect_buffer.instance_count
+            << " frame_arcs=" << report.frame_build.frame_graphic_arcs
+            << " rect_row_capacity=" << report.render.rect_row_capacity
+            << '\n';
+    }
+
+    bool ok = true;
+    ok &= check(prepared,
+        "atlas rect row-stable graphic arc update reaches a prepared frame");
+    ok &= check(report.frame_build.frame_graphic_arcs > 0 &&
+            rect_buffer.row_stable_layout &&
+            rect_buffer.active_instance_count < rect_buffer.instance_count &&
+            report.render.rect_row_capacity >= 8,
+        "atlas rect row-stable graphic arc update reserves stable arc slots");
+    ok &= check(rect_buffer.partial_upload &&
+            !rect_buffer.full_upload &&
+            !rect_buffer.non_dirty_state_upload &&
+            rect_buffer.uploaded_bytes > 0 &&
+            rect_buffer.uploaded_bytes < rect_buffer.buffer_bytes,
+        "atlas rect row-stable graphic arc update patches dirty-row arc bytes");
+    return ok;
+}
+
+bool test_atlas_glyph_row_stable_empty_dirty_update(QGuiApplication& app)
 {
     const term::Terminal_render_snapshot baseline =
         make_atlas_row_stable_text_snapshot(
             940U,
+            QStringLiteral("B"),
+            {{0, 3}});
+    term::Terminal_render_snapshot mutated_flat =
+        make_atlas_row_stable_text_snapshot(
+            941U,
+            QStringLiteral("B"),
+            {{1, 1}});
+    remove_atlas_snapshot_row_cells(mutated_flat, 1);
+    const term::Terminal_render_snapshot mutated_lazy =
+        lazy_snapshot_from_flat(mutated_flat);
+
+    return run_atlas_glyph_row_stable_report_case(
+        app,
+        "empty dirty text row",
+        baseline,
+        mutated_lazy,
+        [](const term::Qsg_atlas_render_summary& render_summary) {
+            const term::Qsg_atlas_buffer_update_summary& glyph_buffer =
+                render_summary.glyph_buffer;
+            const bool retained_text_drawn =
+                render_summary.glyph_draw_calls > 0 ||
+                render_summary.msdf_text_draw_calls > 0;
+            const bool retained_row_slots =
+                glyph_buffer.instance_count > glyph_buffer.active_instance_count &&
+                render_summary.glyph_text_row_capacity > 0;
+            const bool dirty_only_sparse_build =
+                glyph_buffer.active_instance_count == 0;
+            const bool msdf_sparse_full_walk_build =
+                term::k_qsg_atlas_msdf_text_renderer_enabled &&
+                glyph_buffer.active_instance_count > 0;
+            return
+                retained_text_drawn  &&
+                retained_row_slots   &&
+                (dirty_only_sparse_build || msdf_sparse_full_walk_build);
+        });
+}
+
+bool run_atlas_rect_row_stable_empty_dirty_report_case(
+    QGuiApplication& app,
+    const char*      name,
+    const term::Terminal_render_snapshot& baseline_snapshot,
+    const term::Terminal_render_snapshot& mutated_snapshot,
+    const std::function<bool(const term::Qsg_atlas_frame_report&)>&
+                     extra_expected)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_scheme(QStringLiteral("Campbell"));
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(baseline_snapshot));
+    window.show();
+    const bool baseline_rendered = pump_until(
+        app,
+        window,
+        surface,
+        atlas_report_render_state_ready);
+    term::Qsg_atlas_frame_report baseline_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    if (!baseline_rendered ||
+        !pump_atlas_seeded_rect_slots(app, window, surface, baseline_report))
+    {
+        std::cerr << "FAIL: atlas rect row-stable " << name
+            << " could not seed all rect buffer slots"
+            << " prepare_count=" << baseline_report.prepare_count
+            << " seeded_slots=" << baseline_report.render.rect_buffer.seeded_slots
+            << " frames_in_flight="
+            << baseline_report.render.rect_buffer.rhi_frames_in_flight
+            << '\n';
+        return false;
+    }
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(mutated_snapshot));
+
+    term::Qsg_atlas_frame_report report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool prepared = pump_next_atlas_report(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        report);
+    const term::Qsg_atlas_render_summary& render_summary = report.render;
+    const term::Qsg_atlas_buffer_update_summary& rect_buffer =
+        render_summary.rect_buffer;
+    const bool expected_upload =
+        rect_buffer.row_stable_layout       &&
+        rect_buffer.partial_upload          &&
+        !rect_buffer.full_upload            &&
+        !rect_buffer.non_dirty_state_upload &&
+        rect_buffer.uploaded_bytes > 0      &&
+        rect_buffer.uploaded_bytes < rect_buffer.buffer_bytes;
+    const bool retained_slots =
+        rect_buffer.active_instance_count < rect_buffer.instance_count &&
+        render_summary.rect_row_capacity > 0;
+    const bool extra = prepared && extra_expected(report);
+
+    if (!prepared || !expected_upload || !retained_slots || !extra) {
+        std::cerr << "atlas rect row-stable " << name
+            << " prepared=" << prepared
+            << " rect_full=" << rect_buffer.full_upload
+            << " rect_partial=" << rect_buffer.partial_upload
+            << " rect_non_dirty=" << rect_buffer.non_dirty_state_upload
+            << " rect_uploaded=" << rect_buffer.uploaded_bytes
+            << " rect_buffer_bytes=" << rect_buffer.buffer_bytes
+            << " row_stable=" << rect_buffer.row_stable_layout
+            << " active=" << rect_buffer.active_instance_count
+            << " instances=" << rect_buffer.instance_count
+            << " rect_draw_calls=" << render_summary.rect_draw_calls
+            << " frame_rects=" << report.frame_build.frame_graphic_rects
+            << " frame_arcs=" << report.frame_build.frame_graphic_arcs
+            << " frame_rect_instances=" << report.frame_build.rect_instances
+            << " frame_rows=" << report.frame_build.frame_row_descriptors
+            << " rect_row_capacity=" << render_summary.rect_row_capacity
+            << '\n';
+    }
+
+    bool ok = true;
+    ok &= check(prepared,
+        std::string("atlas rect row-stable ") + name +
+            " reaches a prepared frame");
+    ok &= check(expected_upload,
+        std::string("atlas rect row-stable ") + name +
+            " patches the empty dirty row only");
+    ok &= check(retained_slots,
+        std::string("atlas rect row-stable ") + name +
+            " preserves retained clean-row slots");
+    ok &= check(extra,
+        std::string("atlas rect row-stable ") + name +
+            " reports expected case counters");
+    return ok;
+}
+
+bool test_atlas_rect_row_stable_empty_graphic_update(QGuiApplication& app)
+{
+    const term::Terminal_render_snapshot baseline =
+        make_atlas_row_stable_graphic_snapshot(
+            942U,
+            1U,
+            {{0, 3}});
+    term::Terminal_render_snapshot mutated_flat =
+        make_atlas_row_stable_graphic_snapshot(
+            943U,
+            1U,
+            {{1, 1}});
+    remove_atlas_snapshot_row_cells(mutated_flat, 1);
+    const term::Terminal_render_snapshot mutated_lazy =
+        lazy_snapshot_from_flat(mutated_flat);
+
+    return run_atlas_rect_row_stable_empty_dirty_report_case(
+        app,
+        "empty dirty graphic row",
+        baseline,
+        mutated_lazy,
+        [](const term::Qsg_atlas_frame_report& report) {
+            const bool dirty_only_sparse_build =
+                report.frame_build.frame_graphic_rects == 0  &&
+                report.frame_build.frame_graphic_arcs == 0   &&
+                report.frame_build.frame_row_descriptors == 1;
+            const bool msdf_sparse_full_walk_build =
+                term::k_qsg_atlas_msdf_text_renderer_enabled &&
+                report.frame_build.frame_graphic_rects > 0   &&
+                report.frame_build.frame_graphic_arcs == 0   &&
+                report.frame_build.rect_instances ==
+                    report.render.rect_buffer.active_instance_count;
+            return
+                (dirty_only_sparse_build || msdf_sparse_full_walk_build) &&
+                report.render.rect_draw_calls > 0;
+        });
+}
+
+bool test_atlas_rect_row_stable_empty_graphic_arc_update(QGuiApplication& app)
+{
+    const term::Terminal_render_snapshot baseline =
+        make_atlas_row_stable_graphic_arc_snapshot(
+            944U,
+            1U,
+            {{0, 3}});
+    term::Terminal_render_snapshot mutated_flat =
+        make_atlas_row_stable_graphic_arc_snapshot(
+            945U,
+            1U,
+            {{1, 1}});
+    remove_atlas_snapshot_row_cells(mutated_flat, 1);
+    const term::Terminal_render_snapshot mutated_lazy =
+        lazy_snapshot_from_flat(mutated_flat);
+
+    return run_atlas_rect_row_stable_empty_dirty_report_case(
+        app,
+        "empty dirty graphic arc row",
+        baseline,
+        mutated_lazy,
+        [](const term::Qsg_atlas_frame_report& report) {
+            const bool dirty_only_sparse_build =
+                report.frame_build.frame_graphic_rects == 0  &&
+                report.frame_build.frame_graphic_arcs == 0   &&
+                report.frame_build.frame_row_descriptors == 1;
+            const bool msdf_sparse_full_walk_build =
+                term::k_qsg_atlas_msdf_text_renderer_enabled &&
+                report.frame_build.frame_graphic_arcs > 0    &&
+                report.frame_build.rect_instances ==
+                    report.render.rect_buffer.active_instance_count;
+            return
+                (dirty_only_sparse_build || msdf_sparse_full_walk_build) &&
+                report.render.rect_draw_calls > 0;
+        });
+}
+
+bool test_atlas_glyph_row_stable_wide_update(QGuiApplication& app)
+{
+    const term::Terminal_render_snapshot baseline =
+        make_atlas_row_stable_text_snapshot(
+            946U,
             QString::fromUtf8("\xe7\x95\x8c"),
             2,
             true,
             {{0, 3}});
     const term::Terminal_render_snapshot mutated =
         make_atlas_row_stable_text_snapshot(
-            941U,
+            947U,
             QString::fromUtf8("\xe8\xaa\x9e"),
             2,
             true,
@@ -11612,6 +12565,205 @@ bool test_atlas_prepared_text_reuse(QGuiApplication& app)
     return ok;
 }
 
+bool test_atlas_sparse_lazy_style_change_builds_full_frame(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_scheme(QStringLiteral("Campbell"));
+
+    const term::Terminal_render_snapshot baseline =
+        make_atlas_row_stable_text_snapshot(
+            984U,
+            QStringLiteral("."),
+            {{0, 3}});
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!prepare_seeded_atlas_text_surface(
+            app,
+            window,
+            surface,
+            baseline,
+            baseline_report))
+    {
+        std::cerr << "FAIL: atlas sparse lazy style/color fallback could not seed"
+            << " baseline prepare_count=" << baseline_report.prepare_count
+            << '\n';
+        return false;
+    }
+
+    term::Terminal_render_snapshot mutated_flat =
+        make_atlas_row_stable_text_snapshot(
+            985U,
+            QStringLiteral("!"),
+            {{1, 1}});
+    mutated_flat.color_state.default_foreground_rgba = 0xff33c7ffU;
+    const term::Terminal_render_snapshot mutated_lazy =
+        lazy_snapshot_from_flat(mutated_flat);
+
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = pump_prepared_text_reuse_report(
+        app,
+        window,
+        surface,
+        mutated_lazy,
+        baseline_report.prepare_count,
+        report);
+    const term::Qsg_atlas_buffer_update_summary& glyph_buffer =
+        report.render.glyph_buffer;
+
+    bool ok = true;
+    ok &= check(prepared,
+        "atlas sparse lazy style/color fallback reaches a prepared frame");
+    ok &= check(report.frame_build.frame_row_descriptors ==
+            mutated_flat.grid_size.rows,
+        "atlas sparse lazy style/color fallback rebuilds full row descriptors");
+    ok &= check(glyph_buffer.full_upload &&
+            glyph_buffer.non_dirty_state_upload &&
+            glyph_buffer.uploaded_bytes == glyph_buffer.buffer_bytes,
+        "atlas sparse lazy style/color fallback full-uploads populated glyph rows");
+    return ok;
+}
+
+bool test_atlas_sparse_lazy_reverse_video_builds_full_frame(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_scheme(QStringLiteral("Campbell"));
+
+    const term::Terminal_render_snapshot baseline =
+        make_atlas_row_stable_text_snapshot(
+            988U,
+            QStringLiteral("."),
+            {{0, 3}});
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!prepare_seeded_atlas_text_surface(
+            app,
+            window,
+            surface,
+            baseline,
+            baseline_report))
+    {
+        std::cerr << "FAIL: atlas sparse lazy reverse-video fallback could not seed"
+            << " baseline prepare_count=" << baseline_report.prepare_count
+            << '\n';
+        return false;
+    }
+
+    term::Terminal_render_snapshot mutated_flat =
+        make_atlas_row_stable_text_snapshot(
+            989U,
+            QStringLiteral("!"),
+            {{1, 1}});
+    mutated_flat.modes.reverse_video = true;
+    const term::Terminal_render_snapshot mutated_lazy =
+        lazy_snapshot_from_flat(mutated_flat);
+
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = pump_prepared_text_reuse_report(
+        app,
+        window,
+        surface,
+        mutated_lazy,
+        baseline_report.prepare_count,
+        report);
+    const term::Qsg_atlas_buffer_update_summary& glyph_buffer =
+        report.render.glyph_buffer;
+
+    bool ok = true;
+    ok &= check(prepared,
+        "atlas sparse lazy reverse-video fallback reaches a prepared frame");
+    ok &= check(report.frame_build.frame_row_descriptors ==
+            mutated_flat.grid_size.rows,
+        "atlas sparse lazy reverse-video fallback rebuilds full row descriptors");
+    ok &= check(glyph_buffer.full_upload &&
+            glyph_buffer.non_dirty_state_upload &&
+            glyph_buffer.uploaded_bytes == glyph_buffer.buffer_bytes,
+        "atlas sparse lazy reverse-video fallback full-uploads populated glyph rows");
+    return ok;
+}
+
+bool test_atlas_sparse_lazy_previous_cursor_row_builds_full_frame(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_scheme(QStringLiteral("Campbell"));
+
+    term::Terminal_render_snapshot baseline =
+        make_atlas_row_stable_text_snapshot(
+            986U,
+            QStringLiteral("."),
+            {{0, 3}});
+    baseline.cursor.visible       = true;
+    baseline.cursor.blink_enabled = false;
+    baseline.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    baseline.cursor.position      = {0, 0};
+
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!prepare_seeded_atlas_text_surface(
+            app,
+            window,
+            surface,
+            baseline,
+            baseline_report))
+    {
+        std::cerr << "FAIL: atlas sparse lazy previous cursor fallback could not seed"
+            << " baseline prepare_count=" << baseline_report.prepare_count
+            << '\n';
+        return false;
+    }
+
+    term::Terminal_render_snapshot mutated_flat =
+        make_atlas_row_stable_text_snapshot(
+            987U,
+            QStringLiteral("!"),
+            {{2, 1}});
+    mutated_flat.cursor.visible       = true;
+    mutated_flat.cursor.blink_enabled = false;
+    mutated_flat.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    mutated_flat.cursor.position      = {1, 0};
+    const term::Terminal_render_snapshot mutated_lazy =
+        lazy_snapshot_from_flat(mutated_flat);
+
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = pump_prepared_text_reuse_report(
+        app,
+        window,
+        surface,
+        mutated_lazy,
+        baseline_report.prepare_count,
+        report);
+
+    bool ok = true;
+    ok &= check(prepared,
+        "atlas sparse lazy previous cursor fallback reaches a prepared frame");
+    ok &= check(report.frame_build.frame_row_descriptors ==
+            mutated_flat.grid_size.rows,
+        "atlas sparse lazy previous cursor fallback rebuilds full row descriptors");
+    ok &= check(report.render.glyph_cursor_text_row_capacity > 0 &&
+            report.render.glyph_buffer.uploaded_bytes > 0,
+        "atlas sparse lazy previous cursor fallback uploads populated cursor rows");
+    return ok;
+}
+
 bool run_atlas_report_case(
     QGuiApplication& app,
     const char*      name,
@@ -11657,7 +12809,8 @@ bool run_atlas_report_case(
             std::make_shared<const term::Terminal_render_snapshot>(mutated));
         mutate(surface, mutated);
     }
-    else {
+    else
+    {
         mutate(surface, mutated);
         term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
             surface,
@@ -17917,11 +19070,19 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
             return render_summary.non_dirty_visual_bell_invalidation;
         });
     ok &= test_atlas_glyph_row_stable_dirty_update(app);
+    ok &= test_atlas_rect_row_stable_dense_graphic_update(app);
+    ok &= test_atlas_rect_row_stable_graphic_arc_update(app);
+    ok &= test_atlas_glyph_row_stable_empty_dirty_update(app);
+    ok &= test_atlas_rect_row_stable_empty_graphic_update(app);
+    ok &= test_atlas_rect_row_stable_empty_graphic_arc_update(app);
     ok &= test_atlas_glyph_row_stable_wide_update(app);
     ok &= test_atlas_glyph_row_stable_combining_update(app);
     ok &= test_atlas_glyph_row_stable_cursor_dirty_update(app);
     ok &= test_atlas_glyph_row_stable_cursor_clean_row_promoted(app);
     ok &= test_atlas_prepared_text_reuse(app);
+    ok &= test_atlas_sparse_lazy_style_change_builds_full_frame(app);
+    ok &= test_atlas_sparse_lazy_reverse_video_builds_full_frame(app);
+    ok &= test_atlas_sparse_lazy_previous_cursor_row_builds_full_frame(app);
     ok &= test_atlas_msdf_resource_stability(app);
     ok &= test_atlas_msdf_zoom_reuses_baked_atlas(app);
     ok &= test_atlas_msdf_zoom_crosses_bake_bucket(app);
@@ -18165,9 +19326,11 @@ bool run_unit_tests()
     ok &= test_epoch_invalidation();
     ok &= test_atlas_rotating_buffer_planner();
     ok &= test_atlas_row_stable_glyph_planner();
+    ok &= test_atlas_populated_frame_retry_planner_transaction();
     ok &= test_atlas_non_dirty_and_full_reupload_planner();
     ok &= test_msdf_text_buffer_fallback_retry_decision();
     ok &= test_msdf_text_prepare_fallback_retry_decision();
+    ok &= test_msdf_text_failure_diagnostics_merge();
     ok &= test_text_renderer_report_names();
     ok &= test_atlas_budget_stats();
     ok &= test_atlas_warm_set_table_and_shaping();
@@ -18191,11 +19354,16 @@ int main(int argc, char** argv)
     const bool cursor_descender_smoke =
         has_argument(argc, argv, "--cursor-descender-smoke");
     const char* backend = argument_value(argc, argv, "--backend", "d3d11");
-    if (render_smoke || dense_grid_smoke || pixel_parity || layout_parity ||
+    const bool graphics_mode =
+        render_smoke || dense_grid_smoke || pixel_parity || layout_parity ||
         atlas_report || warm_lazy_smoke || lcd_capability_probe ||
-        host_state_smoke || cursor_descender_smoke)
-    {
+        host_state_smoke || cursor_descender_smoke;
+    if (graphics_mode) {
         configure_graphics_api(backend);
+    }
+    else
+    {
+        configure_unit_test_qt_environment();
     }
 
     QGuiApplication app(argc, argv);

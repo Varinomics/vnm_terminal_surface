@@ -640,6 +640,24 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
         "renderer metrics include paint_completed_frames");
     ok &= check(renderer.contains(QStringLiteral("frame")),
         "renderer metrics include the nested frame object");
+    const QJsonObject renderer_frame =
+        renderer.value(QStringLiteral("frame")).toObject();
+    ok &= check(renderer_frame.contains(QStringLiteral("row_descriptors_built")),
+        "renderer frame metrics include row descriptor builds");
+    ok &= check(renderer_frame.contains(QStringLiteral("layer_descriptors_built")),
+        "renderer frame metrics include layer descriptor builds");
+    ok &= check(renderer.contains(QStringLiteral("text_resource_descriptor_builds")),
+        "renderer metrics include text resource descriptor builds");
+    ok &= check(renderer.contains(QStringLiteral("text_resource_descriptor_builds_avoided")),
+        "renderer metrics include avoided text resource descriptor builds");
+    ok &= check(renderer.contains(QStringLiteral("text_resource_descriptor_reuses")),
+        "renderer metrics include text resource descriptor reuses");
+    const auto renderer_qsg_layer_descriptors =
+        renderer.value(QStringLiteral("qsg_layer_descriptors"));
+    ok &= check(
+        renderer_qsg_layer_descriptors.isString() &&
+            renderer_qsg_layer_descriptors.toString() == QStringLiteral("0"),
+        "renderer metrics report zero QSG layer descriptors");
 
     QJsonObject atlas;
     vnm_terminal::diagnostics::append_atlas_metrics_json(surface, atlas);
@@ -649,6 +667,34 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
         "atlas metrics include render_count");
     ok &= check(atlas.value(QStringLiteral("renderer")).toString() == QStringLiteral("atlas"),
         "atlas metrics tag the renderer as atlas");
+    ok &= check(atlas.contains(QStringLiteral("frame_row_descriptors")),
+        "atlas metrics include frame row descriptors");
+    ok &= check(atlas.contains(QStringLiteral("frame_layer_descriptors")),
+        "atlas metrics include frame layer descriptors");
+    const auto atlas_qsg_layer_descriptors =
+        atlas.value(QStringLiteral("qsg_layer_descriptors"));
+    ok &= check(
+        atlas_qsg_layer_descriptors.isString() &&
+            atlas_qsg_layer_descriptors.toString() == QStringLiteral("0"),
+        "atlas metrics report zero QSG layer descriptors");
+    ok &= check(atlas.contains(QStringLiteral("producer")),
+        "atlas metrics include producer summary");
+    ok &= check(atlas.contains(QStringLiteral("warm_lazy")),
+        "atlas metrics include warm-lazy summary");
+    ok &= check(atlas.contains(QStringLiteral("buffer_upload")),
+        "atlas metrics include buffer upload summary");
+    const QJsonObject buffer_upload =
+        atlas.value(QStringLiteral("buffer_upload")).toObject();
+    ok &= check(
+        buffer_upload.value(QStringLiteral("rect_row_capacity")).isString(),
+        "atlas buffer upload metrics include rect row capacity counter");
+    ok &= check(
+        buffer_upload.value(QStringLiteral("glyph_text_row_capacity")).isString(),
+        "atlas buffer upload metrics include glyph text row capacity counter");
+    ok &= check(
+        buffer_upload.value(
+            QStringLiteral("glyph_cursor_text_row_capacity")).isString(),
+        "atlas buffer upload metrics include glyph cursor-text row capacity counter");
 
     return ok;
 }

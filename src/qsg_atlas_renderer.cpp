@@ -35,6 +35,7 @@
 #include <initializer_list>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <span>
 #include <tuple>
@@ -191,6 +192,11 @@ struct Atlas_frame_state_keys
     QByteArray preedit;
     QByteArray options;
     QByteArray visual_bell;
+    QByteArray style_color;
+    QByteArray reverse_video;
+    QByteArray cell_metrics;
+    QByteArray opacity;
+    QByteArray clean_row_qsg_layers;
 };
 
 struct Atlas_prepare_published_state
@@ -1414,6 +1420,12 @@ void append_pass_key(QByteArray& key, const atlas_pass_range_t& pass)
     append_key_int(key, static_cast<int>(pass.count));
 }
 
+void append_key_byte_array(QByteArray& key, const QByteArray& bytes)
+{
+    append_key_int(key, bytes.size());
+    key.append(bytes);
+}
+
 int atlas_pass_draw_count(const atlas_pass_range_t& pass)
 {
     return pass.has_instances() ? 1 : 0;
@@ -1999,19 +2011,34 @@ public:
                         (msdf_ready || forced_msdf_text);
                 };
 
-            bool retried_msdf_text_fallback = false;
-            bool gpu_resources_ready = prepare_gpu_resources(prepare_result);
+            bool retried_msdf_text_fallback     = false;
+            bool retried_populated_frame_upload = false;
+            bool force_populated_frame_upload   = false;
+            bool gpu_resources_ready            = prepare_gpu_resources(prepare_result);
+            std::optional<Qsg_atlas_render_summary> msdf_failure_render;
             const auto retry_without_msdf_text_ownership = [&]() {
                 record_msdf_text_resource_failure(prepare_result);
-                const Qsg_atlas_render_summary failed_msdf_render =
-                    prepare_result.render;
+                msdf_failure_render = prepare_result.render;
                 m_msdf_text_resource_failure_disabled = true;
                 retried_msdf_text_fallback = true;
                 restore_prepare_published_state(prepare_published_state);
-                prepare_result = prepare_atlas_instances(rhi);
-                carry_msdf_text_failure_diagnostics(
-                    failed_msdf_render,
+                prepare_result =
+                    prepare_atlas_instances(rhi, force_populated_frame_upload);
+                qsg_atlas_merge_msdf_text_failure_diagnostics(
+                    *msdf_failure_render,
                     prepare_result.render);
+                gpu_resources_ready = prepare_gpu_resources(prepare_result);
+            };
+            const auto retry_with_populated_frame_upload = [&]() {
+                retried_populated_frame_upload = true;
+                force_populated_frame_upload   = true;
+                restore_prepare_published_state(prepare_published_state);
+                prepare_result = prepare_atlas_instances(rhi, true);
+                if (msdf_failure_render.has_value()) {
+                    qsg_atlas_merge_msdf_text_failure_diagnostics(
+                        *msdf_failure_render,
+                        prepare_result.render);
+                }
                 gpu_resources_ready = prepare_gpu_resources(prepare_result);
             };
 
@@ -2038,15 +2065,29 @@ public:
             }
             bool buffers_ready =
                 buffer_update_result == Qsg_atlas_buffer_update_result::READY;
-            if (!buffers_ready &&
-                msdf_text_fallback_allowed &&
-                qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
-                    retried_msdf_text_fallback,
-                    gpu_resources_ready,
-                    has_msdf_text_draw_passes(),
-                    buffer_update_result))
-            {
-                retry_without_msdf_text_ownership();
+            while (!buffers_ready) {
+                constexpr Qsg_atlas_buffer_update_result populated_frame_result =
+                    Qsg_atlas_buffer_update_result::FULL_UPLOAD_REQUIRES_POPULATED_FRAME;
+                const bool needs_populated_frame =
+                    buffer_update_result == populated_frame_result;
+                if (!retried_populated_frame_upload && needs_populated_frame) {
+                    retry_with_populated_frame_upload();
+                }
+                else
+                if (msdf_text_fallback_allowed &&
+                    qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
+                        retried_msdf_text_fallback,
+                        gpu_resources_ready,
+                        has_msdf_text_draw_passes(),
+                        buffer_update_result))
+                {
+                    retry_without_msdf_text_ownership();
+                }
+                else
+                {
+                    break;
+                }
+
                 buffer_update_result =
                     gpu_resources_ready
                         ? update_atlas_buffers(
@@ -2056,8 +2097,7 @@ public:
                               &prepare_result.render)
                         : Qsg_atlas_buffer_update_result::NOT_RUN;
                 buffers_ready =
-                    buffer_update_result ==
-                    Qsg_atlas_buffer_update_result::READY;
+                    buffer_update_result == Qsg_atlas_buffer_update_result::READY;
             }
             m_resources_ready = rect_ready && gpu_resources_ready && buffers_ready;
             prepare_result.render.coverage_texture_uploaded =
@@ -2237,6 +2277,13 @@ public:
         m_render_glyph_text_row_capacities.clear();
         m_render_glyph_cursor_text_row_capacities.clear();
         m_glyph_buffer_row_stable_ranges.clear();
+        m_render_rect_background_row_capacities.clear();
+        m_render_rect_selection_row_capacities.clear();
+        m_render_rect_graphic_row_capacities.clear();
+        m_render_rect_decoration_row_capacities.clear();
+        m_render_rect_cursor_row_capacities.clear();
+        m_render_rect_overlay_row_capacities.clear();
+        m_rect_buffer_row_stable_ranges.clear();
         m_msdf_text_resources_ready            = false;
         m_msdf_text_resource_failure_disabled = false;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
@@ -3125,16 +3172,13 @@ private:
     }
 
     atlas_pass_range_t append_row_stable_glyph_pass(
-        const atlas_pass_range_t&                    logical_pass,
-        const std::vector<int>&                     row_capacities,
-        std::vector<Qsg_atlas_row_stable_range>& row_ranges)
+        const atlas_pass_range_t&                     logical_pass,
+        const std::vector<int>&                       row_capacities,
+        std::vector<Qsg_atlas_row_stable_range>&      row_ranges)
     {
         atlas_pass_range_t buffer_pass;
         buffer_pass.first =
             static_cast<quint32>(m_glyph_buffer_instances.size());
-        if (!logical_pass.has_instances()) {
-            return buffer_pass;
-        }
 
         std::vector<int> row_write_offsets;
         std::vector<std::size_t> row_first_instances;
@@ -3250,6 +3294,250 @@ private:
         result.render.glyph_cursor_text_row_capacity =
             render_glyph_row_capacity_max(
                 m_render_glyph_cursor_text_row_capacities);
+    }
+
+    std::vector<int> rect_required_row_capacities(
+        const atlas_pass_range_t&     pass,
+        const std::vector<int>&       logical_rows) const
+    {
+        std::vector<int> row_capacities;
+        if (!pass.has_instances() || m_render_row_count <= 0) {
+            return row_capacities;
+        }
+
+        row_capacities.assign(
+            static_cast<std::size_t>(m_render_row_count),
+            0);
+        for (quint32 offset = 0U; offset < pass.count; ++offset) {
+            const std::size_t instance =
+                static_cast<std::size_t>(pass.first + offset);
+            if (instance >= logical_rows.size()) {
+                continue;
+            }
+
+            const int row = logical_rows[instance];
+            if (row < 0 || row >= m_render_row_count) {
+                continue;
+            }
+
+            ++row_capacities[static_cast<std::size_t>(row)];
+        }
+
+        return row_capacities;
+    }
+
+    void update_render_rect_row_capacities(
+        std::vector<int>&        capacities,
+        const std::vector<int>&  required_capacities)
+    {
+        if (m_render_row_count <= 0) {
+            capacities.clear();
+            return;
+        }
+
+        if (capacities.size() != static_cast<std::size_t>(m_render_row_count)) {
+            capacities.assign(static_cast<std::size_t>(m_render_row_count), 0);
+        }
+
+        const std::size_t row_count = std::min(
+            capacities.size(),
+            required_capacities.size());
+        for (std::size_t row = 0; row < row_count; ++row) {
+            const int required = required_capacities[row];
+            if (required > 0) {
+                capacities[row] = std::max(
+                    capacities[row],
+                    render_glyph_row_capacity_bucket(required));
+            }
+        }
+    }
+
+    atlas_pass_range_t append_row_stable_rect_pass(
+        const atlas_pass_range_t&                     logical_pass,
+        const std::vector<atlas_instance_t>&          logical_instances,
+        const std::vector<int>&                       logical_rows,
+        const std::vector<int>&                       row_capacities,
+        std::vector<Qsg_atlas_row_stable_range>&      row_ranges)
+    {
+        atlas_pass_range_t buffer_pass;
+        buffer_pass.first = static_cast<quint32>(m_rect_instances.size());
+
+        std::vector<int> row_write_offsets;
+        std::vector<std::size_t> row_first_instances;
+        if (m_render_row_count > 0 && !row_capacities.empty()) {
+            row_write_offsets.assign(
+                static_cast<std::size_t>(m_render_row_count),
+                0);
+            row_first_instances.assign(
+                static_cast<std::size_t>(m_render_row_count),
+                0U);
+            const std::size_t row_slot_count = static_cast<std::size_t>(
+                render_glyph_row_capacity_sum(row_capacities));
+            const std::size_t row_slot_first = m_rect_instances.size();
+            m_rect_instances.resize(row_slot_first + row_slot_count);
+            m_rect_instance_rows.resize(
+                row_slot_first + row_slot_count,
+                k_qsg_atlas_non_row);
+            std::size_t row_first = row_slot_first;
+            for (int row = 0; row < m_render_row_count; ++row) {
+                row_first_instances[static_cast<std::size_t>(row)] = row_first;
+                const int row_capacity =
+                    row < static_cast<int>(row_capacities.size())
+                        ? row_capacities[static_cast<std::size_t>(row)]
+                        : 0;
+                if (row_capacity > 0) {
+                    row_ranges.push_back({
+                        row,
+                        static_cast<int>(row_first),
+                        row_capacity,
+                    });
+                    std::fill_n(
+                        m_rect_instance_rows.begin() +
+                            static_cast<std::ptrdiff_t>(row_first),
+                        row_capacity,
+                        row);
+                }
+                row_first += static_cast<std::size_t>(std::max(0, row_capacity));
+            }
+        }
+
+        for (quint32 offset = 0U; offset < logical_pass.count; ++offset) {
+            const std::size_t logical_instance =
+                static_cast<std::size_t>(logical_pass.first + offset);
+            if (logical_instance >= logical_instances.size()) {
+                continue;
+            }
+
+            const int row = logical_instance < logical_rows.size()
+                ? logical_rows[logical_instance]
+                : k_qsg_atlas_non_row;
+            const int row_capacity =
+                row >= 0 && row < static_cast<int>(row_capacities.size())
+                    ? row_capacities[static_cast<std::size_t>(row)]
+                    : 0;
+            if (row_capacity > 0 && row < m_render_row_count) {
+                int& row_offset = row_write_offsets[static_cast<std::size_t>(row)];
+                const std::size_t stable_instance =
+                    row_first_instances[static_cast<std::size_t>(row)] +
+                    static_cast<std::size_t>(row_offset);
+                if (row_offset < row_capacity &&
+                    stable_instance < m_rect_instances.size())
+                {
+                    m_rect_instances[stable_instance] =
+                        logical_instances[logical_instance];
+                }
+                ++row_offset;
+                continue;
+            }
+
+            m_rect_instances.push_back(logical_instances[logical_instance]);
+            m_rect_instance_rows.push_back(row);
+        }
+
+        buffer_pass.count =
+            static_cast<quint32>(m_rect_instances.size()) - buffer_pass.first;
+        return buffer_pass;
+    }
+
+    void build_render_rect_buffer_layout(Atlas_prepare_result& result)
+    {
+        const atlas_pass_range_t logical_background_pass = m_background_pass;
+        const atlas_pass_range_t logical_selection_pass  = m_selection_pass;
+        const atlas_pass_range_t logical_graphic_pass    = m_graphic_pass;
+        const atlas_pass_range_t logical_decoration_pass = m_decoration_pass;
+        const atlas_pass_range_t logical_cursor_pass     = m_cursor_pass;
+        const atlas_pass_range_t logical_overlay_pass    = m_overlay_pass;
+        const std::vector<atlas_instance_t> logical_instances =
+            std::move(m_rect_instances);
+        const std::vector<int> logical_rows = std::move(m_rect_instance_rows);
+        m_rect_active_instance_count = static_cast<int>(logical_instances.size());
+        m_rect_instances.clear();
+        m_rect_instance_rows.clear();
+        m_rect_buffer_row_stable_ranges.clear();
+
+        const std::vector<int> background_required =
+            rect_required_row_capacities(logical_background_pass, logical_rows);
+        const std::vector<int> selection_required =
+            rect_required_row_capacities(logical_selection_pass, logical_rows);
+        const std::vector<int> graphic_required =
+            rect_required_row_capacities(logical_graphic_pass, logical_rows);
+        const std::vector<int> decoration_required =
+            rect_required_row_capacities(logical_decoration_pass, logical_rows);
+        const std::vector<int> cursor_required =
+            rect_required_row_capacities(logical_cursor_pass, logical_rows);
+        const std::vector<int> overlay_required =
+            rect_required_row_capacities(logical_overlay_pass, logical_rows);
+        update_render_rect_row_capacities(
+            m_render_rect_background_row_capacities,
+            background_required);
+        update_render_rect_row_capacities(
+            m_render_rect_selection_row_capacities,
+            selection_required);
+        update_render_rect_row_capacities(
+            m_render_rect_graphic_row_capacities,
+            graphic_required);
+        update_render_rect_row_capacities(
+            m_render_rect_decoration_row_capacities,
+            decoration_required);
+        update_render_rect_row_capacities(
+            m_render_rect_cursor_row_capacities,
+            cursor_required);
+        update_render_rect_row_capacities(
+            m_render_rect_overlay_row_capacities,
+            overlay_required);
+
+        m_background_pass = append_row_stable_rect_pass(
+            logical_background_pass,
+            logical_instances,
+            logical_rows,
+            m_render_rect_background_row_capacities,
+            m_rect_buffer_row_stable_ranges);
+        m_selection_pass = append_row_stable_rect_pass(
+            logical_selection_pass,
+            logical_instances,
+            logical_rows,
+            m_render_rect_selection_row_capacities,
+            m_rect_buffer_row_stable_ranges);
+        m_graphic_pass = append_row_stable_rect_pass(
+            logical_graphic_pass,
+            logical_instances,
+            logical_rows,
+            m_render_rect_graphic_row_capacities,
+            m_rect_buffer_row_stable_ranges);
+        m_decoration_pass = append_row_stable_rect_pass(
+            logical_decoration_pass,
+            logical_instances,
+            logical_rows,
+            m_render_rect_decoration_row_capacities,
+            m_rect_buffer_row_stable_ranges);
+        m_cursor_pass = append_row_stable_rect_pass(
+            logical_cursor_pass,
+            logical_instances,
+            logical_rows,
+            m_render_rect_cursor_row_capacities,
+            m_rect_buffer_row_stable_ranges);
+        m_overlay_pass = append_row_stable_rect_pass(
+            logical_overlay_pass,
+            logical_instances,
+            logical_rows,
+            m_render_rect_overlay_row_capacities,
+            m_rect_buffer_row_stable_ranges);
+
+        result.render.rect_row_capacity =
+            std::max({
+                render_glyph_row_capacity_max(
+                    m_render_rect_background_row_capacities),
+                render_glyph_row_capacity_max(
+                    m_render_rect_selection_row_capacities),
+                render_glyph_row_capacity_max(
+                    m_render_rect_graphic_row_capacities),
+                render_glyph_row_capacity_max(
+                    m_render_rect_decoration_row_capacities),
+                render_glyph_row_capacity_max(
+                    m_render_rect_cursor_row_capacities),
+                render_glyph_row_capacity_max(
+                    m_render_rect_overlay_row_capacities),
+            });
     }
 
     void append_rect_instance(
@@ -3377,7 +3665,9 @@ private:
             });
     }
 
-    Atlas_prepare_result prepare_atlas_instances(QRhi* rhi)
+    Atlas_prepare_result prepare_atlas_instances(
+        QRhi* rhi,
+        bool  force_full_cell_walk = false)
     {
         VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::prepare_atlas_instances");
 
@@ -3387,6 +3677,12 @@ private:
         if (font_epoch_changed) {
             m_render_glyph_text_row_capacities.clear();
             m_render_glyph_cursor_text_row_capacities.clear();
+            m_render_rect_background_row_capacities.clear();
+            m_render_rect_selection_row_capacities.clear();
+            m_render_rect_graphic_row_capacities.clear();
+            m_render_rect_decoration_row_capacities.clear();
+            m_render_rect_cursor_row_capacities.clear();
+            m_render_rect_overlay_row_capacities.clear();
             m_failed_visible_lazy_glyph_raster_keys.clear();
         }
         begin_prepared_text_cache_frame(font_epoch_changed);
@@ -3400,7 +3696,10 @@ private:
         m_glyph_instance_rows.clear();
         m_glyph_buffer_instance_rows.clear();
         m_msdf_text_instance_rows.clear();
+        m_render_preserve_clean_row_slots = false;
         m_glyph_buffer_row_stable_ranges.clear();
+        m_rect_buffer_row_stable_ranges.clear();
+        m_rect_active_instance_count = 0;
         m_background_pass     = {};
         m_selection_pass      = {};
         m_graphic_pass        = {};
@@ -3418,7 +3717,7 @@ private:
             ? qsg_atlas_face_id_for_raw_font(base_raw_font)
             : QString();
         ensure_atlas_warm_set(result, rhi);
-        const Terminal_render_frame render_frame = build_terminal_render_frame(
+        Terminal_render_frame render_frame = build_terminal_render_frame(
             m_frame.snapshot.get(),
             m_frame.logical_size,
             m_frame.cell_metrics,
@@ -3426,14 +3725,36 @@ private:
             m_frame.cursor_blink_visible,
             &m_frame.ime_preedit);
         m_render_row_count = render_frame.grid_size.rows;
-        const QByteArray current_cursor_key =
+        QByteArray current_cursor_key =
             render_cursor_state_key(render_frame);
-        const std::vector<int> current_cursor_layer_rows =
+        std::vector<int> current_cursor_layer_rows =
             cursor_layer_rows(render_frame);
+        if (force_full_cell_walk ||
+            sparse_msdf_text_requires_full_cell_walk(render_frame) ||
+            sparse_render_frame_requires_full_cell_walk(
+                render_frame,
+                render_state_keys(render_frame),
+                current_cursor_key,
+                font_epoch_changed))
+        {
+            render_frame = build_terminal_render_frame(
+                m_frame.snapshot.get(),
+                m_frame.logical_size,
+                m_frame.cell_metrics,
+                m_frame.options,
+                m_frame.cursor_blink_visible,
+                &m_frame.ime_preedit,
+                true);
+            m_render_row_count = render_frame.grid_size.rows;
+            current_cursor_key = render_cursor_state_key(render_frame);
+            current_cursor_layer_rows = cursor_layer_rows(render_frame);
+        }
         m_render_dirty_row_ranges = dirty_ranges_with_cursor_layer_rows(
             render_frame.dirty_row_ranges,
             current_cursor_key,
             current_cursor_layer_rows);
+        m_render_preserve_clean_row_slots =
+            render_frame_uses_sparse_descriptors(render_frame);
 
         const qreal opacity = std::clamp(inheritedOpacity(), 0.0, 1.0);
         const std::vector<Terminal_render_rect> background_rects =
@@ -3467,6 +3788,7 @@ private:
         m_msdf_cursor_text_pass = cursor_text_passes.msdf;
         prune_prepared_text_cache(result.producer);
         m_overlay_pass = append_rect_pass(render_frame.overlay_rects, opacity);
+        build_render_rect_buffer_layout(result);
         build_render_glyph_buffer_layout(result);
         result.raw_font_rasterized = result.rasterized_glyphs > 0;
         finalize_frame_build_summary(render_frame, result);
@@ -3648,8 +3970,13 @@ private:
             static_cast<int>(render_frame.text_runs.size());
         summary.frame_overlay_rects       =
             static_cast<int>(render_frame.overlay_rects.size());
+        summary.frame_row_descriptors     =
+            static_cast<int>(render_frame.row_descriptors.size());
+        summary.frame_layer_descriptors   =
+            render_frame.stats.layer_descriptors_built;
+        summary.qsg_layer_descriptors     = 0;
         summary.rect_instances            =
-            static_cast<int>(m_rect_instances.size());
+            m_rect_active_instance_count;
         summary.glyph_instances           =
             static_cast<int>(m_glyph_instances.size());
         summary.distinct_glyph_faces      =
@@ -3766,6 +4093,120 @@ private:
             false);
     }
 
+    bool render_frame_uses_sparse_descriptors(
+        const Terminal_render_frame& render_frame) const
+    {
+        return
+            render_frame.grid_size.rows > 0 &&
+            render_frame.row_descriptors.size() <
+                static_cast<std::size_t>(render_frame.grid_size.rows);
+    }
+
+    bool source_snapshot_uses_lazy_row_payloads() const
+    {
+        return
+            m_frame.snapshot != nullptr &&
+            m_frame.snapshot->lazy_row_payloads != nullptr &&
+            !m_frame.snapshot->lazy_row_payloads->rows.empty();
+    }
+
+    bool sparse_msdf_text_requires_full_cell_walk(
+        const Terminal_render_frame& render_frame) const
+    {
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+        return
+            (render_frame_uses_sparse_descriptors(render_frame) ||
+             source_snapshot_uses_lazy_row_payloads())          &&
+            qsg_atlas_text_renderer_policy_allows_msdf(
+                m_frame.options.text_renderer_policy);
+#else
+        (void)render_frame;
+        return false;
+#endif
+    }
+
+    bool dirty_ranges_include_undescribed_rows(
+        const Terminal_render_frame&                       render_frame,
+        const std::vector<Terminal_render_dirty_row_range>& dirty_row_ranges) const
+    {
+        const int row_count = render_frame.grid_size.rows;
+        if (row_count <= 0) {
+            return false;
+        }
+
+        std::vector<unsigned char> described_rows(
+            static_cast<std::size_t>(row_count),
+            0U);
+        for (const Terminal_render_row_descriptor& descriptor :
+            render_frame.row_descriptors)
+        {
+            if (descriptor.row >= 0 && descriptor.row < row_count) {
+                described_rows[static_cast<std::size_t>(descriptor.row)] = 1U;
+            }
+        }
+
+        for (const Terminal_render_dirty_row_range& range : dirty_row_ranges) {
+            const int first_row = std::clamp(range.first_row, 0, row_count);
+            const int end_row = std::clamp(
+                range.first_row + range.row_count,
+                first_row,
+                row_count);
+            for (int row = first_row; row < end_row; ++row) {
+                if (described_rows[static_cast<std::size_t>(row)] == 0U) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    bool sparse_render_frame_requires_full_cell_walk(
+        const Terminal_render_frame& render_frame,
+        const Atlas_frame_state_keys& current_keys,
+        const QByteArray&            current_cursor_key,
+        bool                         font_epoch_changed) const
+    {
+        if (!render_frame_uses_sparse_descriptors(render_frame)) {
+            return false;
+        }
+
+        if (!m_have_previous_render_state || font_epoch_changed) {
+            return true;
+        }
+
+        if (dirty_range_covers_full_grid(render_frame)) {
+            return true;
+        }
+
+        if (current_keys.selection != m_previous_render_state_keys.selection ||
+            current_keys.cursor_rect != m_previous_render_state_keys.cursor_rect ||
+            current_keys.preedit != m_previous_render_state_keys.preedit ||
+            current_keys.options != m_previous_render_state_keys.options ||
+            current_keys.visual_bell != m_previous_render_state_keys.visual_bell ||
+            current_keys.style_color != m_previous_render_state_keys.style_color ||
+            current_keys.reverse_video !=
+                m_previous_render_state_keys.reverse_video ||
+            current_keys.cell_metrics != m_previous_render_state_keys.cell_metrics ||
+            current_keys.opacity != m_previous_render_state_keys.opacity ||
+            current_keys.clean_row_qsg_layers !=
+                m_previous_render_state_keys.clean_row_qsg_layers)
+        {
+            return true;
+        }
+
+        const std::vector<int> current_cursor_layer_rows =
+            cursor_layer_rows(render_frame);
+        const std::vector<Terminal_render_dirty_row_range> widened_dirty_ranges =
+            dirty_ranges_with_cursor_layer_rows(
+                render_frame.dirty_row_ranges,
+                current_cursor_key,
+                current_cursor_layer_rows);
+        return dirty_ranges_include_undescribed_rows(
+            render_frame,
+            widened_dirty_ranges);
+    }
+
     QByteArray render_options_key(const Terminal_render_options& options) const
     {
         QByteArray key;
@@ -3793,6 +4234,23 @@ private:
         return key;
     }
 
+    QByteArray clean_row_qsg_layer_descriptor_key(
+        const Terminal_render_frame& render_frame) const
+    {
+        QByteArray key;
+        const Terminal_render_layer_descriptors& layers =
+            render_frame.layer_descriptors;
+        append_key_byte_array(key, layers.style_color_key);
+        append_key_byte_array(key, layers.reverse_video_key);
+        append_key_byte_array(key, layers.render_options_key);
+        append_key_byte_array(key, layers.cell_metrics_key);
+        append_key_uint64(key, m_frame.font_epoch);
+        append_key_qreal(key, std::clamp(inheritedOpacity(), 0.0, 1.0));
+        append_key_cell_metrics(key, render_frame.cell_metrics);
+        append_key_byte_array(key, render_options_key(m_frame.options));
+        return key;
+    }
+
     Atlas_frame_state_keys render_state_keys(
         const Terminal_render_frame& render_frame) const
     {
@@ -3812,16 +4270,13 @@ private:
 
         keys.options = render_options_key(m_frame.options);
 
-        append_key_bool(
-            keys.visual_bell,
-            m_frame.snapshot != nullptr &&
-                m_frame.snapshot->metadata.visual_bell_active);
-        append_key_bool(keys.visual_bell, m_frame.options.visual_bell_enabled);
-        append_key_color(keys.visual_bell, m_frame.options.visual_bell_color);
-        append_key_vector(
-            keys.visual_bell,
-            render_frame.overlay_rects,
-            append_key_render_rect);
+        keys.visual_bell = render_frame.layer_descriptors.visual_bell_key;
+        keys.style_color = render_frame.layer_descriptors.style_color_key;
+        keys.reverse_video = render_frame.layer_descriptors.reverse_video_key;
+        keys.cell_metrics = render_frame.layer_descriptors.cell_metrics_key;
+        append_key_qreal(keys.opacity, std::clamp(inheritedOpacity(), 0.0, 1.0));
+        keys.clean_row_qsg_layers =
+            clean_row_qsg_layer_descriptor_key(render_frame);
         return keys;
     }
 
@@ -3899,69 +4354,6 @@ private:
         }
     }
 
-    void carry_msdf_text_failure_diagnostics(
-        const Qsg_atlas_render_summary& failed_msdf_render,
-        Qsg_atlas_render_summary&       fallback_render)
-    {
-        fallback_render.msdf_text_supported_runs = std::max(
-            fallback_render.msdf_text_supported_runs,
-            failed_msdf_render.msdf_text_supported_runs);
-        fallback_render.msdf_text_missed_supported_runs +=
-            failed_msdf_render.msdf_text_missed_supported_runs;
-        fallback_render.msdf_text_missed_supported_glyphs +=
-            failed_msdf_render.msdf_text_missed_supported_glyphs;
-        fallback_render.msdf_text_atlas_built =
-            fallback_render.msdf_text_atlas_built ||
-            failed_msdf_render.msdf_text_atlas_built;
-        fallback_render.msdf_text_atlas_ready =
-            fallback_render.msdf_text_atlas_ready ||
-            failed_msdf_render.msdf_text_atlas_ready;
-        fallback_render.msdf_text_texture_ready =
-            fallback_render.msdf_text_texture_ready ||
-            failed_msdf_render.msdf_text_texture_ready;
-        fallback_render.msdf_text_texture_uploaded =
-            fallback_render.msdf_text_texture_uploaded ||
-            failed_msdf_render.msdf_text_texture_uploaded;
-        // Carry the per-frame baked-cache event flags so a fallback frame still
-        // reports the MSDF build/miss it attempted before falling back. The
-        // cumulative *_total counters are re-snapshotted from the persistent
-        // counters and need no carry; a fallback frame is a miss, so the cache-hit
-        // and baked-atlas-reused flags are intentionally not propagated.
-        fallback_render.msdf_text_cache_miss =
-            fallback_render.msdf_text_cache_miss ||
-            failed_msdf_render.msdf_text_cache_miss;
-        fallback_render.msdf_text_atlas_build_attempted =
-            fallback_render.msdf_text_atlas_build_attempted ||
-            failed_msdf_render.msdf_text_atlas_build_attempted;
-        fallback_render.msdf_text_atlas_build_succeeded =
-            fallback_render.msdf_text_atlas_build_succeeded ||
-            failed_msdf_render.msdf_text_atlas_build_succeeded;
-        fallback_render.msdf_text_baked_pixel_height = std::max(
-            fallback_render.msdf_text_baked_pixel_height,
-            failed_msdf_render.msdf_text_baked_pixel_height);
-        fallback_render.msdf_text_atlas_generation = std::max(
-            fallback_render.msdf_text_atlas_generation,
-            failed_msdf_render.msdf_text_atlas_generation);
-        fallback_render.msdf_text_resources_ready = false;
-        fallback_render.msdf_text_renderer_active = false;
-        fallback_render.msdf_text_font_data_bytes = std::max(
-            fallback_render.msdf_text_font_data_bytes,
-            failed_msdf_render.msdf_text_font_data_bytes);
-        fallback_render.msdf_text_pixel_height = std::max(
-            fallback_render.msdf_text_pixel_height,
-            failed_msdf_render.msdf_text_pixel_height);
-        fallback_render.msdf_text_atlas_size = std::max(
-            fallback_render.msdf_text_atlas_size,
-            failed_msdf_render.msdf_text_atlas_size);
-        fallback_render.msdf_text_px_range = std::max(
-            fallback_render.msdf_text_px_range,
-            failed_msdf_render.msdf_text_px_range);
-        if (!failed_msdf_render.msdf_text_message.isEmpty()) {
-            fallback_render.msdf_text_message =
-                failed_msdf_render.msdf_text_message;
-        }
-    }
-
     void finalize_render_summary(
         const Terminal_render_frame& render_frame,
         bool                         font_epoch_changed,
@@ -4022,6 +4414,23 @@ private:
         const bool visual_bell_changed =
             m_have_previous_render_state &&
             current_keys.visual_bell != m_previous_render_state_keys.visual_bell;
+        const bool style_color_changed =
+            m_have_previous_render_state &&
+            current_keys.style_color != m_previous_render_state_keys.style_color;
+        const bool reverse_video_changed =
+            m_have_previous_render_state &&
+            current_keys.reverse_video !=
+                m_previous_render_state_keys.reverse_video;
+        const bool cell_metrics_changed =
+            m_have_previous_render_state &&
+            current_keys.cell_metrics != m_previous_render_state_keys.cell_metrics;
+        const bool opacity_changed =
+            m_have_previous_render_state &&
+            current_keys.opacity != m_previous_render_state_keys.opacity;
+        const bool clean_row_qsg_layers_changed =
+            m_have_previous_render_state &&
+            current_keys.clean_row_qsg_layers !=
+                m_previous_render_state_keys.clean_row_qsg_layers;
         const bool has_dirty_rows = !render_frame.dirty_row_ranges.empty();
         Terminal_render_options default_options;
         default_options.cursor_shape_override =
@@ -4040,9 +4449,7 @@ private:
         const bool options_present =
             current_keys.options != render_options_key(default_options);
         const bool visual_bell_present =
-            m_frame.snapshot != nullptr &&
-            m_frame.snapshot->metadata.visual_bell_active &&
-            m_frame.options.visual_bell_enabled;
+            !render_frame.overlay_rects.empty();
 
         summary.full_dirty_range_reupload       = result.frame_build.full_dirty_range;
         summary.public_projection_full_reupload =
@@ -4115,6 +4522,11 @@ private:
             preedit_changed      ||
             options_changed      ||
             visual_bell_changed  ||
+            style_color_changed  ||
+            reverse_video_changed ||
+            cell_metrics_changed ||
+            opacity_changed      ||
+            clean_row_qsg_layers_changed ||
             summary.non_dirty_selection_invalidation   ||
             summary.non_dirty_cursor_invalidation      ||
             summary.non_dirty_preedit_invalidation     ||
@@ -5733,11 +6145,17 @@ private:
     {
         QByteArray key;
         append_pass_key(key, m_background_pass);
+        append_key_int_vector(key, m_render_rect_background_row_capacities);
         append_pass_key(key, m_selection_pass);
+        append_key_int_vector(key, m_render_rect_selection_row_capacities);
         append_pass_key(key, m_graphic_pass);
+        append_key_int_vector(key, m_render_rect_graphic_row_capacities);
         append_pass_key(key, m_decoration_pass);
+        append_key_int_vector(key, m_render_rect_decoration_row_capacities);
         append_pass_key(key, m_cursor_pass);
+        append_key_int_vector(key, m_render_rect_cursor_row_capacities);
         append_pass_key(key, m_overlay_pass);
+        append_key_int_vector(key, m_render_rect_overlay_row_capacities);
         return key;
     }
 
@@ -5847,6 +6265,19 @@ private:
         const int msdf_text_byte_count = static_cast<int>(
             m_msdf_text_instances.size() * sizeof(atlas_msdf_instance_t));
 #endif
+        const bool retry_transactional_planning = m_render_preserve_clean_row_slots;
+        const Qsg_atlas_buffer_upload_planner_state rect_planner_state =
+            retry_transactional_planning
+                ? m_rect_upload_planner.snapshot()
+                : Qsg_atlas_buffer_upload_planner_state{};
+        const Qsg_atlas_buffer_upload_planner_state glyph_planner_state =
+            retry_transactional_planning
+                ? m_glyph_upload_planner.snapshot()
+                : Qsg_atlas_buffer_upload_planner_state{};
+        const Qsg_atlas_buffer_upload_planner_state msdf_text_planner_state =
+            retry_transactional_planning
+                ? m_msdf_text_upload_planner.snapshot()
+                : Qsg_atlas_buffer_upload_planner_state{};
         const Qsg_atlas_buffer_update_plan rect_plan =
             m_rect_upload_planner.plan({
                 frames_in_flight,
@@ -5864,8 +6295,10 @@ private:
                 m_render_force_full_reupload,
                 m_render_non_dirty_state_invalidation ||
                     m_render_cursor_rect_state_invalidation,
-                -1,
-                false,
+                m_rect_active_instance_count,
+                !m_rect_instances.empty(),
+                &m_rect_buffer_row_stable_ranges,
+                m_render_preserve_clean_row_slots,
             });
         const Qsg_atlas_buffer_update_plan glyph_plan =
             m_glyph_upload_planner.plan({
@@ -5886,6 +6319,7 @@ private:
                 static_cast<int>(m_glyph_instances.size()),
                 !m_glyph_buffer_instances.empty(),
                 &m_glyph_buffer_row_stable_ranges,
+                m_render_preserve_clean_row_slots,
             });
         Qsg_atlas_buffer_update_plan msdf_text_plan;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
@@ -5914,6 +6348,18 @@ private:
             render_summary->rect_buffer      = rect_plan.summary;
             render_summary->glyph_buffer     = glyph_plan.summary;
             render_summary->msdf_text_buffer = msdf_text_plan.summary;
+        }
+        if (rect_plan.summary.full_upload_requires_populated_frame ||
+            glyph_plan.summary.full_upload_requires_populated_frame ||
+            msdf_text_plan.summary.full_upload_requires_populated_frame)
+        {
+            if (retry_transactional_planning) {
+                m_rect_upload_planner.restore(rect_planner_state);
+                m_glyph_upload_planner.restore(glyph_planner_state);
+                m_msdf_text_upload_planner.restore(msdf_text_planner_state);
+            }
+            return
+                Qsg_atlas_buffer_update_result::FULL_UPLOAD_REQUIRES_POPULATED_FRAME;
         }
 
         QRhiResourceUpdateBatch* updates = rhi->nextResourceUpdateBatch();
@@ -6123,6 +6569,8 @@ private:
     std::vector<int>                         m_glyph_buffer_instance_rows;
     std::vector<int>                         m_msdf_text_instance_rows;
     std::vector<Qsg_atlas_row_stable_range>
+                                             m_rect_buffer_row_stable_ranges;
+    std::vector<Qsg_atlas_row_stable_range>
                                              m_glyph_buffer_row_stable_ranges;
     atlas_pass_range_t                        m_background_pass;
     atlas_pass_range_t                        m_selection_pass;
@@ -6167,6 +6615,13 @@ private:
     Qsg_atlas_buffer_upload_planner   m_glyph_upload_planner;
     Qsg_atlas_buffer_upload_planner   m_msdf_text_upload_planner;
     int                                      m_render_row_count = 0;
+    int                                      m_rect_active_instance_count = 0;
+    std::vector<int>                         m_render_rect_background_row_capacities;
+    std::vector<int>                         m_render_rect_selection_row_capacities;
+    std::vector<int>                         m_render_rect_graphic_row_capacities;
+    std::vector<int>                         m_render_rect_decoration_row_capacities;
+    std::vector<int>                         m_render_rect_cursor_row_capacities;
+    std::vector<int>                         m_render_rect_overlay_row_capacities;
     std::vector<int>                         m_render_glyph_text_row_capacities;
     std::vector<int>                         m_render_glyph_cursor_text_row_capacities;
     std::vector<Terminal_render_dirty_row_range>
@@ -6174,6 +6629,7 @@ private:
     bool                                     m_render_force_full_reupload = false;
     bool                                     m_render_non_dirty_state_invalidation = false;
     bool                                     m_render_cursor_rect_state_invalidation = false;
+    bool                                     m_render_preserve_clean_row_slots = false;
     bool                                     m_have_previous_render_state = false;
     Atlas_frame_state_keys                  m_previous_render_state_keys;
     std::vector<int>                         m_previous_cursor_layer_rows;
@@ -6261,6 +6717,69 @@ bool qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
         msdf_prepare_resource_failed;
 }
 
+void qsg_atlas_merge_msdf_text_failure_diagnostics(
+    const Qsg_atlas_render_summary& failed_msdf_render,
+    Qsg_atlas_render_summary&       fallback_render)
+{
+    fallback_render.msdf_text_supported_runs = std::max(
+        fallback_render.msdf_text_supported_runs,
+        failed_msdf_render.msdf_text_supported_runs);
+    fallback_render.msdf_text_missed_supported_runs +=
+        failed_msdf_render.msdf_text_missed_supported_runs;
+    fallback_render.msdf_text_missed_supported_glyphs +=
+        failed_msdf_render.msdf_text_missed_supported_glyphs;
+    fallback_render.msdf_text_atlas_built =
+        fallback_render.msdf_text_atlas_built ||
+        failed_msdf_render.msdf_text_atlas_built;
+    fallback_render.msdf_text_atlas_ready =
+        fallback_render.msdf_text_atlas_ready ||
+        failed_msdf_render.msdf_text_atlas_ready;
+    fallback_render.msdf_text_texture_ready =
+        fallback_render.msdf_text_texture_ready ||
+        failed_msdf_render.msdf_text_texture_ready;
+    fallback_render.msdf_text_texture_uploaded =
+        fallback_render.msdf_text_texture_uploaded ||
+        failed_msdf_render.msdf_text_texture_uploaded;
+    // Carry the per-frame baked-cache event flags so a fallback frame still
+    // reports the MSDF build/miss it attempted before falling back. The
+    // cumulative *_total counters are re-snapshotted from the persistent
+    // counters and need no carry; a fallback frame is a miss, so the cache-hit
+    // and baked-atlas-reused flags are intentionally not propagated.
+    fallback_render.msdf_text_cache_miss =
+        fallback_render.msdf_text_cache_miss ||
+        failed_msdf_render.msdf_text_cache_miss;
+    fallback_render.msdf_text_atlas_build_attempted =
+        fallback_render.msdf_text_atlas_build_attempted ||
+        failed_msdf_render.msdf_text_atlas_build_attempted;
+    fallback_render.msdf_text_atlas_build_succeeded =
+        fallback_render.msdf_text_atlas_build_succeeded ||
+        failed_msdf_render.msdf_text_atlas_build_succeeded;
+    fallback_render.msdf_text_baked_pixel_height = std::max(
+        fallback_render.msdf_text_baked_pixel_height,
+        failed_msdf_render.msdf_text_baked_pixel_height);
+    fallback_render.msdf_text_atlas_generation = std::max(
+        fallback_render.msdf_text_atlas_generation,
+        failed_msdf_render.msdf_text_atlas_generation);
+    fallback_render.msdf_text_resources_ready = false;
+    fallback_render.msdf_text_renderer_active = false;
+    fallback_render.msdf_text_font_data_bytes = std::max(
+        fallback_render.msdf_text_font_data_bytes,
+        failed_msdf_render.msdf_text_font_data_bytes);
+    fallback_render.msdf_text_pixel_height = std::max(
+        fallback_render.msdf_text_pixel_height,
+        failed_msdf_render.msdf_text_pixel_height);
+    fallback_render.msdf_text_atlas_size = std::max(
+        fallback_render.msdf_text_atlas_size,
+        failed_msdf_render.msdf_text_atlas_size);
+    fallback_render.msdf_text_px_range = std::max(
+        fallback_render.msdf_text_px_range,
+        failed_msdf_render.msdf_text_px_range);
+    if (!failed_msdf_render.msdf_text_message.isEmpty()) {
+        fallback_render.msdf_text_message =
+            failed_msdf_render.msdf_text_message;
+    }
+}
+
 void Qsg_atlas_buffer_upload_planner::reset()
 {
     m_frames_in_flight = 0;
@@ -6268,6 +6787,28 @@ void Qsg_atlas_buffer_upload_planner::reset()
     m_slot_instance_rows.clear();
     m_slot_layout_keys.clear();
     m_seeded_slots.clear();
+}
+
+Qsg_atlas_buffer_upload_planner_state
+Qsg_atlas_buffer_upload_planner::snapshot() const
+{
+    Qsg_atlas_buffer_upload_planner_state state;
+    state.frames_in_flight    = m_frames_in_flight;
+    state.slot_bytes          = m_slot_bytes;
+    state.slot_instance_rows  = m_slot_instance_rows;
+    state.slot_layout_keys    = m_slot_layout_keys;
+    state.seeded_slots        = m_seeded_slots;
+    return state;
+}
+
+void Qsg_atlas_buffer_upload_planner::restore(
+    const Qsg_atlas_buffer_upload_planner_state& state)
+{
+    m_frames_in_flight   = state.frames_in_flight;
+    m_slot_bytes         = state.slot_bytes;
+    m_slot_instance_rows = state.slot_instance_rows;
+    m_slot_layout_keys   = state.slot_layout_keys;
+    m_seeded_slots       = state.seeded_slots;
 }
 
 void Qsg_atlas_buffer_upload_planner::resize_slots(int frames_in_flight)
@@ -6353,7 +6894,26 @@ Qsg_atlas_buffer_upload_planner::plan(
     summary.non_dirty_state_upload         =
         input.non_dirty_state_invalidation;
 
+    const char* const current = input.bytes;
+    const auto record_full_upload_requires_populated_frame = [&]() {
+        summary.full_upload_requires_populated_frame = true;
+        summary.skipped_upload = true;
+        summary.seeded_slots = static_cast<int>(std::count(
+            m_seeded_slots.begin(),
+            m_seeded_slots.end(),
+            static_cast<unsigned char>(1U)));
+    };
+
     const auto record_full_upload = [&]() {
+        if (input.preserve_clean_row_slots &&
+            input.row_stable_layout        &&
+            input.instance_rows != nullptr &&
+            byte_count > 0)
+        {
+            record_full_upload_requires_populated_frame();
+            return false;
+        }
+
         if (byte_count > 0) {
             plan.ranges.push_back({0, byte_count});
             summary.full_upload    = true;
@@ -6363,14 +6923,17 @@ Qsg_atlas_buffer_upload_planner::plan(
         else {
             summary.skipped_upload = true;
         }
-        m_slot_bytes[slot_index]         = QByteArray(input.bytes, byte_count);
+        m_slot_bytes[slot_index]         = QByteArray(current, byte_count);
         m_slot_instance_rows[slot_index] = make_current_rows();
         m_slot_layout_keys[slot_index]   = input.layout_key;
         m_seeded_slots[slot_index]       = 1U;
+        return true;
     };
 
     if (full_upload) {
-        record_full_upload();
+        if (!record_full_upload()) {
+            return plan;
+        }
         summary.seeded_slots = static_cast<int>(std::count(
             m_seeded_slots.begin(),
             m_seeded_slots.end(),
@@ -6378,7 +6941,6 @@ Qsg_atlas_buffer_upload_planner::plan(
         return plan;
     }
 
-    const char* const current = input.bytes;
     const char* const previous = m_slot_bytes[slot_index].constData();
     const int previous_instance_count =
         previous_byte_count / summary.instance_bytes;
@@ -6518,9 +7080,16 @@ Qsg_atlas_buffer_upload_planner::plan(
         }
 
         if (full_required_for_clean_slot_change) {
+            if (input.preserve_clean_row_slots) {
+                finalize_partial_upload();
+                return plan;
+            }
+
             plan.ranges.clear();
             summary.non_dirty_state_upload = true;
-            record_full_upload();
+            if (!record_full_upload()) {
+                return plan;
+            }
             publish_seeded_slots();
             return plan;
         }
@@ -6571,7 +7140,9 @@ Qsg_atlas_buffer_upload_planner::plan(
     if (full_required_for_non_dirty_change) {
         plan.ranges.clear();
         summary.non_dirty_state_upload = true;
-        record_full_upload();
+        if (!record_full_upload()) {
+            return plan;
+        }
         summary.seeded_slots = static_cast<int>(std::count(
             m_seeded_slots.begin(),
             m_seeded_slots.end(),

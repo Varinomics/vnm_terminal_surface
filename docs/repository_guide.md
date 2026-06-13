@@ -238,7 +238,7 @@ trees. Schema 23 includes sparse dirty-row sweep metadata
 `sparse_dirty_row_sweep_applicable`, `configured_sparse_dirty_rows`, and
 `configured_sparse_dirty_row_stride`; per-scenario requested and actual grid
 metadata through `requested_rows`, `requested_columns`, `rows`, `columns`,
-`actual_grid_matches_request`, and `grid_semantics`; and the exact unavailable
+`actual_grid_matches_request`, and `grid_semantics`; and the exact Batch 7
 descriptor counter object. Sparse dirty-row validation requires the
 observed frame and profile dirty-row counts to cover the requested dirty rows,
 rejects full repaint, and allows at most one cursor carry-over row per measured
@@ -268,10 +268,11 @@ producer materialized rows, and producer cells scanned by the observed dirty
 rows times columns.
 
 The schema 23 `descriptor_counters` object has exactly
-`available=false`,
-`schema_semantics="unavailable_until_batch_7_descriptor_reuse"`,
-`frame_row_descriptors="unavailable"`, and
-`qsg_layer_descriptors="unavailable"`.
+`available=true`,
+`schema_semantics="batch_7_frame_qsg_descriptor_reuse"`,
+numeric `frame_row_descriptors`, numeric `frame_layer_descriptors`, and
+numeric `qsg_layer_descriptors`. `qsg_layer_descriptors` is zero until QSG
+layer descriptor-key work is wired back in.
 
 The schema 23 `lazy_snapshot_fallback_reason_counters` object has exactly
 `available=true`,

@@ -44,6 +44,27 @@ bool profile_text_contains_counter(const QString& text, const char* key)
         QStringLiteral("  ") + QString::fromLatin1(key) + QStringLiteral("="));
 }
 
+QString profile_text_section(
+    const QString& text,
+    const QString& begin_marker,
+    const QString& end_marker)
+{
+    const qsizetype begin = text.indexOf(begin_marker);
+    if (begin < 0) {
+        return {};
+    }
+
+    const qsizetype content_begin = begin + begin_marker.size();
+    const qsizetype end = end_marker.isEmpty()
+        ? text.size()
+        : text.indexOf(end_marker, content_begin);
+    if (end < 0) {
+        return text.mid(content_begin);
+    }
+
+    return text.mid(content_begin, end - content_begin);
+}
+
 std::shared_ptr<const term::Terminal_render_snapshot> make_smoke_snapshot(
     std::uint64_t sequence)
 {
@@ -219,16 +240,47 @@ bool test_profile_text_sections(QGuiApplication& app)
         "session_profile_stats reports public_projection_scroll_publications");
     ok &= check(text.contains(QStringLiteral("last_renderer_stats\n")),
         "append_renderer_stats_text emits the last_renderer_stats header");
-    ok &= check(text.contains(QStringLiteral("  frame_visible_rows=")),
+    const QString last_renderer_stats = profile_text_section(
+        text,
+        QStringLiteral("last_renderer_stats\n"),
+        QStringLiteral("cumulative_renderer_stats\n"));
+    ok &= check(last_renderer_stats.contains(QStringLiteral("  frame_visible_rows=")),
         "last_renderer_stats reports frame_visible_rows");
-    ok &= check(text.contains(QStringLiteral("  frame_dirty_row_lookup_count=")),
+    ok &= check(
+        last_renderer_stats.contains(QStringLiteral("  frame_dirty_row_lookup_count=")),
         "last_renderer_stats reports frame_dirty_row_lookup_count");
+    ok &= check(
+        profile_text_contains_counter(last_renderer_stats, "frame_row_descriptors_built"),
+        "last_renderer_stats reports frame row descriptor builds");
+    ok &= check(
+        profile_text_contains_counter(last_renderer_stats, "frame_layer_descriptors_built"),
+        "last_renderer_stats reports frame layer descriptor builds");
+    ok &= check(last_renderer_stats.contains(QStringLiteral("  qsg_layer_descriptors=0\n")),
+        "last_renderer_stats reports zero QSG layer descriptors");
     ok &= check(text.contains(QStringLiteral("cumulative_renderer_stats\n")),
         "append_cumulative_renderer_stats_text emits the cumulative_renderer_stats header");
+    const QString cumulative_renderer_stats = profile_text_section(
+        text,
+        QStringLiteral("cumulative_renderer_stats\n"),
+        QStringLiteral("qsg_atlas\n"));
+    ok &= check(cumulative_renderer_stats.contains(QStringLiteral("  qsg_layer_descriptors=0\n")),
+        "cumulative_renderer_stats reports zero QSG layer descriptors");
     ok &= check(text.contains(QStringLiteral("qsg_atlas\n")),
         "append_qsg_atlas_profile_text emits the qsg_atlas header");
-    ok &= check(text.contains(QStringLiteral("  renderer=atlas\n")),
+    const QString qsg_atlas = profile_text_section(
+        text,
+        QStringLiteral("qsg_atlas\n"),
+        QStringLiteral("slow_text_layouts threshold_ns="));
+    ok &= check(qsg_atlas.contains(QStringLiteral("  renderer=atlas\n")),
         "qsg_atlas section tags the renderer as atlas");
+    ok &= check(profile_text_contains_counter(qsg_atlas, "frame_row_descriptors"),
+        "qsg_atlas section reports frame row descriptors");
+    ok &= check(profile_text_contains_counter(qsg_atlas, "frame_layer_descriptors"),
+        "qsg_atlas section reports frame layer descriptors");
+    ok &= check(qsg_atlas.contains(QStringLiteral("  qsg_layer_descriptors=0\n")),
+        "qsg_atlas section reports zero QSG layer descriptors");
+    ok &= check(qsg_atlas.contains(QStringLiteral("  rect_row_capacity=")),
+        "qsg_atlas section reports rect row-stable capacity");
     ok &= check(text.contains(QStringLiteral("slow_text_layouts threshold_ns=")),
         "append_slow_text_layout_diagnostics_text emits the slow_text_layouts header");
     ok &= check(text.contains(QStringLiteral("render_thread sequence=")),

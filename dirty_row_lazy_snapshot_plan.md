@@ -1345,14 +1345,17 @@ Reviewers should classify findings as:
 
 ## 18. Current Handoff
 
-Batch 6 now contains the narrow opt-in lazy content exercise for eligible
-surface/session sparse content workflows. Production snapshot publication
-remains fully materialized: `Terminal_session::publish_render_snapshot()` still
-publishes the full `Terminal_screen_model::render_snapshot()` result, and the
-default session, model, frame, QSG, transcript, replay, and benchmark paths do
-not publish lazy row payloads.
+Batch 7 now contains the frame-builder and QSG descriptor/reuse work from
+Section 13. Row-content-view input remains the canonical frame-builder path,
+QSG descriptor and reuse keys are derived from the produced
+`Terminal_render_frame`, and no second public renderer input was added. Lazy
+publication is still not enabled by default.
 
-The immediate next step is independent review of the Batch 6 diff and gate
-evidence. If accepted, proceed to Batch 7 frame/QSG descriptor reuse work so
-downstream clean-row costs do not hide the publication-path improvement. Do not
-enable lazy publication by default before Batch 8 gates pass.
+Reviewers should review the Batch 7 diff and evidence before Batch 8. The
+Batch 7 evidence covers row-view versus flat frame parity, sparse dirty-row
+frame descriptor scaling, atlas clean-row reuse and dense block graphic rect
+row-stable upload evidence, descriptor/profile/benchmark schema exposure, and
+the targeted render-frame, render-snapshot, profile-text, QSG/atlas,
+surface-host, backend-session, embedded-benchmark, and surface-stress
+validators. If accepted, proceed to Batch 8 default production enablement and
+decision-grade end-to-end performance gates.

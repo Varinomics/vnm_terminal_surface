@@ -124,6 +124,37 @@ struct Terminal_render_cursor_primitive
     QColor                     color;
 };
 
+struct Terminal_render_row_descriptor
+{
+    int                        row = 0;
+    QByteArray                 content_identity_key;
+    QByteArray                 text_key;
+    QByteArray                 background_key;
+    QByteArray                 graphic_key;
+    QByteArray                 decoration_key;
+    QByteArray                 cursor_inverse_text_key;
+    QByteArray                 selection_key;
+    QByteArray                 ime_preedit_key;
+    QByteArray                 hyperlink_underline_key;
+};
+
+struct Terminal_render_layer_descriptors
+{
+    QByteArray                 text_key;
+    QByteArray                 background_key;
+    QByteArray                 graphic_key;
+    QByteArray                 decoration_key;
+    QByteArray                 cursor_inverse_text_key;
+    QByteArray                 selection_key;
+    QByteArray                 ime_preedit_key;
+    QByteArray                 visual_bell_key;
+    QByteArray                 hyperlink_underline_key;
+    QByteArray                 style_color_key;
+    QByteArray                 reverse_video_key;
+    QByteArray                 render_options_key;
+    QByteArray                 cell_metrics_key;
+};
+
 enum class Terminal_simple_content_text_category
 {
     EMPTY,
@@ -284,6 +315,8 @@ struct terminal_render_frame_stats_t
     int                                            decoration_rects_emitted        = 0;
     int                                            cursor_rects_emitted            = 0;
     int                                            overlay_rects_emitted           = 0;
+    int                                            row_descriptors_built           = 0;
+    int                                            layer_descriptors_built         = 0;
 };
 
 struct terminal_render_frame_cumulative_stats_t
@@ -323,6 +356,8 @@ struct terminal_render_frame_cumulative_stats_t
     std::uint64_t                                  decoration_rects_emitted        = 0U;
     std::uint64_t                                  cursor_rects_emitted            = 0U;
     std::uint64_t                                  overlay_rects_emitted           = 0U;
+    std::uint64_t                                  row_descriptors_built           = 0U;
+    std::uint64_t                                  layer_descriptors_built         = 0U;
 };
 
 struct Terminal_render_frame
@@ -342,6 +377,8 @@ struct Terminal_render_frame
     std::vector<Terminal_render_cursor_primitive>  cursors;
     std::vector<Terminal_render_rect>              overlay_rects;
     std::vector<Terminal_render_dirty_row_range>   dirty_row_ranges;
+    std::vector<Terminal_render_row_descriptor>    row_descriptors;
+    Terminal_render_layer_descriptors              layer_descriptors;
     terminal_render_frame_stats_t                  stats;
 };
 
@@ -351,6 +388,7 @@ Terminal_render_frame build_terminal_render_frame(
     terminal_cell_metrics_t            cell_metrics,
     const Terminal_render_options&     options,
     bool                               cursor_blink_visible,
-    const Ime_preedit_state*           ime_preedit_override = nullptr);
+    const Ime_preedit_state*           ime_preedit_override = nullptr,
+    bool                               force_full_cell_walk = false);
 
 }

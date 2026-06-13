@@ -133,7 +133,7 @@ const QString k_output_high_water_queue_pressure_semantics = QStringLiteral(
 const QString k_surface_session_write_high_water_execution_mode = QStringLiteral(
     "surface_session_write_high_water_reservation_pressure");
 const QString k_descriptor_counter_schema_semantics = QStringLiteral(
-    "unavailable_until_batch_7_descriptor_reuse");
+    "batch_7_frame_qsg_descriptor_reuse");
 const QString k_lazy_snapshot_reason_counter_schema_semantics = QStringLiteral(
     "batch_5_lazy_eligibility");
 const QString k_consumer_materialization_counter_schema_semantics = QStringLiteral(
@@ -167,6 +167,7 @@ const QString k_latency_normalization_multi_update_approximate = QStringLiteral(
 const QString k_profile_time_unit        = QStringLiteral("ns");
 const QString k_profile_thread_semantics = QStringLiteral("separate_thread_trees");
 const QColor  k_surface_background       = QColor(16, 20, 24);
+constexpr qint64 k_descriptor_layer_count = 13;
 
 struct grid_size_t
 {
@@ -208,6 +209,9 @@ struct renderer_totals_t
     qint64                 text_resource_descriptor_builds                      = 0;
     qint64                 text_resource_descriptor_builds_avoided              = 0;
     qint64                 text_resource_descriptor_reuses                      = 0;
+    qint64                 frame_row_descriptors_built                          = 0;
+    qint64                 frame_layer_descriptors_built                        = 0;
+    qint64                 qsg_layer_descriptors                                = 0;
     qint64                 text_coalescing_candidate_groups                     = 0;
     qint64                 text_coalescing_enabled_groups                       = 0;
     qint64                 text_resource_runs_before_coalescing                 = 0;
@@ -2871,6 +2875,8 @@ void add_renderer_stats(
         stats.frame.cell_pass_classification_calls;
     totals.frame.dirty_row_lookup_count += stats.frame.dirty_row_lookup_count;
     totals.frame.cells_considered       += stats.frame.cells_considered;
+    totals.frame.row_descriptors_built  += stats.frame.row_descriptors_built;
+    totals.frame.layer_descriptors_built += stats.frame.layer_descriptors_built;
     totals.text_content_rebuilds   += stats.text_content_rebuilds;
     totals.text_content_reused     += stats.text_content_reused;
     totals.text_content_removed    += stats.text_content_removed;
@@ -2891,6 +2897,7 @@ void add_renderer_stats(
         stats.text_resource_descriptor_builds_avoided;
     totals.text_resource_descriptor_reuses +=
         stats.text_resource_descriptor_reuses;
+    totals.qsg_layer_descriptors += stats.qsg_layer_descriptors;
     totals.text_coalescing_candidate_groups += stats.text_coalescing_candidate_groups;
     totals.text_coalescing_enabled_groups   += stats.text_coalescing_enabled_groups;
     totals.text_resource_runs_before_coalescing +=
@@ -3480,6 +3487,9 @@ void add_renderer_stats(
         stats.text_resource_descriptor_builds_avoided;
     totals.text_resource_descriptor_reuses +=
         stats.text_resource_descriptor_reuses;
+    totals.frame_row_descriptors_built += stats.frame.row_descriptors_built;
+    totals.frame_layer_descriptors_built += stats.frame.layer_descriptors_built;
+    totals.qsg_layer_descriptors += stats.qsg_layer_descriptors;
     totals.text_coalescing_candidate_groups += stats.text_coalescing_candidate_groups;
     totals.text_coalescing_enabled_groups   += stats.text_coalescing_enabled_groups;
     totals.text_resource_runs_before_coalescing +=
@@ -6078,13 +6088,20 @@ QJsonValue scenario_profile_value(const Scenario_result& result)
         : QJsonValue(scenario_profile_json(result.profile_threads));
 }
 
-QJsonObject descriptor_counters_json()
+QJsonObject descriptor_counters_json(const Scenario_result& result)
 {
     QJsonObject object;
-    object.insert(QStringLiteral("available"), false);
+    object.insert(QStringLiteral("available"), true);
     object.insert(QStringLiteral("schema_semantics"), k_descriptor_counter_schema_semantics);
-    object.insert(QStringLiteral("frame_row_descriptors"), QStringLiteral("unavailable"));
-    object.insert(QStringLiteral("qsg_layer_descriptors"), QStringLiteral("unavailable"));
+    object.insert(
+        QStringLiteral("frame_row_descriptors"),
+        result.renderer_totals.frame_row_descriptors_built);
+    object.insert(
+        QStringLiteral("frame_layer_descriptors"),
+        result.renderer_totals.frame_layer_descriptors_built);
+    object.insert(
+        QStringLiteral("qsg_layer_descriptors"),
+        result.renderer_totals.qsg_layer_descriptors);
     return object;
 }
 
@@ -6305,7 +6322,7 @@ QJsonObject scenario_json(
         object,
         QStringLiteral("lazy_snapshot_exercise_consumer_materialization_cells"),
         result.lazy_snapshot_exercise_consumer_materialization_cells);
-    object.insert(QStringLiteral("descriptor_counters"), descriptor_counters_json());
+    object.insert(QStringLiteral("descriptor_counters"), descriptor_counters_json(result));
     object.insert(
         QStringLiteral("lazy_snapshot_fallback_reason_counters"),
         lazy_snapshot_fallback_reason_counters_json(result.session_profile_stats));
@@ -8670,6 +8687,7 @@ bool validate_descriptor_counters_json(
                 QStringLiteral("available"),
                 QStringLiteral("schema_semantics"),
                 QStringLiteral("frame_row_descriptors"),
+                QStringLiteral("frame_layer_descriptors"),
                 QStringLiteral("qsg_layer_descriptors"),
             },
             QStringLiteral("descriptor_counters"),
@@ -8679,16 +8697,83 @@ bool validate_descriptor_counters_json(
     }
 
     if (!counters.value(QStringLiteral("available")).isBool() ||
-        counters.value(QStringLiteral("available")).toBool()  ||
+        !counters.value(QStringLiteral("available")).toBool() ||
         counters.value(QStringLiteral("schema_semantics")).toString() !=
-            k_descriptor_counter_schema_semantics ||
-        counters.value(QStringLiteral("frame_row_descriptors")).toString() !=
-            QStringLiteral("unavailable") ||
-        counters.value(QStringLiteral("qsg_layer_descriptors")).toString() !=
-            QStringLiteral("unavailable"))
+            k_descriptor_counter_schema_semantics)
     {
         *out_error = QStringLiteral("scenario descriptor counter schema changed");
         return false;
+    }
+    for (const QString& key : {
+            QStringLiteral("frame_row_descriptors"),
+            QStringLiteral("frame_layer_descriptors"),
+            QStringLiteral("qsg_layer_descriptors"),
+        })
+    {
+        if (!counters.value(key).isDouble() || counters.value(key).toInteger() < 0) {
+            *out_error = QStringLiteral("scenario descriptor counter is invalid");
+            return false;
+        }
+    }
+
+    const qint64 frame_row_descriptors =
+        counters.value(QStringLiteral("frame_row_descriptors")).toInteger();
+    const qint64 frame_layer_descriptors =
+        counters.value(QStringLiteral("frame_layer_descriptors")).toInteger();
+    const qint64 qsg_layer_descriptors =
+        counters.value(QStringLiteral("qsg_layer_descriptors")).toInteger();
+    if (qsg_layer_descriptors != 0) {
+        *out_error = QStringLiteral(
+            "scenario QSG layer descriptor counter must remain zero");
+        return false;
+    }
+
+    const bool render_expected =
+        object.value(QStringLiteral("render_expected")).toBool(true);
+    const qint64 completed_frames =
+        object.value(QStringLiteral("completed_frames")).toInteger();
+    const qint64 consumed_updates =
+        object.value(QStringLiteral("bridge_consumed_updates_delta")).toInteger();
+    const qint64 descriptor_frame_budget =
+        std::max(completed_frames, consumed_updates);
+    const qint64 actual_rows =
+        object.value(QStringLiteral("rows")).toInteger();
+    const qint64 visible_row_budget =
+        object.value(QStringLiteral("frame_visible_rows")).toInteger();
+    if (render_expected && completed_frames > 0) {
+        if (frame_layer_descriptors <= 0) {
+            *out_error = QStringLiteral(
+                "scenario descriptor layer counter is missing evidence");
+            return false;
+        }
+
+        const bool row_descriptors_expected =
+            object.value(QStringLiteral("frame_cell_pass_input_cells")).toInteger() > 0 ||
+            object.value(QStringLiteral("frame_dirty_rows")).toInteger() > 0;
+        if (row_descriptors_expected && frame_row_descriptors <= 0) {
+            *out_error = QStringLiteral(
+                "scenario descriptor row counter is missing evidence");
+            return false;
+        }
+    }
+
+    if (descriptor_frame_budget > 0 && actual_rows > 0) {
+        const qint64 row_descriptor_limit =
+            std::max(
+                descriptor_frame_budget * actual_rows,
+                visible_row_budget);
+        const qint64 layer_descriptor_limit =
+            descriptor_frame_budget * k_descriptor_layer_count;
+        if (frame_row_descriptors > row_descriptor_limit) {
+            *out_error = QStringLiteral(
+                "scenario frame row descriptor counter exceeded frame-row bound");
+            return false;
+        }
+        if (frame_layer_descriptors > layer_descriptor_limit) {
+            *out_error = QStringLiteral(
+                "scenario descriptor layer counter exceeded frame-layer bound");
+            return false;
+        }
     }
 
     return true;

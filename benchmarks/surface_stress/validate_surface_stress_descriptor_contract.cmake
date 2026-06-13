@@ -34,21 +34,27 @@ if(NOT benchmark_result EQUAL 0)
         "stderr:\n${benchmark_error}")
 endif()
 
-if(NOT benchmark_output MATCHES "frame_row_descriptor_counters_available=false")
+if(NOT benchmark_output MATCHES "frame_row_descriptor_counters_available=true")
     message(FATAL_ERROR
         "surface stress descriptor availability contract missing\n"
         "stdout:\n${benchmark_output}")
 endif()
 
 if(NOT benchmark_output MATCHES
-    "frame_row_descriptor_counter_semantics=unavailable_until_batch_7_descriptor_reuse")
+    "frame_row_descriptor_counter_semantics=batch_7_frame_qsg_descriptor_reuse")
     message(FATAL_ERROR
         "surface stress descriptor semantics contract missing\n"
         "stdout:\n${benchmark_output}")
 endif()
 
-if(benchmark_output MATCHES "frame_row_descriptors_|qsg_layer_descriptors_")
+if(NOT benchmark_output MATCHES "frame_row_descriptors_built=[1-9][0-9]*")
     message(FATAL_ERROR
-        "surface stress output contains stale descriptor counters\n"
+        "surface stress row descriptor counter missing or zero\n"
+        "stdout:\n${benchmark_output}")
+endif()
+
+if(NOT benchmark_output MATCHES "frame_layer_descriptors_built=[1-9][0-9]*")
+    message(FATAL_ERROR
+        "surface stress layer descriptor counter missing or zero\n"
         "stdout:\n${benchmark_output}")
 endif()
