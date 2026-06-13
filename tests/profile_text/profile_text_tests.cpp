@@ -152,10 +152,10 @@ bool test_profile_text_sections(QGuiApplication& app)
         "session_profile_stats reports available consumer materialization counters");
     ok &= check(text.contains(QStringLiteral(
             "  consumer_materialization_counters_schema_semantics="
-            "batch_3_materialization_boundaries")),
+            "batch_6_materialization_boundaries")),
         "session_profile_stats reports consumer materialization counter owner semantics");
     ok &= check(text.contains(QStringLiteral(
-            "  consumer_materialization_counters_owner_batch=Batch 3")),
+            "  consumer_materialization_counters_owner_batch=Batch 6")),
         "session_profile_stats reports consumer materialization counter owner batch");
     ok &= check(text.contains(QStringLiteral(
             "  consumer_materialization_counters_geometry_derived_snapshot_calls=")),
@@ -166,6 +166,15 @@ bool test_profile_text_sections(QGuiApplication& app)
     ok &= check(text.contains(QStringLiteral(
             "  consumer_materialization_counters_geometry_derived_snapshot_cells=")),
         "session_profile_stats reports geometry-derived materialization cells");
+    ok &= check(text.contains(QStringLiteral(
+            "  consumer_materialization_counters_row_view_parity_test_calls=")),
+        "session_profile_stats reports row-view parity materialization calls");
+    ok &= check(text.contains(QStringLiteral(
+            "  consumer_materialization_counters_row_view_parity_test_rows=")),
+        "session_profile_stats reports row-view parity materialization rows");
+    ok &= check(text.contains(QStringLiteral(
+            "  consumer_materialization_counters_row_view_parity_test_cells=")),
+        "session_profile_stats reports row-view parity materialization cells");
     ok &= check(text.contains(QStringLiteral(
             "  lazy_snapshot_fallback_reason_counters_available=true")),
         "session_profile_stats reports available lazy snapshot reason counters");
@@ -179,6 +188,13 @@ bool test_profile_text_sections(QGuiApplication& app)
     const char* const lazy_profile_counter_keys[] = {
         "lazy_snapshot_eligibility_checks",
         "lazy_snapshot_eligible_checks",
+        "lazy_snapshot_full_fallbacks",
+        "lazy_snapshot_dirty_rows_visible",
+        "lazy_snapshot_previous_snapshot_borrowed_rows",
+        "lazy_snapshot_producer_owned_rows",
+        "lazy_snapshot_producer_materialized_rows",
+        "lazy_snapshot_producer_cells_scanned",
+        "lazy_snapshot_producer_cells_emitted",
         "lazy_snapshot_materialization_mismatches_for_testing",
     };
     for (const char* key : lazy_profile_counter_keys) {

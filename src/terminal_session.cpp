@@ -177,6 +177,9 @@ void record_consumer_materialization(
             profile_stats->geometry_derived_materialization_cells += cells;
             break;
         case Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST:
+            ++profile_stats->row_view_parity_materialization_calls;
+            profile_stats->row_view_parity_materialization_rows  += rows;
+            profile_stats->row_view_parity_materialization_cells += cells;
             break;
     }
 }
@@ -1511,6 +1514,7 @@ bool uses_deferred_backend_callbacks(const Terminal_session_config& config)
 // path in Terminal_session::publish_render_snapshot().
 struct lazy_snapshot_composer_input_t
 {
+    std::shared_ptr<const Terminal_render_snapshot> previous_content_snapshot_handle;
     const Terminal_render_snapshot* previous_content_snapshot = nullptr;
     const Terminal_render_snapshot* full_snapshot             = nullptr;
     bool dirty_rows_have_stable_mutation_identity             = true;
@@ -1700,11 +1704,47 @@ Terminal_session_lazy_snapshot_composer_result lazy_snapshot_ineligible_result(
 }
 
 Terminal_session_lazy_snapshot_composer_result
-lazy_snapshot_materialization_mismatch_for_testing_result()
+lazy_snapshot_materialization_mismatch_for_testing_result(
+    std::uint64_t consumer_materialization_calls = 0U,
+    std::uint64_t consumer_materialization_rows  = 0U,
+    std::uint64_t consumer_materialization_cells = 0U)
 {
     Terminal_session_lazy_snapshot_composer_result result;
     result.materialization_mismatch_for_testing = true;
+    result.consumer_materialization_calls       = consumer_materialization_calls;
+    result.consumer_materialization_rows        = consumer_materialization_rows;
+    result.consumer_materialization_cells       = consumer_materialization_cells;
     return result;
+}
+
+bool render_snapshot_cells_match(
+    const std::vector<Terminal_render_cell>& materialized,
+    const std::vector<Terminal_render_cell>& expected)
+{
+    if (materialized.size() != expected.size()) {
+        return false;
+    }
+
+    for (std::size_t i = 0U; i < materialized.size(); ++i) {
+        if (!render_snapshot_cells_equal(materialized[i], expected[i])) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+Terminal_lazy_snapshot_fallback_reason direct_previous_row_borrow_fallback_reason(
+    bool                                                       previous_handle_available,
+    const std::vector<Terminal_render_snapshot_style_id_remap>& style_id_remaps)
+{
+    if (!previous_handle_available) {
+        return Terminal_lazy_snapshot_fallback_reason::MISSING_PREVIOUS_CONTENT_SNAPSHOT;
+    }
+
+    return style_id_remaps_are_identity(style_id_remaps)
+        ? Terminal_lazy_snapshot_fallback_reason::HYPERLINK_NAMESPACE_INCOMPATIBILITY
+        : Terminal_lazy_snapshot_fallback_reason::STYLE_COLOR_MODE_INCOMPATIBILITY;
 }
 
 const terminal_lazy_snapshot_fallback_reason_descriptor_t*
@@ -1802,12 +1842,96 @@ Terminal_lazy_snapshot_fallback_reason evaluate_lazy_snapshot_eligibility(
 
 Terminal_render_snapshot_row_payload_ref lazy_row_payload_ref(
     std::shared_ptr<const Terminal_render_snapshot_row_payload_owner> owner,
-    std::size_t                                                       row)
+    std::size_t                                                       payload_index)
 {
     Terminal_render_snapshot_row_payload_ref ref;
     ref.owner         = std::move(owner);
-    ref.payload_index = row;
+    ref.payload_index = payload_index;
     return ref;
+}
+
+std::uint64_t visible_dirty_row_count(const Terminal_render_snapshot& snapshot)
+{
+    std::uint64_t count = 0U;
+    for (const Terminal_render_dirty_row_range& range : snapshot.dirty_row_ranges) {
+        const int first_row = std::max(range.first_row, 0);
+        const int last_row =
+            std::min(
+                range.first_row + range.row_count,
+                render_snapshot_viewable_row_count(snapshot));
+        if (last_row > first_row) {
+            count += static_cast<std::uint64_t>(last_row - first_row);
+        }
+    }
+
+    return count;
+}
+
+struct dirty_row_payload_owner_result_t
+{
+    std::shared_ptr<const Terminal_render_snapshot_row_payload_owner> owner;
+    std::vector<std::size_t> payload_index_by_row;
+    std::uint64_t owned_rows        = 0U;
+    std::uint64_t materialized_rows = 0U;
+    std::uint64_t cells_scanned     = 0U;
+    std::uint64_t cells_emitted     = 0U;
+};
+
+dirty_row_payload_owner_result_t dirty_row_payload_owner_from_snapshot(
+    const Terminal_render_snapshot&                snapshot,
+    Terminal_render_snapshot_row_payload_namespace metadata_namespace,
+    std::uint64_t                                  retained_generation)
+{
+    constexpr std::size_t missing_payload_index =
+        std::numeric_limits<std::size_t>::max();
+
+    dirty_row_payload_owner_result_t result;
+    const int row_count = render_snapshot_viewable_row_count(snapshot);
+    result.payload_index_by_row.assign(
+        static_cast<std::size_t>(row_count),
+        missing_payload_index);
+
+    const Terminal_render_snapshot_row_content_view rows(snapshot);
+    std::vector<Terminal_render_snapshot_immutable_row_payload> payloads;
+    payloads.reserve(static_cast<std::size_t>(visible_dirty_row_count(snapshot)));
+
+    for (const Terminal_render_dirty_row_range& range : snapshot.dirty_row_ranges) {
+        const int first_row = std::max(range.first_row, 0);
+        const int last_row =
+            std::min(
+                range.first_row + range.row_count,
+                row_count);
+        for (int row = first_row; row < last_row; ++row) {
+            Terminal_render_snapshot_immutable_row_payload payload;
+            const Terminal_render_snapshot_row_content row_content = rows.row_at(row);
+            payload.identity.row                   = row;
+            payload.identity.row_origin_generation =
+                snapshot.metadata.row_origin_generation;
+            payload.identity.metadata_namespace    = metadata_namespace;
+            if (const Terminal_render_line_provenance* provenance =
+                    row_content.provenance_or_null())
+            {
+                payload.identity.provenance = *provenance;
+            }
+            payload.cells.assign(row_content.begin(), row_content.end());
+
+            result.payload_index_by_row[static_cast<std::size_t>(row)] =
+                payloads.size();
+            payloads.push_back(std::move(payload));
+            ++result.owned_rows;
+            ++result.materialized_rows;
+            result.cells_scanned +=
+                static_cast<std::uint64_t>(std::max(snapshot.grid_size.columns, 0));
+            result.cells_emitted +=
+                static_cast<std::uint64_t>(row_content.cell_count());
+        }
+    }
+
+    result.owner =
+        std::make_shared<const Terminal_render_snapshot_row_payload_owner>(
+            retained_generation,
+            std::move(payloads));
+    return result;
 }
 
 Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_input(
@@ -1834,36 +1958,49 @@ Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_
             receiving_namespace,
             style_id_remaps,
             hyperlink_id_remaps);
-    const std::shared_ptr<const Terminal_render_snapshot_row_payload_owner>
-        previous_owner =
-            render_snapshot_row_payload_owner_from_snapshot(
-                previous,
-                previous_namespace,
-                previous.metadata.sequence);
-    const std::shared_ptr<const Terminal_render_snapshot_row_payload_owner>
-        current_owner =
-            render_snapshot_row_payload_owner_from_snapshot(
-                current,
-                receiving_namespace,
-                current.metadata.sequence);
+    const bool previous_handle_available =
+        input.previous_content_snapshot_handle != nullptr;
+    const bool can_borrow_previous_rows_directly =
+        previous_handle_available &&
+        previous_namespace == receiving_namespace;
+    if (!can_borrow_previous_rows_directly) {
+        return lazy_snapshot_ineligible_result(
+            direct_previous_row_borrow_fallback_reason(
+                previous_handle_available,
+                style_id_remaps));
+    }
+
+    const dirty_row_payload_owner_result_t current_dirty_owner =
+        dirty_row_payload_owner_from_snapshot(
+            current,
+            receiving_namespace,
+            current.metadata.sequence);
 
     auto payloads = std::make_shared<Terminal_render_snapshot_lazy_payloads>();
     payloads->receiving_namespace = receiving_namespace;
     payloads->rows.reserve(static_cast<std::size_t>(current.grid_size.rows));
+    const std::uint64_t dirty_rows_visible = visible_dirty_row_count(current);
     for (int row = 0; row < current.grid_size.rows; ++row) {
         const bool dirty = render_snapshot_row_is_dirty(current, row);
+        const std::size_t payload_index =
+            dirty
+                ? current_dirty_owner
+                    .payload_index_by_row[static_cast<std::size_t>(row)]
+                : static_cast<std::size_t>(row);
         const std::optional<Terminal_render_snapshot_lazy_row_payload> payload =
             dirty
                 ? borrowed_render_snapshot_lazy_row_payload(
-                    lazy_row_payload_ref(current_owner, static_cast<std::size_t>(row)),
+                    lazy_row_payload_ref(
+                        current_dirty_owner.owner,
+                        payload_index),
                     receiving_namespace,
                     {},
                     {})
-                : borrowed_render_snapshot_lazy_row_payload(
-                    lazy_row_payload_ref(previous_owner, static_cast<std::size_t>(row)),
-                    receiving_namespace,
-                    style_id_remaps,
-                    hyperlink_id_remaps);
+                : borrowed_render_snapshot_lazy_row_payload_from_snapshot_row(
+                    input.previous_content_snapshot_handle,
+                    row,
+                    previous_namespace,
+                    receiving_namespace);
         if (!payload.has_value()) {
             return lazy_snapshot_ineligible_result(
                 dirty
@@ -1880,24 +2017,45 @@ Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_
     lazy_snapshot.cells.clear();
     lazy_snapshot.lazy_row_payloads = payloads;
 
+    const Terminal_render_snapshot_row_content_view rows(lazy_snapshot);
+    const std::uint64_t materialized_rows =
+        static_cast<std::uint64_t>(rows.row_count());
+    const std::vector<Terminal_render_cell> materialized_cells =
+        rows.materialize_flat_cells(
+            Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST);
+    const std::uint64_t materialized_cell_count =
+        static_cast<std::uint64_t>(materialized_cells.size());
+
     if (validate_render_snapshot(lazy_snapshot).status !=
         Terminal_render_snapshot_status::OK)
     {
-        return lazy_snapshot_materialization_mismatch_for_testing_result();
+        return lazy_snapshot_materialization_mismatch_for_testing_result(
+            1U,
+            materialized_rows,
+            materialized_cell_count);
     }
 
-    const Terminal_render_snapshot_row_content_view rows(lazy_snapshot);
-    if (!rows.materialized_flat_cells_match(
-            current.cells,
-            Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST))
-    {
-        return lazy_snapshot_materialization_mismatch_for_testing_result();
+    if (!render_snapshot_cells_match(materialized_cells, current.cells)) {
+        return lazy_snapshot_materialization_mismatch_for_testing_result(
+            1U,
+            materialized_rows,
+            materialized_cell_count);
     }
 
     Terminal_session_lazy_snapshot_composer_result result;
     result.eligible                              = true;
     result.lazy_snapshot                         = std::move(lazy_snapshot);
     result.materialization_matches_full_snapshot = true;
+    result.dirty_rows_visible                    = dirty_rows_visible;
+    result.previous_snapshot_borrowed_rows =
+        static_cast<std::uint64_t>(current.grid_size.rows) - dirty_rows_visible;
+    result.producer_owned_rows        = current_dirty_owner.owned_rows;
+    result.producer_materialized_rows = current_dirty_owner.materialized_rows;
+    result.producer_cells_scanned     = current_dirty_owner.cells_scanned;
+    result.producer_cells_emitted     = current_dirty_owner.cells_emitted;
+    result.consumer_materialization_calls = 1U;
+    result.consumer_materialization_rows  = materialized_rows;
+    result.consumer_materialization_cells = materialized_cell_count;
     return result;
 }
 
@@ -3519,6 +3677,75 @@ Terminal_session_profile_stats Terminal_session::profile_stats() const
 
 Terminal_session_lazy_snapshot_composer_result
 Terminal_session::compose_lazy_render_snapshot_for_testing(
+    std::shared_ptr<const Terminal_render_snapshot> previous_content_snapshot,
+    const Terminal_render_snapshot& full_snapshot,
+    bool                            unsupported_geometry_or_detached_snapshot_path)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    lazy_snapshot_composer_input_t input;
+    input.previous_content_snapshot_handle = std::move(previous_content_snapshot);
+    input.previous_content_snapshot = input.previous_content_snapshot_handle.get();
+    input.full_snapshot             = &full_snapshot;
+    input.unsupported_geometry_or_detached_snapshot_path =
+        unsupported_geometry_or_detached_snapshot_path;
+    if (m_render_snapshot_model_result.has_value()) {
+        input.dirty_rows_have_stable_mutation_identity =
+            m_render_snapshot_model_result->dirty_rows_have_stable_mutation_identity;
+    }
+
+    Terminal_session_lazy_snapshot_composer_result result =
+        compose_lazy_render_snapshot_for_input(input);
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    if (m_profile_stats.enabled) {
+        ++m_profile_stats.lazy_snapshot_eligibility_checks;
+        if (result.materialization_mismatch_for_testing) {
+            ++m_profile_stats
+                .lazy_snapshot_materialization_mismatches_for_testing;
+        }
+        if (result.consumer_materialization_calls > 0U) {
+            for (std::uint64_t call = 0U;
+                call < result.consumer_materialization_calls;
+                ++call)
+            {
+                record_consumer_materialization(
+                    &m_profile_stats,
+                    Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST,
+                    result.consumer_materialization_rows,
+                    result.consumer_materialization_cells);
+            }
+        }
+        if (result.eligible) {
+            ++m_profile_stats.lazy_snapshot_eligible_checks;
+            m_profile_stats.lazy_snapshot_dirty_rows_visible +=
+                result.dirty_rows_visible;
+            m_profile_stats.lazy_snapshot_previous_snapshot_borrowed_rows +=
+                result.previous_snapshot_borrowed_rows;
+            m_profile_stats.lazy_snapshot_producer_owned_rows +=
+                result.producer_owned_rows;
+            m_profile_stats.lazy_snapshot_producer_materialized_rows +=
+                result.producer_materialized_rows;
+            m_profile_stats.lazy_snapshot_producer_cells_scanned +=
+                result.producer_cells_scanned;
+            m_profile_stats.lazy_snapshot_producer_cells_emitted +=
+                result.producer_cells_emitted;
+        }
+        else
+        if (!result.materialization_mismatch_for_testing) {
+            ++m_profile_stats.lazy_snapshot_full_fallbacks;
+            record_lazy_snapshot_fallback_reason(
+                m_profile_stats.lazy_snapshot_fallback_reasons,
+                result.fallback_reason);
+        }
+    }
+#endif
+
+    return result;
+}
+
+Terminal_session_lazy_snapshot_composer_result
+Terminal_session::compose_lazy_render_snapshot_for_testing(
     const Terminal_render_snapshot* previous_content_snapshot,
     const Terminal_render_snapshot& full_snapshot,
     bool                            unsupported_geometry_or_detached_snapshot_path)
@@ -3545,11 +3772,36 @@ Terminal_session::compose_lazy_render_snapshot_for_testing(
             ++m_profile_stats
                 .lazy_snapshot_materialization_mismatches_for_testing;
         }
+        if (result.consumer_materialization_calls > 0U) {
+            for (std::uint64_t call = 0U;
+                call < result.consumer_materialization_calls;
+                ++call)
+            {
+                record_consumer_materialization(
+                    &m_profile_stats,
+                    Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST,
+                    result.consumer_materialization_rows,
+                    result.consumer_materialization_cells);
+            }
+        }
         if (result.eligible) {
             ++m_profile_stats.lazy_snapshot_eligible_checks;
+            m_profile_stats.lazy_snapshot_dirty_rows_visible +=
+                result.dirty_rows_visible;
+            m_profile_stats.lazy_snapshot_previous_snapshot_borrowed_rows +=
+                result.previous_snapshot_borrowed_rows;
+            m_profile_stats.lazy_snapshot_producer_owned_rows +=
+                result.producer_owned_rows;
+            m_profile_stats.lazy_snapshot_producer_materialized_rows +=
+                result.producer_materialized_rows;
+            m_profile_stats.lazy_snapshot_producer_cells_scanned +=
+                result.producer_cells_scanned;
+            m_profile_stats.lazy_snapshot_producer_cells_emitted +=
+                result.producer_cells_emitted;
         }
         else
         if (!result.materialization_mismatch_for_testing) {
+            ++m_profile_stats.lazy_snapshot_full_fallbacks;
             record_lazy_snapshot_fallback_reason(
                 m_profile_stats.lazy_snapshot_fallback_reasons,
                 result.fallback_reason);

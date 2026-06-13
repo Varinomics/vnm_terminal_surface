@@ -1200,6 +1200,122 @@ bool test_surface_session_snapshot_burst_coalesces_to_latest_render(QGuiApplicat
     return ok;
 }
 
+bool test_surface_session_lazy_composer_exercise_remains_opt_in(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral(
+        "\x1b[1;1HAAAA\x1b[2;1HBBBB\x1b[3;1HCCCC")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "surface lazy composer exercise starts");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> previous_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(previous_snapshot != nullptr &&
+            previous_snapshot->lazy_row_payloads == nullptr,
+        "surface lazy composer baseline production snapshot is full");
+    if (previous_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+            app,
+            fixture.window,
+            fixture.surface,
+            previous_snapshot->metadata.sequence),
+        "surface lazy composer captures baseline before sparse mutation");
+
+    term::VNM_TerminalSurface_render_bridge
+        ::set_session_profile_stats_enabled_for_benchmark(fixture.surface, true);
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[2;1Hbb"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    ok &= check(pump_until(app, [&] {
+            const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            return
+                snapshot != nullptr &&
+                snapshot->metadata.sequence > previous_snapshot->metadata.sequence;
+        }),
+        "surface lazy composer publishes mutation snapshot");
+    const std::shared_ptr<const term::Terminal_render_snapshot> current_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(current_snapshot != nullptr &&
+            current_snapshot->lazy_row_payloads == nullptr &&
+            snapshot_contains_text(*current_snapshot, QStringLiteral("bb")),
+        "surface lazy composer mutation production snapshot remains full");
+    if (current_snapshot == nullptr) {
+        return ok;
+    }
+
+    const term::Terminal_session_lazy_snapshot_composer_result result =
+        term::VNM_TerminalSurface_render_bridge::compose_lazy_render_snapshot_for_testing(
+            fixture.surface,
+            previous_snapshot,
+            *current_snapshot);
+    ok &= check(result.eligible && result.lazy_snapshot.has_value(),
+        "surface lazy composer accepts the opt-in sparse content snapshot");
+    ok &= check(result.lazy_snapshot.has_value() &&
+            result.lazy_snapshot->cells.empty() &&
+            result.lazy_snapshot->lazy_row_payloads != nullptr,
+        "surface lazy composer result is lazy only after explicit test bridge call");
+    const std::uint64_t visible_rows =
+        static_cast<std::uint64_t>(std::max(current_snapshot->grid_size.rows, 0));
+    const std::uint64_t materialized_cells =
+        static_cast<std::uint64_t>(current_snapshot->cells.size());
+    ok &= check(result.previous_snapshot_borrowed_rows ==
+            visible_rows - result.dirty_rows_visible,
+        "surface lazy composer borrows all non-dirty visible rows");
+    ok &= check(result.producer_owned_rows <= result.dirty_rows_visible &&
+            result.producer_materialized_rows <= result.dirty_rows_visible &&
+            result.producer_cells_scanned <=
+                result.dirty_rows_visible *
+                    static_cast<std::uint64_t>(
+                        std::max(current_snapshot->grid_size.columns, 0)),
+        "surface lazy composer producer work is bounded by visible dirty rows");
+    ok &= check(result.producer_cells_emitted <= result.producer_cells_scanned,
+        "surface lazy composer emitted cells are bounded by scanned cells");
+    ok &= check(result.consumer_materialization_calls == 1U &&
+            result.consumer_materialization_rows == visible_rows &&
+            result.consumer_materialization_cells == materialized_cells,
+        "surface lazy composer counts the explicit parity materialization");
+    ok &= check(capture_surface_sequence(
+            app,
+            fixture.window,
+            fixture.surface,
+            current_snapshot->metadata.sequence),
+        "surface lazy composer captures mutation through downstream renderer path");
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    const term::Terminal_session_profile_stats stats =
+        term::VNM_TerminalSurface_render_bridge::session_profile_stats(fixture.surface);
+    ok &= check(stats.full_snapshot_publications > 0U &&
+            stats.lazy_snapshot_full_fallbacks == 0U &&
+            stats.lazy_snapshot_eligibility_checks == 1U &&
+            stats.lazy_snapshot_eligible_checks == 1U,
+        "surface lazy composer profile counters show explicit opt-in lazy exercise "
+        "without production lazy publication");
+    ok &= check(stats.row_view_parity_materialization_calls == 1U &&
+            stats.row_view_parity_materialization_rows == visible_rows &&
+            stats.row_view_parity_materialization_cells == materialized_cells,
+        "surface lazy composer profile counters count consumer materialization");
+#endif
+
+    return ok;
+}
+
 bool test_surface_polish_drains_queued_backend_output_before_render_capture(QGuiApplication& app)
 {
     bool ok = true;
@@ -11900,6 +12016,7 @@ int main(int argc, char** argv)
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
     ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
+    ok &= test_surface_session_lazy_composer_exercise_remains_opt_in(app);
     ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
     ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
     ok &= test_surface_set_render_snapshot_seam_coalesces_on_row_identity(app);

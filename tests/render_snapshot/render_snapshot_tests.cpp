@@ -538,8 +538,12 @@ std::uint64_t lazy_row_source_generation(
         return 0U;
     }
 
-    return lazy_row->source.owner != nullptr
-        ? lazy_row->source.owner->retained_generation()
+    if (lazy_row->source.owner != nullptr) {
+        return lazy_row->source.owner->retained_generation();
+    }
+
+    return lazy_row->source_snapshot != nullptr
+        ? lazy_row->source_snapshot->metadata.sequence
         : 0U;
 }
 
@@ -2729,6 +2733,7 @@ bool test_disabled_lazy_composer_borrows_clean_rows_and_owns_dirty_rows()
         QByteArrayLiteral("\x1b[2;1Hbb"),
         QByteArrayLiteral("\x1b[3;1Hcc"),
     };
+    std::uint64_t expected_row_view_parity_cells = 0U;
     for (const QByteArray& mutation : mutations) {
         ok &= check(backend->emit_output(mutation),
             "lazy composer publishes dirty-row mutation");
@@ -2738,9 +2743,10 @@ bool test_disabled_lazy_composer_borrows_clean_rows_and_owns_dirty_rows()
             "production dirty-row snapshot remains fully materialized");
 
         const term::Terminal_session_lazy_snapshot_composer_result result =
-            session->compose_lazy_render_snapshot_for_testing(previous.get(), *current);
+            session->compose_lazy_render_snapshot_for_testing(previous, *current);
         ok &= check(result.eligible && result.lazy_snapshot.has_value(),
             "disabled lazy composer accepts stable dirty-row mutation");
+        expected_row_view_parity_cells += result.consumer_materialization_cells;
         if (result.lazy_snapshot.has_value()) {
             const term::Terminal_render_snapshot& lazy = *result.lazy_snapshot;
             ok &= check(lazy.cells.empty() && lazy.lazy_row_payloads != nullptr,
@@ -2754,6 +2760,27 @@ bool test_disabled_lazy_composer_borrows_clean_rows_and_owns_dirty_rows()
             ok &= check(dirty_ranges_equal(lazy.dirty_row_ranges,
                     current->dirty_row_ranges),
                 "lazy composer preserves the full path dirty-row ranges");
+            ok &= check(result.previous_snapshot_borrowed_rows ==
+                    static_cast<std::uint64_t>(current->grid_size.rows) -
+                        result.dirty_rows_visible,
+                "lazy composer borrows every clean visible row from the previous "
+                "snapshot");
+            ok &= check(result.producer_owned_rows <= result.dirty_rows_visible &&
+                    result.producer_materialized_rows <= result.dirty_rows_visible,
+                "lazy composer producer ownership is bounded by dirty visible rows");
+            ok &= check(result.producer_cells_scanned <=
+                    result.dirty_rows_visible *
+                        static_cast<std::uint64_t>(current->grid_size.columns),
+                "lazy composer producer cell scanning is bounded by dirty rows times "
+                "columns");
+            ok &= check(result.producer_cells_emitted <=
+                    result.producer_cells_scanned,
+                "lazy composer producer emitted cells are bounded by scanned cells");
+            ok &= check(result.consumer_materialization_calls == 1U &&
+                    result.consumer_materialization_rows ==
+                        static_cast<std::uint64_t>(current->grid_size.rows) &&
+                    result.consumer_materialization_cells == current->cells.size(),
+                "lazy composer counts the explicit row-view parity materialization");
 
             bool observed_dirty_current_row = false;
             bool observed_clean_previous_row = false;
@@ -2812,6 +2839,25 @@ bool test_disabled_lazy_composer_borrows_clean_rows_and_owns_dirty_rows()
     ok &= check(stats.lazy_snapshot_eligibility_checks == 2U &&
             stats.lazy_snapshot_eligible_checks == 2U,
         "disabled lazy composer profile counters count explicit test-only checks");
+    ok &= check(stats.lazy_snapshot_full_fallbacks == 0U,
+        "disabled lazy composer records no full fallbacks for eligible sparse rows");
+    ok &= check(stats.lazy_snapshot_previous_snapshot_borrowed_rows +
+                stats.lazy_snapshot_dirty_rows_visible == 6U &&
+            stats.lazy_snapshot_producer_owned_rows <=
+                stats.lazy_snapshot_dirty_rows_visible &&
+            stats.lazy_snapshot_producer_materialized_rows <=
+                stats.lazy_snapshot_dirty_rows_visible &&
+            stats.lazy_snapshot_producer_cells_scanned <=
+                stats.lazy_snapshot_dirty_rows_visible * 12U &&
+            stats.lazy_snapshot_producer_cells_emitted <=
+                stats.lazy_snapshot_producer_cells_scanned,
+        "disabled lazy composer profile counters preserve dirty-row proportional "
+        "bounds");
+    ok &= check(stats.row_view_parity_materialization_calls == 2U &&
+            stats.row_view_parity_materialization_rows == 6U &&
+            stats.row_view_parity_materialization_cells ==
+                expected_row_view_parity_cells,
+        "disabled lazy composer records row-view parity materialization boundaries");
     ok &= check(stats.lazy_snapshot_materialization_mismatches_for_testing == 0U,
         "disabled lazy composer records no materialization mismatches");
     ok &= check(stats.full_snapshot_publications >= 3U,
@@ -2854,7 +2900,7 @@ bool test_disabled_lazy_composer_rejects_malformed_dirty_row_metadata()
     omitted_dirty_row.dirty_row_ranges.clear();
     const term::Terminal_session_lazy_snapshot_composer_result result =
         session->compose_lazy_render_snapshot_for_testing(
-            previous.get(),
+            previous,
             omitted_dirty_row);
 
     ok &= check(!result.eligible &&
@@ -2864,6 +2910,12 @@ bool test_disabled_lazy_composer_rejects_malformed_dirty_row_metadata()
             result.fallback_reason ==
                 term::Terminal_lazy_snapshot_fallback_reason::NONE,
         "lazy composer rejects eligibility-passing malformed dirty-row metadata");
+    ok &= check(result.consumer_materialization_calls == 1U &&
+            result.consumer_materialization_rows ==
+                static_cast<std::uint64_t>(omitted_dirty_row.grid_size.rows) &&
+            result.consumer_materialization_cells == omitted_dirty_row.cells.size(),
+        "malformed lazy composer mismatch carries row-view parity materialization "
+        "counters");
 
 #if VNM_TERMINAL_PROFILING_ENABLED
     const term::Terminal_session_profile_stats stats = session->profile_stats();
@@ -2872,6 +2924,12 @@ bool test_disabled_lazy_composer_rejects_malformed_dirty_row_metadata()
         "malformed lazy composer input is checked but not counted as eligible");
     ok &= check(stats.lazy_snapshot_materialization_mismatches_for_testing == 1U,
         "malformed lazy composer input records one test-only materialization mismatch");
+    ok &= check(stats.row_view_parity_materialization_calls == 1U &&
+            stats.row_view_parity_materialization_rows ==
+                static_cast<std::uint64_t>(omitted_dirty_row.grid_size.rows) &&
+            stats.row_view_parity_materialization_cells == omitted_dirty_row.cells.size(),
+        "malformed lazy composer profile counters record parity materialization "
+        "before mismatch");
     const term::Terminal_lazy_snapshot_fallback_reason_counters fallback_counters =
         stats.lazy_snapshot_fallback_reasons;
     ok &= lazy_snapshot_fallback_reason_counters_are_zero(fallback_counters);
@@ -3171,25 +3229,69 @@ bool test_disabled_lazy_composer_session_boundary_fallbacks()
             "lazy hyperlink fallback session starts");
         ok &= check(backend != nullptr &&
             backend->emit_output(
-                QByteArrayLiteral("\x1b]8;id=before;https://before.test\x1b\\LINK\x1b]8;;\x1b\\")),
+                QByteArrayLiteral(
+                    "\x1b]8;id=main;https://example.test\x1b\\LINK\x1b]8;;\x1b\\"
+                    "\x1b[2;1HBASE")),
             "lazy hyperlink fallback publishes linked baseline");
         const std::shared_ptr<const term::Terminal_render_snapshot> previous =
             session->latest_render_snapshot_handle();
-        ok &= check(backend->emit_output(
-                QByteArrayLiteral("\x1b]8;id=after;https://after.test\x1b\\NEXT\x1b]8;;\x1b\\")),
-            "lazy hyperlink fallback publishes changed link namespace");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[2;1Hnext")),
+            "lazy hyperlink fallback publishes dirty unlinked row");
         const std::shared_ptr<const term::Terminal_render_snapshot> current =
             session->latest_render_snapshot_handle();
-        if (previous != nullptr && current != nullptr) {
+        ok &= check(previous != nullptr &&
+                current != nullptr &&
+                !previous->hyperlinks.empty(),
+            "lazy hyperlink fallback has linked baseline and mutation snapshots");
+        if (previous != nullptr && current != nullptr && !previous->hyperlinks.empty()) {
+            const std::uint64_t source_hyperlink_id =
+                previous->hyperlinks.front().hyperlink_id;
+            const std::uint64_t receiving_hyperlink_id = source_hyperlink_id + 100U;
+            term::Terminal_render_snapshot remapped_current = *current;
+            for (term::Terminal_render_hyperlink_metadata& hyperlink :
+                remapped_current.hyperlinks)
+            {
+                if (hyperlink.identity_key == previous->hyperlinks.front().identity_key &&
+                    hyperlink.uri          == previous->hyperlinks.front().uri)
+                {
+                    hyperlink.hyperlink_id = receiving_hyperlink_id;
+                }
+            }
+            for (term::Terminal_render_cell& cell : remapped_current.cells) {
+                if (cell.hyperlink_id == source_hyperlink_id) {
+                    cell.hyperlink_id = receiving_hyperlink_id;
+                }
+            }
+            ok &= check(term::validate_render_snapshot(remapped_current).status ==
+                    term::Terminal_render_snapshot_status::OK,
+                "lazy hyperlink fallback remapped current snapshot remains valid");
+#if VNM_TERMINAL_PROFILING_ENABLED
+            session->set_profile_stats_enabled(true);
+#endif
             const term::Terminal_session_lazy_snapshot_composer_result result =
                 session->compose_lazy_render_snapshot_for_testing(
-                    previous.get(),
-                    *current);
-            ok &= check(result.eligible &&
+                    previous,
+                    remapped_current);
+            ok &= check(!result.eligible &&
+                    !result.lazy_snapshot.has_value() &&
                     result.fallback_reason ==
-                        term::Terminal_lazy_snapshot_fallback_reason::NONE &&
-                    result.materialization_matches_full_snapshot,
-                "lazy composer materializes compatible hyperlink namespace change");
+                        term::Terminal_lazy_snapshot_fallback_reason::
+                            HYPERLINK_NAMESPACE_INCOMPATIBILITY &&
+                    !result.materialization_matches_full_snapshot,
+                "lazy composer falls back instead of remapping compatible clean-row "
+                "hyperlink namespace changes");
+#if VNM_TERMINAL_PROFILING_ENABLED
+            const term::Terminal_session_profile_stats stats = session->profile_stats();
+            const term::Terminal_lazy_snapshot_fallback_reason_counters counters =
+                stats.lazy_snapshot_fallback_reasons;
+            ok &= check(stats.lazy_snapshot_eligibility_checks == 1U &&
+                    stats.lazy_snapshot_eligible_checks == 0U &&
+                    stats.lazy_snapshot_full_fallbacks == 1U &&
+                    counters.hyperlink_namespace_incompatibility == 1U &&
+                    stats.lazy_snapshot_previous_snapshot_borrowed_rows == 0U,
+                "lazy composer counts compatible clean-row remap as a full fallback "
+                "without reporting borrowed rows");
+#endif
         }
     }
 

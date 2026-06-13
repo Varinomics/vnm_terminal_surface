@@ -1114,6 +1114,58 @@ Gates:
 - Independent review confirms that default production behavior is still full
   materialization.
 
+Batch 6 implementation record, 2026-06-13:
+
+- Scope: narrow opt-in lazy content exercise only. Default production snapshot
+  publication remains fully materialized; `Terminal_session::publish_render_snapshot()`
+  still publishes the full `Terminal_screen_model::render_snapshot()` output.
+- Composer exercise path:
+  - `Terminal_session::compose_lazy_render_snapshot_for_testing()` now reports
+    per-call dirty visible rows, previous-snapshot borrowed rows, producer-owned
+    rows, producer-materialized rows, producer cells scanned/emitted, and
+    consumer materialization counts.
+  - Eligible dirty rows are copied into a compact current dirty-row payload
+    owner; clean rows borrow from the previous published content snapshot. The
+    current producer-owned/materialized/scanned counts are therefore bounded by
+    visible dirty rows in the opt-in exercise path.
+  - Full fallback counters increment for ineligible composer checks. The
+    explicit row-view parity materialization is counted as a consumer
+    materialization under `ROW_VIEW_PARITY_TEST`.
+- Surface/session and benchmark exercise:
+  - `VNM_TerminalSurface_render_bridge::compose_lazy_render_snapshot_for_testing()`
+    exposes the composer only through an internal testing/benchmark bridge.
+  - `vnm_terminal_surface_host` drives a surface-backed session, renders the
+    baseline and mutation through the downstream renderer path, calls the
+    opt-in composer, and verifies the production snapshots remain full.
+  - Embedded sparse surface/session benchmark scenarios call the opt-in composer
+    after the production snapshot/render wait and emit schema 23 lazy exercise
+    counters beside existing frame/QSG counters. These sparse content scenarios
+    declare `K = 0` through
+    `lazy_snapshot_exercise_promoted_non_content_rows`.
+- Schema and diagnostics:
+  - Embedded benchmark schema 23 adds scenario-level lazy exercise counters and
+    session profile counters for lazy fallbacks, borrowed rows, producer-owned
+    rows, producer materialization, producer scan/emission, and counted
+    row-view parity materialization.
+  - `session_profile_stats.consumer_materialization_counters` now has
+    `batch_6_materialization_boundaries` semantics and includes both
+    geometry-derived direct-output counters and row-view parity test counters.
+- Evidence scope:
+  - The benchmark validation is a schema/counter smoke gate for the opt-in path
+    and downstream frame/QSG visibility. Decision-grade A/B timing, default
+    enablement, and full-size performance evidence remain owned by Batch 8.
+- Commands and results:
+  - `git diff --check` passed.
+  - Lazy publication audit passed: `rg` showed `lazy_snapshot.lazy_row_payloads`
+    assignment only in the explicit composer, plus manual render snapshot tests;
+    `Terminal_session::publish_render_snapshot()` still constructs
+    `Terminal_render_snapshot snapshot = m_screen_model->render_snapshot(request)`
+    and publishes that full snapshot handle.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_render_snapshot vnm_terminal_render_frame vnm_terminal_profile_text vnm_terminal_embedded_benchmark vnm_terminal_backend_session vnm_terminal_surface_host"` passed.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_batch1_profile_on --target vnm_terminal_render_snapshot vnm_terminal_render_frame vnm_terminal_profile_text vnm_terminal_embedded_benchmark vnm_terminal_backend_session vnm_terminal_surface_host"` passed.
+  - `ctest --test-dir build_codex_renderer_graphics_probe -R "^(vnm_terminal_render_snapshot|vnm_terminal_render_frame|vnm_terminal_profile_text|vnm_terminal_backend_session|vnm_terminal_surface_host|vnm_terminal_embedded_benchmark_validate)$" --output-on-failure` passed: 6/6.
+  - `ctest --test-dir build_codex_batch1_profile_on -R "^(vnm_terminal_render_snapshot|vnm_terminal_render_frame|vnm_terminal_profile_text|vnm_terminal_backend_session|vnm_terminal_surface_host|vnm_terminal_embedded_benchmark_profile_validate)$" --output-on-failure` passed: 6/6.
+
 ## 13. Batch 7: Frame Builder And QSG Descriptor Reuse
 
 Purpose: ensure the publication improvement is not lost by a full downstream
@@ -1293,14 +1345,14 @@ Reviewers should classify findings as:
 
 ## 18. Current Handoff
 
-Batch 5 now contains the disabled/test-only eligibility checker and lazy
-composer parity harness. Production snapshot publication remains fully
-materialized: `Terminal_session::publish_render_snapshot()` still publishes the
-full `Terminal_screen_model::render_snapshot()` result, and session, model,
-frame, QSG, transcript, replay, and benchmark default paths must not construct
-or publish lazy row payloads.
+Batch 6 now contains the narrow opt-in lazy content exercise for eligible
+surface/session sparse content workflows. Production snapshot publication
+remains fully materialized: `Terminal_session::publish_render_snapshot()` still
+publishes the full `Terminal_screen_model::render_snapshot()` result, and the
+default session, model, frame, QSG, transcript, replay, and benchmark paths do
+not publish lazy row payloads.
 
-The immediate next step is independent review of the Batch 5 diff and gate
-evidence. If accepted, proceed to Batch 6 narrow lazy-path exercise without
-making it the default production publication path. Do not enable lazy
-publication by default before Batch 8 gates pass.
+The immediate next step is independent review of the Batch 6 diff and gate
+evidence. If accepted, proceed to Batch 7 frame/QSG descriptor reuse work so
+downstream clean-row costs do not hide the publication-path improvement. Do not
+enable lazy publication by default before Batch 8 gates pass.

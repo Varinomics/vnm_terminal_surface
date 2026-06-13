@@ -174,6 +174,15 @@ struct Terminal_session_lazy_snapshot_composer_result
     std::optional<Terminal_render_snapshot> lazy_snapshot;
     bool                                    materialization_matches_full_snapshot = false;
     bool                                    materialization_mismatch_for_testing  = false;
+    std::uint64_t                           dirty_rows_visible = 0U;
+    std::uint64_t                           previous_snapshot_borrowed_rows = 0U;
+    std::uint64_t                           producer_owned_rows = 0U;
+    std::uint64_t                           producer_materialized_rows = 0U;
+    std::uint64_t                           producer_cells_scanned = 0U;
+    std::uint64_t                           producer_cells_emitted = 0U;
+    std::uint64_t                           consumer_materialization_calls = 0U;
+    std::uint64_t                           consumer_materialization_rows = 0U;
+    std::uint64_t                           consumer_materialization_cells = 0U;
 };
 
 struct Terminal_session_profile_stats
@@ -198,12 +207,22 @@ struct Terminal_session_profile_stats
     std::uint64_t              geometry_derived_materialization_calls = 0U;
     std::uint64_t              geometry_derived_materialization_rows  = 0U;
     std::uint64_t              geometry_derived_materialization_cells = 0U;
+    std::uint64_t              row_view_parity_materialization_calls  = 0U;
+    std::uint64_t              row_view_parity_materialization_rows   = 0U;
+    std::uint64_t              row_view_parity_materialization_cells  = 0U;
     std::uint64_t              retained_snapshot_payload_bytes       = 0U;
     std::uint64_t              retained_snapshot_generation_count    = 0U;
     std::uint64_t              max_retained_snapshot_payload_bytes   = 0U;
     std::uint64_t              max_retained_snapshot_generation_count = 0U;
     std::uint64_t              lazy_snapshot_eligibility_checks      = 0U;
     std::uint64_t              lazy_snapshot_eligible_checks         = 0U;
+    std::uint64_t              lazy_snapshot_full_fallbacks          = 0U;
+    std::uint64_t              lazy_snapshot_dirty_rows_visible      = 0U;
+    std::uint64_t              lazy_snapshot_previous_snapshot_borrowed_rows = 0U;
+    std::uint64_t              lazy_snapshot_producer_owned_rows     = 0U;
+    std::uint64_t              lazy_snapshot_producer_materialized_rows = 0U;
+    std::uint64_t              lazy_snapshot_producer_cells_scanned  = 0U;
+    std::uint64_t              lazy_snapshot_producer_cells_emitted  = 0U;
     std::uint64_t              lazy_snapshot_materialization_mismatches_for_testing = 0U;
     Terminal_lazy_snapshot_fallback_reason_counters lazy_snapshot_fallback_reasons;
 };
@@ -372,6 +391,10 @@ public:
     void set_profile_stats_enabled(bool enabled);
     Terminal_screen_model_profile_stats model_profile_stats() const;
     Terminal_session_profile_stats profile_stats() const;
+    Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_testing(
+        std::shared_ptr<const Terminal_render_snapshot> previous_content_snapshot,
+        const Terminal_render_snapshot& full_snapshot,
+        bool unsupported_geometry_or_detached_snapshot_path = false);
     Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_testing(
         const Terminal_render_snapshot* previous_content_snapshot,
         const Terminal_render_snapshot& full_snapshot,

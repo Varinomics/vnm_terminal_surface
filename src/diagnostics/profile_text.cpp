@@ -563,8 +563,8 @@ void append_session_profile_stats_section(
         stats.max_unrendered_snapshot_generations);
     stream << "  consumer_materialization_counters_available=true\n";
     stream << "  consumer_materialization_counters_schema_semantics="
-        << "batch_3_materialization_boundaries\n";
-    stream << "  consumer_materialization_counters_owner_batch=Batch 3\n";
+        << "batch_6_materialization_boundaries\n";
+    stream << "  consumer_materialization_counters_owner_batch=Batch 6\n";
     append_profile_counter(
         stream,
         "consumer_materialization_counters_geometry_derived_snapshot_calls",
@@ -577,6 +577,18 @@ void append_session_profile_stats_section(
         stream,
         "consumer_materialization_counters_geometry_derived_snapshot_cells",
         stats.geometry_derived_materialization_cells);
+    append_profile_counter(
+        stream,
+        "consumer_materialization_counters_row_view_parity_test_calls",
+        stats.row_view_parity_materialization_calls);
+    append_profile_counter(
+        stream,
+        "consumer_materialization_counters_row_view_parity_test_rows",
+        stats.row_view_parity_materialization_rows);
+    append_profile_counter(
+        stream,
+        "consumer_materialization_counters_row_view_parity_test_cells",
+        stats.row_view_parity_materialization_cells);
     append_profile_counter(
         stream,
         "retained_snapshot_payload_bytes",
@@ -605,6 +617,34 @@ void append_session_profile_stats_section(
         stream,
         "lazy_snapshot_eligible_checks",
         stats.lazy_snapshot_eligible_checks);
+    append_profile_counter(
+        stream,
+        "lazy_snapshot_full_fallbacks",
+        stats.lazy_snapshot_full_fallbacks);
+    append_profile_counter(
+        stream,
+        "lazy_snapshot_dirty_rows_visible",
+        stats.lazy_snapshot_dirty_rows_visible);
+    append_profile_counter(
+        stream,
+        "lazy_snapshot_previous_snapshot_borrowed_rows",
+        stats.lazy_snapshot_previous_snapshot_borrowed_rows);
+    append_profile_counter(
+        stream,
+        "lazy_snapshot_producer_owned_rows",
+        stats.lazy_snapshot_producer_owned_rows);
+    append_profile_counter(
+        stream,
+        "lazy_snapshot_producer_materialized_rows",
+        stats.lazy_snapshot_producer_materialized_rows);
+    append_profile_counter(
+        stream,
+        "lazy_snapshot_producer_cells_scanned",
+        stats.lazy_snapshot_producer_cells_scanned);
+    append_profile_counter(
+        stream,
+        "lazy_snapshot_producer_cells_emitted",
+        stats.lazy_snapshot_producer_cells_emitted);
     append_profile_counter(
         stream,
         "lazy_snapshot_materialization_mismatches_for_testing",

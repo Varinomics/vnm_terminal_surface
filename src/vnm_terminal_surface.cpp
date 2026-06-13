@@ -6266,6 +6266,23 @@ void term::VNM_TerminalSurface_render_bridge::set_session_profile_stats_enabled_
     }
 }
 
+term::Terminal_session_lazy_snapshot_composer_result
+term::VNM_TerminalSurface_render_bridge::compose_lazy_render_snapshot_for_testing(
+    VNM_TerminalSurface&                   surface,
+    std::shared_ptr<const term::Terminal_render_snapshot>
+                                           previous_content_snapshot,
+    const term::Terminal_render_snapshot&  full_snapshot,
+    bool                                   unsupported_geometry_or_detached_snapshot_path)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->session != nullptr
+        ? surface.m_private->session->compose_lazy_render_snapshot_for_testing(
+            std::move(previous_content_snapshot),
+            full_snapshot,
+            unsupported_geometry_or_detached_snapshot_path)
+        : term::Terminal_session_lazy_snapshot_composer_result{};
+}
+
 void term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(
     VNM_TerminalSurface&               surface,
     bool                               visible)
