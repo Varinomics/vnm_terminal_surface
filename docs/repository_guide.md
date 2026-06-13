@@ -231,10 +231,10 @@ output, hierarchical profile output, and `--validate-json`.
 Profile flags such as `--profile`, `--profile-json`, and `--profile-text`
 require a `VNM_TERMINAL_ENABLE_PROFILING=ON` build.
 
-Benchmark JSON uses `schema_version` 22. Profile JSON uses
+Benchmark JSON uses `schema_version` 23. Profile JSON uses
 `profile_schema_version` 2, `time_unit` `ns`, and
 `thread_semantics` `separate_thread_trees`, with separate GUI and render thread
-trees. Schema 22 includes sparse dirty-row sweep metadata
+trees. Schema 23 includes sparse dirty-row sweep metadata
 `sparse_dirty_row_sweep_applicable`, `configured_sparse_dirty_rows`, and
 `configured_sparse_dirty_row_stride`; per-scenario requested and actual grid
 metadata through `requested_rows`, `requested_columns`, `rows`, `columns`,
@@ -244,13 +244,36 @@ observed frame and profile dirty-row counts to cover the requested dirty rows,
 rejects full repaint, and allows at most one cursor carry-over row per measured
 frame.
 
-The schema 22 `descriptor_counters` object has exactly
+Schema 23 also exposes the opt-in Batch 6 lazy snapshot exercise counters for
+eligible sparse content session scenarios. The scenario-level keys are
+`lazy_snapshot_exercise_applicable`,
+`lazy_snapshot_exercise_promoted_non_content_rows`,
+`lazy_snapshot_exercise_attempts`,
+`lazy_snapshot_exercise_eligible_attempts`,
+`lazy_snapshot_exercise_full_fallbacks`,
+`lazy_snapshot_exercise_materialization_mismatches`,
+`lazy_snapshot_exercise_dirty_rows_visible`,
+`lazy_snapshot_exercise_previous_snapshot_borrowed_rows`,
+`lazy_snapshot_exercise_producer_owned_rows`,
+`lazy_snapshot_exercise_producer_materialized_rows`,
+`lazy_snapshot_exercise_producer_cells_scanned`,
+`lazy_snapshot_exercise_producer_cells_emitted`,
+`lazy_snapshot_exercise_consumer_materialization_calls`,
+`lazy_snapshot_exercise_consumer_materialization_rows`, and
+`lazy_snapshot_exercise_consumer_materialization_cells`. Sparse content
+validation declares K=0 through
+`lazy_snapshot_exercise_promoted_non_content_rows`, requires zero full
+fallbacks and zero materialization mismatches, and bounds producer owned rows,
+producer materialized rows, and producer cells scanned by the observed dirty
+rows times columns.
+
+The schema 23 `descriptor_counters` object has exactly
 `available=false`,
 `schema_semantics="unavailable_until_batch_7_descriptor_reuse"`,
 `frame_row_descriptors="unavailable"`, and
 `qsg_layer_descriptors="unavailable"`.
 
-The schema 22 `lazy_snapshot_fallback_reason_counters` object has exactly
+The schema 23 `lazy_snapshot_fallback_reason_counters` object has exactly
 `available=true`,
 `schema_semantics="batch_5_lazy_eligibility"`, and a `reasons`
 object whose keys are `missing_previous_content_snapshot`, `grid_mismatch`,
@@ -261,21 +284,30 @@ object whose keys are `missing_previous_content_snapshot`, `grid_mismatch`,
 `unsupported_geometry_or_detached_snapshot_path`; every reason value is a
 nonnegative integer counter.
 
-The schema 22 `session_profile_stats` object also exposes the scalar lazy
+The schema 23 `session_profile_stats` object also exposes the scalar lazy
 snapshot counters `lazy_snapshot_eligibility_checks`,
-`lazy_snapshot_eligible_checks`, and
+`lazy_snapshot_eligible_checks`, `lazy_snapshot_full_fallbacks`,
+`lazy_snapshot_dirty_rows_visible`,
+`lazy_snapshot_previous_snapshot_borrowed_rows`,
+`lazy_snapshot_producer_owned_rows`,
+`lazy_snapshot_producer_materialized_rows`,
+`lazy_snapshot_producer_cells_scanned`,
+`lazy_snapshot_producer_cells_emitted`, and
 `lazy_snapshot_materialization_mismatches_for_testing`. Test-only
 materialization mismatches are counted only by that mismatch counter; they do
 not increment explicit fallback reason counters.
 
-The schema 22 `session_profile_stats.consumer_materialization_counters` object
+The schema 23 `session_profile_stats.consumer_materialization_counters` object
 has exactly `available=true`,
-`schema_semantics="batch_3_materialization_boundaries"`,
-`owner_batch="Batch 3"`, and numeric counters
+`schema_semantics="batch_6_materialization_boundaries"`,
+`owner_batch="Batch 6"`, and numeric counters
 `geometry_derived_snapshot_calls`, `geometry_derived_snapshot_rows`, and
-`geometry_derived_snapshot_cells`. These counters are currently produced by
-geometry-derived snapshot direct-output boundaries. Stale top-level
-materialization numeric counters are rejected by exact key validation.
+`geometry_derived_snapshot_cells`, plus `row_view_parity_test_calls`,
+`row_view_parity_test_rows`, and `row_view_parity_test_cells`. Geometry-derived
+counters are produced by geometry-derived snapshot direct-output boundaries.
+Row-view parity counters are produced by the opt-in Batch 6 lazy snapshot
+exercise materialization boundary. Stale top-level materialization numeric
+counters are rejected by exact key validation.
 
 The `surface_session_selection_snapshot` scenario is a session snapshot contract
 and validates `selection_snapshot_spans_observed`, not renderer overlay
@@ -284,7 +316,7 @@ counters. The `surface_session_resize_smoke_boundary`,
 `surface_session_alternate_buffer_smoke_boundary`,
 `surface_session_style_color_mode_smoke_boundary`, and
 `surface_session_hyperlink_smoke_boundary` scenarios are Batch 1 smoke
-boundaries, not lazy fallback decision runs. Schema 22 includes text coalescing
+boundaries, not lazy fallback decision runs. Schema 23 includes text coalescing
 counters:
 `text_coalescing_candidate_groups`, `text_coalescing_enabled_groups`,
 `text_resource_runs_before_coalescing`, and

@@ -570,9 +570,14 @@ struct Terminal_render_snapshot_hyperlink_id_remap
     std::uint64_t target_id = 0U;
 };
 
+struct Terminal_render_snapshot;
+
 struct Terminal_render_snapshot_lazy_row_payload
 {
     Terminal_render_snapshot_row_payload_ref        source;
+    std::shared_ptr<const Terminal_render_snapshot> source_snapshot;
+    int                                             source_snapshot_row = -1;
+    Terminal_render_snapshot_row_payload_namespace  source_snapshot_metadata_namespace;
     Terminal_render_snapshot_row_payload_namespace  receiving_namespace;
     std::shared_ptr<const std::vector<Terminal_render_cell>>
                                                        cells_in_receiving_namespace;
@@ -1075,6 +1080,25 @@ borrowed_render_snapshot_lazy_row_payload(
     return row;
 }
 
+inline std::optional<Terminal_render_snapshot_lazy_row_payload>
+borrowed_render_snapshot_lazy_row_payload_from_snapshot_row(
+    std::shared_ptr<const Terminal_render_snapshot>             source_snapshot,
+    int                                                         row_index,
+    Terminal_render_snapshot_row_payload_namespace              source_namespace,
+    Terminal_render_snapshot_row_payload_namespace              receiving_namespace)
+{
+    if (source_snapshot == nullptr || !(source_namespace == receiving_namespace)) {
+        return std::nullopt;
+    }
+
+    Terminal_render_snapshot_lazy_row_payload row;
+    row.source_snapshot                    = std::move(source_snapshot);
+    row.source_snapshot_row                = row_index;
+    row.source_snapshot_metadata_namespace = source_namespace;
+    row.receiving_namespace                = receiving_namespace;
+    return row;
+}
+
 class Terminal_render_snapshot_row_content_view;
 
 class Terminal_render_snapshot_row_content
@@ -1291,11 +1315,7 @@ public:
 
         std::size_t count = 0U;
         for (int row = 0; row < row_count(); ++row) {
-            const std::vector<Terminal_render_cell>* row_cells =
-                lazy_row_cells_or_null(row);
-            if (row_cells != nullptr) {
-                count += row_cells->size();
-            }
+            count += row_at_unchecked(row).cell_count();
         }
         return count;
     }
@@ -1387,44 +1407,52 @@ private:
         return Terminal_render_snapshot_row_content(m_snapshot, row, end, end);
     }
 
-    const std::vector<Terminal_render_cell>* lazy_row_cells_or_null(int row) const
-    {
-        const Terminal_render_snapshot_lazy_payloads* payloads =
-            m_snapshot.lazy_row_payloads.get();
-        if (payloads == nullptr ||
-            row < 0             ||
-            static_cast<std::size_t>(row) >= payloads->rows.size())
-        {
-            return nullptr;
-        }
-
-        const Terminal_render_snapshot_lazy_row_payload& lazy_row =
-            payloads->rows[static_cast<std::size_t>(row)];
-        if (lazy_row.cells_in_receiving_namespace != nullptr) {
-            return lazy_row.cells_in_receiving_namespace.get();
-        }
-
-        const Terminal_render_snapshot_immutable_row_payload* payload =
-            lazy_row.source.payload_or_null();
-        return payload != nullptr ? &payload->cells : nullptr;
-    }
-
     Terminal_render_snapshot_row_content row_at_unchecked(int row) const
     {
         Q_ASSERT(render_snapshot_row_is_viewable(m_snapshot, row));
 
         if (m_snapshot.lazy_row_payloads != nullptr) {
-            const std::vector<Terminal_render_cell>* row_cells =
-                lazy_row_cells_or_null(row);
-            if (row_cells == nullptr) {
+            const Terminal_render_snapshot_lazy_payloads* payloads =
+                m_snapshot.lazy_row_payloads.get();
+            if (payloads == nullptr ||
+                static_cast<std::size_t>(row) >= payloads->rows.size())
+            {
                 return empty_row_at(row);
             }
 
-            return Terminal_render_snapshot_row_content(
-                m_snapshot,
-                row,
-                row_cells->begin(),
-                row_cells->end());
+            const Terminal_render_snapshot_lazy_row_payload& lazy_row =
+                payloads->rows[static_cast<std::size_t>(row)];
+            if (lazy_row.cells_in_receiving_namespace != nullptr) {
+                return Terminal_render_snapshot_row_content(
+                    m_snapshot,
+                    row,
+                    lazy_row.cells_in_receiving_namespace->begin(),
+                    lazy_row.cells_in_receiving_namespace->end());
+            }
+
+            if (const Terminal_render_snapshot_immutable_row_payload* payload =
+                    lazy_row.source.payload_or_null())
+            {
+                return Terminal_render_snapshot_row_content(
+                    m_snapshot,
+                    row,
+                    payload->cells.begin(),
+                    payload->cells.end());
+            }
+
+            if (lazy_row.source_snapshot != nullptr) {
+                const Terminal_render_snapshot_row_content_view source_rows(
+                    *lazy_row.source_snapshot);
+                const Terminal_render_snapshot_row_content source_row =
+                    source_rows.row_at(lazy_row.source_snapshot_row);
+                return Terminal_render_snapshot_row_content(
+                    m_snapshot,
+                    row,
+                    source_row.begin(),
+                    source_row.end());
+            }
+
+            return empty_row_at(row);
         }
 
         const std::int64_t target_row = row;
@@ -1680,16 +1708,54 @@ inline Terminal_render_snapshot_validation validate_render_snapshot_lazy_payload
             payloads->rows[static_cast<std::size_t>(row)];
         const Terminal_render_snapshot_immutable_row_payload* payload =
             lazy_row.source.payload_or_null();
-        if (payload == nullptr ||
-            payload->identity.row != row ||
-            payload->identity.row_origin_generation !=
+        Terminal_render_snapshot_row_payload_identity identity;
+        Terminal_render_snapshot_row_content::const_iterator source_first;
+        Terminal_render_snapshot_row_content::const_iterator source_last;
+        std::size_t source_cell_count = 0U;
+        bool source_valid = false;
+        if (payload != nullptr) {
+            identity          = payload->identity;
+            source_first      = payload->cells.begin();
+            source_last       = payload->cells.end();
+            source_cell_count = payload->cells.size();
+            source_valid      = true;
+        }
+        else
+        if (lazy_row.source_snapshot != nullptr) {
+            const Terminal_render_snapshot_row_content_view source_rows(
+                *lazy_row.source_snapshot);
+            const Terminal_render_snapshot_row_content source_row =
+                source_rows.row_at(lazy_row.source_snapshot_row);
+            identity.row                   = lazy_row.source_snapshot_row;
+            identity.row_origin_generation =
+                lazy_row.source_snapshot->metadata.row_origin_generation;
+            identity.metadata_namespace =
+                lazy_row.source_snapshot_metadata_namespace;
+            source_first      = source_row.begin();
+            source_last       = source_row.end();
+            source_cell_count = source_row.cell_count();
+            source_valid      = source_row.valid();
+            if (!lazy_row.source_snapshot->visible_line_provenance.empty() &&
+                render_snapshot_row_is_viewable(
+                    *lazy_row.source_snapshot,
+                    lazy_row.source_snapshot_row))
+            {
+                identity.provenance =
+                    lazy_row.source_snapshot->visible_line_provenance[
+                        static_cast<std::size_t>(lazy_row.source_snapshot_row)];
+            }
+        }
+
+        if (!source_valid ||
+            identity.row != row ||
+            identity.row_origin_generation !=
                 snapshot.metadata.row_origin_generation)
         {
             return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};
         }
 
         if (!snapshot.visible_line_provenance.empty() &&
-            !(payload->identity.provenance ==
+            !(identity.provenance ==
                 snapshot.visible_line_provenance[static_cast<std::size_t>(row)]))
         {
             return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};
@@ -1708,13 +1774,13 @@ inline Terminal_render_snapshot_validation validate_render_snapshot_lazy_payload
         }
 
         if (lazy_row.cells_in_receiving_namespace == nullptr) {
-            if (payload->identity.metadata_namespace.style_table_generation !=
+            if (identity.metadata_namespace.style_table_generation !=
                 lazy_row.receiving_namespace.style_table_generation)
             {
                 return {Terminal_render_snapshot_status::INVALID_STYLE_ID};
             }
 
-            if (payload->identity.metadata_namespace.hyperlink_namespace_generation !=
+            if (identity.metadata_namespace.hyperlink_namespace_generation !=
                 lazy_row.receiving_namespace.hyperlink_namespace_generation)
             {
                 return {Terminal_render_snapshot_status::INVALID_HYPERLINK_METADATA};
@@ -1723,25 +1789,29 @@ inline Terminal_render_snapshot_validation validate_render_snapshot_lazy_payload
         else {
             const std::vector<Terminal_render_cell>& remapped_cells =
                 *lazy_row.cells_in_receiving_namespace;
-            if (remapped_cells.size() != payload->cells.size()) {
+            if (remapped_cells.size() != source_cell_count) {
                 return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};
             }
 
-            for (std::size_t i = 0U; i < remapped_cells.size(); ++i) {
-                const Terminal_render_cell& source_cell   = payload->cells[i];
-                const Terminal_render_cell& remapped_cell = remapped_cells[i];
+            auto source_cell = source_first;
+            for (const Terminal_render_cell& remapped_cell : remapped_cells) {
+                const Terminal_render_cell& source_cell_ref = *source_cell;
                 if (!render_snapshot_cells_equal_except_metadata_ids(
-                        source_cell,
+                        source_cell_ref,
                         remapped_cell))
                 {
                     return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};
                 }
 
-                if ((source_cell.hyperlink_id == 0U) !=
+                if ((source_cell_ref.hyperlink_id == 0U) !=
                     (remapped_cell.hyperlink_id == 0U))
                 {
                     return {Terminal_render_snapshot_status::INVALID_HYPERLINK_METADATA};
                 }
+                ++source_cell;
+            }
+            if (source_cell != source_last) {
+                return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};
             }
         }
     }
