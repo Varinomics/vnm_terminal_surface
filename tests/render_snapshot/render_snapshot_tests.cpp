@@ -9,8 +9,10 @@
 #include <QtGlobal>
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -19,6 +21,16 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 using vnm_terminal::test_helpers::check;
+
+static_assert(std::is_constructible_v<
+    term::Terminal_render_snapshot_row_content_view,
+    const term::Terminal_render_snapshot&>);
+static_assert(!std::is_constructible_v<
+    term::Terminal_render_snapshot_row_content_view,
+    term::Terminal_render_snapshot&&>);
+static_assert(!std::is_constructible_v<
+    term::Terminal_render_snapshot_row_content_view,
+    const term::Terminal_render_snapshot&&>);
 
 term::Terminal_screen_model make_model(term::terminal_grid_size_t grid_size)
 {
@@ -1539,6 +1551,22 @@ bool dirty_ranges_equal(
     return true;
 }
 
+bool check_invalid_row_content(
+    const term::Terminal_render_snapshot_row_content& row,
+    int                                               expected_row,
+    const char*                                       label)
+{
+    bool ok = true;
+    ok &= check(!row.valid(), label);
+    ok &= check(row.row() == expected_row, label);
+    ok &= check(row.cell_count() == 0U && row.begin() == row.end(), label);
+    ok &= check(row.cell_at(0) == nullptr, label);
+    ok &= check(row.provenance_or_null() == nullptr, label);
+    ok &= check(!row.dirty(), label);
+    ok &= check(row.text(0, row.column_count(), false).isEmpty(), label);
+    return ok;
+}
+
 bool test_dirty_row_coalescing_unifies_on_stricter_row_identity()
 {
     bool ok = true;
@@ -1607,6 +1635,455 @@ bool test_dirty_row_coalescing_unifies_on_stricter_row_identity()
         diverging_handle != nullptr &&
         dirty_ranges_equal(diverging_handle->dirty_row_ranges, diverging_result.dirty_row_ranges),
         "handle wrapper matches the value core on the divergent case");
+
+    return ok;
+}
+
+bool test_row_content_view_matches_flat_snapshot_representation()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model({4, 12});
+    model.ingest(
+        QByteArrayLiteral("\x1b[?1000h")
+        + QByteArrayLiteral("\x1b]8;id=main;https://example.test\x1b\\")
+        + QByteArrayLiteral("\x1b[31mA\x1b[1;5HZ\x1b[0m")
+        + QByteArrayLiteral("\x1b]8;;\x1b\\")
+        + QByteArrayLiteral("\x1b[2;1H")
+        + QStringLiteral("\u754c").toUtf8()
+        + QByteArrayLiteral("B\x1b[3;3HC"));
+
+    const term::Terminal_retained_line_provenance first_line =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    const term::Terminal_retained_line_provenance second_line =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
+
+    term::Terminal_render_snapshot_request request = request_for_model(model, 220U);
+    request.row_origin_generation         = 77U;
+    request.dirty_rows                    = {0, 2};
+    request.cursor_shape                  = term::Terminal_cursor_shape::UNDERLINE;
+    request.cursor_blink_enabled          = false;
+    request.backend_geometry_in_sync      = false;
+    request.visual_bell_active            = true;
+    request.mouse_reporting_mode_changed  = true;
+    request.ime_preedit.text              = QStringLiteral("ime");
+    request.ime_preedit.cursor_position   = 2;
+    request.ime_preedit.active            = true;
+    request.selections.push_back({
+        {{0, 0}, {1, 3}, term::Terminal_selection_mode::NORMAL},
+        {
+            term::terminal_selection_line_lease_from_retained_identity(
+                0, first_line.retained_line_id, first_line.content_generation),
+            term::terminal_selection_line_lease_from_retained_identity(
+                1, second_line.retained_line_id, second_line.content_generation),
+        },
+    });
+
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(request);
+    const term::Terminal_render_snapshot_row_content_view rows(snapshot);
+    ok &= check(term::validate_render_snapshot_row_content_view(snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "row-content view validates the rich flat snapshot");
+    const std::vector<term::Terminal_render_cell> direct_materialized =
+        rows.materialize_flat_cells();
+    ok &= check(rows.row_count() == snapshot.grid_size.rows &&
+        rows.column_count() == snapshot.grid_size.columns,
+        "row-content view exposes snapshot grid dimensions");
+    ok &= check(direct_materialized.size() == snapshot.cells.size() &&
+        rows.materialized_flat_cells_match_snapshot(),
+        "row-content view materializes the same row-major flat cells");
+    ok &= check(rows.cell_style_ids_resolve() && rows.cell_hyperlink_ids_resolve(),
+        "row-content view style and hyperlink validation hooks accept the snapshot");
+
+    std::size_t iterated_cell_count = 0U;
+    for (const term::Terminal_render_snapshot_row_content row : rows) {
+        iterated_cell_count += row.cell_count();
+        for (const term::Terminal_render_cell& cell : row) {
+            ok &= check(cell.position.row == row.row(),
+                "row iterator yields cells from the row it names");
+            ok &= check(rows.cell_at(row.row(), cell.position.column) == &cell,
+                "row-content cell lookup returns the flat cell address");
+        }
+    }
+    ok &= check(iterated_cell_count == snapshot.cells.size(),
+        "row-content iteration covers every flat cell exactly once");
+
+    ok &= check(rows.row_at(0).cell_count() == 2U &&
+        rows.row_at(0).cell_at(0) != nullptr &&
+        rows.row_at(0).cell_at(1) == nullptr &&
+        rows.row_at(0).cell_at(-1) == nullptr &&
+        rows.row_at(0).cell_at(snapshot.grid_size.columns) == nullptr &&
+        rows.row_at(0).cell_at(4) != nullptr,
+        "row-content cell lookup preserves sparse and out-of-range missing-cell positions");
+    ok &= check(rows.row_at(0).text(0, 5, false) == QStringLiteral("A   Z"),
+        "row-content text extraction treats missing cells as spaces");
+    ok &= check(rows.row_at(0).text(0, snapshot.grid_size.columns, true) ==
+            QStringLiteral("A   Z"),
+        "row-content text extraction trims trailing missing-cell spaces");
+    ok &= check(rows.row_at(3).cell_count() == 0U &&
+        rows.row_at(3).text(0, snapshot.grid_size.columns, false) ==
+            QString(snapshot.grid_size.columns, QLatin1Char(' ')),
+        "row-content text extraction represents a blank row as spaces");
+    ok &= check(rows.row_at(3).text(0, snapshot.grid_size.columns, true).isEmpty(),
+        "row-content trimmed text extraction keeps blank rows empty");
+    ok &= check(rows.row_at(1).cell_at(0) != nullptr &&
+        rows.row_at(1).cell_at(1) != nullptr &&
+        rows.row_at(1).cell_at(1)->wide_continuation,
+        "row-content cell lookup exposes wide continuations");
+    ok &= check(rows.row_at(1).text(0, 3, false) == QStringLiteral("\u754cB"),
+        "row-content text extraction skips wide continuations");
+
+    const std::vector<const term::Terminal_render_cell*> flat_cells_by_position =
+        term::render_snapshot_cells_by_position(snapshot);
+    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
+        const QString flat_text = term::selected_text_from_render_snapshot_row(
+            snapshot,
+            flat_cells_by_position,
+            row,
+            0,
+            snapshot.grid_size.columns,
+            false);
+        const QString row_view_text = term::selected_text_from_render_snapshot_row(
+            rows.row_at(row),
+            0,
+            snapshot.grid_size.columns,
+            false);
+        ok &= check(row_view_text == flat_text,
+            "row-content full-row text extraction matches flat helper");
+    }
+
+    const term::Terminal_selection_range selection = {
+        {0, 0},
+        {1, 3},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    const term::Terminal_selection_result flat_selection =
+        term::selected_text_from_render_snapshot(snapshot, selection);
+    const term::Terminal_selection_result row_view_selection =
+        term::selected_text_from_render_snapshot_row_view(snapshot, selection);
+    ok &= check(flat_selection.code == term::Terminal_selection_result_code::OK &&
+        row_view_selection.code == flat_selection.code &&
+        row_view_selection.text == flat_selection.text &&
+        row_view_selection.text == QStringLiteral("A   Z\n\u754cB"),
+        "row-content selection extraction matches flat selection helper");
+
+    term::Terminal_screen_model scroll_model = make_model({3, 12});
+    scroll_model.ingest(QByteArrayLiteral("zero\r\none\r\ntwo\r\nthree\r\nfour"));
+    ok &= check(scroll_model.scrollback_size() > 0,
+        "scrolled row-content selection fixture has scrollback");
+    const term::Terminal_render_snapshot scroll_snapshot =
+        scroll_model.render_snapshot(request_for_model(scroll_model, 221U, 1));
+    const int scrolled_first_visible_row =
+        term::render_snapshot_first_visible_logical_row(scroll_snapshot);
+    ok &= check(scrolled_first_visible_row > 0,
+        "scrolled row-content selection fixture has a nonzero first visible logical row");
+    const term::Terminal_selection_range scrolled_selection = {
+        {scrolled_first_visible_row,     0},
+        {scrolled_first_visible_row + 1, 4},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    const term::Terminal_selection_result scrolled_flat_selection =
+        term::selected_text_from_render_snapshot(scroll_snapshot, scrolled_selection);
+    const term::Terminal_selection_result scrolled_row_view_selection =
+        term::selected_text_from_render_snapshot_row_view(
+            scroll_snapshot,
+            scrolled_selection);
+    ok &= check(scrolled_flat_selection.code == term::Terminal_selection_result_code::OK &&
+        scrolled_row_view_selection.code == scrolled_flat_selection.code &&
+        scrolled_row_view_selection.text == scrolled_flat_selection.text,
+        "row-content selection extraction matches flat selection on a scrolled viewport");
+
+    const term::Terminal_render_line_provenance* first_provenance =
+        rows.provenance_at(0);
+    const term::Terminal_render_line_provenance* second_provenance =
+        rows.provenance_at(1);
+    ok &= check(first_provenance == &snapshot.visible_line_provenance[0] &&
+        second_provenance == &snapshot.visible_line_provenance[1],
+        "row-content view exposes row provenance descriptors");
+    ok &= check(first_provenance != nullptr &&
+        first_provenance->logical_row        == 0 &&
+        first_provenance->retained_line_id   == first_line.retained_line_id &&
+        first_provenance->content_generation == first_line.content_generation &&
+        first_provenance->content_stamp_ms   == first_line.content_stamp_ms,
+        "row-content view exposes exact first-row provenance fields");
+    ok &= check(second_provenance != nullptr &&
+        second_provenance->logical_row        == 1 &&
+        second_provenance->retained_line_id   == second_line.retained_line_id &&
+        second_provenance->content_generation == second_line.content_generation &&
+        second_provenance->content_stamp_ms   == second_line.content_stamp_ms,
+        "row-content view exposes exact second-row provenance fields");
+    ok &= check(rows.provenance_at(-1) == nullptr &&
+        rows.provenance_at(rows.row_count()) == nullptr,
+        "row-content provenance lookup rejects out-of-range rows");
+    ok &= check(rows.row_at(0).dirty() && !rows.row_at(1).dirty() && rows.row_at(2).dirty(),
+        "row-content view exposes dirty-row membership");
+    ok &= check(rows.dirty_row_ranges().size() == 2U &&
+        rows.dirty_row_ranges()[0].first_row == 0 &&
+        rows.dirty_row_ranges()[0].row_count == 1 &&
+        rows.dirty_row_ranges()[1].first_row == 2 &&
+        rows.dirty_row_ranges()[1].row_count == 1,
+        "row-content view exposes exact dirty ranges");
+    ok &= check(rows.cell_at(-1, 0) == nullptr &&
+        rows.cell_at(rows.row_count(), 0) == nullptr,
+        "row-content cell lookup rejects out-of-range rows");
+    ok &= check(rows.cursor().shape == term::Terminal_cursor_shape::UNDERLINE &&
+        rows.cursor().position.row == 2 &&
+        rows.cursor().position.column == 3 &&
+        rows.cursor().visible &&
+        !rows.cursor().blink_enabled,
+        "row-content view exposes cursor metadata");
+    ok &= check(rows.selection_spans().size() == 2U,
+        "row-content view exposes selection metadata");
+    if (rows.selection_spans().size() == 2U) {
+        const term::Terminal_render_selection_span& first_span =
+            rows.selection_spans()[0];
+        const term::Terminal_render_selection_span& second_span =
+            rows.selection_spans()[1];
+        ok &= check(first_span.row == 0 &&
+            first_span.first_column == 0 &&
+            first_span.column_count == snapshot.grid_size.columns &&
+            second_span.row == 1 &&
+            second_span.first_column == 0 &&
+            second_span.column_count == 3,
+            "row-content view exposes exact selection span columns");
+        ok &= check(first_span.source_range.start.row    == 0 &&
+            first_span.source_range.start.column         == 0 &&
+            first_span.source_range.end.row              == 1 &&
+            first_span.source_range.end.column           == 3 &&
+            first_span.source_range.mode == term::Terminal_selection_mode::NORMAL &&
+            second_span.source_range.start.row           == 0 &&
+            second_span.source_range.start.column        == 0 &&
+            second_span.source_range.end.row             == 1 &&
+            second_span.source_range.end.column          == 3 &&
+            second_span.source_range.mode == term::Terminal_selection_mode::NORMAL,
+            "row-content view exposes exact selection source ranges");
+    }
+    ok &= check(rows.ime_preedit().text == QStringLiteral("ime") &&
+        rows.ime_preedit().cursor_position == 2 &&
+        rows.ime_preedit().active,
+        "row-content view exposes IME metadata");
+    ok &= check(!rows.metadata().backend_geometry_in_sync &&
+        rows.metadata().visual_bell_active &&
+        rows.metadata().mouse_reporting_mode_changed &&
+        rows.metadata().sequence == 220U &&
+        rows.metadata().row_origin_generation == 77U &&
+        rows.modes().mouse_tracking == term::Terminal_mouse_tracking_mode::BUTTON,
+        "row-content view exposes snapshot metadata");
+
+    return ok;
+}
+
+bool test_row_content_view_malformed_lookup_and_hook_behavior()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model({3, 12});
+    model.ingest(
+        QByteArrayLiteral("\x1b]8;id=main;https://example.test\x1b\\")
+        + QByteArrayLiteral("A")
+        + QStringLiteral("\u754c").toUtf8()
+        + QByteArrayLiteral("B\x1b]8;;\x1b\\"));
+
+    term::Terminal_render_snapshot_request request = request_for_model(model, 230U);
+    const term::Terminal_retained_line_provenance first_line =
+        model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    request.selections.push_back({
+        {{0, 0}, {0, 3}, term::Terminal_selection_mode::NORMAL},
+        {
+            term::terminal_selection_line_lease_from_retained_identity(
+                0, first_line.retained_line_id, first_line.content_generation),
+        },
+    });
+
+    const term::Terminal_render_snapshot valid = model.render_snapshot(request);
+    ok &= check(term::validate_render_snapshot(valid).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "row-content malformed fixture starts from a valid snapshot");
+
+    const term::Terminal_render_snapshot_row_content_view rows(valid);
+    ok &= check_invalid_row_content(
+        rows.row_at(-1),
+        -1,
+        "row-content direct row_at rejects negative rows");
+    ok &= check_invalid_row_content(
+        rows.row_at(rows.row_count()),
+        rows.row_count(),
+        "row-content direct row_at rejects the past-end row");
+    ok &= check_invalid_row_content(
+        rows.row_at(std::numeric_limits<int>::max()),
+        std::numeric_limits<int>::max(),
+        "row-content direct row_at rejects extreme positive rows");
+    ok &= check(rows.cell_at(-1, 0) == nullptr &&
+        rows.cell_at(std::numeric_limits<int>::max(), 0) == nullptr &&
+        rows.provenance_at(-1) == nullptr &&
+        rows.provenance_at(std::numeric_limits<int>::max()) == nullptr,
+        "row-content nullable lookups reject invalid rows");
+
+    term::Terminal_render_snapshot invalid_grid_size = valid;
+    invalid_grid_size.grid_size.rows = -1;
+    const term::Terminal_render_snapshot_row_content_view invalid_grid_rows(
+        invalid_grid_size);
+    std::size_t invalid_grid_iterated_rows = 0U;
+    for (const term::Terminal_render_snapshot_row_content row : invalid_grid_rows) {
+        static_cast<void>(row);
+        ++invalid_grid_iterated_rows;
+    }
+    ok &= check(invalid_grid_rows.row_count() == 0 &&
+        invalid_grid_iterated_rows == 0U &&
+        invalid_grid_rows.cell_at(0, 0) == nullptr &&
+        invalid_grid_rows.provenance_at(0) == nullptr,
+        "row-content view iteration and nullable lookups reject negative row counts");
+    ok &= check_invalid_row_content(
+        invalid_grid_rows.row_at(0),
+        0,
+        "row-content direct row_at rejects rows when the snapshot row count is negative");
+
+    term::Terminal_render_snapshot invalid_style = valid;
+    invalid_style.cells.front().style_id =
+        static_cast<term::Terminal_style_id>(invalid_style.styles.size());
+    ok &= check(!term::Terminal_render_snapshot_row_content_view(invalid_style).
+            cell_style_ids_resolve(),
+        "row-content style validation hook rejects an unresolved style id");
+
+    term::Terminal_render_snapshot invalid_hyperlink = valid;
+    invalid_hyperlink.cells.front().hyperlink_id = 999U;
+    ok &= check(!term::Terminal_render_snapshot_row_content_view(invalid_hyperlink).
+            cell_hyperlink_ids_resolve(),
+        "row-content hyperlink validation hook rejects an unresolved hyperlink id");
+
+    term::Terminal_render_snapshot extra_out_of_range_cell = valid;
+    extra_out_of_range_cell.cells.push_back(valid.cells.front());
+    extra_out_of_range_cell.cells.back().position.row = valid.grid_size.rows;
+    ok &= check(!term::Terminal_render_snapshot_row_content_view(extra_out_of_range_cell).
+            materialized_flat_cells_match_snapshot(),
+        "row-content materialization rejects out-of-range flat cells");
+
+    term::Terminal_render_snapshot out_of_range_unresolved_style = extra_out_of_range_cell;
+    out_of_range_unresolved_style.cells.back().style_id =
+        static_cast<term::Terminal_style_id>(out_of_range_unresolved_style.styles.size());
+    const term::Terminal_render_snapshot_row_content_view out_of_range_style_rows(
+        out_of_range_unresolved_style);
+    ok &= check(!out_of_range_style_rows.cell_style_ids_resolve(),
+        "row-content style hook scans unresolved ids outside the viewable grid");
+
+    term::Terminal_render_snapshot out_of_range_unresolved_hyperlink =
+        extra_out_of_range_cell;
+    out_of_range_unresolved_hyperlink.cells.back().hyperlink_id = 999U;
+    const term::Terminal_render_snapshot_row_content_view out_of_range_hyperlink_rows(
+        out_of_range_unresolved_hyperlink);
+    ok &= check(!out_of_range_hyperlink_rows.cell_hyperlink_ids_resolve(),
+        "row-content hyperlink hook scans unresolved ids outside the viewable grid");
+
+    return ok;
+}
+
+bool test_validate_render_snapshot_reports_wide_overlap_before_missing_continuation()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model({3, 12});
+    model.ingest(QByteArrayLiteral("abcd"));
+    const term::Terminal_render_snapshot valid =
+        model.render_snapshot(request_for_model(model, 231U));
+    ok &= check(term::validate_render_snapshot(valid).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "wide-overlap status-order fixture starts from a valid snapshot");
+    ok &= check(valid.cells.size() >= 3U,
+        "wide-overlap status-order fixture has enough cells");
+
+    if (valid.cells.size() >= 3U) {
+        term::Terminal_render_snapshot wide_overlap = valid;
+        term::Terminal_render_cell base             = valid.cells[0];
+        term::Terminal_render_cell overlapping      = valid.cells[2];
+        base.position                               = {0, 0};
+        base.display_width                          = 3;
+        base.wide_continuation                      = false;
+        overlapping.position                        = {0, 2};
+        overlapping.display_width                   = 1;
+        overlapping.wide_continuation               = false;
+        wide_overlap.cells                          = {base, overlapping};
+
+        ok &= check(term::validate_render_snapshot(wide_overlap).status ==
+                term::Terminal_render_snapshot_status::INVALID_CELL_OVERLAP,
+            "validator reports a non-continuation inside a width-3 base as overlap");
+    }
+
+    return ok;
+}
+
+bool test_validate_render_snapshot_reports_wide_structure_before_style_mismatch()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model({3, 12});
+    model.ingest(QByteArrayLiteral("abcd"));
+    const term::Terminal_render_snapshot valid =
+        model.render_snapshot(request_for_model(model, 233U));
+    ok &= check(term::validate_render_snapshot(valid).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "wide-structure status-order fixture starts from a valid snapshot");
+    ok &= check(valid.cells.size() >= 3U,
+        "wide-structure status-order fixture has enough cells");
+
+    if (valid.cells.size() >= 3U) {
+        term::Terminal_render_snapshot style_before_missing = valid;
+        style_before_missing.styles.push_back(term::make_default_terminal_text_style());
+
+        term::Terminal_render_cell base                     = valid.cells[0];
+        term::Terminal_render_cell wrong_style_continuation = valid.cells[1];
+        base.position                                       = {0, 0};
+        base.display_width                                  = 3;
+        base.wide_continuation                              = false;
+        base.style_id                                       = term::k_default_terminal_style_id;
+        wrong_style_continuation.position                   = {0, 1};
+        wrong_style_continuation.text                       =
+            term::Terminal_render_cell_text::empty();
+        wrong_style_continuation.display_width              = 0;
+        wrong_style_continuation.wide_continuation          = true;
+        wrong_style_continuation.style_id                   =
+            static_cast<term::Terminal_style_id>(
+                style_before_missing.styles.size() - 1U);
+        wrong_style_continuation.hyperlink_id               = base.hyperlink_id;
+        wrong_style_continuation.text_category              =
+            term::Terminal_render_cell_text_category::EMPTY;
+        style_before_missing.cells                          = {base, wrong_style_continuation};
+
+        ok &= check(term::validate_render_snapshot(style_before_missing).status ==
+                term::Terminal_render_snapshot_status::INVALID_WIDE_CELL_CONTINUATION,
+            "validator reports a missing width-3 continuation before wrong continuation style");
+
+        term::Terminal_render_snapshot style_before_overlap = style_before_missing;
+        term::Terminal_render_cell overlapping              = valid.cells[2];
+        overlapping.position                                = {0, 2};
+        overlapping.display_width                           = 1;
+        overlapping.wide_continuation                       = false;
+        style_before_overlap.cells                          =
+            {base, wrong_style_continuation, overlapping};
+
+        ok &= check(term::validate_render_snapshot(style_before_overlap).status ==
+                term::Terminal_render_snapshot_status::INVALID_CELL_OVERLAP,
+            "validator reports a non-continuation overlap before wrong continuation style");
+    }
+
+    return ok;
+}
+
+bool test_validate_render_snapshot_accepts_huge_sparse_empty_snapshot()
+{
+    bool ok = true;
+
+    constexpr int max_grid_extent = std::numeric_limits<int>::max();
+    term::Terminal_viewport_state viewport;
+    viewport.visible_rows = max_grid_extent;
+
+    const term::Terminal_render_snapshot snapshot =
+        term::make_empty_render_snapshot({max_grid_extent, max_grid_extent}, viewport, 232U);
+    const term::Terminal_render_snapshot_validation validation =
+        term::validate_render_snapshot(snapshot);
+
+    ok &= check(snapshot.cells.empty() &&
+            validation.status == term::Terminal_render_snapshot_status::OK,
+        "validator accepts an empty INT_MAX x INT_MAX sparse snapshot");
 
     return ok;
 }
@@ -1774,6 +2251,11 @@ int main()
     ok &= test_synthetic_snapshots_preserve_or_suppress_line_provenance();
     ok &= test_session_profile_snapshot_publication_counters();
     ok &= test_dirty_row_coalescing_unifies_on_stricter_row_identity();
+    ok &= test_row_content_view_matches_flat_snapshot_representation();
+    ok &= test_row_content_view_malformed_lookup_and_hook_behavior();
+    ok &= test_validate_render_snapshot_reports_wide_overlap_before_missing_continuation();
+    ok &= test_validate_render_snapshot_reports_wide_structure_before_style_mismatch();
+    ok &= test_validate_render_snapshot_accepts_huge_sparse_empty_snapshot();
     ok &= test_real_model_snapshot_cells_are_row_major_column_ascending();
     ok &= test_validate_render_snapshot_rejects_out_of_order_cells();
     return ok ? 0 : 1;

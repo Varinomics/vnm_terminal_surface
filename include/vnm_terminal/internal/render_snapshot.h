@@ -12,7 +12,9 @@
 #include <QStringView>
 #include <QtGlobal>
 #include <algorithm>
+#include <iterator>
 #include <memory>
+#include <optional>
 #include <set>
 #include <vector>
 #include <cstddef>
@@ -658,6 +660,448 @@ inline void suppress_selection_spans_without_valid_line_provenance(
     }
 }
 
+inline bool render_snapshot_cells_equal(
+    const Terminal_render_cell& left,
+    const Terminal_render_cell& right)
+{
+    return
+        left.position          == right.position          &&
+        left.text              == right.text              &&
+        left.hyperlink_id      == right.hyperlink_id      &&
+        left.display_width     == right.display_width     &&
+        left.wide_continuation == right.wide_continuation &&
+        left.style_id          == right.style_id          &&
+        left.text_category     == right.text_category;
+}
+
+inline int render_snapshot_viewable_row_count(const Terminal_render_snapshot& snapshot)
+{
+    return std::max(snapshot.grid_size.rows, 0);
+}
+
+inline bool render_snapshot_row_is_viewable(
+    const Terminal_render_snapshot& snapshot,
+    int                             row)
+{
+    return row >= 0 && row < render_snapshot_viewable_row_count(snapshot);
+}
+
+inline bool render_cell_text_has_non_space(const Terminal_render_cell_text& text)
+{
+    const std::optional<ushort> single_code_unit = text.single_code_unit();
+    if (single_code_unit.has_value()) {
+        return *single_code_unit != 0x20U;
+    }
+
+    const QString* fallback = text.fallback_qstring_or_null();
+    if (fallback == nullptr) {
+        return false;
+    }
+
+    for (const QChar character : *fallback) {
+        if (character != QLatin1Char(' ')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool render_snapshot_row_is_dirty(
+    const Terminal_render_snapshot& snapshot,
+    int                             row)
+{
+    if (!render_snapshot_row_is_viewable(snapshot, row)) {
+        return false;
+    }
+
+    const auto range = std::upper_bound(
+        snapshot.dirty_row_ranges.begin(),
+        snapshot.dirty_row_ranges.end(),
+        row,
+        [](int target_row, const Terminal_render_dirty_row_range& range) {
+            return target_row < range.first_row;
+        });
+    if (range == snapshot.dirty_row_ranges.begin()) {
+        return false;
+    }
+
+    const Terminal_render_dirty_row_range& candidate = *std::prev(range);
+    const std::int64_t first_row = candidate.first_row;
+    const std::int64_t end_row =
+        first_row + static_cast<std::int64_t>(candidate.row_count);
+    return
+        static_cast<std::int64_t>(row) >= first_row &&
+        static_cast<std::int64_t>(row) <  end_row;
+}
+
+inline bool render_snapshot_cell_style_ids_resolve(
+    const Terminal_render_snapshot& snapshot)
+{
+    if (snapshot.styles.empty()) {
+        return false;
+    }
+
+    for (const Terminal_render_cell& cell : snapshot.cells) {
+        if (static_cast<std::size_t>(cell.style_id) >= snapshot.styles.size()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool collect_render_snapshot_hyperlink_ids(
+    const Terminal_render_snapshot& snapshot,
+    std::set<std::uint64_t>&        hyperlink_ids)
+{
+    hyperlink_ids.clear();
+    for (const Terminal_render_hyperlink_metadata& hyperlink : snapshot.hyperlinks) {
+        if (hyperlink.hyperlink_id                     == 0U ||
+            hyperlink_ids.find(hyperlink.hyperlink_id) != hyperlink_ids.end())
+        {
+            return false;
+        }
+        hyperlink_ids.insert(hyperlink.hyperlink_id);
+    }
+    return true;
+}
+
+inline bool render_snapshot_cell_hyperlink_ids_resolve(
+    const Terminal_render_snapshot& snapshot)
+{
+    std::set<std::uint64_t> hyperlink_ids;
+    if (!collect_render_snapshot_hyperlink_ids(snapshot, hyperlink_ids)) {
+        return false;
+    }
+
+    for (const Terminal_render_cell& cell : snapshot.cells) {
+        if (cell.hyperlink_id                     != 0U &&
+            hyperlink_ids.find(cell.hyperlink_id) == hyperlink_ids.end())
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+class Terminal_render_snapshot_row_content_view;
+
+class Terminal_render_snapshot_row_content
+{
+public:
+    using const_iterator = std::vector<Terminal_render_cell>::const_iterator;
+
+    int row() const { return m_row; }
+    bool valid() const { return render_snapshot_row_is_viewable(*m_snapshot, m_row); }
+    int column_count() const { return m_snapshot->grid_size.columns; }
+    std::size_t cell_count() const
+    {
+        return static_cast<std::size_t>(std::distance(m_first, m_last));
+    }
+
+    const_iterator begin() const { return m_first; }
+    const_iterator end() const { return m_last; }
+
+    const Terminal_render_cell* cell_at(int column) const
+    {
+        if (column < 0 || column >= m_snapshot->grid_size.columns) {
+            return nullptr;
+        }
+
+        const const_iterator found = std::lower_bound(
+            m_first,
+            m_last,
+            column,
+            [](const Terminal_render_cell& cell, int target_column) {
+                return cell.position.column < target_column;
+            });
+        return found != m_last && found->position.column == column ? &*found : nullptr;
+    }
+
+    QString text(
+        int     first_column,
+        int     end_column,
+        bool    trim_trailing_spaces) const
+    {
+        if (!valid()) {
+            return {};
+        }
+
+        Q_ASSERT(first_column >= 0);
+        Q_ASSERT(first_column <= end_column);
+        Q_ASSERT(end_column <= m_snapshot->grid_size.columns);
+
+        int effective_end_column = end_column;
+        if (trim_trailing_spaces) {
+            effective_end_column = first_column;
+            const_iterator last_cell = m_last;
+            while (last_cell != m_first) {
+                --last_cell;
+                if (last_cell->position.column < first_column) {
+                    break;
+                }
+
+                if (last_cell->position.column >= end_column ||
+                    last_cell->wide_continuation              ||
+                    !render_cell_text_has_non_space(last_cell->text))
+                {
+                    continue;
+                }
+
+                effective_end_column = last_cell->position.column + 1;
+                break;
+            }
+
+            if (effective_end_column == first_column) {
+                return {};
+            }
+        }
+
+        QString extracted;
+        const_iterator cell = m_first;
+        for (int column = first_column; column < effective_end_column; ++column) {
+            while (cell != m_last && cell->position.column < column) {
+                ++cell;
+            }
+
+            if (cell == m_last || cell->position.column > column) {
+                extracted += QLatin1Char(' ');
+                continue;
+            }
+
+            if (cell->wide_continuation) {
+                ++cell;
+                continue;
+            }
+
+            cell->text.append_to(extracted);
+            ++cell;
+        }
+
+        if (trim_trailing_spaces) {
+            while (extracted.endsWith(QLatin1Char(' '))) {
+                extracted.chop(1);
+            }
+        }
+        return extracted;
+    }
+
+    const Terminal_render_line_provenance* provenance_or_null() const
+    {
+        if (!valid()) {
+            return nullptr;
+        }
+
+        const std::size_t row_index = static_cast<std::size_t>(m_row);
+        return row_index < m_snapshot->visible_line_provenance.size()
+            ? &m_snapshot->visible_line_provenance[row_index]
+            : nullptr;
+    }
+
+    bool dirty() const
+    {
+        return render_snapshot_row_is_dirty(*m_snapshot, m_row);
+    }
+
+private:
+    friend class Terminal_render_snapshot_row_content_view;
+
+    Terminal_render_snapshot_row_content(
+        const Terminal_render_snapshot& snapshot,
+        int                             row,
+        const_iterator                  first,
+        const_iterator                  last)
+    :
+        m_snapshot(&snapshot),
+        m_row(row),
+        m_first(first),
+        m_last(last)
+    {}
+
+    const Terminal_render_snapshot* m_snapshot = nullptr;
+    int                             m_row      = 0;
+    const_iterator                  m_first;
+    const_iterator                  m_last;
+};
+
+class Terminal_render_snapshot_row_content_view
+{
+public:
+    class const_iterator
+    {
+    public:
+        Terminal_render_snapshot_row_content operator*() const
+        {
+            return m_view->row_at(m_row);
+        }
+
+        const_iterator& operator++()
+        {
+            ++m_row;
+            return *this;
+        }
+
+        friend bool operator==(const const_iterator&, const const_iterator&) = default;
+
+    private:
+        friend class Terminal_render_snapshot_row_content_view;
+
+        const_iterator(
+            const Terminal_render_snapshot_row_content_view& view,
+            int                                              row)
+        :
+            m_view(&view),
+            m_row(row)
+        {}
+
+        const Terminal_render_snapshot_row_content_view* m_view = nullptr;
+        int                                              m_row  = 0;
+    };
+
+    explicit Terminal_render_snapshot_row_content_view(
+        const Terminal_render_snapshot& snapshot)
+    :
+        m_snapshot(snapshot)
+    {}
+    explicit Terminal_render_snapshot_row_content_view(
+        const Terminal_render_snapshot&& snapshot) = delete;
+
+    const Terminal_render_snapshot& snapshot() const { return m_snapshot; }
+    terminal_grid_size_t grid_size() const { return m_snapshot.grid_size; }
+    int row_count() const { return render_snapshot_viewable_row_count(m_snapshot); }
+    int column_count() const { return m_snapshot.grid_size.columns; }
+
+    const std::vector<Terminal_text_style>& styles() const { return m_snapshot.styles; }
+    const std::vector<Terminal_render_dirty_row_range>& dirty_row_ranges() const
+    {
+        return m_snapshot.dirty_row_ranges;
+    }
+    const std::vector<Terminal_render_line_provenance>& visible_line_provenance() const
+    {
+        return m_snapshot.visible_line_provenance;
+    }
+    const std::vector<Terminal_render_selection_span>& selection_spans() const
+    {
+        return m_snapshot.selection_spans;
+    }
+    const std::vector<Terminal_render_hyperlink_metadata>& hyperlinks() const
+    {
+        return m_snapshot.hyperlinks;
+    }
+    const Terminal_render_cursor& cursor() const { return m_snapshot.cursor; }
+    const Ime_preedit_state& ime_preedit() const { return m_snapshot.ime_preedit; }
+    const Terminal_render_metadata& metadata() const { return m_snapshot.metadata; }
+    const Terminal_mode_state& modes() const { return m_snapshot.modes; }
+
+    Terminal_render_snapshot_row_content row_at(int row) const
+    {
+        if (!render_snapshot_row_is_viewable(m_snapshot, row)) {
+            return empty_row_at(row);
+        }
+
+        return row_at_unchecked(row);
+    }
+
+    const Terminal_render_cell* cell_at(int row, int column) const
+    {
+        if (!render_snapshot_row_is_viewable(m_snapshot, row)) {
+            return nullptr;
+        }
+
+        return row_at_unchecked(row).cell_at(column);
+    }
+
+    QString row_text(
+        int     row,
+        int     first_column,
+        int     end_column,
+        bool    trim_trailing_spaces) const
+    {
+        if (!render_snapshot_row_is_viewable(m_snapshot, row)) {
+            return {};
+        }
+
+        return row_at_unchecked(row).text(first_column, end_column, trim_trailing_spaces);
+    }
+
+    const Terminal_render_line_provenance* provenance_at(int row) const
+    {
+        if (!render_snapshot_row_is_viewable(m_snapshot, row)) {
+            return nullptr;
+        }
+
+        return row_at_unchecked(row).provenance_or_null();
+    }
+
+    const_iterator begin() const { return const_iterator(*this, 0); }
+    const_iterator end() const { return const_iterator(*this, row_count()); }
+
+    bool cell_style_ids_resolve() const
+    {
+        return render_snapshot_cell_style_ids_resolve(m_snapshot);
+    }
+
+    bool cell_hyperlink_ids_resolve() const
+    {
+        return render_snapshot_cell_hyperlink_ids_resolve(m_snapshot);
+    }
+
+    std::vector<Terminal_render_cell> materialize_flat_cells() const
+    {
+        std::vector<Terminal_render_cell> cells;
+        cells.reserve(m_snapshot.cells.size());
+        for (const Terminal_render_snapshot_row_content row : *this) {
+            cells.insert(cells.end(), row.begin(), row.end());
+        }
+        return cells;
+    }
+
+    bool materialized_flat_cells_match_snapshot() const
+    {
+        const std::vector<Terminal_render_cell> materialized = materialize_flat_cells();
+        if (materialized.size() != m_snapshot.cells.size()) {
+            return false;
+        }
+
+        for (std::size_t i = 0; i < materialized.size(); ++i) {
+            if (!render_snapshot_cells_equal(materialized[i], m_snapshot.cells[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    Terminal_render_snapshot_row_content empty_row_at(int row) const
+    {
+        const auto end = m_snapshot.cells.end();
+        return Terminal_render_snapshot_row_content(m_snapshot, row, end, end);
+    }
+
+    Terminal_render_snapshot_row_content row_at_unchecked(int row) const
+    {
+        Q_ASSERT(render_snapshot_row_is_viewable(m_snapshot, row));
+
+        const std::int64_t target_row = row;
+        const auto first = std::lower_bound(
+            m_snapshot.cells.begin(),
+            m_snapshot.cells.end(),
+            target_row,
+            [](const Terminal_render_cell& cell, std::int64_t row) {
+                return cell.position.row < row;
+            });
+        const auto last = std::lower_bound(
+            first,
+            m_snapshot.cells.end(),
+            target_row + 1,
+            [](const Terminal_render_cell& cell, std::int64_t row) {
+                return cell.position.row < row;
+            });
+        return Terminal_render_snapshot_row_content(m_snapshot, row, first, last);
+    }
+
+    const Terminal_render_snapshot& m_snapshot;
+};
+
 inline std::vector<const Terminal_render_cell*> render_snapshot_cells_by_position(
     const Terminal_render_snapshot& snapshot)
 {
@@ -694,6 +1138,15 @@ inline const Terminal_render_cell* render_snapshot_cell_at(
             static_cast<std::size_t>(grid_size.columns) +
         static_cast<std::size_t>(column);
     return cells_by_position[index];
+}
+
+inline QString selected_text_from_render_snapshot_row(
+    const Terminal_render_snapshot_row_content& row,
+    int                                         first_column,
+    int                                         end_column,
+    bool                                        trim_trailing_spaces)
+{
+    return row.text(first_column, end_column, trim_trailing_spaces);
 }
 
 inline QString selected_text_from_render_snapshot_row(
@@ -784,6 +1237,54 @@ inline Terminal_selection_result selected_text_from_render_snapshot(
     return {Terminal_selection_result_code::OK, text};
 }
 
+inline Terminal_selection_result selected_text_from_render_snapshot_row_view(
+    const Terminal_render_snapshot& snapshot,
+    const Terminal_selection_range& selection)
+{
+    if (snapshot.grid_size.rows <= 0 || snapshot.grid_size.columns <= 0 ||
+        selection.mode == Terminal_selection_mode::NONE)
+    {
+        return {Terminal_selection_result_code::INVALID_RANGE, {}};
+    }
+
+    const terminal_grid_position_t start = normalized_selection_start(selection);
+    const terminal_grid_position_t end   = normalized_selection_end(selection);
+    const int first_visible_logical_row  = render_snapshot_first_visible_logical_row(snapshot);
+
+    if (start.row    < first_visible_logical_row                            ||
+        end.row      >= first_visible_logical_row + snapshot.grid_size.rows ||
+        start.column < 0                                                    ||
+        start.column > snapshot.grid_size.columns                           ||
+        end.column   < 0                                                    ||
+        end.column   > snapshot.grid_size.columns)
+    {
+        return {Terminal_selection_result_code::INVALID_RANGE, {}};
+    }
+
+    const Terminal_render_snapshot_row_content_view rows(snapshot);
+    QString text;
+    for (int logical_row = start.row; logical_row <= end.row; ++logical_row) {
+        const int first_column = logical_row == start.row ? start.column : 0;
+        const int end_column =
+            logical_row == end.row ? end.column : snapshot.grid_size.columns;
+        if (end_column < first_column) {
+            return {Terminal_selection_result_code::INVALID_RANGE, {}};
+        }
+
+        if (logical_row > start.row) {
+            text += QLatin1Char('\n');
+        }
+
+        text += selected_text_from_render_snapshot_row(
+            rows.row_at(logical_row - first_visible_logical_row),
+            first_column,
+            end_column,
+            end_column == snapshot.grid_size.columns);
+    }
+
+    return {Terminal_selection_result_code::OK, text};
+}
+
 inline Terminal_render_cell_text_category render_cell_text_category_for_validation(
     const QString& text)
 {
@@ -823,7 +1324,17 @@ inline bool render_cell_text_category_is_valid(const Terminal_render_cell& cell)
             cell.text_category == cell.text.category());
 }
 
-inline Terminal_render_snapshot_validation validate_render_snapshot(
+inline bool render_snapshot_cell_is_strictly_after(
+    const Terminal_render_cell& cell,
+    const Terminal_render_cell& previous)
+{
+    return
+        cell.position.row > previous.position.row ||
+        (cell.position.row    == previous.position.row &&
+         cell.position.column >  previous.position.column);
+}
+
+inline Terminal_render_snapshot_validation validate_render_snapshot_metadata(
     const Terminal_render_snapshot& snapshot)
 {
     if (snapshot.grid_size.rows <= 0 || snapshot.grid_size.columns <= 0) {
@@ -880,26 +1391,27 @@ inline Terminal_render_snapshot_validation validate_render_snapshot(
         return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};
     }
 
-    int next_dirty_row = 0;
+    std::int64_t next_dirty_row = 0;
     for (const Terminal_render_dirty_row_range& range : snapshot.dirty_row_ranges) {
-        if (range.first_row < 0 || range.row_count <= 0 || range.first_row < next_dirty_row ||
-            range.first_row + range.row_count > snapshot.grid_size.rows)
+        const std::int64_t first_row = range.first_row;
+        const std::int64_t row_count = range.row_count;
+        const std::int64_t end_row   = first_row + row_count;
+        if (first_row < 0              ||
+            row_count <= 0             ||
+            first_row < next_dirty_row ||
+            end_row   >  snapshot.grid_size.rows)
         {
             return {Terminal_render_snapshot_status::INVALID_DIRTY_ROW_RANGE};
         }
-        next_dirty_row = range.first_row + range.row_count;
+        next_dirty_row = static_cast<int>(end_row);
     }
 
-    std::set<std::uint64_t> hyperlink_ids;
-    for (const Terminal_render_hyperlink_metadata& hyperlink : snapshot.hyperlinks) {
-        if (hyperlink.hyperlink_id                     == 0U ||
-            hyperlink_ids.find(hyperlink.hyperlink_id) != hyperlink_ids.end())
-        {
-            return {Terminal_render_snapshot_status::INVALID_HYPERLINK_METADATA};
-        }
-        hyperlink_ids.insert(hyperlink.hyperlink_id);
-    }
+    return {};
+}
 
+inline Terminal_render_snapshot_validation validate_render_snapshot_flat_cells(
+    const Terminal_render_snapshot& snapshot)
+{
     for (std::size_t i = 0; i < snapshot.cells.size(); ++i) {
         const Terminal_render_cell& cell = snapshot.cells[i];
         if (cell.position.row    < 0  || cell.position.row    >= snapshot.grid_size.rows ||
@@ -914,28 +1426,14 @@ inline Terminal_render_snapshot_validation validate_render_snapshot(
         // the frame builder iterates snapshot.cells directly relying on it.
         // Enforce the contract here so a violating snapshot fails loudly instead
         // of mis-rendering.
-        if (i > 0) {
-            const Terminal_render_cell& previous = snapshot.cells[i - 1];
-            const bool strictly_after =
-                cell.position.row > previous.position.row ||
-                (cell.position.row    == previous.position.row &&
-                 cell.position.column >  previous.position.column);
-            if (!strictly_after) {
-                return {Terminal_render_snapshot_status::INVALID_CELL_ORDER};
-            }
+        if (i > 0 &&
+            !render_snapshot_cell_is_strictly_after(cell, snapshot.cells[i - 1]))
+        {
+            return {Terminal_render_snapshot_status::INVALID_CELL_ORDER};
         }
 
         if (static_cast<std::size_t>(cell.style_id) >= snapshot.styles.size()) {
             return {Terminal_render_snapshot_status::INVALID_STYLE_ID};
-        }
-
-        for (std::size_t j = 0; j < i; ++j) {
-            const Terminal_render_cell& previous = snapshot.cells[j];
-            if (previous.position.row    == cell.position.row &&
-                previous.position.column == cell.position.column)
-            {
-                return {Terminal_render_snapshot_status::INVALID_CELL_OVERLAP};
-            }
         }
 
         if (cell.wide_continuation) {
@@ -959,58 +1457,78 @@ inline Terminal_render_snapshot_validation validate_render_snapshot(
         }
     }
 
+    return {};
+}
+
+inline Terminal_render_snapshot_validation validate_render_snapshot_wide_cells(
+    const Terminal_render_snapshot& snapshot)
+{
+    const Terminal_render_cell* active_base                = nullptr;
+    int                         active_end_column          = 0;
+    int                         next_continuation_column   = 0;
+    bool                        active_style_mismatch_seen = false;
+
     for (const Terminal_render_cell& cell : snapshot.cells) {
+        if (active_base != nullptr &&
+            cell.position.row != active_base->position.row)
+        {
+            return {Terminal_render_snapshot_status::INVALID_WIDE_CELL_CONTINUATION};
+        }
+
+        if (active_base != nullptr && cell.position.column >= active_end_column) {
+            return {Terminal_render_snapshot_status::INVALID_WIDE_CELL_CONTINUATION};
+        }
+
         if (cell.wide_continuation) {
-            const Terminal_render_cell* covering_base       = nullptr;
-            int                         covering_base_count = 0;
-            for (const Terminal_render_cell& base_cell : snapshot.cells) {
-                if (base_cell.wide_continuation || base_cell.position.row != cell.position.row) {
-                    continue;
-                }
-
-                if (base_cell.position.column                        < cell.position.column &&
-                    cell.position.column - base_cell.position.column < base_cell.display_width)
-                {
-                    covering_base = &base_cell;
-                    ++covering_base_count;
-                }
-            }
-
-            if (covering_base_count != 1) {
+            if (active_base == nullptr ||
+                cell.position.column != next_continuation_column)
+            {
                 return {Terminal_render_snapshot_status::INVALID_WIDE_CELL_CONTINUATION};
             }
 
-            if (covering_base->style_id     != cell.style_id ||
-                covering_base->hyperlink_id != cell.hyperlink_id)
+            if (active_base->style_id     != cell.style_id ||
+                active_base->hyperlink_id != cell.hyperlink_id)
             {
-                return {Terminal_render_snapshot_status::INVALID_WIDE_CELL_STYLE};
+                active_style_mismatch_seen = true;
+            }
+
+            ++next_continuation_column;
+            if (next_continuation_column >= active_end_column) {
+                if (active_style_mismatch_seen) {
+                    return {Terminal_render_snapshot_status::INVALID_WIDE_CELL_STYLE};
+                }
+
+                active_base                = nullptr;
+                active_style_mismatch_seen = false;
             }
             continue;
         }
 
-        int continuation_count = 0;
-        for (const Terminal_render_cell& covered_cell : snapshot.cells) {
-            if (covered_cell.position.row                           != cell.position.row    ||
-                covered_cell.position.column                        <= cell.position.column ||
-                covered_cell.position.column - cell.position.column >= cell.display_width)
-            {
-                continue;
-            }
-
-            if (!covered_cell.wide_continuation) {
-                return {Terminal_render_snapshot_status::INVALID_CELL_OVERLAP};
-            }
-
-            if (covered_cell.wide_continuation) {
-                ++continuation_count;
-            }
+        if (active_base != nullptr &&
+            cell.position.column < active_end_column)
+        {
+            return {Terminal_render_snapshot_status::INVALID_CELL_OVERLAP};
         }
 
-        if (continuation_count != cell.display_width - 1) {
-            return {Terminal_render_snapshot_status::INVALID_WIDE_CELL_CONTINUATION};
+        if (cell.display_width > 1) {
+            active_base                = &cell;
+            active_end_column          = cell.position.column + cell.display_width;
+            next_continuation_column   = cell.position.column + 1;
+            active_style_mismatch_seen = false;
         }
     }
 
+    if (active_base != nullptr) {
+        return {Terminal_render_snapshot_status::INVALID_WIDE_CELL_CONTINUATION};
+    }
+
+    return {};
+}
+
+inline Terminal_render_snapshot_validation validate_render_snapshot_cell_hyperlinks(
+    const Terminal_render_snapshot&  snapshot,
+    const std::set<std::uint64_t>&   hyperlink_ids)
+{
     for (const Terminal_render_cell& cell : snapshot.cells) {
         if (cell.hyperlink_id                     != 0U &&
             hyperlink_ids.find(cell.hyperlink_id) == hyperlink_ids.end())
@@ -1019,6 +1537,12 @@ inline Terminal_render_snapshot_validation validate_render_snapshot(
         }
     }
 
+    return {};
+}
+
+inline Terminal_render_snapshot_validation validate_render_snapshot_overlay_metadata(
+    const Terminal_render_snapshot& snapshot)
+{
     if (snapshot.cursor.visible &&
         (snapshot.cursor.position.row < 0 || snapshot.cursor.position.row >= snapshot.grid_size.rows ||
          snapshot.cursor.position.column <  0 ||
@@ -1037,6 +1561,55 @@ inline Terminal_render_snapshot_validation validate_render_snapshot(
     }
 
     return {};
+}
+
+inline Terminal_render_snapshot_validation validate_render_snapshot(
+    const Terminal_render_snapshot& snapshot)
+{
+    std::set<std::uint64_t> hyperlink_ids;
+    const Terminal_render_snapshot_validation metadata =
+        validate_render_snapshot_metadata(snapshot);
+    if (metadata.status != Terminal_render_snapshot_status::OK) {
+        return metadata;
+    }
+
+    if (!collect_render_snapshot_hyperlink_ids(snapshot, hyperlink_ids)) {
+        return {Terminal_render_snapshot_status::INVALID_HYPERLINK_METADATA};
+    }
+
+    const Terminal_render_snapshot_validation flat_cells =
+        validate_render_snapshot_flat_cells(snapshot);
+    if (flat_cells.status != Terminal_render_snapshot_status::OK) {
+        return flat_cells;
+    }
+
+    const Terminal_render_snapshot_validation wide_cells =
+        validate_render_snapshot_wide_cells(snapshot);
+    if (wide_cells.status != Terminal_render_snapshot_status::OK) {
+        return wide_cells;
+    }
+
+    const Terminal_render_snapshot_validation cell_hyperlinks =
+        validate_render_snapshot_cell_hyperlinks(snapshot, hyperlink_ids);
+    if (cell_hyperlinks.status != Terminal_render_snapshot_status::OK) {
+        return cell_hyperlinks;
+    }
+
+    const Terminal_render_snapshot_validation overlay_metadata =
+        validate_render_snapshot_overlay_metadata(snapshot);
+    if (overlay_metadata.status != Terminal_render_snapshot_status::OK) {
+        return overlay_metadata;
+    }
+
+    return {};
+}
+
+inline Terminal_render_snapshot_validation validate_render_snapshot_row_content_view(
+    const Terminal_render_snapshot& snapshot)
+{
+    // Keep one status-order owner; the canonical validator owns all structural
+    // checks after flat row-major preconditions have been proven.
+    return validate_render_snapshot(snapshot);
 }
 
 }
