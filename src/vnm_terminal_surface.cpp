@@ -82,6 +82,7 @@ constexpr int         k_plain_scroll_lines_per_angle_step        = 3;
 constexpr int         k_min_synchronized_output_stale_timeout_ms = 1;
 constexpr int         k_row_timestamp_tooltip_delay_ms           = 1000;
 constexpr std::chrono::milliseconds k_backend_callback_drain_budget{4};
+constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget{0};
 
 #if defined(_WIN32)
 constexpr unsigned int k_win_spi_get_font_smoothing             = 0x004AU;
@@ -1794,6 +1795,9 @@ struct VNM_TerminalSurface::Private
         render_update_pending = true;
         render_update_window = render_window;
         ++render_invalidation_stats.scheduled_updates;
+        if (surface.thread() == QThread::currentThread()) {
+            surface.polish();
+        }
         surface.update();
     }
 
@@ -3611,7 +3615,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
         }
 
         event->accept();
-        sync_from_session();
+        sync_after_user_input(is_accepted(key_result.result.code));
         if (!is_accepted(key_result.result.code)) {
             report_result_failure(key_result.result);
         }
@@ -5195,7 +5199,10 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
                 preedit_cursor_position);
         }
 
-        sync_from_session();
+        sync_after_user_input(
+            commit_result.has_value() &&
+            commit_result->handled &&
+            is_accepted(commit_result->result.code));
         if (commit_result.has_value() &&
             commit_result->handled &&
             !is_accepted(commit_result->result.code))
@@ -5580,15 +5587,55 @@ void VNM_TerminalSurface::queue_backend_callback_drain()
 
 void VNM_TerminalSurface::drain_backend_callback_events()
 {
-    drain_backend_callback_events(false);
+    drain_backend_callback_events_with_budget(std::nullopt);
 }
 
 void VNM_TerminalSurface::drain_backend_callback_events_for_posted_work()
 {
-    drain_backend_callback_events(true);
+    drain_backend_callback_events_for(k_backend_callback_drain_budget);
+}
+
+void VNM_TerminalSurface::sync_after_user_input(bool input_accepted)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    if (m_private->session == nullptr) {
+        return;
+    }
+
+    term::Terminal_session* const session = m_private->session.get();
+    if (input_accepted &&
+        m_private->render_update_pending &&
+        session->has_pending_backend_callback_events())
+    {
+        // Take only already-queued echo/output here; polish covers the
+        // pre-frame path without predicting cursor movement or waiting.
+        drain_backend_callback_events_for(k_backend_callback_frame_catchup_budget);
+        return;
+    }
+
+    sync_from_session();
 }
 
 void VNM_TerminalSurface::drain_backend_callback_events(bool budgeted)
+{
+    if (budgeted) {
+        drain_backend_callback_events_for(k_backend_callback_drain_budget);
+    }
+    else {
+        drain_backend_callback_events_with_budget(std::nullopt);
+    }
+}
+
+void VNM_TerminalSurface::drain_backend_callback_events_for(
+    std::chrono::steady_clock::duration budget)
+{
+    drain_backend_callback_events_with_budget(
+        std::optional<std::chrono::steady_clock::duration>{budget});
+}
+
+void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
+    std::optional<std::chrono::steady_clock::duration> budget)
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
@@ -5612,9 +5659,8 @@ void VNM_TerminalSurface::drain_backend_callback_events(bool budgeted)
                 .arg(selection_trace_source_identity(before_source)));
     }
     bool drain_complete = true;
-    if (budgeted) {
-        drain_complete = session->process_backend_callback_events_for(
-            k_backend_callback_drain_budget);
+    if (budget.has_value()) {
+        drain_complete = session->process_backend_callback_events_for(*budget);
     }
     else {
         session->process_backend_callback_events();
@@ -5630,7 +5676,7 @@ void VNM_TerminalSurface::drain_backend_callback_events(bool budgeted)
                 .arg(selection_trace_snapshot_identity(m_private->render_snapshot))
                 .arg(selection_trace_source_identity(after_source)));
     }
-    if (budgeted &&
+    if (budget.has_value() &&
         !drain_complete &&
         m_private->session.get() == session &&
         session->has_pending_backend_callback_events())
@@ -5965,6 +6011,23 @@ void VNM_TerminalSurface::reset_session()
     m_private->last_backend_error_signal_sequence = 0U;
 }
 
+void VNM_TerminalSurface::updatePolish()
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    // Polish runs before the scene graph syncs this item into the next frame.
+    // Drain already-arrived backend callbacks here so a pending render update
+    // does not capture a snapshot that is older than queued echo/output.
+    if (m_private->session == nullptr || m_private->shutting_down.load()) {
+        return;
+    }
+    if (!m_private->session->has_pending_backend_callback_events()) {
+        return;
+    }
+
+    drain_backend_callback_events_for(k_backend_callback_frame_catchup_budget);
+}
+
 QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*)
 {
 #if VNM_TERMINAL_PROFILING_ENABLED
@@ -6251,6 +6314,13 @@ void term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.drain_backend_callback_events();
+}
+
+void term::VNM_TerminalSurface_render_bridge::simulate_update_polish(
+    VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    surface.updatePolish();
 }
 
 void term::VNM_TerminalSurface_render_bridge::handle_synchronized_output_recovery_timeout(

@@ -100,6 +100,9 @@ public:
     static void drain_backend_callback_events(
         VNM_TerminalSurface&       surface);
 
+    static void simulate_update_polish(
+        VNM_TerminalSurface&       surface);
+
     static void handle_synchronized_output_recovery_timeout(
         VNM_TerminalSurface&                    surface,
         std::chrono::steady_clock::duration     budget);
