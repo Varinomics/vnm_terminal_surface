@@ -914,6 +914,62 @@ Gates:
   documented generation/byte policy.
 - No production lazy publication enabled.
 
+Batch 4 implementation record, 2026-06-13:
+
+- Scope: test-only lazy row payload representation. Production snapshot
+  publication remains fully materialized; no session, model producer, frame
+  builder, public projection, transcript, replay, or QSG path constructs lazy
+  payloads.
+- Ownership model:
+  - `Terminal_render_snapshot_row_payload_owner` owns immutable row payload
+    vectors and records a retained generation plus retained byte estimate.
+  - `Terminal_render_snapshot_lazy_row_payload` stores a source-owner
+    `shared_ptr` plus row index. Borrowed rows therefore keep the source
+    row-payload owner alive across source snapshot release and
+    `Terminal_render_snapshot` copy/move.
+  - Borrowed rows may carry receiving-namespace remapped cells. Row content
+    view, materialization, and validation see only receiving-snapshot
+    `style_id` and `hyperlink_id` values.
+- Identity and validation:
+  - Each immutable row payload records viewport row, visible-line provenance,
+    row-origin generation, and source style/hyperlink namespace generation.
+  - Lazy snapshots carry no flat `snapshot.cells` backing; validation rejects
+    any nonempty flat cell vector when `lazy_row_payloads` is present.
+  - Lazy validation rejects row/provenance/row-origin mismatch, unresolved
+    receiving style ids, unresolved receiving hyperlink ids, and receiving
+    namespace mismatch. Receiving-namespace rows must preserve the source row
+    content exactly except for `style_id` and `hyperlink_id` translations, and
+    validation rejects hyperlink link/no-link changes such as nonzero source ids
+    remapped to zero. Existing flat validation remains the production path when
+    `lazy_row_payloads` is empty.
+- Retention policy:
+  - `Terminal_render_snapshot_row_payload_retention` retains the newest
+    configured generation count, replaces superseded owners with the same
+    generation, and evicts oldest owners until the retained byte limit is
+    satisfied.
+  - Retained byte estimates include fallback `QString` heap payloads inside
+    `Terminal_render_cell_text`.
+  - Evicting an owner from the retention backlog does not invalidate snapshots
+    that already borrowed rows from that owner.
+- Test evidence added in `tests/render_snapshot/render_snapshot_tests.cpp`:
+  - Mixed owned/borrowed materialization parity against the full model
+    producer, including rejection of lazy snapshots that retain flat cells.
+  - Borrowed-row style and hyperlink remap into the receiving snapshot
+    namespace, plus altered-content, nonzero-hyperlink-to-zero, unresolved-id,
+    and namespace-mismatch validation failures.
+  - Lifetime across model mutation/destruction, source snapshot release, and
+    `Terminal_render_snapshot` copy/move.
+  - Retained generation, retained byte with long fallback text, superseded-owner,
+    and borrowed-after-eviction behavior.
+- Commands and results:
+  - `git diff --check` passed.
+  - `rg -n "lazy_row_payloads\s*=|make_shared<.*Terminal_render_snapshot_lazy_payloads|render_snapshot_row_payload_owner_from_snapshot|borrowed_render_snapshot_lazy_row_payload\(" src tools benchmarks` returned no matches.
+  - `rg -n "lazy_row_payloads\s*=|make_shared<.*Terminal_render_snapshot_lazy_payloads|render_snapshot_row_payload_owner_from_snapshot|borrowed_render_snapshot_lazy_row_payload\(" include\vnm_terminal\internal\render_snapshot.h tests\render_snapshot\render_snapshot_tests.cpp` showed only the internal representation helpers and render snapshot tests.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_render_snapshot"` passed.
+  - `ctest --test-dir build_codex_renderer_graphics_probe -R "^vnm_terminal_render_snapshot$" --output-on-failure` passed: 1/1.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_render_snapshot vnm_terminal_render_frame vnm_terminal_profile_text vnm_terminal_embedded_benchmark"` passed.
+  - `ctest --test-dir build_codex_renderer_graphics_probe -R "^(vnm_terminal_render_snapshot|vnm_terminal_render_frame|vnm_terminal_profile_text|vnm_terminal_embedded_benchmark_validate)$" --output-on-failure` passed: 4/4.
+
 ## 11. Batch 5: Eligibility Signal And Disabled Lazy Composer
 
 Purpose: build the lazy publication decision logic behind a disabled or
@@ -1170,10 +1226,15 @@ Reviewers should classify findings as:
 - serious risk: issue owned by a named future batch;
 - note: optional improvement that should not expand the plan without evidence.
 
-## 18. Immediate Next Step
+## 18. Current Handoff
 
-Close the reviewed Batch 3 consumer-migration/materialization-boundary commit,
-then proceed to Batch 4. Do not implement lazy publication until the consumer
-migration, materialization boundary work, and downstream frame/QSG proof path
-have passed independent review. Do not enable lazy publication by default
+Batch 4 now contains the test-only lazy row payload representation and retained
+row-payload policy scaffolding. Production snapshot publication remains fully
+materialized: session, model, frame, QSG, transcript, replay, and benchmark
+paths must not construct lazy row payloads until the later production-enablement
+batches explicitly do that work and pass their gates.
+
+The immediate next step is independent review of the amended Batch 4 diff and
+gate evidence. If accepted, proceed to Batch 5 eligibility signal work without
+enabling production lazy publication. Do not enable lazy publication by default
 before Batch 8 gates pass.
