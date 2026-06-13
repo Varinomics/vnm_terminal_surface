@@ -1345,17 +1345,90 @@ Reviewers should classify findings as:
 
 ## 18. Current Handoff
 
-Batch 7 now contains the frame-builder and QSG descriptor/reuse work from
-Section 13. Row-content-view input remains the canonical frame-builder path,
-QSG descriptor and reuse keys are derived from the produced
-`Terminal_render_frame`, and no second public renderer input was added. Lazy
-publication is still not enabled by default.
+Batch 8 reviewed the default production enablement gate on 2026-06-13 and
+intentionally deferred default lazy publication. Production publication remains
+fully materialized: `Terminal_session::publish_render_snapshot()` still builds
+and publishes the full `Terminal_screen_model::render_snapshot()` result. The
+only lazy publication path remains the explicit test/benchmark exercise bridge.
 
-Reviewers should review the Batch 7 diff and evidence before Batch 8. The
-Batch 7 evidence covers row-view versus flat frame parity, sparse dirty-row
-frame descriptor scaling, atlas clean-row reuse and dense block graphic rect
-row-stable upload evidence, descriptor/profile/benchmark schema exposure, and
-the targeted render-frame, render-snapshot, profile-text, QSG/atlas,
-surface-host, backend-session, embedded-benchmark, and surface-stress
-validators. If accepted, proceed to Batch 8 default production enablement and
-decision-grade end-to-end performance gates.
+The blocker is missing decision-grade end-to-end evidence, not a correctness
+failure in the predecessor batches:
+
+- The required full-size D3D11 surface/session benchmark invocation failed on
+  this workstation before measurement. Command:
+
+  ```powershell
+  vnm_terminal_embedded_benchmark.exe `
+      --scenario surface_session_sparse_ascii_output `
+      --scenario surface_session_sparse_block_graphics_output `
+      --iterations 1 `
+      --warmup 0 `
+      --grid 235x873 `
+      --window-size 6984x3760 `
+      --dirty-rows 8 `
+      --dirty-row-stride 7 `
+      --quiet `
+      --validate-json
+  ```
+
+  Result: exit code 1, both sparse scenarios `status=failed`,
+  requested grid `235x873`, actual grid `276x970`,
+  `actual_grid_matches_request=false`; Qt reported the requested
+  `8730x4700` window was clamped to `3844x2135`. The Batch 1 decision matrix
+  requires a machine/desktop setup that can create the requested window instead
+  of silently substituting another grid.
+- The current embedded benchmark can validate schema and counters, but it does
+  not provide an interleaved default-lazy versus full-output production A/B
+  switch. Its lazy path is an opt-in exercise after the production snapshot and
+  render wait.
+- The existing composer result is intentionally test/benchmark-oriented: it
+  performs a `ROW_VIEW_PARITY_TEST` materialization to prove equivalence and
+  count the materialization boundary. That is useful evidence for Batches 6 and
+  7, but it is not a zero-materialization production publication path.
+- Local supported-size runs remain non-decision evidence. A profiling-on
+  `surface_session_sparse_ascii_output` run at `--grid 48x160 --window-size
+  1280x768 --dirty-rows 8 --dirty-row-stride 7 --iterations 3 --warmup 1`
+  passed and reported zero lazy full fallbacks, but production still reported
+  full snapshot publications and the opt-in exercise reported row-view parity
+  materialization. The same size also reported
+  `actual_grid_matches_request=false`, so it cannot substitute for the
+  full-size Batch 8 matrix.
+
+The Batch 8 reviewer blocker for this handoff is the defer-trap in this
+section: an unnamed "later batch" deferral would cancel the default-lazy
+publication evidence work. Batch 9 is the concrete successor owner for the
+deferred evidence plumbing and the workstation-size benchmark decision because
+it is the remaining implementation/cleanup batch. Batch 10 remains final
+validation and handoff; it consumes accepted Batch 9 evidence and must not be
+the first owner of missing benchmark plumbing.
+
+Batch 9 owns the relevant file and area list for this evidence decision:
+
+- `benchmarks/embedded_terminal/CMakeLists.txt` and
+  `benchmarks/embedded_terminal/embedded_terminal_benchmark.cpp` for any
+  reviewed production A/B benchmark switch, scenario plumbing,
+  schema/counter validation, or workstation-size matrix amendment.
+- `src/terminal_session.cpp`,
+  `include/vnm_terminal/internal/terminal_session.h`,
+  `src/vnm_terminal_surface.cpp`, and
+  `include/vnm_terminal/internal/vnm_terminal_surface_render_bridge.h` only for
+  the minimal reviewed evidence hook needed to compare full-output production
+  publication with the candidate lazy publication path without enabling it by
+  default.
+- `docs/repository_guide.md` and this plan for schema/command/matrix
+  documentation, the accepted workstation or amended-size decision, and the
+  handoff into Batch 10 final validation.
+
+Do not enable default lazy publication until Batch 9 supplies comparable
+profiling-off and profiling-on evidence that reports snapshot construction,
+frame building, QSG prepare, memory retention, renderer FPS/paint latency,
+fallback counts, and materialization counts in the same comparison, with ASCII
+median/p95 non-regression, user-visible dense block-character improvement, zero
+eligible-workload full fallback, zero unexpected production consumer
+materialization, and retained snapshot memory within the Batch 4 policy.
+
+Until that evidence exists, public projection and detached projections stay on
+their explicit full-output contracts, geometry-derived snapshots stay on their
+counted direct-cell adaptation/output contract, transcript/replay stays on
+row-view full logical extraction, and all fallback/materialization counters
+remain active.
