@@ -208,27 +208,23 @@ QJsonArray row_provenance_array(const Terminal_render_snapshot& snapshot)
     return rows;
 }
 
-QJsonArray visible_rows_array(const Terminal_render_snapshot& snapshot)
+QJsonArray visible_rows_array(const Terminal_render_snapshot_row_content_view& rows)
 {
-    QJsonArray rows;
-    const std::vector<const Terminal_render_cell*> cells_by_position =
-        render_snapshot_cells_by_position(snapshot);
-    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
+    QJsonArray array;
+    for (int row = 0; row < rows.row_count(); ++row) {
         const QString text =
             selected_text_from_render_snapshot_row(
-                snapshot,
-                cells_by_position,
-                row,
+                rows.row_at(row),
                 0,
-                snapshot.grid_size.columns,
+                rows.column_count(),
                 true);
         QJsonObject object;
         object.insert(QStringLiteral("row"), row);
         object.insert(QStringLiteral("text"), text);
         object.insert(QStringLiteral("hash64"), text_hash64(text));
-        rows.append(object);
+        array.append(object);
     }
-    return rows;
+    return array;
 }
 
 QJsonArray selection_spans_array(const Terminal_render_snapshot& snapshot)
@@ -2804,11 +2800,12 @@ bool Terminal_transcript_recorder::record_snapshot(
     insert_snapshot_public_scroll_fields(object, snapshot);
     insert_u64(object, QStringLiteral("snapshot_sequence"), snapshot.metadata.sequence);
     insert_u64(object, QStringLiteral("row_origin_generation"), snapshot.metadata.row_origin_generation);
-    object.insert(QStringLiteral("cell_count"), static_cast<int>(snapshot.cells.size()));
+    const Terminal_render_snapshot_row_content_view rows(snapshot);
+    object.insert(QStringLiteral("cell_count"), static_cast<int>(rows.cell_count()));
     object.insert(QStringLiteral("dirty_row_range_count"), static_cast<int>(snapshot.dirty_row_ranges.size()));
     object.insert(QStringLiteral("selection_span_count"), static_cast<int>(snapshot.selection_spans.size()));
     object.insert(QStringLiteral("backend_geometry_in_sync"), snapshot.metadata.backend_geometry_in_sync);
-    object.insert(QStringLiteral("visible_rows"), visible_rows_array(snapshot));
+    object.insert(QStringLiteral("visible_rows"), visible_rows_array(rows));
     object.insert(QStringLiteral("row_provenance"), row_provenance_array(snapshot));
     object.insert(QStringLiteral("dirty_row_ranges"), dirty_row_ranges_array(snapshot));
     object.insert(QStringLiteral("selection_spans"), selection_spans_array(snapshot));
@@ -2821,7 +2818,7 @@ bool Terminal_transcript_recorder::record_snapshot(
         timing_context.viewport_cell_count =
             static_cast<qint64>(snapshot.grid_size.rows) *
             static_cast<qint64>(snapshot.grid_size.columns);
-        timing_context.snapshot_cell_count   = static_cast<qint64>(snapshot.cells.size());
+        timing_context.snapshot_cell_count   = static_cast<qint64>(rows.cell_count());
         timing_context.snapshot_sequence     = snapshot.metadata.sequence;
         timing_context.has_snapshot_sequence = true;
     }

@@ -693,21 +693,8 @@ std::size_t copied_cell_count(const term::Terminal_public_projection& projection
 
 QString snapshot_row_text(const term::Terminal_render_snapshot& snapshot, int row)
 {
-    QString text;
-    const std::vector<const term::Terminal_render_cell*> cells_by_position =
-        term::render_snapshot_cells_by_position(snapshot);
-    for (int column = 0; column < snapshot.grid_size.columns; ++column) {
-        const term::Terminal_render_cell* cell =
-            term::render_snapshot_cell_at(cells_by_position, snapshot.grid_size, row, column);
-        if (cell == nullptr) {
-            text += QLatin1Char(' ');
-            continue;
-        }
-        if (!cell->wide_continuation) {
-            cell->text.append_to(text);
-        }
-    }
-    return text;
+    const term::Terminal_render_snapshot_row_content_view rows(snapshot);
+    return rows.row_text(row, 0, snapshot.grid_size.columns, false);
 }
 
 bool snapshot_contains_text(const term::Terminal_render_snapshot& snapshot, const QString& needle)

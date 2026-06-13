@@ -56,6 +56,9 @@ struct Terminal_session_profile_stats
     std::uint64_t              snapshots_marked_rendered            = 0U;
     std::uint64_t              snapshots_consumed_by_bridge          = 0U;
     std::uint64_t              max_unrendered_snapshot_generations   = 0U;
+    std::uint64_t              geometry_derived_materialization_calls = 0U;
+    std::uint64_t              geometry_derived_materialization_rows  = 0U;
+    std::uint64_t              geometry_derived_materialization_cells = 0U;
     std::uint64_t              retained_snapshot_payload_bytes       = 0U;
     std::uint64_t              retained_snapshot_generation_count    = 0U;
     std::uint64_t              max_retained_snapshot_payload_bytes   = 0U;

@@ -117,6 +117,19 @@ bool has_graphic_rect(
     return false;
 }
 
+bool has_decoration(
+    const term::Terminal_render_frame&       frame,
+    term::Terminal_render_decoration_kind    kind)
+{
+    for (const term::Terminal_render_decoration& decoration : frame.decorations) {
+        if (decoration.kind == kind) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool has_graphic_arc(
     const term::Terminal_render_frame& frame,
     term::Terminal_render_arc_kind     kind,
@@ -264,6 +277,95 @@ bool test_terminal_graphics_use_grid_primitives()
     return ok;
 }
 
+bool test_full_block_graphic_rects_coalesce_contiguous_cells()
+{
+    bool ok = true;
+    term::Terminal_render_snapshot snapshot = empty_snapshot({1, 5});
+    snapshot.cursor.visible = false;
+    snapshot.cells.push_back({
+        {0, 0},
+        source_cell_text(QStringLiteral("\u2588"), 1),
+        0U,
+        1,
+        false,
+        0U,
+    });
+    snapshot.cells.push_back({
+        {0, 1},
+        source_cell_text(QStringLiteral("\u2588"), 1),
+        0U,
+        1,
+        false,
+        0U,
+    });
+    snapshot.cells.push_back({
+        {0, 3},
+        source_cell_text(QStringLiteral("\u2588"), 1),
+        0U,
+        1,
+        false,
+        0U,
+    });
+
+    const term::Terminal_render_frame frame = build(snapshot);
+    ok &= check(frame.graphic_rects.size() == 2U,
+        "adjacent full block elements coalesce into row spans");
+    ok &= check(has_graphic_rect(frame, QRectF(0.0, 0.0, 20.0, 20.0)),
+        "coalesced full block span covers adjacent cells");
+    ok &= check(has_graphic_rect(frame, QRectF(30.0, 0.0, 10.0, 20.0)),
+        "full block coalescing preserves gaps");
+    ok &= check(frame.text_runs.empty(),
+        "coalesced full block elements bypass text runs");
+    return ok;
+}
+
+bool test_decorated_full_block_graphic_emits_decorations_without_text_run()
+{
+    bool ok = true;
+    term::Terminal_render_snapshot snapshot = empty_snapshot({1, 1});
+    snapshot.cursor.visible = false;
+
+    term::Terminal_text_style decorated = term::make_default_terminal_text_style();
+    term::set_terminal_style_attribute(decorated, term::Terminal_style_attribute::UNDERLINE);
+    term::set_terminal_style_attribute(decorated, term::Terminal_style_attribute::STRIKE);
+    snapshot.styles.push_back(decorated);
+    snapshot.hyperlinks.push_back({
+        17U,
+        QByteArrayLiteral("uri:https://example.test"),
+        QByteArrayLiteral("https://example.test"),
+    });
+    snapshot.cells.push_back({
+        {0, 0},
+        source_cell_text(QStringLiteral("\u2588"), 1),
+        17U,
+        1,
+        false,
+        1U,
+    });
+
+    term::Terminal_render_options render_options = options();
+    render_options.underline_hyperlinks = true;
+    const term::Terminal_render_frame frame = build(snapshot, render_options);
+
+    ok &= check(frame.graphic_rects.size() == 1U &&
+        has_graphic_rect(frame, QRectF(0.0, 0.0, 10.0, 20.0)),
+        "decorated full block cell still emits primitive graphic geometry");
+    ok &= check(frame.text_runs.empty(),
+        "decorated full block primitive bypasses text-run emission");
+    ok &= check(frame.decorations.size() == 3U &&
+        has_decoration(frame, term::Terminal_render_decoration_kind::UNDERLINE) &&
+        has_decoration(frame, term::Terminal_render_decoration_kind::STRIKE)    &&
+        has_decoration(
+            frame,
+            term::Terminal_render_decoration_kind::HYPERLINK_UNDERLINE),
+        "decorated full block primitive emits underline, strike, and hyperlink underline");
+    ok &= check(frame.stats.text_cells_rendered_as_text == 0 &&
+        frame.stats.text_cells_with_decorations == 1         &&
+        frame.stats.decoration_rects_emitted == 3,
+        "decorated full block primitive updates decoration stats without text stats");
+    return ok;
+}
+
 bool test_stale_inline_bmp_category_uses_text_fallback()
 {
     bool ok = true;
@@ -299,7 +401,7 @@ bool test_stale_inline_bmp_category_uses_text_fallback()
     return ok;
 }
 
-bool test_rejected_graphic_cells_stay_on_text_route()
+bool test_invalid_graphic_cells_stay_on_text_route()
 {
     bool ok = true;
 
@@ -314,8 +416,6 @@ bool test_rejected_graphic_cells_stay_on_text_route()
         const char*     message        = "";
         text_storage_t  storage        = text_storage_t::FALLBACK_QSTRING;
         int             display_width  = 1;
-        bool            has_decoration = false;
-        std::uint64_t   hyperlink_id   = 0U;
         term::Terminal_simple_content_rejection_reason
                         expected_reason =
                             term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH;
@@ -326,49 +426,13 @@ bool test_rejected_graphic_cells_stay_on_text_route()
             "fallback QString graphic with invalid text width stays textual",
             text_storage_t::FALLBACK_QSTRING,
             2,
-            false,
-            0U,
             term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
         },
         {
             "inline BMP graphic with invalid text width stays textual",
             text_storage_t::INLINE_SINGLE_BMP,
             2,
-            false,
-            0U,
             term::Terminal_simple_content_rejection_reason::INVALID_TEXT_WIDTH,
-        },
-        {
-            "fallback QString graphic with decoration stays textual",
-            text_storage_t::FALLBACK_QSTRING,
-            1,
-            true,
-            0U,
-            term::Terminal_simple_content_rejection_reason::DECORATION,
-        },
-        {
-            "inline BMP graphic with decoration stays textual",
-            text_storage_t::INLINE_SINGLE_BMP,
-            1,
-            true,
-            0U,
-            term::Terminal_simple_content_rejection_reason::DECORATION,
-        },
-        {
-            "fallback QString graphic with hyperlink stays textual",
-            text_storage_t::FALLBACK_QSTRING,
-            1,
-            false,
-            17U,
-            term::Terminal_simple_content_rejection_reason::HYPERLINK,
-        },
-        {
-            "inline BMP graphic with hyperlink stays textual",
-            text_storage_t::INLINE_SINGLE_BMP,
-            1,
-            false,
-            17U,
-            term::Terminal_simple_content_rejection_reason::HYPERLINK,
         },
     };
 
@@ -377,31 +441,12 @@ bool test_rejected_graphic_cells_stay_on_text_route()
         term::Terminal_render_snapshot snapshot = empty_snapshot({1, 4});
         snapshot.cursor.visible = false;
 
-        if (entry.has_decoration) {
-            term::Terminal_text_style decorated =
-                term::make_default_terminal_text_style();
-            term::set_terminal_style_attribute(
-                decorated,
-                term::Terminal_style_attribute::UNDERLINE);
-            snapshot.styles.push_back(decorated);
-        }
-
-        if (entry.hyperlink_id != 0U) {
-            snapshot.hyperlinks.push_back({
-                entry.hyperlink_id,
-                QByteArrayLiteral("uri:https://example.test"),
-                QByteArrayLiteral("https://example.test"),
-            });
-        }
-
         term::Terminal_render_cell cell;
         cell.position      = {0, 0};
         cell.text          = entry.storage == text_storage_t::INLINE_SINGLE_BMP
             ? source_cell_text(graphic_text, entry.display_width)
             : term::Terminal_render_cell_text::fallback(graphic_text);
         cell.display_width = entry.display_width;
-        cell.style_id      = entry.has_decoration ? 1U : 0U;
-        cell.hyperlink_id  = entry.hyperlink_id;
         snapshot.cells.push_back(cell);
 
         const term::terminal_simple_content_classification_t classification =
@@ -409,7 +454,7 @@ bool test_rejected_graphic_cells_stay_on_text_route()
                 snapshot.cells.front(),
                 snapshot.grid_size,
                 snapshot.styles.size(),
-                entry.has_decoration,
+                false,
                 true);
         ok &= check(!classification.fast_text_eligible &&
             classification.route == term::Terminal_simple_content_route::QT_TEXT_LAYOUT &&
@@ -960,7 +1005,7 @@ bool test_decorations_preedit_hyperlink_and_bell()
     return ok;
 }
 
-bool test_malformed_snapshot_and_preedit_width()
+bool test_zero_grid_and_preedit_width()
 {
     bool ok = true;
     term::Terminal_render_snapshot zero_grid = empty_snapshot({0, 0});
@@ -975,17 +1020,7 @@ bool test_malformed_snapshot_and_preedit_width()
         frame.cursors.empty(),
         "zero-grid active preedit creates no primitives");
 
-    term::Terminal_render_snapshot snapshot = empty_snapshot({2, 4});
-    snapshot.cells.push_back({{0, 4}, QStringLiteral("X"), 0U, 1, false, 0U});
-    snapshot.cells.push_back({{2, 0}, QStringLiteral("Y"), 0U, 1, false, 0U});
-    snapshot.cells.push_back({{0, 3}, QStringLiteral("\u754c"), 0U, 2, false, 0U});
-    snapshot.cells.push_back({{0, 1}, QStringLiteral("A"), 0U, 1, false, 0U});
-    frame = build(snapshot);
-    ok &= check(frame.text_runs.size() == 1U &&
-        frame.text_runs.front().text == QStringLiteral("A"),
-        "offscreen and over-wide cells are skipped");
-
-    snapshot                              = empty_snapshot({2, 8});
+    term::Terminal_render_snapshot snapshot = empty_snapshot({2, 8});
     snapshot.cursor.position              = {0, 1};
     snapshot.ime_preedit.active           = true;
     snapshot.ime_preedit.text             = QStringLiteral("\u754c");
@@ -1099,12 +1134,12 @@ bool test_frame_stats_classify_rendered_cells()
     });
 
     const term::Terminal_render_frame frame = build(snapshot);
-    ok &= check(frame.stats.cells_considered == 6,
-        "frame stats count all snapshot cells considered");
+    ok &= check(frame.stats.cells_considered == 5,
+        "frame stats count row-view cells considered");
     ok &= check(frame.stats.cells_skipped_wide_continuation == 1 &&
-        frame.stats.cells_skipped_invalid == 1 &&
+        frame.stats.cells_skipped_invalid == 0 &&
         frame.stats.cells_rendered == 4,
-        "frame stats distinguish skipped and rendered cells");
+        "frame stats distinguish skipped row-view cells and rendered cells");
     ok &= check(frame.stats.text_cells_rendered_as_text == 3 &&
         frame.graphic_rects.size() == 1U &&
         frame.graphic_arcs.empty(),
@@ -2210,8 +2245,10 @@ int main()
     bool ok = true;
     ok &= test_plain_text_color_inverse_and_wide_skip();
     ok &= test_terminal_graphics_use_grid_primitives();
+    ok &= test_full_block_graphic_rects_coalesce_contiguous_cells();
+    ok &= test_decorated_full_block_graphic_emits_decorations_without_text_run();
     ok &= test_stale_inline_bmp_category_uses_text_fallback();
-    ok &= test_rejected_graphic_cells_stay_on_text_route();
+    ok &= test_invalid_graphic_cells_stay_on_text_route();
     ok &= test_rounded_box_corners_use_arc_primitives();
     ok &= test_block_cursor_over_text_like_symbol_uses_cursor_text();
     ok &= test_terminal_graphics_use_geometry_with_selection_and_ime_text();
@@ -2225,7 +2262,7 @@ int main()
     ok &= test_styled_blank_cells_emit_background_rects();
     ok &= test_selection_cursor_blink_and_shapes();
     ok &= test_decorations_preedit_hyperlink_and_bell();
-    ok &= test_malformed_snapshot_and_preedit_width();
+    ok &= test_zero_grid_and_preedit_width();
     ok &= test_preedit_override_takes_precedence_over_snapshot();
     ok &= test_frame_stats_classify_rendered_cells();
     ok &= test_simple_content_classifier_and_stats();

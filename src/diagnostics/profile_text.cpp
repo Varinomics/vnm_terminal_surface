@@ -561,14 +561,22 @@ void append_session_profile_stats_section(
         stream,
         "max_unrendered_snapshot_generations",
         stats.max_unrendered_snapshot_generations);
-    stream << "  consumer_materialization_counters_available=false\n";
+    stream << "  consumer_materialization_counters_available=true\n";
     stream << "  consumer_materialization_counters_schema_semantics="
-        << "unavailable_until_batch_3_materialization_boundaries\n";
+        << "batch_3_materialization_boundaries\n";
     stream << "  consumer_materialization_counters_owner_batch=Batch 3\n";
-    stream << "  consumer_materialization_counters_frame_builder_rows=unavailable\n";
-    stream << "  consumer_materialization_counters_public_projection_rows=unavailable\n";
-    stream << "  consumer_materialization_counters_transcript_rows=unavailable\n";
-    stream << "  consumer_materialization_counters_selection_rows=unavailable\n";
+    append_profile_counter(
+        stream,
+        "consumer_materialization_counters_geometry_derived_snapshot_calls",
+        stats.geometry_derived_materialization_calls);
+    append_profile_counter(
+        stream,
+        "consumer_materialization_counters_geometry_derived_snapshot_rows",
+        stats.geometry_derived_materialization_rows);
+    append_profile_counter(
+        stream,
+        "consumer_materialization_counters_geometry_derived_snapshot_cells",
+        stats.geometry_derived_materialization_cells);
     append_profile_counter(
         stream,
         "retained_snapshot_payload_bytes",

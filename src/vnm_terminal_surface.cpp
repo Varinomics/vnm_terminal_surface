@@ -901,26 +901,20 @@ Selection_drag_content_validation_status validate_selection_drag_content_drift(
         return Selection_drag_content_validation_status::RANGE_NOT_VISIBLE;
     }
 
-    const std::vector<const term::Terminal_render_cell*> anchor_cells =
-        term::render_snapshot_cells_by_position(*anchor_snapshot);
-    const std::vector<const term::Terminal_render_cell*> current_cells =
-        term::render_snapshot_cells_by_position(*current_snapshot);
+    const term::Terminal_render_snapshot_row_content_view anchor_rows(*anchor_snapshot);
+    const term::Terminal_render_snapshot_row_content_view current_rows(*current_snapshot);
     for (int logical_row = start.row; logical_row <= end.row; ++logical_row) {
         const int anchor_viewport_row  = logical_row - anchor_first_visible_logical_row;
         const int current_viewport_row = logical_row - current_first_visible_logical_row;
         const QString anchor_row =
             term::selected_text_from_render_snapshot_row(
-                *anchor_snapshot,
-                anchor_cells,
-                anchor_viewport_row,
+                anchor_rows.row_at(anchor_viewport_row),
                 0,
                 anchor_snapshot->grid_size.columns,
                 false);
         const QString current_row =
             term::selected_text_from_render_snapshot_row(
-                *current_snapshot,
-                current_cells,
-                current_viewport_row,
+                current_rows.row_at(current_viewport_row),
                 0,
                 current_snapshot->grid_size.columns,
                 false);

@@ -817,12 +817,9 @@ QString scroll_action_name(term::Terminal_viewport_scroll_action action)
 
 QString snapshot_row_text(const term::Terminal_render_snapshot& snapshot, int row)
 {
-    const std::vector<const term::Terminal_render_cell*> cells_by_position =
-        term::render_snapshot_cells_by_position(snapshot);
+    const term::Terminal_render_snapshot_row_content_view rows(snapshot);
     return term::selected_text_from_render_snapshot_row(
-        snapshot,
-        cells_by_position,
-        row,
+        rows.row_at(row),
         0,
         snapshot.grid_size.columns,
         true);
@@ -3521,6 +3518,185 @@ bool test_replay_tool_prints_diagnostics(const QString& replay_tool_path)
     return ok;
 }
 
+bool test_replay_tool_compares_invalid_range_selected_text_result(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "replay tool path is passed to invalid-range test");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary invalid-range selected-text directory is valid")) {
+        return false;
+    }
+
+    const QString path =
+        temp_dir.filePath(QStringLiteral("invalid-range-selected-text.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "invalid-range selected-text recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{2, 8};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "invalid-range replay captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("seed"));
+
+    term::Terminal_viewport_state viewport;
+    viewport.visible_rows = 2;
+    viewport.follow_tail  = true;
+    term::Terminal_render_snapshot snapshot =
+        term::make_empty_render_snapshot({2, 8}, viewport, 31U);
+    snapshot.cursor.visible = false;
+    snapshot.dirty_row_ranges.push_back({0, 2});
+    snapshot.visible_line_provenance = {
+        {0, 1U, 1U},
+        {1, 2U, 1U},
+    };
+
+    term::Terminal_selection_range invalid_range;
+    invalid_range.start = {3, 0};
+    invalid_range.end   = {3, 2};
+    invalid_range.mode  = term::Terminal_selection_mode::NORMAL;
+    snapshot.selection_spans.push_back({
+        invalid_range,
+        0,
+        0,
+        2,
+    });
+
+    const term::Terminal_selection_result selected_text =
+        term::selected_text_from_render_snapshot(snapshot, invalid_range);
+    ok &= check(!snapshot.selection_spans.empty() &&
+            selected_text.code == term::Terminal_selection_result_code::INVALID_RANGE,
+        "invalid-range selected-text fixture has visible spans with an invalid source range");
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "invalid-range selected-text fixture remains structurally valid");
+
+    ok &= check(recorder->record_snapshot(
+            1U,
+            QStringLiteral("invalid range selected text"),
+            snapshot),
+        "invalid-range selected-text snapshot records");
+    recorder.reset();
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "invalid-range selected-text transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    const std::optional<term::Terminal_transcript_event> snapshot_event =
+        last_event(*events, QStringLiteral("snapshot"));
+    ok &= check(snapshot_event.has_value(), "invalid-range selected-text snapshot event exists");
+    if (!snapshot_event.has_value()) {
+        return ok;
+    }
+
+    const QJsonObject recorded_selected_text =
+        snapshot_event->object.value(QStringLiteral("selected_text")).toObject();
+    ok &= check(
+        snapshot_event->object.value(QStringLiteral("selection_span_count")).toInt() > 0 &&
+            !snapshot_event->object.value(QStringLiteral("selection_spans")).toArray().isEmpty(),
+        "invalid-range selected-text recording keeps the non-empty selection spans");
+    ok &= check(
+        recorded_selected_text.value(QStringLiteral("result")).toString() ==
+            QStringLiteral("invalid_range"),
+        "recorder selected_text uses the named invalid_range result");
+    ok &= check(
+        !recorded_selected_text.value(QStringLiteral("available")).toBool(),
+        "invalid-range selected_text is marked unavailable");
+    ok &= check(
+        recorded_selected_text.value(QStringLiteral("source_range")).isObject(),
+        "invalid-range selected_text keeps the source range");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "invalid-range replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code != 0,
+        "invalid-range replay tool reports the deliberately unmatched snapshot");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=1"),
+        "invalid-range replay tool compares the production snapshot diagnostics");
+    ok &= check(replay.stdout_text.contains(
+            "recorded_selected_text.result=invalid_range"),
+        "invalid-range replay tool reports the named recorded selected_text result");
+    ok &= check(!replay.stdout_text.contains("recorded_selected_text.result=2"),
+        "invalid-range replay tool does not report a numeric selected_text result");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+
+    return ok;
+}
+
+bool test_replay_tool_prints_named_non_ok_selected_text_result(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "replay tool path is passed to no-selection test");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary no-selection replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("tool-no-selection.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "no-selection replay transcript recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 12};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "no-selection replay captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("alpha"));
+    recorder.reset();
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "no-selection replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "no-selection replay tool exits successfully");
+    ok &= check(replay.stdout_text.contains("selected_text.result=no_selection"),
+        "replay tool prints named no-selection result");
+    ok &= check(!replay.stdout_text.contains("selected_text.result=1"),
+        "replay tool does not print numeric no-selection result");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -3557,5 +3733,7 @@ int main(int argc, char** argv)
         replay_tool_path);
     ok &= test_replay_tool_compares_only_final_snapshot_in_contiguous_run(replay_tool_path);
     ok &= test_replay_tool_prints_diagnostics(replay_tool_path);
+    ok &= test_replay_tool_compares_invalid_range_selected_text_result(replay_tool_path);
+    ok &= test_replay_tool_prints_named_non_ok_selected_text_result(replay_tool_path);
     return ok ? 0 : 1;
 }

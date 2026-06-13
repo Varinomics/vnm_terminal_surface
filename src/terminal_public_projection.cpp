@@ -145,29 +145,25 @@ Terminal_public_scroll_diagnostic_reason diagnostic_reason_for_disable_reason(
 }
 
 Terminal_public_projection_row copied_projection_row(
-    const Terminal_render_snapshot& snapshot,
-    int                             snapshot_row,
-    int                             public_row,
-    int                             visual_fragment_index,
-    bool                            visual_fragment_index_is_exact)
+    const Terminal_render_snapshot_row_content& snapshot_row_content,
+    int                                         public_row,
+    int                                         visual_fragment_index,
+    bool                                        visual_fragment_index_is_exact)
 {
-    Q_ASSERT(snapshot_row >= 0);
-    Q_ASSERT(snapshot_row < static_cast<int>(snapshot.visible_line_provenance.size()));
+    const Terminal_render_line_provenance* provenance =
+        snapshot_row_content.provenance_or_null();
+    Q_ASSERT(provenance != nullptr);
 
     Terminal_public_projection_row row;
     row.public_row            = public_row;
-    row.provenance            =
-        snapshot.visible_line_provenance[static_cast<std::size_t>(snapshot_row)];
+    row.provenance            = *provenance;
     row.history_handle        =
         projection_history_handle_from_provenance(row.provenance);
     row.visual_fragment_index = visual_fragment_index;
     row.visual_fragment_index_is_exact = visual_fragment_index_is_exact;
 
-    for (const Terminal_render_cell& cell : snapshot.cells) {
-        if (cell.position.row != snapshot_row) {
-            continue;
-        }
-
+    row.cells.reserve(snapshot_row_content.cell_count());
+    for (const Terminal_render_cell& cell : snapshot_row_content) {
         Terminal_render_cell copied_cell = cell;
         copied_cell.position.row         = 0;
         row.cells.push_back(std::move(copied_cell));
@@ -355,6 +351,7 @@ std::vector<Terminal_public_projection_row> copied_primary_projection_rows(
         append_unique_hyperlink_metadata(source_hyperlinks, row_snapshot.hyperlinks);
 
         const int first_public_row = first_public_row_for_snapshot(row_snapshot);
+        const Terminal_render_snapshot_row_content_view row_snapshot_rows(row_snapshot);
         for (int snapshot_row = 0; snapshot_row < row_snapshot.grid_size.rows; ++snapshot_row) {
             const int public_row = first_public_row + snapshot_row;
             if (public_row < 0 ||
@@ -366,7 +363,11 @@ std::vector<Terminal_public_projection_row> copied_primary_projection_rows(
             }
 
             Terminal_public_projection_row copied_row =
-                copied_projection_row(row_snapshot, snapshot_row, public_row, 0, false);
+                copied_projection_row(
+                    row_snapshot_rows.row_at(snapshot_row),
+                    public_row,
+                    0,
+                    false);
             const std::optional<terminal_history_handle_t> history_handle =
                 safe_model.retained_history_handle_at_logical_row(
                     Terminal_buffer_id::PRIMARY,
@@ -391,6 +392,7 @@ std::vector<Terminal_public_projection_row> copied_primary_projection_rows(
 
     const int first_safe_basis_row = first_safe_basis_public_row(safe_basis);
     const int safe_basis_row_count = safe_basis_projection_row_count(safe_basis);
+    const Terminal_render_snapshot_row_content_view safe_basis_rows(safe_basis);
     for (int snapshot_row = 0; snapshot_row < safe_basis_row_count; ++snapshot_row) {
         const int public_row = first_safe_basis_row + snapshot_row;
         if (public_row < 0 || public_row >= public_row_count ||
@@ -401,7 +403,11 @@ std::vector<Terminal_public_projection_row> copied_primary_projection_rows(
         }
 
         const Terminal_public_projection_row expected =
-            copied_projection_row(safe_basis, snapshot_row, public_row, 0, false);
+            copied_projection_row(
+                safe_basis_rows.row_at(snapshot_row),
+                public_row,
+                0,
+                false);
         if (!projection_row_cells_match(
                 copied_by_public_row[static_cast<std::size_t>(public_row)],
                 expected))
@@ -466,6 +472,7 @@ Terminal_public_projection Terminal_public_projection::capture_from_safe_model(
     projection.m_row_capture_snapshot_count = 1U;
 
     projection.m_rows.reserve(projection.m_copied_row_bound);
+    const Terminal_render_snapshot_row_content_view safe_basis_rows(safe_basis);
 
     // Rows are copied from the safe-basis viewport only. Off-viewport public
     // scrollback requires a safe row store; this projection must not reconstruct
@@ -478,8 +485,7 @@ Terminal_public_projection Terminal_public_projection::capture_from_safe_model(
             visual_fragment_index_for_snapshot_row(safe_basis, snapshot_row);
         projection.m_rows.push_back(
             copied_projection_row(
-                safe_basis,
-                snapshot_row,
+                safe_basis_rows.row_at(snapshot_row),
                 projection.m_first_copied_public_row + snapshot_row,
                 visual_fragment_index,
                 false));
