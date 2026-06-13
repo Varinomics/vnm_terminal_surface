@@ -72,6 +72,9 @@ QJsonObject atlas_buffer_summary_json(
     object.insert(QStringLiteral("partial_upload"), summary.partial_upload);
     object.insert(QStringLiteral("skipped_upload"), summary.skipped_upload);
     object.insert(
+        QStringLiteral("full_upload_requires_populated_frame"),
+        summary.full_upload_requires_populated_frame);
+    object.insert(
         QStringLiteral("rotating_slot_seed_upload"),
         summary.rotating_slot_seed_upload);
     object.insert(
@@ -179,6 +182,10 @@ QJsonObject atlas_render_summary_json(
         object,
         "glyph_buffer_instances",
         summary.glyph_buffer_instances);
+    insert_json_counter(
+        object,
+        "rect_row_capacity",
+        summary.rect_row_capacity);
     insert_json_counter(
         object,
         "glyph_text_row_capacity",
@@ -504,6 +511,8 @@ void insert_renderer_frame_stats(
         stats.decoration_rects_emitted);
     insert_json_counter(object, "cursor_rects_emitted", stats.cursor_rects_emitted);
     insert_json_counter(object, "overlay_rects_emitted", stats.overlay_rects_emitted);
+    insert_json_counter(object, "row_descriptors_built", stats.row_descriptors_built);
+    insert_json_counter(object, "layer_descriptors_built", stats.layer_descriptors_built);
     object.insert(QStringLiteral("simple_content"), simple_content);
 }
 
@@ -553,6 +562,18 @@ QJsonObject qsg_atlas_metrics_json(const internal::Qsg_atlas_frame_report& repor
         object,
         "snapped_origin_failures",
         report.frame_build.snapped_origin_failures);
+    insert_json_counter(
+        object,
+        "frame_row_descriptors",
+        report.frame_build.frame_row_descriptors);
+    insert_json_counter(
+        object,
+        "frame_layer_descriptors",
+        report.frame_build.frame_layer_descriptors);
+    insert_json_counter(
+        object,
+        "qsg_layer_descriptors",
+        report.frame_build.qsg_layer_descriptors);
     insert_json_counter(
         object,
         "glyph_missed_instances",
@@ -681,6 +702,10 @@ void append_renderer_metrics_json(const VNM_TerminalSurface& surface, QJsonObjec
         out,
         "text_resource_descriptor_reuses",
         cumulative_stats.text_resource_descriptor_reuses);
+    insert_json_counter(
+        out,
+        "qsg_layer_descriptors",
+        cumulative_stats.qsg_layer_descriptors);
     insert_json_counter(out, "text_key_match_reuses", cumulative_stats.text_key_match_reuses);
     insert_json_counter(out, "text_key_builds", cumulative_stats.text_key_builds);
     insert_json_counter(out, "text_key_bytes", cumulative_stats.text_key_bytes);

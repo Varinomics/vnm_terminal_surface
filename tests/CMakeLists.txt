@@ -887,6 +887,31 @@ if(WIN32)
             SKIP_RETURN_CODE 77
             TIMEOUT 120
     )
+
+    set(vnm_terminal_qsg_atlas_report_environment
+        ${vnm_terminal_qt_windows_qpa_environment}
+        "QSG_RENDER_LOOP=threaded"
+        ${vnm_terminal_qt_unscaled_environment}
+    )
+    add_test(
+        NAME vnm_terminal_qsg_atlas_report_d3d11
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qsg_atlas_report_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+            "--atlas-report"
+            "--backend"
+            "d3d11"
+    )
+
+    set_tests_properties(
+        vnm_terminal_qsg_atlas_report_d3d11
+        PROPERTIES
+            LABELS "qsg;hardware;atlas;report"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 120
+    )
 endif()
 
 if(VNM_TERMINAL_ENABLE_GPU_ATLAS_SMOKE)
@@ -1031,7 +1056,6 @@ if(VNM_TERMINAL_ENABLE_GPU_ATLAS_REPORT)
     set(vnm_terminal_qsg_atlas_report_backends)
     if(WIN32)
         list(APPEND vnm_terminal_qsg_atlas_report_backends
-            d3d11
             d3d12
             vulkan
             opengl

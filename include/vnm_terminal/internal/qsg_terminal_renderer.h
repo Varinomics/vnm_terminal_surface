@@ -178,6 +178,7 @@ struct terminal_renderer_stats_t
     int            text_resource_descriptor_builds                      = 0;
     int            text_resource_descriptor_builds_avoided              = 0;
     int            text_resource_descriptor_reuses                      = 0;
+    int            qsg_layer_descriptors                                = 0;
     int            text_key_builds                                      = 0;
     std::uint64_t  text_key_bytes                                       = 0U;
     int            rect_key_builds                                      = 0;
@@ -360,6 +361,7 @@ struct terminal_renderer_cumulative_stats_t
     std::uint64_t  text_resource_descriptor_builds                      = 0U;
     std::uint64_t  text_resource_descriptor_builds_avoided              = 0U;
     std::uint64_t  text_resource_descriptor_reuses                      = 0U;
+    std::uint64_t  qsg_layer_descriptors                                = 0U;
     std::uint64_t  text_key_builds                                      = 0U;
     std::uint64_t  text_key_bytes                                       = 0U;
     std::uint64_t  rect_key_builds                                      = 0U;

@@ -12,7 +12,7 @@ target_link_libraries(vnm_terminal_surface_stress_benchmark PRIVATE
 
 if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_surface_stress_benchmark)
     add_test(
-        NAME vnm_terminal_surface_stress_descriptor_unavailable_contract
+        NAME vnm_terminal_surface_stress_descriptor_contract
         COMMAND
             "${CMAKE_COMMAND}"
             "-DBENCHMARK_EXE=$<TARGET_FILE:vnm_terminal_surface_stress_benchmark>"
@@ -20,7 +20,7 @@ if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_surface_stress_b
             -P "${CMAKE_CURRENT_SOURCE_DIR}/validate_surface_stress_descriptor_contract.cmake"
     )
 
-    set_tests_properties(vnm_terminal_surface_stress_descriptor_unavailable_contract PROPERTIES
+    set_tests_properties(vnm_terminal_surface_stress_descriptor_contract PROPERTIES
         LABELS "readiness;benchmark;schema"
         TIMEOUT 30
     )

@@ -18,7 +18,7 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 constexpr const char* k_frame_descriptor_counter_semantics =
-    "unavailable_until_batch_7_descriptor_reuse";
+    "batch_7_frame_qsg_descriptor_reuse";
 
 enum class Text_pattern
 {
@@ -56,6 +56,8 @@ struct Benchmark_totals
     std::uint64_t frame_cell_pass_input_cells = 0U;
     std::uint64_t frame_cells_considered = 0U;
     std::uint64_t frame_cell_pass_classification_calls = 0U;
+    std::uint64_t frame_row_descriptors_built = 0U;
+    std::uint64_t frame_layer_descriptors_built = 0U;
     std::uint64_t frame_dirty_row_lookup_count = 0U;
     std::uint64_t frame_dirty_row_range_lookup_count = 0U;
     std::uint64_t frame_dirty_row_range_scan_steps = 0U;
@@ -527,6 +529,10 @@ void accumulate_frame_stats(
         static_cast<std::uint64_t>(frame.stats.cells_considered);
     totals.frame_cell_pass_classification_calls +=
         static_cast<std::uint64_t>(frame.stats.cell_pass_classification_calls);
+    totals.frame_row_descriptors_built +=
+        static_cast<std::uint64_t>(frame.stats.row_descriptors_built);
+    totals.frame_layer_descriptors_built +=
+        static_cast<std::uint64_t>(frame.stats.layer_descriptors_built);
     totals.frame_dirty_row_lookup_count +=
         static_cast<std::uint64_t>(frame.stats.dirty_row_lookup_count);
     totals.frame_dirty_row_range_lookup_count +=
@@ -917,9 +923,11 @@ int main(int argc, char** argv)
     print_metric(
         "frame_cell_pass_classification_calls",
         totals.frame_cell_pass_classification_calls);
-    std::cout << "frame_row_descriptor_counters_available=false\n";
+    std::cout << "frame_row_descriptor_counters_available=true\n";
     std::cout << "frame_row_descriptor_counter_semantics="
         << k_frame_descriptor_counter_semantics << '\n';
+    print_metric("frame_row_descriptors_built", totals.frame_row_descriptors_built);
+    print_metric("frame_layer_descriptors_built", totals.frame_layer_descriptors_built);
     print_metric("frame_dirty_row_lookup_count", totals.frame_dirty_row_lookup_count);
     print_metric(
         "frame_dirty_row_range_lookup_count",

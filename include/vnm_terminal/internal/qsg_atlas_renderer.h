@@ -258,6 +258,9 @@ struct Qsg_atlas_frame_build_summary
     int                              frame_graphic_arcs        = 0;
     int                              frame_text_runs           = 0;
     int                              frame_overlay_rects       = 0;
+    int                              frame_row_descriptors     = 0;
+    int                              frame_layer_descriptors   = 0;
+    int                              qsg_layer_descriptors     = 0;
     int                              rect_instances            = 0;
     int                              glyph_instances           = 0;
     int                              max_glyph_instance_page   = -1;
@@ -296,6 +299,7 @@ enum class Qsg_atlas_buffer_update_result
     RECT_BUFFER_FAILED,
     GLYPH_BUFFER_FAILED,
     MSDF_TEXT_BUFFER_FAILED,
+    FULL_UPLOAD_REQUIRES_POPULATED_FRAME,
 };
 
 bool qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
@@ -326,6 +330,7 @@ struct Qsg_atlas_buffer_update_summary
     bool full_upload                   = false;
     bool partial_upload                = false;
     bool skipped_upload                = false;
+    bool full_upload_requires_populated_frame = false;
     bool rotating_slot_seed_upload     = false;
     bool buffer_recreated_upload       = false;
     bool instance_layout_changed_upload = false;
@@ -368,6 +373,17 @@ struct Qsg_atlas_buffer_update_input
     bool                                     row_stable_layout = false;
     const std::vector<Qsg_atlas_row_stable_range>*
                                              row_stable_ranges = nullptr;
+    bool                                     preserve_clean_row_slots = false;
+};
+
+struct Qsg_atlas_buffer_upload_planner_state
+{
+    int                         frames_in_flight = 0;
+    std::vector<QByteArray>     slot_bytes;
+    std::vector<std::vector<int>>
+                                slot_instance_rows;
+    std::vector<QByteArray>     slot_layout_keys;
+    std::vector<unsigned char>  seeded_slots;
 };
 
 struct Qsg_atlas_shaped_glyph_record
@@ -405,6 +421,9 @@ class Qsg_atlas_buffer_upload_planner final
 public:
     void reset();
 
+    Qsg_atlas_buffer_upload_planner_state snapshot() const;
+    void restore(const Qsg_atlas_buffer_upload_planner_state& state);
+
     Qsg_atlas_buffer_update_plan plan(
         const Qsg_atlas_buffer_update_input& input);
 
@@ -432,6 +451,7 @@ struct Qsg_atlas_render_summary
     int           shaped_missing_string_indexes     = 0;
     int           shaped_invalid_string_indexes     = 0;
     int           glyph_buffer_instances             = 0;
+    int           rect_row_capacity                  = 0;
     int           glyph_text_row_capacity            = 0;
     int           glyph_cursor_text_row_capacity     = 0;
     int           background_rects_before_coalescing = 0;
@@ -521,6 +541,10 @@ struct Qsg_atlas_render_summary
     bool          non_dirty_visual_bell_invalidation = false;
     bool          font_epoch_invalidation            = false;
 };
+
+void qsg_atlas_merge_msdf_text_failure_diagnostics(
+    const Qsg_atlas_render_summary& failed_msdf_render,
+    Qsg_atlas_render_summary&       fallback_render);
 
 struct Qsg_atlas_producer_summary
 {

@@ -623,6 +623,8 @@ void accumulate_simple_content_stats(
     X(decoration_rects_emitted) \
     X(cursor_rects_emitted) \
     X(overlay_rects_emitted) \
+    X(row_descriptors_built) \
+    X(layer_descriptors_built) \
     /**/
 
 void accumulate_frame_stats(
@@ -728,6 +730,7 @@ void accumulate_frame_stats(
     X(text_resource_descriptor_builds) \
     X(text_resource_descriptor_builds_avoided) \
     X(text_resource_descriptor_reuses) \
+    X(qsg_layer_descriptors) \
     X(text_key_builds) \
     X(text_key_bytes) \
     X(rect_key_builds) \
@@ -1587,6 +1590,579 @@ bool terminal_graphic_classification_allows_primitive(
     return false;
 }
 
+template<typename Value>
+void append_frame_key_scalar(QByteArray& key, const Value& value)
+{
+    key.append(
+        reinterpret_cast<const char*>(&value),
+        static_cast<qsizetype>(sizeof(value)));
+}
+
+void append_frame_key_int(QByteArray& key, int value)
+{
+    append_frame_key_scalar(key, value);
+}
+
+void append_frame_key_uint64(QByteArray& key, std::uint64_t value)
+{
+    append_frame_key_scalar(key, value);
+}
+
+void append_frame_key_uint32(QByteArray& key, quint32 value)
+{
+    append_frame_key_scalar(key, value);
+}
+
+void append_frame_key_bool(QByteArray& key, bool value)
+{
+    const unsigned char byte = value ? 1U : 0U;
+    key.append(reinterpret_cast<const char*>(&byte), 1);
+}
+
+void append_frame_key_qreal(QByteArray& key, qreal value)
+{
+    append_frame_key_scalar(key, value);
+}
+
+void append_frame_key_color(QByteArray& key, const QColor& color)
+{
+    append_frame_key_uint32(key, color.rgba());
+}
+
+void append_frame_key_string(QByteArray& key, const QString& value)
+{
+    const qsizetype size = value.size();
+    append_frame_key_scalar(key, size);
+    if (size > 0) {
+        key.append(
+            reinterpret_cast<const char*>(value.utf16()),
+            size * static_cast<qsizetype>(sizeof(ushort)));
+    }
+}
+
+void append_frame_key_rect(QByteArray& key, const QRectF& rect)
+{
+    append_frame_key_qreal(key, rect.x());
+    append_frame_key_qreal(key, rect.y());
+    append_frame_key_qreal(key, rect.width());
+    append_frame_key_qreal(key, rect.height());
+}
+
+void append_frame_key_cell_metrics(
+    QByteArray&                       key,
+    const terminal_cell_metrics_t&    metrics)
+{
+    append_frame_key_qreal(key, metrics.width);
+    append_frame_key_qreal(key, metrics.height);
+    append_frame_key_qreal(key, metrics.ascent);
+    append_frame_key_qreal(key, metrics.descent);
+}
+
+void append_frame_key_render_options(
+    QByteArray&                       key,
+    const Terminal_render_options&    options)
+{
+    append_frame_key_color(key, options.default_background);
+    append_frame_key_color(key, options.default_foreground);
+    append_frame_key_color(key, options.selection_background);
+    append_frame_key_color(key, options.cursor_color);
+    append_frame_key_color(key, options.preedit_background);
+    append_frame_key_color(key, options.visual_bell_color);
+    append_frame_key_bool(key, options.cursor_shape_override.has_value());
+    append_frame_key_int(
+        key,
+        options.cursor_shape_override.has_value()
+            ? static_cast<int>(*options.cursor_shape_override)
+            : 0);
+    append_frame_key_bool(key, options.cursor_blink_enabled_override.has_value());
+    append_frame_key_bool(
+        key,
+        options.cursor_blink_enabled_override.has_value() &&
+            *options.cursor_blink_enabled_override);
+    append_frame_key_bool(key, options.visual_bell_enabled);
+    append_frame_key_bool(key, options.underline_hyperlinks);
+    append_frame_key_int(key, static_cast<int>(options.text_renderer_policy));
+    append_frame_key_int(key, static_cast<int>(options.msdf_lcd_subpixel_order));
+}
+
+void append_frame_key_color_state(
+    QByteArray&                  key,
+    const Terminal_color_state&  state)
+{
+    append_frame_key_uint32(key, state.default_foreground_rgba);
+    append_frame_key_uint32(key, state.default_background_rgba);
+    append_frame_key_uint32(key, state.cursor_rgba);
+    for (const quint32 rgba : state.palette_rgba) {
+        append_frame_key_uint32(key, rgba);
+    }
+}
+
+void append_frame_key_color_ref(
+    QByteArray&                  key,
+    const Terminal_color_ref&    color)
+{
+    append_frame_key_int(key, static_cast<int>(color.kind));
+    append_frame_key_uint32(key, color.palette_index);
+    append_frame_key_uint32(key, color.rgba);
+}
+
+void append_frame_key_text_style(
+    QByteArray&                  key,
+    const Terminal_text_style&   style)
+{
+    append_frame_key_color_ref(key, style.foreground);
+    append_frame_key_color_ref(key, style.background);
+    append_frame_key_uint32(key, style.attributes);
+}
+
+void append_frame_key_line_provenance(
+    QByteArray&                              key,
+    const Terminal_render_line_provenance&   provenance)
+{
+    append_frame_key_uint64(key, provenance.logical_row);
+    append_frame_key_uint64(key, provenance.retained_line_id);
+    append_frame_key_uint64(key, provenance.content_generation);
+    append_frame_key_uint64(key, provenance.content_stamp_ms);
+}
+
+void append_frame_key_cell(
+    QByteArray&                    key,
+    const Terminal_render_cell&    cell)
+{
+    append_frame_key_int(key, cell.position.row);
+    append_frame_key_int(key, cell.position.column);
+    append_frame_key_int(key, cell.display_width);
+    append_frame_key_bool(key, cell.wide_continuation);
+    append_frame_key_uint32(key, cell.style_id);
+    append_frame_key_uint64(key, cell.hyperlink_id);
+    append_frame_key_int(key, static_cast<int>(cell.text_category));
+    QString text;
+    text.reserve(static_cast<qsizetype>(cell.text.code_unit_count()));
+    cell.text.append_to(text);
+    append_frame_key_string(key, text);
+}
+
+void append_frame_key_render_rect(
+    QByteArray&                     key,
+    const Terminal_render_rect&     rect)
+{
+    append_frame_key_rect(key, rect.rect);
+    append_frame_key_color(key, rect.color);
+    append_frame_key_bool(key, rect.antialias);
+}
+
+void append_frame_key_arc(
+    QByteArray&                     key,
+    const Terminal_render_arc&      arc)
+{
+    append_frame_key_int(key, static_cast<int>(arc.kind));
+    append_frame_key_rect(key, arc.rect);
+    append_frame_key_color(key, arc.color);
+    append_frame_key_qreal(key, arc.stroke);
+}
+
+void append_frame_key_text_run(
+    QByteArray&                         key,
+    const Terminal_render_text_run&     run)
+{
+    append_frame_key_int(key, run.row);
+    append_frame_key_int(key, run.logical_row);
+    append_frame_key_uint64(key, run.retained_line_id);
+    append_frame_key_uint64(key, run.content_generation);
+    append_frame_key_int(key, run.column);
+    append_frame_key_rect(key, run.rect);
+    append_frame_key_rect(key, run.clip_rect);
+    append_frame_key_qreal(key, run.baseline_origin.x());
+    append_frame_key_qreal(key, run.baseline_origin.y());
+    append_frame_key_string(key, run.text);
+    append_frame_key_color(key, run.foreground);
+    append_frame_key_color(key, run.background);
+    append_frame_key_uint32(key, run.style_id);
+    append_frame_key_uint64(key, run.hyperlink_id);
+    append_frame_key_bool(key, run.underline);
+    append_frame_key_bool(key, run.strike);
+}
+
+void append_frame_key_decoration(
+    QByteArray&                             key,
+    const Terminal_render_decoration&       decoration)
+{
+    append_frame_key_int(key, static_cast<int>(decoration.kind));
+    append_frame_key_rect(key, decoration.rect);
+    append_frame_key_color(key, decoration.color);
+}
+
+void append_frame_key_cursor(
+    QByteArray&                              key,
+    const Terminal_render_cursor_primitive&  cursor)
+{
+    append_frame_key_int(key, static_cast<int>(cursor.kind));
+    append_frame_key_rect(key, cursor.rect);
+    append_frame_key_color(key, cursor.color);
+}
+
+template<typename Value, typename Append_fn>
+void append_frame_key_vector(
+    QByteArray&                 key,
+    const std::vector<Value>&   values,
+    Append_fn                   append_value)
+{
+    append_frame_key_int(key, static_cast<int>(values.size()));
+    for (const Value& value : values) {
+        append_value(key, value);
+    }
+}
+
+bool dirty_ranges_cover_full_grid(
+    const std::vector<Terminal_render_dirty_row_range>& ranges,
+    int                                                 row_count)
+{
+    return
+        row_count > 0        &&
+        ranges.size() == 1U  &&
+        ranges.front().first_row == 0 &&
+        ranges.front().row_count >= row_count;
+}
+
+bool sparse_lazy_frame_cell_walk_eligible(
+    const Terminal_render_snapshot&       snapshot,
+    const Terminal_render_options&        options)
+{
+    return
+        snapshot.lazy_row_payloads != nullptr                 &&
+        snapshot.grid_size.rows    > 0                        &&
+        snapshot.grid_size.columns > 0                        &&
+        !snapshot.dirty_row_ranges.empty()                    &&
+        !dirty_ranges_cover_full_grid(
+            snapshot.dirty_row_ranges,
+            snapshot.grid_size.rows)                          &&
+        !options.underline_hyperlinks;
+}
+
+void append_dirty_range_rows(
+    std::vector<int>&                                  rows,
+    const std::vector<Terminal_render_dirty_row_range>& ranges,
+    int                                                row_count)
+{
+    for (const Terminal_render_dirty_row_range& range : ranges) {
+        const int first_row = std::clamp(range.first_row, 0, row_count);
+        const int end_row = std::clamp(
+            range.first_row + range.row_count,
+            first_row,
+            row_count);
+        for (int row = first_row; row < end_row; ++row) {
+            rows.push_back(row);
+        }
+    }
+}
+
+void sort_unique_rows(std::vector<int>& rows, int row_count)
+{
+    rows.erase(
+        std::remove_if(
+            rows.begin(),
+            rows.end(),
+            [row_count](int row) { return row < 0 || row >= row_count; }),
+        rows.end());
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+}
+
+std::size_t row_content_cell_count_for_rows(
+    const Terminal_render_snapshot_row_content_view& rows,
+    const std::vector<int>&                          row_indexes)
+{
+    std::size_t count = 0U;
+    for (const int row : row_indexes) {
+        count += rows.row_at(row).cell_count();
+    }
+    return count;
+}
+
+std::size_t frame_cell_pass_input_cell_count(
+    const Terminal_render_snapshot_row_content_view& rows,
+    const std::vector<int>&                          sparse_rows,
+    bool                                             sparse_cell_walk)
+{
+    return sparse_cell_walk
+        ? row_content_cell_count_for_rows(rows, sparse_rows)
+        : rows.cell_count();
+}
+
+void append_rows_for_rect(
+    std::vector<int>&                    rows,
+    const QRectF&                        rect,
+    const terminal_cell_metrics_t&       cell_metrics,
+    int                                  row_count,
+    bool                                 include_full_height_rects)
+{
+    if (row_count <= 0 || !is_valid_cell_metrics(cell_metrics) ||
+        rect.width() <= 0.0 || rect.height() <= 0.0)
+    {
+        return;
+    }
+
+    const int first_row = std::clamp(
+        static_cast<int>(std::floor(rect.top() / cell_metrics.height)),
+        0,
+        row_count);
+    const int end_row = std::clamp(
+        static_cast<int>(std::ceil(rect.bottom() / cell_metrics.height)),
+        first_row,
+        row_count);
+    if (end_row <= first_row) {
+        return;
+    }
+    if (!include_full_height_rects && first_row == 0 && end_row == row_count) {
+        return;
+    }
+
+    for (int row = first_row; row < end_row; ++row) {
+        rows.push_back(row);
+    }
+}
+
+template<typename Append_fn>
+void append_key_to_rows_for_rect(
+    std::vector<Terminal_render_row_descriptor>& row_descriptors,
+    const std::vector<int>&                      row_to_descriptor,
+    const QRectF&                                rect,
+    const terminal_cell_metrics_t&               cell_metrics,
+    int                                          row_count,
+    Append_fn                                    append_value)
+{
+    std::vector<int> rows;
+    append_rows_for_rect(rows, rect, cell_metrics, row_count, true);
+    sort_unique_rows(rows, row_count);
+    for (const int row : rows) {
+        const int descriptor = row_to_descriptor[static_cast<std::size_t>(row)];
+        if (descriptor >= 0) {
+            append_value(
+                row_descriptors[static_cast<std::size_t>(descriptor)]);
+        }
+    }
+}
+
+void build_terminal_render_frame_descriptors(
+    Terminal_render_frame&                       frame,
+    const Terminal_render_snapshot&              snapshot,
+    const Terminal_render_options&               options,
+    const Ime_preedit_state&                     ime_preedit,
+    const std::vector<int>&                      descriptor_rows)
+{
+    Terminal_render_layer_descriptors& layers = frame.layer_descriptors;
+    append_frame_key_vector(
+        layers.text_key,
+        frame.text_runs,
+        append_frame_key_text_run);
+    append_frame_key_vector(
+        layers.background_key,
+        frame.background_rects,
+        append_frame_key_render_rect);
+    append_frame_key_vector(
+        layers.graphic_key,
+        frame.graphic_rects,
+        append_frame_key_render_rect);
+    append_frame_key_vector(
+        layers.graphic_key,
+        frame.graphic_arcs,
+        append_frame_key_arc);
+    append_frame_key_vector(
+        layers.decoration_key,
+        frame.decorations,
+        append_frame_key_decoration);
+    append_frame_key_vector(
+        layers.cursor_inverse_text_key,
+        frame.cursor_text_runs,
+        append_frame_key_text_run);
+    append_frame_key_vector(
+        layers.selection_key,
+        frame.selection_rects,
+        append_frame_key_render_rect);
+    append_frame_key_string(layers.ime_preedit_key, ime_preedit.text);
+    append_frame_key_int(layers.ime_preedit_key, ime_preedit.cursor_position);
+    append_frame_key_bool(layers.ime_preedit_key, ime_preedit.active);
+    append_frame_key_vector(
+        layers.visual_bell_key,
+        frame.overlay_rects,
+        append_frame_key_render_rect);
+    append_frame_key_bool(
+        layers.visual_bell_key,
+        snapshot.metadata.visual_bell_active);
+    append_frame_key_bool(layers.visual_bell_key, options.visual_bell_enabled);
+    append_frame_key_bool(
+        layers.hyperlink_underline_key,
+        options.underline_hyperlinks);
+    append_frame_key_vector(
+        layers.hyperlink_underline_key,
+        frame.text_runs,
+        [](QByteArray& key, const Terminal_render_text_run& run) {
+            append_frame_key_int(key, run.row);
+            append_frame_key_int(key, run.column);
+            append_frame_key_uint64(key, run.hyperlink_id);
+        });
+    append_frame_key_color_state(layers.style_color_key, snapshot.color_state);
+    append_frame_key_int(
+        layers.style_color_key,
+        static_cast<int>(snapshot.styles.size()));
+    for (const Terminal_text_style& style : snapshot.styles) {
+        append_frame_key_text_style(layers.style_color_key, style);
+    }
+    append_frame_key_bool(layers.reverse_video_key, snapshot.modes.reverse_video);
+    append_frame_key_render_options(layers.render_options_key, options);
+    append_frame_key_cell_metrics(layers.cell_metrics_key, frame.cell_metrics);
+    frame.text_style_key = layers.style_color_key;
+
+    std::vector<int> rows = descriptor_rows;
+    const int row_count = frame.grid_size.rows;
+    sort_unique_rows(rows, row_count);
+    frame.row_descriptors.clear();
+    frame.row_descriptors.reserve(rows.size());
+    std::vector<int> row_to_descriptor(
+        static_cast<std::size_t>(std::max(0, row_count)),
+        -1);
+    const Terminal_render_snapshot_row_content_view row_view(snapshot);
+    const bool use_visible_line_provenance =
+        render_snapshot_visible_line_provenance_is_valid(snapshot);
+    const Snapshot_dirty_row_flags dirty_row_flags =
+        build_snapshot_dirty_row_flags(snapshot.dirty_row_ranges, row_count);
+    for (const int row : rows) {
+        row_to_descriptor[static_cast<std::size_t>(row)] =
+            static_cast<int>(frame.row_descriptors.size());
+        Terminal_render_row_descriptor descriptor;
+        descriptor.row = row;
+        append_frame_key_int(descriptor.content_identity_key, row);
+        append_frame_key_bool(
+            descriptor.content_identity_key,
+            snapshot_row_is_dirty(dirty_row_flags, row));
+        append_frame_key_line_provenance(
+            descriptor.content_identity_key,
+            line_provenance_for_viewport_row(
+                snapshot,
+                row,
+                use_visible_line_provenance));
+        const Terminal_render_snapshot_row_content row_content =
+            row_view.row_at(row);
+        append_frame_key_int(
+            descriptor.content_identity_key,
+            static_cast<int>(row_content.cell_count()));
+        for (const Terminal_render_cell& cell : row_content) {
+            append_frame_key_cell(descriptor.content_identity_key, cell);
+        }
+        append_frame_key_bool(
+            descriptor.hyperlink_underline_key,
+            options.underline_hyperlinks);
+        frame.row_descriptors.push_back(std::move(descriptor));
+    }
+
+    for (const Terminal_render_text_run& run : frame.text_runs) {
+        if (run.row < 0 || run.row >= row_count) {
+            continue;
+        }
+        const int descriptor = row_to_descriptor[static_cast<std::size_t>(run.row)];
+        if (descriptor < 0) {
+            continue;
+        }
+        Terminal_render_row_descriptor& row =
+            frame.row_descriptors[static_cast<std::size_t>(descriptor)];
+        append_frame_key_text_run(row.text_key, run);
+        if (run.hyperlink_id != 0U) {
+            append_frame_key_int(row.hyperlink_underline_key, run.column);
+            append_frame_key_uint64(row.hyperlink_underline_key, run.hyperlink_id);
+        }
+    }
+
+    const auto append_rect_rows =
+        [&](const Terminal_render_rect& rect, QByteArray Terminal_render_row_descriptor::*member) {
+            append_key_to_rows_for_rect(
+                frame.row_descriptors,
+                row_to_descriptor,
+                rect.rect,
+                frame.cell_metrics,
+                row_count,
+                [&](Terminal_render_row_descriptor& descriptor) {
+                    append_frame_key_render_rect(descriptor.*member, rect);
+                });
+        };
+    for (const Terminal_render_rect& rect : frame.background_rects) {
+        append_rect_rows(rect, &Terminal_render_row_descriptor::background_key);
+    }
+    for (const Terminal_render_rect& rect : frame.graphic_rects) {
+        append_rect_rows(rect, &Terminal_render_row_descriptor::graphic_key);
+    }
+    for (const Terminal_render_arc& arc : frame.graphic_arcs) {
+        append_key_to_rows_for_rect(
+            frame.row_descriptors,
+            row_to_descriptor,
+            arc.rect,
+            frame.cell_metrics,
+            row_count,
+            [&](Terminal_render_row_descriptor& descriptor) {
+                append_frame_key_arc(descriptor.graphic_key, arc);
+            });
+    }
+    for (const Terminal_render_rect& rect : frame.selection_rects) {
+        append_rect_rows(rect, &Terminal_render_row_descriptor::selection_key);
+    }
+    for (const Terminal_render_decoration& decoration : frame.decorations) {
+        append_key_to_rows_for_rect(
+            frame.row_descriptors,
+            row_to_descriptor,
+            decoration.rect,
+            frame.cell_metrics,
+            row_count,
+            [&](Terminal_render_row_descriptor& descriptor) {
+                append_frame_key_decoration(
+                    descriptor.decoration_key,
+                    decoration);
+            });
+    }
+    for (const Terminal_render_cursor_primitive& cursor : frame.cursors) {
+        append_key_to_rows_for_rect(
+            frame.row_descriptors,
+            row_to_descriptor,
+            cursor.rect,
+            frame.cell_metrics,
+            row_count,
+            [&](Terminal_render_row_descriptor& descriptor) {
+                append_frame_key_cursor(
+                    descriptor.cursor_inverse_text_key,
+                    cursor);
+            });
+    }
+    for (const Terminal_render_text_run& run : frame.cursor_text_runs) {
+        if (run.row < 0 || run.row >= row_count) {
+            continue;
+        }
+        const int descriptor = row_to_descriptor[static_cast<std::size_t>(run.row)];
+        if (descriptor >= 0) {
+            append_frame_key_text_run(
+                frame.row_descriptors[
+                    static_cast<std::size_t>(descriptor)].cursor_inverse_text_key,
+                run);
+        }
+    }
+    if (row_count > 0 && ime_preedit.active && !ime_preedit.text.isEmpty()) {
+        const int row = std::clamp(snapshot.cursor.position.row, 0, row_count - 1);
+        if (row >= 0 && row < row_count) {
+            const int descriptor = row_to_descriptor[static_cast<std::size_t>(row)];
+            if (descriptor >= 0) {
+                Terminal_render_row_descriptor& row_descriptor =
+                    frame.row_descriptors[static_cast<std::size_t>(descriptor)];
+                append_frame_key_string(row_descriptor.ime_preedit_key, ime_preedit.text);
+                append_frame_key_int(
+                    row_descriptor.ime_preedit_key,
+                    ime_preedit.cursor_position);
+                append_frame_key_bool(row_descriptor.ime_preedit_key, ime_preedit.active);
+            }
+        }
+    }
+
+    frame.stats.row_descriptors_built =
+        static_cast<int>(frame.row_descriptors.size());
+    frame.stats.layer_descriptors_built = 13;
+}
+
 } // namespace
 
 Terminal_render_frame build_terminal_render_frame(
@@ -1595,7 +2171,8 @@ Terminal_render_frame build_terminal_render_frame(
     terminal_cell_metrics_t            cell_metrics,
     const Terminal_render_options&     options,
     bool                               cursor_blink_visible,
-    const Ime_preedit_state*           ime_preedit_override)
+    const Ime_preedit_state*           ime_preedit_override,
+    bool                               force_full_cell_walk)
 {
     VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame");
 
@@ -1606,10 +2183,30 @@ Terminal_render_frame build_terminal_render_frame(
 
         frame.logical_size = logical_size;
         frame.cell_metrics = cell_metrics;
+        std::size_t base_reserve_cells = 0U;
+        if (snapshot != nullptr && metrics_valid) {
+            const Terminal_render_snapshot_row_content_view reserve_rows(*snapshot);
+            if (!force_full_cell_walk &&
+                sparse_lazy_frame_cell_walk_eligible(*snapshot, options))
+            {
+                std::vector<int> dirty_rows;
+                append_dirty_range_rows(
+                    dirty_rows,
+                    snapshot->dirty_row_ranges,
+                    snapshot->grid_size.rows);
+                sort_unique_rows(dirty_rows, snapshot->grid_size.rows);
+                base_reserve_cells =
+                    row_content_cell_count_for_rows(reserve_rows, dirty_rows);
+            }
+            else
+            {
+                base_reserve_cells = reserve_rows.cell_count();
+            }
+        }
         frame.background_rects.reserve(
             snapshot != nullptr && metrics_valid
                 ? bounded_frame_reserve(
-                    Terminal_render_snapshot_row_content_view(*snapshot).cell_count() + 1U,
+                    base_reserve_cells + 1U,
                     snapshot->grid_size.rows,
                     8U,
                     64U)
@@ -1637,7 +2234,6 @@ Terminal_render_frame build_terminal_render_frame(
         frame.viewport         = snapshot->viewport;
         frame.dirty_row_ranges = snapshot->dirty_row_ranges;
         frame.stats.visible_rows          = snapshot->grid_size.rows;
-        frame.stats.cell_pass_input_cells = static_cast<int>(rows.cell_count());
         for (const Terminal_render_dirty_row_range& range : snapshot->dirty_row_ranges) {
             frame.stats.dirty_rows += range.row_count;
         }
@@ -1689,11 +2285,34 @@ Terminal_render_frame build_terminal_render_frame(
             snapshot->grid_size.columns - ime_preedit_column)
         : 0;
     Render_style_attribute_cache style_attributes(*snapshot);
+    const bool sparse_cell_walk =
+        !force_full_cell_walk &&
+        sparse_lazy_frame_cell_walk_eligible(*snapshot, options);
+    std::vector<int> frame_cell_rows_to_process;
+    if (sparse_cell_walk) {
+        append_dirty_range_rows(
+            frame_cell_rows_to_process,
+            snapshot->dirty_row_ranges,
+            snapshot->grid_size.rows);
+        if (cursor_visible) {
+            frame_cell_rows_to_process.push_back(snapshot->cursor.position.row);
+        }
+        if (ime_preedit_visible) {
+            frame_cell_rows_to_process.push_back(ime_preedit_row);
+        }
+        sort_unique_rows(frame_cell_rows_to_process, snapshot->grid_size.rows);
+    }
+    frame.stats.cell_pass_input_cells = static_cast<int>(
+        frame_cell_pass_input_cell_count(
+            rows,
+            frame_cell_rows_to_process,
+            sparse_cell_walk));
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::reserve_outputs");
 
-        const std::size_t cell_count = rows.cell_count();
+        const std::size_t cell_count =
+            static_cast<std::size_t>(std::max(0, frame.stats.cell_pass_input_cells));
         frame.selection_rects.reserve(snapshot->selection_spans.size() + 1U);
         frame.graphic_rects.reserve(
             bounded_frame_reserve(cell_count, snapshot->grid_size.rows, 8U, 64U));
@@ -2115,9 +2734,20 @@ Terminal_render_frame build_terminal_render_frame(
                 append_decorations_for_run(run);
         };
 
-        for (const Terminal_render_snapshot_row_content row : rows) {
-            for (const Terminal_render_cell& cell : row) {
-                process_cell(cell);
+        if (sparse_cell_walk) {
+            for (const int row_index : frame_cell_rows_to_process) {
+                const Terminal_render_snapshot_row_content row = rows.row_at(row_index);
+                for (const Terminal_render_cell& cell : row) {
+                    process_cell(cell);
+                }
+            }
+        }
+        else
+        {
+            for (const Terminal_render_snapshot_row_content row : rows) {
+                for (const Terminal_render_cell& cell : row) {
+                    process_cell(cell);
+                }
             }
         }
     }
@@ -2219,6 +2849,25 @@ Terminal_render_frame build_terminal_render_frame(
             options.visual_bell_color,
         });
     }
+
+    std::vector<int> descriptor_rows;
+    if (sparse_cell_walk) {
+        descriptor_rows = frame_cell_rows_to_process;
+    }
+    else
+    {
+        descriptor_rows.reserve(
+            static_cast<std::size_t>(std::max(0, snapshot->grid_size.rows)));
+        for (int row = 0; row < snapshot->grid_size.rows; ++row) {
+            descriptor_rows.push_back(row);
+        }
+    }
+    build_terminal_render_frame_descriptors(
+        frame,
+        *snapshot,
+        options,
+        ime_preedit,
+        descriptor_rows);
 
     frame.stats.background_rects_emitted = static_cast<int>(frame.background_rects.size());
     frame.stats.selection_rects_emitted  = static_cast<int>(frame.selection_rects.size());

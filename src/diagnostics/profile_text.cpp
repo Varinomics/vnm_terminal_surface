@@ -182,6 +182,14 @@ void append_renderer_frame_stats_text(
         stream,
         "frame_overlay_rects_emitted",
         static_cast<std::uint64_t>(stats.overlay_rects_emitted));
+    append_profile_counter(
+        stream,
+        "frame_row_descriptors_built",
+        static_cast<std::uint64_t>(stats.row_descriptors_built));
+    append_profile_counter(
+        stream,
+        "frame_layer_descriptors_built",
+        static_cast<std::uint64_t>(stats.layer_descriptors_built));
 }
 
 QString profile_string_literal(const QString& value)
@@ -750,6 +758,10 @@ void append_renderer_stats_section(
     }
     append_profile_counter(
         stream,
+        "qsg_layer_descriptors",
+        static_cast<std::uint64_t>(stats.qsg_layer_descriptors));
+    append_profile_counter(
+        stream,
         "text_key_builds",
         static_cast<std::uint64_t>(stats.text_key_builds));
     append_profile_counter(
@@ -1070,6 +1082,10 @@ void append_cumulative_renderer_stats_section(
             "text_resource_descriptor_clean_reuse_skips",
             stats.text_resource_descriptor_clean_reuse_skips);
     }
+    append_profile_counter(
+        stream,
+        "qsg_layer_descriptors",
+        stats.qsg_layer_descriptors);
     append_profile_counter(stream, "text_key_builds",       stats.text_key_builds);
     append_profile_counter(stream, "text_dirty_row_ranges", stats.text_dirty_row_ranges);
     append_profile_counter(stream, "text_dirty_rows",       stats.text_dirty_rows);
@@ -1408,6 +1424,18 @@ void append_qsg_atlas_profile_section(
         stream,
         "snapped_origin_failures",
         static_cast<std::uint64_t>(report.frame_build.snapped_origin_failures));
+    append_profile_counter(
+        stream,
+        "frame_row_descriptors",
+        static_cast<std::uint64_t>(report.frame_build.frame_row_descriptors));
+    append_profile_counter(
+        stream,
+        "frame_layer_descriptors",
+        static_cast<std::uint64_t>(report.frame_build.frame_layer_descriptors));
+    append_profile_counter(
+        stream,
+        "qsg_layer_descriptors",
+        static_cast<std::uint64_t>(report.frame_build.qsg_layer_descriptors));
     stream << "  misses\n";
     append_profile_counter(
         stream,
@@ -1509,6 +1537,10 @@ void append_qsg_atlas_profile_section(
     append_profile_counter(stream, "draw_calls", report.render.draw_calls);
     append_profile_counter(stream, "rect_draw_calls", report.render.rect_draw_calls);
     append_profile_counter(stream, "glyph_draw_calls", report.render.glyph_draw_calls);
+    append_profile_counter(
+        stream,
+        "rect_row_capacity",
+        static_cast<std::uint64_t>(report.render.rect_row_capacity));
     append_profile_counter(
         stream,
         "rect_buffer_uploaded_bytes",
