@@ -2,6 +2,7 @@
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/session_contract.h"
+#include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
@@ -91,7 +92,7 @@ constexpr int k_surface_session_write_high_water_bytes        = 64 * 1024;
 constexpr int k_surface_session_resize_boundary_width_delta   = 16;
 constexpr int k_surface_session_geometry_boundary_height_delta = 16;
 
-constexpr int k_schema_version              = 21;
+constexpr int k_schema_version              = 22;
 constexpr int k_profile_schema_version      = 2;
 constexpr int k_profile_text_format         = 2;
 constexpr int k_flat_rect_vertices_per_rect = 6;
@@ -134,7 +135,7 @@ const QString k_surface_session_write_high_water_execution_mode = QStringLiteral
 const QString k_descriptor_counter_schema_semantics = QStringLiteral(
     "unavailable_until_batch_7_descriptor_reuse");
 const QString k_lazy_snapshot_reason_counter_schema_semantics = QStringLiteral(
-    "unavailable_until_batch_5_lazy_eligibility");
+    "batch_5_lazy_eligibility");
 const QString k_consumer_materialization_counter_schema_semantics = QStringLiteral(
     "batch_3_materialization_boundaries");
 const QString k_requested_grid_semantics = QStringLiteral("requested_grid_validated");
@@ -5831,6 +5832,18 @@ QJsonObject session_profile_stats_json(
         object,
         QStringLiteral("max_retained_snapshot_generation_count"),
         stats.max_retained_snapshot_generation_count);
+    insert_profile_counter(
+        object,
+        QStringLiteral("lazy_snapshot_eligibility_checks"),
+        stats.lazy_snapshot_eligibility_checks);
+    insert_profile_counter(
+        object,
+        QStringLiteral("lazy_snapshot_eligible_checks"),
+        stats.lazy_snapshot_eligible_checks);
+    insert_profile_counter(
+        object,
+        QStringLiteral("lazy_snapshot_materialization_mismatches_for_testing"),
+        stats.lazy_snapshot_materialization_mismatches_for_testing);
     return object;
 }
 
@@ -5920,29 +5933,35 @@ QJsonObject descriptor_counters_json()
 
 QStringList lazy_snapshot_fallback_reason_keys()
 {
-    return {
-        QStringLiteral("missing_previous_content_snapshot"),
-        QStringLiteral("grid_mismatch"),
-        QStringLiteral("viewport_mismatch"),
-        QStringLiteral("active_buffer_mismatch"),
-        QStringLiteral("public_projection"),
-        QStringLiteral("row_origin_generation_mismatch"),
-        QStringLiteral("style_color_mode_incompatibility"),
-        QStringLiteral("hyperlink_namespace_incompatibility"),
-        QStringLiteral("unstable_dirty_row_mutation_identity"),
-        QStringLiteral("unsupported_geometry_or_detached_snapshot_path"),
-    };
+    QStringList keys;
+    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
+        term::terminal_lazy_snapshot_fallback_reason_descriptors())
+    {
+        keys.push_back(QString::fromLatin1(descriptor.key));
+    }
+
+    return keys;
 }
 
-QJsonObject lazy_snapshot_fallback_reason_counters_json()
+QJsonObject lazy_snapshot_fallback_reason_counters_json(
+    const term::Terminal_session_profile_stats& stats)
 {
     QJsonObject reasons;
-    for (const QString& key : lazy_snapshot_fallback_reason_keys()) {
-        reasons.insert(key, QJsonValue());
+    const term::Terminal_lazy_snapshot_fallback_reason_counters& counters =
+        stats.lazy_snapshot_fallback_reasons;
+    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
+        term::terminal_lazy_snapshot_fallback_reason_descriptors())
+    {
+        reasons.insert(
+            QString::fromLatin1(descriptor.key),
+            static_cast<qint64>(
+                term::terminal_lazy_snapshot_fallback_reason_counter(
+                    counters,
+                    descriptor)));
     }
 
     QJsonObject object;
-    object.insert(QStringLiteral("available"), false);
+    object.insert(QStringLiteral("available"), true);
     object.insert(
         QStringLiteral("schema_semantics"),
         k_lazy_snapshot_reason_counter_schema_semantics);
@@ -6074,7 +6093,7 @@ QJsonObject scenario_json(
     object.insert(QStringLiteral("descriptor_counters"), descriptor_counters_json());
     object.insert(
         QStringLiteral("lazy_snapshot_fallback_reason_counters"),
-        lazy_snapshot_fallback_reason_counters_json());
+        lazy_snapshot_fallback_reason_counters_json(result.session_profile_stats));
     object.insert(QStringLiteral("elapsed_ns"),        summary_json(result.elapsed_ns));
     object.insert(
         QStringLiteral("snapshot_prep_ns"),
@@ -7076,6 +7095,9 @@ QStringList session_profile_counter_keys()
         QStringLiteral("retained_snapshot_generation_count"),
         QStringLiteral("max_retained_snapshot_payload_bytes"),
         QStringLiteral("max_retained_snapshot_generation_count"),
+        QStringLiteral("lazy_snapshot_eligibility_checks"),
+        QStringLiteral("lazy_snapshot_eligible_checks"),
+        QStringLiteral("lazy_snapshot_materialization_mismatches_for_testing"),
     };
 }
 
@@ -8477,7 +8499,7 @@ bool validate_lazy_snapshot_fallback_reason_counters_json(
     }
 
     if (!counters.value(QStringLiteral("available")).isBool() ||
-        counters.value(QStringLiteral("available")).toBool()  ||
+        !counters.value(QStringLiteral("available")).toBool() ||
         counters.value(QStringLiteral("schema_semantics")).toString() !=
             k_lazy_snapshot_reason_counter_schema_semantics ||
         !counters.value(QStringLiteral("reasons")).isObject())
@@ -8498,10 +8520,12 @@ bool validate_lazy_snapshot_fallback_reason_counters_json(
     }
 
     for (const QString& key : lazy_snapshot_fallback_reason_keys()) {
-        if (!reasons.value(key).isNull()) {
-            *out_error = QStringLiteral(
-                "scenario lazy snapshot reason counter is not unavailable: %1")
-                .arg(key);
+        if (!validate_nonnegative_integer_json_field(
+                reasons,
+                key,
+                QStringLiteral("lazy_snapshot_fallback_reason_counters.reasons"),
+                out_error))
+        {
             return false;
         }
     }

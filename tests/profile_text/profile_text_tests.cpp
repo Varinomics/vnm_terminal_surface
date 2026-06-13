@@ -7,6 +7,7 @@
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/terminal_render_cell_text.h"
+#include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 
@@ -35,6 +36,12 @@ void pump_events(QGuiApplication& app, int rounds = 6)
         app.processEvents(QEventLoop::AllEvents, 50);
         QThread::msleep(10);
     }
+}
+
+bool profile_text_contains_counter(const QString& text, const char* key)
+{
+    return text.contains(
+        QStringLiteral("  ") + QString::fromLatin1(key) + QStringLiteral("="));
 }
 
 std::shared_ptr<const term::Terminal_render_snapshot> make_smoke_snapshot(
@@ -159,6 +166,31 @@ bool test_profile_text_sections(QGuiApplication& app)
     ok &= check(text.contains(QStringLiteral(
             "  consumer_materialization_counters_geometry_derived_snapshot_cells=")),
         "session_profile_stats reports geometry-derived materialization cells");
+    ok &= check(text.contains(QStringLiteral(
+            "  lazy_snapshot_fallback_reason_counters_available=true")),
+        "session_profile_stats reports available lazy snapshot reason counters");
+    ok &= check(text.contains(QStringLiteral(
+            "  lazy_snapshot_fallback_reason_counters_schema_semantics="
+            "batch_5_lazy_eligibility")),
+        "session_profile_stats reports lazy snapshot reason counter owner semantics");
+    ok &= check(text.contains(QStringLiteral(
+            "  lazy_snapshot_fallback_reason_counters_owner_batch=Batch 5")),
+        "session_profile_stats reports lazy snapshot reason counter owner batch");
+    const char* const lazy_profile_counter_keys[] = {
+        "lazy_snapshot_eligibility_checks",
+        "lazy_snapshot_eligible_checks",
+        "lazy_snapshot_materialization_mismatches_for_testing",
+    };
+    for (const char* key : lazy_profile_counter_keys) {
+        ok &= check(profile_text_contains_counter(text, key), key);
+    }
+    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
+        term::terminal_lazy_snapshot_fallback_reason_descriptors())
+    {
+        ok &= check(
+            profile_text_contains_counter(text, descriptor.profile_key),
+            descriptor.profile_key);
+    }
     ok &= check(text.contains(QStringLiteral("  retained_snapshot_payload_bytes=")),
         "session_profile_stats reports retained_snapshot_payload_bytes");
     ok &= check(text.contains(QStringLiteral("  retained_snapshot_generation_count=")),

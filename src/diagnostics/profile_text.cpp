@@ -593,6 +593,32 @@ void append_session_profile_stats_section(
         stream,
         "max_retained_snapshot_generation_count",
         stats.max_retained_snapshot_generation_count);
+    stream << "  lazy_snapshot_fallback_reason_counters_available=true\n";
+    stream << "  lazy_snapshot_fallback_reason_counters_schema_semantics="
+        << "batch_5_lazy_eligibility\n";
+    stream << "  lazy_snapshot_fallback_reason_counters_owner_batch=Batch 5\n";
+    append_profile_counter(
+        stream,
+        "lazy_snapshot_eligibility_checks",
+        stats.lazy_snapshot_eligibility_checks);
+    append_profile_counter(
+        stream,
+        "lazy_snapshot_eligible_checks",
+        stats.lazy_snapshot_eligible_checks);
+    append_profile_counter(
+        stream,
+        "lazy_snapshot_materialization_mismatches_for_testing",
+        stats.lazy_snapshot_materialization_mismatches_for_testing);
+    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
+        term::terminal_lazy_snapshot_fallback_reason_descriptors())
+    {
+        append_profile_counter(
+            stream,
+            descriptor.profile_key,
+            term::terminal_lazy_snapshot_fallback_reason_counter(
+                stats.lazy_snapshot_fallback_reasons,
+                descriptor));
+    }
 }
 
 template<typename Renderer_stats>

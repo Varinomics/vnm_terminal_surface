@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -36,6 +37,144 @@ using Terminal_mouse_event_result = Terminal_input_event_result;
 using Terminal_ime_commit_result  = Terminal_input_event_result;
 using Terminal_paste_text_result  = Terminal_input_event_result;
 using Terminal_focus_event_result = Terminal_input_event_result;
+
+enum class Terminal_lazy_snapshot_fallback_reason
+{
+    NONE,
+    MISSING_PREVIOUS_CONTENT_SNAPSHOT,
+    GRID_MISMATCH,
+    VIEWPORT_MISMATCH,
+    ACTIVE_BUFFER_MISMATCH,
+    PUBLIC_PROJECTION,
+    ROW_ORIGIN_GENERATION_MISMATCH,
+    STYLE_COLOR_MODE_INCOMPATIBILITY,
+    HYPERLINK_NAMESPACE_INCOMPATIBILITY,
+    UNSTABLE_DIRTY_ROW_MUTATION_IDENTITY,
+    UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH,
+};
+
+struct Terminal_lazy_snapshot_fallback_reason_counters
+{
+    std::uint64_t missing_previous_content_snapshot        = 0U;
+    std::uint64_t grid_mismatch                            = 0U;
+    std::uint64_t viewport_mismatch                        = 0U;
+    std::uint64_t active_buffer_mismatch                   = 0U;
+    std::uint64_t public_projection                        = 0U;
+    std::uint64_t row_origin_generation_mismatch           = 0U;
+    std::uint64_t style_color_mode_incompatibility         = 0U;
+    std::uint64_t hyperlink_namespace_incompatibility      = 0U;
+    std::uint64_t unstable_dirty_row_mutation_identity     = 0U;
+    std::uint64_t unsupported_geometry_or_detached_snapshot_path = 0U;
+};
+
+struct terminal_lazy_snapshot_fallback_reason_descriptor_t
+{
+    Terminal_lazy_snapshot_fallback_reason reason;
+    const char*                            key;
+    const char*                            profile_key;
+    std::uint64_t Terminal_lazy_snapshot_fallback_reason_counters::*counter;
+};
+
+inline constexpr terminal_lazy_snapshot_fallback_reason_descriptor_t
+    k_terminal_lazy_snapshot_fallback_reason_descriptors[] = {
+        {
+            Terminal_lazy_snapshot_fallback_reason::
+                MISSING_PREVIOUS_CONTENT_SNAPSHOT,
+            "missing_previous_content_snapshot",
+            "lazy_snapshot_fallback_missing_previous_content_snapshot",
+            &Terminal_lazy_snapshot_fallback_reason_counters::
+                missing_previous_content_snapshot,
+        },
+        {
+            Terminal_lazy_snapshot_fallback_reason::GRID_MISMATCH,
+            "grid_mismatch",
+            "lazy_snapshot_fallback_grid_mismatch",
+            &Terminal_lazy_snapshot_fallback_reason_counters::grid_mismatch,
+        },
+        {
+            Terminal_lazy_snapshot_fallback_reason::VIEWPORT_MISMATCH,
+            "viewport_mismatch",
+            "lazy_snapshot_fallback_viewport_mismatch",
+            &Terminal_lazy_snapshot_fallback_reason_counters::viewport_mismatch,
+        },
+        {
+            Terminal_lazy_snapshot_fallback_reason::ACTIVE_BUFFER_MISMATCH,
+            "active_buffer_mismatch",
+            "lazy_snapshot_fallback_active_buffer_mismatch",
+            &Terminal_lazy_snapshot_fallback_reason_counters::
+                active_buffer_mismatch,
+        },
+        {
+            Terminal_lazy_snapshot_fallback_reason::PUBLIC_PROJECTION,
+            "public_projection",
+            "lazy_snapshot_fallback_public_projection",
+            &Terminal_lazy_snapshot_fallback_reason_counters::public_projection,
+        },
+        {
+            Terminal_lazy_snapshot_fallback_reason::
+                ROW_ORIGIN_GENERATION_MISMATCH,
+            "row_origin_generation_mismatch",
+            "lazy_snapshot_fallback_row_origin_generation_mismatch",
+            &Terminal_lazy_snapshot_fallback_reason_counters::
+                row_origin_generation_mismatch,
+        },
+        {
+            Terminal_lazy_snapshot_fallback_reason::
+                STYLE_COLOR_MODE_INCOMPATIBILITY,
+            "style_color_mode_incompatibility",
+            "lazy_snapshot_fallback_style_color_mode_incompatibility",
+            &Terminal_lazy_snapshot_fallback_reason_counters::
+                style_color_mode_incompatibility,
+        },
+        {
+            Terminal_lazy_snapshot_fallback_reason::
+                HYPERLINK_NAMESPACE_INCOMPATIBILITY,
+            "hyperlink_namespace_incompatibility",
+            "lazy_snapshot_fallback_hyperlink_namespace_incompatibility",
+            &Terminal_lazy_snapshot_fallback_reason_counters::
+                hyperlink_namespace_incompatibility,
+        },
+        {
+            Terminal_lazy_snapshot_fallback_reason::
+                UNSTABLE_DIRTY_ROW_MUTATION_IDENTITY,
+            "unstable_dirty_row_mutation_identity",
+            "lazy_snapshot_fallback_unstable_dirty_row_mutation_identity",
+            &Terminal_lazy_snapshot_fallback_reason_counters::
+                unstable_dirty_row_mutation_identity,
+        },
+        {
+            Terminal_lazy_snapshot_fallback_reason::
+                UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH,
+            "unsupported_geometry_or_detached_snapshot_path",
+            "lazy_snapshot_fallback_unsupported_geometry_or_detached_snapshot_path",
+            &Terminal_lazy_snapshot_fallback_reason_counters::
+                unsupported_geometry_or_detached_snapshot_path,
+        },
+    };
+
+inline constexpr std::span<const terminal_lazy_snapshot_fallback_reason_descriptor_t>
+terminal_lazy_snapshot_fallback_reason_descriptors()
+{
+    return std::span<const terminal_lazy_snapshot_fallback_reason_descriptor_t>(
+        k_terminal_lazy_snapshot_fallback_reason_descriptors);
+}
+
+inline std::uint64_t terminal_lazy_snapshot_fallback_reason_counter(
+    const Terminal_lazy_snapshot_fallback_reason_counters&       counters,
+    const terminal_lazy_snapshot_fallback_reason_descriptor_t&   descriptor)
+{
+    return counters.*descriptor.counter;
+}
+
+struct Terminal_session_lazy_snapshot_composer_result
+{
+    bool                                    eligible = false;
+    Terminal_lazy_snapshot_fallback_reason  fallback_reason =
+        Terminal_lazy_snapshot_fallback_reason::NONE;
+    std::optional<Terminal_render_snapshot> lazy_snapshot;
+    bool                                    materialization_matches_full_snapshot = false;
+    bool                                    materialization_mismatch_for_testing  = false;
+};
 
 struct Terminal_session_profile_stats
 {
@@ -63,6 +202,10 @@ struct Terminal_session_profile_stats
     std::uint64_t              retained_snapshot_generation_count    = 0U;
     std::uint64_t              max_retained_snapshot_payload_bytes   = 0U;
     std::uint64_t              max_retained_snapshot_generation_count = 0U;
+    std::uint64_t              lazy_snapshot_eligibility_checks      = 0U;
+    std::uint64_t              lazy_snapshot_eligible_checks         = 0U;
+    std::uint64_t              lazy_snapshot_materialization_mismatches_for_testing = 0U;
+    Terminal_lazy_snapshot_fallback_reason_counters lazy_snapshot_fallback_reasons;
 };
 
 class Terminal_session
@@ -229,6 +372,10 @@ public:
     void set_profile_stats_enabled(bool enabled);
     Terminal_screen_model_profile_stats model_profile_stats() const;
     Terminal_session_profile_stats profile_stats() const;
+    Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_testing(
+        const Terminal_render_snapshot* previous_content_snapshot,
+        const Terminal_render_snapshot& full_snapshot,
+        bool unsupported_geometry_or_detached_snapshot_path = false);
     std::optional<Terminal_backend_exit> exit_status() const;
 
     /**

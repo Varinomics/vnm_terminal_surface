@@ -482,6 +482,109 @@ std::unique_ptr<term::Terminal_session> make_session(Recording_backend*& backend
         config);
 }
 
+bool lazy_snapshot_materializes_like_full_snapshot(
+    const term::Terminal_render_snapshot& lazy_snapshot,
+    const term::Terminal_render_snapshot& full_snapshot,
+    const char*                           label)
+{
+    const term::Terminal_render_snapshot_row_content_view rows(lazy_snapshot);
+    return check(
+        rows.materialized_flat_cells_match(
+            full_snapshot.cells,
+            term::Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST),
+        label);
+}
+
+bool expect_lazy_fallback_reason(
+    term::Terminal_session&                  session,
+    const term::Terminal_render_snapshot*    previous,
+    const term::Terminal_render_snapshot&    current,
+    term::Terminal_lazy_snapshot_fallback_reason expected_reason,
+    const char*                              label,
+    bool                                     detached_path = false)
+{
+    const term::Terminal_session_lazy_snapshot_composer_result result =
+        session.compose_lazy_render_snapshot_for_testing(
+            previous,
+            current,
+            detached_path);
+    return check(!result.eligible                  &&
+            !result.lazy_snapshot.has_value()      &&
+            result.fallback_reason == expected_reason,
+        label);
+}
+
+const term::Terminal_render_snapshot_lazy_row_payload* lazy_row_payload_or_null(
+    const term::Terminal_render_snapshot& snapshot,
+    int                                   row)
+{
+    if (snapshot.lazy_row_payloads == nullptr ||
+        row < 0                               ||
+        static_cast<std::size_t>(row) >= snapshot.lazy_row_payloads->rows.size())
+    {
+        return nullptr;
+    }
+
+    return &snapshot.lazy_row_payloads->rows[static_cast<std::size_t>(row)];
+}
+
+std::uint64_t lazy_row_source_generation(
+    const term::Terminal_render_snapshot& snapshot,
+    int                                   row)
+{
+    const term::Terminal_render_snapshot_lazy_row_payload* lazy_row =
+        lazy_row_payload_or_null(snapshot, row);
+    if (lazy_row == nullptr) {
+        return 0U;
+    }
+
+    return lazy_row->source.owner != nullptr
+        ? lazy_row->source.owner->retained_generation()
+        : 0U;
+}
+
+bool lazy_snapshot_fallback_reason_counters_are_zero(
+    const term::Terminal_lazy_snapshot_fallback_reason_counters& counters)
+{
+    bool ok = true;
+
+    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
+        term::terminal_lazy_snapshot_fallback_reason_descriptors())
+    {
+        ok &= check(
+            term::terminal_lazy_snapshot_fallback_reason_counter(
+                counters,
+                descriptor) == 0U,
+            descriptor.profile_key);
+    }
+
+    return ok;
+}
+
+bool lazy_snapshot_fallback_reason_counters_match_synthetic_expectations(
+    const term::Terminal_lazy_snapshot_fallback_reason_counters& counters)
+{
+    bool ok = true;
+
+    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
+        term::terminal_lazy_snapshot_fallback_reason_descriptors())
+    {
+        const std::uint64_t expected =
+            descriptor.reason ==
+                term::Terminal_lazy_snapshot_fallback_reason::
+                    UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH
+                ? 2U
+                : 1U;
+        ok &= check(
+            term::terminal_lazy_snapshot_fallback_reason_counter(
+                counters,
+                descriptor) == expected,
+            descriptor.profile_key);
+    }
+
+    return ok;
+}
+
 bool test_owned_styled_wide_hyperlink_scrollback_snapshot()
 {
     bool ok = true;
@@ -2599,6 +2702,500 @@ bool test_lazy_row_payload_retention_policy_evicts_superseded_backlog()
     return ok;
 }
 
+bool test_disabled_lazy_composer_borrows_clean_rows_and_owns_dirty_rows()
+{
+    bool ok = true;
+
+    Recording_backend* backend = nullptr;
+    std::unique_ptr<term::Terminal_session> session = make_session(backend);
+#if VNM_TERMINAL_PROFILING_ENABLED
+    session->set_profile_stats_enabled(true);
+#endif
+
+    ok &= check(session->start(launch_config({3, 12})).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "lazy composer dirty-row session starts");
+    ok &= check(backend != nullptr &&
+        backend->emit_output(QByteArrayLiteral(
+            "\x1b[1;1HAAAA\x1b[2;1HBBBB\x1b[3;1HCCCC")),
+        "lazy composer publishes baseline rows");
+    std::shared_ptr<const term::Terminal_render_snapshot> previous =
+        session->latest_render_snapshot_handle();
+    ok &= check(previous != nullptr && previous->lazy_row_payloads == nullptr,
+        "baseline production snapshot is fully materialized");
+    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+
+    const QByteArray mutations[] = {
+        QByteArrayLiteral("\x1b[2;1Hbb"),
+        QByteArrayLiteral("\x1b[3;1Hcc"),
+    };
+    for (const QByteArray& mutation : mutations) {
+        ok &= check(backend->emit_output(mutation),
+            "lazy composer publishes dirty-row mutation");
+        const std::shared_ptr<const term::Terminal_render_snapshot> current =
+            session->latest_render_snapshot_handle();
+        ok &= check(current != nullptr && current->lazy_row_payloads == nullptr,
+            "production dirty-row snapshot remains fully materialized");
+
+        const term::Terminal_session_lazy_snapshot_composer_result result =
+            session->compose_lazy_render_snapshot_for_testing(previous.get(), *current);
+        ok &= check(result.eligible && result.lazy_snapshot.has_value(),
+            "disabled lazy composer accepts stable dirty-row mutation");
+        if (result.lazy_snapshot.has_value()) {
+            const term::Terminal_render_snapshot& lazy = *result.lazy_snapshot;
+            ok &= check(lazy.cells.empty() && lazy.lazy_row_payloads != nullptr,
+                "disabled lazy composer stores rows through lazy payloads only");
+            ok &= check(result.materialization_matches_full_snapshot,
+                "disabled lazy composer reports materialization parity");
+            ok &= lazy_snapshot_materializes_like_full_snapshot(
+                lazy,
+                *current,
+                "disabled lazy composer materializes to the full producer output");
+            ok &= check(dirty_ranges_equal(lazy.dirty_row_ranges,
+                    current->dirty_row_ranges),
+                "lazy composer preserves the full path dirty-row ranges");
+
+            bool observed_dirty_current_row = false;
+            bool observed_clean_previous_row = false;
+            bool all_rows_from_expected_generation = true;
+            bool clean_rows_without_namespace_copy = true;
+            for (int row = 0; row < current->grid_size.rows; ++row) {
+                const bool dirty = term::render_snapshot_row_is_dirty(*current, row);
+                const term::Terminal_render_snapshot_lazy_row_payload* lazy_row =
+                    lazy_row_payload_or_null(lazy, row);
+                const std::uint64_t source_generation =
+                    lazy_row_source_generation(lazy, row);
+                const std::uint64_t expected_source_generation =
+                    dirty
+                        ? current->metadata.sequence
+                        : previous->metadata.sequence;
+                all_rows_from_expected_generation =
+                    all_rows_from_expected_generation &&
+                    source_generation == expected_source_generation;
+                if (dirty) {
+                    observed_dirty_current_row = true;
+                }
+                else {
+                    observed_clean_previous_row = true;
+                    clean_rows_without_namespace_copy =
+                        clean_rows_without_namespace_copy          &&
+                        lazy_row != nullptr                       &&
+                        lazy_row->cells_in_receiving_namespace == nullptr;
+                }
+            }
+            ok &= check(all_rows_from_expected_generation,
+                "lazy composer sources every dirty row from current and every clean row "
+                "from previous");
+            ok &= check(observed_dirty_current_row,
+                "lazy composer owns dirty rows from the current full snapshot payloads");
+            ok &= check(observed_clean_previous_row,
+                "lazy composer borrows clean rows from the previous content payloads");
+            ok &= check(clean_rows_without_namespace_copy,
+                "lazy composer clean-row borrows avoid remap copies for compatible "
+                "metadata");
+        }
+
+        previous = current;
+        session->mark_render_snapshot_synced(session->render_snapshot_generation());
+    }
+
+    term::Terminal_screen_model model = make_model({2, 8});
+    model.ingest(QByteArrayLiteral("MODEL"));
+    const term::Terminal_render_snapshot model_snapshot =
+        model.render_snapshot(request_for_model(model, 910U));
+    ok &= check(model_snapshot.lazy_row_payloads == nullptr &&
+            !model_snapshot.cells.empty(),
+        "generic model render_snapshot remains a full detached builder");
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    const term::Terminal_session_profile_stats stats = session->profile_stats();
+    ok &= check(stats.lazy_snapshot_eligibility_checks == 2U &&
+            stats.lazy_snapshot_eligible_checks == 2U,
+        "disabled lazy composer profile counters count explicit test-only checks");
+    ok &= check(stats.lazy_snapshot_materialization_mismatches_for_testing == 0U,
+        "disabled lazy composer records no materialization mismatches");
+    ok &= check(stats.full_snapshot_publications >= 3U,
+        "production publication counters still report full snapshots");
+#endif
+
+    return ok;
+}
+
+bool test_disabled_lazy_composer_rejects_malformed_dirty_row_metadata()
+{
+    bool ok = true;
+
+    Recording_backend* backend = nullptr;
+    std::unique_ptr<term::Terminal_session> session = make_session(backend);
+#if VNM_TERMINAL_PROFILING_ENABLED
+    session->set_profile_stats_enabled(true);
+#endif
+
+    ok &= check(session->start(launch_config({3, 12})).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "malformed lazy composer session starts");
+    ok &= check(backend != nullptr &&
+        backend->emit_output(QByteArrayLiteral(
+            "\x1b[1;1HAAAA\x1b[2;1HBBBB\x1b[3;1HCCCC")),
+        "malformed lazy composer publishes baseline rows");
+    const std::shared_ptr<const term::Terminal_render_snapshot> previous =
+        session->latest_render_snapshot_handle();
+    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[2;1Hbb")),
+        "malformed lazy composer publishes a dirty-row mutation");
+    const std::shared_ptr<const term::Terminal_render_snapshot> current =
+        session->latest_render_snapshot_handle();
+    if (previous == nullptr || current == nullptr) {
+        return false;
+    }
+
+    term::Terminal_render_snapshot omitted_dirty_row = *current;
+    omitted_dirty_row.dirty_row_ranges.clear();
+    const term::Terminal_session_lazy_snapshot_composer_result result =
+        session->compose_lazy_render_snapshot_for_testing(
+            previous.get(),
+            omitted_dirty_row);
+
+    ok &= check(!result.eligible &&
+            !result.lazy_snapshot.has_value() &&
+            !result.materialization_matches_full_snapshot &&
+            result.materialization_mismatch_for_testing &&
+            result.fallback_reason ==
+                term::Terminal_lazy_snapshot_fallback_reason::NONE,
+        "lazy composer rejects eligibility-passing malformed dirty-row metadata");
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    const term::Terminal_session_profile_stats stats = session->profile_stats();
+    ok &= check(stats.lazy_snapshot_eligibility_checks == 1U &&
+            stats.lazy_snapshot_eligible_checks == 0U,
+        "malformed lazy composer input is checked but not counted as eligible");
+    ok &= check(stats.lazy_snapshot_materialization_mismatches_for_testing == 1U,
+        "malformed lazy composer input records one test-only materialization mismatch");
+    const term::Terminal_lazy_snapshot_fallback_reason_counters fallback_counters =
+        stats.lazy_snapshot_fallback_reasons;
+    ok &= lazy_snapshot_fallback_reason_counters_are_zero(fallback_counters);
+#endif
+
+    return ok;
+}
+
+bool test_disabled_lazy_composer_reports_specific_fallback_reasons()
+{
+    bool ok = true;
+
+    Recording_backend* backend = nullptr;
+    std::unique_ptr<term::Terminal_session> session = make_session(backend);
+#if VNM_TERMINAL_PROFILING_ENABLED
+    session->set_profile_stats_enabled(true);
+#endif
+
+    ok &= check(session->start(launch_config({3, 12})).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "lazy fallback reason session starts");
+    ok &= check(backend != nullptr &&
+        backend->emit_output(QByteArrayLiteral("base")),
+        "lazy fallback reason session publishes baseline");
+    const std::shared_ptr<const term::Terminal_render_snapshot> previous =
+        session->latest_render_snapshot_handle();
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[2;1Hnext")),
+        "lazy fallback reason session publishes current content");
+    const std::shared_ptr<const term::Terminal_render_snapshot> current =
+        session->latest_render_snapshot_handle();
+    if (previous == nullptr || current == nullptr) {
+        return false;
+    }
+
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        nullptr,
+        *current,
+        term::Terminal_lazy_snapshot_fallback_reason::MISSING_PREVIOUS_CONTENT_SNAPSHOT,
+        "lazy composer reports missing previous content snapshot");
+
+    term::Terminal_render_snapshot grid_mismatch = *current;
+    grid_mismatch.grid_size.rows += 1;
+    grid_mismatch.viewport.visible_rows = grid_mismatch.grid_size.rows;
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        previous.get(),
+        grid_mismatch,
+        term::Terminal_lazy_snapshot_fallback_reason::GRID_MISMATCH,
+        "lazy composer reports grid mismatch");
+
+    term::Terminal_render_snapshot active_buffer_mismatch = *current;
+    active_buffer_mismatch.viewport.active_buffer = term::Terminal_buffer_id::ALTERNATE;
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        previous.get(),
+        active_buffer_mismatch,
+        term::Terminal_lazy_snapshot_fallback_reason::ACTIVE_BUFFER_MISMATCH,
+        "lazy composer reports active buffer mismatch");
+
+    term::Terminal_render_snapshot viewport_mismatch = *current;
+    viewport_mismatch.viewport.offset_from_tail += 1;
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        previous.get(),
+        viewport_mismatch,
+        term::Terminal_lazy_snapshot_fallback_reason::VIEWPORT_MISMATCH,
+        "lazy composer reports viewport mismatch");
+
+    term::Terminal_render_snapshot row_origin_mismatch = *current;
+    ++row_origin_mismatch.metadata.row_origin_generation;
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        previous.get(),
+        row_origin_mismatch,
+        term::Terminal_lazy_snapshot_fallback_reason::ROW_ORIGIN_GENERATION_MISMATCH,
+        "lazy composer reports row-origin generation mismatch");
+
+    term::Terminal_render_snapshot style_color_mode_mismatch = *current;
+    style_color_mode_mismatch.color_state.default_foreground_rgba ^= 0x00010101U;
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        previous.get(),
+        style_color_mode_mismatch,
+        term::Terminal_lazy_snapshot_fallback_reason::STYLE_COLOR_MODE_INCOMPATIBILITY,
+        "lazy composer reports style/color/mode incompatibility");
+
+    term::Terminal_render_snapshot hyperlink_mismatch = *current;
+    term::Terminal_render_snapshot previous_with_hyperlink = *previous;
+    previous_with_hyperlink.hyperlinks.push_back({
+        7U,
+        QByteArrayLiteral("uri:https://previous.example"),
+        QByteArrayLiteral("https://previous.example"),
+    });
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        &previous_with_hyperlink,
+        hyperlink_mismatch,
+        term::Terminal_lazy_snapshot_fallback_reason::
+            HYPERLINK_NAMESPACE_INCOMPATIBILITY,
+        "lazy composer reports hyperlink namespace incompatibility");
+
+    term::Terminal_render_snapshot public_projection = *current;
+    public_projection.basis   = term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION;
+    public_projection.purpose = term::Terminal_render_snapshot_purpose::SCROLL;
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        previous.get(),
+        public_projection,
+        term::Terminal_lazy_snapshot_fallback_reason::PUBLIC_PROJECTION,
+        "lazy composer reports public projection boundary");
+
+    term::Terminal_render_snapshot geometry_derived = *current;
+    geometry_derived.purpose =
+        term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED;
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        previous.get(),
+        geometry_derived,
+        term::Terminal_lazy_snapshot_fallback_reason::
+            UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH,
+        "lazy composer reports geometry-derived snapshot boundary");
+
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        previous.get(),
+        *current,
+        term::Terminal_lazy_snapshot_fallback_reason::
+            UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH,
+        "lazy composer reports detached projection path boundary",
+        true);
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
+        "lazy fallback reason session enters synchronized-output hold");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "lazy fallback reason session releases synchronized-output hold");
+    const std::shared_ptr<const term::Terminal_render_snapshot> unstable_current =
+        session->latest_render_snapshot_handle();
+    if (unstable_current != nullptr) {
+        ok &= expect_lazy_fallback_reason(
+            *session,
+            current.get(),
+            *unstable_current,
+            term::Terminal_lazy_snapshot_fallback_reason::
+                UNSTABLE_DIRTY_ROW_MUTATION_IDENTITY,
+            "lazy composer reports unstable dirty-row mutation identity");
+    }
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    const term::Terminal_lazy_snapshot_fallback_reason_counters counters =
+        session->profile_stats().lazy_snapshot_fallback_reasons;
+    ok &= lazy_snapshot_fallback_reason_counters_match_synthetic_expectations(counters);
+#endif
+
+    return ok;
+}
+
+bool test_disabled_lazy_composer_session_boundary_fallbacks()
+{
+    bool ok = true;
+
+    {
+        Recording_backend* backend = nullptr;
+        std::unique_ptr<term::Terminal_session> session = make_session(backend);
+        ok &= check(session->start(launch_config({3, 12})).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "lazy viewport fallback session starts");
+        ok &= check(backend != nullptr &&
+            backend->emit_output(QByteArrayLiteral("one\r\ntwo\r\nthree\r\nfour")),
+            "lazy viewport fallback creates scrollback");
+        const std::shared_ptr<const term::Terminal_render_snapshot> previous =
+            session->latest_render_snapshot_handle();
+        const term::Terminal_viewport_scroll_result scroll =
+            session->scroll_viewport_lines(1);
+        const std::shared_ptr<const term::Terminal_render_snapshot> current =
+            session->latest_render_snapshot_handle();
+        ok &= check(scroll.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+            "lazy viewport fallback moves the viewport");
+        ok &= check(previous != nullptr && current != nullptr,
+            "lazy viewport fallback has before and after snapshots");
+        if (previous != nullptr && current != nullptr) {
+            ok &= expect_lazy_fallback_reason(
+                *session,
+                previous.get(),
+                *current,
+                term::Terminal_lazy_snapshot_fallback_reason::VIEWPORT_MISMATCH,
+                "lazy composer reports viewport change fallback");
+        }
+    }
+
+    {
+        Recording_backend* backend = nullptr;
+        std::unique_ptr<term::Terminal_session> session = make_session(backend);
+        ok &= check(session->start(launch_config({3, 12})).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "lazy resize fallback session starts");
+        ok &= check(backend != nullptr && backend->emit_output(QByteArrayLiteral("resize")),
+            "lazy resize fallback publishes baseline");
+        const std::shared_ptr<const term::Terminal_render_snapshot> previous =
+            session->latest_render_snapshot_handle();
+        ok &= check(session->resize(QSizeF(160.0, 80.0), {4, 12}).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "lazy resize fallback applies changed grid");
+        const std::shared_ptr<const term::Terminal_render_snapshot> current =
+            session->latest_render_snapshot_handle();
+        if (previous != nullptr && current != nullptr) {
+            ok &= expect_lazy_fallback_reason(
+                *session,
+                previous.get(),
+                *current,
+                term::Terminal_lazy_snapshot_fallback_reason::GRID_MISMATCH,
+                "lazy composer reports resize grid fallback");
+        }
+    }
+
+    {
+        Recording_backend* backend = nullptr;
+        std::unique_ptr<term::Terminal_session> session = make_session(backend);
+        ok &= check(session->start(launch_config({3, 12})).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "lazy alternate-buffer fallback session starts");
+        ok &= check(backend != nullptr && backend->emit_output(QByteArrayLiteral("primary")),
+            "lazy alternate-buffer fallback publishes primary baseline");
+        const std::shared_ptr<const term::Terminal_render_snapshot> previous =
+            session->latest_render_snapshot_handle();
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1049hALT")),
+            "lazy alternate-buffer fallback enters alternate screen");
+        const std::shared_ptr<const term::Terminal_render_snapshot> current =
+            session->latest_render_snapshot_handle();
+        if (previous != nullptr && current != nullptr) {
+            ok &= expect_lazy_fallback_reason(
+                *session,
+                previous.get(),
+                *current,
+                term::Terminal_lazy_snapshot_fallback_reason::ACTIVE_BUFFER_MISMATCH,
+                "lazy composer reports alternate-buffer fallback");
+        }
+    }
+
+    {
+        Recording_backend* backend = nullptr;
+        std::unique_ptr<term::Terminal_session> session = make_session(backend);
+        ok &= check(session->start(launch_config({3, 12})).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "lazy synchronized-output fallback session starts");
+        ok &= check(backend != nullptr && backend->emit_output(QByteArrayLiteral("base")),
+            "lazy synchronized-output fallback publishes baseline");
+        const std::shared_ptr<const term::Terminal_render_snapshot> previous =
+            session->latest_render_snapshot_handle();
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
+            "lazy synchronized-output fallback enters hold");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "lazy synchronized-output fallback releases hold");
+        const std::shared_ptr<const term::Terminal_render_snapshot> current =
+            session->latest_render_snapshot_handle();
+        if (previous != nullptr && current != nullptr) {
+            ok &= expect_lazy_fallback_reason(
+                *session,
+                previous.get(),
+                *current,
+                term::Terminal_lazy_snapshot_fallback_reason::
+                    UNSTABLE_DIRTY_ROW_MUTATION_IDENTITY,
+                "lazy composer reports synchronized-output release fallback");
+        }
+    }
+
+    {
+        Recording_backend* backend = nullptr;
+        std::unique_ptr<term::Terminal_session> session = make_session(backend);
+        ok &= check(session->start(launch_config({3, 12})).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "lazy mode fallback session starts");
+        ok &= check(backend != nullptr && backend->emit_output(QByteArrayLiteral("plain")),
+            "lazy mode fallback publishes baseline");
+        const std::shared_ptr<const term::Terminal_render_snapshot> previous =
+            session->latest_render_snapshot_handle();
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?25l")),
+            "lazy mode fallback hides the cursor");
+        const std::shared_ptr<const term::Terminal_render_snapshot> current =
+            session->latest_render_snapshot_handle();
+        if (previous != nullptr && current != nullptr) {
+            ok &= expect_lazy_fallback_reason(
+                *session,
+                previous.get(),
+                *current,
+                term::Terminal_lazy_snapshot_fallback_reason::
+                    STYLE_COLOR_MODE_INCOMPATIBILITY,
+                "lazy composer reports style/color/mode change fallback");
+        }
+    }
+
+    {
+        Recording_backend* backend = nullptr;
+        std::unique_ptr<term::Terminal_session> session = make_session(backend);
+        ok &= check(session->start(launch_config({3, 12})).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "lazy hyperlink fallback session starts");
+        ok &= check(backend != nullptr &&
+            backend->emit_output(
+                QByteArrayLiteral("\x1b]8;id=before;https://before.test\x1b\\LINK\x1b]8;;\x1b\\")),
+            "lazy hyperlink fallback publishes linked baseline");
+        const std::shared_ptr<const term::Terminal_render_snapshot> previous =
+            session->latest_render_snapshot_handle();
+        ok &= check(backend->emit_output(
+                QByteArrayLiteral("\x1b]8;id=after;https://after.test\x1b\\NEXT\x1b]8;;\x1b\\")),
+            "lazy hyperlink fallback publishes changed link namespace");
+        const std::shared_ptr<const term::Terminal_render_snapshot> current =
+            session->latest_render_snapshot_handle();
+        if (previous != nullptr && current != nullptr) {
+            const term::Terminal_session_lazy_snapshot_composer_result result =
+                session->compose_lazy_render_snapshot_for_testing(
+                    previous.get(),
+                    *current);
+            ok &= check(result.eligible &&
+                    result.fallback_reason ==
+                        term::Terminal_lazy_snapshot_fallback_reason::NONE &&
+                    result.materialization_matches_full_snapshot,
+                "lazy composer materializes compatible hyperlink namespace change");
+        }
+    }
+
+    return ok;
+}
+
 bool test_row_content_view_malformed_lookup_behavior()
 {
     bool ok = true;
@@ -2954,6 +3551,10 @@ int main()
     ok &= test_lazy_borrowed_row_payloads_remap_metadata_namespace();
     ok &= test_lazy_row_payload_lifetime_survives_source_release_and_snapshot_copy_move();
     ok &= test_lazy_row_payload_retention_policy_evicts_superseded_backlog();
+    ok &= test_disabled_lazy_composer_borrows_clean_rows_and_owns_dirty_rows();
+    ok &= test_disabled_lazy_composer_rejects_malformed_dirty_row_metadata();
+    ok &= test_disabled_lazy_composer_reports_specific_fallback_reasons();
+    ok &= test_disabled_lazy_composer_session_boundary_fallbacks();
     ok &= test_row_content_view_malformed_lookup_behavior();
     ok &= test_validate_render_snapshot_reports_wide_overlap_before_missing_continuation();
     ok &= test_validate_render_snapshot_reports_wide_structure_before_style_mismatch();

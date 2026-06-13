@@ -1007,6 +1007,71 @@ Gates:
 - Fallback counters identify every ineligible case.
 - Production path still uses full materialization.
 
+Batch 5 implementation record, 2026-06-13:
+
+- Scope: disabled/test-only lazy composer eligibility and parity checks only.
+  Production snapshot publication remains fully materialized; no default
+  session publication path constructs or publishes lazy row payloads.
+- Session eligibility model:
+  - `dirty_rows_have_stable_mutation_identity` is carried from the current
+    `Terminal_screen_model_result` into the session-level test-only composer
+    input.
+  - `Terminal_lazy_snapshot_fallback_reason` records explicit ineligible
+    boundaries for missing previous content snapshots, grid mismatch, viewport
+    mismatch, active-buffer mismatch, public projection, row-origin generation
+    mismatch, style/color/mode incompatibility, hyperlink namespace
+    incompatibility, unstable dirty-row mutation identity, and unsupported
+    geometry or detached snapshot paths.
+  - Session profile stats, profile text, and embedded benchmark JSON now expose
+    Batch 5 numeric reason counters and scalar eligibility/parity counters.
+    The Batch 1 unavailable placeholders are replaced by
+    `batch_5_lazy_eligibility` semantics under embedded benchmark schema 22.
+    Schema 22 remains the final Batch 5 schema version for this unpushed
+    schema shape.
+- Disabled composer behavior:
+  - `Terminal_session::compose_lazy_render_snapshot_for_testing()` evaluates
+    eligibility under the session lock, uses Batch 4 immutable row payloads for
+    eligible content snapshots, borrows clean rows from the prior content
+    snapshot without remap copies when metadata ids are already in the
+    receiving namespace, owns dirty rows from the current full snapshot, and
+    compares row view materialization against the current full producer output
+    with `ROW_VIEW_PARITY_TEST`.
+  - Eligibility-passing malformed composer inputs, such as omitted dirty-row
+    metadata that would materialize stale clean rows, are rejected without an
+    explicit fallback reason and do not return or count an eligible lazy
+    snapshot. They count only the test-only materialization mismatch counter.
+  - Generic `Terminal_screen_model::render_snapshot()` remains a full detached
+    flat-cell builder. The production `Terminal_session::publish_render_snapshot`
+    path still constructs `Terminal_render_snapshot snapshot =
+    m_screen_model->render_snapshot(request);` and records full snapshot
+    publications.
+- Test evidence added:
+  - Dirty-row parity after synced partial mutations proves lazy materialization
+    matches the full producer, dirty ranges remain identical to the full path,
+    every dirty row is sourced from the current snapshot payloads, every clean
+    row is borrowed from the previous content payloads without a remap copy
+    when metadata is compatible, and production snapshots still carry no lazy
+    payloads.
+  - Synthetic fallback tests prove missing previous content snapshot, grid,
+    viewport, active-buffer, public-projection, row-origin, style/color/mode,
+    hyperlink namespace, unstable dirty-row identity, geometry-derived, and
+    detached-path reasons and their counters.
+  - Session-boundary tests cover viewport movement, resize, alternate buffer,
+    synchronized output release, mode-state change, and a real hyperlink
+    namespace change that remains compatible and materializes successfully.
+  - Existing Batch 4 row-payload tests continue to cover detached/lazy row-view
+    validation, remap, lifetime, and retention semantics.
+- Commands and results:
+  - `git diff --check` passed.
+  - The removed Batch 5 counter/input/helper symbol grep returned no matches.
+  - The stale Batch 5 unavailable-schema label grep returned no matches.
+  - `rg -n "lazy_row_payloads\s*=|make_shared<.*Terminal_render_snapshot_lazy_payloads|render_snapshot_row_payload_owner_from_snapshot|borrowed_render_snapshot_lazy_row_payload\(" src tools benchmarks -S` showed lazy payload construction only in the disabled/test-only session composer; the default publication path remains full materialization.
+  - `rg -n "Terminal_render_snapshot snapshot = m_screen_model->render_snapshot\(request\)|full_snapshot_publications|compose_lazy_render_snapshot_for_testing|lazy_snapshot\.lazy_row_payloads|publish_render_snapshot" src\terminal_session.cpp -S` confirmed the production publish path still calls the full model producer and increments full-publication counters; lazy payload assignment is outside that path.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_renderer_graphics_probe --target vnm_terminal_render_snapshot vnm_terminal_render_frame vnm_terminal_profile_text vnm_terminal_embedded_benchmark vnm_terminal_backend_session"` passed.
+  - `cmd.exe /d /c "call ""C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"" x64 && cmake --build build_codex_batch1_profile_on --target vnm_terminal_render_snapshot vnm_terminal_render_frame vnm_terminal_profile_text vnm_terminal_embedded_benchmark vnm_terminal_backend_session"` passed.
+  - `ctest --test-dir build_codex_renderer_graphics_probe -R "^(vnm_terminal_render_snapshot|vnm_terminal_render_frame|vnm_terminal_profile_text|vnm_terminal_backend_session|vnm_terminal_embedded_benchmark_validate)$" --output-on-failure` passed: 5/5.
+  - `ctest --test-dir build_codex_batch1_profile_on -R "^(vnm_terminal_render_snapshot|vnm_terminal_render_frame|vnm_terminal_profile_text|vnm_terminal_backend_session|vnm_terminal_embedded_benchmark_profile_validate)$" --output-on-failure` passed: 5/5.
+
 ## 12. Batch 6: Narrow Lazy Path, Not Default
 
 Purpose: exercise the safe core lazy content path in an end-to-end
@@ -1228,13 +1293,14 @@ Reviewers should classify findings as:
 
 ## 18. Current Handoff
 
-Batch 4 now contains the test-only lazy row payload representation and retained
-row-payload policy scaffolding. Production snapshot publication remains fully
-materialized: session, model, frame, QSG, transcript, replay, and benchmark
-paths must not construct lazy row payloads until the later production-enablement
-batches explicitly do that work and pass their gates.
+Batch 5 now contains the disabled/test-only eligibility checker and lazy
+composer parity harness. Production snapshot publication remains fully
+materialized: `Terminal_session::publish_render_snapshot()` still publishes the
+full `Terminal_screen_model::render_snapshot()` result, and session, model,
+frame, QSG, transcript, replay, and benchmark default paths must not construct
+or publish lazy row payloads.
 
-The immediate next step is independent review of the amended Batch 4 diff and
-gate evidence. If accepted, proceed to Batch 5 eligibility signal work without
-enabling production lazy publication. Do not enable lazy publication by default
-before Batch 8 gates pass.
+The immediate next step is independent review of the Batch 5 diff and gate
+evidence. If accepted, proceed to Batch 6 narrow lazy-path exercise without
+making it the default production publication path. Do not enable lazy
+publication by default before Batch 8 gates pass.
