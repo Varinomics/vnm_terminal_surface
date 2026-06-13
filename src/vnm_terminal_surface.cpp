@@ -82,6 +82,9 @@ constexpr int         k_plain_scroll_lines_per_angle_step        = 3;
 constexpr int         k_min_synchronized_output_stale_timeout_ms = 1;
 constexpr int         k_row_timestamp_tooltip_delay_ms           = 1000;
 constexpr std::chrono::milliseconds k_backend_callback_drain_budget{4};
+// Posted drains are the primary backend-output pump; keep each wakeup bounded
+// but large enough that high-volume output does not depend on pointer redelivery.
+constexpr std::chrono::milliseconds k_backend_callback_posted_drain_budget{32};
 constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget{0};
 
 #if defined(_WIN32)
@@ -404,6 +407,13 @@ bool is_live_process_state(term::Terminal_process_state state)
 bool is_accepted(term::Terminal_session_result_code code)
 {
     return code == term::Terminal_session_result_code::ACCEPTED;
+}
+
+bool backend_drain_reached_notification_boundary(
+    bool                            drain_complete,
+    const term::Terminal_session&   session)
+{
+    return drain_complete || !session.has_pending_backend_callback_events();
 }
 
 term::Terminal_paste_framing_policy paste_framing_policy(
@@ -3893,9 +3903,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     if (row_timestamp_tooltip_pointer_moved(event->position())) {
         dismiss_row_timestamp_tooltip();
     }
-    drain_backend_callback_events();
-
-    const std::optional<term::terminal_grid_position_t> position = grid_position_for_local_point(
+    std::optional<term::terminal_grid_position_t> position = grid_position_for_local_point(
         m_private->render_snapshot,
         m_private->cell_metrics,
         event->position());
@@ -3904,6 +3912,8 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     const bool force_local_selection = local_selection_override(event->modifiers());
     const bool terminal_mouse_grab_active =
         m_private->mouse_reporting_pressed_buttons != Qt::NoButton;
+    const bool published_mouse_tracking =
+        snapshot_has_terminal_mouse_tracking(m_private->render_snapshot);
     const auto trace_decision = [&](const QString& reason) {
         trace_surface_mouse_decision(
             m_selection_trace_enabled,
@@ -3925,7 +3935,8 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     if (!m_private->selection_drag_active &&
         (!force_local_selection || terminal_mouse_grab_active)       &&
         m_mouse_reporting_policy != Mouse_reporting_policy::DISABLED &&
-        m_private->session       != nullptr)
+        m_private->session       != nullptr                          &&
+        (published_mouse_tracking || terminal_mouse_grab_active))
     {
         std::optional<term::terminal_grid_position_t> report_position = position;
         if (!report_position.has_value() && terminal_mouse_grab_active) {
@@ -3952,15 +3963,20 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                 button == term::Terminal_mouse_button::NONE
                     ? term::Terminal_mouse_event_kind::MOVE
                     : term::Terminal_mouse_event_kind::DRAG;
-            const term::Terminal_mouse_event_result mouse_result =
-                m_private->session->write_mouse_event({
+            const std::optional<term::Terminal_mouse_event_result> mouse_result =
+                m_private->session->try_write_mouse_event_without_backend_drain_if_callbacks_empty({
                     kind,
                     button,
                     report_position->row,
                     report_position->column,
                     event->modifiers(),
                 });
-            if (mouse_result.handled) {
+            if (!mouse_result.has_value()) {
+                viewport_position = report_position;
+                trace_decision(QStringLiteral("mouse-reporting-callbacks-pending"));
+                return;
+            }
+            if (mouse_result->handled) {
                 m_private->mouse_reporting_last_position = *report_position;
                 m_private->clear_selection_drag_state();
                 record_surface_selection_drag_transcript(
@@ -3973,8 +3989,8 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                 m_private->session->clear_selection();
                 event->accept();
                 sync_from_session();
-                if (!is_accepted(mouse_result.result.code)) {
-                    report_result_failure(mouse_result.result);
+                if (!is_accepted(mouse_result->result.code)) {
+                    report_result_failure(mouse_result->result);
                 }
                 viewport_position = report_position;
                 trace_decision(QStringLiteral("mouse-reporting"));
@@ -4002,6 +4018,18 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         trace_decision(QStringLiteral("drag-inactive"));
         return;
     }
+
+    drain_backend_callback_events();
+    if (m_private->session == nullptr) {
+        trace_decision(QStringLiteral("drag-inactive"));
+        return;
+    }
+
+    position = grid_position_for_local_point(
+        m_private->render_snapshot,
+        m_private->cell_metrics,
+        event->position());
+    viewport_position = position;
 
     if (m_private->selection_drag_cancelled) {
         event->accept();
@@ -4533,8 +4561,6 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
             m_private->row_timestamp_tooltip_timer.start();
         }
     }
-    drain_backend_callback_events();
-
     if (m_mouse_reporting_policy == Mouse_reporting_policy::DISABLED ||
         m_private->session       == nullptr                          ||
         local_selection_override(event->modifiers()))
@@ -4550,15 +4576,23 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
         return;
     }
 
-    const term::Terminal_mouse_event_result mouse_result =
-        m_private->session->write_mouse_event({
+    if (!snapshot_has_terminal_mouse_tracking(m_private->render_snapshot)) {
+        return;
+    }
+
+    const std::optional<term::Terminal_mouse_event_result> mouse_result =
+        m_private->session->try_write_mouse_event_without_backend_drain_if_callbacks_empty({
             term::Terminal_mouse_event_kind::MOVE,
             term::Terminal_mouse_button::NONE,
             position->row,
             position->column,
             event->modifiers(),
         });
-    if (!mouse_result.handled) {
+    if (!mouse_result.has_value()) {
+        event->accept();
+        return;
+    }
+    if (!mouse_result->handled) {
         if (snapshot_has_terminal_mouse_tracking(m_private->render_snapshot) &&
             !snapshot_has_sgr_mouse_reporting(m_private->render_snapshot))
         {
@@ -4569,8 +4603,8 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
 
     event->accept();
     sync_from_session();
-    if (!is_accepted(mouse_result.result.code)) {
-        report_result_failure(mouse_result.result);
+    if (!is_accepted(mouse_result->result.code)) {
+        report_result_failure(mouse_result->result);
     }
 }
 
@@ -5670,7 +5704,7 @@ void VNM_TerminalSurface::drain_backend_callback_events()
 
 void VNM_TerminalSurface::drain_backend_callback_events_for_posted_work()
 {
-    drain_backend_callback_events_for(k_backend_callback_drain_budget);
+    drain_backend_callback_events_for(k_backend_callback_posted_drain_budget);
 }
 
 void VNM_TerminalSurface::sync_after_user_input(bool input_accepted)
@@ -5743,7 +5777,13 @@ void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
     else {
         session->process_backend_callback_events();
     }
-    sync_from_session();
+    // Time-sliced drains may publish intermediate render snapshots, but public
+    // notifications stay queued until the slice reaches a boundary so the
+    // session's coalescing contract is not split by pump cadence.
+    const bool deliver_notifications =
+        !budget.has_value() ||
+        backend_drain_reached_notification_boundary(drain_complete, *session);
+    sync_from_session(deliver_notifications);
     if (trace_drain) {
         const std::optional<term::terminal_selection_source_identity_t> after_source =
             m_private->session != nullptr
@@ -5793,7 +5833,7 @@ void VNM_TerminalSurface::refresh_active_session_geometry()
     }
 }
 
-void VNM_TerminalSurface::sync_from_session()
+void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
 {
     Q_ASSERT(thread() == QThread::currentThread());
     VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session");
@@ -5883,7 +5923,7 @@ void VNM_TerminalSurface::sync_from_session()
         }
     }
 
-    {
+    if (deliver_notifications) {
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::notifications");
 
         const std::vector<term::Terminal_session_notification> notifications =
@@ -5936,25 +5976,32 @@ void VNM_TerminalSurface::handle_synchronized_output_recovery_timeout(
 
     term::Terminal_session* const session = m_private->session.get();
     const bool drain_complete = session->process_backend_callback_events_for(budget);
-    sync_from_session();
-    if (m_private->session.get() != session ||
-        !session->render_publication_blocked())
-    {
+    const bool deliver_notifications =
+        backend_drain_reached_notification_boundary(drain_complete, *session);
+    sync_from_session(deliver_notifications);
+    if (m_private->session.get() != session) {
+        return;
+    }
+
+    const auto queue_remaining_callbacks = [&] {
+        if (!drain_complete && session->has_pending_backend_callback_events()) {
+            queue_backend_callback_drain();
+        }
+    };
+
+    if (!session->render_publication_blocked()) {
+        queue_remaining_callbacks();
         return;
     }
 
     const term::Terminal_session_result result =
         session->force_release_synchronized_output_without_backend_drain();
-    sync_from_session();
-    if (!drain_complete &&
-        m_private->session.get() == session &&
-        session->has_pending_backend_callback_events())
-    {
-        queue_backend_callback_drain();
-    }
+    sync_from_session(deliver_notifications);
     if (m_private->session.get() != session) {
         return;
     }
+
+    queue_remaining_callbacks();
 
     if (!is_accepted(result.code)) {
         report_result_failure(result);

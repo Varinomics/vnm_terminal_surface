@@ -2519,6 +2519,23 @@ Terminal_mouse_event_result Terminal_session::write_mouse_event(Terminal_mouse_e
     return write_mouse_event_locked(event, Backend_callback_drain_policy::DRAIN_CALLBACKS);
 }
 
+std::optional<Terminal_mouse_event_result>
+Terminal_session::try_write_mouse_event_without_backend_drain_if_callbacks_empty(
+    Terminal_mouse_event event)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    if (!m_pending_commands.empty() ||
+        m_callback_lifetime->has_pending_or_active_callbacks())
+    {
+        return std::nullopt;
+    }
+
+    return write_mouse_event_locked(
+        event,
+        Backend_callback_drain_policy::KEEP_CALLBACKS_QUEUED);
+}
+
 Terminal_mouse_event_result Terminal_session::write_mouse_event_locked(
     Terminal_mouse_event               event,
     Backend_callback_drain_policy      drain_policy)

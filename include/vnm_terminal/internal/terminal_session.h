@@ -268,6 +268,12 @@ public:
 
     Terminal_mouse_event_result write_mouse_event(
         Terminal_mouse_event       event);
+    // Writes a terminal mouse report without draining backend callbacks only
+    // when callback ingress is empty under the session lock. Returns std::nullopt
+    // without writing when pending callbacks could make mouse protocol state stale.
+    std::optional<Terminal_mouse_event_result>
+        try_write_mouse_event_without_backend_drain_if_callbacks_empty(
+            Terminal_mouse_event   event);
 
     Terminal_ime_commit_result write_ime_commit(
         QString                    text);

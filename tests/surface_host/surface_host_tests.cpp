@@ -9571,6 +9571,15 @@ bool test_stale_synchronized_output_recovery_force_releases_after_budgeted_catch
     Surface_fixture fixture;
     pump_events(app);
 
+    int title_changed_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::terminal_title_changed,
+        &fixture.surface,
+        [&] {
+            ++title_changed_count;
+        });
+
     auto backend = std::make_unique<Scripted_backend>();
     bool started = false;
     Scripted_backend* backend_ptr = start_surface_with_backend(
@@ -9581,6 +9590,7 @@ bool test_stale_synchronized_output_recovery_force_releases_after_budgeted_catch
     ok &= check(started, "budgeted stale recovery surface starts");
 
     QByteArray output = QByteArrayLiteral("\x1b[?2026h");
+    output += QByteArrayLiteral("\x1b]2;surface-stale-partial-title\a");
     for (int i = 0; i < 180; ++i) {
         output += QByteArrayLiteral("\r\nsurface-repaint-fill");
     }
@@ -9603,6 +9613,8 @@ bool test_stale_synchronized_output_recovery_force_releases_after_budgeted_catch
     ok &= check(released_snapshot != nullptr &&
         !snapshot_contains_text(*released_snapshot, QStringLiteral("surface-tail-after-timeout")),
         "budgeted stale recovery does not drain the full backend output during timeout");
+    ok &= check_int_equal(title_changed_count, 0,
+        "budgeted stale recovery defers partial-drain title notifications");
     ok &= check(term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
         fixture.surface),
         "budgeted stale recovery reposts remaining backend output");
@@ -9614,6 +9626,11 @@ bool test_stale_synchronized_output_recovery_force_releases_after_budgeted_catch
             snapshot_contains_text(*snapshot, QStringLiteral("surface-tail-after-timeout"));
     }),
         "budgeted stale recovery drains remaining output through posted GUI work");
+    ok &= check_int_equal(title_changed_count, 1,
+        "budgeted stale recovery delivers deferred title notification after drain boundary");
+    ok &= check(fixture.surface.terminal_title() ==
+        QStringLiteral("surface-stale-partial-title"),
+        "budgeted stale recovery preserves deferred title notification payload");
 
     return ok;
 }
@@ -11322,6 +11339,82 @@ bool test_worker_callback_drains_on_gui_thread(QGuiApplication& app)
     return ok;
 }
 
+bool test_hover_move_does_not_drain_queued_backend_output(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_row_timestamp_tooltip_enabled(false);
+    pump_events(app);
+
+    int activity_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::output_activity,
+        &fixture.surface,
+        [&] {
+            ++activity_count;
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1003;1006hhover-baseline"),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "hover queued-drain surface starts");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("hover-baseline")),
+        "hover queued-drain publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+    const int baseline_activity_count = activity_count;
+    const std::size_t baseline_write_count = backend_ptr->writes.size();
+
+    backend_ptr->emit_output_from_worker(QByteArrayLiteral("\r\nhover-worker-output"));
+    backend_ptr->join_worker();
+    ok &= check(activity_count == baseline_activity_count,
+        "hover queued-drain does not emit activity on the worker callback thread");
+    ok &= check(term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
+        fixture.surface),
+        "hover queued-drain has pending GUI drain work before hover");
+
+    ok &= send_hover_move(
+        fixture.surface,
+        QPointF(1.0, 1.0),
+        Qt::NoModifier,
+        true,
+        "hover queued-drain hover move is accepted while mouse reporting is published");
+    ok &= check(backend_ptr->writes.size() == baseline_write_count,
+        "hover queued-drain hover move writes no stale mouse report while callbacks are pending");
+    const std::shared_ptr<const term::Terminal_render_snapshot> hover_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(hover_snapshot != nullptr &&
+        hover_snapshot->metadata.sequence == baseline_snapshot->metadata.sequence &&
+        !snapshot_contains_text(*hover_snapshot, QStringLiteral("hover-worker-output")),
+        "hover queued-drain hover move does not publish queued backend output");
+    ok &= check(activity_count == baseline_activity_count,
+        "hover queued-drain hover move does not drain backend callbacks");
+
+    ok &= check(pump_until(app, [&] {
+        const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        return snapshot != nullptr &&
+            snapshot_contains_text(*snapshot, QStringLiteral("hover-worker-output"));
+    }),
+        "hover queued-drain event loop publishes queued backend output without hover");
+
+    return ok;
+}
+
 bool test_heap_surface_destroy_closes_queued_worker_callback(QGuiApplication& app)
 {
     bool ok = true;
@@ -11864,7 +11957,7 @@ bool test_notification_burst_uses_durable_channel(QGuiApplication& app)
     backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 5});
     pump_events(app);
 
-    ok &= check(title_changed_count == 1,
+    ok &= check_int_equal(title_changed_count, 1,
         "durable notification drain coalesces title burst for GUI delivery");
     ok &= check(fixture.surface.terminal_title() ==
         QStringLiteral("burst-title-%1").arg(k_title_notification_count - 1),
@@ -12085,6 +12178,7 @@ int main(int argc, char** argv)
     ok &= test_keyboard_no_session_and_post_exit_semantics(app);
     ok &= test_keyboard_unhandled_key_skips_backend_drain(app);
     ok &= test_worker_callback_drains_on_gui_thread(app);
+    ok &= test_hover_move_does_not_drain_queued_backend_output(app);
     ok &= test_heap_surface_destroy_closes_queued_worker_callback(app);
     ok &= test_window_destroy_keeps_surface_session_until_surface_destroy(app);
     ok &= test_geometry_change_resizes_session(app);
