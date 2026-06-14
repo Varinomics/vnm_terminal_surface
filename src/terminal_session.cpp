@@ -4994,7 +4994,8 @@ bool Terminal_session::process_backend_callback_events_for(
 }
 
 bool Terminal_session::process_backend_callback_events_until_epoch(
-    std::uint64_t target_epoch)
+    std::uint64_t                                      target_epoch,
+    std::optional<std::chrono::steady_clock::duration> budget)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
@@ -5004,9 +5005,16 @@ bool Terminal_session::process_backend_callback_events_until_epoch(
         return true;
     }
 
+    Backend_callback_drain_deadline deadline = std::nullopt;
+    if (budget.has_value()) {
+        const std::chrono::steady_clock::duration zero =
+            std::chrono::steady_clock::duration::zero();
+        deadline = std::chrono::steady_clock::now() + std::max(*budget, zero);
+    }
+
     return process_pending_commands(
         Backend_callback_drain_policy::DRAIN_CALLBACKS,
-        std::nullopt,
+        deadline,
         target_epoch);
 }
 

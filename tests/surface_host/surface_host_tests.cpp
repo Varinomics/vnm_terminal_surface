@@ -620,6 +620,15 @@ QByteArray repeated_scroll_lines(int count, const QByteArray& line)
 }
 
 constexpr std::chrono::milliseconds k_posted_drain_budget_probe_write_delay{8};
+constexpr qsizetype k_epoch_catchup_budget_probe_payload_bytes = 8192;
+
+QByteArray epoch_catchup_budget_probe_payload(const QByteArray& tail_output)
+{
+    QByteArray bytes(k_epoch_catchup_budget_probe_payload_bytes, 'x');
+    bytes += QByteArrayLiteral("\r\n");
+    bytes += tail_output;
+    return bytes;
+}
 
 struct Scripted_backend_lifecycle_state
 {
@@ -1802,6 +1811,107 @@ bool test_surface_posted_backend_drain_uses_frame_pending_small_budget(
 
     term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
         fixture.surface);
+
+    return ok;
+}
+
+bool test_surface_epoch_catchup_uses_frame_budget_override(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("epoch-catchup-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface epoch catch-up budget test starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("epoch-catchup-baseline")),
+        "surface epoch catch-up budget test publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "surface epoch catch-up budget test captures baseline");
+
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_budget_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    const QString tail_text = QStringLiteral("epoch-catchup-tail");
+    backend_ptr->emit_output(epoch_catchup_budget_probe_payload(tail_text.toUtf8()));
+    const std::uint64_t target_epoch =
+        term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+            fixture.surface);
+
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+
+    const term::Terminal_surface_backend_drain_stats_t stats_after_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot_after_polish =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    const std::uint64_t processed_epoch_after_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+            fixture.surface);
+
+    ok &= check(
+        stats_after_polish.budgeted_drain_calls ==
+            stats_before_polish.budgeted_drain_calls + 1U,
+        "surface epoch catch-up budget test counts polish catch-up as budgeted");
+    ok &= check(
+        stats_after_polish.unbudgeted_drain_calls ==
+            stats_before_polish.unbudgeted_drain_calls,
+        "surface epoch catch-up budget test does not use an unbudgeted epoch drain");
+    ok &= check(
+        stats_after_polish.budget_exhausted_incomplete ==
+            stats_before_polish.budget_exhausted_incomplete + 1U,
+        "surface epoch catch-up budget test exhausts the frame catch-up budget");
+    ok &= check(
+        stats_after_polish.pending_callback_after_drain ==
+            stats_before_polish.pending_callback_after_drain + 1U,
+        "surface epoch catch-up budget test leaves callback work pending");
+    ok &= check(
+        stats_after_polish.requeue_count ==
+            stats_before_polish.requeue_count + 1U,
+        "surface epoch catch-up budget test requeues incomplete epoch work");
+    ok &= check(
+        processed_epoch_after_polish < target_epoch,
+        "surface epoch catch-up budget test stops before the target callback epoch");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) > 0U,
+        "surface epoch catch-up budget test leaves the sliced output pending");
+    ok &= check(snapshot_after_polish != nullptr &&
+        !snapshot_contains_text(*snapshot_after_polish, tail_text),
+        "surface epoch catch-up budget test does not publish the delayed tail");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot_after_drain =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(snapshot_after_drain != nullptr &&
+        snapshot_contains_text(*snapshot_after_drain, tail_text),
+        "surface epoch catch-up budget test publishes tail after full drain");
 
     return ok;
 }
@@ -12703,6 +12813,7 @@ int main(int argc, char** argv)
     ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
     ok &= test_surface_backend_drain_metrics_split_stages(app);
     ok &= test_surface_posted_backend_drain_uses_frame_pending_small_budget(app);
+    ok &= test_surface_epoch_catchup_uses_frame_budget_override(app);
     ok &= test_surface_posted_backend_drain_uses_full_budget_without_frame_work(app);
     ok &= test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(app);
     ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
