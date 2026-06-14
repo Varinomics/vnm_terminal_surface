@@ -458,6 +458,14 @@ private:
         int                             viewport_row = 0;
     };
 
+    struct Deferred_backend_content_snapshot
+    {
+        Terminal_screen_model_result        model_result;
+        Terminal_public_scroll_diagnostics public_scroll_diagnostics;
+        QString                            message;
+        std::uint64_t                      sequence = 0U;
+    };
+
     Terminal_session_result enqueue_command(
         Terminal_session_command   command);
 
@@ -579,6 +587,14 @@ private:
     void ingest_backend_output_segment(
         std::uint64_t              sequence,
         QByteArrayView             bytes);
+
+    void defer_backend_content_snapshot(
+        std::uint64_t                          sequence,
+        QString                                message,
+        const Terminal_screen_model_result&    model_result,
+        Terminal_public_scroll_diagnostics     public_scroll_diagnostics);
+
+    void flush_deferred_backend_content_snapshot();
 
     bool handle_parser_actions(
         std::uint64_t                          sequence,
@@ -786,6 +802,7 @@ private:
     Terminal_public_viewport_controller                    m_public_viewport_controller;
     std::optional<Terminal_screen_model_result>            m_last_model_ingest_result;
     std::optional<Terminal_screen_model_result>            m_render_snapshot_model_result;
+    std::optional<Deferred_backend_content_snapshot>       m_deferred_backend_content_snapshot;
     std::optional<Terminal_backend_exit>                   m_exit_status;
     Ime_preedit_state                                      m_ime_preedit;
     Terminal_process_state                     m_process_state =
@@ -812,6 +829,7 @@ private:
     bool                                                   m_backend_geometry_in_sync = false;
     bool                                                   m_output_backpressure_active = false;
     bool                                                   m_processing_commands = false;
+    bool                                                   m_backend_content_snapshot_deferral_active = false;
     bool                                                   m_backend_error_queued_during_command = false;
     bool                                                   m_stop_requested = false;
     std::uint64_t                                          m_stop_requested_sequence = 0U;

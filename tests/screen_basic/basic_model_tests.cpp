@@ -27,6 +27,16 @@ QByteArray bytes_from_hex(const char* hex)
     return QByteArray::fromHex(hex);
 }
 
+QByteArray repeated_bytes(const QByteArray& unit, int count)
+{
+    QByteArray bytes;
+    bytes.reserve(unit.size() * count);
+    for (int index = 0; index < count; ++index) {
+        bytes += unit;
+    }
+    return bytes;
+}
+
 const term::Terminal_render_cell& snapshot_cell_at_index(
     const term::Terminal_render_snapshot&  snapshot,
     std::size_t                            index)
@@ -495,6 +505,223 @@ bool test_printable_ascii_span_semantics()
         0,
         1U,
         "styled ASCII space span keeps current background");
+
+    return ok;
+}
+
+bool test_single_width_bmp_span_semantics()
+{
+    bool ok = true;
+
+    const QByteArray block_bytes       = bytes_from_hex("e29688");
+    const QByteArray shade_bytes       = bytes_from_hex("e29691");
+    const QByteArray e_acute_bytes     = bytes_from_hex("c3a9");
+    const QByteArray n_tilde_bytes     = bytes_from_hex("c3b1");
+    const QByteArray o_slash_bytes     = bytes_from_hex("c3b8");
+    const QByteArray ae_bytes          = bytes_from_hex("c3a6");
+    const QByteArray deseret_bytes     = bytes_from_hex("f0909080");
+    const QByteArray four_blocks       = repeated_bytes(block_bytes, 4);
+    const QByteArray four_shades       = repeated_bytes(shade_bytes, 4);
+    const QString    block             = QString::fromUtf8(block_bytes);
+    const QString    shade             = QString::fromUtf8(shade_bytes);
+    const QString    e_acute           = QString::fromUtf8(e_acute_bytes);
+    const QString    n_tilde           = QString::fromUtf8(n_tilde_bytes);
+    const QString    o_slash           = QString::fromUtf8(o_slash_bytes);
+    const QString    ae                = QString::fromUtf8(ae_bytes);
+    const QString    expected_blocks   = QString::fromUtf8(four_blocks);
+    const QString    expected_shades   = QString::fromUtf8(four_shades);
+
+    term::Terminal_screen_model model = make_model(2, 4);
+    term::Terminal_screen_model_result result = model.ingest(four_blocks);
+    ok &= check(diagnostic_count(result) == 0, "BMP block span has no diagnostics");
+    ok &= check(result.dirty_rows.size() == 1U && result.dirty_rows[0] == 0,
+        "BMP block span dirties only the written row");
+    ok &= check(model.row_text(0) == expected_blocks,
+        "BMP block span fills the row");
+
+    term::Terminal_render_snapshot snapshot = model.render_snapshot(42U);
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "BMP block span snapshot validates");
+    ok &= check(snapshot.cells.size() == 4U, "BMP block span emits four occupied cells");
+    for (int column = 0; column < 4; ++column) {
+        const term::Terminal_render_cell& cell =
+            snapshot_cell_at_index(snapshot, static_cast<std::size_t>(column));
+        ok &= check(cell.position.row == 0 &&
+                cell.position.column == column &&
+                cell.text == block &&
+                cell.text_category == term::Terminal_render_cell_text_category::NON_ASCII &&
+                cell.display_width == 1 &&
+                !cell.wide_continuation,
+            "BMP block span cell stores one single-width non-ASCII BMP character");
+    }
+
+    result = model.ingest(QByteArrayLiteral("\r") + four_shades);
+    ok &= check(diagnostic_count(result) == 0, "BMP shade overwrite has no diagnostics");
+    ok &= check(result.dirty_rows.size() == 1U && result.dirty_rows[0] == 0,
+        "BMP shade overwrite dirties only the rewritten row");
+    ok &= check(model.row_text(0) == expected_shades,
+        "BMP shade overwrite replaces the full row");
+
+    const QByteArray mixed_bmp_bytes =
+        block_bytes + e_acute_bytes + shade_bytes + n_tilde_bytes;
+    const QString mixed_bmp_text = QString::fromUtf8(mixed_bmp_bytes);
+    term::Terminal_screen_model mixed_bmp_model = make_model(1, 4);
+    result = mixed_bmp_model.ingest(mixed_bmp_bytes);
+    ok &= check(diagnostic_count(result) == 0, "mixed BMP span has no diagnostics");
+    ok &= check(mixed_bmp_model.row_text(0) == mixed_bmp_text,
+        "mixed BMP span preserves exact row text");
+    snapshot = mixed_bmp_model.render_snapshot(46U);
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "mixed BMP span snapshot validates");
+    ok &= check(snapshot.cells.size() == 4U, "mixed BMP span emits four occupied cells");
+    ok &= check(
+        snapshot_cell_at_index(snapshot, 0U).text == block &&
+            snapshot_cell_at_index(snapshot, 1U).text == e_acute &&
+            snapshot_cell_at_index(snapshot, 2U).text == shade &&
+            snapshot_cell_at_index(snapshot, 3U).text == n_tilde,
+        "mixed BMP span stores distinct per-cell text");
+
+    term::Terminal_screen_model bmp_wrap_model = make_model(2, 4);
+    term::Terminal_screen_model scalar_wrap_model = make_model(2, 4);
+    const QByteArray five_blocks            = repeated_bytes(block_bytes, 5);
+    const QByteArray five_scalar_references = repeated_bytes(deseret_bytes, 5);
+    const term::Terminal_screen_model_result bmp_wrap_result =
+        bmp_wrap_model.ingest(five_blocks);
+    const term::Terminal_screen_model_result scalar_wrap_result =
+        scalar_wrap_model.ingest(five_scalar_references);
+    ok &= check(diagnostic_count(bmp_wrap_result) == 0 &&
+            diagnostic_count(scalar_wrap_result) == 0,
+        "BMP and scalar single-width wrap references have no diagnostics");
+    ok &= check(bmp_wrap_model.row_text(0) == expected_blocks &&
+            bmp_wrap_model.row_text(1) == block,
+        "BMP block span wraps after the row boundary");
+    ok &= check(scalar_wrap_model.row_text(0) == QString::fromUtf8(
+                repeated_bytes(deseret_bytes, 4)) &&
+            scalar_wrap_model.row_text(1) == QString::fromUtf8(deseret_bytes),
+        "surrogate scalar reference wraps after the row boundary");
+    ok &= check(bmp_wrap_model.cursor_position().row ==
+                scalar_wrap_model.cursor_position().row &&
+            bmp_wrap_model.cursor_position().column ==
+                scalar_wrap_model.cursor_position().column &&
+            bmp_wrap_result.dirty_rows == scalar_wrap_result.dirty_rows,
+        "BMP block span row-boundary state matches scalar single-width text");
+
+    const QByteArray no_wrap_clipped_bytes =
+        block_bytes + e_acute_bytes + shade_bytes + n_tilde_bytes + o_slash_bytes + ae_bytes;
+    const QString no_wrap_clipped_text = block + e_acute + shade + ae;
+    term::Terminal_screen_model no_wrap_model = make_model(2, 4);
+    const std::uint64_t no_wrap_initial_generation =
+        no_wrap_model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0).content_generation;
+    result = no_wrap_model.ingest(QByteArrayLiteral("\x1b[?7l") + no_wrap_clipped_bytes);
+    ok &= check(diagnostic_count(result) == 0,
+        "BMP no-autowrap clipped span has no diagnostics");
+    ok &= check(no_wrap_model.row_text(0) == no_wrap_clipped_text,
+        "BMP no-autowrap clipped span writes prefix and right margin");
+    ok &= check(no_wrap_model.row_text(1).isEmpty(),
+        "BMP no-autowrap clipped span does not wrap");
+    ok &= check(no_wrap_model.cursor_position().row == 0 &&
+            no_wrap_model.cursor_position().column == 3,
+        "BMP no-autowrap clipped span keeps cursor at right margin");
+    const std::uint64_t no_wrap_clipped_generation =
+        no_wrap_model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0).content_generation;
+    ok &= check(no_wrap_clipped_generation == no_wrap_initial_generation + 1U,
+        "BMP no-autowrap clipped span advances generation once");
+
+    result = no_wrap_model.ingest(QByteArrayLiteral("\r") + no_wrap_clipped_bytes);
+    ok &= check(diagnostic_count(result) == 0,
+        "idempotent BMP no-autowrap clipped rewrite has no diagnostics");
+    ok &= check(no_wrap_model.row_text(0) == no_wrap_clipped_text,
+        "idempotent BMP no-autowrap clipped rewrite preserves row text");
+    ok &= check(no_wrap_model.retained_line_provenance_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                0).content_generation == no_wrap_clipped_generation,
+        "idempotent BMP no-autowrap clipped rewrite preserves row generation");
+
+    const QByteArray changed_prefix_clipped_bytes =
+        block_bytes + o_slash_bytes + shade_bytes + n_tilde_bytes + o_slash_bytes + ae_bytes;
+    const QString changed_prefix_clipped_text = block + o_slash + shade + ae;
+    result = no_wrap_model.ingest(QByteArrayLiteral("\r") + changed_prefix_clipped_bytes);
+    ok &= check(diagnostic_count(result) == 0,
+        "changed-prefix BMP no-autowrap clipped rewrite has no diagnostics");
+    ok &= check(no_wrap_model.row_text(0) == changed_prefix_clipped_text,
+        "changed-prefix BMP no-autowrap clipped rewrite updates row text");
+    const std::uint64_t changed_prefix_generation =
+        no_wrap_model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0).content_generation;
+    ok &= check(changed_prefix_generation == no_wrap_clipped_generation + 1U,
+        "changed-prefix BMP no-autowrap clipped rewrite advances generation");
+
+    const QByteArray changed_margin_clipped_bytes =
+        block_bytes + o_slash_bytes + shade_bytes + n_tilde_bytes + o_slash_bytes + e_acute_bytes;
+    const QString changed_margin_clipped_text = block + o_slash + shade + e_acute;
+    result = no_wrap_model.ingest(QByteArrayLiteral("\r") + changed_margin_clipped_bytes);
+    ok &= check(diagnostic_count(result) == 0,
+        "changed-margin BMP no-autowrap clipped rewrite has no diagnostics");
+    ok &= check(no_wrap_model.row_text(0) == changed_margin_clipped_text,
+        "changed-margin BMP no-autowrap clipped rewrite updates row text");
+    ok &= check(no_wrap_model.retained_line_provenance_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                0).content_generation == changed_prefix_generation + 1U,
+        "changed-margin BMP no-autowrap clipped rewrite advances generation");
+
+    term::Terminal_screen_model wide_base_model = make_model(1, 5);
+    result = wide_base_model.ingest(bytes_from_hex("e4b880") + QByteArrayLiteral("AB"));
+    ok &= check(diagnostic_count(result) == 0, "wide base setup has no diagnostics");
+    result = wide_base_model.ingest(QByteArrayLiteral("\r") + block_bytes);
+    ok &= check(diagnostic_count(result) == 0, "BMP overwrite of wide base has no diagnostics");
+    ok &= check(wide_base_model.row_text(0) == block + QStringLiteral(" AB"),
+        "BMP overwrite of wide base clears the old continuation cell");
+    ok &= check(term::validate_render_snapshot(wide_base_model.render_snapshot(43U)).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "BMP overwrite of wide base snapshot validates");
+
+    term::Terminal_screen_model wide_continuation_model = make_model(1, 5);
+    result = wide_continuation_model.ingest(bytes_from_hex("e4b880") + QByteArrayLiteral("AB"));
+    ok &= check(diagnostic_count(result) == 0, "wide continuation setup has no diagnostics");
+    result = wide_continuation_model.ingest(QByteArrayLiteral("\x1b[1;2H") + block_bytes);
+    ok &= check(diagnostic_count(result) == 0,
+        "BMP overwrite of wide continuation has no diagnostics");
+    ok &= check(wide_continuation_model.row_text(0) == QStringLiteral(" ") + block +
+            QStringLiteral("AB"),
+        "BMP overwrite of wide continuation clears the old wide base cell");
+    ok &= check(term::validate_render_snapshot(
+            wide_continuation_model.render_snapshot(44U)).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "BMP overwrite of wide continuation snapshot validates");
+
+    term::Terminal_screen_model style_generation_model = make_model(1, 4);
+    const std::uint64_t initial_generation =
+        style_generation_model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0).content_generation;
+    result = style_generation_model.ingest(QByteArrayLiteral("\x1b[41m") + four_blocks);
+    ok &= check(diagnostic_count(result) == 0, "styled BMP span has no diagnostics");
+    const std::uint64_t written_generation =
+        style_generation_model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0).content_generation;
+    ok &= check(written_generation == initial_generation + 1U,
+        "styled BMP span advances generation once for changed content");
+    snapshot = style_generation_model.render_snapshot(45U);
+    ok &= check_cell_background_palette(
+        snapshot,
+        0,
+        0,
+        1U,
+        "styled BMP span keeps current background");
+    result = style_generation_model.ingest(QByteArrayLiteral("\r") + four_blocks);
+    ok &= check(diagnostic_count(result) == 0, "idempotent BMP rewrite has no diagnostics");
+    ok &= check(style_generation_model.retained_line_provenance_for_testing(
+                term::Terminal_buffer_id::PRIMARY,
+                0).content_generation == written_generation,
+        "idempotent BMP rewrite preserves row content generation");
 
     return ok;
 }
@@ -1683,6 +1910,7 @@ int main()
     ok &= test_structural_action_retention_can_be_disabled();
     ok &= test_printable_controls_wrap_and_scrollback();
     ok &= test_printable_ascii_span_semantics();
+    ok &= test_single_width_bmp_span_semantics();
     ok &= test_erase_uses_current_style_for_blank_cells();
     ok &= test_utf8_replacement_and_snapshot();
     ok &= test_unicode_width_model();

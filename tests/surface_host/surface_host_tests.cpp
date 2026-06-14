@@ -27,6 +27,7 @@
 #include <QVariant>
 #include <QWheelEvent>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -579,6 +580,8 @@ QByteArray repeated_scroll_lines(int count, const QByteArray& line)
     return bytes;
 }
 
+constexpr std::chrono::milliseconds k_posted_drain_budget_probe_write_delay{8};
+
 struct Scripted_backend_lifecycle_state
 {
     std::atomic<int> destructed_count{0};
@@ -636,6 +639,12 @@ public:
     term::Terminal_backend_result write(QByteArray bytes) override
     {
         writes.push_back(std::move(bytes));
+        if (write_delay > std::chrono::steady_clock::duration::zero()) {
+            const auto deadline = std::chrono::steady_clock::now() + write_delay;
+            // Stay inside the owner drain without depending on platform sleep granularity.
+            while (std::chrono::steady_clock::now() < deadline) {
+            }
+        }
         if (reject_writes) {
             return
                 term::backend_reject(
@@ -737,6 +746,8 @@ public:
     bool                       running                = false;
     bool                       reject_writes          = false;
     bool                       output_paused          = false;
+    std::chrono::steady_clock::duration
+                               write_delay{};
     std::vector<QByteArray>    outputs_during_start;
     std::vector<QByteArray>    outputs_during_write;
     std::vector<term::Terminal_launch_config>
@@ -785,6 +796,15 @@ Scripted_backend* start_surface_with_backend(
         std::move(backend),
         std::move(argv));
     return backend_ptr;
+}
+
+void queue_posted_drain_budget_probe(
+    Scripted_backend&   backend,
+    QByteArray          tail_output)
+{
+    backend.write_delay          = k_posted_drain_budget_probe_write_delay;
+    backend.outputs_during_write = {std::move(tail_output)};
+    backend.emit_output(QByteArrayLiteral("\x1b[6n"));
 }
 
 bool send_key(
@@ -1399,6 +1419,338 @@ bool test_surface_polish_drains_queued_backend_output_before_render_capture(QGui
         fixture.surface,
         polished_snapshot->metadata.sequence),
         "surface polish drain captures the polished snapshot");
+
+    return ok;
+}
+
+bool test_surface_backend_drain_metrics_split_stages(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("drain-stage-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface drain stage metrics starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("drain-stage-baseline")),
+        "surface drain stage metrics publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "surface drain stage metrics captures baseline before metric checks");
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_unbudgeted =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    backend_ptr->emit_output(QByteArrayLiteral("\r\ndrain-stage-output"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const term::Terminal_surface_backend_drain_stats_t stats_after_unbudgeted =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+
+    ok &= check(
+        stats_after_unbudgeted.unbudgeted_drain_calls ==
+            stats_before_unbudgeted.unbudgeted_drain_calls + 1U,
+        "surface drain stage metrics count the explicit unbudgeted drain");
+    ok &= check(
+        stats_after_unbudgeted.session_processing_calls ==
+            stats_before_unbudgeted.session_processing_calls + 1U,
+        "surface drain stage metrics count session processing stage calls");
+    ok &= check(
+        stats_after_unbudgeted.sync_from_session_calls ==
+            stats_before_unbudgeted.sync_from_session_calls + 1U,
+        "surface drain stage metrics count surface sync stage calls");
+    ok &= check(
+        stats_after_unbudgeted.session_processing_elapsed_ns >=
+            stats_before_unbudgeted.session_processing_elapsed_ns &&
+            stats_after_unbudgeted.sync_from_session_elapsed_ns >=
+                stats_before_unbudgeted.sync_from_session_elapsed_ns,
+        "surface drain stage metrics preserve monotonic stage elapsed counters");
+
+    return ok;
+}
+
+bool test_surface_posted_backend_drain_uses_frame_pending_small_budget(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("posted-small-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface posted small-budget test starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("posted-small-baseline")),
+        "surface posted small-budget test publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "surface posted small-budget test captures baseline");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\r\nposted-small-render-pending"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    const term::Terminal_surface_render_invalidation_stats_t pending_stats =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+    ok &= check(pending_stats.pending_update,
+        "surface posted small-budget test leaves render work pending");
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_posted =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    const QString tail_text = QStringLiteral("posted-small-tail");
+    const QByteArray tail   = QByteArrayLiteral("\r\nposted-small-tail");
+    queue_posted_drain_budget_probe(*backend_ptr, tail);
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events_for_posted_work(
+        fixture.surface);
+    const term::Terminal_surface_backend_drain_stats_t stats_after_posted =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot_after_posted =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+
+    ok &= check(
+        stats_after_posted.posted_drain_calls ==
+            stats_before_posted.posted_drain_calls + 1U,
+        "surface posted small-budget test counts posted drains");
+    ok &= check(
+        stats_after_posted.posted_frame_pending_small_budget_calls ==
+            stats_before_posted.posted_frame_pending_small_budget_calls + 1U,
+        "surface posted small-budget test uses the frame-pending budget");
+    ok &= check(
+        stats_after_posted.posted_full_budget_calls ==
+            stats_before_posted.posted_full_budget_calls,
+        "surface posted small-budget test skips the full posted budget");
+    ok &= check(
+        stats_after_posted.frame_work_pending_drain_calls ==
+            stats_before_posted.frame_work_pending_drain_calls + 1U,
+        "surface posted small-budget test records frame-pending drain stats");
+    ok &= check(
+        stats_after_posted.render_update_pending_drain_calls ==
+            stats_before_posted.render_update_pending_drain_calls + 1U,
+        "surface posted small-budget test records render-update-pending drain stats");
+    ok &= check(
+        stats_after_posted.budget_exhausted_incomplete ==
+            stats_before_posted.budget_exhausted_incomplete + 1U,
+        "surface posted small-budget test exhausts the selected budget");
+    ok &= check(
+        stats_after_posted.pending_callback_after_drain ==
+            stats_before_posted.pending_callback_after_drain + 1U,
+        "surface posted small-budget test leaves callback work pending");
+    ok &= check(
+        stats_after_posted.requeue_count ==
+            stats_before_posted.requeue_count + 1U,
+        "surface posted small-budget test requeues incomplete posted work");
+    ok &= check(snapshot_after_posted != nullptr &&
+        !snapshot_contains_text(*snapshot_after_posted, tail_text),
+        "surface posted small-budget test does not publish the delayed tail");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    return ok;
+}
+
+bool test_surface_posted_backend_drain_uses_full_budget_without_frame_work(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    pump_events(app);
+
+    VNM_TerminalSurface surface;
+    surface.setSize(QSizeF(520.0, 240.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(12.0);
+
+    auto backend = std::make_unique<Scripted_backend>();
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface posted full-budget test starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const term::Terminal_surface_render_invalidation_stats_t ready_stats =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(surface);
+    ok &= check(!ready_stats.pending_update,
+        "surface posted full-budget test starts without pending frame work");
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_posted =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(surface);
+    const QString tail_text = QStringLiteral("posted-full-tail");
+    const QByteArray tail   = QByteArrayLiteral("\r\nposted-full-tail");
+    queue_posted_drain_budget_probe(*backend_ptr, tail);
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events_for_posted_work(
+        surface);
+    const term::Terminal_surface_backend_drain_stats_t stats_after_posted =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot_after_posted =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(surface);
+
+    ok &= check(
+        stats_after_posted.posted_drain_calls ==
+            stats_before_posted.posted_drain_calls + 1U,
+        "surface posted full-budget test counts posted drains");
+    ok &= check(
+        stats_after_posted.posted_full_budget_calls ==
+            stats_before_posted.posted_full_budget_calls + 1U,
+        "surface posted full-budget test uses the full posted budget");
+    ok &= check(
+        stats_after_posted.posted_frame_pending_small_budget_calls ==
+            stats_before_posted.posted_frame_pending_small_budget_calls,
+        "surface posted full-budget test skips the frame-pending budget");
+    ok &= check(
+        stats_after_posted.budget_exhausted_incomplete ==
+            stats_before_posted.budget_exhausted_incomplete,
+        "surface posted full-budget test completes the delayed callback work");
+    ok &= check(
+        stats_after_posted.pending_callback_after_drain ==
+            stats_before_posted.pending_callback_after_drain,
+        "surface posted full-budget test leaves no callback work pending");
+    ok &= check(
+        stats_after_posted.requeue_count ==
+            stats_before_posted.requeue_count,
+        "surface posted full-budget test does not requeue complete posted work");
+    ok &= check(snapshot_after_posted != nullptr &&
+        snapshot_contains_text(*snapshot_after_posted, tail_text),
+        "surface posted full-budget test publishes the delayed tail");
+
+    return ok;
+}
+
+bool test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("posted-atlas-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface posted atlas-budget test starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("posted-atlas-baseline")),
+        "surface posted atlas-budget test publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "surface posted atlas-budget test captures baseline");
+    // The normal render-completion helpers read stats and clear the private latch.
+    // Re-latch the last completed atlas report so the posted drain owns reconciliation.
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::mark_completed_atlas_completion_pending_for_testing(
+            fixture.surface),
+        "surface posted atlas-budget test marks completed atlas work pending");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "surface posted atlas-budget test leaves raw atlas completion pending");
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_posted =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    const QString tail_text = QStringLiteral("posted-atlas-tail");
+    const QByteArray tail   = QByteArrayLiteral("\r\nposted-atlas-tail");
+    queue_posted_drain_budget_probe(*backend_ptr, tail);
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events_for_posted_work(
+        fixture.surface);
+    const term::Terminal_surface_backend_drain_stats_t stats_after_posted =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot_after_posted =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "surface posted atlas-budget test reconciles the completed atlas latch");
+    ok &= check(
+        stats_after_posted.posted_full_budget_calls ==
+            stats_before_posted.posted_full_budget_calls + 1U,
+        "surface posted atlas-budget test uses the full posted budget");
+    ok &= check(
+        stats_after_posted.posted_frame_pending_small_budget_calls ==
+            stats_before_posted.posted_frame_pending_small_budget_calls,
+        "surface posted atlas-budget test skips the stale frame-pending budget");
+    ok &= check(
+        stats_after_posted.frame_work_pending_drain_calls ==
+            stats_before_posted.frame_work_pending_drain_calls,
+        "surface posted atlas-budget test records no stale frame-pending drain");
+    ok &= check(
+        stats_after_posted.atlas_completion_pending_drain_calls ==
+            stats_before_posted.atlas_completion_pending_drain_calls,
+        "surface posted atlas-budget test records no stale atlas-pending drain");
+    ok &= check(
+        stats_after_posted.budget_exhausted_incomplete ==
+            stats_before_posted.budget_exhausted_incomplete,
+        "surface posted atlas-budget test completes the delayed callback work");
+    ok &= check(
+        stats_after_posted.requeue_count ==
+            stats_before_posted.requeue_count,
+        "surface posted atlas-budget test does not requeue after atlas reconciliation");
+    ok &= check(snapshot_after_posted != nullptr &&
+        snapshot_contains_text(*snapshot_after_posted, tail_text),
+        "surface posted atlas-budget test publishes the delayed tail");
 
     return ok;
 }
@@ -12111,6 +12463,10 @@ int main(int argc, char** argv)
     ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
     ok &= test_surface_session_lazy_composer_exercise_remains_opt_in(app);
     ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
+    ok &= test_surface_backend_drain_metrics_split_stages(app);
+    ok &= test_surface_posted_backend_drain_uses_frame_pending_small_budget(app);
+    ok &= test_surface_posted_backend_drain_uses_full_budget_without_frame_work(app);
+    ok &= test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(app);
     ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
     ok &= test_surface_set_render_snapshot_seam_coalesces_on_row_identity(app);
     ok &= test_osc52_clipboard_write_signal_and_deny(app);

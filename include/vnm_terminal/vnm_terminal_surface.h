@@ -21,6 +21,7 @@ class QInputMethodEvent;
 
 namespace vnm_terminal::internal {
 class Terminal_backend;
+class Terminal_session;
 struct Terminal_backend_error;
 struct Terminal_viewport_state;
 struct Terminal_session_notification;
@@ -553,6 +554,23 @@ private:
         QStringList            argv,
         QString                working_directory);
 
+    struct backend_callback_drain_result_t
+    {
+        bool drain_complete                = true;
+        bool deliver_notifications         = true;
+        bool callbacks_pending_after_drain = false;
+    };
+
+    backend_callback_drain_result_t process_backend_callback_events_recorded(
+        vnm_terminal::internal::Terminal_session*
+                               session,
+        std::optional<std::chrono::steady_clock::duration>
+                               budget,
+        bool                   use_budget_notification_boundary);
+    void queue_backend_callback_drain_after_incomplete_recorded_drain(
+        vnm_terminal::internal::Terminal_session*
+                               session,
+        bool                   drain_complete);
     void drain_backend_callback_events();
     void drain_backend_callback_events(bool budgeted);
     void drain_backend_callback_events_for(std::chrono::steady_clock::duration budget);

@@ -27,6 +27,32 @@ struct Terminal_surface_render_invalidation_stats_t
     bool                                    pending_update                  = false;
 };
 
+struct Terminal_surface_backend_drain_stats_t
+{
+    std::uint64_t                           total_drain_calls                    = 0U;
+    std::uint64_t                           budgeted_drain_calls                 = 0U;
+    std::uint64_t                           unbudgeted_drain_calls               = 0U;
+    std::uint64_t                           posted_drain_calls                   = 0U;
+    std::uint64_t                           posted_full_budget_calls             = 0U;
+    std::uint64_t                           posted_frame_pending_small_budget_calls = 0U;
+    std::uint64_t                           budget_exhausted_incomplete          = 0U;
+    std::uint64_t                           total_elapsed_ns                     = 0U;
+    std::uint64_t                           max_elapsed_ns                       = 0U;
+    std::uint64_t                           session_processing_calls             = 0U;
+    std::uint64_t                           session_processing_elapsed_ns        = 0U;
+    std::uint64_t                           session_processing_max_elapsed_ns    = 0U;
+    std::uint64_t                           sync_from_session_calls              = 0U;
+    std::uint64_t                           sync_from_session_elapsed_ns         = 0U;
+    std::uint64_t                           sync_from_session_max_elapsed_ns     = 0U;
+    std::uint64_t                           frame_work_pending_drain_calls       = 0U;
+    std::uint64_t                           frame_work_pending_elapsed_ns        = 0U;
+    std::uint64_t                           render_update_pending_drain_calls    = 0U;
+    std::uint64_t                           atlas_completion_pending_drain_calls = 0U;
+    std::uint64_t                           requeue_count                        = 0U;
+    std::uint64_t                           pending_callback_after_drain         = 0U;
+    std::uint64_t                           output_backpressure_after_drain      = 0U;
+};
+
 struct Render_profile_snapshot_t
 {
     std::uint64_t                           sequence                        = 0U;
@@ -119,6 +145,9 @@ public:
     static void drain_backend_callback_events(
         VNM_TerminalSurface&       surface);
 
+    static void drain_backend_callback_events_for_posted_work(
+        VNM_TerminalSurface&       surface);
+
     static void simulate_update_polish(
         VNM_TerminalSurface&       surface);
 
@@ -141,6 +170,15 @@ public:
 
     static Terminal_surface_render_invalidation_stats_t invalidation_stats(
         const VNM_TerminalSurface& surface);
+
+    static Terminal_surface_backend_drain_stats_t backend_drain_stats(
+        const VNM_TerminalSurface& surface);
+
+    static bool atlas_completion_pending_for_testing(
+        const VNM_TerminalSurface& surface);
+
+    static bool mark_completed_atlas_completion_pending_for_testing(
+        VNM_TerminalSurface&       surface);
 
     static terminal_renderer_stats_t last_renderer_stats(
         const VNM_TerminalSurface& surface);

@@ -633,6 +633,16 @@ private:
         int                            first_column,
         QStringView                    text) const;
 
+    bool single_width_bmp_cell_changes_selection_content(
+        const Terminal_screen_row&     row,
+        int                            column,
+        QChar                          text) const;
+
+    bool single_width_bmp_span_changes_selection_content(
+        const Terminal_screen_row&     row,
+        int                            first_column,
+        QStringView                    text) const;
+
     bool scalar_span_changes_selection_content(
         const Terminal_screen_row&     row,
         terminal_grid_position_t       position,
@@ -691,6 +701,9 @@ private:
     void put_printable_ascii_text(
         QStringView                    text);
 
+    void put_single_width_bmp_text(
+        QStringView                    text);
+
     void write_printable_ascii_span(
         int                            row,
         int                            first_column,
@@ -705,6 +718,21 @@ private:
         Terminal_screen_row&           row,
         int                            column,
         QChar                          text);
+
+    void write_single_width_bmp_span(
+        int                            row,
+        int                            first_column,
+        QStringView                    text);
+
+    void write_single_width_bmp_span_content(
+        Terminal_screen_row&           row,
+        int                            first_column,
+        QStringView                    text);
+
+    void write_single_width_bmp_cell_content(
+        Terminal_screen_row&           row,
+        int                            column,
+        const QString&                 text);
 
     void put_spacing_scalar(
         QString                        text,
@@ -1105,7 +1133,7 @@ private:
                                     m_dirty_row_stats_start_time;
     mutable Terminal_screen_model_profile_stats
                                     m_profile_stats;
-    int                             m_printable_text_profile_depth = 0;
+    int                             m_text_span_profile_depth = 0;
     bool                            m_synchronized_viewport_changed = false;
     bool                            m_synchronized_terminal_content_changed = false;
     bool                            m_synchronized_active_buffer_changed = false;

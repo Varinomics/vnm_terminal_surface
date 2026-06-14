@@ -72,6 +72,17 @@ if(DEFINED make_program AND NOT "${make_program}" STREQUAL "")
     list(APPEND configure_args "-DCMAKE_MAKE_PROGRAM=${make_program}")
 endif()
 
+set(single_config_generator ON)
+if(DEFINED generator AND
+    "${generator}" MATCHES "Visual Studio|Xcode|Multi-Config")
+    set(single_config_generator OFF)
+endif()
+
+if(single_config_generator AND
+    DEFINED install_config AND NOT "${install_config}" STREQUAL "")
+    list(APPEND configure_args "-DCMAKE_BUILD_TYPE=${install_config}")
+endif()
+
 if(DEFINED qt6_dir AND NOT "${qt6_dir}" STREQUAL "")
     list(APPEND configure_args "-DQt6_DIR=${qt6_dir}")
 endif()

@@ -10579,11 +10579,94 @@ bool test_deferred_callback_ingress_merges_adjacent_output()
     return ok;
 }
 
+// Budgeted owner drains slice a BACKEND_OUTPUT command at this byte boundary.
+// The production contract is `k_backend_output_drain_slice_bytes`.
+constexpr qsizetype k_budgeted_output_slice_contract_bytes = 4096;
+
+QByteArray cursor_position_sequence(int row, int column)
+{
+    QByteArray sequence = QByteArrayLiteral("\x1b[");
+    sequence += QByteArray::number(row + 1);
+    sequence += ';';
+    sequence += QByteArray::number(column + 1);
+    sequence += 'H';
+    return sequence;
+}
+
+QByteArray cursor_horizontal_position_sequence(qsizetype byte_count)
+{
+    if (byte_count < 3) {
+        return {};
+    }
+
+    QByteArray sequence = QByteArrayLiteral("\x1b[");
+    if (byte_count > 3) {
+        sequence += QByteArray(byte_count - 4, '0');
+        sequence += '1';
+    }
+    sequence += 'G';
+    return sequence;
+}
+
+QByteArray cursor_horizontal_position_padding(qsizetype byte_count)
+{
+    QByteArray padding;
+    while (byte_count > 0) {
+        qsizetype sequence_size = std::min<qsizetype>(byte_count, 16);
+        const qsizetype remaining_after_max = byte_count - sequence_size;
+        if (remaining_after_max == 1 || remaining_after_max == 2) {
+            sequence_size -= 3;
+        }
+        if (sequence_size < 3) {
+            return {};
+        }
+
+        padding += cursor_horizontal_position_sequence(sequence_size);
+        byte_count -= sequence_size;
+    }
+    return padding;
+}
+
+QByteArray budgeted_dirty_row_slice(int target_row, int neutral_row, QByteArray marker)
+{
+    const QByteArray prefix = cursor_position_sequence(neutral_row, 0);
+
+    QByteArray suffix = cursor_position_sequence(target_row, 0);
+    suffix += marker;
+    suffix += cursor_position_sequence(neutral_row, 0);
+
+    const qsizetype padding_bytes =
+        k_budgeted_output_slice_contract_bytes - prefix.size() - suffix.size();
+    QByteArray slice = prefix;
+    slice += cursor_horizontal_position_padding(padding_bytes);
+    slice += suffix;
+    return slice;
+}
+
+bool dirty_row_ranges_include_row(
+    const std::vector<term::Terminal_render_dirty_row_range>& ranges,
+    int                                                       row)
+{
+    return std::any_of(
+        ranges.begin(),
+        ranges.end(),
+        [row](const term::Terminal_render_dirty_row_range& range) {
+            return row >= range.first_row && row < range.first_row + range.row_count;
+        });
+}
+
+bool dirty_row_ranges_are_full_viewport(
+    const term::Terminal_render_snapshot& snapshot)
+{
+    return
+        snapshot.dirty_row_ranges.size() == 1U                         &&
+        snapshot.dirty_row_ranges.front().first_row == 0                &&
+        snapshot.dirty_row_ranges.front().row_count == snapshot.grid_size.rows;
+}
+
 bool test_budgeted_backend_callback_drain_yields_inside_coalesced_output()
 {
     bool ok = true;
-
-    constexpr qsizetype expected_budgeted_slice_bytes = 4096;
 
     term::Terminal_session_config config;
     config.backend_event_notifier = [] {};
@@ -10614,7 +10697,7 @@ bool test_budgeted_backend_callback_drain_yields_inside_coalesced_output()
     ok &= check(!session->exit_status().has_value(),
         "budgeted backend drain keeps later callback commands behind output remainder");
     ok &= check(first_chunks.size() == 1U &&
-        first_chunks.front().size() == expected_budgeted_slice_bytes,
+        first_chunks.front().size() == k_budgeted_output_slice_contract_bytes,
         "budgeted backend drain processes exactly one bounded output slice first");
 
     bool complete = first_drain_complete;
@@ -10636,6 +10719,133 @@ bool test_budgeted_backend_callback_drain_yields_inside_coalesced_output()
     ok &= check_processed_sequences_are_monotonic(
         *session,
         "budgeted backend drain command trace stays monotonic");
+
+    return ok;
+}
+
+bool test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    const term::Terminal_launch_config launch_config = valid_launch_config();
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "complete coalesced backend drain session starts");
+
+    const int row_a       = 0;
+    const int row_b       = 6;
+    const int row_c       = 12;
+    const int neutral_row = launch_config.initial_grid_size->rows - 1;
+    const QByteArray marker_a = QByteArrayLiteral("slice-row-a");
+    const QByteArray marker_b = QByteArrayLiteral("slice-row-b");
+    const QByteArray marker_c = QByteArrayLiteral("slice-row-c");
+
+    QByteArray output;
+    output += budgeted_dirty_row_slice(row_a, neutral_row, marker_a);
+    output += budgeted_dirty_row_slice(row_b, neutral_row, marker_b);
+    output += budgeted_dirty_row_slice(row_c, neutral_row, marker_c);
+    ok &= check(
+        output.size() == k_budgeted_output_slice_contract_bytes * 3,
+        "complete coalesced backend drain fixture spans three exact budgeted slices");
+
+    const std::uint64_t generation_before_output =
+        session->render_snapshot_generation();
+    session->mark_render_snapshot_synced(generation_before_output);
+    ok &= check(backend->emit_output(output),
+        "complete coalesced backend drain queues large output");
+
+    const bool complete = session->process_backend_callback_events_for(
+        std::chrono::seconds(10));
+    const std::vector<QByteArray> chunks = session->output_chunks();
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(complete && !session->has_pending_backend_callback_events(),
+        "complete coalesced backend drain finishes in one owner drain");
+    ok &= check(chunks.size() == 3U &&
+            chunks[0].size() == k_budgeted_output_slice_contract_bytes &&
+            chunks[1].size() == k_budgeted_output_slice_contract_bytes &&
+            chunks[2].size() == k_budgeted_output_slice_contract_bytes,
+        "complete coalesced backend drain processes three bounded slices");
+    ok &= check(
+        session->render_snapshot_generation() == generation_before_output + 1U,
+        "complete coalesced backend drain publishes one content snapshot for the owner drain");
+    ok &= check(notification_count(
+            *session,
+            term::Terminal_session_notification_kind::SNAPSHOT_READY) == 1U,
+        "complete coalesced backend drain records one snapshot notification");
+    ok &= check(snapshot.has_value() &&
+            snapshot_contains_text(*snapshot, QString::fromLatin1(marker_a)) &&
+            snapshot_contains_text(*snapshot, QString::fromLatin1(marker_b)) &&
+            snapshot_contains_text(*snapshot, QString::fromLatin1(marker_c)),
+        "complete coalesced backend drain snapshot contains all slice row markers");
+    ok &= check(snapshot.has_value() && !dirty_row_ranges_are_full_viewport(*snapshot),
+        "complete coalesced backend drain dirty rows are not masked by a full repaint range");
+    ok &= check(snapshot.has_value() &&
+            dirty_row_ranges_include_row(snapshot->dirty_row_ranges, row_a) &&
+            dirty_row_ranges_include_row(snapshot->dirty_row_ranges, row_b) &&
+            dirty_row_ranges_include_row(snapshot->dirty_row_ranges, row_c),
+        "complete coalesced backend drain dirty-row payload includes all slice-dirtied rows");
+
+    return ok;
+}
+
+bool test_budgeted_backend_callback_drain_coalesces_incomplete_content_snapshot()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "incomplete coalesced backend drain session starts");
+
+    const QByteArray drained_tail   = QByteArrayLiteral("\r\npartial-coalesced-tail\r\n");
+    const QByteArray undrained_tail = QByteArrayLiteral("\r\ncomplete-tail-not-yet-drained");
+    QByteArray output(k_budgeted_output_slice_contract_bytes - drained_tail.size(), 'x');
+    output += drained_tail;
+    output += QByteArray(5000, 'y');
+    output += undrained_tail;
+
+    const std::uint64_t generation_before_output =
+        session->render_snapshot_generation();
+    ok &= check(backend->emit_output(output),
+        "incomplete coalesced backend drain queues large output");
+
+    const bool complete = session->process_backend_callback_events_for(
+        std::chrono::steady_clock::duration::zero());
+    const std::vector<QByteArray> chunks = session->output_chunks();
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(!complete,
+        "incomplete coalesced backend drain yields after one owner drain");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "incomplete coalesced backend drain keeps remaining output queued");
+    ok &= check(chunks.size() == 1U &&
+        chunks.front().size() == k_budgeted_output_slice_contract_bytes,
+        "incomplete coalesced backend drain processes one bounded slice");
+    ok &= check(
+        session->render_snapshot_generation() == generation_before_output + 1U,
+        "incomplete coalesced backend drain publishes one partial snapshot");
+    ok &= check(notification_count(
+            *session,
+            term::Terminal_session_notification_kind::SNAPSHOT_READY) == 1U,
+        "incomplete coalesced backend drain records one partial snapshot notification");
+    ok &= check(snapshot.has_value() &&
+        snapshot_contains_text(*snapshot, QStringLiteral("partial-coalesced-tail")),
+        "incomplete coalesced backend drain exposes latest drained content");
+    ok &= check(snapshot.has_value() &&
+        !snapshot_contains_text(*snapshot, QStringLiteral("complete-tail-not-yet-drained")),
+        "incomplete coalesced backend drain does not expose undrained tail content");
 
     return ok;
 }
@@ -13329,6 +13539,8 @@ int main()
     ok &= test_worker_thread_callback_is_delivered();
     ok &= test_deferred_callback_ingress_merges_adjacent_output();
     ok &= test_budgeted_backend_callback_drain_yields_inside_coalesced_output();
+    ok &= test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot();
+    ok &= test_budgeted_backend_callback_drain_coalesces_incomplete_content_snapshot();
     ok &= test_budgeted_backend_callback_drain_holds_output_command_backpressure();
     ok &= test_deferred_callback_ingress_pauses_backend_at_high_water();
     ok &= test_deferred_callback_ingress_overflow_is_bounded();
