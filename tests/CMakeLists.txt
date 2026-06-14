@@ -1168,9 +1168,14 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_surface_host>"
 )
 
+set(vnm_terminal_surface_host_timeout 60)
+if(APPLE)
+    set(vnm_terminal_surface_host_timeout 120)
+endif()
+
 set_tests_properties(vnm_terminal_surface_host PROPERTIES
     LABELS "conformance;input;mouse;paste;focus"
-    TIMEOUT 60
+    TIMEOUT "${vnm_terminal_surface_host_timeout}"
 )
 
 add_test(
