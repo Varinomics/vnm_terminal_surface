@@ -50,6 +50,7 @@ enum class Terminal_lazy_snapshot_fallback_reason
     STYLE_COLOR_MODE_INCOMPATIBILITY,
     HYPERLINK_NAMESPACE_INCOMPATIBILITY,
     UNSTABLE_DIRTY_ROW_MUTATION_IDENTITY,
+    NO_BORROWABLE_ROWS,
     UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH,
 };
 
@@ -70,6 +71,7 @@ struct Terminal_lazy_snapshot_fallback_reason_counters
     std::uint64_t style_color_mode_incompatibility         = 0U;
     std::uint64_t hyperlink_namespace_incompatibility      = 0U;
     std::uint64_t unstable_dirty_row_mutation_identity     = 0U;
+    std::uint64_t no_borrowable_rows                       = 0U;
     std::uint64_t unsupported_geometry_or_detached_snapshot_path = 0U;
 };
 
@@ -147,6 +149,12 @@ inline constexpr terminal_lazy_snapshot_fallback_reason_descriptor_t
             "lazy_snapshot_fallback_unstable_dirty_row_mutation_identity",
             &Terminal_lazy_snapshot_fallback_reason_counters::
                 unstable_dirty_row_mutation_identity,
+        },
+        {
+            Terminal_lazy_snapshot_fallback_reason::NO_BORROWABLE_ROWS,
+            "no_borrowable_rows",
+            "lazy_snapshot_fallback_no_borrowable_rows",
+            &Terminal_lazy_snapshot_fallback_reason_counters::no_borrowable_rows,
         },
         {
             Terminal_lazy_snapshot_fallback_reason::

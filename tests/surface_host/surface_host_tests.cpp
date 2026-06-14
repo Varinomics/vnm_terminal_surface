@@ -1328,6 +1328,7 @@ bool test_surface_session_lazy_composer_exercise_remains_opt_in(QGuiApplication&
         "surface lazy composer accepts the opt-in sparse content snapshot");
     ok &= check(result.lazy_snapshot.has_value() &&
             result.lazy_snapshot->cells.empty() &&
+            result.lazy_snapshot->cells.capacity() == 0U &&
             result.lazy_snapshot->lazy_row_payloads != nullptr,
         "surface lazy composer result is lazy only after explicit test bridge call");
     const std::uint64_t visible_rows =
