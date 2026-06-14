@@ -11044,6 +11044,88 @@ bool atlas_msdf_resource_stability_render_ok(
     return ok;
 }
 
+bool atlas_msdf_text_path_unsupported_by_adapter(
+    const term::Qsg_atlas_frame_report& report,
+    bool                                software_adapter)
+{
+    const term::Qsg_atlas_render_summary& render = report.render;
+    const bool glyph_fallback_evidence =
+        render.text_renderer_fallback_allowed &&
+        render.text_renderer_fallback_used    &&
+        (render.effective_text_renderer ==
+                term::Terminal_text_renderer_kind::GLYPH ||
+            render.effective_text_renderer ==
+                term::Terminal_text_renderer_kind::MIXED) &&
+        render.glyph_draw_calls > 0;
+
+    return
+        software_adapter                         &&
+        atlas_report_render_state_ready(report)  &&
+        render.msdf_text_renderer_enabled        &&
+        !render.msdf_text_renderer_active        &&
+        glyph_fallback_evidence;
+}
+
+bool atlas_msdf_text_path_skipped(
+    const char*                         label,
+    QQuickWindow&                       window,
+    const term::Qsg_atlas_frame_report& report)
+{
+    if (!atlas_msdf_text_path_unsupported_by_adapter(
+            report,
+            window_uses_known_software_adapter(window)))
+    {
+        return false;
+    }
+
+    std::cerr << "SKIP: " << label << " cannot activate MSDF text on this "
+        << "backend; it falls back to the glyph renderer\n";
+    return true;
+}
+
+bool test_atlas_msdf_text_path_adapter_skip_predicate()
+{
+    term::Qsg_atlas_frame_report report;
+    report.render.msdf_text_renderer_enabled = false;
+
+    bool ok = true;
+    ok &= check(
+        !atlas_msdf_text_path_unsupported_by_adapter(report, true),
+        "MSDF adapter skip predicate rejects disabled MSDF renderer");
+
+    report.render.msdf_text_renderer_enabled = true;
+    ok &= check(
+        !atlas_msdf_text_path_unsupported_by_adapter(report, false),
+        "MSDF adapter skip predicate keeps inactive real-hardware path strict");
+    ok &= check(
+        !atlas_msdf_text_path_unsupported_by_adapter(report, true),
+        "MSDF adapter skip predicate rejects stale software-adapter report");
+
+    report.prepare_count = 1U;
+    report.render_count = 1U;
+    report.drew = true;
+    report.command_buffer_non_null = true;
+    report.render_target_non_null = true;
+    report.rhi_non_null = true;
+    ok &= check(
+        !atlas_msdf_text_path_unsupported_by_adapter(report, true),
+        "MSDF adapter skip predicate requires explicit glyph fallback evidence");
+
+    report.render.effective_text_renderer =
+        term::Terminal_text_renderer_kind::GLYPH;
+    report.render.text_renderer_fallback_used = true;
+    report.render.glyph_draw_calls = 1;
+    ok &= check(
+        atlas_msdf_text_path_unsupported_by_adapter(report, true),
+        "MSDF adapter skip predicate accepts rendered glyph-fallback software path");
+
+    report.render.msdf_text_renderer_active = true;
+    ok &= check(
+        !atlas_msdf_text_path_unsupported_by_adapter(report, true),
+        "MSDF adapter skip predicate keeps active renderer strict");
+    return ok;
+}
+
 enum class Atlas_msdf_steady_buffer_expectation
 {
     SKIPPED,
@@ -11169,6 +11251,13 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         "baseline",
         baseline_report);
     if (!baseline_rendered) {
+        if (atlas_msdf_text_path_skipped(
+                "atlas MSDF resource stability",
+                window,
+                baseline_report))
+        {
+            return true;
+        }
         std::cerr << "FAIL: atlas MSDF resource stability did not reach "
             << "a usable baseline render state\n";
         return false;
@@ -11404,6 +11493,13 @@ bool test_atlas_msdf_zoom_reuses_baked_atlas(QGuiApplication& app)
     const term::Qsg_atlas_frame_report small_report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
     if (!ready_small) {
+        if (atlas_msdf_text_path_skipped(
+                "msdf zoom reuse",
+                window,
+                small_report))
+        {
+            return true;
+        }
         std::cerr << "FAIL: msdf zoom reuse did not reach a usable render "
             << "state at the first size\n";
         return false;
@@ -11504,6 +11600,13 @@ bool test_atlas_msdf_zoom_crosses_bake_bucket(QGuiApplication& app)
     const term::Qsg_atlas_frame_report small_report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
     if (!ready_small) {
+        if (atlas_msdf_text_path_skipped(
+                "msdf zoom bucket-cross",
+                window,
+                small_report))
+        {
+            return true;
+        }
         std::cerr << "FAIL: msdf zoom bucket-cross did not reach a usable "
             << "render state at the small size\n";
         return false;
@@ -19331,6 +19434,7 @@ bool run_unit_tests()
     ok &= test_msdf_text_buffer_fallback_retry_decision();
     ok &= test_msdf_text_prepare_fallback_retry_decision();
     ok &= test_msdf_text_failure_diagnostics_merge();
+    ok &= test_atlas_msdf_text_path_adapter_skip_predicate();
     ok &= test_text_renderer_report_names();
     ok &= test_atlas_budget_stats();
     ok &= test_atlas_warm_set_table_and_shaping();
