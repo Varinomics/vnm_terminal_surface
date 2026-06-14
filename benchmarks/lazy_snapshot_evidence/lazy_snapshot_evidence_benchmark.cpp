@@ -23,7 +23,7 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 constexpr const char* k_schema = "vnm_terminal_lazy_snapshot_evidence_benchmark";
-constexpr int k_schema_version = 3;
+constexpr int k_schema_version = 4;
 
 enum class Case_kind
 {
@@ -1592,18 +1592,17 @@ QJsonObject decision_json(const QString& status, const std::vector<case_result_t
     }
     const bool correctness_ready = status == QStringLiteral("ok");
     const bool capacity_ready = memory_ready(results);
-    const bool enable_ready = correctness_ready && sparse_ready && capacity_ready;
+    const bool evidence_only_ready = correctness_ready && sparse_ready;
 
     QJsonObject observed;
     observed.insert(QStringLiteral("correctness_ready"), correctness_ready);
     observed.insert(QStringLiteral("sparse_reduction_ready"), sparse_ready);
     observed.insert(QStringLiteral("memory_capacity_ready"), capacity_ready);
-    observed.insert(QStringLiteral("enablement_ready"), enable_ready);
+    observed.insert(QStringLiteral("evidence_only_ready"), evidence_only_ready);
+    observed.insert(QStringLiteral("production_enablement_ready"), false);
     observed.insert(
         QStringLiteral("recommendation"),
-        enable_ready
-            ? QStringLiteral("integrate_after_end_to_end_qsg_gate")
-            : QStringLiteral("reject_enablement_keep_evidence"));
+        QStringLiteral("retain_evidence_only_no_production_switch"));
 
     QJsonObject criteria;
     criteria.insert(
@@ -1614,7 +1613,7 @@ QJsonObject decision_json(const QString& status, const std::vector<case_result_t
         QStringLiteral("fallback cases require exact expected reasons; eligible cases require none"));
     criteria.insert(
         QStringLiteral("materialization_counts"),
-        QStringLiteral("publication candidates require zero consumer materialization; parity materialization is separate"));
+        QStringLiteral("evidence candidates require zero consumer materialization; parity materialization is separate"));
     criteria.insert(
         QStringLiteral("borrowed_row_ratio"),
         QStringLiteral("sparse cases must borrow clean rows; full repaint is a no-benefit control"));
@@ -1626,7 +1625,21 @@ QJsonObject decision_json(const QString& status, const std::vector<case_result_t
         QStringLiteral("use timings only after correctness status is ok; do not classify validation failures as performance results"));
     criteria.insert(
         QStringLiteral("memory_capacity"),
-        QStringLiteral("every eligible publication candidate must retain zero lazy flat-cell capacity and total retained lazy capacity below the eager flat-cell capacity, including previous snapshot retention"));
+        QStringLiteral("eligible evidence candidates must retain zero lazy flat-cell capacity; retained previous snapshots currently prevent production enablement"));
+
+    QJsonObject final_state;
+    final_state.insert(QStringLiteral("state"), QStringLiteral("evidence-only"));
+    final_state.insert(
+        QStringLiteral("production_enablement_status"),
+        QStringLiteral("rejected"));
+    final_state.insert(
+        QStringLiteral("production_publication_path"),
+        QStringLiteral("full_snapshot_only"));
+    final_state.insert(
+        QStringLiteral("lazy_composer_reachability"),
+        QStringLiteral("internal_testing_and_benchmark_evidence_api"));
+    final_state.insert(QStringLiteral("default_production_enabled"), false);
+    final_state.insert(QStringLiteral("no_production_switch"), true);
 
     QJsonObject input_echo;
     input_echo.insert(
@@ -1638,10 +1651,11 @@ QJsonObject decision_json(const QString& status, const std::vector<case_result_t
 
     QJsonObject object;
     object.insert(QStringLiteral("observed"), observed);
-    object.insert(QStringLiteral("enable_lazy_publication"), criteria);
+    object.insert(QStringLiteral("evidence_contract"), criteria);
+    object.insert(QStringLiteral("final_lazy_state"), final_state);
     object.insert(
-        QStringLiteral("delete_or_keep_disabled"),
-        QStringLiteral("delete or keep disabled when parity fails, fallback reasons are wrong, materialization is required on the publication path, or sparse reductions do not survive"));
+        QStringLiteral("evidence_only_settlement"),
+        QStringLiteral("lazy composition remains a testing and benchmark evidence fixture; production publication remains full snapshots"));
     object.insert(QStringLiteral("input_echo_event_order_fix"), input_echo);
     return object;
 }
@@ -1865,11 +1879,23 @@ bool validate_decision_contract(const QJsonObject& root, QString* error)
         return false;
     }
 
+    const QJsonObject decision = decision_value.toObject();
+    if (decision.contains(QStringLiteral("enable_lazy_publication"))) {
+        *error = QStringLiteral("stale enable_lazy_publication decision field present");
+        return false;
+    }
+
     const QJsonObject observed = observed_value.toObject();
+    if (observed.contains(QStringLiteral("enablement_ready"))) {
+        *error = QStringLiteral("stale enablement_ready decision field present");
+        return false;
+    }
+
     bool correctness_ready = false;
     bool sparse_reduction_ready = false;
     bool memory_capacity_ready = false;
-    bool enablement_ready = false;
+    bool evidence_only_ready = false;
+    bool production_enablement_ready = false;
     if (!read_bool_field(
             observed,
             QStringLiteral("correctness_ready"),
@@ -1887,8 +1913,13 @@ bool validate_decision_contract(const QJsonObject& root, QString* error)
             error) ||
         !read_bool_field(
             observed,
-            QStringLiteral("enablement_ready"),
-            &enablement_ready,
+            QStringLiteral("evidence_only_ready"),
+            &evidence_only_ready,
+            error) ||
+        !read_bool_field(
+            observed,
+            QStringLiteral("production_enablement_ready"),
+            &production_enablement_ready,
             error))
     {
         return false;
@@ -1899,22 +1930,66 @@ bool validate_decision_contract(const QJsonObject& root, QString* error)
         return false;
     }
 
-    const bool expected_enablement_ready =
-        correctness_ready && sparse_reduction_ready && memory_capacity_ready;
-    if (enablement_ready != expected_enablement_ready) {
+    const bool expected_evidence_only_ready =
+        correctness_ready && sparse_reduction_ready;
+    if (evidence_only_ready != expected_evidence_only_ready) {
         *error =
-            QStringLiteral("enablement_ready is inconsistent with readiness fields");
+            QStringLiteral("evidence_only_ready is inconsistent with readiness fields");
         return false;
     }
 
-    const QString expected_recommendation =
-        enablement_ready
-            ? QStringLiteral("integrate_after_end_to_end_qsg_gate")
-            : QStringLiteral("reject_enablement_keep_evidence");
+    if (production_enablement_ready) {
+        *error = QStringLiteral("production enablement must remain rejected");
+        return false;
+    }
+
+    (void)memory_capacity_ready;
+
     if (observed.value(QStringLiteral("recommendation")).toString() !=
-        expected_recommendation)
+        QStringLiteral("retain_evidence_only_no_production_switch"))
     {
         *error = QStringLiteral("decision recommendation is inconsistent");
+        return false;
+    }
+
+    const QJsonValue final_state_value =
+        decision.value(QStringLiteral("final_lazy_state"));
+    if (!final_state_value.isObject()) {
+        *error = QStringLiteral("missing final_lazy_state object");
+        return false;
+    }
+
+    const QJsonObject final_state = final_state_value.toObject();
+    if (final_state.value(QStringLiteral("state")).toString() !=
+            QStringLiteral("evidence-only") ||
+        final_state.value(QStringLiteral("production_enablement_status")).toString() !=
+            QStringLiteral("rejected") ||
+        final_state.value(QStringLiteral("production_publication_path")).toString() !=
+            QStringLiteral("full_snapshot_only") ||
+        final_state.value(QStringLiteral("lazy_composer_reachability")).toString() !=
+            QStringLiteral("internal_testing_and_benchmark_evidence_api"))
+    {
+        *error = QStringLiteral("final lazy state identity is inconsistent");
+        return false;
+    }
+
+    bool default_production_enabled = true;
+    bool no_production_switch = false;
+    if (!read_bool_field(
+            final_state,
+            QStringLiteral("default_production_enabled"),
+            &default_production_enabled,
+            error) ||
+        !read_bool_field(
+            final_state,
+            QStringLiteral("no_production_switch"),
+            &no_production_switch,
+            error))
+    {
+        return false;
+    }
+    if (default_production_enabled || !no_production_switch) {
+        *error = QStringLiteral("final lazy state production switch is inconsistent");
         return false;
     }
 

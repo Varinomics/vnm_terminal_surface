@@ -365,6 +365,8 @@ configured Qt runtime path, not a performance comparison.
 profiling-off structural lane for
 `publication_candidate_no_materialization`; validation requires zero consumer
 materialization counters for the sparse surface-session evidence scenarios.
+This lane is evidence-only: it exercises the candidate composer after the
+normal full-snapshot production publication and does not publish lazy snapshots.
 `vnm_terminal_embedded_benchmark_require_requested_grid_rejects_mismatch`
 expects a deliberate requested-grid mismatch to fail and validates the emitted
 schema fields and diagnostic.
@@ -382,23 +384,27 @@ Benchmark comparisons should record the build directory, profiling state,
 renderer backend, scenario list, grid, window size, warmup count, iteration
 count, command line, output JSON, and any profile artifacts.
 
-Batch 10 lazy-publication decision evidence must use the sparse surface-session
-scenarios with `--require-requested-grid` so a window-manager clamp cannot
-silently substitute another grid. The full-size matrix remains
+Lazy snapshot settlement evidence must use the sparse surface-session scenarios
+with `--require-requested-grid` so a window-manager clamp cannot silently
+substitute another grid. The historical full-size matrix is
 `--grid 235x873 --window-size 6984x3760 --dirty-rows 8 --dirty-row-stride 7`
 for both `surface_session_sparse_ascii_output` and
 `surface_session_sparse_block_graphics_output`. If the machine cannot create
 that requested grid, the run must fail validation and move to a reviewed
 machine requirement or matrix amendment instead of being treated as substitute
 evidence. The local `48x160` CTest lanes are structural validation, not
-decision-grade performance evidence.
+decision-grade performance evidence. Current lazy publication state is
+evidence-only: production publication remains full snapshots, and future
+enablement would require a new governed representation and memory-capacity
+plan rather than another local benchmark threshold.
 
 Use the default `row_view_parity_test` mode when the run is proving row-view
 equivalence. Use `--lazy-snapshot-evidence-mode` with
 `publication_candidate_no_materialization` for the Batch 9/10 candidate
 evidence lane; it measures the normal full-output production publication path
 and then exercises the candidate lazy composer without publishing it or
-materializing the row view for parity.
+materializing the row view for parity. The mode name is historical; it is not a
+production publication candidate after the evidence-only settlement.
 
 ## CMake Consumers
 

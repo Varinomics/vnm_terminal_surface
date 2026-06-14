@@ -1447,10 +1447,13 @@ Batch 9 audit results:
 - Alias check for `safe_basis.cells` and `public_snapshot.cells` found no
   current code call sites.
 
-Batch 10 final validation record, 2026-06-13:
+Batch 10 final validation record, 2026-06-13; Phase 5 settlement update,
+2026-06-14:
 
-- Default lazy publication remains disabled. Batch 10 did not enable, stage, or
-  commit a default-production lazy path.
+- Selected final lazy state is evidence-only. Batch 10 did not enable, stage,
+  or commit a default-production lazy path, and Phase 5 rejected carrying a
+  future default-enable lane after the retained previous-snapshot memory gate
+  failed.
 - Direct production audit passed:
   `Terminal_session::publish_render_snapshot()` still constructs
   `Terminal_render_snapshot snapshot = m_screen_model->render_snapshot(request)`,
@@ -1654,13 +1657,11 @@ Batch 10 CMDG / Assembly 2025 supplemental scope:
 
 Batch 10 final handoff:
 
-- Remaining blocker owner: the next default-enable reviewer or release owner
-  must run the matched profiling-off and profiling-on full-size `235x873` /
-  `6984x3760` default and `publication_candidate_no_materialization` evidence
-  lanes on a reviewed machine or desktop setup that can satisfy
-  `--require-requested-grid`, or land a reviewed matrix amendment before
-  considering default lazy publication.
-- Until that blocker is closed by decision-grade evidence and review, default
-  lazy publication remains disabled.
-- Status: BLOCKED for default lazy publication enablement on this workstation;
-  local structural validation is ready for review.
+- Final state: evidence-only. Production publication remains full snapshots,
+  and lazy composition remains limited to testing and benchmark evidence
+  helpers.
+- There is no Phase 6 default-enable lane. The previous blocker is closed by
+  rejection, not by a deferred benchmark threshold.
+- Future lazy publication enablement requires a new governed plan after release,
+  including a representation change that avoids retaining previous full
+  snapshots and new decision-grade memory/performance evidence.
