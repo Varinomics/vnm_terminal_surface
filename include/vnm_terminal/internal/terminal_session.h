@@ -348,6 +348,7 @@ public:
     bool render_publication_blocked() const;
     Terminal_synchronized_output_scroll_policy effective_synchronized_output_scroll_policy() const;
     bool has_pending_backend_callback_events() const;
+    std::size_t pending_backend_callback_event_count() const;
     std::uint64_t backend_callback_enqueue_epoch() const;
     std::uint64_t backend_callback_processed_epoch() const;
     bool mouse_reporting_active() const;

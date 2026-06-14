@@ -94,6 +94,7 @@ if(vnm_terminal_surface_testing_enabled)
             "${vnm_terminal_input_echo_qt_runtime_path}"
             "$<TARGET_FILE:vnm_terminal_input_echo_catchup_benchmark>"
             "--queue-contract"
+            "--queue-contract-iterations" "100"
             "--output" "${CMAKE_CURRENT_BINARY_DIR}/input_echo_queue_contract_validate_output.json"
             "--quiet"
             "--validate-json"
@@ -101,7 +102,32 @@ if(vnm_terminal_surface_testing_enabled)
 
     set_tests_properties(vnm_terminal_input_echo_queue_contract_benchmark_validate PROPERTIES
         LABELS "readiness;benchmark;input-echo;queue-contract"
-        TIMEOUT 60
+        TIMEOUT 120
+    )
+
+    add_test(
+        NAME vnm_terminal_input_echo_continuous_output_benchmark_validate
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            "QT_QPA_PLATFORM=offscreen"
+            "QT_QPA_PLATFORM_PLUGIN_PATH=$<TARGET_FILE_DIR:Qt6::QOffscreenIntegrationPlugin>"
+            "QT_SCALE_FACTOR=1"
+            "QT_SCREEN_SCALE_FACTORS="
+            "QT_AUTO_SCREEN_SCALE_FACTOR=0"
+            "QT_DEVICE_PIXEL_RATIO="
+            "QT_SCALE_FACTOR_ROUNDING_POLICY=PassThrough"
+            "${vnm_terminal_input_echo_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_input_echo_catchup_benchmark>"
+            "--continuous-output-contract"
+            "--continuous-output-iterations" "32"
+            "--output" "${CMAKE_CURRENT_BINARY_DIR}/input_echo_continuous_output_validate_output.json"
+            "--quiet"
+            "--validate-json"
+    )
+
+    set_tests_properties(vnm_terminal_input_echo_continuous_output_benchmark_validate PROPERTIES
+        LABELS "readiness;benchmark;input-echo;continuous-output"
+        TIMEOUT 120
     )
 
     add_test(
