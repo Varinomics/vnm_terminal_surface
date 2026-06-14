@@ -56,6 +56,10 @@ boolean values are JSON booleans. These diagnostics are `UNSTABLE`.
 | `scheduled_updates` | Counter | Count | Unstable |
 | `coalesced_requests` | Counter | Count | Unstable |
 | `consumed_updates` | Counter | Count | Unstable |
+| `backend_callback_frame_deferrals` | Counter | Count | Unstable |
+| `backend_callback_event_epoch` | Counter | Count | Unstable |
+| `backend_callback_frame_boundary_epoch` | Counter | Count | Unstable |
+| `render_snapshot_callback_epoch` | Counter | Count | Unstable |
 | `last_rendered_snapshot_sequence` | Counter | Count | Unstable |
 | `pending_update` | Bool | None | Unstable |
 

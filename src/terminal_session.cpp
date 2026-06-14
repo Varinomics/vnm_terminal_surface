@@ -2098,6 +2098,8 @@ Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_
     result.materialization_matches_full_snapshot =
         materialization_matches_full_snapshot;
     result.dirty_rows_visible                    = dirty_rows_visible;
+    result.previous_snapshot_borrow_candidate_rows =
+        static_cast<std::uint64_t>(current.grid_size.rows);
     result.previous_snapshot_borrowed_rows =
         static_cast<std::uint64_t>(current.grid_size.rows) - dirty_rows_visible;
     result.producer_owned_rows        = current_dirty_owner.owned_rows;
@@ -2153,6 +2155,8 @@ void record_lazy_snapshot_composer_profile_stats(
         ++profile_stats.lazy_snapshot_eligible_checks;
         profile_stats.lazy_snapshot_dirty_rows_visible +=
             result.dirty_rows_visible;
+        profile_stats.lazy_snapshot_previous_snapshot_borrow_candidate_rows +=
+            result.previous_snapshot_borrow_candidate_rows;
         profile_stats.lazy_snapshot_previous_snapshot_borrowed_rows +=
             result.previous_snapshot_borrowed_rows;
         profile_stats.lazy_snapshot_producer_owned_rows +=
@@ -2241,6 +2245,7 @@ public:
                 !m_backend_exit_after_stop_pending)
             {
                 m_backend_exit_after_stop_pending = true;
+                command.backend_callback_epoch = next_backend_callback_epoch_locked();
                 m_pending_commands.push_back(std::move(command));
             }
             return {Terminal_queue_result_code::ACCEPTED, false};
@@ -2269,11 +2274,13 @@ public:
         if (result.code == Terminal_queue_result_code::HARD_LIMIT_REACHED) {
             drop_pending_output_locked();
             if (!m_backend_callback_overflow_report_pending) {
-                m_pending_commands.push_back(make_backend_error_command(
+                Terminal_session_command error_command = make_backend_error_command(
                     0U,
                     make_backend_error(
                         Terminal_backend_error_code::OUTPUT_OVERFLOW,
-                        QStringLiteral("pending backend callback hard limit reached"))));
+                        QStringLiteral("pending backend callback hard limit reached")));
+                error_command.backend_callback_epoch = next_backend_callback_epoch_locked();
+                m_pending_commands.push_back(std::move(error_command));
                 m_backend_callback_overflow_report_pending = true;
             }
             if (!output_command) {
@@ -2284,10 +2291,14 @@ public:
         }
 
         if (append_to_previous_output) {
+            command.backend_callback_epoch = next_backend_callback_epoch_locked();
+            m_pending_commands.back().backend_callback_epoch =
+                command.backend_callback_epoch;
             m_pending_commands.back().bytes += command.bytes;
             return result;
         }
 
+        command.backend_callback_epoch = next_backend_callback_epoch_locked();
         m_pending_commands.push_back(std::move(command));
         return result;
     }
@@ -2316,6 +2327,13 @@ public:
         return !m_pending_commands.empty() || m_active_callbacks != 0U;
     }
 
+    std::uint64_t last_enqueued_backend_callback_epoch() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        return m_last_enqueued_backend_callback_epoch;
+    }
+
     void stop_backend_output()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -2335,6 +2353,16 @@ public:
     }
 
 private:
+    std::uint64_t next_backend_callback_epoch_locked()
+    {
+        const std::uint64_t epoch = m_next_backend_callback_epoch++;
+        if (m_next_backend_callback_epoch == 0U) {
+            m_next_backend_callback_epoch = 1U;
+        }
+        m_last_enqueued_backend_callback_epoch = epoch;
+        return epoch;
+    }
+
     void drop_pending_output_locked()
     {
         std::deque<Terminal_session_command> retained_commands;
@@ -2356,7 +2384,7 @@ private:
         }
     }
 
-    std::mutex                           m_mutex;
+    mutable std::mutex                   m_mutex;
     std::condition_variable              m_idle;
     Terminal_session*                    m_session = nullptr;
     std::deque<Terminal_session_command> m_pending_commands;
@@ -2369,6 +2397,8 @@ private:
     bool                                 m_backend_output_stopped = false;
     bool                                 m_backend_callback_overflow_report_pending = false;
     bool                                 m_coalesce_output_callbacks = false;
+    std::uint64_t                        m_next_backend_callback_epoch = 1U;
+    std::uint64_t                        m_last_enqueued_backend_callback_epoch = 0U;
 };
 
 Backend_callback_invocation::Backend_callback_invocation(
@@ -3325,6 +3355,20 @@ bool Terminal_session::has_pending_backend_callback_events() const
         m_callback_lifetime->has_pending_or_active_callbacks();
 }
 
+std::uint64_t Terminal_session::backend_callback_enqueue_epoch() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_callback_lifetime->last_enqueued_backend_callback_epoch();
+}
+
+std::uint64_t Terminal_session::backend_callback_processed_epoch() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_last_processed_backend_callback_epoch;
+}
+
 bool Terminal_session::mouse_reporting_active() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -3965,7 +4009,8 @@ Terminal_session_result Terminal_session::enqueue_command(Terminal_session_comma
 
 bool Terminal_session::process_pending_commands(
     Backend_callback_drain_policy          drain_policy,
-    Backend_callback_drain_deadline        deadline)
+    Backend_callback_drain_deadline        deadline,
+    std::optional<std::uint64_t>           target_backend_callback_epoch)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::process_pending_commands");
 
@@ -3988,6 +4033,8 @@ bool Terminal_session::process_pending_commands(
 
         Terminal_session_command command = std::move(m_pending_commands.front());
         m_pending_commands.pop_front();
+        const std::uint64_t command_backend_callback_epoch =
+            command.backend_callback_epoch;
 
         const bool continuing_budgeted_output =
             command.kind     == Terminal_session_command_kind::BACKEND_OUTPUT &&
@@ -4021,7 +4068,15 @@ bool Terminal_session::process_pending_commands(
         const Queue_category category   = queue_category_for(command.kind);
         const std::size_t    byte_count = static_cast<std::size_t>(command.bytes.size());
         const std::size_t    command_count = slice_backend_output ? 0U : 1U;
+        const bool completes_backend_callback =
+            command_backend_callback_epoch != 0U && !slice_backend_output;
         m_last_processed_sequence = command.sequence;
+        if (completes_backend_callback) {
+            m_backend_callback_publication_epoch =
+                std::max(
+                    m_backend_callback_publication_epoch,
+                    command_backend_callback_epoch);
+        }
 
         if (command.kind != Terminal_session_command_kind::BACKEND_OUTPUT ||
             should_ignore_backend_output_after_stop(command.sequence))
@@ -4040,6 +4095,18 @@ bool Terminal_session::process_pending_commands(
                 queue_high_water_reached(category),
                 m_last_processed_sequence);
         }
+        if (completes_backend_callback) {
+            m_last_processed_backend_callback_epoch =
+                std::max(
+                    m_last_processed_backend_callback_epoch,
+                    command_backend_callback_epoch);
+        }
+
+        if (target_backend_callback_epoch.has_value() &&
+            m_last_processed_backend_callback_epoch >= *target_backend_callback_epoch)
+        {
+            break;
+        }
 
         if (backend_callback_drain_deadline_reached(deadline) &&
             (!m_pending_commands.empty() ||
@@ -4054,6 +4121,11 @@ bool Terminal_session::process_pending_commands(
     m_backend_content_snapshot_deferral_active =
         previous_backend_content_snapshot_deferral;
     m_processing_commands = false;
+    if (target_backend_callback_epoch.has_value() &&
+        m_last_processed_backend_callback_epoch < *target_backend_callback_epoch)
+    {
+        complete = false;
+    }
     return complete;
 }
 
@@ -4884,6 +4956,23 @@ bool Terminal_session::process_backend_callback_events_for(
         std::chrono::steady_clock::now() + budget);
 }
 
+bool Terminal_session::process_backend_callback_events_until_epoch(
+    std::uint64_t target_epoch)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    if (target_epoch == 0U ||
+        m_last_processed_backend_callback_epoch >= target_epoch)
+    {
+        return true;
+    }
+
+    return process_pending_commands(
+        Backend_callback_drain_policy::DRAIN_CALLBACKS,
+        std::nullopt,
+        target_epoch);
+}
+
 void Terminal_session::pause_backend_output_from_callback_ingress()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -4921,16 +5010,28 @@ void Terminal_session::drain_backend_callback_commands()
                 command.error.has_value()                                           &&
                 command.error->code == Terminal_backend_error_code::OUTPUT_OVERFLOW)
             {
+                m_backend_callback_publication_epoch =
+                    std::max(
+                        m_backend_callback_publication_epoch,
+                        command.backend_callback_epoch);
                 Terminal_session_result result = handle_output_overflow(
                     command.sequence,
                     command.error->message);
                 record_result(std::move(result));
+                m_last_processed_backend_callback_epoch =
+                    std::max(
+                        m_last_processed_backend_callback_epoch,
+                        command.backend_callback_epoch);
                 continue;
             }
 
             if (command.kind == Terminal_session_command_kind::BACKEND_OUTPUT &&
                 should_ignore_backend_output_after_stop(command.sequence))
             {
+                m_backend_callback_publication_epoch =
+                    std::max(
+                        m_backend_callback_publication_epoch,
+                        command.backend_callback_epoch);
                 Terminal_session_result result = make_rejected_result(
                     command.sequence,
                     Terminal_session_result_code::INVALID_STATE,
@@ -4938,6 +5039,10 @@ void Terminal_session::drain_backend_callback_commands()
                         Terminal_backend_error_code::OUTPUT_OVERFLOW,
                         QStringLiteral("backend output ignored after terminal stop request")));
                 record_result(std::move(result));
+                m_last_processed_backend_callback_epoch =
+                    std::max(
+                        m_last_processed_backend_callback_epoch,
+                        command.backend_callback_epoch);
                 continue;
             }
 
@@ -6196,6 +6301,7 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
 {
     Terminal_render_snapshot_request request;
     request.sequence                 = sequence;
+    request.backend_callback_epoch   = m_backend_callback_publication_epoch;
     request.row_origin_generation    = m_row_origin_generation;
     request.basis                    = Terminal_render_snapshot_basis::LIVE_CONTENT;
     request.purpose                  = purpose;

@@ -635,6 +635,10 @@ void append_session_profile_stats_section(
         stats.lazy_snapshot_dirty_rows_visible);
     append_profile_counter(
         stream,
+        "lazy_snapshot_previous_snapshot_borrow_candidate_rows",
+        stats.lazy_snapshot_previous_snapshot_borrow_candidate_rows);
+    append_profile_counter(
+        stream,
         "lazy_snapshot_previous_snapshot_borrowed_rows",
         stats.lazy_snapshot_previous_snapshot_borrowed_rows);
     append_profile_counter(

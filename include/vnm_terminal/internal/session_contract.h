@@ -101,6 +101,7 @@ struct Terminal_resize_transaction
 struct Terminal_session_command
 {
     std::uint64_t                              sequence = 0U;
+    std::uint64_t                              backend_callback_epoch = 0U;
     Terminal_session_command_kind              kind     = Terminal_session_command_kind::BACKEND_OUTPUT;
     QByteArray                                 bytes;
     std::optional<Terminal_launch_config>      launch_config;

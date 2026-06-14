@@ -1,3 +1,7 @@
 add_subdirectory(embedded_terminal)
+add_subdirectory(input_echo_catchup)
+add_subdirectory(lazy_snapshot_evidence)
+add_subdirectory(lazy_snapshot_replay)
 add_subdirectory(phase7_public_scroll)
 add_subdirectory(surface_stress)
+add_subdirectory(evidence)

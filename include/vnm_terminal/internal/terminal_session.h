@@ -181,6 +181,7 @@ struct Terminal_session_lazy_snapshot_composer_result
     bool                                    materialization_matches_full_snapshot = false;
     bool                                    materialization_mismatch_for_testing  = false;
     std::uint64_t                           dirty_rows_visible = 0U;
+    std::uint64_t                           previous_snapshot_borrow_candidate_rows = 0U;
     std::uint64_t                           previous_snapshot_borrowed_rows = 0U;
     std::uint64_t                           producer_owned_rows = 0U;
     std::uint64_t                           producer_materialized_rows = 0U;
@@ -224,6 +225,7 @@ struct Terminal_session_profile_stats
     std::uint64_t              lazy_snapshot_eligible_checks         = 0U;
     std::uint64_t              lazy_snapshot_full_fallbacks          = 0U;
     std::uint64_t              lazy_snapshot_dirty_rows_visible      = 0U;
+    std::uint64_t              lazy_snapshot_previous_snapshot_borrow_candidate_rows = 0U;
     std::uint64_t              lazy_snapshot_previous_snapshot_borrowed_rows = 0U;
     std::uint64_t              lazy_snapshot_producer_owned_rows     = 0U;
     std::uint64_t              lazy_snapshot_producer_materialized_rows = 0U;
@@ -346,6 +348,8 @@ public:
     bool render_publication_blocked() const;
     Terminal_synchronized_output_scroll_policy effective_synchronized_output_scroll_policy() const;
     bool has_pending_backend_callback_events() const;
+    std::uint64_t backend_callback_enqueue_epoch() const;
+    std::uint64_t backend_callback_processed_epoch() const;
     bool mouse_reporting_active() const;
     bool alternate_scroll_active() const;
     std::uint64_t alternate_scroll_mode_generation() const;
@@ -431,6 +435,8 @@ public:
     void process_backend_callback_events();
     bool process_backend_callback_events_for(
         std::chrono::steady_clock::duration     budget);
+    bool process_backend_callback_events_until_epoch(
+        std::uint64_t                           target_epoch);
 
 private:
     enum class Queue_category
@@ -478,7 +484,9 @@ private:
         Backend_callback_drain_policy      drain_policy =
             Backend_callback_drain_policy::DRAIN_CALLBACKS,
         std::optional<std::chrono::steady_clock::time_point>
-                                            deadline = std::nullopt);
+                                            deadline = std::nullopt,
+        std::optional<std::uint64_t>       target_backend_callback_epoch =
+            std::nullopt);
 
     Terminal_session_result process_command(
         Terminal_session_command   command);
@@ -811,6 +819,8 @@ private:
     std::uint64_t                                          m_next_sequence = 1U;
     std::uint64_t                                          m_next_resize_id = 1U;
     std::uint64_t                                          m_last_processed_sequence = 0U;
+    std::uint64_t                                          m_backend_callback_publication_epoch = 0U;
+    std::uint64_t                                          m_last_processed_backend_callback_epoch = 0U;
     std::uint64_t                                          m_budgeted_backend_output_sequence = 0U;
     std::uint64_t                                          m_render_snapshot_generation = 0U;
     std::uint64_t                                          m_render_snapshot_synced_generation = 0U;

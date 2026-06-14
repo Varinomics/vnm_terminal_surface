@@ -410,6 +410,7 @@ struct Terminal_render_hyperlink_metadata
 struct Terminal_render_metadata
 {
     std::uint64_t              sequence                     = 0U;
+    std::uint64_t              backend_callback_epoch       = 0U;
     std::uint64_t              row_origin_generation         = 0U;
     bool                       backend_geometry_in_sync     = true;
     bool                       visual_bell_active           = false;
@@ -444,6 +445,7 @@ struct Terminal_public_scroll_diagnostics
 struct Terminal_render_snapshot_request
 {
     std::uint64_t                         sequence = 0U;
+    std::uint64_t                         backend_callback_epoch = 0U;
     std::uint64_t                         row_origin_generation = 0U;
     Terminal_render_snapshot_basis        basis = Terminal_render_snapshot_basis::LIVE_CONTENT;
     Terminal_render_snapshot_purpose      purpose = Terminal_render_snapshot_purpose::CONTENT;

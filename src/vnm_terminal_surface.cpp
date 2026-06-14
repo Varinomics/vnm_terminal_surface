@@ -1898,6 +1898,45 @@ struct VNM_TerminalSurface::Private
         surface.update();
     }
 
+    void record_backend_callback_frame_boundary()
+    {
+        const std::uint64_t epoch =
+            backend_callback_event_epoch.load(std::memory_order_acquire);
+        backend_callback_frame_boundary_epoch.store(epoch, std::memory_order_release);
+    }
+
+    bool backend_callback_arrived_after_frame_boundary() const
+    {
+        const std::uint64_t callback_epoch =
+            backend_callback_event_epoch.load(std::memory_order_acquire);
+        const std::uint64_t boundary_epoch =
+            backend_callback_frame_boundary_epoch.load(std::memory_order_acquire);
+        return callback_epoch > boundary_epoch;
+    }
+
+    void defer_render_update_for_backend_callback(VNM_TerminalSurface& surface)
+    {
+        ++render_invalidation_stats.backend_callback_frame_deferrals;
+        reset_render_update_schedule();
+        reset_atlas_completion();
+
+        (void)QMetaObject::invokeMethod(
+            &surface,
+            [&surface] {
+                if (surface.m_private->shutting_down.load()) {
+                    return;
+                }
+
+                surface.drain_backend_callback_events_for_posted_work();
+                if (!surface.m_private->frame_work_pending() &&
+                    surface.m_private->render_snapshot != nullptr)
+                {
+                    surface.m_private->request_render_update(surface);
+                }
+            },
+            Qt::QueuedConnection);
+    }
+
     void reset_render_update_schedule()
     {
         render_update_pending = false;
@@ -2032,6 +2071,14 @@ struct VNM_TerminalSurface::Private
     {
         reconcile_atlas_completion();
         term::Terminal_surface_render_invalidation_stats_t stats = render_invalidation_stats;
+        stats.backend_callback_event_epoch =
+            backend_callback_event_epoch.load(std::memory_order_acquire);
+        stats.backend_callback_frame_boundary_epoch =
+            backend_callback_frame_boundary_epoch.load(std::memory_order_acquire);
+        stats.render_snapshot_callback_epoch =
+            render_snapshot != nullptr
+                ? render_snapshot->metadata.backend_callback_epoch
+                : 0U;
         stats.pending_update = frame_work_pending();
         return stats;
     }
@@ -2153,6 +2200,12 @@ struct VNM_TerminalSurface::Private
         warmed_prompt_text_layout_font_key = font_key;
     }
 
+    std::chrono::steady_clock::duration backend_callback_frame_catchup_budget() const
+    {
+        return backend_callback_frame_catchup_budget_override.value_or(
+            k_backend_callback_frame_catchup_budget);
+    }
+
     term::Qt_grid_metrics_provider                         grid_metrics_provider;
     term::terminal_cell_metrics_t                          cell_metrics;
     QFont                                                  render_font;
@@ -2177,6 +2230,9 @@ struct VNM_TerminalSurface::Private
 
     term::Terminal_surface_render_invalidation_stats_t     render_invalidation_stats;
     term::Terminal_surface_backend_drain_stats_t           backend_drain_stats;
+    std::atomic<std::uint64_t>                             backend_callback_event_epoch{0U};
+    std::atomic<std::uint64_t>                             backend_callback_frame_boundary_epoch{0U};
+    std::optional<std::chrono::steady_clock::duration>     backend_callback_frame_catchup_budget_override;
     bool                                                   render_update_pending              = false;
     bool                                                   render_node_release_pending        = false;
     bool                                                   render_node_release_requeue_update = false;
@@ -5665,6 +5721,9 @@ bool VNM_TerminalSurface::start_process_with_backend(
     session_config.bell_policy.visual_enabled =
         m_visual_bell_policy == Bell_policy::ENABLED;
     session_config.backend_event_notifier = [this] {
+        m_private->backend_callback_event_epoch.fetch_add(
+            1U,
+            std::memory_order_acq_rel);
         queue_backend_callback_drain();
     };
 
@@ -5758,9 +5817,10 @@ void VNM_TerminalSurface::sync_after_user_input(bool input_accepted)
         m_private->render_update_pending &&
         session->has_pending_backend_callback_events())
     {
-        // Take only already-queued echo/output here; polish covers the
-        // pre-frame path without predicting cursor movement or waiting.
-        drain_backend_callback_events_for(k_backend_callback_frame_catchup_budget);
+        // Take only already-queued echo/output here. Later callbacks are
+        // handled by the pre-sync frame-boundary gate without waiting.
+        drain_backend_callback_events_until_epoch(
+            session->backend_callback_enqueue_epoch());
         return;
     }
 
@@ -5784,11 +5844,33 @@ void VNM_TerminalSurface::drain_backend_callback_events_for(
         std::optional<std::chrono::steady_clock::duration>{budget});
 }
 
+void VNM_TerminalSurface::drain_backend_callback_events_until_epoch(
+    std::uint64_t target_epoch)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    if (m_private->session == nullptr) {
+        (void)process_backend_callback_events_recorded(
+            nullptr,
+            std::nullopt,
+            true,
+            target_epoch);
+        return;
+    }
+
+    (void)process_backend_callback_events_recorded(
+        m_private->session.get(),
+        std::nullopt,
+        true,
+        target_epoch);
+}
+
 VNM_TerminalSurface::backend_callback_drain_result_t
 VNM_TerminalSurface::process_backend_callback_events_recorded(
     term::Terminal_session*                                  session,
     std::optional<std::chrono::steady_clock::duration>       budget,
-    bool                                                     use_budget_notification_boundary)
+    bool                                                     use_budget_notification_boundary,
+    std::optional<std::uint64_t>                             target_backend_callback_epoch)
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
@@ -5846,6 +5928,12 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     }
 
     const auto session_processing_started = std::chrono::steady_clock::now();
+    if (target_backend_callback_epoch.has_value()) {
+        result.drain_complete =
+            session->process_backend_callback_events_until_epoch(
+                *target_backend_callback_epoch);
+    }
+    else
     if (budget.has_value()) {
         result.drain_complete = session->process_backend_callback_events_for(*budget);
     }
@@ -5873,6 +5961,9 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     const bool session_still_active = m_private->session.get() == session;
     result.callbacks_pending_after_drain =
         session_still_active && session->has_pending_backend_callback_events();
+    if (session_still_active && !result.callbacks_pending_after_drain) {
+        m_private->record_backend_callback_frame_boundary();
+    }
     if (budget.has_value() && !result.drain_complete) {
         ++drain_stats.budget_exhausted_incomplete;
     }
@@ -6288,10 +6379,16 @@ void VNM_TerminalSurface::updatePolish()
         return;
     }
     if (!m_private->session->has_pending_backend_callback_events()) {
+        m_private->record_backend_callback_frame_boundary();
         return;
     }
 
-    drain_backend_callback_events_for(k_backend_callback_frame_catchup_budget);
+    const std::uint64_t target_epoch =
+        m_private->session->backend_callback_enqueue_epoch();
+    if (target_epoch > m_private->session->backend_callback_processed_epoch()) {
+        drain_backend_callback_events_until_epoch(target_epoch);
+    }
+    m_private->record_backend_callback_frame_boundary();
 }
 
 QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*)
@@ -6360,6 +6457,13 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
         if (m_private->qsg_atlas_recorder == nullptr) {
             m_private->qsg_atlas_recorder =
                 std::make_shared<term::Qsg_atlas_recorder>();
+        }
+
+        // GUI-thread polish is the last safe drain point before QSG capture.
+        // A later backend callback makes this frame stale by construction.
+        if (m_private->backend_callback_arrived_after_frame_boundary()) {
+            m_private->defer_render_update_for_backend_callback(*this);
+            return old_node;
         }
 
         const term::Terminal_render_options options = render_options_for_surface(*this);
@@ -6612,6 +6716,24 @@ bool term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
     return surface.m_private->session_drain_queued.load();
 }
 
+std::uint64_t term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->session != nullptr
+        ? surface.m_private->session->backend_callback_enqueue_epoch()
+        : 0U;
+}
+
+std::uint64_t term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->session != nullptr
+        ? surface.m_private->session->backend_callback_processed_epoch()
+        : 0U;
+}
+
 void term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
     VNM_TerminalSurface& surface)
 {
@@ -6624,6 +6746,17 @@ void term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events_for_
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.drain_backend_callback_events_for_posted_work();
+}
+
+void term::VNM_TerminalSurface_render_bridge::set_backend_callback_frame_catchup_budget_for_benchmark(
+    VNM_TerminalSurface&                    surface,
+    std::chrono::steady_clock::duration     budget)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    const std::chrono::steady_clock::duration zero =
+        std::chrono::steady_clock::duration::zero();
+    surface.m_private->backend_callback_frame_catchup_budget_override =
+        std::max(budget, zero);
 }
 
 void term::VNM_TerminalSurface_render_bridge::simulate_update_polish(

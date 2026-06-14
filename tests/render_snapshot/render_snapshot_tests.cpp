@@ -2841,8 +2841,10 @@ bool test_disabled_lazy_composer_borrows_clean_rows_and_owns_dirty_rows()
         "disabled lazy composer profile counters count explicit test-only checks");
     ok &= check(stats.lazy_snapshot_full_fallbacks == 0U,
         "disabled lazy composer records no full fallbacks for eligible sparse rows");
-    ok &= check(stats.lazy_snapshot_previous_snapshot_borrowed_rows +
-                stats.lazy_snapshot_dirty_rows_visible == 6U &&
+    ok &= check(stats.lazy_snapshot_previous_snapshot_borrow_candidate_rows == 6U &&
+            stats.lazy_snapshot_previous_snapshot_borrowed_rows +
+                stats.lazy_snapshot_dirty_rows_visible ==
+                    stats.lazy_snapshot_previous_snapshot_borrow_candidate_rows &&
             stats.lazy_snapshot_producer_owned_rows <=
                 stats.lazy_snapshot_dirty_rows_visible &&
             stats.lazy_snapshot_producer_materialized_rows <=
