@@ -503,6 +503,8 @@ struct Attempt_result
                                                                                      = 0U;
     std::uint64_t                                     lazy_snapshot_exercise_dirty_rows_visible
                                                                                      = 0U;
+    std::uint64_t                                     lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows
+                                                                                     = 0U;
     std::uint64_t                                     lazy_snapshot_exercise_previous_snapshot_borrowed_rows
                                                                                      = 0U;
     std::uint64_t                                     lazy_snapshot_exercise_producer_owned_rows
@@ -645,6 +647,7 @@ struct Scenario_result
     std::uint64_t          lazy_snapshot_exercise_full_fallbacks = 0U;
     std::uint64_t          lazy_snapshot_exercise_materialization_mismatches = 0U;
     std::uint64_t          lazy_snapshot_exercise_dirty_rows_visible = 0U;
+    std::uint64_t          lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows = 0U;
     std::uint64_t          lazy_snapshot_exercise_previous_snapshot_borrowed_rows = 0U;
     std::uint64_t          lazy_snapshot_exercise_producer_owned_rows = 0U;
     std::uint64_t          lazy_snapshot_exercise_producer_materialized_rows = 0U;
@@ -4008,6 +4011,8 @@ void add_lazy_snapshot_exercise_attempt(
         attempt.lazy_snapshot_exercise_materialization_mismatches;
     result.lazy_snapshot_exercise_dirty_rows_visible +=
         attempt.lazy_snapshot_exercise_dirty_rows_visible;
+    result.lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows +=
+        attempt.lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows;
     result.lazy_snapshot_exercise_previous_snapshot_borrowed_rows +=
         attempt.lazy_snapshot_exercise_previous_snapshot_borrowed_rows;
     result.lazy_snapshot_exercise_producer_owned_rows +=
@@ -4932,6 +4937,8 @@ Attempt_result run_surface_session_action_attempt(
             lazy_result.materialization_mismatch_for_testing ? 1U : 0U;
         attempt.lazy_snapshot_exercise_dirty_rows_visible =
             lazy_result.dirty_rows_visible;
+        attempt.lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows =
+            lazy_result.previous_snapshot_borrow_candidate_rows;
         attempt.lazy_snapshot_exercise_previous_snapshot_borrowed_rows =
             lazy_result.previous_snapshot_borrowed_rows;
         attempt.lazy_snapshot_exercise_producer_owned_rows =
@@ -6105,6 +6112,10 @@ QJsonObject session_profile_stats_json(
         stats.lazy_snapshot_dirty_rows_visible);
     insert_profile_counter(
         object,
+        QStringLiteral("lazy_snapshot_previous_snapshot_borrow_candidate_rows"),
+        stats.lazy_snapshot_previous_snapshot_borrow_candidate_rows);
+    insert_profile_counter(
+        object,
         QStringLiteral("lazy_snapshot_previous_snapshot_borrowed_rows"),
         stats.lazy_snapshot_previous_snapshot_borrowed_rows);
     insert_profile_counter(
@@ -6412,6 +6423,10 @@ QJsonObject scenario_json(
         object,
         QStringLiteral("lazy_snapshot_exercise_dirty_rows_visible"),
         result.lazy_snapshot_exercise_dirty_rows_visible);
+    insert_profile_counter(
+        object,
+        QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows"),
+        result.lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows);
     insert_profile_counter(
         object,
         QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrowed_rows"),
@@ -7453,6 +7468,7 @@ QStringList session_profile_counter_keys()
         QStringLiteral("lazy_snapshot_eligible_checks"),
         QStringLiteral("lazy_snapshot_full_fallbacks"),
         QStringLiteral("lazy_snapshot_dirty_rows_visible"),
+        QStringLiteral("lazy_snapshot_previous_snapshot_borrow_candidate_rows"),
         QStringLiteral("lazy_snapshot_previous_snapshot_borrowed_rows"),
         QStringLiteral("lazy_snapshot_producer_owned_rows"),
         QStringLiteral("lazy_snapshot_producer_materialized_rows"),
@@ -9164,6 +9180,7 @@ bool validate_scenario_json(
         QStringLiteral("lazy_snapshot_exercise_full_fallbacks"),
         QStringLiteral("lazy_snapshot_exercise_materialization_mismatches"),
         QStringLiteral("lazy_snapshot_exercise_dirty_rows_visible"),
+        QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows"),
         QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrowed_rows"),
         QStringLiteral("lazy_snapshot_exercise_producer_owned_rows"),
         QStringLiteral("lazy_snapshot_exercise_producer_materialized_rows"),
@@ -9473,6 +9490,7 @@ bool validate_scenario_json(
         QStringLiteral("lazy_snapshot_exercise_full_fallbacks"),
         QStringLiteral("lazy_snapshot_exercise_materialization_mismatches"),
         QStringLiteral("lazy_snapshot_exercise_dirty_rows_visible"),
+        QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows"),
         QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrowed_rows"),
         QStringLiteral("lazy_snapshot_exercise_producer_owned_rows"),
         QStringLiteral("lazy_snapshot_exercise_producer_materialized_rows"),
@@ -9552,6 +9570,11 @@ bool validate_scenario_json(
             json_counter(
                 object,
                 QStringLiteral("lazy_snapshot_exercise_dirty_rows_visible"));
+        const qint64 lazy_exercise_borrow_candidate_rows =
+            json_counter(
+                object,
+                QStringLiteral(
+                    "lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows"));
         const qint64 lazy_exercise_borrowed_rows =
             json_counter(
                 object,
@@ -9615,13 +9638,25 @@ bool validate_scenario_json(
             return false;
         }
 
+        if (completed_frames <= 0 ||
+            lazy_exercise_attempts <= 0 ||
+            lazy_exercise_eligible_attempts <= 0)
+        {
+            *out_error = QStringLiteral(
+                "lazy snapshot sparse evidence did not measure any completed eligible frames: %1")
+                .arg(scenario_name);
+            return false;
+        }
+
         if (lazy_exercise_promoted_rows != 0 ||
             lazy_exercise_attempts != completed_frames ||
             lazy_exercise_eligible_attempts != lazy_exercise_attempts ||
             lazy_exercise_full_fallbacks != 0 ||
             lazy_exercise_materialization_mismatches != 0 ||
+            lazy_exercise_borrow_candidate_rows !=
+                lazy_exercise_attempts * actual_rows ||
             lazy_exercise_borrowed_rows !=
-                lazy_exercise_attempts * actual_rows -
+                lazy_exercise_borrow_candidate_rows -
                     lazy_exercise_dirty_rows -
                     promoted_dirty_rows ||
             lazy_exercise_owned_rows >
@@ -9689,6 +9724,11 @@ bool validate_scenario_json(
                     session_profile,
                     QStringLiteral("lazy_snapshot_dirty_rows_visible")) !=
                     lazy_exercise_dirty_rows ||
+                json_counter(
+                    session_profile,
+                    QStringLiteral(
+                        "lazy_snapshot_previous_snapshot_borrow_candidate_rows")) !=
+                    lazy_exercise_borrow_candidate_rows ||
                 json_counter(
                     session_profile,
                     QStringLiteral("lazy_snapshot_previous_snapshot_borrowed_rows")) !=

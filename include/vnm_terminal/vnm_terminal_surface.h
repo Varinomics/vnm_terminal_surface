@@ -566,7 +566,9 @@ private:
                                session,
         std::optional<std::chrono::steady_clock::duration>
                                budget,
-        bool                   use_budget_notification_boundary);
+        bool                   use_budget_notification_boundary,
+        std::optional<std::uint64_t>
+                               target_backend_callback_epoch = std::nullopt);
     void queue_backend_callback_drain_after_incomplete_recorded_drain(
         vnm_terminal::internal::Terminal_session*
                                session,
@@ -574,6 +576,7 @@ private:
     void drain_backend_callback_events();
     void drain_backend_callback_events(bool budgeted);
     void drain_backend_callback_events_for(std::chrono::steady_clock::duration budget);
+    void drain_backend_callback_events_until_epoch(std::uint64_t target_epoch);
     void drain_backend_callback_events_with_budget(std::optional<std::chrono::steady_clock::duration> budget);
     void drain_backend_callback_events_for_posted_work();
     void queue_backend_callback_drain();

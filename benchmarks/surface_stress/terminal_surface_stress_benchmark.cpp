@@ -39,6 +39,7 @@ struct Benchmark_options
     int columns          = 873;
     int dirty_rows       = 235;
     int dirty_row_stride = 1;
+    int dirty_row_seed   = 37;
     int graphics_every   = 11;
     int style_period     = 8;
     Text_pattern text_pattern = Text_pattern::LEGACY_ASCII_BLOCK;
@@ -171,6 +172,7 @@ Benchmark_options parse_options(int argc, char** argv)
             parse_int_arg(argc, argv, index, "--cols", options.columns) ||
             parse_int_arg(argc, argv, index, "--dirty-rows", options.dirty_rows) ||
             parse_int_arg(argc, argv, index, "--dirty-row-stride", options.dirty_row_stride) ||
+            parse_int_arg(argc, argv, index, "--dirty-row-seed", options.dirty_row_seed) ||
             parse_int_arg(argc, argv, index, "--graphics-every", options.graphics_every) ||
             parse_int_arg(argc, argv, index, "--style-period", options.style_period))
         {
@@ -211,6 +213,7 @@ Benchmark_options parse_options(int argc, char** argv)
                 << "  --cols <n>                   grid columns, default 873\n"
                 << "  --dirty-rows <n>             rows rewritten per frame, default all rows\n"
                 << "  --dirty-row-stride <n>       strided dirty row walk; fragmentation requires --dirty-rows < --rows, default 1\n"
+                << "  --dirty-row-seed <n>         deterministic dirty row walk seed, default 37\n"
                 << "  --graphics-every <n>         emit U+2588 every N cells, 0 disables\n"
                 << "  --style-period <n>           ANSI color variation period, 0 disables\n"
                 << "  --text-pattern <name>        ascii|block|box|cjk|mixed_non_ascii|emoji; default preserves old mixed ASCII+U+2588 via --graphics-every\n"
@@ -228,6 +231,7 @@ Benchmark_options parse_options(int argc, char** argv)
     options.columns       = std::max(1, options.columns);
     options.dirty_rows    = std::clamp(options.dirty_rows, 1, options.rows);
     options.dirty_row_stride = std::clamp(options.dirty_row_stride, 1, options.rows);
+    options.dirty_row_seed = std::max(1, options.dirty_row_seed);
     options.graphics_every = std::max(0, options.graphics_every);
     options.style_period   = std::max(0, options.style_period);
     return options;
@@ -251,7 +255,8 @@ std::vector<int> dirty_rows_for_frame(const Benchmark_options& options, int fram
     std::vector<bool> used(static_cast<std::size_t>(options.rows), false);
     std::vector<int> rows;
     rows.reserve(static_cast<std::size_t>(options.dirty_rows));
-    std::int64_t probe = static_cast<std::int64_t>(frame_index) * 37;
+    std::int64_t probe =
+        static_cast<std::int64_t>(frame_index) * options.dirty_row_seed;
     while (static_cast<int>(rows.size()) < options.dirty_rows) {
         const std::int64_t frame_offset = static_cast<std::int64_t>(frame_index) * 13;
         const int candidate = options.dirty_row_stride > 1
@@ -890,6 +895,7 @@ int main(int argc, char** argv)
     print_metric("columns", static_cast<std::uint64_t>(options.columns));
     print_metric("dirty_rows_requested", static_cast<std::uint64_t>(options.dirty_rows));
     print_metric("dirty_row_stride", static_cast<std::uint64_t>(options.dirty_row_stride));
+    print_metric("dirty_row_seed", static_cast<std::uint64_t>(options.dirty_row_seed));
     print_metric("graphics_every", static_cast<std::uint64_t>(options.graphics_every));
     print_metric("style_period", static_cast<std::uint64_t>(options.style_period));
     std::cout << "text_pattern=" << text_pattern_name(options.text_pattern).toUtf8().constData()

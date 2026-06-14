@@ -16,6 +16,7 @@
 #include <QInputMethodEvent>
 #include <QJsonObject>
 #include <QKeyEvent>
+#include <QMetaObject>
 #include <QMetaProperty>
 #include <QMouseEvent>
 #include <QPointer>
@@ -58,6 +59,18 @@ bool check_bytes_equal(const QByteArray& actual, const QByteArray& expected, con
 }
 
 bool check_int_equal(int actual, int expected, const char* message)
+{
+    if (actual != expected) {
+        std::cerr << "FAIL: " << message
+            << " expected=" << expected
+            << " actual="   << actual << '\n';
+        return false;
+    }
+
+    return true;
+}
+
+bool check_uint64_equal(std::uint64_t actual, std::uint64_t expected, const char* message)
 {
     if (actual != expected) {
         std::cerr << "FAIL: " << message
@@ -372,6 +385,32 @@ bool window_render_matches(
     }
 
     return false;
+}
+
+std::optional<term::Qsg_atlas_frame_report> capture_next_surface_frame(
+    QGuiApplication&       app,
+    QQuickWindow&          window,
+    VNM_TerminalSurface&   surface,
+    std::uint64_t          previous_capture_count)
+{
+    for (int i = 0; i < 30; ++i) {
+        surface.update();
+        window.requestUpdate();
+        pump_events(app, 1);
+        const QImage image = window.grabWindow();
+        const term::Qsg_atlas_frame_report atlas_report =
+            term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+        const term::terminal_renderer_stats_t renderer_stats =
+            term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+        if (!image.isNull() &&
+            atlas_report.capture_count > previous_capture_count &&
+            renderer_stats.text_content_failures == 0)
+        {
+            return atlas_report;
+        }
+    }
+
+    return std::nullopt;
 }
 
 bool capture_surface_sequence(
@@ -1298,6 +1337,10 @@ bool test_surface_session_lazy_composer_exercise_remains_opt_in(QGuiApplication&
     ok &= check(result.previous_snapshot_borrowed_rows ==
             visible_rows - result.dirty_rows_visible,
         "surface lazy composer borrows all non-dirty visible rows");
+    ok &= check(result.previous_snapshot_borrow_candidate_rows == visible_rows &&
+            result.previous_snapshot_borrowed_rows + result.dirty_rows_visible ==
+                result.previous_snapshot_borrow_candidate_rows,
+        "surface lazy composer reports a complete previous-row borrow denominator");
     ok &= check(result.producer_owned_rows <= result.dirty_rows_visible &&
             result.producer_materialized_rows <= result.dirty_rows_visible &&
             result.producer_cells_scanned <=
@@ -1419,6 +1462,179 @@ bool test_surface_polish_drains_queued_backend_output_before_render_capture(QGui
         fixture.surface,
         polished_snapshot->metadata.sequence),
         "surface polish drain captures the polished snapshot");
+
+    return ok;
+}
+
+enum class Input_echo_timing_expectation
+{
+    RACE_EXPOSED,
+    SAME_FRAME,
+};
+
+bool test_surface_input_echo_after_polish_timing_repro(
+    QGuiApplication&                  app,
+    Input_echo_timing_expectation     expectation)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("\x1b[1;1Hecho-timing-ready")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "input echo timing repro surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("echo-timing-ready")),
+        "input echo timing repro publishes baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "input echo timing repro captures baseline");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[2;1Hecho> "));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> pending_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(pending_snapshot != nullptr &&
+        pending_snapshot->metadata.sequence > baseline_snapshot->metadata.sequence &&
+        snapshot_contains_text(*pending_snapshot, QStringLiteral("echo>")) &&
+        !snapshot_contains_text(*pending_snapshot, QStringLiteral("echo> x")),
+        "input echo timing repro creates a pending pre-echo prompt snapshot");
+    if (pending_snapshot == nullptr) {
+        return ok;
+    }
+
+    const term::Terminal_surface_render_invalidation_stats_t pending_stats =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+    ok &= check(pending_stats.pending_update,
+        "input echo timing repro leaves the prompt snapshot pending for frame capture");
+
+    ok &= send_key_and_expect_write(
+        fixture.surface,
+        *backend_ptr,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        QByteArrayLiteral("x"),
+        "input echo timing repro accepts and writes the user key");
+
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> polished_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(polished_snapshot != nullptr &&
+        polished_snapshot->metadata.sequence == pending_snapshot->metadata.sequence &&
+        !snapshot_contains_text(*polished_snapshot, QStringLiteral("echo> x")),
+        "input echo timing repro pre-echo polish leaves the pending snapshot unchanged");
+    if (polished_snapshot == nullptr) {
+        return ok;
+    }
+
+    const term::Qsg_atlas_frame_report report_before_first_frame =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+    std::atomic<bool> echo_injected{false};
+    const QMetaObject::Connection echo_connection = QObject::connect(
+        &fixture.window,
+        &QQuickWindow::beforeSynchronizing,
+        &fixture.window,
+        [&] {
+            if (!echo_injected.exchange(true)) {
+                backend_ptr->emit_output(QByteArrayLiteral("x"));
+            }
+        },
+        Qt::DirectConnection);
+
+    const std::optional<term::Qsg_atlas_frame_report> first_frame_report =
+        capture_next_surface_frame(
+            app,
+            fixture.window,
+            fixture.surface,
+            report_before_first_frame.capture_count);
+    QObject::disconnect(echo_connection);
+
+    ok &= check(echo_injected.load(),
+        "input echo timing repro injects echo after polish and before frame sync");
+    ok &= check(first_frame_report.has_value(),
+        "input echo timing repro captures the first post-input frame");
+    if (!first_frame_report.has_value()) {
+        return ok;
+    }
+
+    const bool first_frame_used_pre_echo_snapshot =
+        first_frame_report->captured_snapshot_sequence ==
+            polished_snapshot->metadata.sequence;
+    if (expectation == Input_echo_timing_expectation::RACE_EXPOSED) {
+        ok &= check_uint64_equal(
+            first_frame_report->captured_snapshot_sequence,
+            polished_snapshot->metadata.sequence,
+            "input echo timing repro first frame captures the pre-echo snapshot");
+    }
+    else {
+        ok &= check(
+            !first_frame_used_pre_echo_snapshot,
+            "input echo timing repro first frame must not capture the pre-echo snapshot");
+        const term::Terminal_surface_render_invalidation_stats_t deferral_stats =
+            term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+        ok &= check(deferral_stats.backend_callback_frame_deferrals > 0U,
+            "input echo timing repro defers stale capture without a catch-up delay");
+    }
+
+    ok &= check(pump_until(app, [&] {
+        const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        return
+            snapshot != nullptr &&
+            snapshot->metadata.sequence > polished_snapshot->metadata.sequence &&
+            snapshot_contains_text(*snapshot, QStringLiteral("echo> x"));
+    }),
+        "input echo timing repro posted drain publishes the echoed input snapshot");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> echo_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(echo_snapshot != nullptr &&
+        echo_snapshot->cursor.position.row == pending_snapshot->cursor.position.row &&
+        echo_snapshot->cursor.position.column > pending_snapshot->cursor.position.column,
+        "input echo timing repro echoed snapshot advances the cursor after the prompt");
+    if (echo_snapshot == nullptr) {
+        return ok;
+    }
+
+    const term::Qsg_atlas_frame_report report_before_catchup_frame =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+    const std::optional<term::Qsg_atlas_frame_report> catchup_frame_report =
+        capture_next_surface_frame(
+            app,
+            fixture.window,
+            fixture.surface,
+            report_before_catchup_frame.capture_count);
+    ok &= check(catchup_frame_report.has_value(),
+        "input echo timing repro captures a catch-up frame");
+    if (catchup_frame_report.has_value()) {
+        ok &= check_uint64_equal(
+            catchup_frame_report->captured_snapshot_sequence,
+            echo_snapshot->metadata.sequence,
+            "input echo timing repro next frame captures the echoed input snapshot");
+    }
 
     return ok;
 }
@@ -12457,6 +12673,27 @@ bool test_invalid_argv_reports_backend_error(QGuiApplication& app)
 int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
+    const QStringList arguments = app.arguments();
+
+    if (arguments.contains(QStringLiteral("--input-echo-timing-repro"))) {
+        const bool expect_race =
+            arguments.contains(QStringLiteral("--expect-race"));
+        const bool expect_same_frame =
+            arguments.contains(QStringLiteral("--expect-same-frame"));
+        if (expect_race == expect_same_frame) {
+            std::cerr << "FAIL: choose exactly one of --expect-race or "
+                "--expect-same-frame for --input-echo-timing-repro\n";
+            return 2;
+        }
+
+        const Input_echo_timing_expectation expectation =
+            expect_race
+                ? Input_echo_timing_expectation::RACE_EXPOSED
+                : Input_echo_timing_expectation::SAME_FRAME;
+        return test_surface_input_echo_after_polish_timing_repro(app, expectation)
+            ? 0
+            : 1;
+    }
 
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);

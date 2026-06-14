@@ -211,6 +211,7 @@ bool test_profile_text_sections(QGuiApplication& app)
         "lazy_snapshot_eligible_checks",
         "lazy_snapshot_full_fallbacks",
         "lazy_snapshot_dirty_rows_visible",
+        "lazy_snapshot_previous_snapshot_borrow_candidate_rows",
         "lazy_snapshot_previous_snapshot_borrowed_rows",
         "lazy_snapshot_producer_owned_rows",
         "lazy_snapshot_producer_materialized_rows",

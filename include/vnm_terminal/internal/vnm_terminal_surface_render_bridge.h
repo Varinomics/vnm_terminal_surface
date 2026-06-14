@@ -19,12 +19,16 @@ namespace vnm_terminal::internal {
 
 struct Terminal_surface_render_invalidation_stats_t
 {
-    std::uint64_t                           update_requests                 = 0U;
-    std::uint64_t                           scheduled_updates               = 0U;
-    std::uint64_t                           coalesced_requests              = 0U;
-    std::uint64_t                           consumed_updates                = 0U;
-    std::uint64_t                           last_rendered_snapshot_sequence = 0U;
-    bool                                    pending_update                  = false;
+    std::uint64_t                           update_requests                       = 0U;
+    std::uint64_t                           scheduled_updates                     = 0U;
+    std::uint64_t                           coalesced_requests                    = 0U;
+    std::uint64_t                           consumed_updates                      = 0U;
+    std::uint64_t                           backend_callback_frame_deferrals     = 0U;
+    std::uint64_t                           backend_callback_event_epoch          = 0U;
+    std::uint64_t                           backend_callback_frame_boundary_epoch = 0U;
+    std::uint64_t                           render_snapshot_callback_epoch        = 0U;
+    std::uint64_t                           last_rendered_snapshot_sequence       = 0U;
+    bool                                    pending_update                        = false;
 };
 
 struct Terminal_surface_backend_drain_stats_t
@@ -142,11 +146,21 @@ public:
     static bool backend_callback_drain_queued(
         const VNM_TerminalSurface& surface);
 
+    static std::uint64_t backend_callback_enqueue_epoch(
+        const VNM_TerminalSurface& surface);
+
+    static std::uint64_t backend_callback_processed_epoch(
+        const VNM_TerminalSurface& surface);
+
     static void drain_backend_callback_events(
         VNM_TerminalSurface&       surface);
 
     static void drain_backend_callback_events_for_posted_work(
         VNM_TerminalSurface&       surface);
+
+    static void set_backend_callback_frame_catchup_budget_for_benchmark(
+        VNM_TerminalSurface&                    surface,
+        std::chrono::steady_clock::duration     budget);
 
     static void simulate_update_polish(
         VNM_TerminalSurface&       surface);
