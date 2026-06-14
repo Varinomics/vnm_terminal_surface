@@ -576,7 +576,9 @@ private:
     void drain_backend_callback_events();
     void drain_backend_callback_events(bool budgeted);
     void drain_backend_callback_events_for(std::chrono::steady_clock::duration budget);
-    void drain_backend_callback_events_until_epoch(std::uint64_t target_epoch);
+    backend_callback_drain_result_t drain_backend_callback_events_until_epoch(
+        std::uint64_t                                     target_epoch,
+        std::optional<std::chrono::steady_clock::duration> budget = std::nullopt);
     void drain_backend_callback_events_with_budget(std::optional<std::chrono::steady_clock::duration> budget);
     void drain_backend_callback_events_for_posted_work();
     void queue_backend_callback_drain();

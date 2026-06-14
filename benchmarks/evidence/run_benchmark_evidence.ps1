@@ -394,6 +394,7 @@ function Add-InputEchoCaseRecords {
             budgeted_drain_calls = [double] $case.backend_drain_delta_total.budgeted_drain_calls
             budget_exhausted_incomplete = [double] $case.backend_drain_delta_total.budget_exhausted_incomplete
             pending_callback_after_drain = [double] $case.backend_drain_delta_total.pending_callback_after_drain
+            requeue_count = [double] $case.backend_drain_delta_total.requeue_count
         })
     }
 }
@@ -529,18 +530,21 @@ function Invoke-InputEchoEvidence {
         if ($record["sample_count"] -ne $config.iterations) {
             Add-Failure "Input echo sample count mismatch in $($record["raw_json_path"])"
         }
-        if ($record["echo_eligible_for_polish_count"] -gt 0 -and
-            ($record["stale_frame_at_polish_count"] -gt 0 -or
-                $record["cursor_stale_at_polish_count"] -gt 0))
-        {
-            Add-Failure "Input echo eligible case captured stale frame/cursor state"
+        $eligible = $record["echo_eligible_for_polish_count"] -gt 0
+        $staleAtPolish =
+            $record["stale_frame_at_polish_count"] -gt 0 -or
+            $record["cursor_stale_at_polish_count"] -gt 0
+        if ($eligible -and $record["catchup_budget_us"] -gt 0 -and $staleAtPolish) {
+            Add-Failure "Input echo nonzero-budget eligible case captured stale frame/cursor state"
         }
-        if ($record["catchup_budget_us"] -eq 0 -and
-            $record["echo_eligible_for_polish_count"] -gt 0 -and
-            $record["echo_visible_at_polish_count"] -ne
-                $record["echo_eligible_for_polish_count"])
+        if ($eligible -and
+            $record["catchup_budget_us"] -eq 0 -and
+            $staleAtPolish -and
+            ($record["budget_exhausted_incomplete"] -le 0 -or
+                $record["pending_callback_after_drain"] -le 0 -or
+                $record["requeue_count"] -le 0))
         {
-            Add-Failure "Input echo zero-budget eligible case did not publish fresh echo"
+            Add-Failure "Input echo zero-budget stale polish case lacked budget-exhaustion evidence"
         }
     }
 
@@ -569,7 +573,8 @@ function Invoke-InputEchoEvidence {
         "input_to_polish_done_ns_median",
         "polish_elapsed_ns_median",
         "budget_exhausted_incomplete",
-        "pending_callback_after_drain"
+        "pending_callback_after_drain",
+        "requeue_count"
     )
     $summaries = [ordered]@{}
     foreach ($metric in $metrics) {
@@ -591,7 +596,7 @@ function Invoke-InputEchoEvidence {
             zero_budget_baseline_present = ($expectedBudgets -contains 0)
             same_delay_ab_pairs_present = $abPairsPresent
             queue_contract_present = ($queueContractRecords.Count -eq $RepeatCount)
-            pass_rule = "commands pass, raw schema validates, all cases are present, eligible zero-budget cases are fresh, and queue-contract captures are not stale"
+            pass_rule = "commands pass, raw schema validates, all cases are present, nonzero-budget eligible cases are fresh, zero-budget stale polish cases report budget exhaustion and requeue, and queue-contract captures are not stale"
             rejects_waited_long_enough_evidence = "queue-contract evidence proves callbacks already enqueued before sync are included without waiting for future output"
         }
         metric_summaries = $summaries

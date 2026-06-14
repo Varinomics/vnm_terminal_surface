@@ -1906,7 +1906,17 @@ struct VNM_TerminalSurface::Private
 
     void record_backend_callback_frame_boundary(std::uint64_t epoch)
     {
-        backend_callback_frame_boundary_epoch.store(epoch, std::memory_order_release);
+        std::uint64_t current =
+            backend_callback_frame_boundary_epoch.load(std::memory_order_acquire);
+        while (current < epoch &&
+            !backend_callback_frame_boundary_epoch.compare_exchange_weak(
+                current,
+                epoch,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
+        {
+            // current is updated with the observed value on compare failure.
+        }
     }
 
     bool backend_callback_arrived_after_frame_boundary() const
@@ -5838,7 +5848,8 @@ void VNM_TerminalSurface::sync_after_user_input(bool input_accepted)
         // Take only already-queued echo/output here. Later callbacks are
         // handled by the pre-sync frame-boundary gate without waiting.
         drain_backend_callback_events_until_epoch(
-            session->backend_callback_enqueue_epoch());
+            session->backend_callback_enqueue_epoch(),
+            m_private->backend_callback_frame_catchup_budget());
         return;
     }
 
@@ -5862,25 +5873,34 @@ void VNM_TerminalSurface::drain_backend_callback_events_for(
         std::optional<std::chrono::steady_clock::duration>{budget});
 }
 
-void VNM_TerminalSurface::drain_backend_callback_events_until_epoch(
-    std::uint64_t target_epoch)
+VNM_TerminalSurface::backend_callback_drain_result_t
+VNM_TerminalSurface::drain_backend_callback_events_until_epoch(
+    std::uint64_t                                     target_epoch,
+    std::optional<std::chrono::steady_clock::duration> budget)
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
     if (m_private->session == nullptr) {
-        (void)process_backend_callback_events_recorded(
+        return process_backend_callback_events_recorded(
             nullptr,
-            std::nullopt,
+            budget,
             true,
             target_epoch);
-        return;
     }
 
-    (void)process_backend_callback_events_recorded(
-        m_private->session.get(),
-        std::nullopt,
-        true,
-        target_epoch);
+    term::Terminal_session* const session = m_private->session.get();
+    const backend_callback_drain_result_t drain_result =
+        process_backend_callback_events_recorded(
+            session,
+            budget,
+            true,
+            target_epoch);
+    if (budget.has_value()) {
+        queue_backend_callback_drain_after_incomplete_recorded_drain(
+            session,
+            drain_result.drain_complete);
+    }
+    return drain_result;
 }
 
 VNM_TerminalSurface::backend_callback_drain_result_t
@@ -5949,7 +5969,8 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     if (target_backend_callback_epoch.has_value()) {
         result.drain_complete =
             session->process_backend_callback_events_until_epoch(
-                *target_backend_callback_epoch);
+                *target_backend_callback_epoch,
+                budget);
     }
     else
     if (budget.has_value()) {
@@ -6405,16 +6426,20 @@ void VNM_TerminalSurface::updatePolish()
     }
     const std::uint64_t frame_boundary_epoch =
         m_private->current_backend_callback_event_epoch();
-    if (!m_private->session->has_pending_backend_callback_events()) {
+    term::Terminal_session* const session = m_private->session.get();
+    if (!session->has_pending_backend_callback_events()) {
         m_private->record_backend_callback_frame_boundary(frame_boundary_epoch);
         return;
     }
 
-    const std::uint64_t target_epoch =
-        m_private->session->backend_callback_enqueue_epoch();
-    if (target_epoch > m_private->session->backend_callback_processed_epoch()) {
-        drain_backend_callback_events_until_epoch(target_epoch);
+    const std::uint64_t target_epoch = session->backend_callback_enqueue_epoch();
+    if (target_epoch > session->backend_callback_processed_epoch()) {
+        (void)drain_backend_callback_events_until_epoch(
+            target_epoch,
+            m_private->backend_callback_frame_catchup_budget());
+        return;
     }
+
     m_private->record_backend_callback_frame_boundary(frame_boundary_epoch);
 }
 

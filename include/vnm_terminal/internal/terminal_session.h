@@ -445,7 +445,9 @@ public:
     bool process_backend_callback_events_for(
         std::chrono::steady_clock::duration     budget);
     bool process_backend_callback_events_until_epoch(
-        std::uint64_t                           target_epoch);
+        std::uint64_t                           target_epoch,
+        std::optional<std::chrono::steady_clock::duration>
+                                                budget = std::nullopt);
 
 private:
     enum class Queue_category
