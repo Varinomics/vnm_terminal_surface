@@ -6,6 +6,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QSizeF>
 #include <QStringList>
 #include <algorithm>
@@ -22,7 +23,7 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 constexpr const char* k_schema = "vnm_terminal_lazy_snapshot_evidence_benchmark";
-constexpr int k_schema_version = 2;
+constexpr int k_schema_version = 3;
 
 enum class Case_kind
 {
@@ -78,6 +79,7 @@ struct counters_t
     std::uint64_t lazy_validation_failures = 0U;
     std::uint64_t materialization_mismatches = 0U;
     std::uint64_t full_walk_frame_mismatches = 0U;
+    std::uint64_t candidate_consumer_materialization_frames = 0U;
     std::uint64_t unexpected_eligibility = 0U;
     std::uint64_t unexpected_fallback = 0U;
     std::uint64_t missing_snapshots = 0U;
@@ -94,6 +96,7 @@ struct fallback_counts_t
     std::uint64_t style_color_mode_incompatibility = 0U;
     std::uint64_t hyperlink_namespace_incompatibility = 0U;
     std::uint64_t unstable_dirty_row_mutation_identity = 0U;
+    std::uint64_t no_borrowable_rows = 0U;
     std::uint64_t unsupported_geometry_or_detached_snapshot_path = 0U;
 };
 
@@ -128,9 +131,13 @@ struct metrics_t
     std::uint64_t lazy_sparse_frame_layer_descriptors = 0U;
     std::uint64_t lazy_full_walk_frame_input_cells = 0U;
     std::uint64_t lazy_full_walk_frame_row_descriptors = 0U;
+    std::uint64_t eligible_lazy_candidates = 0U;
+    std::uint64_t memory_capacity_failed_candidates = 0U;
     std::uint64_t lazy_flat_cell_capacity_bytes = 0U;
     std::uint64_t lazy_payload_row_capacity_bytes = 0U;
     std::uint64_t lazy_unique_owner_retained_bytes = 0U;
+    std::uint64_t retained_previous_snapshot_flat_cell_capacity_bytes = 0U;
+    std::uint64_t retained_previous_snapshot_total_capacity_bytes = 0U;
 };
 
 struct repeat_t
@@ -307,6 +314,9 @@ void record_fallback(
         case term::Terminal_lazy_snapshot_fallback_reason::UNSTABLE_DIRTY_ROW_MUTATION_IDENTITY:
             ++counts.unstable_dirty_row_mutation_identity;
             return;
+        case term::Terminal_lazy_snapshot_fallback_reason::NO_BORROWABLE_ROWS:
+            ++counts.no_borrowable_rows;
+            return;
         case term::Terminal_lazy_snapshot_fallback_reason::
             UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH:
             ++counts.unsupported_geometry_or_detached_snapshot_path;
@@ -327,6 +337,8 @@ std::uint64_t fallback_count(
             return counts.style_color_mode_incompatibility;
         case term::Terminal_lazy_snapshot_fallback_reason::HYPERLINK_NAMESPACE_INCOMPATIBILITY:
             return counts.hyperlink_namespace_incompatibility;
+        case term::Terminal_lazy_snapshot_fallback_reason::NO_BORROWABLE_ROWS:
+            return counts.no_borrowable_rows;
         case term::Terminal_lazy_snapshot_fallback_reason::
             UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH:
             return counts.unsupported_geometry_or_detached_snapshot_path;
@@ -564,6 +576,58 @@ std::uint64_t flat_capacity_bytes(const term::Terminal_render_snapshot& snapshot
         static_cast<std::uint64_t>(sizeof(term::Terminal_render_cell));
 }
 
+std::uint64_t byte_array_capacity_bytes(const QByteArray& value)
+{
+    return static_cast<std::uint64_t>(value.capacity());
+}
+
+std::uint64_t string_capacity_bytes(const QString& value)
+{
+    return
+        static_cast<std::uint64_t>(sizeof(QString)) +
+        static_cast<std::uint64_t>(value.capacity()) *
+            static_cast<std::uint64_t>(sizeof(QChar));
+}
+
+std::uint64_t cell_text_capacity_bytes(const term::Terminal_render_cell_text& text)
+{
+    const QString* fallback = text.fallback_qstring_or_null();
+    return fallback != nullptr ? string_capacity_bytes(*fallback) : 0U;
+}
+
+std::uint64_t snapshot_retained_capacity_bytes(
+    const term::Terminal_render_snapshot& snapshot)
+{
+    std::uint64_t bytes = flat_capacity_bytes(snapshot);
+    bytes +=
+        static_cast<std::uint64_t>(snapshot.styles.capacity()) *
+        static_cast<std::uint64_t>(sizeof(term::Terminal_text_style));
+    bytes +=
+        static_cast<std::uint64_t>(snapshot.visible_line_provenance.capacity()) *
+        static_cast<std::uint64_t>(sizeof(term::Terminal_render_line_provenance));
+    bytes +=
+        static_cast<std::uint64_t>(snapshot.dirty_row_ranges.capacity()) *
+        static_cast<std::uint64_t>(sizeof(term::Terminal_render_dirty_row_range));
+    bytes +=
+        static_cast<std::uint64_t>(snapshot.hyperlinks.capacity()) *
+        static_cast<std::uint64_t>(sizeof(term::Terminal_render_hyperlink_metadata));
+    bytes +=
+        static_cast<std::uint64_t>(snapshot.selection_spans.capacity()) *
+        static_cast<std::uint64_t>(sizeof(term::Terminal_render_selection_span));
+    for (const term::Terminal_render_hyperlink_metadata& hyperlink : snapshot.hyperlinks) {
+        bytes += byte_array_capacity_bytes(hyperlink.identity_key);
+        bytes += byte_array_capacity_bytes(hyperlink.uri);
+    }
+
+    const term::Terminal_render_snapshot_row_content_view rows(snapshot);
+    for (const term::Terminal_render_snapshot_row_content row : rows) {
+        for (const term::Terminal_render_cell& cell : row) {
+            bytes += cell_text_capacity_bytes(cell.text);
+        }
+    }
+    return bytes;
+}
+
 std::uint64_t lazy_payload_row_capacity_bytes(
     const term::Terminal_render_snapshot& snapshot)
 {
@@ -600,6 +664,33 @@ std::uint64_t lazy_owner_bytes(const term::Terminal_render_snapshot& snapshot)
         }
     }
     return bytes;
+}
+
+struct previous_snapshot_capacity_t
+{
+    std::uint64_t flat_cell_capacity_bytes = 0U;
+    std::uint64_t total_capacity_bytes     = 0U;
+};
+
+previous_snapshot_capacity_t retained_previous_snapshot_capacity(
+    const term::Terminal_render_snapshot& snapshot)
+{
+    previous_snapshot_capacity_t result;
+    if (snapshot.lazy_row_payloads == nullptr) {
+        return result;
+    }
+
+    std::set<const term::Terminal_render_snapshot*> snapshots;
+    for (const term::Terminal_render_snapshot_lazy_row_payload& row :
+        snapshot.lazy_row_payloads->rows)
+    {
+        const term::Terminal_render_snapshot* source = row.source_snapshot.get();
+        if (source != nullptr && snapshots.insert(source).second) {
+            result.flat_cell_capacity_bytes += flat_capacity_bytes(*source);
+            result.total_capacity_bytes += snapshot_retained_capacity_bytes(*source);
+        }
+    }
+    return result;
 }
 
 std::optional<std::uint64_t> first_hyperlink_id(
@@ -677,6 +768,7 @@ bool counters_failed(const counters_t& counters)
         counters.lazy_validation_failures    != 0U ||
         counters.materialization_mismatches  != 0U ||
         counters.full_walk_frame_mismatches  != 0U ||
+        counters.candidate_consumer_materialization_frames != 0U ||
         counters.unexpected_eligibility      != 0U ||
         counters.unexpected_fallback         != 0U ||
         counters.missing_snapshots           != 0U;
@@ -825,12 +917,37 @@ void measure_frame(
     }
 
     add_lazy_metrics(repeat.metrics, candidate);
+    if (candidate.consumer_materialization_calls != 0U) {
+        ++repeat.counters.candidate_consumer_materialization_frames;
+    }
     if (candidate.eligible && candidate.lazy_snapshot.has_value()) {
         const term::Terminal_render_snapshot& lazy = *candidate.lazy_snapshot;
-        repeat.metrics.lazy_flat_cell_capacity_bytes += flat_capacity_bytes(lazy);
-        repeat.metrics.lazy_payload_row_capacity_bytes +=
+        const std::uint64_t eager_flat_cell_capacity = flat_capacity_bytes(candidate_full);
+        const std::uint64_t lazy_flat_cell_capacity = flat_capacity_bytes(lazy);
+        const std::uint64_t lazy_payload_row_capacity =
             lazy_payload_row_capacity_bytes(lazy);
-        repeat.metrics.lazy_unique_owner_retained_bytes += lazy_owner_bytes(lazy);
+        const std::uint64_t lazy_owner_retained = lazy_owner_bytes(lazy);
+        const previous_snapshot_capacity_t previous_capacity =
+            retained_previous_snapshot_capacity(lazy);
+        const std::uint64_t lazy_total_retained_capacity =
+            lazy_flat_cell_capacity +
+            lazy_payload_row_capacity +
+            lazy_owner_retained +
+            previous_capacity.total_capacity_bytes;
+
+        ++repeat.metrics.eligible_lazy_candidates;
+        repeat.metrics.lazy_flat_cell_capacity_bytes += lazy_flat_cell_capacity;
+        repeat.metrics.lazy_payload_row_capacity_bytes += lazy_payload_row_capacity;
+        repeat.metrics.lazy_unique_owner_retained_bytes += lazy_owner_retained;
+        repeat.metrics.retained_previous_snapshot_flat_cell_capacity_bytes +=
+            previous_capacity.flat_cell_capacity_bytes;
+        repeat.metrics.retained_previous_snapshot_total_capacity_bytes +=
+            previous_capacity.total_capacity_bytes;
+        if (lazy_flat_cell_capacity != 0U ||
+            lazy_total_retained_capacity >= eager_flat_cell_capacity)
+        {
+            ++repeat.metrics.memory_capacity_failed_candidates;
+        }
 
         if (term::validate_render_snapshot(lazy).status !=
             term::Terminal_render_snapshot_status::OK)
@@ -961,8 +1078,8 @@ std::vector<case_t> all_cases()
             term::Terminal_lazy_snapshot_fallback_reason::NONE},
         {QStringLiteral("full_repaint_ascii_48x160"),
             Case_kind::FULL_REPAINT, Text_pattern::ASCII, {48, 160},
-            0, 48, 1, 8, true,
-            term::Terminal_lazy_snapshot_fallback_reason::NONE},
+            0, 48, 1, 8, false,
+            term::Terminal_lazy_snapshot_fallback_reason::NO_BORROWABLE_ROWS},
         {QStringLiteral("style_mismatch_fallback_24x80"),
             Case_kind::STYLE_FALLBACK, Text_pattern::ASCII, {24, 80},
             0, 3, 7, 4, false,
@@ -1029,6 +1146,8 @@ void add(counters_t& total, const counters_t& value)
     total.lazy_validation_failures += value.lazy_validation_failures;
     total.materialization_mismatches += value.materialization_mismatches;
     total.full_walk_frame_mismatches += value.full_walk_frame_mismatches;
+    total.candidate_consumer_materialization_frames +=
+        value.candidate_consumer_materialization_frames;
     total.unexpected_eligibility += value.unexpected_eligibility;
     total.unexpected_fallback += value.unexpected_fallback;
     total.missing_snapshots += value.missing_snapshots;
@@ -1045,6 +1164,7 @@ void add(fallback_counts_t& total, const fallback_counts_t& value)
     total.style_color_mode_incompatibility += value.style_color_mode_incompatibility;
     total.hyperlink_namespace_incompatibility += value.hyperlink_namespace_incompatibility;
     total.unstable_dirty_row_mutation_identity += value.unstable_dirty_row_mutation_identity;
+    total.no_borrowable_rows += value.no_borrowable_rows;
     total.unsupported_geometry_or_detached_snapshot_path +=
         value.unsupported_geometry_or_detached_snapshot_path;
 }
@@ -1080,9 +1200,15 @@ void add(metrics_t& total, const metrics_t& value)
     total.lazy_sparse_frame_layer_descriptors += value.lazy_sparse_frame_layer_descriptors;
     total.lazy_full_walk_frame_input_cells += value.lazy_full_walk_frame_input_cells;
     total.lazy_full_walk_frame_row_descriptors += value.lazy_full_walk_frame_row_descriptors;
+    total.eligible_lazy_candidates += value.eligible_lazy_candidates;
+    total.memory_capacity_failed_candidates += value.memory_capacity_failed_candidates;
     total.lazy_flat_cell_capacity_bytes += value.lazy_flat_cell_capacity_bytes;
     total.lazy_payload_row_capacity_bytes += value.lazy_payload_row_capacity_bytes;
     total.lazy_unique_owner_retained_bytes += value.lazy_unique_owner_retained_bytes;
+    total.retained_previous_snapshot_flat_cell_capacity_bytes +=
+        value.retained_previous_snapshot_flat_cell_capacity_bytes;
+    total.retained_previous_snapshot_total_capacity_bytes +=
+        value.retained_previous_snapshot_total_capacity_bytes;
 }
 
 double ratio(std::uint64_t numerator, std::uint64_t denominator)
@@ -1133,6 +1259,9 @@ QJsonObject counters_json(const counters_t& counters, const fallback_counts_t& f
         QStringLiteral("unstable_dirty_row_mutation_identity"),
         json_int(fallbacks.unstable_dirty_row_mutation_identity));
     fallback.insert(
+        QStringLiteral("no_borrowable_rows"),
+        json_int(fallbacks.no_borrowable_rows));
+    fallback.insert(
         QStringLiteral("unsupported_geometry_or_detached_snapshot_path"),
         json_int(fallbacks.unsupported_geometry_or_detached_snapshot_path));
 
@@ -1150,6 +1279,9 @@ QJsonObject counters_json(const counters_t& counters, const fallback_counts_t& f
     object.insert(
         QStringLiteral("frame_full_walk_mismatch_frames"),
         json_int(counters.full_walk_frame_mismatches));
+    object.insert(
+        QStringLiteral("candidate_consumer_materialization_frames"),
+        json_int(counters.candidate_consumer_materialization_frames));
     object.insert(
         QStringLiteral("unexpected_eligibility_frames"),
         json_int(counters.unexpected_eligibility));
@@ -1273,6 +1405,24 @@ QJsonObject metrics_json(const metrics_t& metrics)
         json_int(metrics.lazy_full_walk_frame_row_descriptors));
 
     QJsonObject memory;
+    const std::uint64_t lazy_total_retained_capacity =
+        metrics.lazy_flat_cell_capacity_bytes +
+        metrics.lazy_payload_row_capacity_bytes +
+        metrics.lazy_unique_owner_retained_bytes +
+        metrics.retained_previous_snapshot_total_capacity_bytes;
+    const bool capacity_less_than_eager_flat =
+        metrics.eligible_lazy_candidates > 0U &&
+        metrics.memory_capacity_failed_candidates == 0U;
+
+    memory.insert(
+        QStringLiteral("eligible_lazy_candidates"),
+        json_int(metrics.eligible_lazy_candidates));
+    memory.insert(
+        QStringLiteral("memory_capacity_failed_candidates"),
+        json_int(metrics.memory_capacity_failed_candidates));
+    memory.insert(
+        QStringLiteral("eager_flat_cell_capacity_bytes"),
+        json_int(metrics.full_snapshot_capacity_bytes));
     memory.insert(
         QStringLiteral("lazy_flat_cell_capacity_bytes"),
         json_int(metrics.lazy_flat_cell_capacity_bytes));
@@ -1283,17 +1433,24 @@ QJsonObject metrics_json(const metrics_t& metrics)
         QStringLiteral("lazy_unique_owner_retained_bytes"),
         json_int(metrics.lazy_unique_owner_retained_bytes));
     memory.insert(
+        QStringLiteral("retained_previous_snapshot_flat_cell_capacity_bytes"),
+        json_int(metrics.retained_previous_snapshot_flat_cell_capacity_bytes));
+    memory.insert(
+        QStringLiteral("retained_previous_snapshot_total_capacity_bytes"),
+        json_int(metrics.retained_previous_snapshot_total_capacity_bytes));
+    memory.insert(
         QStringLiteral("lazy_total_capacity_bytes"),
-        json_int(
-            metrics.lazy_flat_cell_capacity_bytes +
-            metrics.lazy_payload_row_capacity_bytes +
-            metrics.lazy_unique_owner_retained_bytes));
+        json_int(lazy_total_retained_capacity));
+    memory.insert(
+        QStringLiteral("lazy_total_retained_capacity_bytes"),
+        json_int(lazy_total_retained_capacity));
+    memory.insert(
+        QStringLiteral("capacity_less_than_eager_flat"),
+        capacity_less_than_eager_flat);
     memory.insert(
         QStringLiteral("lazy_to_full_capacity_ratio"),
         ratio(
-            metrics.lazy_flat_cell_capacity_bytes +
-                metrics.lazy_payload_row_capacity_bytes +
-                metrics.lazy_unique_owner_retained_bytes,
+            lazy_total_retained_capacity,
             metrics.full_snapshot_capacity_bytes));
 
     QJsonObject object;
@@ -1417,7 +1574,10 @@ bool memory_ready(const std::vector<case_result_t>& results)
         for (const repeat_t& repeat : result.repeats) {
             add(metrics, repeat.metrics);
         }
-        if (metrics.lazy_flat_cell_capacity_bytes != 0U) {
+        if (metrics.eligible_lazy_candidates == 0U ||
+            metrics.memory_capacity_failed_candidates != 0U ||
+            metrics.lazy_flat_cell_capacity_bytes != 0U)
+        {
             return false;
         }
     }
@@ -1466,7 +1626,7 @@ QJsonObject decision_json(const QString& status, const std::vector<case_result_t
         QStringLiteral("use timings only after correctness status is ok; do not classify validation failures as performance results"));
     criteria.insert(
         QStringLiteral("memory_capacity"),
-        QStringLiteral("lazy snapshots must not retain full flat-cell vector capacity before enablement"));
+        QStringLiteral("every eligible publication candidate must retain zero lazy flat-cell capacity and total retained lazy capacity below the eager flat-cell capacity, including previous snapshot retention"));
 
     QJsonObject input_echo;
     input_echo.insert(
@@ -1659,6 +1819,108 @@ bool write_file(const QString& path, const QByteArray& bytes, QString* error)
     return true;
 }
 
+bool read_bool_field(
+    const QJsonObject& object,
+    const QString&     key,
+    bool*              value,
+    QString*           error)
+{
+    const QJsonValue field = object.value(key);
+    if (!field.isBool()) {
+        *error =
+            QStringLiteral("missing or non-boolean decision field: %1").arg(key);
+        return false;
+    }
+
+    *value = field.toBool();
+    return true;
+}
+
+bool validate_decision_contract(const QJsonObject& root, QString* error)
+{
+    if (root.value(QStringLiteral("schema")).toString() !=
+            QString::fromLatin1(k_schema) ||
+        root.value(QStringLiteral("schema_version")).toInt() != k_schema_version)
+    {
+        *error = QStringLiteral("schema identity mismatch");
+        return false;
+    }
+
+    const QString status = root.value(QStringLiteral("status")).toString();
+    if (status != QStringLiteral("ok")) {
+        *error = QStringLiteral("root status is not ok");
+        return false;
+    }
+
+    const QJsonValue decision_value = root.value(QStringLiteral("decision_criteria"));
+    if (!decision_value.isObject()) {
+        *error = QStringLiteral("missing decision_criteria object");
+        return false;
+    }
+
+    const QJsonValue observed_value =
+        decision_value.toObject().value(QStringLiteral("observed"));
+    if (!observed_value.isObject()) {
+        *error = QStringLiteral("missing decision_criteria.observed object");
+        return false;
+    }
+
+    const QJsonObject observed = observed_value.toObject();
+    bool correctness_ready = false;
+    bool sparse_reduction_ready = false;
+    bool memory_capacity_ready = false;
+    bool enablement_ready = false;
+    if (!read_bool_field(
+            observed,
+            QStringLiteral("correctness_ready"),
+            &correctness_ready,
+            error) ||
+        !read_bool_field(
+            observed,
+            QStringLiteral("sparse_reduction_ready"),
+            &sparse_reduction_ready,
+            error) ||
+        !read_bool_field(
+            observed,
+            QStringLiteral("memory_capacity_ready"),
+            &memory_capacity_ready,
+            error) ||
+        !read_bool_field(
+            observed,
+            QStringLiteral("enablement_ready"),
+            &enablement_ready,
+            error))
+    {
+        return false;
+    }
+
+    if (!correctness_ready) {
+        *error = QStringLiteral("status ok requires correctness_ready");
+        return false;
+    }
+
+    const bool expected_enablement_ready =
+        correctness_ready && sparse_reduction_ready && memory_capacity_ready;
+    if (enablement_ready != expected_enablement_ready) {
+        *error =
+            QStringLiteral("enablement_ready is inconsistent with readiness fields");
+        return false;
+    }
+
+    const QString expected_recommendation =
+        enablement_ready
+            ? QStringLiteral("integrate_after_end_to_end_qsg_gate")
+            : QStringLiteral("reject_enablement_keep_evidence");
+    if (observed.value(QStringLiteral("recommendation")).toString() !=
+        expected_recommendation)
+    {
+        *error = QStringLiteral("decision recommendation is inconsistent");
+        return false;
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1702,11 +1964,15 @@ int main(int argc, char** argv)
         std::cout << output.constData();
     }
 
-    if (options.validate_json &&
-        root.value(QStringLiteral("status")).toString() != QStringLiteral("ok"))
-    {
-        std::cerr << "lazy snapshot evidence correctness validation failed\n";
-        return 3;
+    if (options.validate_json) {
+        QString validation_error;
+        if (!validate_decision_contract(root, &validation_error)) {
+            std::cerr
+                << "lazy snapshot evidence JSON validation failed: "
+                << validation_error.toUtf8().constData()
+                << '\n';
+            return 3;
+        }
     }
 
     return root.value(QStringLiteral("status")).toString() == QStringLiteral("ok")

@@ -514,6 +514,23 @@ bool expect_lazy_fallback_reason(
         label);
 }
 
+bool expect_lazy_fallback_reason(
+    term::Terminal_session&                         session,
+    std::shared_ptr<const term::Terminal_render_snapshot> previous,
+    const term::Terminal_render_snapshot&           current,
+    term::Terminal_lazy_snapshot_fallback_reason    expected_reason,
+    const char*                                     label)
+{
+    const term::Terminal_session_lazy_snapshot_composer_result result =
+        session.compose_lazy_render_snapshot_for_testing(
+            std::move(previous),
+            current);
+    return check(!result.eligible                  &&
+            !result.lazy_snapshot.has_value()      &&
+            result.fallback_reason == expected_reason,
+        label);
+}
+
 const term::Terminal_render_snapshot_lazy_row_payload* lazy_row_payload_or_null(
     const term::Terminal_render_snapshot& snapshot,
     int                                   row)
@@ -2260,7 +2277,7 @@ bool test_lazy_row_payload_materialization_matches_full_snapshot()
         "lazy parity fixture borrows unchanged last row");
 
     term::Terminal_render_snapshot lazy_snapshot = expected_snapshot;
-    lazy_snapshot.cells.clear();
+    std::vector<term::Terminal_render_cell>().swap(lazy_snapshot.cells);
     lazy_snapshot.lazy_row_payloads = payloads;
 
     const term::Terminal_render_snapshot_row_content_view rows(lazy_snapshot);
@@ -2269,6 +2286,8 @@ bool test_lazy_row_payload_materialization_matches_full_snapshot()
             term::Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST);
     ok &= check(lazy_snapshot.cells.empty(),
         "lazy parity fixture carries no flat cell backing");
+    ok &= check(lazy_snapshot.cells.capacity() == 0U,
+        "lazy parity fixture carries no flat cell capacity");
     ok &= check(render_cells_match(materialized, expected_snapshot.cells) &&
             rows.materialized_flat_cells_match(
                 expected_snapshot.cells,
@@ -2751,6 +2770,8 @@ bool test_disabled_lazy_composer_borrows_clean_rows_and_owns_dirty_rows()
             const term::Terminal_render_snapshot& lazy = *result.lazy_snapshot;
             ok &= check(lazy.cells.empty() && lazy.lazy_row_payloads != nullptr,
                 "disabled lazy composer stores rows through lazy payloads only");
+            ok &= check(lazy.cells.capacity() == 0U,
+                "disabled lazy composer retains no flat cell capacity");
             ok &= check(result.materialization_matches_full_snapshot,
                 "disabled lazy composer reports materialization parity");
             ok &= lazy_snapshot_materializes_like_full_snapshot(
@@ -3063,6 +3084,18 @@ bool test_disabled_lazy_composer_reports_specific_fallback_reasons()
             UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH,
         "lazy composer reports detached projection path boundary",
         true);
+
+    term::Terminal_render_snapshot no_borrowable_rows = *current;
+    no_borrowable_rows.dirty_row_ranges = {{
+        0,
+        no_borrowable_rows.grid_size.rows,
+    }};
+    ok &= expect_lazy_fallback_reason(
+        *session,
+        previous,
+        no_borrowable_rows,
+        term::Terminal_lazy_snapshot_fallback_reason::NO_BORROWABLE_ROWS,
+        "lazy composer reports full-dirty no-borrowable-rows boundary");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
         "lazy fallback reason session enters synchronized-output hold");

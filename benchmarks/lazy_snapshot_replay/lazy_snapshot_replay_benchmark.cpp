@@ -24,7 +24,7 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
-constexpr int k_schema_version = 1;
+constexpr int k_schema_version = 2;
 constexpr int k_initial_rows   = 10;
 constexpr int k_initial_cols   = 48;
 constexpr int k_resized_rows   = 12;
@@ -95,11 +95,19 @@ struct Summary
     int unexpected_eligible_events    = 0;
     int parity_mismatch_events        = 0;
     int candidate_materialized_events = 0;
+    int fallback_reason_mismatch_events = 0;
+    std::uint64_t candidate_materialization_calls = 0U;
+    std::uint64_t candidate_materialization_rows  = 0U;
+    std::uint64_t candidate_materialization_cells = 0U;
     std::uint64_t full_cells          = 0U;
     std::uint64_t lazy_cells_scanned  = 0U;
     std::uint64_t lazy_cells_emitted  = 0U;
     std::uint64_t lazy_dirty_rows     = 0U;
     std::uint64_t lazy_borrowed_rows  = 0U;
+    term::Terminal_lazy_snapshot_fallback_reason_counters
+        expected_fallback_reason_counts;
+    term::Terminal_lazy_snapshot_fallback_reason_counters
+        observed_fallback_reason_counts;
 };
 
 struct Run_result
@@ -268,6 +276,41 @@ QString fallback_reason_name(term::Terminal_lazy_snapshot_fallback_reason reason
         }
     }
     return QStringLiteral("unknown");
+}
+
+void increment_fallback_reason_counter(
+    term::Terminal_lazy_snapshot_fallback_reason_counters& counters,
+    term::Terminal_lazy_snapshot_fallback_reason           reason)
+{
+    if (reason == term::Terminal_lazy_snapshot_fallback_reason::NONE) {
+        return;
+    }
+
+    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
+        term::terminal_lazy_snapshot_fallback_reason_descriptors())
+    {
+        if (descriptor.reason == reason) {
+            ++(counters.*descriptor.counter);
+            return;
+        }
+    }
+}
+
+QJsonObject fallback_reason_counts_json(
+    const term::Terminal_lazy_snapshot_fallback_reason_counters& counters)
+{
+    QJsonObject object;
+    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
+        term::terminal_lazy_snapshot_fallback_reason_descriptors())
+    {
+        insert_u64(
+            object,
+            QString::fromLatin1(descriptor.key),
+            term::terminal_lazy_snapshot_fallback_reason_counter(
+                counters,
+                descriptor));
+    }
+    return object;
 }
 
 QString event_kind_name(Replay_event_kind kind)
@@ -856,7 +899,7 @@ std::vector<Replay_event> deterministic_workload()
         tui,
         QStringLiteral("tui_dense_update"),
         tui_frame(2),
-        eligible()));
+        fallback(term::Terminal_lazy_snapshot_fallback_reason::NO_BORROWABLE_ROWS)));
     events.push_back(output_event(
         tui,
         QStringLiteral("exit_alternate_screen"),
@@ -1019,6 +1062,7 @@ bool status_passes(const QString& status)
 
 void update_summary(
     Summary&                                                    summary,
+    const Expected_outcome&                                     expected,
     bool                                                        snapshot_available,
     const QString&                                              status,
     const term::Terminal_render_snapshot*                       snapshot,
@@ -1032,20 +1076,37 @@ void update_summary(
     }
 
     ++summary.snapshot_events;
+    if (expected.result == Expected_result::FALLBACK) {
+        increment_fallback_reason_counter(
+            summary.expected_fallback_reason_counts,
+            expected.fallback);
+    }
     if (status == QStringLiteral("eligible_match")) {
         ++summary.eligible_events;
     }
     else
     if (status == QStringLiteral("expected_fallback")) {
         ++summary.expected_fallback_events;
+        if (parity != nullptr) {
+            increment_fallback_reason_counter(
+                summary.observed_fallback_reason_counts,
+                parity->fallback_reason);
+        }
     }
     else
     if (status == QStringLiteral("unexpected_fallback")) {
         ++summary.unexpected_fallback_events;
+        ++summary.fallback_reason_mismatch_events;
+        if (parity != nullptr) {
+            increment_fallback_reason_counter(
+                summary.observed_fallback_reason_counts,
+                parity->fallback_reason);
+        }
     }
     else
     if (status == QStringLiteral("unexpected_eligible")) {
         ++summary.unexpected_eligible_events;
+        ++summary.fallback_reason_mismatch_events;
     }
     else
     if (status == QStringLiteral("parity_mismatch")) {
@@ -1063,6 +1124,14 @@ void update_summary(
     }
     if (candidate != nullptr && candidate->consumer_materialization_calls != 0U) {
         ++summary.candidate_materialized_events;
+    }
+    if (candidate != nullptr) {
+        summary.candidate_materialization_calls +=
+            candidate->consumer_materialization_calls;
+        summary.candidate_materialization_rows +=
+            candidate->consumer_materialization_rows;
+        summary.candidate_materialization_cells +=
+            candidate->consumer_materialization_cells;
     }
 }
 
@@ -1208,6 +1277,7 @@ Run_result run_replay()
 
         update_summary(
             run.summary,
+            event.expected,
             snapshot_available,
             status,
             snapshot_available && current != nullptr ? current.get() : nullptr,
@@ -1221,8 +1291,25 @@ Run_result run_replay()
 
 QJsonObject summary_json(const Summary& summary, bool passed)
 {
+    const bool replay_parity_ready =
+        summary.unexpected_fallback_events == 0 &&
+        summary.unexpected_eligible_events == 0 &&
+        summary.parity_mismatch_events == 0;
+    const bool fallback_reason_ready =
+        summary.fallback_reason_mismatch_events == 0;
+    const bool candidate_materialization_ready =
+        summary.candidate_materialized_events == 0 &&
+        summary.candidate_materialization_calls == 0U &&
+        summary.candidate_materialization_rows  == 0U &&
+        summary.candidate_materialization_cells == 0U;
+
     QJsonObject object;
     object.insert(QStringLiteral("passed"), passed);
+    object.insert(QStringLiteral("replay_parity_ready"), replay_parity_ready);
+    object.insert(QStringLiteral("fallback_reason_ready"), fallback_reason_ready);
+    object.insert(
+        QStringLiteral("candidate_materialization_ready"),
+        candidate_materialization_ready);
     object.insert(QStringLiteral("events"), summary.events);
     object.insert(QStringLiteral("snapshot_events"), summary.snapshot_events);
     object.insert(QStringLiteral("no_snapshot_events"), summary.no_snapshot_events);
@@ -1234,11 +1321,32 @@ QJsonObject summary_json(const Summary& summary, bool passed)
     object.insert(
         QStringLiteral("candidate_materialized_events"),
         summary.candidate_materialized_events);
+    object.insert(
+        QStringLiteral("fallback_reason_mismatch_events"),
+        summary.fallback_reason_mismatch_events);
+    insert_u64(
+        object,
+        QStringLiteral("candidate_materialization_calls"),
+        summary.candidate_materialization_calls);
+    insert_u64(
+        object,
+        QStringLiteral("candidate_materialization_rows"),
+        summary.candidate_materialization_rows);
+    insert_u64(
+        object,
+        QStringLiteral("candidate_materialization_cells"),
+        summary.candidate_materialization_cells);
     insert_u64(object, QStringLiteral("full_cells"), summary.full_cells);
     insert_u64(object, QStringLiteral("lazy_cells_scanned"), summary.lazy_cells_scanned);
     insert_u64(object, QStringLiteral("lazy_cells_emitted"), summary.lazy_cells_emitted);
     insert_u64(object, QStringLiteral("lazy_dirty_rows"), summary.lazy_dirty_rows);
     insert_u64(object, QStringLiteral("lazy_borrowed_rows"), summary.lazy_borrowed_rows);
+    object.insert(
+        QStringLiteral("expected_fallback_reason_counts"),
+        fallback_reason_counts_json(summary.expected_fallback_reason_counts));
+    object.insert(
+        QStringLiteral("observed_fallback_reason_counts"),
+        fallback_reason_counts_json(summary.observed_fallback_reason_counts));
     return object;
 }
 
@@ -1307,6 +1415,9 @@ QJsonObject build_root_json(const Run_result& run)
     QJsonObject root;
     root.insert(QStringLiteral("schema"), k_schema_name);
     root.insert(QStringLiteral("schema_version"), k_schema_version);
+    root.insert(
+        QStringLiteral("status"),
+        run.passed ? QStringLiteral("ok") : QStringLiteral("failed"));
     root.insert(QStringLiteral("measurement_boundary"), k_measurement_boundary);
     root.insert(QStringLiteral("config"), config);
     root.insert(QStringLiteral("workloads"), workload_names_json());
@@ -1325,11 +1436,46 @@ bool validate_json_root(const QJsonObject& root, QString* out_error)
         *out_error = QStringLiteral("root schema fields are invalid");
         return false;
     }
+    if (root.value(QStringLiteral("status")).toString() != QStringLiteral("ok")) {
+        *out_error = QStringLiteral("replay root status is not ok");
+        return false;
+    }
 
     const QJsonObject summary = root.value(QStringLiteral("summary")).toObject();
     if (!summary.value(QStringLiteral("passed")).toBool()) {
         *out_error = QStringLiteral("replay summary did not pass");
         return false;
+    }
+    if (!summary.value(QStringLiteral("replay_parity_ready")).toBool() ||
+        !summary.value(QStringLiteral("fallback_reason_ready")).toBool() ||
+        !summary.value(QStringLiteral("candidate_materialization_ready")).toBool())
+    {
+        *out_error = QStringLiteral("replay summary readiness flags are not all true");
+        return false;
+    }
+    if (summary.value(QStringLiteral("fallback_reason_mismatch_events")).toInt() != 0) {
+        *out_error = QStringLiteral("fallback reason mismatches were recorded");
+        return false;
+    }
+    if (summary.value(QStringLiteral("candidate_materialization_calls")).toInt() != 0 ||
+        summary.value(QStringLiteral("candidate_materialization_rows")).toInt()  != 0 ||
+        summary.value(QStringLiteral("candidate_materialization_cells")).toInt() != 0)
+    {
+        *out_error = QStringLiteral("candidate materialization aggregates are nonzero");
+        return false;
+    }
+    const QJsonObject expected_fallbacks =
+        summary.value(QStringLiteral("expected_fallback_reason_counts")).toObject();
+    const QJsonObject observed_fallbacks =
+        summary.value(QStringLiteral("observed_fallback_reason_counts")).toObject();
+    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
+        term::terminal_lazy_snapshot_fallback_reason_descriptors())
+    {
+        const QString key = QString::fromLatin1(descriptor.key);
+        if (expected_fallbacks.value(key).toInt() != observed_fallbacks.value(key).toInt()) {
+            *out_error = QStringLiteral("fallback reason count mismatch for %1").arg(key);
+            return false;
+        }
     }
 
     const QJsonArray events = root.value(QStringLiteral("events")).toArray();

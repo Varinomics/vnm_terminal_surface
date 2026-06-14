@@ -427,6 +427,10 @@ bool snapshot_observations_match(
     ok &= check_labeled(lazy.lazy_row_payloads != nullptr, label, "lazy payload presence");
     ok &= check_labeled(lazy.cells.empty(), label, "lazy snapshot has no flat cells");
     ok &= check_labeled(
+        lazy.cells.capacity() == 0U,
+        label,
+        "lazy snapshot retains no flat cell capacity");
+    ok &= check_labeled(
         term::validate_render_snapshot(full).status ==
             term::Terminal_render_snapshot_status::OK,
         label,

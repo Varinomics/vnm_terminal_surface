@@ -92,8 +92,8 @@ constexpr int k_surface_session_write_high_water_bytes        = 64 * 1024;
 constexpr int k_surface_session_resize_boundary_width_delta   = 16;
 constexpr int k_surface_session_geometry_boundary_height_delta = 16;
 
-constexpr int k_schema_version              = 24;
-constexpr int k_profile_schema_version      = 2;
+constexpr int k_schema_version              = 25;
+constexpr int k_profile_schema_version      = 3;
 constexpr int k_profile_text_format         = 2;
 constexpr int k_flat_rect_vertices_per_rect = 6;
 

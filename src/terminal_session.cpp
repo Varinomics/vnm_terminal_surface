@@ -2009,6 +2009,12 @@ Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_
                 style_id_remaps));
     }
 
+    const std::uint64_t dirty_rows_visible = visible_dirty_row_count(current);
+    if (dirty_rows_visible >= static_cast<std::uint64_t>(current.grid_size.rows)) {
+        return lazy_snapshot_ineligible_result(
+            Terminal_lazy_snapshot_fallback_reason::NO_BORROWABLE_ROWS);
+    }
+
     const dirty_row_payload_owner_result_t current_dirty_owner =
         dirty_row_payload_owner_from_snapshot(
             current,
@@ -2018,7 +2024,6 @@ Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_
     auto payloads = std::make_shared<Terminal_render_snapshot_lazy_payloads>();
     payloads->receiving_namespace = receiving_namespace;
     payloads->rows.reserve(static_cast<std::size_t>(current.grid_size.rows));
-    const std::uint64_t dirty_rows_visible = visible_dirty_row_count(current);
     for (int row = 0; row < current.grid_size.rows; ++row) {
         const bool dirty = render_snapshot_row_is_dirty(current, row);
         const std::size_t payload_index =
@@ -2053,7 +2058,7 @@ Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_
     }
 
     Terminal_render_snapshot lazy_snapshot = current;
-    lazy_snapshot.cells.clear();
+    std::vector<Terminal_render_cell>().swap(lazy_snapshot.cells);
     lazy_snapshot.lazy_row_payloads = payloads;
 
     const bool row_view_parity_materialization =
