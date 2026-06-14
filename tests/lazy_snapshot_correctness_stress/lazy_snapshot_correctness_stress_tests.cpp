@@ -1,4 +1,5 @@
 #include "helpers/test_check.h"
+#include "helpers/primary_backing_test_config.h"
 #include "vnm_terminal/internal/terminal_session.h"
 
 #include <QByteArray>
@@ -18,6 +19,7 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 using vnm_terminal::test_helpers::check;
+using vnm_terminal::test_helpers::recovery_disabled_primary_backing_session_config;
 
 class Replay_backend final : public term::Terminal_backend
 {
@@ -108,11 +110,11 @@ std::unique_ptr<term::Terminal_session> make_session(
     auto owned_backend = std::make_unique<Replay_backend>();
     backend = owned_backend.get();
 
-    term::Terminal_session_config config;
+    term::Terminal_session_config config =
+        recovery_disabled_primary_backing_session_config();
     config.trace_notification_limit                 = 128U;
     config.trace_resize_limit                       = 32U;
     config.scrollback_limit                         = 24;
-    config.recover_scrollback_from_primary_repaints = false;
 
     auto session = std::make_unique<term::Terminal_session>(
         std::move(owned_backend),
