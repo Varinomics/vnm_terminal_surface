@@ -696,6 +696,45 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
             QStringLiteral("glyph_cursor_text_row_capacity")).isString(),
         "atlas buffer upload metrics include glyph cursor-text row capacity counter");
 
+    QJsonObject render_invalidation;
+    vnm_terminal::diagnostics::append_render_invalidation_metrics_json(
+        surface,
+        render_invalidation);
+    ok &= check(!render_invalidation.isEmpty(),
+        "append_render_invalidation_metrics_json fills the runtime object");
+    ok &= check(
+        render_invalidation.value(QStringLiteral("update_requests")).isString(),
+        "render invalidation metrics include update request counter");
+    ok &= check(
+        render_invalidation.value(QStringLiteral("pending_update")).isBool(),
+        "render invalidation metrics include pending-update flag");
+
+    QJsonObject backend_drain;
+    vnm_terminal::diagnostics::append_backend_drain_metrics_json(
+        surface,
+        backend_drain);
+    ok &= check(!backend_drain.isEmpty(),
+        "append_backend_drain_metrics_json fills the runtime object");
+    ok &= check(
+        backend_drain.value(QStringLiteral("total_drain_calls")).isString(),
+        "backend drain metrics include total drain calls counter");
+    ok &= check(
+        backend_drain.value(QStringLiteral("session_processing_elapsed_ns")).isString(),
+        "backend drain metrics include session processing elapsed counter");
+    ok &= check(
+        backend_drain.value(QStringLiteral("sync_from_session_elapsed_ns")).isString(),
+        "backend drain metrics include surface sync elapsed counter");
+    ok &= check(
+        backend_drain.value(
+            QStringLiteral("posted_frame_pending_small_budget_calls")).isString(),
+        "backend drain metrics include frame-pending posted budget counter");
+    ok &= check(
+        backend_drain.value(QStringLiteral("frame_work_pending_elapsed_ns")).isString(),
+        "backend drain metrics include frame-pending elapsed counter");
+    ok &= check(
+        backend_drain.value(QStringLiteral("pending_callback_after_drain")).isString(),
+        "backend drain metrics include pending callback counter");
+
     return ok;
 }
 

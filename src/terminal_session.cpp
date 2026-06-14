@@ -51,6 +51,41 @@ bool model_result_warrants_render_snapshot(const Terminal_screen_model_result& r
         result.mouse_reporting_mode_changed;
 }
 
+void coalesce_dirty_rows(std::vector<int>& dirty_rows, const std::vector<int>& added_rows)
+{
+    dirty_rows.insert(dirty_rows.end(), added_rows.begin(), added_rows.end());
+    std::sort(dirty_rows.begin(), dirty_rows.end());
+    dirty_rows.erase(
+        std::unique(dirty_rows.begin(), dirty_rows.end()),
+        dirty_rows.end());
+}
+
+void coalesce_backend_content_model_result(
+    Terminal_screen_model_result&       target,
+    const Terminal_screen_model_result& update)
+{
+    coalesce_dirty_rows(target.dirty_rows, update.dirty_rows);
+    target.dirty_rows_have_stable_mutation_identity =
+        target.dirty_rows_have_stable_mutation_identity &&
+        update.dirty_rows_have_stable_mutation_identity;
+    target.terminal_content_changed =
+        target.terminal_content_changed || update.terminal_content_changed;
+    target.active_buffer_changed =
+        target.active_buffer_changed || update.active_buffer_changed;
+    target.grid_reflow_changed =
+        target.grid_reflow_changed || update.grid_reflow_changed;
+    target.viewport_changed =
+        target.viewport_changed || update.viewport_changed;
+    target.mode_state_changed =
+        target.mode_state_changed || update.mode_state_changed;
+    target.mouse_reporting_mode_changed =
+        target.mouse_reporting_mode_changed || update.mouse_reporting_mode_changed;
+    target.alternate_scroll_mode_changed =
+        target.alternate_scroll_mode_changed || update.alternate_scroll_mode_changed;
+    target.scrollback_rows          = update.scrollback_rows;
+    target.evicted_scrollback_rows += update.evicted_scrollback_rows;
+}
+
 bool backend_callback_drain_deadline_reached(
     const Backend_callback_drain_deadline& deadline)
 {
@@ -3939,6 +3974,9 @@ bool Terminal_session::process_pending_commands(
     }
 
     m_processing_commands = true;
+    const bool previous_backend_content_snapshot_deferral =
+        m_backend_content_snapshot_deferral_active;
+    m_backend_content_snapshot_deferral_active = deadline.has_value();
     bool complete = true;
     for (;;) {
         if (drain_policy == Backend_callback_drain_policy::DRAIN_CALLBACKS) {
@@ -3985,6 +4023,12 @@ bool Terminal_session::process_pending_commands(
         const std::size_t    command_count = slice_backend_output ? 0U : 1U;
         m_last_processed_sequence = command.sequence;
 
+        if (command.kind != Terminal_session_command_kind::BACKEND_OUTPUT ||
+            should_ignore_backend_output_after_stop(command.sequence))
+        {
+            flush_deferred_backend_content_snapshot();
+        }
+
         m_backend_error_queued_during_command = false;
         Terminal_session_result result = process_command(std::move(command));
         if (!slice_backend_output) {
@@ -4006,6 +4050,9 @@ bool Terminal_session::process_pending_commands(
             break;
         }
     }
+    flush_deferred_backend_content_snapshot();
+    m_backend_content_snapshot_deferral_active =
+        previous_backend_content_snapshot_deferral;
     m_processing_commands = false;
     return complete;
 }
@@ -4607,6 +4654,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
                     continue;
                 }
 
+                flush_deferred_backend_content_snapshot();
                 const QByteArray prefix = sync_sequence_prefix(remaining, sync_reset, 'l');
                 if (!prefix.isEmpty()) {
                     ingest_backend_output_segment(command.sequence, QByteArrayView(prefix));
@@ -4647,6 +4695,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
         const bool synchronized_output_entry_boundary =
             !m_screen_model->mode_state().synchronized_output;
         if (synchronized_output_entry_boundary) {
+            flush_deferred_backend_content_snapshot();
             latch_synchronized_output_scroll_policy_for_new_hold();
         }
         const bool immediate_entry_boundary =
@@ -5080,6 +5129,7 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     reset_public_projection_lifecycle();
     m_last_model_ingest_result.reset();
     m_render_snapshot_model_result.reset();
+    m_deferred_backend_content_snapshot.reset();
     m_selection.clear();
     m_selection_buffer_id               = Terminal_buffer_id::PRIMARY;
     m_selection_content_basis           = {};
@@ -5111,6 +5161,8 @@ void Terminal_session::ingest_backend_output_segment(
         return;
     }
 
+    const bool render_snapshot_was_blocked =
+        !model_allows_render_snapshot(*m_screen_model);
     const bool had_public_projection_hold = public_projection_hold_active();
     const std::optional<Terminal_public_release_intent> release_intent =
         had_public_projection_hold && immediate_public_projection_policy_enabled()
@@ -5149,6 +5201,8 @@ void Terminal_session::ingest_backend_output_segment(
     if (!render_snapshot_available) {
         record_blocked_synchronized_row_origin_change(ingest_result);
     }
+    const bool synchronized_output_released =
+        render_snapshot_was_blocked && render_snapshot_available;
     if ((model_result_warrants_render_snapshot(ingest_result) ||
         render_snapshot_metadata_changed                      ||
         m_visual_bell_active)
@@ -5168,11 +5222,26 @@ void Terminal_session::ingest_backend_output_segment(
                     *release_intent,
                     m_viewport_controller.state())
                 : synchronized_output_policy_change_diagnostics();
-        publish_render_snapshot(
-            sequence,
-            QStringLiteral("backend output received"),
-            Terminal_render_snapshot_purpose::CONTENT,
-            release_diagnostics.value_or(Terminal_public_scroll_diagnostics{}));
+        const bool can_defer_content_snapshot =
+            m_backend_content_snapshot_deferral_active &&
+            !synchronized_output_released              &&
+            !render_snapshot_metadata_changed          &&
+            !release_diagnostics.has_value();
+        if (can_defer_content_snapshot) {
+            defer_backend_content_snapshot(
+                sequence,
+                QStringLiteral("backend output received"),
+                ingest_result,
+                Terminal_public_scroll_diagnostics{});
+        }
+        else {
+            flush_deferred_backend_content_snapshot();
+            publish_render_snapshot(
+                sequence,
+                QStringLiteral("backend output received"),
+                Terminal_render_snapshot_purpose::CONTENT,
+                release_diagnostics.value_or(Terminal_public_scroll_diagnostics{}));
+        }
     }
     if (render_snapshot_available) {
         reset_synchronized_output_policy_lifecycle();
@@ -5180,6 +5249,47 @@ void Terminal_session::ingest_backend_output_segment(
     if (had_public_projection_hold && render_snapshot_available) {
         reset_public_projection_lifecycle();
     }
+}
+
+void Terminal_session::defer_backend_content_snapshot(
+    std::uint64_t                       sequence,
+    QString                             message,
+    const Terminal_screen_model_result& model_result,
+    Terminal_public_scroll_diagnostics  public_scroll_diagnostics)
+{
+    if (!m_deferred_backend_content_snapshot.has_value()) {
+        m_deferred_backend_content_snapshot = Deferred_backend_content_snapshot{
+            model_result,
+            std::move(public_scroll_diagnostics),
+            std::move(message),
+            sequence,
+        };
+        return;
+    }
+
+    Deferred_backend_content_snapshot& pending =
+        *m_deferred_backend_content_snapshot;
+    coalesce_backend_content_model_result(pending.model_result, model_result);
+    pending.public_scroll_diagnostics = std::move(public_scroll_diagnostics);
+    pending.message                   = std::move(message);
+    pending.sequence                  = sequence;
+}
+
+void Terminal_session::flush_deferred_backend_content_snapshot()
+{
+    if (!m_deferred_backend_content_snapshot.has_value()) {
+        return;
+    }
+
+    Deferred_backend_content_snapshot pending =
+        std::move(*m_deferred_backend_content_snapshot);
+    m_deferred_backend_content_snapshot.reset();
+    m_render_snapshot_model_result = std::move(pending.model_result);
+    publish_render_snapshot(
+        pending.sequence,
+        std::move(pending.message),
+        Terminal_render_snapshot_purpose::CONTENT,
+        pending.public_scroll_diagnostics);
 }
 
 bool Terminal_session::apply_text_area_resize_request(

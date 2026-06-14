@@ -16,4 +16,18 @@ void append_renderer_metrics_json(const VNM_TerminalSurface& surface, QJsonObjec
 // "qsg_atlas" key of the runtime metrics document.
 void append_atlas_metrics_json(const VNM_TerminalSurface& surface, QJsonObject& out);
 
+// Fill `out` with GUI-thread render invalidation counters for `surface`. The
+// caller owns the surrounding object: production places this content under the
+// "render_invalidation" key of the runtime metrics document.
+void append_render_invalidation_metrics_json(
+    const VNM_TerminalSurface&  surface,
+    QJsonObject&                out);
+
+// Fill `out` with backend callback drain/pump counters for `surface`. The
+// caller owns the surrounding object: production places this content under the
+// "backend_drain" key of the runtime metrics document.
+void append_backend_drain_metrics_json(
+    const VNM_TerminalSurface&  surface,
+    QJsonObject&                out);
+
 }

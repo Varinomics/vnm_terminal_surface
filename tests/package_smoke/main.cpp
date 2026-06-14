@@ -10,6 +10,10 @@ int main()
         &vnm_terminal::diagnostics::append_renderer_metrics_json;
     void (*append_atlas)(const VNM_TerminalSurface&, QJsonObject&) =
         &vnm_terminal::diagnostics::append_atlas_metrics_json;
+    void (*append_render_invalidation)(const VNM_TerminalSurface&, QJsonObject&) =
+        &vnm_terminal::diagnostics::append_render_invalidation_metrics_json;
+    void (*append_backend_drain)(const VNM_TerminalSurface&, QJsonObject&) =
+        &vnm_terminal::diagnostics::append_backend_drain_metrics_json;
 
     // Prove the installed public font/metrics header is includable and that its
     // functions link from the packaged library.
@@ -20,6 +24,8 @@ int main()
         &vnm_terminal::cell_metrics_valid;
 
     return (append_renderer != nullptr && append_atlas != nullptr &&
+            append_render_invalidation != nullptr &&
+            append_backend_drain != nullptr &&
             default_family != nullptr && metrics_for_font != nullptr &&
             metrics_valid != nullptr)
         ? 0

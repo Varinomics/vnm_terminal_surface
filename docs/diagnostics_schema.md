@@ -8,9 +8,9 @@ are the single source of truth for the field lists, and the byte-golden test
 `tests/diagnostics_text_layout/diagnostics_text_layout_tests.cpp` pins the
 output against them.
 
-## Two serializations, one field list
+## Descriptor-backed serializations
 
-Every counter block is emitted in two forms:
+Descriptor-backed counter blocks are emitted in two forms:
 
 - **JSON** (`src/diagnostics/metrics_json.cpp`, always built): the runtime
   metrics document. Counters are emitted as decimal **strings** (so a 64-bit
@@ -29,6 +29,11 @@ descriptor table each, consumed by both `emit_metrics_json` and
 `emit_metrics_text`, so the field set and order cannot diverge. For every
 table-driven block the JSON key and the TEXT label are identical strings.
 
+The runtime metrics document also contains hand-written JSON-only sections such
+as `render_invalidation` and `backend_drain`. Those sections are public runtime
+JSON helpers, not descriptor-backed JSON/TEXT metric blocks, and no TEXT
+profile section mirrors them.
+
 A few atlas fields are deliberately left hand-written rather than table-driven
 because they are not plain counter/bool field reads: the `warm_elapsed_ms` and
 `lazy_elapsed_ms` durations (emitted as raw `double` values), the top-level
@@ -36,6 +41,50 @@ because they are not plain counter/bool field reads: the `warm_elapsed_ms` and
 (text-renderer policy, sampler mode, LCD order), the nested `first_glyph_miss`
 diagnostic, and the `msdf_text` doubles. These stay in the serializers, around
 the shared tables.
+
+## Runtime JSON-only sections
+
+These sections are emitted only by the runtime JSON helpers in
+`vnm_terminal/diagnostics/metrics_json.h`. Counter values are decimal strings;
+boolean values are JSON booleans. These diagnostics are `UNSTABLE`.
+
+### Render invalidation block (JSON key `render_invalidation`)
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `update_requests` | Counter | Count | Unstable |
+| `scheduled_updates` | Counter | Count | Unstable |
+| `coalesced_requests` | Counter | Count | Unstable |
+| `consumed_updates` | Counter | Count | Unstable |
+| `last_rendered_snapshot_sequence` | Counter | Count | Unstable |
+| `pending_update` | Bool | None | Unstable |
+
+### Backend drain block (JSON key `backend_drain`)
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `total_drain_calls` | Counter | Count | Unstable |
+| `budgeted_drain_calls` | Counter | Count | Unstable |
+| `unbudgeted_drain_calls` | Counter | Count | Unstable |
+| `posted_drain_calls` | Counter | Count | Unstable |
+| `posted_full_budget_calls` | Counter | Count | Unstable |
+| `posted_frame_pending_small_budget_calls` | Counter | Count | Unstable |
+| `budget_exhausted_incomplete` | Counter | Count | Unstable |
+| `total_elapsed_ns` | Counter | Nanoseconds | Unstable |
+| `max_elapsed_ns` | Counter | Nanoseconds | Unstable |
+| `session_processing_calls` | Counter | Count | Unstable |
+| `session_processing_elapsed_ns` | Counter | Nanoseconds | Unstable |
+| `session_processing_max_elapsed_ns` | Counter | Nanoseconds | Unstable |
+| `sync_from_session_calls` | Counter | Count | Unstable |
+| `sync_from_session_elapsed_ns` | Counter | Nanoseconds | Unstable |
+| `sync_from_session_max_elapsed_ns` | Counter | Nanoseconds | Unstable |
+| `frame_work_pending_drain_calls` | Counter | Count | Unstable |
+| `frame_work_pending_elapsed_ns` | Counter | Nanoseconds | Unstable |
+| `render_update_pending_drain_calls` | Counter | Count | Unstable |
+| `atlas_completion_pending_drain_calls` | Counter | Count | Unstable |
+| `requeue_count` | Counter | Count | Unstable |
+| `pending_callback_after_drain` | Counter | Count | Unstable |
+| `output_backpressure_after_drain` | Counter | Count | Unstable |
 
 ## Descriptor model
 

@@ -968,4 +968,95 @@ void append_atlas_metrics_json(const VNM_TerminalSurface& surface, QJsonObject& 
     out = qsg_atlas_metrics_json(report);
 }
 
+void append_render_invalidation_metrics_json(
+    const VNM_TerminalSurface&  surface,
+    QJsonObject&                out)
+{
+    const internal::Terminal_surface_render_invalidation_stats_t stats =
+        internal::VNM_TerminalSurface_render_bridge::invalidation_stats(surface);
+
+    insert_json_counter(out, "update_requests", stats.update_requests);
+    insert_json_counter(out, "scheduled_updates", stats.scheduled_updates);
+    insert_json_counter(out, "coalesced_requests", stats.coalesced_requests);
+    insert_json_counter(out, "consumed_updates", stats.consumed_updates);
+    insert_json_counter(
+        out,
+        "last_rendered_snapshot_sequence",
+        stats.last_rendered_snapshot_sequence);
+    out.insert(QStringLiteral("pending_update"), stats.pending_update);
+}
+
+void append_backend_drain_metrics_json(
+    const VNM_TerminalSurface&  surface,
+    QJsonObject&                out)
+{
+    const internal::Terminal_surface_backend_drain_stats_t stats =
+        internal::VNM_TerminalSurface_render_bridge::backend_drain_stats(surface);
+
+    insert_json_counter(out, "total_drain_calls", stats.total_drain_calls);
+    insert_json_counter(out, "budgeted_drain_calls", stats.budgeted_drain_calls);
+    insert_json_counter(out, "unbudgeted_drain_calls", stats.unbudgeted_drain_calls);
+    insert_json_counter(out, "posted_drain_calls", stats.posted_drain_calls);
+    insert_json_counter(out, "posted_full_budget_calls", stats.posted_full_budget_calls);
+    insert_json_counter(
+        out,
+        "posted_frame_pending_small_budget_calls",
+        stats.posted_frame_pending_small_budget_calls);
+    insert_json_counter(
+        out,
+        "budget_exhausted_incomplete",
+        stats.budget_exhausted_incomplete);
+    insert_json_counter(out, "total_elapsed_ns", stats.total_elapsed_ns);
+    insert_json_counter(out, "max_elapsed_ns", stats.max_elapsed_ns);
+    insert_json_counter(
+        out,
+        "session_processing_calls",
+        stats.session_processing_calls);
+    insert_json_counter(
+        out,
+        "session_processing_elapsed_ns",
+        stats.session_processing_elapsed_ns);
+    insert_json_counter(
+        out,
+        "session_processing_max_elapsed_ns",
+        stats.session_processing_max_elapsed_ns);
+    insert_json_counter(
+        out,
+        "sync_from_session_calls",
+        stats.sync_from_session_calls);
+    insert_json_counter(
+        out,
+        "sync_from_session_elapsed_ns",
+        stats.sync_from_session_elapsed_ns);
+    insert_json_counter(
+        out,
+        "sync_from_session_max_elapsed_ns",
+        stats.sync_from_session_max_elapsed_ns);
+    insert_json_counter(
+        out,
+        "frame_work_pending_drain_calls",
+        stats.frame_work_pending_drain_calls);
+    insert_json_counter(
+        out,
+        "frame_work_pending_elapsed_ns",
+        stats.frame_work_pending_elapsed_ns);
+    insert_json_counter(
+        out,
+        "render_update_pending_drain_calls",
+        stats.render_update_pending_drain_calls);
+    insert_json_counter(
+        out,
+        "atlas_completion_pending_drain_calls",
+        stats.atlas_completion_pending_drain_calls);
+    insert_json_counter(out, "requeue_count", stats.requeue_count);
+    insert_json_counter(
+        out,
+        "pending_callback_after_drain",
+        stats.pending_callback_after_drain);
+    insert_json_counter(
+        out,
+        "output_backpressure_after_drain",
+        stats.output_backpressure_after_drain);
+}
+
 }

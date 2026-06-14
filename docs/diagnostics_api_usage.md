@@ -34,12 +34,20 @@ exported include directories and asserts the public headers are present
   cumulative-counter metrics.
 - `append_atlas_metrics_json(surface, out)` fills `out` with the QSG atlas
   frame-report metrics.
+- `append_render_invalidation_metrics_json(surface, out)` fills `out` with
+  GUI-thread render invalidation counters.
+- `append_backend_drain_metrics_json(surface, out)` fills `out` with backend
+  callback drain/pump counters, including stage timings and frame-pending
+  scheduling counters.
 
 The caller owns the surrounding document and chooses the enclosing keys; the
-first-party app nests these under `"renderer"` and `"qsg_atlas"` in its
-runtime metrics document. The key sets and their units and stability classes
-are recorded in `diagnostics_schema.md`; the structural expectations
-are pinned by the app's `metrics_json_smoke` test.
+first-party app nests these under `"renderer"`, `"qsg_atlas"`,
+`"render_invalidation"`, and `"backend_drain"` in its runtime metrics
+document. The render invalidation and backend drain sections are runtime
+JSON-only sections: they are not descriptor-backed JSON/TEXT metric blocks and
+do not have matching profile-text output. The descriptor-backed key sets and
+their units and stability classes are recorded in `diagnostics_schema.md`; the
+structural expectations are pinned by the app's `metrics_json_smoke` test.
 
 Frame counters pair with the serialized metrics for host-level framing (FPS,
 frame-evidence):
@@ -97,6 +105,14 @@ metrics.insert("renderer", renderer);
 QJsonObject atlas;
 vnm_terminal::diagnostics::append_atlas_metrics_json(*surface, atlas);
 metrics.insert("qsg_atlas", atlas);
+QJsonObject invalidation;
+vnm_terminal::diagnostics::append_render_invalidation_metrics_json(
+    *surface, invalidation);
+metrics.insert("render_invalidation", invalidation);
+QJsonObject backend_drain;
+vnm_terminal::diagnostics::append_backend_drain_metrics_json(
+    *surface, backend_drain);
+metrics.insert("backend_drain", backend_drain);
 metrics.insert("paint_completed_frames",
     static_cast<qint64>(surface->paint_completed_frame_count()));
 

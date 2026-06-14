@@ -72,6 +72,23 @@ bool is_printable_ascii(QChar character)
     return codepoint >= k_printable_ascii_first && codepoint <= k_printable_ascii_last;
 }
 
+bool is_single_width_non_ascii_bmp(QChar character)
+{
+    const ushort codepoint = character.unicode();
+    if (is_printable_ascii(character) ||
+        character.isHighSurrogate()   ||
+        character.isLowSurrogate())
+    {
+        return false;
+    }
+
+    if (codepoint == 0x2588U) {
+        return true;
+    }
+
+    return width_for_codepoint(static_cast<char32_t>(codepoint)).cells == 1;
+}
+
 Terminal_render_cell_text_category render_cell_text_category(QStringView text)
 {
     if (text.isEmpty()) {
@@ -2487,6 +2504,37 @@ bool Terminal_screen_model::printable_ascii_span_changes_selection_content(
     return false;
 }
 
+bool Terminal_screen_model::single_width_bmp_cell_changes_selection_content(
+    const Terminal_screen_row& row,
+    int                        column,
+    QChar                      text) const
+{
+    const Cell& cell = row.cells[static_cast<std::size_t>(column)];
+    return cell.text.size()   != 1 ||
+        cell.text[0]          != text ||
+        cell.display_width    != 1 ||
+        cell.wide_continuation      ||
+        !cell.occupied;
+}
+
+bool Terminal_screen_model::single_width_bmp_span_changes_selection_content(
+    const Terminal_screen_row& row,
+    int                        first_column,
+    QStringView                text) const
+{
+    for (qsizetype offset = 0; offset < text.size(); ++offset) {
+        if (single_width_bmp_cell_changes_selection_content(
+                row,
+                first_column + static_cast<int>(offset),
+                text[offset]))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool Terminal_screen_model::scalar_span_changes_selection_content(
     const Terminal_screen_row& row,
     terminal_grid_position_t   position,
@@ -2849,6 +2897,16 @@ void Terminal_screen_model::put_text(QString text)
             continue;
         }
 
+        const qsizetype single_width_bmp_begin = i;
+        while (i < text.size() && is_single_width_non_ascii_bmp(text[i])) {
+            ++i;
+        }
+        if (i > single_width_bmp_begin) {
+            put_single_width_bmp_text(
+                QStringView(text).sliced(single_width_bmp_begin, i - single_width_bmp_begin));
+            continue;
+        }
+
         const QChar current = text[i];
         if (current.isHighSurrogate() &&
             i + 1 < text.size() &&
@@ -2877,8 +2935,8 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
         }
     };
 
-    ++m_printable_text_profile_depth;
-    const profile_depth_guard_t profile_depth_guard{m_printable_text_profile_depth};
+    ++m_text_span_profile_depth;
+    const profile_depth_guard_t profile_depth_guard{m_text_span_profile_depth};
 #endif
     qsizetype offset = 0;
     while (offset < text.size()) {
@@ -2942,6 +3000,101 @@ void Terminal_screen_model::put_printable_ascii_text(QStringView text)
             available_columns));
         mark_cursor_dirty();
         write_printable_ascii_span(
+            m_cursor.row,
+            m_cursor.column,
+            text.sliced(offset, span_length));
+        if (span_length >= available_columns) {
+            m_cursor.column = m_config.grid_size.columns - 1;
+            m_pending_wrap = m_modes.autowrap;
+        }
+        else {
+            m_cursor.column += span_length;
+            m_pending_wrap = false;
+        }
+        mark_cursor_dirty();
+        offset += span_length;
+    }
+}
+
+void Terminal_screen_model::put_single_width_bmp_text(QStringView text)
+{
+#if VNM_TERMINAL_PROFILING_ENABLED
+    struct profile_depth_guard_t
+    {
+        int& depth;
+
+        ~profile_depth_guard_t()
+        {
+            --depth;
+        }
+    };
+
+    ++m_text_span_profile_depth;
+    const profile_depth_guard_t profile_depth_guard{m_text_span_profile_depth};
+#endif
+    qsizetype offset = 0;
+    while (offset < text.size()) {
+        if (m_modes.autowrap && m_pending_wrap) {
+#if VNM_TERMINAL_PROFILING_ENABLED
+            if (m_profile_stats.enabled) {
+                ++m_profile_stats.line_wraps_from_text_writes;
+            }
+#endif
+            carriage_return();
+            line_feed();
+            m_pending_wrap = false;
+        }
+
+        const int available_columns = m_config.grid_size.columns - m_cursor.column;
+        if (available_columns <= 0) {
+            return;
+        }
+
+        const qsizetype remaining = text.size() - offset;
+        if (!m_modes.autowrap && remaining > available_columns) {
+            mark_cursor_dirty();
+            Terminal_screen_row& screen_row =
+                active_grid_rows()[static_cast<std::size_t>(m_cursor.row)];
+            bool selection_content_changed = false;
+            if (available_columns > 1) {
+                selection_content_changed =
+                    single_width_bmp_span_changes_selection_content(
+                        screen_row,
+                        m_cursor.column,
+                        text.sliced(offset, available_columns - 1));
+                write_single_width_bmp_span_content(
+                    screen_row,
+                    m_cursor.column,
+                    text.sliced(offset, available_columns - 1));
+            }
+            else {
+                mark_terminal_content_changed();
+            }
+            selection_content_changed =
+                selection_content_changed ||
+                single_width_bmp_cell_changes_selection_content(
+                    screen_row,
+                    m_config.grid_size.columns - 1,
+                    text[text.size() - 1]);
+            const QString margin_text(text[text.size() - 1]);
+            write_single_width_bmp_cell_content(
+                screen_row,
+                m_config.grid_size.columns - 1,
+                margin_text);
+            advance_row_content_generation_with_change_flag(
+                screen_row,
+                selection_content_changed);
+            m_cursor.column = m_config.grid_size.columns - 1;
+            m_pending_wrap = false;
+            mark_cursor_dirty();
+            return;
+        }
+
+        const int span_length = static_cast<int>(std::min<qsizetype>(
+            remaining,
+            available_columns));
+        mark_cursor_dirty();
+        write_single_width_bmp_span(
             m_cursor.row,
             m_cursor.column,
             text.sliced(offset, span_length));
@@ -3022,6 +3175,70 @@ void Terminal_screen_model::write_printable_ascii_cell_content(
     Cell& target_cell = row.cells[static_cast<std::size_t>(column)];
     target_cell.text              = printable_ascii_cell_text(text);
     target_cell.text_category     = Terminal_render_cell_text_category::PRINTABLE_ASCII;
+    target_cell.display_width     = 1;
+    target_cell.wide_continuation = false;
+    target_cell.occupied          = true;
+    target_cell.style_id          = m_current_style_id;
+    target_cell.hyperlink_id      = m_current_hyperlink_id;
+}
+
+void Terminal_screen_model::write_single_width_bmp_span(
+    int                        row,
+    int                        first_column,
+    QStringView                text)
+{
+    Terminal_screen_row& screen_row = active_grid_rows()[static_cast<std::size_t>(row)];
+
+    const bool selection_content_changed =
+        single_width_bmp_span_changes_selection_content(screen_row, first_column, text);
+    write_single_width_bmp_span_content(screen_row, first_column, text);
+    advance_row_content_generation_with_change_flag(screen_row, selection_content_changed);
+    mark_dirty(row);
+}
+
+void Terminal_screen_model::write_single_width_bmp_span_content(
+    Terminal_screen_row&       row,
+    int                        first_column,
+    QStringView                text)
+{
+    if (text.isEmpty()) {
+        return;
+    }
+
+    mark_terminal_content_changed();
+    const QString first_text(text[0]);
+    for (qsizetype offset = 0; offset < text.size(); ++offset) {
+        if (text[offset] == text[0]) {
+            write_single_width_bmp_cell_content(
+                row,
+                first_column + static_cast<int>(offset),
+                first_text);
+        }
+        else {
+            const QString cell_text(text[offset]);
+            write_single_width_bmp_cell_content(
+                row,
+                first_column + static_cast<int>(offset),
+                cell_text);
+        }
+    }
+}
+
+void Terminal_screen_model::write_single_width_bmp_cell_content(
+    Terminal_screen_row&       row,
+    int                        column,
+    const QString&             text)
+{
+    Cell& cell = row.cells[static_cast<std::size_t>(column)];
+    if (cell.wide_continuation ||
+        cell.display_width != 1)
+    {
+        clear_cell_at_content(row, column);
+    }
+
+    Cell& target_cell = row.cells[static_cast<std::size_t>(column)];
+    target_cell.text              = text;
+    target_cell.text_category     = Terminal_render_cell_text_category::NON_ASCII;
     target_cell.display_width     = 1;
     target_cell.wide_continuation = false;
     target_cell.occupied          = true;
@@ -3203,7 +3420,7 @@ void Terminal_screen_model::clear_cell_at(terminal_grid_position_t position)
 {
     const terminal_grid_position_t base_position = cell_base_position(position);
 #if VNM_TERMINAL_PROFILING_ENABLED
-    if (m_profile_stats.enabled && m_printable_text_profile_depth > 0) {
+    if (m_profile_stats.enabled && m_text_span_profile_depth > 0) {
         const Cell& base_cell =
             active_grid_rows()[base_position.row].cells[base_position.column];
         if (base_position.row    != position.row ||
@@ -3241,7 +3458,7 @@ void Terminal_screen_model::clear_cell_at_content(
 {
     const int base_column = cell_base_column_in_row(row, column);
 #if VNM_TERMINAL_PROFILING_ENABLED
-    if (m_profile_stats.enabled && m_printable_text_profile_depth > 0) {
+    if (m_profile_stats.enabled && m_text_span_profile_depth > 0) {
         const Cell& base_cell = row.cells[static_cast<std::size_t>(base_column)];
         if (base_column != column || base_cell.display_width > 1) {
             ++m_profile_stats.wide_boundary_repairs_from_text_writes;
@@ -4000,7 +4217,7 @@ void Terminal_screen_model::append_scrollback_row(
     const std::map<std::uint64_t, QByteArray>* hyperlink_identity_keys)
 {
 #if VNM_TERMINAL_PROFILING_ENABLED
-    if (m_profile_stats.enabled && m_printable_text_profile_depth > 0) {
+    if (m_profile_stats.enabled && m_text_span_profile_depth > 0) {
         ++m_profile_stats.scrollback_appends_from_text_writes;
     }
 #endif
@@ -4427,7 +4644,7 @@ void Terminal_screen_model::mark_cursor_dirty()
 void Terminal_screen_model::mark_dirty(int row)
 {
 #if VNM_TERMINAL_PROFILING_ENABLED
-    if (m_profile_stats.enabled && m_printable_text_profile_depth > 0) {
+    if (m_profile_stats.enabled && m_text_span_profile_depth > 0) {
         ++m_profile_stats.dirty_marks_from_text_writes;
     }
     if (m_dirty_row_stats.enabled) {
