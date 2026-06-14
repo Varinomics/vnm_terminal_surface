@@ -169,6 +169,8 @@ struct Terminal_session_config
     Terminal_bell_policy            bell_policy;
     std::function<std::uint64_t()>  bell_clock_ms;
     std::function<void()>           backend_event_notifier;
+    std::function<void(std::uint64_t)>
+                                    backend_event_epoch_notifier;
     std::size_t                     trace_command_limit                      = 0U;
     std::size_t                     trace_notification_limit                 = 0U;
     std::size_t                     trace_result_limit                       = 0U;

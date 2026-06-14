@@ -88,6 +88,7 @@ constexpr std::chrono::milliseconds k_backend_callback_posted_drain_budget{32};
 constexpr std::chrono::milliseconds k_backend_callback_frame_pending_posted_drain_budget =
     k_backend_callback_drain_budget;
 constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget{0};
+constexpr std::uint64_t k_backend_callback_frame_boundary_deferral_limit = 2U;
 
 #if defined(_WIN32)
 constexpr unsigned int k_win_spi_get_font_smoothing             = 0x004AU;
@@ -1898,10 +1899,13 @@ struct VNM_TerminalSurface::Private
         surface.update();
     }
 
-    void record_backend_callback_frame_boundary()
+    std::uint64_t current_backend_callback_event_epoch() const
     {
-        const std::uint64_t epoch =
-            backend_callback_event_epoch.load(std::memory_order_acquire);
+        return backend_callback_event_epoch.load(std::memory_order_acquire);
+    }
+
+    void record_backend_callback_frame_boundary(std::uint64_t epoch)
+    {
         backend_callback_frame_boundary_epoch.store(epoch, std::memory_order_release);
     }
 
@@ -2231,8 +2235,13 @@ struct VNM_TerminalSurface::Private
     term::Terminal_surface_render_invalidation_stats_t     render_invalidation_stats;
     term::Terminal_surface_backend_drain_stats_t           backend_drain_stats;
     std::atomic<std::uint64_t>                             backend_callback_event_epoch{0U};
+    std::atomic<std::uint64_t>                             backend_callback_enqueue_epoch_at_event{0U};
     std::atomic<std::uint64_t>                             backend_callback_frame_boundary_epoch{0U};
+    std::atomic<std::uint64_t>                             backend_callback_input_generation{0U};
     std::optional<std::chrono::steady_clock::duration>     backend_callback_frame_catchup_budget_override;
+    std::uint64_t                                          backend_callback_frame_deferral_input_generation = 0U;
+    std::uint64_t                                          backend_callback_frame_deferral_target_epoch = 0U;
+    std::uint64_t                                          backend_callback_frame_deferral_streak = 0U;
     bool                                                   render_update_pending              = false;
     bool                                                   render_node_release_pending        = false;
     bool                                                   render_node_release_requeue_update = false;
@@ -5720,7 +5729,10 @@ bool VNM_TerminalSurface::start_process_with_backend(
         m_audible_bell_policy == Bell_policy::ENABLED;
     session_config.bell_policy.visual_enabled =
         m_visual_bell_policy == Bell_policy::ENABLED;
-    session_config.backend_event_notifier = [this] {
+    session_config.backend_event_epoch_notifier = [this](std::uint64_t backend_callback_epoch) {
+        m_private->backend_callback_enqueue_epoch_at_event.store(
+            backend_callback_epoch,
+            std::memory_order_release);
         m_private->backend_callback_event_epoch.fetch_add(
             1U,
             std::memory_order_acq_rel);
@@ -5813,6 +5825,12 @@ void VNM_TerminalSurface::sync_after_user_input(bool input_accepted)
     }
 
     term::Terminal_session* const session = m_private->session.get();
+    if (input_accepted) {
+        m_private->backend_callback_input_generation.fetch_add(
+            1U,
+            std::memory_order_acq_rel);
+    }
+
     if (input_accepted &&
         m_private->render_update_pending &&
         session->has_pending_backend_callback_events())
@@ -5959,10 +5977,12 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         sync_started);
 
     const bool session_still_active = m_private->session.get() == session;
+    const std::uint64_t drained_boundary_epoch =
+        m_private->current_backend_callback_event_epoch();
     result.callbacks_pending_after_drain =
         session_still_active && session->has_pending_backend_callback_events();
     if (session_still_active && !result.callbacks_pending_after_drain) {
-        m_private->record_backend_callback_frame_boundary();
+        m_private->record_backend_callback_frame_boundary(drained_boundary_epoch);
     }
     if (budget.has_value() && !result.drain_complete) {
         ++drain_stats.budget_exhausted_incomplete;
@@ -6347,6 +6367,11 @@ void VNM_TerminalSurface::reset_session()
     m_private->session.reset();
     m_private->transcript_recorder.reset();
     m_private->session_drain_queued.store(false);
+    m_private->backend_callback_enqueue_epoch_at_event.store(0U);
+    m_private->backend_callback_input_generation.store(0U);
+    m_private->backend_callback_frame_deferral_input_generation = 0U;
+    m_private->backend_callback_frame_deferral_target_epoch     = 0U;
+    m_private->backend_callback_frame_deferral_streak           = 0U;
     m_private->clear_mouse_reporting_state();
     m_private->clear_selection_drag_state();
     m_private->pending_clipboard_write.reset();
@@ -6378,8 +6403,10 @@ void VNM_TerminalSurface::updatePolish()
     if (m_private->session == nullptr || m_private->shutting_down.load()) {
         return;
     }
+    const std::uint64_t frame_boundary_epoch =
+        m_private->current_backend_callback_event_epoch();
     if (!m_private->session->has_pending_backend_callback_events()) {
-        m_private->record_backend_callback_frame_boundary();
+        m_private->record_backend_callback_frame_boundary(frame_boundary_epoch);
         return;
     }
 
@@ -6388,7 +6415,7 @@ void VNM_TerminalSurface::updatePolish()
     if (target_epoch > m_private->session->backend_callback_processed_epoch()) {
         drain_backend_callback_events_until_epoch(target_epoch);
     }
-    m_private->record_backend_callback_frame_boundary();
+    m_private->record_backend_callback_frame_boundary(frame_boundary_epoch);
 }
 
 QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*)
@@ -6461,9 +6488,46 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
 
         // GUI-thread polish is the last safe drain point before QSG capture.
         // A later backend callback makes this frame stale by construction.
+        const std::uint64_t input_generation =
+            m_private->backend_callback_input_generation.load(std::memory_order_acquire);
+        if (m_private->backend_callback_frame_deferral_input_generation !=
+            input_generation)
+        {
+            m_private->backend_callback_frame_deferral_input_generation =
+                input_generation;
+            m_private->backend_callback_frame_deferral_target_epoch = 0U;
+            m_private->backend_callback_frame_deferral_streak       = 0U;
+        }
         if (m_private->backend_callback_arrived_after_frame_boundary()) {
-            m_private->defer_render_update_for_backend_callback(*this);
-            return old_node;
+            if (m_private->backend_callback_frame_deferral_target_epoch == 0U) {
+                m_private->backend_callback_frame_deferral_target_epoch =
+                    m_private->backend_callback_enqueue_epoch_at_event.load(
+                        std::memory_order_acquire);
+            }
+
+            const std::uint64_t target_backend_callback_epoch =
+                m_private->backend_callback_frame_deferral_target_epoch;
+            const bool target_snapshot_caught_up =
+                target_backend_callback_epoch == 0U ||
+                (m_private->render_snapshot != nullptr &&
+                    m_private->render_snapshot->metadata.backend_callback_epoch >=
+                        target_backend_callback_epoch);
+            if (!target_snapshot_caught_up ||
+                m_private->backend_callback_frame_deferral_streak <
+                    k_backend_callback_frame_boundary_deferral_limit)
+            {
+                ++m_private->backend_callback_frame_deferral_streak;
+                m_private->defer_render_update_for_backend_callback(*this);
+                return old_node;
+            }
+            // Sustained backend output can otherwise defer every frame forever.
+            // Once the target callback that opened this deferral burst is
+            // visible in the snapshot, newer after-boundary output is left for
+            // the next drain/frame instead of starving an already-fresh input.
+        }
+        else {
+            m_private->backend_callback_frame_deferral_target_epoch = 0U;
+            m_private->backend_callback_frame_deferral_streak       = 0U;
         }
 
         const term::Terminal_render_options options = render_options_for_surface(*this);
@@ -6518,6 +6582,8 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             m_private->reset_render_update_schedule();
             m_private->reset_atlas_completion();
         }
+        m_private->backend_callback_frame_deferral_target_epoch = 0U;
+        m_private->backend_callback_frame_deferral_streak       = 0U;
         return updated_node;
     };
 
@@ -6714,6 +6780,15 @@ bool term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
     return surface.m_private->session_drain_queued.load();
+}
+
+std::size_t term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->session != nullptr
+        ? surface.m_private->session->pending_backend_callback_event_count()
+        : 0U;
 }
 
 std::uint64_t term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(

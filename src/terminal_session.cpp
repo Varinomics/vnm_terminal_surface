@@ -1542,7 +1542,9 @@ bool backend_output_is_plain_ascii_without_prescan_intro(QByteArrayView bytes)
 
 bool uses_deferred_backend_callbacks(const Terminal_session_config& config)
 {
-    return static_cast<bool>(config.backend_event_notifier);
+    return
+        static_cast<bool>(config.backend_event_notifier) ||
+        static_cast<bool>(config.backend_event_epoch_notifier);
 }
 
 // Lazy snapshot composition stays separate from the production publication
@@ -2325,6 +2327,13 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
 
         return !m_pending_commands.empty() || m_active_callbacks != 0U;
+    }
+
+    std::size_t pending_command_count() const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        return m_pending_commands.size();
     }
 
     std::uint64_t last_enqueued_backend_callback_epoch() const
@@ -3353,6 +3362,19 @@ bool Terminal_session::has_pending_backend_callback_events() const
 
     return !m_pending_commands.empty() ||
         m_callback_lifetime->has_pending_or_active_callbacks();
+}
+
+std::size_t Terminal_session::pending_backend_callback_event_count() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    std::size_t count = 0U;
+    for (const Terminal_session_command& command : m_pending_commands) {
+        if (command.backend_callback_epoch != 0U) {
+            ++count;
+        }
+    }
+    return count + m_callback_lifetime->pending_command_count();
 }
 
 std::uint64_t Terminal_session::backend_callback_enqueue_epoch() const
@@ -4884,9 +4906,19 @@ Terminal_backend_callbacks Terminal_session::make_backend_callbacks()
     const std::shared_ptr<Terminal_session_callback_lifetime> lifetime =
         m_callback_lifetime;
     const std::function<void()> backend_event_notifier = m_config.backend_event_notifier;
+    const std::function<void(std::uint64_t)> backend_event_epoch_notifier =
+        m_config.backend_event_epoch_notifier;
     const bool deferred_callback_delivery = uses_deferred_backend_callbacks(m_config);
 
-    const auto notify_backend_event = [backend_event_notifier](Terminal_session* session) {
+    const auto notify_backend_event = [
+        backend_event_notifier,
+        backend_event_epoch_notifier](Terminal_session* session) {
+        if (backend_event_epoch_notifier) {
+            backend_event_epoch_notifier(session->backend_callback_enqueue_epoch());
+            if (!backend_event_notifier) {
+                return;
+            }
+        }
         if (backend_event_notifier) {
             // Callback commands are durable in the lifetime queue; the notifier
             // only needs to wake the owner once for all commands queued so far.

@@ -10,6 +10,7 @@
 #include <QString>
 #include <QStringList>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -144,6 +145,9 @@ public:
         QString                                working_directory = {});
 
     static bool backend_callback_drain_queued(
+        const VNM_TerminalSurface& surface);
+
+    static std::size_t pending_backend_callback_count(
         const VNM_TerminalSurface& surface);
 
     static std::uint64_t backend_callback_enqueue_epoch(
