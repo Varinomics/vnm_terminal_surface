@@ -50,9 +50,9 @@ constexpr int k_max_warmup           = 100;
 constexpr int k_max_delay_us         = 1000000;
 constexpr int k_max_backlog          = 64;
 constexpr int k_max_contract_iterations = 1000;
-// The product cap limits sustained newer-output deferrals to two frame
-// boundaries after the target callback is fresh. The deterministic Qt test can
-// need one extra boundary for the queued target-catch-up drain itself.
+// Once the target callback is fresh, newer after-boundary output must not hold
+// the old QSG node. The deterministic Qt test can still need a small number of
+// frame boundaries for queued target-catch-up drains before that point.
 constexpr int k_max_allowed_frame_deferrals = 3;
 constexpr int k_backlog_slice_bytes  = 4096;
 constexpr int k_prompt_cursor_column = 2;

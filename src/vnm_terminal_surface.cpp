@@ -88,7 +88,6 @@ constexpr std::chrono::milliseconds k_backend_callback_posted_drain_budget{32};
 constexpr std::chrono::milliseconds k_backend_callback_frame_pending_posted_drain_budget =
     k_backend_callback_drain_budget;
 constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget{0};
-constexpr std::uint64_t k_backend_callback_frame_boundary_deferral_limit = 2U;
 
 #if defined(_WIN32)
 constexpr unsigned int k_win_spi_get_font_smoothing             = 0x004AU;
@@ -2251,7 +2250,6 @@ struct VNM_TerminalSurface::Private
     std::optional<std::chrono::steady_clock::duration>     backend_callback_frame_catchup_budget_override;
     std::uint64_t                                          backend_callback_frame_deferral_input_generation = 0U;
     std::uint64_t                                          backend_callback_frame_deferral_target_epoch = 0U;
-    std::uint64_t                                          backend_callback_frame_deferral_streak = 0U;
     bool                                                   render_update_pending              = false;
     bool                                                   render_node_release_pending        = false;
     bool                                                   render_node_release_requeue_update = false;
@@ -6392,7 +6390,6 @@ void VNM_TerminalSurface::reset_session()
     m_private->backend_callback_input_generation.store(0U);
     m_private->backend_callback_frame_deferral_input_generation = 0U;
     m_private->backend_callback_frame_deferral_target_epoch     = 0U;
-    m_private->backend_callback_frame_deferral_streak           = 0U;
     m_private->clear_mouse_reporting_state();
     m_private->clear_selection_drag_state();
     m_private->pending_clipboard_write.reset();
@@ -6521,7 +6518,6 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             m_private->backend_callback_frame_deferral_input_generation =
                 input_generation;
             m_private->backend_callback_frame_deferral_target_epoch = 0U;
-            m_private->backend_callback_frame_deferral_streak       = 0U;
         }
         if (m_private->backend_callback_arrived_after_frame_boundary()) {
             if (m_private->backend_callback_frame_deferral_target_epoch == 0U) {
@@ -6537,22 +6533,18 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
                 (m_private->render_snapshot != nullptr &&
                     m_private->render_snapshot->metadata.backend_callback_epoch >=
                         target_backend_callback_epoch);
-            if (!target_snapshot_caught_up ||
-                m_private->backend_callback_frame_deferral_streak <
-                    k_backend_callback_frame_boundary_deferral_limit)
-            {
-                ++m_private->backend_callback_frame_deferral_streak;
+            if (!target_snapshot_caught_up) {
                 m_private->defer_render_update_for_backend_callback(*this);
                 return old_node;
             }
-            // Sustained backend output can otherwise defer every frame forever.
+
             // Once the target callback that opened this deferral burst is
             // visible in the snapshot, newer after-boundary output is left for
             // the next drain/frame instead of starving an already-fresh input.
+            m_private->backend_callback_frame_deferral_target_epoch = 0U;
         }
         else {
             m_private->backend_callback_frame_deferral_target_epoch = 0U;
-            m_private->backend_callback_frame_deferral_streak       = 0U;
         }
 
         const term::Terminal_render_options options = render_options_for_surface(*this);
@@ -6608,7 +6600,6 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             m_private->reset_atlas_completion();
         }
         m_private->backend_callback_frame_deferral_target_epoch = 0U;
-        m_private->backend_callback_frame_deferral_streak       = 0U;
         return updated_node;
     };
 

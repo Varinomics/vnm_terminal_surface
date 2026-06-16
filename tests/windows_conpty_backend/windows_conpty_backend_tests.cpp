@@ -1796,6 +1796,7 @@ bool test_destructor_stops_running_process(const QString& fixture_path)
 
     Backend_capture capture;
     Win32_process_handle child_process;
+    auto destroy_started_at = std::chrono::steady_clock::time_point{};
     {
         std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
         const term::Terminal_backend_result start_result =
@@ -1823,7 +1824,13 @@ bool test_destructor_stops_running_process(const QString& fixture_path)
             process_handle_is_running(child_process.get());
         ok &= check(child_running.has_value() && *child_running,
             "destructor fixture child process is alive before backend teardown");
+
+        destroy_started_at = std::chrono::steady_clock::now();
     }
+    const auto destroy_elapsed = std::chrono::steady_clock::now() - destroy_started_at;
+    ok &= check(
+        destroy_elapsed < std::chrono::milliseconds(2500),
+        "ConPTY backend destructor returns promptly while stopping the child process");
 
     const bool child_exited = wait_for_process_exit(child_process.get());
     ok &= check(child_exited,
