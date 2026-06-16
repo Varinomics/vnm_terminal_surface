@@ -198,6 +198,26 @@ std::optional<Conpty_api> load_conpty_api()
     return api;
 }
 
+void close_pseudoconsole_detached(
+    Conpty_api::ClosePseudoConsole_fn  close_conpty,
+    HPCON                             conpty)
+{
+    if (close_conpty == nullptr || conpty == nullptr) {
+        return;
+    }
+
+    try {
+        std::thread([close_conpty, conpty] {
+            close_conpty(conpty);
+        }).detach();
+    }
+    catch (const std::system_error&) {
+        // Thread creation failure is rarer than ClosePseudoConsole hanging; keep
+        // ownership deterministic when the fallback path is the only option.
+        close_conpty(conpty);
+    }
+}
+
 bool size_fits_conpty(terminal_grid_size_t grid_size)
 {
     return
@@ -734,7 +754,7 @@ public:
 
         cancel_blocking_io();
         join_threads();
-        close_conpty();
+        request_conpty_close();
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_input_write.reset();
@@ -829,7 +849,7 @@ private:
         });
     }
 
-    void close_conpty()
+    void request_conpty_close()
     {
         HPCON conpty = nullptr;
         Conpty_api::ClosePseudoConsole_fn close_conpty_api = nullptr;
@@ -840,9 +860,7 @@ private:
             m_conpty         = nullptr;
         }
 
-        if (conpty != nullptr && close_conpty_api != nullptr) {
-            close_conpty_api(conpty);
-        }
+        close_pseudoconsole_detached(close_conpty_api, conpty);
     }
 
     void read_loop()
@@ -1065,7 +1083,7 @@ private:
             deliver_output(std::move(paused_output));
         }
         m_output_cv.notify_all();
-        close_conpty();
+        request_conpty_close();
         wait_for_reader_finished();
         report_exit_once(Terminal_exit_reason::EXITED, static_cast<int>(exit_code));
     }

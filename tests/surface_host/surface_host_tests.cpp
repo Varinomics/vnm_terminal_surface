@@ -1562,7 +1562,14 @@ bool test_surface_input_echo_after_polish_timing_repro(
 
     const term::Qsg_atlas_frame_report report_before_first_frame =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+    const std::uint64_t deferrals_before_first_frame =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals;
     std::atomic<bool> echo_injected{false};
+    std::atomic<std::uint64_t> echo_callback_epoch{0U};
+    std::atomic<bool> post_echo_callback_injected{false};
+    std::atomic<std::uint64_t> echo_snapshot_sequence_before_post_echo_callback{0U};
+    std::atomic<std::uint64_t> deferrals_before_post_echo_callback{0U};
     const QMetaObject::Connection echo_connection = QObject::connect(
         &fixture.window,
         &QQuickWindow::beforeSynchronizing,
@@ -1570,6 +1577,35 @@ bool test_surface_input_echo_after_polish_timing_repro(
         [&] {
             if (!echo_injected.exchange(true)) {
                 backend_ptr->emit_output(QByteArrayLiteral("x"));
+                echo_callback_epoch.store(
+                    term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+                        fixture.surface),
+                    std::memory_order_release);
+                return;
+            }
+
+            const std::uint64_t target_epoch =
+                echo_callback_epoch.load(std::memory_order_acquire);
+            const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            if (expectation == Input_echo_timing_expectation::SAME_FRAME &&
+                !post_echo_callback_injected.load(std::memory_order_acquire) &&
+                target_epoch != 0U &&
+                snapshot != nullptr &&
+                snapshot->metadata.backend_callback_epoch >= target_epoch)
+            {
+                echo_snapshot_sequence_before_post_echo_callback.store(
+                    snapshot->metadata.sequence,
+                    std::memory_order_release);
+                const std::uint64_t deferrals =
+                    term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+                        fixture.surface).backend_callback_frame_deferrals;
+                deferrals_before_post_echo_callback.store(
+                    deferrals,
+                    std::memory_order_release);
+                if (!post_echo_callback_injected.exchange(true)) {
+                    backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;post-echo-title\a"));
+                }
             }
         },
         Qt::DirectConnection);
@@ -1605,8 +1641,31 @@ bool test_surface_input_echo_after_polish_timing_repro(
             "input echo timing repro first frame must not capture the pre-echo snapshot");
         const term::Terminal_surface_render_invalidation_stats_t deferral_stats =
             term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-        ok &= check(deferral_stats.backend_callback_frame_deferrals > 0U,
+        ok &= check(deferral_stats.backend_callback_frame_deferrals >
+                deferrals_before_first_frame,
             "input echo timing repro defers stale capture without a catch-up delay");
+        ok &= check(post_echo_callback_injected.load(std::memory_order_acquire),
+            "input echo timing repro injects a later callback after the echo snapshot is fresh");
+        const std::uint64_t deferrals_before_post_echo =
+            deferrals_before_post_echo_callback.load(std::memory_order_acquire);
+        ok &= check(deferrals_before_post_echo != 0U,
+            "input echo timing repro records deferrals before the later callback");
+        if (deferrals_before_post_echo != 0U) {
+            ok &= check_uint64_equal(
+                deferral_stats.backend_callback_frame_deferrals,
+                deferrals_before_post_echo,
+                "input echo timing repro does not defer after the echo snapshot is fresh");
+        }
+        const std::uint64_t echo_snapshot_sequence_before_post_echo =
+            echo_snapshot_sequence_before_post_echo_callback.load(std::memory_order_acquire);
+        ok &= check(echo_snapshot_sequence_before_post_echo != 0U,
+            "input echo timing repro records the fresh echo snapshot before the later callback");
+        if (echo_snapshot_sequence_before_post_echo != 0U) {
+            ok &= check_uint64_equal(
+                first_frame_report->captured_snapshot_sequence,
+                echo_snapshot_sequence_before_post_echo,
+                "input echo timing repro captures the fresh echo snapshot despite later callback");
+        }
     }
 
     ok &= check(pump_until(app, [&] {
