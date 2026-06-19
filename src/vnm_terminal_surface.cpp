@@ -2066,41 +2066,9 @@ struct VNM_TerminalSurface::Private
     void defer_render_update_for_backend_callback(VNM_TerminalSurface& surface)
     {
         ++render_invalidation_stats.backend_callback_frame_deferrals;
-        retain_unrendered_snapshot_dirty_basis();
         reset_render_update_schedule();
         reset_atlas_completion();
         queue_backend_callback_drain_after_frame(surface);
-    }
-
-    void retain_unrendered_snapshot_dirty_basis()
-    {
-        if (!render_update_pending || render_snapshot == nullptr) {
-            return;
-        }
-
-        unrendered_render_snapshot_dirty_basis =
-            unrendered_render_snapshot_dirty_basis != nullptr
-                ? term::coalesced_dirty_row_snapshot_handle(
-                    *unrendered_render_snapshot_dirty_basis,
-                    *render_snapshot)
-                : render_snapshot;
-    }
-
-    std::shared_ptr<const term::Terminal_render_snapshot> render_snapshot_dirty_basis() const
-    {
-        std::shared_ptr<const term::Terminal_render_snapshot> basis =
-            unrendered_render_snapshot_dirty_basis;
-        if (render_update_pending && render_snapshot != nullptr) {
-            basis = basis != nullptr
-                ? term::coalesced_dirty_row_snapshot_handle(*basis, *render_snapshot)
-                : render_snapshot;
-        }
-        return basis;
-    }
-
-    void clear_unrendered_snapshot_dirty_basis()
-    {
-        unrendered_render_snapshot_dirty_basis.reset();
     }
 
     void reset_render_update_schedule()
@@ -2401,7 +2369,6 @@ struct VNM_TerminalSurface::Private
     QFont                                                  render_font;
     qreal                                                  render_device_pixel_ratio             = 1.0;
     std::shared_ptr<const term::Terminal_render_snapshot>  render_snapshot;
-    std::shared_ptr<const term::Terminal_render_snapshot>  unrendered_render_snapshot_dirty_basis;
     term::Ime_preedit_state                                ime_preedit;
     bool                                                   cursor_blink_visible                  = true;
     std::shared_ptr<term::Qsg_atlas_recorder>              qsg_atlas_recorder;
@@ -5918,7 +5885,6 @@ bool VNM_TerminalSurface::start_process_with_backend(
     set_backend_ready(false);
     set_backend_geometry_in_sync(false);
     m_private->render_snapshot.reset();
-    m_private->clear_unrendered_snapshot_dirty_basis();
     m_private->input_cursor_freshness = {};
     m_private->set_ime_preedit_state(*this, {});
     m_private->last_installed_render_publication_generation = 0U;
@@ -6637,7 +6603,6 @@ void VNM_TerminalSurface::reset_session()
     m_private->backend_callback_frame_deferral_input_generation = 0U;
     m_private->backend_callback_frame_deferral_target_epoch     = 0U;
     m_private->input_cursor_freshness = {};
-    m_private->clear_unrendered_snapshot_dirty_basis();
     m_private->clear_mouse_reporting_state();
     m_private->clear_selection_drag_state();
     m_private->pending_clipboard_write.reset();
@@ -6860,7 +6825,6 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             captured_snapshot_sequence,
             captured_capture_sequence);
         if (captured_snapshot_sequence != 0U) {
-            m_private->clear_unrendered_snapshot_dirty_basis();
             m_private->consume_fresh_text_input_render_snapshot(
                 captured_snapshot_sequence);
         }
@@ -6897,13 +6861,6 @@ void term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
     std::shared_ptr<const Terminal_render_snapshot>    snapshot)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    const std::shared_ptr<const term::Terminal_render_snapshot> dirty_basis =
-        surface.m_private->render_snapshot_dirty_basis();
-    if (dirty_basis != nullptr && snapshot != nullptr) {
-        snapshot = term::coalesced_dirty_row_snapshot_handle(
-            *dirty_basis,
-            *snapshot);
-    }
     surface.m_private->render_snapshot = std::move(snapshot);
     surface.m_private->retire_text_input_freshness_if_caught_up();
     surface.updateInputMethod(Qt::ImCursorRectangle);
