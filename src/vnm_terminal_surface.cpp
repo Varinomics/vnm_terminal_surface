@@ -1776,81 +1776,74 @@ struct VNM_TerminalSurface::Private
     struct input_cursor_freshness_t
     {
         bool                                      active = false;
-        bool                                      fresh_snapshot_pending = false;
-        std::uint64_t                             accepted_input_sequence = 0U;
-        std::uint64_t                             pre_input_backend_callback_epoch = 0U;
-        std::uint64_t                             fresh_snapshot_sequence = 0U;
+        std::uint64_t                             accepted_input_freshness_token = 0U;
+        std::uint64_t                             satisfying_publication_generation = 0U;
     };
 
     void record_accepted_text_input(
-        const term::Terminal_session_result& result,
-        std::uint64_t                        pre_input_backend_callback_epoch,
-        bool                                 pre_input_backend_activity)
+        const term::Terminal_session_result& result)
     {
         backend_callback_input_generation.fetch_add(1U, std::memory_order_acq_rel);
-        input_cursor_freshness = {};
-        if (!pre_input_backend_activity) {
+        if (result.accepted_input_freshness_token == 0U) {
             return;
         }
 
+        input_cursor_freshness = {};
         input_cursor_freshness.active = true;
-        input_cursor_freshness.accepted_input_sequence = result.sequence;
-        input_cursor_freshness.pre_input_backend_callback_epoch =
-            pre_input_backend_callback_epoch;
+        input_cursor_freshness.accepted_input_freshness_token =
+            result.accepted_input_freshness_token;
     }
 
-    bool render_snapshot_is_stale_for_text_input(
+    bool render_snapshot_satisfies_text_input(
         const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot) const
     {
         return
-            input_cursor_freshness.active             &&
-            snapshot != nullptr                       &&
-            snapshot->metadata.sequence <
-                input_cursor_freshness.accepted_input_sequence &&
-            snapshot->metadata.processed_backend_callback_epoch <=
-                input_cursor_freshness.pre_input_backend_callback_epoch;
+            input_cursor_freshness.active &&
+            snapshot != nullptr           &&
+            snapshot->metadata.satisfied_input_freshness_token >=
+                input_cursor_freshness.accepted_input_freshness_token;
     }
 
     bool should_suppress_cursor_for_render_snapshot() const
     {
-        return render_snapshot_is_stale_for_text_input(render_snapshot);
+        return
+            input_cursor_freshness.active &&
+            render_snapshot != nullptr    &&
+            !render_snapshot_satisfies_text_input(render_snapshot);
     }
 
     bool render_snapshot_is_fresh_for_text_input() const
     {
-        return
-            input_cursor_freshness.fresh_snapshot_pending &&
-            render_snapshot != nullptr                    &&
-            render_snapshot->metadata.sequence ==
-                input_cursor_freshness.fresh_snapshot_sequence;
+        return render_snapshot_satisfies_text_input(render_snapshot);
     }
 
-    void consume_fresh_text_input_render_snapshot(std::uint64_t snapshot_sequence)
+    void record_text_input_satisfying_publication(
+        const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot)
     {
-        if (!input_cursor_freshness.fresh_snapshot_pending ||
-            snapshot_sequence != input_cursor_freshness.fresh_snapshot_sequence)
+        if (!render_snapshot_satisfies_text_input(snapshot)) {
+            return;
+        }
+
+        if (input_cursor_freshness.satisfying_publication_generation == 0U ||
+            snapshot->metadata.publication_generation <
+                input_cursor_freshness.satisfying_publication_generation)
+        {
+            input_cursor_freshness.satisfying_publication_generation =
+                snapshot->metadata.publication_generation;
+        }
+    }
+
+    void retire_text_input_freshness_if_rendered(std::uint64_t publication_generation)
+    {
+        if (!input_cursor_freshness.active ||
+            input_cursor_freshness.satisfying_publication_generation == 0U ||
+            publication_generation <
+                input_cursor_freshness.satisfying_publication_generation)
         {
             return;
         }
 
-        input_cursor_freshness.fresh_snapshot_pending = false;
-        input_cursor_freshness.fresh_snapshot_sequence = 0U;
-    }
-
-    void retire_text_input_freshness_if_caught_up()
-    {
-        if (!input_cursor_freshness.active || render_snapshot == nullptr) {
-            return;
-        }
-
-        if (render_snapshot->metadata.processed_backend_callback_epoch >
-            input_cursor_freshness.pre_input_backend_callback_epoch)
-        {
-            input_cursor_freshness.active = false;
-            input_cursor_freshness.fresh_snapshot_pending = true;
-            input_cursor_freshness.fresh_snapshot_sequence =
-                render_snapshot->metadata.sequence;
-        }
+        input_cursor_freshness = {};
     }
 
     std::shared_ptr<Renderer_lifecycle_recorder> lifecycle_recorder() const
@@ -2039,7 +2032,8 @@ struct VNM_TerminalSurface::Private
 
                 VNM_TerminalSurface& surface = *surface_ptr;
                 surface.drain_backend_callback_events_for_posted_work();
-                if (!surface.m_private->frame_work_pending() &&
+                if (!surface.m_private->render_update_pending &&
+                    !surface.m_private->atlas_completion_pending &&
                     surface.m_private->render_snapshot != nullptr)
                 {
                     surface.m_private->request_render_update(surface);
@@ -2163,7 +2157,10 @@ struct VNM_TerminalSurface::Private
             report.render_snapshot_sequence >= renderer_stats_snapshot_sequence;
     }
 
-    void complete_atlas_completion(const term::Qsg_atlas_frame_report& report)
+    bool complete_atlas_completion(
+        VNM_TerminalSurface&                 surface,
+        const term::Qsg_atlas_frame_report&  report,
+        bool                                 install_follow_up_publication)
     {
         atlas_completion_pending = false;
         ++render_invalidation_stats.consumed_updates;
@@ -2171,17 +2168,25 @@ struct VNM_TerminalSurface::Private
             report.render_snapshot_sequence;
         render_invalidation_stats.last_rendered_publication_generation =
             report.render_publication_generation;
+        bool follow_up_publication_ready = false;
         if (session != nullptr) {
-            session->mark_render_publication_rendered(
+            follow_up_publication_ready = session->mark_render_publication_rendered(
                 report.render_publication_generation);
         }
+        if (follow_up_publication_ready && install_follow_up_publication) {
+            surface.sync_from_session(false);
+        }
+        retire_text_input_freshness_if_rendered(report.render_publication_generation);
+        return follow_up_publication_ready;
     }
 
-    void reconcile_atlas_completion()
+    bool reconcile_atlas_completion(
+        VNM_TerminalSurface&  surface,
+        bool                  install_follow_up_publication = true)
     {
         if (!atlas_completion_pending || qsg_atlas_recorder == nullptr) {
             if (!atlas_completion_complete_for_testing) {
-                return;
+                return false;
             }
         }
 
@@ -2194,25 +2199,30 @@ struct VNM_TerminalSurface::Private
                 atlas_completion_report_generation_for_testing;
             synthetic_report.drew = atlas_completion_report_drew_for_testing;
             if (!atlas_report_completes_pending_update(synthetic_report)) {
-                return;
+                return false;
             }
             atlas_completion_complete_for_testing = false;
-            complete_atlas_completion(synthetic_report);
-            return;
+            return complete_atlas_completion(
+                surface,
+                synthetic_report,
+                install_follow_up_publication);
         }
 
         const term::Qsg_atlas_frame_report atlas_report =
             qsg_atlas_recorder->snapshot();
         if (!atlas_report_completes_pending_update(atlas_report)) {
-            return;
+            return false;
         }
 
-        complete_atlas_completion(atlas_report);
+        return complete_atlas_completion(
+            surface,
+            atlas_report,
+            install_follow_up_publication);
     }
 
-    term::terminal_renderer_stats_t current_renderer_stats()
+    term::terminal_renderer_stats_t current_renderer_stats(VNM_TerminalSurface& surface)
     {
-        reconcile_atlas_completion();
+        reconcile_atlas_completion(surface);
         term::terminal_renderer_stats_t stats = renderer_stats_publisher.snapshot();
         if (qsg_atlas_recorder == nullptr) {
             stats.paint_completed = false;
@@ -2225,9 +2235,10 @@ struct VNM_TerminalSurface::Private
         return stats;
     }
 
-    term::Terminal_surface_render_invalidation_stats_t current_invalidation_stats()
+    term::Terminal_surface_render_invalidation_stats_t current_invalidation_stats(
+        VNM_TerminalSurface& surface)
     {
-        reconcile_atlas_completion();
+        reconcile_atlas_completion(surface);
         term::Terminal_surface_render_invalidation_stats_t stats = render_invalidation_stats;
         stats.backend_callback_event_epoch =
             backend_callback_event_epoch.load(std::memory_order_acquire);
@@ -2237,14 +2248,20 @@ struct VNM_TerminalSurface::Private
             render_snapshot != nullptr
                 ? render_snapshot->metadata.processed_backend_callback_epoch
                 : 0U;
-        stats.pending_update = frame_work_pending();
+        stats.pending_update = frame_work_pending(surface);
         return stats;
     }
 
-    bool frame_work_pending()
+    bool frame_work_pending(
+        VNM_TerminalSurface&  surface,
+        bool                  install_follow_up_publication = true)
     {
-        reconcile_atlas_completion();
-        return render_update_pending || atlas_completion_pending;
+        const bool follow_up_publication_ready =
+            reconcile_atlas_completion(surface, install_follow_up_publication);
+        return
+            render_update_pending ||
+            atlas_completion_pending ||
+            (!install_follow_up_publication && follow_up_publication_ready);
     }
 
     QRectF input_method_cursor_rectangle(const VNM_TerminalSurface& surface) const
@@ -2396,6 +2413,7 @@ struct VNM_TerminalSurface::Private
     std::optional<std::chrono::steady_clock::duration>     backend_callback_frame_catchup_budget_override;
     std::uint64_t                                          backend_callback_frame_deferral_input_generation = 0U;
     std::uint64_t                                          backend_callback_frame_deferral_target_epoch = 0U;
+    std::function<void()>                                  before_session_key_input_for_testing;
     bool                                                   render_update_pending              = false;
     bool                                                   render_node_release_pending        = false;
     bool                                                   render_node_release_requeue_update = false;
@@ -3451,12 +3469,6 @@ bool VNM_TerminalSurface::paste_text(QString text)
     }
 
     const bool text_input = text_input_can_advance_cursor(text);
-    const std::uint64_t pre_input_backend_callback_epoch =
-        m_private->session->backend_callback_enqueue_epoch();
-    const std::uint64_t pre_input_backend_processed_epoch =
-        m_private->session->backend_callback_processed_epoch();
-    const bool pre_input_backend_activity =
-        pre_input_backend_callback_epoch > pre_input_backend_processed_epoch;
     const term::Terminal_paste_text_result paste_result =
         m_private->session->write_paste_text(
             std::move(text),
@@ -3467,10 +3479,7 @@ bool VNM_TerminalSurface::paste_text(QString text)
     }
 
     if (text_input && is_accepted(paste_result.result.code)) {
-        sync_after_user_input(
-            paste_result.result,
-            pre_input_backend_callback_epoch,
-            pre_input_backend_activity);
+        sync_after_user_input(paste_result.result);
     }
     else {
         sync_from_session();
@@ -3964,12 +3973,9 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
         }
 
         const bool text_input_key = text_input_can_advance_cursor(event->text());
-        const std::uint64_t pre_input_backend_callback_epoch =
-            m_private->session->backend_callback_enqueue_epoch();
-        const std::uint64_t pre_input_backend_processed_epoch =
-            m_private->session->backend_callback_processed_epoch();
-        const bool pre_input_backend_activity =
-            pre_input_backend_callback_epoch > pre_input_backend_processed_epoch;
+        if (m_private->before_session_key_input_for_testing) {
+            m_private->before_session_key_input_for_testing();
+        }
         const term::Terminal_key_event_result key_result =
             m_private->session->write_key_event(*event);
         if (!key_result.handled) {
@@ -3979,10 +3985,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
 
         event->accept();
         if (text_input_key && is_accepted(key_result.result.code)) {
-            sync_after_user_input(
-                key_result.result,
-                pre_input_backend_callback_epoch,
-                pre_input_backend_activity);
+            sync_after_user_input(key_result.result);
         }
         else {
             sync_from_session();
@@ -5574,17 +5577,8 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
     const int     preedit_cursor_position = preedit_cursor_position_from_event(*event);
 
     std::optional<term::Terminal_ime_commit_result> commit_result;
-    std::uint64_t pre_input_backend_callback_epoch = 0U;
-    std::uint64_t pre_input_backend_processed_epoch = 0U;
-    bool pre_input_backend_activity = false;
     if (m_private->session != nullptr) {
         if (!commit_text.isEmpty()) {
-            pre_input_backend_callback_epoch =
-                m_private->session->backend_callback_enqueue_epoch();
-            pre_input_backend_processed_epoch =
-                m_private->session->backend_callback_processed_epoch();
-            pre_input_backend_activity =
-                pre_input_backend_callback_epoch > pre_input_backend_processed_epoch;
             commit_result = m_private->session->write_ime_commit(commit_text);
         }
 
@@ -5608,10 +5602,7 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
             text_input_can_advance_cursor(commit_text) &&
             is_accepted(commit_result->result.code))
         {
-            sync_after_user_input(
-                commit_result->result,
-                pre_input_backend_callback_epoch,
-                pre_input_backend_activity);
+            sync_after_user_input(commit_result->result);
         }
         else {
             sync_from_session();
@@ -6014,7 +6005,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_for_posted_work()
 {
     auto& drain_stats = m_private->backend_drain_stats;
     ++drain_stats.posted_drain_calls;
-    if (m_private->frame_work_pending()) {
+    if (m_private->frame_work_pending(*this, false)) {
         ++drain_stats.posted_frame_pending_small_budget_calls;
         drain_backend_callback_events_for(k_backend_callback_frame_pending_posted_drain_budget);
         return;
@@ -6025,9 +6016,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_for_posted_work()
 }
 
 void VNM_TerminalSurface::sync_after_user_input(
-    const term::Terminal_session_result& result,
-    std::uint64_t                        pre_input_backend_callback_epoch,
-    bool                                 pre_input_backend_activity)
+    const term::Terminal_session_result& result)
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
@@ -6041,12 +6030,7 @@ void VNM_TerminalSurface::sync_after_user_input(
         return;
     }
 
-    m_private->record_accepted_text_input(
-        result,
-        pre_input_backend_callback_epoch,
-        pre_input_backend_activity);
-
-    m_private->retire_text_input_freshness_if_caught_up();
+    m_private->record_accepted_text_input(result);
 
     if (m_private->input_cursor_freshness.active &&
         m_private->render_update_pending &&
@@ -6120,7 +6104,7 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     Q_ASSERT(thread() == QThread::currentThread());
 
     const auto drain_started = std::chrono::steady_clock::now();
-    m_private->reconcile_atlas_completion();
+    m_private->reconcile_atlas_completion(*this);
     const bool render_update_pending_before_drain = m_private->render_update_pending;
     const bool atlas_completion_pending_before_drain = m_private->atlas_completion_pending;
     const bool frame_work_pending_before_drain =
@@ -6603,6 +6587,7 @@ void VNM_TerminalSurface::reset_session()
     m_private->backend_callback_frame_deferral_input_generation = 0U;
     m_private->backend_callback_frame_deferral_target_epoch     = 0U;
     m_private->input_cursor_freshness = {};
+    m_private->reset_atlas_completion();
     m_private->clear_mouse_reporting_state();
     m_private->clear_selection_drag_state();
     m_private->pending_clipboard_write.reset();
@@ -6824,10 +6809,6 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             renderer_stats,
             captured_snapshot_sequence,
             captured_capture_sequence);
-        if (captured_snapshot_sequence != 0U) {
-            m_private->consume_fresh_text_input_render_snapshot(
-                captured_snapshot_sequence);
-        }
         if (updated_node != nullptr) {
             m_private->wait_for_atlas_completion(
                 window(),
@@ -6862,7 +6843,8 @@ void term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.m_private->render_snapshot = std::move(snapshot);
-    surface.m_private->retire_text_input_freshness_if_caught_up();
+    surface.m_private->record_text_input_satisfying_publication(
+        surface.m_private->render_snapshot);
     surface.updateInputMethod(Qt::ImCursorRectangle);
     surface.m_private->request_render_update(surface);
 }
@@ -7083,6 +7065,14 @@ void term::VNM_TerminalSurface_render_bridge::set_backend_callback_frame_catchup
         std::max(budget, zero);
 }
 
+void term::VNM_TerminalSurface_render_bridge::set_before_session_key_input_hook_for_testing(
+    VNM_TerminalSurface&   surface,
+    std::function<void()>  hook)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    surface.m_private->before_session_key_input_for_testing = std::move(hook);
+}
+
 void term::VNM_TerminalSurface_render_bridge::simulate_update_polish(
     VNM_TerminalSurface& surface)
 {
@@ -7126,7 +7116,8 @@ term::VNM_TerminalSurface_render_bridge::invalidation_stats(
     const VNM_TerminalSurface& surface)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    return surface.m_private->current_invalidation_stats();
+    VNM_TerminalSurface& mutable_surface = const_cast<VNM_TerminalSurface&>(surface);
+    return mutable_surface.m_private->current_invalidation_stats(mutable_surface);
 }
 
 std::uint64_t
@@ -7199,7 +7190,8 @@ term::VNM_TerminalSurface_render_bridge::last_renderer_stats(
     const VNM_TerminalSurface& surface)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    return surface.m_private->current_renderer_stats();
+    VNM_TerminalSurface& mutable_surface = const_cast<VNM_TerminalSurface&>(surface);
+    return mutable_surface.m_private->current_renderer_stats(mutable_surface);
 }
 
 term::terminal_renderer_cumulative_stats_t

@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 class VNM_TerminalSurface;
@@ -169,6 +170,10 @@ public:
     static void set_backend_callback_frame_catchup_budget_for_benchmark(
         VNM_TerminalSurface&                    surface,
         std::chrono::steady_clock::duration     budget);
+
+    static void set_before_session_key_input_hook_for_testing(
+        VNM_TerminalSurface&       surface,
+        std::function<void()>      hook);
 
     static void simulate_update_polish(
         VNM_TerminalSurface&       surface);
