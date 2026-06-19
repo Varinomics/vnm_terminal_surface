@@ -91,7 +91,9 @@ void print_usage()
         << "       vnm_terminal_canvas_fixture --hold-open\n"
         << "       vnm_terminal_canvas_fixture --hold-open-pid\n"
         << "       vnm_terminal_canvas_fixture --hold-open-pid-no-read\n"
+        << "       vnm_terminal_canvas_fixture --spawn-hold-open-child-pid-no-read\n"
         << "       vnm_terminal_canvas_fixture --hold-open-no-read\n"
+        << "       vnm_terminal_canvas_fixture --sleep-no-stdio\n"
         << "       vnm_terminal_canvas_fixture --utf8-payload\n"
         << "       vnm_terminal_canvas_fixture --sync-raw-resize-gate <checkpoint-path>\n"
         << "       vnm_terminal_canvas_fixture --quick-exit\n"
@@ -1149,6 +1151,86 @@ int run_hold_open_pid_no_read()
     return run_hold_open_no_read_with_marker(ready_marker, 47, 48);
 }
 
+#if defined(_WIN32)
+std::optional<DWORD> start_detached_sleep_child()
+{
+    std::vector<wchar_t> module_path(MAX_PATH);
+    DWORD path_size = GetModuleFileNameW(
+        nullptr,
+        module_path.data(),
+        static_cast<DWORD>(module_path.size()));
+    if (path_size == 0U) {
+        std::cerr << "failed to read fixture module path: " << GetLastError() << '\n';
+        return std::nullopt;
+    }
+
+    while (path_size == module_path.size()) {
+        module_path.resize(module_path.size() * 2U);
+        path_size = GetModuleFileNameW(
+            nullptr,
+            module_path.data(),
+            static_cast<DWORD>(module_path.size()));
+        if (path_size == 0U) {
+            std::cerr << "failed to read fixture module path: " << GetLastError() << '\n';
+            return std::nullopt;
+        }
+    }
+
+    module_path.resize(path_size + 1U);
+
+    std::wstring command_line = L"\"";
+    command_line += module_path.data();
+    command_line += L"\" --sleep-no-stdio";
+
+    STARTUPINFOW startup_info{};
+    startup_info.cb = sizeof(startup_info);
+
+    PROCESS_INFORMATION process_information{};
+    if (!CreateProcessW(
+            module_path.data(),
+            command_line.data(),
+            nullptr,
+            nullptr,
+            FALSE,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            nullptr,
+            nullptr,
+            &startup_info,
+            &process_information))
+    {
+        std::cerr << "failed to spawn hold-open child: " << GetLastError() << '\n';
+        return std::nullopt;
+    }
+
+    const DWORD child_pid = process_information.dwProcessId;
+    CloseHandle(process_information.hThread);
+    CloseHandle(process_information.hProcess);
+    return child_pid;
+}
+#endif
+
+int run_spawn_hold_open_child_pid_no_read()
+{
+#if defined(_WIN32)
+    const std::optional<DWORD> child_pid = start_detached_sleep_child();
+    if (!child_pid.has_value()) {
+        return 49;
+    }
+
+    std::ostringstream ready;
+    ready << "hold-open-child-pid-no-read " << *child_pid << '\n';
+    return run_hold_open_no_read_with_marker(ready.str(), 50, 51);
+#else
+    return 49;
+#endif
+}
+
+int run_sleep_no_stdio()
+{
+    std::this_thread::sleep_for(std::chrono::seconds(60));
+    return 52;
+}
+
 int run_utf8_payload()
 {
     if (!configure_binary_stdout()) {
@@ -1336,8 +1418,16 @@ int main(int argc, char** argv)
         return run_hold_open_pid_no_read();
     }
 
+    if (argc == 2 && argument_equals(argv[1], "--spawn-hold-open-child-pid-no-read")) {
+        return run_spawn_hold_open_child_pid_no_read();
+    }
+
     if (argc == 2 && argument_equals(argv[1], "--hold-open-no-read")) {
         return run_hold_open_no_read();
+    }
+
+    if (argc == 2 && argument_equals(argv[1], "--sleep-no-stdio")) {
+        return run_sleep_no_stdio();
     }
 
     if (argc == 2 && argument_equals(argv[1], "--utf8-payload")) {

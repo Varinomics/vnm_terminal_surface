@@ -119,13 +119,7 @@ inline constexpr Metric_descriptor<Stats> k_before_lazy_elapsed[] = {
 };
 
 inline constexpr Metric_descriptor<Stats> k_after_lazy_elapsed[] = {
-    // lazy_max_insert_us is a microsecond duration, not a plain count.
-    counter_metric<Stats>(
-        "lazy_max_insert_us",
-        [](const Stats& s) -> std::uint64_t {
-            return static_cast<std::uint64_t>(s.lazy_max_insert_us);
-        },
-        Metric_unit::MICROSECONDS),
+    VNM_ATLAS_COUNTER(lazy_max_insert_us),
     VNM_ATLAS_COUNTER(lazy_frames),
     VNM_ATLAS_COUNTER(incomplete_frames),
 };

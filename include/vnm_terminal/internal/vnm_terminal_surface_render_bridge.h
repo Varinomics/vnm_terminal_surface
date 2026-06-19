@@ -25,6 +25,9 @@ struct Terminal_surface_render_invalidation_stats_t
     std::uint64_t                           coalesced_requests                    = 0U;
     std::uint64_t                           consumed_updates                      = 0U;
     std::uint64_t                           backend_callback_frame_deferrals     = 0U;
+    std::uint64_t                           input_stale_cursor_suppressed_frames = 0U;
+    // Old-node avoidance is a subset of stale cursor suppression.
+    std::uint64_t                           input_stale_old_node_frames_avoided  = 0U;
     std::uint64_t                           backend_callback_event_epoch          = 0U;
     std::uint64_t                           backend_callback_frame_boundary_epoch = 0U;
     std::uint64_t                           render_snapshot_callback_epoch        = 0U;

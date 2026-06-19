@@ -34,12 +34,6 @@ enum class Terminal_osc52_policy
     ALLOW,
 };
 
-enum class Terminal_clipboard_response_decision
-{
-    DENY,
-    ALLOW,
-};
-
 enum class Terminal_selection_internal_state
 {
     NONE,
@@ -204,13 +198,6 @@ struct Terminal_osc52_write_request
     QByteArray     decoded_payload;
     std::size_t    raw_payload_size = 0U;
     QString        source_sequence;
-};
-
-struct Terminal_osc52_write_response
-{
-    std::uint64_t  request_id       = 0U;
-    Terminal_clipboard_response_decision decision =
-        Terminal_clipboard_response_decision::DENY;
 };
 
 class Selection_contract_controller

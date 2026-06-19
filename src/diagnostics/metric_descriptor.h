@@ -28,67 +28,38 @@ enum class Metric_kind
     BOOL,
 };
 
-enum class Metric_unit
-{
-    COUNT,
-    BYTES,
-    MICROSECONDS,
-    MILLISECONDS,
-    NONE,
-};
-
-enum class Metric_stability
-{
-    STABLE,
-    UNSTABLE,
-};
-
 // One row of metric knowledge for a given Stats type. The reader for the kind
 // that does not apply is null (a COUNTER row leaves read_bool null; a BOOL row
 // leaves read_u64 null). Readers are plain function pointers: a stateless lambda
 // converts to one, which lets each row absorb its own int->uint64 cast without
 // std::function.
-//
-// text_label may equal json_key; for the text-layout block they are identical.
 template<typename Stats>
 struct Metric_descriptor
 {
     const char*          json_key;
-    const char*          text_label;
     Metric_kind          kind;
-    Metric_unit          unit;
-    Metric_stability     stability;
     std::uint64_t      (*read_u64)(const Stats&);
     bool               (*read_bool)(const Stats&);
 };
 
 // Build a COUNTER row. The reader casts the field to uint64 so int-typed and
-// uint64-typed stats structs share one table. unit/stability default to the
-// common case for the debug counter blocks (raw counts, unstable across
-// versions).
+// uint64-typed stats structs share one table.
 template<typename Stats>
 constexpr Metric_descriptor<Stats> counter_metric(
     const char*        key,
-    std::uint64_t    (*reader)(const Stats&),
-    Metric_unit        unit      = Metric_unit::COUNT,
-    Metric_stability   stability = Metric_stability::UNSTABLE)
+    std::uint64_t    (*reader)(const Stats&))
 {
-    return Metric_descriptor<Stats>{
-        key, key, Metric_kind::COUNTER, unit, stability, reader, nullptr};
+    return Metric_descriptor<Stats>{key, Metric_kind::COUNTER, reader, nullptr};
 }
 
 // Build a BOOL row. The reader returns the field as a native bool; JSON emits a
-// native JSON bool and TEXT emits the literal `true`/`false`. A boolean flag has
-// no count/byte unit, so the unit defaults to NONE; like the counters these are
-// debug diagnostics and default to UNSTABLE.
+// native JSON bool and TEXT emits the literal `true`/`false`.
 template<typename Stats>
 constexpr Metric_descriptor<Stats> bool_metric(
     const char*        key,
-    bool             (*reader)(const Stats&),
-    Metric_stability   stability = Metric_stability::UNSTABLE)
+    bool             (*reader)(const Stats&))
 {
-    return Metric_descriptor<Stats>{
-        key, key, Metric_kind::BOOL, Metric_unit::NONE, stability, nullptr, reader};
+    return Metric_descriptor<Stats>{key, Metric_kind::BOOL, nullptr, reader};
 }
 
 // JSON: COUNTER -> decimal string (QString::number); BOOL -> native bool. This
@@ -124,7 +95,7 @@ void emit_metrics_text(
     std::span<const Metric_descriptor<Stats>>   table)
 {
     for (const Metric_descriptor<Stats>& metric : table) {
-        out << "  " << metric.text_label << '=';
+        out << "  " << metric.json_key << '=';
         switch (metric.kind) {
             case Metric_kind::COUNTER:
                 out << static_cast<qulonglong>(metric.read_u64(stats));

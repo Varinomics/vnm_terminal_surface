@@ -27,7 +27,7 @@ two could drift (a counter added to JSON but not TEXT, or reordered). The
 text-layout block and several atlas blocks now flow through one shared
 descriptor table each, consumed by both `emit_metrics_json` and
 `emit_metrics_text`, so the field set and order cannot diverge. For every
-table-driven block the JSON key and the TEXT label are identical strings.
+table-driven block the JSON key is also the TEXT label.
 
 The runtime metrics document also contains hand-written JSON-only sections such
 as `render_invalidation` and `backend_drain`. Those sections are public runtime
@@ -94,24 +94,24 @@ boolean values are JSON booleans. These diagnostics are `UNSTABLE`.
 
 A `Metric_descriptor<Stats>` row carries:
 
-| Column      | Meaning                                                              |
-|-------------|---------------------------------------------------------------------|
-| `json_key`  | JSON object key.                                                    |
-| `text_label`| TEXT report label (identical to `json_key` for the text-layout block). |
-| `kind`      | `COUNTER` (numeric) or `BOOL`.                                      |
-| `unit`      | `COUNT`, `BYTES`, `MICROSECONDS`, `MILLISECONDS`, or `NONE`.        |
-| `stability` | `STABLE` or `UNSTABLE` (see below).                                 |
-| reader      | A stateless function pointer that reads the field from `Stats` (one reader per kind; the other is null). |
+| Column     | Meaning                                                              |
+|------------|----------------------------------------------------------------------|
+| `json_key` | JSON object key and TEXT report label.                               |
+| `kind`     | `COUNTER` (numeric) or `BOOL`.                                       |
+| reader     | A stateless function pointer that reads the field from `Stats` (one reader per kind; the other is null). |
 
 Each reader casts its field to `std::uint64_t`, which lets one table serve both
 the `int`-typed per-frame stats struct and the `std::uint64_t`-typed cumulative
 stats struct.
 
+The `Unit` and `Stability` columns in the tables below are schema
+documentation, not stored descriptor fields.
+
 ### Stability
 
 These are debug/diagnostic counters. They reflect internal renderer accounting
 (fast-path screening, classification buckets, cache reuse) and are expected to
-change as the renderer evolves. They are therefore marked **`UNSTABLE`**: tools
+change as the renderer evolves. They are therefore treated as unstable: tools
 may read them for investigation, but no external contract guarantees a counter
 name, its meaning, or its presence across versions. They are not a public API.
 

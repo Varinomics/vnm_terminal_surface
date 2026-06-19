@@ -13,7 +13,7 @@ if(VNM_TERMINAL_DISTRIBUTION_BUILD AND VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_RE
         "VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=OFF")
 endif()
 
-project(vnm_terminal_surface LANGUAGES CXX VERSION 1.3.1)
+project(vnm_terminal_surface LANGUAGES CXX VERSION 1.3.2)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -34,9 +34,6 @@ option(VNM_TERMINAL_SURFACE_BUILD_TESTING
 option(VNM_TERMINAL_BUILD_REQUIRED_READINESS "Build vnm_terminal_surface readiness validation gates" OFF)
 option(VNM_TERMINAL_BUILD_BENCHMARKS "Build vnm_terminal_surface benchmark executables" OFF)
 option(VNM_TERMINAL_ENABLE_PROFILING "Compile vnm_terminal_surface profile scope instrumentation" OFF)
-option(VNM_TERMINAL_ENABLE_SHADER_GENERATION
-    "Require Qt ShaderTools for source-tree shader tooling"
-    OFF)
 option(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER
     "Build the MSDF text renderer"
     ON)
@@ -48,6 +45,14 @@ mark_as_advanced(
     VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
     VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS
 )
+if(VNM_TERMINAL_DISTRIBUTION_BUILD AND
+    VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER AND
+    NOT VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS)
+    message(FATAL_ERROR
+        "VNM_TERMINAL_DISTRIBUTION_BUILD with MSDF requires "
+        "VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS=ON and a packaged "
+        "vnm_msdf_text.")
+endif()
 if(VNM_TERMINAL_BUILD_REQUIRED_READINESS AND NOT VNM_TERMINAL_BUILD_BENCHMARKS)
     set(VNM_TERMINAL_BUILD_BENCHMARKS ON)
 endif()
@@ -73,10 +78,6 @@ set(vnm_terminal_qt_components
     QuickPrivate
     GuiPrivate
 )
-
-if(VNM_TERMINAL_ENABLE_SHADER_GENERATION)
-    list(APPEND vnm_terminal_qt_components ShaderTools)
-endif()
 
 find_package(Qt6 6.7 REQUIRED COMPONENTS ${vnm_terminal_qt_components})
 include(cmake/vnm_terminal_qt_posture.cmake)
@@ -231,11 +232,20 @@ if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER)
         CONTEXT "vnm_terminal_surface"
         REQUIRED_BY "MSDF text renderer"
         SOURCE_DIR_VAR VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
-        SOURCE_DIR_OPTION VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
         USE_SYSTEM_LIBS "${VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS}")
-    target_link_libraries(vnm_terminal_surface PRIVATE
-        "$<BUILD_INTERFACE:vnm_msdf_text::vnm_msdf_text>"
-    )
+    get_target_property(
+        vnm_terminal_msdf_text_package_dependency
+        vnm_msdf_text::vnm_msdf_text
+        IMPORTED)
+    if(vnm_terminal_msdf_text_package_dependency)
+        target_link_libraries(vnm_terminal_surface PRIVATE
+            vnm_msdf_text::vnm_msdf_text
+        )
+    else()
+        target_link_libraries(vnm_terminal_surface PRIVATE
+            "$<BUILD_INTERFACE:vnm_msdf_text::vnm_msdf_text>"
+        )
+    endif()
 endif()
 
 if(MSVC)
@@ -274,6 +284,16 @@ install(TARGETS
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
 )
+
+if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER AND NOT vnm_terminal_msdf_text_package_dependency)
+    install(CODE [[
+        message(FATAL_ERROR
+            "Installing vnm_terminal_surface with MSDF requires packaged "
+            "vnm_msdf_text. Reconfigure with "
+            "-DVNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS=ON and provide "
+            "vnm_msdf_text_DIR or CMAKE_PREFIX_PATH.")
+    ]])
+endif()
 
 install(FILES
     include/vnm_terminal/font_metrics.h
