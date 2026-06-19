@@ -1,3 +1,5 @@
+set(vnm_terminal_qsg_atlas_report_timeout_seconds 240)
+
 if(WIN32)
     set(vnm_terminal_qt_runtime_path
         "PATH=$<TARGET_FILE_DIR:Qt6::Core>$<SEMICOLON>$ENV{PATH}")
@@ -896,7 +898,9 @@ if(WIN32)
         PROPERTIES
             LABELS "qsg;hardware;atlas;report"
             SKIP_RETURN_CODE 77
-            TIMEOUT 120
+            # The report suite includes several real-window transactional
+            # render-loop regressions and can run slowly on debug D3D/WARP.
+            TIMEOUT ${vnm_terminal_qsg_atlas_report_timeout_seconds}
     )
 endif()
 
@@ -1077,7 +1081,7 @@ if(VNM_TERMINAL_ENABLE_GPU_ATLAS_REPORT)
             PROPERTIES
                 LABELS "qsg;hardware;atlas;report"
                 SKIP_RETURN_CODE 77
-                TIMEOUT 120
+                TIMEOUT ${vnm_terminal_qsg_atlas_report_timeout_seconds}
         )
     endforeach()
 

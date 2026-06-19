@@ -6585,9 +6585,7 @@ bool test_source_posture()
         atlas_source.contains(QByteArrayLiteral(
             "record_msdf_text_resource_failure(prepare_result)")) &&
             atlas_source.contains(QByteArrayLiteral(
-                "m_msdf_text_resource_failure_disabled = true")) &&
-            atlas_source.contains(QByteArrayLiteral(
-                "restore_prepare_published_state(prepare_published_state)")),
+                "m_msdf_text_resource_failure_disabled = true")),
         "atlas prepare retries with shaped glyph fallback after MSDF resource failure");
     const QByteArray msdf_prepare_retry_decision =
         QByteArrayLiteral(
@@ -6639,10 +6637,6 @@ bool test_source_posture()
             "QByteArray qsg_layer_descriptor_key(")) &&
             !atlas_source.contains(QByteArrayLiteral("keys.qsg_layers")),
         "atlas source does not build unused qsg layer descriptor keys");
-    ok &= check(
-        atlas_source.contains(QByteArrayLiteral(
-            "m_resources_ready = rect_ready && gpu_resources_ready && buffers_ready")),
-        "atlas prepare does not let failed MSDF resources blank ready glyph and rect resources");
     ok &= check(
         atlas_source.contains(QByteArrayLiteral(
             "const bool msdf_text_buffer_needed = has_msdf_text_draw_passes()")) &&
@@ -8201,6 +8195,15 @@ QByteArray buffer_update_instance_bytes(
         static_cast<int>(instances.size() * sizeof(Buffer_update_test_instance)));
 }
 
+term::Qsg_atlas_buffer_update_plan committed_buffer_update_plan(
+    term::Qsg_atlas_buffer_upload_planner&        planner,
+    const term::Qsg_atlas_buffer_update_input&    input)
+{
+    term::Qsg_atlas_buffer_update_plan plan = planner.plan(input);
+    planner.commit(plan);
+    return plan;
+}
+
 bool test_atlas_rotating_buffer_planner()
 {
     term::Qsg_atlas_buffer_upload_planner planner;
@@ -8230,7 +8233,7 @@ bool test_atlas_rotating_buffer_planner()
     const QByteArray grown_row_owner_bytes =
         buffer_update_instance_bytes(grown_row_owner);
     const term::Qsg_atlas_buffer_update_plan seed_slot_0 =
-        planner.plan({
+        committed_buffer_update_plan(planner, {
             2,
             0,
             3,
@@ -8245,7 +8248,7 @@ bool test_atlas_rotating_buffer_planner()
             false,
         });
     const term::Qsg_atlas_buffer_update_plan seed_slot_1 =
-        planner.plan({
+        committed_buffer_update_plan(planner, {
             2,
             1,
             3,
@@ -8260,7 +8263,7 @@ bool test_atlas_rotating_buffer_planner()
             false,
         });
     const term::Qsg_atlas_buffer_update_plan partial_slot_0 =
-        planner.plan({
+        committed_buffer_update_plan(planner, {
             2,
             0,
             3,
@@ -8275,7 +8278,7 @@ bool test_atlas_rotating_buffer_planner()
             false,
         });
     const term::Qsg_atlas_buffer_update_plan partial_slot_1 =
-        planner.plan({
+        committed_buffer_update_plan(planner, {
             2,
             1,
             3,
@@ -8290,7 +8293,7 @@ bool test_atlas_rotating_buffer_planner()
             false,
         });
     const term::Qsg_atlas_buffer_update_plan clean_slot_0 =
-        planner.plan({
+        committed_buffer_update_plan(planner, {
             2,
             0,
             3,
@@ -8305,7 +8308,7 @@ bool test_atlas_rotating_buffer_planner()
             false,
         });
     const term::Qsg_atlas_buffer_update_plan shifted_rows_slot_0 =
-        planner.plan({
+        committed_buffer_update_plan(planner, {
             2,
             0,
             3,
@@ -8320,7 +8323,7 @@ bool test_atlas_rotating_buffer_planner()
             false,
         });
     const term::Qsg_atlas_buffer_update_plan grown_rows_slot_0 =
-        planner.plan({
+        committed_buffer_update_plan(planner, {
             2,
             0,
             3,
@@ -8425,7 +8428,7 @@ bool test_atlas_row_stable_glyph_planner()
     };
     term::Qsg_atlas_buffer_upload_planner no_source_planner;
     const term::Qsg_atlas_buffer_update_plan unseeded_preserve =
-        no_source_planner.plan({
+        committed_buffer_update_plan(no_source_planner, {
             1,
             0,
             row_count,
@@ -8443,7 +8446,7 @@ bool test_atlas_row_stable_glyph_planner()
             nullptr,
             true,
         });
-    (void)planner.plan({
+    (void)committed_buffer_update_plan(planner, {
         1,
         0,
         row_count,
@@ -8461,7 +8464,7 @@ bool test_atlas_row_stable_glyph_planner()
     });
 
     const term::Qsg_atlas_buffer_update_plan dirty =
-        planner.plan({
+        committed_buffer_update_plan(planner, {
             1,
             0,
             row_count,
@@ -8478,7 +8481,7 @@ bool test_atlas_row_stable_glyph_planner()
             true,
         });
     term::Qsg_atlas_buffer_upload_planner shrink_planner;
-    (void)shrink_planner.plan({
+    (void)committed_buffer_update_plan(shrink_planner, {
         1,
         0,
         row_count,
@@ -8495,7 +8498,7 @@ bool test_atlas_row_stable_glyph_planner()
         true,
     });
     const term::Qsg_atlas_buffer_update_plan shrink =
-        shrink_planner.plan({
+        committed_buffer_update_plan(shrink_planner, {
             1,
             0,
             row_count,
@@ -8513,7 +8516,7 @@ bool test_atlas_row_stable_glyph_planner()
         });
 
     term::Qsg_atlas_buffer_upload_planner fallback_planner;
-    (void)fallback_planner.plan({
+    (void)committed_buffer_update_plan(fallback_planner, {
         1,
         0,
         row_count,
@@ -8530,7 +8533,7 @@ bool test_atlas_row_stable_glyph_planner()
         true,
     });
     const term::Qsg_atlas_buffer_update_plan clean_slot_fallback =
-        fallback_planner.plan({
+        committed_buffer_update_plan(fallback_planner, {
             1,
             0,
             row_count,
@@ -8548,7 +8551,7 @@ bool test_atlas_row_stable_glyph_planner()
         });
 
     term::Qsg_atlas_buffer_upload_planner preserve_planner;
-    (void)preserve_planner.plan({
+    (void)committed_buffer_update_plan(preserve_planner, {
         1,
         0,
         row_count,
@@ -8565,7 +8568,7 @@ bool test_atlas_row_stable_glyph_planner()
         true,
     });
     const term::Qsg_atlas_buffer_update_plan clean_slot_preserved =
-        preserve_planner.plan({
+        committed_buffer_update_plan(preserve_planner, {
             1,
             0,
             row_count,
@@ -8585,7 +8588,7 @@ bool test_atlas_row_stable_glyph_planner()
         });
 
     term::Qsg_atlas_buffer_upload_planner row_span_planner;
-    (void)row_span_planner.plan({
+    (void)committed_buffer_update_plan(row_span_planner, {
         1,
         0,
         row_count,
@@ -8603,7 +8606,7 @@ bool test_atlas_row_stable_glyph_planner()
         &row_stable_ranges,
     });
     const term::Qsg_atlas_buffer_update_plan dirty_row_span =
-        row_span_planner.plan({
+        committed_buffer_update_plan(row_span_planner, {
             1,
             0,
             row_count,
@@ -8746,15 +8749,12 @@ bool test_atlas_populated_frame_retry_planner_transaction()
     term::Qsg_atlas_buffer_upload_planner rect_planner;
     term::Qsg_atlas_buffer_upload_planner glyph_planner;
     term::Qsg_atlas_buffer_upload_planner msdf_text_planner;
-    (void)rect_planner.plan(make_input(base_bytes, {}, false));
-    (void)glyph_planner.plan(make_input(base_bytes, {}, false));
-
-    const term::Qsg_atlas_buffer_upload_planner_state rect_state =
-        rect_planner.snapshot();
-    const term::Qsg_atlas_buffer_upload_planner_state glyph_state =
-        glyph_planner.snapshot();
-    const term::Qsg_atlas_buffer_upload_planner_state msdf_text_state =
-        msdf_text_planner.snapshot();
+    (void)committed_buffer_update_plan(
+        rect_planner,
+        make_input(base_bytes, {}, false));
+    (void)committed_buffer_update_plan(
+        glyph_planner,
+        make_input(base_bytes, {}, false));
 
     const term::Qsg_atlas_buffer_update_plan abandoned_rect =
         rect_planner.plan(make_input(dirty_row_changed_bytes, dirty_row_1, false));
@@ -8763,15 +8763,6 @@ bool test_atlas_populated_frame_retry_planner_transaction()
     const term::Qsg_atlas_buffer_update_plan abandoned_msdf_text =
         msdf_text_planner.plan(
             make_input(dirty_row_changed_bytes, dirty_row_1, true));
-
-    if (abandoned_rect.summary.full_upload_requires_populated_frame ||
-        abandoned_glyph.summary.full_upload_requires_populated_frame ||
-        abandoned_msdf_text.summary.full_upload_requires_populated_frame)
-    {
-        rect_planner.restore(rect_state);
-        glyph_planner.restore(glyph_state);
-        msdf_text_planner.restore(msdf_text_state);
-    }
 
     const term::Qsg_atlas_buffer_update_plan retry_rect =
         rect_planner.plan(make_input(dirty_row_changed_bytes, dirty_row_1, false));
@@ -8782,16 +8773,13 @@ bool test_atlas_populated_frame_retry_planner_transaction()
             make_input(dirty_row_changed_bytes, dirty_row_1, false));
 
     term::Qsg_atlas_buffer_upload_planner recreated_planner;
-    (void)recreated_planner.plan(make_input(base_bytes, {}, false));
+    (void)committed_buffer_update_plan(
+        recreated_planner,
+        make_input(base_bytes, {}, false));
     recreated_planner.reset();
-    const term::Qsg_atlas_buffer_upload_planner_state recreated_state =
-        recreated_planner.snapshot();
     const term::Qsg_atlas_buffer_update_plan abandoned_recreated =
         recreated_planner.plan(
             make_input(dirty_row_changed_bytes, dirty_row_1, true));
-    if (abandoned_recreated.summary.full_upload_requires_populated_frame) {
-        recreated_planner.restore(recreated_state);
-    }
     const term::Qsg_atlas_buffer_update_plan recreated_retry =
         recreated_planner.plan(
             make_input(dirty_row_changed_bytes, dirty_row_1, false));
@@ -8800,13 +8788,13 @@ bool test_atlas_populated_frame_retry_planner_transaction()
     ok &= check(abandoned_rect.summary.partial_upload &&
             abandoned_glyph.summary.partial_upload &&
             abandoned_msdf_text.summary.full_upload_requires_populated_frame,
-        "atlas populated-frame retry transaction reproduces sibling side effects");
+        "atlas populated-frame retry transaction sees abandoned sibling plans");
     ok &= check(retry_rect.summary.partial_upload &&
             retry_rect.summary.uploaded_bytes > 0,
-        "atlas populated-frame retry transaction restores rect planner state");
+        "atlas populated-frame retry transaction leaves rect planner uncommitted");
     ok &= check(retry_glyph.summary.partial_upload &&
             retry_glyph.summary.uploaded_bytes > 0,
-        "atlas populated-frame retry transaction restores glyph planner state");
+        "atlas populated-frame retry transaction leaves glyph planner uncommitted");
     ok &= check(retry_msdf_text.summary.full_upload &&
             retry_msdf_text.summary.uploaded_bytes ==
                 retry_msdf_text.summary.buffer_bytes,
@@ -8828,7 +8816,7 @@ bool test_atlas_non_dirty_and_full_reupload_planner()
         {1, 20},
     };
     const QByteArray bytes = buffer_update_instance_bytes(instances);
-    (void)planner.plan({
+    (void)committed_buffer_update_plan(planner, {
         1,
         0,
         2,
@@ -8853,7 +8841,7 @@ bool test_atlas_non_dirty_and_full_reupload_planner()
         })
     {
         const term::Qsg_atlas_buffer_update_plan non_dirty =
-            planner.plan({
+            committed_buffer_update_plan(planner, {
                 1,
                 0,
                 2,
@@ -8874,7 +8862,7 @@ bool test_atlas_non_dirty_and_full_reupload_planner()
     }
 
     const term::Qsg_atlas_buffer_update_plan public_projection =
-        planner.plan({
+        committed_buffer_update_plan(planner, {
             1,
             0,
             2,
@@ -9546,6 +9534,42 @@ bool pump_next_atlas_report(
         const term::Qsg_atlas_frame_report report =
             term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
         if (report.prepare_count > previous_prepare_count) {
+            out_report = report;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool atlas_report_matches_sequence(
+    const term::Qsg_atlas_frame_report& report,
+    std::uint64_t                       sequence)
+{
+    return
+        report.captured_snapshot_sequence == sequence &&
+        report.render_snapshot_sequence == sequence;
+}
+
+bool pump_next_atlas_report_for_sequence(
+    QGuiApplication&    app,
+    QQuickWindow&       window,
+    VNM_TerminalSurface& surface,
+    std::uint64_t       previous_prepare_count,
+    std::uint64_t       expected_sequence,
+    term::Qsg_atlas_frame_report& out_report,
+    int                 attempts = 120)
+{
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        surface.update();
+        window.requestUpdate();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        const term::Qsg_atlas_frame_report report =
+            term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+        if (report.prepare_count > previous_prepare_count &&
+            atlas_report_matches_sequence(report, expected_sequence))
+        {
             out_report = report;
             return true;
         }
@@ -12951,6 +12975,615 @@ bool run_atlas_report_case(
             report.render.glyph_buffer.full_upload,
         std::string("atlas report full-uploads at least one instance buffer for ") +
             name);
+    return ok;
+}
+
+void configure_atlas_prepare_transaction_surface(
+    QQuickWindow&        window,
+    VNM_TerminalSurface& surface)
+{
+    window.resize(280, 160);
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_scheme(QStringLiteral("Campbell"));
+    surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::GLYPH);
+}
+
+void configure_atlas_prepare_transaction_forced_msdf_surface(
+    QQuickWindow&        window,
+    VNM_TerminalSurface& surface)
+{
+    window.resize(420, 140);
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(360.0, 90.0));
+    surface.set_font_family(QString());
+    surface.set_font_size(18.0);
+    surface.set_color_scheme(QStringLiteral("Campbell"));
+    surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::MSDF);
+}
+
+void configure_atlas_prepare_transaction_auto_msdf_surface(
+    QQuickWindow&        window,
+    VNM_TerminalSurface& surface)
+{
+    window.resize(420, 140);
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(360.0, 90.0));
+    surface.set_font_family(QString());
+    surface.set_font_size(18.0);
+    surface.set_color_scheme(QStringLiteral("Campbell"));
+    surface.set_text_renderer_mode(VNM_TerminalSurface::Text_renderer_mode::AUTO);
+}
+
+bool seed_atlas_prepare_transaction_baseline(
+    QGuiApplication&                      app,
+    QQuickWindow&                         window,
+    VNM_TerminalSurface&                  surface,
+    const term::Terminal_render_snapshot& baseline,
+    const char*                           name,
+    term::Qsg_atlas_frame_report&         report)
+{
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(baseline));
+    window.show();
+    const bool baseline_rendered = pump_until(
+        app,
+        window,
+        surface,
+        atlas_report_render_state_ready);
+    report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool seeded =
+        baseline_rendered &&
+        pump_atlas_seeded_glyph_slots(app, window, surface, report);
+    if (!seeded) {
+        std::cerr << "FAIL: atlas prepare transaction " << name
+            << " could not seed glyph buffer slots"
+            << " prepare_count=" << report.prepare_count
+            << " seeded_slots=" << report.render.glyph_buffer.seeded_slots
+            << " frames_in_flight="
+            << report.render.glyph_buffer.rhi_frames_in_flight
+            << '\n';
+    }
+    return seeded;
+}
+
+bool seed_atlas_prepare_transaction_msdf_baseline(
+    QGuiApplication&              app,
+    QQuickWindow&                 window,
+    VNM_TerminalSurface&          surface,
+    std::uint64_t                 sequence,
+    const char*                   name,
+    term::Qsg_atlas_frame_report& report,
+    bool&                         skipped)
+{
+    skipped = false;
+#if !VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED
+    std::cerr << "SKIP: atlas MSDF transaction " << name
+        << " requires the MSDF text renderer test dependency\n";
+    skipped = true;
+    (void)app;
+    (void)window;
+    (void)surface;
+    (void)sequence;
+    (void)report;
+    return false;
+#else
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(sequence, false)));
+    window.show();
+    const int expected_glyphs =
+        atlas_msdf_resource_stability_expected_glyphs();
+    const bool baseline_rendered = pump_until(
+        app,
+        window,
+        surface,
+        [&](const term::Qsg_atlas_frame_report& current_report) {
+            return
+                atlas_report_render_state_ready(current_report) &&
+                current_report.render.msdf_text_renderer_active &&
+                current_report.render.msdf_text_resources_ready &&
+                current_report.render.msdf_text_texture_ready &&
+                current_report.render.msdf_text_glyph_instances ==
+                    expected_glyphs;
+        });
+    report = term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    if (!baseline_rendered) {
+        if (!report.render.msdf_text_renderer_enabled ||
+            window_uses_known_software_adapter(window))
+        {
+            std::cerr << "SKIP: atlas MSDF transaction " << name
+                << " cannot activate forced MSDF on this backend\n";
+            skipped = true;
+            return false;
+        }
+
+        std::cerr << "FAIL: atlas MSDF transaction " << name
+            << " could not reach a ready MSDF baseline"
+            << " prepare_count=" << report.prepare_count
+            << " render_count=" << report.render_count
+            << " active=" << report.render.msdf_text_renderer_active
+            << " resources_ready=" << report.render.msdf_text_resources_ready
+            << " texture_ready=" << report.render.msdf_text_texture_ready
+            << " msdf_instances="
+            << report.render.msdf_text_glyph_instances
+            << '\n';
+        return false;
+    }
+
+    return true;
+#endif
+}
+
+bool atlas_buffer_has_no_accepted_upload(
+    const term::Qsg_atlas_buffer_update_summary& buffer)
+{
+    return
+        !buffer.full_upload      &&
+        !buffer.partial_upload   &&
+        !buffer.skipped_upload   &&
+        buffer.uploaded_bytes == 0;
+}
+
+bool atlas_failed_prepare_has_no_buffer_upload(
+    const term::Qsg_atlas_frame_report& report)
+{
+    return
+        atlas_buffer_has_no_accepted_upload(report.render.rect_buffer)  &&
+        atlas_buffer_has_no_accepted_upload(report.render.glyph_buffer) &&
+        atlas_buffer_has_no_accepted_upload(report.render.msdf_text_buffer);
+}
+
+bool test_atlas_failed_prepare_forces_next_sparse_full_upload(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_surface(window, surface);
+
+    const term::Terminal_render_snapshot baseline =
+        make_atlas_row_stable_text_snapshot(
+            19830U,
+            QStringLiteral("B"),
+            {{0, 3}});
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!seed_atlas_prepare_transaction_baseline(
+            app,
+            window,
+            surface,
+            baseline,
+            "failed sparse upload",
+            baseline_report))
+    {
+        return false;
+    }
+
+    term::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(19831U);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_row_stable_text_snapshot(
+                19831U,
+                QStringLiteral("BC"),
+                {{1, 1}})));
+    term::Qsg_atlas_frame_report failed_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool failed_prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        19831U,
+        failed_report);
+
+    const term::Terminal_render_snapshot next_sparse =
+        make_atlas_row_stable_text_snapshot(
+            19832U,
+            QStringLiteral("BD"),
+            {{2, 1}});
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(next_sparse));
+    term::Qsg_atlas_frame_report next_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool next_prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        failed_report.prepare_count,
+        19832U,
+        next_report);
+    const term::Qsg_atlas_buffer_update_summary& glyph_buffer =
+        next_report.render.glyph_buffer;
+
+    bool ok = true;
+    ok &= check(failed_prepared && atlas_failed_prepare_has_no_buffer_upload(failed_report),
+        "atlas failed sparse prepare records no accepted buffer upload");
+    ok &= check(next_prepared && atlas_report_render_state_ready(next_report),
+        "atlas sparse frame after failed prepare renders");
+    ok &= check(glyph_buffer.full_upload &&
+            glyph_buffer.full_repaint_upload &&
+            !glyph_buffer.partial_upload &&
+            next_report.frame_build.frame_row_descriptors ==
+                next_sparse.grid_size.rows,
+        "atlas sparse frame after failed prepare uses a conservative full upload");
+    term::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    return ok;
+}
+
+bool test_atlas_failed_prepare_preserves_font_epoch_basis(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_surface(window, surface);
+
+    const term::Terminal_render_snapshot baseline =
+        make_atlas_row_stable_text_snapshot(
+            19833U,
+            QStringLiteral("B"),
+            {{0, 3}});
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!seed_atlas_prepare_transaction_baseline(
+            app,
+            window,
+            surface,
+            baseline,
+            "font epoch",
+            baseline_report))
+    {
+        return false;
+    }
+
+    term::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(19834U);
+    surface.set_font_size(20.0);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_row_stable_text_snapshot(
+                19834U,
+                QStringLiteral("BC"),
+                {{1, 1}})));
+    term::Qsg_atlas_frame_report failed_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool failed_prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        19834U,
+        failed_report);
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_row_stable_text_snapshot(
+                19835U,
+                QStringLiteral("BD"),
+                {{2, 1}})));
+    term::Qsg_atlas_frame_report next_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool next_prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        failed_report.prepare_count,
+        19835U,
+        next_report);
+
+    bool ok = true;
+    ok &= check(failed_prepared && atlas_failed_prepare_has_no_buffer_upload(failed_report),
+        "atlas failed font-epoch prepare records no accepted buffer upload");
+    ok &= check(next_prepared && atlas_report_render_state_ready(next_report),
+        "atlas frame after failed font-epoch prepare renders");
+    ok &= check(next_report.render.font_epoch_invalidation &&
+            next_report.render.glyph_buffer.full_upload &&
+            next_report.render.glyph_buffer.full_repaint_upload,
+        "atlas frame after failed font-epoch prepare keeps the old epoch basis");
+    term::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    return ok;
+}
+
+bool test_atlas_failed_prepare_preserves_cursor_layer_basis(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_surface(window, surface);
+
+    term::Terminal_render_snapshot baseline =
+        make_atlas_row_stable_text_snapshot(
+            19836U,
+            QStringLiteral("B"),
+            {{0, 3}});
+    baseline.cursor.visible       = true;
+    baseline.cursor.blink_enabled = false;
+    baseline.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    baseline.cursor.position      = {0, 0};
+
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!seed_atlas_prepare_transaction_baseline(
+            app,
+            window,
+            surface,
+            baseline,
+            "cursor layer",
+            baseline_report))
+    {
+        return false;
+    }
+
+    term::Terminal_render_snapshot failed = baseline;
+    failed.metadata.sequence = 19837U;
+    failed.dirty_row_ranges.clear();
+    failed.cursor.position = {1, 0};
+    term::qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(19837U);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(failed));
+    term::Qsg_atlas_frame_report failed_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool failed_prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        19837U,
+        failed_report);
+
+    term::Terminal_render_snapshot next = failed;
+    next.metadata.sequence = 19838U;
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(next));
+    term::Qsg_atlas_frame_report next_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool next_prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        failed_report.prepare_count,
+        19838U,
+        next_report);
+
+    bool ok = true;
+    ok &= check(failed_prepared && atlas_failed_prepare_has_no_buffer_upload(failed_report),
+        "atlas failed cursor prepare records no accepted buffer upload");
+    ok &= check(next_prepared && atlas_report_render_state_ready(next_report),
+        "atlas frame after failed cursor prepare renders");
+    ok &= check(next_report.render.non_dirty_cursor_invalidation &&
+            next_report.render.rect_buffer.full_upload &&
+            next_report.render.rect_buffer.non_dirty_state_upload,
+        "atlas frame after failed cursor prepare keeps the old cursor-row basis");
+    term::qsg_atlas_clear_resource_prepare_failure_for_testing();
+    return ok;
+}
+
+bool test_atlas_forced_msdf_prepare_resource_failure_does_not_commit(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_forced_msdf_surface(window, surface);
+
+    bool skipped = false;
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!seed_atlas_prepare_transaction_msdf_baseline(
+            app,
+            window,
+            surface,
+            19839U,
+            "prepare resources",
+            baseline_report,
+            skipped))
+    {
+        return skipped;
+    }
+
+    term::qsg_atlas_fail_msdf_resource_prepare_for_snapshot_sequence_for_testing(
+        19840U);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(19840U, true)));
+
+    term::Qsg_atlas_frame_report failed_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool failed_prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        19840U,
+        failed_report);
+    term::qsg_atlas_clear_msdf_resource_failures_for_testing();
+
+    bool ok = true;
+    ok &= check(failed_prepared,
+        "atlas forced MSDF prepare-resource failure reports the failed sequence");
+    ok &= check(failed_prepared &&
+            !atlas_report_render_state_ready(failed_report),
+        "atlas forced MSDF prepare-resource failure does not render ready");
+    ok &= check(failed_prepared &&
+            atlas_failed_prepare_has_no_buffer_upload(failed_report),
+        "atlas forced MSDF prepare-resource failure records no accepted buffer upload");
+    return ok;
+}
+
+bool test_atlas_forced_msdf_buffer_failure_does_not_commit(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_forced_msdf_surface(window, surface);
+
+    bool skipped = false;
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!seed_atlas_prepare_transaction_msdf_baseline(
+            app,
+            window,
+            surface,
+            19841U,
+            "instance buffer",
+            baseline_report,
+            skipped))
+    {
+        return skipped;
+    }
+
+    term::qsg_atlas_fail_msdf_text_buffer_update_for_snapshot_sequence_for_testing(
+        19842U);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(19842U, true)));
+
+    term::Qsg_atlas_frame_report failed_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool failed_prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        19842U,
+        failed_report);
+    term::qsg_atlas_clear_msdf_resource_failures_for_testing();
+
+    bool ok = true;
+    ok &= check(failed_prepared,
+        "atlas forced MSDF instance-buffer failure reports the failed sequence");
+    ok &= check(failed_prepared &&
+            !atlas_report_render_state_ready(failed_report),
+        "atlas forced MSDF instance-buffer failure does not render ready");
+    ok &= check(failed_prepared &&
+            atlas_failed_prepare_has_no_buffer_upload(failed_report),
+        "atlas forced MSDF instance-buffer failure records no accepted buffer upload");
+    return ok;
+}
+
+bool test_atlas_auto_msdf_prepare_resource_failure_falls_back(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_auto_msdf_surface(window, surface);
+
+    bool skipped = false;
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!seed_atlas_prepare_transaction_msdf_baseline(
+            app,
+            window,
+            surface,
+            19843U,
+            "auto fallback",
+            baseline_report,
+            skipped))
+    {
+        return skipped;
+    }
+
+    term::qsg_atlas_fail_msdf_resource_prepare_for_snapshot_sequence_for_testing(
+        19844U);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(19844U, true)));
+
+    term::Qsg_atlas_frame_report fallback_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        19844U,
+        fallback_report);
+    term::qsg_atlas_clear_msdf_resource_failures_for_testing();
+
+    const term::Qsg_atlas_render_summary& render = fallback_report.render;
+    bool ok = true;
+    ok &= check(prepared && atlas_report_render_state_ready(fallback_report),
+        "atlas AUTO MSDF prepare-resource failure renders via fallback");
+    ok &= check(render.text_renderer_fallback_used &&
+            render.effective_text_renderer ==
+                term::Terminal_text_renderer_kind::GLYPH &&
+            render.glyph_draw_calls > 0 &&
+            render.glyph_buffer_instances > 0,
+        "atlas AUTO MSDF prepare-resource failure uses glyph fallback");
+    ok &= check(!render.msdf_text_resources_ready &&
+            render.msdf_text_missed_supported_runs > 0,
+        "atlas AUTO MSDF prepare-resource failure preserves MSDF diagnostics");
+    return ok;
+}
+
+bool test_atlas_auto_msdf_buffer_failure_falls_back(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    VNM_TerminalSurface surface;
+    configure_atlas_prepare_transaction_auto_msdf_surface(window, surface);
+
+    bool skipped = false;
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!seed_atlas_prepare_transaction_msdf_baseline(
+            app,
+            window,
+            surface,
+            19845U,
+            "auto instance-buffer fallback",
+            baseline_report,
+            skipped))
+    {
+        return skipped;
+    }
+
+    constexpr std::uint64_t k_fallback_sequence = 19846U;
+    term::qsg_atlas_fail_msdf_text_buffer_update_for_snapshot_sequence_for_testing(
+        k_fallback_sequence);
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_msdf_resource_stability_snapshot(
+                k_fallback_sequence,
+                true)));
+
+    term::Qsg_atlas_frame_report fallback_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool prepared = pump_next_atlas_report_for_sequence(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        k_fallback_sequence,
+        fallback_report);
+    term::qsg_atlas_clear_msdf_resource_failures_for_testing();
+
+    const int expected_glyphs =
+        atlas_msdf_resource_stability_expected_glyphs();
+    const term::Qsg_atlas_render_summary& render = fallback_report.render;
+    bool ok = true;
+    ok &= check(prepared && atlas_report_render_state_ready(fallback_report),
+        "atlas AUTO MSDF instance-buffer failure renders via fallback");
+    ok &= check(render.text_renderer_fallback_used &&
+            render.effective_text_renderer ==
+                term::Terminal_text_renderer_kind::GLYPH &&
+            render.glyph_draw_calls > 0 &&
+            render.glyph_buffer_instances > 0,
+        "atlas AUTO MSDF instance-buffer failure uses glyph fallback");
+    ok &= check(!render.msdf_text_renderer_active &&
+            !render.msdf_text_resources_ready &&
+            render.msdf_text_draw_calls == 0,
+        "atlas AUTO MSDF instance-buffer failure disables MSDF renderer state");
+    ok &= check(render.msdf_text_supported_runs >=
+                baseline_report.render.msdf_text_supported_runs &&
+            render.msdf_text_missed_supported_runs >
+                baseline_report.render.msdf_text_missed_supported_runs &&
+            render.msdf_text_missed_supported_glyphs >= expected_glyphs,
+        "atlas AUTO MSDF instance-buffer failure preserves MSDF diagnostics");
     return ok;
 }
 
@@ -19186,6 +19819,9 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_sparse_lazy_style_change_builds_full_frame(app);
     ok &= test_atlas_sparse_lazy_reverse_video_builds_full_frame(app);
     ok &= test_atlas_sparse_lazy_previous_cursor_row_builds_full_frame(app);
+    ok &= test_atlas_failed_prepare_forces_next_sparse_full_upload(app);
+    ok &= test_atlas_failed_prepare_preserves_font_epoch_basis(app);
+    ok &= test_atlas_failed_prepare_preserves_cursor_layer_basis(app);
     ok &= test_atlas_msdf_resource_stability(app);
     ok &= test_atlas_msdf_zoom_reuses_baked_atlas(app);
     ok &= test_atlas_msdf_zoom_crosses_bake_bucket(app);
@@ -19272,6 +19908,10 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
             atlas.atlas_report.frame_build.glyph_coverage_failures == 0 &&
             atlas.atlas_report.frame_build.glyph_atlas_insert_failures == 0,
         "atlas report records no silent glyph misses");
+    ok &= test_atlas_auto_msdf_prepare_resource_failure_falls_back(app);
+    ok &= test_atlas_auto_msdf_buffer_failure_falls_back(app);
+    ok &= test_atlas_forced_msdf_prepare_resource_failure_does_not_commit(app);
+    ok &= test_atlas_forced_msdf_buffer_failure_does_not_commit(app);
     return ok ? 0 : 1;
 }
 
