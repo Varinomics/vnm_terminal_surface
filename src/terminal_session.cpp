@@ -2629,15 +2629,6 @@ Terminal_key_event_result Terminal_session::write_key_event_locked(
     return {true, result};
 }
 
-Terminal_mouse_event_result Terminal_session::write_mouse_event(Terminal_mouse_event event)
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    drain_backend_callback_commands();
-    process_pending_commands();
-
-    return write_mouse_event_locked(event, Backend_callback_drain_policy::DRAIN_CALLBACKS);
-}
-
 std::optional<Terminal_mouse_event_result>
 Terminal_session::try_write_mouse_event_without_backend_drain_if_callbacks_empty(
     Terminal_mouse_event event)
