@@ -324,6 +324,19 @@ bool qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
     bool msdf_prepare_resource_attempted,
     bool msdf_prepare_resource_failed);
 
+void qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(
+    std::uint64_t sequence);
+
+void qsg_atlas_clear_resource_prepare_failure_for_testing();
+
+void qsg_atlas_fail_msdf_resource_prepare_for_snapshot_sequence_for_testing(
+    std::uint64_t sequence);
+
+void qsg_atlas_fail_msdf_text_buffer_update_for_snapshot_sequence_for_testing(
+    std::uint64_t sequence);
+
+void qsg_atlas_clear_msdf_resource_failures_for_testing();
+
 struct Qsg_atlas_buffer_update_summary
 {
     int  rhi_frames_in_flight          = 1;
@@ -347,14 +360,6 @@ struct Qsg_atlas_buffer_update_summary
     bool full_repaint_upload           = false;
     bool non_dirty_state_upload        = false;
     bool row_stable_layout             = false;
-};
-
-struct Qsg_atlas_buffer_update_plan
-{
-    Qsg_atlas_buffer_update_summary
-                                  summary;
-    std::vector<Qsg_atlas_buffer_update_range>
-                                  ranges;
 };
 
 struct Qsg_atlas_row_stable_range
@@ -386,14 +391,23 @@ struct Qsg_atlas_buffer_update_input
     bool                                     preserve_clean_row_slots = false;
 };
 
-struct Qsg_atlas_buffer_upload_planner_state
+struct Qsg_atlas_buffer_upload_commit
 {
     int                         frames_in_flight = 0;
     std::vector<QByteArray>     slot_bytes;
-    std::vector<std::vector<int>>
-                                slot_instance_rows;
     std::vector<QByteArray>     slot_layout_keys;
     std::vector<unsigned char>  seeded_slots;
+    bool                        valid = false;
+};
+
+struct Qsg_atlas_buffer_update_plan
+{
+    Qsg_atlas_buffer_update_summary
+                                  summary;
+    std::vector<Qsg_atlas_buffer_update_range>
+                                  ranges;
+    Qsg_atlas_buffer_upload_commit
+                                  commit;
 };
 
 struct Qsg_atlas_shaped_glyph_record
@@ -431,19 +445,15 @@ class Qsg_atlas_buffer_upload_planner final
 public:
     void reset();
 
-    Qsg_atlas_buffer_upload_planner_state snapshot() const;
-    void restore(const Qsg_atlas_buffer_upload_planner_state& state);
-
     Qsg_atlas_buffer_update_plan plan(
         const Qsg_atlas_buffer_update_input& input);
+    void commit(const Qsg_atlas_buffer_update_plan& plan);
 
 private:
-    void resize_slots(int frames_in_flight);
+    Qsg_atlas_buffer_upload_commit commit_for_frames(int frames_in_flight) const;
 
     int                         m_frames_in_flight = 0;
     std::vector<QByteArray>     m_slot_bytes;
-    std::vector<std::vector<int>>
-                                m_slot_instance_rows;
     std::vector<QByteArray>     m_slot_layout_keys;
     std::vector<unsigned char>  m_seeded_slots;
 };

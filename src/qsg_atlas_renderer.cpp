@@ -29,6 +29,7 @@
 #include <rhi/qshader.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -46,6 +47,10 @@
 namespace vnm_terminal::internal {
 
 namespace {
+
+std::atomic<std::uint64_t> s_fail_resource_prepare_snapshot_sequence = 0U;
+std::atomic<std::uint64_t> s_fail_msdf_resource_prepare_snapshot_sequence = 0U;
+std::atomic<std::uint64_t> s_fail_msdf_text_buffer_update_snapshot_sequence = 0U;
 
 constexpr const char* k_atlas_vertex_shader_path =
     ":/vnm_terminal_surface/shaders/atlas_quad.vert.qsb";
@@ -164,20 +169,6 @@ struct atlas_text_pass_ranges_t
     atlas_pass_range_t msdf;
 };
 
-struct Atlas_prepare_result
-{
-    bool                            raw_font_rasterized = false;
-    std::uint64_t                   raster_thread       = 0U;
-    int                             rasterized_glyphs   = 0;
-    QString                         base_face_id;
-    std::set<QString>               glyph_face_ids;
-    std::set<QString>               fallback_face_ids;
-    Qsg_atlas_frame_build_summary frame_build;
-    Qsg_atlas_render_summary      render;
-    Qsg_atlas_producer_summary    producer;
-    Qsg_atlas_warm_lazy_summary   warm_lazy;
-};
-
 enum class Atlas_cache_insert_source
 {
     WARM,
@@ -199,7 +190,7 @@ struct Atlas_frame_state_keys
     QByteArray clean_row_qsg_layers;
 };
 
-struct Atlas_prepare_published_state
+struct Atlas_prepare_commit
 {
     Atlas_frame_state_keys previous_render_state_keys;
     std::vector<int>       previous_cursor_layer_rows;
@@ -209,6 +200,33 @@ struct Atlas_prepare_published_state
     bool                   render_force_full_reupload = false;
     bool                   render_non_dirty_state_invalidation = false;
     bool                   render_cursor_rect_state_invalidation = false;
+};
+
+struct Atlas_prepare_layout_state
+{
+    std::vector<int> render_rect_background_row_capacities;
+    std::vector<int> render_rect_selection_row_capacities;
+    std::vector<int> render_rect_graphic_row_capacities;
+    std::vector<int> render_rect_decoration_row_capacities;
+    std::vector<int> render_rect_cursor_row_capacities;
+    std::vector<int> render_rect_overlay_row_capacities;
+    std::vector<int> render_glyph_text_row_capacities;
+    std::vector<int> render_glyph_cursor_text_row_capacities;
+};
+
+struct Atlas_prepare_result
+{
+    bool                          raw_font_rasterized = false;
+    std::uint64_t                 raster_thread       = 0U;
+    int                           rasterized_glyphs   = 0;
+    QString                       base_face_id;
+    std::set<QString>             glyph_face_ids;
+    std::set<QString>             fallback_face_ids;
+    Qsg_atlas_frame_build_summary frame_build;
+    Qsg_atlas_render_summary      render;
+    Qsg_atlas_producer_summary    producer;
+    Qsg_atlas_warm_lazy_summary   warm_lazy;
+    Atlas_prepare_commit          commit;
 };
 
 struct Glyph_raster_image
@@ -358,6 +376,42 @@ void delete_resource(T*& resource)
     delete resource;
     resource = nullptr;
 }
+
+bool qsg_atlas_should_fail_resource_prepare_for_sequence(std::uint64_t sequence)
+{
+    if (sequence == 0U) {
+        return false;
+    }
+
+    return
+        s_fail_resource_prepare_snapshot_sequence.load(
+            std::memory_order_relaxed) == sequence;
+}
+
+bool qsg_atlas_should_fail_msdf_resource_prepare_for_sequence(
+    std::uint64_t sequence)
+{
+    if (sequence == 0U) {
+        return false;
+    }
+
+    return
+        s_fail_msdf_resource_prepare_snapshot_sequence.load(
+            std::memory_order_relaxed) == sequence;
+}
+
+bool qsg_atlas_should_fail_msdf_text_buffer_update_for_sequence(
+    std::uint64_t sequence)
+{
+    if (sequence == 0U) {
+        return false;
+    }
+
+    return
+        s_fail_msdf_text_buffer_update_snapshot_sequence.load(
+            std::memory_order_relaxed) == sequence;
+}
+
 std::uint64_t current_thread_id()
 {
     return static_cast<std::uint64_t>(
@@ -2038,19 +2092,21 @@ public:
             rect_ready = ensure_rect_resources(rhi, target);
         }
 
-        const Atlas_prepare_published_state prepare_published_state =
-            capture_prepare_published_state();
+        const Atlas_prepare_layout_state prepare_layout_state =
+            capture_prepare_layout_state();
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         m_msdf_text_used_this_frame   = false;
         m_msdf_text_missed_this_frame = false;
 #endif
         Atlas_prepare_result prepare_result = prepare_atlas_instances(rhi);
+        publish_prepare_upload_directives(prepare_result.commit);
         const bool msdf_text_fallback_allowed =
             qsg_atlas_text_renderer_policy_allows_fallback(
                 m_frame.options.text_renderer_policy);
-        const bool forced_msdf_text =
-            qsg_atlas_text_renderer_policy_requires_msdf(
-                m_frame.options.text_renderer_policy);
+        const std::uint64_t snapshot_sequence =
+            m_frame.snapshot != nullptr
+                ? m_frame.snapshot->metadata.sequence
+                : 0U;
 
         if (rhi != nullptr && command_buffer != nullptr && target != nullptr) {
             bool atlas_ready = false;
@@ -2085,6 +2141,12 @@ public:
                             msdf_ready =
                                 msdf_atlas_ready &&
                                 ensure_msdf_text_resources(rhi, target);
+                            if (qsg_atlas_should_fail_msdf_resource_prepare_for_sequence(
+                                    snapshot_sequence))
+                            {
+                                msdf_ready = false;
+                                m_msdf_text_resources_ready = false;
+                            }
                             msdf_prepare_resource_failed = !msdf_ready;
                         }
                         else {
@@ -2094,10 +2156,16 @@ public:
                     else {
                         m_msdf_text_resources_ready = false;
                     }
-                    return
+                    bool resources_ready =
                         atlas_ready &&
                         glyph_ready &&
-                        (msdf_ready || forced_msdf_text);
+                        msdf_ready;
+                    if (qsg_atlas_should_fail_resource_prepare_for_sequence(
+                            snapshot_sequence))
+                    {
+                        resources_ready = false;
+                    }
+                    return resources_ready;
                 };
 
             bool retried_msdf_text_fallback     = false;
@@ -2110,9 +2178,10 @@ public:
                 msdf_failure_render = prepare_result.render;
                 m_msdf_text_resource_failure_disabled = true;
                 retried_msdf_text_fallback = true;
-                restore_prepare_published_state(prepare_published_state);
+                restore_prepare_layout_state(prepare_layout_state);
                 prepare_result =
                     prepare_atlas_instances(rhi, force_populated_frame_upload);
+                publish_prepare_upload_directives(prepare_result.commit);
                 qsg_atlas_merge_msdf_text_failure_diagnostics(
                     *msdf_failure_render,
                     prepare_result.render);
@@ -2121,8 +2190,9 @@ public:
             const auto retry_with_populated_frame_upload = [&]() {
                 retried_populated_frame_upload = true;
                 force_populated_frame_upload   = true;
-                restore_prepare_published_state(prepare_published_state);
+                restore_prepare_layout_state(prepare_layout_state);
                 prepare_result = prepare_atlas_instances(rhi, true);
+                publish_prepare_upload_directives(prepare_result.commit);
                 if (msdf_failure_render.has_value()) {
                     qsg_atlas_merge_msdf_text_failure_diagnostics(
                         *msdf_failure_render,
@@ -2198,6 +2268,15 @@ public:
         }
         else {
             m_resources_ready = false;
+        }
+
+        if (m_resources_ready) {
+            commit_prepare_state(prepare_result.commit);
+            m_force_next_render_full_upload = false;
+        }
+        else {
+            restore_prepare_layout_state(prepare_layout_state);
+            m_force_next_render_full_upload = true;
         }
 
         raw_font_rasterized = prepare_result.raw_font_rasterized;
@@ -2356,6 +2435,7 @@ public:
         m_msdf_text_instance_buffer_size = 0U;
         m_static_vertex_upload_needed    = true;
         m_resources_ready                = false;
+        m_force_next_render_full_upload  = true;
         m_dual_source_blend_factors_probe_completed = false;
         m_dual_source_blend_factors_available       = false;
         m_rect_upload_planner.reset();
@@ -3819,6 +3899,7 @@ private:
         std::vector<int> current_cursor_layer_rows =
             cursor_layer_rows(render_frame);
         if (force_full_cell_walk ||
+            m_force_next_render_full_upload ||
             sparse_msdf_text_requires_full_cell_walk(render_frame) ||
             sparse_render_frame_requires_full_cell_walk(
                 render_frame,
@@ -3881,8 +3962,11 @@ private:
         build_render_glyph_buffer_layout(result);
         result.raw_font_rasterized = result.rasterized_glyphs > 0;
         finalize_frame_build_summary(render_frame, result);
-        finalize_render_summary(render_frame, font_epoch_changed, result);
-        m_previous_cursor_layer_rows = current_cursor_layer_rows;
+        finalize_render_summary(
+            render_frame,
+            current_cursor_layer_rows,
+            font_epoch_changed,
+            result);
         finalize_warm_lazy_summary(result);
         return result;
     }
@@ -4372,37 +4456,71 @@ private:
         return keys;
     }
 
-    Atlas_prepare_published_state capture_prepare_published_state() const
+    Atlas_prepare_layout_state capture_prepare_layout_state() const
     {
-        Atlas_prepare_published_state state;
-        state.previous_render_state_keys = m_previous_render_state_keys;
-        state.previous_cursor_layer_rows = m_previous_cursor_layer_rows;
-        state.previous_render_font_epoch = m_previous_render_font_epoch;
-        state.have_previous_render_state = m_have_previous_render_state;
-        state.have_previous_render_font_epoch =
-            m_have_previous_render_font_epoch;
-        state.render_force_full_reupload = m_render_force_full_reupload;
-        state.render_non_dirty_state_invalidation =
-            m_render_non_dirty_state_invalidation;
-        state.render_cursor_rect_state_invalidation =
-            m_render_cursor_rect_state_invalidation;
+        Atlas_prepare_layout_state state;
+        state.render_rect_background_row_capacities =
+            m_render_rect_background_row_capacities;
+        state.render_rect_selection_row_capacities =
+            m_render_rect_selection_row_capacities;
+        state.render_rect_graphic_row_capacities =
+            m_render_rect_graphic_row_capacities;
+        state.render_rect_decoration_row_capacities =
+            m_render_rect_decoration_row_capacities;
+        state.render_rect_cursor_row_capacities =
+            m_render_rect_cursor_row_capacities;
+        state.render_rect_overlay_row_capacities =
+            m_render_rect_overlay_row_capacities;
+        state.render_glyph_text_row_capacities =
+            m_render_glyph_text_row_capacities;
+        state.render_glyph_cursor_text_row_capacities =
+            m_render_glyph_cursor_text_row_capacities;
         return state;
     }
 
-    void restore_prepare_published_state(
-        const Atlas_prepare_published_state& state)
+    void restore_prepare_layout_state(const Atlas_prepare_layout_state& state)
     {
-        m_previous_render_state_keys = state.previous_render_state_keys;
-        m_previous_cursor_layer_rows = state.previous_cursor_layer_rows;
-        m_previous_render_font_epoch = state.previous_render_font_epoch;
-        m_have_previous_render_state = state.have_previous_render_state;
-        m_have_previous_render_font_epoch =
-            state.have_previous_render_font_epoch;
-        m_render_force_full_reupload = state.render_force_full_reupload;
+        m_render_rect_background_row_capacities =
+            state.render_rect_background_row_capacities;
+        m_render_rect_selection_row_capacities =
+            state.render_rect_selection_row_capacities;
+        m_render_rect_graphic_row_capacities =
+            state.render_rect_graphic_row_capacities;
+        m_render_rect_decoration_row_capacities =
+            state.render_rect_decoration_row_capacities;
+        m_render_rect_cursor_row_capacities =
+            state.render_rect_cursor_row_capacities;
+        m_render_rect_overlay_row_capacities =
+            state.render_rect_overlay_row_capacities;
+        m_render_glyph_text_row_capacities =
+            state.render_glyph_text_row_capacities;
+        m_render_glyph_cursor_text_row_capacities =
+            state.render_glyph_cursor_text_row_capacities;
+    }
+
+    void publish_prepare_upload_directives(
+        const Atlas_prepare_commit& commit)
+    {
+        m_render_force_full_reupload =
+            commit.render_force_full_reupload;
         m_render_non_dirty_state_invalidation =
-            state.render_non_dirty_state_invalidation;
+            commit.render_non_dirty_state_invalidation;
         m_render_cursor_rect_state_invalidation =
-            state.render_cursor_rect_state_invalidation;
+            commit.render_cursor_rect_state_invalidation;
+    }
+
+    void commit_prepare_state(const Atlas_prepare_commit& commit)
+    {
+        m_previous_render_state_keys =
+            commit.previous_render_state_keys;
+        m_previous_cursor_layer_rows =
+            commit.previous_cursor_layer_rows;
+        m_previous_render_font_epoch =
+            commit.previous_render_font_epoch;
+        m_have_previous_render_state =
+            commit.have_previous_render_state;
+        m_have_previous_render_font_epoch =
+            commit.have_previous_render_font_epoch;
     }
 
     bool msdf_text_ownership_available() const
@@ -4448,6 +4566,7 @@ private:
 
     void finalize_render_summary(
         const Terminal_render_frame& render_frame,
+        const std::vector<int>&      current_cursor_layer_rows,
         bool                         font_epoch_changed,
         Atlas_prepare_result&       result)
     {
@@ -4607,9 +4726,11 @@ private:
         summary.dual_source_blend_factors_available =
             m_dual_source_blend_factors_available;
 
-        m_render_force_full_reupload =
+        Atlas_prepare_commit& commit = result.commit;
+        commit.render_force_full_reupload =
+            m_force_next_render_full_upload ||
             result.frame_build.full_repaint_fallback;
-        m_render_non_dirty_state_invalidation =
+        commit.render_non_dirty_state_invalidation =
             selection_changed    ||
             preedit_changed      ||
             options_changed      ||
@@ -4633,14 +4754,15 @@ private:
         // Keep the larger glyph/MSDF buffers on their existing partial-update
         // path and make only the rect buffer conservative whenever the cursor
         // primitive itself changed.
-        m_render_cursor_rect_state_invalidation =
+        commit.render_cursor_rect_state_invalidation =
             cursor_rect_changed ||
             (!m_have_previous_render_state && cursor_rect_present) ||
             font_epoch_changed;
-        m_previous_render_state_keys      = current_keys;
-        m_have_previous_render_state      = true;
-        m_previous_render_font_epoch      = m_frame.font_epoch;
-        m_have_previous_render_font_epoch = true;
+        commit.previous_render_state_keys      = current_keys;
+        commit.previous_cursor_layer_rows      = current_cursor_layer_rows;
+        commit.previous_render_font_epoch      = m_frame.font_epoch;
+        commit.have_previous_render_state      = true;
+        commit.have_previous_render_font_epoch = true;
     }
 
     void finalize_warm_lazy_summary(Atlas_prepare_result& result)
@@ -6286,11 +6408,14 @@ private:
         bool glyph_buffer_recreated = false;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         const bool msdf_text_buffer_needed = has_msdf_text_draw_passes();
+        const std::uint64_t snapshot_sequence =
+            m_frame.snapshot != nullptr
+                ? m_frame.snapshot->metadata.sequence
+                : 0U;
         const quint32 msdf_text_buffer_size = static_cast<quint32>(
             std::max<std::size_t>(1U, m_msdf_text_instances.size()) *
                 sizeof(atlas_msdf_instance_t));
         bool msdf_text_buffer_recreated = false;
-        bool msdf_text_buffer_ready = true;
 #endif
         if (!ensure_dynamic_buffer(
                 rhi,
@@ -6322,7 +6447,11 @@ private:
 
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         if (msdf_text_buffer_needed) {
-            if (!ensure_dynamic_buffer(
+            const bool forced_msdf_text_buffer_failure =
+                qsg_atlas_should_fail_msdf_text_buffer_update_for_sequence(
+                    snapshot_sequence);
+            if (forced_msdf_text_buffer_failure ||
+                !ensure_dynamic_buffer(
                     rhi,
                     m_msdf_text_instance_buffer,
                     m_msdf_text_instance_buffer_size,
@@ -6330,14 +6459,8 @@ private:
                     QRhiBuffer::VertexBuffer,
                     &msdf_text_buffer_recreated))
             {
-                if (!qsg_atlas_text_renderer_policy_requires_msdf(
-                        m_frame.options.text_renderer_policy))
-                {
-                    return Qsg_atlas_buffer_update_result::MSDF_TEXT_BUFFER_FAILED;
-                }
-
-                msdf_text_buffer_ready      = false;
                 m_msdf_text_resources_ready = false;
+                return Qsg_atlas_buffer_update_result::MSDF_TEXT_BUFFER_FAILED;
             }
             if (msdf_text_buffer_recreated) {
                 m_msdf_text_upload_planner.reset();
@@ -6357,19 +6480,6 @@ private:
         const int msdf_text_byte_count = static_cast<int>(
             m_msdf_text_instances.size() * sizeof(atlas_msdf_instance_t));
 #endif
-        const bool retry_transactional_planning = m_render_preserve_clean_row_slots;
-        const Qsg_atlas_buffer_upload_planner_state rect_planner_state =
-            retry_transactional_planning
-                ? m_rect_upload_planner.snapshot()
-                : Qsg_atlas_buffer_upload_planner_state{};
-        const Qsg_atlas_buffer_upload_planner_state glyph_planner_state =
-            retry_transactional_planning
-                ? m_glyph_upload_planner.snapshot()
-                : Qsg_atlas_buffer_upload_planner_state{};
-        const Qsg_atlas_buffer_upload_planner_state msdf_text_planner_state =
-            retry_transactional_planning
-                ? m_msdf_text_upload_planner.snapshot()
-                : Qsg_atlas_buffer_upload_planner_state{};
         const Qsg_atlas_buffer_update_plan rect_plan =
             m_rect_upload_planner.plan({
                 frames_in_flight,
@@ -6415,7 +6525,7 @@ private:
             });
         Qsg_atlas_buffer_update_plan msdf_text_plan;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
-        if (msdf_text_buffer_needed && msdf_text_buffer_ready) {
+        if (msdf_text_buffer_needed) {
             msdf_text_plan = m_msdf_text_upload_planner.plan({
                 frames_in_flight,
                 frame_slot,
@@ -6445,11 +6555,6 @@ private:
             glyph_plan.summary.full_upload_requires_populated_frame ||
             msdf_text_plan.summary.full_upload_requires_populated_frame)
         {
-            if (retry_transactional_planning) {
-                m_rect_upload_planner.restore(rect_planner_state);
-                m_glyph_upload_planner.restore(glyph_planner_state);
-                m_msdf_text_upload_planner.restore(msdf_text_planner_state);
-            }
             return
                 Qsg_atlas_buffer_update_result::FULL_UPLOAD_REQUIRES_POPULATED_FRAME;
         }
@@ -6479,7 +6584,6 @@ private:
             &uniform);
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         if (msdf_text_buffer_needed &&
-            msdf_text_buffer_ready &&
             m_msdf_text_uniform_buffer != nullptr)
         {
             atlas_msdf_uniform_t msdf_uniform;
@@ -6519,7 +6623,7 @@ private:
                     range.byte_offset);
         }
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
-        if (msdf_text_buffer_needed && msdf_text_buffer_ready) {
+        if (msdf_text_buffer_needed) {
             for (const Qsg_atlas_buffer_update_range& range : msdf_text_plan.ranges) {
                 updates->updateDynamicBuffer(
                     m_msdf_text_instance_buffer,
@@ -6532,6 +6636,11 @@ private:
 #endif
 
         command_buffer->resourceUpdate(updates);
+        m_rect_upload_planner.commit(rect_plan);
+        m_glyph_upload_planner.commit(glyph_plan);
+#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+        m_msdf_text_upload_planner.commit(msdf_text_plan);
+#endif
         return Qsg_atlas_buffer_update_result::READY;
     }
 
@@ -6722,6 +6831,7 @@ private:
     bool                                     m_render_non_dirty_state_invalidation = false;
     bool                                     m_render_cursor_rect_state_invalidation = false;
     bool                                     m_render_preserve_clean_row_slots = false;
+    bool                                     m_force_next_render_full_upload = false;
     bool                                     m_have_previous_render_state = false;
     Atlas_frame_state_keys                  m_previous_render_state_keys;
     std::vector<int>                         m_previous_cursor_layer_rows;
@@ -6809,6 +6919,47 @@ bool qsg_atlas_should_retry_msdf_text_fallback_after_prepare(
         msdf_prepare_resource_failed;
 }
 
+void qsg_atlas_fail_resource_prepare_for_snapshot_sequence_for_testing(
+    std::uint64_t sequence)
+{
+    s_fail_resource_prepare_snapshot_sequence.store(
+        sequence,
+        std::memory_order_relaxed);
+}
+
+void qsg_atlas_clear_resource_prepare_failure_for_testing()
+{
+    s_fail_resource_prepare_snapshot_sequence.store(
+        0U,
+        std::memory_order_relaxed);
+}
+
+void qsg_atlas_fail_msdf_resource_prepare_for_snapshot_sequence_for_testing(
+    std::uint64_t sequence)
+{
+    s_fail_msdf_resource_prepare_snapshot_sequence.store(
+        sequence,
+        std::memory_order_relaxed);
+}
+
+void qsg_atlas_fail_msdf_text_buffer_update_for_snapshot_sequence_for_testing(
+    std::uint64_t sequence)
+{
+    s_fail_msdf_text_buffer_update_snapshot_sequence.store(
+        sequence,
+        std::memory_order_relaxed);
+}
+
+void qsg_atlas_clear_msdf_resource_failures_for_testing()
+{
+    s_fail_msdf_resource_prepare_snapshot_sequence.store(
+        0U,
+        std::memory_order_relaxed);
+    s_fail_msdf_text_buffer_update_snapshot_sequence.store(
+        0U,
+        std::memory_order_relaxed);
+}
+
 void qsg_atlas_merge_msdf_text_failure_diagnostics(
     const Qsg_atlas_render_summary& failed_msdf_render,
     Qsg_atlas_render_summary&       fallback_render)
@@ -6876,45 +7027,41 @@ void Qsg_atlas_buffer_upload_planner::reset()
 {
     m_frames_in_flight = 0;
     m_slot_bytes.clear();
-    m_slot_instance_rows.clear();
     m_slot_layout_keys.clear();
     m_seeded_slots.clear();
 }
 
-Qsg_atlas_buffer_upload_planner_state
-Qsg_atlas_buffer_upload_planner::snapshot() const
-{
-    Qsg_atlas_buffer_upload_planner_state state;
-    state.frames_in_flight    = m_frames_in_flight;
-    state.slot_bytes          = m_slot_bytes;
-    state.slot_instance_rows  = m_slot_instance_rows;
-    state.slot_layout_keys    = m_slot_layout_keys;
-    state.seeded_slots        = m_seeded_slots;
-    return state;
-}
-
-void Qsg_atlas_buffer_upload_planner::restore(
-    const Qsg_atlas_buffer_upload_planner_state& state)
-{
-    m_frames_in_flight   = state.frames_in_flight;
-    m_slot_bytes         = state.slot_bytes;
-    m_slot_instance_rows = state.slot_instance_rows;
-    m_slot_layout_keys   = state.slot_layout_keys;
-    m_seeded_slots       = state.seeded_slots;
-}
-
-void Qsg_atlas_buffer_upload_planner::resize_slots(int frames_in_flight)
+Qsg_atlas_buffer_upload_commit
+Qsg_atlas_buffer_upload_planner::commit_for_frames(int frames_in_flight) const
 {
     const int normalized_frames = std::max(1, frames_in_flight);
+    Qsg_atlas_buffer_upload_commit commit;
+    commit.frames_in_flight = normalized_frames;
+    commit.valid            = true;
     if (m_frames_in_flight == normalized_frames) {
+        commit.slot_bytes       = m_slot_bytes;
+        commit.slot_layout_keys = m_slot_layout_keys;
+        commit.seeded_slots     = m_seeded_slots;
+        return commit;
+    }
+
+    commit.slot_bytes.assign(static_cast<std::size_t>(normalized_frames), {});
+    commit.slot_layout_keys.assign(static_cast<std::size_t>(normalized_frames), {});
+    commit.seeded_slots.assign(static_cast<std::size_t>(normalized_frames), 0U);
+    return commit;
+}
+
+void Qsg_atlas_buffer_upload_planner::commit(
+    const Qsg_atlas_buffer_update_plan& plan)
+{
+    if (!plan.commit.valid) {
         return;
     }
 
-    m_frames_in_flight = normalized_frames;
-    m_slot_bytes.assign(static_cast<std::size_t>(normalized_frames), {});
-    m_slot_instance_rows.assign(static_cast<std::size_t>(normalized_frames), {});
-    m_slot_layout_keys.assign(static_cast<std::size_t>(normalized_frames), {});
-    m_seeded_slots.assign(static_cast<std::size_t>(normalized_frames), 0U);
+    m_frames_in_flight = plan.commit.frames_in_flight;
+    m_slot_bytes       = plan.commit.slot_bytes;
+    m_slot_layout_keys = plan.commit.slot_layout_keys;
+    m_seeded_slots     = plan.commit.seeded_slots;
 }
 
 Qsg_atlas_buffer_update_plan
@@ -6923,7 +7070,8 @@ Qsg_atlas_buffer_upload_planner::plan(
 {
     const int frames_in_flight = std::max(1, input.frames_in_flight);
     const int frame_slot = std::clamp(input.frame_slot, 0, frames_in_flight - 1);
-    resize_slots(frames_in_flight);
+    Qsg_atlas_buffer_upload_commit commit =
+        commit_for_frames(frames_in_flight);
 
     Qsg_atlas_buffer_update_plan plan;
     Qsg_atlas_buffer_update_summary& summary = plan.summary;
@@ -6966,13 +7114,13 @@ Qsg_atlas_buffer_upload_planner::plan(
         return rows;
     };
 
-    const bool slot_seeded = m_seeded_slots[slot_index] != 0U;
+    const bool slot_seeded = commit.seeded_slots[slot_index] != 0U;
     const int previous_byte_count =
-        slot_seeded ? m_slot_bytes[slot_index].size() : 0;
+        slot_seeded ? commit.slot_bytes[slot_index].size() : 0;
     const bool layout_changed =
         slot_seeded &&
         (previous_byte_count != byte_count ||
-            m_slot_layout_keys[slot_index] != input.layout_key);
+            commit.slot_layout_keys[slot_index] != input.layout_key);
     const bool full_upload =
         input.buffer_recreated                ||
         input.force_full_reupload             ||
@@ -6991,8 +7139,8 @@ Qsg_atlas_buffer_upload_planner::plan(
         summary.full_upload_requires_populated_frame = true;
         summary.skipped_upload = true;
         summary.seeded_slots = static_cast<int>(std::count(
-            m_seeded_slots.begin(),
-            m_seeded_slots.end(),
+            commit.seeded_slots.begin(),
+            commit.seeded_slots.end(),
             static_cast<unsigned char>(1U)));
     };
 
@@ -7015,10 +7163,10 @@ Qsg_atlas_buffer_upload_planner::plan(
         else {
             summary.skipped_upload = true;
         }
-        m_slot_bytes[slot_index]         = QByteArray(current, byte_count);
-        m_slot_instance_rows[slot_index] = make_current_rows();
-        m_slot_layout_keys[slot_index]   = input.layout_key;
-        m_seeded_slots[slot_index]       = 1U;
+        commit.slot_bytes[slot_index] =
+            byte_count > 0 ? QByteArray(current, byte_count) : QByteArray();
+        commit.slot_layout_keys[slot_index] = input.layout_key;
+        commit.seeded_slots[slot_index]     = 1U;
         return true;
     };
 
@@ -7027,13 +7175,14 @@ Qsg_atlas_buffer_upload_planner::plan(
             return plan;
         }
         summary.seeded_slots = static_cast<int>(std::count(
-            m_seeded_slots.begin(),
-            m_seeded_slots.end(),
+            commit.seeded_slots.begin(),
+            commit.seeded_slots.end(),
             static_cast<unsigned char>(1U)));
+        plan.commit = commit;
         return plan;
     }
 
-    const char* const previous = m_slot_bytes[slot_index].constData();
+    const char* const previous = commit.slot_bytes[slot_index].constData();
     const int previous_instance_count =
         previous_byte_count / summary.instance_bytes;
     const int common_instance_count = std::min(
@@ -7072,8 +7221,8 @@ Qsg_atlas_buffer_upload_planner::plan(
 
     const auto publish_seeded_slots = [&]() {
         summary.seeded_slots = static_cast<int>(std::count(
-            m_seeded_slots.begin(),
-            m_seeded_slots.end(),
+            commit.seeded_slots.begin(),
+            commit.seeded_slots.end(),
             static_cast<unsigned char>(1U)));
     };
 
@@ -7081,16 +7230,17 @@ Qsg_atlas_buffer_upload_planner::plan(
         for (const Qsg_atlas_buffer_update_range& range : plan.ranges) {
             summary.uploaded_bytes += range.byte_count;
             std::memcpy(
-                m_slot_bytes[slot_index].data() + range.byte_offset,
+                commit.slot_bytes[slot_index].data() + range.byte_offset,
                 current + range.byte_offset,
                 static_cast<std::size_t>(range.byte_count));
         }
         summary.partial_uploads = static_cast<int>(plan.ranges.size());
         summary.partial_upload  = !plan.ranges.empty();
         summary.skipped_upload  = plan.ranges.empty();
-        m_slot_layout_keys[slot_index] = input.layout_key;
-        m_seeded_slots[slot_index]     = 1U;
+        commit.slot_layout_keys[slot_index] = input.layout_key;
+        commit.seeded_slots[slot_index]     = 1U;
         publish_seeded_slots();
+        plan.commit = commit;
     };
 
     if (input.row_stable_layout       &&
@@ -7183,6 +7333,7 @@ Qsg_atlas_buffer_upload_planner::plan(
                 return plan;
             }
             publish_seeded_slots();
+            plan.commit = commit;
             return plan;
         }
 
@@ -7236,14 +7387,15 @@ Qsg_atlas_buffer_upload_planner::plan(
             return plan;
         }
         summary.seeded_slots = static_cast<int>(std::count(
-            m_seeded_slots.begin(),
-            m_seeded_slots.end(),
+            commit.seeded_slots.begin(),
+            commit.seeded_slots.end(),
             static_cast<unsigned char>(1U)));
+        plan.commit = commit;
         return plan;
     }
 
-    m_slot_bytes[slot_index]         = QByteArray(input.bytes, byte_count);
-    m_slot_instance_rows[slot_index] = current_rows;
+    commit.slot_bytes[slot_index] =
+        byte_count > 0 ? QByteArray(input.bytes, byte_count) : QByteArray();
     finalize_partial_upload();
     return plan;
 }
