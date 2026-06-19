@@ -32,6 +32,7 @@ struct Terminal_surface_render_invalidation_stats_t
     std::uint64_t                           backend_callback_frame_boundary_epoch = 0U;
     std::uint64_t                           render_snapshot_callback_epoch        = 0U;
     std::uint64_t                           last_rendered_snapshot_sequence       = 0U;
+    std::uint64_t                           last_rendered_publication_generation  = 0U;
     bool                                    pending_update                        = false;
 };
 
@@ -192,6 +193,9 @@ public:
     static Terminal_surface_render_invalidation_stats_t invalidation_stats(
         const VNM_TerminalSurface& surface);
 
+    static std::uint64_t session_rendered_render_snapshot_generation(
+        const VNM_TerminalSurface& surface);
+
     static Terminal_surface_backend_drain_stats_t backend_drain_stats(
         const VNM_TerminalSurface& surface);
 
@@ -200,6 +204,11 @@ public:
 
     static bool mark_completed_atlas_completion_pending_for_testing(
         VNM_TerminalSurface&       surface);
+
+    static bool mark_reported_atlas_completion_pending_for_testing(
+        VNM_TerminalSurface&       surface,
+        std::uint64_t              reported_publication_generation,
+        bool                       drew);
 
     static terminal_renderer_stats_t last_renderer_stats(
         const VNM_TerminalSurface& surface);

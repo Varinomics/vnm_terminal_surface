@@ -2405,6 +2405,174 @@ bool test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(
     return ok;
 }
 
+bool test_surface_reported_atlas_completion_advances_rendered_publication(
+    QGuiApplication& app)
+{
+    bool ok = true;
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("atlas-publication")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "surface atlas publication test starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(snapshot != nullptr &&
+            snapshot->metadata.publication_generation > 0U,
+        "surface atlas publication test has a published generation");
+    if (snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::uint64_t publication_generation =
+        snapshot->metadata.publication_generation;
+    const std::uint64_t rendered_generation_before =
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                publication_generation,
+                true),
+        "surface atlas publication test reports the current drawn generation");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    const term::Terminal_surface_render_invalidation_stats_t stats =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "surface atlas drew completion clears pending completion");
+    ok &= check(
+        stats.last_rendered_publication_generation == publication_generation,
+        "surface atlas drew report advances rendered publication generation");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) ==
+            publication_generation &&
+            rendered_generation_before != publication_generation,
+        "surface atlas drew report advances session rendered publication generation");
+    return ok;
+}
+
+bool test_surface_stale_atlas_completion_does_not_advance_rendered_publication(
+    QGuiApplication& app)
+{
+    bool ok = true;
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("stale-atlas")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "surface stale atlas completion test starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(snapshot != nullptr &&
+            snapshot->metadata.publication_generation > 0U,
+        "surface stale atlas completion test has a pending publication");
+    if (snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::uint64_t current_generation =
+        snapshot->metadata.publication_generation;
+    const std::uint64_t stale_generation =
+        current_generation > 1U ? current_generation - 1U : 0U;
+    const std::uint64_t rendered_generation_before =
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface);
+
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                stale_generation,
+                true),
+        "surface stale atlas completion test reports an older rendered generation");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "surface stale atlas completion leaves completion pending");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).last_rendered_publication_generation ==
+            rendered_generation_before,
+        "surface stale atlas completion does not advance rendered generation");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) ==
+            rendered_generation_before,
+        "surface stale atlas completion does not advance session rendered generation");
+
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                current_generation,
+                false),
+        "surface stale atlas completion test reports current generation without draw");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "surface no-draw atlas completion leaves completion pending");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) ==
+            rendered_generation_before,
+        "surface no-draw atlas completion does not advance session rendered generation");
+
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                current_generation,
+                true),
+        "surface stale atlas completion test reports current drawn generation");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "surface current drawn atlas completion clears completion pending");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).last_rendered_publication_generation == current_generation,
+        "surface current drawn atlas completion advances rendered generation");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) ==
+            current_generation,
+        "surface current drawn atlas completion advances session rendered generation");
+    return ok;
+}
+
 bool test_surface_session_single_drain_coalesces_dirty_rows(QGuiApplication& app)
 {
     bool ok = true;
@@ -13147,6 +13315,8 @@ int main(int argc, char** argv)
     ok &= test_surface_epoch_catchup_uses_frame_budget_override(app);
     ok &= test_surface_posted_backend_drain_uses_full_budget_without_frame_work(app);
     ok &= test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(app);
+    ok &= test_surface_reported_atlas_completion_advances_rendered_publication(app);
+    ok &= test_surface_stale_atlas_completion_does_not_advance_rendered_publication(app);
     ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
     ok &= test_surface_set_render_snapshot_seam_coalesces_on_row_identity(app);
     ok &= test_osc52_clipboard_write_signal_and_deny(app);

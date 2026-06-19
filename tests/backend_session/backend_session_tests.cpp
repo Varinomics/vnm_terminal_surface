@@ -1261,7 +1261,7 @@ bool test_text_area_resize_retry_publishes_geometry_metadata()
         !failed_snapshot->metadata.backend_geometry_in_sync,
         "failed text-area resize snapshot records out-of-sync geometry");
     const std::uint64_t failed_generation = session->render_snapshot_generation();
-    session->mark_render_snapshot_synced(failed_generation);
+    session->mark_render_publication_rendered(failed_generation);
 
     backend->fail_resize = false;
     const std::size_t failed_resize_count = backend->resize_requests.size();
@@ -1376,7 +1376,7 @@ bool test_selection_snapshot_and_visible_text()
         "selection backend emits visible rows");
 
     const std::uint64_t output_generation = session->render_snapshot_generation();
-    session->mark_render_snapshot_synced(output_generation);
+    session->mark_render_publication_rendered(output_generation);
     const term::Terminal_selection_result empty_text = session->selected_text();
     ok &= check(empty_text.code == term::Terminal_selection_result_code::NO_SELECTION,
         "session selected_text reports no selection before selection starts");
@@ -10759,7 +10759,7 @@ bool test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot()
 
     const std::uint64_t generation_before_output =
         session->render_snapshot_generation();
-    session->mark_render_snapshot_synced(generation_before_output);
+    session->mark_render_publication_rendered(generation_before_output);
     ok &= check(backend->emit_output(output),
         "complete coalesced backend drain queues large output");
 

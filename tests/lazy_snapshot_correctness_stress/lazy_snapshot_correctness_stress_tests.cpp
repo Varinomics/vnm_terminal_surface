@@ -673,7 +673,7 @@ bool emit_output_and_compare(
     ok &= compose_and_compare_lazy_snapshot(session, previous, *current, label);
 
     previous = current;
-    session.mark_render_snapshot_synced(session.render_snapshot_generation());
+    session.mark_render_publication_rendered(session.render_snapshot_generation());
     return ok;
 }
 
@@ -753,7 +753,7 @@ bool test_lazy_snapshot_correctness_stress_replay()
     ok &= check(previous->lazy_row_payloads == nullptr,
         "stress replay baseline production snapshot is full");
     ok &= expect_rich_snapshot_features(*previous, "stress replay baseline");
-    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+    session->mark_render_publication_rendered(session->render_snapshot_generation());
 
     ok &= emit_output_and_compare(
         *backend,
@@ -813,7 +813,7 @@ bool test_lazy_snapshot_resize_and_viewport_replay_boundaries()
     if (previous == nullptr) {
         return false;
     }
-    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+    session->mark_render_publication_rendered(session->render_snapshot_generation());
 
     const term::Terminal_viewport_scroll_result scroll =
         session->scroll_viewport_lines(1);
@@ -857,7 +857,7 @@ bool test_lazy_snapshot_resize_and_viewport_replay_boundaries()
             "lazy composer keeps public viewport projection out of lazy content");
     }
 
-    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+    session->mark_render_publication_rendered(session->render_snapshot_generation());
     const term::Terminal_session_result resize =
         session->resize(QSizeF(240.0, 80.0), {6, 24});
     const std::shared_ptr<const term::Terminal_render_snapshot> resized =

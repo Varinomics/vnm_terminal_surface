@@ -1263,7 +1263,7 @@ Run_result run_replay()
                 previous_content_snapshot = current;
             }
             last_snapshot = current;
-            session->mark_render_snapshot_synced(session->render_snapshot_generation());
+            session->mark_render_publication_rendered(session->render_snapshot_generation());
         }
         else {
             status = parity_status(event.expected, false, nullptr, nullptr);

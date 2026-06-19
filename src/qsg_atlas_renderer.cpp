@@ -440,6 +440,15 @@ std::uint64_t snapshot_sequence(const Captured_atlas_frame& frame)
         : 0U;
 }
 
+std::uint64_t publication_generation(const Captured_atlas_frame& frame)
+{
+    return frame.publication_generation != 0U
+        ? frame.publication_generation
+        : frame.snapshot != nullptr
+            ? frame.snapshot->metadata.publication_generation
+            : 0U;
+}
+
 bool cursor_position_inside_grid(
     terminal_grid_position_t position,
     terminal_grid_size_t     grid_size)
@@ -7709,18 +7718,22 @@ void Qsg_atlas_recorder::record_capture(const Captured_atlas_frame& frame)
 {
     const std::lock_guard<std::mutex> lock(m_mutex);
     const std::uint64_t frame_snapshot_sequence = snapshot_sequence(frame);
+    const std::uint64_t frame_publication_generation = publication_generation(frame);
     const QColor frame_diagnostic_color = qsg_atlas_diagnostic_color(frame);
     const bool frame_light_options = captured_options_are_light(frame);
     if (m_report.capture_count == 0U) {
         m_report.first_captured_snapshot_sequence = frame_snapshot_sequence;
+        m_report.first_captured_publication_generation =
+            frame_publication_generation;
         m_report.first_captured_font_epoch        = frame.font_epoch;
         m_report.first_captured_diagnostic_color       = frame_diagnostic_color;
         m_report.first_captured_light_options     = frame_light_options;
     }
     ++m_report.capture_count;
-    m_report.capture_sequence           = frame.capture_sequence;
-    m_report.captured_snapshot_sequence = frame_snapshot_sequence;
-    m_report.captured_font_epoch        = frame.font_epoch;
+    m_report.capture_sequence                = frame.capture_sequence;
+    m_report.captured_snapshot_sequence      = frame_snapshot_sequence;
+    m_report.captured_publication_generation = frame_publication_generation;
+    m_report.captured_font_epoch             = frame.font_epoch;
     m_report.captured_diagnostic_color       = frame_diagnostic_color;
     m_report.captured_light_options     = frame_light_options;
     m_report.captured_snapshot_cursor   = captured_snapshot_cursor_report(frame);
@@ -7824,16 +7837,19 @@ void Qsg_atlas_recorder::record_render(
 {
     const std::lock_guard<std::mutex> lock(m_mutex);
     ++m_report.render_count;
-    m_report.render_capture_sequence  = frame.capture_sequence;
-    m_report.render_snapshot_sequence = snapshot_sequence(frame);
-    m_report.render_font_epoch        = frame.font_epoch;
-    m_report.render_diagnostic_color  = qsg_atlas_diagnostic_color(frame);
-    m_report.render_light_options     = captured_options_are_light(frame);
-    m_report.viewport_rect            = viewport_rect;
-    m_report.drew                     = drew;
+    m_report.render_capture_sequence        = frame.capture_sequence;
+    m_report.render_snapshot_sequence       = snapshot_sequence(frame);
+    m_report.render_publication_generation  = publication_generation(frame);
+    m_report.render_font_epoch              = frame.font_epoch;
+    m_report.render_diagnostic_color        = qsg_atlas_diagnostic_color(frame);
+    m_report.render_light_options           = captured_options_are_light(frame);
+    m_report.viewport_rect                  = viewport_rect;
+    m_report.drew                           = drew;
     if (m_report.first_render_snapshot_sequence == 0U) {
         m_report.first_render_capture_sequence  = frame.capture_sequence;
         m_report.first_render_snapshot_sequence = m_report.render_snapshot_sequence;
+        m_report.first_render_publication_generation =
+            m_report.render_publication_generation;
         m_report.first_render_font_epoch        = frame.font_epoch;
         m_report.first_render_diagnostic_color  = m_report.render_diagnostic_color;
         m_report.first_render_light_options     = captured_options_are_light(frame);
@@ -8697,6 +8713,7 @@ Captured_atlas_frame capture_qsg_atlas_frame(
     frame.device_pixel_ratio   = device_pixel_ratio;
     frame.font_epoch           = font_epoch;
     frame.capture_sequence     = capture_sequence;
+    frame.publication_generation = publication_generation(frame);
     frame.cursor_blink_visible = cursor_blink_visible;
     return frame;
 }
