@@ -669,6 +669,7 @@ struct Captured_atlas_frame
     qreal                            device_pixel_ratio  = 1.0;
     std::uint64_t                    font_epoch          = 0U;
     std::uint64_t                    capture_sequence    = 0U;
+    std::uint64_t                    publication_generation = 0U;
     bool                             cursor_blink_visible = true;
 };
 
@@ -679,14 +680,18 @@ struct Qsg_atlas_frame_report
     std::uint64_t render_count                    = 0U;
     std::uint64_t capture_sequence                = 0U;
     std::uint64_t captured_snapshot_sequence      = 0U;
+    std::uint64_t captured_publication_generation = 0U;
     std::uint64_t captured_font_epoch             = 0U;
     std::uint64_t first_render_capture_sequence   = 0U;
     std::uint64_t first_captured_snapshot_sequence = 0U;
+    std::uint64_t first_captured_publication_generation = 0U;
     std::uint64_t first_captured_font_epoch       = 0U;
     std::uint64_t first_render_snapshot_sequence  = 0U;
+    std::uint64_t first_render_publication_generation = 0U;
     std::uint64_t first_render_font_epoch         = 0U;
     std::uint64_t render_capture_sequence         = 0U;
     std::uint64_t render_snapshot_sequence        = 0U;
+    std::uint64_t render_publication_generation   = 0U;
     std::uint64_t render_font_epoch               = 0U;
     QColor        captured_diagnostic_color;
     QColor        first_captured_diagnostic_color;

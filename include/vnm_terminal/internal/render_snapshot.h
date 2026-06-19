@@ -410,6 +410,7 @@ struct Terminal_render_hyperlink_metadata
 struct Terminal_render_metadata
 {
     std::uint64_t              sequence                         = 0U;
+    std::uint64_t              publication_generation           = 0U;
     std::uint64_t              processed_backend_callback_epoch = 0U;
     std::uint64_t              row_origin_generation            = 0U;
     bool                       backend_geometry_in_sync         = true;
@@ -445,6 +446,7 @@ struct Terminal_public_scroll_diagnostics
 struct Terminal_render_snapshot_request
 {
     std::uint64_t                         sequence                         = 0U;
+    std::uint64_t                         publication_generation           = 0U;
     std::uint64_t                         processed_backend_callback_epoch = 0U;
     std::uint64_t                         row_origin_generation            = 0U;
     Terminal_render_snapshot_basis        basis = Terminal_render_snapshot_basis::LIVE_CONTENT;
@@ -705,13 +707,15 @@ struct Terminal_render_snapshot_validation
 inline Terminal_render_snapshot make_empty_render_snapshot(
     terminal_grid_size_t       grid_size,
     Terminal_viewport_state    viewport,
-    std::uint64_t              sequence)
+    std::uint64_t              sequence,
+    std::uint64_t              publication_generation = 0U)
 {
     Terminal_render_snapshot snapshot;
-    snapshot.grid_size             = grid_size;
-    snapshot.viewport              = viewport;
-    snapshot.viewport.visible_rows = grid_size.rows > 0 ? grid_size.rows : viewport.visible_rows;
-    snapshot.metadata.sequence     = sequence;
+    snapshot.grid_size                       = grid_size;
+    snapshot.viewport                        = viewport;
+    snapshot.viewport.visible_rows           = grid_size.rows > 0 ? grid_size.rows : viewport.visible_rows;
+    snapshot.metadata.sequence               = sequence;
+    snapshot.metadata.publication_generation = publication_generation;
     snapshot.styles.push_back(make_default_terminal_text_style());
     return snapshot;
 }

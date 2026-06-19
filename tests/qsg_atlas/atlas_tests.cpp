@@ -10125,10 +10125,13 @@ void mutate_surface_after_sync(VNM_TerminalSurface& surface)
 {
     surface.set_color_scheme(QStringLiteral("Campbell"));
     surface.set_font_size(surface.font_size() + 1.0);
+    term::Terminal_render_snapshot mutation_snapshot =
+        make_text_snapshot(777U, QStringLiteral("B"));
+    mutation_snapshot.metadata.publication_generation = 1777U;
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
         std::make_shared<const term::Terminal_render_snapshot>(
-            make_text_snapshot(777U, QStringLiteral("B"))));
+            std::move(mutation_snapshot)));
 }
 
 int test_render_smoke(QGuiApplication& app, const char* backend)
@@ -10153,10 +10156,13 @@ int test_render_smoke(QGuiApplication& app, const char* backend)
     surface.set_font_family(QStringLiteral("monospace"));
     surface.set_font_size(18.0);
     surface.set_color_scheme(QStringLiteral("Solarized Light"));
+    term::Terminal_render_snapshot publication_snapshot =
+        make_text_snapshot(601U, QStringLiteral("A"));
+    publication_snapshot.metadata.publication_generation = 1601U;
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
         std::make_shared<const term::Terminal_render_snapshot>(
-            make_text_snapshot(601U, QStringLiteral("A"))));
+            std::move(publication_snapshot)));
     std::atomic_bool mutation_started = false;
     std::atomic_bool mutation_done    = false;
     const QMetaObject::Connection mutation_connection = QObject::connect(
@@ -10224,6 +10230,15 @@ int test_render_smoke(QGuiApplication& app, const char* backend)
         "atlas render smoke draws the captured frame");
     ok &= check(report.first_render_snapshot_sequence == 601U,
         "atlas render smoke uses captured snapshot for first render");
+    const auto known_publication_generation = [](std::uint64_t generation) {
+        return generation == 1601U || generation == 1777U;
+    };
+    ok &= check(known_publication_generation(report.captured_publication_generation) &&
+            known_publication_generation(
+                report.first_captured_publication_generation) &&
+            known_publication_generation(report.render_publication_generation) &&
+            known_publication_generation(report.first_render_publication_generation),
+        "atlas render smoke carries publication generation through capture and render");
     ok &= check(report.first_render_snapshot_sequence ==
             report.first_captured_snapshot_sequence,
         "atlas first render uses the first captured snapshot value");

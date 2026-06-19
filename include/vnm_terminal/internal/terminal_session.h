@@ -406,7 +406,10 @@ public:
     void set_synchronized_output_scroll_policy_for_testing(
         Terminal_synchronized_output_scroll_policy policy);
     std::uint64_t render_snapshot_generation() const;
-    void mark_render_snapshot_synced(std::uint64_t generation);
+    std::uint64_t installed_render_snapshot_generation() const;
+    std::uint64_t rendered_render_snapshot_generation() const;
+    void mark_render_snapshot_installed(std::uint64_t generation);
+    void mark_render_publication_rendered(std::uint64_t generation);
     Ime_preedit_state ime_preedit_state() const;
     std::uint64_t ime_preedit_generation() const;
     std::optional<Terminal_screen_model_result> last_model_ingest_result() const;
@@ -695,7 +698,8 @@ private:
         Terminal_render_snapshot_purpose   purpose,
         Terminal_public_scroll_diagnostics public_scroll_diagnostics = {}) const;
 
-    void record_snapshot_publication_queued_for_bridge();
+    void record_snapshot_publication_queued_for_bridge(
+        std::uint64_t              publication_generation);
 
     void publish_render_snapshot(
         std::uint64_t              sequence,
@@ -851,8 +855,10 @@ private:
     std::uint64_t                                          m_incomplete_backend_output_callback_epoch = 0U;
     std::uint64_t                                          m_budgeted_backend_output_sequence = 0U;
     std::uint64_t                                          m_render_snapshot_generation = 0U;
-    std::uint64_t                                          m_render_snapshot_synced_generation = 0U;
+    std::uint64_t                                          m_render_snapshot_installed_generation = 0U;
+    std::uint64_t                                          m_render_snapshot_rendered_generation = 0U;
     std::uint64_t                                          m_next_public_projection_generation = 1U;
+    std::shared_ptr<const Terminal_render_snapshot>        m_unrendered_render_snapshot_dirty_basis;
     std::optional<Terminal_synchronized_output_scroll_policy>
                                                            m_synchronized_output_hold_policy;
     Terminal_synchronized_output_policy_change_event       m_synchronized_output_policy_change_event =

@@ -1563,6 +1563,8 @@ struct lazy_snapshot_composer_input_t
 Terminal_render_snapshot_row_payload_namespace receiving_lazy_payload_namespace_for_snapshot(
     const Terminal_render_snapshot& snapshot)
 {
+    // Lazy row payload namespaces identify content metadata tables. Render
+    // completion uses metadata.publication_generation instead.
     return {
         snapshot.metadata.sequence,
         snapshot.metadata.sequence,
@@ -3742,21 +3744,56 @@ std::uint64_t Terminal_session::render_snapshot_generation() const
     return m_render_snapshot_generation;
 }
 
-void Terminal_session::mark_render_snapshot_synced(std::uint64_t generation)
+std::uint64_t Terminal_session::installed_render_snapshot_generation() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_render_snapshot_installed_generation;
+}
+
+std::uint64_t Terminal_session::rendered_render_snapshot_generation() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_render_snapshot_rendered_generation;
+}
+
+void Terminal_session::mark_render_snapshot_installed(std::uint64_t generation)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     if (generation <= m_render_snapshot_generation) {
-        const std::uint64_t previous_synced_generation =
-            m_render_snapshot_synced_generation;
-        m_render_snapshot_synced_generation =
-            std::max(m_render_snapshot_synced_generation, generation);
+        const std::uint64_t previous_installed_generation =
+            m_render_snapshot_installed_generation;
+        m_render_snapshot_installed_generation =
+            std::max(m_render_snapshot_installed_generation, generation);
 #if VNM_TERMINAL_PROFILING_ENABLED
         if (m_profile_stats.enabled) {
-            ++m_profile_stats.snapshots_marked_rendered;
-            if (m_render_snapshot_synced_generation > previous_synced_generation) {
+            if (m_render_snapshot_installed_generation > previous_installed_generation) {
                 ++m_profile_stats.snapshots_consumed_by_bridge;
             }
+        }
+#endif
+    }
+}
+
+void Terminal_session::mark_render_publication_rendered(std::uint64_t generation)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    if (generation <= m_render_snapshot_generation) {
+        const std::uint64_t previous_rendered_generation =
+            m_render_snapshot_rendered_generation;
+        m_render_snapshot_rendered_generation =
+            std::max(m_render_snapshot_rendered_generation, generation);
+        if (m_render_snapshot_rendered_generation >= m_render_snapshot_generation) {
+            m_unrendered_render_snapshot_dirty_basis.reset();
+        }
+#if VNM_TERMINAL_PROFILING_ENABLED
+        if (m_profile_stats.enabled &&
+            m_render_snapshot_rendered_generation > previous_rendered_generation)
+        {
+            ++m_profile_stats.snapshots_marked_rendered;
         }
 #endif
     }
@@ -5380,7 +5417,9 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     m_selection_content_basis           = {};
     m_ime_preedit                       = {};
     m_render_snapshot_generation        = 0U;
-    m_render_snapshot_synced_generation = 0U;
+    m_render_snapshot_installed_generation = 0U;
+    m_render_snapshot_rendered_generation  = 0U;
+    m_unrendered_render_snapshot_dirty_basis.reset();
     m_next_public_projection_generation = 1U;
     m_synchronized_output_hold_policy.reset();
     m_synchronized_output_policy_change_event =
@@ -5972,6 +6011,7 @@ void Terminal_session::publish_selection_snapshot(
         snapshot.selection_spans.clear();
         snapshot.dirty_row_ranges = compact_dirty_row_ranges({}, snapshot.grid_size.rows, true);
         snapshot.metadata.sequence                     = sequence;
+        snapshot.metadata.publication_generation       = m_render_snapshot_generation + 1U;
         snapshot.metadata.backend_geometry_in_sync     = m_backend_geometry_in_sync;
         snapshot.metadata.visual_bell_active           = false;
         snapshot.metadata.mouse_reporting_mode_changed = false;
@@ -5981,9 +6021,11 @@ void Terminal_session::publish_selection_snapshot(
 #if VNM_TERMINAL_PROFILING_ENABLED
         if (m_profile_stats.enabled) {
             ++m_profile_stats.render_snapshots_constructed;
-            record_snapshot_publication_queued_for_bridge();
         }
 #endif
+        m_unrendered_render_snapshot_dirty_basis = m_latest_render_snapshot;
+        record_snapshot_publication_queued_for_bridge(
+            m_latest_render_snapshot->metadata.publication_generation);
         ++m_render_snapshot_generation;
 #if VNM_TERMINAL_PROFILING_ENABLED
         if (m_profile_stats.enabled) {
@@ -6445,6 +6487,7 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
 {
     Terminal_render_snapshot_request request;
     request.sequence                         = sequence;
+    request.publication_generation           = m_render_snapshot_generation + 1U;
     request.processed_backend_callback_epoch =
         m_last_processed_backend_callback_epoch;
     request.row_origin_generation            = m_row_origin_generation;
@@ -6579,19 +6622,20 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
     return request;
 }
 
-void Terminal_session::record_snapshot_publication_queued_for_bridge()
+void Terminal_session::record_snapshot_publication_queued_for_bridge(
+    std::uint64_t publication_generation)
 {
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (!m_profile_stats.enabled) {
         return;
     }
 
-    if (m_render_snapshot_synced_generation < m_render_snapshot_generation) {
+    if (m_render_snapshot_rendered_generation < m_render_snapshot_generation) {
         ++m_profile_stats.snapshots_superseded_before_render;
     }
 
     const std::uint64_t pending_generations =
-        m_render_snapshot_generation - m_render_snapshot_synced_generation + 1U;
+        publication_generation - m_render_snapshot_rendered_generation;
     m_profile_stats.max_unrendered_snapshot_generations =
         std::max(
             m_profile_stats.max_unrendered_snapshot_generations,
@@ -7083,6 +7127,7 @@ bool Terminal_session::publish_public_projection_scroll_snapshot(
     if (!snapshot.has_value()) {
         return false;
     }
+    snapshot->metadata.publication_generation = m_render_snapshot_generation + 1U;
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled) {
         ++m_profile_stats.render_snapshots_constructed;
@@ -7100,7 +7145,9 @@ bool Terminal_session::publish_public_projection_scroll_snapshot(
     }
 #endif
     m_latest_render_snapshot = snapshot_handle;
-    record_snapshot_publication_queued_for_bridge();
+    m_unrendered_render_snapshot_dirty_basis = snapshot_handle;
+    record_snapshot_publication_queued_for_bridge(
+        snapshot_handle->metadata.publication_generation);
     ++m_render_snapshot_generation;
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled) {
@@ -7171,11 +7218,13 @@ void Terminal_session::publish_render_snapshot(
                 .arg(static_cast<qulonglong>(snapshot.dirty_row_ranges.size())));
     }
     const Terminal_render_snapshot* dirty_coalescing_snapshot =
-        purpose == Terminal_render_snapshot_purpose::CONTENT
-            ? m_latest_content_render_snapshot.get()
-            : m_latest_render_snapshot.get();
+        m_unrendered_render_snapshot_dirty_basis != nullptr
+            ? m_unrendered_render_snapshot_dirty_basis.get()
+            : purpose == Terminal_render_snapshot_purpose::CONTENT
+                ? m_latest_content_render_snapshot.get()
+                : m_latest_render_snapshot.get();
     if (dirty_coalescing_snapshot           != nullptr &&
-        m_render_snapshot_synced_generation <  m_render_snapshot_generation)
+        m_render_snapshot_rendered_generation < m_render_snapshot_generation)
     {
 #if VNM_TERMINAL_PROFILING_ENABLED
         if (m_profile_stats.enabled) {
@@ -7222,7 +7271,9 @@ void Terminal_session::publish_render_snapshot(
     }
     m_deferred_viewport_changed      = false;
     m_visual_bell_active             = false;
-    record_snapshot_publication_queued_for_bridge();
+    m_unrendered_render_snapshot_dirty_basis = snapshot_handle;
+    record_snapshot_publication_queued_for_bridge(
+        snapshot_handle->metadata.publication_generation);
     ++m_render_snapshot_generation;
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled) {
@@ -7303,6 +7354,7 @@ void Terminal_session::publish_synchronized_resize_snapshot(
             m_backend_geometry_in_sync,
             &m_profile_stats);
     snapshot.metadata.row_origin_generation = m_row_origin_generation;
+    snapshot.metadata.publication_generation = m_render_snapshot_generation + 1U;
     m_latest_render_snapshot =
         std::make_shared<const Terminal_render_snapshot>(std::move(snapshot));
 #if VNM_TERMINAL_PROFILING_ENABLED
@@ -7318,7 +7370,9 @@ void Terminal_session::publish_synchronized_resize_snapshot(
             *m_latest_render_snapshot);
     }
 #endif
-    record_snapshot_publication_queued_for_bridge();
+    m_unrendered_render_snapshot_dirty_basis = m_latest_render_snapshot;
+    record_snapshot_publication_queued_for_bridge(
+        m_latest_render_snapshot->metadata.publication_generation);
     ++m_render_snapshot_generation;
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled) {

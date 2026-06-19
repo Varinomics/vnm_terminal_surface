@@ -999,7 +999,7 @@ void measure_frame(
     }
 
     previous = current;
-    fixture.session->mark_render_snapshot_synced(
+    fixture.session->mark_render_publication_rendered(
         fixture.session->render_snapshot_generation());
 }
 
@@ -1018,7 +1018,7 @@ bool prepare_baseline(
     if (previous == nullptr) {
         return false;
     }
-    fixture.session->mark_render_snapshot_synced(
+    fixture.session->mark_render_publication_rendered(
         fixture.session->render_snapshot_generation());
     return true;
 }
@@ -1048,7 +1048,7 @@ repeat_t run_repeat(const options_t& options, const case_t& config, int repeat_i
                 run_update(fixture, config, -options.warmup_frames + warmup, &ignored_ns);
             if (current != nullptr) {
                 previous = current;
-                fixture.session->mark_render_snapshot_synced(
+                fixture.session->mark_render_publication_rendered(
                     fixture.session->render_snapshot_generation());
             }
         }

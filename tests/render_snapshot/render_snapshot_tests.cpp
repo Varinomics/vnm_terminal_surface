@@ -1445,6 +1445,89 @@ bool test_session_snapshot_handles_and_synchronized_release()
     return ok;
 }
 
+bool test_snapshot_publication_generation_metadata()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model({2, 12});
+    model.ingest(QByteArrayLiteral("publication"));
+
+    term::Terminal_render_snapshot_request request = request_for_model(model, 711U);
+    request.publication_generation = 19U;
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(request);
+    ok &= check(snapshot.metadata.sequence == 711U,
+        "snapshot keeps content sequence metadata");
+    ok &= check(snapshot.metadata.publication_generation == 19U,
+        "snapshot carries render publication generation metadata");
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "snapshot with publication generation metadata validates");
+
+    const term::Terminal_render_snapshot empty =
+        term::make_empty_render_snapshot({2, 12}, tail_viewport(model), 712U, 20U);
+    ok &= check(empty.metadata.sequence == 712U &&
+            empty.metadata.publication_generation == 20U,
+        "empty snapshot helper carries publication generation metadata");
+    return ok;
+}
+
+bool test_session_install_does_not_advance_rendered_publication()
+{
+    bool                                    ok      = true;
+    Recording_backend*                      backend = nullptr;
+    std::unique_ptr<term::Terminal_session> session = make_session(backend);
+
+#if VNM_TERMINAL_PROFILING_ENABLED
+    session->set_profile_stats_enabled(true);
+#endif
+
+    ok &= check(session->start(launch_config({3, 12})).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "installed/rendered split session starts");
+    ok &= check(backend != nullptr &&
+        backend->emit_output(QByteArrayLiteral("\x1b[1;1Hone\x1b[3;1H")),
+        "installed/rendered split publishes first snapshot");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> first =
+        session->latest_render_snapshot_handle();
+    const std::uint64_t first_generation = session->render_snapshot_generation();
+    ok &= check(first != nullptr &&
+            first->metadata.publication_generation == first_generation,
+        "first snapshot metadata matches session publication generation");
+    ok &= check(first != nullptr && term::render_snapshot_row_is_dirty(*first, 0),
+        "first snapshot marks the prior unrendered row dirty");
+
+    session->mark_render_snapshot_installed(first_generation);
+    ok &= check(session->installed_render_snapshot_generation() == first_generation,
+        "bridge install advances installed publication generation");
+    ok &= check(session->rendered_render_snapshot_generation() == 0U,
+        "bridge install does not advance actually rendered publication generation");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[2;1Htwo")),
+        "installed/rendered split publishes second snapshot");
+    const std::shared_ptr<const term::Terminal_render_snapshot> second =
+        session->latest_render_snapshot_handle();
+    ok &= check(second != nullptr &&
+            second->metadata.publication_generation == first_generation + 1U,
+        "second snapshot advances publication generation metadata");
+    ok &= check(second != nullptr &&
+            term::render_snapshot_row_is_dirty(*second, 0) &&
+            term::render_snapshot_row_is_dirty(*second, 1),
+        "second snapshot keeps prior unrendered and current dirty rows");
+#if VNM_TERMINAL_PROFILING_ENABLED
+    const term::Terminal_session_profile_stats stats = session->profile_stats();
+    ok &= check(stats.dirty_coalescing_applied > 0U,
+        "bridge install does not clear session-owned dirty coalescing basis");
+#endif
+
+    session->mark_render_publication_rendered(session->render_snapshot_generation());
+    ok &= check(
+        session->rendered_render_snapshot_generation() ==
+            session->render_snapshot_generation(),
+        "actual render completion advances rendered publication generation");
+    return ok;
+}
+
 bool test_session_ime_overlay_does_not_clone_render_snapshot()
 {
     bool                                    ok      = true;
@@ -1759,20 +1842,20 @@ bool test_session_profile_snapshot_publication_counters()
     ok &= check(before_sync.snapshots_consumed_by_bridge == 0U,
         "profile counter session has no bridge consumption before sync");
 
-    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+    session->mark_render_snapshot_installed(session->render_snapshot_generation());
     const term::Terminal_session_profile_stats after_sync = session->profile_stats();
     ok &= check(after_sync.snapshots_consumed_by_bridge == 1U,
         "profile counter session consumed only the latest installed snapshot");
-    ok &= check(after_sync.snapshots_marked_rendered == 1U,
-        "profile counter session counted the first render sync mark");
+    ok &= check(after_sync.snapshots_marked_rendered == 0U,
+        "profile counter session does not count bridge install as actual render");
 
-    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+    session->mark_render_publication_rendered(session->render_snapshot_generation());
     const term::Terminal_session_profile_stats after_repeat_sync =
         session->profile_stats();
     ok &= check(after_repeat_sync.snapshots_consumed_by_bridge == 1U,
-        "profile counter session repeat sync does not consume another snapshot");
-    ok &= check(after_repeat_sync.snapshots_marked_rendered == 2U,
-        "profile counter session still records repeated render sync marks");
+        "profile counter session render completion does not consume another snapshot");
+    ok &= check(after_repeat_sync.snapshots_marked_rendered == 1U,
+        "profile counter session records actual render completion separately");
 
     Recording_backend* late_backend = nullptr;
     std::unique_ptr<term::Terminal_session> late_profile_session =
@@ -2751,7 +2834,7 @@ bool test_disabled_lazy_composer_borrows_clean_rows_and_owns_dirty_rows()
         session->latest_render_snapshot_handle();
     ok &= check(previous != nullptr && previous->lazy_row_payloads == nullptr,
         "baseline production snapshot is fully materialized");
-    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+    session->mark_render_publication_rendered(session->render_snapshot_generation());
 
     const QByteArray mutations[] = {
         QByteArrayLiteral("\x1b[2;1Hbb"),
@@ -2849,7 +2932,7 @@ bool test_disabled_lazy_composer_borrows_clean_rows_and_owns_dirty_rows()
         }
 
         previous = current;
-        session->mark_render_snapshot_synced(session->render_snapshot_generation());
+        session->mark_render_publication_rendered(session->render_snapshot_generation());
     }
 
     term::Terminal_screen_model model = make_model({2, 8});
@@ -2914,7 +2997,7 @@ bool test_disabled_lazy_composer_rejects_malformed_dirty_row_metadata()
         "malformed lazy composer publishes baseline rows");
     const std::shared_ptr<const term::Terminal_render_snapshot> previous =
         session->latest_render_snapshot_handle();
-    session->mark_render_snapshot_synced(session->render_snapshot_generation());
+    session->mark_render_publication_rendered(session->render_snapshot_generation());
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[2;1Hbb")),
         "malformed lazy composer publishes a dirty-row mutation");
@@ -3682,6 +3765,8 @@ int main()
     ok &= test_visible_line_provenance_validation();
     ok &= test_public_projection_scroll_snapshot_structural_validation();
     ok &= test_session_snapshot_handles_and_synchronized_release();
+    ok &= test_snapshot_publication_generation_metadata();
+    ok &= test_session_install_does_not_advance_rendered_publication();
     ok &= test_session_ime_overlay_does_not_clone_render_snapshot();
     ok &= test_backend_sync_metadata_publishes_after_same_grid_retry();
     ok &= test_resize_metadata_publication_respects_synchronized_output();

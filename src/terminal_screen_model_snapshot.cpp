@@ -116,7 +116,11 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
     }
 
     Terminal_render_snapshot snapshot =
-        make_empty_render_snapshot(m_config.grid_size, viewport, request.sequence);
+        make_empty_render_snapshot(
+            m_config.grid_size,
+            viewport,
+            request.sequence,
+            request.publication_generation);
     snapshot.basis                     = request.basis;
     snapshot.purpose                   = request.purpose;
     snapshot.public_scroll_diagnostics = request.public_scroll_diagnostics;
