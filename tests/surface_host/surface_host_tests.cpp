@@ -1836,6 +1836,650 @@ bool test_surface_no_echo_input_keeps_cursor_visible(QGuiApplication& app)
     return ok;
 }
 
+bool test_surface_input_freshness_non_rendering_callback_waits_for_render(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+    fixture.surface.set_cursor_blink_enabled(false);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("freshness-ready")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "input freshness non-rendering callback surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("freshness-ready")),
+        "input freshness non-rendering callback publishes baseline");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "input freshness non-rendering callback captures baseline");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                baseline_snapshot->metadata.publication_generation,
+                true),
+        "input freshness non-rendering callback reports baseline rendered");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+
+    backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b]0;fresh-title\a"));
+    backend_ptr->join_worker();
+    ok &= check(term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) > 0U,
+        "input freshness non-rendering callback queues title callback before input");
+
+    ok &= send_key_and_expect_write(
+        fixture.surface,
+        *backend_ptr,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        QByteArrayLiteral("x"),
+        "input freshness non-rendering callback accepts printable input");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> satisfying_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(satisfying_snapshot != nullptr &&
+        satisfying_snapshot->metadata.publication_generation >
+            baseline_snapshot->metadata.publication_generation &&
+        satisfying_snapshot->metadata.satisfied_input_freshness_token != 0U,
+        "input freshness non-rendering callback publishes a satisfying token snapshot");
+    if (satisfying_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) <
+                satisfying_snapshot->metadata.publication_generation,
+        "input freshness non-rendering callback leaves satisfying publication unrendered");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                satisfying_snapshot->metadata.publication_generation,
+                false),
+        "input freshness non-rendering callback reports satisfying publication without draw");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "input freshness non-rendering callback keeps atlas completion pending");
+
+    const std::uint64_t deferrals_before =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals;
+    std::atomic<bool> post_boundary_callback_injected{false};
+    const QMetaObject::Connection post_boundary_connection = QObject::connect(
+        &fixture.window,
+        &QQuickWindow::beforeSynchronizing,
+        &fixture.window,
+        [&] {
+            if (!post_boundary_callback_injected.exchange(true)) {
+                backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;post-title\a"));
+            }
+        },
+        Qt::DirectConnection);
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+    QObject::disconnect(post_boundary_connection);
+
+    ok &= check(post_boundary_callback_injected.load(std::memory_order_acquire),
+        "input freshness non-rendering callback injects post-boundary callback");
+    ok &= check(frame_attempt.valid,
+        "input freshness non-rendering callback observes a frame attempt");
+    ok &= check_uint64_equal(
+        frame_attempt.report.captured_snapshot_sequence,
+        satisfying_snapshot->metadata.sequence,
+        "input freshness non-rendering callback captures the satisfying snapshot");
+    ok &= check_uint64_equal(
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals,
+        deferrals_before,
+        "input freshness non-rendering callback does not retire on bridge install");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) <
+                satisfying_snapshot->metadata.publication_generation,
+        "input freshness non-rendering callback remains unrendered after first capture");
+
+    const std::uint64_t second_deferrals_before =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals;
+    std::atomic<bool> second_post_boundary_callback_injected{false};
+    const QMetaObject::Connection second_post_boundary_connection = QObject::connect(
+        &fixture.window,
+        &QQuickWindow::beforeSynchronizing,
+        &fixture.window,
+        [&] {
+            if (!second_post_boundary_callback_injected.exchange(true)) {
+                backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;post-title-again\a"));
+            }
+        },
+        Qt::DirectConnection);
+    const Surface_frame_attempt second_frame_attempt =
+        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+    QObject::disconnect(second_post_boundary_connection);
+
+    ok &= check(second_post_boundary_callback_injected.load(std::memory_order_acquire),
+        "input freshness non-rendering callback injects second post-boundary callback");
+    ok &= check(second_frame_attempt.valid,
+        "input freshness non-rendering callback observes a second frame attempt");
+    ok &= check_uint64_equal(
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals,
+        second_deferrals_before,
+        "input freshness non-rendering callback keeps token pending after capture");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> completion_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(completion_snapshot != nullptr,
+        "input freshness non-rendering callback has completion snapshot");
+    if (completion_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                completion_snapshot->metadata.publication_generation,
+                true),
+        "input freshness non-rendering callback reports satisfying publication rendered");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "input freshness non-rendering callback clears completion after draw");
+
+    return ok;
+}
+
+bool test_surface_input_freshness_catches_between_sample_and_write_callback(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+    fixture.surface.set_cursor_blink_enabled(false);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("\x1b[1;1Hsample-ready")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "input freshness between-sample callback surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr,
+        "input freshness between-sample callback publishes baseline");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "input freshness between-sample callback captures baseline");
+
+    std::atomic<bool> between_sample_callback_injected{false};
+    std::uint64_t external_sample_epoch = 0U;
+    term::VNM_TerminalSurface_render_bridge::
+        set_before_session_key_input_hook_for_testing(
+            fixture.surface,
+            [&] {
+                if (!between_sample_callback_injected.exchange(true)) {
+                    external_sample_epoch =
+                        term::VNM_TerminalSurface_render_bridge::
+                            backend_callback_enqueue_epoch(fixture.surface);
+                    backend_ptr->emit_output(QByteArrayLiteral("\x1b[2;1Hsample> "));
+                }
+            });
+
+    ok &= send_key_and_expect_write(
+        fixture.surface,
+        *backend_ptr,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        QByteArrayLiteral("x"),
+        "input freshness between-sample callback accepts printable input");
+    term::VNM_TerminalSurface_render_bridge::
+        set_before_session_key_input_hook_for_testing(fixture.surface, {});
+
+    ok &= check(between_sample_callback_injected.load(std::memory_order_acquire),
+        "input freshness between-sample callback injects before session write");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+            fixture.surface) > external_sample_epoch,
+        "input freshness between-sample callback arrives after external sample");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> prompt_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(prompt_snapshot != nullptr &&
+        prompt_snapshot->metadata.sequence > baseline_snapshot->metadata.sequence &&
+        prompt_snapshot->metadata.satisfied_input_freshness_token == 0U &&
+        snapshot_contains_text(*prompt_snapshot, QStringLiteral("sample>")) &&
+        !snapshot_contains_text(*prompt_snapshot, QStringLiteral("sample> x")),
+        "input freshness between-sample callback leaves pre-echo snapshot unsatisfied");
+    if (prompt_snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::uint64_t tokenless_input_epoch =
+        term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+            fixture.surface);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) == 0U,
+        "input freshness tokenless follow-up starts without pending callbacks");
+    ok &= send_key_and_expect_write(
+        fixture.surface,
+        *backend_ptr,
+        Qt::Key_Y,
+        Qt::NoModifier,
+        QStringLiteral("y"),
+        QByteArrayLiteral("y"),
+        "input freshness tokenless follow-up accepts printable input");
+    ok &= check_uint64_equal(
+        term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+            fixture.surface),
+        tokenless_input_epoch,
+        "input freshness tokenless follow-up has no backend callback activity");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> tokenless_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(tokenless_snapshot != nullptr &&
+        tokenless_snapshot->metadata.satisfied_input_freshness_token == 0U &&
+        snapshot_contains_text(*tokenless_snapshot, QStringLiteral("sample>")) &&
+        !snapshot_contains_text(*tokenless_snapshot, QStringLiteral("sample> xy")),
+        "input freshness tokenless follow-up leaves active token unsatisfied");
+    if (tokenless_snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::uint64_t suppressed_before =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).input_stale_cursor_suppressed_frames;
+    std::atomic<bool> echo_injected{false};
+    const QMetaObject::Connection echo_connection = QObject::connect(
+        &fixture.window,
+        &QQuickWindow::beforeSynchronizing,
+        &fixture.window,
+        [&] {
+            if (!echo_injected.exchange(true)) {
+                backend_ptr->emit_output(QByteArrayLiteral("xy"));
+            }
+        },
+        Qt::DirectConnection);
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+    QObject::disconnect(echo_connection);
+
+    ok &= check(echo_injected.load(std::memory_order_acquire),
+        "input freshness between-sample callback injects echo after frame boundary");
+    ok &= check(frame_attempt.valid,
+        "input freshness between-sample callback observes stale frame attempt");
+    ok &= check_uint64_equal(
+        frame_attempt.report.captured_snapshot_sequence,
+        tokenless_snapshot->metadata.sequence,
+        "input freshness between-sample callback captures the prompt snapshot");
+    ok &= check(
+        frame_attempt.report.captured_snapshot_cursor.visible &&
+        !frame_attempt.report.captured_render_cursor.visible,
+        "input freshness between-sample callback suppresses stale cursor");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).input_stale_cursor_suppressed_frames >
+                suppressed_before,
+        "input freshness between-sample callback records cursor suppression");
+
+    return ok;
+}
+
+bool test_surface_input_freshness_no_draw_keeps_pending_until_render(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+    fixture.surface.set_cursor_blink_enabled(false);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("no-draw-freshness")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "input freshness no-draw surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr,
+        "input freshness no-draw publishes baseline");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "input freshness no-draw captures baseline");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                baseline_snapshot->metadata.publication_generation,
+                true),
+        "input freshness no-draw reports baseline rendered");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+
+    backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b]0;no-draw-title\a"));
+    backend_ptr->join_worker();
+    ok &= send_key_and_expect_write(
+        fixture.surface,
+        *backend_ptr,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        QByteArrayLiteral("x"),
+        "input freshness no-draw accepts printable input");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> satisfying_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(satisfying_snapshot != nullptr &&
+        satisfying_snapshot->metadata.satisfied_input_freshness_token != 0U,
+        "input freshness no-draw publishes satisfying snapshot");
+    if (satisfying_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                satisfying_snapshot->metadata.publication_generation,
+                false),
+        "input freshness no-draw reports satisfying publication without draw");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "input freshness no-draw leaves atlas completion pending");
+
+    const std::uint64_t deferrals_before =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals;
+    std::atomic<bool> post_boundary_callback_injected{false};
+    const QMetaObject::Connection post_boundary_connection = QObject::connect(
+        &fixture.window,
+        &QQuickWindow::beforeSynchronizing,
+        &fixture.window,
+        [&] {
+            if (!post_boundary_callback_injected.exchange(true)) {
+                backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;still-pending\a"));
+            }
+        },
+        Qt::DirectConnection);
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+    QObject::disconnect(post_boundary_connection);
+
+    ok &= check(post_boundary_callback_injected.load(std::memory_order_acquire),
+        "input freshness no-draw injects post-boundary callback");
+    ok &= check(frame_attempt.valid,
+        "input freshness no-draw observes frame attempt");
+    ok &= check_uint64_equal(
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals,
+        deferrals_before,
+        "input freshness no-draw keeps token pending until rendered publication");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) <
+                satisfying_snapshot->metadata.publication_generation,
+        "input freshness no-draw remains unrendered after first capture");
+
+    const std::uint64_t second_deferrals_before =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals;
+    std::atomic<bool> second_post_boundary_callback_injected{false};
+    const QMetaObject::Connection second_post_boundary_connection = QObject::connect(
+        &fixture.window,
+        &QQuickWindow::beforeSynchronizing,
+        &fixture.window,
+        [&] {
+            if (!second_post_boundary_callback_injected.exchange(true)) {
+                backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;still-pending-again\a"));
+            }
+        },
+        Qt::DirectConnection);
+    const Surface_frame_attempt second_frame_attempt =
+        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+    QObject::disconnect(second_post_boundary_connection);
+
+    ok &= check(second_post_boundary_callback_injected.load(std::memory_order_acquire),
+        "input freshness no-draw injects second post-boundary callback");
+    ok &= check(second_frame_attempt.valid,
+        "input freshness no-draw observes second frame attempt");
+    ok &= check_uint64_equal(
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals,
+        second_deferrals_before,
+        "input freshness no-draw keeps token pending after capture");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> completion_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(completion_snapshot != nullptr,
+        "input freshness no-draw has completion snapshot");
+    if (completion_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                completion_snapshot->metadata.publication_generation,
+                true),
+        "input freshness no-draw reports satisfying publication rendered");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "input freshness no-draw clears atlas completion after draw");
+
+    return ok;
+}
+
+bool test_surface_input_freshness_rendered_pre_input_no_echo_installs_followup(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+    fixture.surface.set_cursor_blink_enabled(false);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("rendered-pre-input-ready")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "input freshness rendered pre-input surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("rendered-pre-input-ready")),
+        "input freshness rendered pre-input publishes baseline");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "input freshness rendered pre-input captures baseline");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                baseline_snapshot->metadata.publication_generation,
+                true),
+        "input freshness rendered pre-input reports baseline rendered");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+
+    backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b[2;1Hnoecho> "));
+    backend_ptr->join_worker();
+    ok &= check(term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) > 0U,
+        "input freshness rendered pre-input queues prompt before input");
+
+    ok &= send_key_and_expect_write(
+        fixture.surface,
+        *backend_ptr,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        QByteArrayLiteral("x"),
+        "input freshness rendered pre-input accepts printable input");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> stale_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(stale_snapshot != nullptr &&
+        stale_snapshot->metadata.satisfied_input_freshness_token == 0U &&
+        snapshot_contains_text(*stale_snapshot, QStringLiteral("noecho>")) &&
+        !snapshot_contains_text(*stale_snapshot, QStringLiteral("noecho> x")),
+        "input freshness rendered pre-input publishes unsatisfied pre-echo snapshot");
+    if (stale_snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::uint64_t cursor_suppressed_before =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).input_stale_cursor_suppressed_frames;
+    const Surface_frame_attempt stale_frame_attempt =
+        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+    ok &= check(stale_frame_attempt.valid,
+        "input freshness rendered pre-input observes stale frame attempt");
+    ok &= check_uint64_equal(
+        stale_frame_attempt.report.captured_snapshot_sequence,
+        stale_snapshot->metadata.sequence,
+        "input freshness rendered pre-input captures stale pre-echo snapshot");
+    ok &= check(
+        stale_frame_attempt.report.captured_snapshot_cursor.visible &&
+        !stale_frame_attempt.report.captured_render_cursor.visible,
+        "input freshness rendered pre-input suppresses first stale cursor");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).input_stale_cursor_suppressed_frames >
+                cursor_suppressed_before,
+        "input freshness rendered pre-input records stale cursor suppression");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> after_stale_frame_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    if (after_stale_frame_snapshot != nullptr &&
+        after_stale_frame_snapshot->metadata.publication_generation ==
+            stale_snapshot->metadata.publication_generation)
+    {
+        ok &= check(
+            term::VNM_TerminalSurface_render_bridge::
+                mark_reported_atlas_completion_pending_for_testing(
+                    fixture.surface,
+                    stale_snapshot->metadata.publication_generation,
+                    true),
+            "input freshness rendered pre-input reports stale publication rendered");
+        (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> followup_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(followup_snapshot != nullptr &&
+        followup_snapshot->metadata.sequence > stale_snapshot->metadata.sequence &&
+        followup_snapshot->metadata.publication_generation >
+            stale_snapshot->metadata.publication_generation &&
+        followup_snapshot->metadata.satisfied_input_freshness_token != 0U &&
+        snapshot_contains_text(*followup_snapshot, QStringLiteral("noecho>")) &&
+        !snapshot_contains_text(*followup_snapshot, QStringLiteral("noecho> x")),
+        "input freshness rendered pre-input installs satisfying follow-up snapshot");
+    if (followup_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).pending_update,
+        "input freshness rendered pre-input requests follow-up render");
+
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) <
+                followup_snapshot->metadata.publication_generation,
+        "input freshness rendered pre-input leaves follow-up unrendered before completion");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                followup_snapshot->metadata.publication_generation,
+                true),
+        "input freshness rendered pre-input reports follow-up publication rendered");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) >=
+                followup_snapshot->metadata.publication_generation,
+        "input freshness rendered pre-input marks follow-up rendered");
+
+    return ok;
+}
+
 bool test_surface_held_deferral_coalesces_skipped_dirty_rows(QGuiApplication& app)
 {
     bool ok = true;
@@ -2593,6 +3237,83 @@ bool test_surface_stale_atlas_completion_does_not_advance_rendered_publication(
             session_rendered_render_snapshot_generation(fixture.surface) ==
             current_generation,
         "surface current drawn atlas completion advances session rendered generation");
+    return ok;
+}
+
+bool test_surface_reset_session_clears_pending_atlas_completion(QGuiApplication& app)
+{
+    bool ok = true;
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto first_backend = std::make_unique<Scripted_backend>();
+    first_backend->outputs_during_start = {QByteArrayLiteral("reset-atlas-first")};
+
+    bool first_started = false;
+    Scripted_backend* first_backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(first_backend),
+        { QStringLiteral("scripted-terminal") },
+        &first_started);
+    ok &= check(first_started && first_backend_ptr != nullptr,
+        "surface reset atlas completion first session starts");
+    if (!first_started || first_backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> first_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(first_snapshot != nullptr &&
+        snapshot_contains_text(*first_snapshot, QStringLiteral("reset-atlas-first")),
+        "surface reset atlas completion first session publishes output");
+    if (first_snapshot == nullptr) {
+        return ok;
+    }
+
+    first_backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    ok &= check(fixture.surface.process_state() ==
+            VNM_TerminalSurface::Process_state::EXITED,
+        "surface reset atlas completion first session exits");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> exited_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(exited_snapshot != nullptr,
+        "surface reset atlas completion has an exited-session snapshot");
+    if (exited_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                exited_snapshot->metadata.publication_generation,
+                false),
+        "surface reset atlas completion latches stale no-draw completion");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "surface reset atlas completion starts with pending stale completion");
+
+    auto second_backend = std::make_unique<Scripted_backend>();
+    second_backend->outputs_during_start = {QByteArrayLiteral("reset-atlas-second")};
+
+    bool second_started = false;
+    (void)start_surface_with_backend(
+        fixture.surface,
+        std::move(second_backend),
+        { QStringLiteral("scripted-terminal") },
+        &second_started);
+    ok &= check(second_started,
+        "surface reset atlas completion second session starts");
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "surface reset atlas completion clears stale completion before replacement session");
+
     return ok;
 }
 
@@ -13339,6 +14060,10 @@ int main(int argc, char** argv)
         bool ok = test_surface_input_echo_after_polish_timing_repro(app, expectation);
         if (expectation == Input_echo_timing_expectation::CURSOR_SUPPRESSED) {
             ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
+            ok &= test_surface_input_freshness_non_rendering_callback_waits_for_render(app);
+            ok &= test_surface_input_freshness_catches_between_sample_and_write_callback(app);
+            ok &= test_surface_input_freshness_no_draw_keeps_pending_until_render(app);
+            ok &= test_surface_input_freshness_rendered_pre_input_no_echo_installs_followup(app);
             ok &= test_surface_held_deferral_coalesces_skipped_dirty_rows(app);
         }
         return ok ? 0 : 1;
@@ -13353,6 +14078,10 @@ int main(int argc, char** argv)
         app,
         Input_echo_timing_expectation::CURSOR_SUPPRESSED);
     ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
+    ok &= test_surface_input_freshness_non_rendering_callback_waits_for_render(app);
+    ok &= test_surface_input_freshness_catches_between_sample_and_write_callback(app);
+    ok &= test_surface_input_freshness_no_draw_keeps_pending_until_render(app);
+    ok &= test_surface_input_freshness_rendered_pre_input_no_echo_installs_followup(app);
     ok &= test_surface_held_deferral_coalesces_skipped_dirty_rows(app);
     ok &= test_surface_backend_drain_metrics_split_stages(app);
     ok &= test_surface_posted_backend_drain_uses_frame_pending_small_budget(app);
@@ -13361,6 +14090,7 @@ int main(int argc, char** argv)
     ok &= test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(app);
     ok &= test_surface_reported_atlas_completion_advances_rendered_publication(app);
     ok &= test_surface_stale_atlas_completion_does_not_advance_rendered_publication(app);
+    ok &= test_surface_reset_session_clears_pending_atlas_completion(app);
     ok &= test_surface_qsg_capture_without_draw_preserves_dirty_rows(app);
     ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
     ok &= test_osc52_clipboard_write_signal_and_deny(app);

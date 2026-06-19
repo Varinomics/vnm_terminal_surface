@@ -9063,6 +9063,153 @@ bool test_synchronized_output_defers_content_until_release()
     return ok;
 }
 
+bool test_selection_only_synchronized_hold_does_not_satisfy_input_freshness()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "selection-only freshness hold session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("prompt> ")),
+        "selection-only freshness hold queues visible baseline");
+    session->process_backend_callback_events();
+    const std::optional<term::Terminal_render_snapshot> baseline_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(baseline_snapshot.has_value() &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("prompt>")),
+        "selection-only freshness hold publishes visible baseline");
+
+    session->set_selection_range({
+        { 0, 0 },
+        { 0, 6 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::Terminal_render_snapshot> selected_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(selected_snapshot.has_value() &&
+        selected_snapshot->purpose == term::Terminal_render_snapshot_purpose::SELECTION_DERIVED &&
+        !selected_snapshot->selection_spans.empty() &&
+        selected_snapshot->metadata.satisfied_input_freshness_token == 0U,
+        "selection-only freshness hold establishes visible selection basis");
+    const std::uint64_t selected_generation = session->render_snapshot_generation();
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
+        "selection-only freshness hold queues held output before input");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "selection-only freshness hold has pending callback before input");
+
+    QKeyEvent key_event(
+        QEvent::KeyPress,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"));
+    const term::Terminal_key_event_result key_result =
+        session->write_key_event(key_event);
+    const std::uint64_t accepted_token =
+        key_result.result.accepted_input_freshness_token;
+    ok &= check(key_result.handled &&
+        key_result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+        accepted_token != 0U,
+        "selection-only freshness hold accepts input with freshness token");
+    ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("x"),
+        "selection-only freshness hold writes input bytes");
+    ok &= check(session->render_snapshot_generation() == selected_generation,
+        "selection-only freshness hold keeps held output unpublished after input");
+
+    session->detach_selection_visual_attachment();
+    const std::optional<term::Terminal_render_snapshot> detached_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(detached_snapshot.has_value() &&
+        detached_snapshot->purpose == term::Terminal_render_snapshot_purpose::SELECTION_DERIVED &&
+        detached_snapshot->selection_spans.empty() &&
+        !snapshot_contains_text(*detached_snapshot, QStringLiteral("held")) &&
+        detached_snapshot->metadata.satisfied_input_freshness_token < accepted_token,
+        "selection-only freshness hold does not satisfy pending token");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026lrelease")),
+        "selection-only freshness hold queues synchronized release");
+    session->process_backend_callback_events();
+    const std::optional<term::Terminal_render_snapshot> released_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(released_snapshot.has_value() &&
+        released_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+        snapshot_contains_text(*released_snapshot, QStringLiteral("heldrelease")) &&
+        released_snapshot->metadata.satisfied_input_freshness_token >= accepted_token,
+        "selection-only freshness hold satisfies token on real content publication");
+
+    return ok;
+}
+
+bool test_input_freshness_rendering_pre_input_callback_satisfies_without_echo()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "rendering pre-input freshness repro session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("ready")),
+        "rendering pre-input freshness repro queues output before input");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "rendering pre-input freshness repro has pending callback before input");
+    const std::uint64_t pre_input_generation =
+        session->render_snapshot_generation();
+
+    QKeyEvent key_event(
+        QEvent::KeyPress,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"));
+    const term::Terminal_key_event_result key_result =
+        session->write_key_event(key_event);
+    const std::uint64_t accepted_token =
+        key_result.result.accepted_input_freshness_token;
+    const std::optional<term::Terminal_render_snapshot> snapshot_after_input =
+        session->latest_render_snapshot();
+
+    ok &= check(key_result.handled &&
+        key_result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+        accepted_token != 0U,
+        "rendering pre-input freshness repro accepts input with token");
+    ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("x"),
+        "rendering pre-input freshness repro writes key without echo");
+    ok &= check(snapshot_after_input.has_value() &&
+        snapshot_contains_text(*snapshot_after_input, QStringLiteral("ready")) &&
+        session->render_snapshot_generation() > pre_input_generation,
+        "rendering pre-input freshness repro drains output into snapshot during input");
+    ok &= check(snapshot_after_input.has_value() &&
+        snapshot_after_input->metadata.satisfied_input_freshness_token < accepted_token,
+        "rendering pre-input freshness repro remains pending until render completion");
+
+    bool followup_publication_ready = false;
+    if (snapshot_after_input.has_value()) {
+        followup_publication_ready = session->mark_render_publication_rendered(
+            snapshot_after_input->metadata.publication_generation);
+    }
+    const std::optional<term::Terminal_render_snapshot> snapshot_after_render =
+        session->latest_render_snapshot();
+    ok &= check(followup_publication_ready,
+        "rendering pre-input freshness repro reports follow-up publication");
+    ok &= check(snapshot_after_input.has_value() &&
+        snapshot_after_render.has_value() &&
+        snapshot_after_render->metadata.publication_generation >
+            snapshot_after_input->metadata.publication_generation &&
+        snapshot_contains_text(*snapshot_after_render, QStringLiteral("ready")) &&
+        snapshot_after_render->metadata.satisfied_input_freshness_token >= accepted_token,
+        "rendering pre-input freshness repro satisfies accepted token after render without echo");
+
+    return ok;
+}
+
 bool test_viewport_scroll_public_session_path()
 {
     bool ok = true;
@@ -13968,6 +14115,8 @@ int main()
     ok &= test_empty_backend_output_chunk_does_not_synthesize_blank_line();
     ok &= test_immediate_public_synchronized_release_preserves_held_crlf_blank_rows();
     ok &= test_synchronized_output_defers_content_until_release();
+    ok &= test_selection_only_synchronized_hold_does_not_satisfy_input_freshness();
+    ok &= test_input_freshness_rendering_pre_input_callback_satisfies_without_echo();
     ok &= test_viewport_scroll_public_session_path();
     ok &= test_resize_preserves_primary_scrollback();
     ok &= test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback();

@@ -409,7 +409,7 @@ public:
     std::uint64_t installed_render_snapshot_generation() const;
     std::uint64_t rendered_render_snapshot_generation() const;
     void mark_render_snapshot_installed(std::uint64_t generation);
-    void mark_render_publication_rendered(std::uint64_t generation);
+    bool mark_render_publication_rendered(std::uint64_t generation);
     Ime_preedit_state ime_preedit_state() const;
     std::uint64_t ime_preedit_generation() const;
     std::optional<Terminal_screen_model_result> last_model_ingest_result() const;
@@ -470,6 +470,14 @@ private:
     {
         DRAIN_CALLBACKS,
         KEEP_CALLBACKS_QUEUED,
+    };
+
+    struct Accepted_input_freshness_basis
+    {
+        std::uint64_t backend_callback_epoch = 0U;
+        std::uint64_t processed_backend_callback_epoch = 0U;
+        std::uint64_t render_snapshot_generation = 0U;
+        bool          backend_callback_activity = false;
     };
 
     struct Live_primary_viewport_anchor
@@ -552,11 +560,17 @@ private:
         QByteArray                         bytes,
         User_write_viewport_policy         viewport_policy,
         Backend_callback_drain_policy      drain_policy =
-            Backend_callback_drain_policy::DRAIN_CALLBACKS);
+            Backend_callback_drain_policy::DRAIN_CALLBACKS,
+        std::optional<Accepted_input_freshness_basis>
+                                           input_freshness_basis =
+            std::nullopt);
 
     Terminal_key_event_result write_key_event_locked(
         const QKeyEvent&                   event,
-        Backend_callback_drain_policy      drain_policy);
+        Backend_callback_drain_policy      drain_policy,
+        std::optional<Accepted_input_freshness_basis>
+                                           input_freshness_basis =
+            std::nullopt);
 
     Terminal_mouse_event_result write_mouse_event_locked(
         Terminal_mouse_event               event,
@@ -700,6 +714,20 @@ private:
 
     void record_snapshot_publication_queued_for_bridge(
         std::uint64_t              publication_generation);
+
+    Accepted_input_freshness_basis capture_accepted_input_freshness_basis() const;
+    std::uint64_t next_input_freshness_token();
+    void attach_accepted_input_freshness_token(
+        Terminal_session_result&               result,
+        const Accepted_input_freshness_basis&  basis);
+    void publish_accepted_input_freshness_snapshot_if_needed(
+        const Terminal_session_result& result);
+    std::uint64_t satisfied_input_freshness_token_for_snapshot(
+        std::uint64_t                  sequence,
+        std::uint64_t                  processed_backend_callback_epoch,
+        Terminal_render_snapshot_basis basis) const;
+    void record_input_freshness_snapshot_publication(
+        const Terminal_render_snapshot& snapshot);
 
     void publish_render_snapshot(
         std::uint64_t              sequence,
@@ -857,6 +885,12 @@ private:
     std::uint64_t                                          m_render_snapshot_generation = 0U;
     std::uint64_t                                          m_render_snapshot_installed_generation = 0U;
     std::uint64_t                                          m_render_snapshot_rendered_generation = 0U;
+    std::uint64_t                                          m_next_input_freshness_token = 1U;
+    std::uint64_t                                          m_pending_input_freshness_token = 0U;
+    std::uint64_t                                          m_pending_input_freshness_sequence = 0U;
+    std::uint64_t                                          m_pending_input_freshness_backend_callback_epoch = 0U;
+    std::uint64_t                                          m_visible_input_freshness_token = 0U;
+    bool                                                   m_pending_input_freshness_requires_post_input_callback = false;
     std::uint64_t                                          m_next_public_projection_generation = 1U;
     std::shared_ptr<const Terminal_render_snapshot>        m_unrendered_render_snapshot_dirty_basis;
     std::optional<Terminal_synchronized_output_scroll_policy>
