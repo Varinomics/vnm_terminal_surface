@@ -30,7 +30,7 @@ namespace {
 
 constexpr std::size_t k_printable_ascii_count =
     k_printable_ascii_last - k_printable_ascii_first + 1U;
-constexpr int k_resize_repaint_clear_guard_action_budget = 64;
+constexpr int k_primary_repaint_recovery_resize_guard_action_budget = 64;
 constexpr std::size_t k_retained_history_ring_capacity_bytes = 64U * 1024U * 1024U;
 
 template <typename T>
@@ -469,7 +469,6 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
             }
             clear_dirty();
             apply_action(action, result.actions, &publication);
-            advance_resize_repaint_clear_guard();
             advance_primary_repaint_recovery_resize_guard();
 
             if (m_modes.synchronized_output) {
@@ -530,7 +529,6 @@ void Terminal_screen_model::apply_action(const Parser_action& action)
 {
     std::vector<Parser_action> generated_actions;
     apply_action(action, generated_actions, nullptr);
-    advance_resize_repaint_clear_guard();
     advance_primary_repaint_recovery_resize_guard();
 }
 
@@ -598,9 +596,6 @@ void Terminal_screen_model::apply_action(
                         ++m_profile_stats.print_text_calls;
                     }
 #endif
-                    if (!mutation.text.isEmpty()) {
-                        cancel_resize_repaint_clear_guard_before_visible_clear();
-                    }
                     put_printable_ascii_text(QStringView(mutation.text));
                 }
                 else {
@@ -2692,7 +2687,7 @@ void Terminal_screen_model::reset_grid()
 
 bool Terminal_screen_model::apply_grid_resize(
     terminal_grid_size_t grid_size,
-    bool                 guard_scrollback_clear)
+    bool                 guard_primary_repaint_recovery)
 {
     if (!is_terminal_screen_model_grid_size_supported(grid_size)) {
         return false;
@@ -2713,12 +2708,10 @@ bool Terminal_screen_model::apply_grid_resize(
     m_config.grid_size = grid_size;
     restore_buffer_state(active_buffer_state());
     mark_grid_reflow_changed();
-    if (guard_scrollback_clear) {
-        arm_resize_repaint_clear_guard();
+    if (guard_primary_repaint_recovery) {
         arm_primary_repaint_recovery_resize_guard();
     }
     else {
-        cancel_resize_repaint_clear_guard();
         cancel_primary_repaint_recovery_resize_guard();
     }
     mark_all_dirty();
@@ -2846,7 +2839,6 @@ void Terminal_screen_model::set_primary_repaint_recovery_enabled(bool enabled)
 
     m_config.recover_scrollback_from_primary_repaints = enabled;
     if (!enabled) {
-        cancel_resize_repaint_clear_guard();
         cancel_primary_repaint_recovery_resize_guard();
         cancel_primary_repaint_recovery_candidate();
     }
@@ -2883,9 +2875,6 @@ void Terminal_screen_model::put_text(QString text)
         ++m_profile_stats.print_text_calls;
     }
 #endif
-    if (!text.isEmpty()) {
-        cancel_resize_repaint_clear_guard_before_visible_clear();
-    }
 
     for (qsizetype i = 0; i < text.size();) {
         const qsizetype ascii_begin = i;
@@ -3545,7 +3534,6 @@ void Terminal_screen_model::clear_screen_after_cursor()
 
 void Terminal_screen_model::erase_visible_screen()
 {
-    note_resize_repaint_visible_clear();
     mark_terminal_content_changed();
     const bool primary_repaint_rebuild =
         m_primary_repaint_recovery_candidate.active;
@@ -3582,12 +3570,9 @@ void Terminal_screen_model::erase_in_display(int mode)
         case 1:  clear_screen_before_cursor(); break;
         case 2:  erase_visible_screen();       break;
         case 3:
-            if (consume_resize_repaint_scrollback_clear_guard()) {
-                break;
-            }
-            if (m_active_buffer_id == Terminal_buffer_id::PRIMARY &&
-                m_primary_backing.retained_history_empty())
-            {
+        {
+            cancel_primary_repaint_recovery_candidate();
+            if (m_primary_backing.retained_history_empty()) {
                 record_primary_history_delta(
                     Terminal_backing_delta_kind::BACKING_UNCHANGED,
                     scrollback_size(),
@@ -3595,25 +3580,24 @@ void Terminal_screen_model::erase_in_display(int mode)
                     0,
                     0,
                     0);
+                break;
             }
-            if (m_active_buffer_id == Terminal_buffer_id::PRIMARY &&
-                !m_primary_backing.retained_history_empty())
-            {
-                const int scrollback_rows_before = scrollback_size();
-                m_scrollback_evicted_rows       += scrollback_rows_before;
-                m_primary_backing.clear_retained_history();
-                invalidate_retained_lookup_caches();
-                record_primary_history_delta(
-                    Terminal_backing_delta_kind::PRIMARY_HISTORY_CLEARED,
-                    scrollback_rows_before,
-                    0,
-                    0,
-                    scrollback_rows_before,
-                    0);
-                mark_terminal_content_changed();
-                mark_viewport_changed();
-            }
+
+            const int scrollback_rows_before = scrollback_size();
+            m_scrollback_evicted_rows       += scrollback_rows_before;
+            m_primary_backing.clear_retained_history();
+            invalidate_retained_lookup_caches();
+            record_primary_history_delta(
+                Terminal_backing_delta_kind::PRIMARY_HISTORY_CLEARED,
+                scrollback_rows_before,
+                0,
+                0,
+                scrollback_rows_before,
+                0);
+            mark_terminal_content_changed();
+            mark_viewport_changed();
             break;
+        }
         default: break;
     }
 }
@@ -4312,72 +4296,6 @@ void Terminal_screen_model::reverse_index()
     mark_cursor_dirty();
 }
 
-void Terminal_screen_model::arm_resize_repaint_clear_guard()
-{
-    if (!m_config.recover_scrollback_from_primary_repaints ||
-        m_active_buffer_id != Terminal_buffer_id::PRIMARY   ||
-        m_primary_backing.retained_history_empty())
-    {
-        cancel_resize_repaint_clear_guard();
-        return;
-    }
-
-    m_resize_repaint_clear_guard_remaining         =
-        k_resize_repaint_clear_guard_action_budget;
-    m_resize_repaint_clear_guard_saw_visible_clear = false;
-}
-
-void Terminal_screen_model::cancel_resize_repaint_clear_guard()
-{
-    m_resize_repaint_clear_guard_remaining         = 0;
-    m_resize_repaint_clear_guard_saw_visible_clear = false;
-}
-
-void Terminal_screen_model::cancel_resize_repaint_clear_guard_before_visible_clear()
-{
-    if (m_resize_repaint_clear_guard_saw_visible_clear) {
-        return;
-    }
-
-    cancel_resize_repaint_clear_guard();
-}
-
-void Terminal_screen_model::advance_resize_repaint_clear_guard()
-{
-    if (m_resize_repaint_clear_guard_remaining <= 0) {
-        return;
-    }
-
-    --m_resize_repaint_clear_guard_remaining;
-    if (m_resize_repaint_clear_guard_remaining <= 0) {
-        cancel_resize_repaint_clear_guard();
-    }
-}
-
-void Terminal_screen_model::note_resize_repaint_visible_clear()
-{
-    if (m_resize_repaint_clear_guard_remaining <= 0 ||
-        m_cursor.row                               != 0 ||
-        m_cursor.column                            != 0)
-    {
-        return;
-    }
-
-    m_resize_repaint_clear_guard_saw_visible_clear = true;
-}
-
-bool Terminal_screen_model::consume_resize_repaint_scrollback_clear_guard()
-{
-    if (m_resize_repaint_clear_guard_remaining <= 0 ||
-        !m_resize_repaint_clear_guard_saw_visible_clear)
-    {
-        return false;
-    }
-
-    cancel_resize_repaint_clear_guard();
-    return true;
-}
-
 void Terminal_screen_model::arm_primary_repaint_recovery_resize_guard()
 {
     if (!m_config.recover_scrollback_from_primary_repaints ||
@@ -4388,7 +4306,7 @@ void Terminal_screen_model::arm_primary_repaint_recovery_resize_guard()
     }
 
     m_primary_repaint_recovery_resize_guard_remaining =
-        k_resize_repaint_clear_guard_action_budget;
+        k_primary_repaint_recovery_resize_guard_action_budget;
 }
 
 void Terminal_screen_model::cancel_primary_repaint_recovery_resize_guard()
@@ -4580,7 +4498,6 @@ bool Terminal_screen_model::row_has_visible_text(const Terminal_screen_row& row)
 
 void Terminal_screen_model::carriage_return()
 {
-    cancel_resize_repaint_clear_guard_before_visible_clear();
     mark_cursor_dirty();
     m_cursor.column = 0;
     m_pending_wrap  = false;
@@ -4589,7 +4506,6 @@ void Terminal_screen_model::carriage_return()
 
 void Terminal_screen_model::line_feed()
 {
-    cancel_resize_repaint_clear_guard_before_visible_clear();
     mark_cursor_dirty();
     m_pending_wrap = false;
 

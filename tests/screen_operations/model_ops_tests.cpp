@@ -2007,6 +2007,100 @@ bool test_phase_r_primary_repaint_recovery_toggle_cancels_candidate()
     return ok;
 }
 
+bool test_phase_r_ed3_cancels_active_primary_repaint_recovery_candidate()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+    ok &= check(model.scrollback_size() == 0,
+        "Phase R ED3 active-candidate fixture starts without retained scrollback");
+
+    const term::Terminal_screen_model_result ed3_result =
+        model.ingest(QByteArrayLiteral(
+            "\x1b[?25l"
+            "\x1b[1;1H" "bb" "\x1b[K"
+            "\x1b[2;1H" "cc" "\x1b[K"
+            "\x1b[3;1H" "dd" "\x1b[K"
+            "\x1b[4;1H" "ee" "\x1b[K"
+            "\x1b[3J"));
+
+    ok &= check(model.scrollback_size() == 0,
+        "Phase R ED3 active-candidate clear leaves retained scrollback empty");
+    ok &= check(ed3_result.recovery_proposals.empty(),
+        "Phase R ED3 active-candidate clear accepts no recovery proposal");
+    ok &= check(ed3_result.backing_deltas.size() == 1U &&
+            primary_backing_delta_matches(
+                ed3_result.backing_deltas[0],
+                term::Terminal_backing_delta_kind::BACKING_UNCHANGED,
+                0,
+                0,
+                0,
+                0),
+        "Phase R ED3 active-candidate clear emits an empty-history no-op delta");
+
+    const term::Terminal_screen_model_result finish_result =
+        model.ingest(QByteArrayLiteral("\x1b[?25h"));
+    ok &= check(model.scrollback_size() == 0,
+        "Phase R ED3 active-candidate finish trigger does not resurrect scrollback");
+    ok &= check(finish_result.recovery_proposals.empty(),
+        "Phase R ED3 active-candidate finish trigger accepts no recovery proposal");
+    ok &= check(finish_result.backing_deltas.empty(),
+        "Phase R ED3 active-candidate finish trigger emits no recovered history delta");
+
+    return ok;
+}
+
+bool test_phase_r_ed3_clears_scrollback_after_resize_repaint_visible_clear()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(2, 8, 8);
+    model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc"));
+    ok &= check(model.scrollback_size() > 0,
+        "Phase R ED3 resize fixture creates retained scrollback");
+
+    const term::Terminal_screen_model_result resize_result =
+        model.resize(term::terminal_grid_size_t{3, 8});
+    ok &= check(resize_result.grid_reflow_changed,
+        "Phase R ED3 resize fixture applies a public row-count resize");
+
+    // This preserves the former resize-repaint clear-guard precondition:
+    // resize, home-visible ED2, then explicit ED3.
+    model.ingest(QByteArrayLiteral("\x1b[H\x1b[2J"));
+    const int scrollback_rows_before_ed3 = model.scrollback_size();
+    ok &= check(scrollback_rows_before_ed3 > 0,
+        "Phase R ED3 visible clear precondition leaves retained scrollback");
+
+    const term::Terminal_screen_model_result result =
+        model.ingest(QByteArrayLiteral("\x1b[3J"));
+
+    ok &= check(model.scrollback_size() == 0,
+        "Phase R ED3 clears retained scrollback after resize repaint visible clear");
+    ok &= check(result.scrollback_rows == 0,
+        "Phase R ED3 result reports cleared retained scrollback");
+    ok &= check(result.evicted_scrollback_rows == scrollback_rows_before_ed3,
+        "Phase R ED3 result reports evicted retained rows");
+    ok &= check(result.backing_deltas.size() == 1U &&
+            primary_backing_delta_matches(
+                result.backing_deltas[0],
+                term::Terminal_backing_delta_kind::PRIMARY_HISTORY_CLEARED,
+                scrollback_rows_before_ed3,
+                0,
+                0,
+                scrollback_rows_before_ed3),
+        "Phase R ED3 emits a retained-history clear delta");
+
+    return ok;
+}
+
 bool test_erase_operations_and_wide_damage()
 {
     bool ok = true;
@@ -3907,6 +4001,8 @@ int main()
     ok &= test_flat_ring_phase5b_retained_hyperlink_metadata_authority();
     ok &= test_phase_r_primary_repaint_recovery_suppresses_false_positives();
     ok &= test_phase_r_primary_repaint_recovery_toggle_cancels_candidate();
+    ok &= test_phase_r_ed3_cancels_active_primary_repaint_recovery_candidate();
+    ok &= test_phase_r_ed3_clears_scrollback_after_resize_repaint_visible_clear();
     ok &= test_erase_operations_and_wide_damage();
     ok &= test_scroll_region_and_origin_mode();
     ok &= test_top_anchored_scroll_region_appends_scrollback();
