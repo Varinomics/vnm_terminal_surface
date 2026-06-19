@@ -277,11 +277,13 @@ bool metadata_match(
     const term::Terminal_render_metadata& right)
 {
     return
-        left.sequence                     == right.sequence                     &&
-        left.row_origin_generation        == right.row_origin_generation        &&
-        left.backend_geometry_in_sync     == right.backend_geometry_in_sync     &&
-        left.visual_bell_active           == right.visual_bell_active           &&
-        left.mouse_reporting_mode_changed == right.mouse_reporting_mode_changed;
+        left.sequence                         == right.sequence                         &&
+        left.publication_generation           == right.publication_generation           &&
+        left.processed_backend_callback_epoch == right.processed_backend_callback_epoch &&
+        left.row_origin_generation            == right.row_origin_generation            &&
+        left.backend_geometry_in_sync         == right.backend_geometry_in_sync         &&
+        left.visual_bell_active               == right.visual_bell_active               &&
+        left.mouse_reporting_mode_changed     == right.mouse_reporting_mode_changed;
 }
 
 bool provenance_matches_exactly(
@@ -425,6 +427,15 @@ bool snapshot_observations_match(
 {
     bool ok = true;
     ok &= check_labeled(lazy.lazy_row_payloads != nullptr, label, "lazy payload presence");
+    if (lazy.lazy_row_payloads != nullptr) {
+        ok &= check_labeled(
+            lazy.lazy_row_payloads->receiving_namespace.style_table_generation ==
+                full.metadata.sequence &&
+                lazy.lazy_row_payloads->receiving_namespace.hyperlink_namespace_generation ==
+                    full.metadata.sequence,
+            label,
+            "lazy row namespace stays keyed to content sequence");
+    }
     ok &= check_labeled(lazy.cells.empty(), label, "lazy snapshot has no flat cells");
     ok &= check_labeled(
         lazy.cells.capacity() == 0U,
@@ -658,6 +669,11 @@ bool emit_output_and_compare(
     std::string_view                                     label)
 {
     bool ok = true;
+    ok &= check_labeled(
+        session.rendered_render_snapshot_generation() ==
+            session.render_snapshot_generation(),
+        label,
+        "rendered-generation gate starts caught up");
     ok &= check_labeled(backend.emit_output(std::move(output)), label, "backend emits output");
     const std::shared_ptr<const term::Terminal_render_snapshot> current =
         session.latest_render_snapshot_handle();
@@ -667,6 +683,16 @@ bool emit_output_and_compare(
     }
 
     ok &= check_labeled(
+        current->metadata.publication_generation ==
+            session.render_snapshot_generation(),
+        label,
+        "current snapshot carries the active publication generation");
+    ok &= check_labeled(
+        session.rendered_render_snapshot_generation() <
+            session.render_snapshot_generation(),
+        label,
+        "new publication stays unrendered until the render report");
+    ok &= check_labeled(
         current->lazy_row_payloads == nullptr && !current->cells.empty(),
         label,
         "production snapshot remains fully materialized");
@@ -674,6 +700,11 @@ bool emit_output_and_compare(
 
     previous = current;
     session.mark_render_publication_rendered(session.render_snapshot_generation());
+    ok &= check_labeled(
+        session.rendered_render_snapshot_generation() ==
+            session.render_snapshot_generation(),
+        label,
+        "rendered-generation gate catches up after render report");
     return ok;
 }
 

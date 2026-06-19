@@ -1874,6 +1874,21 @@ bool test_surface_held_deferral_coalesces_skipped_dirty_rows(QGuiApplication& ap
         fixture.surface,
         baseline_snapshot->metadata.sequence),
         "held deferral dirty coalescing captures baseline");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                baseline_snapshot->metadata.publication_generation,
+                true),
+        "held deferral dirty coalescing reports baseline rendered");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    const std::uint64_t baseline_rendered_generation =
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface);
+    ok &= check_uint64_equal(
+        baseline_rendered_generation,
+        baseline_snapshot->metadata.publication_generation,
+        "held deferral dirty coalescing starts from a rendered baseline");
 
     backend_ptr->emit_output(QByteArrayLiteral("\x1b[1;1Hhold-row-zero-new"));
     term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
@@ -1924,6 +1939,11 @@ bool test_surface_held_deferral_coalesces_skipped_dirty_rows(QGuiApplication& ap
     ok &= check(held_stats.backend_callback_frame_deferrals >
             deferrals_before_held_frame,
         "held deferral dirty coalescing records a stale-frame deferral");
+    ok &= check_uint64_equal(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface),
+        baseline_rendered_generation,
+        "held deferral dirty coalescing does not render the held publication");
 
     ok &= check(pump_until(app, [&] {
         const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
@@ -1947,6 +1967,9 @@ bool test_surface_held_deferral_coalesces_skipped_dirty_rows(QGuiApplication& ap
     ok &= check(snapshot_dirty_ranges_contain_row(*catchup_snapshot, 0) &&
         snapshot_dirty_ranges_contain_row(*catchup_snapshot, 1),
         "held deferral dirty coalescing catch-up snapshot keeps both dirty rows");
+    ok &= check(
+        catchup_snapshot->metadata.publication_generation > baseline_rendered_generation,
+        "held deferral dirty coalescing catch-up remains pending render completion");
 
     const term::Qsg_atlas_frame_report report_before_catchup_frame =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
@@ -2573,6 +2596,108 @@ bool test_surface_stale_atlas_completion_does_not_advance_rendered_publication(
     return ok;
 }
 
+bool test_surface_qsg_capture_without_draw_preserves_dirty_rows(QGuiApplication& app)
+{
+    bool ok = true;
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("no-draw-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "surface no-draw capture dirty coalescing starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("no-draw-baseline")),
+        "surface no-draw capture publishes a visible baseline");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "surface no-draw capture renders the visible baseline");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                baseline_snapshot->metadata.publication_generation,
+                true),
+        "surface no-draw capture reports baseline rendered");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) ==
+            baseline_snapshot->metadata.publication_generation,
+        "surface no-draw capture starts from a rendered baseline");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?25l\x1b[2J\x1b[H"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> cleared_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(cleared_snapshot != nullptr &&
+        !snapshot_contains_text(*cleared_snapshot, QStringLiteral("no-draw-baseline")) &&
+        snapshot_dirty_ranges_contain_row(*cleared_snapshot, 0),
+        "surface no-draw capture publishes a dirty cleared snapshot");
+    if (cleared_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                cleared_snapshot->metadata.publication_generation,
+                false),
+        "surface no-draw capture reports the cleared publication without draw");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
+            fixture.surface),
+        "surface no-draw capture leaves undrawn atlas completion pending");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            session_rendered_render_snapshot_generation(fixture.surface) ==
+            baseline_snapshot->metadata.publication_generation,
+        "surface no-draw capture does not advance rendered publication generation");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[2;1Hafter-no-draw"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> catchup_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(catchup_snapshot != nullptr &&
+        snapshot_contains_text(*catchup_snapshot, QStringLiteral("after-no-draw")),
+        "surface no-draw capture publishes the follow-up text snapshot");
+    if (catchup_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(snapshot_dirty_ranges_contain_row(*catchup_snapshot, 0),
+        "surface no-draw capture keeps the cleared row dirty; rendered-basis reset "
+        "would drop row 0");
+    ok &= check(snapshot_dirty_ranges_contain_row(*catchup_snapshot, 1),
+        "surface no-draw capture marks the follow-up text row dirty");
+
+    return ok;
+}
+
 bool test_surface_session_single_drain_coalesces_dirty_rows(QGuiApplication& app)
 {
     bool ok = true;
@@ -2644,87 +2769,6 @@ bool test_surface_session_single_drain_coalesces_dirty_rows(QGuiApplication& app
         term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
     ok &= check(render_stats.text_content_rebuilds >= 3,
         "surface single-drain dirty coalescing rebuilds all skipped changed rows");
-
-    return ok;
-}
-
-std::shared_ptr<const term::Terminal_render_snapshot> seam_coalescing_snapshot(
-    std::uint64_t                                       sequence,
-    std::uint64_t                                       row_origin_generation,
-    std::vector<term::Terminal_render_dirty_row_range>  dirty_row_ranges)
-{
-    auto snapshot = std::make_shared<term::Terminal_render_snapshot>();
-    snapshot->grid_size.rows                 = 10;
-    snapshot->grid_size.columns              = 80;
-    snapshot->viewport.active_buffer         = term::Terminal_buffer_id::PRIMARY;
-    snapshot->viewport.visible_rows          = 10;
-    snapshot->viewport.scrollback_rows       = 0;
-    snapshot->viewport.offset_from_tail      = 0;
-    snapshot->metadata.sequence              = sequence;
-    snapshot->metadata.row_origin_generation = row_origin_generation;
-    snapshot->dirty_row_ranges               = std::move(dirty_row_ranges);
-    return snapshot;
-}
-
-bool test_surface_set_render_snapshot_seam_coalesces_on_row_identity(QGuiApplication& app)
-{
-    bool ok = true;
-
-    // The coalescing branch in set_render_snapshot fires when a render update is
-    // already pending and both the stored and the incoming snapshot are non-null.
-    // The first seam call stores a snapshot and (the fixture window is non-null)
-    // marks render_update_pending; the second seam call exercises the branch with
-    // no intervening event pump.
-
-    // Divergent row_origin_generation -> stricter canonical predicate -> full
-    // viewport repaint.
-    {
-        Surface_fixture fixture;
-        pump_events(app);
-
-        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-            fixture.surface,
-            seam_coalescing_snapshot(1U, 3U, {{1, 1}}));
-        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-            fixture.surface,
-            seam_coalescing_snapshot(2U, 4U, {{4, 1}}));
-
-        const std::shared_ptr<const term::Terminal_render_snapshot> coalesced =
-            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-        ok &= check(coalesced != nullptr,
-            "seam divergent row-origin path publishes a coalesced snapshot");
-        if (coalesced != nullptr) {
-            ok &= check(coalesced->dirty_row_ranges.size() == 1U &&
-                coalesced->dirty_row_ranges.front().first_row == 0 &&
-                coalesced->dirty_row_ranges.front().row_count == 10,
-                "seam divergent row-origin path forces a full-viewport dirty range");
-        }
-    }
-
-    // Matching row_origin_generation -> normal coalescing -> union of dirty rows.
-    {
-        Surface_fixture fixture;
-        pump_events(app);
-
-        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-            fixture.surface,
-            seam_coalescing_snapshot(1U, 3U, {{1, 1}}));
-        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-            fixture.surface,
-            seam_coalescing_snapshot(2U, 3U, {{4, 1}}));
-
-        const std::shared_ptr<const term::Terminal_render_snapshot> coalesced =
-            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-        ok &= check(coalesced != nullptr,
-            "seam matching row-origin path publishes a coalesced snapshot");
-        if (coalesced != nullptr) {
-            ok &= check(snapshot_dirty_ranges_contain_row(*coalesced, 1) &&
-                snapshot_dirty_ranges_contain_row(*coalesced, 4) &&
-                !snapshot_dirty_ranges_contain_row(*coalesced, 0) &&
-                !snapshot_dirty_ranges_contain_row(*coalesced, 2),
-                "seam matching row-origin path coalesces to the union of dirty rows");
-        }
-    }
 
     return ok;
 }
@@ -13317,8 +13361,8 @@ int main(int argc, char** argv)
     ok &= test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(app);
     ok &= test_surface_reported_atlas_completion_advances_rendered_publication(app);
     ok &= test_surface_stale_atlas_completion_does_not_advance_rendered_publication(app);
+    ok &= test_surface_qsg_capture_without_draw_preserves_dirty_rows(app);
     ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
-    ok &= test_surface_set_render_snapshot_seam_coalesces_on_row_identity(app);
     ok &= test_osc52_clipboard_write_signal_and_deny(app);
     ok &= test_osc52_clipboard_wrong_duplicate_and_replacement(app);
     ok &= test_osc52_clipboard_late_exit_restart_and_targets(app);
