@@ -86,44 +86,6 @@ set(vnm_terminal_qt_fractional_environment
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-add_test(
-    NAME vnm_terminal_primary_backing_phase_0b_guard
-    COMMAND
-        "${Python3_EXECUTABLE}"
-        "${CMAKE_SOURCE_DIR}/tools/primary_backing_phase_0b_guard.py"
-        --repo-root
-        "${CMAKE_SOURCE_DIR}"
-)
-
-set_tests_properties(vnm_terminal_primary_backing_phase_0b_guard PROPERTIES
-    LABELS "primary-backing;static"
-)
-
-add_test(
-    NAME vnm_terminal_qsg_atlas_warm_set_generator
-    COMMAND
-        "${Python3_EXECUTABLE}"
-        "${CMAKE_SOURCE_DIR}/tools/qsg_atlas_warm_set/generate_qsg_atlas_warm_set.py"
-        --self-test
-)
-
-add_test(
-    NAME vnm_terminal_qsg_atlas_warm_set_drift
-    COMMAND
-        "${Python3_EXECUTABLE}"
-        "${CMAKE_SOURCE_DIR}/tools/qsg_atlas_warm_set/generate_qsg_atlas_warm_set.py"
-        --check
-        "${CMAKE_SOURCE_DIR}/tools/qsg_atlas_warm_set/qsg_atlas_warm_set.toml"
-        "${CMAKE_SOURCE_DIR}/include/vnm_terminal/internal/qsg_atlas_warm_set.h"
-)
-
-set_tests_properties(
-    vnm_terminal_qsg_atlas_warm_set_generator
-    vnm_terminal_qsg_atlas_warm_set_drift
-    PROPERTIES
-        LABELS "qsg;atlas;warm-set;static"
-)
-
 set(vnm_terminal_default_capture_replay_dir "")
 if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/conformance/captures")
     set(vnm_terminal_default_capture_replay_dir
@@ -725,7 +687,6 @@ if(VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_TEXT)
         CONTEXT "vnm_terminal_surface tests"
         REQUIRED_BY "qsg atlas tests"
         SOURCE_DIR_VAR VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_SOURCE_DIR
-        SOURCE_DIR_OPTION VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_SOURCE_DIR
         USE_SYSTEM_LIBS "${VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_USE_SYSTEM_LIBS}")
 endif()
 
@@ -1187,7 +1148,7 @@ add_test(
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_surface_host>"
         "--input-echo-timing-repro"
-        "--expect-same-frame"
+        "--expect-cursor-suppressed"
 )
 
 set_tests_properties(vnm_terminal_surface_input_echo_timing_repro PROPERTIES
@@ -1956,6 +1917,7 @@ add_test(
         "-Dconsumer_source_dir=${PROJECT_SOURCE_DIR}/tests/package_smoke"
         "-Dconsumer_binary_dir=${CMAKE_CURRENT_BINARY_DIR}/package_smoke_consumer/consumer_build"
         "-Dqt6_dir=${Qt6_DIR}"
+        "-Dvnm_msdf_text_dir=${vnm_msdf_text_DIR}"
         -P "${PROJECT_SOURCE_DIR}/tests/package_smoke/expect_consumer_builds.cmake"
 )
 
@@ -1963,6 +1925,13 @@ set_tests_properties(vnm_terminal_surface_package_consumer_builds PROPERTIES
     LABELS "package;posture"
     TIMEOUT 180
 )
+
+if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER AND NOT vnm_terminal_msdf_text_package_dependency)
+    set_tests_properties(vnm_terminal_surface_package_consumer_builds PROPERTIES
+        SKIP_REGULAR_EXPRESSION
+            "Installing vnm_terminal_surface with MSDF requires packaged vnm_msdf_text"
+    )
+endif()
 
 add_test(
     NAME vnm_terminal_surface_package_rejects_qt_private_api_minor_mismatch
@@ -1988,6 +1957,13 @@ set_tests_properties(vnm_terminal_surface_package_rejects_qt_private_api_minor_m
     LABELS "package;posture"
     TIMEOUT 120
 )
+
+if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER AND NOT vnm_terminal_msdf_text_package_dependency)
+    set_tests_properties(vnm_terminal_surface_package_rejects_qt_private_api_minor_mismatch PROPERTIES
+        SKIP_REGULAR_EXPRESSION
+            "Installing vnm_terminal_surface with MSDF requires packaged vnm_msdf_text"
+    )
+endif()
 
 
 

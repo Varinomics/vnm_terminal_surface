@@ -386,6 +386,95 @@ std::uint64_t snapshot_sequence(const Captured_atlas_frame& frame)
         : 0U;
 }
 
+bool cursor_position_inside_grid(
+    terminal_grid_position_t position,
+    terminal_grid_size_t     grid_size)
+{
+    return
+        position.row    >= 0 &&
+        position.column >= 0 &&
+        position.row    < grid_size.rows &&
+        position.column < grid_size.columns;
+}
+
+Qsg_atlas_cursor_report captured_snapshot_cursor_report(
+    const Captured_atlas_frame& frame)
+{
+    Qsg_atlas_cursor_report report;
+    if (frame.snapshot == nullptr) {
+        return report;
+    }
+
+    const Terminal_render_cursor& cursor = frame.snapshot->cursor;
+    report.valid  = true;
+    report.visible =
+        cursor.visible &&
+        cursor_position_inside_grid(cursor.position, frame.snapshot->grid_size);
+    report.shape  = cursor.shape;
+    report.row    = cursor.position.row;
+    report.column = cursor.position.column;
+    return report;
+}
+
+Qsg_atlas_cursor_report captured_render_cursor_report(
+    const Captured_atlas_frame& frame)
+{
+    Qsg_atlas_cursor_report report;
+    if (frame.snapshot == nullptr) {
+        return report;
+    }
+
+    const Terminal_render_snapshot& snapshot = *frame.snapshot;
+    report.valid =
+        snapshot.grid_size.rows > 0 &&
+        snapshot.grid_size.columns > 0 &&
+        is_valid_cell_metrics(frame.cell_metrics);
+    report.shape =
+        frame.options.cursor_shape_override.value_or(snapshot.cursor.shape);
+    report.row    = snapshot.cursor.position.row;
+    report.column = snapshot.cursor.position.column;
+    if (!report.valid) {
+        return report;
+    }
+
+    const bool cursor_blink_enabled =
+        frame.options.cursor_blink_enabled_override.value_or(
+            snapshot.cursor.blink_enabled);
+    report.visible =
+        snapshot.cursor.visible                                      &&
+        !frame.options.suppress_cursor                               &&
+        cursor_position_inside_grid(snapshot.cursor.position, snapshot.grid_size) &&
+        (!cursor_blink_enabled || frame.cursor_blink_visible);
+    return report;
+}
+
+Qsg_atlas_cursor_report emitted_cursor_report(
+    const Terminal_render_frame&  frame,
+    terminal_cell_metrics_t       metrics)
+{
+    Qsg_atlas_cursor_report report;
+    report.valid = frame.grid_size.rows > 0 && frame.grid_size.columns > 0;
+    if (frame.cursors.empty() || !is_valid_cell_metrics(metrics)) {
+        return report;
+    }
+
+    const Terminal_render_cursor_primitive& cursor = frame.cursors.front();
+    const QPointF center = cursor.rect.center();
+    const int row = static_cast<int>(std::floor(center.y() / metrics.height));
+    const int column = static_cast<int>(std::floor(center.x() / metrics.width));
+
+    report.visible = true;
+    report.shape   = cursor.kind;
+    report.row     = row;
+    report.column  = column;
+    report.valid   =
+        row    >= 0 &&
+        column >= 0 &&
+        row    < frame.grid_size.rows &&
+        column < frame.grid_size.columns;
+    return report;
+}
+
 QRhiGraphicsPipeline::TargetBlend atlas_blend()
 {
     QRhiGraphicsPipeline::TargetBlend blend;
@@ -3970,6 +4059,8 @@ private:
             static_cast<int>(render_frame.text_runs.size());
         summary.frame_overlay_rects       =
             static_cast<int>(render_frame.overlay_rects.size());
+        summary.emitted_cursor            =
+            emitted_cursor_report(render_frame, m_frame.cell_metrics);
         summary.frame_row_descriptors     =
             static_cast<int>(render_frame.row_descriptors.size());
         summary.frame_layer_descriptors   =
@@ -4227,6 +4318,7 @@ private:
             key,
             options.cursor_blink_enabled_override.has_value() &&
                 *options.cursor_blink_enabled_override);
+        append_key_bool(key, options.suppress_cursor);
         append_key_bool(key, options.visual_bell_enabled);
         append_key_bool(key, options.underline_hyperlinks);
         append_key_int(key, static_cast<int>(options.text_renderer_policy));
@@ -7479,6 +7571,8 @@ void Qsg_atlas_recorder::record_capture(const Captured_atlas_frame& frame)
     m_report.captured_font_epoch        = frame.font_epoch;
     m_report.captured_diagnostic_color       = frame_diagnostic_color;
     m_report.captured_light_options     = frame_light_options;
+    m_report.captured_snapshot_cursor   = captured_snapshot_cursor_report(frame);
+    m_report.captured_render_cursor     = captured_render_cursor_report(frame);
 }
 
 void Qsg_atlas_recorder::record_prepare(

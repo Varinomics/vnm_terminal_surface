@@ -27,6 +27,7 @@
 #include <QTemporaryDir>
 #include <QVariant>
 #include <QWheelEvent>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -411,6 +412,33 @@ std::optional<term::Qsg_atlas_frame_report> capture_next_surface_frame(
     }
 
     return std::nullopt;
+}
+
+struct Surface_frame_attempt
+{
+    bool                         valid = false;
+    term::Qsg_atlas_frame_report report;
+};
+
+Surface_frame_attempt capture_surface_frame_attempt(
+    QGuiApplication&       app,
+    QQuickWindow&          window,
+    VNM_TerminalSurface&   surface)
+{
+    surface.update();
+    window.requestUpdate();
+    pump_events(app, 1);
+
+    const QImage image = window.grabWindow();
+    const term::terminal_renderer_stats_t renderer_stats =
+        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+    Surface_frame_attempt attempt;
+    attempt.valid =
+        !image.isNull() &&
+        renderer_stats.text_content_failures == 0;
+    attempt.report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    return attempt;
 }
 
 bool capture_surface_sequence(
@@ -1479,7 +1507,7 @@ bool test_surface_polish_drains_queued_backend_output_before_render_capture(QGui
 enum class Input_echo_timing_expectation
 {
     RACE_EXPOSED,
-    SAME_FRAME,
+    CURSOR_SUPPRESSED,
 };
 
 bool test_surface_input_echo_after_polish_timing_repro(
@@ -1489,6 +1517,7 @@ bool test_surface_input_echo_after_polish_timing_repro(
     bool ok = true;
     Surface_fixture fixture;
     pump_events(app);
+    fixture.surface.set_cursor_blink_enabled(false);
 
     auto backend = std::make_unique<Scripted_backend>();
     backend->outputs_during_start = {QByteArrayLiteral("\x1b[1;1Hecho-timing-ready")};
@@ -1521,24 +1550,18 @@ bool test_surface_input_echo_after_polish_timing_repro(
         baseline_snapshot->metadata.sequence),
         "input echo timing repro captures baseline");
 
-    backend_ptr->emit_output(QByteArrayLiteral("\x1b[2;1Hecho> "));
-    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
-        fixture.surface);
-    const std::shared_ptr<const term::Terminal_render_snapshot> pending_snapshot =
-        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(pending_snapshot != nullptr &&
-        pending_snapshot->metadata.sequence > baseline_snapshot->metadata.sequence &&
-        snapshot_contains_text(*pending_snapshot, QStringLiteral("echo>")) &&
-        !snapshot_contains_text(*pending_snapshot, QStringLiteral("echo> x")),
-        "input echo timing repro creates a pending pre-echo prompt snapshot");
-    if (pending_snapshot == nullptr) {
-        return ok;
-    }
-
-    const term::Terminal_surface_render_invalidation_stats_t pending_stats =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    ok &= check(pending_stats.pending_update,
-        "input echo timing repro leaves the prompt snapshot pending for frame capture");
+    backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b[2;1Hecho> "));
+    backend_ptr->join_worker();
+    const std::size_t queued_callback_count =
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface);
+    const std::uint64_t queued_callback_epoch =
+        term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
+            fixture.surface);
+    ok &= check(queued_callback_count > 0U,
+        "input echo timing repro queues backend output before keypress");
+    ok &= check(queued_callback_epoch != 0U,
+        "input echo timing repro records a queued callback epoch before keypress");
 
     ok &= send_key_and_expect_write(
         fixture.surface,
@@ -1548,6 +1571,22 @@ bool test_surface_input_echo_after_polish_timing_repro(
         QStringLiteral("x"),
         QByteArrayLiteral("x"),
         "input echo timing repro accepts and writes the user key");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> pending_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(pending_snapshot != nullptr &&
+        pending_snapshot->metadata.sequence > baseline_snapshot->metadata.sequence &&
+        snapshot_contains_text(*pending_snapshot, QStringLiteral("echo>")) &&
+        !snapshot_contains_text(*pending_snapshot, QStringLiteral("echo> x")),
+        "input echo timing repro drains queued pre-key output into a pending pre-echo snapshot");
+    if (pending_snapshot == nullptr) {
+        return ok;
+    }
+
+    const term::Terminal_surface_render_invalidation_stats_t pending_stats =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+    ok &= check(pending_stats.pending_update,
+        "input echo timing repro leaves the prompt snapshot pending for frame capture");
 
     term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
     const std::shared_ptr<const term::Terminal_render_snapshot> polished_snapshot =
@@ -1562,14 +1601,10 @@ bool test_surface_input_echo_after_polish_timing_repro(
 
     const term::Qsg_atlas_frame_report report_before_first_frame =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
-    const std::uint64_t deferrals_before_first_frame =
+    const std::uint64_t old_node_avoids_before_first_frame =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(
-            fixture.surface).backend_callback_frame_deferrals;
+            fixture.surface).input_stale_old_node_frames_avoided;
     std::atomic<bool> echo_injected{false};
-    std::atomic<std::uint64_t> echo_callback_epoch{0U};
-    std::atomic<bool> post_echo_callback_injected{false};
-    std::atomic<std::uint64_t> echo_snapshot_sequence_before_post_echo_callback{0U};
-    std::atomic<std::uint64_t> deferrals_before_post_echo_callback{0U};
     const QMetaObject::Connection echo_connection = QObject::connect(
         &fixture.window,
         &QQuickWindow::beforeSynchronizing,
@@ -1577,95 +1612,75 @@ bool test_surface_input_echo_after_polish_timing_repro(
         [&] {
             if (!echo_injected.exchange(true)) {
                 backend_ptr->emit_output(QByteArrayLiteral("x"));
-                echo_callback_epoch.store(
-                    term::VNM_TerminalSurface_render_bridge::backend_callback_enqueue_epoch(
-                        fixture.surface),
-                    std::memory_order_release);
-                return;
-            }
-
-            const std::uint64_t target_epoch =
-                echo_callback_epoch.load(std::memory_order_acquire);
-            const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
-                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-            if (expectation == Input_echo_timing_expectation::SAME_FRAME &&
-                !post_echo_callback_injected.load(std::memory_order_acquire) &&
-                target_epoch != 0U &&
-                snapshot != nullptr &&
-                snapshot->metadata.backend_callback_epoch >= target_epoch)
-            {
-                echo_snapshot_sequence_before_post_echo_callback.store(
-                    snapshot->metadata.sequence,
-                    std::memory_order_release);
-                const std::uint64_t deferrals =
-                    term::VNM_TerminalSurface_render_bridge::invalidation_stats(
-                        fixture.surface).backend_callback_frame_deferrals;
-                deferrals_before_post_echo_callback.store(
-                    deferrals,
-                    std::memory_order_release);
-                if (!post_echo_callback_injected.exchange(true)) {
-                    backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;post-echo-title\a"));
-                }
             }
         },
         Qt::DirectConnection);
 
-    const std::optional<term::Qsg_atlas_frame_report> first_frame_report =
-        capture_next_surface_frame(
-            app,
-            fixture.window,
-            fixture.surface,
-            report_before_first_frame.capture_count);
+    std::optional<term::Qsg_atlas_frame_report> first_frame_report;
+    Surface_frame_attempt first_frame_attempt;
+    if (expectation == Input_echo_timing_expectation::CURSOR_SUPPRESSED) {
+        first_frame_attempt =
+            capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+    }
+    else
+    {
+        first_frame_report =
+            capture_next_surface_frame(
+                app,
+                fixture.window,
+                fixture.surface,
+                report_before_first_frame.capture_count);
+    }
     QObject::disconnect(echo_connection);
 
     ok &= check(echo_injected.load(),
         "input echo timing repro injects echo after polish and before frame sync");
-    ok &= check(first_frame_report.has_value(),
-        "input echo timing repro captures the first post-input frame");
-    if (!first_frame_report.has_value()) {
-        return ok;
-    }
-
-    const bool first_frame_used_pre_echo_snapshot =
-        first_frame_report->captured_snapshot_sequence ==
-            polished_snapshot->metadata.sequence;
     if (expectation == Input_echo_timing_expectation::RACE_EXPOSED) {
+        ok &= check(first_frame_report.has_value(),
+            "input echo timing repro captures the first post-input frame");
+        if (!first_frame_report.has_value()) {
+            return ok;
+        }
+
         ok &= check_uint64_equal(
             first_frame_report->captured_snapshot_sequence,
             polished_snapshot->metadata.sequence,
             "input echo timing repro first frame captures the pre-echo snapshot");
-    }
-    else {
         ok &= check(
-            !first_frame_used_pre_echo_snapshot,
-            "input echo timing repro first frame must not capture the pre-echo snapshot");
-        const term::Terminal_surface_render_invalidation_stats_t deferral_stats =
+            first_frame_report->captured_render_cursor.visible &&
+            first_frame_report->captured_render_cursor.column ==
+                polished_snapshot->cursor.position.column,
+            "input echo timing repro race exposes the stale cursor column");
+    }
+    else
+    {
+        ok &= check(first_frame_attempt.valid,
+            "input echo timing repro observes the first post-input frame attempt");
+        if (!first_frame_attempt.valid) {
+            return ok;
+        }
+
+        const term::Qsg_atlas_frame_report& first_report =
+            first_frame_attempt.report;
+        const term::Terminal_surface_render_invalidation_stats_t stale_frame_stats =
             term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-        ok &= check(deferral_stats.backend_callback_frame_deferrals >
-                deferrals_before_first_frame,
-            "input echo timing repro defers stale capture without a catch-up delay");
-        ok &= check(post_echo_callback_injected.load(std::memory_order_acquire),
-            "input echo timing repro injects a later callback after the echo snapshot is fresh");
-        const std::uint64_t deferrals_before_post_echo =
-            deferrals_before_post_echo_callback.load(std::memory_order_acquire);
-        ok &= check(deferrals_before_post_echo != 0U,
-            "input echo timing repro records deferrals before the later callback");
-        if (deferrals_before_post_echo != 0U) {
-            ok &= check_uint64_equal(
-                deferral_stats.backend_callback_frame_deferrals,
-                deferrals_before_post_echo,
-                "input echo timing repro does not defer after the echo snapshot is fresh");
-        }
-        const std::uint64_t echo_snapshot_sequence_before_post_echo =
-            echo_snapshot_sequence_before_post_echo_callback.load(std::memory_order_acquire);
-        ok &= check(echo_snapshot_sequence_before_post_echo != 0U,
-            "input echo timing repro records the fresh echo snapshot before the later callback");
-        if (echo_snapshot_sequence_before_post_echo != 0U) {
-            ok &= check_uint64_equal(
-                first_frame_report->captured_snapshot_sequence,
-                echo_snapshot_sequence_before_post_echo,
-                "input echo timing repro captures the fresh echo snapshot despite later callback");
-        }
+        ok &= check(stale_frame_stats.input_stale_old_node_frames_avoided >
+                old_node_avoids_before_first_frame,
+            "input echo timing repro avoids old-node presentation for stale input");
+        ok &= check_uint64_equal(
+            first_report.captured_snapshot_sequence,
+            polished_snapshot->metadata.sequence,
+            "input echo timing repro captures the pre-echo snapshot as a cursor-hidden frame");
+        ok &= check(first_report.capture_count > report_before_first_frame.capture_count,
+            "input echo timing repro captures a new cursor-hidden stale frame");
+        ok &= check_uint64_equal(
+            first_report.captured_snapshot_cursor.column,
+            polished_snapshot->cursor.position.column,
+            "input echo timing repro evidence records the stale snapshot cursor column");
+        ok &= check(
+            first_report.captured_snapshot_cursor.visible &&
+            !first_report.captured_render_cursor.visible,
+            "input echo timing repro suppresses the stale snapshot cursor in the emitted frame");
     }
 
     ok &= check(pump_until(app, [&] {
@@ -1690,12 +1705,35 @@ bool test_surface_input_echo_after_polish_timing_repro(
 
     const term::Qsg_atlas_frame_report report_before_catchup_frame =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+    const std::uint64_t deferrals_before_catchup_frame =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals;
+    std::atomic<bool> post_echo_callback_injected{false};
+    const QMetaObject::Connection post_echo_connection = QObject::connect(
+        &fixture.window,
+        &QQuickWindow::beforeSynchronizing,
+        &fixture.window,
+        [&] {
+            if (!post_echo_callback_injected.exchange(true)) {
+                backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;post-echo-title\a"));
+            }
+        },
+        Qt::DirectConnection);
     const std::optional<term::Qsg_atlas_frame_report> catchup_frame_report =
         capture_next_surface_frame(
             app,
             fixture.window,
             fixture.surface,
             report_before_catchup_frame.capture_count);
+    QObject::disconnect(post_echo_connection);
+    ok &= check(post_echo_callback_injected.load(std::memory_order_acquire),
+        "input echo timing repro injects a later callback after the echo snapshot is fresh");
+    const term::Terminal_surface_render_invalidation_stats_t catchup_deferral_stats =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+    ok &= check_uint64_equal(
+        catchup_deferral_stats.backend_callback_frame_deferrals,
+        deferrals_before_catchup_frame,
+        "input echo timing repro does not defer after the echo snapshot is fresh");
     ok &= check(catchup_frame_report.has_value(),
         "input echo timing repro captures a catch-up frame");
     if (catchup_frame_report.has_value()) {
@@ -1703,7 +1741,233 @@ bool test_surface_input_echo_after_polish_timing_repro(
             catchup_frame_report->captured_snapshot_sequence,
             echo_snapshot->metadata.sequence,
             "input echo timing repro next frame captures the echoed input snapshot");
+        ok &= check(
+            catchup_frame_report->captured_render_cursor.visible &&
+            catchup_frame_report->captured_render_cursor.column ==
+                echo_snapshot->cursor.position.column,
+            "input echo timing repro catch-up frame emits the fresh cursor column");
     }
+
+    return ok;
+}
+
+bool test_surface_no_echo_input_keeps_cursor_visible(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+    fixture.surface.set_cursor_blink_enabled(false);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("\x1b[1;1Hsecret> ")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "no-echo cursor visibility surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("secret>")),
+        "no-echo cursor visibility publishes baseline prompt");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "no-echo cursor visibility captures baseline prompt");
+
+    const term::Terminal_surface_render_invalidation_stats_t stats_before =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+    ok &= check(!term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
+            fixture.surface),
+        "no-echo cursor visibility starts without queued backend callbacks");
+
+    ok &= send_key_and_expect_write(
+        fixture.surface,
+        *backend_ptr,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        QByteArrayLiteral("x"),
+        "no-echo cursor visibility accepts and writes printable input");
+
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+    ok &= check(frame_attempt.valid,
+        "no-echo cursor visibility observes a post-input frame attempt");
+    if (!frame_attempt.valid) {
+        return ok;
+    }
+
+    ok &= check_uint64_equal(
+        frame_attempt.report.captured_snapshot_sequence,
+        baseline_snapshot->metadata.sequence,
+        "no-echo cursor visibility keeps the baseline snapshot");
+    ok &= check(
+        frame_attempt.report.captured_render_cursor.visible &&
+        frame_attempt.report.captured_render_cursor.column ==
+            baseline_snapshot->cursor.position.column,
+        "no-echo cursor visibility keeps the terminal cursor visible");
+
+    const term::Terminal_surface_render_invalidation_stats_t stats_after =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+    ok &= check_uint64_equal(
+        stats_after.input_stale_cursor_suppressed_frames,
+        stats_before.input_stale_cursor_suppressed_frames,
+        "no-echo cursor visibility does not suppress a stale cursor");
+    ok &= check_uint64_equal(
+        stats_after.input_stale_old_node_frames_avoided,
+        stats_before.input_stale_old_node_frames_avoided,
+        "no-echo cursor visibility does not avoid old-node presentation");
+
+    return ok;
+}
+
+bool test_surface_held_deferral_coalesces_skipped_dirty_rows(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral(
+        "\x1b[1;1Hhold-row-zero-old\x1b[2;1Hhold-row-one-old")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "held deferral dirty coalescing surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_row_text(*baseline_snapshot, 0).contains(QStringLiteral("hold-row-zero-old")) &&
+        snapshot_row_text(*baseline_snapshot, 1).contains(QStringLiteral("hold-row-one-old")),
+        "held deferral dirty coalescing publishes baseline rows");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "held deferral dirty coalescing captures baseline");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[1;1Hhold-row-zero-new"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> first_dirty_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(first_dirty_snapshot != nullptr &&
+        first_dirty_snapshot->metadata.sequence > baseline_snapshot->metadata.sequence &&
+        snapshot_row_text(*first_dirty_snapshot, 0).contains(QStringLiteral("hold-row-zero-new")) &&
+        snapshot_row_text(*first_dirty_snapshot, 1).contains(QStringLiteral("hold-row-one-old")),
+        "held deferral dirty coalescing publishes first dirty row before capture");
+    if (first_dirty_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(snapshot_dirty_ranges_contain_row(*first_dirty_snapshot, 0),
+        "held deferral dirty coalescing first snapshot marks row zero dirty");
+
+    const term::Qsg_atlas_frame_report report_before_held_frame =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+    const std::uint64_t deferrals_before_held_frame =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
+            fixture.surface).backend_callback_frame_deferrals;
+    std::atomic<bool> second_dirty_injected{false};
+    const QMetaObject::Connection second_dirty_connection = QObject::connect(
+        &fixture.window,
+        &QQuickWindow::beforeSynchronizing,
+        &fixture.window,
+        [&] {
+            if (!second_dirty_injected.exchange(true)) {
+                backend_ptr->emit_output(QByteArrayLiteral("\x1b[2;1Hhold-row-one-new"));
+            }
+        },
+        Qt::DirectConnection);
+
+    const Surface_frame_attempt held_attempt =
+        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+    QObject::disconnect(second_dirty_connection);
+    ok &= check(second_dirty_injected.load(std::memory_order_acquire),
+        "held deferral dirty coalescing injects second dirty row after frame boundary");
+    ok &= check(held_attempt.valid,
+        "held deferral dirty coalescing observes the held frame attempt");
+    ok &= check_uint64_equal(
+        held_attempt.report.capture_count,
+        report_before_held_frame.capture_count,
+        "held deferral dirty coalescing holds the previous QSG capture");
+    const term::Terminal_surface_render_invalidation_stats_t held_stats =
+        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
+    ok &= check(held_stats.backend_callback_frame_deferrals >
+            deferrals_before_held_frame,
+        "held deferral dirty coalescing records a stale-frame deferral");
+
+    ok &= check(pump_until(app, [&] {
+        const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        return
+            snapshot != nullptr &&
+            snapshot->metadata.sequence > first_dirty_snapshot->metadata.sequence &&
+            snapshot_row_text(*snapshot, 1).contains(QStringLiteral("hold-row-one-new"));
+    }),
+        "held deferral dirty coalescing publishes the catch-up row");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> catchup_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(catchup_snapshot != nullptr &&
+        snapshot_row_text(*catchup_snapshot, 0).contains(QStringLiteral("hold-row-zero-new")) &&
+        snapshot_row_text(*catchup_snapshot, 1).contains(QStringLiteral("hold-row-one-new")),
+        "held deferral dirty coalescing catch-up snapshot has both changed rows");
+    if (catchup_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(snapshot_dirty_ranges_contain_row(*catchup_snapshot, 0) &&
+        snapshot_dirty_ranges_contain_row(*catchup_snapshot, 1),
+        "held deferral dirty coalescing catch-up snapshot keeps both dirty rows");
+
+    const term::Qsg_atlas_frame_report report_before_catchup_frame =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+    const std::optional<term::Qsg_atlas_frame_report> catchup_frame_report =
+        capture_next_surface_frame(
+            app,
+            fixture.window,
+            fixture.surface,
+            report_before_catchup_frame.capture_count);
+    ok &= check(catchup_frame_report.has_value(),
+        "held deferral dirty coalescing captures catch-up frame");
+    if (catchup_frame_report.has_value()) {
+        ok &= check_uint64_equal(
+            catchup_frame_report->captured_snapshot_sequence,
+            catchup_snapshot->metadata.sequence,
+            "held deferral dirty coalescing catch-up frame captures coalesced snapshot");
+    }
+    const term::terminal_renderer_stats_t render_stats =
+        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    ok &= check(render_stats.text_content_rebuilds >= 2,
+        "held deferral dirty coalescing rebuilds both changed text rows");
 
     return ok;
 }
@@ -12848,21 +13112,24 @@ int main(int argc, char** argv)
     if (arguments.contains(QStringLiteral("--input-echo-timing-repro"))) {
         const bool expect_race =
             arguments.contains(QStringLiteral("--expect-race"));
-        const bool expect_same_frame =
-            arguments.contains(QStringLiteral("--expect-same-frame"));
-        if (expect_race == expect_same_frame) {
+        const bool expect_cursor_suppressed =
+            arguments.contains(QStringLiteral("--expect-cursor-suppressed"));
+        if (expect_race == expect_cursor_suppressed) {
             std::cerr << "FAIL: choose exactly one of --expect-race or "
-                "--expect-same-frame for --input-echo-timing-repro\n";
+                "--expect-cursor-suppressed for --input-echo-timing-repro\n";
             return 2;
         }
 
         const Input_echo_timing_expectation expectation =
             expect_race
                 ? Input_echo_timing_expectation::RACE_EXPOSED
-                : Input_echo_timing_expectation::SAME_FRAME;
-        return test_surface_input_echo_after_polish_timing_repro(app, expectation)
-            ? 0
-            : 1;
+                : Input_echo_timing_expectation::CURSOR_SUPPRESSED;
+        bool ok = test_surface_input_echo_after_polish_timing_repro(app, expectation);
+        if (expectation == Input_echo_timing_expectation::CURSOR_SUPPRESSED) {
+            ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
+            ok &= test_surface_held_deferral_coalesces_skipped_dirty_rows(app);
+        }
+        return ok ? 0 : 1;
     }
 
     bool ok = true;
@@ -12870,6 +13137,11 @@ int main(int argc, char** argv)
     ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
     ok &= test_surface_session_lazy_composer_exercise_remains_opt_in(app);
     ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
+    ok &= test_surface_input_echo_after_polish_timing_repro(
+        app,
+        Input_echo_timing_expectation::CURSOR_SUPPRESSED);
+    ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
+    ok &= test_surface_held_deferral_coalesces_skipped_dirty_rows(app);
     ok &= test_surface_backend_drain_metrics_split_stages(app);
     ok &= test_surface_posted_backend_drain_uses_frame_pending_small_budget(app);
     ok &= test_surface_epoch_catchup_uses_frame_budget_override(app);

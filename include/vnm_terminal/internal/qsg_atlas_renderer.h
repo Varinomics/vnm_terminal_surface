@@ -136,6 +136,15 @@ struct Glyph_coverage_counts
     int missed_images      = 0;
 };
 
+struct Qsg_atlas_cursor_report
+{
+    bool                  valid   = false;
+    bool                  visible = false;
+    Terminal_cursor_shape shape   = Terminal_cursor_shape::BLOCK;
+    int                   row     = -1;
+    int                   column  = -1;
+};
+
 struct Qsg_atlas_glyph_image_diagnostic
 {
     Glyph_coverage_kind      coverage_kind =
@@ -276,6 +285,7 @@ struct Qsg_atlas_frame_build_summary
     int                              first_text_logical_row = 0;
     std::uint64_t                    first_text_retained_line_id = 0U;
     std::uint64_t                    first_text_content_generation = 0U;
+    Qsg_atlas_cursor_report          emitted_cursor;
     bool                             selection_provenance_valid = false;
     bool                             full_dirty_range          = false;
     bool                             public_projection_full_repaint = false;
@@ -676,6 +686,10 @@ struct Qsg_atlas_frame_report
     bool          first_captured_light_options    = false;
     bool          first_render_light_options      = false;
     bool          render_light_options            = false;
+    Qsg_atlas_cursor_report
+                  captured_snapshot_cursor;
+    Qsg_atlas_cursor_report
+                  captured_render_cursor;
     bool          command_buffer_non_null         = false;
     bool          render_target_non_null          = false;
     bool          rhi_non_null                    = false;

@@ -516,6 +516,17 @@ void insert_renderer_frame_stats(
     object.insert(QStringLiteral("simple_content"), simple_content);
 }
 
+QJsonObject atlas_cursor_report_json(const internal::Qsg_atlas_cursor_report& report)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("valid"), report.valid);
+    object.insert(QStringLiteral("visible"), report.visible);
+    object.insert(QStringLiteral("shape"), static_cast<int>(report.shape));
+    object.insert(QStringLiteral("row"), report.row);
+    object.insert(QStringLiteral("column"), report.column);
+    return object;
+}
+
 QJsonObject qsg_atlas_metrics_json(const internal::Qsg_atlas_frame_report& report)
 {
     QJsonObject object;
@@ -553,6 +564,15 @@ QJsonObject qsg_atlas_metrics_json(const internal::Qsg_atlas_frame_report& repor
     object.insert(QStringLiteral("coverage_texture_created"), report.coverage_texture_created);
     object.insert(QStringLiteral("coverage_upload_recorded"), report.coverage_upload_recorded);
     object.insert(QStringLiteral("raw_font_rasterized"), report.raw_font_rasterized);
+    object.insert(
+        QStringLiteral("captured_snapshot_cursor"),
+        atlas_cursor_report_json(report.captured_snapshot_cursor));
+    object.insert(
+        QStringLiteral("captured_render_cursor"),
+        atlas_cursor_report_json(report.captured_render_cursor));
+    object.insert(
+        QStringLiteral("emitted_cursor"),
+        atlas_cursor_report_json(report.frame_build.emitted_cursor));
     detail::emit_metrics_json(object, report, detail::atlas_report_rasterization_metrics());
     insert_json_counter(
         object,
@@ -983,6 +1003,14 @@ void append_render_invalidation_metrics_json(
         out,
         "backend_callback_frame_deferrals",
         stats.backend_callback_frame_deferrals);
+    insert_json_counter(
+        out,
+        "input_stale_cursor_suppressed_frames",
+        stats.input_stale_cursor_suppressed_frames);
+    insert_json_counter(
+        out,
+        "input_stale_old_node_frames_avoided",
+        stats.input_stale_old_node_frames_avoided);
     insert_json_counter(
         out,
         "backend_callback_event_epoch",

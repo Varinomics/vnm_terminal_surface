@@ -583,7 +583,11 @@ private:
     void drain_backend_callback_events_for_posted_work();
     void queue_backend_callback_drain();
     void refresh_active_session_geometry();
-    void sync_after_user_input(bool input_accepted);
+    void sync_after_user_input(
+        const vnm_terminal::internal::Terminal_session_result&
+                               result,
+        std::uint64_t          pre_input_backend_callback_epoch,
+        bool                   pre_input_backend_activity);
     void sync_from_session(bool deliver_notifications = true);
     void sync_synchronized_output_recovery_timer();
     void handle_synchronized_output_recovery_timeout();

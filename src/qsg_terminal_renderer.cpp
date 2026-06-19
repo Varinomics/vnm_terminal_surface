@@ -1679,6 +1679,7 @@ void append_frame_key_render_options(
         key,
         options.cursor_blink_enabled_override.has_value() &&
             *options.cursor_blink_enabled_override);
+    append_frame_key_bool(key, options.suppress_cursor);
     append_frame_key_bool(key, options.visual_bell_enabled);
     append_frame_key_bool(key, options.underline_hyperlinks);
     append_frame_key_int(key, static_cast<int>(options.text_renderer_policy));
@@ -2260,6 +2261,7 @@ Terminal_render_frame build_terminal_render_frame(
         options.cursor_blink_enabled_override.value_or(snapshot->cursor.blink_enabled);
     const bool cursor_visible =
         cursor_in_grid && snapshot->cursor.visible &&
+        !options.suppress_cursor &&
         (!cursor_blink_enabled || cursor_blink_visible);
     const bool use_visible_line_provenance =
         render_snapshot_visible_line_provenance_is_valid(*snapshot);

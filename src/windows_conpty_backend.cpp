@@ -39,6 +39,8 @@ namespace vnm_terminal::internal {
 
 namespace {
 
+constexpr std::chrono::milliseconds k_conpty_reader_close_grace(1000);
+
 DWORD wait_timeout_from_interval(std::chrono::milliseconds interval)
 {
     if (interval <= std::chrono::milliseconds(0)) {
@@ -57,15 +59,6 @@ DWORD wait_timeout_from_interval(std::chrono::milliseconds interval)
 bool process_exited_within(HANDLE process, std::chrono::milliseconds interval)
 {
     return WaitForSingleObject(process, wait_timeout_from_interval(interval)) == WAIT_OBJECT_0;
-}
-
-HANDLE thread_handle_for_cancel(std::thread& thread)
-{
-#if defined(__MINGW32__)
-    return reinterpret_cast<HANDLE>(thread.native_handle());
-#else
-    return thread.native_handle();
-#endif
 }
 
 class Unique_handle
@@ -123,6 +116,61 @@ public:
 private:
     HANDLE m_handle = nullptr;
 };
+
+Unique_handle duplicate_handle(HANDLE source)
+{
+    if (source == nullptr || source == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+
+    HANDLE duplicate = nullptr;
+    if (!DuplicateHandle(
+            GetCurrentProcess(),
+            source,
+            GetCurrentProcess(),
+            &duplicate,
+            0,
+            FALSE,
+            DUPLICATE_SAME_ACCESS))
+    {
+        return {};
+    }
+
+    return Unique_handle(duplicate);
+}
+
+Unique_handle duplicate_current_thread_handle()
+{
+    return duplicate_handle(GetCurrentThread());
+}
+
+struct Job_object_create_result
+{
+    Unique_handle handle;
+    QString       failed_operation;
+    DWORD         error_code = ERROR_SUCCESS;
+};
+
+Job_object_create_result create_process_tree_job()
+{
+    Unique_handle job(CreateJobObjectW(nullptr, nullptr));
+    if (!job) {
+        return {{}, QStringLiteral("CreateJobObjectW"), GetLastError()};
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (!SetInformationJobObject(
+            job.get(),
+            JobObjectExtendedLimitInformation,
+            &limits,
+            sizeof(limits)))
+    {
+        return {{}, QStringLiteral("SetInformationJobObject"), GetLastError()};
+    }
+
+    return {std::move(job), {}, ERROR_SUCCESS};
+}
 
 struct Queued_write
 {
@@ -476,9 +524,22 @@ public:
         std::wstring environment_block =
             environment_block_from_process_environment(effective_config.environment);
 
+        Job_object_create_result process_job_result = create_process_tree_job();
+        if (!process_job_result.handle) {
+            conpty_api->close(local_conpty);
+            return
+                reject_start(
+                    Terminal_backend_error_code::START_FAILED,
+                    windows_error_message(
+                        process_job_result.failed_operation,
+                        process_job_result.error_code));
+        }
+        Unique_handle process_job = std::move(process_job_result.handle);
+
         DWORD creation_flags =
             EXTENDED_STARTUPINFO_PRESENT |
-            CREATE_UNICODE_ENVIRONMENT;
+            CREATE_UNICODE_ENVIRONMENT |
+            CREATE_SUSPENDED;
         if (effective_config.process_group_policy ==
             Terminal_process_group_policy::CREATE_NEW_SESSION)
         {
@@ -514,6 +575,28 @@ public:
         pty_input_read.reset();
         pty_output_write.reset();
 
+        if (!AssignProcessToJobObject(process_job.get(), process_handle.get())) {
+            const DWORD assign_job_error = GetLastError();
+            TerminateProcess(process_handle.get(), 1U);
+            conpty_api->close(local_conpty);
+            return
+                reject_start(
+                    Terminal_backend_error_code::START_FAILED,
+                    windows_error_message(
+                        QStringLiteral("AssignProcessToJobObject"),
+                        assign_job_error));
+        }
+
+        if (ResumeThread(thread_handle.get()) == static_cast<DWORD>(-1)) {
+            const DWORD resume_error = GetLastError();
+            TerminateJobObject(process_job.get(), 1U);
+            conpty_api->close(local_conpty);
+            return
+                reject_start(
+                    Terminal_backend_error_code::START_FAILED,
+                    windows_error_message(QStringLiteral("ResumeThread"), resume_error));
+        }
+
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_api                = *conpty_api;
@@ -521,6 +604,7 @@ public:
             m_callbacks          = std::move(callbacks);
             m_input_write        = std::move(pty_input_write);
             m_output_read        = std::move(pty_output_read);
+            m_process_job        = std::move(process_job);
             m_process            = std::move(process_handle);
             m_running            = true;
             m_start_attempted    = true;
@@ -533,6 +617,8 @@ public:
             m_termination_policy = effective_config.termination_policy;
             m_exit_reason_override.reset();
             m_queued_write_bytes = 0U;
+            m_reader_thread_handle.reset();
+            m_writer_thread_handle.reset();
             m_write_queue.clear();
         }
 
@@ -674,7 +760,8 @@ public:
 
     Terminal_backend_result terminate()
     {
-        HANDLE process = nullptr;
+        HANDLE process     = nullptr;
+        HANDLE process_job = nullptr;
         Terminal_termination_policy policy;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
@@ -685,8 +772,9 @@ public:
                         QStringLiteral("ConPTY terminate requires a running process"));
             }
 
-            process = m_process.get();
-            policy = m_termination_policy;
+            process     = m_process.get();
+            process_job = m_process_job.get();
+            policy      = m_termination_policy;
 
             m_stopping             = true;
             m_output_paused        = false;
@@ -695,29 +783,35 @@ public:
 
         m_output_cv.notify_all();
         m_write_cv.notify_all();
-        cancel_blocking_io();
-        return start_termination_escalation(process, policy);
+        cancel_blocking_input();
+        request_conpty_close();
+        return start_termination_escalation(process, process_job, policy);
     }
 
     Terminal_backend_result start_termination_escalation(
         HANDLE                         process,
+        HANDLE                         process_job,
         Terminal_termination_policy    policy)
     {
         try {
             m_termination_thread = std::thread(
-                [this, process, policy] {
-                    termination_escalation_loop(process, policy);
+                [this, process, process_job, policy] {
+                    termination_escalation_loop(process, process_job, policy);
                 });
         }
         catch (const std::system_error& error) {
             const QString message =
                 QStringLiteral("ConPTY termination escalation worker failed: %1")
                     .arg(QString::fromLocal8Bit(error.what()));
-            if (!TerminateProcess(process, 1U)) {
+            if (!TerminateJobObject(process_job, 1U)) {
+                const DWORD terminate_job_error = GetLastError();
+                TerminateProcess(process, 1U);
                 return
                     backend_reject(
                         Terminal_backend_error_code::TERMINATE_FAILED,
-                        windows_error_message(QStringLiteral("TerminateProcess"), GetLastError()));
+                        windows_error_message(
+                            QStringLiteral("TerminateJobObject"),
+                            terminate_job_error));
             }
 
             return backend_reject(Terminal_backend_error_code::TERMINATE_FAILED, message);
@@ -728,7 +822,8 @@ public:
 
     void shutdown()
     {
-        HANDLE process = nullptr;
+        HANDLE process     = nullptr;
+        HANDLE process_job = nullptr;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_shutdown_started) {
@@ -740,26 +835,41 @@ public:
             m_output_paused    = false;
             m_callbacks        = {};
             process            = m_process.get();
+            process_job        = m_process_job.get();
         }
 
         m_output_cv.notify_all();
         m_write_cv.notify_all();
+        cancel_blocking_input();
+        request_conpty_close();
 
-        if (process != nullptr && process != INVALID_HANDLE_VALUE) {
+        bool process_tree_terminated = false;
+        if (process_job != nullptr && process_job != INVALID_HANDLE_VALUE) {
+            process_tree_terminated = TerminateJobObject(process_job, 1U);
+        }
+
+        if (!process_tree_terminated &&
+            process != nullptr &&
+            process != INVALID_HANDLE_VALUE)
+        {
             DWORD exit_code = 0;
             if (GetExitCodeProcess(process, &exit_code) && exit_code == STILL_ACTIVE) {
                 TerminateProcess(process, 1U);
             }
         }
 
-        cancel_blocking_io();
+        if (!reader_finished_within(k_conpty_reader_close_grace)) {
+            cancel_blocking_io();
+        }
         join_threads();
-        request_conpty_close();
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_input_write.reset();
         m_output_read.reset();
         m_process.reset();
+        m_process_job.reset();
+        m_reader_thread_handle.reset();
+        m_writer_thread_handle.reset();
         m_write_queue.clear();
         m_queued_write_bytes = 0U;
         m_running = false;
@@ -849,6 +959,14 @@ private:
         });
     }
 
+    bool reader_finished_within(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_reader_cv.wait_for(lock, timeout, [&] {
+            return m_reader_finished;
+        });
+    }
+
     void request_conpty_close()
     {
         HPCON conpty = nullptr;
@@ -863,8 +981,24 @@ private:
         close_pseudoconsole_detached(close_conpty_api, conpty);
     }
 
+    void record_reader_thread_handle()
+    {
+        Unique_handle thread_handle = duplicate_current_thread_handle();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_reader_thread_handle = std::move(thread_handle);
+    }
+
+    void record_writer_thread_handle()
+    {
+        Unique_handle thread_handle = duplicate_current_thread_handle();
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_writer_thread_handle = std::move(thread_handle);
+    }
+
     void read_loop()
     {
+        record_reader_thread_handle();
+
         std::vector<char> buffer(k_native_backend_output_read_chunk_bytes);
 
         for (;;) {
@@ -875,11 +1009,10 @@ private:
                     return m_stopping || !m_output_paused;
                 });
 
-                if (m_stopping) {
+                output_read = m_output_read.get();
+                if (output_read == nullptr || output_read == INVALID_HANDLE_VALUE) {
                     break;
                 }
-
-                output_read = m_output_read.get();
             }
 
             DWORD bytes_read = 0U;
@@ -916,6 +1049,8 @@ private:
 
     void write_loop()
     {
+        record_writer_thread_handle();
+
         for (;;) {
             Queued_write write;
             {
@@ -1084,22 +1219,32 @@ private:
         }
         m_output_cv.notify_all();
         request_conpty_close();
-        wait_for_reader_finished();
+        if (!reader_finished_within(k_conpty_reader_close_grace)) {
+            cancel_blocking_io();
+            wait_for_reader_finished();
+        }
         report_exit_once(Terminal_exit_reason::EXITED, static_cast<int>(exit_code));
+        terminate_process_tree_after_root_exit();
     }
 
     void termination_escalation_loop(
         HANDLE                         process,
+        HANDLE                         process_job,
         Terminal_termination_policy    policy)
     {
         if (process_exited_within(process, policy.graceful_interval)) {
+            terminate_process_tree_after_root_exit();
             return;
         }
 
-        if (!TerminateProcess(process, 1U)) {
+        if (!TerminateJobObject(process_job, 1U)) {
+            const DWORD terminate_job_error = GetLastError();
+            TerminateProcess(process, 1U);
             report_error(
                 Terminal_backend_error_code::TERMINATE_FAILED,
-                windows_error_message(QStringLiteral("TerminateProcess"), GetLastError()));
+                windows_error_message(
+                    QStringLiteral("TerminateJobObject"),
+                    terminate_job_error));
             return;
         }
 
@@ -1112,6 +1257,23 @@ private:
             QStringLiteral("ConPTY process remained active after forced termination"));
     }
 
+    void terminate_process_tree_after_root_exit()
+    {
+        HANDLE process_job = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            process_job = m_process_job.get();
+        }
+
+        if (process_job != nullptr && process_job != INVALID_HANDLE_VALUE) {
+            if (!TerminateJobObject(process_job, 1U)) {
+                report_error(
+                    Terminal_backend_error_code::TERMINATE_FAILED,
+                    windows_error_message(QStringLiteral("TerminateJobObject"), GetLastError()));
+            }
+        }
+    }
+
     bool stopping()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1120,12 +1282,51 @@ private:
 
     void cancel_blocking_io()
     {
-        if (m_reader_thread.joinable()) {
-            CancelSynchronousIo(thread_handle_for_cancel(m_reader_thread));
+        Unique_handle output_read;
+        Unique_handle input_write;
+        Unique_handle reader_thread;
+        Unique_handle writer_thread;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            output_read   = duplicate_handle(m_output_read.get());
+            input_write   = duplicate_handle(m_input_write.get());
+            reader_thread = duplicate_handle(m_reader_thread_handle.get());
+            writer_thread = duplicate_handle(m_writer_thread_handle.get());
         }
 
-        if (m_writer_thread.joinable()) {
-            CancelSynchronousIo(thread_handle_for_cancel(m_writer_thread));
+        if (output_read) {
+            CancelIoEx(output_read.get(), nullptr);
+        }
+
+        if (input_write) {
+            CancelIoEx(input_write.get(), nullptr);
+        }
+
+        if (reader_thread) {
+            CancelSynchronousIo(reader_thread.get());
+        }
+
+        if (writer_thread) {
+            CancelSynchronousIo(writer_thread.get());
+        }
+    }
+
+    void cancel_blocking_input()
+    {
+        Unique_handle input_write;
+        Unique_handle writer_thread;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            input_write   = duplicate_handle(m_input_write.get());
+            writer_thread = duplicate_handle(m_writer_thread_handle.get());
+        }
+
+        if (input_write) {
+            CancelIoEx(input_write.get(), nullptr);
+        }
+
+        if (writer_thread) {
+            CancelSynchronousIo(writer_thread.get());
         }
     }
 
@@ -1146,7 +1347,10 @@ private:
     HPCON                              m_conpty = nullptr;
     Unique_handle                      m_input_write;
     Unique_handle                      m_output_read;
+    Unique_handle                      m_process_job;
     Unique_handle                      m_process;
+    Unique_handle                      m_reader_thread_handle;
+    Unique_handle                      m_writer_thread_handle;
     std::thread                        m_reader_thread;
     std::thread                        m_writer_thread;
     std::thread                        m_wait_thread;

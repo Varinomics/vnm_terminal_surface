@@ -16,6 +16,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -29,12 +30,14 @@
 #include <thread>
 #include <vector>
 #include <cstddef>
+#include <cwchar>
 
 namespace term = vnm_terminal::internal;
 
 namespace {
 
 constexpr std::chrono::milliseconds k_wait_timeout(10000);
+constexpr std::chrono::milliseconds k_conhost_exit_timeout(1000);
 
 using vnm_terminal::test_helpers::check;
 using vnm_terminal::test_helpers::decode_hex;
@@ -99,6 +102,58 @@ bool wait_for_file(const QString& path)
     while (std::chrono::steady_clock::now() < deadline);
 
     return false;
+}
+
+std::vector<DWORD> current_process_conhost_children()
+{
+    std::vector<DWORD> pids;
+    const DWORD        current_pid = GetCurrentProcessId();
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return pids;
+    }
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (!Process32FirstW(snapshot, &entry)) {
+        CloseHandle(snapshot);
+        return pids;
+    }
+
+    do {
+        if (entry.th32ParentProcessID == current_pid &&
+            std::wcscmp(entry.szExeFile, L"conhost.exe") == 0)
+        {
+            pids.push_back(entry.th32ProcessID);
+        }
+    }
+    while (Process32NextW(snapshot, &entry));
+
+    CloseHandle(snapshot);
+    return pids;
+}
+
+bool wait_for_conhost_children_to_exit(std::string_view test_name)
+{
+    const auto deadline = std::chrono::steady_clock::now() + k_conhost_exit_timeout;
+    std::vector<DWORD> pids;
+    do {
+        pids = current_process_conhost_children();
+        if (pids.empty()) {
+            return true;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    while (std::chrono::steady_clock::now() < deadline);
+
+    std::cerr << "ConPTY test left conhost.exe child processes after "
+        << test_name << ':';
+    for (const DWORD pid : pids) {
+        std::cerr << ' ' << pid;
+    }
+    std::cerr << '\n';
+    return check(false, "ConPTY backend releases conhost child processes");
 }
 
 std::optional<DWORD> parse_pid_after_prefix(
@@ -223,7 +278,10 @@ private:
 Win32_process_handle open_process_handle(DWORD pid)
 {
     return Win32_process_handle(
-        OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+        OpenProcess(
+            SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+            FALSE,
+            pid));
 }
 
 std::optional<bool> process_handle_is_running(HANDLE process)
@@ -275,6 +333,15 @@ std::optional<DWORD> process_exit_code(HANDLE process)
     }
 
     return exit_code;
+}
+
+void terminate_process_if_running(HANDLE process)
+{
+    DWORD exit_code = 0U;
+    if (GetExitCodeProcess(process, &exit_code) && exit_code == STILL_ACTIVE) {
+        (void)TerminateProcess(process, 1U);
+        (void)WaitForSingleObject(process, 5000U);
+    }
 }
 
 std::optional<QByteArray> conpty_observable_output_payload(
@@ -1472,6 +1539,70 @@ bool test_terminate_after_resize_storm_stops_child_process(const QString& fixtur
     return ok;
 }
 
+bool test_close_path_stops_descendant_process(const QString& fixture_path)
+{
+    bool ok = true;
+
+    Backend_capture capture;
+    Win32_process_handle descendant_process;
+    auto destroy_started_at = std::chrono::steady_clock::time_point{};
+    {
+        std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
+        term::Terminal_launch_config config = launch_config(
+            fixture_path,
+            {QStringLiteral("--spawn-hold-open-child-pid-no-read")});
+        config.termination_policy.graceful_interval = std::chrono::milliseconds(0);
+        config.termination_policy.kill_interval     = std::chrono::milliseconds(500);
+
+        const term::Terminal_backend_result start_result =
+            backend->start(config, capture.callbacks());
+        ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+            "close-path descendant fixture starts");
+        if (start_result.code != term::Terminal_backend_result_code::ACCEPTED) {
+            return false;
+        }
+
+        const std::optional<DWORD> descendant_pid =
+            capture.wait_for_pid_output(QByteArrayLiteral("hold-open-child-pid-no-read "));
+        ok &= check(descendant_pid.has_value(),
+            "close-path descendant fixture reports descendant pid");
+        if (!descendant_pid.has_value()) {
+            return false;
+        }
+
+        descendant_process = open_process_handle(*descendant_pid);
+        ok &= check(descendant_process.is_valid(),
+            "close-path descendant process handle opens");
+        if (!descendant_process.is_valid()) {
+            return false;
+        }
+
+        const std::optional<bool> descendant_running =
+            process_handle_is_running(descendant_process.get());
+        ok &= check(descendant_running.has_value() && *descendant_running,
+            "close-path descendant process is alive before terminal teardown");
+
+        const term::Terminal_backend_result terminate_result = backend->terminate();
+        ok &= check(terminate_result.code == term::Terminal_backend_result_code::ACCEPTED,
+            "close-path backend accepts terminate before destruction");
+
+        destroy_started_at = std::chrono::steady_clock::now();
+    }
+    const auto destroy_elapsed = std::chrono::steady_clock::now() - destroy_started_at;
+    ok &= check(
+        destroy_elapsed < std::chrono::milliseconds(2500),
+        "ConPTY close path returns promptly while stopping descendants");
+
+    const bool descendant_exited = wait_for_process_exit(descendant_process.get());
+    if (!descendant_exited) {
+        terminate_process_if_running(descendant_process.get());
+    }
+    ok &= check(descendant_exited,
+        "ConPTY close path stops descendant processes");
+
+    return ok;
+}
+
 bool test_missing_working_directory(const QString& fixture_path)
 {
     bool ok = true;
@@ -1860,24 +1991,40 @@ int main(int argc, char** argv)
     const QString fixture_path = QString::fromLocal8Bit(argv[1]);
 
     bool ok = true;
-    ok &= test_pid_parser_requires_line_delimiter();
-    ok &= test_interactive_canvas_fixture(fixture_path);
-    ok &= test_resize_storm_reports_final_shell_size(fixture_path);
-    ok &= test_resize_interleaved_with_shell_output(fixture_path);
-    ok &= test_scroll_region_scrollback_survives_conpty(fixture_path);
-    ok &= test_utf8_payload_preserves_exact_conpty_bytes(fixture_path);
-    ok &= test_sync_raw_resize_gate_preserves_order(fixture_path);
-    ok &= test_fast_start_exit_loop(fixture_path);
-    ok &= test_start_resize_terminate_ordering(fixture_path);
-    ok &= test_terminate_after_resize_storm_stops_child_process(fixture_path);
-    ok &= test_missing_working_directory(fixture_path);
-    ok &= test_failed_executable(fixture_path);
-    ok &= test_rejection_paths(fixture_path);
-    ok &= test_interrupt(fixture_path);
-    ok &= test_interrupt_without_stdin_reader(fixture_path);
-    ok &= test_terminate(fixture_path);
-    ok &= test_terminate_accepts_zero_grace_policy(fixture_path);
-    ok &= test_terminate_returns_before_child_exit(fixture_path);
-    ok &= test_destructor_stops_running_process(fixture_path);
+    const auto run_test = [&ok](std::string_view test_name, bool test_result) {
+        ok &= test_result;
+        ok &= wait_for_conhost_children_to_exit(test_name);
+    };
+
+    run_test("pid parser", test_pid_parser_requires_line_delimiter());
+    run_test("interactive canvas fixture", test_interactive_canvas_fixture(fixture_path));
+    run_test("resize storm reports final shell size",
+        test_resize_storm_reports_final_shell_size(fixture_path));
+    run_test("resize interleaved with shell output",
+        test_resize_interleaved_with_shell_output(fixture_path));
+    run_test("scroll region scrollback survives conpty",
+        test_scroll_region_scrollback_survives_conpty(fixture_path));
+    run_test("utf8 payload preserves exact conpty bytes",
+        test_utf8_payload_preserves_exact_conpty_bytes(fixture_path));
+    run_test("sync raw resize gate preserves order",
+        test_sync_raw_resize_gate_preserves_order(fixture_path));
+    run_test("fast start exit loop", test_fast_start_exit_loop(fixture_path));
+    run_test("start resize terminate ordering",
+        test_start_resize_terminate_ordering(fixture_path));
+    run_test("terminate after resize storm stops child process",
+        test_terminate_after_resize_storm_stops_child_process(fixture_path));
+    run_test("close path stops descendant process",
+        test_close_path_stops_descendant_process(fixture_path));
+    run_test("missing working directory", test_missing_working_directory(fixture_path));
+    run_test("failed executable", test_failed_executable(fixture_path));
+    run_test("rejection paths", test_rejection_paths(fixture_path));
+    run_test("interrupt", test_interrupt(fixture_path));
+    run_test("interrupt without stdin reader", test_interrupt_without_stdin_reader(fixture_path));
+    run_test("terminate", test_terminate(fixture_path));
+    run_test("terminate accepts zero grace policy",
+        test_terminate_accepts_zero_grace_policy(fixture_path));
+    run_test("terminate returns before child exit",
+        test_terminate_returns_before_child_exit(fixture_path));
+    run_test("destructor stops running process", test_destructor_stops_running_process(fixture_path));
     return ok ? 0 : 1;
 }

@@ -21,6 +21,10 @@ if(NOT DEFINED VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR OR
     message(FATAL_ERROR
         "vnm_terminal_surface package must record the Qt private API major/minor")
 endif()
+if(NOT DEFINED VNM_TERMINAL_SURFACE_MSDF_TEXT_RENDERER_ENABLED)
+    message(FATAL_ERROR
+        "vnm_terminal_surface package must record whether MSDF text is enabled")
+endif()
 
 if((NOT "${Qt6_VERSION_MAJOR}" STREQUAL "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR}") OR
     (NOT "${Qt6_VERSION_MINOR}" STREQUAL "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR}"))
@@ -40,6 +44,16 @@ endif()
 if(vnm_terminal_surface_interface MATCHES "ShaderTools")
     message(FATAL_ERROR
         "vnm_terminal_surface package must not export Qt6::ShaderTools")
+endif()
+if(VNM_TERMINAL_SURFACE_MSDF_TEXT_RENDERER_ENABLED)
+    if(NOT TARGET vnm_msdf_text::vnm_msdf_text)
+        message(FATAL_ERROR
+            "vnm_terminal_surface package must find vnm_msdf_text when MSDF is enabled")
+    endif()
+    if(NOT vnm_terminal_surface_interface MATCHES "vnm_msdf_text::vnm_msdf_text")
+        message(FATAL_ERROR
+            "vnm_terminal_surface package must export the vnm_msdf_text link dependency")
+    endif()
 endif()
 
 get_target_property(vnm_terminal_surface_include_dirs

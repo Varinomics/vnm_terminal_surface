@@ -25,13 +25,11 @@ resolve a different Qt minor. Source-tree consumers that use `add_subdirectory`
 rebuild the surface against their selected Qt and are not an installed-package
 minor-mismatch case.
 
-`Qt6::ShaderTools` is source-tree tooling only when
-`VNM_TERMINAL_ENABLE_SHADER_GENERATION` is enabled. The current build embeds
-checked-in `.qsb` shader packages from `resources/shaders/`; the option only
-requires the ShaderTools component for source-tree shader tooling and does not
-wire shader package regeneration into the target build. ShaderTools is not
-linked to `vnm_terminal_surface`, not part of the Qt posture link allowlist, and
-not an installed package dependency.
+The build embeds checked-in `.qsb` shader packages from `resources/shaders/`.
+Shader regeneration is a source-tree maintenance step using Qt Shader Baker,
+not a target build dependency. ShaderTools is not linked to
+`vnm_terminal_surface`, not part of the Qt posture link allowlist, and not an
+installed package dependency.
 
 Dual-source atlas fragment shader packages must carry OpenGL GLSL 330 targets
 and patched GLSL 150 replacements from the corresponding `.glsl150.frag`

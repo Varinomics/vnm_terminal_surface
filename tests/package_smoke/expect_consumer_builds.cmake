@@ -86,6 +86,9 @@ endif()
 if(DEFINED qt6_dir AND NOT "${qt6_dir}" STREQUAL "")
     list(APPEND configure_args "-DQt6_DIR=${qt6_dir}")
 endif()
+if(DEFINED vnm_msdf_text_dir AND NOT "${vnm_msdf_text_dir}" STREQUAL "")
+    list(APPEND configure_args "-Dvnm_msdf_text_DIR=${vnm_msdf_text_dir}")
+endif()
 
 execute_process(
     COMMAND
