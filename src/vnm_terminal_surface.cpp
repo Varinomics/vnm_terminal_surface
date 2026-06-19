@@ -1798,7 +1798,7 @@ struct VNM_TerminalSurface::Private
             snapshot != nullptr                       &&
             snapshot->metadata.sequence <
                 input_cursor_freshness.accepted_input_sequence &&
-            snapshot->metadata.backend_callback_epoch <=
+            snapshot->metadata.processed_backend_callback_epoch <=
                 input_cursor_freshness.pre_input_backend_callback_epoch;
     }
 
@@ -1834,7 +1834,7 @@ struct VNM_TerminalSurface::Private
             return;
         }
 
-        if (render_snapshot->metadata.backend_callback_epoch >
+        if (render_snapshot->metadata.processed_backend_callback_epoch >
             input_cursor_freshness.pre_input_backend_callback_epoch)
         {
             input_cursor_freshness.active = false;
@@ -2234,7 +2234,7 @@ struct VNM_TerminalSurface::Private
             backend_callback_frame_boundary_epoch.load(std::memory_order_acquire);
         stats.render_snapshot_callback_epoch =
             render_snapshot != nullptr
-                ? render_snapshot->metadata.backend_callback_epoch
+                ? render_snapshot->metadata.processed_backend_callback_epoch
                 : 0U;
         stats.pending_update = frame_work_pending();
         return stats;
@@ -6740,7 +6740,7 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             const bool target_snapshot_caught_up =
                 target_backend_callback_epoch == 0U ||
                 (m_private->render_snapshot != nullptr &&
-                    m_private->render_snapshot->metadata.backend_callback_epoch >=
+                    m_private->render_snapshot->metadata.processed_backend_callback_epoch >=
                         target_backend_callback_epoch);
             if (!target_snapshot_caught_up) {
                 if (m_private->should_suppress_cursor_for_render_snapshot()) {

@@ -596,6 +596,20 @@ private:
     void record_output_activity(
         std::uint64_t              sequence);
 
+    void advance_processed_backend_callback_epoch(
+        std::uint64_t              epoch);
+
+    void flush_ready_processed_backend_callback_epoch();
+
+    bool pending_backend_callback_blocks_processed_callback_epoch(
+        std::uint64_t              epoch) const;
+
+    void complete_processing_backend_callback_side_effects();
+
+    void complete_processing_backend_output_side_effects();
+
+    void record_incomplete_processing_backend_output_side_effects();
+
     void record_backend_error(
         std::uint64_t              sequence,
         Terminal_backend_error     error);
@@ -605,7 +619,8 @@ private:
 
     void ingest_backend_output_segment(
         std::uint64_t              sequence,
-        QByteArrayView             bytes);
+        QByteArrayView             bytes,
+        bool                       completes_backend_output_callback = false);
 
     void defer_backend_content_snapshot(
         std::uint64_t                          sequence,
@@ -830,8 +845,10 @@ private:
     std::uint64_t                                          m_next_sequence = 1U;
     std::uint64_t                                          m_next_resize_id = 1U;
     std::uint64_t                                          m_last_processed_sequence = 0U;
-    std::uint64_t                                          m_backend_callback_publication_epoch = 0U;
     std::uint64_t                                          m_last_processed_backend_callback_epoch = 0U;
+    std::uint64_t                                          m_ready_processed_backend_callback_epoch = 0U;
+    std::uint64_t                                          m_processing_backend_callback_epoch = 0U;
+    std::uint64_t                                          m_incomplete_backend_output_callback_epoch = 0U;
     std::uint64_t                                          m_budgeted_backend_output_sequence = 0U;
     std::uint64_t                                          m_render_snapshot_generation = 0U;
     std::uint64_t                                          m_render_snapshot_synced_generation = 0U;
