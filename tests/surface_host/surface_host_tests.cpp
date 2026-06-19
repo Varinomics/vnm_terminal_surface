@@ -6483,6 +6483,45 @@ bool test_plain_wheel_boundaries_and_alternate_input(QGuiApplication& app)
             "primary no-scrollback legacy non-SGR mouse wheel writes no unsupported bytes");
     }
 
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {QByteArrayLiteral("\x1b[?1000hlegacy-ready")};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "post-exit legacy non-SGR mouse surface starts");
+
+        backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+        const std::size_t write_index = backend_ptr->writes.size();
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            point_in_grid_cell(fixture.surface, 0, 1),
+            Qt::MiddleButton,
+            Qt::MiddleButton,
+            Qt::NoModifier,
+            false,
+            "post-exit legacy non-SGR mouse press is not accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            point_in_grid_cell(fixture.surface, 0, 2),
+            Qt::NoButton,
+            Qt::MiddleButton,
+            Qt::NoModifier,
+            false,
+            "post-exit legacy non-SGR synthetic drag is not accepted");
+        ok &= check(backend_ptr->writes.size() == write_index,
+            "post-exit legacy non-SGR mouse events write no backend bytes");
+    }
+
     return ok;
 }
 
@@ -6870,6 +6909,141 @@ bool test_mouse_reporting_surface_events(QGuiApplication& app)
         ok &= check(drained_reset_snapshot != nullptr &&
             drained_reset_snapshot->viewport.offset_from_tail > 0,
             "future wheel after drained mouse DECRST scrolls published primary scrollback");
+    }
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            QByteArrayLiteral("\x1b[?1000;1006h") + numbered_scroll_lines(80),
+        };
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "detached viewport SGR press surface starts");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> tail_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(tail_snapshot != nullptr &&
+            tail_snapshot->viewport.scrollback_rows > 0 &&
+            tail_snapshot->viewport.offset_from_tail == 0,
+            "detached viewport SGR press fixture starts at tail with scrollback");
+
+        constexpr int detached_offset = 3;
+        ok &= check(fixture.surface.scroll_viewport_lines(detached_offset),
+            "detached viewport SGR press fixture detaches the viewport");
+        const std::shared_ptr<const term::Terminal_render_snapshot> detached_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(detached_snapshot != nullptr &&
+            detached_snapshot->viewport.offset_from_tail == detached_offset,
+            "detached viewport SGR press fixture publishes detached viewport");
+
+        constexpr int report_row    = 0;
+        constexpr int report_column = 1;
+        const std::size_t press_index = backend_ptr->writes.size();
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            point_in_grid_cell(fixture.surface, report_row, report_column),
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "detached viewport SGR press is accepted");
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            press_index,
+            { sgr_mouse_report(0, report_row, report_column, 'M') },
+            "detached viewport SGR press writes press bytes");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> post_press_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        ok &= check(post_press_snapshot != nullptr &&
+            post_press_snapshot->viewport.offset_from_tail == 0,
+            "detached viewport SGR press returns the viewport to tail");
+    }
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            QByteArrayLiteral("\x1b[?1000;1006hsgr-ready"),
+        };
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "post-exit SGR mouse surface starts");
+
+        backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+        pump_events(app);
+        const std::size_t write_index = backend_ptr->writes.size();
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            point_in_grid_cell(fixture.surface, 0, 1),
+            Qt::MiddleButton,
+            Qt::MiddleButton,
+            Qt::NoModifier,
+            false,
+            "post-exit SGR mouse press is not accepted");
+        ok &= check(backend_ptr->writes.size() == write_index,
+            "post-exit SGR mouse press writes no backend bytes");
+    }
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        std::vector<VNM_TerminalSurface::Backend_error_code> error_codes;
+        observe_backend_error_codes(fixture.surface, error_codes);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            QByteArrayLiteral("\x1b[?1000;1006hsgr-ready"),
+        };
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "write-rejected SGR mouse surface starts");
+
+        backend_ptr->reject_writes = true;
+        const std::size_t write_index = backend_ptr->writes.size();
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            point_in_grid_cell(fixture.surface, 0, 1),
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "write-rejected SGR mouse press is terminal-owned");
+        ok &= check(backend_ptr->writes.size() == write_index + 1U,
+            "write-rejected SGR mouse press reaches backend write");
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            write_index,
+            { sgr_mouse_report(0, 0, 1, 'M') },
+            "write-rejected SGR mouse press records attempted press bytes");
+        ok &= check(error_codes.size() == 1U &&
+            error_codes.front() == VNM_TerminalSurface::Backend_error_code::WRITE_FAILED,
+            "write-rejected SGR mouse press reports one WRITE_FAILED backend_error");
     }
 
     {
@@ -7553,6 +7727,326 @@ bool test_wheel_mouse_reporting_stops_after_post_barrier_callbacks_become_pendin
     ok &= check(drained_snapshot != nullptr &&
         drained_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
         "mouse wheel queued post-barrier callback is applied by the next drain");
+
+    return ok;
+}
+
+bool test_mouse_press_ignores_hidden_pending_mouse_enable(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("visible-no-mouse")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "hidden mouse-enable press surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> visible_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(visible_snapshot != nullptr &&
+        visible_snapshot->modes.mouse_tracking == term::Terminal_mouse_tracking_mode::NONE,
+        "hidden mouse-enable press starts from a non-mouse published frame");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026h\x1b[?1000;1006h"));
+    const std::size_t write_count = backend_ptr->writes.size();
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        point_in_grid_cell(fixture.surface, 0, 0),
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        false,
+        "hidden mouse-enable press is not consumed from hidden live mode");
+    ok &= check(backend_ptr->writes.size() == write_count,
+        "hidden mouse-enable press writes no stale SGR report");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> post_press_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(post_press_snapshot != nullptr &&
+        post_press_snapshot->modes.mouse_tracking == term::Terminal_mouse_tracking_mode::NONE,
+        "hidden mouse-enable press keeps the visible frame non-mouse");
+
+    return ok;
+}
+
+bool test_mouse_release_pending_report_uses_published_modes(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1000;1006hvisible-mouse"),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "hidden mouse-disable release surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    constexpr int report_row    = 0;
+    constexpr int report_column = 4;
+    const QPointF point = point_in_grid_cell(
+        fixture.surface,
+        report_row,
+        report_column);
+    const term::terminal_cell_metrics_t original_metrics =
+        current_cell_metrics(fixture.surface);
+    const std::size_t press_index = backend_ptr->writes.size();
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "hidden mouse-disable release setup press is accepted");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        press_index,
+        { sgr_mouse_report(0, report_row, report_column, 'M') },
+        "hidden mouse-disable release setup writes one press");
+
+    int title_changed_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::terminal_title_changed,
+        &fixture.surface,
+        [&] {
+            ++title_changed_count;
+            if (title_changed_count == 1) {
+                (void)backend_ptr->emit_output(
+                    QByteArrayLiteral(
+                        "\x1b]0;deferred-release-basis\a"
+                        "\x1b[?1000;1006l"));
+                return;
+            }
+            if (title_changed_count == 2) {
+                fixture.surface.set_font_size(fixture.surface.font_size() * 2.0);
+            }
+        });
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;entry-release-basis\a"));
+    const std::size_t release_index = backend_ptr->writes.size();
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "hidden mouse-disable release is delivered after pending callback");
+    const term::terminal_cell_metrics_t current_metrics =
+        current_cell_metrics(fixture.surface);
+    ok &= check(current_metrics.width > original_metrics.width,
+        "deferred release callback changes the live coordinate basis");
+    const int recomputed_column =
+        static_cast<int>(std::floor(point.x() / current_metrics.width));
+    ok &= check(recomputed_column != report_column,
+        "deferred release would use a different column without recompute");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        release_index,
+        { sgr_mouse_report(0, report_row, report_column, 'm') },
+        "deferred release writes exactly one published-frame release");
+    ok &= check(title_changed_count == 2,
+        "deferred release drains the post-entry backend callback");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> post_release_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(post_release_snapshot != nullptr &&
+        post_release_snapshot->modes.mouse_tracking == term::Terminal_mouse_tracking_mode::NONE &&
+        !post_release_snapshot->modes.sgr_mouse_encoding,
+        "deferred release survives the published mouse disable");
+
+    return ok;
+}
+
+bool test_mouse_press_release_pending_callbacks_clear_grab(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1002;1006hvisible-button-event"),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "pending mouse pair surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    int post_entry_output_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::terminal_title_changed,
+        &fixture.surface,
+        [&] {
+            ++post_entry_output_count;
+            (void)backend_ptr->emit_output(QByteArrayLiteral("post-entry-callback"));
+        });
+
+    const QPointF point = point_in_grid_cell(fixture.surface, 0, 1);
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;press-deferral\a"));
+    const std::size_t write_index = backend_ptr->writes.size();
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "pending mouse pair press is accepted");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;release-deferral\a"));
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "pending mouse pair release is accepted");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        write_index,
+        {
+            sgr_mouse_report(0, 0, 1, 'M'),
+            sgr_mouse_report(0, 0, 1, 'm'),
+        },
+        "pending mouse pair writes one press and one release");
+    ok &= check(post_entry_output_count == 2,
+        "pending mouse pair exercises deferred press and release writes");
+
+    const std::size_t probe_index = backend_ptr->writes.size();
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        QPointF(fixture.surface.width() + 10.0, fixture.surface.height() + 10.0),
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        false,
+        "post-release synthetic drag is not accepted after grab clears");
+    ok &= check(backend_ptr->writes.size() == probe_index,
+        "post-release synthetic drag writes no stuck-grab report");
+
+    return ok;
+}
+
+bool test_mouse_passive_motion_preserves_detached_viewport(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_scrollback_limit(200);
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1003;1006h") + numbered_scroll_lines(80),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "detached viewport hover mouse surface starts");
+    if (!started) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> tail_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(tail_snapshot != nullptr &&
+        tail_snapshot->modes.mouse_tracking == term::Terminal_mouse_tracking_mode::ANY &&
+        tail_snapshot->modes.sgr_mouse_encoding &&
+        tail_snapshot->viewport.scrollback_rows > 0 &&
+        tail_snapshot->viewport.offset_from_tail == 0,
+        "detached viewport hover fixture starts with all-motion mouse reporting");
+
+    constexpr int detached_offset = 3;
+    ok &= check(fixture.surface.scroll_viewport_lines(detached_offset),
+        "detached viewport hover fixture detaches the viewport");
+    const std::shared_ptr<const term::Terminal_render_snapshot> detached_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(detached_snapshot != nullptr &&
+        detached_snapshot->viewport.offset_from_tail == detached_offset,
+        "detached viewport hover fixture publishes detached viewport");
+
+    constexpr int report_row    = 0;
+    constexpr int report_column = 4;
+    const std::size_t hover_index = backend_ptr->writes.size();
+    ok &= send_hover_move(
+        fixture.surface,
+        point_in_grid_cell(fixture.surface, report_row, report_column),
+        Qt::NoModifier,
+        true,
+        "all-motion hover over detached viewport is accepted");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        hover_index,
+        { sgr_mouse_report(35, report_row, report_column, 'M') },
+        "all-motion hover writes one passive move report");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> hover_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(hover_snapshot != nullptr &&
+        hover_snapshot->viewport.offset_from_tail == detached_offset,
+        "all-motion hover preserves the detached viewport");
+
+    const std::size_t move_index = backend_ptr->writes.size();
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        point_in_grid_cell(fixture.surface, report_row, report_column + 1),
+        Qt::NoButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "all-motion passive mouse move over detached viewport is accepted");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        move_index,
+        { sgr_mouse_report(35, report_row, report_column + 1, 'M') },
+        "all-motion passive mouse move writes one passive move report");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> move_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(move_snapshot != nullptr &&
+        move_snapshot->viewport.offset_from_tail == detached_offset,
+        "all-motion passive mouse move preserves the detached viewport");
 
     return ok;
 }
@@ -14118,6 +14612,10 @@ int main(int argc, char** argv)
     ok &= test_local_first_wheel_scroll_keeps_callbacks_queued_without_backend_drain(app);
     ok &= test_wheel_input_stops_after_post_barrier_callbacks_become_pending(app);
     ok &= test_wheel_mouse_reporting_stops_after_post_barrier_callbacks_become_pending(app);
+    ok &= test_mouse_press_ignores_hidden_pending_mouse_enable(app);
+    ok &= test_mouse_release_pending_report_uses_published_modes(app);
+    ok &= test_mouse_press_release_pending_callbacks_clear_grab(app);
+    ok &= test_mouse_passive_motion_preserves_detached_viewport(app);
     ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
     ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);
     ok &= test_mid_hold_policy_flip_keeps_text_area_wheel_boundary_input(app);

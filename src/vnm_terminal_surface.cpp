@@ -47,6 +47,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -276,6 +277,40 @@ term::Terminal_input_mode_state input_modes_from_render_snapshot(
     modes.sgr_mouse_encoding      = snapshot.modes.sgr_mouse_encoding;
     modes.bracketed_paste         = snapshot.modes.bracketed_paste;
     return modes;
+}
+
+struct Published_mouse_report_write_result
+{
+    std::optional<term::Terminal_session_result> result;
+    std::optional<term::terminal_grid_position_t> position;
+    QByteArray                                    bytes;
+    bool                                          encoded = false;
+};
+
+enum class Published_mouse_report_attempt_status
+{
+    WRITTEN,
+    CALLBACKS_PENDING,
+    NOT_ENCODED,
+    SESSION_INACTIVE,
+    NON_WRITABLE,
+};
+
+struct Published_mouse_report_attempt
+{
+    Published_mouse_report_attempt_status        status =
+        Published_mouse_report_attempt_status::SESSION_INACTIVE;
+    std::optional<term::Terminal_session_result> result;
+    std::optional<term::terminal_grid_position_t> position;
+};
+
+bool mouse_report_write_is_non_writable_noop(
+    const term::Terminal_session_result& result)
+{
+    return
+        result.code == term::Terminal_session_result_code::INVALID_STATE &&
+        result.error.has_value()                                         &&
+        result.error->code == term::Terminal_backend_error_code::WRITE_FAILED;
 }
 
 bool viewport_state_can_scroll_locally(
@@ -2333,6 +2368,185 @@ struct VNM_TerminalSurface::Private
         mouse_reporting_last_position.reset();
     }
 
+    struct Pending_published_mouse_report
+    {
+        term::Terminal_session*         session = nullptr;
+        std::uint64_t                   session_generation = 0U;
+        term::Terminal_mouse_event_kind kind =
+            term::Terminal_mouse_event_kind::PRESS;
+        QByteArray                      bytes;
+        term::terminal_grid_position_t  position;
+    };
+
+    bool pending_report_session_is_active(
+        const Pending_published_mouse_report& report) const
+    {
+        return
+            session != nullptr                         &&
+            session.get() == report.session             &&
+            session_generation == report.session_generation;
+    }
+
+    Published_mouse_report_write_result encode_published_mouse_report(
+        term::Terminal_mouse_event_kind                              kind,
+        term::Terminal_mouse_button                                  button,
+        term::terminal_grid_position_t                               position,
+        Qt::KeyboardModifiers                                        modifiers,
+        const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot) const
+    {
+        if (snapshot == nullptr) {
+            return {};
+        }
+
+        const term::Terminal_mouse_event mouse_event{
+            kind,
+            button,
+            position.row,
+            position.column,
+            modifiers,
+        };
+        const QByteArray bytes = term::encode_terminal_mouse_event(
+            mouse_event,
+            input_modes_from_render_snapshot(*snapshot));
+        if (bytes.isEmpty()) {
+            return {};
+        }
+
+        return {std::nullopt, position, bytes, true};
+    }
+
+    Pending_published_mouse_report pending_published_mouse_report(
+        term::Terminal_mouse_event_kind               kind,
+        const Published_mouse_report_write_result&    encoded) const
+    {
+        Q_ASSERT(session != nullptr);
+        Q_ASSERT(encoded.encoded);
+        Q_ASSERT(encoded.position.has_value());
+        return {
+            session.get(),
+            session_generation,
+            kind,
+            encoded.bytes,
+            *encoded.position,
+        };
+    }
+
+    Published_mouse_report_attempt try_write_pending_published_mouse_report(
+        const Pending_published_mouse_report& report)
+    {
+        if (!pending_report_session_is_active(report)) {
+            return {
+                Published_mouse_report_attempt_status::SESSION_INACTIVE,
+                std::nullopt,
+                report.position,
+            };
+        }
+        if (report.bytes.isEmpty()) {
+            return {
+                Published_mouse_report_attempt_status::NOT_ENCODED,
+                std::nullopt,
+                report.position,
+            };
+        }
+
+        std::optional<term::Terminal_session_result> result =
+            report.session->try_write_user_bytes_without_backend_drain_if_callbacks_empty(
+                report.bytes);
+        if (!result.has_value()) {
+            return {
+                Published_mouse_report_attempt_status::CALLBACKS_PENDING,
+                std::nullopt,
+                report.position,
+            };
+        }
+        if (mouse_report_write_is_non_writable_noop(*result)) {
+            return {
+                Published_mouse_report_attempt_status::NON_WRITABLE,
+                std::move(result),
+                report.position,
+            };
+        }
+        return {
+            Published_mouse_report_attempt_status::WRITTEN,
+            std::move(result),
+            report.position,
+        };
+    }
+
+    void handle_pending_published_mouse_report_invalidated(
+        const Pending_published_mouse_report& report)
+    {
+        if (report.kind == term::Terminal_mouse_event_kind::PRESS) {
+            clear_mouse_reporting_state();
+        }
+    }
+
+    bool retry_pending_published_mouse_reports(
+        VNM_TerminalSurface& surface,
+        bool                 drain_once)
+    {
+        if (retrying_pending_published_mouse_reports) {
+            return pending_published_mouse_reports.empty();
+        }
+
+        retrying_pending_published_mouse_reports = true;
+        while (!pending_published_mouse_reports.empty()) {
+            const Pending_published_mouse_report report =
+                pending_published_mouse_reports.front();
+            const Published_mouse_report_attempt attempt =
+                try_write_pending_published_mouse_report(report);
+            if (attempt.status ==
+                Published_mouse_report_attempt_status::CALLBACKS_PENDING)
+            {
+                if (drain_once) {
+                    drain_once = false;
+                    surface.drain_backend_callback_events();
+                    continue;
+                }
+
+                surface.queue_backend_callback_drain();
+                retrying_pending_published_mouse_reports = false;
+                return false;
+            }
+
+            pending_published_mouse_reports.pop_front();
+            if (attempt.status == Published_mouse_report_attempt_status::WRITTEN) {
+                surface.sync_from_session();
+                if (attempt.result.has_value() &&
+                    !is_accepted(attempt.result->code))
+                {
+                    surface.report_result_failure(*attempt.result);
+                }
+            }
+            else {
+                handle_pending_published_mouse_report_invalidated(report);
+            }
+        }
+
+        retrying_pending_published_mouse_reports = false;
+        return true;
+    }
+
+    bool block_terminal_input_behind_pending_published_mouse_report(
+        VNM_TerminalSurface& surface)
+    {
+        if (pending_published_mouse_reports.empty()) {
+            return false;
+        }
+
+        return !retry_pending_published_mouse_reports(surface, true);
+    }
+
+    void clear_pending_published_mouse_reports()
+    {
+        for (const Pending_published_mouse_report& report :
+            pending_published_mouse_reports)
+        {
+            handle_pending_published_mouse_report_invalidated(report);
+        }
+        pending_published_mouse_reports.clear();
+    }
+
     void clear_selection_drag_state()
     {
         selection_anchor.reset();
@@ -2441,6 +2655,8 @@ struct VNM_TerminalSurface::Private
     term::Terminal_mouse_button                       mouse_reporting_drag_button =
         term::Terminal_mouse_button::NONE;
     std::optional<term::terminal_grid_position_t>          mouse_reporting_last_position;
+    std::deque<Pending_published_mouse_report>             pending_published_mouse_reports;
+    bool                                                   retrying_pending_published_mouse_reports = false;
     std::optional<term::terminal_grid_position_t>          selection_anchor;
     std::optional<term::Terminal_buffer_id>                selection_anchor_buffer_id;
     std::optional<term::terminal_selection_source_identity_t>
@@ -2467,6 +2683,7 @@ struct VNM_TerminalSurface::Private
     QMetaObject::Connection                                screen_physical_dpi_changed_connection;
     QPointer<QQuickWindow>                                 bound_window;
     std::unique_ptr<term::Terminal_session>                session;
+    std::uint64_t                                          session_generation = 0U;
     std::unique_ptr<term::Terminal_resize_controller>      resize_controller;
     std::shared_ptr<term::Terminal_transcript_recorder>    transcript_recorder;
     std::uint64_t                                          last_installed_render_publication_generation = 0U;
@@ -3035,6 +3252,7 @@ void VNM_TerminalSurface::set_mouse_reporting_policy(Mouse_reporting_policy poli
     }
 
     m_mouse_reporting_policy = policy;
+    m_private->clear_pending_published_mouse_reports();
     m_private->clear_mouse_reporting_state();
     m_private->clear_mouse_wheel_remainders();
     emit mouse_reporting_policy_changed();
@@ -3464,6 +3682,12 @@ bool VNM_TerminalSurface::paste_text(QString text)
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
+    if (m_private->session == nullptr) {
+        return false;
+    }
+    if (m_private->block_terminal_input_behind_pending_published_mouse_report(*this)) {
+        return false;
+    }
     if (m_private->session == nullptr) {
         return false;
     }
@@ -3900,6 +4124,14 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
     else
     if (change == ItemActiveFocusHasChanged && !hasActiveFocus()) {
         if (m_private->session != nullptr) {
+            if (m_private->block_terminal_input_behind_pending_published_mouse_report(*this)) {
+                return;
+            }
+            if (m_private->session == nullptr) {
+                term::Ime_preedit_state state;
+                m_private->set_ime_preedit_state(*this, std::move(state));
+                return;
+            }
             const term::Terminal_focus_event_result focus_result =
                 m_private->session->write_focus_event(false);
             m_private->session->cancel_ime_preedit();
@@ -3916,6 +4148,12 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
     else
     if (change == ItemActiveFocusHasChanged) {
         if (m_private->session != nullptr) {
+            if (m_private->block_terminal_input_behind_pending_published_mouse_report(*this)) {
+                return;
+            }
+            if (m_private->session == nullptr) {
+                return;
+            }
             const term::Terminal_focus_event_result focus_result =
                 m_private->session->write_focus_event(true);
             sync_from_session();
@@ -3973,6 +4211,14 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
         }
 
         const bool text_input_key = text_input_can_advance_cursor(event->text());
+        if (m_private->block_terminal_input_behind_pending_published_mouse_report(*this)) {
+            event->ignore();
+            return;
+        }
+        if (m_private->session == nullptr) {
+            event->ignore();
+            return;
+        }
         if (m_private->before_session_key_input_for_testing) {
             m_private->before_session_key_input_for_testing();
         }
@@ -4022,8 +4268,10 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
     drain_backend_callback_events();
 
     const term::Terminal_mouse_button button = terminal_mouse_button(event->button());
-    const std::optional<term::terminal_grid_position_t> position = grid_position_for_local_point(
-        m_private->render_snapshot,
+    std::shared_ptr<const term::Terminal_render_snapshot> published_snapshot =
+        m_private->render_snapshot;
+    std::optional<term::terminal_grid_position_t> position = grid_position_for_local_point(
+        published_snapshot,
         m_private->cell_metrics,
         event->position());
     const bool force_local_selection = local_selection_override(event->modifiers());
@@ -4052,18 +4300,47 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
         position.has_value()                &&
         button                   != term::Terminal_mouse_button::NONE)
     {
-        const term::Terminal_mouse_event_result mouse_result =
-            m_private->session->write_mouse_event({
+        const Published_mouse_report_write_result encoded =
+            m_private->encode_published_mouse_report(
                 term::Terminal_mouse_event_kind::PRESS,
                 button,
-                position->row,
-                position->column,
+                *position,
                 event->modifiers(),
-        });
-        if (mouse_result.handled) {
+                published_snapshot);
+        std::optional<VNM_TerminalSurface::Private::Pending_published_mouse_report> report;
+        if (encoded.encoded) {
+            report = m_private->pending_published_mouse_report(
+                term::Terminal_mouse_event_kind::PRESS,
+                encoded);
+        }
+
+        Published_mouse_report_attempt mouse_write{
+            Published_mouse_report_attempt_status::NOT_ENCODED,
+            std::nullopt,
+            encoded.position,
+        };
+        if (report.has_value()) {
+            if (m_private->pending_published_mouse_reports.empty()) {
+                mouse_write =
+                    m_private->try_write_pending_published_mouse_report(*report);
+            }
+            else {
+                mouse_write = {
+                    Published_mouse_report_attempt_status::CALLBACKS_PENDING,
+                    std::nullopt,
+                    report->position,
+                };
+            }
+        }
+
+        if ((mouse_write.status == Published_mouse_report_attempt_status::WRITTEN ||
+             mouse_write.status == Published_mouse_report_attempt_status::CALLBACKS_PENDING) &&
+            mouse_write.position.has_value())
+        {
             m_private->mouse_reporting_pressed_buttons |= event->button();
             m_private->mouse_reporting_drag_button      = button;
-            m_private->mouse_reporting_last_position    = *position;
+            m_private->mouse_reporting_last_position    = *mouse_write.position;
+            position                                    = mouse_write.position;
             m_private->clear_selection_drag_state();
             record_surface_selection_drag_transcript(
                 m_private->transcript_recorder,
@@ -4072,17 +4349,33 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
                 logical_position,
                 std::nullopt,
                 false);
-            m_private->session->clear_selection();
+            if (m_private->session != nullptr) {
+                m_private->session->clear_selection();
+            }
             event->accept();
-            sync_from_session();
-            if (!is_accepted(mouse_result.result.code)) {
-                report_result_failure(mouse_result.result);
+            if (mouse_write.status ==
+                Published_mouse_report_attempt_status::CALLBACKS_PENDING)
+            {
+                Q_ASSERT(report.has_value());
+                m_private->pending_published_mouse_reports.push_back(*report);
+                (void)m_private->retry_pending_published_mouse_reports(*this, true);
+                sync_from_session();
+            }
+            else {
+                sync_from_session();
+                if (mouse_write.result.has_value() &&
+                    !is_accepted(mouse_write.result->code))
+                {
+                    report_result_failure(*mouse_write.result);
+                }
             }
             trace_decision(QStringLiteral("mouse-reporting"));
             return;
         }
-        if (snapshot_has_terminal_mouse_tracking(m_private->render_snapshot) &&
-            !snapshot_has_sgr_mouse_reporting(m_private->render_snapshot))
+        if (m_private->session != nullptr &&
+            m_private->session->process_state() == term::Terminal_process_state::RUNNING &&
+            snapshot_has_terminal_mouse_tracking(published_snapshot) &&
+            !snapshot_has_sgr_mouse_reporting(published_snapshot))
         {
             m_private->mouse_reporting_pressed_buttons |= event->button();
             m_private->mouse_reporting_drag_button      = button;
@@ -4224,6 +4517,15 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         m_private->session       != nullptr                          &&
         (published_mouse_tracking || terminal_mouse_grab_active))
     {
+        if (m_private->block_terminal_input_behind_pending_published_mouse_report(*this)) {
+            trace_decision(QStringLiteral("mouse-reporting-callbacks-pending"));
+            return;
+        }
+        if (m_private->session == nullptr) {
+            trace_decision(QStringLiteral("no-session"));
+            return;
+        }
+
         std::optional<term::terminal_grid_position_t> report_position = position;
         if (!report_position.has_value() && terminal_mouse_grab_active) {
             report_position = m_private->mouse_reporting_last_position.has_value()
@@ -4282,7 +4584,8 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                 trace_decision(QStringLiteral("mouse-reporting"));
                 return;
             }
-            if (snapshot_has_terminal_mouse_tracking(m_private->render_snapshot) &&
+            if (m_private->session->process_state() == term::Terminal_process_state::RUNNING &&
+                snapshot_has_terminal_mouse_tracking(m_private->render_snapshot) &&
                 !snapshot_has_sgr_mouse_reporting(m_private->render_snapshot))
             {
                 m_private->mouse_reporting_last_position = *report_position;
@@ -4754,56 +5057,32 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
 
     button = terminal_mouse_button(released_qt_button);
 
-    viewport_position = grid_position_for_local_point(
-        m_private->render_snapshot,
-        m_private->cell_metrics,
-        event->position());
-    std::optional<term::terminal_grid_position_t> report_position = viewport_position;
-    if (!report_position.has_value() && terminal_mouse_grab_active) {
-        report_position = m_private->mouse_reporting_last_position.has_value()
-            ? m_private->mouse_reporting_last_position
-            : clamped_grid_position_for_local_point(
-                m_private->render_snapshot,
-                m_private->cell_metrics,
-                event->position());
-    }
-    viewport_position = report_position;
+    std::shared_ptr<const term::Terminal_render_snapshot> published_snapshot =
+        m_private->render_snapshot;
+    std::optional<term::terminal_grid_position_t> report_position;
+    const auto refresh_report_position = [&] {
+        published_snapshot = m_private->render_snapshot;
+        viewport_position = grid_position_for_local_point(
+            published_snapshot,
+            m_private->cell_metrics,
+            event->position());
+        report_position = viewport_position;
+        if (!report_position.has_value() && terminal_mouse_grab_active) {
+            report_position = m_private->mouse_reporting_last_position.has_value()
+                ? m_private->mouse_reporting_last_position
+                : clamped_grid_position_for_local_point(
+                    published_snapshot,
+                    m_private->cell_metrics,
+                    event->position());
+        }
+        viewport_position = report_position;
+    };
+    refresh_report_position();
     if (!report_position.has_value() || button == term::Terminal_mouse_button::NONE) {
         if (final_release) {
             m_private->clear_mouse_reporting_state();
         }
         trace_decision(QStringLiteral("out-of-grid"));
-        return;
-    }
-
-    const term::Terminal_mouse_event_result mouse_result =
-        m_private->session->write_mouse_event({
-            term::Terminal_mouse_event_kind::RELEASE,
-            button,
-            report_position->row,
-            report_position->column,
-            event->modifiers(),
-        });
-    if (!mouse_result.handled) {
-        if (final_release) {
-            m_private->clear_mouse_reporting_state();
-        }
-        else {
-            m_private->mouse_reporting_pressed_buttons &= ~Qt::MouseButtons(released_qt_button);
-            m_private->mouse_reporting_drag_button =
-                terminal_mouse_button(m_private->mouse_reporting_pressed_buttons);
-        }
-        const bool non_sgr_mouse_tracking =
-            snapshot_has_terminal_mouse_tracking(m_private->render_snapshot) &&
-            !snapshot_has_sgr_mouse_reporting(m_private->render_snapshot);
-        if (non_sgr_mouse_tracking)
-        {
-            event->accept();
-        }
-        trace_decision(
-            non_sgr_mouse_tracking
-                ? QStringLiteral("mouse-reporting-non-sgr")
-                : QStringLiteral("mouse-reporting-unhandled"));
         return;
     }
 
@@ -4816,6 +5095,57 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
         m_private->mouse_reporting_drag_button =
             terminal_mouse_button(m_private->mouse_reporting_pressed_buttons);
     }
+
+    const Published_mouse_report_write_result encoded =
+        m_private->encode_published_mouse_report(
+            term::Terminal_mouse_event_kind::RELEASE,
+            button,
+            *report_position,
+            event->modifiers(),
+            published_snapshot);
+    std::optional<VNM_TerminalSurface::Private::Pending_published_mouse_report> report;
+    if (encoded.encoded) {
+        report = m_private->pending_published_mouse_report(
+            term::Terminal_mouse_event_kind::RELEASE,
+            encoded);
+    }
+
+    Published_mouse_report_attempt mouse_write{
+        Published_mouse_report_attempt_status::NOT_ENCODED,
+        std::nullopt,
+        encoded.position,
+    };
+    if (report.has_value()) {
+        if (m_private->pending_published_mouse_reports.empty()) {
+            mouse_write = m_private->try_write_pending_published_mouse_report(*report);
+        }
+        else {
+            mouse_write = {
+                Published_mouse_report_attempt_status::CALLBACKS_PENDING,
+                std::nullopt,
+                report->position,
+            };
+        }
+    }
+    if (mouse_write.status != Published_mouse_report_attempt_status::WRITTEN &&
+        mouse_write.status != Published_mouse_report_attempt_status::CALLBACKS_PENDING)
+    {
+        const bool non_sgr_mouse_tracking =
+            m_private->session != nullptr &&
+            m_private->session->process_state() == term::Terminal_process_state::RUNNING &&
+            snapshot_has_terminal_mouse_tracking(published_snapshot) &&
+            !snapshot_has_sgr_mouse_reporting(published_snapshot);
+        if (non_sgr_mouse_tracking)
+        {
+            event->accept();
+        }
+        trace_decision(
+            non_sgr_mouse_tracking
+                ? QStringLiteral("mouse-reporting-non-sgr")
+                : QStringLiteral("mouse-reporting-unhandled"));
+        return;
+    }
+
     record_surface_selection_drag_transcript(
         m_private->transcript_recorder,
         QStringLiteral("clear"),
@@ -4823,11 +5153,23 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
         logical_position,
         std::nullopt,
         false);
-    m_private->session->clear_selection();
+    if (m_private->session != nullptr) {
+        m_private->session->clear_selection();
+    }
     event->accept();
-    sync_from_session();
-    if (!is_accepted(mouse_result.result.code)) {
-        report_result_failure(mouse_result.result);
+    if (mouse_write.status == Published_mouse_report_attempt_status::CALLBACKS_PENDING) {
+        Q_ASSERT(report.has_value());
+        m_private->pending_published_mouse_reports.push_back(*report);
+        (void)m_private->retry_pending_published_mouse_reports(*this, true);
+        sync_from_session();
+    }
+    else {
+        sync_from_session();
+        if (mouse_write.result.has_value() &&
+            !is_accepted(mouse_write.result->code))
+        {
+            report_result_failure(*mouse_write.result);
+        }
     }
     trace_decision(QStringLiteral("mouse-reporting"));
 }
@@ -4866,6 +5208,13 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
         return;
     }
 
+    if (m_private->block_terminal_input_behind_pending_published_mouse_report(*this)) {
+        return;
+    }
+    if (m_private->session == nullptr) {
+        return;
+    }
+
     const std::optional<term::Terminal_mouse_event_result> mouse_result =
         m_private->session->try_write_mouse_event_without_backend_drain_if_callbacks_empty({
             term::Terminal_mouse_event_kind::MOVE,
@@ -4879,7 +5228,8 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
         return;
     }
     if (!mouse_result->handled) {
-        if (snapshot_has_terminal_mouse_tracking(m_private->render_snapshot) &&
+        if (m_private->session->process_state() == term::Terminal_process_state::RUNNING &&
+            snapshot_has_terminal_mouse_tracking(m_private->render_snapshot) &&
             !snapshot_has_sgr_mouse_reporting(m_private->render_snapshot))
         {
             event->accept();
@@ -5115,6 +5465,23 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
         return;
     }
 
+    if (m_private->session == nullptr) {
+        QQuickItem::wheelEvent(event);
+        finish_trace(
+            QStringLiteral("qt_fallback"),
+            QStringLiteral("no_session"),
+            event->isAccepted());
+        return;
+    }
+
+    if (m_private->block_terminal_input_behind_pending_published_mouse_report(*this)) {
+        event->ignore();
+        finish_trace(
+            QStringLiteral("application"),
+            QStringLiteral("pending_published_mouse_report"),
+            false);
+        return;
+    }
     if (m_private->session == nullptr) {
         QQuickItem::wheelEvent(event);
         finish_trace(
@@ -5579,6 +5946,14 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
     std::optional<term::Terminal_ime_commit_result> commit_result;
     if (m_private->session != nullptr) {
         if (!commit_text.isEmpty()) {
+            if (m_private->block_terminal_input_behind_pending_published_mouse_report(*this)) {
+                event->ignore();
+                return;
+            }
+            if (m_private->session == nullptr) {
+                event->ignore();
+                return;
+            }
             commit_result = m_private->session->write_ime_commit(commit_text);
         }
 
@@ -5940,6 +6315,7 @@ bool VNM_TerminalSurface::start_process_with_backend(
 
     m_private->session =
         std::make_unique<term::Terminal_session>(std::move(backend), session_config);
+    ++m_private->session_generation;
     m_private->session->set_color_state(
         term::make_terminal_color_state(resolve_surface_color_scheme(*this)));
     m_private->resize_controller = std::make_unique<term::Terminal_resize_controller>(
@@ -6206,6 +6582,9 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         ++drain_stats.output_backpressure_after_drain;
     }
     record_total_elapsed();
+    if (session_still_active) {
+        (void)m_private->retry_pending_published_mouse_reports(*this, false);
+    }
     return result;
 }
 
@@ -6483,6 +6862,8 @@ void VNM_TerminalSurface::replay_session_notification(
             emit process_started();
             break;
         case term::Terminal_session_notification_kind::PROCESS_EXITED:
+            m_private->clear_pending_published_mouse_reports();
+            m_private->clear_mouse_reporting_state();
             m_private->pending_clipboard_write.reset();
             if (notification.exit.has_value()) {
                 emit process_exited(
@@ -6578,6 +6959,8 @@ void VNM_TerminalSurface::report_result_failure(
 void VNM_TerminalSurface::reset_session()
 {
     m_private->synchronized_output_recovery_timer.stop();
+    ++m_private->session_generation;
+    m_private->clear_pending_published_mouse_reports();
     m_private->resize_controller.reset();
     m_private->session.reset();
     m_private->transcript_recorder.reset();

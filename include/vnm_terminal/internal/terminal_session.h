@@ -276,8 +276,6 @@ public:
     Terminal_key_event_result write_key_event(
         const QKeyEvent&           event);
 
-    Terminal_mouse_event_result write_mouse_event(
-        Terminal_mouse_event       event);
     // Writes a terminal mouse report without draining backend callbacks only
     // when callback ingress is empty under the session lock. Returns std::nullopt
     // without writing when pending callbacks could make mouse protocol state stale.
