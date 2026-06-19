@@ -4283,6 +4283,10 @@ bool test_public_projection_phase1_copies_public_rows_and_metadata()
             projection->generation() &&
         projection->active_buffer_epoch() == 0U,
         "Phase 1 projection records coherent diagnostics and initial buffer epoch");
+    ok &= check(projection->metadata().processed_backend_callback_epoch ==
+            session->backend_callback_processed_epoch() &&
+        projection->metadata().processed_backend_callback_epoch != 0U,
+        "Phase 1 projection metadata preserves the processed backend callback epoch");
 
     const std::optional<term::Terminal_public_projection> next_projection =
         session->capture_public_projection_for_testing();
@@ -10795,6 +10799,458 @@ bool test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot()
     return ok;
 }
 
+bool test_deferred_snapshot_before_non_output_callback_uses_previous_processed_epoch()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "deferred pre-exit epoch session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("deferred-before-exit")),
+        "deferred pre-exit epoch queues output");
+    const std::uint64_t output_epoch = session->backend_callback_enqueue_epoch();
+    backend->emit_exit({term::Terminal_exit_reason::TERMINATED, 0});
+    const std::uint64_t exit_epoch = session->backend_callback_enqueue_epoch();
+
+    const bool complete = session->process_backend_callback_events_for(std::chrono::seconds(10));
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(complete && !session->has_pending_backend_callback_events(),
+        "deferred pre-exit epoch drains all queued callbacks");
+    ok &= check(snapshot.has_value() &&
+        snapshot_contains_text(*snapshot, QStringLiteral("deferred-before-exit")),
+        "deferred pre-exit epoch publishes deferred output snapshot");
+    ok &= check(snapshot.has_value() &&
+        snapshot->metadata.processed_backend_callback_epoch == output_epoch,
+        "deferred snapshot flushed before exit side effects keeps previous processed epoch");
+    ok &= check(snapshot.has_value() &&
+        snapshot->metadata.processed_backend_callback_epoch != exit_epoch,
+        "deferred snapshot flushed before exit side effects does not claim exit epoch");
+    ok &= check(session->backend_callback_processed_epoch() == exit_epoch,
+        "deferred pre-exit epoch session processes exit callback after snapshot flush");
+    ok &= check(session->exit_status().has_value(),
+        "deferred pre-exit epoch records backend exit");
+
+    return ok;
+}
+
+bool test_deferred_snapshot_after_output_command_claims_processed_epoch()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "post-command deferred epoch session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("post-command-deferred")),
+        "post-command deferred epoch queues output");
+    const std::uint64_t output_epoch = session->backend_callback_enqueue_epoch();
+
+    const bool complete = session->process_backend_callback_events_for(std::chrono::seconds(10));
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(complete && !session->has_pending_backend_callback_events(),
+        "post-command deferred epoch drains queued output callback");
+    ok &= check(session->backend_callback_processed_epoch() == output_epoch,
+        "post-command deferred epoch records output callback as processed");
+    ok &= check(snapshot.has_value() &&
+        snapshot_contains_text(*snapshot, QStringLiteral("post-command-deferred")),
+        "post-command deferred epoch publishes output snapshot");
+    ok &= check(snapshot.has_value() &&
+        snapshot->metadata.processed_backend_callback_epoch ==
+            session->backend_callback_processed_epoch(),
+        "post-command deferred snapshot agrees with processed callback epoch");
+
+    return ok;
+}
+
+bool test_output_callback_snapshot_inside_command_claims_processed_epoch()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "inline output epoch session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("inline-output-epoch")),
+        "inline output epoch queues output");
+    const std::uint64_t output_epoch = session->backend_callback_enqueue_epoch();
+
+    session->process_backend_callback_events();
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(!session->has_pending_backend_callback_events(),
+        "inline output epoch drains queued output callback");
+    ok &= check(session->backend_callback_processed_epoch() == output_epoch,
+        "inline output epoch records output callback as processed");
+    ok &= check(snapshot.has_value() &&
+        snapshot_contains_text(*snapshot, QStringLiteral("inline-output-epoch")),
+        "inline output epoch publishes output snapshot inside command processing");
+    ok &= check(snapshot.has_value() &&
+        snapshot->metadata.processed_backend_callback_epoch == output_epoch,
+        "inline output snapshot carries the processed callback epoch");
+
+    return ok;
+}
+
+bool test_incomplete_csi_output_callback_snapshot_keeps_previous_processed_epoch()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "incomplete CSI epoch session starts");
+
+    QByteArray prefix = QByteArrayLiteral("incomplete-csi-prefix");
+    prefix += QByteArray("\x1b[", 2);
+    ok &= check(backend->emit_output(prefix),
+        "incomplete CSI epoch queues prefix output");
+    const std::uint64_t prefix_epoch = session->backend_callback_enqueue_epoch();
+
+    session->process_backend_callback_events();
+    const std::optional<term::Terminal_render_snapshot> prefix_snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(prefix_snapshot.has_value() &&
+        snapshot_contains_text(*prefix_snapshot, QStringLiteral("incomplete-csi-prefix")),
+        "incomplete CSI epoch publishes visible prefix snapshot");
+    ok &= check(prefix_snapshot.has_value() &&
+        prefix_snapshot->metadata.processed_backend_callback_epoch < prefix_epoch,
+        "incomplete CSI prefix snapshot does not claim the incomplete callback epoch");
+    ok &= check(session->backend_callback_processed_epoch() < prefix_epoch,
+        "incomplete CSI prefix callback remains unprocessed until pending bytes complete");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("Hcomplete-csi-tail")),
+        "incomplete CSI epoch queues completion output");
+    const std::uint64_t completion_epoch = session->backend_callback_enqueue_epoch();
+
+    session->process_backend_callback_events();
+    const std::optional<term::Terminal_render_snapshot> completion_snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(session->backend_callback_processed_epoch() == completion_epoch,
+        "incomplete CSI completion advances processed callback epoch");
+    ok &= check(completion_snapshot.has_value() &&
+        completion_snapshot->metadata.processed_backend_callback_epoch == completion_epoch,
+        "incomplete CSI completion snapshot claims the completed callback epoch");
+
+    return ok;
+}
+
+bool test_non_output_after_incomplete_csi_does_not_advance_processed_epoch()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "incomplete CSI before exit epoch session starts");
+
+    QByteArray prefix = QByteArrayLiteral("incomplete-before-exit");
+    prefix += QByteArray("\x1b[", 2);
+    ok &= check(backend->emit_output(prefix),
+        "incomplete CSI before exit queues prefix output");
+    const std::uint64_t prefix_epoch = session->backend_callback_enqueue_epoch();
+    backend->emit_exit({term::Terminal_exit_reason::TERMINATED, 0});
+    const std::uint64_t exit_epoch = session->backend_callback_enqueue_epoch();
+
+    const bool complete = session->process_backend_callback_events_for(std::chrono::seconds(10));
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(complete && !session->has_pending_backend_callback_events(),
+        "incomplete CSI before exit drains queued callbacks");
+    ok &= check(snapshot.has_value() &&
+        snapshot_contains_text(*snapshot, QStringLiteral("incomplete-before-exit")),
+        "incomplete CSI before exit publishes visible prefix snapshot");
+    ok &= check(snapshot.has_value() &&
+        snapshot->metadata.processed_backend_callback_epoch < prefix_epoch,
+        "incomplete CSI before exit snapshot does not claim incomplete output epoch");
+    ok &= check(snapshot.has_value() &&
+        snapshot->metadata.processed_backend_callback_epoch != exit_epoch,
+        "incomplete CSI before exit snapshot does not claim exit epoch");
+    ok &= check(session->backend_callback_processed_epoch() < prefix_epoch,
+        "incomplete CSI before exit keeps processed epoch behind pending output");
+    ok &= check(session->backend_callback_processed_epoch() != exit_epoch,
+        "incomplete CSI before exit does not advance processed epoch to exit");
+    ok &= check(session->exit_status().has_value(),
+        "incomplete CSI before exit records backend exit side effects");
+
+    return ok;
+}
+
+bool test_rejected_output_callback_enqueue_advances_processed_epoch()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier                  = [] {};
+    config.output_queue_limits.high_water_bytes    = 6000U;
+    config.output_queue_limits.hard_limit_bytes    = 6000U;
+    config.output_queue_limits.high_water_commands = 64U;
+    config.output_queue_limits.hard_limit_commands = 64U;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    backend->exit_on_terminate = false;
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "rejected callback enqueue epoch session starts");
+
+    const QByteArray sliced_output(5000, 'a');
+    ok &= check(backend->emit_output(sliced_output),
+        "rejected callback enqueue queues sliced output");
+    const bool first_complete = session->process_backend_callback_events_for(
+        std::chrono::steady_clock::duration::zero());
+    ok &= check(!first_complete && session->has_pending_backend_callback_events(),
+        "rejected callback enqueue leaves first sliced output continuation pending");
+
+    const QByteArray rejected_output(5200, 'b');
+    ok &= check(backend->emit_output(rejected_output),
+        "rejected callback enqueue accepts later callback into ingress");
+    const std::uint64_t rejected_epoch = session->backend_callback_enqueue_epoch();
+
+    const bool target_reached = session->process_backend_callback_events_until_epoch(
+        rejected_epoch,
+        std::chrono::seconds(10));
+
+    ok &= check(target_reached,
+        "rejected callback enqueue reaches the rejected callback target epoch");
+    ok &= check(session->backend_callback_processed_epoch() >= rejected_epoch,
+        "rejected callback enqueue advances processed epoch for rejected callback");
+
+    return ok;
+}
+
+bool test_rejected_callback_epoch_waits_for_lower_sliced_output()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier                  = [] {};
+    config.output_queue_limits.high_water_bytes    = 18000U;
+    config.output_queue_limits.hard_limit_bytes    = 18000U;
+    config.output_queue_limits.high_water_commands = 64U;
+    config.output_queue_limits.hard_limit_commands = 64U;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    backend->exit_on_terminate = false;
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "rejected callback behind sliced output session starts");
+
+    const QByteArray sliced_output(17000, 's');
+    ok &= check(backend->emit_output(sliced_output),
+        "rejected callback behind sliced output queues lower-epoch output");
+    const std::uint64_t sliced_epoch = session->backend_callback_enqueue_epoch();
+    const bool first_complete = session->process_backend_callback_events_for(
+        std::chrono::steady_clock::duration::zero());
+    ok &= check(!first_complete && session->has_pending_backend_callback_events(),
+        "rejected callback behind sliced output leaves lower-epoch slices pending");
+    ok &= check(session->backend_callback_processed_epoch() < sliced_epoch,
+        "rejected callback behind sliced output keeps lower sliced epoch unprocessed");
+
+    const QByteArray rejected_output(5200, 'r');
+    ok &= check(backend->emit_output(rejected_output),
+        "rejected callback behind sliced output accepts later callback into ingress");
+    const std::uint64_t rejected_epoch = session->backend_callback_enqueue_epoch();
+
+    const bool early_target_reached = session->process_backend_callback_events_until_epoch(
+        rejected_epoch,
+        std::chrono::steady_clock::duration::zero());
+    const std::optional<term::Terminal_render_snapshot> early_snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(!early_target_reached,
+        "rejected callback behind sliced output does not reach target while slices remain");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "rejected callback behind sliced output still has lower-epoch output pending");
+    ok &= check(session->backend_callback_processed_epoch() < rejected_epoch,
+        "rejected callback behind sliced output does not advance processed epoch to rejection");
+    ok &= check(early_snapshot.has_value() &&
+        early_snapshot->metadata.processed_backend_callback_epoch < rejected_epoch,
+        "rejected callback behind sliced output partial snapshot does not claim rejection");
+
+    const bool target_reached = session->process_backend_callback_events_until_epoch(
+        rejected_epoch,
+        std::chrono::seconds(10));
+
+    ok &= check(target_reached,
+        "rejected callback behind sliced output reaches target after lower output drains");
+    ok &= check(!session->has_pending_backend_callback_events(),
+        "rejected callback behind sliced output has no pending work once target is reached");
+    ok &= check(session->backend_callback_processed_epoch() >= rejected_epoch,
+        "rejected callback behind sliced output flushes parked rejected epoch");
+
+    return ok;
+}
+
+bool test_rejected_callback_epoch_waits_for_lower_non_output_callback()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier                  = [] {};
+    config.output_queue_limits.high_water_bytes    = 18000U;
+    config.output_queue_limits.hard_limit_bytes    = 18000U;
+    config.output_queue_limits.high_water_commands = 64U;
+    config.output_queue_limits.hard_limit_commands = 64U;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    backend->exit_on_terminate = false;
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "rejected callback behind non-output session starts");
+
+    const QByteArray sliced_output(17000, 'n');
+    ok &= check(backend->emit_output(sliced_output),
+        "rejected callback behind non-output queues lower-epoch output");
+    const std::uint64_t sliced_epoch = session->backend_callback_enqueue_epoch();
+    const bool first_complete = session->process_backend_callback_events_for(
+        std::chrono::steady_clock::duration::zero());
+    ok &= check(!first_complete && session->has_pending_backend_callback_events(),
+        "rejected callback behind non-output leaves lower output slices pending");
+    ok &= check(session->backend_callback_processed_epoch() < sliced_epoch,
+        "rejected callback behind non-output keeps lower sliced epoch unprocessed");
+
+    ok &= check(!has_backend_error_code(
+            session->notifications(),
+            term::Terminal_backend_error_code::READ_FAILED),
+        "rejected callback behind non-output fixture starts without read failure");
+    ok &= check(backend->emit_error({
+            term::Terminal_backend_error_code::READ_FAILED,
+            QStringLiteral("lower non-output callback"),
+        }),
+        "rejected callback behind non-output queues lower backend error");
+    const std::uint64_t error_epoch = session->backend_callback_enqueue_epoch();
+
+    const QByteArray rejected_output(5200, 'x');
+    ok &= check(backend->emit_output(rejected_output),
+        "rejected callback behind non-output accepts later callback into ingress");
+    const std::uint64_t rejected_epoch = session->backend_callback_enqueue_epoch();
+
+    bool target_reached = false;
+    for (int i = 0; i < 4; ++i) {
+        target_reached = session->process_backend_callback_events_until_epoch(
+            rejected_epoch,
+            std::chrono::steady_clock::duration::zero());
+    }
+    const std::optional<term::Terminal_render_snapshot> before_error_snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(session->output_chunks().size() == 5U,
+        "rejected callback behind non-output drains all lower output slices");
+    ok &= check(!target_reached,
+        "rejected callback behind non-output does not reach target before lower error");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "rejected callback behind non-output keeps lower error pending");
+    ok &= check(!session->exit_status().has_value(),
+        "rejected callback behind non-output has no exit side effect");
+    ok &= check(!has_backend_error_code(
+            session->notifications(),
+            term::Terminal_backend_error_code::READ_FAILED),
+        "rejected callback behind non-output has not processed lower backend error");
+    ok &= check(session->backend_callback_processed_epoch() < error_epoch,
+        "rejected callback behind non-output processed epoch stays before lower error");
+    ok &= check(session->backend_callback_processed_epoch() < rejected_epoch,
+        "rejected callback behind non-output does not advance processed epoch to rejection");
+    ok &= check(before_error_snapshot.has_value() &&
+        before_error_snapshot->metadata.processed_backend_callback_epoch < rejected_epoch,
+        "rejected callback behind non-output snapshot does not claim rejection");
+
+    target_reached = session->process_backend_callback_events_until_epoch(
+        rejected_epoch,
+        std::chrono::seconds(10));
+
+    ok &= check(target_reached,
+        "rejected callback behind non-output reaches target after lower error");
+    ok &= check(!session->has_pending_backend_callback_events(),
+        "rejected callback behind non-output has no pending work once target is reached");
+    ok &= check(has_backend_error_code(
+            session->notifications(),
+            term::Terminal_backend_error_code::READ_FAILED),
+        "rejected callback behind non-output processes lower backend error");
+    ok &= check(session->backend_callback_processed_epoch() >= rejected_epoch,
+        "rejected callback behind non-output flushes parked rejected epoch");
+
+    return ok;
+}
+
+bool test_combined_synchronized_release_suffix_does_not_publish_epoch_early()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "combined synchronized release epoch session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("visible")),
+        "combined synchronized release epoch queues visible baseline");
+    session->process_backend_callback_events();
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
+        "combined synchronized release epoch enters synchronized output");
+    const std::uint64_t hold_epoch = session->backend_callback_enqueue_epoch();
+    session->process_backend_callback_events();
+    ok &= check(session->backend_callback_processed_epoch() == hold_epoch,
+        "combined synchronized release epoch processes held output callback");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026;9999l")),
+        "combined synchronized release epoch queues release with private-mode suffix");
+    const std::uint64_t release_epoch = session->backend_callback_enqueue_epoch();
+    session->process_backend_callback_events();
+    const std::optional<term::Terminal_render_snapshot> release_snapshot =
+        session->latest_render_snapshot();
+
+    ok &= check(release_snapshot.has_value() &&
+        snapshot_contains_text(*release_snapshot, QStringLiteral("held")),
+        "combined synchronized release epoch publishes held content on release");
+    ok &= check(release_snapshot.has_value() &&
+        release_snapshot->metadata.processed_backend_callback_epoch < release_epoch,
+        "combined synchronized release snapshot does not claim epoch before suffix ingest");
+    ok &= check(session->backend_callback_processed_epoch() == release_epoch,
+        "combined synchronized release epoch advances after transformed suffix ingest");
+
+    return ok;
+}
+
 bool test_budgeted_backend_callback_drain_coalesces_incomplete_content_snapshot()
 {
     bool ok = true;
@@ -13540,6 +13996,15 @@ int main()
     ok &= test_deferred_callback_ingress_merges_adjacent_output();
     ok &= test_budgeted_backend_callback_drain_yields_inside_coalesced_output();
     ok &= test_budgeted_backend_callback_drain_coalesces_complete_content_snapshot();
+    ok &= test_deferred_snapshot_before_non_output_callback_uses_previous_processed_epoch();
+    ok &= test_deferred_snapshot_after_output_command_claims_processed_epoch();
+    ok &= test_output_callback_snapshot_inside_command_claims_processed_epoch();
+    ok &= test_incomplete_csi_output_callback_snapshot_keeps_previous_processed_epoch();
+    ok &= test_non_output_after_incomplete_csi_does_not_advance_processed_epoch();
+    ok &= test_rejected_output_callback_enqueue_advances_processed_epoch();
+    ok &= test_rejected_callback_epoch_waits_for_lower_sliced_output();
+    ok &= test_rejected_callback_epoch_waits_for_lower_non_output_callback();
+    ok &= test_combined_synchronized_release_suffix_does_not_publish_epoch_early();
     ok &= test_budgeted_backend_callback_drain_coalesces_incomplete_content_snapshot();
     ok &= test_budgeted_backend_callback_drain_holds_output_command_backpressure();
     ok &= test_deferred_callback_ingress_pauses_backend_at_high_water();

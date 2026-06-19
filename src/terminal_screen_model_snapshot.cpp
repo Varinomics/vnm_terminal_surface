@@ -134,7 +134,8 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
         snapshot.cursor.visible                    = m_modes.cursor_visible;
         snapshot.cursor.blink_enabled              = request.cursor_blink_enabled;
         snapshot.ime_preedit                       = request.ime_preedit;
-        snapshot.metadata.backend_callback_epoch   = request.backend_callback_epoch;
+        snapshot.metadata.processed_backend_callback_epoch =
+            request.processed_backend_callback_epoch;
         snapshot.metadata.backend_geometry_in_sync = request.backend_geometry_in_sync;
         snapshot.metadata.row_origin_generation    = request.row_origin_generation;
         snapshot.metadata.visual_bell_active       = request.visual_bell_active;

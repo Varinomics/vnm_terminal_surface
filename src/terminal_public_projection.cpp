@@ -287,18 +287,20 @@ Terminal_render_snapshot_request public_projection_row_snapshot_request(
     int                             offset_from_tail)
 {
     Terminal_render_snapshot_request request;
-    request.sequence                     = safe_basis.metadata.sequence;
-    request.row_origin_generation        = safe_basis.metadata.row_origin_generation;
-    request.basis                        = safe_basis.basis;
-    request.purpose                      = safe_basis.purpose;
-    request.viewport                     = safe_basis.viewport;
-    request.viewport.offset_from_tail    = offset_from_tail;
-    request.viewport_changed             = true;
-    request.cursor_shape                 = safe_basis.cursor.shape;
-    request.cursor_blink_enabled         = safe_basis.cursor.blink_enabled;
-    request.ime_preedit                  = safe_basis.ime_preedit;
-    request.backend_geometry_in_sync     = safe_basis.metadata.backend_geometry_in_sync;
-    request.visual_bell_active           = safe_basis.metadata.visual_bell_active;
+    request.sequence                         = safe_basis.metadata.sequence;
+    request.processed_backend_callback_epoch =
+        safe_basis.metadata.processed_backend_callback_epoch;
+    request.row_origin_generation            = safe_basis.metadata.row_origin_generation;
+    request.basis                            = safe_basis.basis;
+    request.purpose                          = safe_basis.purpose;
+    request.viewport                         = safe_basis.viewport;
+    request.viewport.offset_from_tail        = offset_from_tail;
+    request.viewport_changed                 = true;
+    request.cursor_shape                     = safe_basis.cursor.shape;
+    request.cursor_blink_enabled             = safe_basis.cursor.blink_enabled;
+    request.ime_preedit                      = safe_basis.ime_preedit;
+    request.backend_geometry_in_sync         = safe_basis.metadata.backend_geometry_in_sync;
+    request.visual_bell_active               = safe_basis.metadata.visual_bell_active;
     request.mouse_reporting_mode_changed =
         safe_basis.metadata.mouse_reporting_mode_changed;
     return request;

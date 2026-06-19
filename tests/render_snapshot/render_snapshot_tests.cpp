@@ -932,14 +932,15 @@ bool test_request_metadata_damage_selection_and_ime()
     model.ingest(QByteArrayLiteral("abcdef"));
 
     term::Terminal_render_snapshot_request request = request_for_model(model, 30U);
-    request.dirty_rows                  = {5, 1, 2, 2, 3};
-    request.cursor_shape                = term::Terminal_cursor_shape::BAR;
-    request.cursor_blink_enabled        = false;
-    request.backend_geometry_in_sync    = false;
-    request.visual_bell_active          = true;
-    request.ime_preedit.text            = QStringLiteral("ime");
-    request.ime_preedit.cursor_position = 2;
-    request.ime_preedit.active          = true;
+    request.dirty_rows                       = {5, 1, 2, 2, 3};
+    request.processed_backend_callback_epoch = 17U;
+    request.cursor_shape                     = term::Terminal_cursor_shape::BAR;
+    request.cursor_blink_enabled             = false;
+    request.backend_geometry_in_sync         = false;
+    request.visual_bell_active               = true;
+    request.ime_preedit.text                 = QStringLiteral("ime");
+    request.ime_preedit.cursor_position      = 2;
+    request.ime_preedit.active               = true;
     const term::Terminal_retained_line_provenance first_line =
         model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
     const term::Terminal_retained_line_provenance second_line =
@@ -970,6 +971,8 @@ bool test_request_metadata_damage_selection_and_ime()
     ok &= check(!snapshot.metadata.backend_geometry_in_sync &&
         snapshot.metadata.visual_bell_active,
         "backend sync and visual bell metadata are copied");
+    ok &= check(snapshot.metadata.processed_backend_callback_epoch == 17U,
+        "processed backend callback epoch metadata is copied");
     ok &= check(snapshot.selection_spans.size() == 2U &&
         snapshot.selection_spans[0].row == 0 &&
         snapshot.selection_spans[1].row == 1,
@@ -2008,16 +2011,17 @@ bool test_row_content_view_matches_flat_snapshot_representation()
         model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 1);
 
     term::Terminal_render_snapshot_request request = request_for_model(model, 220U);
-    request.row_origin_generation         = 77U;
-    request.dirty_rows                    = {0, 2};
-    request.cursor_shape                  = term::Terminal_cursor_shape::UNDERLINE;
-    request.cursor_blink_enabled          = false;
-    request.backend_geometry_in_sync      = false;
-    request.visual_bell_active            = true;
-    request.mouse_reporting_mode_changed  = true;
-    request.ime_preedit.text              = QStringLiteral("ime");
-    request.ime_preedit.cursor_position   = 2;
-    request.ime_preedit.active            = true;
+    request.row_origin_generation            = 77U;
+    request.processed_backend_callback_epoch = 23U;
+    request.dirty_rows                        = {0, 2};
+    request.cursor_shape                      = term::Terminal_cursor_shape::UNDERLINE;
+    request.cursor_blink_enabled              = false;
+    request.backend_geometry_in_sync          = false;
+    request.visual_bell_active                = true;
+    request.mouse_reporting_mode_changed      = true;
+    request.ime_preedit.text                  = QStringLiteral("ime");
+    request.ime_preedit.cursor_position       = 2;
+    request.ime_preedit.active                = true;
     request.selections.push_back({
         {{0, 0}, {1, 3}, term::Terminal_selection_mode::NORMAL},
         {
@@ -2215,6 +2219,7 @@ bool test_row_content_view_matches_flat_snapshot_representation()
         rows.metadata().visual_bell_active &&
         rows.metadata().mouse_reporting_mode_changed &&
         rows.metadata().sequence == 220U &&
+        rows.metadata().processed_backend_callback_epoch == 23U &&
         rows.metadata().row_origin_generation == 77U &&
         rows.modes().mouse_tracking == term::Terminal_mouse_tracking_mode::BUTTON,
         "row-content view exposes snapshot metadata");

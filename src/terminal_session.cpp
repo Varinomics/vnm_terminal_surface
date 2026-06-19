@@ -4092,18 +4092,13 @@ bool Terminal_session::process_pending_commands(
             m_budgeted_backend_output_sequence = 0U;
         }
 
-        const Queue_category category   = queue_category_for(command.kind);
-        const std::size_t    byte_count = static_cast<std::size_t>(command.bytes.size());
+        const Queue_category category      = queue_category_for(command.kind);
+        const std::size_t    byte_count    = static_cast<std::size_t>(command.bytes.size());
         const std::size_t    command_count = slice_backend_output ? 0U : 1U;
         const bool completes_backend_callback =
             command_backend_callback_epoch != 0U && !slice_backend_output;
+        const Terminal_session_command_kind command_kind = command.kind;
         m_last_processed_sequence = command.sequence;
-        if (completes_backend_callback) {
-            m_backend_callback_publication_epoch =
-                std::max(
-                    m_backend_callback_publication_epoch,
-                    command_backend_callback_epoch);
-        }
 
         if (command.kind != Terminal_session_command_kind::BACKEND_OUTPUT ||
             should_ignore_backend_output_after_stop(command.sequence))
@@ -4112,7 +4107,10 @@ bool Terminal_session::process_pending_commands(
         }
 
         m_backend_error_queued_during_command = false;
+        m_processing_backend_callback_epoch =
+            completes_backend_callback ? command_backend_callback_epoch : 0U;
         Terminal_session_result result = process_command(std::move(command));
+        m_processing_backend_callback_epoch = 0U;
         if (!slice_backend_output) {
             record_result(std::move(result));
         }
@@ -4122,11 +4120,10 @@ bool Terminal_session::process_pending_commands(
                 queue_high_water_reached(category),
                 m_last_processed_sequence);
         }
-        if (completes_backend_callback) {
-            m_last_processed_backend_callback_epoch =
-                std::max(
-                    m_last_processed_backend_callback_epoch,
-                    command_backend_callback_epoch);
+        if (completes_backend_callback &&
+            command_kind != Terminal_session_command_kind::BACKEND_OUTPUT)
+        {
+            advance_processed_backend_callback_epoch(command_backend_callback_epoch);
         }
 
         if (target_backend_callback_epoch.has_value() &&
@@ -4671,6 +4668,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::process_backend_output_command");
 
     if (should_ignore_backend_output_after_stop(command.sequence)) {
+        complete_processing_backend_callback_side_effects();
         return make_rejected_result(
             command.sequence,
             Terminal_session_result_code::INVALID_STATE,
@@ -4692,6 +4690,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             Terminal_backend_error_code::READ_FAILED,
             QStringLiteral("backend output requires an initialized screen model"));
         record_backend_error(command.sequence, error);
+        complete_processing_backend_callback_side_effects();
         return make_rejected_result(
             command.sequence,
             Terminal_session_result_code::INVALID_STATE,
@@ -4710,7 +4709,10 @@ Terminal_session_result Terminal_session::process_backend_output_command(
         utf8_scan_state_is_reset(backend_output_prescan_utf8_state)   &&
         backend_output_is_plain_ascii_without_prescan_intro(command.bytes);
     if (use_plain_ascii_prescan_fast_path) {
-        ingest_backend_output_segment(command.sequence, QByteArrayView(command.bytes));
+        ingest_backend_output_segment(
+            command.sequence,
+            QByteArrayView(command.bytes),
+            true);
         return make_accepted_result(command.sequence);
     }
 
@@ -4765,9 +4767,12 @@ Terminal_session_result Terminal_session::process_backend_output_command(
                 }
 
                 const QByteArray release = sync_sequence_only('l');
-                ingest_backend_output_segment(command.sequence, QByteArrayView(release));
                 combined_output =
                     sync_sequence_post_parameter_suffix_and_tail(remaining, sync_reset, 'l');
+                ingest_backend_output_segment(
+                    command.sequence,
+                    QByteArrayView(release),
+                    m_backend_output_prescan_pending.isEmpty() && combined_output.isEmpty());
                 remaining = QByteArrayView(combined_output);
                 reset_utf8_scan_state(remaining_utf8_scan_state);
                 continue;
@@ -4778,7 +4783,10 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             remaining,
             remaining_utf8_scan_state);
         if (sync_set.start < 0) {
-            ingest_backend_output_segment(command.sequence, remaining);
+            ingest_backend_output_segment(
+                command.sequence,
+                remaining,
+                m_backend_output_prescan_pending.isEmpty());
             break;
         }
 
@@ -4814,10 +4822,13 @@ Terminal_session_result Terminal_session::process_backend_output_command(
 
         if (immediate_entry_boundary) {
             const QByteArray entry = sync_sequence_only('h');
-            ingest_backend_output_segment(command.sequence, QByteArrayView(entry));
-            (void)capture_public_projection_from_latest_content_basis();
             combined_output =
                 sync_sequence_post_parameter_suffix_and_tail(remaining, sync_set, 'h');
+            ingest_backend_output_segment(
+                command.sequence,
+                QByteArrayView(entry),
+                m_backend_output_prescan_pending.isEmpty() && combined_output.isEmpty());
+            (void)capture_public_projection_from_latest_content_basis();
             remaining = QByteArrayView(combined_output);
             reset_utf8_scan_state(remaining_utf8_scan_state);
             continue;
@@ -4832,8 +4843,19 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             continue;
         }
 
-        ingest_backend_output_segment(command.sequence, remaining);
+        ingest_backend_output_segment(
+            command.sequence,
+            remaining,
+            m_backend_output_prescan_pending.isEmpty());
         break;
+    }
+
+    if (command.bytes.isEmpty() && m_backend_output_prescan_pending.isEmpty()) {
+        complete_processing_backend_output_side_effects();
+    }
+
+    if (!m_backend_output_prescan_pending.isEmpty()) {
+        record_incomplete_processing_backend_output_side_effects();
     }
 
     m_backend_output_prescan_utf8_state = utf8_scan_state_after(
@@ -5055,28 +5077,17 @@ void Terminal_session::drain_backend_callback_commands()
                 command.error.has_value()                                           &&
                 command.error->code == Terminal_backend_error_code::OUTPUT_OVERFLOW)
             {
-                m_backend_callback_publication_epoch =
-                    std::max(
-                        m_backend_callback_publication_epoch,
-                        command.backend_callback_epoch);
                 Terminal_session_result result = handle_output_overflow(
                     command.sequence,
                     command.error->message);
                 record_result(std::move(result));
-                m_last_processed_backend_callback_epoch =
-                    std::max(
-                        m_last_processed_backend_callback_epoch,
-                        command.backend_callback_epoch);
+                advance_processed_backend_callback_epoch(command.backend_callback_epoch);
                 continue;
             }
 
             if (command.kind == Terminal_session_command_kind::BACKEND_OUTPUT &&
                 should_ignore_backend_output_after_stop(command.sequence))
             {
-                m_backend_callback_publication_epoch =
-                    std::max(
-                        m_backend_callback_publication_epoch,
-                        command.backend_callback_epoch);
                 Terminal_session_result result = make_rejected_result(
                     command.sequence,
                     Terminal_session_result_code::INVALID_STATE,
@@ -5084,14 +5095,16 @@ void Terminal_session::drain_backend_callback_commands()
                         Terminal_backend_error_code::OUTPUT_OVERFLOW,
                         QStringLiteral("backend output ignored after terminal stop request")));
                 record_result(std::move(result));
-                m_last_processed_backend_callback_epoch =
-                    std::max(
-                        m_last_processed_backend_callback_epoch,
-                        command.backend_callback_epoch);
+                advance_processed_backend_callback_epoch(command.backend_callback_epoch);
                 continue;
             }
 
+            const std::uint64_t command_backend_callback_epoch =
+                command.backend_callback_epoch;
             Terminal_session_result result = enqueue_command(std::move(command));
+            if (result.code != Terminal_session_result_code::ACCEPTED) {
+                advance_processed_backend_callback_epoch(command_backend_callback_epoch);
+            }
             record_result(std::move(result));
         }
     }
@@ -5231,6 +5244,87 @@ void Terminal_session::record_output_activity(std::uint64_t sequence)
     });
 }
 
+void Terminal_session::advance_processed_backend_callback_epoch(std::uint64_t epoch)
+{
+    if (epoch == 0U) {
+        return;
+    }
+
+    m_ready_processed_backend_callback_epoch =
+        std::max(m_ready_processed_backend_callback_epoch, epoch);
+    flush_ready_processed_backend_callback_epoch();
+}
+
+void Terminal_session::flush_ready_processed_backend_callback_epoch()
+{
+    const std::uint64_t epoch = m_ready_processed_backend_callback_epoch;
+    if (epoch == 0U) {
+        return;
+    }
+
+    if (m_incomplete_backend_output_callback_epoch != 0U &&
+        epoch >= m_incomplete_backend_output_callback_epoch)
+    {
+        return;
+    }
+
+    if (pending_backend_callback_blocks_processed_callback_epoch(epoch)) {
+        return;
+    }
+
+    m_last_processed_backend_callback_epoch =
+        std::max(m_last_processed_backend_callback_epoch, epoch);
+    m_ready_processed_backend_callback_epoch = 0U;
+}
+
+bool Terminal_session::pending_backend_callback_blocks_processed_callback_epoch(
+    std::uint64_t epoch) const
+{
+    for (const Terminal_session_command& command : m_pending_commands) {
+        if (command.backend_callback_epoch != 0U &&
+            command.backend_callback_epoch <= epoch)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Terminal_session::complete_processing_backend_callback_side_effects()
+{
+    advance_processed_backend_callback_epoch(m_processing_backend_callback_epoch);
+}
+
+void Terminal_session::complete_processing_backend_output_side_effects()
+{
+    const std::uint64_t epoch = m_processing_backend_callback_epoch;
+    if (epoch == 0U) {
+        return;
+    }
+
+    if (m_incomplete_backend_output_callback_epoch != 0U &&
+        epoch > m_incomplete_backend_output_callback_epoch)
+    {
+        m_incomplete_backend_output_callback_epoch = 0U;
+    }
+
+    advance_processed_backend_callback_epoch(epoch);
+}
+
+void Terminal_session::record_incomplete_processing_backend_output_side_effects()
+{
+    const std::uint64_t epoch = m_processing_backend_callback_epoch;
+    if (epoch == 0U) {
+        return;
+    }
+
+    if (m_incomplete_backend_output_callback_epoch == 0U ||
+        epoch < m_incomplete_backend_output_callback_epoch)
+    {
+        m_incomplete_backend_output_callback_epoch = epoch;
+    }
+}
+
 void Terminal_session::record_backend_error(
     std::uint64_t          sequence,
     Terminal_backend_error error)
@@ -5272,6 +5366,7 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     m_viewport_controller = Terminal_viewport_controller{};
     m_viewport_controller.set_visible_rows(grid_size.rows);
     m_backend_output_prescan_pending.clear();
+    m_incomplete_backend_output_callback_epoch = 0U;
     reset_utf8_scan_state(m_backend_output_prescan_utf8_state);
     m_latest_render_snapshot.reset();
     m_latest_content_render_snapshot.reset();
@@ -5303,7 +5398,8 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
 
 void Terminal_session::ingest_backend_output_segment(
     std::uint64_t  sequence,
-    QByteArrayView bytes)
+    QByteArrayView bytes,
+    bool           completes_backend_output_callback)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::ingest_backend_output_segment");
 
@@ -5345,6 +5441,9 @@ void Terminal_session::ingest_backend_output_segment(
     {
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::sync_viewport_from_model_result");
         sync_viewport_from_model_result(ingest_result, detached_viewport_anchor);
+    }
+    if (completes_backend_output_callback) {
+        complete_processing_backend_output_side_effects();
     }
 
     const bool render_snapshot_available = model_allows_render_snapshot(*m_screen_model);
@@ -6345,16 +6444,17 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
     Terminal_public_scroll_diagnostics public_scroll_diagnostics) const
 {
     Terminal_render_snapshot_request request;
-    request.sequence                 = sequence;
-    request.backend_callback_epoch   = m_backend_callback_publication_epoch;
-    request.row_origin_generation    = m_row_origin_generation;
-    request.basis                    = Terminal_render_snapshot_basis::LIVE_CONTENT;
-    request.purpose                  = purpose;
-    request.public_scroll_diagnostics = public_scroll_diagnostics;
-    request.viewport                 = m_viewport_controller.state();
-    request.backend_geometry_in_sync = m_backend_geometry_in_sync;
-    request.visual_bell_active       = m_visual_bell_active;
-    request.ime_preedit              = m_ime_preedit;
+    request.sequence                         = sequence;
+    request.processed_backend_callback_epoch =
+        m_last_processed_backend_callback_epoch;
+    request.row_origin_generation            = m_row_origin_generation;
+    request.basis                            = Terminal_render_snapshot_basis::LIVE_CONTENT;
+    request.purpose                          = purpose;
+    request.public_scroll_diagnostics        = public_scroll_diagnostics;
+    request.viewport                         = m_viewport_controller.state();
+    request.backend_geometry_in_sync         = m_backend_geometry_in_sync;
+    request.visual_bell_active               = m_visual_bell_active;
+    request.ime_preedit                      = m_ime_preedit;
     if (m_render_snapshot_model_result.has_value()) {
         request.dirty_rows       = m_render_snapshot_model_result->dirty_rows;
         request.viewport_changed = m_render_snapshot_model_result->viewport_changed;

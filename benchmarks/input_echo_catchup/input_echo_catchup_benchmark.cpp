@@ -71,7 +71,7 @@ const QString k_continuous_output_measurement_boundary = QStringLiteral(
     "backend_callback_enqueue_at_every_qsg_sync_boundary");
 const QString k_queue_contract_decision_criteria = QStringLiteral(
     "first captured post-input frame must not consume a snapshot whose "
-    "backend_callback_epoch is older than a backend callback delivered before sync");
+    "processed_backend_callback_epoch is older than a backend callback delivered before sync");
 const QString k_continuous_output_decision_criteria = QStringLiteral(
     "accepted input must reach a fresh captured frame despite backend output "
     "arriving after every frame eligibility boundary");
@@ -1058,7 +1058,7 @@ std::optional<Queue_contract_result> run_queue_contract(
     }
     result.pre_echo_snapshot_sequence = pre_echo_snapshot->metadata.sequence;
     result.pre_echo_snapshot_callback_epoch =
-        pre_echo_snapshot->metadata.backend_callback_epoch;
+        pre_echo_snapshot->metadata.processed_backend_callback_epoch;
 
     const term::Terminal_surface_render_invalidation_stats_t invalidation_before =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
@@ -1082,7 +1082,7 @@ std::optional<Queue_contract_result> run_queue_contract(
     if (polished_snapshot != nullptr) {
         result.polished_snapshot_sequence = polished_snapshot->metadata.sequence;
         result.polished_snapshot_callback_epoch =
-            polished_snapshot->metadata.backend_callback_epoch;
+            polished_snapshot->metadata.processed_backend_callback_epoch;
     }
 
     const term::Qsg_atlas_frame_report report_before =
@@ -1147,10 +1147,10 @@ std::optional<Queue_contract_result> run_queue_contract(
         result.echo_snapshot_published = true;
         result.echo_snapshot_sequence = echo_snapshot->metadata.sequence;
         result.echo_snapshot_callback_epoch =
-            echo_snapshot->metadata.backend_callback_epoch;
+            echo_snapshot->metadata.processed_backend_callback_epoch;
         result.surface_publication_snapshot_sequence = echo_snapshot->metadata.sequence;
         result.surface_publication_callback_epoch =
-            echo_snapshot->metadata.backend_callback_epoch;
+            echo_snapshot->metadata.processed_backend_callback_epoch;
     }
 
     result.callback_processed_epoch_after_capture =
@@ -1337,10 +1337,10 @@ std::optional<Continuous_output_result> run_continuous_output_contract(
     if (echo_snapshot != nullptr) {
         result.echo_snapshot_sequence = echo_snapshot->metadata.sequence;
         result.echo_snapshot_callback_epoch =
-            echo_snapshot->metadata.backend_callback_epoch;
+            echo_snapshot->metadata.processed_backend_callback_epoch;
         result.surface_publication_snapshot_sequence = echo_snapshot->metadata.sequence;
         result.surface_publication_callback_epoch =
-            echo_snapshot->metadata.backend_callback_epoch;
+            echo_snapshot->metadata.processed_backend_callback_epoch;
     }
 
     if (first_frame_report.has_value()) {
