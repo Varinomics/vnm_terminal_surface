@@ -1679,7 +1679,6 @@ void append_frame_key_render_options(
         key,
         options.cursor_blink_enabled_override.has_value() &&
             *options.cursor_blink_enabled_override);
-    append_frame_key_bool(key, options.suppress_cursor);
     append_frame_key_bool(key, options.visual_bell_enabled);
     append_frame_key_bool(key, options.underline_hyperlinks);
     append_frame_key_int(key, static_cast<int>(options.text_renderer_policy));
