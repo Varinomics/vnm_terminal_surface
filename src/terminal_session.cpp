@@ -2523,9 +2523,13 @@ Terminal_session_result Terminal_session::start(Terminal_launch_config launch_co
 Terminal_session_result Terminal_session::write_user_bytes(QByteArray bytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    const Accepted_input_freshness_basis input_freshness_basis =
+    Accepted_input_freshness_basis input_freshness_basis =
         capture_accepted_input_freshness_basis();
+    run_after_accepted_input_freshness_sample_hook_for_testing();
     drain_backend_callback_commands();
+    input_freshness_basis =
+        finalize_accepted_input_freshness_basis(input_freshness_basis);
+    run_after_accepted_input_freshness_finalize_hook_for_testing();
 
     return write_user_bytes_locked(
         std::move(bytes),
@@ -2583,38 +2587,24 @@ Terminal_session_result Terminal_session::write_user_bytes_locked(
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
         make_user_write_command(sequence, std::move(bytes)),
         drain_policy);
-    if (result.code     == Terminal_session_result_code::ACCEPTED &&
-        viewport_policy == User_write_viewport_policy::RETURN_TO_TAIL)
-    {
-        Terminal_session_result accepted_result = result;
-        if (input_freshness_basis.has_value()) {
-            attach_accepted_input_freshness_token(
-                accepted_result,
-                *input_freshness_basis);
-        }
-        return_viewport_to_tail_after_user_input(sequence);
-        publish_accepted_input_freshness_snapshot_if_needed(accepted_result);
-        return accepted_result;
-    }
-    Terminal_session_result final_result = result;
-    if (result.code == Terminal_session_result_code::ACCEPTED &&
-        input_freshness_basis.has_value())
-    {
-        attach_accepted_input_freshness_token(
-            final_result,
-            *input_freshness_basis);
-        publish_accepted_input_freshness_snapshot_if_needed(final_result);
-    }
-    return final_result;
+    return finalize_accepted_text_input_result(
+        result,
+        sequence,
+        viewport_policy,
+        input_freshness_basis);
 }
 
 Terminal_key_event_result Terminal_session::write_key_event(const QKeyEvent& event)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    const Accepted_input_freshness_basis input_freshness_basis =
+    Accepted_input_freshness_basis input_freshness_basis =
         capture_accepted_input_freshness_basis();
+    run_after_accepted_input_freshness_sample_hook_for_testing();
     drain_backend_callback_commands();
     process_pending_commands();
+    input_freshness_basis =
+        finalize_accepted_input_freshness_basis(input_freshness_basis);
+    run_after_accepted_input_freshness_finalize_hook_for_testing();
 
     return write_key_event_locked(
         event,
@@ -2658,18 +2648,14 @@ Terminal_key_event_result Terminal_session::write_key_event_locked(
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
         make_user_write_command(sequence, std::move(bytes)),
         drain_policy);
-    if (result.code == Terminal_session_result_code::ACCEPTED) {
-        Terminal_session_result accepted_result = result;
-        if (input_freshness_basis.has_value()) {
-            attach_accepted_input_freshness_token(
-                accepted_result,
-                *input_freshness_basis);
-        }
-        return_viewport_to_tail_after_user_input(sequence);
-        publish_accepted_input_freshness_snapshot_if_needed(accepted_result);
-        return {true, accepted_result};
-    }
-    return {true, result};
+    return {
+        true,
+        finalize_accepted_text_input_result(
+            result,
+            sequence,
+            User_write_viewport_policy::RETURN_TO_TAIL,
+            input_freshness_basis),
+    };
 }
 
 std::optional<Terminal_mouse_event_result>
@@ -2725,10 +2711,14 @@ Terminal_ime_commit_result Terminal_session::write_ime_commit(QString text)
     }
 
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    const Accepted_input_freshness_basis input_freshness_basis =
+    Accepted_input_freshness_basis input_freshness_basis =
         capture_accepted_input_freshness_basis();
+    run_after_accepted_input_freshness_sample_hook_for_testing();
     drain_backend_callback_commands();
     process_pending_commands();
+    input_freshness_basis =
+        finalize_accepted_input_freshness_basis(input_freshness_basis);
+    run_after_accepted_input_freshness_finalize_hook_for_testing();
 
     QByteArray bytes = text.toUtf8();
     if (m_process_state == Terminal_process_state::NOT_STARTED ||
@@ -2753,16 +2743,16 @@ Terminal_ime_commit_result Terminal_session::write_ime_commit(QString text)
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
         make_user_write_command(sequence, std::move(bytes)));
 
-    Terminal_session_result final_result = result;
-    if (result.code == Terminal_session_result_code::ACCEPTED) {
-        attach_accepted_input_freshness_token(
-            final_result,
+    Terminal_session_result final_result =
+        finalize_accepted_text_input_result(
+            result,
+            sequence,
+            User_write_viewport_policy::RETURN_TO_TAIL,
             input_freshness_basis);
-        return_viewport_to_tail_after_user_input(sequence);
-        publish_accepted_input_freshness_snapshot_if_needed(final_result);
-    }
 
-    if (final_result.code == Terminal_session_result_code::ACCEPTED && ime_preedit_has_content(m_ime_preedit)) {
+    if (final_result.code == Terminal_session_result_code::ACCEPTED &&
+        ime_preedit_has_content(m_ime_preedit))
+    {
         m_ime_preedit = {};
         advance_ime_preedit_generation();
     }
@@ -2775,10 +2765,14 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     Terminal_paste_framing_policy  policy)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    const Accepted_input_freshness_basis input_freshness_basis =
+    Accepted_input_freshness_basis input_freshness_basis =
         capture_accepted_input_freshness_basis();
+    run_after_accepted_input_freshness_sample_hook_for_testing();
     drain_backend_callback_commands();
     process_pending_commands();
+    input_freshness_basis =
+        finalize_accepted_input_freshness_basis(input_freshness_basis);
+    run_after_accepted_input_freshness_finalize_hook_for_testing();
 
     const Terminal_input_mode_state modes = m_screen_model.has_value()
         ? m_screen_model->input_mode_state()
@@ -2809,16 +2803,14 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
 
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
         make_user_paste_command(sequence, std::move(bytes)));
-    if (result.code == Terminal_session_result_code::ACCEPTED) {
-        Terminal_session_result accepted_result = result;
-        attach_accepted_input_freshness_token(
-            accepted_result,
-            input_freshness_basis);
-        return_viewport_to_tail_after_user_input(sequence);
-        publish_accepted_input_freshness_snapshot_if_needed(accepted_result);
-        return {true, accepted_result};
-    }
-    return {true, result};
+    return {
+        true,
+        finalize_accepted_text_input_result(
+            result,
+            sequence,
+            User_write_viewport_policy::RETURN_TO_TAIL,
+            input_freshness_basis),
+    };
 }
 
 Terminal_focus_event_result Terminal_session::write_focus_event(bool focused)
@@ -3824,6 +3816,22 @@ void Terminal_session::set_synchronized_output_scroll_policy_for_testing(
     set_synchronized_output_scroll_policy(policy);
 }
 
+void Terminal_session::set_after_accepted_input_freshness_sample_hook_for_testing(
+    std::function<void()> hook)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    m_after_accepted_input_freshness_sample_for_testing = std::move(hook);
+}
+
+void Terminal_session::set_after_accepted_input_freshness_finalize_hook_for_testing(
+    std::function<void()> hook)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    m_after_accepted_input_freshness_finalize_for_testing = std::move(hook);
+}
+
 std::uint64_t Terminal_session::render_snapshot_generation() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -3879,11 +3887,13 @@ bool Terminal_session::mark_render_publication_rendered(std::uint64_t generation
     if (m_render_snapshot_rendered_generation >= m_render_snapshot_generation) {
         m_unrendered_render_snapshot_dirty_basis.reset();
     }
-    const bool publish_rendered_pre_input_freshness =
+    const bool publish_rendered_input_freshness =
         m_pending_input_freshness_token != 0U &&
-        m_pending_input_freshness_requires_post_input_callback &&
+        m_pending_input_freshness_render_generation != 0U &&
         m_last_processed_backend_callback_epoch >=
             m_pending_input_freshness_backend_callback_epoch &&
+        m_render_snapshot_rendered_generation >=
+            m_pending_input_freshness_render_generation &&
         m_render_snapshot_rendered_generation >= m_render_snapshot_generation &&
         m_screen_model.has_value() &&
         model_allows_render_snapshot(*m_screen_model);
@@ -3894,13 +3904,13 @@ bool Terminal_session::mark_render_publication_rendered(std::uint64_t generation
         ++m_profile_stats.snapshots_marked_rendered;
     }
 #endif
-    if (publish_rendered_pre_input_freshness) {
-        m_pending_input_freshness_requires_post_input_callback = false;
+    if (publish_rendered_input_freshness) {
+        m_pending_input_freshness_render_generation = 0U;
         Terminal_screen_model_result model_result;
         m_render_snapshot_model_result = model_result;
         publish_render_snapshot(
             next_sequence(),
-            QStringLiteral("input freshness advanced after rendered pre-input output"),
+            QStringLiteral("input freshness advanced after rendered live output"),
             Terminal_render_snapshot_purpose::CONTENT);
         return true;
     }
@@ -5566,6 +5576,7 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     m_render_snapshot_generation        = 0U;
     m_render_snapshot_installed_generation = 0U;
     m_render_snapshot_rendered_generation  = 0U;
+    m_pending_input_freshness_render_generation = 0U;
     m_unrendered_render_snapshot_dirty_basis.reset();
     m_next_public_projection_generation = 1U;
     m_synchronized_output_hold_policy.reset();
@@ -6814,7 +6825,48 @@ Terminal_session::capture_accepted_input_freshness_basis() const
     basis.render_snapshot_generation = m_render_snapshot_generation;
     basis.backend_callback_activity =
         basis.backend_callback_epoch > basis.processed_backend_callback_epoch;
+    basis.live_content_publication_unrendered =
+        has_unrendered_live_content_publication();
     return basis;
+}
+
+Terminal_session::Accepted_input_freshness_basis
+Terminal_session::finalize_accepted_input_freshness_basis(
+    Accepted_input_freshness_basis basis) const
+{
+    basis.backend_callback_epoch =
+        std::max(
+            basis.backend_callback_epoch,
+            m_callback_lifetime->last_enqueued_backend_callback_epoch());
+    basis.backend_callback_activity =
+        basis.backend_callback_activity ||
+        basis.backend_callback_epoch > basis.processed_backend_callback_epoch;
+    basis.live_content_publication_unrendered =
+        basis.live_content_publication_unrendered ||
+        has_unrendered_live_content_publication();
+    return basis;
+}
+
+void Terminal_session::run_after_accepted_input_freshness_sample_hook_for_testing()
+{
+    if (m_after_accepted_input_freshness_sample_for_testing) {
+        m_after_accepted_input_freshness_sample_for_testing();
+    }
+}
+
+void Terminal_session::run_after_accepted_input_freshness_finalize_hook_for_testing()
+{
+    if (m_after_accepted_input_freshness_finalize_for_testing) {
+        m_after_accepted_input_freshness_finalize_for_testing();
+    }
+}
+
+bool Terminal_session::has_unrendered_live_content_publication() const
+{
+    return
+        m_latest_content_render_snapshot != nullptr &&
+        m_latest_content_render_snapshot->metadata.publication_generation >
+            m_render_snapshot_rendered_generation;
 }
 
 std::uint64_t Terminal_session::next_input_freshness_token()
@@ -6831,7 +6883,8 @@ void Terminal_session::attach_accepted_input_freshness_token(
     const Accepted_input_freshness_basis&  basis)
 {
     if (result.code != Terminal_session_result_code::ACCEPTED ||
-        !basis.backend_callback_activity)
+        (!basis.backend_callback_activity &&
+            !basis.live_content_publication_unrendered))
     {
         return;
     }
@@ -6843,8 +6896,33 @@ void Terminal_session::attach_accepted_input_freshness_token(
     m_pending_input_freshness_sequence = result.sequence;
     m_pending_input_freshness_backend_callback_epoch =
         basis.backend_callback_epoch;
-    m_pending_input_freshness_requires_post_input_callback =
-        m_render_snapshot_generation > basis.render_snapshot_generation;
+    m_pending_input_freshness_render_generation =
+        basis.live_content_publication_unrendered ||
+            m_render_snapshot_generation > basis.render_snapshot_generation
+            ? m_render_snapshot_generation
+            : 0U;
+}
+
+Terminal_session_result Terminal_session::finalize_accepted_text_input_result(
+    Terminal_session_result                         result,
+    std::uint64_t                                   sequence,
+    User_write_viewport_policy                      viewport_policy,
+    std::optional<Accepted_input_freshness_basis>   input_freshness_basis)
+{
+    if (result.code != Terminal_session_result_code::ACCEPTED) {
+        return result;
+    }
+
+    if (input_freshness_basis.has_value()) {
+        attach_accepted_input_freshness_token(
+            result,
+            *input_freshness_basis);
+    }
+    if (viewport_policy == User_write_viewport_policy::RETURN_TO_TAIL) {
+        return_viewport_to_tail_after_user_input(sequence);
+    }
+    publish_accepted_input_freshness_snapshot_if_needed(result);
+    return result;
 }
 
 void Terminal_session::publish_accepted_input_freshness_snapshot_if_needed(
@@ -6852,7 +6930,7 @@ void Terminal_session::publish_accepted_input_freshness_snapshot_if_needed(
 {
     if (result.accepted_input_freshness_token == 0U ||
         result.accepted_input_freshness_token != m_pending_input_freshness_token ||
-        m_pending_input_freshness_requires_post_input_callback ||
+        m_pending_input_freshness_render_generation != 0U ||
         m_visible_input_freshness_token >= result.accepted_input_freshness_token ||
         !m_screen_model.has_value() ||
         !model_allows_render_snapshot(*m_screen_model))
@@ -6882,12 +6960,13 @@ std::uint64_t Terminal_session::satisfied_input_freshness_token_for_snapshot(
     const bool sequence_caught_up =
         sequence >= m_pending_input_freshness_sequence;
     const bool backend_callbacks_caught_up =
-        m_pending_input_freshness_requires_post_input_callback
-            ? processed_backend_callback_epoch >
-                m_pending_input_freshness_backend_callback_epoch
-            : processed_backend_callback_epoch >=
-                m_pending_input_freshness_backend_callback_epoch;
+        processed_backend_callback_epoch >=
+            m_pending_input_freshness_backend_callback_epoch;
     if (!sequence_caught_up || !backend_callbacks_caught_up) {
+        return m_visible_input_freshness_token;
+    }
+
+    if (m_pending_input_freshness_render_generation != 0U) {
         return m_visible_input_freshness_token;
     }
 
@@ -6911,7 +6990,7 @@ void Terminal_session::record_input_freshness_snapshot_publication(
         m_pending_input_freshness_token = 0U;
         m_pending_input_freshness_sequence = 0U;
         m_pending_input_freshness_backend_callback_epoch = 0U;
-        m_pending_input_freshness_requires_post_input_callback = false;
+        m_pending_input_freshness_render_generation = 0U;
     }
 }
 

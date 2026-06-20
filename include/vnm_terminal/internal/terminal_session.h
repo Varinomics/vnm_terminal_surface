@@ -11,6 +11,7 @@
 #include <QString>
 #include <chrono>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -403,6 +404,10 @@ public:
         Terminal_synchronized_output_scroll_policy policy);
     void set_synchronized_output_scroll_policy_for_testing(
         Terminal_synchronized_output_scroll_policy policy);
+    void set_after_accepted_input_freshness_sample_hook_for_testing(
+        std::function<void()> hook);
+    void set_after_accepted_input_freshness_finalize_hook_for_testing(
+        std::function<void()> hook);
     std::uint64_t render_snapshot_generation() const;
     std::uint64_t installed_render_snapshot_generation() const;
     std::uint64_t rendered_render_snapshot_generation() const;
@@ -476,6 +481,7 @@ private:
         std::uint64_t processed_backend_callback_epoch = 0U;
         std::uint64_t render_snapshot_generation = 0U;
         bool          backend_callback_activity = false;
+        bool          live_content_publication_unrendered = false;
     };
 
     struct Live_primary_viewport_anchor
@@ -714,10 +720,20 @@ private:
         std::uint64_t              publication_generation);
 
     Accepted_input_freshness_basis capture_accepted_input_freshness_basis() const;
+    Accepted_input_freshness_basis finalize_accepted_input_freshness_basis(
+        Accepted_input_freshness_basis basis) const;
+    void run_after_accepted_input_freshness_sample_hook_for_testing();
+    void run_after_accepted_input_freshness_finalize_hook_for_testing();
+    bool has_unrendered_live_content_publication() const;
     std::uint64_t next_input_freshness_token();
     void attach_accepted_input_freshness_token(
         Terminal_session_result&               result,
         const Accepted_input_freshness_basis&  basis);
+    Terminal_session_result finalize_accepted_text_input_result(
+        Terminal_session_result                         result,
+        std::uint64_t                                   sequence,
+        User_write_viewport_policy                      viewport_policy,
+        std::optional<Accepted_input_freshness_basis>   input_freshness_basis);
     void publish_accepted_input_freshness_snapshot_if_needed(
         const Terminal_session_result& result);
     std::uint64_t satisfied_input_freshness_token_for_snapshot(
@@ -887,8 +903,8 @@ private:
     std::uint64_t                                          m_pending_input_freshness_token = 0U;
     std::uint64_t                                          m_pending_input_freshness_sequence = 0U;
     std::uint64_t                                          m_pending_input_freshness_backend_callback_epoch = 0U;
+    std::uint64_t                                          m_pending_input_freshness_render_generation = 0U;
     std::uint64_t                                          m_visible_input_freshness_token = 0U;
-    bool                                                   m_pending_input_freshness_requires_post_input_callback = false;
     std::uint64_t                                          m_next_public_projection_generation = 1U;
     std::shared_ptr<const Terminal_render_snapshot>        m_unrendered_render_snapshot_dirty_basis;
     std::optional<Terminal_synchronized_output_scroll_policy>
@@ -920,6 +936,8 @@ private:
         Terminal_buffer_id::PRIMARY;
     bool                                                   m_deferred_viewport_changed = false;
     bool                                                   m_visual_bell_active        = false;
+    std::function<void()>                                  m_after_accepted_input_freshness_sample_for_testing;
+    std::function<void()>                                  m_after_accepted_input_freshness_finalize_for_testing;
 };
 
 }
