@@ -706,6 +706,10 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
         render_invalidation.value(QStringLiteral("update_requests")).isString(),
         "render invalidation metrics include update request counter");
     ok &= check(
+        render_invalidation.value(
+            QStringLiteral("last_rendered_publication_generation")).isString(),
+        "render invalidation metrics include rendered publication generation");
+    ok &= check(
         render_invalidation.value(QStringLiteral("pending_update")).isBool(),
         "render invalidation metrics include pending-update flag");
 
