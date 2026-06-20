@@ -344,6 +344,9 @@ QJsonArray row_provenance_array(const term::Terminal_render_snapshot& snapshot)
         object.insert(
             QStringLiteral("content_generation"),
             QString::number(static_cast<qulonglong>(provenance.content_generation)));
+        object.insert(
+            QStringLiteral("source"),
+            term::retained_line_provenance_source_name(provenance.source));
         rows.append(object);
     }
     return rows;
@@ -1218,7 +1221,9 @@ void print_snapshot_diagnostics(const term::Terminal_render_snapshot& snapshot)
                 << " retained_line_id="
                 << static_cast<unsigned long long>(provenance.retained_line_id)
                 << " content_generation="
-                << static_cast<unsigned long long>(provenance.content_generation);
+                << static_cast<unsigned long long>(provenance.content_generation)
+                << " source="
+                << term::retained_line_provenance_source_name(provenance.source).toStdString();
         }
         std::cout << '\n';
     }

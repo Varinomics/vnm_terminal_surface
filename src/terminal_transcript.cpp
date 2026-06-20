@@ -203,6 +203,9 @@ QJsonArray row_provenance_array(const Terminal_render_snapshot& snapshot)
         object.insert(QStringLiteral("logical_row"), static_cast<qint64>(provenance.logical_row));
         object.insert(QStringLiteral("retained_line_id"), u64_string(provenance.retained_line_id));
         object.insert(QStringLiteral("content_generation"), u64_string(provenance.content_generation));
+        object.insert(
+            QStringLiteral("source"),
+            retained_line_provenance_source_name(provenance.source));
         rows.append(object);
     }
     return rows;
@@ -449,6 +452,22 @@ void apply_snapshot_schema_compatibility_defaults(QJsonObject& object)
         if (!object.contains(QStringLiteral("live_viewport_after_on_release"))) {
             object.insert(QStringLiteral("live_viewport_after_on_release"), viewport);
         }
+    }
+
+    QJsonArray row_provenance = object.value(QStringLiteral("row_provenance")).toArray();
+    bool updated_row_provenance = false;
+    for (int row = 0; row < row_provenance.size(); ++row) {
+        QJsonObject provenance = row_provenance.at(row).toObject();
+        if (provenance.contains(QStringLiteral("source"))) {
+            continue;
+        }
+
+        provenance.insert(QStringLiteral("source"), QStringLiteral("terminal_storage"));
+        row_provenance.replace(row, provenance);
+        updated_row_provenance = true;
+    }
+    if (updated_row_provenance) {
+        object.insert(QStringLiteral("row_provenance"), row_provenance);
     }
 }
 
@@ -1246,6 +1265,32 @@ bool validate_visible_rows_array(
     return true;
 }
 
+bool validate_retained_line_provenance_source_name(
+    const QJsonObject& row,
+    int                line_number,
+    QString*           out_error)
+{
+    if (!row.contains(QStringLiteral("source"))) {
+        return true;
+    }
+
+    QString source;
+    if (!require_string_field(row, QStringLiteral("source"), line_number, out_error, &source)) {
+        return false;
+    }
+
+    if (source == QStringLiteral("terminal_storage") ||
+        source == QStringLiteral("recovered_primary_repaint"))
+    {
+        return true;
+    }
+
+    return fail_read(
+        out_error,
+        QStringLiteral("transcript line %1 row_provenance source is invalid")
+            .arg(line_number));
+}
+
 bool validate_row_provenance_array(
     const QJsonObject& object,
     int                line_number,
@@ -1268,7 +1313,8 @@ bool validate_row_provenance_array(
         if (!require_nonnegative_int_field(row, QStringLiteral("row"), line_number, out_error) ||
             !require_integral_field(row, QStringLiteral("logical_row"), line_number, out_error) ||
             !require_string_field(row, QStringLiteral("retained_line_id"), line_number, out_error) ||
-            !require_string_field(row, QStringLiteral("content_generation"), line_number, out_error))
+            !require_string_field(row, QStringLiteral("content_generation"), line_number, out_error) ||
+            !validate_retained_line_provenance_source_name(row, line_number, out_error))
         {
             return false;
         }

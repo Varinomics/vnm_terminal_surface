@@ -15,6 +15,7 @@
 #include <QTemporaryDir>
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -70,6 +71,30 @@ QString text_hash64(const QString& text)
 {
     const QByteArray bytes = text.toUtf8();
     return hex_u64(fnv1a64(QByteArrayView(bytes)));
+}
+
+QByteArray visible_row_write_stream(
+    std::initializer_list<QByteArray>  rows,
+    bool                               cursor_hidden)
+{
+    QByteArray stream;
+    if (cursor_hidden) {
+        stream += QByteArrayLiteral("\x1b[?25l");
+    }
+
+    int row_number = 1;
+    for (const QByteArray& row : rows) {
+        stream += QByteArrayLiteral("\x1b[");
+        stream += QByteArray::number(row_number);
+        stream += QByteArrayLiteral(";1H");
+        stream += row;
+        stream += QByteArrayLiteral("\x1b[K");
+        ++row_number;
+    }
+    if (cursor_hidden) {
+        stream += QByteArrayLiteral("\x1b[?25h");
+    }
+    return stream;
 }
 
 QJsonObject valid_header_object(std::uint64_t event_index = 0U)
@@ -151,6 +176,7 @@ QJsonObject valid_compact_snapshot_object(std::uint64_t event_index)
             {QStringLiteral("logical_row"),        0},
             {QStringLiteral("retained_line_id"),   QStringLiteral("1")},
             {QStringLiteral("content_generation"), QStringLiteral("1")},
+            {QStringLiteral("source"),             QStringLiteral("terminal_storage")},
         },
     });
     object.insert(QStringLiteral("dirty_row_ranges"), QJsonArray{
@@ -484,6 +510,96 @@ bool rewrite_first_snapshot_reason(const QString& path, const QString& reason)
         {
             object.insert(QStringLiteral("reason"), reason);
             rewritten = true;
+        }
+        lines.push_back(json_line(object));
+    }
+    file.close();
+
+    return rewritten && write_transcript_lines(path, lines);
+}
+
+bool rewrite_first_recovered_row_provenance_source(
+    const QString& path,
+    const QString& source)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+
+    bool rewritten = false;
+    std::vector<QByteArray> lines;
+    while (!file.atEnd()) {
+        const QByteArray line = file.readLine();
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
+            return false;
+        }
+
+        QJsonObject object = document.object();
+        if (!rewritten && object.value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("snapshot"))
+        {
+            QJsonArray row_provenance =
+                object.value(QStringLiteral("row_provenance")).toArray();
+            for (int row = 0; row < row_provenance.size(); ++row) {
+                QJsonObject provenance = row_provenance.at(row).toObject();
+                if (provenance.value(QStringLiteral("source")).toString() ==
+                    QStringLiteral("recovered_primary_repaint"))
+                {
+                    provenance.insert(QStringLiteral("source"), source);
+                    row_provenance.replace(row, provenance);
+                    object.insert(QStringLiteral("row_provenance"), row_provenance);
+                    rewritten = true;
+                    break;
+                }
+            }
+        }
+        lines.push_back(json_line(object));
+    }
+    file.close();
+
+    return rewritten && write_transcript_lines(path, lines);
+}
+
+bool remove_snapshot_row_provenance_sources(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return false;
+    }
+
+    bool rewritten = false;
+    std::vector<QByteArray> lines;
+    while (!file.atEnd()) {
+        const QByteArray line = file.readLine();
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
+            return false;
+        }
+
+        QJsonObject object = document.object();
+        if (object.value(QStringLiteral("kind")).toString() == QStringLiteral("snapshot")) {
+            QJsonArray row_provenance =
+                object.value(QStringLiteral("row_provenance")).toArray();
+            bool row_provenance_changed = false;
+            for (int row = 0; row < row_provenance.size(); ++row) {
+                QJsonObject provenance = row_provenance.at(row).toObject();
+                if (!provenance.contains(QStringLiteral("source"))) {
+                    continue;
+                }
+
+                provenance.remove(QStringLiteral("source"));
+                row_provenance.replace(row, provenance);
+                row_provenance_changed = true;
+            }
+
+            if (row_provenance_changed) {
+                object.insert(QStringLiteral("row_provenance"), row_provenance);
+                rewritten = true;
+            }
         }
         lines.push_back(json_line(object));
     }
@@ -2122,6 +2238,70 @@ bool test_reader_accepts_session_config_without_recovery_flag()
     return ok;
 }
 
+bool test_reader_defaults_missing_row_provenance_source()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary row-provenance source directory is valid")) {
+        return false;
+    }
+
+    QJsonObject snapshot = valid_compact_snapshot_object(1U);
+    QJsonArray row_provenance = snapshot.value(QStringLiteral("row_provenance")).toArray();
+    QJsonObject provenance = row_provenance.at(0).toObject();
+    provenance.remove(QStringLiteral("source"));
+    row_provenance.replace(0, provenance);
+    snapshot.insert(QStringLiteral("row_provenance"), row_provenance);
+
+    const QString path =
+        temp_dir.filePath(QStringLiteral("missing-row-provenance-source.ndjson"));
+    bool ok = true;
+    ok &= check(
+        write_transcript_lines(path, {json_line(valid_header_object()), json_line(snapshot)}),
+        "missing row-provenance source transcript writes");
+
+    QString error;
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "reader accepts missing row_provenance source");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    const std::optional<term::Terminal_transcript_event> snapshot_event =
+        first_event(*events, QStringLiteral("snapshot"));
+    const QJsonArray defaulted_provenance = snapshot_event.has_value()
+        ? snapshot_event->object.value(QStringLiteral("row_provenance")).toArray()
+        : QJsonArray{};
+    ok &= check(snapshot_event.has_value() &&
+            !defaulted_provenance.isEmpty() &&
+            defaulted_provenance.at(0).toObject().value(QStringLiteral("source")).toString() ==
+                QStringLiteral("terminal_storage"),
+        "reader defaults missing row_provenance source to terminal_storage");
+    return ok;
+}
+
+bool test_reader_rejects_invalid_row_provenance_source()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary invalid row-provenance source directory is valid")) {
+        return false;
+    }
+
+    QJsonObject snapshot = valid_compact_snapshot_object(1U);
+    QJsonArray row_provenance = snapshot.value(QStringLiteral("row_provenance")).toArray();
+    QJsonObject provenance = row_provenance.at(0).toObject();
+    provenance.insert(QStringLiteral("source"), QStringLiteral("invalid_source"));
+    row_provenance.replace(0, provenance);
+    snapshot.insert(QStringLiteral("row_provenance"), row_provenance);
+
+    return expect_reader_failure(
+        temp_dir,
+        QStringLiteral("invalid-row-provenance-source.ndjson"),
+        {json_line(valid_header_object()), json_line(snapshot)},
+        QStringLiteral("row_provenance source is invalid"));
+}
+
 bool test_reader_rejects_compact_snapshots_missing_required_diagnostics()
 {
     QTemporaryDir temp_dir;
@@ -2980,6 +3160,224 @@ bool test_replay_tool_preserves_recorded_disabled_recovery_flag(
     return ok;
 }
 
+bool test_replay_tool_compares_recovered_row_provenance_source(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "recovered-source replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "recovered-source replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("recovered-source-replay.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "recovered-source replay recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    config.scrollback_limit = 8;
+    config.recover_scrollback_from_primary_repaints = true;
+
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{4, 8};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "recovered-source replay captured session starts");
+    backend_ptr->emit_output(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+    backend_ptr->emit_output(visible_row_write_stream({
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+    }, true));
+
+    const auto visible_viewport = [&]() {
+        const std::optional<term::Terminal_render_snapshot> snapshot =
+            session.latest_render_snapshot();
+        return snapshot.has_value() ? snapshot->viewport : session.viewport_state();
+    };
+    const term::Terminal_viewport_state viewport_before = visible_viewport();
+    ok &= check(
+        recorder->record_surface_scroll_intent({
+            QStringLiteral("api.offset"),
+            1,
+            1,
+            viewport_before,
+        }),
+        "recovered-source replay records offset scroll intent");
+    const term::Terminal_viewport_scroll_result scroll =
+        session.scroll_published_viewport_to_offset_from_tail(1);
+    ok &= check(scroll.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "recovered-source replay scrolls recovered row into published viewport");
+    ok &= check(
+        recorder->record_surface_scroll({
+            QStringLiteral("api.offset"),
+            1,
+            1,
+            scroll,
+            viewport_before,
+            visible_viewport(),
+        }),
+        "recovered-source replay records offset scroll result");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session.latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+            snapshot->viewport.offset_from_tail == 1 &&
+            !snapshot->visible_line_provenance.empty() &&
+            snapshot->visible_line_provenance[0].source ==
+                term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
+        "recovered-source replay production snapshot carries recovered source");
+    recorder.reset();
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "recovered-source transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    bool recorded_recovered_source = false;
+    for (const term::Terminal_transcript_event& event : *events) {
+        if (event.kind != QStringLiteral("snapshot")) {
+            continue;
+        }
+
+        const QJsonArray row_provenance =
+            event.object.value(QStringLiteral("row_provenance")).toArray();
+        for (const QJsonValue& value : row_provenance) {
+            recorded_recovered_source =
+                recorded_recovered_source ||
+                value.toObject().value(QStringLiteral("source")).toString() ==
+                    QStringLiteral("recovered_primary_repaint");
+        }
+    }
+    ok &= check(recorded_recovered_source,
+        "recovered-source transcript snapshot emits recovered row provenance source");
+
+    Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "recovered-source replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "recovered-source replay tool exits successfully");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "recovered-source replay compares recovered source without divergence");
+    ok &= check(replay.stdout_text.contains("source=recovered_primary_repaint"),
+        "recovered-source replay tool prints recovered provenance source");
+
+    ok &= check(
+        rewrite_first_recovered_row_provenance_source(
+            path,
+            QStringLiteral("terminal_storage")),
+        "recovered-source replay fixture rewrites recovered source");
+    replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "recovered-source mismatched replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code != 0,
+        "recovered-source mismatched replay tool reports divergence");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=1"),
+        "recovered-source mismatched replay compares provenance source");
+    ok &= check(replay.stdout_text.contains("fields=row_provenance"),
+        "recovered-source mismatched replay reports row_provenance field");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
+bool test_replay_tool_defaults_missing_row_provenance_source(
+    const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "missing-source replay tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "missing-source replay directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("missing-source-replay.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "missing-source replay recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 12};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "missing-source replay captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("alpha\r\nbravo\r\ncharlie"));
+    recorder.reset();
+
+    ok &= check(remove_snapshot_row_provenance_sources(path),
+        "missing-source replay fixture removes row_provenance source fields");
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "missing-source replay transcript parses");
+    if (!events.has_value()) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    const std::optional<term::Terminal_transcript_event> snapshot_event =
+        first_event(*events, QStringLiteral("snapshot"));
+    const QJsonArray row_provenance = snapshot_event.has_value()
+        ? snapshot_event->object.value(QStringLiteral("row_provenance")).toArray()
+        : QJsonArray{};
+    ok &= check(snapshot_event.has_value() &&
+            !row_provenance.isEmpty() &&
+            row_provenance.at(0).toObject().value(QStringLiteral("source")).toString() ==
+                QStringLiteral("terminal_storage"),
+        "missing-source replay reader defaults row provenance before replay");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "missing-source replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
+        "missing-source replay tool exits successfully");
+    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
+        "missing-source replay has no model divergence");
+    ok &= check(replay.stdout_text.contains("source=terminal_storage"),
+        "missing-source replay prints defaulted terminal-storage source");
+    if (!ok) {
+        print_replay_tool_output(replay);
+    }
+    return ok;
+}
+
 bool test_replay_tool_accepts_natural_public_projection_scroll_snapshot(
     const QString& replay_tool_path)
 {
@@ -3709,6 +4107,8 @@ int main(int argc, char** argv)
     ok &= test_reader_rejects_malformed_transcripts();
     ok &= test_reader_rejects_invalid_leading_event_fields();
     ok &= test_reader_accepts_session_config_without_recovery_flag();
+    ok &= test_reader_defaults_missing_row_provenance_source();
+    ok &= test_reader_rejects_invalid_row_provenance_source();
     ok &= test_reader_rejects_compact_snapshots_missing_required_diagnostics();
     ok &= test_reader_rejects_invalid_snapshot_public_scroll_enum_values();
     ok &= test_reader_rejects_snapshot_basis_purpose_mismatches();
@@ -3728,6 +4128,8 @@ int main(int argc, char** argv)
     const QString replay_tool_path =
         argc >= 2 ? QString::fromLocal8Bit(argv[1]) : QString();
     ok &= test_replay_tool_preserves_recorded_disabled_recovery_flag(replay_tool_path);
+    ok &= test_replay_tool_compares_recovered_row_provenance_source(replay_tool_path);
+    ok &= test_replay_tool_defaults_missing_row_provenance_source(replay_tool_path);
     ok &= test_replay_tool_accepts_natural_public_projection_scroll_snapshot(replay_tool_path);
     ok &= test_replay_tool_rejects_unmatched_public_projection_scroll_snapshot_before_release(
         replay_tool_path);

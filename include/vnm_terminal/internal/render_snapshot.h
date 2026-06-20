@@ -94,6 +94,37 @@ enum class Terminal_render_snapshot_materialization_reason
     ROW_VIEW_PARITY_TEST,
 };
 
+enum class Terminal_retained_line_provenance_source
+{
+    TERMINAL_STORAGE,
+    RECOVERED_PRIMARY_REPAINT,
+};
+
+inline bool retained_line_provenance_source_is_valid(
+    Terminal_retained_line_provenance_source source)
+{
+    switch (source) {
+        case Terminal_retained_line_provenance_source::TERMINAL_STORAGE:
+        case Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT:
+            return true;
+    }
+
+    return false;
+}
+
+inline QString retained_line_provenance_source_name(
+    Terminal_retained_line_provenance_source source)
+{
+    switch (source) {
+        case Terminal_retained_line_provenance_source::TERMINAL_STORAGE:
+            return QStringLiteral("terminal_storage");
+        case Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT:
+            return QStringLiteral("recovered_primary_repaint");
+    }
+
+    return QStringLiteral("unknown");
+}
+
 inline bool render_snapshot_materialization_reason_is_valid(
     Terminal_render_snapshot_materialization_reason reason)
 {
@@ -382,6 +413,9 @@ struct Terminal_render_line_provenance
     // moves when content_generation advances, so equality stays decided by the
     // generation and the field rides along for GUI-thread timestamp lookups.
     qint64                     content_stamp_ms   = 0;
+    Terminal_retained_line_provenance_source
+                               source             =
+                                   Terminal_retained_line_provenance_source::TERMINAL_STORAGE;
 };
 
 struct Terminal_render_selection_request
@@ -397,7 +431,8 @@ inline bool operator==(
     return
         left.logical_row        == right.logical_row        &&
         left.retained_line_id   == right.retained_line_id   &&
-        left.content_generation == right.content_generation;
+        left.content_generation == right.content_generation &&
+        left.source             == right.source;
 }
 
 struct Terminal_render_hyperlink_metadata
@@ -883,7 +918,8 @@ inline bool render_snapshot_visible_line_provenance_is_valid(
         const std::int64_t expected_logical_row =
             first_visible_logical_row + static_cast<std::int64_t>(row);
         if (provenance.logical_row != expected_logical_row ||
-            provenance.retained_line_id == 0U)
+            provenance.retained_line_id == 0U              ||
+            !retained_line_provenance_source_is_valid(provenance.source))
         {
             return false;
         }

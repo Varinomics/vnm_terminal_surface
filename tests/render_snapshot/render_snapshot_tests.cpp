@@ -9,6 +9,7 @@
 #include <QtGlobal>
 #include <algorithm>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -35,6 +36,30 @@ static_assert(!std::is_constructible_v<
 term::Terminal_screen_model make_model(term::terminal_grid_size_t grid_size)
 {
     return term::Terminal_screen_model({grid_size, 16, 8});
+}
+
+QByteArray visible_row_write_stream(
+    std::initializer_list<QByteArray>  rows,
+    bool                               cursor_hidden)
+{
+    QByteArray stream;
+    if (cursor_hidden) {
+        stream += QByteArrayLiteral("\x1b[?25l");
+    }
+
+    int row_number = 1;
+    for (const QByteArray& row : rows) {
+        stream += QByteArrayLiteral("\x1b[");
+        stream += QByteArray::number(row_number);
+        stream += QByteArrayLiteral(";1H");
+        stream += row;
+        stream += QByteArrayLiteral("\x1b[K");
+        ++row_number;
+    }
+    if (cursor_hidden) {
+        stream += QByteArrayLiteral("\x1b[?25h");
+    }
+    return stream;
 }
 
 term::Terminal_viewport_state tail_viewport(
@@ -373,6 +398,7 @@ bool check_visible_line_provenance_matches_model(
         ok &= check(actual.logical_row == static_cast<std::int64_t>(logical_row), label);
         ok &= check(actual.retained_line_id == expected.retained_line_id, label);
         ok &= check(actual.content_generation == expected.content_generation, label);
+        ok &= check(actual.source == expected.source, label);
     }
     return ok;
 }
@@ -1101,6 +1127,14 @@ bool test_model_snapshots_publish_visible_line_provenance()
         scroll_model,
         tail_snapshot,
         "tail line provenance descriptors match visible logical rows");
+    ok &= check(std::all_of(
+            tail_snapshot.visible_line_provenance.begin(),
+            tail_snapshot.visible_line_provenance.end(),
+            [](const term::Terminal_render_line_provenance& provenance) {
+                return provenance.source ==
+                    term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE;
+            }),
+        "recovery-disabled ordinary output publishes terminal-storage provenance source");
 
     const term::Terminal_render_snapshot scrollback_snapshot =
         scroll_model.render_snapshot(request_for_model(scroll_model, 61U, 1));
@@ -1137,6 +1171,53 @@ bool test_model_snapshots_publish_visible_line_provenance()
         mutated.visible_line_provenance[1] == before_cursor.visible_line_provenance[1] &&
         mutated.visible_line_provenance[2] == before_cursor.visible_line_provenance[2],
         "unmodified visible rows keep line provenance descriptors");
+
+    term::Terminal_screen_model_config config;
+    config.grid_size                                = {4, 8};
+    config.scrollback_limit                         = 8;
+    config.tab_width                                = 8;
+    config.recover_scrollback_from_primary_repaints = true;
+    term::Terminal_screen_model recovered_model(config);
+    recovered_model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+    const term::Terminal_screen_model_result recovery_result =
+        recovered_model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("ee"),
+        }, true));
+    ok &= check(recovery_result.recovery_proposals.size() == 1U &&
+            recovered_model.scrollback_size() == 1,
+        "recovered provenance fixture accepts one primary-repaint row");
+
+    const term::Terminal_render_snapshot recovered_snapshot =
+        recovered_model.render_snapshot(request_for_model(recovered_model, 73U, 1));
+    ok &= check(term::validate_render_snapshot(recovered_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "recovered provenance snapshot validates");
+    ok &= check_visible_line_provenance_matches_model(
+        recovered_model,
+        recovered_snapshot,
+        "recovered provenance snapshot descriptors match visible logical rows");
+    ok &= check(
+        row_text(recovered_snapshot, 0) == QStringLiteral("aa") &&
+            recovered_snapshot.visible_line_provenance[0].source ==
+                term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT &&
+            recovered_snapshot.visible_line_provenance[1].source ==
+                term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        "recovered provenance source survives render snapshot construction");
+
+    term::Terminal_render_line_provenance ordinary_source =
+        recovered_snapshot.visible_line_provenance[0];
+    ordinary_source.source = term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE;
+    ok &= check(
+        !(ordinary_source == recovered_snapshot.visible_line_provenance[0]),
+        "visible line provenance equality distinguishes recovered source");
     return ok;
 }
 
@@ -1289,6 +1370,13 @@ bool test_visible_line_provenance_validation()
     ok &= check(term::validate_render_snapshot(wrong_logical_row).status ==
         term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE,
         "line provenance validation rejects mismatched logical row");
+
+    term::Terminal_render_snapshot invalid_source = valid;
+    invalid_source.visible_line_provenance[0].source =
+        static_cast<term::Terminal_retained_line_provenance_source>(100);
+    ok &= check(term::validate_render_snapshot(invalid_source).status ==
+        term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE,
+        "line provenance validation rejects invalid source");
 
     term::Terminal_render_snapshot empty_without_spans =
         term::make_empty_render_snapshot({2, 8}, tail_viewport(model), 81U);
