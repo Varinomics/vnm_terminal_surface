@@ -175,6 +175,10 @@ public:
         VNM_TerminalSurface&       surface,
         std::function<void()>      hook);
 
+    static void set_pending_published_mouse_report_block_count_for_testing(
+        VNM_TerminalSurface&       surface,
+        int                        count);
+
     static void simulate_update_polish(
         VNM_TerminalSurface&       surface);
 

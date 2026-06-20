@@ -8141,6 +8141,130 @@ bool test_mouse_press_release_pending_callbacks_clear_grab(QGuiApplication& app)
     return ok;
 }
 
+bool test_pending_mouse_report_preserves_following_key_input(QGuiApplication& app)
+{
+    bool ok = true;
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            QByteArrayLiteral("\x1b[?1000;1006hsingle-pending-mouse"),
+        };
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "single pending mouse/key preservation surface starts");
+        if (!started) {
+            return ok;
+        }
+
+        term::VNM_TerminalSurface_render_bridge::
+            set_pending_published_mouse_report_block_count_for_testing(
+                fixture.surface,
+                2);
+        const QPointF point = point_in_grid_cell(fixture.surface, 0, 1);
+        const std::size_t write_index = backend_ptr->writes.size();
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "single pending mouse/key preservation press is accepted");
+        ok &= check(backend_ptr->writes.size() == write_index,
+            "single pending mouse/key preservation press remains pending while blocked");
+
+        ok &= send_key(
+            fixture.surface,
+            Qt::Key_X,
+            Qt::NoModifier,
+            QStringLiteral("x"),
+            "single pending mouse/key preservation key is accepted");
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            write_index,
+            {
+                sgr_mouse_report(0, 0, 1, 'M'),
+                QByteArrayLiteral("x"),
+            },
+            "single pending mouse/key preservation writes mouse before following key");
+    }
+
+    {
+        Surface_fixture fixture;
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            QByteArrayLiteral("\x1b[?1000;1006hmulti-pending-mouse"),
+        };
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "multi pending mouse/key preservation surface starts");
+        if (!started) {
+            return ok;
+        }
+
+        term::VNM_TerminalSurface_render_bridge::
+            set_pending_published_mouse_report_block_count_for_testing(
+                fixture.surface,
+                5);
+        const QPointF point = point_in_grid_cell(fixture.surface, 0, 1);
+        const std::size_t write_index = backend_ptr->writes.size();
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "multi pending mouse/key preservation press is accepted");
+        ok &= check(backend_ptr->writes.size() == write_index,
+            "multi pending mouse/key preservation press remains pending while blocked");
+
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "multi pending mouse/key preservation release is accepted");
+        ok &= check(backend_ptr->writes.size() == write_index,
+            "multi pending mouse/key preservation release remains pending while blocked");
+
+        ok &= send_key(
+            fixture.surface,
+            Qt::Key_X,
+            Qt::NoModifier,
+            QStringLiteral("x"),
+            "multi pending mouse/key preservation key is accepted while mouse is blocked");
+        ok &= check_write_chunks_equal(
+            backend_ptr->writes,
+            write_index,
+            { QByteArrayLiteral("x") },
+            "multi pending mouse/key preservation cancels the stale mouse queue and writes the key");
+    }
+
+    return ok;
+}
+
 bool test_mouse_passive_motion_preserves_detached_viewport(QGuiApplication& app)
 {
     bool ok = true;
@@ -14741,6 +14865,11 @@ int main(int argc, char** argv)
         return ok ? 0 : 1;
     }
 
+    if (arguments.contains(QStringLiteral("--pending-mouse-input-preservation"))) {
+        const bool ok = test_pending_mouse_report_preserves_following_key_input(app);
+        return ok ? 0 : 1;
+    }
+
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
     ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
@@ -14794,6 +14923,7 @@ int main(int argc, char** argv)
     ok &= test_mouse_press_ignores_hidden_pending_mouse_enable(app);
     ok &= test_mouse_release_pending_report_uses_published_modes(app);
     ok &= test_mouse_press_release_pending_callbacks_clear_grab(app);
+    ok &= test_pending_mouse_report_preserves_following_key_input(app);
     ok &= test_mouse_passive_motion_preserves_detached_viewport(app);
     ok &= test_local_first_wheel_trace_records_ingress_before_route(app);
     ok &= test_local_first_wheel_scroll_applies_during_synchronized_output_block(app);
