@@ -212,6 +212,16 @@ invalidated-projection fallback names, are diagnostic schema values rather than
 stable public API enum names. Hosts should branch on the documented surface
 policy and method return values, not on diagnostic string spelling.
 
+## Diagnostic Replay Tool
+
+When built with `VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY`, the
+`vnm_terminal_transcript_replay` diagnostic CLI accepts
+`[--strict-all-snapshots] <transcript.ndjson>`. Strict all-snapshot comparison is
+the default, and the named option lets corpus and test callers make that intent
+explicit. The tool compares every recorded snapshot event against replayed
+snapshot publications in order. Final-only contiguous snapshot replay is not a
+supported mode.
+
 The C++ diagnostic scroll overloads (`scroll_viewport_lines_with_diagnostics()`,
 `scroll_to_offset_from_tail_with_diagnostics()`) return a
 `wheel_scroll_diagnostic_result_t` carrying the TYPED enums

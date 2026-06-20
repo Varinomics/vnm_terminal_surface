@@ -382,13 +382,13 @@ struct Replay_tool_process_result
     QByteArray           stderr_text;
 };
 
-Replay_tool_process_result run_replay_tool(
+Replay_tool_process_result run_replay_tool_with_arguments(
     const QString& replay_tool_path,
-    const QString& transcript_path)
+    const QStringList& arguments)
 {
     Replay_tool_process_result result;
     QProcess process;
-    process.start(replay_tool_path, {transcript_path});
+    process.start(replay_tool_path, arguments);
     result.finished = process.waitForFinished(10000);
     if (!result.finished) {
         process.kill();
@@ -399,6 +399,15 @@ Replay_tool_process_result run_replay_tool(
     result.stdout_text = process.readAllStandardOutput();
     result.stderr_text = process.readAllStandardError();
     return result;
+}
+
+Replay_tool_process_result run_replay_tool(
+    const QString& replay_tool_path,
+    const QString& transcript_path)
+{
+    return run_replay_tool_with_arguments(
+        replay_tool_path,
+        {QStringLiteral("--strict-all-snapshots"), transcript_path});
 }
 
 void print_replay_tool_output(const Replay_tool_process_result& result)
@@ -706,104 +715,96 @@ bool corrupt_first_public_projection_scroll_snapshot_to_self_consistent_wrong_co
     return rewritten && write_transcript_lines(path, lines);
 }
 
-QJsonObject transcript_timing_diagnostic_object(
-    const QString& record_kind,
-    const QString& operation,
-    std::uint64_t  record_event_index)
-{
-    QJsonObject object;
-    object.insert(QStringLiteral("kind"), QStringLiteral("transcript.timing"));
-    object.insert(QStringLiteral("operation"), operation);
-    object.insert(QStringLiteral("record_kind"), record_kind);
-    insert_u64(object, QStringLiteral("record_event_index"), record_event_index);
-    object.insert(QStringLiteral("object_construction_elapsed_ns"), 0);
-    object.insert(QStringLiteral("json_serialization_elapsed_ns"), 0);
-    object.insert(QStringLiteral("ndjson_append_elapsed_ns"), 0);
-    object.insert(QStringLiteral("file_write_elapsed_ns"), 0);
-    object.insert(QStringLiteral("file_flush_elapsed_ns"), 0);
-    object.insert(QStringLiteral("write_event_elapsed_ns"), 0);
-    object.insert(QStringLiteral("total_elapsed_ns"), 0);
-    object.insert(QStringLiteral("ndjson_byte_count"), 0);
-    return object;
-}
-
-QJsonObject wheel_ingress_diagnostic_object()
-{
-    QJsonObject object;
-    object.insert(QStringLiteral("kind"), QStringLiteral("surface.wheel_ingress"));
-    object.insert(QStringLiteral("source"), QStringLiteral("app.scrollbar"));
-    object.insert(QStringLiteral("phase"), QStringLiteral("ingress"));
-    object.insert(QStringLiteral("accepted_on_entry"), true);
-    object.insert(QStringLiteral("angle_delta_x"), 0);
-    object.insert(QStringLiteral("angle_delta_y"), -120);
-    object.insert(QStringLiteral("pixel_delta_x"), 0);
-    object.insert(QStringLiteral("pixel_delta_y"), 0);
-    object.insert(QStringLiteral("modifiers"), 0);
-    object.insert(QStringLiteral("position_x"), 4.0);
-    object.insert(QStringLiteral("position_y"), 8.0);
-    return object;
-}
-
-bool insert_replay_transparent_diagnostics_around_first_snapshot(const QString& path)
+int insert_final_snapshot_copy_before_last_snapshot(const QString& path)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        return false;
+        return 0;
     }
 
-    bool inserted_pre_start_diagnostic = false;
-    bool inserted_snapshot_diagnostics = false;
     std::vector<QJsonObject> objects;
     while (!file.atEnd()) {
         const QByteArray line = file.readLine();
         QJsonParseError parse_error;
         const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
         if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
-            return false;
+            return 0;
         }
 
-        QJsonObject object = document.object();
-        const QString kind = object.value(QStringLiteral("kind")).toString();
-        if (!inserted_pre_start_diagnostic && kind == QStringLiteral("session.start")) {
-            objects.push_back(transcript_timing_diagnostic_object(
-                QStringLiteral("header"),
-                QStringLiteral("event_write"),
-                0U));
-            inserted_pre_start_diagnostic = true;
-        }
-
-        if (!inserted_snapshot_diagnostics && kind ==
-            QStringLiteral("snapshot"))
-        {
-            QJsonObject intermediate = object;
-            QJsonArray visible_rows =
-                intermediate.value(QStringLiteral("visible_rows")).toArray();
-            if (visible_rows.isEmpty()) {
-                return false;
-            }
-
-            QJsonObject first_row = visible_rows.at(0).toObject();
-            first_row.insert(QStringLiteral("text"), QStringLiteral("intermediate"));
-            first_row.insert(QStringLiteral("hash64"), QStringLiteral("intermediate-diagnostic-hash"));
-            visible_rows.replace(0, first_row);
-            intermediate.insert(QStringLiteral("visible_rows"), visible_rows);
-            intermediate.insert(
-                QStringLiteral("diagnostic_reason"),
-                QStringLiteral("public_projection_memory_pressure_invalidated"));
-            intermediate.insert(
-                QStringLiteral("public_projection_disable_reason"),
-                QStringLiteral("memory_pressure"));
-            objects.push_back(std::move(intermediate));
-            objects.push_back(transcript_timing_diagnostic_object(
-                QStringLiteral("snapshot"),
-                QStringLiteral("snapshot_diagnostic_emit"),
-                0U));
-            objects.push_back(wheel_ingress_diagnostic_object());
-            inserted_snapshot_diagnostics = true;
-        }
-        objects.push_back(std::move(object));
+        objects.push_back(document.object());
     }
     file.close();
+
+    std::optional<std::size_t> last_snapshot_index;
+    for (std::size_t index = 0U; index < objects.size(); ++index) {
+        if (objects[index].value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("snapshot"))
+        {
+            last_snapshot_index = index;
+        }
+    }
+
+    if (!last_snapshot_index.has_value()) {
+        return 0;
+    }
+
+    std::vector<QJsonObject> rewritten_objects;
+    rewritten_objects.reserve(objects.size() + 1U);
+    for (std::size_t index = 0U; index < objects.size(); ++index) {
+        if (index == *last_snapshot_index) {
+            rewritten_objects.push_back(objects[index]);
+        }
+        rewritten_objects.push_back(std::move(objects[index]));
+    }
+
+    std::vector<QByteArray> lines;
+    lines.reserve(rewritten_objects.size());
+    for (std::size_t index = 0U; index < rewritten_objects.size(); ++index) {
+        rewritten_objects[index].insert(
+            QStringLiteral("event_index"),
+            static_cast<qint64>(index));
+        lines.push_back(json_line(std::move(rewritten_objects[index])));
+    }
+
+    return write_transcript_lines(path, lines) ? 1 : 0;
+}
+
+int remove_last_snapshot_event(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return 0;
+    }
+
+    std::vector<QJsonObject> objects;
+    while (!file.atEnd()) {
+        const QByteArray line = file.readLine();
+        QJsonParseError parse_error;
+        const QJsonDocument document = QJsonDocument::fromJson(line, &parse_error);
+        if (parse_error.error != QJsonParseError::NoError || !document.isObject()) {
+            return 0;
+        }
+
+        objects.push_back(document.object());
+    }
+    file.close();
+
+    std::optional<std::size_t> last_snapshot_index;
+    for (std::size_t index = 0U; index < objects.size(); ++index) {
+        if (objects[index].value(QStringLiteral("kind")).toString() ==
+            QStringLiteral("snapshot"))
+        {
+            last_snapshot_index = index;
+        }
+    }
+
+    if (!last_snapshot_index.has_value()) {
+        return 0;
+    }
+
+    const auto erase_offset =
+        static_cast<std::vector<QJsonObject>::difference_type>(*last_snapshot_index);
+    objects.erase(objects.begin() + erase_offset);
 
     std::vector<QByteArray> lines;
     lines.reserve(objects.size());
@@ -814,10 +815,7 @@ bool insert_replay_transparent_diagnostics_around_first_snapshot(const QString& 
         lines.push_back(json_line(std::move(objects[index])));
     }
 
-    return
-        inserted_pre_start_diagnostic &&
-        inserted_snapshot_diagnostics &&
-        write_transcript_lines(path, lines);
+    return write_transcript_lines(path, lines) ? 1 : 0;
 }
 
 bool expect_reader_failure(
@@ -3767,25 +3765,25 @@ bool test_replay_tool_rejects_unmatched_public_projection_scroll_snapshot_before
     return ok;
 }
 
-bool test_replay_tool_compares_only_final_snapshot_in_contiguous_run(
+bool test_replay_tool_compares_every_snapshot_in_contiguous_run(
     const QString& replay_tool_path)
 {
     bool ok = true;
-    ok &= check(!replay_tool_path.isEmpty(), "snapshot-run replay tool path is passed");
+    ok &= check(!replay_tool_path.isEmpty(), "strict snapshot-run replay tool path is passed");
     if (replay_tool_path.isEmpty()) {
         return false;
     }
 
     QTemporaryDir temp_dir;
-    if (!check(temp_dir.isValid(), "temporary snapshot-run replay directory is valid")) {
+    if (!check(temp_dir.isValid(), "temporary strict snapshot-run replay directory is valid")) {
         return false;
     }
 
-    const QString path = temp_dir.filePath(QStringLiteral("snapshot-run.ndjson"));
+    const QString path = temp_dir.filePath(QStringLiteral("strict-snapshot-run.ndjson"));
     QString error;
     std::shared_ptr<term::Terminal_transcript_recorder> recorder =
         term::Terminal_transcript_recorder::create(path, true, &error);
-    ok &= check(recorder != nullptr, "snapshot-run replay transcript recorder opens");
+    ok &= check(recorder != nullptr, "strict snapshot-run replay transcript recorder opens");
     if (recorder == nullptr) {
         std::cerr << error.toStdString() << '\n';
         return false;
@@ -3801,43 +3799,157 @@ bool test_replay_tool_compares_only_final_snapshot_in_contiguous_run(
     term::Terminal_launch_config launch_config = valid_launch_config();
     launch_config.initial_grid_size = term::terminal_grid_size_t{3, 12};
     ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
-        "snapshot-run replay captured session starts");
-    backend_ptr->emit_output(QByteArrayLiteral("final"));
-    ok &= check(session.write_user_bytes(QByteArrayLiteral("x")).code ==
-        term::Terminal_session_result_code::ACCEPTED,
-        "snapshot-run replay writes following input event");
+        "strict snapshot-run replay captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("before"));
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hheld"));
+    backend_ptr->emit_output(QByteArrayLiteral("final\x1b[?2026l"));
     recorder.reset();
 
-    ok &= check(insert_replay_transparent_diagnostics_around_first_snapshot(path),
-        "snapshot-run replay fixture inserts replay-transparent diagnostics");
+    const int inserted_snapshot_events =
+        insert_final_snapshot_copy_before_last_snapshot(path);
+    ok &= check(inserted_snapshot_events > 0,
+        "strict snapshot-run replay fixture inserts a duplicate final snapshot");
 
-    const std::optional<std::vector<term::Terminal_transcript_event>> memory_events =
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
         term::read_terminal_transcript(path, &error);
-    ok &= check(memory_events.has_value(),
-        "snapshot-run memory-pressure diagnostic transcript parses");
-    const std::optional<term::Terminal_transcript_event> memory_snapshot =
-        memory_events.has_value()
-            ? first_event(*memory_events, QStringLiteral("snapshot"))
-            : std::nullopt;
-    ok &= check(memory_snapshot.has_value() &&
-        memory_snapshot->object.value(QStringLiteral("diagnostic_reason")).toString() ==
-            QStringLiteral("public_projection_memory_pressure_invalidated") &&
-        memory_snapshot->object.value(QStringLiteral("public_projection_disable_reason")).toString() ==
-            QStringLiteral("memory_pressure"),
-        "snapshot-run memory-pressure diagnostic values round-trip through reader");
+    ok &= check(events.has_value(), "strict snapshot-run rewritten transcript parses");
+    const int recorded_snapshot_count =
+        events.has_value() ? event_count(*events, QStringLiteral("snapshot")) : 0;
+    ok &= check(recorded_snapshot_count > inserted_snapshot_events,
+        "strict snapshot-run fixture leaves final snapshot unchanged");
+    const int expected_matching_snapshot_events =
+        recorded_snapshot_count - inserted_snapshot_events;
 
     const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
-    ok &= check(replay.finished, "snapshot-run replay tool finishes");
-    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code == 0,
-        "snapshot-run replay tool exits successfully");
-    ok &= check(replay.stdout_text.contains("recorded_snapshot_events=2"),
-        "snapshot-run replay sees both recorded snapshots");
-    ok &= check(replay.stdout_text.contains("intermediate_snapshot_events=1"),
-        "snapshot-run replay classifies the earlier snapshot as intermediate");
-    ok &= check(replay.stdout_text.contains("matching_snapshot_events=1"),
-        "snapshot-run replay still compares the final snapshot");
-    ok &= check(replay.stdout_text.contains("divergent_snapshot_events=0"),
-        "snapshot-run replay has no model divergence");
+    ok &= check(replay.finished, "strict snapshot-run replay tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code != 0,
+        "strict snapshot-run replay tool rejects final-only snapshot masking");
+    const std::optional<int> recorded_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("recorded_snapshot_events"));
+    ok &= check(recorded_snapshot_events.has_value() &&
+            *recorded_snapshot_events == recorded_snapshot_count,
+        "strict snapshot-run replay sees every recorded snapshot");
+    const std::optional<int> replayed_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("replayed_snapshot_events"));
+    ok &= check(replayed_snapshot_events.has_value() &&
+            *replayed_snapshot_events == expected_matching_snapshot_events,
+        "strict snapshot-run replay reports replayed snapshot count");
+    const std::optional<int> matching_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("matching_snapshot_events"));
+    ok &= check(matching_snapshot_events.has_value() &&
+            *matching_snapshot_events == expected_matching_snapshot_events,
+        "strict snapshot-run replay still compares unchanged snapshots");
+    const std::optional<int> divergent_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("divergent_snapshot_events"));
+    ok &= check(divergent_snapshot_events.has_value() &&
+            *divergent_snapshot_events == inserted_snapshot_events,
+        "strict snapshot-run replay rejects final-only snapshot masking");
+
+    const Replay_tool_process_result default_replay =
+        run_replay_tool_with_arguments(replay_tool_path, {path});
+    ok &= check(default_replay.finished, "default snapshot-run replay tool finishes");
+    ok &= check(
+        default_replay.exit_status == QProcess::NormalExit && default_replay.exit_code != 0,
+        "default snapshot-run replay is strict all-snapshot replay");
+    const std::optional<int> default_divergent_snapshot_events =
+        replay_stdout_metric(
+            default_replay.stdout_text,
+            QByteArrayLiteral("divergent_snapshot_events"));
+    ok &= check(default_divergent_snapshot_events.has_value() &&
+            *default_divergent_snapshot_events == inserted_snapshot_events,
+        "default snapshot-run replay compares every snapshot");
+    if (!ok) {
+        print_replay_tool_output(replay);
+        print_replay_tool_output(default_replay);
+    }
+    return ok;
+}
+
+bool test_replay_tool_rejects_surplus_replayed_snapshots(const QString& replay_tool_path)
+{
+    bool ok = true;
+    ok &= check(!replay_tool_path.isEmpty(), "surplus replayed snapshot tool path is passed");
+    if (replay_tool_path.isEmpty()) {
+        return false;
+    }
+
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary surplus replayed snapshot directory is valid")) {
+        return false;
+    }
+
+    const QString path = temp_dir.filePath(QStringLiteral("surplus-replayed-snapshot.ndjson"));
+    QString error;
+    std::shared_ptr<term::Terminal_transcript_recorder> recorder =
+        term::Terminal_transcript_recorder::create(path, true, &error);
+    ok &= check(recorder != nullptr, "surplus replayed snapshot recorder opens");
+    if (recorder == nullptr) {
+        std::cerr << error.toStdString() << '\n';
+        return false;
+    }
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+
+    term::Terminal_session_config config;
+    config.transcript_recorder = recorder;
+    term::Terminal_session session(std::move(backend), config);
+
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = term::terminal_grid_size_t{3, 12};
+    ok &= check(session.start(launch_config).code == term::Terminal_session_result_code::ACCEPTED,
+        "surplus replayed snapshot captured session starts");
+    backend_ptr->emit_output(QByteArrayLiteral("before"));
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026hheld"));
+    backend_ptr->emit_output(QByteArrayLiteral("final\x1b[?2026l"));
+    recorder.reset();
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> original_events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(original_events.has_value(), "surplus replayed original transcript parses");
+    const int original_snapshot_count =
+        original_events.has_value() ? event_count(*original_events, QStringLiteral("snapshot")) : 0;
+    ok &= check(original_snapshot_count > 1,
+        "surplus replayed fixture records multiple snapshots");
+
+    const int removed_snapshot_events = remove_last_snapshot_event(path);
+    ok &= check(removed_snapshot_events == 1,
+        "surplus replayed fixture removes the final recorded snapshot");
+
+    const std::optional<std::vector<term::Terminal_transcript_event>> events =
+        term::read_terminal_transcript(path, &error);
+    ok &= check(events.has_value(), "surplus replayed rewritten transcript parses");
+    const int recorded_snapshot_count =
+        events.has_value() ? event_count(*events, QStringLiteral("snapshot")) : 0;
+    ok &= check(recorded_snapshot_count == original_snapshot_count - removed_snapshot_events,
+        "surplus replayed fixture leaves a recorded snapshot prefix");
+
+    const Replay_tool_process_result replay = run_replay_tool(replay_tool_path, path);
+    ok &= check(replay.finished, "surplus replayed snapshot tool finishes");
+    ok &= check(replay.exit_status == QProcess::NormalExit && replay.exit_code != 0,
+        "surplus replayed snapshot tool rejects snapshot count mismatch");
+    const std::optional<int> recorded_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("recorded_snapshot_events"));
+    ok &= check(recorded_snapshot_events.has_value() &&
+            *recorded_snapshot_events == recorded_snapshot_count,
+        "surplus replayed snapshot tool reports recorded count");
+    const std::optional<int> replayed_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("replayed_snapshot_events"));
+    ok &= check(replayed_snapshot_events.has_value() &&
+            *replayed_snapshot_events == original_snapshot_count,
+        "surplus replayed snapshot tool reports replayed count");
+    const std::optional<int> matching_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("matching_snapshot_events"));
+    ok &= check(matching_snapshot_events.has_value() &&
+            *matching_snapshot_events == recorded_snapshot_count,
+        "surplus replayed snapshot tool matches the recorded prefix");
+    const std::optional<int> divergent_snapshot_events =
+        replay_stdout_metric(replay.stdout_text, QByteArrayLiteral("divergent_snapshot_events"));
+    ok &= check(divergent_snapshot_events.has_value() &&
+            *divergent_snapshot_events == removed_snapshot_events,
+        "surplus replayed snapshot tool reports the surplus snapshot divergence");
+    ok &= check(replay.stdout_text.contains("fields=surplus_replayed_snapshot"),
+        "surplus replayed snapshot tool identifies the first surplus replayed snapshot");
     if (!ok) {
         print_replay_tool_output(replay);
     }
@@ -4133,7 +4245,8 @@ int main(int argc, char** argv)
     ok &= test_replay_tool_accepts_natural_public_projection_scroll_snapshot(replay_tool_path);
     ok &= test_replay_tool_rejects_unmatched_public_projection_scroll_snapshot_before_release(
         replay_tool_path);
-    ok &= test_replay_tool_compares_only_final_snapshot_in_contiguous_run(replay_tool_path);
+    ok &= test_replay_tool_compares_every_snapshot_in_contiguous_run(replay_tool_path);
+    ok &= test_replay_tool_rejects_surplus_replayed_snapshots(replay_tool_path);
     ok &= test_replay_tool_prints_diagnostics(replay_tool_path);
     ok &= test_replay_tool_compares_invalid_range_selected_text_result(replay_tool_path);
     ok &= test_replay_tool_prints_named_non_ok_selected_text_result(replay_tool_path);

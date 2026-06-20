@@ -68,7 +68,7 @@ set(failed_transcripts "")
 set(failed_transcript_summaries "")
 foreach(transcript_file IN LISTS transcript_files)
     execute_process(
-        COMMAND "${replay_executable}" "${transcript_file}"
+        COMMAND "${replay_executable}" "--strict-all-snapshots" "${transcript_file}"
         RESULT_VARIABLE replay_result
         OUTPUT_VARIABLE replay_stdout
         ERROR_VARIABLE replay_stderr
