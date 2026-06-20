@@ -1027,6 +1027,10 @@ void append_render_invalidation_metrics_json(
         out,
         "last_rendered_snapshot_sequence",
         stats.last_rendered_snapshot_sequence);
+    insert_json_counter(
+        out,
+        "last_rendered_publication_generation",
+        stats.last_rendered_publication_generation);
     out.insert(QStringLiteral("pending_update"), stats.pending_update);
 }
 

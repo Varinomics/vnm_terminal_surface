@@ -2471,6 +2471,39 @@ bool test_surface_input_freshness_no_draw_keeps_pending_until_render(
             fixture.surface),
         "input freshness no-draw clears atlas completion after draw");
 
+    const term::Qsg_atlas_frame_report report_before_restored_cursor_frame =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+    const std::optional<term::Qsg_atlas_frame_report> restored_cursor_frame =
+        capture_next_surface_frame(
+            app,
+            fixture.window,
+            fixture.surface,
+            report_before_restored_cursor_frame.capture_count);
+    ok &= check(restored_cursor_frame.has_value(),
+        "input freshness no-draw observes a post-render cursor frame");
+    if (restored_cursor_frame.has_value()) {
+        ok &= check(
+            restored_cursor_frame->capture_count >
+                report_before_restored_cursor_frame.capture_count,
+            "input freshness no-draw captures a fresh post-render cursor frame");
+        ok &= check_uint64_equal(
+            restored_cursor_frame->captured_snapshot_sequence,
+            completion_snapshot->metadata.sequence,
+            "input freshness no-draw captures the rendered satisfying snapshot");
+        ok &= check_uint64_equal(
+            restored_cursor_frame->captured_publication_generation,
+            completion_snapshot->metadata.publication_generation,
+            "input freshness no-draw captures the rendered satisfying publication");
+        ok &= check(
+            restored_cursor_frame->captured_snapshot_cursor.visible &&
+            restored_cursor_frame->captured_render_cursor.visible   &&
+            restored_cursor_frame->captured_render_cursor.row ==
+                completion_snapshot->cursor.position.row &&
+            restored_cursor_frame->captured_render_cursor.column ==
+                completion_snapshot->cursor.position.column,
+            "input freshness no-draw restores cursor after satisfying publication renders");
+    }
+
     return ok;
 }
 

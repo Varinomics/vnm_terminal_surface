@@ -64,6 +64,15 @@ std::vector<const char*> descriptor_backed_keys()
     return keys;
 }
 
+std::vector<const char*> hand_written_runtime_keys()
+{
+    return {
+        "input_stale_cursor_suppressed_frames",
+        "input_stale_old_node_frames_avoided",
+        "last_rendered_publication_generation",
+    };
+}
+
 }
 
 int main(int argc, char** argv)
@@ -91,6 +100,11 @@ int main(int argc, char** argv)
         ok &= check(
             doc.contains(key),
             std::string("diagnostics_schema.md documents descriptor field ") + key);
+    }
+    for (const char* key : hand_written_runtime_keys()) {
+        ok &= check(
+            doc.contains(key),
+            std::string("diagnostics_schema.md documents runtime field ") + key);
     }
 
     return ok ? 0 : 1;
