@@ -69,12 +69,6 @@ enum class Terminal_screen_model_config_status
 Terminal_screen_model_config_status validate_terminal_screen_model_config(
     const Terminal_screen_model_config&    config);
 
-enum class Terminal_retained_line_provenance_source
-{
-    TERMINAL_STORAGE,
-    RECOVERED_PRIMARY_REPAINT,
-};
-
 struct Terminal_retained_line_provenance
 {
     std::uint64_t                            retained_line_id   = 0U;

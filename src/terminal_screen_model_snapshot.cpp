@@ -267,6 +267,7 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                         provenance->retained_line_id,
                         provenance->content_generation,
                         provenance->content_stamp_ms,
+                        provenance->source,
                     });
                 }
             }
