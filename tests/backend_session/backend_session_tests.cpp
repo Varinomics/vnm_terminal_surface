@@ -104,6 +104,9 @@ public:
         start_configs.push_back(config);
 
         if (fail_start) {
+            for (const QByteArray& output : outputs_before_start_failure) {
+                m_callbacks.output_received(output);
+            }
             term::Terminal_backend_result result = term::backend_reject(
                 term::Terminal_backend_error_code::START_FAILED,
                 QStringLiteral("scripted start failure"));
@@ -279,6 +282,7 @@ public:
     int                        fail_output_pause_request_number = 0;
     int                        interrupt_count                  = 0;
     int                        terminate_count                  = 0;
+    std::vector<QByteArray>    outputs_before_start_failure;
     std::vector<QByteArray>    outputs_during_start;
     std::vector<QByteArray>    outputs_during_write;
     std::function<void()>      after_outputs_during_write;
@@ -1188,6 +1192,102 @@ bool test_backend_output_capture_file()
     const QByteArray captured_bytes = capture_file.readAll();
     ok &= check(captured_bytes == QByteArray("ready\0", 6) + QByteArrayLiteral("prompt> tail"),
         "backend output capture preserves raw backend byte stream");
+
+    return ok;
+}
+
+bool test_backend_output_capture_open_failure_reports_backend_error()
+{
+    bool ok = true;
+
+    QTemporaryDir temp_dir;
+    ok &= check(temp_dir.isValid(), "capture failure temp dir is valid");
+
+    term::Terminal_session_config config;
+    config.backend_output_capture_path = temp_dir.path();
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "capture failure session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("capture-open-failure")),
+        "capture failure session accepts backend output");
+
+    const std::vector<term::Terminal_session_notification> backend_errors =
+        notifications_of_kind(*session, term::Terminal_session_notification_kind::BACKEND_ERROR);
+    bool capture_failure_reported = false;
+    for (const term::Terminal_session_notification& error : backend_errors) {
+        if (error.backend_error.has_value() &&
+            error.backend_error->code == term::Terminal_backend_error_code::WRITE_FAILED &&
+            error.message.contains(QStringLiteral("backend output capture open failed")))
+        {
+            capture_failure_reported = true;
+        }
+    }
+
+    ok &= check(capture_failure_reported,
+        "backend output capture open failure reports a backend error");
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_contains_text(*snapshot, QStringLiteral("capture-open-failure")),
+        "backend output capture open failure does not drop backend output");
+
+    return ok;
+}
+
+bool test_backend_output_capture_failure_does_not_hide_start_failure()
+{
+    bool ok = true;
+
+    QTemporaryDir temp_dir;
+    ok &= check(temp_dir.isValid(), "capture start-failure temp dir is valid");
+
+    term::Terminal_session_config config;
+    config.backend_output_capture_path = temp_dir.path();
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    backend->fail_start = true;
+    backend->outputs_before_start_failure = {
+        QByteArrayLiteral("failed-start-output"),
+    };
+
+    const term::Terminal_session_result start_result =
+        session->start(valid_launch_config());
+    ok &= check(start_result.code == term::Terminal_session_result_code::BACKEND_REJECTED &&
+        start_result.error.has_value() &&
+        start_result.error->code == term::Terminal_backend_error_code::START_FAILED,
+        "capture start-failure session returns the start failure");
+
+    const std::vector<term::Terminal_session_notification> backend_errors =
+        notifications_of_kind(*session, term::Terminal_session_notification_kind::BACKEND_ERROR);
+    bool capture_failure_reported = false;
+    bool start_failure_reported   = false;
+    for (const term::Terminal_session_notification& error : backend_errors) {
+        if (!error.backend_error.has_value()) {
+            continue;
+        }
+
+        if (error.backend_error->code == term::Terminal_backend_error_code::WRITE_FAILED &&
+            error.message.contains(QStringLiteral("backend output capture open failed")))
+        {
+            capture_failure_reported = true;
+        }
+        if (error.backend_error->code == term::Terminal_backend_error_code::START_FAILED &&
+            error.message.contains(QStringLiteral("scripted start failure")))
+        {
+            start_failure_reported = true;
+        }
+    }
+
+    ok &= check(backend_errors.size() == 2U,
+        "capture start-failure session reports exactly two backend errors");
+    ok &= check(capture_failure_reported,
+        "capture start-failure session reports the capture failure");
+    ok &= check(start_failure_reported,
+        "capture start-failure session reports the backend start failure");
 
     return ok;
 }
@@ -13877,6 +13977,8 @@ int main()
     bool ok = true;
     ok &= test_start_callback_ordering_and_output();
     ok &= test_backend_output_capture_file();
+    ok &= test_backend_output_capture_open_failure_reports_backend_error();
+    ok &= test_backend_output_capture_failure_does_not_hide_start_failure();
     ok &= test_text_area_resize_request_updates_session_grid_in_sequence();
     ok &= test_text_area_resize_retry_publishes_geometry_metadata();
     ok &= test_backend_output_capture_records_callback_overflow_bytes();
