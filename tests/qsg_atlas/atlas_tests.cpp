@@ -9578,6 +9578,128 @@ bool pump_next_atlas_report_for_sequence(
     return false;
 }
 
+class Direct_atlas_item final : public QQuickItem
+{
+public:
+    Direct_atlas_item(
+        term::terminal_cell_metrics_t  metrics,
+        QFont                          font,
+        QSizeF                         logical_size)
+    :
+        m_metrics(metrics),
+        m_font(std::move(font))
+    {
+        setFlag(QQuickItem::ItemHasContents, true);
+        setSize(logical_size);
+    }
+
+    std::uint64_t set_frame(
+        std::shared_ptr<const term::Terminal_render_snapshot>
+                                      snapshot,
+        term::Terminal_render_options options)
+    {
+        m_snapshot = std::move(snapshot);
+        m_options  = std::move(options);
+        ++m_capture_sequence;
+        update();
+        return m_capture_sequence;
+    }
+
+    term::Qsg_atlas_frame_report report() const
+    {
+        return m_recorder->snapshot();
+    }
+
+protected:
+    QSGNode* updatePaintNode(
+        QSGNode*           old_node,
+        UpdatePaintNodeData*) override
+    {
+        QQuickWindow* const current_window = window();
+        const qreal dpr = current_window != nullptr
+            ? pixel_window_device_pixel_ratio(*current_window)
+            : 1.0;
+
+        term::Captured_atlas_frame frame = term::capture_qsg_atlas_frame(
+            m_snapshot,
+            {},
+            m_options,
+            m_metrics,
+            size(),
+            m_font,
+            nullptr,
+            dpr,
+            m_font_epoch,
+            m_capture_sequence,
+            true);
+        return term::update_qsg_atlas_node(
+            old_node,
+            std::move(frame),
+            m_recorder);
+    }
+
+private:
+    std::shared_ptr<term::Qsg_atlas_recorder> m_recorder =
+        std::make_shared<term::Qsg_atlas_recorder>();
+    std::shared_ptr<const term::Terminal_render_snapshot>
+                                      m_snapshot;
+    term::Terminal_render_options     m_options;
+    term::terminal_cell_metrics_t     m_metrics{};
+    QFont                             m_font;
+    std::uint64_t                     m_capture_sequence = 0U;
+    std::uint64_t                     m_font_epoch       = 1U;
+};
+
+bool pump_next_direct_atlas_report(
+    QGuiApplication&                app,
+    QQuickWindow&                   window,
+    Direct_atlas_item&              item,
+    std::uint64_t                   previous_prepare_count,
+    std::uint64_t                   expected_capture_sequence,
+    term::Qsg_atlas_frame_report&   out_report,
+    int                             attempts = 120)
+{
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        item.update();
+        window.requestUpdate();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        const term::Qsg_atlas_frame_report report = item.report();
+        if (report.prepare_count > previous_prepare_count &&
+            report.capture_sequence == expected_capture_sequence)
+        {
+            out_report = report;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool pump_direct_atlas_until(
+    QGuiApplication&    app,
+    QQuickWindow&       window,
+    Direct_atlas_item&  item,
+    const std::function<bool(const term::Qsg_atlas_frame_report&)>&
+                        predicate,
+    term::Qsg_atlas_frame_report& out_report,
+    int                 attempts = 120)
+{
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        item.update();
+        window.requestUpdate();
+        app.processEvents(QEventLoop::AllEvents, 50);
+        QThread::msleep(20);
+        const term::Qsg_atlas_frame_report report = item.report();
+        if (predicate(report)) {
+            out_report = report;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 struct Atlas_host_state_capture
 {
     QImage                       image;
@@ -12990,6 +13112,186 @@ bool run_atlas_report_case(
             report.render.glyph_buffer.full_upload,
         std::string("atlas report full-uploads at least one instance buffer for ") +
             name);
+    return ok;
+}
+
+bool test_atlas_suppress_cursor_uses_cursor_invalidation(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    const qreal dpr = pixel_probe_render_window_device_pixel_ratio(app);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+    const QSizeF logical_size(
+        metrics.width * 8.0,
+        metrics.height * 3.0);
+    Direct_atlas_item item(
+        metrics,
+        term::vnm_terminal_font(QStringLiteral("monospace"), 18.0),
+        logical_size);
+    item.setParentItem(window.contentItem());
+    window.resize(
+        static_cast<int>(std::ceil(logical_size.width())),
+        static_cast<int>(std::ceil(logical_size.height())));
+
+    term::Terminal_render_snapshot baseline = make_atlas_report_snapshot(902U);
+    baseline.cursor.visible       = true;
+    baseline.cursor.blink_enabled = false;
+    baseline.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    baseline.cursor.position      = {0, 0};
+
+    term::Terminal_render_options render_options;
+    const std::uint64_t baseline_capture_sequence = item.set_frame(
+        std::make_shared<const term::Terminal_render_snapshot>(baseline),
+        render_options);
+    window.show();
+
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!pump_direct_atlas_until(
+            app,
+            window,
+            item,
+            [baseline_capture_sequence](
+                const term::Qsg_atlas_frame_report& report) {
+                return
+                    atlas_report_render_state_ready(report) &&
+                    report.capture_sequence == baseline_capture_sequence &&
+                    report.render_capture_sequence == baseline_capture_sequence;
+            },
+            baseline_report))
+    {
+        std::cerr << "FAIL: atlas suppress-cursor invalidation could not "
+            << "prepare baseline"
+            << " prepare_count=" << baseline_report.prepare_count
+            << " render_count=" << baseline_report.render_count
+            << '\n';
+        return false;
+    }
+
+    term::Terminal_render_snapshot suppressed = make_atlas_report_snapshot(903U);
+    suppressed.dirty_row_ranges.clear();
+    suppressed.cursor.visible       = true;
+    suppressed.cursor.blink_enabled = false;
+    suppressed.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    suppressed.cursor.position      = {0, 0};
+
+    term::Terminal_render_options suppressed_options = render_options;
+    suppressed_options.suppress_cursor = true;
+    const std::uint64_t suppressed_capture_sequence = item.set_frame(
+        std::make_shared<const term::Terminal_render_snapshot>(suppressed),
+        suppressed_options);
+
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = pump_next_direct_atlas_report(
+        app,
+        window,
+        item,
+        baseline_report.prepare_count,
+        suppressed_capture_sequence,
+        report);
+
+    bool ok = true;
+    ok &= check(prepared,
+        "atlas suppress-cursor invalidation reaches a prepared frame");
+    ok &= check(
+        report.captured_snapshot_cursor.visible &&
+            !report.captured_render_cursor.visible &&
+            !report.frame_build.emitted_cursor.visible,
+        "atlas suppress-cursor invalidation suppresses only rendered cursor state");
+    ok &= check(
+        report.render.non_dirty_cursor_invalidation &&
+            !report.render.non_dirty_options_invalidation,
+        "atlas suppress-cursor invalidation stays out of broad options invalidation");
+    return ok;
+}
+
+bool test_atlas_clean_no_cursor_suppression_skips_state_invalidation(
+    QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    const qreal dpr = pixel_probe_render_window_device_pixel_ratio(app);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+    const QSizeF logical_size(
+        metrics.width * 8.0,
+        metrics.height * 3.0);
+    Direct_atlas_item item(
+        metrics,
+        term::vnm_terminal_font(QStringLiteral("monospace"), 18.0),
+        logical_size);
+    item.setParentItem(window.contentItem());
+    window.resize(
+        static_cast<int>(std::ceil(logical_size.width())),
+        static_cast<int>(std::ceil(logical_size.height())));
+
+    term::Terminal_render_snapshot baseline = make_atlas_report_snapshot(904U);
+    baseline.cursor.visible = false;
+
+    term::Terminal_render_options render_options;
+    const std::uint64_t baseline_capture_sequence = item.set_frame(
+        std::make_shared<const term::Terminal_render_snapshot>(baseline),
+        render_options);
+    window.show();
+
+    term::Qsg_atlas_frame_report baseline_report;
+    if (!pump_direct_atlas_until(
+            app,
+            window,
+            item,
+            [baseline_capture_sequence](
+                const term::Qsg_atlas_frame_report& report) {
+                return
+                    atlas_report_render_state_ready(report) &&
+                    report.capture_sequence == baseline_capture_sequence &&
+                    report.render_capture_sequence == baseline_capture_sequence;
+            },
+            baseline_report))
+    {
+        std::cerr << "FAIL: atlas clean no-cursor suppression could not "
+            << "prepare baseline"
+            << " prepare_count=" << baseline_report.prepare_count
+            << " render_count=" << baseline_report.render_count
+            << '\n';
+        return false;
+    }
+
+    term::Terminal_render_snapshot suppressed = make_atlas_report_snapshot(905U);
+    suppressed.dirty_row_ranges.clear();
+    suppressed.cursor.visible = false;
+
+    term::Terminal_render_options suppressed_options = render_options;
+    suppressed_options.suppress_cursor = true;
+    const std::uint64_t suppressed_capture_sequence = item.set_frame(
+        std::make_shared<const term::Terminal_render_snapshot>(suppressed),
+        suppressed_options);
+
+    term::Qsg_atlas_frame_report report;
+    const bool prepared = pump_next_direct_atlas_report(
+        app,
+        window,
+        item,
+        baseline_report.prepare_count,
+        suppressed_capture_sequence,
+        report);
+
+    bool ok = true;
+    ok &= check(prepared,
+        "atlas clean no-cursor suppression reaches a prepared frame");
+    ok &= check(
+        !report.captured_snapshot_cursor.visible &&
+            !report.captured_render_cursor.visible &&
+            !report.frame_build.emitted_cursor.visible,
+        "atlas clean no-cursor suppression keeps cursor state absent");
+    ok &= check(
+        !report.render.non_dirty_cursor_invalidation &&
+            !report.render.non_dirty_options_invalidation,
+        "atlas clean no-cursor suppression skips broad and cursor invalidation");
+    ok &= check(
+        !report.render.rect_buffer.non_dirty_state_upload &&
+            !report.render.glyph_buffer.non_dirty_state_upload &&
+            !report.render.msdf_text_buffer.non_dirty_state_upload,
+        "atlas clean no-cursor suppression does not request non-dirty state uploads");
     return ok;
 }
 
@@ -19820,6 +20122,8 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
         [](const term::Qsg_atlas_render_summary& render_summary) {
             return render_summary.non_dirty_visual_bell_invalidation;
         });
+    ok &= test_atlas_suppress_cursor_uses_cursor_invalidation(app);
+    ok &= test_atlas_clean_no_cursor_suppression_skips_state_invalidation(app);
     ok &= test_atlas_glyph_row_stable_dirty_update(app);
     ok &= test_atlas_rect_row_stable_dense_graphic_update(app);
     ok &= test_atlas_rect_row_stable_graphic_arc_update(app);
