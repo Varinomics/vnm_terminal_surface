@@ -462,6 +462,7 @@ Terminal_public_projection Terminal_public_projection::capture_from_safe_model(
     projection.m_cursor                    = safe_basis.cursor;
     projection.m_modes                     = safe_basis.modes;
     projection.m_metadata                  = safe_basis.metadata;
+    projection.m_metadata.cursor_safe_input_freshness_token = 0U;
     projection.m_public_scroll_diagnostics = safe_basis.public_scroll_diagnostics;
     projection.m_public_scroll_diagnostics.public_projection_generation = generation;
     projection.m_safe_basis_viewport_dirty_row_ranges = safe_basis.dirty_row_ranges;
@@ -554,6 +555,7 @@ Terminal_public_projection Terminal_public_projection::with_copied_rows_for_test
                                             rows)
 {
     Terminal_public_projection projection = source;
+    projection.m_metadata.cursor_safe_input_freshness_token = 0U;
     projection.m_first_copied_public_row = first_copied_public_row;
     projection.m_copied_row_bound        = rows.size();
     projection.m_rows                    = std::move(rows);

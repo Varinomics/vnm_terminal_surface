@@ -740,6 +740,11 @@ private:
         std::uint64_t                  sequence,
         std::uint64_t                  processed_backend_callback_epoch,
         Terminal_render_snapshot_basis basis) const;
+    std::uint64_t cursor_safe_input_freshness_token_for_snapshot(
+        std::uint64_t                    sequence,
+        std::uint64_t                    processed_backend_callback_epoch,
+        Terminal_render_snapshot_basis   basis,
+        Terminal_render_snapshot_purpose purpose) const;
     void record_input_freshness_snapshot_publication(
         const Terminal_render_snapshot& snapshot);
 

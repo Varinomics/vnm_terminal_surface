@@ -1829,7 +1829,7 @@ struct VNM_TerminalSurface::Private
             result.accepted_input_freshness_token;
     }
 
-    bool render_snapshot_satisfies_text_input(
+    bool render_snapshot_strictly_satisfies_text_input(
         const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot) const
     {
         return
@@ -1839,23 +1839,30 @@ struct VNM_TerminalSurface::Private
                 input_cursor_freshness.accepted_input_freshness_token;
     }
 
-    bool should_suppress_cursor_for_render_snapshot() const
+    bool render_snapshot_is_cursor_safe_for_text_input(
+        const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot) const
     {
         return
             input_cursor_freshness.active &&
-            render_snapshot != nullptr    &&
-            !render_snapshot_satisfies_text_input(render_snapshot);
+            snapshot != nullptr           &&
+            snapshot->metadata.cursor_safe_input_freshness_token >=
+                input_cursor_freshness.accepted_input_freshness_token;
     }
 
-    bool render_snapshot_is_fresh_for_text_input() const
+    bool should_suppress_cursor_for_render_snapshot() const
     {
-        return render_snapshot_satisfies_text_input(render_snapshot);
+        return false;
+    }
+
+    bool render_snapshot_allows_text_input_cursor_render_and_drain() const
+    {
+        return input_cursor_freshness.active && render_snapshot != nullptr;
     }
 
     void record_text_input_satisfying_publication(
         const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot)
     {
-        if (!render_snapshot_satisfies_text_input(snapshot)) {
+        if (!render_snapshot_strictly_satisfies_text_input(snapshot)) {
             return;
         }
 
@@ -2282,6 +2289,18 @@ struct VNM_TerminalSurface::Private
         stats.render_snapshot_callback_epoch =
             render_snapshot != nullptr
                 ? render_snapshot->metadata.processed_backend_callback_epoch
+                : 0U;
+        stats.input_freshness_active =
+            input_cursor_freshness.active;
+        stats.accepted_input_freshness_token =
+            input_cursor_freshness.accepted_input_freshness_token;
+        stats.cursor_safe_input_freshness_token =
+            render_snapshot != nullptr
+                ? render_snapshot->metadata.cursor_safe_input_freshness_token
+                : 0U;
+        stats.strict_satisfied_input_freshness_token =
+            render_snapshot != nullptr
+                ? render_snapshot->metadata.satisfied_input_freshness_token
                 : 0U;
         stats.pending_update = frame_work_pending(surface);
         return stats;
@@ -7157,7 +7176,7 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
                     m_private->queue_backend_callback_drain_after_frame(*this);
                 }
                 else
-                if (m_private->render_snapshot_is_fresh_for_text_input()) {
+                if (m_private->render_snapshot_allows_text_input_cursor_render_and_drain()) {
                     m_private->queue_backend_callback_drain_after_frame(*this);
                 }
                 else
@@ -7185,6 +7204,15 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             m_private->should_suppress_cursor_for_render_snapshot();
         if (options.suppress_cursor) {
             ++m_private->render_invalidation_stats.input_stale_cursor_suppressed_frames;
+        }
+        else
+        if (m_private->render_snapshot_is_cursor_safe_for_text_input(
+                m_private->render_snapshot) &&
+            !m_private->render_snapshot_strictly_satisfies_text_input(
+                m_private->render_snapshot))
+        {
+            ++m_private->render_invalidation_stats
+                .cursor_safe_rendered_while_strict_unsatisfied_frames;
         }
         term::Captured_atlas_frame captured_frame =
             term::capture_qsg_atlas_frame(

@@ -448,6 +448,7 @@ struct Terminal_render_metadata
     std::uint64_t              publication_generation           = 0U;
     std::uint64_t              processed_backend_callback_epoch = 0U;
     std::uint64_t              satisfied_input_freshness_token  = 0U;
+    std::uint64_t              cursor_safe_input_freshness_token = 0U;
     std::uint64_t              row_origin_generation            = 0U;
     bool                       backend_geometry_in_sync         = true;
     bool                       visual_bell_active               = false;
@@ -485,6 +486,7 @@ struct Terminal_render_snapshot_request
     std::uint64_t                         publication_generation           = 0U;
     std::uint64_t                         processed_backend_callback_epoch = 0U;
     std::uint64_t                         satisfied_input_freshness_token  = 0U;
+    std::uint64_t                         cursor_safe_input_freshness_token = 0U;
     std::uint64_t                         row_origin_generation            = 0U;
     Terminal_render_snapshot_basis        basis = Terminal_render_snapshot_basis::LIVE_CONTENT;
     Terminal_render_snapshot_purpose      purpose = Terminal_render_snapshot_purpose::CONTENT;
