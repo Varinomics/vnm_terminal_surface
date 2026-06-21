@@ -10904,6 +10904,32 @@ term::Terminal_render_snapshot make_atlas_row_stable_graphic_arc_snapshot(
     return snapshot;
 }
 
+term::Terminal_render_snapshot make_atlas_row_stable_background_snapshot(
+    std::uint64_t sequence,
+    term::Terminal_style_id middle_style,
+    std::vector<term::Terminal_render_dirty_row_range>
+                  dirty_row_ranges)
+{
+    term::Terminal_render_snapshot snapshot =
+        make_pixel_base_snapshot({3, 8}, sequence);
+    snapshot.cursor.visible   = false;
+    snapshot.dirty_row_ranges = std::move(dirty_row_ranges);
+    snapshot.styles.push_back(rgb_style(0xffe6edf3U, 0xff303030U));
+    snapshot.styles.push_back(rgb_style(0xffe6edf3U, 0xff505050U));
+
+    const auto append_blank_row =
+        [&](int row, term::Terminal_style_id style_id) {
+            for (int column = 0; column < snapshot.grid_size.columns; ++column) {
+                snapshot.cells.push_back(
+                    make_pixel_cell(row, column, QString(), 1, style_id));
+            }
+        };
+    append_blank_row(0, 1U);
+    append_blank_row(1, middle_style);
+    append_blank_row(2, 1U);
+    return snapshot;
+}
+
 void remove_atlas_snapshot_row_cells(
     term::Terminal_render_snapshot& snapshot,
     int                             row)
@@ -12231,6 +12257,153 @@ bool test_atlas_rect_row_stable_graphic_arc_update(QGuiApplication& app)
             rect_buffer.uploaded_bytes > 0 &&
             rect_buffer.uploaded_bytes < rect_buffer.buffer_bytes,
         "atlas rect row-stable graphic arc update patches dirty-row arc bytes");
+    return ok;
+}
+
+bool test_atlas_rect_row_stable_styled_blank_background_update(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    VNM_TerminalSurface surface;
+    surface.setParentItem(window.contentItem());
+    surface.setSize(QSizeF(220.0, 110.0));
+    surface.set_font_family(QStringLiteral("monospace"));
+    surface.set_font_size(18.0);
+    surface.set_color_scheme(QStringLiteral("Campbell"));
+
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(
+            make_atlas_row_stable_background_snapshot(
+                946U,
+                1U,
+                {{0, 3}})));
+    window.show();
+    const bool baseline_rendered = pump_until(
+        app,
+        window,
+        surface,
+        atlas_report_render_state_ready);
+    term::Qsg_atlas_frame_report baseline_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    if (!baseline_rendered ||
+        !pump_atlas_seeded_rect_slots(app, window, surface, baseline_report))
+    {
+        std::cerr << "FAIL: atlas rect row-stable styled blank background update "
+            << "could not seed all rect buffer slots"
+            << " prepare_count=" << baseline_report.prepare_count
+            << " seeded_slots=" << baseline_report.render.rect_buffer.seeded_slots
+            << " frames_in_flight="
+            << baseline_report.render.rect_buffer.rhi_frames_in_flight
+            << '\n';
+        return false;
+    }
+
+    const term::Terminal_render_snapshot mutated_lazy =
+        lazy_snapshot_from_flat(
+            make_atlas_row_stable_background_snapshot(
+                947U,
+                2U,
+                {{1, 1}}));
+    term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+        surface,
+        std::make_shared<const term::Terminal_render_snapshot>(mutated_lazy));
+
+    term::Qsg_atlas_frame_report report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const bool prepared = pump_next_atlas_report(
+        app,
+        window,
+        surface,
+        baseline_report.prepare_count,
+        report);
+    const term::Qsg_atlas_buffer_update_summary& rect_buffer =
+        report.render.rect_buffer;
+
+    if (!prepared ||
+        !rect_buffer.partial_upload ||
+        rect_buffer.full_upload ||
+        rect_buffer.non_dirty_state_upload ||
+        report.frame_build.frame_background_rects <= 1)
+    {
+        std::cerr << "atlas rect row-stable styled blank background update"
+            << " prepared=" << prepared
+            << " rect_full=" << rect_buffer.full_upload
+            << " rect_partial=" << rect_buffer.partial_upload
+            << " rect_non_dirty=" << rect_buffer.non_dirty_state_upload
+            << " rect_uploaded=" << rect_buffer.uploaded_bytes
+            << " rect_buffer_bytes=" << rect_buffer.buffer_bytes
+            << " row_stable=" << rect_buffer.row_stable_layout
+            << " active=" << rect_buffer.active_instance_count
+            << " instances=" << rect_buffer.instance_count
+            << " rect_row_capacity=" << report.render.rect_row_capacity
+            << " frame_background_rects=" << report.frame_build.frame_background_rects
+            << " frame_rows=" << report.frame_build.frame_row_descriptors
+            << '\n';
+    }
+
+    bool ok = true;
+    ok &= check(prepared,
+        "atlas rect row-stable styled blank background update reaches a prepared frame");
+    ok &= check(rect_buffer.row_stable_layout &&
+            rect_buffer.active_instance_count < rect_buffer.instance_count &&
+            report.render.rect_row_capacity >= 8,
+        "atlas rect row-stable styled blank background update reserves stable row slots");
+    ok &= check(report.frame_build.frame_background_rects > 1 &&
+            report.frame_build.frame_row_descriptors >= 1,
+        "atlas rect row-stable styled blank background update builds the dirty blank row");
+    ok &= check(rect_buffer.partial_upload &&
+            !rect_buffer.full_upload &&
+            !rect_buffer.non_dirty_state_upload &&
+            rect_buffer.uploaded_bytes > 0 &&
+            rect_buffer.uploaded_bytes < rect_buffer.buffer_bytes,
+        "atlas rect row-stable styled blank background update patches dirty-row background bytes");
+
+    surface.update();
+    window.requestUpdate();
+    app.processEvents(QEventLoop::AllEvents, 50);
+    QThread::msleep(20);
+    const QImage rendered = window.grabWindow();
+    const qreal dpr = pixel_window_device_pixel_ratio(window);
+    const term::terminal_cell_metrics_t metrics =
+        pixel_metrics(dpr, 18.0, QStringLiteral("monospace"));
+    const auto row_center_pixel = [&](int row) {
+        const QRect sample_rect = logical_rect_to_pixels_for_dpr(
+            inset_rect(pixel_cell_rect(row, 0, 8, metrics), 2.0, 2.0),
+            dpr).intersected(rendered.rect());
+        if (rendered.isNull() || sample_rect.isEmpty()) {
+            return QColor();
+        }
+        return rendered.pixelColor(sample_rect.center());
+    };
+    const QColor row_0_pixel = row_center_pixel(0);
+    const QColor row_1_pixel = row_center_pixel(1);
+    const QColor row_2_pixel = row_center_pixel(2);
+    const QColor dark_gray(0x30, 0x30, 0x30);
+    const QColor middle_gray(0x50, 0x50, 0x50);
+    if (rendered.isNull() ||
+        pixel_delta(row_0_pixel, dark_gray) > 4 ||
+        pixel_delta(row_1_pixel, middle_gray) > 4 ||
+        pixel_delta(row_2_pixel, dark_gray) > 4)
+    {
+        std::cerr << "atlas rect row-stable styled blank background pixels"
+            << " image_null=" << rendered.isNull()
+            << " row0=" << row_0_pixel.red() << ','
+            << row_0_pixel.green() << ',' << row_0_pixel.blue()
+            << " row1=" << row_1_pixel.red() << ','
+            << row_1_pixel.green() << ',' << row_1_pixel.blue()
+            << " row2=" << row_2_pixel.red() << ','
+            << row_2_pixel.green() << ',' << row_2_pixel.blue()
+            << " dpr=" << dpr
+            << " cell=" << metrics.width << 'x' << metrics.height
+            << '\n';
+    }
+    ok &= check(!rendered.isNull() &&
+            pixel_delta(row_0_pixel, dark_gray) <= 4 &&
+            pixel_delta(row_1_pixel, middle_gray) <= 4 &&
+            pixel_delta(row_2_pixel, dark_gray) <= 4,
+        "atlas rect row-stable styled blank background update paints expected pixels");
     return ok;
 }
 
@@ -20127,6 +20300,7 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_glyph_row_stable_dirty_update(app);
     ok &= test_atlas_rect_row_stable_dense_graphic_update(app);
     ok &= test_atlas_rect_row_stable_graphic_arc_update(app);
+    ok &= test_atlas_rect_row_stable_styled_blank_background_update(app);
     ok &= test_atlas_glyph_row_stable_empty_dirty_update(app);
     ok &= test_atlas_rect_row_stable_empty_graphic_update(app);
     ok &= test_atlas_rect_row_stable_empty_graphic_arc_update(app);

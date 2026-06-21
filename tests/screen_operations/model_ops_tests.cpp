@@ -1151,6 +1151,51 @@ bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row()
     return ok;
 }
 
+bool test_phase_r_primary_repaint_recovery_preserves_styled_blank_separator_row()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("\x1b[41m"),
+        QByteArrayLiteral("\x1b[0mbb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+
+    const term::Terminal_screen_model_result result =
+        model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("ee"),
+        }, true));
+
+    ok &= check(model.scrollback_size() == 1,
+        "Phase R recovery recovers a styled blank separator row");
+    ok &= check(result.recovery_proposals.size() == 1U &&
+            result.recovery_proposals[0].recovered_row_count == 1,
+        "Phase R recovery accepts the styled blank-row shift");
+
+    const term::Terminal_render_snapshot scrollback_snapshot =
+        model.render_snapshot(request_for_model(model, 82U, 1));
+    ok &= check(snapshot_row_text(scrollback_snapshot, 0).isEmpty() &&
+            snapshot_row_text(scrollback_snapshot, 1) == QStringLiteral("bb") &&
+            snapshot_row_text(scrollback_snapshot, 2) == QStringLiteral("cc") &&
+            snapshot_row_text(scrollback_snapshot, 3) == QStringLiteral("dd"),
+        "Phase R recovery exposes the styled blank separator through primary backing");
+    ok &= check_row_background_palette(
+        scrollback_snapshot,
+        0,
+        0,
+        8,
+        1U,
+        "Phase R recovery preserves the styled blank separator background");
+
+    return ok;
+}
+
 bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_tail()
 {
     bool ok = true;
@@ -2527,6 +2572,62 @@ bool test_scroll_up_down_sequences()
 bool test_blank_fill_operations_use_current_style()
 {
     bool ok = true;
+
+    term::Terminal_screen_model erase_model = make_model(2, 8);
+    term::Terminal_screen_model_result erase_result =
+        erase_model.ingest(QByteArrayLiteral(
+            "\x1b[44mabcdefgh\x1b[2;1Hijklmnop"
+            "\x1b[41m\x1b[1;3H\x1b[3X"
+            "\x1b[2;5H\x1b[K"));
+    ok &= check(diagnostic_count(erase_result) == 0,
+        "styled erase operations have no diagnostics");
+    ok &= check(erase_model.row_text(0) == QStringLiteral("ab   fgh") &&
+            erase_model.row_text(1) == QStringLiteral("ijkl"),
+        "styled erase operations preserve surrounding text");
+    term::Terminal_render_snapshot erase_snapshot =
+        erase_model.render_snapshot(42U);
+    ok &= check(term::validate_render_snapshot(erase_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "styled erase operations snapshot validates");
+    ok &= check_row_background_palette(
+        erase_snapshot,
+        0,
+        2,
+        3,
+        1U,
+        "styled ECH blanks keep current background");
+    ok &= check_row_background_palette(
+        erase_snapshot,
+        1,
+        4,
+        4,
+        1U,
+        "styled EL suffix blanks keep current background");
+
+    erase_model = make_model(2, 8);
+    erase_result = erase_model.ingest(QByteArrayLiteral(
+        "\x1b[44mabcdefgh\x1b[2;1Hijklmnop"
+        "\x1b[41m\x1b[1;5H\x1b[J"));
+    ok &= check(diagnostic_count(erase_result) == 0,
+        "styled ED suffix has no diagnostics");
+    erase_snapshot = erase_model.render_snapshot(43U);
+    ok &= check(term::validate_render_snapshot(erase_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "styled ED suffix snapshot validates");
+    ok &= check_row_background_palette(
+        erase_snapshot,
+        0,
+        4,
+        4,
+        1U,
+        "styled ED current-row suffix blanks keep current background");
+    ok &= check_row_background_palette(
+        erase_snapshot,
+        1,
+        0,
+        8,
+        1U,
+        "styled ED following-row blanks keep current background");
 
     term::Terminal_screen_model model = make_model(1, 8);
     term::Terminal_screen_model_result result =
@@ -3993,6 +4094,7 @@ int main()
     ok &= test_phase_r_primary_repaint_recovery_accepts_distinct_shift();
     ok &= test_phase_r_primary_repaint_recovery_preserves_row_content_stamps();
     ok &= test_phase_r_primary_repaint_recovery_recovers_blank_separator_row();
+    ok &= test_phase_r_primary_repaint_recovery_preserves_styled_blank_separator_row();
     ok &= test_phase_r_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_tail();
     ok &= test_phase_r_primary_repaint_recovery_suppresses_broad_blank_layout_repaint();
     ok &= test_flat_ring_phase3_retained_record_producer_contract();

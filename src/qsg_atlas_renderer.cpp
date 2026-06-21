@@ -1511,6 +1511,18 @@ void append_key_int_vector(QByteArray& key, const std::vector<int>& values)
     }
 }
 
+void append_key_row_stable_ranges(
+    QByteArray&                                      key,
+    const std::vector<Qsg_atlas_row_stable_range>&   ranges)
+{
+    append_key_int(key, static_cast<int>(ranges.size()));
+    for (const Qsg_atlas_row_stable_range& range : ranges) {
+        append_key_int(key, range.row);
+        append_key_int(key, range.first_instance);
+        append_key_int(key, range.instance_count);
+    }
+}
+
 int atlas_rect_row(
     const QRectF&            rect,
     terminal_cell_metrics_t  cell_metrics,
@@ -3542,6 +3554,32 @@ private:
 
         std::vector<int> row_write_offsets;
         std::vector<std::size_t> row_first_instances;
+        // Leading non-row rects include the full-grid background. They must
+        // stay before row-stable overrides so styled blank rows remain visible.
+        quint32 first_stable_offset = logical_pass.count;
+        for (quint32 offset = 0U; offset < logical_pass.count; ++offset) {
+            const std::size_t logical_instance =
+                static_cast<std::size_t>(logical_pass.first + offset);
+            const int row = logical_instance < logical_rows.size()
+                ? logical_rows[logical_instance]
+                : k_qsg_atlas_non_row;
+            const int row_capacity =
+                row >= 0 && row < static_cast<int>(row_capacities.size())
+                    ? row_capacities[static_cast<std::size_t>(row)]
+                    : 0;
+            if (row_capacity > 0 && row < m_render_row_count) {
+                first_stable_offset = offset;
+                break;
+            }
+
+            if (logical_instance >= logical_instances.size()) {
+                continue;
+            }
+
+            m_rect_instances.push_back(logical_instances[logical_instance]);
+            m_rect_instance_rows.push_back(row);
+        }
+
         if (m_render_row_count > 0 && !row_capacities.empty()) {
             row_write_offsets.assign(
                 static_cast<std::size_t>(m_render_row_count),
@@ -3580,6 +3618,10 @@ private:
         }
 
         for (quint32 offset = 0U; offset < logical_pass.count; ++offset) {
+            if (offset < first_stable_offset) {
+                continue;
+            }
+
             const std::size_t logical_instance =
                 static_cast<std::size_t>(logical_pass.first + offset);
             if (logical_instance >= logical_instances.size()) {
@@ -6378,6 +6420,7 @@ private:
         append_key_int_vector(key, m_render_rect_cursor_row_capacities);
         append_pass_key(key, m_overlay_pass);
         append_key_int_vector(key, m_render_rect_overlay_row_capacities);
+        append_key_row_stable_ranges(key, m_rect_buffer_row_stable_ranges);
         return key;
     }
 
