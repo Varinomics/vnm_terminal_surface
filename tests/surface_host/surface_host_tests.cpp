@@ -541,6 +541,47 @@ bool snapshot_dirty_ranges_contain_row(
     return false;
 }
 
+bool snapshot_cell_has_rgb_background(
+    const term::Terminal_render_snapshot&  snapshot,
+    int                                    row,
+    int                                    column,
+    quint32                                rgba)
+{
+    for (const term::Terminal_render_cell& cell : snapshot.cells) {
+        if (cell.position.row != row || cell.position.column != column) {
+            continue;
+        }
+        if (cell.style_id >= snapshot.styles.size()) {
+            return false;
+        }
+
+        const term::Terminal_text_style& style =
+            snapshot.styles[static_cast<std::size_t>(cell.style_id)];
+        return
+            style.background.kind == term::Terminal_color_ref_kind::RGB &&
+            style.background.rgba == rgba;
+    }
+
+    return false;
+}
+
+bool snapshot_row_has_rgb_background(
+    const term::Terminal_render_snapshot&  snapshot,
+    int                                    row,
+    int                                    first_column,
+    int                                    column_count,
+    quint32                                rgba)
+{
+    bool ok = true;
+    for (int column = first_column;
+         column < first_column + column_count;
+         ++column)
+    {
+        ok &= snapshot_cell_has_rgb_background(snapshot, row, column, rgba);
+    }
+    return ok;
+}
+
 bool snapshot_has_selection_span(
     const term::Terminal_render_snapshot&  snapshot,
     int                                    row,
@@ -12294,6 +12335,97 @@ bool test_stale_synchronized_output_recovery(QGuiApplication& app)
     return ok;
 }
 
+bool test_synchronized_output_styled_blank_rows_preserve_background(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("visible")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "synchronized styled blank background surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+            snapshot_contains_text(*baseline_snapshot, QStringLiteral("visible")),
+        "synchronized styled blank background publishes baseline");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    constexpr quint32 k_gray_background = 0xff404040U;
+    backend_ptr->emit_output(QByteArrayLiteral(
+        "\x1b[?2026h"
+        "\x1b[48;2;64;64;64m"
+        "\x1b[1;1H\x1b[2K"
+        "\x1b[2;1H\x1b[2K"
+        "\x1b[3;1H> hi\x1b[K"
+        "\x1b[0m"
+        "\x1b[?2026l"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    ok &= check(pump_until(app, [&] {
+            const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            return
+                snapshot != nullptr &&
+                snapshot->metadata.sequence > baseline_snapshot->metadata.sequence &&
+                snapshot_row_text(*snapshot, 2) == QStringLiteral("> hi");
+        }),
+        "synchronized styled blank background publishes released prompt rows");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(snapshot != nullptr,
+        "synchronized styled blank background has released snapshot");
+    if (snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(snapshot->lazy_row_payloads == nullptr,
+        "synchronized styled blank background production snapshot is full");
+    ok &= check(snapshot_dirty_ranges_contain_row(*snapshot, 0) &&
+            snapshot_dirty_ranges_contain_row(*snapshot, 1) &&
+            snapshot_dirty_ranges_contain_row(*snapshot, 2),
+        "synchronized styled blank background marks every gray row dirty");
+    ok &= check(snapshot_row_has_rgb_background(
+            *snapshot,
+            0,
+            0,
+            snapshot->grid_size.columns,
+            k_gray_background),
+        "synchronized styled blank background preserves first blank row background");
+    ok &= check(snapshot_row_has_rgb_background(
+            *snapshot,
+            1,
+            0,
+            snapshot->grid_size.columns,
+            k_gray_background),
+        "synchronized styled blank background preserves second blank row background");
+    ok &= check(snapshot_row_has_rgb_background(
+            *snapshot,
+            2,
+            0,
+            snapshot->grid_size.columns,
+            k_gray_background),
+        "synchronized styled blank background preserves prompt row background");
+
+    return ok;
+}
+
 bool test_stale_synchronized_output_recovery_force_releases_after_budgeted_catchup(
     QGuiApplication& app)
 {
@@ -14942,6 +15074,7 @@ int main(int argc, char** argv)
     ok &= test_selection_drag_preserves_payload_after_mid_drag_drift(app);
     ok &= test_selection_drag_rejects_snapshot_change(app);
     ok &= test_stale_synchronized_output_recovery(app);
+    ok &= test_synchronized_output_styled_blank_rows_preserve_background(app);
     ok &= test_stale_synchronized_output_recovery_force_releases_after_budgeted_catchup(app);
     ok &= test_paste_text_public_method_and_policy(app);
     ok &= test_right_click_paste_and_mouse_reporting_precedence(app);
