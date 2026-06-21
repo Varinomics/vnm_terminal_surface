@@ -410,6 +410,7 @@ std::optional<Terminal_render_snapshot> public_projection_scroll_snapshot_from_p
     snapshot.ime_preedit               = projection.ime_preedit();
     snapshot.metadata                  = projection.metadata();
     snapshot.metadata.sequence         = sequence;
+    snapshot.metadata.cursor_safe_input_freshness_token = 0U;
     snapshot.modes                     = projection.modes();
     snapshot.dirty_row_ranges          = {{0, viewport.visible_rows}};
 
@@ -1189,6 +1190,7 @@ Terminal_render_snapshot geometry_snapshot_from_public_snapshot(
     snapshot.selection_spans.clear();
     snapshot.dirty_row_ranges                      = compact_dirty_row_ranges({}, grid_size.rows, true);
     snapshot.metadata.sequence                     = sequence;
+    snapshot.metadata.cursor_safe_input_freshness_token = 0U;
     snapshot.metadata.backend_geometry_in_sync     = backend_geometry_in_sync;
     snapshot.metadata.visual_bell_active           = false;
     snapshot.metadata.mouse_reporting_mode_changed = false;
@@ -6178,6 +6180,7 @@ void Terminal_session::publish_selection_snapshot(
             std::min(
                 source_satisfied_input_freshness_token,
                 m_visible_input_freshness_token);
+        snapshot.metadata.cursor_safe_input_freshness_token = 0U;
         snapshot.metadata.backend_geometry_in_sync     = m_backend_geometry_in_sync;
         snapshot.metadata.visual_bell_active           = false;
         snapshot.metadata.mouse_reporting_mode_changed = false;
@@ -6664,6 +6667,12 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
             request.basis);
     request.row_origin_generation            = m_row_origin_generation;
     request.purpose                          = purpose;
+    request.cursor_safe_input_freshness_token =
+        cursor_safe_input_freshness_token_for_snapshot(
+            request.sequence,
+            request.processed_backend_callback_epoch,
+            request.basis,
+            request.purpose);
     request.public_scroll_diagnostics        = public_scroll_diagnostics;
     request.viewport                         = m_viewport_controller.state();
     request.backend_geometry_in_sync         = m_backend_geometry_in_sync;
@@ -6967,6 +6976,36 @@ std::uint64_t Terminal_session::satisfied_input_freshness_token_for_snapshot(
     }
 
     if (m_pending_input_freshness_render_generation != 0U) {
+        return m_visible_input_freshness_token;
+    }
+
+    return std::max(
+        m_visible_input_freshness_token,
+        m_pending_input_freshness_token);
+}
+
+std::uint64_t Terminal_session::cursor_safe_input_freshness_token_for_snapshot(
+    std::uint64_t                    sequence,
+    std::uint64_t                    processed_backend_callback_epoch,
+    Terminal_render_snapshot_basis   basis,
+    Terminal_render_snapshot_purpose purpose) const
+{
+    if (basis != Terminal_render_snapshot_basis::LIVE_CONTENT ||
+        purpose != Terminal_render_snapshot_purpose::CONTENT)
+    {
+        return 0U;
+    }
+
+    if (m_pending_input_freshness_token == 0U) {
+        return m_visible_input_freshness_token;
+    }
+
+    const bool sequence_caught_up =
+        sequence >= m_pending_input_freshness_sequence;
+    const bool backend_callbacks_caught_up =
+        processed_backend_callback_epoch >=
+            m_pending_input_freshness_backend_callback_epoch;
+    if (!sequence_caught_up || !backend_callbacks_caught_up) {
         return m_visible_input_freshness_token;
     }
 
@@ -7484,6 +7523,7 @@ bool Terminal_session::publish_public_projection_scroll_snapshot(
             sequence,
             snapshot->metadata.processed_backend_callback_epoch,
             snapshot->basis);
+    snapshot->metadata.cursor_safe_input_freshness_token = 0U;
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled) {
         ++m_profile_stats.render_snapshots_constructed;
@@ -7718,6 +7758,7 @@ void Terminal_session::publish_synchronized_resize_snapshot(
             sequence,
             snapshot.metadata.processed_backend_callback_epoch,
             snapshot.basis);
+    snapshot.metadata.cursor_safe_input_freshness_token = 0U;
     m_latest_render_snapshot =
         std::make_shared<const Terminal_render_snapshot>(std::move(snapshot));
 #if VNM_TERMINAL_PROFILING_ENABLED

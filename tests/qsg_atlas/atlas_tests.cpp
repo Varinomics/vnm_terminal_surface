@@ -13378,6 +13378,115 @@ bool test_atlas_suppress_cursor_uses_cursor_invalidation(QGuiApplication& app)
     return ok;
 }
 
+bool test_atlas_suppressed_block_cursor_restores_inverse_text(QGuiApplication& app)
+{
+    QQuickWindow window;
+    window.resize(280, 160);
+
+    const qreal dpr = pixel_probe_render_window_device_pixel_ratio(app);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(dpr);
+    const QSizeF logical_size(
+        metrics.width * 8.0,
+        metrics.height * 3.0);
+    Direct_atlas_item item(
+        metrics,
+        term::vnm_terminal_font(QStringLiteral("monospace"), 18.0),
+        logical_size);
+    item.setParentItem(window.contentItem());
+    window.resize(
+        static_cast<int>(std::ceil(logical_size.width())),
+        static_cast<int>(std::ceil(logical_size.height())));
+
+    term::Terminal_render_snapshot suppressed = make_atlas_report_snapshot(906U);
+    suppressed.cursor.visible       = true;
+    suppressed.cursor.blink_enabled = false;
+    suppressed.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    suppressed.cursor.position      = {0, 0};
+
+    term::Terminal_render_options suppressed_options;
+    suppressed_options.suppress_cursor = true;
+    const std::uint64_t suppressed_capture_sequence = item.set_frame(
+        std::make_shared<const term::Terminal_render_snapshot>(suppressed),
+        suppressed_options);
+    window.show();
+
+    term::Qsg_atlas_frame_report suppressed_report;
+    if (!pump_direct_atlas_until(
+            app,
+            window,
+            item,
+            [suppressed_capture_sequence](
+                const term::Qsg_atlas_frame_report& report) {
+                return
+                    atlas_report_render_state_ready(report) &&
+                    report.capture_sequence == suppressed_capture_sequence &&
+                    report.render_capture_sequence == suppressed_capture_sequence;
+            },
+            suppressed_report))
+    {
+        std::cerr << "FAIL: atlas suppressed block cursor restore could not "
+            << "prepare suppressed baseline"
+            << " prepare_count=" << suppressed_report.prepare_count
+            << " render_count=" << suppressed_report.render_count
+            << '\n';
+        return false;
+    }
+
+    bool ok = true;
+    ok &= check(
+        suppressed_report.captured_snapshot_cursor.visible &&
+            !suppressed_report.captured_render_cursor.visible &&
+            !suppressed_report.frame_build.emitted_cursor.visible,
+        "atlas suppressed block cursor restore starts from a cursorless emitted frame");
+
+    term::Terminal_render_snapshot restored = make_atlas_report_snapshot(907U);
+    restored.dirty_row_ranges.clear();
+    restored.cursor.visible       = true;
+    restored.cursor.blink_enabled = false;
+    restored.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    restored.cursor.position      = {0, 0};
+
+    term::Terminal_render_options restored_options;
+    const std::uint64_t restored_capture_sequence = item.set_frame(
+        std::make_shared<const term::Terminal_render_snapshot>(restored),
+        restored_options);
+
+    term::Qsg_atlas_frame_report restored_report;
+    const bool prepared = pump_next_direct_atlas_report(
+        app,
+        window,
+        item,
+        suppressed_report.prepare_count,
+        restored_capture_sequence,
+        restored_report);
+    const bool state_upload =
+        restored_report.render.rect_buffer.non_dirty_state_upload  ||
+        restored_report.render.glyph_buffer.non_dirty_state_upload ||
+        restored_report.render.rect_buffer.full_upload             ||
+        restored_report.render.glyph_buffer.full_upload;
+
+    ok &= check(prepared,
+        "atlas suppressed block cursor restore reaches a prepared frame");
+    ok &= check(
+        restored_report.captured_snapshot_cursor.visible &&
+            restored_report.captured_render_cursor.visible &&
+            restored_report.frame_build.emitted_cursor.valid &&
+            restored_report.frame_build.emitted_cursor.visible &&
+            restored_report.frame_build.emitted_cursor.shape ==
+                term::Terminal_cursor_shape::BLOCK &&
+            restored_report.frame_build.emitted_cursor.row    == 0 &&
+            restored_report.frame_build.emitted_cursor.column == 0,
+        "atlas suppressed block cursor restore emits a visible block cursor");
+    ok &= check(
+        restored_report.render.glyph_cursor_text_row_capacity > 0 &&
+            restored_report.frame_build.glyph_instances > 0,
+        "atlas suppressed block cursor restore emits inverse cursor text rows");
+    ok &= check(state_upload,
+        "atlas suppressed block cursor restore uploads cursor state or performs full upload");
+
+    return ok;
+}
+
 bool test_atlas_clean_no_cursor_suppression_skips_state_invalidation(
     QGuiApplication& app)
 {
@@ -20296,6 +20405,7 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
             return render_summary.non_dirty_visual_bell_invalidation;
         });
     ok &= test_atlas_suppress_cursor_uses_cursor_invalidation(app);
+    ok &= test_atlas_suppressed_block_cursor_restores_inverse_text(app);
     ok &= test_atlas_clean_no_cursor_suppression_skips_state_invalidation(app);
     ok &= test_atlas_glyph_row_stable_dirty_update(app);
     ok &= test_atlas_rect_row_stable_dense_graphic_update(app);

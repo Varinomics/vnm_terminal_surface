@@ -2150,6 +2150,22 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
     ok &= check(session->render_snapshot_generation() == selected_generation,
         "held scrollback churn stays unpublished before resize");
 
+    QKeyEvent key_event(
+        QEvent::KeyPress,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"));
+    const term::Terminal_key_event_result key_result =
+        session->write_key_event(key_event);
+    const std::uint64_t accepted_token =
+        key_result.result.accepted_input_freshness_token;
+    ok &= check(key_result.handled &&
+        key_result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+        accepted_token != 0U,
+        "blocked detach resize accepts input with active freshness token");
+    ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("x"),
+        "blocked detach resize writes input bytes");
+
     const term::Terminal_session_result resize_result =
         session->resize(QSizeF(120.0, 80.0), {4, 12});
     const std::optional<term::Terminal_render_snapshot> resize_snapshot =
@@ -2163,6 +2179,9 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
         resize_snapshot->purpose == term::Terminal_render_snapshot_purpose::GEOMETRY_DERIVED &&
         snapshot_cells_fit_grid(*resize_snapshot),
         "synchronized resize snapshot publishes current live-content geometry");
+    ok &= check(resize_snapshot.has_value() &&
+        resize_snapshot->metadata.cursor_safe_input_freshness_token < accepted_token,
+        "synchronized resize geometry snapshot is not cursor-safe for active input");
     ok &= check(selected_snapshot.has_value() && resize_snapshot.has_value() &&
         resize_snapshot->metadata.row_origin_generation >
             selected_snapshot->metadata.row_origin_generation,
@@ -2179,6 +2198,9 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
         snapshot_contains_text(*detached_snapshot, QStringLiteral("visible")) &&
         !snapshot_contains_text(*detached_snapshot, QStringLiteral("scroll-line")),
         "blocked detach after synchronized resize preserves current live-content geometry and visible content only");
+    ok &= check(detached_snapshot.has_value() &&
+        detached_snapshot->metadata.cursor_safe_input_freshness_token < accepted_token,
+        "selection-derived detach after synchronized resize remains cursor-unsafe");
     ok &= check(resize_snapshot.has_value() && detached_snapshot.has_value() &&
         detached_snapshot->metadata.row_origin_generation ==
             resize_snapshot->metadata.row_origin_generation,
@@ -9196,6 +9218,9 @@ bool test_selection_only_synchronized_hold_does_not_satisfy_input_freshness()
         !selected_snapshot->selection_spans.empty() &&
         selected_snapshot->metadata.satisfied_input_freshness_token == 0U,
         "selection-only freshness hold establishes visible selection basis");
+    ok &= check(selected_snapshot.has_value() &&
+        selected_snapshot->metadata.cursor_safe_input_freshness_token == 0U,
+        "selection-derived baseline has no cursor-safe input token");
     const std::uint64_t selected_generation = session->render_snapshot_generation();
     session->mark_render_publication_rendered(selected_generation);
 
@@ -9231,6 +9256,9 @@ bool test_selection_only_synchronized_hold_does_not_satisfy_input_freshness()
         !snapshot_contains_text(*detached_snapshot, QStringLiteral("held")) &&
         detached_snapshot->metadata.satisfied_input_freshness_token < accepted_token,
         "selection-only freshness hold does not satisfy pending token");
+    ok &= check(detached_snapshot.has_value() &&
+        detached_snapshot->metadata.cursor_safe_input_freshness_token < accepted_token,
+        "selection-only freshness hold keeps selection-derived snapshot cursor-unsafe");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026lrelease")),
         "selection-only freshness hold queues synchronized release");
@@ -9242,6 +9270,280 @@ bool test_selection_only_synchronized_hold_does_not_satisfy_input_freshness()
         snapshot_contains_text(*released_snapshot, QStringLiteral("heldrelease")) &&
         released_snapshot->metadata.satisfied_input_freshness_token >= accepted_token,
         "selection-only freshness hold satisfies token on real content publication");
+    ok &= check(released_snapshot.has_value() &&
+        released_snapshot->metadata.cursor_safe_input_freshness_token >= accepted_token,
+        "selection-only freshness hold advances cursor-safe token on real content release");
+
+    return ok;
+}
+
+bool test_input_freshness_live_content_cursor_safe_before_strict_render()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "cursor-safe split session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("split> ")),
+        "cursor-safe split publishes older visible prompt");
+    const std::optional<term::Terminal_render_snapshot> prompt_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(prompt_snapshot.has_value() &&
+        prompt_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        prompt_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+        snapshot_contains_text(*prompt_snapshot, QStringLiteral("split>")) &&
+        session->rendered_render_snapshot_generation() <
+            prompt_snapshot->metadata.publication_generation,
+        "cursor-safe split leaves an older content publication unrendered");
+    if (!prompt_snapshot.has_value()) {
+        return ok;
+    }
+
+    QKeyEvent key_event(
+        QEvent::KeyPress,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"));
+    const term::Terminal_key_event_result key_result =
+        session->write_key_event(key_event);
+    const std::uint64_t accepted_token =
+        key_result.result.accepted_input_freshness_token;
+    ok &= check(key_result.handled &&
+        key_result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+        accepted_token != 0U,
+        "cursor-safe split accepts input with active freshness token");
+    ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("x"),
+        "cursor-safe split writes key bytes");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("x")),
+        "cursor-safe split publishes echo after input");
+    const std::optional<term::Terminal_render_snapshot> echo_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(echo_snapshot.has_value() &&
+        echo_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        echo_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+        snapshot_contains_text(*echo_snapshot, QStringLiteral("split> x")),
+        "cursor-safe split publishes a true live-content echo snapshot");
+    ok &= check(echo_snapshot.has_value() &&
+        echo_snapshot->metadata.cursor_safe_input_freshness_token >= accepted_token,
+        "cursor-safe split advances cursor-safe token on true content");
+    ok &= check(echo_snapshot.has_value() &&
+        echo_snapshot->metadata.satisfied_input_freshness_token < accepted_token,
+        "cursor-safe split keeps strict satisfaction pending until render retirement");
+    ok &= check(session->rendered_render_snapshot_generation() <
+            prompt_snapshot->metadata.publication_generation,
+        "cursor-safe split keeps the older publication unrendered");
+
+    return ok;
+}
+
+bool test_public_projection_cursor_safe_input_freshness_fails_closed()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.scrollback_limit = 4;
+    config.synchronized_output_scroll_policy =
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {3, 24};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "projection cursor-safe freshness session starts");
+
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("row-0\r\nrow-1\r\nrow-2\r\nrow-3")),
+        "projection cursor-safe freshness publishes scrollback basis");
+    const std::optional<term::Terminal_render_snapshot> prompt_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(prompt_snapshot.has_value() &&
+        prompt_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        prompt_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+        prompt_snapshot->viewport.scrollback_rows > 0 &&
+        session->rendered_render_snapshot_generation() <
+            prompt_snapshot->metadata.publication_generation,
+        "projection cursor-safe freshness leaves content basis unrendered");
+    if (!prompt_snapshot.has_value()) {
+        return ok;
+    }
+
+    QKeyEvent key_event(
+        QEvent::KeyPress,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"));
+    const term::Terminal_key_event_result key_result =
+        session->write_key_event(key_event);
+    const std::uint64_t accepted_token =
+        key_result.result.accepted_input_freshness_token;
+    ok &= check(key_result.handled &&
+        key_result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+        accepted_token != 0U,
+        "projection cursor-safe freshness accepts input with active token");
+    ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("x"),
+        "projection cursor-safe freshness writes key bytes");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("x")),
+        "projection cursor-safe freshness publishes echo");
+    const std::optional<term::Terminal_render_snapshot> content_after_echo =
+        session->latest_content_render_snapshot_for_testing();
+    ok &= check(content_after_echo.has_value() &&
+        content_after_echo->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        content_after_echo->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+        content_after_echo->metadata.cursor_safe_input_freshness_token >= accepted_token &&
+        content_after_echo->metadata.satisfied_input_freshness_token < accepted_token,
+        "projection cursor-safe freshness has live content that is cursor-safe but strict-pending");
+    if (!content_after_echo.has_value()) {
+        return ok;
+    }
+
+    const std::optional<term::Terminal_public_projection> direct_projection =
+        session->capture_public_projection_for_testing();
+    ok &= check(direct_projection.has_value() &&
+        direct_projection->metadata().cursor_safe_input_freshness_token < accepted_token,
+        "direct public projection capture clears cursor-safe freshness");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
+        "projection cursor-safe freshness enters synchronized hold");
+    const std::optional<term::Terminal_public_projection> hold_projection =
+        session->public_projection_for_testing();
+    ok &= check(hold_projection.has_value() &&
+        hold_projection->metadata().cursor_safe_input_freshness_token < accepted_token,
+        "synchronized-output public projection capture clears cursor-safe freshness");
+
+    const term::Terminal_viewport_scroll_result scroll_result =
+        session->scroll_viewport_lines_from_published_state(
+            1,
+            content_after_echo->viewport);
+    const std::optional<term::Terminal_render_snapshot> public_scroll =
+        session->latest_render_snapshot();
+    ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "projection cursor-safe freshness scrolls the published viewport during hold");
+    ok &= check(public_scroll.has_value() &&
+        public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
+        public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
+        public_scroll->metadata.cursor_safe_input_freshness_token < accepted_token &&
+        public_scroll->metadata.satisfied_input_freshness_token < accepted_token,
+        "public projection scroll snapshot remains cursor-unsafe and strict-pending");
+
+    return ok;
+}
+
+bool test_input_freshness_tokens_cover_text_input_entry_points()
+{
+    bool ok = true;
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "write_user_bytes freshness entry session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("write> ")),
+            "write_user_bytes freshness entry publishes unrendered prompt");
+        const std::optional<term::Terminal_render_snapshot> prompt =
+            session->latest_render_snapshot();
+        ok &= check(prompt.has_value() &&
+            session->rendered_render_snapshot_generation() <
+                prompt->metadata.publication_generation,
+            "write_user_bytes freshness entry leaves prompt unrendered");
+
+        const term::Terminal_session_result result =
+            session->write_user_bytes(QByteArrayLiteral("w"));
+        ok &= check(result.code == term::Terminal_session_result_code::ACCEPTED &&
+            result.accepted_input_freshness_token != 0U,
+            "normal write_user_bytes receives accepted freshness token");
+        ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("w"),
+            "normal write_user_bytes writes expected bytes");
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "key freshness entry session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("key> ")),
+            "key freshness entry publishes unrendered prompt");
+        const std::optional<term::Terminal_render_snapshot> prompt =
+            session->latest_render_snapshot();
+        ok &= check(prompt.has_value() &&
+            session->rendered_render_snapshot_generation() <
+                prompt->metadata.publication_generation,
+            "key freshness entry leaves prompt unrendered");
+
+        QKeyEvent key_event(
+            QEvent::KeyPress,
+            Qt::Key_K,
+            Qt::NoModifier,
+            QStringLiteral("k"));
+        const term::Terminal_key_event_result result =
+            session->write_key_event(key_event);
+        ok &= check(result.handled &&
+            result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+            result.result.accepted_input_freshness_token != 0U,
+            "normal key input receives accepted freshness token");
+        ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("k"),
+            "normal key input writes expected bytes");
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "IME freshness entry session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("ime> ")),
+            "IME freshness entry publishes unrendered prompt");
+        const std::optional<term::Terminal_render_snapshot> prompt =
+            session->latest_render_snapshot();
+        ok &= check(prompt.has_value() &&
+            session->rendered_render_snapshot_generation() <
+                prompt->metadata.publication_generation,
+            "IME freshness entry leaves prompt unrendered");
+
+        const term::Terminal_ime_commit_result result =
+            session->write_ime_commit(QStringLiteral("i"));
+        ok &= check(result.handled &&
+            result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+            result.result.accepted_input_freshness_token != 0U,
+            "normal IME commit receives accepted freshness token");
+        ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("i"),
+            "normal IME commit writes expected bytes");
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "paste freshness entry session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("paste> ")),
+            "paste freshness entry publishes unrendered prompt");
+        const std::optional<term::Terminal_render_snapshot> prompt =
+            session->latest_render_snapshot();
+        ok &= check(prompt.has_value() &&
+            session->rendered_render_snapshot_generation() <
+                prompt->metadata.publication_generation,
+            "paste freshness entry leaves prompt unrendered");
+
+        const term::Terminal_paste_text_result result =
+            session->write_paste_text(
+                QStringLiteral("p"),
+                term::Terminal_paste_framing_policy::DISABLED);
+        ok &= check(result.handled &&
+            result.result.code == term::Terminal_session_result_code::ACCEPTED &&
+            result.result.accepted_input_freshness_token != 0U,
+            "normal paste receives accepted freshness token");
+        ok &= check(!backend->writes.empty() && backend->writes.back() == QByteArrayLiteral("p"),
+            "normal paste writes expected bytes");
+    }
 
     return ok;
 }
@@ -14298,6 +14600,9 @@ int main()
     ok &= test_immediate_public_synchronized_release_preserves_held_crlf_blank_rows();
     ok &= test_synchronized_output_defers_content_until_release();
     ok &= test_selection_only_synchronized_hold_does_not_satisfy_input_freshness();
+    ok &= test_input_freshness_live_content_cursor_safe_before_strict_render();
+    ok &= test_public_projection_cursor_safe_input_freshness_fails_closed();
+    ok &= test_input_freshness_tokens_cover_text_input_entry_points();
     ok &= test_input_freshness_rendering_pre_input_callback_satisfies_without_echo();
     ok &= test_input_freshness_unrendered_publication_activates_without_callback();
     ok &= test_input_freshness_post_sample_pre_drain_callback_activates();
