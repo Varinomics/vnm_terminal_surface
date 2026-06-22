@@ -2,8 +2,6 @@ include_guard(GLOBAL)
 
 include(FetchContent)
 
-set(VNM_TERMINAL_MSDF_TEXT_VERSION 0.2.0)
-
 function(vnm_terminal_msdf_text_make_available out_var)
     set(_vnm_terminal_msdf_text_one_value_args
         CONTEXT
@@ -31,7 +29,7 @@ function(vnm_terminal_msdf_text_make_available out_var)
 
     if(_vnm_terminal_msdf_text_USE_SYSTEM_LIBS)
         set(VNM_MSDF_TEXT_FETCH_DEPS OFF CACHE BOOL "" FORCE)
-        find_package(vnm_msdf_text ${VNM_TERMINAL_MSDF_TEXT_VERSION} CONFIG QUIET)
+        find_package(vnm_msdf_text CONFIG QUIET)
         if(TARGET vnm_msdf_text::vnm_msdf_text)
             set(${out_var} ON PARENT_SCOPE)
             return()
@@ -63,6 +61,8 @@ function(vnm_terminal_msdf_text_make_available out_var)
         message(STATUS "${_vnm_terminal_msdf_text_CONTEXT}: Fetching vnm_msdf_text")
         FetchContent_Declare(vnm_msdf_text
             GIT_REPOSITORY https://github.com/imakris/vnm_msdf_text.git
+            # vnm_terminal intentionally tracks vnm_msdf_text master so API
+            # breaks fail here instead of hiding behind stale compatibility pins.
             GIT_TAG master)
     endif()
 
