@@ -14,7 +14,7 @@ find_dependency(Qt6
     COMPONENTS Core Gui Quick QuickPrivate GuiPrivate)
 
 if(VNM_TERMINAL_SURFACE_MSDF_TEXT_RENDERER_ENABLED)
-    find_dependency(vnm_msdf_text "@VNM_TERMINAL_MSDF_TEXT_VERSION@" CONFIG)
+    find_dependency(vnm_msdf_text CONFIG)
 endif()
 
 if((NOT "${Qt6_VERSION_MAJOR}" STREQUAL "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR}") OR
