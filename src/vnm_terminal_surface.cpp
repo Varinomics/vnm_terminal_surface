@@ -1005,6 +1005,17 @@ bool selection_drag_content_validation_allows_payload_detach(
         status == Selection_drag_content_validation_status::SELECTED_ROW_CONTENT_CHANGED;
 }
 
+bool selection_drag_can_rebase_after_content_validation_failure(
+    Selection_drag_content_validation_status status,
+    bool                                     drag_moved)
+{
+    // First-move capped-history drift selects the current visible text. Use
+    // retained-line remapping if press-time row identity must survive eviction.
+    return
+        status == Selection_drag_content_validation_status::ROW_ORIGIN_AMBIGUOUS &&
+        !drag_moved;
+}
+
 void cancel_selection_drag_after_content_validation_failure(
     term::Terminal_session&                 session,
     Selection_drag_content_validation_status status,
@@ -2605,6 +2616,7 @@ struct VNM_TerminalSurface::Private
     void clear_selection_drag_state()
     {
         selection_anchor.reset();
+        selection_anchor_viewport.reset();
         selection_anchor_buffer_id.reset();
         selection_anchor_source.reset();
         selection_anchor_snapshot.reset();
@@ -2714,6 +2726,7 @@ struct VNM_TerminalSurface::Private
     std::deque<Pending_published_mouse_report>             pending_published_mouse_reports;
     bool                                                   retrying_pending_published_mouse_reports = false;
     std::optional<term::terminal_grid_position_t>          selection_anchor;
+    std::optional<term::terminal_grid_position_t>          selection_anchor_viewport;
     std::optional<term::Terminal_buffer_id>                selection_anchor_buffer_id;
     std::optional<term::terminal_selection_source_identity_t>
                                                            selection_anchor_source;
@@ -4502,6 +4515,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
     }
 
     m_private->selection_anchor           = *logical_position;
+    m_private->selection_anchor_viewport  = *position;
     m_private->selection_anchor_buffer_id = m_private->render_snapshot->viewport.active_buffer;
     m_private->selection_anchor_source    = *source;
     m_private->selection_anchor_snapshot  = m_private->render_snapshot;
@@ -4787,6 +4801,56 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
             m_scrollback_limit);
     if (!selection_drag_content_validation_accepted(content_validation))
     {
+        if (selection_drag_can_rebase_after_content_validation_failure(
+                content_validation,
+                m_private->selection_drag_moved) &&
+            m_private->selection_anchor_viewport.has_value())
+        {
+            const std::optional<term::terminal_grid_position_t> current_anchor =
+                logical_grid_position_for_viewport_cell(
+                    m_private->render_snapshot,
+                    *m_private->selection_anchor_viewport);
+            if (current_anchor.has_value()) {
+                if (*current_anchor == *logical_position) {
+                    m_private->selection_anchor          = *current_anchor;
+                    m_private->selection_anchor_source   = *source;
+                    m_private->selection_anchor_snapshot = m_private->render_snapshot;
+                    record_surface_selection_drag_transcript(
+                        m_private->transcript_recorder,
+                        QStringLiteral("clear"),
+                        m_private->selection_anchor,
+                        logical_position,
+                        std::nullopt,
+                        false);
+                    m_private->session->clear_selection();
+                    event->accept();
+                    sync_from_session();
+                    trace_decision(QStringLiteral("clear-on-rebased-click"));
+                    return;
+                }
+
+                const term::Terminal_selection_range current_range =
+                    selection_range_for_drag(*current_anchor, *logical_position);
+                m_private->selection_anchor          = *current_anchor;
+                m_private->selection_anchor_source   = *source;
+                m_private->selection_anchor_snapshot = m_private->render_snapshot;
+                m_private->selection_drag_moved      = true;
+                record_surface_selection_drag_transcript(
+                    m_private->transcript_recorder,
+                    QStringLiteral("update"),
+                    m_private->selection_anchor,
+                    logical_position,
+                    current_range,
+                    true);
+                m_private->session->set_selection_range_from_drained_published_source(
+                    current_range,
+                    *source);
+                event->accept();
+                sync_from_session();
+                trace_decision(QStringLiteral("selection-range-rebased"));
+                return;
+            }
+        }
         if (m_selection_trace_enabled) {
             write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral(
@@ -4996,6 +5060,51 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                     : Selection_drag_content_validation_status::ACCEPTED;
             if (!selection_drag_content_validation_accepted(content_validation))
             {
+                if (selection_drag_can_rebase_after_content_validation_failure(
+                        content_validation,
+                        m_private->selection_drag_moved) &&
+                    m_private->selection_anchor_viewport.has_value())
+                {
+                    const std::optional<term::terminal_grid_position_t> current_anchor =
+                        logical_grid_position_for_viewport_cell(
+                            m_private->render_snapshot,
+                            *m_private->selection_anchor_viewport);
+                    if (current_anchor.has_value()) {
+                        if (*current_anchor == *logical_position) {
+                            record_surface_selection_drag_transcript(
+                                m_private->transcript_recorder,
+                                QStringLiteral("clear"),
+                                current_anchor,
+                                logical_position,
+                                std::nullopt,
+                                false);
+                            m_private->session->clear_selection();
+                            m_private->clear_selection_drag_state();
+                            event->accept();
+                            sync_from_session();
+                            trace_decision(QStringLiteral("clear-on-rebased-click"));
+                            return;
+                        }
+
+                        const term::Terminal_selection_range current_range =
+                            selection_range_for_drag(*current_anchor, *logical_position);
+                        record_surface_selection_drag_transcript(
+                            m_private->transcript_recorder,
+                            QStringLiteral("finish"),
+                            current_anchor,
+                            logical_position,
+                            current_range,
+                            true);
+                        m_private->session->set_selection_range_from_drained_published_source(
+                            current_range,
+                            *source);
+                        m_private->clear_selection_drag_state();
+                        event->accept();
+                        sync_from_session();
+                        trace_decision(QStringLiteral("selection-range-rebased"));
+                        return;
+                    }
+                }
                 if (m_selection_trace_enabled) {
                     write_selection_trace(m_selection_trace_enabled,
                         QStringLiteral(

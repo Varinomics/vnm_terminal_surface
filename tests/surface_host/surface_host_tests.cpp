@@ -11583,7 +11583,7 @@ bool test_selection_drag_survives_stable_row_content_drift(QGuiApplication& app)
 
         auto backend = std::make_unique<Scripted_backend>();
         backend->outputs_during_start = {
-            repeated_scroll_lines(80, QByteArrayLiteral("repeat")),
+            numbered_scroll_lines(80),
         };
 
         bool started = false;
@@ -11592,7 +11592,7 @@ bool test_selection_drag_survives_stable_row_content_drift(QGuiApplication& app)
             std::move(backend),
             { QStringLiteral("scripted-terminal") },
             &started);
-        ok &= check(started, "eviction-ambiguous drag surface starts");
+        ok &= check(started, "eviction-rebased drag surface starts");
 
         const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
             term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
@@ -11601,11 +11601,11 @@ bool test_selection_drag_survives_stable_row_content_drift(QGuiApplication& app)
             anchor_snapshot->grid_size.columns > 5                  &&
             anchor_snapshot->viewport.scrollback_rows == scrollback_limit;
         ok &= check(usable_anchor_snapshot,
-            "eviction-ambiguous drag fixture fills scrollback limit");
+            "eviction-rebased drag fixture fills scrollback limit");
 
         if (usable_anchor_snapshot) {
+            const QString anchor_text = snapshot_row_text(*anchor_snapshot, 0);
             const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
-            const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 5);
             ok &= send_mouse_event(
                 fixture.surface,
                 QEvent::MouseButtonPress,
@@ -11614,45 +11614,136 @@ bool test_selection_drag_survives_stable_row_content_drift(QGuiApplication& app)
                 Qt::LeftButton,
                 Qt::NoModifier,
                 true,
-                "eviction-ambiguous drag press is accepted");
+                "eviction-rebased drag press is accepted");
 
-            backend_ptr->emit_output(QByteArrayLiteral("repeat\r\n"));
+            backend_ptr->emit_output(QByteArrayLiteral("scroll-line-999\r\n"));
+            term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+                fixture.surface);
+            const std::shared_ptr<const term::Terminal_render_snapshot> eviction_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            const QString current_text = eviction_snapshot != nullptr
+                ? snapshot_row_text(*eviction_snapshot, 0)
+                : QString();
+            const int line_last_column = current_text.size() - 1;
+            const bool usable_eviction_snapshot =
+                eviction_snapshot != nullptr                                      &&
+                eviction_snapshot->viewport.scrollback_rows == scrollback_limit &&
+                !current_text.isEmpty()                                         &&
+                current_text != anchor_text                                     &&
+                eviction_snapshot->grid_size.columns > line_last_column;
+            ok &= check(usable_eviction_snapshot,
+                "eviction-rebased drag shifts to distinct visible text after eviction");
+
+            if (usable_eviction_snapshot) {
+                const QPointF end_point =
+                    point_in_grid_cell(fixture.surface, 0, line_last_column);
+                ok &= send_mouse_event(
+                    fixture.surface,
+                    QEvent::MouseMove,
+                    end_point,
+                    Qt::NoButton,
+                    Qt::LeftButton,
+                    Qt::NoModifier,
+                    true,
+                    "eviction-rebased drag move is accepted");
+                ok &= send_mouse_event(
+                    fixture.surface,
+                    QEvent::MouseButtonRelease,
+                    end_point,
+                    Qt::LeftButton,
+                    Qt::NoButton,
+                    Qt::NoModifier,
+                    true,
+                    "eviction-rebased drag release is accepted");
+                const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
+                    term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+                ok &= check(fixture.surface.selection_state() ==
+                    VNM_TerminalSurface::Selection_state::ACTIVE,
+                    "eviction-rebased drag keeps current visible selection active");
+                ok &= check(fixture.surface.selected_text() == current_text,
+                    "eviction-rebased drag selects the current visible text");
+                ok &= check(final_snapshot != nullptr &&
+                    final_snapshot->selection_spans.size() == 1U &&
+                    snapshot_has_selection_span(
+                        *final_snapshot,
+                        0,
+                        0,
+                        line_last_column + 1),
+                    "eviction-rebased drag publishes a current visible selection span");
+            }
+        }
+    }
+
+    {
+        constexpr int scrollback_limit = 3;
+
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(scrollback_limit);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {
+            numbered_scroll_lines(80),
+        };
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "eviction-rebased click surface starts");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> anchor_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_anchor_snapshot =
+            anchor_snapshot != nullptr                              &&
+            anchor_snapshot->grid_size.columns > 0                  &&
+            anchor_snapshot->viewport.scrollback_rows == scrollback_limit;
+        ok &= check(usable_anchor_snapshot,
+            "eviction-rebased click fixture fills scrollback limit");
+
+        if (usable_anchor_snapshot) {
+            const QString anchor_text = snapshot_row_text(*anchor_snapshot, 0);
+            const QPointF click_point = point_in_grid_cell(fixture.surface, 0, 0);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                click_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "eviction-rebased click press is accepted");
+
+            backend_ptr->emit_output(QByteArrayLiteral("scroll-line-999\r\n"));
             term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
                 fixture.surface);
             const std::shared_ptr<const term::Terminal_render_snapshot> eviction_snapshot =
                 term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
             ok &= check(eviction_snapshot != nullptr &&
                 eviction_snapshot->viewport.scrollback_rows == scrollback_limit &&
-                snapshot_row_text(*eviction_snapshot, 0) == QStringLiteral("repeat"),
-                "eviction-ambiguous drag keeps identical visible text after eviction");
+                snapshot_row_text(*eviction_snapshot, 0) != anchor_text,
+                "eviction-rebased click shifts the same viewport cell to new text");
 
             ok &= send_mouse_event(
                 fixture.surface,
-                QEvent::MouseMove,
-                end_point,
-                Qt::NoButton,
-                Qt::LeftButton,
-                Qt::NoModifier,
-                true,
-                "eviction-ambiguous drag move is accepted");
-            ok &= send_mouse_event(
-                fixture.surface,
                 QEvent::MouseButtonRelease,
-                end_point,
+                click_point,
                 Qt::LeftButton,
                 Qt::NoButton,
                 Qt::NoModifier,
                 true,
-                "eviction-ambiguous drag release is accepted");
+                "eviction-rebased click release is accepted");
             const std::shared_ptr<const term::Terminal_render_snapshot> final_snapshot =
                 term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
             ok &= check(fixture.surface.selection_state() ==
                 VNM_TerminalSurface::Selection_state::NONE,
-                "eviction-ambiguous drag rejects repeated text at scrollback limit");
+                "eviction-rebased click keeps click semantics after eviction");
             ok &= check(fixture.surface.selected_text().isEmpty(),
-                "eviction-ambiguous drag exposes no selected text");
+                "eviction-rebased click exposes no selected text");
             ok &= check(final_snapshot != nullptr && final_snapshot->selection_spans.empty(),
-                "eviction-ambiguous drag emits no stale selection spans");
+                "eviction-rebased click publishes no selection span");
         }
     }
 
