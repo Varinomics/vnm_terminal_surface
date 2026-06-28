@@ -6216,6 +6216,16 @@ void VNM_TerminalSurface::refresh_grid_metrics()
     updateInputMethod(Qt::ImCursorRectangle);
 }
 
+void VNM_TerminalSurface::refresh_grid_metrics_if_device_pixel_ratio_changed()
+{
+    const qreal device_pixel_ratio = current_device_pixel_ratio(window());
+    if (same_property_value(device_pixel_ratio, m_private->render_device_pixel_ratio)) {
+        return;
+    }
+
+    refresh_grid_metrics();
+}
+
 void VNM_TerminalSurface::set_grid_size(int rows, int columns)
 {
     if (m_rows == rows && m_columns == columns) {
@@ -7160,6 +7170,8 @@ void VNM_TerminalSurface::reset_session()
 void VNM_TerminalSurface::updatePolish()
 {
     Q_ASSERT(thread() == QThread::currentThread());
+
+    refresh_grid_metrics_if_device_pixel_ratio_changed();
 
     // Polish runs before the scene graph syncs this item into the next frame.
     // Drain already-arrived backend callbacks here so a pending render update

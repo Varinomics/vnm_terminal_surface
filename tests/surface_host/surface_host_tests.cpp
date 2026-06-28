@@ -1,4 +1,5 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
+#include "vnm_terminal/internal/qt_grid_metrics_provider.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
@@ -27,6 +28,7 @@
 #include <QTemporaryDir>
 #include <QVariant>
 #include <QWheelEvent>
+#include <QtGui/private/qwindow_p.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1153,6 +1155,47 @@ term::terminal_cell_metrics_t current_cell_metrics(const VNM_TerminalSurface& su
     return term::VNM_TerminalSurface_render_bridge::cell_metrics(surface);
 }
 
+bool metrics_equal(
+    const term::terminal_cell_metrics_t&  actual,
+    const term::terminal_cell_metrics_t&  expected,
+    qreal                                tolerance)
+{
+    return
+        std::abs(actual.width - expected.width)     <= tolerance &&
+        std::abs(actual.height - expected.height)   <= tolerance &&
+        std::abs(actual.ascent - expected.ascent)   <= tolerance &&
+        std::abs(actual.descent - expected.descent) <= tolerance;
+}
+
+bool check_metrics_equal(
+    const term::terminal_cell_metrics_t&  actual,
+    const term::terminal_cell_metrics_t&  expected,
+    const char*                           message)
+{
+    constexpr qreal tolerance = 0.000001;
+    const bool equal = metrics_equal(actual, expected, tolerance);
+    if (equal) {
+        return true;
+    }
+
+    std::cerr << "FAIL: " << message
+        << " expected={width=" << expected.width
+        << ", height="          << expected.height
+        << ", ascent="          << expected.ascent
+        << ", descent="         << expected.descent
+        << "} actual={width="   << actual.width
+        << ", height="          << actual.height
+        << ", ascent="          << actual.ascent
+        << ", descent="         << actual.descent
+        << "}\n";
+    return false;
+}
+
+void set_window_device_pixel_ratio(QQuickWindow& window, qreal device_pixel_ratio)
+{
+    QWindowPrivate::get(&window)->devicePixelRatio = device_pixel_ratio;
+}
+
 QPointF point_in_grid_cell(
     const VNM_TerminalSurface& surface,
     int                        row,
@@ -1223,6 +1266,36 @@ bool test_start_maps_output_to_snapshot(QGuiApplication& app)
     ok &= check(snapshot != nullptr && snapshot_contains_text(*snapshot, QStringLiteral("hello")),
         "surface publishes session render snapshot for start output");
 
+    return ok;
+}
+
+bool test_surface_polish_refreshes_metrics_after_window_dpr_change(QGuiApplication& app)
+{
+    (void)app;
+
+    Surface_fixture fixture;
+    const term::terminal_cell_metrics_t initial_metrics =
+        current_cell_metrics(fixture.surface);
+    set_window_device_pixel_ratio(fixture.window, 1.25);
+
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+
+    const term::Qt_grid_metrics_provider expected_provider(
+        term::vnm_terminal_font(fixture.surface.font_family(), fixture.surface.font_size()),
+        1.25);
+    const term::terminal_cell_metrics_t expected_metrics =
+        expected_provider.cell_metrics();
+    const term::terminal_cell_metrics_t updated_metrics =
+        current_cell_metrics(fixture.surface);
+
+    bool ok = true;
+    ok &= check(
+        !metrics_equal(initial_metrics, expected_metrics, 0.000001),
+        "DPR test fixture must choose metrics that differ after scaling");
+    ok &= check_metrics_equal(
+        updated_metrics,
+        expected_metrics,
+        "surface polish refreshes terminal metrics after DPR-only window change");
     return ok;
 }
 
@@ -15334,6 +15407,7 @@ int main(int argc, char** argv)
 
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
+    ok &= test_surface_polish_refreshes_metrics_after_window_dpr_change(app);
     ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
     ok &= test_surface_session_lazy_composer_exercise_remains_opt_in(app);
     ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
