@@ -56,8 +56,23 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: ctest --output-on-failure
 
+      # The main build links vnm_msdf_text from source via FetchContent, which is
+      # intentionally not an installable/exportable configuration (the MSDF install
+      # guard in CMakeLists.txt fails closed so a source-built dependency is never
+      # packaged into a broken consumer config). Validate the install and
+      # package-consume path against a dedicated MSDF-disabled library build; an
+      # MSDF-enabled package is a distribution build that supplies a packaged
+      # vnm_msdf_text via -DVNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS=ON.
       - name: Install package
-        run: cmake --install build --config ${CMAKE_BUILD_TYPE} --prefix "${GITHUB_WORKSPACE}/install"
+        run: |
+          cmake -B build-install -S . \
+            -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE} \
+            -DBUILD_TESTING=OFF \
+            -DVNM_TERMINAL_BUILD_BENCHMARKS=OFF \
+            -DVNM_TERMINAL_ENABLE_PROFILING=OFF \
+            -DVNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER=OFF
+          cmake --build build-install --config ${CMAKE_BUILD_TYPE} --parallel
+          cmake --install build-install --config ${CMAKE_BUILD_TYPE} --prefix "${GITHUB_WORKSPACE}/install"
 
       - name: Configure package smoke
         run: |
