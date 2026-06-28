@@ -1824,6 +1824,12 @@ struct VNM_TerminalSurface::Private
         bool                                      active = false;
         std::uint64_t                             accepted_input_freshness_token = 0U;
         std::uint64_t                             satisfying_publication_generation = 0U;
+        // Cursor position the user last saw when this printable input was
+        // accepted, captured from the pre-echo snapshot. Used to recognize the
+        // intermediate-repaint frame whose block cursor still sits at or behind
+        // this column while the typed glyph has already arrived.
+        bool                                      have_pre_input_cursor = false;
+        term::terminal_grid_position_t            pre_input_cursor_position{};
     };
 
     void record_accepted_text_input(
@@ -1834,10 +1840,23 @@ struct VNM_TerminalSurface::Private
             return;
         }
 
+        // At input-acceptance time the displayed snapshot still predates the
+        // echo, so its visible cursor is where the caret rested before this
+        // keystroke. Remember it as the pre-input reference; only a forward
+        // advance past this column settles the caret.
+        const bool have_pre_input_cursor =
+            render_snapshot != nullptr && render_snapshot->cursor.visible;
+        const term::terminal_grid_position_t pre_input_cursor_position =
+            have_pre_input_cursor
+                ? render_snapshot->cursor.position
+                : term::terminal_grid_position_t{};
+
         input_cursor_freshness = {};
         input_cursor_freshness.active = true;
         input_cursor_freshness.accepted_input_freshness_token =
             result.accepted_input_freshness_token;
+        input_cursor_freshness.have_pre_input_cursor = have_pre_input_cursor;
+        input_cursor_freshness.pre_input_cursor_position = pre_input_cursor_position;
     }
 
     bool render_snapshot_strictly_satisfies_text_input(
@@ -1862,7 +1881,64 @@ struct VNM_TerminalSurface::Private
 
     bool should_suppress_cursor_for_render_snapshot() const
     {
-        return false;
+        // Cursor-risk suppression for the post-input repaint catch-up window.
+        //
+        // With remote echo and per-segment snapshot publication, a snapshot can
+        // already carry the just-typed glyph - so it is "cursor safe" for the
+        // accepted input - while the application has not yet emitted the cursor
+        // movement that settles the caret past that glyph. A faithful render of
+        // that intermediate snapshot draws the block cursor at, or behind, the
+        // column the user last saw, momentarily inverting the freshly typed
+        // character before the next segment corrects it. Content freshness does
+        // not imply cursor settledness, so the freshness tokens alone cannot
+        // rule this frame out.
+        //
+        // Recognize exactly that frame: forward-advancing printable input is in
+        // flight, the snapshot is content-fresh but not yet strictly settled,
+        // and its block cursor sits on the pre-input row at or before the
+        // pre-input column. Suppress the block cursor for this one frame; the
+        // settled snapshot a segment later draws it at the advanced position.
+        // Only the block shape inverts the glyph, so bar and underline cursors
+        // are left untouched.
+        if (!input_cursor_freshness.active                ||
+            !input_cursor_freshness.have_pre_input_cursor ||
+            render_snapshot == nullptr)
+        {
+            return false;
+        }
+
+        if (!render_snapshot_is_cursor_safe_for_text_input(render_snapshot) ||
+            render_snapshot_strictly_satisfies_text_input(render_snapshot))
+        {
+            return false;
+        }
+
+        const term::Terminal_render_cursor& cursor = render_snapshot->cursor;
+        if (!cursor.visible ||
+            cursor.shape != term::Terminal_cursor_shape::BLOCK)
+        {
+            return false;
+        }
+
+        const term::terminal_grid_position_t pre_input =
+            input_cursor_freshness.pre_input_cursor_position;
+        if (cursor.position.row    != pre_input.row ||
+            cursor.position.column >  pre_input.column)
+        {
+            return false;
+        }
+
+        // Require the just-typed glyph to actually be present at the pre-input
+        // column. Without landed content the caret is legitimately at rest there
+        // (there is no echo to settle past), and suppressing it would blink the
+        // cursor for no reason; the landed glyph is what a block cursor at or
+        // behind this column visually inverts.
+        const term::Terminal_render_snapshot_row_content_view row_view(*render_snapshot);
+        const term::Terminal_render_cell* const landed_cell =
+            row_view.cell_at(pre_input.row, pre_input.column);
+        return
+            landed_cell != nullptr &&
+            term::render_cell_text_has_non_space(landed_cell->text);
     }
 
     bool render_snapshot_allows_text_input_cursor_render_and_drain() const

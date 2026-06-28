@@ -1362,7 +1362,13 @@ bool qsg_atlas_msdf_cursor_text_run_candidate(
 {
     return qsg_atlas_text_is_printable_ascii(run.text);
 }
+#endif // VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
 
+// The text-renderer policy, LCD-order, and render-summary helpers below are
+// MSDF-independent: they classify policy/subpixel-order enums and fold per-frame
+// draw counters into the render summary. The glyph-only (MSDF-disabled) build
+// reaches them from unguarded code and from the non-MSDF branches, so they must
+// compile regardless of the MSDF guard above.
 bool qsg_atlas_text_renderer_policy_allows_msdf(
     Terminal_text_renderer_policy policy)
 {
@@ -1444,7 +1450,6 @@ void qsg_atlas_update_text_renderer_summary(
         qsg_atlas_lcd_subpixel_order_uses_lcd_sampling(
             summary.msdf_lcd_subpixel_order);
 }
-#endif
 
 bool text_has_emoji_presentation(const QString& text);
 
