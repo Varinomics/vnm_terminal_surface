@@ -521,6 +521,7 @@ private:
     void itemChange(ItemChange change, const ItemChangeData& value) override;
 
     void refresh_grid_metrics();
+    void refresh_grid_metrics_if_device_pixel_ratio_changed();
 
     void set_grid_size(
         int                    rows,

@@ -1113,6 +1113,7 @@ add_executable(vnm_terminal_surface_host
 
 target_link_libraries(vnm_terminal_surface_host PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
+    Qt6::GuiPrivate
 )
 
 target_compile_definitions(vnm_terminal_surface_host PRIVATE
