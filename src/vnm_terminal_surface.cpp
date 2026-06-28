@@ -1830,6 +1830,11 @@ struct VNM_TerminalSurface::Private
         // this column while the typed glyph has already arrived.
         bool                                      have_pre_input_cursor = false;
         term::terminal_grid_position_t            pre_input_cursor_position{};
+        // Consecutive frames this unsettled post-input repaint has been held
+        // off-screen while draining for the caret-settling segment. Bounded by
+        // k_max_unsettled_caret_hold_frames so a stalled application can never
+        // strand the typed echo behind a permanently held frame.
+        int                                       unsettled_caret_hold_frames = 0;
     };
 
     void record_accepted_text_input(
@@ -1879,9 +1884,9 @@ struct VNM_TerminalSurface::Private
                 input_cursor_freshness.accepted_input_freshness_token;
     }
 
-    bool should_suppress_cursor_for_render_snapshot() const
+    bool render_snapshot_has_unsettled_post_input_block_cursor() const
     {
-        // Cursor-risk suppression for the post-input repaint catch-up window.
+        // Detect the unsettled post-input repaint frame in the catch-up window.
         //
         // With remote echo and per-segment snapshot publication, a snapshot can
         // already carry the just-typed glyph - so it is "cursor safe" for the
@@ -1896,10 +1901,10 @@ struct VNM_TerminalSurface::Private
         // Recognize exactly that frame: forward-advancing printable input is in
         // flight, the snapshot is content-fresh but not yet strictly settled,
         // and its block cursor sits on the pre-input row at or before the
-        // pre-input column. Suppress the block cursor for this one frame; the
-        // settled snapshot a segment later draws it at the advanced position.
-        // Only the block shape inverts the glyph, so bar and underline cursors
-        // are left untouched.
+        // pre-input column with the typed glyph already landed there. The caller
+        // holds the previous complete frame for this state rather than present a
+        // half-updated one. Only the block shape inverts the glyph, so bar and
+        // underline cursors are left untouched.
         if (!input_cursor_freshness.active                ||
             !input_cursor_freshness.have_pre_input_cursor ||
             render_snapshot == nullptr)
@@ -7353,6 +7358,27 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
                 input_generation;
             m_private->backend_callback_frame_deferral_target_epoch = 0U;
         }
+
+        // Unsettled post-input caret: hold the whole previous frame rather than
+        // present a half-updated terminal state (the freshly typed glyph with
+        // the block cursor still drawn at or behind it). Keep the last settled
+        // frame on screen and drain for the caret-settling segment, then render
+        // that. Bounded so a stalled application can never strand the typed
+        // echo; the budget-exhausted fallback below shows the fresh text with
+        // the stale terminal cursor suppressed instead of misplaced.
+        constexpr int k_max_unsettled_caret_hold_frames = 2;
+        const bool unsettled_post_input_block_cursor =
+            m_private->render_snapshot_has_unsettled_post_input_block_cursor();
+        if (unsettled_post_input_block_cursor &&
+            m_private->input_cursor_freshness.unsettled_caret_hold_frames <
+                k_max_unsettled_caret_hold_frames)
+        {
+            ++m_private->input_cursor_freshness.unsettled_caret_hold_frames;
+            ++m_private->render_invalidation_stats.input_unsettled_caret_held_frames;
+            m_private->defer_render_update_for_backend_callback(*this);
+            return old_node;
+        }
+
         if (m_private->backend_callback_arrived_after_frame_boundary()) {
             if (m_private->backend_callback_frame_deferral_target_epoch == 0U) {
                 m_private->backend_callback_frame_deferral_target_epoch =
@@ -7368,11 +7394,6 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
                     m_private->render_snapshot->metadata.processed_backend_callback_epoch >=
                         target_backend_callback_epoch);
             if (!target_snapshot_caught_up) {
-                if (m_private->should_suppress_cursor_for_render_snapshot()) {
-                    ++m_private->render_invalidation_stats.input_stale_old_node_frames_avoided;
-                    m_private->queue_backend_callback_drain_after_frame(*this);
-                }
-                else
                 if (m_private->render_snapshot_allows_text_input_cursor_render_and_drain()) {
                     m_private->queue_backend_callback_drain_after_frame(*this);
                 }
@@ -7397,9 +7418,12 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
         }
 
         term::Terminal_render_options options = render_options_for_surface(*this);
-        options.suppress_cursor =
-            m_private->should_suppress_cursor_for_render_snapshot();
-        if (options.suppress_cursor) {
+        if (unsettled_post_input_block_cursor) {
+            // Hold budget exhausted: present the fresh text but suppress the
+            // stale terminal cursor rather than draw the block over the
+            // just-typed glyph, so the echo still appears without the misplaced
+            // caret if the caret-settling output never arrives.
+            options.suppress_cursor = true;
             ++m_private->render_invalidation_stats.input_stale_cursor_suppressed_frames;
         }
         else
