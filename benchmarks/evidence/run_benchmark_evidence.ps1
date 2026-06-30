@@ -764,7 +764,7 @@ function Invoke-SurfaceStressEvidence {
     }
 
     return [ordered]@{
-        schema = "vnm_terminal_lazy_snapshot_stage_evidence_summary"
+        schema = "vnm_terminal_surface_stress_evidence_summary"
         schema_version = 1
         repeat_count = $RepeatCount
         frames = $frames
@@ -774,10 +774,7 @@ function Invoke-SurfaceStressEvidence {
         decision_checks = [ordered]@{
             structural_only = $true
             performance_thresholds_encoded = $false
-            production_enablement_status = "rejected"
-            final_lazy_state = "evidence-only"
             pass_rule = "commands pass, required metrics are present, dirty-row validation in the executable passes, and every matrix case runs all repeats"
-            deletion_or_rejection_rule = "stage-only surface stress evidence is retained only as evidence; production lazy publication remains rejected"
         }
         metric_summaries = $summaries
         case_records = $records
@@ -829,17 +826,7 @@ $root = [ordered]@{
         }
     }
     input_echo = $inputEcho
-    lazy_snapshot_stage = $surfaceStress
-    final_lazy_snapshot_state = [ordered]@{
-        state = "evidence-only"
-        production_enablement_status = "rejected"
-        production_publication_path = "full_snapshot_only"
-        lazy_composer_reachability = "internal_testing_and_benchmark_evidence_api"
-        structural_only = $true
-        performance_thresholds_encoded = $false
-        default_production_enabled = $false
-        no_production_switch = $true
-    }
+    surface_stress_stage = $surfaceStress
     commands = $commands
     result = [ordered]@{
         status = if ($failures.Count -eq 0) { "pass" } else { "fail" }
