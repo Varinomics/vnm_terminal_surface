@@ -1934,8 +1934,6 @@ bool test_surface_no_echo_input_keeps_cursor_visible(QGuiApplication& app)
         "no-echo cursor visibility reports baseline rendered");
     (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
 
-    const term::Terminal_surface_render_invalidation_stats_t stats_before =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
     ok &= check(!term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
             fixture.surface),
         "no-echo cursor visibility starts without queued backend callbacks");
@@ -1966,17 +1964,6 @@ bool test_surface_no_echo_input_keeps_cursor_visible(QGuiApplication& app)
         frame_attempt.report.captured_render_cursor.column ==
             baseline_snapshot->cursor.position.column,
         "no-echo cursor visibility keeps the terminal cursor visible");
-
-    const term::Terminal_surface_render_invalidation_stats_t stats_after =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    ok &= check_uint64_equal(
-        stats_after.input_stale_cursor_suppressed_frames,
-        stats_before.input_stale_cursor_suppressed_frames,
-        "no-echo cursor visibility does not suppress a stale cursor");
-    ok &= check_uint64_equal(
-        stats_after.input_stale_old_node_frames_avoided,
-        stats_before.input_stale_old_node_frames_avoided,
-        "no-echo cursor visibility does not avoid old-node presentation");
 
     return ok;
 }
@@ -2047,9 +2034,6 @@ bool test_surface_input_freshness_unrendered_publication_keeps_cursor_visible(
         return ok;
     }
 
-    const std::uint64_t suppressed_before =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
-            fixture.surface).input_stale_cursor_suppressed_frames;
     ok &= send_key_and_expect_write(
         fixture.surface,
         *backend_ptr,
@@ -2068,8 +2052,6 @@ bool test_surface_input_freshness_unrendered_publication_keeps_cursor_visible(
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
     ok &= check(active_stats.input_freshness_active &&
         active_stats.accepted_input_freshness_token != 0U &&
-        active_stats.cursor_safe_input_freshness_token <
-        active_stats.accepted_input_freshness_token &&
         active_stats.strict_satisfied_input_freshness_token <
             active_stats.accepted_input_freshness_token,
         "input freshness unrendered publication reports active unsatisfied state");
@@ -2092,219 +2074,6 @@ bool test_surface_input_freshness_unrendered_publication_keeps_cursor_visible(
         frame_attempt.report.captured_render_cursor.column ==
             unrendered_snapshot->cursor.position.column,
         "input freshness unrendered publication keeps stale cursor visible");
-    ok &= check_uint64_equal(
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
-            fixture.surface).input_stale_cursor_suppressed_frames,
-        suppressed_before,
-        "input freshness unrendered publication does not suppress the cursor");
-
-    return ok;
-}
-
-bool test_surface_input_freshness_cursor_safe_after_suppressed_frame_renders_and_drains(
-    QGuiApplication& app)
-{
-    bool ok = true;
-    Surface_fixture fixture;
-    pump_events(app);
-    fixture.surface.set_cursor_blink_enabled(false);
-
-    auto backend = std::make_unique<Scripted_backend>();
-    backend->outputs_during_start = {QByteArrayLiteral("\x1b[1;1Hcursor-safe-ready")};
-
-    bool started = false;
-    Scripted_backend* backend_ptr = start_surface_with_backend(
-        fixture.surface,
-        std::move(backend),
-        { QStringLiteral("scripted-terminal") },
-        &started);
-    ok &= check(started && backend_ptr != nullptr,
-        "input freshness cursor-safe after suppressed frame surface starts");
-    if (!started || backend_ptr == nullptr) {
-        return ok;
-    }
-
-    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
-        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(baseline_snapshot != nullptr &&
-        snapshot_contains_text(*baseline_snapshot, QStringLiteral("cursor-safe-ready")),
-        "input freshness cursor-safe after suppressed frame publishes baseline");
-    if (baseline_snapshot == nullptr) {
-        return ok;
-    }
-
-    ok &= check(capture_surface_sequence(
-        app,
-        fixture.window,
-        fixture.surface,
-        baseline_snapshot->metadata.sequence),
-        "input freshness cursor-safe after suppressed frame captures baseline");
-    ok &= check(
-        term::VNM_TerminalSurface_render_bridge::
-            mark_reported_atlas_completion_pending_for_testing(
-                fixture.surface,
-                baseline_snapshot->metadata.publication_generation,
-                true),
-        "input freshness cursor-safe after suppressed frame reports baseline rendered");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
-
-    backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b[2;1Hstale> "));
-    backend_ptr->join_worker();
-    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
-        fixture.surface);
-    const std::shared_ptr<const term::Terminal_render_snapshot> unrendered_snapshot =
-        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(unrendered_snapshot != nullptr &&
-        snapshot_contains_text(*unrendered_snapshot, QStringLiteral("stale>")) &&
-        term::VNM_TerminalSurface_render_bridge::
-            session_rendered_render_snapshot_generation(fixture.surface) <
-                unrendered_snapshot->metadata.publication_generation,
-        "input freshness cursor-safe after suppressed frame has unrendered stale basis");
-    if (unrendered_snapshot == nullptr) {
-        return ok;
-    }
-
-    ok &= send_key_and_expect_write(
-        fixture.surface,
-        *backend_ptr,
-        Qt::Key_X,
-        Qt::NoModifier,
-        QStringLiteral("x"),
-        QByteArrayLiteral("x"),
-        "input freshness cursor-safe after suppressed frame accepts stale input");
-    const Surface_frame_attempt suppressed_attempt =
-        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
-    ok &= check(suppressed_attempt.valid,
-        "input freshness cursor-safe after suppressed frame captures suppressed frame");
-    ok &= check(
-        suppressed_attempt.report.captured_snapshot_cursor.visible &&
-        suppressed_attempt.report.captured_render_cursor.visible,
-        "input freshness cursor-safe after suppressed frame keeps stale cursor visible");
-
-    const std::shared_ptr<const term::Terminal_render_snapshot> cleanup_snapshot =
-        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    if (cleanup_snapshot != nullptr) {
-        ok &= check(
-            term::VNM_TerminalSurface_render_bridge::
-                mark_reported_atlas_completion_pending_for_testing(
-                    fixture.surface,
-                    cleanup_snapshot->metadata.publication_generation,
-                    true),
-            "input freshness cursor-safe after suppressed frame reports cleanup rendered");
-        (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
-    }
-
-    backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b[3;1Hsafe> "));
-    backend_ptr->join_worker();
-    ok &= check(term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
-            fixture.surface) > 0U,
-        "input freshness cursor-safe after suppressed frame queues pre-input prompt");
-    ok &= send_key_and_expect_write(
-        fixture.surface,
-        *backend_ptr,
-        Qt::Key_Y,
-        Qt::NoModifier,
-        QStringLiteral("y"),
-        QByteArrayLiteral("y"),
-        "input freshness cursor-safe after suppressed frame accepts cursor-safe input");
-
-    const std::shared_ptr<const term::Terminal_render_snapshot> pre_input_snapshot =
-        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(pre_input_snapshot != nullptr &&
-        snapshot_contains_text(*pre_input_snapshot, QStringLiteral("safe>")) &&
-        !snapshot_contains_text(*pre_input_snapshot, QStringLiteral("safe> y")),
-        "input freshness cursor-safe after suppressed frame first publishes pre-input prompt");
-
-    backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b[3;8H"));
-    backend_ptr->join_worker();
-    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
-        fixture.surface);
-
-    const std::shared_ptr<const term::Terminal_render_snapshot> cursor_safe_snapshot =
-        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(cursor_safe_snapshot != nullptr &&
-        pre_input_snapshot != nullptr &&
-        cursor_safe_snapshot->metadata.sequence > pre_input_snapshot->metadata.sequence &&
-        snapshot_contains_text(*cursor_safe_snapshot, QStringLiteral("safe>")) &&
-        !snapshot_contains_text(*cursor_safe_snapshot, QStringLiteral("safe> y")),
-        "input freshness cursor-safe after suppressed frame publishes post-input no-echo snapshot");
-    const term::Terminal_surface_render_invalidation_stats_t ready_stats =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    ok &= check(cursor_safe_snapshot != nullptr &&
-        ready_stats.input_freshness_active &&
-        ready_stats.accepted_input_freshness_token != 0U &&
-        ready_stats.cursor_safe_input_freshness_token >=
-        ready_stats.accepted_input_freshness_token &&
-        ready_stats.strict_satisfied_input_freshness_token <
-            ready_stats.accepted_input_freshness_token,
-        "input freshness cursor-safe after suppressed frame is cursor-safe but strict-pending");
-    if (cursor_safe_snapshot == nullptr) {
-        return ok;
-    }
-
-    const term::Qsg_atlas_frame_report report_before =
-        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
-    const std::uint64_t suppressed_before =
-        ready_stats.input_stale_cursor_suppressed_frames;
-    const std::uint64_t old_node_avoids_before =
-        ready_stats.input_stale_old_node_frames_avoided;
-    const std::uint64_t deferrals_before =
-        ready_stats.backend_callback_frame_deferrals;
-    const std::uint64_t cursor_safe_strict_pending_before =
-        ready_stats.cursor_safe_rendered_while_strict_unsatisfied_frames;
-
-    std::atomic<bool> post_boundary_callback_injected{false};
-    const QMetaObject::Connection post_boundary_connection = QObject::connect(
-        &fixture.window,
-        &QQuickWindow::beforeSynchronizing,
-        &fixture.window,
-        [&] {
-            if (!post_boundary_callback_injected.exchange(true)) {
-                backend_ptr->emit_output(QByteArrayLiteral("\x1b]0;cursor-safe-post\a"));
-            }
-        },
-        Qt::DirectConnection);
-    const Surface_frame_attempt frame_attempt =
-        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
-    QObject::disconnect(post_boundary_connection);
-
-    ok &= check(post_boundary_callback_injected.load(std::memory_order_acquire),
-        "input freshness cursor-safe after suppressed frame injects after-boundary callback");
-    ok &= check(frame_attempt.valid,
-        "input freshness cursor-safe after suppressed frame captures cursor-safe frame");
-    ok &= check(frame_attempt.report.capture_count > report_before.capture_count,
-        "input freshness cursor-safe after suppressed frame advances capture");
-    ok &= check_uint64_equal(
-        frame_attempt.report.captured_snapshot_sequence,
-        cursor_safe_snapshot->metadata.sequence,
-        "input freshness cursor-safe after suppressed frame captures cursor-safe snapshot");
-    ok &= check(
-        frame_attempt.report.captured_snapshot_cursor.visible &&
-        frame_attempt.report.captured_render_cursor.visible &&
-        frame_attempt.report.captured_render_cursor.row ==
-            cursor_safe_snapshot->cursor.position.row &&
-        frame_attempt.report.captured_render_cursor.column ==
-            cursor_safe_snapshot->cursor.position.column,
-        "input freshness cursor-safe after suppressed frame renders cursor from cursor-safe snapshot");
-
-    const term::Terminal_surface_render_invalidation_stats_t stats_after =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    ok &= check_uint64_equal(
-        stats_after.input_stale_cursor_suppressed_frames,
-        suppressed_before,
-        "input freshness cursor-safe after suppressed frame does not suppress cursor-safe frame");
-    ok &= check_uint64_equal(
-        stats_after.input_stale_old_node_frames_avoided,
-        old_node_avoids_before,
-        "input freshness cursor-safe after suppressed frame does not avoid old node");
-    ok &= check_uint64_equal(
-        stats_after.backend_callback_frame_deferrals,
-        deferrals_before,
-        "input freshness cursor-safe after suppressed frame does not defer cursor-safe frame");
-    ok &= check(
-        stats_after.cursor_safe_rendered_while_strict_unsatisfied_frames >
-            cursor_safe_strict_pending_before,
-        "input freshness cursor-safe after suppressed frame records cursor-safe strict-pending render");
 
     return ok;
 }
@@ -2601,9 +2370,6 @@ bool test_surface_input_freshness_catches_between_sample_and_write_callback(
         return ok;
     }
 
-    const std::uint64_t suppressed_before =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
-            fixture.surface).input_stale_cursor_suppressed_frames;
     std::atomic<bool> echo_injected{false};
     const QMetaObject::Connection echo_connection = QObject::connect(
         &fixture.window,
@@ -2634,11 +2400,6 @@ bool test_surface_input_freshness_catches_between_sample_and_write_callback(
         frame_attempt.report.captured_render_cursor.visible;
     ok &= check(visible_stale_frame || rendered_caught_up_frame,
         "input freshness between-sample callback keeps stale cursor visible or renders caught-up cursor");
-    ok &= check_uint64_equal(
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
-            fixture.surface).input_stale_cursor_suppressed_frames,
-        suppressed_before,
-        "input freshness between-sample callback does not suppress the cursor");
 
     return ok;
 }
@@ -2916,14 +2677,10 @@ bool test_surface_input_freshness_rendered_pre_input_no_echo_installs_followup(
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
     ok &= check(stale_stats.input_freshness_active &&
         stale_stats.accepted_input_freshness_token != 0U &&
-        stale_stats.cursor_safe_input_freshness_token <
-        stale_stats.accepted_input_freshness_token &&
         stale_stats.strict_satisfied_input_freshness_token <
             stale_stats.accepted_input_freshness_token,
         "input freshness rendered pre-input remains strict-pending by sequence");
 
-    const std::uint64_t cursor_suppressed_before =
-        stale_stats.input_stale_cursor_suppressed_frames;
     const Surface_frame_attempt stale_frame_attempt =
         capture_surface_frame_attempt(app, fixture.window, fixture.surface);
     ok &= check(stale_frame_attempt.valid,
@@ -2938,11 +2695,6 @@ bool test_surface_input_freshness_rendered_pre_input_no_echo_installs_followup(
         stale_frame_attempt.report.captured_render_cursor.column ==
             stale_snapshot->cursor.position.column,
         "input freshness rendered pre-input keeps first stale cursor visible");
-    ok &= check_uint64_equal(
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(
-            fixture.surface).input_stale_cursor_suppressed_frames,
-        cursor_suppressed_before,
-        "input freshness rendered pre-input does not suppress stale cursor");
 
     const std::shared_ptr<const term::Terminal_render_snapshot> after_stale_frame_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
@@ -15390,7 +15142,6 @@ int main(int argc, char** argv)
         if (expectation == Input_echo_timing_expectation::CURSOR_SUPPRESSED) {
             ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
             ok &= test_surface_input_freshness_unrendered_publication_keeps_cursor_visible(app);
-            ok &= test_surface_input_freshness_cursor_safe_after_suppressed_frame_renders_and_drains(app);
             ok &= test_surface_input_freshness_non_rendering_callback_waits_for_render(app);
             ok &= test_surface_input_freshness_catches_between_sample_and_write_callback(app);
             ok &= test_surface_input_freshness_no_draw_keeps_pending_until_render(app);
@@ -15416,7 +15167,6 @@ int main(int argc, char** argv)
         Input_echo_timing_expectation::CURSOR_SUPPRESSED);
     ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
     ok &= test_surface_input_freshness_unrendered_publication_keeps_cursor_visible(app);
-    ok &= test_surface_input_freshness_cursor_safe_after_suppressed_frame_renders_and_drains(app);
     ok &= test_surface_input_freshness_non_rendering_callback_waits_for_render(app);
     ok &= test_surface_input_freshness_catches_between_sample_and_write_callback(app);
     ok &= test_surface_input_freshness_no_draw_keeps_pending_until_render(app);

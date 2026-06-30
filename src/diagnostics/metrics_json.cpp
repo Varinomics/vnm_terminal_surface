@@ -1005,14 +1005,6 @@ void append_render_invalidation_metrics_json(
         stats.backend_callback_frame_deferrals);
     insert_json_counter(
         out,
-        "input_stale_cursor_suppressed_frames",
-        stats.input_stale_cursor_suppressed_frames);
-    insert_json_counter(
-        out,
-        "input_stale_old_node_frames_avoided",
-        stats.input_stale_old_node_frames_avoided);
-    insert_json_counter(
-        out,
         "backend_callback_event_epoch",
         stats.backend_callback_event_epoch);
     insert_json_counter(
