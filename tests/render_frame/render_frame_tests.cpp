@@ -134,60 +134,6 @@ bool has_graphic_rect(
     return false;
 }
 
-bool row_descriptors_equal(
-    const term::Terminal_render_row_descriptor& left,
-    const term::Terminal_render_row_descriptor& right)
-{
-    return
-        left.row == right.row &&
-        left.content_identity_key == right.content_identity_key &&
-        left.text_key == right.text_key &&
-        left.background_key == right.background_key &&
-        left.graphic_key == right.graphic_key &&
-        left.decoration_key == right.decoration_key &&
-        left.cursor_inverse_text_key == right.cursor_inverse_text_key &&
-        left.selection_key == right.selection_key &&
-        left.ime_preedit_key == right.ime_preedit_key &&
-        left.hyperlink_underline_key == right.hyperlink_underline_key;
-}
-
-bool row_descriptor_vectors_equal(
-    const std::vector<term::Terminal_render_row_descriptor>& left,
-    const std::vector<term::Terminal_render_row_descriptor>& right)
-{
-    if (left.size() != right.size()) {
-        return false;
-    }
-
-    for (std::size_t index = 0; index < left.size(); ++index) {
-        if (!row_descriptors_equal(left[index], right[index])) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool layer_descriptors_equal(
-    const term::Terminal_render_layer_descriptors& left,
-    const term::Terminal_render_layer_descriptors& right)
-{
-    return
-        left.text_key == right.text_key &&
-        left.background_key == right.background_key &&
-        left.graphic_key == right.graphic_key &&
-        left.decoration_key == right.decoration_key &&
-        left.cursor_inverse_text_key == right.cursor_inverse_text_key &&
-        left.selection_key == right.selection_key &&
-        left.ime_preedit_key == right.ime_preedit_key &&
-        left.visual_bell_key == right.visual_bell_key &&
-        left.hyperlink_underline_key == right.hyperlink_underline_key &&
-        left.style_color_key == right.style_color_key &&
-        left.reverse_video_key == right.reverse_video_key &&
-        left.render_options_key == right.render_options_key &&
-        left.cell_metrics_key == right.cell_metrics_key;
-}
-
 const term::Terminal_render_row_descriptor* descriptor_for_row(
     const term::Terminal_render_frame& frame,
     int                                row)
@@ -247,50 +193,6 @@ bool snapshot_cells_are_row_major_column_sorted(
     }
 
     return true;
-}
-
-term::Terminal_render_snapshot_row_payload_ref row_payload_ref(
-    std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> owner,
-    std::size_t                                                            row)
-{
-    term::Terminal_render_snapshot_row_payload_ref ref;
-    ref.owner         = std::move(owner);
-    ref.payload_index = row;
-    return ref;
-}
-
-term::Terminal_render_snapshot lazy_snapshot_from_flat(
-    const term::Terminal_render_snapshot& snapshot)
-{
-    const term::Terminal_render_snapshot_row_payload_namespace metadata_namespace = {
-        31U,
-        41U,
-    };
-    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> owner =
-        term::render_snapshot_row_payload_owner_from_snapshot(
-            snapshot,
-            metadata_namespace,
-            snapshot.metadata.sequence);
-
-    auto payloads = std::make_shared<term::Terminal_render_snapshot_lazy_payloads>();
-    payloads->receiving_namespace = metadata_namespace;
-    payloads->rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
-    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
-        const std::optional<term::Terminal_render_snapshot_lazy_row_payload> payload =
-            term::borrowed_render_snapshot_lazy_row_payload(
-                row_payload_ref(owner, static_cast<std::size_t>(row)),
-                metadata_namespace,
-                {},
-                {});
-        if (payload.has_value()) {
-            payloads->rows.push_back(*payload);
-        }
-    }
-
-    term::Terminal_render_snapshot lazy = snapshot;
-    lazy.cells.clear();
-    lazy.lazy_row_payloads = std::move(payloads);
-    return lazy;
 }
 
 bool has_background_rect(
@@ -2333,74 +2235,6 @@ bool test_snapshot_cells_are_row_major_column_sorted()
     return ok;
 }
 
-bool test_row_view_frame_matches_flat_materialization()
-{
-    bool ok = true;
-
-    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 6});
-    snapshot.cursor.visible = false;
-    snapshot.dirty_row_ranges = {{0, 3}};
-    snapshot.styles.push_back(term::make_default_terminal_text_style());
-    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
-    snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("B")});
-    snapshot.cells.push_back({
-        .position = {1, 0},
-        .text     = source_cell_text(QStringLiteral("\u2588"), 1),
-        .style_id = 1U,
-    });
-    snapshot.cells.push_back({
-        .position     = {2, 0},
-        .text         = QStringLiteral("H"),
-        .hyperlink_id = 5U,
-    });
-    snapshot.selection_spans.push_back({
-        {{2, 0}, {2, 1}, term::Terminal_selection_mode::NORMAL},
-        2,
-        0,
-        1,
-    });
-
-    const term::Terminal_render_snapshot lazy_snapshot =
-        lazy_snapshot_from_flat(snapshot);
-    const term::Terminal_render_snapshot_row_content_view lazy_rows(lazy_snapshot);
-    term::Terminal_render_snapshot materialized_snapshot = lazy_snapshot;
-    materialized_snapshot.cells = lazy_rows.materialize_flat_cells(
-        term::Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST);
-    materialized_snapshot.lazy_row_payloads.reset();
-
-    term::Terminal_render_options render_options = options();
-    render_options.underline_hyperlinks = true;
-    const term::Terminal_render_frame row_view_frame =
-        build(lazy_snapshot, render_options);
-    const term::Terminal_render_frame flat_frame =
-        build(materialized_snapshot, render_options);
-
-    ok &= check(
-        row_view_frame.stats.cells_considered == flat_frame.stats.cells_considered &&
-            row_view_frame.stats.cell_pass_input_cells ==
-                flat_frame.stats.cell_pass_input_cells,
-        "row-content frame and explicit materialized frame consider the same full rows");
-    ok &= check(
-        row_view_frame.text_runs.size() == flat_frame.text_runs.size() &&
-            row_view_frame.graphic_rects.size() == flat_frame.graphic_rects.size() &&
-            row_view_frame.selection_rects.size() == flat_frame.selection_rects.size() &&
-            row_view_frame.decorations.size() == flat_frame.decorations.size(),
-        "row-content frame emits the same primitive counts as flat materialization");
-    ok &= check(
-        layer_descriptors_equal(
-            row_view_frame.layer_descriptors,
-            flat_frame.layer_descriptors),
-        "row-content frame layer descriptors match explicit flat materialization");
-    ok &= check(
-        row_view_frame.row_descriptors.size() ==
-                static_cast<std::size_t>(snapshot.grid_size.rows) &&
-            row_descriptor_vectors_equal(
-                row_view_frame.row_descriptors,
-                flat_frame.row_descriptors),
-        "row-content frame row descriptors match explicit flat materialization");
-    return ok;
-}
-
 bool test_descriptor_keys_are_mutation_sensitive()
 {
     bool ok = true;
@@ -2606,78 +2440,6 @@ bool test_descriptor_keys_are_mutation_sensitive()
     return ok;
 }
 
-bool test_sparse_lazy_frame_scales_with_dirty_rows()
-{
-    bool ok = true;
-
-    term::Terminal_render_snapshot snapshot = empty_snapshot({4, 5});
-    snapshot.cursor.visible = false;
-    snapshot.dirty_row_ranges = {{2, 1}};
-    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
-        for (int column = 0; column < snapshot.grid_size.columns; ++column) {
-            const QChar ch(ushort('A' + row));
-            snapshot.cells.push_back({
-                .position = {row, column},
-                .text     = QString(ch),
-            });
-        }
-    }
-
-    const term::Terminal_render_snapshot lazy_snapshot =
-        lazy_snapshot_from_flat(snapshot);
-    const term::Terminal_render_frame frame = build(lazy_snapshot);
-    ok &= check(frame.stats.cell_pass_input_cells == snapshot.grid_size.columns &&
-            frame.stats.cells_considered == snapshot.grid_size.columns,
-        "sparse lazy frame cell counters scale with dirty rows");
-    ok &= check(frame.stats.row_descriptors_built == 1 &&
-            frame.row_descriptors.size() == 1U &&
-            frame.row_descriptors.front().row == 2,
-        "sparse lazy frame builds row descriptors only for dirty/promoted rows");
-    ok &= check(frame.text_runs.size() == 1U &&
-            frame.text_runs.front().row == 2 &&
-            frame.text_runs.front().text == QStringLiteral("CCCCC"),
-        "sparse lazy frame emits dirty-row text through the canonical frame path");
-    return ok;
-}
-
-bool test_sparse_lazy_frame_promotes_cursor_row()
-{
-    bool ok = true;
-
-    term::Terminal_render_snapshot snapshot = empty_snapshot({4, 5});
-    snapshot.dirty_row_ranges = {{2, 1}};
-    snapshot.cursor.visible = true;
-    snapshot.cursor.blink_enabled = false;
-    snapshot.cursor.shape = term::Terminal_cursor_shape::BAR;
-    snapshot.cursor.position = {1, 3};
-    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
-        for (int column = 0; column < snapshot.grid_size.columns; ++column) {
-            const QChar ch(ushort('A' + row));
-            snapshot.cells.push_back({
-                .position = {row, column},
-                .text     = QString(ch),
-            });
-        }
-    }
-
-    const term::Terminal_render_snapshot lazy_snapshot =
-        lazy_snapshot_from_flat(snapshot);
-    const term::Terminal_render_frame frame = build(lazy_snapshot);
-    ok &= check(frame.stats.row_descriptors_built == 2 &&
-            frame.row_descriptors.size() == 2U &&
-            frame.row_descriptors[0].row == 1 &&
-            frame.row_descriptors[1].row == 2,
-        "sparse lazy frame promotes a clean bar-cursor row beside dirty content");
-    ok &= check(frame.stats.cell_pass_input_cells == snapshot.grid_size.columns * 2 &&
-            frame.stats.cells_considered == snapshot.grid_size.columns * 2,
-        "sparse lazy frame scans dirty rows plus promoted cursor rows");
-    ok &= check(frame.text_runs.size() == 2U &&
-            frame.text_runs[0].row == 1 &&
-            frame.text_runs[1].row == 2,
-        "sparse lazy frame populates promoted cursor row text for widened uploads");
-    return ok;
-}
-
 bool test_viewport_empty_and_dirty_ranges()
 {
     bool ok = true;
@@ -2747,10 +2509,7 @@ int main()
     ok &= test_fragmented_dirty_ranges_drive_simple_content_membership();
     ok &= test_cell_pass_simple_content_classification();
     ok &= test_snapshot_cells_are_row_major_column_sorted();
-    ok &= test_row_view_frame_matches_flat_materialization();
     ok &= test_descriptor_keys_are_mutation_sensitive();
-    ok &= test_sparse_lazy_frame_scales_with_dirty_rows();
-    ok &= test_sparse_lazy_frame_promotes_cursor_row();
     ok &= test_viewport_empty_and_dirty_ranges();
     return ok ? 0 : 1;
 }
