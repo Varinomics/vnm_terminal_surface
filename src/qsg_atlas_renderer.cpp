@@ -505,7 +505,6 @@ Qsg_atlas_cursor_report captured_render_cursor_report(
             snapshot.cursor.blink_enabled);
     report.visible =
         snapshot.cursor.visible                                      &&
-        !frame.options.suppress_cursor                               &&
         cursor_position_inside_grid(snapshot.cursor.position, snapshot.grid_size) &&
         (!cursor_blink_enabled || frame.cursor_blink_visible);
     return report;

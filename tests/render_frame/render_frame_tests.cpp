@@ -2516,25 +2516,6 @@ bool test_descriptor_keys_are_mutation_sensitive()
                 base_row_1->cursor_inverse_text_key,
         "cursor inverse-text mutations change layer and row descriptor keys");
 
-    term::Terminal_render_options suppressed_cursor_options = options();
-    suppressed_cursor_options.suppress_cursor = true;
-    const term::Terminal_render_frame suppressed_cursor_frame =
-        build(cursor, suppressed_cursor_options);
-    const term::Terminal_render_row_descriptor* const suppressed_cursor_row =
-        descriptor_for_row(suppressed_cursor_frame, 1);
-    ok &= check(
-        cursor_frame.layer_descriptors.render_options_key ==
-                suppressed_cursor_frame.layer_descriptors.render_options_key &&
-            !cursor_frame.cursors.empty() &&
-            suppressed_cursor_frame.cursors.empty(),
-        "cursor suppression leaves the broad render-options descriptor key unchanged");
-    ok &= check(
-        cursor_row != nullptr &&
-            suppressed_cursor_row != nullptr &&
-            suppressed_cursor_row->cursor_inverse_text_key !=
-                cursor_row->cursor_inverse_text_key,
-        "cursor suppression changes the cursor row descriptor key");
-
     term::Terminal_render_snapshot selection = base;
     selection.selection_spans.push_back({
         {{1, 1}, {1, 2}, term::Terminal_selection_mode::NORMAL},

@@ -66,7 +66,6 @@ struct Terminal_render_options
     std::optional<Terminal_cursor_shape>
                                cursor_shape_override;
     std::optional<bool>        cursor_blink_enabled_override;
-    bool                       suppress_cursor      = false;
     bool                       visual_bell_enabled  = true;
     bool                       underline_hyperlinks = false;
     Terminal_text_renderer_policy
