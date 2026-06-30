@@ -26,21 +26,12 @@ struct Terminal_surface_render_invalidation_stats_t
     std::uint64_t                           coalesced_requests                    = 0U;
     std::uint64_t                           consumed_updates                      = 0U;
     std::uint64_t                           backend_callback_frame_deferrals     = 0U;
-    std::uint64_t                           input_stale_cursor_suppressed_frames = 0U;
-    // Old-node avoidance is a subset of stale cursor suppression.
-    std::uint64_t                           input_stale_old_node_frames_avoided  = 0U;
-    // Frames whose unsettled post-input repaint was held off-screen (the whole
-    // previous frame kept up) while draining for the caret-settling segment.
-    std::uint64_t                           input_unsettled_caret_held_frames    = 0U;
-    std::uint64_t                           cursor_safe_rendered_while_strict_unsatisfied_frames =
-        0U;
     std::uint64_t                           backend_callback_event_epoch          = 0U;
     std::uint64_t                           backend_callback_frame_boundary_epoch = 0U;
     std::uint64_t                           render_snapshot_callback_epoch        = 0U;
     std::uint64_t                           last_rendered_snapshot_sequence       = 0U;
     std::uint64_t                           last_rendered_publication_generation  = 0U;
     std::uint64_t                           accepted_input_freshness_token        = 0U;
-    std::uint64_t                           cursor_safe_input_freshness_token     = 0U;
     std::uint64_t                           strict_satisfied_input_freshness_token =
         0U;
     bool                                    input_freshness_active                = false;

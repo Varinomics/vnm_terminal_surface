@@ -142,8 +142,6 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
             request.processed_backend_callback_epoch;
         snapshot.metadata.satisfied_input_freshness_token =
             request.satisfied_input_freshness_token;
-        snapshot.metadata.cursor_safe_input_freshness_token =
-            request.cursor_safe_input_freshness_token;
         snapshot.metadata.backend_geometry_in_sync = request.backend_geometry_in_sync;
         snapshot.metadata.row_origin_generation    = request.row_origin_generation;
         snapshot.metadata.visual_bell_active       = request.visual_bell_active;

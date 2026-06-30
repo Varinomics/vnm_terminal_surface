@@ -67,8 +67,6 @@ std::vector<const char*> descriptor_backed_keys()
 std::vector<const char*> hand_written_runtime_keys()
 {
     return {
-        "input_stale_cursor_suppressed_frames",
-        "input_stale_old_node_frames_avoided",
         "last_rendered_publication_generation",
     };
 }
