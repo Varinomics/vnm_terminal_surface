@@ -1301,7 +1301,6 @@ int atlas_capture_sparse_descriptor_row_count(
     const bool cursor_visible =
         cursor_in_grid &&
         snapshot.cursor.visible &&
-        !frame.options.suppress_cursor &&
         (!cursor_blink_enabled || frame.cursor_blink_visible);
     if (cursor_visible) {
         rows.push_back(snapshot.cursor.position.row);

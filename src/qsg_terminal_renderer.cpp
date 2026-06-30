@@ -2260,7 +2260,6 @@ Terminal_render_frame build_terminal_render_frame(
         options.cursor_blink_enabled_override.value_or(snapshot->cursor.blink_enabled);
     const bool cursor_visible =
         cursor_in_grid && snapshot->cursor.visible &&
-        !options.suppress_cursor &&
         (!cursor_blink_enabled || cursor_blink_visible);
     const bool use_visible_line_provenance =
         render_snapshot_visible_line_provenance_is_valid(*snapshot);
