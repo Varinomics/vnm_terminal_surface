@@ -187,27 +187,6 @@ if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_embedded_benchma
         TIMEOUT 240
     )
 
-    vnm_terminal_benchmark_add_readback_test(
-        vnm_terminal_embedded_benchmark_publication_candidate_validate
-        "--iterations" "1"
-        "--warmup" "0"
-        "--grid" "48x160"
-        "--window-size" "1280x768"
-        "--dirty-rows" "5"
-        "--dirty-row-stride" "3"
-        "--scenario" "surface_session_sparse_ascii_output"
-        "--scenario" "surface_session_sparse_block_graphics_output"
-        "--lazy-snapshot-evidence-mode" "publication_candidate_no_materialization"
-        "--output" "${CMAKE_CURRENT_BINARY_DIR}/publication_candidate_validate_output.json"
-        "--quiet"
-        "--validate-json"
-    )
-
-    set_tests_properties(vnm_terminal_embedded_benchmark_publication_candidate_validate PROPERTIES
-        LABELS "readiness;benchmark;lazy-snapshot"
-        TIMEOUT 120
-    )
-
     vnm_terminal_benchmark_add_requested_grid_mismatch_test(
         vnm_terminal_embedded_benchmark_require_requested_grid_rejects_mismatch
         "--iterations" "1"
@@ -299,31 +278,6 @@ if(vnm_terminal_surface_testing_enabled AND TARGET vnm_terminal_embedded_benchma
         set_tests_properties(vnm_terminal_embedded_benchmark_profile_validate PROPERTIES
             LABELS "readiness;benchmark;profile"
             TIMEOUT 180
-        )
-
-        vnm_terminal_benchmark_add_readback_test(
-            vnm_terminal_embedded_benchmark_profile_publication_candidate_validate
-            "--iterations" "1"
-            "--warmup" "0"
-            "--grid" "48x160"
-            "--window-size" "1280x768"
-            "--dirty-rows" "5"
-            "--dirty-row-stride" "3"
-            "--scenario" "surface_session_sparse_ascii_output"
-            "--scenario" "surface_session_sparse_block_graphics_output"
-            "--profile"
-            "--lazy-snapshot-evidence-mode" "publication_candidate_no_materialization"
-            "--profile-json" "${CMAKE_CURRENT_BINARY_DIR}/profile_publication_candidate_validate_profile.json"
-            "--profile-text" "${CMAKE_CURRENT_BINARY_DIR}/profile_publication_candidate_validate_profile.txt"
-            "--output" "${CMAKE_CURRENT_BINARY_DIR}/profile_publication_candidate_validate_output.json"
-            "--quiet"
-            "--validate-json"
-        )
-
-        set_tests_properties(
-            vnm_terminal_embedded_benchmark_profile_publication_candidate_validate PROPERTIES
-            LABELS "readiness;benchmark;profile;lazy-snapshot"
-            TIMEOUT 120
         )
     endif()
 endif()

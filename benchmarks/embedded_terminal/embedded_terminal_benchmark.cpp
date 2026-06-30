@@ -138,10 +138,6 @@ const QString k_lazy_snapshot_reason_counter_schema_semantics = QStringLiteral(
     "batch_5_lazy_eligibility");
 const QString k_consumer_materialization_counter_schema_semantics = QStringLiteral(
     "batch_6_materialization_boundaries");
-const QString k_lazy_snapshot_evidence_row_view_parity = QStringLiteral(
-    "row_view_parity_test");
-const QString k_lazy_snapshot_evidence_publication_candidate = QStringLiteral(
-    "publication_candidate_no_materialization");
 const QString k_requested_grid_semantics = QStringLiteral("requested_grid_validated");
 const QString k_surface_session_actual_grid_semantics = QStringLiteral(
     "surface_session_actual_grid_from_qquick_surface_metrics");
@@ -388,8 +384,6 @@ struct App_options
     QString                profile_text_path;
     int                    sparse_dirty_rows = k_surface_session_sparse_dirty_rows;
     int                    sparse_dirty_row_stride = k_surface_session_sparse_dirty_row_stride;
-    term::Terminal_lazy_snapshot_evidence_mode lazy_snapshot_evidence_mode =
-        term::Terminal_lazy_snapshot_evidence_mode::ROW_VIEW_PARITY_TEST;
     bool                   quiet             = false;
     bool                   validate_json     = false;
     bool                   include_attempts  = false;
@@ -494,33 +488,6 @@ struct Attempt_result
     bool                                              style_color_mode_boundary_observed
                                                                                      = false;
     bool                                              hyperlink_boundary_observed    = false;
-    bool                                              lazy_snapshot_exercise_attempted
-                                                                                     = false;
-    bool                                              lazy_snapshot_exercise_eligible = false;
-    std::uint64_t                                     lazy_snapshot_exercise_full_fallbacks
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_materialization_mismatches
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_dirty_rows_visible
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_previous_snapshot_borrowed_rows
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_producer_owned_rows
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_producer_materialized_rows
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_producer_cells_scanned
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_producer_cells_emitted
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_consumer_materialization_calls
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_consumer_materialization_rows
-                                                                                     = 0U;
-    std::uint64_t                                     lazy_snapshot_exercise_consumer_materialization_cells
-                                                                                     = 0U;
 };
 
 struct raw_attempt_sample_t
@@ -640,24 +607,6 @@ struct Scenario_result
                            model_profile_stats;
     term::Terminal_session_profile_stats
                            session_profile_stats;
-    bool                   lazy_snapshot_exercise_applicable  = false;
-    int                    lazy_snapshot_exercise_promoted_non_content_rows = 0;
-    std::uint64_t          lazy_snapshot_exercise_attempts     = 0U;
-    std::uint64_t          lazy_snapshot_exercise_eligible_attempts = 0U;
-    std::uint64_t          lazy_snapshot_exercise_full_fallbacks = 0U;
-    std::uint64_t          lazy_snapshot_exercise_materialization_mismatches = 0U;
-    std::uint64_t          lazy_snapshot_exercise_dirty_rows_visible = 0U;
-    std::uint64_t          lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows = 0U;
-    std::uint64_t          lazy_snapshot_exercise_previous_snapshot_borrowed_rows = 0U;
-    std::uint64_t          lazy_snapshot_exercise_producer_owned_rows = 0U;
-    std::uint64_t          lazy_snapshot_exercise_producer_materialized_rows = 0U;
-    std::uint64_t          lazy_snapshot_exercise_producer_cells_scanned = 0U;
-    std::uint64_t          lazy_snapshot_exercise_producer_cells_emitted = 0U;
-    std::uint64_t          lazy_snapshot_exercise_consumer_materialization_calls = 0U;
-    std::uint64_t          lazy_snapshot_exercise_consumer_materialization_rows = 0U;
-    std::uint64_t          lazy_snapshot_exercise_consumer_materialization_cells = 0U;
-    QString                lazy_snapshot_evidence_mode =
-        k_lazy_snapshot_evidence_row_view_parity;
     QString                dominant_latency_component         = QStringLiteral("no_completed_samples");
     QString                primary_pressure                   = QStringLiteral("no_completed_samples");
     std::vector<profile_thread_snapshot_t>
@@ -864,8 +813,6 @@ void print_usage()
         << "  --grid <ROWSxCOLS>        terminal grid size\n"
         << "  --dirty-rows <n>          sparse surface/session rows touched per update\n"
         << "  --dirty-row-stride <n>    sparse surface/session row stride\n"
-        << "  --lazy-snapshot-evidence-mode <mode>\n"
-        << "                            row_view_parity_test or publication_candidate_no_materialization\n"
         << "  --require-requested-grid  fail validation if the surface grid differs from --grid\n"
         << "  --output <path>           write JSON to a file\n"
 #if VNM_TERMINAL_PROFILING_ENABLED
@@ -897,43 +844,6 @@ QStringList raw_arguments(int argc, char** argv)
 bool argument_is(const QString& argument, const char* expected)
 {
     return argument == QLatin1String(expected);
-}
-
-QString lazy_snapshot_evidence_mode_name(
-    term::Terminal_lazy_snapshot_evidence_mode mode)
-{
-    switch (mode) {
-        case term::Terminal_lazy_snapshot_evidence_mode::ROW_VIEW_PARITY_TEST:
-            return k_lazy_snapshot_evidence_row_view_parity;
-        case term::Terminal_lazy_snapshot_evidence_mode::
-            PUBLICATION_CANDIDATE_NO_MATERIALIZATION:
-            return k_lazy_snapshot_evidence_publication_candidate;
-    }
-
-    return QStringLiteral("unknown");
-}
-
-std::optional<term::Terminal_lazy_snapshot_evidence_mode>
-parse_lazy_snapshot_evidence_mode(const QString& value)
-{
-    if (value == k_lazy_snapshot_evidence_row_view_parity) {
-        return term::Terminal_lazy_snapshot_evidence_mode::ROW_VIEW_PARITY_TEST;
-    }
-
-    if (value == k_lazy_snapshot_evidence_publication_candidate) {
-        return
-            term::Terminal_lazy_snapshot_evidence_mode::
-                PUBLICATION_CANDIDATE_NO_MATERIALIZATION;
-    }
-
-    return std::nullopt;
-}
-
-bool lazy_snapshot_evidence_uses_row_view_parity_materialization(
-    const App_options& options)
-{
-    return options.lazy_snapshot_evidence_mode ==
-        term::Terminal_lazy_snapshot_evidence_mode::ROW_VIEW_PARITY_TEST;
 }
 
 bool take_option_value(
@@ -1308,25 +1218,6 @@ Parse_result parse_arguments(const QStringList& arguments)
                 return result;
             }
 
-            continue;
-        }
-
-        if (argument_is(argument, "--lazy-snapshot-evidence-mode")) {
-            if (!take_option_value(arguments, index, &value, &result.error)) {
-                return result;
-            }
-
-            const std::optional<term::Terminal_lazy_snapshot_evidence_mode> parsed =
-                parse_lazy_snapshot_evidence_mode(value);
-            if (!parsed.has_value()) {
-                result.error = QStringLiteral(
-                    "--lazy-snapshot-evidence-mode must be %1 or %2")
-                    .arg(k_lazy_snapshot_evidence_row_view_parity)
-                    .arg(k_lazy_snapshot_evidence_publication_candidate);
-                return result;
-            }
-
-            result.options.lazy_snapshot_evidence_mode = *parsed;
             continue;
         }
 
@@ -3993,44 +3884,6 @@ bool atlas_failures_zero_for_attempt(
         attempt.atlas_report.frame_build.glyph_atlas_insert_failures == 0;
 }
 
-void add_lazy_snapshot_exercise_attempt(
-    Scenario_result&       result,
-    const Attempt_result&  attempt)
-{
-    if (!attempt.lazy_snapshot_exercise_attempted) {
-        return;
-    }
-
-    ++result.lazy_snapshot_exercise_attempts;
-    if (attempt.lazy_snapshot_exercise_eligible) {
-        ++result.lazy_snapshot_exercise_eligible_attempts;
-    }
-    result.lazy_snapshot_exercise_full_fallbacks +=
-        attempt.lazy_snapshot_exercise_full_fallbacks;
-    result.lazy_snapshot_exercise_materialization_mismatches +=
-        attempt.lazy_snapshot_exercise_materialization_mismatches;
-    result.lazy_snapshot_exercise_dirty_rows_visible +=
-        attempt.lazy_snapshot_exercise_dirty_rows_visible;
-    result.lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows +=
-        attempt.lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows;
-    result.lazy_snapshot_exercise_previous_snapshot_borrowed_rows +=
-        attempt.lazy_snapshot_exercise_previous_snapshot_borrowed_rows;
-    result.lazy_snapshot_exercise_producer_owned_rows +=
-        attempt.lazy_snapshot_exercise_producer_owned_rows;
-    result.lazy_snapshot_exercise_producer_materialized_rows +=
-        attempt.lazy_snapshot_exercise_producer_materialized_rows;
-    result.lazy_snapshot_exercise_producer_cells_scanned +=
-        attempt.lazy_snapshot_exercise_producer_cells_scanned;
-    result.lazy_snapshot_exercise_producer_cells_emitted +=
-        attempt.lazy_snapshot_exercise_producer_cells_emitted;
-    result.lazy_snapshot_exercise_consumer_materialization_calls +=
-        attempt.lazy_snapshot_exercise_consumer_materialization_calls;
-    result.lazy_snapshot_exercise_consumer_materialization_rows +=
-        attempt.lazy_snapshot_exercise_consumer_materialization_rows;
-    result.lazy_snapshot_exercise_consumer_materialization_cells +=
-        attempt.lazy_snapshot_exercise_consumer_materialization_cells;
-}
-
 void update_structural_checks(
     Scenario_result&       result,
     const Attempt_result&  attempt)
@@ -4448,8 +4301,6 @@ Scenario_result run_surface_session_scroll_scenario(
     result.viewport_metrics_applicable = true;
     result.wheel_burst_size            = scroll_profile.wheel_event_count;
     result.wheel_steps_per_event       = scroll_profile.wheel_steps_per_event;
-    result.lazy_snapshot_evidence_mode =
-        lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode);
 
     const bool public_projection_boundary =
         scenario_name == QStringLiteral("surface_session_public_projection_boundary");
@@ -4916,46 +4767,6 @@ Attempt_result run_surface_session_action_attempt(
         attempt.snapshot_valid  = false;
         attempt.snapshot_status = QStringLiteral("MISSING_SESSION_SNAPSHOT_UPDATE");
     }
-    if (is_surface_session_sparse_text_output_scenario(scenario_name) &&
-        before_snapshot != nullptr                                  &&
-        after_snapshot  != nullptr                                  &&
-        after_snapshot->metadata.sequence > previous_sequence)
-    {
-        const term::Terminal_session_lazy_snapshot_composer_result lazy_result =
-            term::VNM_TerminalSurface_render_bridge
-                ::compose_lazy_render_snapshot_for_benchmark_evidence(
-                    context.surface,
-                    before_snapshot,
-                    *after_snapshot,
-                    options.lazy_snapshot_evidence_mode);
-        attempt.lazy_snapshot_exercise_attempted = true;
-        attempt.lazy_snapshot_exercise_eligible  = lazy_result.eligible;
-        attempt.lazy_snapshot_exercise_full_fallbacks =
-            !lazy_result.eligible &&
-            !lazy_result.materialization_mismatch_for_testing ? 1U : 0U;
-        attempt.lazy_snapshot_exercise_materialization_mismatches =
-            lazy_result.materialization_mismatch_for_testing ? 1U : 0U;
-        attempt.lazy_snapshot_exercise_dirty_rows_visible =
-            lazy_result.dirty_rows_visible;
-        attempt.lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows =
-            lazy_result.previous_snapshot_borrow_candidate_rows;
-        attempt.lazy_snapshot_exercise_previous_snapshot_borrowed_rows =
-            lazy_result.previous_snapshot_borrowed_rows;
-        attempt.lazy_snapshot_exercise_producer_owned_rows =
-            lazy_result.producer_owned_rows;
-        attempt.lazy_snapshot_exercise_producer_materialized_rows =
-            lazy_result.producer_materialized_rows;
-        attempt.lazy_snapshot_exercise_producer_cells_scanned =
-            lazy_result.producer_cells_scanned;
-        attempt.lazy_snapshot_exercise_producer_cells_emitted =
-            lazy_result.producer_cells_emitted;
-        attempt.lazy_snapshot_exercise_consumer_materialization_calls =
-            lazy_result.consumer_materialization_calls;
-        attempt.lazy_snapshot_exercise_consumer_materialization_rows =
-            lazy_result.consumer_materialization_rows;
-        attempt.lazy_snapshot_exercise_consumer_materialization_cells =
-            lazy_result.consumer_materialization_cells;
-    }
     if (before_snapshot != nullptr && after_snapshot != nullptr) {
         attempt.resize_boundary_observed =
             profile.resize_surface &&
@@ -5000,11 +4811,6 @@ Scenario_result run_surface_session_action_scenario(
     result.warmup                       = options.warmup;
     result.window_size                  = options.window_size;
     result.render_expected              = profile.render_expected;
-    result.lazy_snapshot_exercise_applicable =
-        is_surface_session_sparse_text_output_scenario(scenario_name);
-    result.lazy_snapshot_exercise_promoted_non_content_rows = 0;
-    result.lazy_snapshot_evidence_mode =
-        lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode);
     result.render_measurement_semantics = profile.render_expected
         ? k_render_expected_semantics
         : k_no_render_expected_semantics;
@@ -5225,7 +5031,6 @@ Scenario_result run_surface_session_action_scenario(
         if (profile.render_expected) {
             update_atlas_renderer_observation(result.atlas_renderer, attempt.atlas_report);
         }
-        add_lazy_snapshot_exercise_attempt(result, attempt);
         if (profile.render_expected) {
             update_structural_checks(result, attempt);
         }
@@ -5319,8 +5124,6 @@ Scenario_result run_scenario_impl(
     result.rows           = options.grid.rows;
     result.columns        = options.grid.columns;
     result.window_size    = options.window_size;
-    result.lazy_snapshot_evidence_mode =
-        lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode);
 
     for (int warmup_index = 0; warmup_index < options.warmup; ++warmup_index) {
         Attempt_result attempt =
@@ -6310,9 +6113,6 @@ QJsonObject scenario_profile_summary_json(const Scenario_result& result)
     object.insert(QStringLiteral("source_mode"),    result.source_mode);
     object.insert(QStringLiteral("execution_mode"), result.execution_mode);
     object.insert(
-        QStringLiteral("lazy_snapshot_evidence_mode"),
-        result.lazy_snapshot_evidence_mode);
-    object.insert(
         QStringLiteral("resize_boundary_row_changes_observed"),
         result.resize_boundary_row_changes_observed);
     object.insert(
@@ -6388,77 +6188,12 @@ QJsonObject scenario_json(
     object.insert(QStringLiteral("iterations"),        result.iterations);
     object.insert(QStringLiteral("warmup"),            result.warmup);
     object.insert(
-        QStringLiteral("lazy_snapshot_evidence_mode"),
-        result.lazy_snapshot_evidence_mode);
-    object.insert(
         QStringLiteral("sparse_dirty_row_sweep_applicable"),
         is_surface_session_sparse_text_output_scenario(result.name));
     object.insert(QStringLiteral("configured_sparse_dirty_rows"), options.sparse_dirty_rows);
     object.insert(
         QStringLiteral("configured_sparse_dirty_row_stride"),
         options.sparse_dirty_row_stride);
-    object.insert(
-        QStringLiteral("lazy_snapshot_exercise_applicable"),
-        result.lazy_snapshot_exercise_applicable);
-    object.insert(
-        QStringLiteral("lazy_snapshot_exercise_promoted_non_content_rows"),
-        result.lazy_snapshot_exercise_promoted_non_content_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_attempts"),
-        result.lazy_snapshot_exercise_attempts);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_eligible_attempts"),
-        result.lazy_snapshot_exercise_eligible_attempts);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_full_fallbacks"),
-        result.lazy_snapshot_exercise_full_fallbacks);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_materialization_mismatches"),
-        result.lazy_snapshot_exercise_materialization_mismatches);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_dirty_rows_visible"),
-        result.lazy_snapshot_exercise_dirty_rows_visible);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows"),
-        result.lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrowed_rows"),
-        result.lazy_snapshot_exercise_previous_snapshot_borrowed_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_producer_owned_rows"),
-        result.lazy_snapshot_exercise_producer_owned_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_producer_materialized_rows"),
-        result.lazy_snapshot_exercise_producer_materialized_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_producer_cells_scanned"),
-        result.lazy_snapshot_exercise_producer_cells_scanned);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_producer_cells_emitted"),
-        result.lazy_snapshot_exercise_producer_cells_emitted);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_consumer_materialization_calls"),
-        result.lazy_snapshot_exercise_consumer_materialization_calls);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_consumer_materialization_rows"),
-        result.lazy_snapshot_exercise_consumer_materialization_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_exercise_consumer_materialization_cells"),
-        result.lazy_snapshot_exercise_consumer_materialization_cells);
     object.insert(QStringLiteral("descriptor_counters"), descriptor_counters_json(result));
     object.insert(
         QStringLiteral("lazy_snapshot_fallback_reason_counters"),
@@ -9169,26 +8904,9 @@ bool validate_scenario_json(
         QStringLiteral("status"),
         QStringLiteral("iterations"),
         QStringLiteral("warmup"),
-        QStringLiteral("lazy_snapshot_evidence_mode"),
         QStringLiteral("sparse_dirty_row_sweep_applicable"),
         QStringLiteral("configured_sparse_dirty_rows"),
         QStringLiteral("configured_sparse_dirty_row_stride"),
-        QStringLiteral("lazy_snapshot_exercise_applicable"),
-        QStringLiteral("lazy_snapshot_exercise_promoted_non_content_rows"),
-        QStringLiteral("lazy_snapshot_exercise_attempts"),
-        QStringLiteral("lazy_snapshot_exercise_eligible_attempts"),
-        QStringLiteral("lazy_snapshot_exercise_full_fallbacks"),
-        QStringLiteral("lazy_snapshot_exercise_materialization_mismatches"),
-        QStringLiteral("lazy_snapshot_exercise_dirty_rows_visible"),
-        QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows"),
-        QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrowed_rows"),
-        QStringLiteral("lazy_snapshot_exercise_producer_owned_rows"),
-        QStringLiteral("lazy_snapshot_exercise_producer_materialized_rows"),
-        QStringLiteral("lazy_snapshot_exercise_producer_cells_scanned"),
-        QStringLiteral("lazy_snapshot_exercise_producer_cells_emitted"),
-        QStringLiteral("lazy_snapshot_exercise_consumer_materialization_calls"),
-        QStringLiteral("lazy_snapshot_exercise_consumer_materialization_rows"),
-        QStringLiteral("lazy_snapshot_exercise_consumer_materialization_cells"),
         QStringLiteral("descriptor_counters"),
         QStringLiteral("lazy_snapshot_fallback_reason_counters"),
         QStringLiteral("elapsed_ns"),
@@ -9459,9 +9177,7 @@ bool validate_scenario_json(
     if (object.value(QStringLiteral("source_mode")).toString()       != scenario_source_mode(scenario_name)    ||
         object.value(QStringLiteral("execution_mode")).toString()    != scenario_execution_mode(scenario_name) ||
         object.value(QStringLiteral("latency_semantics")).toString() != k_latency_semantics                    ||
-        object.value(QStringLiteral("elapsed_semantics")).toString() != k_elapsed_semantics                    ||
-        object.value(QStringLiteral("lazy_snapshot_evidence_mode")).toString() !=
-            lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode))
+        object.value(QStringLiteral("elapsed_semantics")).toString() != k_elapsed_semantics)
     {
         *out_error = QStringLiteral("scenario metadata is inconsistent: %1")
             .arg(scenario_name);
@@ -9477,44 +9193,6 @@ bool validate_scenario_json(
             options.sparse_dirty_row_stride)
     {
         *out_error = QStringLiteral("scenario sparse dirty-row configuration is inconsistent: %1")
-            .arg(scenario_name);
-        return false;
-    }
-
-    const bool lazy_exercise_expected =
-        is_surface_session_sparse_text_output_scenario(scenario_name);
-    const QStringList lazy_exercise_counter_keys = {
-        QStringLiteral("lazy_snapshot_exercise_promoted_non_content_rows"),
-        QStringLiteral("lazy_snapshot_exercise_attempts"),
-        QStringLiteral("lazy_snapshot_exercise_eligible_attempts"),
-        QStringLiteral("lazy_snapshot_exercise_full_fallbacks"),
-        QStringLiteral("lazy_snapshot_exercise_materialization_mismatches"),
-        QStringLiteral("lazy_snapshot_exercise_dirty_rows_visible"),
-        QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows"),
-        QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrowed_rows"),
-        QStringLiteral("lazy_snapshot_exercise_producer_owned_rows"),
-        QStringLiteral("lazy_snapshot_exercise_producer_materialized_rows"),
-        QStringLiteral("lazy_snapshot_exercise_producer_cells_scanned"),
-        QStringLiteral("lazy_snapshot_exercise_producer_cells_emitted"),
-        QStringLiteral("lazy_snapshot_exercise_consumer_materialization_calls"),
-        QStringLiteral("lazy_snapshot_exercise_consumer_materialization_rows"),
-        QStringLiteral("lazy_snapshot_exercise_consumer_materialization_cells"),
-    };
-    for (const QString& key : lazy_exercise_counter_keys) {
-        if (!validate_nonnegative_integer_json_field(
-                object,
-                key,
-                QStringLiteral("scenario"),
-                out_error))
-        {
-            return false;
-        }
-    }
-    if (!object.value(QStringLiteral("lazy_snapshot_exercise_applicable")).isBool() ||
-        object.value(QStringLiteral("lazy_snapshot_exercise_applicable")).toBool() !=
-            lazy_exercise_expected)
-    {
-        *out_error = QStringLiteral("lazy snapshot exercise applicability changed: %1")
             .arg(scenario_name);
         return false;
     }
@@ -9552,78 +9230,6 @@ bool validate_scenario_json(
         const qint64 requested_dirty_rows =
             static_cast<qint64>(completed_frames) * options.sparse_dirty_rows;
         const qint64 accounted_cursor_rows = completed_frames;
-        const qint64 lazy_exercise_attempts =
-            json_counter(object, QStringLiteral("lazy_snapshot_exercise_attempts"));
-        const qint64 lazy_exercise_eligible_attempts =
-            json_counter(object, QStringLiteral("lazy_snapshot_exercise_eligible_attempts"));
-        const qint64 lazy_exercise_full_fallbacks =
-            json_counter(object, QStringLiteral("lazy_snapshot_exercise_full_fallbacks"));
-        const qint64 lazy_exercise_materialization_mismatches =
-            json_counter(
-                object,
-                QStringLiteral("lazy_snapshot_exercise_materialization_mismatches"));
-        const qint64 lazy_exercise_promoted_rows =
-            json_counter(
-                object,
-                QStringLiteral("lazy_snapshot_exercise_promoted_non_content_rows"));
-        const qint64 lazy_exercise_dirty_rows =
-            json_counter(
-                object,
-                QStringLiteral("lazy_snapshot_exercise_dirty_rows_visible"));
-        const qint64 lazy_exercise_borrow_candidate_rows =
-            json_counter(
-                object,
-                QStringLiteral(
-                    "lazy_snapshot_exercise_previous_snapshot_borrow_candidate_rows"));
-        const qint64 lazy_exercise_borrowed_rows =
-            json_counter(
-                object,
-                QStringLiteral("lazy_snapshot_exercise_previous_snapshot_borrowed_rows"));
-        const qint64 lazy_exercise_owned_rows =
-            json_counter(
-                object,
-                QStringLiteral("lazy_snapshot_exercise_producer_owned_rows"));
-        const qint64 lazy_exercise_materialized_rows =
-            json_counter(
-                object,
-                QStringLiteral("lazy_snapshot_exercise_producer_materialized_rows"));
-        const qint64 lazy_exercise_cells_scanned =
-            json_counter(
-                object,
-                QStringLiteral("lazy_snapshot_exercise_producer_cells_scanned"));
-        const qint64 lazy_exercise_cells_emitted =
-            json_counter(
-                object,
-                QStringLiteral("lazy_snapshot_exercise_producer_cells_emitted"));
-        const qint64 lazy_exercise_consumer_materialization_calls =
-            json_counter(
-                object,
-                QStringLiteral(
-                    "lazy_snapshot_exercise_consumer_materialization_calls"));
-        const qint64 lazy_exercise_consumer_materialization_rows =
-            json_counter(
-                object,
-                QStringLiteral("lazy_snapshot_exercise_consumer_materialization_rows"));
-        const qint64 lazy_exercise_consumer_materialization_cells =
-            json_counter(
-                object,
-                QStringLiteral("lazy_snapshot_exercise_consumer_materialization_cells"));
-        const qint64 promoted_dirty_rows =
-            lazy_exercise_attempts * lazy_exercise_promoted_rows;
-        const qint64 producer_row_budget =
-            lazy_exercise_dirty_rows + promoted_dirty_rows;
-        const bool row_view_parity_materialization =
-            lazy_snapshot_evidence_uses_row_view_parity_materialization(options);
-        const qint64 consumer_materialization_calls_expected =
-            row_view_parity_materialization ? lazy_exercise_attempts : 0;
-        const qint64 consumer_materialization_rows_expected =
-            row_view_parity_materialization
-                ? lazy_exercise_attempts * actual_rows
-                : 0;
-        const qint64 consumer_materialization_cells_expected =
-            row_view_parity_materialization
-                ? lazy_exercise_attempts * actual_rows * actual_columns
-                : 0;
         const qint64 observed_frame_dirty_rows =
             json_counter(object, QStringLiteral("frame_dirty_rows"));
         const qint64 observed_frame_full_dirty_rows =
@@ -9638,44 +9244,9 @@ bool validate_scenario_json(
             return false;
         }
 
-        if (completed_frames <= 0 ||
-            lazy_exercise_attempts <= 0 ||
-            lazy_exercise_eligible_attempts <= 0)
-        {
+        if (completed_frames <= 0) {
             *out_error = QStringLiteral(
-                "lazy snapshot sparse evidence did not measure any completed eligible frames: %1")
-                .arg(scenario_name);
-            return false;
-        }
-
-        if (lazy_exercise_promoted_rows != 0 ||
-            lazy_exercise_attempts != completed_frames ||
-            lazy_exercise_eligible_attempts != lazy_exercise_attempts ||
-            lazy_exercise_full_fallbacks != 0 ||
-            lazy_exercise_materialization_mismatches != 0 ||
-            lazy_exercise_borrow_candidate_rows !=
-                lazy_exercise_attempts * actual_rows ||
-            lazy_exercise_borrowed_rows !=
-                lazy_exercise_borrow_candidate_rows -
-                    lazy_exercise_dirty_rows -
-                    promoted_dirty_rows ||
-            lazy_exercise_owned_rows >
-                producer_row_budget ||
-            lazy_exercise_materialized_rows >
-                producer_row_budget ||
-            lazy_exercise_cells_scanned >
-                producer_row_budget * actual_columns ||
-            lazy_exercise_cells_emitted > producer_row_budget * actual_columns ||
-            lazy_exercise_cells_emitted > lazy_exercise_cells_scanned ||
-            lazy_exercise_consumer_materialization_calls !=
-                consumer_materialization_calls_expected ||
-            lazy_exercise_consumer_materialization_rows !=
-                consumer_materialization_rows_expected ||
-            lazy_exercise_consumer_materialization_cells !=
-                consumer_materialization_cells_expected)
-        {
-            *out_error = QStringLiteral(
-                "lazy snapshot sparse K=0 evidence counters violated Batch 9 bounds: %1")
+                "sparse evidence did not measure any completed frames: %1")
                 .arg(scenario_name);
             return false;
         }
@@ -9696,88 +9267,7 @@ bool validate_scenario_json(
                     .arg(scenario_name);
                 return false;
             }
-
-            const QJsonObject session_profile =
-                object.value(QStringLiteral("session_profile_stats")).toObject();
-            const QJsonObject materialization_counters =
-                session_profile.value(
-                    QStringLiteral("consumer_materialization_counters")).toObject();
-            const QJsonObject fallback_reasons =
-                object.value(QStringLiteral("lazy_snapshot_fallback_reason_counters"))
-                    .toObject()
-                    .value(QStringLiteral("reasons"))
-                    .toObject();
-            bool fallback_reason_counters_zero = true;
-            for (const QString& key : lazy_snapshot_fallback_reason_keys()) {
-                fallback_reason_counters_zero =
-                    fallback_reason_counters_zero &&
-                    json_counter(fallback_reasons, key) == 0;
-            }
-
-            if (json_counter(session_profile, QStringLiteral("lazy_snapshot_eligibility_checks")) !=
-                    lazy_exercise_attempts ||
-                json_counter(session_profile, QStringLiteral("lazy_snapshot_eligible_checks")) !=
-                    lazy_exercise_attempts ||
-                json_counter(session_profile, QStringLiteral("lazy_snapshot_full_fallbacks")) != 0 ||
-                !fallback_reason_counters_zero ||
-                json_counter(
-                    session_profile,
-                    QStringLiteral("lazy_snapshot_dirty_rows_visible")) !=
-                    lazy_exercise_dirty_rows ||
-                json_counter(
-                    session_profile,
-                    QStringLiteral(
-                        "lazy_snapshot_previous_snapshot_borrow_candidate_rows")) !=
-                    lazy_exercise_borrow_candidate_rows ||
-                json_counter(
-                    session_profile,
-                    QStringLiteral("lazy_snapshot_previous_snapshot_borrowed_rows")) !=
-                    lazy_exercise_borrowed_rows ||
-                json_counter(
-                    session_profile,
-                    QStringLiteral("lazy_snapshot_producer_owned_rows")) !=
-                    lazy_exercise_owned_rows ||
-                json_counter(
-                    session_profile,
-                    QStringLiteral("lazy_snapshot_producer_materialized_rows")) !=
-                    lazy_exercise_materialized_rows ||
-                json_counter(
-                    session_profile,
-                    QStringLiteral("lazy_snapshot_producer_cells_scanned")) !=
-                    lazy_exercise_cells_scanned ||
-                json_counter(
-                    session_profile,
-                    QStringLiteral("lazy_snapshot_producer_cells_emitted")) !=
-                    lazy_exercise_cells_emitted ||
-                json_counter(
-                    materialization_counters,
-                    QStringLiteral("row_view_parity_test_calls")) !=
-                    lazy_exercise_consumer_materialization_calls ||
-                json_counter(
-                    materialization_counters,
-                    QStringLiteral("row_view_parity_test_rows")) !=
-                    lazy_exercise_consumer_materialization_rows ||
-                json_counter(
-                    materialization_counters,
-                    QStringLiteral("row_view_parity_test_cells")) !=
-                    lazy_exercise_consumer_materialization_cells)
-            {
-                *out_error = QStringLiteral(
-                    "lazy snapshot profile counters did not match Batch 6 exercise totals: %1")
-                    .arg(scenario_name);
-                return false;
-            }
         }
-    }
-    else
-    if (json_counter(object, QStringLiteral("lazy_snapshot_exercise_attempts")) != 0 ||
-        json_counter(
-            object,
-            QStringLiteral("lazy_snapshot_exercise_promoted_non_content_rows")) != 0)
-    {
-        *out_error = QStringLiteral("lazy snapshot exercise ran for non-sparse scenario: %1")
-            .arg(scenario_name);
-        return false;
     }
 
     if (options.profile &&
@@ -10327,9 +9817,7 @@ bool validate_json_output(
         return false;
     }
 
-    if (root.value(QStringLiteral("lazy_snapshot_evidence_mode")).toString() !=
-            lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode) ||
-        !root.value(QStringLiteral("requested_grid_required")).isBool()           ||
+    if (!root.value(QStringLiteral("requested_grid_required")).isBool()           ||
         root.value(QStringLiteral("requested_grid_required")).toBool() !=
             options.require_requested_grid)
     {
@@ -10438,9 +9926,6 @@ QJsonObject make_profile_root_json(
     root.insert(QStringLiteral("renderer"),          QStringLiteral("atlas"));
     root.insert(QStringLiteral("profiling"),         profiling_metadata_json(options));
     root.insert(
-        QStringLiteral("lazy_snapshot_evidence_mode"),
-        lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode));
-    root.insert(
         QStringLiteral("requested_grid_required"),
         options.require_requested_grid);
     root.insert(QStringLiteral("status"),            ok ? QStringLiteral("ok") : QStringLiteral("failed"));
@@ -10476,9 +9961,7 @@ bool validate_profile_json_output(
         return false;
     }
 
-    if (root.value(QStringLiteral("lazy_snapshot_evidence_mode")).toString() !=
-            lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode) ||
-        !root.value(QStringLiteral("requested_grid_required")).isBool()           ||
+    if (!root.value(QStringLiteral("requested_grid_required")).isBool()           ||
         root.value(QStringLiteral("requested_grid_required")).toBool() !=
             options.require_requested_grid)
     {
@@ -10539,8 +10022,6 @@ bool validate_profile_json_output(
             scenario.value(QStringLiteral("source_mode")).toString() != scenario_source_mode(name) ||
             scenario.value(QStringLiteral("execution_mode")).toString() !=
                 scenario_execution_mode(name) ||
-            scenario.value(QStringLiteral("lazy_snapshot_evidence_mode")).toString() !=
-                lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode) ||
             !scenario.value(QStringLiteral("profile")).isObject())
         {
             *out_error = QStringLiteral("profile scenario metadata is inconsistent: %1")
@@ -10790,9 +10271,6 @@ QJsonObject make_root_json(
     root.insert(QStringLiteral("warmup"), options.warmup);
     root.insert(QStringLiteral("rows"), options.grid.rows);
     root.insert(QStringLiteral("columns"), options.grid.columns);
-    root.insert(
-        QStringLiteral("lazy_snapshot_evidence_mode"),
-        lazy_snapshot_evidence_mode_name(options.lazy_snapshot_evidence_mode));
     root.insert(
         QStringLiteral("requested_grid_required"),
         options.require_requested_grid);
