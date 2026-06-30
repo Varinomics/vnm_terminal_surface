@@ -117,25 +117,6 @@ public:
         VNM_TerminalSurface&       surface,
         bool                       enabled);
 
-    static Terminal_session_lazy_snapshot_composer_result
-        compose_lazy_render_snapshot_for_testing(
-            VNM_TerminalSurface&                   surface,
-            std::shared_ptr<const Terminal_render_snapshot>
-                                                   previous_content_snapshot,
-            const Terminal_render_snapshot&        full_snapshot,
-            bool                                   unsupported_geometry_or_detached_snapshot_path =
-                false);
-
-    static Terminal_session_lazy_snapshot_composer_result
-        compose_lazy_render_snapshot_for_benchmark_evidence(
-            VNM_TerminalSurface&                   surface,
-            std::shared_ptr<const Terminal_render_snapshot>
-                                                   previous_content_snapshot,
-            const Terminal_render_snapshot&        full_snapshot,
-            Terminal_lazy_snapshot_evidence_mode   evidence_mode,
-            bool                                   unsupported_geometry_or_detached_snapshot_path =
-                false);
-
     static void set_cursor_blink_visible(
         VNM_TerminalSurface&       surface,
         bool                       visible);

@@ -55,12 +55,6 @@ enum class Terminal_lazy_snapshot_fallback_reason
     UNSUPPORTED_GEOMETRY_OR_DETACHED_SNAPSHOT_PATH,
 };
 
-enum class Terminal_lazy_snapshot_evidence_mode
-{
-    ROW_VIEW_PARITY_TEST,
-    PUBLICATION_CANDIDATE_NO_MATERIALIZATION,
-};
-
 struct Terminal_lazy_snapshot_fallback_reason_counters
 {
     std::uint64_t missing_previous_content_snapshot        = 0U;
@@ -180,26 +174,6 @@ inline std::uint64_t terminal_lazy_snapshot_fallback_reason_counter(
 {
     return counters.*descriptor.counter;
 }
-
-struct Terminal_session_lazy_snapshot_composer_result
-{
-    bool                                    eligible = false;
-    Terminal_lazy_snapshot_fallback_reason  fallback_reason =
-        Terminal_lazy_snapshot_fallback_reason::NONE;
-    std::optional<Terminal_render_snapshot> lazy_snapshot;
-    bool                                    materialization_matches_full_snapshot = false;
-    bool                                    materialization_mismatch_for_testing  = false;
-    std::uint64_t                           dirty_rows_visible = 0U;
-    std::uint64_t                           previous_snapshot_borrow_candidate_rows = 0U;
-    std::uint64_t                           previous_snapshot_borrowed_rows = 0U;
-    std::uint64_t                           producer_owned_rows = 0U;
-    std::uint64_t                           producer_materialized_rows = 0U;
-    std::uint64_t                           producer_cells_scanned = 0U;
-    std::uint64_t                           producer_cells_emitted = 0U;
-    std::uint64_t                           consumer_materialization_calls = 0U;
-    std::uint64_t                           consumer_materialization_rows = 0U;
-    std::uint64_t                           consumer_materialization_cells = 0U;
-};
 
 struct Terminal_session_profile_stats
 {
@@ -422,20 +396,6 @@ public:
     void set_profile_stats_enabled(bool enabled);
     Terminal_screen_model_profile_stats model_profile_stats() const;
     Terminal_session_profile_stats profile_stats() const;
-    Terminal_session_lazy_snapshot_composer_result
-        compose_lazy_render_snapshot_for_benchmark_evidence(
-            std::shared_ptr<const Terminal_render_snapshot> previous_content_snapshot,
-            const Terminal_render_snapshot& full_snapshot,
-            Terminal_lazy_snapshot_evidence_mode evidence_mode,
-            bool unsupported_geometry_or_detached_snapshot_path = false);
-    Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_testing(
-        std::shared_ptr<const Terminal_render_snapshot> previous_content_snapshot,
-        const Terminal_render_snapshot& full_snapshot,
-        bool unsupported_geometry_or_detached_snapshot_path = false);
-    Terminal_session_lazy_snapshot_composer_result compose_lazy_render_snapshot_for_testing(
-        const Terminal_render_snapshot* previous_content_snapshot,
-        const Terminal_render_snapshot& full_snapshot,
-        bool unsupported_geometry_or_detached_snapshot_path = false);
     std::optional<Terminal_backend_exit> exit_status() const;
 
     /**
