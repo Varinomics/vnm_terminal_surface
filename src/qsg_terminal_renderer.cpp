@@ -1813,32 +1813,6 @@ void append_frame_key_vector(
     }
 }
 
-bool dirty_ranges_cover_full_grid(
-    const std::vector<Terminal_render_dirty_row_range>& ranges,
-    int                                                 row_count)
-{
-    return
-        row_count > 0        &&
-        ranges.size() == 1U  &&
-        ranges.front().first_row == 0 &&
-        ranges.front().row_count >= row_count;
-}
-
-bool sparse_lazy_frame_cell_walk_eligible(
-    const Terminal_render_snapshot&       snapshot,
-    const Terminal_render_options&        options)
-{
-    return
-        snapshot.lazy_row_payloads != nullptr                 &&
-        snapshot.grid_size.rows    > 0                        &&
-        snapshot.grid_size.columns > 0                        &&
-        !snapshot.dirty_row_ranges.empty()                    &&
-        !dirty_ranges_cover_full_grid(
-            snapshot.dirty_row_ranges,
-            snapshot.grid_size.rows)                          &&
-        !options.underline_hyperlinks;
-}
-
 void append_dirty_range_rows(
     std::vector<int>&                                  rows,
     const std::vector<Terminal_render_dirty_row_range>& ranges,
@@ -1866,27 +1840,6 @@ void sort_unique_rows(std::vector<int>& rows, int row_count)
         rows.end());
     std::sort(rows.begin(), rows.end());
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
-}
-
-std::size_t row_content_cell_count_for_rows(
-    const Terminal_render_snapshot_row_content_view& rows,
-    const std::vector<int>&                          row_indexes)
-{
-    std::size_t count = 0U;
-    for (const int row : row_indexes) {
-        count += rows.row_at(row).cell_count();
-    }
-    return count;
-}
-
-std::size_t frame_cell_pass_input_cell_count(
-    const Terminal_render_snapshot_row_content_view& rows,
-    const std::vector<int>&                          sparse_rows,
-    bool                                             sparse_cell_walk)
-{
-    return sparse_cell_walk
-        ? row_content_cell_count_for_rows(rows, sparse_rows)
-        : rows.cell_count();
 }
 
 void append_rows_for_rect(
@@ -2186,22 +2139,7 @@ Terminal_render_frame build_terminal_render_frame(
         std::size_t base_reserve_cells = 0U;
         if (snapshot != nullptr && metrics_valid) {
             const Terminal_render_snapshot_row_content_view reserve_rows(*snapshot);
-            if (!force_full_cell_walk &&
-                sparse_lazy_frame_cell_walk_eligible(*snapshot, options))
-            {
-                std::vector<int> dirty_rows;
-                append_dirty_range_rows(
-                    dirty_rows,
-                    snapshot->dirty_row_ranges,
-                    snapshot->grid_size.rows);
-                sort_unique_rows(dirty_rows, snapshot->grid_size.rows);
-                base_reserve_cells =
-                    row_content_cell_count_for_rows(reserve_rows, dirty_rows);
-            }
-            else
-            {
-                base_reserve_cells = reserve_rows.cell_count();
-            }
+            base_reserve_cells = reserve_rows.cell_count();
         }
         frame.background_rects.reserve(
             snapshot != nullptr && metrics_valid
@@ -2285,28 +2223,7 @@ Terminal_render_frame build_terminal_render_frame(
             snapshot->grid_size.columns - ime_preedit_column)
         : 0;
     Render_style_attribute_cache style_attributes(*snapshot);
-    const bool sparse_cell_walk =
-        !force_full_cell_walk &&
-        sparse_lazy_frame_cell_walk_eligible(*snapshot, options);
-    std::vector<int> frame_cell_rows_to_process;
-    if (sparse_cell_walk) {
-        append_dirty_range_rows(
-            frame_cell_rows_to_process,
-            snapshot->dirty_row_ranges,
-            snapshot->grid_size.rows);
-        if (cursor_visible) {
-            frame_cell_rows_to_process.push_back(snapshot->cursor.position.row);
-        }
-        if (ime_preedit_visible) {
-            frame_cell_rows_to_process.push_back(ime_preedit_row);
-        }
-        sort_unique_rows(frame_cell_rows_to_process, snapshot->grid_size.rows);
-    }
-    frame.stats.cell_pass_input_cells = static_cast<int>(
-        frame_cell_pass_input_cell_count(
-            rows,
-            frame_cell_rows_to_process,
-            sparse_cell_walk));
+    frame.stats.cell_pass_input_cells = static_cast<int>(rows.cell_count());
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::reserve_outputs");
@@ -2734,20 +2651,9 @@ Terminal_render_frame build_terminal_render_frame(
                 append_decorations_for_run(run);
         };
 
-        if (sparse_cell_walk) {
-            for (const int row_index : frame_cell_rows_to_process) {
-                const Terminal_render_snapshot_row_content row = rows.row_at(row_index);
-                for (const Terminal_render_cell& cell : row) {
-                    process_cell(cell);
-                }
-            }
-        }
-        else
-        {
-            for (const Terminal_render_snapshot_row_content row : rows) {
-                for (const Terminal_render_cell& cell : row) {
-                    process_cell(cell);
-                }
+        for (const Terminal_render_snapshot_row_content row : rows) {
+            for (const Terminal_render_cell& cell : row) {
+                process_cell(cell);
             }
         }
     }
@@ -2851,16 +2757,10 @@ Terminal_render_frame build_terminal_render_frame(
     }
 
     std::vector<int> descriptor_rows;
-    if (sparse_cell_walk) {
-        descriptor_rows = frame_cell_rows_to_process;
-    }
-    else
-    {
-        descriptor_rows.reserve(
-            static_cast<std::size_t>(std::max(0, snapshot->grid_size.rows)));
-        for (int row = 0; row < snapshot->grid_size.rows; ++row) {
-            descriptor_rows.push_back(row);
-        }
+    descriptor_rows.reserve(
+        static_cast<std::size_t>(std::max(0, snapshot->grid_size.rows)));
+    for (int row = 0; row < snapshot->grid_size.rows; ++row) {
+        descriptor_rows.push_back(row);
     }
     build_terminal_render_frame_descriptors(
         frame,

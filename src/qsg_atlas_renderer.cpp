@@ -4332,21 +4332,12 @@ private:
                 static_cast<std::size_t>(render_frame.grid_size.rows);
     }
 
-    bool source_snapshot_uses_lazy_row_payloads() const
-    {
-        return
-            m_frame.snapshot != nullptr &&
-            m_frame.snapshot->lazy_row_payloads != nullptr &&
-            !m_frame.snapshot->lazy_row_payloads->rows.empty();
-    }
-
     bool sparse_msdf_text_requires_full_cell_walk(
         const Terminal_render_frame& render_frame) const
     {
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
         return
-            (render_frame_uses_sparse_descriptors(render_frame) ||
-             source_snapshot_uses_lazy_row_payloads())          &&
+            render_frame_uses_sparse_descriptors(render_frame) &&
             qsg_atlas_text_renderer_policy_allows_msdf(
                 m_frame.options.text_renderer_policy);
 #else
