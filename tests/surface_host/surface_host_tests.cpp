@@ -12434,8 +12434,6 @@ bool test_synchronized_output_styled_blank_rows_preserve_background(QGuiApplicat
         return ok;
     }
 
-    ok &= check(snapshot->lazy_row_payloads == nullptr,
-        "synchronized styled blank background production snapshot is full");
     ok &= check(snapshot_dirty_ranges_contain_row(*snapshot, 0) &&
             snapshot_dirty_ranges_contain_row(*snapshot, 1) &&
             snapshot_dirty_ranges_contain_row(*snapshot, 2),
