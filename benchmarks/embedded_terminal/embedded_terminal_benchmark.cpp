@@ -134,8 +134,6 @@ const QString k_surface_session_write_high_water_execution_mode = QStringLiteral
     "surface_session_write_high_water_reservation_pressure");
 const QString k_descriptor_counter_schema_semantics = QStringLiteral(
     "batch_7_frame_qsg_descriptor_reuse");
-const QString k_lazy_snapshot_reason_counter_schema_semantics = QStringLiteral(
-    "batch_5_lazy_eligibility");
 const QString k_consumer_materialization_counter_schema_semantics = QStringLiteral(
     "batch_6_materialization_boundaries");
 const QString k_requested_grid_semantics = QStringLiteral("requested_grid_validated");
@@ -5792,18 +5790,6 @@ QJsonObject consumer_materialization_counters_json(
         object,
         QStringLiteral("geometry_derived_snapshot_cells"),
         stats.geometry_derived_materialization_cells);
-    insert_profile_counter(
-        object,
-        QStringLiteral("row_view_parity_test_calls"),
-        stats.row_view_parity_materialization_calls);
-    insert_profile_counter(
-        object,
-        QStringLiteral("row_view_parity_test_rows"),
-        stats.row_view_parity_materialization_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("row_view_parity_test_cells"),
-        stats.row_view_parity_materialization_cells);
     return object;
 }
 
@@ -5897,50 +5883,6 @@ QJsonObject session_profile_stats_json(
         object,
         QStringLiteral("max_retained_snapshot_generation_count"),
         stats.max_retained_snapshot_generation_count);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_eligibility_checks"),
-        stats.lazy_snapshot_eligibility_checks);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_eligible_checks"),
-        stats.lazy_snapshot_eligible_checks);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_full_fallbacks"),
-        stats.lazy_snapshot_full_fallbacks);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_dirty_rows_visible"),
-        stats.lazy_snapshot_dirty_rows_visible);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_previous_snapshot_borrow_candidate_rows"),
-        stats.lazy_snapshot_previous_snapshot_borrow_candidate_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_previous_snapshot_borrowed_rows"),
-        stats.lazy_snapshot_previous_snapshot_borrowed_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_producer_owned_rows"),
-        stats.lazy_snapshot_producer_owned_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_producer_materialized_rows"),
-        stats.lazy_snapshot_producer_materialized_rows);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_producer_cells_scanned"),
-        stats.lazy_snapshot_producer_cells_scanned);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_producer_cells_emitted"),
-        stats.lazy_snapshot_producer_cells_emitted);
-    insert_profile_counter(
-        object,
-        QStringLiteral("lazy_snapshot_materialization_mismatches_for_testing"),
-        stats.lazy_snapshot_materialization_mismatches_for_testing);
     return object;
 }
 
@@ -6032,44 +5974,6 @@ QJsonObject descriptor_counters_json(const Scenario_result& result)
     object.insert(
         QStringLiteral("qsg_layer_descriptors"),
         result.renderer_totals.qsg_layer_descriptors);
-    return object;
-}
-
-QStringList lazy_snapshot_fallback_reason_keys()
-{
-    QStringList keys;
-    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
-        term::terminal_lazy_snapshot_fallback_reason_descriptors())
-    {
-        keys.push_back(QString::fromLatin1(descriptor.key));
-    }
-
-    return keys;
-}
-
-QJsonObject lazy_snapshot_fallback_reason_counters_json(
-    const term::Terminal_session_profile_stats& stats)
-{
-    QJsonObject reasons;
-    const term::Terminal_lazy_snapshot_fallback_reason_counters& counters =
-        stats.lazy_snapshot_fallback_reasons;
-    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
-        term::terminal_lazy_snapshot_fallback_reason_descriptors())
-    {
-        reasons.insert(
-            QString::fromLatin1(descriptor.key),
-            static_cast<qint64>(
-                term::terminal_lazy_snapshot_fallback_reason_counter(
-                    counters,
-                    descriptor)));
-    }
-
-    QJsonObject object;
-    object.insert(QStringLiteral("available"), true);
-    object.insert(
-        QStringLiteral("schema_semantics"),
-        k_lazy_snapshot_reason_counter_schema_semantics);
-    object.insert(QStringLiteral("reasons"), reasons);
     return object;
 }
 
@@ -6195,9 +6099,6 @@ QJsonObject scenario_json(
         QStringLiteral("configured_sparse_dirty_row_stride"),
         options.sparse_dirty_row_stride);
     object.insert(QStringLiteral("descriptor_counters"), descriptor_counters_json(result));
-    object.insert(
-        QStringLiteral("lazy_snapshot_fallback_reason_counters"),
-        lazy_snapshot_fallback_reason_counters_json(result.session_profile_stats));
     object.insert(QStringLiteral("elapsed_ns"),        summary_json(result.elapsed_ns));
     object.insert(
         QStringLiteral("snapshot_prep_ns"),
@@ -7199,17 +7100,6 @@ QStringList session_profile_counter_keys()
         QStringLiteral("retained_snapshot_generation_count"),
         QStringLiteral("max_retained_snapshot_payload_bytes"),
         QStringLiteral("max_retained_snapshot_generation_count"),
-        QStringLiteral("lazy_snapshot_eligibility_checks"),
-        QStringLiteral("lazy_snapshot_eligible_checks"),
-        QStringLiteral("lazy_snapshot_full_fallbacks"),
-        QStringLiteral("lazy_snapshot_dirty_rows_visible"),
-        QStringLiteral("lazy_snapshot_previous_snapshot_borrow_candidate_rows"),
-        QStringLiteral("lazy_snapshot_previous_snapshot_borrowed_rows"),
-        QStringLiteral("lazy_snapshot_producer_owned_rows"),
-        QStringLiteral("lazy_snapshot_producer_materialized_rows"),
-        QStringLiteral("lazy_snapshot_producer_cells_scanned"),
-        QStringLiteral("lazy_snapshot_producer_cells_emitted"),
-        QStringLiteral("lazy_snapshot_materialization_mismatches_for_testing"),
     };
 }
 
@@ -8652,72 +8542,6 @@ bool validate_descriptor_counters_json(
     return true;
 }
 
-bool validate_lazy_snapshot_fallback_reason_counters_json(
-    const QJsonObject& object,
-    QString*           out_error)
-{
-    const QJsonValue value =
-        object.value(QStringLiteral("lazy_snapshot_fallback_reason_counters"));
-    if (!value.isObject()) {
-        *out_error = QStringLiteral(
-            "scenario lazy_snapshot_fallback_reason_counters is not an object");
-        return false;
-    }
-
-    const QJsonObject counters = value.toObject();
-    if (!validate_exact_json_key_set(
-            counters,
-            {
-                QStringLiteral("available"),
-                QStringLiteral("schema_semantics"),
-                QStringLiteral("reasons"),
-            },
-            QStringLiteral("lazy_snapshot_fallback_reason_counters"),
-            out_error))
-    {
-        return false;
-    }
-
-    if (!counters.value(QStringLiteral("available")).isBool() ||
-        !counters.value(QStringLiteral("available")).toBool() ||
-        counters.value(QStringLiteral("schema_semantics")).toString() !=
-            k_lazy_snapshot_reason_counter_schema_semantics ||
-        !counters.value(QStringLiteral("reasons")).isObject())
-    {
-        *out_error = QStringLiteral(
-            "scenario lazy snapshot reason counter schema changed");
-        return false;
-    }
-
-    const QJsonObject reasons = counters.value(QStringLiteral("reasons")).toObject();
-    if (!validate_exact_json_key_set(
-            reasons,
-            lazy_snapshot_fallback_reason_keys(),
-            QStringLiteral("lazy_snapshot_fallback_reason_counters.reasons"),
-            out_error))
-    {
-        return false;
-    }
-
-    for (const QString& key : lazy_snapshot_fallback_reason_keys()) {
-        if (!validate_nonnegative_integer_json_field(
-                reasons,
-                key,
-                QStringLiteral("lazy_snapshot_fallback_reason_counters.reasons"),
-                out_error))
-        {
-            return false;
-        }
-    }
-
-    if (reasons.size() != lazy_snapshot_fallback_reason_keys().size()) {
-        *out_error = QStringLiteral("scenario lazy snapshot reason counter key set changed");
-        return false;
-    }
-
-    return true;
-}
-
 bool validate_consumer_materialization_counters_json(
     const QJsonObject& object,
     QString*           out_error)
@@ -8739,9 +8563,6 @@ bool validate_consumer_materialization_counters_json(
                 QStringLiteral("geometry_derived_snapshot_calls"),
                 QStringLiteral("geometry_derived_snapshot_rows"),
                 QStringLiteral("geometry_derived_snapshot_cells"),
-                QStringLiteral("row_view_parity_test_calls"),
-                QStringLiteral("row_view_parity_test_rows"),
-                QStringLiteral("row_view_parity_test_cells"),
             },
             QStringLiteral("consumer_materialization_counters"),
             out_error))
@@ -8762,9 +8583,6 @@ bool validate_consumer_materialization_counters_json(
     qint64 geometry_derived_snapshot_calls = 0;
     qint64 geometry_derived_snapshot_rows  = 0;
     qint64 geometry_derived_snapshot_cells = 0;
-    qint64 row_view_parity_test_calls      = 0;
-    qint64 row_view_parity_test_rows       = 0;
-    qint64 row_view_parity_test_cells      = 0;
     if (!profile_nonnegative_integer_field(
             counters,
             QStringLiteral("geometry_derived_snapshot_calls"),
@@ -8782,24 +8600,6 @@ bool validate_consumer_materialization_counters_json(
             QStringLiteral("geometry_derived_snapshot_cells"),
             QStringLiteral("consumer_materialization_counters"),
             &geometry_derived_snapshot_cells,
-            out_error) ||
-        !profile_nonnegative_integer_field(
-            counters,
-            QStringLiteral("row_view_parity_test_calls"),
-            QStringLiteral("consumer_materialization_counters"),
-            &row_view_parity_test_calls,
-            out_error) ||
-        !profile_nonnegative_integer_field(
-            counters,
-            QStringLiteral("row_view_parity_test_rows"),
-            QStringLiteral("consumer_materialization_counters"),
-            &row_view_parity_test_rows,
-            out_error) ||
-        !profile_nonnegative_integer_field(
-            counters,
-            QStringLiteral("row_view_parity_test_cells"),
-            QStringLiteral("consumer_materialization_counters"),
-            &row_view_parity_test_cells,
             out_error))
     {
         return false;
@@ -8908,7 +8708,6 @@ bool validate_scenario_json(
         QStringLiteral("configured_sparse_dirty_rows"),
         QStringLiteral("configured_sparse_dirty_row_stride"),
         QStringLiteral("descriptor_counters"),
-        QStringLiteral("lazy_snapshot_fallback_reason_counters"),
         QStringLiteral("elapsed_ns"),
         QStringLiteral("snapshot_prep_ns"),
         QStringLiteral("session_scroll_ns"),
@@ -9133,7 +8932,6 @@ bool validate_scenario_json(
         !validate_window_size_json(object, out_error)                                            ||
         !validate_lifecycle_json(object, out_error)                                              ||
         !validate_descriptor_counters_json(object, out_error)                                     ||
-        !validate_lazy_snapshot_fallback_reason_counters_json(object, out_error)                  ||
         !validate_renderer_counter_json(object, out_error)                                       ||
         !validate_renderer_counter_invariants(object, out_error)                                 ||
         !validate_atlas_renderer_json(object, out_error)                                         ||

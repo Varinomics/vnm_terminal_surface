@@ -587,18 +587,6 @@ void append_session_profile_stats_section(
         stats.geometry_derived_materialization_cells);
     append_profile_counter(
         stream,
-        "consumer_materialization_counters_row_view_parity_test_calls",
-        stats.row_view_parity_materialization_calls);
-    append_profile_counter(
-        stream,
-        "consumer_materialization_counters_row_view_parity_test_rows",
-        stats.row_view_parity_materialization_rows);
-    append_profile_counter(
-        stream,
-        "consumer_materialization_counters_row_view_parity_test_cells",
-        stats.row_view_parity_materialization_cells);
-    append_profile_counter(
-        stream,
         "retained_snapshot_payload_bytes",
         stats.retained_snapshot_payload_bytes);
     append_profile_counter(
@@ -613,64 +601,6 @@ void append_session_profile_stats_section(
         stream,
         "max_retained_snapshot_generation_count",
         stats.max_retained_snapshot_generation_count);
-    stream << "  lazy_snapshot_fallback_reason_counters_available=true\n";
-    stream << "  lazy_snapshot_fallback_reason_counters_schema_semantics="
-        << "batch_5_lazy_eligibility\n";
-    stream << "  lazy_snapshot_fallback_reason_counters_owner_batch=Batch 5\n";
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_eligibility_checks",
-        stats.lazy_snapshot_eligibility_checks);
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_eligible_checks",
-        stats.lazy_snapshot_eligible_checks);
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_full_fallbacks",
-        stats.lazy_snapshot_full_fallbacks);
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_dirty_rows_visible",
-        stats.lazy_snapshot_dirty_rows_visible);
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_previous_snapshot_borrow_candidate_rows",
-        stats.lazy_snapshot_previous_snapshot_borrow_candidate_rows);
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_previous_snapshot_borrowed_rows",
-        stats.lazy_snapshot_previous_snapshot_borrowed_rows);
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_producer_owned_rows",
-        stats.lazy_snapshot_producer_owned_rows);
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_producer_materialized_rows",
-        stats.lazy_snapshot_producer_materialized_rows);
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_producer_cells_scanned",
-        stats.lazy_snapshot_producer_cells_scanned);
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_producer_cells_emitted",
-        stats.lazy_snapshot_producer_cells_emitted);
-    append_profile_counter(
-        stream,
-        "lazy_snapshot_materialization_mismatches_for_testing",
-        stats.lazy_snapshot_materialization_mismatches_for_testing);
-    for (const term::terminal_lazy_snapshot_fallback_reason_descriptor_t& descriptor :
-        term::terminal_lazy_snapshot_fallback_reason_descriptors())
-    {
-        append_profile_counter(
-            stream,
-            descriptor.profile_key,
-            term::terminal_lazy_snapshot_fallback_reason_counter(
-                stats.lazy_snapshot_fallback_reasons,
-                descriptor));
-    }
 }
 
 template<typename Renderer_stats>
