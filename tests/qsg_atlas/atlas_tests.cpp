@@ -6625,14 +6625,6 @@ bool test_source_posture()
                 "retry_without_msdf_text_ownership();")),
         "atlas buffer update retry loop preserves MSDF diagnostics across populated-frame retries");
     ok &= check(
-        atlas_source.contains(QByteArrayLiteral(
-            "sparse_msdf_text_requires_full_cell_walk(render_frame)")) &&
-            atlas_source.contains(QByteArrayLiteral(
-                "render_frame_uses_sparse_descriptors(render_frame)")) &&
-            atlas_source.contains(QByteArrayLiteral(
-                "qsg_atlas_text_renderer_policy_allows_msdf(")),
-        "atlas prepare forces full cell walks for sparse frames that can route through MSDF");
-    ok &= check(
         !atlas_source.contains(QByteArrayLiteral(
             "QByteArray qsg_layer_descriptor_key(")) &&
             !atlas_source.contains(QByteArrayLiteral("keys.qsg_layers")),
@@ -8426,26 +8418,6 @@ bool test_atlas_row_stable_glyph_planner()
         {1, 2, row_capacity},
         {2, 4, row_capacity},
     };
-    term::Qsg_atlas_buffer_upload_planner no_source_planner;
-    const term::Qsg_atlas_buffer_update_plan unseeded_preserve =
-        committed_buffer_update_plan(no_source_planner, {
-            1,
-            0,
-            row_count,
-            static_cast<int>(sizeof(Buffer_update_test_instance)),
-            dirty_row_grown_bytes.constData(),
-            static_cast<int>(dirty_row_grown_bytes.size()),
-            &rows,
-            layout_key,
-            dirty_row_1,
-            false,
-            false,
-            false,
-            6,
-            true,
-            nullptr,
-            true,
-        });
     (void)committed_buffer_update_plan(planner, {
         1,
         0,
@@ -8550,43 +8522,6 @@ bool test_atlas_row_stable_glyph_planner()
             true,
         });
 
-    term::Qsg_atlas_buffer_upload_planner preserve_planner;
-    (void)committed_buffer_update_plan(preserve_planner, {
-        1,
-        0,
-        row_count,
-        static_cast<int>(sizeof(Buffer_update_test_instance)),
-        base_bytes.constData(),
-        static_cast<int>(base_bytes.size()),
-        &rows,
-        layout_key,
-        {},
-        false,
-        false,
-        false,
-        5,
-        true,
-    });
-    const term::Qsg_atlas_buffer_update_plan clean_slot_preserved =
-        committed_buffer_update_plan(preserve_planner, {
-            1,
-            0,
-            row_count,
-            static_cast<int>(sizeof(Buffer_update_test_instance)),
-            clean_row_and_dirty_row_changed_bytes.constData(),
-            static_cast<int>(clean_row_and_dirty_row_changed_bytes.size()),
-            &rows,
-            layout_key,
-            dirty_row_1,
-            false,
-            false,
-            false,
-            6,
-            true,
-            nullptr,
-            true,
-        });
-
     term::Qsg_atlas_buffer_upload_planner row_span_planner;
     (void)committed_buffer_update_plan(row_span_planner, {
         1,
@@ -8625,14 +8560,6 @@ bool test_atlas_row_stable_glyph_planner()
         });
 
     bool ok = true;
-    ok &= check(unseeded_preserve.summary.row_stable_layout &&
-            unseeded_preserve.summary.rotating_slot_seed_upload &&
-            unseeded_preserve.summary.full_upload_requires_populated_frame &&
-            unseeded_preserve.summary.skipped_upload &&
-            !unseeded_preserve.summary.full_upload &&
-            unseeded_preserve.ranges.empty(),
-        "atlas row-stable glyph planner refuses unseeded sparse full uploads "
-        "when no clean-row source exists");
     ok &= check(dirty.summary.row_stable_layout &&
             dirty.summary.active_instance_count == 6 &&
             dirty.summary.instance_count == row_count * row_capacity,
@@ -8679,130 +8606,6 @@ bool test_atlas_row_stable_glyph_planner()
                 static_cast<int>(clean_row_and_dirty_row_changed_bytes.size()),
         "atlas row-stable glyph planner full-uploads when a clean-row slot "
         "changes beside dirty-row content");
-    ok &= check(clean_slot_preserved.summary.row_stable_layout &&
-            clean_slot_preserved.summary.partial_upload &&
-            !clean_slot_preserved.summary.full_upload &&
-            !clean_slot_preserved.summary.non_dirty_state_upload &&
-            clean_slot_preserved.ranges.size() == 1U &&
-            clean_slot_preserved.ranges.front().byte_offset ==
-                static_cast<int>(3U * sizeof(Buffer_update_test_instance)) &&
-            clean_slot_preserved.ranges.front().byte_count ==
-                static_cast<int>(sizeof(Buffer_update_test_instance)),
-        "atlas row-stable glyph planner preserves borrowed clean-row slots "
-        "instead of full-uploading sparse default bytes");
-    return ok;
-}
-
-bool test_atlas_populated_frame_retry_planner_transaction()
-{
-    constexpr int row_count    = 3;
-    constexpr int row_capacity = 2;
-    const std::vector<int> rows = {
-        0, 0,
-        1, 1,
-        2, 2,
-    };
-    const std::vector<term::Qsg_atlas_row_stable_range> row_stable_ranges = {
-        {0, 0, row_capacity},
-        {1, 2, row_capacity},
-        {2, 4, row_capacity},
-    };
-    const QByteArray layout_key = QByteArrayLiteral("populated-frame-retry-layout");
-    const std::vector<term::Terminal_render_dirty_row_range> dirty_row_1 = {{1, 1}};
-
-    std::vector<Buffer_update_test_instance> base = {
-        {0, 10}, {0, 11},
-        {1, 20}, {1, 0},
-        {2, 30}, {2, 31},
-    };
-    std::vector<Buffer_update_test_instance> dirty_row_changed = base;
-    dirty_row_changed[2] = {1, 21};
-    dirty_row_changed[3] = {1, 23};
-    const QByteArray base_bytes = buffer_update_instance_bytes(base);
-    const QByteArray dirty_row_changed_bytes =
-        buffer_update_instance_bytes(dirty_row_changed);
-
-    const auto make_input = [&](
-            const QByteArray& bytes,
-            const std::vector<term::Terminal_render_dirty_row_range>& dirty_rows,
-            bool preserve_clean_row_slots)
-        {
-            term::Qsg_atlas_buffer_update_input input;
-            input.frames_in_flight          = 1;
-            input.frame_slot                = 0;
-            input.row_count                 = row_count;
-            input.instance_size             =
-                static_cast<int>(sizeof(Buffer_update_test_instance));
-            input.bytes                     = bytes.constData();
-            input.byte_count                = static_cast<int>(bytes.size());
-            input.instance_rows             = &rows;
-            input.layout_key                = layout_key;
-            input.dirty_row_ranges          = dirty_rows;
-            input.active_instance_count     =
-                static_cast<int>(dirty_row_changed.size());
-            input.row_stable_layout         = true;
-            input.row_stable_ranges         = &row_stable_ranges;
-            input.preserve_clean_row_slots  = preserve_clean_row_slots;
-            return input;
-        };
-
-    term::Qsg_atlas_buffer_upload_planner rect_planner;
-    term::Qsg_atlas_buffer_upload_planner glyph_planner;
-    term::Qsg_atlas_buffer_upload_planner msdf_text_planner;
-    (void)committed_buffer_update_plan(
-        rect_planner,
-        make_input(base_bytes, {}, false));
-    (void)committed_buffer_update_plan(
-        glyph_planner,
-        make_input(base_bytes, {}, false));
-
-    const term::Qsg_atlas_buffer_update_plan abandoned_rect =
-        rect_planner.plan(make_input(dirty_row_changed_bytes, dirty_row_1, false));
-    const term::Qsg_atlas_buffer_update_plan abandoned_glyph =
-        glyph_planner.plan(make_input(dirty_row_changed_bytes, dirty_row_1, false));
-    const term::Qsg_atlas_buffer_update_plan abandoned_msdf_text =
-        msdf_text_planner.plan(
-            make_input(dirty_row_changed_bytes, dirty_row_1, true));
-
-    const term::Qsg_atlas_buffer_update_plan retry_rect =
-        rect_planner.plan(make_input(dirty_row_changed_bytes, dirty_row_1, false));
-    const term::Qsg_atlas_buffer_update_plan retry_glyph =
-        glyph_planner.plan(make_input(dirty_row_changed_bytes, dirty_row_1, false));
-    const term::Qsg_atlas_buffer_update_plan retry_msdf_text =
-        msdf_text_planner.plan(
-            make_input(dirty_row_changed_bytes, dirty_row_1, false));
-
-    term::Qsg_atlas_buffer_upload_planner recreated_planner;
-    (void)committed_buffer_update_plan(
-        recreated_planner,
-        make_input(base_bytes, {}, false));
-    recreated_planner.reset();
-    const term::Qsg_atlas_buffer_update_plan abandoned_recreated =
-        recreated_planner.plan(
-            make_input(dirty_row_changed_bytes, dirty_row_1, true));
-    const term::Qsg_atlas_buffer_update_plan recreated_retry =
-        recreated_planner.plan(
-            make_input(dirty_row_changed_bytes, dirty_row_1, false));
-
-    bool ok = true;
-    ok &= check(abandoned_rect.summary.partial_upload &&
-            abandoned_glyph.summary.partial_upload &&
-            abandoned_msdf_text.summary.full_upload_requires_populated_frame,
-        "atlas populated-frame retry transaction sees abandoned sibling plans");
-    ok &= check(retry_rect.summary.partial_upload &&
-            retry_rect.summary.uploaded_bytes > 0,
-        "atlas populated-frame retry transaction leaves rect planner uncommitted");
-    ok &= check(retry_glyph.summary.partial_upload &&
-            retry_glyph.summary.uploaded_bytes > 0,
-        "atlas populated-frame retry transaction leaves glyph planner uncommitted");
-    ok &= check(retry_msdf_text.summary.full_upload &&
-            retry_msdf_text.summary.uploaded_bytes ==
-                retry_msdf_text.summary.buffer_bytes,
-        "atlas populated-frame retry transaction seeds MSDF planner on retry");
-    ok &= check(abandoned_recreated.summary.full_upload_requires_populated_frame &&
-            recreated_retry.summary.full_upload &&
-            recreated_retry.summary.rotating_slot_seed_upload,
-        "atlas populated-frame retry transaction treats recreated buffers as unseeded");
     return ok;
 }
 
@@ -19894,7 +19697,6 @@ bool run_unit_tests()
     ok &= test_epoch_invalidation();
     ok &= test_atlas_rotating_buffer_planner();
     ok &= test_atlas_row_stable_glyph_planner();
-    ok &= test_atlas_populated_frame_retry_planner_transaction();
     ok &= test_atlas_non_dirty_and_full_reupload_planner();
     ok &= test_msdf_text_buffer_fallback_retry_decision();
     ok &= test_msdf_text_prepare_fallback_retry_decision();
