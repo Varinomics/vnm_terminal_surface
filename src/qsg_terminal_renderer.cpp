@@ -2124,8 +2124,7 @@ Terminal_render_frame build_terminal_render_frame(
     terminal_cell_metrics_t            cell_metrics,
     const Terminal_render_options&     options,
     bool                               cursor_blink_visible,
-    const Ime_preedit_state*           ime_preedit_override,
-    bool                               force_full_cell_walk)
+    const Ime_preedit_state*           ime_preedit_override)
 {
     VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame");
 

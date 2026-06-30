@@ -3968,8 +3968,7 @@ private:
                 m_frame.cell_metrics,
                 m_frame.options,
                 m_frame.cursor_blink_visible,
-                &m_frame.ime_preedit,
-                true);
+                &m_frame.ime_preedit);
             m_render_row_count = render_frame.grid_size.rows;
             current_cursor_key = render_cursor_state_key(render_frame);
             current_cursor_layer_rows = cursor_layer_rows(render_frame);
