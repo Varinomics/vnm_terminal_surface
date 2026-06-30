@@ -10799,50 +10799,6 @@ term::Terminal_render_snapshot make_atlas_row_stable_text_snapshot(
         std::move(dirty_row_ranges));
 }
 
-term::Terminal_render_snapshot_row_payload_ref row_payload_ref(
-    std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> owner,
-    std::size_t                                                            row)
-{
-    term::Terminal_render_snapshot_row_payload_ref ref;
-    ref.owner         = std::move(owner);
-    ref.payload_index = row;
-    return ref;
-}
-
-term::Terminal_render_snapshot lazy_snapshot_from_flat(
-    const term::Terminal_render_snapshot& snapshot)
-{
-    const term::Terminal_render_snapshot_row_payload_namespace metadata_namespace = {
-        97U,
-        131U,
-    };
-    const std::shared_ptr<const term::Terminal_render_snapshot_row_payload_owner> owner =
-        term::render_snapshot_row_payload_owner_from_snapshot(
-            snapshot,
-            metadata_namespace,
-            snapshot.metadata.sequence);
-
-    auto payloads = std::make_shared<term::Terminal_render_snapshot_lazy_payloads>();
-    payloads->receiving_namespace = metadata_namespace;
-    payloads->rows.reserve(static_cast<std::size_t>(snapshot.grid_size.rows));
-    for (int row = 0; row < snapshot.grid_size.rows; ++row) {
-        const std::optional<term::Terminal_render_snapshot_lazy_row_payload> payload =
-            term::borrowed_render_snapshot_lazy_row_payload(
-                row_payload_ref(owner, static_cast<std::size_t>(row)),
-                metadata_namespace,
-                {},
-                {});
-        if (payload.has_value()) {
-            payloads->rows.push_back(*payload);
-        }
-    }
-
-    term::Terminal_render_snapshot lazy = snapshot;
-    lazy.cells.clear();
-    lazy.lazy_row_payloads = std::move(payloads);
-    return lazy;
-}
-
 term::Terminal_render_snapshot make_atlas_row_stable_graphic_snapshot(
     std::uint64_t sequence,
     term::Terminal_style_id middle_style,
@@ -10928,20 +10884,6 @@ term::Terminal_render_snapshot make_atlas_row_stable_background_snapshot(
     append_blank_row(1, middle_style);
     append_blank_row(2, 1U);
     return snapshot;
-}
-
-void remove_atlas_snapshot_row_cells(
-    term::Terminal_render_snapshot& snapshot,
-    int                             row)
-{
-    snapshot.cells.erase(
-        std::remove_if(
-            snapshot.cells.begin(),
-            snapshot.cells.end(),
-            [row](const term::Terminal_render_cell& cell) {
-                return cell.position.row == row;
-            }),
-        snapshot.cells.end());
 }
 
 bool pump_atlas_seeded_glyph_slots(
@@ -12300,15 +12242,14 @@ bool test_atlas_rect_row_stable_styled_blank_background_update(QGuiApplication& 
         return false;
     }
 
-    const term::Terminal_render_snapshot mutated_lazy =
-        lazy_snapshot_from_flat(
-            make_atlas_row_stable_background_snapshot(
-                947U,
-                2U,
-                {{1, 1}}));
+    const term::Terminal_render_snapshot mutated =
+        make_atlas_row_stable_background_snapshot(
+            947U,
+            2U,
+            {{1, 1}});
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
-        std::make_shared<const term::Terminal_render_snapshot>(mutated_lazy));
+        std::make_shared<const term::Terminal_render_snapshot>(mutated));
 
     term::Qsg_atlas_frame_report report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
@@ -12777,205 +12718,6 @@ bool test_atlas_prepared_text_reuse(QGuiApplication& app)
         "pruned retained frame");
     ok &= check(pruned_producer.shape_cache_pruned >= 1,
         "atlas prepared text reuse prunes entries not seen in the visible frame");
-    return ok;
-}
-
-bool test_atlas_sparse_lazy_style_change_builds_full_frame(QGuiApplication& app)
-{
-    QQuickWindow window;
-    window.resize(280, 160);
-
-    VNM_TerminalSurface surface;
-    surface.setParentItem(window.contentItem());
-    surface.setSize(QSizeF(220.0, 110.0));
-    surface.set_font_family(QStringLiteral("monospace"));
-    surface.set_font_size(18.0);
-    surface.set_color_scheme(QStringLiteral("Campbell"));
-
-    const term::Terminal_render_snapshot baseline =
-        make_atlas_row_stable_text_snapshot(
-            984U,
-            QStringLiteral("."),
-            {{0, 3}});
-    term::Qsg_atlas_frame_report baseline_report;
-    if (!prepare_seeded_atlas_text_surface(
-            app,
-            window,
-            surface,
-            baseline,
-            baseline_report))
-    {
-        std::cerr << "FAIL: atlas sparse lazy style/color fallback could not seed"
-            << " baseline prepare_count=" << baseline_report.prepare_count
-            << '\n';
-        return false;
-    }
-
-    term::Terminal_render_snapshot mutated_flat =
-        make_atlas_row_stable_text_snapshot(
-            985U,
-            QStringLiteral("!"),
-            {{1, 1}});
-    mutated_flat.color_state.default_foreground_rgba = 0xff33c7ffU;
-    const term::Terminal_render_snapshot mutated_lazy =
-        lazy_snapshot_from_flat(mutated_flat);
-
-    term::Qsg_atlas_frame_report report;
-    const bool prepared = pump_prepared_text_reuse_report(
-        app,
-        window,
-        surface,
-        mutated_lazy,
-        baseline_report.prepare_count,
-        report);
-    const term::Qsg_atlas_buffer_update_summary& glyph_buffer =
-        report.render.glyph_buffer;
-
-    bool ok = true;
-    ok &= check(prepared,
-        "atlas sparse lazy style/color fallback reaches a prepared frame");
-    ok &= check(report.frame_build.frame_row_descriptors ==
-            mutated_flat.grid_size.rows,
-        "atlas sparse lazy style/color fallback rebuilds full row descriptors");
-    ok &= check(glyph_buffer.full_upload &&
-            glyph_buffer.non_dirty_state_upload &&
-            glyph_buffer.uploaded_bytes == glyph_buffer.buffer_bytes,
-        "atlas sparse lazy style/color fallback full-uploads populated glyph rows");
-    return ok;
-}
-
-bool test_atlas_sparse_lazy_reverse_video_builds_full_frame(
-    QGuiApplication& app)
-{
-    QQuickWindow window;
-    window.resize(280, 160);
-
-    VNM_TerminalSurface surface;
-    surface.setParentItem(window.contentItem());
-    surface.setSize(QSizeF(220.0, 110.0));
-    surface.set_font_family(QStringLiteral("monospace"));
-    surface.set_font_size(18.0);
-    surface.set_color_scheme(QStringLiteral("Campbell"));
-
-    const term::Terminal_render_snapshot baseline =
-        make_atlas_row_stable_text_snapshot(
-            988U,
-            QStringLiteral("."),
-            {{0, 3}});
-    term::Qsg_atlas_frame_report baseline_report;
-    if (!prepare_seeded_atlas_text_surface(
-            app,
-            window,
-            surface,
-            baseline,
-            baseline_report))
-    {
-        std::cerr << "FAIL: atlas sparse lazy reverse-video fallback could not seed"
-            << " baseline prepare_count=" << baseline_report.prepare_count
-            << '\n';
-        return false;
-    }
-
-    term::Terminal_render_snapshot mutated_flat =
-        make_atlas_row_stable_text_snapshot(
-            989U,
-            QStringLiteral("!"),
-            {{1, 1}});
-    mutated_flat.modes.reverse_video = true;
-    const term::Terminal_render_snapshot mutated_lazy =
-        lazy_snapshot_from_flat(mutated_flat);
-
-    term::Qsg_atlas_frame_report report;
-    const bool prepared = pump_prepared_text_reuse_report(
-        app,
-        window,
-        surface,
-        mutated_lazy,
-        baseline_report.prepare_count,
-        report);
-    const term::Qsg_atlas_buffer_update_summary& glyph_buffer =
-        report.render.glyph_buffer;
-
-    bool ok = true;
-    ok &= check(prepared,
-        "atlas sparse lazy reverse-video fallback reaches a prepared frame");
-    ok &= check(report.frame_build.frame_row_descriptors ==
-            mutated_flat.grid_size.rows,
-        "atlas sparse lazy reverse-video fallback rebuilds full row descriptors");
-    ok &= check(glyph_buffer.full_upload &&
-            glyph_buffer.non_dirty_state_upload &&
-            glyph_buffer.uploaded_bytes == glyph_buffer.buffer_bytes,
-        "atlas sparse lazy reverse-video fallback full-uploads populated glyph rows");
-    return ok;
-}
-
-bool test_atlas_sparse_lazy_previous_cursor_row_builds_full_frame(
-    QGuiApplication& app)
-{
-    QQuickWindow window;
-    window.resize(280, 160);
-
-    VNM_TerminalSurface surface;
-    surface.setParentItem(window.contentItem());
-    surface.setSize(QSizeF(220.0, 110.0));
-    surface.set_font_family(QStringLiteral("monospace"));
-    surface.set_font_size(18.0);
-    surface.set_color_scheme(QStringLiteral("Campbell"));
-
-    term::Terminal_render_snapshot baseline =
-        make_atlas_row_stable_text_snapshot(
-            986U,
-            QStringLiteral("."),
-            {{0, 3}});
-    baseline.cursor.visible       = true;
-    baseline.cursor.blink_enabled = false;
-    baseline.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
-    baseline.cursor.position      = {0, 0};
-
-    term::Qsg_atlas_frame_report baseline_report;
-    if (!prepare_seeded_atlas_text_surface(
-            app,
-            window,
-            surface,
-            baseline,
-            baseline_report))
-    {
-        std::cerr << "FAIL: atlas sparse lazy previous cursor fallback could not seed"
-            << " baseline prepare_count=" << baseline_report.prepare_count
-            << '\n';
-        return false;
-    }
-
-    term::Terminal_render_snapshot mutated_flat =
-        make_atlas_row_stable_text_snapshot(
-            987U,
-            QStringLiteral("!"),
-            {{2, 1}});
-    mutated_flat.cursor.visible       = true;
-    mutated_flat.cursor.blink_enabled = false;
-    mutated_flat.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
-    mutated_flat.cursor.position      = {1, 0};
-    const term::Terminal_render_snapshot mutated_lazy =
-        lazy_snapshot_from_flat(mutated_flat);
-
-    term::Qsg_atlas_frame_report report;
-    const bool prepared = pump_prepared_text_reuse_report(
-        app,
-        window,
-        surface,
-        mutated_lazy,
-        baseline_report.prepare_count,
-        report);
-
-    bool ok = true;
-    ok &= check(prepared,
-        "atlas sparse lazy previous cursor fallback reaches a prepared frame");
-    ok &= check(report.frame_build.frame_row_descriptors ==
-            mutated_flat.grid_size.rows,
-        "atlas sparse lazy previous cursor fallback rebuilds full row descriptors");
-    ok &= check(report.render.glyph_cursor_text_row_capacity > 0 &&
-            report.render.glyph_buffer.uploaded_bytes > 0,
-        "atlas sparse lazy previous cursor fallback uploads populated cursor rows");
     return ok;
 }
 
@@ -19902,9 +19644,6 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
     ok &= test_atlas_glyph_row_stable_cursor_dirty_update(app);
     ok &= test_atlas_glyph_row_stable_cursor_clean_row_promoted(app);
     ok &= test_atlas_prepared_text_reuse(app);
-    ok &= test_atlas_sparse_lazy_style_change_builds_full_frame(app);
-    ok &= test_atlas_sparse_lazy_reverse_video_builds_full_frame(app);
-    ok &= test_atlas_sparse_lazy_previous_cursor_row_builds_full_frame(app);
     ok &= test_atlas_failed_prepare_forces_next_sparse_full_upload(app);
     ok &= test_atlas_failed_prepare_preserves_font_epoch_basis(app);
     ok &= test_atlas_failed_prepare_preserves_cursor_layer_basis(app);

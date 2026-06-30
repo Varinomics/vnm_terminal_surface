@@ -2023,15 +2023,15 @@ bool test_row_content_view_matches_flat_snapshot_representation()
     ok &= check(term::validate_render_snapshot(snapshot).status ==
             term::Terminal_render_snapshot_status::OK,
         "row-content view validates the rich flat snapshot");
-    const std::vector<term::Terminal_render_cell> direct_materialized =
-        rows.materialize_flat_cells(
-            term::Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST);
+    std::vector<term::Terminal_render_cell> view_flat_cells;
+    for (const term::Terminal_render_snapshot_row_content row : rows) {
+        view_flat_cells.insert(view_flat_cells.end(), row.begin(), row.end());
+    }
     ok &= check(rows.row_count() == snapshot.grid_size.rows &&
         rows.column_count() == snapshot.grid_size.columns,
         "row-content view exposes snapshot grid dimensions");
-    ok &= check(direct_materialized.size() == snapshot.cells.size() &&
-        rows.materialized_flat_cells_match_snapshot(
-            term::Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST),
+    ok &= check(view_flat_cells.size() == snapshot.cells.size() &&
+        render_cells_match(view_flat_cells, snapshot.cells),
         "row-content view materializes the same row-major flat cells");
 
     std::size_t iterated_cell_count = 0U;
@@ -2281,10 +2281,17 @@ bool test_row_content_view_malformed_lookup_behavior()
     term::Terminal_render_snapshot extra_out_of_range_cell = valid;
     extra_out_of_range_cell.cells.push_back(valid.cells.front());
     extra_out_of_range_cell.cells.back().position.row = valid.grid_size.rows;
-    ok &= check(!term::Terminal_render_snapshot_row_content_view(extra_out_of_range_cell).
-            materialized_flat_cells_match_snapshot(
-                term::Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST),
-        "row-content materialization rejects out-of-range flat cells");
+    const term::Terminal_render_snapshot_row_content_view extra_rows(
+        extra_out_of_range_cell);
+    std::vector<term::Terminal_render_cell> extra_view_flat_cells;
+    for (const term::Terminal_render_snapshot_row_content row : extra_rows) {
+        extra_view_flat_cells.insert(
+            extra_view_flat_cells.end(), row.begin(), row.end());
+    }
+    ok &= check(extra_view_flat_cells.size() + 1U ==
+            extra_out_of_range_cell.cells.size() &&
+        !render_cells_match(extra_view_flat_cells, extra_out_of_range_cell.cells),
+        "row-content view drops out-of-range flat cells beyond the viewable rows");
 
     return ok;
 }

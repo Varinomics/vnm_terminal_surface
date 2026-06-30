@@ -211,11 +211,6 @@ void record_consumer_materialization(
             profile_stats->geometry_derived_materialization_rows  += rows;
             profile_stats->geometry_derived_materialization_cells += cells;
             break;
-        case Terminal_render_snapshot_materialization_reason::ROW_VIEW_PARITY_TEST:
-            ++profile_stats->row_view_parity_materialization_calls;
-            profile_stats->row_view_parity_materialization_rows  += rows;
-            profile_stats->row_view_parity_materialization_cells += cells;
-            break;
     }
 }
 
