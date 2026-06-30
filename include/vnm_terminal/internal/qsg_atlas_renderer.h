@@ -388,7 +388,6 @@ struct Qsg_atlas_buffer_update_input
     bool                                     row_stable_layout = false;
     const std::vector<Qsg_atlas_row_stable_range>*
                                              row_stable_ranges = nullptr;
-    bool                                     preserve_clean_row_slots = false;
 };
 
 struct Qsg_atlas_buffer_upload_commit

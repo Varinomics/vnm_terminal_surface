@@ -1248,17 +1248,6 @@ bool atlas_capture_has_full_dirty_range(const term::Terminal_render_snapshot& sn
         snapshot.dirty_row_ranges.front().row_count >= visible_rows;
 }
 
-int atlas_capture_sparse_descriptor_row_count(
-    const term::Captured_atlas_frame& frame)
-{
-    if (frame.snapshot == nullptr) {
-        return 0;
-    }
-
-    const term::Terminal_render_snapshot& snapshot = *frame.snapshot;
-    return std::max(0, snapshot.grid_size.rows);
-}
-
 std::uint64_t atlas_frame_snapshot_sequence(const term::Captured_atlas_frame& frame)
 {
     return frame.snapshot != nullptr
@@ -1287,8 +1276,7 @@ term::terminal_renderer_stats_t atlas_renderer_stats_for_capture(
     const int visible_rows = std::max(0, snapshot.grid_size.rows);
     const int columns      = std::max(0, snapshot.grid_size.columns);
     const int dirty_rows   = atlas_capture_dirty_row_count(snapshot);
-    const int frame_descriptor_rows =
-        atlas_capture_sparse_descriptor_row_count(frame);
+    const int frame_descriptor_rows = visible_rows;
 
     stats.frame.visible_rows    = visible_rows;
     stats.frame.dirty_rows      = dirty_rows;

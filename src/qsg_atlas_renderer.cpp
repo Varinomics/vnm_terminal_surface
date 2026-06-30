@@ -3920,7 +3920,6 @@ private:
         m_glyph_instance_rows.clear();
         m_glyph_buffer_instance_rows.clear();
         m_msdf_text_instance_rows.clear();
-        m_render_preserve_clean_row_slots = false;
         m_glyph_buffer_row_stable_ranges.clear();
         m_rect_buffer_row_stable_ranges.clear();
         m_rect_active_instance_count = 0;
@@ -3954,13 +3953,7 @@ private:
         std::vector<int> current_cursor_layer_rows =
             cursor_layer_rows(render_frame);
         if (force_full_cell_walk ||
-            m_force_next_render_full_upload ||
-            sparse_msdf_text_requires_full_cell_walk(render_frame) ||
-            sparse_render_frame_requires_full_cell_walk(
-                render_frame,
-                render_state_keys(render_frame),
-                current_cursor_key,
-                font_epoch_changed))
+            m_force_next_render_full_upload)
         {
             render_frame = build_terminal_render_frame(
                 m_frame.snapshot.get(),
@@ -3977,8 +3970,6 @@ private:
             render_frame.dirty_row_ranges,
             current_cursor_key,
             current_cursor_layer_rows);
-        m_render_preserve_clean_row_slots =
-            render_frame_uses_sparse_descriptors(render_frame);
 
         const qreal opacity = std::clamp(inheritedOpacity(), 0.0, 1.0);
         const std::vector<Terminal_render_rect> background_rects =
@@ -4320,111 +4311,6 @@ private:
             std::move(dirty_rows),
             m_render_row_count,
             false);
-    }
-
-    bool render_frame_uses_sparse_descriptors(
-        const Terminal_render_frame& render_frame) const
-    {
-        return
-            render_frame.grid_size.rows > 0 &&
-            render_frame.row_descriptors.size() <
-                static_cast<std::size_t>(render_frame.grid_size.rows);
-    }
-
-    bool sparse_msdf_text_requires_full_cell_walk(
-        const Terminal_render_frame& render_frame) const
-    {
-#if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
-        return
-            render_frame_uses_sparse_descriptors(render_frame) &&
-            qsg_atlas_text_renderer_policy_allows_msdf(
-                m_frame.options.text_renderer_policy);
-#else
-        (void)render_frame;
-        return false;
-#endif
-    }
-
-    bool dirty_ranges_include_undescribed_rows(
-        const Terminal_render_frame&                       render_frame,
-        const std::vector<Terminal_render_dirty_row_range>& dirty_row_ranges) const
-    {
-        const int row_count = render_frame.grid_size.rows;
-        if (row_count <= 0) {
-            return false;
-        }
-
-        std::vector<unsigned char> described_rows(
-            static_cast<std::size_t>(row_count),
-            0U);
-        for (const Terminal_render_row_descriptor& descriptor :
-            render_frame.row_descriptors)
-        {
-            if (descriptor.row >= 0 && descriptor.row < row_count) {
-                described_rows[static_cast<std::size_t>(descriptor.row)] = 1U;
-            }
-        }
-
-        for (const Terminal_render_dirty_row_range& range : dirty_row_ranges) {
-            const int first_row = std::clamp(range.first_row, 0, row_count);
-            const int end_row = std::clamp(
-                range.first_row + range.row_count,
-                first_row,
-                row_count);
-            for (int row = first_row; row < end_row; ++row) {
-                if (described_rows[static_cast<std::size_t>(row)] == 0U) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    bool sparse_render_frame_requires_full_cell_walk(
-        const Terminal_render_frame& render_frame,
-        const Atlas_frame_state_keys& current_keys,
-        const QByteArray&            current_cursor_key,
-        bool                         font_epoch_changed) const
-    {
-        if (!render_frame_uses_sparse_descriptors(render_frame)) {
-            return false;
-        }
-
-        if (!m_have_previous_render_state || font_epoch_changed) {
-            return true;
-        }
-
-        if (dirty_range_covers_full_grid(render_frame)) {
-            return true;
-        }
-
-        if (current_keys.selection != m_previous_render_state_keys.selection ||
-            current_keys.cursor_rect != m_previous_render_state_keys.cursor_rect ||
-            current_keys.preedit != m_previous_render_state_keys.preedit ||
-            current_keys.options != m_previous_render_state_keys.options ||
-            current_keys.visual_bell != m_previous_render_state_keys.visual_bell ||
-            current_keys.style_color != m_previous_render_state_keys.style_color ||
-            current_keys.reverse_video !=
-                m_previous_render_state_keys.reverse_video ||
-            current_keys.cell_metrics != m_previous_render_state_keys.cell_metrics ||
-            current_keys.opacity != m_previous_render_state_keys.opacity ||
-            current_keys.clean_row_qsg_layers !=
-                m_previous_render_state_keys.clean_row_qsg_layers)
-        {
-            return true;
-        }
-
-        const std::vector<int> current_cursor_layer_rows =
-            cursor_layer_rows(render_frame);
-        const std::vector<Terminal_render_dirty_row_range> widened_dirty_ranges =
-            dirty_ranges_with_cursor_layer_rows(
-                render_frame.dirty_row_ranges,
-                current_cursor_key,
-                current_cursor_layer_rows);
-        return dirty_ranges_include_undescribed_rows(
-            render_frame,
-            widened_dirty_ranges);
     }
 
     QByteArray render_options_key(const Terminal_render_options& options) const
@@ -6545,7 +6431,6 @@ private:
                 m_rect_active_instance_count,
                 !m_rect_instances.empty(),
                 &m_rect_buffer_row_stable_ranges,
-                m_render_preserve_clean_row_slots,
             });
         const Qsg_atlas_buffer_update_plan glyph_plan =
             m_glyph_upload_planner.plan({
@@ -6566,7 +6451,6 @@ private:
                 static_cast<int>(m_glyph_instances.size()),
                 !m_glyph_buffer_instances.empty(),
                 &m_glyph_buffer_row_stable_ranges,
-                m_render_preserve_clean_row_slots,
             });
         Qsg_atlas_buffer_update_plan msdf_text_plan;
 #if VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
@@ -6875,7 +6759,6 @@ private:
     bool                                     m_render_force_full_reupload = false;
     bool                                     m_render_non_dirty_state_invalidation = false;
     bool                                     m_render_cursor_rect_state_invalidation = false;
-    bool                                     m_render_preserve_clean_row_slots = false;
     bool                                     m_force_next_render_full_upload = false;
     bool                                     m_have_previous_render_state = false;
     Atlas_frame_state_keys                  m_previous_render_state_keys;
@@ -7180,25 +7063,7 @@ Qsg_atlas_buffer_upload_planner::plan(
         input.non_dirty_state_invalidation;
 
     const char* const current = input.bytes;
-    const auto record_full_upload_requires_populated_frame = [&]() {
-        summary.full_upload_requires_populated_frame = true;
-        summary.skipped_upload = true;
-        summary.seeded_slots = static_cast<int>(std::count(
-            commit.seeded_slots.begin(),
-            commit.seeded_slots.end(),
-            static_cast<unsigned char>(1U)));
-    };
-
     const auto record_full_upload = [&]() {
-        if (input.preserve_clean_row_slots &&
-            input.row_stable_layout        &&
-            input.instance_rows != nullptr &&
-            byte_count > 0)
-        {
-            record_full_upload_requires_populated_frame();
-            return false;
-        }
-
         if (byte_count > 0) {
             plan.ranges.push_back({0, byte_count});
             summary.full_upload    = true;
@@ -7367,11 +7232,6 @@ Qsg_atlas_buffer_upload_planner::plan(
         }
 
         if (full_required_for_clean_slot_change) {
-            if (input.preserve_clean_row_slots) {
-                finalize_partial_upload();
-                return plan;
-            }
-
             plan.ranges.clear();
             summary.non_dirty_state_upload = true;
             if (!record_full_upload()) {
