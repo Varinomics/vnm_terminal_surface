@@ -1620,8 +1620,14 @@ bool test_surface_polish_drains_queued_backend_output_before_render_capture(QGui
 
 enum class Input_echo_timing_expectation
 {
+    // The repro deterministically forces the pre-echo frame and asserts the
+    // stale cursor is shown there. This is a manual --expect-race diagnostic
+    // for the still-present echo/caret race; it is not a registered gate.
     RACE_EXPOSED,
-    CURSOR_SUPPRESSED,
+    // The registered expectation after the cursor-suppression workaround was
+    // removed: the cursor stays visible, either the stale pre-echo cursor for
+    // one frame or a caught-up cursor. There is no suppressed-cursor outcome.
+    CURSOR_KEPT_VISIBLE,
 };
 
 bool test_surface_input_echo_after_polish_timing_repro(
@@ -1737,7 +1743,7 @@ bool test_surface_input_echo_after_polish_timing_repro(
 
     std::optional<term::Qsg_atlas_frame_report> first_frame_report;
     Surface_frame_attempt first_frame_attempt;
-    if (expectation == Input_echo_timing_expectation::CURSOR_SUPPRESSED) {
+    if (expectation == Input_echo_timing_expectation::CURSOR_KEPT_VISIBLE) {
         first_frame_attempt =
             capture_surface_frame_attempt(app, fixture.window, fixture.surface);
     }
@@ -15126,20 +15132,20 @@ int main(int argc, char** argv)
     if (arguments.contains(QStringLiteral("--input-echo-timing-repro"))) {
         const bool expect_race =
             arguments.contains(QStringLiteral("--expect-race"));
-        const bool expect_cursor_suppressed =
-            arguments.contains(QStringLiteral("--expect-cursor-suppressed"));
-        if (expect_race == expect_cursor_suppressed) {
+        const bool expect_cursor_visible =
+            arguments.contains(QStringLiteral("--expect-cursor-visible"));
+        if (expect_race == expect_cursor_visible) {
             std::cerr << "FAIL: choose exactly one of --expect-race or "
-                "--expect-cursor-suppressed for --input-echo-timing-repro\n";
+                "--expect-cursor-visible for --input-echo-timing-repro\n";
             return 2;
         }
 
         const Input_echo_timing_expectation expectation =
             expect_race
                 ? Input_echo_timing_expectation::RACE_EXPOSED
-                : Input_echo_timing_expectation::CURSOR_SUPPRESSED;
+                : Input_echo_timing_expectation::CURSOR_KEPT_VISIBLE;
         bool ok = test_surface_input_echo_after_polish_timing_repro(app, expectation);
-        if (expectation == Input_echo_timing_expectation::CURSOR_SUPPRESSED) {
+        if (expectation == Input_echo_timing_expectation::CURSOR_KEPT_VISIBLE) {
             ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
             ok &= test_surface_input_freshness_unrendered_publication_keeps_cursor_visible(app);
             ok &= test_surface_input_freshness_non_rendering_callback_waits_for_render(app);
@@ -15164,7 +15170,7 @@ int main(int argc, char** argv)
     ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
     ok &= test_surface_input_echo_after_polish_timing_repro(
         app,
-        Input_echo_timing_expectation::CURSOR_SUPPRESSED);
+        Input_echo_timing_expectation::CURSOR_KEPT_VISIBLE);
     ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
     ok &= test_surface_input_freshness_unrendered_publication_keeps_cursor_visible(app);
     ok &= test_surface_input_freshness_non_rendering_callback_waits_for_render(app);

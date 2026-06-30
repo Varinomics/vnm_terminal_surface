@@ -1153,7 +1153,7 @@ add_test(
         "${vnm_terminal_qt_runtime_path}"
         "$<TARGET_FILE:vnm_terminal_surface_host>"
         "--input-echo-timing-repro"
-        "--expect-cursor-suppressed"
+        "--expect-cursor-visible"
 )
 
 set_tests_properties(vnm_terminal_surface_input_echo_timing_repro PROPERTIES
