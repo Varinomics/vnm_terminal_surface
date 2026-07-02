@@ -39,6 +39,7 @@ struct Terminal_surface_backend_drain_stats_t
     std::uint64_t                           posted_full_budget_calls             = 0U;
     std::uint64_t                           posted_frame_pending_small_budget_calls = 0U;
     std::uint64_t                           budget_exhausted_incomplete          = 0U;
+    std::uint64_t                           cursor_stable_incomplete             = 0U;
     std::uint64_t                           total_elapsed_ns                     = 0U;
     std::uint64_t                           max_elapsed_ns                       = 0U;
     std::uint64_t                           session_processing_calls             = 0U;
@@ -147,6 +148,14 @@ public:
 
     static std::chrono::steady_clock::duration backend_callback_frame_catchup_budget_for_testing(
         const VNM_TerminalSurface& surface);
+
+    static void set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
+        VNM_TerminalSurface&                    surface,
+        std::chrono::steady_clock::duration     extension);
+
+    static std::chrono::steady_clock::duration
+        backend_callback_frame_catchup_cursor_stable_stop_extension_for_testing(
+            const VNM_TerminalSurface& surface);
 
     static void set_pending_published_mouse_report_block_count_for_testing(
         VNM_TerminalSurface&       surface,

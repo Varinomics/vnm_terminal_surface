@@ -3382,22 +3382,42 @@ Terminal_session_result Terminal_session::enqueue_command(Terminal_session_comma
     };
 }
 
-bool Terminal_session::process_pending_commands(
+Backend_callback_drain_stop Terminal_session::process_pending_commands(
     Backend_callback_drain_policy          drain_policy,
     Backend_callback_drain_deadline        deadline,
-    std::optional<std::uint64_t>           target_backend_callback_epoch)
+    std::optional<std::uint64_t>           target_backend_callback_epoch,
+    std::optional<std::chrono::steady_clock::duration>
+                                           cursor_stable_stop_extension)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::process_pending_commands");
 
     if (m_processing_commands) {
-        return false;
+        return Backend_callback_drain_stop::UNSETTLED;
     }
 
     m_processing_commands = true;
+    m_drain_synchronized_release_publication_generation.reset();
+    m_drain_latest_live_content_publication_generation.reset();
     const bool previous_backend_content_snapshot_deferral =
         m_backend_content_snapshot_deferral_active;
     m_backend_content_snapshot_deferral_active = deadline.has_value();
-    bool complete = true;
+
+    // Cursor-stable stop-point state, sampled at every command/slice boundary
+    // from drain start. Sampling is per boundary, so a DECTCM transition is
+    // detected at one-slice granularity: the stop can overshoot the exact
+    // ?25h by the tail of the slice that contained it, and a full hide/show
+    // bracket inside one slice is invisible.
+    bool prev_cursor_visible      = true;
+    bool prev_synchronized_output = false;
+    if (m_screen_model.has_value()) {
+        const Terminal_mode_state& modes = m_screen_model->mode_state();
+        prev_cursor_visible      = modes.cursor_visible;
+        prev_synchronized_output = modes.synchronized_output;
+    }
+    bool hide_observed_this_drain = !prev_cursor_visible;
+    Backend_callback_drain_deadline extension_deadline = std::nullopt;
+
+    Backend_callback_drain_stop stop = Backend_callback_drain_stop::COMPLETE;
     for (;;) {
         if (drain_policy == Backend_callback_drain_policy::DRAIN_CALLBACKS) {
             drain_backend_callback_commands();
@@ -3474,18 +3494,96 @@ bool Terminal_session::process_pending_commands(
             advance_processed_backend_callback_epoch(command_backend_callback_epoch);
         }
 
+        bool cursor_visible             = prev_cursor_visible;
+        bool synchronized_output_active = prev_synchronized_output;
+        if (m_screen_model.has_value()) {
+            const Terminal_mode_state& modes = m_screen_model->mode_state();
+            cursor_visible             = modes.cursor_visible;
+            synchronized_output_active = modes.synchronized_output;
+        }
+        const bool cursor_shown_at_boundary =
+            !prev_cursor_visible && cursor_visible;
+        hide_observed_this_drain = hide_observed_this_drain || !cursor_visible;
+        prev_cursor_visible      = cursor_visible;
+        prev_synchronized_output = synchronized_output_active;
+
         if (target_backend_callback_epoch.has_value() &&
             m_last_processed_backend_callback_epoch >= *target_backend_callback_epoch)
         {
             break;
         }
 
-        if (backend_callback_drain_deadline_reached(deadline) &&
-            (!m_pending_commands.empty() ||
-                (drain_policy == Backend_callback_drain_policy::DRAIN_CALLBACKS &&
-                    m_callback_lifetime->has_pending_or_active_callbacks())))
-        {
-            complete = false;
+        if (!backend_callback_drain_deadline_reached(deadline)) {
+            continue;
+        }
+        const bool drain_work_remaining =
+            !m_pending_commands.empty() ||
+            (drain_policy == Backend_callback_drain_policy::DRAIN_CALLBACKS &&
+                m_callback_lifetime->has_pending_or_active_callbacks());
+        if (!drain_work_remaining) {
+            continue;
+        }
+
+        // The primary budget expired at a command/slice boundary with work
+        // remaining: classify the stop. A synchronized-output release that is
+        // still the latest live-content publication leaves a whole released
+        // frame installed (settled); an active hold is HELD only when the
+        // installed publication stays unchanged; a DECTCM hidden -> visible
+        // flip across this boundary is ConPTY's repaint-complete marker
+        // (settled); otherwise the extension may run, but only when this drain
+        // has seen bracket evidence, streams that never hide the cursor stop
+        // unsettled immediately and pay no extension.
+        const bool deferred_content_publication_pending =
+            m_deferred_backend_content_snapshot.has_value();
+        const bool release_is_latest_publication =
+            m_drain_synchronized_release_publication_generation.has_value() &&
+            (!m_drain_latest_live_content_publication_generation.has_value() ||
+                *m_drain_latest_live_content_publication_generation <=
+                    *m_drain_synchronized_release_publication_generation) &&
+            !deferred_content_publication_pending;
+        if (release_is_latest_publication) {
+            stop = Backend_callback_drain_stop::CURSOR_STABLE;
+            break;
+        }
+        if (synchronized_output_active) {
+            const bool hold_publication_unchanged =
+                !m_drain_latest_live_content_publication_generation.has_value() &&
+                !m_drain_synchronized_release_publication_generation.has_value() &&
+                !deferred_content_publication_pending;
+            stop = hold_publication_unchanged
+                ? Backend_callback_drain_stop::HELD
+                : Backend_callback_drain_stop::UNSETTLED;
+            break;
+        }
+        if (cursor_shown_at_boundary) {
+            // Default-off frame drains keep DECTCM cursor-stable boundaries
+            // inert; synchronized-output release-stable stops are handled
+            // above and remain settled without the extension.
+            const bool frame_dectcm_stop_extension_disabled =
+                target_backend_callback_epoch.has_value() &&
+                !cursor_stable_stop_extension.has_value();
+            stop = frame_dectcm_stop_extension_disabled
+                ? Backend_callback_drain_stop::UNSETTLED
+                : Backend_callback_drain_stop::CURSOR_STABLE;
+            break;
+        }
+        if (!extension_deadline.has_value()) {
+            if (!cursor_stable_stop_extension.has_value() ||
+                !m_screen_model.has_value()               ||
+                !hide_observed_this_drain)
+            {
+                stop = Backend_callback_drain_stop::UNSETTLED;
+                break;
+            }
+            // The hard cap is anchored on the primary deadline. Deadline
+            // checks run only after a processed command or slice, and
+            // non-output commands process whole, so primary-budget overshoot
+            // eats into the extension window and can consume it entirely on
+            // this drain.
+            extension_deadline = *deadline + *cursor_stable_stop_extension;
+        }
+        if (backend_callback_drain_deadline_reached(extension_deadline)) {
+            stop = Backend_callback_drain_stop::UNSETTLED;
             break;
         }
     }
@@ -3493,12 +3591,18 @@ bool Terminal_session::process_pending_commands(
     m_backend_content_snapshot_deferral_active =
         previous_backend_content_snapshot_deferral;
     m_processing_commands = false;
-    if (target_backend_callback_epoch.has_value() &&
+    // Applies only to the empty-queue exit (callbacks still in flight with the
+    // target epoch unreached); an explicit loop-tail stop kind is never
+    // overwritten.
+    if (stop == Backend_callback_drain_stop::COMPLETE     &&
+        target_backend_callback_epoch.has_value()         &&
         m_last_processed_backend_callback_epoch < *target_backend_callback_epoch)
     {
-        complete = false;
+        stop = Backend_callback_drain_stop::UNSETTLED;
     }
-    return complete;
+    m_drain_synchronized_release_publication_generation.reset();
+    m_drain_latest_live_content_publication_generation.reset();
+    return stop;
 }
 
 Terminal_session_result Terminal_session::process_command(Terminal_session_command command)
@@ -4347,7 +4451,7 @@ void Terminal_session::process_backend_callback_events()
     (void)process_pending_commands();
 }
 
-bool Terminal_session::process_backend_callback_events_for(
+Backend_callback_drain_stop Terminal_session::process_backend_callback_events_for(
     std::chrono::steady_clock::duration budget)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -4363,29 +4467,30 @@ bool Terminal_session::process_backend_callback_events_for(
         std::chrono::steady_clock::now() + budget);
 }
 
-bool Terminal_session::process_backend_callback_events_until_epoch(
-    std::uint64_t                                      target_epoch,
-    std::optional<std::chrono::steady_clock::duration> budget)
+Backend_callback_drain_stop Terminal_session::process_backend_callback_events_until_epoch(
+    std::uint64_t                     target_epoch,
+    backend_callback_drain_budgets_t  budgets)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     if (target_epoch == 0U ||
         m_last_processed_backend_callback_epoch >= target_epoch)
     {
-        return true;
+        return Backend_callback_drain_stop::COMPLETE;
     }
 
     Backend_callback_drain_deadline deadline = std::nullopt;
-    if (budget.has_value()) {
+    if (budgets.budget.has_value()) {
         const std::chrono::steady_clock::duration zero =
             std::chrono::steady_clock::duration::zero();
-        deadline = std::chrono::steady_clock::now() + std::max(*budget, zero);
+        deadline = std::chrono::steady_clock::now() + std::max(*budgets.budget, zero);
     }
 
     return process_pending_commands(
         Backend_callback_drain_policy::DRAIN_CALLBACKS,
         deadline,
-        target_epoch);
+        target_epoch,
+        budgets.cursor_stable_stop_extension);
 }
 
 void Terminal_session::pause_backend_output_from_callback_ingress()
@@ -4873,11 +4978,19 @@ void Terminal_session::ingest_backend_output_segment(
         }
         else {
             flush_deferred_backend_content_snapshot();
+            const std::uint64_t generation_before_publish =
+                m_render_snapshot_generation;
             publish_render_snapshot(
                 sequence,
                 QStringLiteral("backend output received"),
                 Terminal_render_snapshot_purpose::CONTENT,
                 release_diagnostics.value_or(Terminal_public_scroll_diagnostics{}));
+            if (m_render_snapshot_generation != generation_before_publish) {
+                record_backend_callback_drain_content_publication(
+                    m_render_snapshot_generation,
+                    synchronized_output_released,
+                    ingest_result.terminal_content_changed);
+            }
         }
     }
     if (render_snapshot_available) {
@@ -4922,11 +5035,37 @@ void Terminal_session::flush_deferred_backend_content_snapshot()
         std::move(*m_deferred_backend_content_snapshot);
     m_deferred_backend_content_snapshot.reset();
     m_render_snapshot_model_result = std::move(pending.model_result);
+    const bool terminal_content_changed =
+        m_render_snapshot_model_result->terminal_content_changed;
+    const std::uint64_t generation_before_publish = m_render_snapshot_generation;
     publish_render_snapshot(
         pending.sequence,
         std::move(pending.message),
         Terminal_render_snapshot_purpose::CONTENT,
         pending.public_scroll_diagnostics);
+    if (m_render_snapshot_generation != generation_before_publish) {
+        record_backend_callback_drain_content_publication(
+            m_render_snapshot_generation,
+            false,
+            terminal_content_changed);
+    }
+}
+
+void Terminal_session::record_backend_callback_drain_content_publication(
+    std::uint64_t publication_generation,
+    bool          synchronized_output_release,
+    bool          terminal_content_changed)
+{
+    Q_ASSERT(m_processing_commands);
+
+    if (synchronized_output_release) {
+        m_drain_synchronized_release_publication_generation =
+            publication_generation;
+    }
+    if (terminal_content_changed) {
+        m_drain_latest_live_content_publication_generation =
+            publication_generation;
+    }
 }
 
 bool Terminal_session::apply_text_area_resize_request(

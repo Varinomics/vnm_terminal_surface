@@ -72,6 +72,7 @@ boolean values are JSON booleans. These diagnostics are `UNSTABLE`.
 | `posted_full_budget_calls` | Counter | Count | Unstable |
 | `posted_frame_pending_small_budget_calls` | Counter | Count | Unstable |
 | `budget_exhausted_incomplete` | Counter | Count | Unstable |
+| `cursor_stable_incomplete` | Counter | Count | Unstable |
 | `total_elapsed_ns` | Counter | Nanoseconds | Unstable |
 | `max_elapsed_ns` | Counter | Nanoseconds | Unstable |
 | `session_processing_calls` | Counter | Count | Unstable |
@@ -87,6 +88,13 @@ boolean values are JSON booleans. These diagnostics are `UNSTABLE`.
 | `requeue_count` | Counter | Count | Unstable |
 | `pending_callback_after_drain` | Counter | Count | Unstable |
 | `output_backpressure_after_drain` | Counter | Count | Unstable |
+
+Budgeted drains that stop `UNSETTLED` increment
+`budget_exhausted_incomplete`. Budgeted drains that stop `CURSOR_STABLE`
+increment `cursor_stable_incomplete`. `HELD` drains increment neither. When
+the cursor-stable extension is disabled, frame-drain DECTCM cursor-stable
+boundaries are reported as `UNSETTLED` for default-off behavior;
+synchronized-output release-stable stops remain `CURSOR_STABLE`.
 
 ## Descriptor model
 
@@ -244,12 +252,12 @@ emitted outside the shared table (so they are not table rows below).
 | `warm_insert_attempts` | Counter | Count | Unstable |
 | `warm_inserts` | Counter | Count | Unstable |
 | `warm_failed_inserts` | Counter | Count | Unstable |
-| `warm_elapsed_ms` (hand-written, `double`) | — | Milliseconds | Unstable |
+| `warm_elapsed_ms` (hand-written, `double`) | Double | Milliseconds | Unstable |
 | `warm_page_pressure` | Bool | None | Unstable |
 | `lazy_insert_attempts` | Counter | Count | Unstable |
 | `lazy_inserts` | Counter | Count | Unstable |
 | `lazy_failed_inserts` | Counter | Count | Unstable |
-| `lazy_elapsed_ms` (hand-written, `double`) | — | Milliseconds | Unstable |
+| `lazy_elapsed_ms` (hand-written, `double`) | Double | Milliseconds | Unstable |
 | `lazy_max_insert_us` | Counter | Microseconds | Unstable |
 | `lazy_frames` | Counter | Count | Unstable |
 | `incomplete_frames` | Counter | Count | Unstable |

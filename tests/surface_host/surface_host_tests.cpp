@@ -725,7 +725,22 @@ QByteArray repeated_scroll_lines(int count, const QByteArray& line)
 }
 
 constexpr std::chrono::milliseconds k_posted_drain_budget_probe_write_delay{8};
+constexpr qsizetype k_backend_output_drain_slice_contract_bytes = 4096;
 constexpr qsizetype k_epoch_catchup_budget_probe_payload_bytes = 8192;
+
+QByteArray cursor_show_boundary_title_slice(const QByteArray& title)
+{
+    QByteArray slice;
+    slice += QByteArrayLiteral("\x1b]2;");
+    slice += title;
+    slice += '\a';
+    const QByteArray cursor_show = QByteArrayLiteral("\x1b[?25h");
+    slice += QByteArray(
+        k_backend_output_drain_slice_contract_bytes - slice.size() - cursor_show.size(),
+        'x');
+    slice += cursor_show;
+    return slice;
+}
 
 QByteArray epoch_catchup_budget_probe_payload(const QByteArray& tail_output)
 {
@@ -2455,6 +2470,74 @@ bool test_surface_frame_catchup_budget_env_config()
     return ok;
 }
 
+bool test_surface_frame_catchup_cursor_stable_stop_extension_env_config()
+{
+    bool ok = true;
+    const char* const env_name =
+        "VNM_TERMINAL_BACKEND_CALLBACK_FRAME_CATCHUP_CURSOR_STABLE_STOP_EXTENSION_MS";
+
+    {
+        Scoped_env_var env(env_name, std::nullopt);
+        VNM_TerminalSurface surface;
+        const auto extension = std::chrono::duration_cast<std::chrono::milliseconds>(
+            term::VNM_TerminalSurface_render_bridge::
+                backend_callback_frame_catchup_cursor_stable_stop_extension_for_testing(
+                    surface));
+        ok &= check(extension.count() == 0,
+            "surface cursor-stable stop extension defaults to disabled when unset");
+    }
+
+    {
+        Scoped_env_var env(env_name, QByteArrayLiteral("2"));
+        VNM_TerminalSurface surface;
+        const auto extension = std::chrono::duration_cast<std::chrono::milliseconds>(
+            term::VNM_TerminalSurface_render_bridge::
+                backend_callback_frame_catchup_cursor_stable_stop_extension_for_testing(
+                    surface));
+        ok &= check(extension.count() == 2,
+            "surface cursor-stable stop extension env accepts millisecond values");
+    }
+
+    {
+        Scoped_env_var env(env_name, QByteArrayLiteral("0"));
+        VNM_TerminalSurface surface;
+        const auto extension = std::chrono::duration_cast<std::chrono::milliseconds>(
+            term::VNM_TerminalSurface_render_bridge::
+                backend_callback_frame_catchup_cursor_stable_stop_extension_for_testing(
+                    surface));
+        ok &= check(extension.count() == 0,
+            "surface cursor-stable stop extension env value zero disables the extension");
+    }
+
+    {
+        Scoped_env_var env(env_name, QByteArrayLiteral("invalid"));
+        VNM_TerminalSurface surface;
+        const auto extension = std::chrono::duration_cast<std::chrono::milliseconds>(
+            term::VNM_TerminalSurface_render_bridge::
+                backend_callback_frame_catchup_cursor_stable_stop_extension_for_testing(
+                    surface));
+        ok &= check(extension.count() == 0,
+            "surface cursor-stable stop extension rejects invalid values to disabled");
+    }
+
+    {
+        Scoped_env_var env(env_name, QByteArrayLiteral("5"));
+        VNM_TerminalSurface surface;
+        term::VNM_TerminalSurface_render_bridge::
+            set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
+                surface,
+                std::chrono::milliseconds{2});
+        const auto extension = std::chrono::duration_cast<std::chrono::milliseconds>(
+            term::VNM_TerminalSurface_render_bridge::
+                backend_callback_frame_catchup_cursor_stable_stop_extension_for_testing(
+                    surface));
+        ok &= check(extension.count() == 2,
+            "surface cursor-stable stop extension explicit override wins over env config");
+    }
+
+    return ok;
+}
+
 bool test_surface_epoch_catchup_uses_frame_budget_override(QGuiApplication& app)
 {
     bool ok = true;
@@ -2493,6 +2576,10 @@ bool test_surface_epoch_catchup_uses_frame_budget_override(QGuiApplication& app)
 
     term::VNM_TerminalSurface_render_bridge::
         set_backend_callback_frame_catchup_budget_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
             fixture.surface,
             std::chrono::steady_clock::duration::zero());
 
@@ -2558,6 +2645,281 @@ bool test_surface_epoch_catchup_uses_frame_budget_override(QGuiApplication& app)
     ok &= check(snapshot_after_drain != nullptr &&
         snapshot_contains_text(*snapshot_after_drain, tail_text),
         "surface epoch catch-up budget test publishes tail after full drain");
+
+    return ok;
+}
+
+bool test_surface_cursor_stable_extension_disabled_preserves_incomplete_boundary(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("disabled-boundary-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface disabled cursor-stable boundary test starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    int title_changed_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::terminal_title_changed,
+        &fixture.surface,
+        [&] {
+            ++title_changed_count;
+        });
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("disabled-boundary-baseline")),
+        "surface disabled cursor-stable boundary test publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "surface disabled cursor-stable boundary test captures baseline");
+
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_budget_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?25l"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    const QByteArray title = QByteArrayLiteral("disabled-boundary-title");
+    QByteArray output = cursor_show_boundary_title_slice(title);
+    output += QByteArrayLiteral("\r\ndisabled-boundary-tail");
+    ok &= check(output.startsWith(QByteArrayLiteral("\x1b]2;")) &&
+            output.indexOf(QByteArrayLiteral("\x1b[?25h")) <
+                k_backend_output_drain_slice_contract_bytes,
+        "surface disabled cursor-stable boundary fixture shows the cursor in the first slice");
+    backend_ptr->emit_output(output);
+
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+
+    const term::Terminal_surface_backend_drain_stats_t stats_after_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    ok &= check(
+        stats_after_polish.budget_exhausted_incomplete ==
+            stats_before_polish.budget_exhausted_incomplete + 1U,
+        "surface disabled cursor-stable boundary records the incomplete budget stat");
+    ok &= check(
+        stats_after_polish.cursor_stable_incomplete ==
+            stats_before_polish.cursor_stable_incomplete,
+        "surface disabled cursor-stable boundary records no cursor-stable stat");
+    ok &= check_int_equal(title_changed_count, 0,
+        "surface disabled cursor-stable boundary defers the title notification");
+    ok &= check(term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) > 0U,
+        "surface disabled cursor-stable boundary leaves later output pending");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    ok &= check_int_equal(title_changed_count, 1,
+        "surface disabled cursor-stable boundary delivers the title after the complete drain");
+    ok &= check(fixture.surface.terminal_title() == QString::fromLatin1(title),
+        "surface disabled cursor-stable boundary preserves the deferred title payload");
+
+    return ok;
+}
+
+bool test_surface_synchronized_release_stable_with_extension_disabled_counts_cursor_stable(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    fixture.surface.set_synchronized_output_scroll_policy(
+        VNM_TerminalSurface::Synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("release-stable-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface release-stable stats test starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("release-stable-baseline")),
+        "surface release-stable stats test publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "surface release-stable stats test captures baseline");
+
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_budget_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026h"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    QByteArray output = QByteArrayLiteral("release-stable-frame\x1b[?2026l\x1b[?2026h");
+    output += QByteArray(
+        k_backend_output_drain_slice_contract_bytes - output.size(),
+        'x');
+    output += QByteArrayLiteral("release-stable-tail");
+    ok &= check(output.indexOf(QByteArrayLiteral("\x1b[?2026l")) <
+            k_backend_output_drain_slice_contract_bytes,
+        "surface release-stable stats fixture releases inside the first slice");
+    backend_ptr->emit_output(output);
+
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+
+    const term::Terminal_surface_backend_drain_stats_t stats_after_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot_after_polish =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+
+    ok &= check(
+        stats_after_polish.budget_exhausted_incomplete ==
+            stats_before_polish.budget_exhausted_incomplete,
+        "surface release-stable stats test does not count release-stable as budget-exhausted");
+    ok &= check(
+        stats_after_polish.cursor_stable_incomplete ==
+            stats_before_polish.cursor_stable_incomplete + 1U,
+        "surface release-stable stats test counts release-stable as cursor-stable");
+    ok &= check(
+        stats_after_polish.pending_callback_after_drain ==
+            stats_before_polish.pending_callback_after_drain + 1U,
+        "surface release-stable stats test leaves held tail work pending");
+    ok &= check(snapshot_after_polish != nullptr &&
+        snapshot_contains_text(*snapshot_after_polish, QStringLiteral("release-stable-frame")),
+        "surface release-stable stats test publishes the release frame");
+    ok &= check(snapshot_after_polish != nullptr &&
+        !snapshot_contains_text(*snapshot_after_polish, QStringLiteral("release-stable-tail")),
+        "surface release-stable stats test leaves later held content unpublished");
+
+    return ok;
+}
+
+bool test_surface_synchronized_hold_stop_preserves_drain_stats(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("held-stop-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "surface held stop stats test starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("held-stop-baseline")),
+        "surface held stop stats test publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "surface held stop stats test captures baseline");
+
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_budget_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    QByteArray output = QByteArrayLiteral("\x1b[?2026hheld-stop-a");
+    output += QByteArray(
+        k_backend_output_drain_slice_contract_bytes - output.size(),
+        'x');
+    output += QByteArrayLiteral("held-stop-b");
+    backend_ptr->emit_output(output);
+
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+
+    const term::Terminal_surface_backend_drain_stats_t stats_after_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot_after_polish =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+
+    ok &= check(
+        stats_after_polish.budget_exhausted_incomplete ==
+            stats_before_polish.budget_exhausted_incomplete,
+        "surface held stop stats test does not count HELD as budget-exhausted");
+    ok &= check(
+        stats_after_polish.cursor_stable_incomplete ==
+            stats_before_polish.cursor_stable_incomplete,
+        "surface held stop stats test does not count HELD as cursor-stable");
+    ok &= check(
+        stats_after_polish.pending_callback_after_drain ==
+            stats_before_polish.pending_callback_after_drain + 1U,
+        "surface held stop stats test leaves held callback work pending");
+    ok &= check(snapshot_after_polish != nullptr &&
+        !snapshot_contains_text(*snapshot_after_polish, QStringLiteral("held-stop-a")),
+        "surface held stop stats test keeps held content unpublished");
+    ok &= check(snapshot_after_polish != nullptr &&
+        snapshot_after_polish->metadata.sequence == baseline_snapshot->metadata.sequence,
+        "surface held stop stats test leaves the installed snapshot unchanged");
 
     return ok;
 }
@@ -2629,6 +2991,10 @@ bool test_surface_epoch_catchup_pending_mouse_retry_stays_on_frame_path(
 
     term::VNM_TerminalSurface_render_bridge::
         set_backend_callback_frame_catchup_budget_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
             fixture.surface,
             std::chrono::steady_clock::duration::zero());
 
@@ -14107,6 +14473,10 @@ bool test_after_frame_callback_update_latch_falls_back_on_window_destroy(
         set_backend_callback_frame_catchup_budget_for_benchmark(
             *surface,
             std::chrono::steady_clock::duration::zero());
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
+            *surface,
+            std::chrono::steady_clock::duration::zero());
 
     const QString tail_text = QStringLiteral("after-frame-detach-tail");
     backend_ptr->emit_output(epoch_catchup_budget_probe_payload(tail_text.toUtf8()));
@@ -14777,7 +15147,11 @@ int main(int argc, char** argv)
     ok &= test_surface_backend_drain_metrics_split_stages(app);
     ok &= test_surface_posted_backend_drain_uses_frame_pending_small_budget(app);
     ok &= test_surface_frame_catchup_budget_env_config();
+    ok &= test_surface_frame_catchup_cursor_stable_stop_extension_env_config();
     ok &= test_surface_epoch_catchup_uses_frame_budget_override(app);
+    ok &= test_surface_cursor_stable_extension_disabled_preserves_incomplete_boundary(app);
+    ok &= test_surface_synchronized_release_stable_with_extension_disabled_counts_cursor_stable(app);
+    ok &= test_surface_synchronized_hold_stop_preserves_drain_stats(app);
     ok &= test_surface_epoch_catchup_pending_mouse_retry_stays_on_frame_path(app);
     ok &= test_surface_posted_backend_drain_uses_full_budget_without_frame_work(app);
     ok &= test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(app);

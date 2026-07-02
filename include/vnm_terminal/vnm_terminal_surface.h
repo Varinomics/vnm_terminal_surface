@@ -23,6 +23,8 @@ class QInputMethodEvent;
 namespace vnm_terminal::internal {
 class Terminal_backend;
 class Terminal_session;
+enum class Backend_callback_drain_stop : std::uint8_t;
+struct backend_callback_drain_budgets_t;
 struct Terminal_backend_error;
 struct Terminal_viewport_state;
 struct Terminal_session_notification;
@@ -558,7 +560,9 @@ private:
 
     struct backend_callback_drain_result_t
     {
-        bool drain_complete                = true;
+        // Zero-init reads as Backend_callback_drain_stop::COMPLETE; the
+        // null-session drain path returns a default-constructed result.
+        vnm_terminal::internal::Backend_callback_drain_stop stop{};
         bool deliver_notifications         = true;
         bool callbacks_pending_after_drain = false;
     };
@@ -577,21 +581,25 @@ private:
         bool                   use_budget_notification_boundary,
         std::optional<std::uint64_t>
                                target_backend_callback_epoch = std::nullopt,
+        std::optional<std::chrono::steady_clock::duration>
+                               cursor_stable_stop_extension = std::nullopt,
         Backend_callback_incomplete_follow_up
                                pending_mouse_report_follow_up =
                                    Backend_callback_incomplete_follow_up::POSTED_DRAIN);
     void request_backend_callback_follow_up_after_incomplete_recorded_drain(
         vnm_terminal::internal::Terminal_session*
                                session,
-        bool                   drain_complete,
+        vnm_terminal::internal::Backend_callback_drain_stop
+                               stop,
         Backend_callback_incomplete_follow_up
                                follow_up);
     void drain_backend_callback_events();
     void drain_backend_callback_events(bool budgeted);
     void drain_backend_callback_events_for(std::chrono::steady_clock::duration budget);
     backend_callback_drain_result_t drain_backend_callback_events_until_epoch(
-        std::uint64_t                                     target_epoch,
-        std::optional<std::chrono::steady_clock::duration> budget = std::nullopt);
+        std::uint64_t          target_epoch,
+        vnm_terminal::internal::backend_callback_drain_budgets_t
+                               budgets);
     void drain_backend_callback_events_with_budget(std::optional<std::chrono::steady_clock::duration> budget);
     void drain_backend_callback_events_for_posted_work();
     void queue_backend_callback_drain();
