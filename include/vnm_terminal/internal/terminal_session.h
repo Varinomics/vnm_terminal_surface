@@ -66,6 +66,31 @@ struct Terminal_session_profile_stats
     std::uint64_t              max_retained_snapshot_generation_count = 0U;
 };
 
+enum class Backend_callback_drain_stop : std::uint8_t
+{
+    // COMPLETE must stay enumerator 0: default-constructed drain results are
+    // zero-initialized and must read as a complete drain (the surface's
+    // null-session early path relies on it).
+    COMPLETE = 0,
+    // Stopped early at a settled whole-frame client state: the model's DECTCM
+    // state flipped hidden -> visible across a command/slice boundary
+    // (ConPTY's repaint-complete marker), or a synchronized-output release is
+    // still the drain's latest live-content publication.
+    CURSOR_STABLE,
+    // Stopped early anywhere else: primary budget or extension cap exhausted,
+    // or the drain re-entered while one was already in progress.
+    UNSETTLED,
+    // Stopped while a synchronized-output hold was active with no release
+    // published during this drain; the installed publication is unchanged.
+    HELD,
+};
+
+struct backend_callback_drain_budgets_t
+{
+    std::optional<std::chrono::steady_clock::duration> budget;
+    std::optional<std::chrono::steady_clock::duration> cursor_stable_stop_extension;
+};
+
 class Terminal_session
 {
 public:
@@ -252,12 +277,11 @@ public:
      * path calls this method inline, preserving the synchronous test/backend contract.
      */
     void process_backend_callback_events();
-    bool process_backend_callback_events_for(
+    Backend_callback_drain_stop process_backend_callback_events_for(
         std::chrono::steady_clock::duration     budget);
-    bool process_backend_callback_events_until_epoch(
+    Backend_callback_drain_stop process_backend_callback_events_until_epoch(
         std::uint64_t                           target_epoch,
-        std::optional<std::chrono::steady_clock::duration>
-                                                budget = std::nullopt);
+        backend_callback_drain_budgets_t        budgets = {});
 
 private:
     enum class Queue_category
@@ -301,12 +325,15 @@ private:
         Backend_callback_drain_policy      drain_policy =
             Backend_callback_drain_policy::DRAIN_CALLBACKS);
 
-    bool process_pending_commands(
+    Backend_callback_drain_stop process_pending_commands(
         Backend_callback_drain_policy      drain_policy =
             Backend_callback_drain_policy::DRAIN_CALLBACKS,
         std::optional<std::chrono::steady_clock::time_point>
                                             deadline = std::nullopt,
         std::optional<std::uint64_t>       target_backend_callback_epoch =
+            std::nullopt,
+        std::optional<std::chrono::steady_clock::duration>
+                                            cursor_stable_stop_extension =
             std::nullopt);
 
     Terminal_session_result process_command(
@@ -439,6 +466,11 @@ private:
         Terminal_public_scroll_diagnostics     public_scroll_diagnostics);
 
     void flush_deferred_backend_content_snapshot();
+
+    void record_backend_callback_drain_content_publication(
+        std::uint64_t                          publication_generation,
+        bool                                   synchronized_output_release,
+        bool                                   terminal_content_changed);
 
     bool handle_parser_actions(
         std::uint64_t                          sequence,
@@ -669,6 +701,8 @@ private:
     std::uint64_t                                          m_render_snapshot_generation = 0U;
     std::uint64_t                                          m_render_snapshot_installed_generation = 0U;
     std::uint64_t                                          m_render_snapshot_rendered_generation = 0U;
+    std::optional<std::uint64_t>                           m_drain_synchronized_release_publication_generation;
+    std::optional<std::uint64_t>                           m_drain_latest_live_content_publication_generation;
     std::uint64_t                                          m_next_public_projection_generation = 1U;
     std::shared_ptr<const Terminal_render_snapshot>        m_unrendered_render_snapshot_dirty_basis;
     std::optional<Terminal_synchronized_output_scroll_policy>
