@@ -88,7 +88,9 @@ constexpr std::chrono::milliseconds k_backend_callback_drain_budget{4};
 constexpr std::chrono::milliseconds k_backend_callback_posted_drain_budget{32};
 constexpr std::chrono::milliseconds k_backend_callback_frame_pending_posted_drain_budget =
     k_backend_callback_drain_budget;
-constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget{0};
+constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget_default{0};
+constexpr char k_backend_callback_frame_catchup_budget_env[] =
+    "VNM_TERMINAL_BACKEND_CALLBACK_FRAME_CATCHUP_BUDGET_MS";
 
 #if defined(_WIN32)
 constexpr unsigned int k_win_spi_get_font_smoothing             = 0x004AU;
@@ -119,6 +121,30 @@ std::uint64_t elapsed_ns_count(std::chrono::steady_clock::duration elapsed)
     const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::max(elapsed, std::chrono::steady_clock::duration::zero()));
     return static_cast<std::uint64_t>(elapsed_ns.count());
+}
+
+std::chrono::steady_clock::duration configured_backend_callback_frame_catchup_budget()
+{
+    if (!qEnvironmentVariableIsSet(k_backend_callback_frame_catchup_budget_env)) {
+        return k_backend_callback_frame_catchup_budget_default;
+    }
+
+    bool ok = false;
+    const QString budget_text =
+        qEnvironmentVariable(k_backend_callback_frame_catchup_budget_env);
+    const int budget_ms = budget_text.toInt(&ok);
+    if (!ok || budget_ms < 0) {
+        const QByteArray budget_bytes = budget_text.toLocal8Bit();
+        qWarning(
+            "VNM_TerminalSurface: ignoring invalid %s=%s; using %lldms",
+            k_backend_callback_frame_catchup_budget_env,
+            budget_bytes.constData(),
+            static_cast<long long>(
+                k_backend_callback_frame_catchup_budget_default.count()));
+        return k_backend_callback_frame_catchup_budget_default;
+    }
+
+    return std::chrono::milliseconds{budget_ms};
 }
 
 bool set_terminal_clipboard_text(const QString& text)
@@ -1739,71 +1765,6 @@ struct VNM_TerminalSurface::Private
 {
     using Renderer_lifecycle_recorder = term::Terminal_renderer_lifecycle_recorder;
 
-    struct input_cursor_freshness_t
-    {
-        bool                                      active = false;
-        std::uint64_t                             accepted_input_freshness_token = 0U;
-        std::uint64_t                             satisfying_publication_generation = 0U;
-    };
-
-    void record_accepted_text_input(
-        const term::Terminal_session_result& result)
-    {
-        backend_callback_input_generation.fetch_add(1U, std::memory_order_acq_rel);
-        if (result.accepted_input_freshness_token == 0U) {
-            return;
-        }
-
-        input_cursor_freshness = {};
-        input_cursor_freshness.active = true;
-        input_cursor_freshness.accepted_input_freshness_token =
-            result.accepted_input_freshness_token;
-    }
-
-    bool render_snapshot_strictly_satisfies_text_input(
-        const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot) const
-    {
-        return
-            input_cursor_freshness.active &&
-            snapshot != nullptr           &&
-            snapshot->metadata.satisfied_input_freshness_token >=
-                input_cursor_freshness.accepted_input_freshness_token;
-    }
-
-    bool render_snapshot_allows_text_input_cursor_render_and_drain() const
-    {
-        return input_cursor_freshness.active && render_snapshot != nullptr;
-    }
-
-    void record_text_input_satisfying_publication(
-        const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot)
-    {
-        if (!render_snapshot_strictly_satisfies_text_input(snapshot)) {
-            return;
-        }
-
-        if (input_cursor_freshness.satisfying_publication_generation == 0U ||
-            snapshot->metadata.publication_generation <
-                input_cursor_freshness.satisfying_publication_generation)
-        {
-            input_cursor_freshness.satisfying_publication_generation =
-                snapshot->metadata.publication_generation;
-        }
-    }
-
-    void retire_text_input_freshness_if_rendered(std::uint64_t publication_generation)
-    {
-        if (!input_cursor_freshness.active ||
-            input_cursor_freshness.satisfying_publication_generation == 0U ||
-            publication_generation <
-                input_cursor_freshness.satisfying_publication_generation)
-        {
-            return;
-        }
-
-        input_cursor_freshness = {};
-    }
-
     std::shared_ptr<Renderer_lifecycle_recorder> lifecycle_recorder() const
     {
         if (!renderer_lifecycle_recorder_enabled.load(std::memory_order_acquire)) {
@@ -1949,52 +1910,102 @@ struct VNM_TerminalSurface::Private
         surface.update();
     }
 
-    std::uint64_t current_backend_callback_event_epoch() const
+    bool backend_callback_frame_target_live_visible(
+        const VNM_TerminalSurface& surface) const
     {
-        return backend_callback_event_epoch.load(std::memory_order_acquire);
+        return
+            session != nullptr                                  &&
+            is_live_process_state(session->process_state())     &&
+            surface.window() != nullptr                         &&
+            surface.isVisible();
     }
 
-    void record_backend_callback_frame_boundary(std::uint64_t epoch)
+    void request_backend_callback_frame_update_or_queue_posted_drain(
+        VNM_TerminalSurface& surface)
     {
-        std::uint64_t current =
-            backend_callback_frame_boundary_epoch.load(std::memory_order_acquire);
-        while (current < epoch &&
-            !backend_callback_frame_boundary_epoch.compare_exchange_weak(
-                current,
-                epoch,
-                std::memory_order_acq_rel,
-                std::memory_order_acquire))
-        {
-            // current is updated with the observed value on compare failure.
+        Q_ASSERT(surface.thread() == QThread::currentThread());
+
+        if (session == nullptr || !session->has_pending_backend_callback_events()) {
+            return;
         }
+        if (!backend_callback_frame_target_live_visible(surface)) {
+            surface.queue_backend_callback_drain();
+            return;
+        }
+
+        if (render_update_pending &&
+            render_update_window == surface.window())
+        {
+            queue_backend_callback_frame_update_after_frame(surface);
+            return;
+        }
+
+        request_render_update(surface);
     }
 
-    bool backend_callback_arrived_after_frame_boundary() const
+    void queue_backend_callback_frame_update_on_surface_thread(
+        VNM_TerminalSurface& surface)
     {
-        const std::uint64_t callback_epoch =
-            backend_callback_event_epoch.load(std::memory_order_acquire);
-        const std::uint64_t boundary_epoch =
-            backend_callback_frame_boundary_epoch.load(std::memory_order_acquire);
-        return callback_epoch > boundary_epoch;
-    }
+        if (shutting_down.load()) {
+            return;
+        }
 
-    void queue_backend_callback_drain_after_frame(VNM_TerminalSurface& surface)
-    {
-        const auto drain_deferred_callback =
+        bool expected = false;
+        if (!backend_callback_frame_update_queued.compare_exchange_strong(
+                expected,
+                true))
+        {
+            return;
+        }
+
+        const bool queued = QMetaObject::invokeMethod(
+            &surface,
             [surface_ptr = QPointer<VNM_TerminalSurface>(&surface)] {
-                if (surface_ptr == nullptr ||
-                    surface_ptr->m_private->shutting_down.load())
-                {
+                if (surface_ptr == nullptr) {
                     return;
                 }
 
                 VNM_TerminalSurface& surface = *surface_ptr;
-                surface.drain_backend_callback_events_for_posted_work();
-                if (!surface.m_private->render_update_pending &&
-                    !surface.m_private->atlas_completion_pending &&
-                    surface.m_private->render_snapshot != nullptr)
-                {
-                    surface.m_private->request_render_update(surface);
+                auto& surface_private = *surface.m_private;
+                surface_private.backend_callback_frame_update_queued.store(false);
+                if (!surface_private.shutting_down.load()) {
+                    surface_private.request_backend_callback_frame_update_or_queue_posted_drain(
+                        surface);
+                }
+            },
+            Qt::QueuedConnection);
+        if (!queued) {
+            backend_callback_frame_update_queued.store(false);
+        }
+    }
+
+    void queue_backend_callback_frame_update_after_frame(
+        VNM_TerminalSurface& surface)
+    {
+        if (shutting_down.load()) {
+            return;
+        }
+
+        bool expected = false;
+        if (!backend_callback_frame_update_queued.compare_exchange_strong(
+                expected,
+                true))
+        {
+            return;
+        }
+
+        const auto update_after_frame =
+            [surface_ptr = QPointer<VNM_TerminalSurface>(&surface)] {
+                if (surface_ptr == nullptr) {
+                    return;
+                }
+
+                VNM_TerminalSurface& surface = *surface_ptr;
+                auto& surface_private = *surface.m_private;
+                surface_private.backend_callback_frame_update_queued.store(false);
+                if (!surface_private.shutting_down.load()) {
+                    surface_private.request_backend_callback_frame_update_or_queue_posted_drain(
+                        surface);
                 }
             };
 
@@ -2003,24 +2014,46 @@ struct VNM_TerminalSurface::Private
                 render_window,
                 &QQuickWindow::afterFrameEnd,
                 &surface,
-                drain_deferred_callback,
+                update_after_frame,
                 static_cast<Qt::ConnectionType>(
                     Qt::QueuedConnection | Qt::SingleShotConnection));
             return;
         }
 
-        (void)QMetaObject::invokeMethod(
+        const bool queued = QMetaObject::invokeMethod(
             &surface,
-            drain_deferred_callback,
+            update_after_frame,
             Qt::QueuedConnection);
+        if (!queued) {
+            backend_callback_frame_update_queued.store(false);
+        }
     }
 
-    void defer_render_update_for_backend_callback(VNM_TerminalSurface& surface)
+    void schedule_backend_callback_frame_or_posted_drain(
+        VNM_TerminalSurface& surface)
     {
-        ++render_invalidation_stats.backend_callback_frame_deferrals;
-        reset_render_update_schedule();
-        reset_atlas_completion();
-        queue_backend_callback_drain_after_frame(surface);
+        if (shutting_down.load()) {
+            return;
+        }
+
+        queue_backend_callback_frame_update_on_surface_thread(surface);
+    }
+
+    void cancel_backend_callback_frame_update_or_queue_posted_drain(
+        VNM_TerminalSurface& surface)
+    {
+        if (!backend_callback_frame_update_queued.exchange(false)) {
+            return;
+        }
+
+        if (shutting_down.load() ||
+            session == nullptr   ||
+            !session->has_pending_backend_callback_events())
+        {
+            return;
+        }
+
+        surface.queue_backend_callback_drain();
     }
 
     void reset_render_update_schedule()
@@ -2115,10 +2148,7 @@ struct VNM_TerminalSurface::Private
             report.render_snapshot_sequence >= renderer_stats_snapshot_sequence;
     }
 
-    bool complete_atlas_completion(
-        VNM_TerminalSurface&                 surface,
-        const term::Qsg_atlas_frame_report&  report,
-        bool                                 install_follow_up_publication)
+    void complete_atlas_completion(const term::Qsg_atlas_frame_report& report)
     {
         atlas_completion_pending = false;
         ++render_invalidation_stats.consumed_updates;
@@ -2126,25 +2156,17 @@ struct VNM_TerminalSurface::Private
             report.render_snapshot_sequence;
         render_invalidation_stats.last_rendered_publication_generation =
             report.render_publication_generation;
-        bool follow_up_publication_ready = false;
         if (session != nullptr) {
-            follow_up_publication_ready = session->mark_render_publication_rendered(
+            session->mark_render_publication_rendered(
                 report.render_publication_generation);
         }
-        if (follow_up_publication_ready && install_follow_up_publication) {
-            surface.sync_from_session(false);
-        }
-        retire_text_input_freshness_if_rendered(report.render_publication_generation);
-        return follow_up_publication_ready;
     }
 
-    bool reconcile_atlas_completion(
-        VNM_TerminalSurface&  surface,
-        bool                  install_follow_up_publication = true)
+    void reconcile_atlas_completion()
     {
         if (!atlas_completion_pending || qsg_atlas_recorder == nullptr) {
             if (!atlas_completion_complete_for_testing) {
-                return false;
+                return;
             }
         }
 
@@ -2157,30 +2179,25 @@ struct VNM_TerminalSurface::Private
                 atlas_completion_report_generation_for_testing;
             synthetic_report.drew = atlas_completion_report_drew_for_testing;
             if (!atlas_report_completes_pending_update(synthetic_report)) {
-                return false;
+                return;
             }
             atlas_completion_complete_for_testing = false;
-            return complete_atlas_completion(
-                surface,
-                synthetic_report,
-                install_follow_up_publication);
+            complete_atlas_completion(synthetic_report);
+            return;
         }
 
         const term::Qsg_atlas_frame_report atlas_report =
             qsg_atlas_recorder->snapshot();
         if (!atlas_report_completes_pending_update(atlas_report)) {
-            return false;
+            return;
         }
 
-        return complete_atlas_completion(
-            surface,
-            atlas_report,
-            install_follow_up_publication);
+        complete_atlas_completion(atlas_report);
     }
 
-    term::terminal_renderer_stats_t current_renderer_stats(VNM_TerminalSurface& surface)
+    term::terminal_renderer_stats_t current_renderer_stats()
     {
-        reconcile_atlas_completion(surface);
+        reconcile_atlas_completion();
         term::terminal_renderer_stats_t stats = renderer_stats_publisher.snapshot();
         if (qsg_atlas_recorder == nullptr) {
             stats.paint_completed = false;
@@ -2193,41 +2210,22 @@ struct VNM_TerminalSurface::Private
         return stats;
     }
 
-    term::Terminal_surface_render_invalidation_stats_t current_invalidation_stats(
-        VNM_TerminalSurface& surface)
+    term::Terminal_surface_render_invalidation_stats_t current_invalidation_stats()
     {
-        reconcile_atlas_completion(surface);
+        reconcile_atlas_completion();
         term::Terminal_surface_render_invalidation_stats_t stats = render_invalidation_stats;
-        stats.backend_callback_event_epoch =
-            backend_callback_event_epoch.load(std::memory_order_acquire);
-        stats.backend_callback_frame_boundary_epoch =
-            backend_callback_frame_boundary_epoch.load(std::memory_order_acquire);
         stats.render_snapshot_callback_epoch =
             render_snapshot != nullptr
                 ? render_snapshot->metadata.processed_backend_callback_epoch
                 : 0U;
-        stats.input_freshness_active =
-            input_cursor_freshness.active;
-        stats.accepted_input_freshness_token =
-            input_cursor_freshness.accepted_input_freshness_token;
-        stats.strict_satisfied_input_freshness_token =
-            render_snapshot != nullptr
-                ? render_snapshot->metadata.satisfied_input_freshness_token
-                : 0U;
-        stats.pending_update = frame_work_pending(surface);
+        stats.pending_update = frame_work_pending();
         return stats;
     }
 
-    bool frame_work_pending(
-        VNM_TerminalSurface&  surface,
-        bool                  install_follow_up_publication = true)
+    bool frame_work_pending()
     {
-        const bool follow_up_publication_ready =
-            reconcile_atlas_completion(surface, install_follow_up_publication);
-        return
-            render_update_pending ||
-            atlas_completion_pending ||
-            (!install_follow_up_publication && follow_up_publication_ready);
+        reconcile_atlas_completion();
+        return render_update_pending || atlas_completion_pending;
     }
 
     QRectF input_method_cursor_rectangle(const VNM_TerminalSurface& surface) const
@@ -2423,8 +2421,10 @@ struct VNM_TerminalSurface::Private
     }
 
     bool retry_pending_published_mouse_reports(
-        VNM_TerminalSurface& surface,
-        bool                 drain_once)
+        VNM_TerminalSurface&                   surface,
+        bool                                   drain_once,
+        Backend_callback_incomplete_follow_up  follow_up =
+            Backend_callback_incomplete_follow_up::POSTED_DRAIN)
     {
         if (retrying_pending_published_mouse_reports) {
             return pending_published_mouse_reports.empty();
@@ -2452,7 +2452,13 @@ struct VNM_TerminalSurface::Private
                     continue;
                 }
 
-                surface.queue_backend_callback_drain();
+                if (follow_up == Backend_callback_incomplete_follow_up::FRAME_UPDATE) {
+                    request_backend_callback_frame_update_or_queue_posted_drain(
+                        surface);
+                }
+                else {
+                    surface.queue_backend_callback_drain();
+                }
                 retrying_pending_published_mouse_reports = false;
                 return false;
             }
@@ -2560,7 +2566,7 @@ struct VNM_TerminalSurface::Private
     std::chrono::steady_clock::duration backend_callback_frame_catchup_budget() const
     {
         return backend_callback_frame_catchup_budget_override.value_or(
-            k_backend_callback_frame_catchup_budget);
+            configured_backend_callback_frame_catchup_budget());
     }
 
     term::Qt_grid_metrics_provider                         grid_metrics_provider;
@@ -2587,17 +2593,11 @@ struct VNM_TerminalSurface::Private
 
     term::Terminal_surface_render_invalidation_stats_t     render_invalidation_stats;
     term::Terminal_surface_backend_drain_stats_t           backend_drain_stats;
-    std::atomic<std::uint64_t>                             backend_callback_event_epoch{0U};
-    std::atomic<std::uint64_t>                             backend_callback_enqueue_epoch_at_event{0U};
-    std::atomic<std::uint64_t>                             backend_callback_frame_boundary_epoch{0U};
-    std::atomic<std::uint64_t>                             backend_callback_input_generation{0U};
-    input_cursor_freshness_t                               input_cursor_freshness;
     std::optional<std::chrono::steady_clock::duration>     backend_callback_frame_catchup_budget_override;
     int                                                    pending_published_mouse_report_block_count_for_testing = 0;
-    std::uint64_t                                          backend_callback_frame_deferral_input_generation = 0U;
-    std::uint64_t                                          backend_callback_frame_deferral_target_epoch = 0U;
-    std::function<void()>                                  before_session_key_input_for_testing;
     bool                                                   render_update_pending              = false;
+    std::atomic_bool                                       backend_callback_frame_update_queued =
+                                                           false;
     bool                                                   render_node_release_pending        = false;
     bool                                                   render_node_release_requeue_update = false;
     bool                                                   atlas_completion_pending           = false;
@@ -3671,7 +3671,7 @@ bool VNM_TerminalSurface::paste_text(QString text)
     }
 
     if (text_input && is_accepted(paste_result.result.code)) {
-        sync_after_user_input(paste_result.result);
+        sync_from_session();
     }
     else {
         sync_from_session();
@@ -4082,6 +4082,10 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
             m_private->render_node_release_requeue_update = false;
             m_private->reset_render_update_schedule();
         }
+        if (value.window == nullptr) {
+            m_private->cancel_backend_callback_frame_update_or_queue_posted_drain(
+                *this);
+        }
         bind_window_signals(value.window);
         refresh_grid_metrics();
     }
@@ -4180,9 +4184,6 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             event->ignore();
             return;
         }
-        if (m_private->before_session_key_input_for_testing) {
-            m_private->before_session_key_input_for_testing();
-        }
         const term::Terminal_key_event_result key_result =
             m_private->session->write_key_event(*event);
         if (!key_result.handled) {
@@ -4192,7 +4193,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
 
         event->accept();
         if (text_input_key && is_accepted(key_result.result.code)) {
-            sync_after_user_input(key_result.result);
+            sync_from_session();
         }
         else {
             sync_from_session();
@@ -6043,7 +6044,7 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
             text_input_can_advance_cursor(commit_text) &&
             is_accepted(commit_result->result.code))
         {
-            sync_after_user_input(commit_result->result);
+            sync_from_session();
         }
         else {
             sync_from_session();
@@ -6258,6 +6259,8 @@ void VNM_TerminalSurface::handle_scene_graph_invalidated(
     }
     if (window_binding_generation == m_private->window_binding_generation) {
         m_private->reset_render_update_schedule();
+        m_private->cancel_backend_callback_frame_update_or_queue_posted_drain(
+            *this);
     }
 }
 
@@ -6327,7 +6330,6 @@ bool VNM_TerminalSurface::start_process_with_backend(
     set_backend_ready(false);
     set_backend_geometry_in_sync(false);
     m_private->render_snapshot.reset();
-    m_private->input_cursor_freshness = {};
     m_private->set_ime_preedit_state(*this, {});
     m_private->last_installed_render_publication_generation = 0U;
     m_private->last_ime_preedit_generation        = 0U;
@@ -6379,14 +6381,8 @@ bool VNM_TerminalSurface::start_process_with_backend(
         m_audible_bell_policy == Bell_policy::ENABLED;
     session_config.bell_policy.visual_enabled =
         m_visual_bell_policy == Bell_policy::ENABLED;
-    session_config.backend_event_epoch_notifier = [this](std::uint64_t backend_callback_epoch) {
-        m_private->backend_callback_enqueue_epoch_at_event.store(
-            backend_callback_epoch,
-            std::memory_order_release);
-        m_private->backend_callback_event_epoch.fetch_add(
-            1U,
-            std::memory_order_acq_rel);
-        queue_backend_callback_drain();
+    session_config.backend_event_epoch_notifier = [this](std::uint64_t) {
+        m_private->schedule_backend_callback_frame_or_posted_drain(*this);
     };
 
     m_private->session =
@@ -6457,7 +6453,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_for_posted_work()
 {
     auto& drain_stats = m_private->backend_drain_stats;
     ++drain_stats.posted_drain_calls;
-    if (m_private->frame_work_pending(*this, false)) {
+    if (m_private->frame_work_pending()) {
         ++drain_stats.posted_frame_pending_small_budget_calls;
         drain_backend_callback_events_for(k_backend_callback_frame_pending_posted_drain_budget);
         return;
@@ -6465,38 +6461,6 @@ void VNM_TerminalSurface::drain_backend_callback_events_for_posted_work()
 
     ++drain_stats.posted_full_budget_calls;
     drain_backend_callback_events_for(k_backend_callback_posted_drain_budget);
-}
-
-void VNM_TerminalSurface::sync_after_user_input(
-    const term::Terminal_session_result& result)
-{
-    Q_ASSERT(thread() == QThread::currentThread());
-
-    if (m_private->session == nullptr) {
-        return;
-    }
-
-    term::Terminal_session* const session = m_private->session.get();
-    if (!is_accepted(result.code)) {
-        sync_from_session();
-        return;
-    }
-
-    m_private->record_accepted_text_input(result);
-
-    if (m_private->input_cursor_freshness.active &&
-        m_private->render_update_pending &&
-        session->has_pending_backend_callback_events())
-    {
-        // Take only already-queued echo/output here. Later callbacks are
-        // handled by the pre-sync frame-boundary gate without waiting.
-        drain_backend_callback_events_until_epoch(
-            session->backend_callback_enqueue_epoch(),
-            m_private->backend_callback_frame_catchup_budget());
-        return;
-    }
-
-    sync_from_session();
 }
 
 void VNM_TerminalSurface::drain_backend_callback_events(bool budgeted)
@@ -6523,12 +6487,18 @@ VNM_TerminalSurface::drain_backend_callback_events_until_epoch(
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
+    const Backend_callback_incomplete_follow_up incomplete_follow_up =
+        budget.has_value()
+            ? Backend_callback_incomplete_follow_up::FRAME_UPDATE
+            : Backend_callback_incomplete_follow_up::POSTED_DRAIN;
+
     if (m_private->session == nullptr) {
         return process_backend_callback_events_recorded(
             nullptr,
             budget,
             true,
-            target_epoch);
+            target_epoch,
+            incomplete_follow_up);
     }
 
     term::Terminal_session* const session = m_private->session.get();
@@ -6537,11 +6507,13 @@ VNM_TerminalSurface::drain_backend_callback_events_until_epoch(
             session,
             budget,
             true,
-            target_epoch);
+            target_epoch,
+            incomplete_follow_up);
     if (budget.has_value()) {
-        queue_backend_callback_drain_after_incomplete_recorded_drain(
+        request_backend_callback_follow_up_after_incomplete_recorded_drain(
             session,
-            drain_result.drain_complete);
+            drain_result.drain_complete,
+            incomplete_follow_up);
     }
     return drain_result;
 }
@@ -6551,12 +6523,13 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     term::Terminal_session*                                  session,
     std::optional<std::chrono::steady_clock::duration>       budget,
     bool                                                     use_budget_notification_boundary,
-    std::optional<std::uint64_t>                             target_backend_callback_epoch)
+    std::optional<std::uint64_t>                             target_backend_callback_epoch,
+    Backend_callback_incomplete_follow_up                    pending_mouse_report_follow_up)
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
     const auto drain_started = std::chrono::steady_clock::now();
-    m_private->reconcile_atlas_completion(*this);
+    m_private->reconcile_atlas_completion();
     const bool render_update_pending_before_drain = m_private->render_update_pending;
     const bool atlas_completion_pending_before_drain = m_private->atlas_completion_pending;
     const bool frame_work_pending_before_drain =
@@ -6641,13 +6614,8 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         sync_started);
 
     const bool session_still_active = m_private->session.get() == session;
-    const std::uint64_t drained_boundary_epoch =
-        m_private->current_backend_callback_event_epoch();
     result.callbacks_pending_after_drain =
         session_still_active && session->has_pending_backend_callback_events();
-    if (session_still_active && !result.callbacks_pending_after_drain) {
-        m_private->record_backend_callback_frame_boundary(drained_boundary_epoch);
-    }
     if (budget.has_value() && !result.drain_complete) {
         ++drain_stats.budget_exhausted_incomplete;
     }
@@ -6659,20 +6627,31 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     }
     record_total_elapsed();
     if (session_still_active) {
-        (void)m_private->retry_pending_published_mouse_reports(*this, false);
+        (void)m_private->retry_pending_published_mouse_reports(
+            *this,
+            false,
+            pending_mouse_report_follow_up);
     }
     return result;
 }
 
-void VNM_TerminalSurface::queue_backend_callback_drain_after_incomplete_recorded_drain(
-    term::Terminal_session*  session,
-    bool                    drain_complete)
+void VNM_TerminalSurface::
+request_backend_callback_follow_up_after_incomplete_recorded_drain(
+    term::Terminal_session*                         session,
+    bool                                           drain_complete,
+    Backend_callback_incomplete_follow_up          follow_up)
 {
     if (!drain_complete &&
         session != nullptr &&
         m_private->session.get() == session &&
         session->has_pending_backend_callback_events())
     {
+        if (follow_up == Backend_callback_incomplete_follow_up::FRAME_UPDATE) {
+            m_private->request_backend_callback_frame_update_or_queue_posted_drain(
+                *this);
+            return;
+        }
+
         ++m_private->backend_drain_stats.requeue_count;
         queue_backend_callback_drain();
     }
@@ -6719,9 +6698,10 @@ void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
                 .arg(selection_trace_source_identity(after_source)));
     }
     if (budget.has_value()) {
-        queue_backend_callback_drain_after_incomplete_recorded_drain(
+        request_backend_callback_follow_up_after_incomplete_recorded_drain(
             session,
-            drain_result.drain_complete);
+            drain_result.drain_complete,
+            Backend_callback_incomplete_follow_up::POSTED_DRAIN);
     }
 }
 
@@ -6906,9 +6886,10 @@ void VNM_TerminalSurface::handle_synchronized_output_recovery_timeout(
     }
 
     const auto queue_remaining_callbacks = [&] {
-        queue_backend_callback_drain_after_incomplete_recorded_drain(
+        request_backend_callback_follow_up_after_incomplete_recorded_drain(
             session,
-            drain_result.drain_complete);
+            drain_result.drain_complete,
+            Backend_callback_incomplete_follow_up::POSTED_DRAIN);
     };
 
     if (!session->render_publication_blocked()) {
@@ -7041,11 +7022,7 @@ void VNM_TerminalSurface::reset_session()
     m_private->session.reset();
     m_private->transcript_recorder.reset();
     m_private->session_drain_queued.store(false);
-    m_private->backend_callback_enqueue_epoch_at_event.store(0U);
-    m_private->backend_callback_input_generation.store(0U);
-    m_private->backend_callback_frame_deferral_input_generation = 0U;
-    m_private->backend_callback_frame_deferral_target_epoch     = 0U;
-    m_private->input_cursor_freshness = {};
+    m_private->backend_callback_frame_update_queued.store(false);
     m_private->reset_atlas_completion();
     m_private->clear_mouse_reporting_state();
     m_private->clear_selection_drag_state();
@@ -7080,11 +7057,16 @@ void VNM_TerminalSurface::updatePolish()
     if (m_private->session == nullptr || m_private->shutting_down.load()) {
         return;
     }
-    const std::uint64_t frame_boundary_epoch =
-        m_private->current_backend_callback_event_epoch();
     term::Terminal_session* const session = m_private->session.get();
     if (!session->has_pending_backend_callback_events()) {
-        m_private->record_backend_callback_frame_boundary(frame_boundary_epoch);
+        if (session->render_snapshot_generation() !=
+            m_private->last_installed_render_publication_generation)
+        {
+            sync_from_session();
+            if (m_private->session.get() != session) {
+                return;
+            }
+        }
         return;
     }
 
@@ -7093,10 +7075,7 @@ void VNM_TerminalSurface::updatePolish()
         (void)drain_backend_callback_events_until_epoch(
             target_epoch,
             m_private->backend_callback_frame_catchup_budget());
-        return;
     }
-
-    m_private->record_backend_callback_frame_boundary(frame_boundary_epoch);
 }
 
 QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*)
@@ -7167,57 +7146,8 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
                 std::make_shared<term::Qsg_atlas_recorder>();
         }
 
-        // GUI-thread polish is the last safe drain point before QSG capture.
-        // A later backend callback makes this frame stale by construction.
-        const std::uint64_t input_generation =
-            m_private->backend_callback_input_generation.load(std::memory_order_acquire);
-        if (m_private->backend_callback_frame_deferral_input_generation !=
-            input_generation)
-        {
-            m_private->backend_callback_frame_deferral_input_generation =
-                input_generation;
-            m_private->backend_callback_frame_deferral_target_epoch = 0U;
-        }
-
-        if (m_private->backend_callback_arrived_after_frame_boundary()) {
-            if (m_private->backend_callback_frame_deferral_target_epoch == 0U) {
-                m_private->backend_callback_frame_deferral_target_epoch =
-                    m_private->backend_callback_enqueue_epoch_at_event.load(
-                        std::memory_order_acquire);
-            }
-
-            const std::uint64_t target_backend_callback_epoch =
-                m_private->backend_callback_frame_deferral_target_epoch;
-            const bool target_snapshot_caught_up =
-                target_backend_callback_epoch == 0U ||
-                (m_private->render_snapshot != nullptr &&
-                    m_private->render_snapshot->metadata.processed_backend_callback_epoch >=
-                        target_backend_callback_epoch);
-            if (!target_snapshot_caught_up) {
-                if (m_private->render_snapshot_allows_text_input_cursor_render_and_drain()) {
-                    m_private->queue_backend_callback_drain_after_frame(*this);
-                }
-                else
-                {
-                    m_private->defer_render_update_for_backend_callback(*this);
-                    return old_node;
-                }
-            }
-            else
-            {
-                // Once the target callback that opened this deferral burst is
-                // visible in the snapshot, newer after-boundary output is left
-                // for the next drain/frame instead of starving an already-fresh
-                // input.
-                m_private->backend_callback_frame_deferral_target_epoch = 0U;
-            }
-        }
-        else
-        {
-            m_private->backend_callback_frame_deferral_target_epoch = 0U;
-        }
-
         term::Terminal_render_options options = render_options_for_surface(*this);
+
         term::Captured_atlas_frame captured_frame =
             term::capture_qsg_atlas_frame(
                 m_private->render_snapshot,
@@ -7272,7 +7202,6 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             m_private->reset_render_update_schedule();
             m_private->reset_atlas_completion();
         }
-        m_private->backend_callback_frame_deferral_target_epoch = 0U;
         return updated_node;
     };
 
@@ -7295,8 +7224,6 @@ void term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.m_private->render_snapshot = std::move(snapshot);
-    surface.m_private->record_text_input_satisfying_publication(
-        surface.m_private->render_snapshot);
     surface.updateInputMethod(Qt::ImCursorRectangle);
     surface.m_private->request_render_update(surface);
 }
@@ -7480,12 +7407,12 @@ void term::VNM_TerminalSurface_render_bridge::set_backend_callback_frame_catchup
         std::max(budget, zero);
 }
 
-void term::VNM_TerminalSurface_render_bridge::set_before_session_key_input_hook_for_testing(
-    VNM_TerminalSurface&   surface,
-    std::function<void()>  hook)
+std::chrono::steady_clock::duration
+term::VNM_TerminalSurface_render_bridge::backend_callback_frame_catchup_budget_for_testing(
+    const VNM_TerminalSurface& surface)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    surface.m_private->before_session_key_input_for_testing = std::move(hook);
+    return surface.m_private->backend_callback_frame_catchup_budget();
 }
 
 void term::VNM_TerminalSurface_render_bridge::
@@ -7541,8 +7468,7 @@ term::VNM_TerminalSurface_render_bridge::invalidation_stats(
     const VNM_TerminalSurface& surface)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    VNM_TerminalSurface& mutable_surface = const_cast<VNM_TerminalSurface&>(surface);
-    return mutable_surface.m_private->current_invalidation_stats(mutable_surface);
+    return surface.m_private->current_invalidation_stats();
 }
 
 std::uint64_t
@@ -7615,8 +7541,7 @@ term::VNM_TerminalSurface_render_bridge::last_renderer_stats(
     const VNM_TerminalSurface& surface)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    VNM_TerminalSurface& mutable_surface = const_cast<VNM_TerminalSurface&>(surface);
-    return mutable_surface.m_private->current_renderer_stats(mutable_surface);
+    return surface.m_private->current_renderer_stats();
 }
 
 term::terminal_renderer_cumulative_stats_t

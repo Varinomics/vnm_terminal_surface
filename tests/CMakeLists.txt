@@ -1119,23 +1119,6 @@ set_tests_properties(vnm_terminal_surface_host PROPERTIES
     TIMEOUT "${vnm_terminal_surface_host_timeout}"
 )
 
-add_test(
-    NAME vnm_terminal_surface_input_echo_timing_repro
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        ${vnm_terminal_qt_offscreen_environment}
-        ${vnm_terminal_qt_unscaled_environment}
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_surface_host>"
-        "--input-echo-timing-repro"
-        "--expect-cursor-visible"
-)
-
-set_tests_properties(vnm_terminal_surface_input_echo_timing_repro PROPERTIES
-    LABELS "conformance;input;render;timing;repro"
-    TIMEOUT 30
-)
-
 add_executable(vnm_terminal_input_encoder
     input_encoder/input_encoder_tests.cpp
 )

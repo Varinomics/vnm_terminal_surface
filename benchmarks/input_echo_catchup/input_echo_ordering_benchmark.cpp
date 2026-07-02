@@ -89,12 +89,9 @@ struct Ordering_sample
     std::uint64_t second_capture_count           = 0U;
     std::uint64_t first_captured_snapshot        = 0U;
     std::uint64_t second_captured_snapshot       = 0U;
-    std::uint64_t frame_deferrals_before_capture = 0U;
-    std::uint64_t frame_deferrals_after_capture  = 0U;
 
     bool input_accepted                   = false;
     bool echo_visible_at_polish           = false;
-    bool callback_queued_after_polish     = false;
     bool first_capture_contains_echo      = false;
     bool first_capture_used_pre_echo      = false;
     bool second_capture_contains_echo     = false;
@@ -406,6 +403,7 @@ bool complete_after_callback_delivery(
     Ordering_sample*       sample)
 {
     for (int i = 0; i < 20; ++i) {
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(surface);
         pump_events(app, 1);
         if (snapshot_sequence_contains_echo(surface, &sample->echo_snapshot_sequence)) {
             sample->callback_deliver_epoch = recorder.mark();
@@ -425,10 +423,6 @@ bool capture_first_frame(
 {
     const term::Qsg_atlas_frame_report before =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
-    const term::Terminal_surface_render_invalidation_stats_t invalidation_before =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    sample->frame_deferrals_before_capture =
-        invalidation_before.backend_callback_frame_deferrals;
 
     const std::optional<term::Qsg_atlas_frame_report> report =
         capture_next_surface_frame(app, fixture.window, fixture.surface, before.capture_count);
@@ -436,11 +430,6 @@ bool capture_first_frame(
         *out_error = QStringLiteral("first frame was not captured");
         return false;
     }
-
-    const term::Terminal_surface_render_invalidation_stats_t invalidation_after =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    sample->frame_deferrals_after_capture =
-        invalidation_after.backend_callback_frame_deferrals;
 
     if (sample->echo_snapshot_sequence == 0U &&
         snapshot_sequence_contains_echo(fixture.surface, &sample->echo_snapshot_sequence))
@@ -514,8 +503,6 @@ void simulate_polish(
         }
     }
 
-    sample->callback_queued_after_polish =
-        term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(surface);
 }
 
 bool run_case(
@@ -590,6 +577,11 @@ bool run_case(
             *out_error = QStringLiteral("echo callback was not delivered after sync injection");
             return false;
         }
+        if (!sample->first_capture_contains_echo &&
+            !capture_second_frame(app, fixture, recorder, sample, out_error))
+        {
+            return false;
+        }
     }
     else {
         if (!capture_first_frame(app, fixture, recorder, sample, out_error)) {
@@ -625,10 +617,12 @@ bool run_case(
         sample->passed =
             sample->polish_complete_epoch     <  sample->qsg_sync_epoch &&
             sample->qsg_sync_epoch            <  sample->callback_enqueue_epoch &&
-            sample->frame_deferrals_after_capture >
-                sample->frame_deferrals_before_capture                  &&
-            sample->first_capture_contains_echo                         &&
-            !sample->first_capture_used_pre_echo;
+            sample->callback_enqueue_epoch    <  sample->callback_deliver_epoch &&
+            sample->echo_snapshot_sequence != 0U                         &&
+            (sample->first_capture_contains_echo
+                ? !sample->first_capture_used_pre_echo
+                : sample->second_capture_contains_echo &&
+                    sample->second_capture_used_echo_snapshot);
     }
     else
     if (stage == Injection_stage::AFTER_CAPTURE) {
@@ -735,19 +729,8 @@ QJsonObject sample_json(const Ordering_sample& sample)
         object,
         QStringLiteral("second_captured_snapshot"),
         sample.second_captured_snapshot);
-    insert_u64(
-        object,
-        QStringLiteral("frame_deferrals_before_capture"),
-        sample.frame_deferrals_before_capture);
-    insert_u64(
-        object,
-        QStringLiteral("frame_deferrals_after_capture"),
-        sample.frame_deferrals_after_capture);
     object.insert(QStringLiteral("input_accepted"), sample.input_accepted);
     object.insert(QStringLiteral("echo_visible_at_polish"), sample.echo_visible_at_polish);
-    object.insert(
-        QStringLiteral("callback_queued_after_polish"),
-        sample.callback_queued_after_polish);
     object.insert(
         QStringLiteral("first_capture_contains_echo"),
         sample.first_capture_contains_echo);
@@ -777,7 +760,7 @@ QJsonObject build_root_json(const std::vector<Ordering_sample>& samples)
     criteria.insert(
         QStringLiteral("after_polish_before_sync"),
         QStringLiteral("polish_complete_epoch < qsg_sync_epoch < callback_enqueue_epoch, "
-                       "frame_deferrals increases, and first captured snapshot is not pre-echo"));
+                       "and the first or follow-up capture uses the echo snapshot"));
     criteria.insert(
         QStringLiteral("after_capture"),
         QStringLiteral("callback_enqueue_epoch follows first_capture_epoch; first capture may be "

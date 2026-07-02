@@ -1001,18 +1001,6 @@ void append_render_invalidation_metrics_json(
     insert_json_counter(out, "consumed_updates", stats.consumed_updates);
     insert_json_counter(
         out,
-        "backend_callback_frame_deferrals",
-        stats.backend_callback_frame_deferrals);
-    insert_json_counter(
-        out,
-        "backend_callback_event_epoch",
-        stats.backend_callback_event_epoch);
-    insert_json_counter(
-        out,
-        "backend_callback_frame_boundary_epoch",
-        stats.backend_callback_frame_boundary_epoch);
-    insert_json_counter(
-        out,
         "render_snapshot_callback_epoch",
         stats.render_snapshot_callback_epoch);
     insert_json_counter(

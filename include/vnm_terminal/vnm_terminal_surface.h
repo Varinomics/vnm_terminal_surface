@@ -7,6 +7,7 @@
 #include <QStringList>
 #include <QVariant>
 #include <chrono>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -562,6 +563,12 @@ private:
         bool callbacks_pending_after_drain = false;
     };
 
+    enum class Backend_callback_incomplete_follow_up
+    {
+        POSTED_DRAIN,
+        FRAME_UPDATE,
+    };
+
     backend_callback_drain_result_t process_backend_callback_events_recorded(
         vnm_terminal::internal::Terminal_session*
                                session,
@@ -569,11 +576,16 @@ private:
                                budget,
         bool                   use_budget_notification_boundary,
         std::optional<std::uint64_t>
-                               target_backend_callback_epoch = std::nullopt);
-    void queue_backend_callback_drain_after_incomplete_recorded_drain(
+                               target_backend_callback_epoch = std::nullopt,
+        Backend_callback_incomplete_follow_up
+                               pending_mouse_report_follow_up =
+                                   Backend_callback_incomplete_follow_up::POSTED_DRAIN);
+    void request_backend_callback_follow_up_after_incomplete_recorded_drain(
         vnm_terminal::internal::Terminal_session*
                                session,
-        bool                   drain_complete);
+        bool                   drain_complete,
+        Backend_callback_incomplete_follow_up
+                               follow_up);
     void drain_backend_callback_events();
     void drain_backend_callback_events(bool budgeted);
     void drain_backend_callback_events_for(std::chrono::steady_clock::duration budget);
@@ -584,9 +596,6 @@ private:
     void drain_backend_callback_events_for_posted_work();
     void queue_backend_callback_drain();
     void refresh_active_session_geometry();
-    void sync_after_user_input(
-        const vnm_terminal::internal::Terminal_session_result&
-                               result);
     void sync_from_session(bool deliver_notifications = true);
     void sync_synchronized_output_recovery_timer();
     void handle_synchronized_output_recovery_timeout();
