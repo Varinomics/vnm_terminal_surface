@@ -12,7 +12,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <memory>
 
 class VNM_TerminalSurface;
@@ -25,16 +24,9 @@ struct Terminal_surface_render_invalidation_stats_t
     std::uint64_t                           scheduled_updates                     = 0U;
     std::uint64_t                           coalesced_requests                    = 0U;
     std::uint64_t                           consumed_updates                      = 0U;
-    std::uint64_t                           backend_callback_frame_deferrals     = 0U;
-    std::uint64_t                           backend_callback_event_epoch          = 0U;
-    std::uint64_t                           backend_callback_frame_boundary_epoch = 0U;
     std::uint64_t                           render_snapshot_callback_epoch        = 0U;
     std::uint64_t                           last_rendered_snapshot_sequence       = 0U;
     std::uint64_t                           last_rendered_publication_generation  = 0U;
-    std::uint64_t                           accepted_input_freshness_token        = 0U;
-    std::uint64_t                           strict_satisfied_input_freshness_token =
-        0U;
-    bool                                    input_freshness_active                = false;
     bool                                    pending_update                        = false;
 };
 
@@ -153,9 +145,8 @@ public:
         VNM_TerminalSurface&                    surface,
         std::chrono::steady_clock::duration     budget);
 
-    static void set_before_session_key_input_hook_for_testing(
-        VNM_TerminalSurface&       surface,
-        std::function<void()>      hook);
+    static std::chrono::steady_clock::duration backend_callback_frame_catchup_budget_for_testing(
+        const VNM_TerminalSurface& surface);
 
     static void set_pending_published_mouse_report_block_count_for_testing(
         VNM_TerminalSurface&       surface,

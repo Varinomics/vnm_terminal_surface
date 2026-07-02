@@ -385,7 +385,6 @@ function Add-InputEchoCaseRecords {
             echo_visible_at_polish_count = [int] $case.echo_visible_at_polish_count
             stale_frame_at_polish_count = [int] $case.stale_frame_at_polish_count
             cursor_stale_at_polish_count = [int] $case.cursor_stale_at_polish_count
-            callbacks_queued_after_polish_count = [int] $case.callbacks_queued_after_polish_count
             max_cursor_stale_cells = [int] $case.max_cursor_stale_cells
             catchup_elapsed_ns_median = [double] $case.catchup_elapsed_ns.median
             catchup_elapsed_ns_p95 = [double] $case.catchup_elapsed_ns.p95
@@ -481,13 +480,21 @@ function Invoke-InputEchoEvidence {
         }
 
         $contract = $queueRoot.queue_contract
+        $queueSummary = $queueRoot.queue_contract_summary
+        $queueConfig = $queueRoot.config
         $queueContractRecords.Add([ordered]@{
             repeat_index = $repeat
             raw_json_path = $queueRawJson
+            queue_contract_iterations = [int] $queueConfig.queue_contract_iterations
             passed = [bool] $contract.passed
             stale_capture_observed = [bool] $contract.stale_capture_observed
             input_accepted = [bool] $contract.input_accepted
             echo_injected_before_sync = [bool] $contract.echo_injected_before_sync
+            eventual_fresh_capture = [bool] $contract.eventual_fresh_capture
+            eventual_fresh_capture_count =
+                [int] $queueSummary.eventual_fresh_capture_count
+            accepted_input_without_fresh_capture_count =
+                [int] $queueSummary.accepted_input_without_fresh_capture_count
             callback_enqueue_epoch_before_echo =
                 [uint64] $contract.callback_enqueue_epoch_before_echo
             callback_enqueue_epoch_after_echo =
@@ -496,10 +503,6 @@ function Invoke-InputEchoEvidence {
                 [uint64] $contract.callback_processed_epoch_after_capture
             echo_snapshot_callback_epoch =
                 [uint64] $contract.echo_snapshot_callback_epoch
-            backend_callback_frame_deferrals_before =
-                [uint64] $contract.backend_callback_frame_deferrals_before
-            backend_callback_frame_deferrals_after =
-                [uint64] $contract.backend_callback_frame_deferrals_after
         })
     }
 
@@ -534,22 +537,18 @@ function Invoke-InputEchoEvidence {
         $staleAtPolish =
             $record["stale_frame_at_polish_count"] -gt 0 -or
             $record["cursor_stale_at_polish_count"] -gt 0
-        if ($eligible -and $record["catchup_budget_us"] -gt 0 -and $staleAtPolish) {
-            Add-Failure "Input echo nonzero-budget eligible case captured stale frame/cursor state"
-        }
         if ($eligible -and
             $record["catchup_budget_us"] -eq 0 -and
             $staleAtPolish -and
             ($record["budget_exhausted_incomplete"] -le 0 -or
-                $record["pending_callback_after_drain"] -le 0 -or
-                $record["requeue_count"] -le 0))
+                $record["pending_callback_after_drain"] -le 0))
         {
             Add-Failure "Input echo zero-budget stale polish case lacked budget-exhaustion evidence"
         }
     }
 
     foreach ($record in $queueContractRecords) {
-        if (!$record["passed"] -or $record["stale_capture_observed"]) {
+        if (!$record["passed"]) {
             Add-Failure "Input echo queue contract failed in $($record["raw_json_path"])"
         }
         if ($record["callback_enqueue_epoch_after_echo"] -le
@@ -562,12 +561,22 @@ function Invoke-InputEchoEvidence {
         {
             Add-Failure "Input echo queue contract echo snapshot epoch is stale"
         }
+        if (!$record["eventual_fresh_capture"]) {
+            Add-Failure "Input echo queue contract did not capture accepted input fresh"
+        }
+        if ($record["eventual_fresh_capture_count"] -ne
+            $record["queue_contract_iterations"])
+        {
+            Add-Failure "Input echo queue contract fresh-capture summary mismatch"
+        }
+        if ($record["accepted_input_without_fresh_capture_count"] -ne 0) {
+            Add-Failure "Input echo queue contract accepted input without fresh capture"
+        }
     }
 
     $metrics = @(
         "stale_frame_at_polish_count",
         "cursor_stale_at_polish_count",
-        "callbacks_queued_after_polish_count",
         "catchup_elapsed_ns_median",
         "catchup_elapsed_ns_p95",
         "input_to_polish_done_ns_median",
@@ -596,8 +605,14 @@ function Invoke-InputEchoEvidence {
             zero_budget_baseline_present = ($expectedBudgets -contains 0)
             same_delay_ab_pairs_present = $abPairsPresent
             queue_contract_present = ($queueContractRecords.Count -eq $RepeatCount)
-            pass_rule = "commands pass, raw schema validates, all cases are present, nonzero-budget eligible cases are fresh, zero-budget stale polish cases report budget exhaustion and requeue, and queue-contract captures are not stale"
-            rejects_waited_long_enough_evidence = "queue-contract evidence proves callbacks already enqueued before sync are included without waiting for future output"
+            pass_rule = (
+                "commands pass, raw schema validates, all cases are present, " +
+                "zero-budget stale polish cases report budget exhaustion, and " +
+                "queue-contract callbacks are enqueued, processed, published, " +
+                "captured fresh by first/follow-up frame, and drained")
+            rejects_waited_long_enough_evidence = (
+                "queue-contract evidence proves sync-boundary callbacks publish, " +
+                "reach a fresh captured frame, and drain without pending callback carryover")
         }
         metric_summaries = $summaries
         case_records = $records

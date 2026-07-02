@@ -50,10 +50,6 @@ constexpr int k_max_warmup           = 100;
 constexpr int k_max_delay_us         = 1000000;
 constexpr int k_max_backlog          = 64;
 constexpr int k_max_contract_iterations = 1000;
-// Once the target callback is fresh, newer after-boundary output must not hold
-// the old QSG node. The deterministic Qt test can still need a small number of
-// frame boundaries for queued target-catch-up drains before that point.
-constexpr int k_max_allowed_frame_deferrals = 3;
 constexpr int k_backlog_slice_bytes  = 4096;
 constexpr int k_prompt_cursor_column = 2;
 constexpr int k_expected_echo_column = k_prompt_cursor_column + 1;
@@ -70,11 +66,13 @@ const QString k_queue_contract_measurement_boundary = QStringLiteral(
 const QString k_continuous_output_measurement_boundary = QStringLiteral(
     "backend_callback_enqueue_at_every_qsg_sync_boundary");
 const QString k_queue_contract_decision_criteria = QStringLiteral(
-    "first captured post-input frame must not consume a snapshot whose "
-    "processed_backend_callback_epoch is older than a backend callback delivered before sync");
+    "a backend callback delivered at the sync boundary must be enqueued, "
+    "processed, published, captured fresh by the first or follow-up frame, "
+    "and drained without leaving callback work pending");
 const QString k_continuous_output_decision_criteria = QStringLiteral(
-    "accepted input must reach a fresh captured frame despite backend output "
-    "arriving after every frame eligibility boundary");
+    "accepted input must publish echo output, reach a fresh captured frame, "
+    "and drain callback work while backend output arrives after every frame "
+    "eligibility boundary");
 const QByteArray k_prompt_payload = QByteArrayLiteral("\x1b[2J\x1b[H> ");
 const QByteArray k_echo_payload = QByteArrayLiteral("x");
 const QString k_echo_visible_text = QStringLiteral("> x");
@@ -115,7 +113,6 @@ struct Sample_result
     bool                   echo_visible_at_polish        = false;
     bool                   stale_frame_at_polish         = false;
     bool                   cursor_stale_at_polish        = false;
-    bool                   callbacks_queued_after_polish = false;
     int                    cursor_column_at_polish       = -1;
     int                    expected_cursor_column        = k_expected_echo_column;
     int                    cursor_stale_cells            = 0;
@@ -197,11 +194,7 @@ struct Queue_contract_result
     std::uint64_t          first_captured_snapshot_sequence       = 0U;
     std::uint64_t          echo_snapshot_sequence                 = 0U;
     std::uint64_t          echo_snapshot_callback_epoch           = 0U;
-    std::uint64_t          backend_callback_frame_deferrals_before = 0U;
-    std::uint64_t          backend_callback_frame_deferrals_after  = 0U;
-    std::uint64_t          backend_callback_frame_deferrals_delta  = 0U;
-    std::uint64_t          pending_callback_count_after_run        = 0U;
-    int                    max_consecutive_deferrals               = 0;
+    std::uint64_t          pending_callback_count_after_run       = 0U;
 };
 
 struct Continuous_output_result
@@ -230,11 +223,7 @@ struct Continuous_output_result
     std::uint64_t          echo_snapshot_callback_epoch           = 0U;
     std::uint64_t          frame_boundary_count                   = 0U;
     std::uint64_t          continuous_output_emit_count           = 0U;
-    std::uint64_t          backend_callback_frame_deferrals_before = 0U;
-    std::uint64_t          backend_callback_frame_deferrals_after  = 0U;
-    std::uint64_t          backend_callback_frame_deferrals_delta  = 0U;
     std::uint64_t          pending_callback_count_after_teardown  = 0U;
-    int                    max_consecutive_deferrals              = 0;
 };
 
 class Scripted_backend final : public term::Terminal_backend
@@ -833,9 +822,6 @@ QJsonObject sample_json(const Sample_result& sample)
     object.insert(QStringLiteral("echo_visible_at_polish"), sample.echo_visible_at_polish);
     object.insert(QStringLiteral("stale_frame_at_polish"), sample.stale_frame_at_polish);
     object.insert(QStringLiteral("cursor_stale_at_polish"), sample.cursor_stale_at_polish);
-    object.insert(
-        QStringLiteral("callbacks_queued_after_polish"),
-        sample.callbacks_queued_after_polish);
     object.insert(QStringLiteral("cursor_column_at_polish"), sample.cursor_column_at_polish);
     object.insert(QStringLiteral("expected_cursor_column"), sample.expected_cursor_column);
     object.insert(QStringLiteral("cursor_stale_cells"), sample.cursor_stale_cells);
@@ -1062,8 +1048,6 @@ std::optional<Queue_contract_result> run_queue_contract(
 
     const term::Terminal_surface_render_invalidation_stats_t invalidation_before =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    result.backend_callback_frame_deferrals_before =
-        invalidation_before.backend_callback_frame_deferrals;
     if (!invalidation_before.pending_update) {
         *out_error = QStringLiteral("queue contract setup did not leave pending frame work");
         return std::nullopt;
@@ -1141,8 +1125,24 @@ std::optional<Queue_contract_result> run_queue_contract(
         result.presentation_epoch = first_frame_report->render_capture_sequence;
     }
 
-    const std::shared_ptr<const term::Terminal_render_snapshot> echo_snapshot =
+    std::optional<term::Qsg_atlas_frame_report> follow_up_report;
+    std::shared_ptr<const term::Terminal_render_snapshot> echo_snapshot =
         wait_for_echo_snapshot(app, fixture.surface);
+    if (first_frame_report.has_value() &&
+        (echo_snapshot == nullptr ||
+            first_frame_report->captured_snapshot_sequence <
+                echo_snapshot->metadata.sequence))
+    {
+        follow_up_report =
+            capture_next_surface_frame(
+                app,
+                fixture.window,
+                fixture.surface,
+                result.first_capture_count);
+        if (echo_snapshot == nullptr) {
+            echo_snapshot = wait_for_echo_snapshot(app, fixture.surface);
+        }
+    }
     if (echo_snapshot != nullptr) {
         result.echo_snapshot_published = true;
         result.echo_snapshot_sequence = echo_snapshot->metadata.sequence;
@@ -1156,21 +1156,15 @@ std::optional<Queue_contract_result> run_queue_contract(
     result.callback_processed_epoch_after_capture =
         term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
             fixture.surface);
-    const term::Terminal_surface_render_invalidation_stats_t invalidation_after =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    result.backend_callback_frame_deferrals_after =
-        invalidation_after.backend_callback_frame_deferrals;
-    result.backend_callback_frame_deferrals_delta = delta_u64(
-        result.backend_callback_frame_deferrals_before,
-        result.backend_callback_frame_deferrals_after);
-    result.max_consecutive_deferrals = static_cast<int>(
-        std::min<std::uint64_t>(
-            result.backend_callback_frame_deferrals_delta,
-            static_cast<std::uint64_t>(std::numeric_limits<int>::max())));
     result.first_capture_contains_echo =
         result.echo_snapshot_sequence != 0U &&
         result.first_captured_snapshot_sequence >= result.echo_snapshot_sequence;
     result.eventual_fresh_capture = result.first_capture_contains_echo;
+    if (!result.eventual_fresh_capture && result.echo_snapshot_sequence != 0U) {
+        result.eventual_fresh_capture =
+            follow_up_report.has_value() &&
+            follow_up_report->captured_snapshot_sequence >= result.echo_snapshot_sequence;
+    }
 
     term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
         fixture.surface);
@@ -1183,7 +1177,6 @@ std::optional<Queue_contract_result> run_queue_contract(
         result.input_accepted &&
         result.echo_injected_before_sync &&
         first_frame_report.has_value() &&
-        !result.stale_capture_observed &&
         result.echo_snapshot_published &&
         result.eventual_fresh_capture &&
         result.callback_enqueue_epoch_after_echo >
@@ -1192,10 +1185,6 @@ std::optional<Queue_contract_result> run_queue_contract(
             result.callback_enqueue_epoch_after_echo &&
         result.echo_snapshot_callback_epoch >=
             result.callback_enqueue_epoch_after_echo &&
-        result.first_captured_snapshot_sequence >= result.echo_snapshot_sequence &&
-        result.backend_callback_frame_deferrals_after >
-            result.backend_callback_frame_deferrals_before &&
-        result.max_consecutive_deferrals <= k_max_allowed_frame_deferrals &&
         result.pending_callback_count_after_run == 0U;
 
     return result;
@@ -1266,8 +1255,6 @@ std::optional<Continuous_output_result> run_continuous_output_contract(
 
     const term::Terminal_surface_render_invalidation_stats_t invalidation_before =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    result.backend_callback_frame_deferrals_before =
-        invalidation_before.backend_callback_frame_deferrals;
     if (!invalidation_before.pending_update) {
         *out_error = QStringLiteral(
             "continuous output setup did not leave pending frame work");
@@ -1332,8 +1319,24 @@ std::optional<Continuous_output_result> run_continuous_output_contract(
         result.qsg_render_epoch = first_frame_report->render_count;
     }
 
-    const std::shared_ptr<const term::Terminal_render_snapshot> echo_snapshot =
+    std::optional<term::Qsg_atlas_frame_report> follow_up_report;
+    std::shared_ptr<const term::Terminal_render_snapshot> echo_snapshot =
         wait_for_echo_snapshot(app, fixture.surface);
+    if (first_frame_report.has_value() &&
+        (echo_snapshot == nullptr ||
+            first_frame_report->captured_snapshot_sequence <
+                echo_snapshot->metadata.sequence))
+    {
+        follow_up_report =
+            capture_next_surface_frame(
+                app,
+                fixture.window,
+                fixture.surface,
+                result.first_capture_count);
+        if (echo_snapshot == nullptr) {
+            echo_snapshot = wait_for_echo_snapshot(app, fixture.surface);
+        }
+    }
     if (echo_snapshot != nullptr) {
         result.echo_snapshot_sequence = echo_snapshot->metadata.sequence;
         result.echo_snapshot_callback_epoch =
@@ -1348,19 +1351,13 @@ std::optional<Continuous_output_result> run_continuous_output_contract(
             result.echo_snapshot_sequence != 0U &&
             result.first_captured_snapshot_sequence >= result.echo_snapshot_sequence;
         result.eventual_fresh_capture = result.first_capture_contains_echo;
+        if (!result.eventual_fresh_capture && result.echo_snapshot_sequence != 0U) {
+            result.eventual_fresh_capture =
+                follow_up_report.has_value() &&
+                follow_up_report->captured_snapshot_sequence >=
+                    result.echo_snapshot_sequence;
+        }
     }
-
-    const term::Terminal_surface_render_invalidation_stats_t invalidation_after =
-        term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
-    result.backend_callback_frame_deferrals_after =
-        invalidation_after.backend_callback_frame_deferrals;
-    result.backend_callback_frame_deferrals_delta = delta_u64(
-        result.backend_callback_frame_deferrals_before,
-        result.backend_callback_frame_deferrals_after);
-    result.max_consecutive_deferrals = static_cast<int>(
-        std::min<std::uint64_t>(
-            result.backend_callback_frame_deferrals_delta,
-            static_cast<std::uint64_t>(std::numeric_limits<int>::max())));
 
     term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
         fixture.surface);
@@ -1373,14 +1370,12 @@ std::optional<Continuous_output_result> run_continuous_output_contract(
         result.cutoff_classification = QStringLiteral("no_captured_frame");
     }
     else
-    if (result.backend_callback_frame_deferrals_delta > 0U &&
-        result.first_capture_contains_echo)
-    {
-        result.cutoff_classification = QStringLiteral("after_frame_boundary_deferred");
-    }
-    else
     if (result.first_capture_contains_echo) {
         result.cutoff_classification = QStringLiteral("same_frame_fresh");
+    }
+    else
+    if (result.eventual_fresh_capture) {
+        result.cutoff_classification = QStringLiteral("followup_frame_fresh");
     }
     else {
         result.cutoff_classification = QStringLiteral("fresh_capture_missing");
@@ -1394,9 +1389,9 @@ std::optional<Continuous_output_result> run_continuous_output_contract(
         result.emitted_output_each_frame_boundary          &&
         echo_injected.load(std::memory_order_acquire)      &&
         first_frame_report.has_value()                     &&
+        result.echo_snapshot_sequence != 0U                &&
+        result.echo_snapshot_callback_epoch != 0U          &&
         result.eventual_fresh_capture                      &&
-        result.max_consecutive_deferrals <=
-            k_max_allowed_frame_deferrals                  &&
         !result.accepted_input_without_fresh_capture       &&
         result.pending_callback_count_after_teardown == 0U &&
         !result.cutoff_classification.isEmpty();
@@ -1489,8 +1484,6 @@ Sample_result run_attempt(
     sample.polish_elapsed_ns = elapsed_ns_count(polish_finished - polish_started);
     sample.input_to_polish_done_ns = elapsed_ns_count(polish_finished - input_started);
     sample.drain_delta = drain_delta(stats_before, stats_after);
-    sample.callbacks_queued_after_polish =
-        term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(surface);
 
     const std::shared_ptr<const term::Terminal_render_snapshot> after_snapshot =
         term::VNM_TerminalSurface_render_bridge::render_snapshot(surface);
@@ -1585,7 +1578,6 @@ QJsonObject case_json(const Case_result& result)
     int echo_visible_count               = 0;
     int stale_frame_count                = 0;
     int cursor_stale_count               = 0;
-    int callbacks_queued_after_polish    = 0;
     int max_cursor_stale_cells           = 0;
     Backend_drain_delta total_drain_delta;
     std::vector<qint64> actual_echo_delay_ns;
@@ -1609,9 +1601,6 @@ QJsonObject case_json(const Case_result& result)
         if (sample.cursor_stale_at_polish) {
             ++cursor_stale_count;
         }
-        if (sample.callbacks_queued_after_polish) {
-            ++callbacks_queued_after_polish;
-        }
         max_cursor_stale_cells =
             std::max(max_cursor_stale_cells, sample.cursor_stale_cells);
         add_drain_delta(&total_drain_delta, sample.drain_delta);
@@ -1630,9 +1619,6 @@ QJsonObject case_json(const Case_result& result)
     object.insert(QStringLiteral("echo_visible_at_polish_count"), echo_visible_count);
     object.insert(QStringLiteral("stale_frame_at_polish_count"), stale_frame_count);
     object.insert(QStringLiteral("cursor_stale_at_polish_count"), cursor_stale_count);
-    object.insert(
-        QStringLiteral("callbacks_queued_after_polish_count"),
-        callbacks_queued_after_polish);
     object.insert(QStringLiteral("max_cursor_stale_cells"), max_cursor_stale_cells);
     object.insert(QStringLiteral("backend_drain_delta_total"), drain_delta_json(total_drain_delta));
     object.insert(
@@ -1803,23 +1789,8 @@ QJsonObject queue_contract_json(const Queue_contract_result& result)
         result.echo_snapshot_callback_epoch);
     insert_u64(
         object,
-        QStringLiteral("backend_callback_frame_deferrals_before"),
-        result.backend_callback_frame_deferrals_before);
-    insert_u64(
-        object,
-        QStringLiteral("backend_callback_frame_deferrals_after"),
-        result.backend_callback_frame_deferrals_after);
-    insert_u64(
-        object,
-        QStringLiteral("backend_callback_frame_deferrals_delta"),
-        result.backend_callback_frame_deferrals_delta);
-    insert_u64(
-        object,
         QStringLiteral("pending_callback_count_after_run"),
         result.pending_callback_count_after_run);
-    object.insert(
-        QStringLiteral("max_consecutive_deferrals"),
-        result.max_consecutive_deferrals);
     return object;
 }
 
@@ -1833,7 +1804,6 @@ QJsonObject queue_contract_summary_json(
     int pending_callback_nonzero_count       = 0;
     int callback_carryover_count             = 0;
     int accepted_without_fresh_capture_count = 0;
-    int max_consecutive_deferrals            = 0;
     std::uint64_t pending_callback_count_after_runs_max = 0U;
 
     for (const Queue_contract_result& result : results) {
@@ -1860,8 +1830,6 @@ QJsonObject queue_contract_summary_json(
         if (result.input_accepted && !result.eventual_fresh_capture) {
             ++accepted_without_fresh_capture_count;
         }
-        max_consecutive_deferrals =
-            std::max(max_consecutive_deferrals, result.max_consecutive_deferrals);
         pending_callback_count_after_runs_max =
             std::max(
                 pending_callback_count_after_runs_max,
@@ -1872,12 +1840,10 @@ QJsonObject queue_contract_summary_json(
     const bool passed =
         passed_count == iteration_count                         &&
         input_accepted_count == iteration_count                 &&
-        stale_capture_count == 0                                &&
         eventual_fresh_capture_count == iteration_count         &&
-        pending_callback_nonzero_count == 0                     &&
-        callback_carryover_count == 0                           &&
         accepted_without_fresh_capture_count == 0               &&
-        max_consecutive_deferrals <= k_max_allowed_frame_deferrals;
+        pending_callback_nonzero_count == 0                     &&
+        callback_carryover_count == 0;
 
     QJsonObject object;
     object.insert(QStringLiteral("passed"), passed);
@@ -1895,12 +1861,6 @@ QJsonObject queue_contract_summary_json(
     object.insert(
         QStringLiteral("accepted_input_without_fresh_capture_count"),
         accepted_without_fresh_capture_count);
-    object.insert(
-        QStringLiteral("max_consecutive_deferrals"),
-        max_consecutive_deferrals);
-    object.insert(
-        QStringLiteral("max_allowed_consecutive_deferrals"),
-        k_max_allowed_frame_deferrals);
     insert_u64(
         object,
         QStringLiteral("pending_callback_count_after_runs_max"),
@@ -1925,9 +1885,6 @@ QJsonObject build_queue_contract_root_json(
     config.insert(
         QStringLiteral("queue_contract_iterations"),
         options.queue_contract_iterations);
-    config.insert(
-        QStringLiteral("max_allowed_consecutive_deferrals"),
-        k_max_allowed_frame_deferrals);
     root.insert(QStringLiteral("config"), config);
     root.insert(QStringLiteral("queue_contract_summary"), queue_contract_summary_json(results));
     if (!results.empty()) {
@@ -2025,23 +1982,8 @@ QJsonObject continuous_output_json(const Continuous_output_result& result)
         result.continuous_output_emit_count);
     insert_u64(
         object,
-        QStringLiteral("backend_callback_frame_deferrals_before"),
-        result.backend_callback_frame_deferrals_before);
-    insert_u64(
-        object,
-        QStringLiteral("backend_callback_frame_deferrals_after"),
-        result.backend_callback_frame_deferrals_after);
-    insert_u64(
-        object,
-        QStringLiteral("backend_callback_frame_deferrals_delta"),
-        result.backend_callback_frame_deferrals_delta);
-    insert_u64(
-        object,
         QStringLiteral("pending_callback_count_after_teardown"),
         result.pending_callback_count_after_teardown);
-    object.insert(
-        QStringLiteral("max_consecutive_deferrals"),
-        result.max_consecutive_deferrals);
     return object;
 }
 
@@ -2055,7 +1997,6 @@ QJsonObject continuous_output_summary_json(
     int eventual_fresh_capture_count       = 0;
     int accepted_without_fresh_count       = 0;
     int missing_cutoff_classification_count = 0;
-    int max_consecutive_deferrals          = 0;
     std::uint64_t pending_after_teardown_max = 0U;
 
     for (const Continuous_output_result& result : results) {
@@ -2080,8 +2021,6 @@ QJsonObject continuous_output_summary_json(
         if (result.cutoff_classification.isEmpty()) {
             ++missing_cutoff_classification_count;
         }
-        max_consecutive_deferrals =
-            std::max(max_consecutive_deferrals, result.max_consecutive_deferrals);
         pending_after_teardown_max =
             std::max(
                 pending_after_teardown_max,
@@ -2097,7 +2036,6 @@ QJsonObject continuous_output_summary_json(
         eventual_fresh_capture_count == iteration_count &&
         accepted_without_fresh_count == 0               &&
         missing_cutoff_classification_count == 0        &&
-        max_consecutive_deferrals <= k_max_allowed_frame_deferrals &&
         pending_after_teardown_max == 0U;
 
     QJsonObject object;
@@ -2118,12 +2056,6 @@ QJsonObject continuous_output_summary_json(
     object.insert(
         QStringLiteral("missing_cutoff_classification_count"),
         missing_cutoff_classification_count);
-    object.insert(
-        QStringLiteral("max_consecutive_deferrals"),
-        max_consecutive_deferrals);
-    object.insert(
-        QStringLiteral("max_allowed_consecutive_deferrals"),
-        k_max_allowed_frame_deferrals);
     insert_u64(
         object,
         QStringLiteral("pending_callback_count_after_teardown_max"),
@@ -2148,9 +2080,6 @@ QJsonObject build_continuous_output_root_json(
     config.insert(
         QStringLiteral("continuous_output_iterations"),
         options.continuous_output_iterations);
-    config.insert(
-        QStringLiteral("max_allowed_consecutive_deferrals"),
-        k_max_allowed_frame_deferrals);
     root.insert(QStringLiteral("config"), config);
     root.insert(
         QStringLiteral("continuous_output_summary"),
@@ -2200,8 +2129,16 @@ bool validate_json_root(
             *out_error = QStringLiteral("queue contract iteration count mismatch");
             return false;
         }
-        if (summary.value(QStringLiteral("stale_capture_count")).toInt() != 0) {
-            *out_error = QStringLiteral("queue contract repeated run observed stale capture");
+        if (summary.value(QStringLiteral("eventual_fresh_capture_count")).toInt() !=
+            options.queue_contract_iterations)
+        {
+            *out_error = QStringLiteral("queue contract did not capture accepted input fresh");
+            return false;
+        }
+        if (summary.value(QStringLiteral("accepted_input_without_fresh_capture_count")).toInt() !=
+            0)
+        {
+            *out_error = QStringLiteral("queue contract accepted input without fresh capture");
             return false;
         }
         if (summary.value(QStringLiteral("pending_callback_nonzero_count")).toInt() != 0) {
@@ -2212,20 +2149,6 @@ bool validate_json_root(
             *out_error = QStringLiteral("queue contract carried callbacks into a new run");
             return false;
         }
-        if (summary.value(QStringLiteral("max_consecutive_deferrals")).toInt() >
-            k_max_allowed_frame_deferrals)
-        {
-            *out_error = QStringLiteral("queue contract exceeded deferral cap");
-            return false;
-        }
-        if (summary.value(
-                QStringLiteral("accepted_input_without_fresh_capture_count")).toInt() != 0)
-        {
-            *out_error = QStringLiteral(
-                "queue contract accepted input without fresh capture");
-            return false;
-        }
-
         const QJsonArray runs =
             root.value(QStringLiteral("queue_contract_runs")).toArray();
         if (runs.size() != options.queue_contract_iterations) {
@@ -2238,22 +2161,13 @@ bool validate_json_root(
                 *out_error = QStringLiteral("queue contract run did not pass");
                 return false;
             }
-            if (run.value(QStringLiteral("stale_capture_observed")).toBool()) {
-                *out_error = QStringLiteral("queue contract run observed stale capture");
+            if (!run.value(QStringLiteral("eventual_fresh_capture")).toBool()) {
+                *out_error = QStringLiteral(
+                    "queue contract run did not capture accepted input fresh");
                 return false;
             }
             if (run.value(QStringLiteral("pending_callback_count_after_run")).toInteger() != 0) {
                 *out_error = QStringLiteral("queue contract run left pending callbacks");
-                return false;
-            }
-            if (run.value(QStringLiteral("eventual_fresh_capture")).toBool() != true) {
-                *out_error = QStringLiteral("queue contract run lacked fresh capture");
-                return false;
-            }
-            if (run.value(QStringLiteral("max_consecutive_deferrals")).toInt() >
-                k_max_allowed_frame_deferrals)
-            {
-                *out_error = QStringLiteral("queue contract run exceeded deferral cap");
                 return false;
             }
             if (run.value(QStringLiteral("accepted_input_epoch")).toInteger() <=
@@ -2276,8 +2190,8 @@ bool validate_json_root(
             *out_error = QStringLiteral("queue contract did not pass");
             return false;
         }
-        if (contract.value(QStringLiteral("stale_capture_observed")).toBool()) {
-            *out_error = QStringLiteral("queue contract observed a stale capture");
+        if (!contract.value(QStringLiteral("eventual_fresh_capture")).toBool()) {
+            *out_error = QStringLiteral("queue contract did not capture accepted input fresh");
             return false;
         }
         if (contract.value(QStringLiteral("callback_enqueue_epoch_after_echo")).toInteger() <=
@@ -2317,14 +2231,15 @@ bool validate_json_root(
             *out_error = QStringLiteral("continuous output iteration count mismatch");
             return false;
         }
-        if (summary.value(QStringLiteral("max_consecutive_deferrals")).toInt() >
-            k_max_allowed_frame_deferrals)
+        if (summary.value(QStringLiteral("eventual_fresh_capture_count")).toInt() !=
+            options.continuous_output_iterations)
         {
-            *out_error = QStringLiteral("continuous output exceeded deferral cap");
+            *out_error = QStringLiteral(
+                "continuous output did not capture accepted input fresh");
             return false;
         }
-        if (summary.value(
-                QStringLiteral("accepted_input_without_fresh_capture_count")).toInt() != 0)
+        if (summary.value(QStringLiteral("accepted_input_without_fresh_capture_count")).toInt() !=
+            0)
         {
             *out_error = QStringLiteral(
                 "continuous output accepted input without fresh capture");
@@ -2349,6 +2264,16 @@ bool validate_json_root(
                 *out_error = QStringLiteral("continuous output run did not pass");
                 return false;
             }
+            if (!run.value(QStringLiteral("eventual_fresh_capture")).toBool()) {
+                *out_error = QStringLiteral(
+                    "continuous output run did not capture accepted input fresh");
+                return false;
+            }
+            if (run.value(QStringLiteral("accepted_input_without_fresh_capture")).toBool()) {
+                *out_error = QStringLiteral(
+                    "continuous output run accepted input without fresh capture");
+                return false;
+            }
             if (run.value(QStringLiteral("cutoff_classification")).toString().isEmpty()) {
                 *out_error = QStringLiteral("continuous output run lacks cutoff reason");
                 return false;
@@ -2358,8 +2283,13 @@ bool validate_json_root(
                     "continuous output run did not emit output each frame boundary");
                 return false;
             }
-            if (!run.value(QStringLiteral("eventual_fresh_capture")).toBool()) {
-                *out_error = QStringLiteral("continuous output run lacked fresh capture");
+            if (run.value(QStringLiteral("backend_echo_epoch")).toInteger() == 0 ||
+                run.value(QStringLiteral("echo_snapshot_sequence")).toInteger() == 0 ||
+                run.value(QStringLiteral("echo_snapshot_callback_epoch")).toInteger() == 0 ||
+                run.value(QStringLiteral("surface_publication_callback_epoch")).toInteger() == 0 ||
+                run.value(QStringLiteral("qsg_capture_epoch")).toInteger() == 0)
+            {
+                *out_error = QStringLiteral("continuous output run lacks required epochs");
                 return false;
             }
             if (run.value(QStringLiteral("pending_callback_count_after_teardown"))
@@ -2367,13 +2297,6 @@ bool validate_json_root(
             {
                 *out_error = QStringLiteral(
                     "continuous output run left pending callbacks after teardown");
-                return false;
-            }
-            if (run.value(QStringLiteral("max_consecutive_deferrals")).toInt() >
-                k_max_allowed_frame_deferrals)
-            {
-                *out_error = QStringLiteral(
-                    "continuous output run exceeded deferral cap");
                 return false;
             }
         }

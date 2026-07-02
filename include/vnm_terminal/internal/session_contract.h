@@ -116,7 +116,6 @@ struct Terminal_session_result
     std::uint64_t                            sequence = 0U;
     bool                                     high_water_reached = false;
     std::optional<Terminal_backend_error>    error;
-    std::uint64_t                            accepted_input_freshness_token = 0U;
 };
 
 struct Terminal_queue_result
