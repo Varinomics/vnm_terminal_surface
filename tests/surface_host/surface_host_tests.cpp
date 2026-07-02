@@ -2408,8 +2408,8 @@ bool test_surface_frame_catchup_budget_env_config()
         const auto budget = std::chrono::duration_cast<std::chrono::milliseconds>(
             term::VNM_TerminalSurface_render_bridge::
                 backend_callback_frame_catchup_budget_for_testing(surface));
-        ok &= check(budget.count() == 0,
-            "surface catch-up budget env defaults to zero when unset");
+        ok &= check(budget.count() == 4,
+            "surface catch-up budget env defaults to the bounded drain slice when unset");
     }
 
     {
@@ -2432,8 +2432,8 @@ bool test_surface_frame_catchup_budget_env_config()
         const auto budget = std::chrono::duration_cast<std::chrono::milliseconds>(
             term::VNM_TerminalSurface_render_bridge::
                 backend_callback_frame_catchup_budget_for_testing(surface));
-        ok &= check(budget.count() == 0,
-            "surface catch-up budget env rejects invalid values to default zero");
+        ok &= check(budget.count() == 4,
+            "surface catch-up budget env rejects invalid values to the default drain slice");
     }
 
     {

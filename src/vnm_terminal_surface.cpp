@@ -88,7 +88,8 @@ constexpr std::chrono::milliseconds k_backend_callback_drain_budget{4};
 constexpr std::chrono::milliseconds k_backend_callback_posted_drain_budget{32};
 constexpr std::chrono::milliseconds k_backend_callback_frame_pending_posted_drain_budget =
     k_backend_callback_drain_budget;
-constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget_default{0};
+constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget_default =
+    k_backend_callback_drain_budget;
 constexpr char k_backend_callback_frame_catchup_budget_env[] =
     "VNM_TERMINAL_BACKEND_CALLBACK_FRAME_CATCHUP_BUDGET_MS";
 
