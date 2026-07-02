@@ -502,7 +502,6 @@ void simulate_polish(
             sample->callback_deliver_epoch = recorder.mark();
         }
     }
-
 }
 
 bool run_case(

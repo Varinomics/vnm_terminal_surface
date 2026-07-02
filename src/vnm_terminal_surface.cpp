@@ -479,16 +479,6 @@ bool is_accepted(term::Terminal_session_result_code code)
     return code == term::Terminal_session_result_code::ACCEPTED;
 }
 
-bool text_input_can_advance_cursor(const QString& text)
-{
-    for (const QChar character : text) {
-        if (character.isPrint()) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool backend_drain_reached_notification_boundary(
     bool                            drain_complete,
     const term::Terminal_session&   session)
@@ -3660,7 +3650,6 @@ bool VNM_TerminalSurface::paste_text(QString text)
         return false;
     }
 
-    const bool text_input = text_input_can_advance_cursor(text);
     const term::Terminal_paste_text_result paste_result =
         m_private->session->write_paste_text(
             std::move(text),
@@ -3670,12 +3659,7 @@ bool VNM_TerminalSurface::paste_text(QString text)
         return false;
     }
 
-    if (text_input && is_accepted(paste_result.result.code)) {
-        sync_from_session();
-    }
-    else {
-        sync_from_session();
-    }
+    sync_from_session();
 
     if (!is_accepted(paste_result.result.code)) {
         report_result_failure(paste_result.result);
@@ -4178,7 +4162,6 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             }
         }
 
-        const bool text_input_key = text_input_can_advance_cursor(event->text());
         m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
         if (m_private->session == nullptr) {
             event->ignore();
@@ -4192,12 +4175,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
         }
 
         event->accept();
-        if (text_input_key && is_accepted(key_result.result.code)) {
-            sync_from_session();
-        }
-        else {
-            sync_from_session();
-        }
+        sync_from_session();
         if (!is_accepted(key_result.result.code)) {
             report_result_failure(key_result.result);
         }
@@ -6039,16 +6017,7 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
                 preedit_cursor_position);
         }
 
-        if (commit_result.has_value() &&
-            commit_result->handled &&
-            text_input_can_advance_cursor(commit_text) &&
-            is_accepted(commit_result->result.code))
-        {
-            sync_from_session();
-        }
-        else {
-            sync_from_session();
-        }
+        sync_from_session();
         if (commit_result.has_value() &&
             commit_result->handled &&
             !is_accepted(commit_result->result.code))
