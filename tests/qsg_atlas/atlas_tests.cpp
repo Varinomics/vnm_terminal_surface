@@ -48,6 +48,10 @@
 #define VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED 0
 #endif
 
+#if !defined(VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED)
+#define VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED 0
+#endif
+
 #if defined(VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_DIAGNOSTIC) || \
     VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED
 #if defined(__has_include)
@@ -10442,6 +10446,13 @@ int render_cursor_descender_capture(
 // rows as the unobscured Q ink.
 int test_cursor_descender_clip(QGuiApplication& app, const char* backend)
 {
+#if !VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED
+    std::cerr << "SKIP: cursor descender clip requires the MSDF text "
+        << "renderer\n";
+    (void)app;
+    (void)backend;
+    return k_unsupported_backend_skip_return_code;
+#else
     const int backend_status =
         verify_requested_backend(app, backend, "cursor descender clip");
     if (backend_status != 0) {
@@ -10538,6 +10549,7 @@ int test_cursor_descender_clip(QGuiApplication& app, const char* backend)
             k_ink_row_tolerance_pixels,
         "block caret keeps the clipped Q ink bottom row in place");
     return ok ? 0 : 1;
+#endif
 }
 
 term::Terminal_render_snapshot make_atlas_report_snapshot(std::uint64_t sequence)
