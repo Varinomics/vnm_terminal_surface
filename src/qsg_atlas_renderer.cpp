@@ -500,13 +500,11 @@ Qsg_atlas_cursor_report captured_render_cursor_report(
         return report;
     }
 
-    const bool cursor_blink_enabled =
-        frame.options.cursor_blink_enabled_override.value_or(
-            snapshot.cursor.blink_enabled);
     report.visible =
-        snapshot.cursor.visible                                      &&
-        cursor_position_inside_grid(snapshot.cursor.position, snapshot.grid_size) &&
-        (!cursor_blink_enabled || frame.cursor_blink_visible);
+        terminal_render_cursor_visible(
+            snapshot,
+            frame.options,
+            frame.cursor_blink_visible);
     return report;
 }
 
@@ -4333,6 +4331,7 @@ private:
             key,
             options.cursor_blink_enabled_override.has_value() &&
                 *options.cursor_blink_enabled_override);
+        append_key_bool(key, options.cursor_withheld);
         append_key_bool(key, options.visual_bell_enabled);
         append_key_bool(key, options.underline_hyperlinks);
         append_key_int(key, static_cast<int>(options.text_renderer_policy));

@@ -558,6 +558,12 @@ private:
         QStringList            argv,
         QString                working_directory);
 
+    enum class Cursor_withhold_publication_safety
+    {
+        CLASSIFY_FROM_SESSION_FACTS,
+        SETTLED_DRAIN_PUBLICATION_IF_INSTALLED,
+    };
+
     struct backend_callback_drain_result_t
     {
         // Zero-init reads as Backend_callback_drain_stop::COMPLETE; the
@@ -589,6 +595,7 @@ private:
     void request_backend_callback_follow_up_after_incomplete_recorded_drain(
         vnm_terminal::internal::Terminal_session*
                                session,
+        std::uint64_t          session_generation,
         vnm_terminal::internal::Backend_callback_drain_stop
                                stop,
         Backend_callback_incomplete_follow_up
@@ -604,7 +611,10 @@ private:
     void drain_backend_callback_events_for_posted_work();
     void queue_backend_callback_drain();
     void refresh_active_session_geometry();
-    void sync_from_session(bool deliver_notifications = true);
+    void sync_from_session(
+        bool                                deliver_notifications = true,
+        Cursor_withhold_publication_safety publication_safety =
+            Cursor_withhold_publication_safety::CLASSIFY_FROM_SESSION_FACTS);
     void sync_synchronized_output_recovery_timer();
     void handle_synchronized_output_recovery_timeout();
     void handle_synchronized_output_recovery_timeout(

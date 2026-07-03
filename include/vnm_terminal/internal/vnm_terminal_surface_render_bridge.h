@@ -67,6 +67,16 @@ struct Render_profile_snapshot_t
 #endif
 };
 
+struct Cursor_withhold_state_snapshot
+{
+    std::uint64_t                           session_generation = 0U;
+    std::uint64_t                           successful_withheld_frame_count = 0U;
+    std::uint64_t                           successful_withheld_frame_bound = 0U;
+    bool                                    risk_episode_active = false;
+    bool                                    visibility_forced = false;
+    bool                                    cursor_withheld = false;
+};
+
 class VNM_TerminalSurface_render_bridge
 {
 public:
@@ -208,6 +218,9 @@ public:
         const VNM_TerminalSurface& surface);
 
     static terminal_renderer_lifecycle_stats_t lifecycle_stats(
+        const VNM_TerminalSurface& surface);
+
+    static Cursor_withhold_state_snapshot cursor_withhold_state_for_testing(
         const VNM_TerminalSurface& surface);
 
     static std::shared_ptr<Terminal_renderer_lifecycle_recorder> lifecycle_recorder(

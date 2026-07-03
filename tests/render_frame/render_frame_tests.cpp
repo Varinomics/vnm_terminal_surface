@@ -566,6 +566,14 @@ bool test_block_cursor_over_text_like_symbol_uses_cursor_text()
         frame.cursor_text_runs.front().text == QStringLiteral("\u2500") &&
         frame.cursor_text_runs.front().clip_rect == frame.cursors.front().rect,
         "block cursor inverse text comes from the shaped text run");
+
+    term::Terminal_render_options withheld_options = options();
+    withheld_options.cursor_withheld = true;
+    const term::Terminal_render_frame withheld_frame = build(snapshot, withheld_options);
+    ok &= check(withheld_frame.cursors.empty(),
+        "withheld block cursor emits no cursor rect");
+    ok &= check(withheld_frame.cursor_text_runs.empty(),
+        "withheld block cursor emits no inverse text run");
     return ok;
 }
 
@@ -984,6 +992,64 @@ bool test_selection_cursor_blink_and_shapes()
     ok              &= check(frame.cursors.front().kind == term::Terminal_cursor_shape::UNDERLINE &&
         frame.cursors.front().rect.height() < metrics().height,
         "underline cursor is short");
+    return ok;
+}
+
+bool test_terminal_render_cursor_visible_truth_table()
+{
+    bool ok = true;
+    term::Terminal_render_snapshot snapshot = empty_snapshot({2, 4});
+    snapshot.cursor = {{0, 0}, term::Terminal_cursor_shape::BLOCK, true, true};
+    term::Terminal_render_options render_options = options();
+
+    ok &= check(
+        term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate accepts visible in-grid cursor");
+
+    render_options.cursor_withheld = true;
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate rejects withheld cursor");
+
+    render_options.cursor_withheld = false;
+    snapshot.cursor.visible = false;
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate rejects DECTCM-hidden cursor");
+
+    snapshot.cursor.visible = true;
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, false),
+        "cursor visibility predicate applies blink-hidden phase");
+
+    snapshot.cursor.blink_enabled = false;
+    ok &= check(
+        term::terminal_render_cursor_visible(snapshot, render_options, false),
+        "cursor visibility predicate keeps blink-disabled cursor visible");
+
+    snapshot.cursor.blink_enabled = true;
+    render_options.cursor_blink_enabled_override = false;
+    ok &= check(
+        term::terminal_render_cursor_visible(snapshot, render_options, false),
+        "cursor visibility predicate lets render options disable blink");
+
+    render_options.cursor_blink_enabled_override = true;
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, false),
+        "cursor visibility predicate lets render options force blink");
+
+    render_options.cursor_blink_enabled_override.reset();
+    snapshot.cursor.position = {3, 0};
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate rejects cursor outside the grid");
+
+    snapshot.grid_size = {0, 0};
+    snapshot.cursor.position = {0, 0};
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate rejects zero-grid cursor");
+
     return ok;
 }
 
@@ -2415,6 +2481,15 @@ bool test_descriptor_keys_are_mutation_sensitive()
             base_frame.layer_descriptors.render_options_key,
         "render option mutations change the layer descriptor key");
 
+    term::Terminal_render_options cursor_withheld_options = options();
+    cursor_withheld_options.cursor_withheld = true;
+    const term::Terminal_render_frame cursor_withheld_options_frame =
+        build(base, cursor_withheld_options);
+    ok &= check(
+        cursor_withheld_options_frame.layer_descriptors.render_options_key !=
+            base_frame.layer_descriptors.render_options_key,
+        "cursor-withheld render option changes the layer descriptor key");
+
     term::terminal_cell_metrics_t changed_metrics = metrics();
     changed_metrics.width = 11.0;
     const term::Terminal_render_frame metrics_frame =
@@ -2499,6 +2574,7 @@ int main()
     ok &= test_default_and_reverse_full_grid_background();
     ok &= test_styled_blank_cells_emit_background_rects();
     ok &= test_selection_cursor_blink_and_shapes();
+    ok &= test_terminal_render_cursor_visible_truth_table();
     ok &= test_decorations_preedit_hyperlink_and_bell();
     ok &= test_zero_grid_and_preedit_width();
     ok &= test_preedit_override_takes_precedence_over_snapshot();
