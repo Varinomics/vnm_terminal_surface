@@ -288,6 +288,10 @@ Terminal_render_snapshot_request public_projection_row_snapshot_request(
 {
     Terminal_render_snapshot_request request;
     request.sequence                         = safe_basis.metadata.sequence;
+    request.content_identity_generation =
+        safe_basis.metadata.content_identity_generation;
+    request.backend_output_progress_generation =
+        safe_basis.metadata.backend_output_progress_generation;
     request.processed_backend_callback_epoch =
         safe_basis.metadata.processed_backend_callback_epoch;
     request.row_origin_generation            = safe_basis.metadata.row_origin_generation;

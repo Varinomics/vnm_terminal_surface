@@ -2343,12 +2343,25 @@ Terminal_viewport_scroll_result Terminal_session::scroll_viewport_lines_locked(i
 Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_lines(
     int line_delta)
 {
+    return scroll_published_viewport_lines_with_drain_observation(line_delta).scroll;
+}
+
+Terminal_session::Published_viewport_scroll_result
+Terminal_session::scroll_published_viewport_lines_with_drain_observation(int line_delta)
+{
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     drain_backend_callback_commands();
-    process_pending_commands();
+    Published_viewport_scroll_result result;
+    result.backend_drain.callbacks_pending_before =
+        m_callback_lifetime->has_pending_or_active_callbacks() ||
+        !m_pending_commands.empty();
+    result.backend_drain.stop = process_pending_commands();
+    result.backend_drain.callbacks_pending_after =
+        m_callback_lifetime->has_pending_or_active_callbacks() ||
+        !m_pending_commands.empty();
 
     if (!m_screen_model.has_value() || line_delta == 0) {
-        return {};
+        return result;
     }
     const bool render_publication_blocked =
         !model_allows_render_snapshot(*m_screen_model);
@@ -2359,47 +2372,65 @@ Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_line
         const Terminal_viewport_state public_viewport_before =
             m_public_viewport_controller.viewport();
         if (public_viewport_before.active_buffer != Terminal_buffer_id::PRIMARY) {
-            return {};
+            return result;
         }
 
         const Terminal_public_viewport_controller public_viewport_controller_before =
             m_public_viewport_controller;
         Terminal_public_viewport_scroll_result public_scroll_result =
             m_public_viewport_controller.scroll_lines(line_delta);
-        return finish_public_projection_scroll(
+        result.scroll = finish_public_projection_scroll(
             std::move(public_scroll_result),
             public_viewport_controller_before,
             public_viewport_before,
             QStringLiteral("public projection viewport scrolled"));
+        return result;
     }
     if (render_publication_blocked) {
-        return {};
+        return result;
     }
     if (m_viewport_controller.state().active_buffer != Terminal_buffer_id::PRIMARY) {
-        return {};
+        return result;
     }
 
     const Terminal_viewport_scroll_result scroll_result =
         m_viewport_controller.scroll_lines(line_delta);
     if (scroll_result.action != Terminal_viewport_scroll_action::VIEWPORT_MOVED) {
-        return scroll_result;
+        result.scroll = scroll_result;
+        return result;
     }
 
     publish_viewport_snapshot_if_allowed(
         next_sequence(),
         QStringLiteral("viewport scrolled"));
-    return scroll_result;
+    result.scroll = scroll_result;
+    return result;
 }
 
 Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_to_offset_from_tail(
     int offset_from_tail)
 {
+    return scroll_published_viewport_to_offset_from_tail_with_drain_observation(
+        offset_from_tail).scroll;
+}
+
+Terminal_session::Published_viewport_scroll_result
+Terminal_session::scroll_published_viewport_to_offset_from_tail_with_drain_observation(
+    int offset_from_tail)
+{
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     drain_backend_callback_commands();
-    process_pending_commands();
+    Published_viewport_scroll_result result;
+    result.backend_drain.callbacks_pending_before =
+        m_callback_lifetime->has_pending_or_active_callbacks() ||
+        !m_pending_commands.empty();
+    result.backend_drain.stop = process_pending_commands();
+    result.backend_drain.callbacks_pending_after =
+        m_callback_lifetime->has_pending_or_active_callbacks() ||
+        !m_pending_commands.empty();
 
     if (!m_screen_model.has_value()) {
-        return {};
+        return result;
     }
     const bool render_publication_blocked =
         !model_allows_render_snapshot(*m_screen_model);
@@ -2410,24 +2441,25 @@ Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_to_o
         const Terminal_viewport_state public_viewport_before =
             m_public_viewport_controller.viewport();
         if (public_viewport_before.active_buffer != Terminal_buffer_id::PRIMARY) {
-            return {};
+            return result;
         }
 
         const Terminal_public_viewport_controller public_viewport_controller_before =
             m_public_viewport_controller;
         Terminal_public_viewport_scroll_result public_scroll_result =
             m_public_viewport_controller.scroll_to_offset_from_tail(offset_from_tail);
-        return finish_public_projection_scroll(
+        result.scroll = finish_public_projection_scroll(
             std::move(public_scroll_result),
             public_viewport_controller_before,
             public_viewport_before,
             QStringLiteral("public projection viewport scrolled"));
+        return result;
     }
     if (render_publication_blocked) {
-        return {};
+        return result;
     }
     if (m_viewport_controller.state().active_buffer != Terminal_buffer_id::PRIMARY) {
-        return {};
+        return result;
     }
 
     const Terminal_viewport_state viewport = m_viewport_controller.state();
@@ -2435,19 +2467,21 @@ Terminal_viewport_scroll_result Terminal_session::scroll_published_viewport_to_o
         std::clamp(offset_from_tail, 0, std::max(0, viewport.scrollback_rows));
     const int line_delta = target_offset - viewport.offset_from_tail;
     if (line_delta == 0) {
-        return {};
+        return result;
     }
 
     const Terminal_viewport_scroll_result scroll_result =
         m_viewport_controller.scroll_lines(line_delta);
     if (scroll_result.action != Terminal_viewport_scroll_action::VIEWPORT_MOVED) {
-        return scroll_result;
+        result.scroll = scroll_result;
+        return result;
     }
 
     publish_viewport_snapshot_if_allowed(
         next_sequence(),
         QStringLiteral("viewport scrolled"));
-    return scroll_result;
+    result.scroll = scroll_result;
+    return result;
 }
 
 Terminal_viewport_scroll_result Terminal_session::finish_public_projection_scroll(
@@ -3556,15 +3590,9 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
             break;
         }
         if (cursor_shown_at_boundary) {
-            // Default-off frame drains keep DECTCM cursor-stable boundaries
-            // inert; synchronized-output release-stable stops are handled
-            // above and remain settled without the extension.
-            const bool frame_dectcm_stop_extension_disabled =
-                target_backend_callback_epoch.has_value() &&
-                !cursor_stable_stop_extension.has_value();
-            stop = frame_dectcm_stop_extension_disabled
-                ? Backend_callback_drain_stop::UNSETTLED
-                : Backend_callback_drain_stop::CURSOR_STABLE;
+            // A primary-expiry boundary has already observed the repaint close.
+            // The optional extension only waits for a future boundary.
+            stop = Backend_callback_drain_stop::CURSOR_STABLE;
             break;
         }
         if (!extension_deadline.has_value()) {
@@ -3588,6 +3616,16 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
         }
     }
     flush_deferred_backend_content_snapshot();
+    if (stop == Backend_callback_drain_stop::COMPLETE &&
+        !deadline.has_value()                         &&
+        m_screen_model.has_value()                    &&
+        m_screen_model->mode_state().synchronized_output &&
+        !m_drain_latest_live_content_publication_generation.has_value() &&
+        !m_drain_synchronized_release_publication_generation.has_value() &&
+        !m_deferred_backend_content_snapshot.has_value())
+    {
+        stop = Backend_callback_drain_stop::HELD;
+    }
     m_backend_content_snapshot_deferral_active =
         previous_backend_content_snapshot_deferral;
     m_processing_commands = false;
@@ -4444,11 +4482,11 @@ Terminal_backend_callbacks Terminal_session::make_backend_callbacks()
     return callbacks;
 }
 
-void Terminal_session::process_backend_callback_events()
+Backend_callback_drain_stop Terminal_session::process_backend_callback_events()
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
-    (void)process_pending_commands();
+    return process_pending_commands();
 }
 
 Backend_callback_drain_stop Terminal_session::process_backend_callback_events_for(
@@ -4858,6 +4896,7 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     m_viewport_controller.set_visible_rows(grid_size.rows);
     m_backend_output_prescan_pending.clear();
     m_incomplete_backend_output_callback_epoch = 0U;
+    m_backend_output_progress_generation       = 0U;
     reset_utf8_scan_state(m_backend_output_prescan_utf8_state);
     m_latest_render_snapshot.reset();
     m_latest_content_render_snapshot.reset();
@@ -4984,7 +5023,8 @@ void Terminal_session::ingest_backend_output_segment(
                 sequence,
                 QStringLiteral("backend output received"),
                 Terminal_render_snapshot_purpose::CONTENT,
-                release_diagnostics.value_or(Terminal_public_scroll_diagnostics{}));
+                release_diagnostics.value_or(Terminal_public_scroll_diagnostics{}),
+                true);
             if (m_render_snapshot_generation != generation_before_publish) {
                 record_backend_callback_drain_content_publication(
                     m_render_snapshot_generation,
@@ -5042,7 +5082,8 @@ void Terminal_session::flush_deferred_backend_content_snapshot()
         pending.sequence,
         std::move(pending.message),
         Terminal_render_snapshot_purpose::CONTENT,
-        pending.public_scroll_diagnostics);
+        pending.public_scroll_diagnostics,
+        true);
     if (m_render_snapshot_generation != generation_before_publish) {
         record_backend_callback_drain_content_publication(
             m_render_snapshot_generation,
@@ -5978,6 +6019,9 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
     Terminal_render_snapshot_request request;
     request.sequence                         = sequence;
     request.publication_generation           = m_render_snapshot_generation + 1U;
+    request.content_identity_generation      = m_selection_content_basis.content_generation;
+    request.backend_output_progress_generation =
+        m_backend_output_progress_generation;
     request.processed_backend_callback_epoch =
         m_last_processed_backend_callback_epoch;
     request.basis                            = Terminal_render_snapshot_basis::LIVE_CONTENT;
@@ -6678,7 +6722,8 @@ void Terminal_session::publish_render_snapshot(
     QString        message,
     Terminal_render_snapshot_purpose
                   purpose,
-    Terminal_public_scroll_diagnostics public_scroll_diagnostics)
+    Terminal_public_scroll_diagnostics public_scroll_diagnostics,
+    bool                               backend_output_progress)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::publish_render_snapshot");
 
@@ -6687,6 +6732,9 @@ void Terminal_session::publish_render_snapshot(
         ++m_profile_stats.render_snapshot_requests;
     }
 #endif
+    if (backend_output_progress) {
+        ++m_backend_output_progress_generation;
+    }
     Terminal_render_snapshot_request request =
         make_render_snapshot_request(sequence, purpose, public_scroll_diagnostics);
     if (m_config.selection_trace_enabled) {

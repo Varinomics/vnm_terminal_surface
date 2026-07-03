@@ -138,6 +138,10 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
         snapshot.cursor.visible                    = m_modes.cursor_visible;
         snapshot.cursor.blink_enabled              = request.cursor_blink_enabled;
         snapshot.ime_preedit                       = request.ime_preedit;
+        snapshot.metadata.content_identity_generation =
+            request.content_identity_generation;
+        snapshot.metadata.backend_output_progress_generation =
+            request.backend_output_progress_generation;
         snapshot.metadata.processed_backend_callback_epoch =
             request.processed_backend_callback_epoch;
         snapshot.metadata.backend_geometry_in_sync = request.backend_geometry_in_sync;

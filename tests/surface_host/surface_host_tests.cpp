@@ -453,6 +453,7 @@ std::optional<term::Qsg_atlas_frame_report> capture_next_surface_frame(
 struct Surface_frame_attempt
 {
     bool                         valid = false;
+    bool                         offline_frame_build = false;
     term::Qsg_atlas_frame_report report;
 };
 
@@ -475,6 +476,110 @@ Surface_frame_attempt capture_surface_frame_attempt(
     attempt.report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
     return attempt;
+}
+
+Surface_frame_attempt capture_surface_cursor_frame_attempt_without_polish(
+    VNM_TerminalSurface& surface)
+{
+    Surface_frame_attempt attempt;
+    attempt.offline_frame_build = true;
+    attempt.report =
+        term::VNM_TerminalSurface_render_bridge::
+            capture_qsg_atlas_frame_for_testing(surface);
+    attempt.valid =
+        attempt.report.capture_count > 0U &&
+        attempt.report.captured_render_cursor.valid;
+    return attempt;
+}
+
+Surface_frame_attempt capture_surface_cursor_frame_attempt(
+    QGuiApplication&       app,
+    QQuickWindow&          window,
+    VNM_TerminalSurface&   surface,
+    bool                   expected_visible)
+{
+    const term::Qsg_atlas_frame_report report_before =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+    const std::uint64_t capture_count_before = report_before.capture_count;
+    surface.set_cursor_style(
+        surface.cursor_style() == VNM_TerminalSurface::Cursor_style::BLOCK
+            ? VNM_TerminalSurface::Cursor_style::BAR
+            : VNM_TerminalSurface::Cursor_style::BLOCK);
+
+    Surface_frame_attempt attempt;
+    for (int i = 0; i < 30; ++i) {
+        attempt = capture_surface_frame_attempt(app, window, surface);
+        const bool captured_after_toggle =
+            attempt.report.capture_count > capture_count_before;
+        const bool emitted_report_matches =
+            attempt.report.prepare_count > 0U
+                ? attempt.report.frame_build.emitted_cursor.visible ==
+                    expected_visible
+                : !attempt.report.frame_build.emitted_cursor.valid &&
+                    !attempt.report.frame_build.emitted_cursor.visible;
+        if (attempt.valid &&
+            captured_after_toggle &&
+            attempt.report.captured_render_cursor.visible == expected_visible &&
+            emitted_report_matches)
+        {
+            return attempt;
+        }
+    }
+    return attempt;
+}
+
+bool check_frame_cursor_visibility(
+    const Surface_frame_attempt& attempt,
+    bool                         expected_visible,
+    const QString&               route)
+{
+    bool ok = true;
+    const bool captured_matches =
+        attempt.report.capture_count > 0U &&
+        attempt.report.captured_render_cursor.valid &&
+        attempt.report.captured_render_cursor.visible == expected_visible;
+    if (!captured_matches) {
+        std::cerr << "FAIL: " << route.toStdString()
+            << " cursor report expected_visible=" << expected_visible
+            << " capture_count=" << attempt.report.capture_count
+            << " prepare_count=" << attempt.report.prepare_count
+            << " captured_valid="
+            << attempt.report.captured_render_cursor.valid
+            << " captured_visible="
+            << attempt.report.captured_render_cursor.visible
+            << " captured_row=" << attempt.report.captured_render_cursor.row
+            << " captured_column="
+            << attempt.report.captured_render_cursor.column
+            << " emitted_valid="
+            << attempt.report.frame_build.emitted_cursor.valid
+            << " emitted_visible="
+            << attempt.report.frame_build.emitted_cursor.visible
+            << '\n';
+    }
+    ok &= check_route(
+        captured_matches,
+        route,
+        expected_visible
+            ? " captures a visible rendered cursor"
+            : " captures a withheld rendered cursor");
+    // surface_host can render without an atlas prepare; then emitted_cursor is
+    // intentionally empty default report data rather than an emitted primitive.
+    if (attempt.offline_frame_build || attempt.report.prepare_count > 0U) {
+        ok &= check_route(
+            attempt.report.frame_build.emitted_cursor.visible == expected_visible,
+            route,
+            expected_visible
+                ? " emits a visible cursor"
+                : " emits no cursor");
+    }
+    else {
+        ok &= check_route(
+            !attempt.report.frame_build.emitted_cursor.valid &&
+                !attempt.report.frame_build.emitted_cursor.visible,
+            route,
+            " has no prepared emitted-cursor report");
+    }
+    return ok;
 }
 
 bool capture_surface_sequence(
@@ -750,6 +855,41 @@ QByteArray epoch_catchup_budget_probe_payload(const QByteArray& tail_output)
     return bytes;
 }
 
+QByteArray unsettled_drain_stop_first_slice(const QByteArray& partial_marker)
+{
+    const qsizetype first_slice_filler_bytes =
+        k_backend_output_drain_slice_contract_bytes -
+        QByteArrayLiteral("\r\n").size() -
+        partial_marker.size();
+    QByteArray bytes(std::max<qsizetype>(0, first_slice_filler_bytes), 'u');
+    bytes += QByteArrayLiteral("\r\n");
+    bytes += partial_marker;
+    return bytes;
+}
+
+QByteArray unsettled_drain_stop_probe_payload(
+    const QByteArray& partial_marker,
+    const QByteArray& tail_output)
+{
+    QByteArray bytes = unsettled_drain_stop_first_slice(partial_marker);
+    bytes += QByteArray(k_backend_output_drain_slice_contract_bytes * 5, 'u');
+    bytes += QByteArrayLiteral("\r\n");
+    bytes += tail_output;
+    return bytes;
+}
+
+void use_zero_frame_catchup_budget(VNM_TerminalSurface& surface)
+{
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_budget_for_benchmark(
+            surface,
+            std::chrono::steady_clock::duration::zero());
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
+            surface,
+            std::chrono::steady_clock::duration::zero());
+}
+
 struct Scripted_backend_lifecycle_state
 {
     std::atomic<int> destructed_count{0};
@@ -807,6 +947,9 @@ public:
     term::Terminal_backend_result write(QByteArray bytes) override
     {
         writes.push_back(std::move(bytes));
+        if (on_write != nullptr) {
+            on_write();
+        }
         if (write_delay > std::chrono::steady_clock::duration::zero()) {
             const auto deadline = std::chrono::steady_clock::now() + write_delay;
             // Stay inside the owner drain without depending on platform sleep granularity.
@@ -887,6 +1030,14 @@ public:
         m_callbacks.process_exited(exit);
     }
 
+    void emit_error(QString message = QStringLiteral("scripted backend diagnostic"))
+    {
+        m_callbacks.error_reported({
+            term::Terminal_backend_error_code::READ_FAILED,
+            std::move(message),
+        });
+    }
+
     void emit_output_from_worker(QByteArray bytes)
     {
         join_worker();
@@ -927,6 +1078,7 @@ public:
     std::vector<term::Terminal_launch_config>*
                                start_config_observer  = nullptr;
     std::function<void()>      on_start;
+    std::function<void()>      on_write;
     std::shared_ptr<Scripted_backend_lifecycle_state>
                                lifecycle_state;
     int*                       start_attempt_observer = nullptr;
@@ -964,6 +1116,132 @@ Scripted_backend* start_surface_with_backend(
         std::move(backend),
         std::move(argv));
     return backend_ptr;
+}
+
+std::shared_ptr<const term::Terminal_render_snapshot> publish_unsettled_drain_stop(
+    VNM_TerminalSurface&    surface,
+    Scripted_backend&       backend,
+    const QByteArray&       tail_output,
+    bool&                   ok,
+    const QString&          route,
+    const QByteArray&       delayed_absent_marker = {},
+    bool                    expect_active_cursor_withhold = true)
+{
+    static std::uint64_t s_probe_marker_counter = 0U;
+
+    const QByteArray partial_marker =
+        QByteArrayLiteral("unsettled-drain-probe-") +
+        QByteArray::number(++s_probe_marker_counter);
+    const QByteArray absent_marker =
+        delayed_absent_marker.isEmpty()
+            ? tail_output
+            : delayed_absent_marker;
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot_before_polish =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(surface);
+    const std::uint64_t sequence_before_polish =
+        snapshot_before_polish != nullptr
+            ? snapshot_before_polish->metadata.sequence
+            : 0U;
+    const term::Terminal_surface_backend_drain_stats_t stats_before_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(surface);
+    backend.emit_output(unsettled_drain_stop_probe_payload(partial_marker, tail_output));
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(surface);
+    const term::Terminal_surface_backend_drain_stats_t stats_after_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot_after_polish =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(surface);
+    ok &= check_route(
+        snapshot_after_polish != nullptr &&
+            snapshot_after_polish->metadata.sequence > sequence_before_polish,
+        route,
+        " advances the snapshot sequence during the UNSETTLED drain");
+    ok &= check_route(
+        snapshot_after_polish != nullptr &&
+            snapshot_contains_text(
+                *snapshot_after_polish,
+                QString::fromLatin1(partial_marker)),
+        route,
+        " publishes the unique partial marker");
+    ok &= check_route(
+        snapshot_after_polish != nullptr &&
+            !snapshot_contains_text(
+                *snapshot_after_polish,
+                QString::fromLatin1(absent_marker)),
+        route,
+        " excludes the delayed tail marker");
+    ok &= check_route(
+        stats_after_polish.budget_exhausted_incomplete ==
+            stats_before_polish.budget_exhausted_incomplete + 1U,
+        route,
+        " records one UNSETTLED budget stop");
+    ok &= check_route(
+        stats_after_polish.cursor_stable_incomplete ==
+            stats_before_polish.cursor_stable_incomplete,
+        route,
+        " records no cursor-stable stop");
+    ok &= check_route(
+        stats_after_polish.pending_callback_after_drain ==
+            stats_before_polish.pending_callback_after_drain + 1U,
+        route,
+        " records pending callback work after the drain");
+    ok &= check_route(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            surface) > 0U,
+        route,
+        " leaves callback work pending");
+    ok &= check_route(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            surface) == expect_active_cursor_withhold,
+        route,
+        expect_active_cursor_withhold
+            ? " records an active UNSETTLED cursor withhold"
+            : " records an UNSETTLED drain without cursor withhold");
+    return snapshot_after_polish;
+}
+
+bool start_cursor_withhold_surface(
+    QGuiApplication&                                      app,
+    Surface_fixture&                                     fixture,
+    QByteArray                                           baseline_output,
+    Scripted_backend**                                   out_backend,
+    std::shared_ptr<const term::Terminal_render_snapshot>* out_baseline_snapshot,
+    const char*                                          start_message,
+    const char*                                          snapshot_message,
+    const char*                                          capture_message)
+{
+    pump_events(app);
+    fixture.surface.set_cursor_blink_enabled(false);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {std::move(baseline_output)};
+
+    bool started = false;
+    *out_backend = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+
+    bool ok = true;
+    ok &= check(started && *out_backend != nullptr, start_message);
+    if (!started || *out_backend == nullptr) {
+        return ok;
+    }
+
+    *out_baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(*out_baseline_snapshot != nullptr, snapshot_message);
+    if (*out_baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        (*out_baseline_snapshot)->metadata.sequence),
+        capture_message);
+    return ok;
 }
 
 void queue_posted_drain_budget_probe(
@@ -1609,7 +1887,11 @@ bool test_surface_no_echo_input_keeps_cursor_visible(QGuiApplication& app)
         "no-echo cursor visibility accepts and writes printable input");
 
     const Surface_frame_attempt frame_attempt =
-        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
     ok &= check(frame_attempt.valid,
         "no-echo cursor visibility observes a post-input frame attempt");
     if (!frame_attempt.valid) {
@@ -1625,6 +1907,10 @@ bool test_surface_no_echo_input_keeps_cursor_visible(QGuiApplication& app)
         frame_attempt.report.captured_render_cursor.column ==
             baseline_snapshot->cursor.position.column,
         "no-echo cursor visibility keeps the terminal cursor visible");
+    ok &= check_frame_cursor_visibility(
+        frame_attempt,
+        true,
+        QStringLiteral("no-echo cursor visibility"));
 
     return ok;
 }
@@ -1711,7 +1997,11 @@ bool test_surface_unrendered_publication_input_keeps_cursor_visible(
         "unrendered publication input keeps pending snapshot after input");
 
     const Surface_frame_attempt frame_attempt =
-        capture_surface_frame_attempt(app, fixture.window, fixture.surface);
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
     ok &= check(frame_attempt.valid,
         "unrendered publication input observes a post-input frame attempt");
     if (!frame_attempt.valid) {
@@ -2404,9 +2694,50 @@ bool test_surface_posted_backend_drain_uses_frame_pending_small_budget(
     ok &= check(snapshot_after_posted != nullptr &&
         !snapshot_contains_text(*snapshot_after_posted, tail_text),
         "surface posted small-budget test does not publish the delayed tail");
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "transition table row: no_publication_no_settlement does not create cursor withhold");
+
+    const Surface_frame_attempt posted_frame =
+        capture_surface_cursor_frame_attempt_without_polish(fixture.surface);
+    ok &= check(posted_frame.valid,
+        "surface posted small-budget test captures the no-publication posted frame");
+    if (!posted_frame.valid) {
+        return ok;
+    }
+    ok &= check_frame_cursor_visibility(
+        posted_frame,
+        true,
+        QStringLiteral("surface posted small-budget test no-publication frame"));
 
     term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
         fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> settled_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(settled_snapshot != nullptr &&
+        snapshot_contains_text(*settled_snapshot, tail_text),
+        "surface posted small-budget test publishes delayed tail on settled drain");
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface posted small-budget test clears withhold after settled drain");
+
+    const Surface_frame_attempt settled_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(settled_frame.valid,
+        "surface posted small-budget test captures settled posted frame");
+    if (!settled_frame.valid) {
+        return ok;
+    }
+    ok &= check_frame_cursor_visibility(
+        settled_frame,
+        true,
+        QStringLiteral("surface posted small-budget test settled frame"));
 
     return ok;
 }
@@ -2649,7 +2980,7 @@ bool test_surface_epoch_catchup_uses_frame_budget_override(QGuiApplication& app)
     return ok;
 }
 
-bool test_surface_cursor_stable_extension_disabled_preserves_incomplete_boundary(
+bool test_surface_cursor_stable_extension_disabled_preserves_observed_boundary(
     QGuiApplication& app)
 {
     bool ok = true;
@@ -2725,14 +3056,16 @@ bool test_surface_cursor_stable_extension_disabled_preserves_incomplete_boundary
         term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
     ok &= check(
         stats_after_polish.budget_exhausted_incomplete ==
-            stats_before_polish.budget_exhausted_incomplete + 1U,
-        "surface disabled cursor-stable boundary records the incomplete budget stat");
+            stats_before_polish.budget_exhausted_incomplete,
+        "semantic oracle A3: observed cursor boundary is not a budget stop");
     ok &= check(
         stats_after_polish.cursor_stable_incomplete ==
-            stats_before_polish.cursor_stable_incomplete,
-        "surface disabled cursor-stable boundary records no cursor-stable stat");
-    ok &= check_int_equal(title_changed_count, 0,
-        "surface disabled cursor-stable boundary defers the title notification");
+            stats_before_polish.cursor_stable_incomplete + 1U,
+        "semantic oracle A3: disabled extension records the observed cursor boundary as cursor-stable");
+    ok &= check_int_equal(title_changed_count, 1,
+        "semantic oracle A3: disabled extension publishes metadata at the cursor-stable boundary");
+    ok &= check(fixture.surface.terminal_title() == QString::fromLatin1(title),
+        "semantic oracle A3: disabled extension preserves the boundary title payload");
     ok &= check(term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
             fixture.surface) > 0U,
         "surface disabled cursor-stable boundary leaves later output pending");
@@ -2740,9 +3073,9 @@ bool test_surface_cursor_stable_extension_disabled_preserves_incomplete_boundary
     term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
         fixture.surface);
     ok &= check_int_equal(title_changed_count, 1,
-        "surface disabled cursor-stable boundary delivers the title after the complete drain");
+        "semantic oracle A3: complete tail drain does not redeliver the boundary title");
     ok &= check(fixture.surface.terminal_title() == QString::fromLatin1(title),
-        "surface disabled cursor-stable boundary preserves the deferred title payload");
+        "semantic oracle A3: complete tail drain preserves the boundary title payload");
 
     return ok;
 }
@@ -2920,6 +3253,2632 @@ bool test_surface_synchronized_hold_stop_preserves_drain_stats(QGuiApplication& 
     ok &= check(snapshot_after_polish != nullptr &&
         snapshot_after_polish->metadata.sequence == baseline_snapshot->metadata.sequence,
         "surface held stop stats test leaves the installed snapshot unchanged");
+
+    return ok;
+}
+
+bool test_surface_unsettled_drain_stop_withholds_cursor_primitive(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("unsettled-withhold-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface unsettled drain-stop withhold starts",
+        "surface unsettled drain-stop withhold publishes a baseline snapshot",
+        "surface unsettled drain-stop withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const QByteArray tail = QByteArrayLiteral("unsettled-withhold-tail");
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            tail,
+            ok,
+            QStringLiteral("surface unsettled drain-stop withhold"));
+    ok &= check(unsettled_snapshot != nullptr &&
+        unsettled_snapshot->metadata.sequence > baseline_snapshot->metadata.sequence,
+        "surface unsettled drain-stop withhold publishes partial output");
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(unsettled_snapshot->cursor.visible,
+        "surface unsettled drain-stop withhold leaves DECTCM cursor visible");
+    ok &= check(!snapshot_contains_text(
+            *unsettled_snapshot,
+            QString::fromLatin1(tail)),
+        "surface unsettled drain-stop withhold leaves later output pending");
+
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            false);
+    ok &= check(frame_attempt.valid,
+        "surface unsettled drain-stop withhold captures a frame");
+    if (!frame_attempt.valid) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> captured_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(captured_snapshot != nullptr &&
+        frame_attempt.report.captured_snapshot_sequence ==
+            captured_snapshot->metadata.sequence &&
+        captured_snapshot->metadata.sequence >= unsettled_snapshot->metadata.sequence &&
+        !snapshot_contains_text(*captured_snapshot, QString::fromLatin1(tail)),
+        "surface unsettled drain-stop withhold captures the partial output snapshot");
+    ok &= check(frame_attempt.report.captured_snapshot_cursor.visible,
+        "surface unsettled drain-stop withhold captures a visible snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        frame_attempt,
+        false,
+        QStringLiteral("surface unsettled drain-stop withhold"));
+
+    return ok;
+}
+
+bool test_surface_cursor_only_backend_publication_withholds_cursor(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("cursor-only-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface cursor-only withhold starts",
+        "surface cursor-only withhold publishes a baseline snapshot",
+        "surface cursor-only withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const std::optional<term::Cursor_withhold_content_id> baseline_content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(baseline_content_id.has_value(),
+        "surface cursor-only withhold has a baseline content id");
+    if (!baseline_content_id.has_value()) {
+        return ok;
+    }
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    QByteArray cursor_only_output;
+    for (int i = 0; i < 720; ++i) {
+        cursor_only_output += QByteArrayLiteral("\x1b[2;7H");
+    }
+    cursor_only_output += QByteArrayLiteral("\r\ncursor-only-same-callback-tail");
+    backend_ptr->emit_output(std::move(cursor_only_output));
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+
+    const term::Terminal_surface_backend_drain_stats_t stats_after_polish =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> cursor_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    const std::optional<term::Cursor_withhold_content_id> cursor_content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+
+    ok &= check(
+        stats_after_polish.budget_exhausted_incomplete ==
+            stats_before_polish.budget_exhausted_incomplete + 1U,
+        "surface cursor-only withhold records an UNSETTLED budget stop");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) > 0U,
+        "surface cursor-only withhold leaves later backend output pending");
+    ok &= check(cursor_snapshot != nullptr &&
+        cursor_snapshot->metadata.sequence > baseline_snapshot->metadata.sequence,
+        "surface cursor-only withhold advances the snapshot sequence");
+    ok &= check(cursor_snapshot != nullptr &&
+        cursor_snapshot->metadata.content_identity_generation ==
+            baseline_snapshot->metadata.content_identity_generation,
+        "surface cursor-only withhold preserves the terminal content generation");
+    ok &= check(cursor_snapshot != nullptr &&
+        cursor_snapshot->metadata.processed_backend_callback_epoch ==
+            baseline_snapshot->metadata.processed_backend_callback_epoch,
+        "surface cursor-only withhold keeps same-callback processed epoch unchanged");
+    ok &= check(cursor_snapshot != nullptr &&
+        cursor_snapshot->metadata.backend_output_progress_generation >
+            baseline_snapshot->metadata.backend_output_progress_generation,
+        "surface cursor-only withhold advances backend output progress");
+    ok &= check(cursor_snapshot != nullptr &&
+        cursor_snapshot->cursor.position.row == 1 &&
+        cursor_snapshot->cursor.position.column == 6,
+        "surface cursor-only withhold publishes the backend cursor move");
+    ok &= check(cursor_snapshot != nullptr &&
+        !snapshot_contains_text(
+            *cursor_snapshot,
+            QStringLiteral("cursor-only-same-callback-tail")),
+        "surface cursor-only withhold leaves the same-callback tail unpublished");
+    ok &= check(cursor_content_id.has_value() &&
+        *cursor_content_id != *baseline_content_id,
+        "surface cursor-only withhold advances the backend-progress content id component");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface cursor-only withhold arms cursor-withhold for the cursor-only publication");
+
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_cursor_frame_attempt_without_polish(fixture.surface);
+    ok &= check(frame_attempt.valid,
+        "surface cursor-only withhold captures a frame without draining later output");
+    if (!frame_attempt.valid) {
+        return ok;
+    }
+    ok &= check(frame_attempt.report.captured_snapshot_cursor.visible,
+        "surface cursor-only withhold captures a visible snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        frame_attempt,
+        false,
+        QStringLiteral("surface cursor-only withhold"));
+
+    return ok;
+}
+
+bool test_surface_held_drain_preserves_active_cursor_withhold(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("held-preserve-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface HELD preserve withhold starts",
+        "surface HELD preserve withhold publishes a baseline snapshot",
+        "surface HELD preserve withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const std::optional<term::Cursor_withhold_content_id> content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(content_id.has_value(),
+        "surface HELD preserve withhold has a protected content id");
+    if (!content_id.has_value()) {
+        return ok;
+    }
+    const std::uint64_t session_generation =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).session_generation;
+    term::VNM_TerminalSurface_render_bridge::apply_cursor_withhold_event_for_testing(
+        fixture.surface,
+        {
+            term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED,
+            content_id,
+            session_generation,
+        });
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface HELD preserve withhold enters active protected cursor state");
+
+    const QByteArray held_marker = QByteArrayLiteral("held-preserve-held");
+    const QByteArray tail_marker = QByteArrayLiteral("held-preserve-tail");
+    QByteArray output = QByteArrayLiteral("\x1b[?2026h");
+    output += held_marker;
+    output += QByteArray(k_backend_output_drain_slice_contract_bytes - output.size(), 'x');
+    output += tail_marker;
+    const term::Terminal_surface_backend_drain_stats_t stats_before_held =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    backend_ptr->emit_output(output);
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+    const term::Terminal_surface_backend_drain_stats_t stats_after_held =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(fixture.surface);
+    ok &= check(
+        stats_after_held.pending_callback_after_drain ==
+            stats_before_held.pending_callback_after_drain + 1U,
+        "surface HELD preserve withhold observes a budgeted held no-publication drain");
+    ok &= check(
+        stats_after_held.budget_exhausted_incomplete ==
+            stats_before_held.budget_exhausted_incomplete,
+        "surface HELD preserve withhold does not count held stop as budget-exhausted");
+    ok &= check(
+        stats_after_held.cursor_stable_incomplete ==
+            stats_before_held.cursor_stable_incomplete,
+        "surface HELD preserve withhold does not count held stop as cursor-stable");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) > 0U,
+        "surface HELD preserve withhold leaves held callback work pending");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> held_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(held_snapshot != nullptr &&
+        held_snapshot->metadata.sequence == baseline_snapshot->metadata.sequence &&
+        !snapshot_contains_text(*held_snapshot, QString::fromLatin1(held_marker)) &&
+        !snapshot_contains_text(*held_snapshot, QString::fromLatin1(tail_marker)),
+        "surface HELD preserve withhold leaves the installed snapshot unchanged");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface HELD preserve withhold keeps the active UNSETTLED state");
+
+    const Surface_frame_attempt held_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            false);
+    ok &= check(held_frame.valid,
+        "surface HELD preserve withhold captures a frame");
+    if (!held_frame.valid) {
+        return ok;
+    }
+    ok &= check_frame_cursor_visibility(
+        held_frame,
+        false,
+        QStringLiteral("surface HELD preserve withhold"));
+
+    return ok;
+}
+
+bool test_cursor_withhold_transition_table_rows()
+{
+    bool ok = true;
+    Surface_fixture fixture;
+
+    const term::Cursor_withhold_content_id content_a{1U, 1001U, 5001U};
+    const term::Cursor_withhold_content_id content_b{1U, 1002U, 5002U};
+    const term::Cursor_withhold_content_id stale_content{0U, 9001U, 4001U};
+
+    const auto apply = [&](
+        term::Cursor_withhold_test_event_kind kind,
+        std::optional<term::Cursor_withhold_content_id> content_id = std::nullopt,
+        std::uint64_t session_generation = 1U) {
+        term::VNM_TerminalSurface_render_bridge::apply_cursor_withhold_event_for_testing(
+            fixture.surface,
+            {kind, std::move(content_id), session_generation});
+    };
+
+    const auto expect = [&](
+        std::optional<term::Cursor_withhold_content_id> expected_content_id,
+        bool                                            input_exemption,
+        bool                                            cursor_withheld,
+        const char*                                     row) {
+        const term::Cursor_withhold_state_snapshot state =
+            term::VNM_TerminalSurface_render_bridge::
+                cursor_withhold_state_for_testing(fixture.surface);
+        const bool content_matches =
+            expected_content_id.has_value() == state.protected_content_id.has_value() &&
+            (!expected_content_id.has_value() ||
+                *expected_content_id == *state.protected_content_id);
+        ok &= check(content_matches, row);
+        ok &= check(state.input_exemption == input_exemption, row);
+        ok &= check(state.cursor_withheld == cursor_withheld, row);
+    };
+
+    apply(term::Cursor_withhold_test_event_kind::SESSION_RESET);
+    expect(std::nullopt, false, false,
+        "transition table row: session_reset clears initial cursor-withhold state");
+
+    apply(term::Cursor_withhold_test_event_kind::HELD_NO_PUBLICATION);
+    expect(std::nullopt, false, false,
+        "transition table row: no protected content + held_no_publication no-op");
+
+    apply(term::Cursor_withhold_test_event_kind::NO_PUBLICATION_NO_SETTLEMENT);
+    expect(std::nullopt, false, false,
+        "transition table row: no protected content + no_publication_no_settlement no-op");
+
+    apply(term::Cursor_withhold_test_event_kind::METADATA_ONLY_PUBLICATION, content_a);
+    expect(std::nullopt, false, false,
+        "transition table row: no protected content + metadata_only_publication no-op");
+
+    apply(term::Cursor_withhold_test_event_kind::STALE_SESSION_EVENT, stale_content, 0U);
+    expect(std::nullopt, false, false,
+        "transition table row: no protected content + stale event no-op");
+
+    apply(term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED, content_a);
+    expect(content_a, false, true,
+        "transition table row: no protected content + unsettled_content_published(A)");
+
+    apply(term::Cursor_withhold_test_event_kind::SESSION_RESET);
+    apply(term::Cursor_withhold_test_event_kind::ACCEPTED_TERMINAL_INPUT);
+    expect(std::nullopt, true, false,
+        "transition table row: no protected content + accepted_terminal_input");
+
+    apply(term::Cursor_withhold_test_event_kind::HELD_NO_PUBLICATION);
+    expect(std::nullopt, true, false,
+        "transition table row: no protected input-exempt + held_no_publication");
+
+    apply(term::Cursor_withhold_test_event_kind::NO_PUBLICATION_NO_SETTLEMENT);
+    expect(std::nullopt, true, false,
+        "transition table row: no protected input-exempt + no_publication_no_settlement");
+
+    apply(term::Cursor_withhold_test_event_kind::METADATA_ONLY_PUBLICATION, content_a);
+    expect(std::nullopt, true, false,
+        "transition table row: no protected input-exempt + metadata_only_publication");
+
+    apply(term::Cursor_withhold_test_event_kind::STALE_SESSION_EVENT, stale_content, 0U);
+    expect(std::nullopt, true, false,
+        "transition table row: no protected input-exempt + stale event");
+
+    apply(term::Cursor_withhold_test_event_kind::SETTLED_CONTENT_PUBLISHED, content_a);
+    expect(std::nullopt, false, false,
+        "transition table row: no protected input-exempt + settled_content_published clears latch");
+
+    apply(term::Cursor_withhold_test_event_kind::ACCEPTED_TERMINAL_INPUT);
+    apply(term::Cursor_withhold_test_event_kind::SUCCESSFUL_RECOVERY_RELEASE, content_a);
+    expect(std::nullopt, false, false,
+        "transition table row: no protected input-exempt + successful_recovery_release clears latch");
+
+    apply(term::Cursor_withhold_test_event_kind::ACCEPTED_TERMINAL_INPUT);
+    apply(term::Cursor_withhold_test_event_kind::INSTALLED_CONTENT_SNAPSHOT_SETTLED, content_a);
+    expect(std::nullopt, false, false,
+        "transition table row: no protected input-exempt + installed settlement clears latch");
+
+    apply(term::Cursor_withhold_test_event_kind::ACCEPTED_TERMINAL_INPUT);
+    apply(term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED, content_a);
+    expect(content_a, true, false,
+        "transition table row: input exemption + unsettled_content_published(A)");
+
+    apply(term::Cursor_withhold_test_event_kind::HELD_NO_PUBLICATION);
+    expect(content_a, true, false,
+        "transition table row: held_no_publication preserves input exemption");
+
+    apply(term::Cursor_withhold_test_event_kind::NO_PUBLICATION_NO_SETTLEMENT);
+    expect(content_a, true, false,
+        "transition table row: no_publication_no_settlement preserves input exemption");
+
+    apply(term::Cursor_withhold_test_event_kind::METADATA_ONLY_PUBLICATION, content_a);
+    expect(content_a, true, false,
+        "transition table row: metadata_only_publication(A) preserves input exemption");
+
+    apply(term::Cursor_withhold_test_event_kind::STALE_SESSION_EVENT, stale_content, 0U);
+    expect(content_a, true, false,
+        "transition table row: stale session event is unchanged");
+
+    apply(term::Cursor_withhold_test_event_kind::SETTLED_CONTENT_PUBLISHED, content_a);
+    expect(std::nullopt, false, false,
+        "transition table row: settled_content_published(A, proof) clears input exemption");
+
+    apply(term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED, content_a);
+    apply(term::Cursor_withhold_test_event_kind::HELD_NO_PUBLICATION);
+    expect(content_a, false, true,
+        "transition table row: protected A + held_no_publication");
+
+    apply(term::Cursor_withhold_test_event_kind::NO_PUBLICATION_NO_SETTLEMENT);
+    expect(content_a, false, true,
+        "transition table row: protected A + no_publication_no_settlement");
+
+    apply(term::Cursor_withhold_test_event_kind::METADATA_ONLY_PUBLICATION, content_a);
+    expect(content_a, false, true,
+        "transition table row: protected A + metadata_only_publication(A)");
+
+    apply(term::Cursor_withhold_test_event_kind::SUCCESSFUL_RECOVERY_RELEASE, stale_content, 1U);
+    expect(content_a, false, true,
+        "transition table row: protected A + mismatched recovery release unchanged");
+
+    apply(term::Cursor_withhold_test_event_kind::SUCCESSFUL_RECOVERY_RELEASE, stale_content, 0U);
+    expect(content_a, false, true,
+        "transition table row: protected A + stale recovery release unchanged");
+
+    apply(term::Cursor_withhold_test_event_kind::ACCEPTED_TERMINAL_INPUT);
+    expect(content_a, true, false,
+        "transition table row: protected A + accepted_terminal_input");
+
+    apply(term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED, content_a);
+    expect(content_a, true, false,
+        "transition table row: protected A input-exempt + unsettled_content_published(A)");
+
+    apply(term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED, content_b);
+    expect(content_b, true, false,
+        "transition table row: protected A input-exempt + unsettled_content_published(B)");
+
+    apply(term::Cursor_withhold_test_event_kind::INSTALLED_CONTENT_SNAPSHOT_SETTLED, content_b);
+    expect(std::nullopt, false, false,
+        "transition table row: installed_content_snapshot_settled(B, proof) clears");
+
+    apply(term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED, content_a);
+    apply(term::Cursor_withhold_test_event_kind::SETTLED_CONTENT_PUBLISHED, content_b);
+    expect(std::nullopt, false, false,
+        "transition table row: protected A + settled_content_published(B, proof) clears");
+
+    apply(term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED, content_a);
+    apply(term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED, content_b);
+    expect(content_b, false, true,
+        "transition table row: protected A + unsettled_content_published(B)");
+
+    apply(term::Cursor_withhold_test_event_kind::SETTLED_CONTENT_PUBLISHED, stale_content, 1U);
+    expect(content_b, false, true,
+        "transition table row: protected B + stale settled_content_published no-op");
+
+    apply(term::Cursor_withhold_test_event_kind::SETTLED_CONTENT_PUBLISHED, content_b);
+    expect(std::nullopt, false, false,
+        "transition table row: protected B + settled_content_published(B, proof)");
+
+    apply(term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED, content_b);
+    apply(term::Cursor_withhold_test_event_kind::METADATA_ONLY_PUBLICATION, content_b);
+    expect(content_b, false, true,
+        "transition table row: protected B + metadata_only_publication(B)");
+
+    apply(term::Cursor_withhold_test_event_kind::NO_PUBLICATION_NO_SETTLEMENT);
+    expect(content_b, false, true,
+        "transition table row: protected B + no_publication_no_settlement");
+
+    apply(term::Cursor_withhold_test_event_kind::SUCCESSFUL_RECOVERY_RELEASE, content_b);
+    expect(std::nullopt, false, false,
+        "transition table row: successful_recovery_release(B) clears active session");
+
+    apply(term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED, content_a);
+    apply(term::Cursor_withhold_test_event_kind::SESSION_RESET, std::nullopt, 2U);
+    expect(std::nullopt, false, false,
+        "transition table row: session_reset(new_generation) clears protected content");
+
+    return ok;
+}
+
+bool test_surface_cursor_withhold_content_id_tracks_production_content_boundary(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        repeated_scroll_lines(80, QByteArrayLiteral("content-id-baseline")),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface content-id boundary starts",
+        "surface content-id boundary publishes baseline snapshot",
+        "surface content-id boundary captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    std::optional<term::Cursor_withhold_content_id> baseline_content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(baseline_content_id.has_value(),
+        "surface content-id boundary derives a baseline production content id");
+    if (!baseline_content_id.has_value()) {
+        return ok;
+    }
+
+    const std::uint64_t session_generation =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).session_generation;
+    term::VNM_TerminalSurface_render_bridge::apply_cursor_withhold_event_for_testing(
+        fixture.surface,
+        {
+            term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED,
+            baseline_content_id,
+            session_generation,
+        });
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface content-id boundary starts with active protected content");
+
+    const auto expect_current_content_id = [&](
+        const std::optional<term::Cursor_withhold_content_id>& expected,
+        const char*                                            label) {
+        const std::optional<term::Cursor_withhold_content_id> actual =
+            term::VNM_TerminalSurface_render_bridge::
+                installed_cursor_withhold_content_id_for_testing(fixture.surface);
+        ok &= check(
+            actual.has_value() == expected.has_value() &&
+                (!actual.has_value() || *actual == *expected),
+            label);
+    };
+
+    const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 1);
+    const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        start_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "surface content-id boundary selection press is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        end_point,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "surface content-id boundary selection drag is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        end_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "surface content-id boundary selection release is accepted");
+    expect_current_content_id(
+        baseline_content_id,
+        "surface content-id boundary selection metadata preserves production content id");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface content-id boundary selection metadata preserves active withhold");
+
+    ok &= check(fixture.surface.scrollback_rows() > 0,
+        "surface content-id boundary has scrollback for viewport metadata");
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(1),
+        "surface content-id boundary viewport route publishes metadata");
+    expect_current_content_id(
+        baseline_content_id,
+        "surface content-id boundary viewport metadata preserves production content id");
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(0),
+        "surface content-id boundary scroll route restores tail metadata");
+    expect_current_content_id(
+        baseline_content_id,
+        "surface content-id boundary scroll metadata preserves production content id");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface content-id boundary scroll metadata preserves active withhold");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> before_geometry_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(before_geometry_snapshot != nullptr,
+        "surface content-id boundary has a snapshot before geometry metadata");
+    if (before_geometry_snapshot == nullptr) {
+        return ok;
+    }
+    const std::uint64_t sequence_before_geometry =
+        before_geometry_snapshot->metadata.sequence;
+    const QSizeF geometry_candidates[] = {
+        QSizeF(800.0, 360.0),
+        QSizeF(900.0, 420.0),
+        QSizeF(360.0, 180.0),
+    };
+    for (QSizeF size : geometry_candidates) {
+        fixture.surface.setSize(size);
+        pump_events(app, 2);
+        const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        if (snapshot != nullptr && snapshot->metadata.sequence > sequence_before_geometry) {
+            break;
+        }
+    }
+    const std::shared_ptr<const term::Terminal_render_snapshot> geometry_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(geometry_snapshot != nullptr &&
+        geometry_snapshot->metadata.sequence > sequence_before_geometry,
+        "surface content-id boundary geometry route publishes resize metadata");
+    expect_current_content_id(
+        baseline_content_id,
+        "surface content-id boundary geometry metadata preserves production content id");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface content-id boundary geometry metadata preserves active withhold");
+
+    backend_ptr->emit_output(QByteArrayLiteral("content-id-new-content"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::optional<term::Cursor_withhold_content_id> content_after_output =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(content_after_output.has_value() &&
+        *content_after_output != *baseline_content_id,
+        "surface content-id boundary real content produces a distinct production content id");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> before_noop_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(before_noop_snapshot != nullptr,
+        "surface content-id boundary has a snapshot before no-publication drain");
+    if (before_noop_snapshot == nullptr) {
+        return ok;
+    }
+    const std::uint64_t publication_before_noop =
+        before_noop_snapshot->metadata.publication_generation;
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> no_publication_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(no_publication_snapshot != nullptr &&
+        no_publication_snapshot->metadata.publication_generation == publication_before_noop,
+        "surface content-id boundary no-publication route leaves publication generation unchanged");
+    expect_current_content_id(
+        content_after_output,
+        "surface content-id boundary no-publication route preserves installed content id");
+
+    backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    auto replacement_backend = std::make_unique<Scripted_backend>();
+    replacement_backend->outputs_during_start = {
+        QByteArrayLiteral("content-id-replacement-baseline"),
+    };
+    bool replacement_started = false;
+    (void)start_surface_with_backend(
+        fixture.surface,
+        std::move(replacement_backend),
+        { QStringLiteral("scripted-terminal") },
+        &replacement_started);
+    ok &= check(replacement_started,
+        "surface content-id boundary replacement session starts");
+    const std::optional<term::Cursor_withhold_content_id> replacement_content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(replacement_content_id.has_value() &&
+        replacement_content_id->session_generation !=
+            baseline_content_id->session_generation &&
+        *replacement_content_id != *baseline_content_id,
+        "surface content-id boundary stale old-session content id is distinct");
+
+    return ok;
+}
+
+bool test_surface_no_publication_requires_settlement_proof_for_cursor_withhold(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("no-publication-proof-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface no-publication proof starts",
+        "surface no-publication proof publishes a baseline snapshot",
+        "surface no-publication proof captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::optional<term::Cursor_withhold_content_id> content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(content_id.has_value(),
+        "surface no-publication proof has a baseline content id");
+    if (!content_id.has_value()) {
+        return ok;
+    }
+
+    const std::uint64_t session_generation =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).session_generation;
+    term::VNM_TerminalSurface_render_bridge::apply_cursor_withhold_event_for_testing(
+        fixture.surface,
+        {
+            term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED,
+            content_id,
+            session_generation,
+        });
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "transition table row: unsettled_content_published(A) protects A");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> after_complete =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(after_complete != nullptr &&
+        after_complete->metadata.sequence == baseline_snapshot->metadata.sequence,
+        "surface no-publication proof drain installs no snapshot");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "transition table row: no_publication_no_settlement preserves protected A");
+
+    term::VNM_TerminalSurface_render_bridge::apply_cursor_withhold_event_for_testing(
+        fixture.surface,
+        {
+            term::Cursor_withhold_test_event_kind::INSTALLED_CONTENT_SNAPSHOT_SETTLED,
+            content_id,
+            session_generation,
+        });
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "transition table row: installed_content_snapshot_settled(A, proof) clears A");
+
+    return ok;
+}
+
+bool test_surface_no_publication_settlement_proof_clears_cursor_withhold(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("no-publication-settled-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface no-publication settled starts",
+        "surface no-publication settled publishes a baseline snapshot",
+        "surface no-publication settled captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::optional<term::Cursor_withhold_content_id> content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(content_id.has_value(),
+        "surface no-publication settled has a baseline content id");
+    if (!content_id.has_value()) {
+        return ok;
+    }
+
+    const std::uint64_t session_generation =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).session_generation;
+    term::VNM_TerminalSurface_render_bridge::apply_cursor_withhold_event_for_testing(
+        fixture.surface,
+        {
+            term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED,
+            content_id,
+            session_generation,
+        });
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface no-publication settled starts protected");
+
+    backend_ptr->emit_error(
+        QStringLiteral("surface no-publication settled callback proof"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> settled_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    const term::Cursor_withhold_state_snapshot settled_state =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(settled_snapshot != nullptr &&
+        settled_snapshot->metadata.sequence == baseline_snapshot->metadata.sequence,
+        "surface no-publication settled installs no render publication");
+    ok &= check(!settled_state.protected_content_id.has_value(),
+        "surface no-publication settled production proof clears protected content");
+    ok &= check(!settled_state.input_exemption,
+        "surface no-publication settled production proof clears input exemption");
+    ok &= check(!settled_state.cursor_withheld,
+        "surface no-publication settled production proof emits installed snapshot settlement");
+
+    return ok;
+}
+
+bool check_unsettled_drain_stop_input_keeps_cursor_visible(
+    QGuiApplication&                                      app,
+    QByteArray                                           baseline_output,
+    const QString&                                       route,
+    const std::function<bool(VNM_TerminalSurface&, Scripted_backend&)>&
+                                                         send_input)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    const QByteArray route_bytes      = route.toUtf8();
+    const QByteArray start_message    = route_bytes + " surface starts";
+    const QByteArray snapshot_message = route_bytes + " publishes a baseline snapshot";
+    const QByteArray capture_message  = route_bytes + " captures baseline";
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        std::move(baseline_output),
+        &backend_ptr,
+        &baseline_snapshot,
+        start_message.constData(),
+        snapshot_message.constData(),
+        capture_message.constData());
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const QByteArray tail = route_bytes + "-tail";
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            tail,
+            ok,
+            route);
+    ok &= check(unsettled_snapshot != nullptr &&
+        !snapshot_contains_text(*unsettled_snapshot, QString::fromLatin1(tail)),
+        (route_bytes + " fixture leaves output pending").constData());
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= send_input(fixture.surface, *backend_ptr);
+
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(frame_attempt.valid,
+        (route_bytes + " captures a frame").constData());
+    if (!frame_attempt.valid) {
+        return ok;
+    }
+
+    ok &= check(frame_attempt.report.captured_snapshot_cursor.visible,
+        (route_bytes + " captures a visible snapshot cursor").constData());
+    ok &= check_frame_cursor_visibility(frame_attempt, true, route);
+
+    return ok;
+}
+
+bool test_surface_unsettled_drain_stop_input_keeps_cursor_visible(QGuiApplication& app)
+{
+    bool ok = true;
+    ok &= check_unsettled_drain_stop_input_keeps_cursor_visible(
+        app,
+        QByteArrayLiteral("unsettled-key-baseline"),
+        QStringLiteral("surface unsettled drain-stop key input"),
+        [](VNM_TerminalSurface& surface, Scripted_backend& backend) {
+            return send_key_and_expect_write(
+                surface,
+                backend,
+                Qt::Key_X,
+                Qt::NoModifier,
+                QStringLiteral("x"),
+                QByteArrayLiteral("x"),
+                "surface unsettled drain-stop key input accepts printable input");
+        });
+    ok &= check_unsettled_drain_stop_input_keeps_cursor_visible(
+        app,
+        QByteArrayLiteral("unsettled-paste-baseline"),
+        QStringLiteral("surface unsettled drain-stop paste input"),
+        [](VNM_TerminalSurface& surface, Scripted_backend& backend) {
+            const std::size_t write_index = backend.writes.size();
+            bool input_ok = check(surface.paste_text(QStringLiteral("paste-input")),
+                "surface unsettled drain-stop paste input accepts paste");
+            input_ok &= check_write_chunks_equal(
+                backend.writes,
+                write_index,
+                { QByteArrayLiteral("paste-input") },
+                "surface unsettled drain-stop paste input writes paste bytes");
+            return input_ok;
+        });
+    ok &= check_unsettled_drain_stop_input_keeps_cursor_visible(
+        app,
+        QByteArrayLiteral("unsettled-ime-baseline"),
+        QStringLiteral("surface unsettled drain-stop IME input"),
+        [](VNM_TerminalSurface& surface, Scripted_backend& backend) {
+            const std::size_t write_index = backend.writes.size();
+            bool input_ok = send_ime_commit(
+                surface,
+                QStringLiteral("ime-input"),
+                "surface unsettled drain-stop IME input accepts commit");
+            input_ok &= check_write_chunks_equal(
+                backend.writes,
+                write_index,
+                { QByteArrayLiteral("ime-input") },
+                "surface unsettled drain-stop IME input writes commit bytes");
+            return input_ok;
+        });
+    return ok;
+}
+
+bool test_surface_stale_accepted_input_does_not_latch_replacement_session(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    bool second_started = false;
+    Scripted_backend* second_backend_ptr = nullptr;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::process_exited,
+        &fixture.surface,
+        [&]() {
+            auto second_backend = std::make_unique<Scripted_backend>();
+            second_backend->outputs_during_start = {
+                QByteArrayLiteral("stale-input-second-baseline"),
+            };
+            second_backend_ptr = start_surface_with_backend(
+                fixture.surface,
+                std::move(second_backend),
+                { QStringLiteral("scripted-terminal") },
+                &second_started);
+        });
+
+    auto first_backend = std::make_unique<Scripted_backend>();
+    first_backend->outputs_during_start = {
+        QByteArrayLiteral("stale-input-first-baseline"),
+    };
+    Scripted_backend* first_backend_raw = first_backend.get();
+    first_backend->on_write = [first_backend_raw, &second_started]() {
+        if (second_started) {
+            return;
+        }
+        first_backend_raw->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+    };
+
+    bool first_started = false;
+    Scripted_backend* first_backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(first_backend),
+        { QStringLiteral("scripted-terminal") },
+        &first_started);
+    ok &= check(first_started && first_backend_ptr != nullptr,
+        "surface stale input replacement first session starts");
+    if (!first_started || first_backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const term::Cursor_withhold_state_snapshot state_before_input =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= send_key(
+        fixture.surface,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        "surface stale input replacement accepts key on old session");
+    ok &= check(second_started && second_backend_ptr != nullptr,
+        "surface stale input replacement starts replacement session during sync");
+    const term::Cursor_withhold_state_snapshot state_after_input =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(
+        state_after_input.session_generation > state_before_input.session_generation,
+        "surface stale input replacement advances session generation");
+    ok &= check(!state_after_input.input_exemption,
+        "surface stale input replacement does not latch old accepted input on new session");
+    ok &= check(!state_after_input.cursor_withheld,
+        "surface stale input replacement leaves new session cursor visible");
+
+    return ok;
+}
+
+bool test_surface_unsettled_content_catchup_after_input_keeps_cursor_visible(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("input-catchup-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface input catchup withhold surface starts",
+        "surface input catchup withhold publishes a baseline snapshot",
+        "surface input catchup withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const std::optional<term::Cursor_withhold_content_id> content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(content_id.has_value(),
+        "surface input catchup withhold has a protected content id");
+    if (!content_id.has_value()) {
+        return ok;
+    }
+    const std::uint64_t session_generation =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).session_generation;
+    term::VNM_TerminalSurface_render_bridge::apply_cursor_withhold_event_for_testing(
+        fixture.surface,
+        {
+            term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED,
+            content_id,
+            session_generation,
+        });
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "transition table row: protected A, input exemption clear withholds");
+
+    ok &= send_key_and_expect_write(
+        fixture.surface,
+        *backend_ptr,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        QByteArrayLiteral("x"),
+        "surface input catchup withhold accepts printable input");
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface input catchup withhold input breaks active UNSETTLED state");
+
+    const std::uint64_t processed_epoch_before =
+        term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+            fixture.surface);
+    const QByteArray first_epoch = QByteArrayLiteral("\r\ninput-catchup-first-epoch");
+    const QByteArray delayed_tail = QByteArrayLiteral("input-catchup-delayed-tail");
+    backend_ptr->emit_output(first_epoch);
+    backend_ptr->emit_error(
+        QStringLiteral("surface input catchup withhold callback separator"));
+    backend_ptr->emit_output(epoch_catchup_budget_probe_payload(delayed_tail));
+    const term::Backend_callback_drain_stop partial_stop =
+        term::VNM_TerminalSurface_render_bridge::
+            drain_backend_callback_events_with_budget_for_testing(
+                fixture.surface,
+                std::chrono::steady_clock::duration::zero());
+
+    const std::uint64_t processed_epoch_after =
+        term::VNM_TerminalSurface_render_bridge::backend_callback_processed_epoch(
+            fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> partial_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(processed_epoch_after > processed_epoch_before,
+        "surface input catchup withhold partial drain advances one callback epoch");
+    ok &= check(partial_snapshot != nullptr &&
+        snapshot_contains_text(*partial_snapshot, QStringLiteral("input-catchup-first-epoch")) &&
+        !snapshot_contains_text(*partial_snapshot, QString::fromLatin1(delayed_tail)),
+        "surface input catchup withhold publishes first epoch only");
+    ok &= check(
+        partial_stop == term::Backend_callback_drain_stop::UNSETTLED,
+        "surface input catchup withhold later drain remains UNSETTLED");
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface input catchup withhold does not refresh the input anchor mid-drain");
+
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_cursor_frame_attempt_without_polish(fixture.surface);
+    ok &= check(frame_attempt.valid,
+        "surface input catchup withhold captures a frame without draining");
+    if (!frame_attempt.valid) {
+        return ok;
+    }
+    ok &= check_frame_cursor_visibility(
+        frame_attempt,
+        true,
+        QStringLiteral("surface input catchup withhold partial frame"));
+
+    return ok;
+}
+
+bool test_surface_unsettled_drain_stop_alternate_wheel_input_keeps_cursor_visible(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("\x1b[?1049halternate-wheel-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface unsettled drain-stop alternate wheel input surface starts",
+        "surface unsettled drain-stop alternate wheel input publishes a baseline snapshot",
+        "surface unsettled drain-stop alternate wheel input captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const std::size_t write_index = backend_ptr->writes.size();
+    ok &= send_wheel_event(
+        fixture.surface,
+        Qt::NoModifier,
+        120,
+        true,
+        "surface unsettled drain-stop alternate wheel input accepts wheel");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        write_index,
+        {
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+            QByteArrayLiteral("\x1b[A"),
+        },
+        "surface unsettled drain-stop alternate wheel input writes cursor keys");
+
+    const QByteArray tail = QByteArrayLiteral("alternate-wheel-tail");
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            tail,
+            ok,
+            QStringLiteral("surface unsettled drain-stop alternate wheel input"),
+            QByteArray(),
+            false);
+    ok &= check(unsettled_snapshot != nullptr &&
+        !snapshot_contains_text(*unsettled_snapshot, QString::fromLatin1(tail)),
+        "surface unsettled drain-stop alternate wheel input leaves output pending");
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(frame_attempt.valid,
+        "surface unsettled drain-stop alternate wheel input captures a frame");
+    if (!frame_attempt.valid) {
+        return ok;
+    }
+    ok &= check(frame_attempt.report.captured_snapshot_cursor.visible,
+        "surface unsettled drain-stop alternate wheel input captures a visible snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        frame_attempt,
+        true,
+        QStringLiteral("surface unsettled drain-stop alternate wheel input"));
+
+    return ok;
+}
+
+bool test_surface_unsettled_drain_stop_alternate_wheel_pending_callbacks_preserves_withhold(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("\x1b[?1049halternate-wheel-pending-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface pending alternate wheel withhold surface starts",
+        "surface pending alternate wheel withhold publishes a baseline snapshot",
+        "surface pending alternate wheel withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const QByteArray tail = QByteArrayLiteral("alternate-wheel-pending-tail");
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            tail,
+            ok,
+            QStringLiteral("surface pending alternate wheel withhold"));
+    ok &= check(unsettled_snapshot != nullptr &&
+        !snapshot_contains_text(*unsettled_snapshot, QString::fromLatin1(tail)),
+        "surface pending alternate wheel withhold leaves output pending");
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+
+    const bool input_exemption_before_wheel =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).input_exemption;
+    const std::size_t write_index = backend_ptr->writes.size();
+    ok &= send_wheel_event(
+        fixture.surface,
+        Qt::NoModifier,
+        120,
+        true,
+        "surface pending alternate wheel withhold accepts wheel");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        write_index,
+        {},
+        "surface pending alternate wheel withhold writes no stale cursor keys");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).input_exemption ==
+                input_exemption_before_wheel,
+        "surface pending alternate wheel withhold does not accept deferred wheel input");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface pending alternate wheel withhold preserves active cursor withhold");
+
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_cursor_frame_attempt_without_polish(fixture.surface);
+    ok &= check(frame_attempt.valid,
+        "surface pending alternate wheel withhold captures a frame");
+    if (!frame_attempt.valid) {
+        return ok;
+    }
+    ok &= check_frame_cursor_visibility(
+        frame_attempt,
+        false,
+        QStringLiteral("surface pending alternate wheel withhold"));
+
+    return ok;
+}
+
+bool test_surface_unsettled_drain_stop_mouse_report_preserves_cursor_withhold(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("\x1b[?1000;1006hmouse-report-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface unsettled drain-stop mouse report surface starts",
+        "surface unsettled drain-stop mouse report publishes a baseline snapshot",
+        "surface unsettled drain-stop mouse report captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const QPointF     report_point = point_in_grid_cell(fixture.surface, 0, 0);
+    const std::size_t write_index  = backend_ptr->writes.size();
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        report_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "surface unsettled drain-stop mouse report accepts SGR press");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        write_index,
+        { sgr_mouse_report(0, 0, 0, 'M') },
+        "surface unsettled drain-stop mouse report writes SGR bytes");
+
+    const QByteArray tail = QByteArrayLiteral("mouse-report-withhold-tail");
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            tail,
+            ok,
+            QStringLiteral("surface unsettled drain-stop mouse report"));
+    ok &= check(unsettled_snapshot != nullptr &&
+        !snapshot_contains_text(*unsettled_snapshot, QString::fromLatin1(tail)),
+        "surface unsettled drain-stop mouse report leaves output pending");
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            false);
+    ok &= check(frame_attempt.valid,
+        "surface unsettled drain-stop mouse report captures a frame");
+    if (!frame_attempt.valid) {
+        return ok;
+    }
+    ok &= check(frame_attempt.report.captured_snapshot_cursor.visible,
+        "surface unsettled drain-stop mouse report captures a visible snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        frame_attempt,
+        false,
+        QStringLiteral("surface unsettled drain-stop mouse report"));
+
+    return ok;
+}
+
+bool test_surface_unsettled_drain_stop_focus_report_is_not_terminal_input(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("\x1b[?1004hfocus-report-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface unsettled drain-stop focus report surface starts",
+        "surface unsettled drain-stop focus report publishes a baseline snapshot",
+        "surface unsettled drain-stop focus report captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    QQuickItem other_item;
+    other_item.setParentItem(fixture.window.contentItem());
+    other_item.setFocus(true);
+    const auto focus_surface = [&]() {
+        fixture.surface.forceActiveFocus();
+        return fixture.surface.hasActiveFocus();
+    };
+    const auto focus_other = [&]() {
+        other_item.forceActiveFocus();
+        return pump_until(app, [&] { return !fixture.surface.hasActiveFocus(); });
+    };
+
+    ok &= check(focus_other(),
+        "surface unsettled drain-stop focus report fixture starts unfocused");
+
+    const QByteArray tail = QByteArrayLiteral("focus-report-withhold-tail");
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            tail,
+            ok,
+            QStringLiteral("surface unsettled drain-stop focus report"));
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+
+    const bool input_exemption_before_focus =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).input_exemption;
+    const std::size_t focus_in_index = backend_ptr->writes.size();
+    ok &= check(focus_surface(),
+        "surface unsettled drain-stop focus report focuses surface while withheld");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        focus_in_index,
+        { QByteArrayLiteral("\x1b[I") },
+        "surface unsettled drain-stop focus report writes after ordered catch-up");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).input_exemption ==
+                input_exemption_before_focus,
+        "surface unsettled drain-stop focus report is not accepted terminal input");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface unsettled drain-stop focus report preserves withhold after unproven catch-up");
+    const std::shared_ptr<const term::Terminal_render_snapshot> caught_up_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(caught_up_snapshot != nullptr &&
+        snapshot_contains_text(*caught_up_snapshot, QString::fromLatin1(tail)),
+        "surface unsettled drain-stop focus report publishes delayed content before reporting");
+
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(frame_attempt.valid,
+        "surface unsettled drain-stop focus report captures a frame");
+    if (!frame_attempt.valid) {
+        return ok;
+    }
+    ok &= check(frame_attempt.report.captured_snapshot_cursor.visible,
+        "surface unsettled drain-stop focus report captures a visible snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        frame_attempt,
+        false,
+        QStringLiteral("surface unsettled drain-stop focus report"));
+
+    return ok;
+}
+
+bool test_surface_unsettled_drain_stop_focus_report_observes_pending_mode_reset(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("\x1b[?1004hfocus-reset-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface focus reset withhold surface starts",
+        "surface focus reset withhold publishes a baseline snapshot",
+        "surface focus reset withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    QQuickItem other_item;
+    other_item.setParentItem(fixture.window.contentItem());
+    other_item.setFocus(true);
+    const auto focus_surface = [&]() {
+        fixture.surface.forceActiveFocus();
+        return fixture.surface.hasActiveFocus();
+    };
+    const auto focus_other = [&]() {
+        other_item.forceActiveFocus();
+        return pump_until(app, [&] { return !fixture.surface.hasActiveFocus(); });
+    };
+
+    ok &= check(focus_other(),
+        "surface focus reset withhold fixture starts unfocused");
+
+    const QByteArray tail = QByteArrayLiteral("focus-reset-tail");
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            tail,
+            ok,
+            QStringLiteral("surface focus reset withhold unsettled stop"));
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface focus reset withhold starts from active cursor withhold");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?1004l"));
+
+    const bool input_exemption_before_focus =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).input_exemption;
+    const std::size_t focus_in_index = backend_ptr->writes.size();
+    ok &= check(focus_surface(),
+        "surface focus reset withhold focuses surface after queued DECRST");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        focus_in_index,
+        {},
+        "surface focus reset withhold emits no stale CSI I report");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).input_exemption ==
+                input_exemption_before_focus,
+        "surface focus reset withhold focus report is not accepted terminal input");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface focus reset withhold preserves after unproven ordered catch-up");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> caught_up_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(caught_up_snapshot != nullptr &&
+        snapshot_contains_text(*caught_up_snapshot, QString::fromLatin1(tail)),
+        "surface focus reset withhold publishes delayed content before mode reset");
+
+    return ok;
+}
+
+bool test_surface_unsettled_drain_stop_preedit_preserves_cursor_withhold(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("preedit-withhold-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface unsettled drain-stop preedit surface starts",
+        "surface unsettled drain-stop preedit publishes a baseline snapshot",
+        "surface unsettled drain-stop preedit captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const QByteArray tail = QByteArrayLiteral("preedit-withhold-tail");
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            tail,
+            ok,
+            QStringLiteral("surface unsettled drain-stop preedit"));
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+
+    const bool input_exemption_before_preedit =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).input_exemption;
+    const std::size_t write_index = backend_ptr->writes.size();
+    ok &= send_ime_preedit(
+        fixture.surface,
+        QStringLiteral("compose"),
+        3,
+        "surface unsettled drain-stop preedit accepts preedit update");
+    ok &= check(backend_ptr->writes.size() == write_index,
+        "surface unsettled drain-stop preedit update writes no backend bytes");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).input_exemption ==
+                input_exemption_before_preedit,
+        "surface unsettled drain-stop preedit update is not accepted terminal input");
+
+    Surface_frame_attempt preedit_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            false);
+    ok &= check(preedit_frame.valid,
+        "surface unsettled drain-stop preedit captures preedit frame");
+    if (!preedit_frame.valid) {
+        return ok;
+    }
+    ok &= check_frame_cursor_visibility(
+        preedit_frame,
+        false,
+        QStringLiteral("surface unsettled drain-stop preedit update"));
+
+    ok &= send_ime_preedit(
+        fixture.surface,
+        QString(),
+        0,
+        "surface unsettled drain-stop preedit accepts preedit cancel");
+    ok &= check(backend_ptr->writes.size() == write_index,
+        "surface unsettled drain-stop preedit cancel writes no backend bytes");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).input_exemption ==
+                input_exemption_before_preedit,
+        "surface unsettled drain-stop preedit cancel is not accepted terminal input");
+
+    const Surface_frame_attempt cancel_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            false);
+    ok &= check(cancel_frame.valid,
+        "surface unsettled drain-stop preedit captures cancel frame");
+    if (!cancel_frame.valid) {
+        return ok;
+    }
+    ok &= check_frame_cursor_visibility(
+        cancel_frame,
+        false,
+        QStringLiteral("surface unsettled drain-stop preedit cancel"));
+
+    return ok;
+}
+
+bool test_surface_settled_drain_rearms_cursor_withhold_after_input(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("settled-rearm-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface settled-drain rearm surface starts",
+        "surface settled-drain rearm publishes a baseline snapshot",
+        "surface settled-drain rearm captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            QByteArrayLiteral("settled-rearm-first-tail"),
+            ok,
+            QStringLiteral("surface settled-drain rearm first unsettled stop"));
+    ok &= check(unsettled_snapshot != nullptr,
+        "surface settled-drain rearm publishes a first unsettled snapshot");
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= send_key_and_expect_write(
+        fixture.surface,
+        *backend_ptr,
+        Qt::Key_X,
+        Qt::NoModifier,
+        QStringLiteral("x"),
+        QByteArrayLiteral("x"),
+        "surface settled-drain rearm accepts printable input");
+
+    Surface_frame_attempt input_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(input_frame.valid,
+        "surface settled-drain rearm captures the input frame");
+    if (!input_frame.valid) {
+        return ok;
+    }
+    ok &= check_frame_cursor_visibility(
+        input_frame,
+        true,
+        QStringLiteral("surface settled-drain rearm input frame"));
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> settled_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(settled_snapshot != nullptr &&
+        snapshot_contains_text(
+            *settled_snapshot,
+            QStringLiteral("settled-rearm-first-tail")),
+        "surface settled-drain rearm reaches a settled drain after input");
+    if (settled_snapshot == nullptr) {
+        return ok;
+    }
+
+    const term::Cursor_withhold_state_snapshot state_after_first_settlement =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(!state_after_first_settlement.cursor_withheld,
+        "transition table row: input-exempt settled catch-up leaves cursor visible");
+    ok &= check(state_after_first_settlement.input_exemption,
+        "transition table row: accepted input latch persists until a later settlement");
+
+    const QByteArray second_tail = QByteArrayLiteral("settled-rearm-second-tail");
+    std::shared_ptr<const term::Terminal_render_snapshot> second_unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            second_tail,
+            ok,
+            QStringLiteral("surface settled-drain rearm second unsettled stop"),
+            {},
+            false);
+    ok &= check(second_unsettled_snapshot != nullptr &&
+        second_unsettled_snapshot->metadata.sequence > settled_snapshot->metadata.sequence &&
+        !snapshot_contains_text(
+            *second_unsettled_snapshot,
+            QString::fromLatin1(second_tail)),
+        "surface settled-drain rearm publishes a second unsettled snapshot under input exemption");
+
+    const Surface_frame_attempt frame_attempt =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(frame_attempt.valid,
+        "surface settled-drain rearm captures a frame");
+    if (!frame_attempt.valid) {
+        return ok;
+    }
+    ok &= check(frame_attempt.report.captured_snapshot_cursor.visible,
+        "surface settled-drain rearm captures a visible snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        frame_attempt,
+        true,
+        QStringLiteral("surface settled-drain rearm input-exempt unsettled frame"));
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const term::Cursor_withhold_state_snapshot state_after_second_settlement =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(!state_after_second_settlement.cursor_withheld,
+        "transition table row: proof-bearing settlement clears input-exempt protection");
+    ok &= check(!state_after_second_settlement.input_exemption,
+        "transition table row: proof-bearing settlement clears the input latch");
+
+    const QByteArray third_tail = QByteArrayLiteral("settled-rearm-third-tail");
+    std::shared_ptr<const term::Terminal_render_snapshot> third_unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            third_tail,
+            ok,
+            QStringLiteral("surface settled-drain rearm third unsettled stop"));
+    ok &= check(third_unsettled_snapshot != nullptr &&
+        !snapshot_contains_text(
+            *third_unsettled_snapshot,
+            QString::fromLatin1(third_tail)),
+        "surface settled-drain rearm publishes a third protected unsettled snapshot");
+
+    return ok;
+}
+
+bool test_surface_metadata_publication_preserves_cursor_withhold_until_catchup(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        repeated_scroll_lines(80, QByteArrayLiteral("metadata-baseline")),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface metadata withhold surface starts",
+        "surface metadata withhold publishes a baseline snapshot",
+        "surface metadata withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    ok &= check(fixture.surface.scrollback_rows() > 0,
+        "surface metadata withhold fixture has scrollback for metadata publication");
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(1),
+        "surface metadata withhold applies settled scroll metadata");
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(0),
+        "surface metadata withhold restores settled viewport metadata");
+    Surface_frame_attempt settled_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(settled_frame.valid,
+        "surface metadata withhold captures settled metadata frame");
+    if (!settled_frame.valid) {
+        return ok;
+    }
+    ok &= check(settled_frame.report.captured_snapshot_cursor.visible,
+        "surface metadata withhold captures a visible settled snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        settled_frame,
+        true,
+        QStringLiteral("surface metadata withhold settled frame"));
+
+    const QByteArray tail = QByteArrayLiteral("metadata-withhold-tail");
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            tail,
+            ok,
+            QStringLiteral("surface metadata withhold unsettled stop"));
+    ok &= check(unsettled_snapshot != nullptr &&
+        !snapshot_contains_text(*unsettled_snapshot, QString::fromLatin1(tail)),
+        "surface metadata withhold publishes unsettled output");
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface metadata withhold starts with an active cursor withhold");
+    const term::Cursor_withhold_state_snapshot protected_state_before_scroll =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(protected_state_before_scroll.protected_content_id.has_value(),
+        "surface metadata withhold records protected content before scroll catch-up");
+
+    ok &= check(fixture.surface.scrollback_rows() > 0,
+        "surface metadata withhold unsettled snapshot has scrollback");
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(1),
+        "surface metadata withhold scroll route drains pending content");
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(0),
+        "surface metadata withhold restores viewport after content catch-up");
+    const std::shared_ptr<const term::Terminal_render_snapshot> catchup_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(catchup_snapshot != nullptr &&
+        catchup_snapshot->metadata.sequence > unsettled_snapshot->metadata.sequence &&
+        snapshot_contains_text(*catchup_snapshot, QString::fromLatin1(tail)),
+        "surface metadata withhold scroll route publishes the delayed tail");
+    if (catchup_snapshot == nullptr) {
+        return ok;
+    }
+    const std::optional<term::Cursor_withhold_content_id> catchup_content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(catchup_content_id.has_value() &&
+        protected_state_before_scroll.protected_content_id.has_value() &&
+        *catchup_content_id != *protected_state_before_scroll.protected_content_id,
+        "surface metadata withhold scroll route installs a distinct catch-up content id");
+    const term::Cursor_withhold_state_snapshot state_after_catchup =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(!state_after_catchup.protected_content_id.has_value() &&
+        !state_after_catchup.input_exemption &&
+        !state_after_catchup.cursor_withheld,
+        "surface metadata withhold scroll route clears through complete catch-up proof");
+
+    const Surface_frame_attempt catchup_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(catchup_frame.valid,
+        "surface metadata withhold captures caught-up metadata frame");
+    if (!catchup_frame.valid) {
+        return ok;
+    }
+    ok &= check(catchup_frame.report.captured_snapshot_cursor.visible,
+        "surface metadata withhold captures a visible caught-up snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        catchup_frame,
+        true,
+        QStringLiteral("surface metadata withhold caught-up frame"));
+
+    const std::uint64_t sequence_before_metadata_only =
+        catchup_snapshot->metadata.sequence;
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(1),
+        "surface metadata withhold applies metadata-only scroll after catch-up");
+    const std::shared_ptr<const term::Terminal_render_snapshot> metadata_only_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(metadata_only_snapshot != nullptr &&
+        metadata_only_snapshot->metadata.sequence > sequence_before_metadata_only &&
+        metadata_only_snapshot->metadata.processed_backend_callback_epoch ==
+            catchup_snapshot->metadata.processed_backend_callback_epoch,
+        "surface metadata withhold metadata-only scroll does not advance backend catch-up");
+    ok &= check(metadata_only_snapshot != nullptr &&
+        metadata_only_snapshot->metadata.backend_output_progress_generation ==
+            catchup_snapshot->metadata.backend_output_progress_generation,
+        "surface metadata withhold metadata-only scroll preserves backend output progress");
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface metadata withhold metadata-only scroll leaves settled cursor visible");
+
+    return ok;
+}
+
+bool test_surface_selection_metadata_snapshot_preserves_cursor_withhold_until_content(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("selection-metadata-visible"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface selection metadata withhold starts",
+        "surface selection metadata withhold publishes a baseline snapshot",
+        "surface selection metadata withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 1);
+    const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        start_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "surface selection metadata withhold press is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        end_point,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "surface selection metadata withhold drag is accepted");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        end_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "surface selection metadata withhold release commits selection");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> selection_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(selection_snapshot != nullptr &&
+        snapshot_has_selection_span(*selection_snapshot, 0, 1, 4),
+        "surface selection metadata withhold publishes a visible selection span");
+    if (selection_snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::optional<term::Cursor_withhold_content_id> content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(content_id.has_value(),
+        "surface selection metadata withhold has a protected content id");
+    if (!content_id.has_value()) {
+        return ok;
+    }
+    const std::uint64_t session_generation =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).session_generation;
+    term::VNM_TerminalSurface_render_bridge::apply_cursor_withhold_event_for_testing(
+        fixture.surface,
+        {
+            term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED,
+            content_id,
+            session_generation,
+        });
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "transition table row: unsettled_content_published(A) protects A");
+
+    const QByteArray held_marker = QByteArrayLiteral("selection-metadata-held");
+    QByteArray held_output = QByteArrayLiteral("\x1b[?2026h\x1b[3;1H");
+    held_output += held_marker;
+    backend_ptr->emit_output(held_output);
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> held_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(held_snapshot != nullptr &&
+        held_snapshot->metadata.sequence == selection_snapshot->metadata.sequence &&
+        !snapshot_contains_text(*held_snapshot, QString::fromLatin1(held_marker)),
+        "surface selection metadata withhold keeps held content unpublished");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface selection metadata withhold preserves UNSETTLED through HELD drain");
+    if (held_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            detach_selection_visual_attachment_for_testing(fixture.surface),
+        "surface selection metadata withhold detaches selection visual while blocked");
+    const std::shared_ptr<const term::Terminal_render_snapshot> metadata_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(metadata_snapshot != nullptr &&
+        metadata_snapshot->metadata.sequence > held_snapshot->metadata.sequence &&
+        metadata_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        metadata_snapshot->purpose == term::Terminal_render_snapshot_purpose::SELECTION_DERIVED &&
+        !snapshot_contains_text(*metadata_snapshot, QString::fromLatin1(held_marker)),
+        "surface selection metadata withhold installs selection-derived live metadata only");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface selection metadata withhold survives selection-derived live snapshot");
+    if (metadata_snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::uint64_t metadata_processed_epoch =
+        metadata_snapshot->metadata.processed_backend_callback_epoch;
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            force_release_synchronized_output_without_backend_drain_for_testing(
+                fixture.surface),
+        "surface selection metadata withhold force release is accepted");
+    const std::shared_ptr<const term::Terminal_render_snapshot> release_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(release_snapshot != nullptr &&
+        release_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        release_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
+        release_snapshot->metadata.processed_backend_callback_epoch ==
+            metadata_processed_epoch &&
+        snapshot_contains_text(*release_snapshot, QString::fromLatin1(held_marker)),
+        "surface selection metadata withhold installs same-epoch content release");
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface selection metadata withhold clears only after same-epoch content release");
+
+    return ok;
+}
+
+bool test_surface_session_replacement_resets_unsettled_drain_cursor_withhold(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* first_backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("replacement-first-baseline"),
+        &first_backend_ptr,
+        &baseline_snapshot,
+        "surface replacement withhold first session starts",
+        "surface replacement withhold publishes first baseline snapshot",
+        "surface replacement withhold captures first baseline");
+    if (first_backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    bool second_started = false;
+    Scripted_backend* second_backend_ptr = nullptr;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::process_exited,
+        &fixture.surface,
+        [&]() {
+            auto second_backend = std::make_unique<Scripted_backend>();
+            second_backend->outputs_during_start = {
+                QByteArrayLiteral("replacement-second-baseline"),
+            };
+            second_backend_ptr = start_surface_with_backend(
+                fixture.surface,
+                std::move(second_backend),
+                { QStringLiteral("scripted-terminal") },
+                &second_started);
+        });
+
+    first_backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+    first_backend_ptr->emit_output(unsettled_drain_stop_probe_payload(
+        QByteArrayLiteral("replacement-stale-old-drain"),
+        QByteArrayLiteral("replacement-stale-tail")));
+    const term::Backend_callback_drain_stop old_drain_stop =
+        term::VNM_TerminalSurface_render_bridge::
+            drain_backend_callback_events_with_budget_for_testing(
+                fixture.surface,
+                std::chrono::steady_clock::duration::zero());
+    ok &= check(old_drain_stop == term::Backend_callback_drain_stop::UNSETTLED,
+        "surface replacement withhold old drain returns UNSETTLED after replacement");
+    ok &= check(second_started && second_backend_ptr != nullptr,
+        "surface replacement withhold second session starts during old UNSETTLED drain");
+    if (!second_started || second_backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> second_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(second_snapshot != nullptr &&
+        snapshot_contains_text(*second_snapshot, QStringLiteral("replacement-second-baseline")),
+        "surface replacement withhold publishes second-session baseline");
+    if (second_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface replacement withhold old drain does not overwrite the fresh session state");
+
+    const Surface_frame_attempt second_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(second_frame.valid,
+        "surface replacement withhold captures second-session frame");
+    if (!second_frame.valid) {
+        return ok;
+    }
+    ok &= check(second_frame.report.captured_snapshot_cursor.visible,
+        "surface replacement withhold captures a visible second-session snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        second_frame,
+        true,
+        QStringLiteral("surface replacement withhold second-session frame"));
+
+    return ok;
+}
+
+bool test_surface_synchronized_release_paced_output_keeps_cursor_visible(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_synchronized_output_scroll_policy(
+        VNM_TerminalSurface::Synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION);
+
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("release-paced-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface synchronized release-paced surface starts",
+        "surface synchronized release-paced publishes a baseline snapshot",
+        "surface synchronized release-paced captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const auto held_output = [](const QByteArray& head, const QByteArray& tail) {
+        QByteArray output = QByteArrayLiteral("\x1b[?2026h");
+        output += head;
+        output += QByteArray(
+            k_backend_output_drain_slice_contract_bytes - output.size(),
+            'x');
+        output += tail;
+        return output;
+    };
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_held =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(
+            fixture.surface);
+    backend_ptr->emit_output(held_output(
+        QByteArrayLiteral("release-paced-held-a"),
+        QByteArrayLiteral("release-paced-held-a-tail")));
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+    const term::Terminal_surface_backend_drain_stats_t stats_after_held =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(
+            fixture.surface);
+    ok &= check(
+        stats_after_held.budget_exhausted_incomplete ==
+            stats_before_held.budget_exhausted_incomplete,
+        "surface synchronized release-paced does not count first HELD as budget-exhausted");
+    ok &= check(
+        stats_after_held.cursor_stable_incomplete ==
+            stats_before_held.cursor_stable_incomplete,
+        "surface synchronized release-paced does not count first HELD as cursor-stable");
+    ok &= check(
+        stats_after_held.pending_callback_after_drain ==
+            stats_before_held.pending_callback_after_drain + 1U,
+        "surface synchronized release-paced records first HELD pending callbacks");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) > 0U,
+        "surface synchronized release-paced first HELD leaves callbacks pending");
+    Surface_frame_attempt held_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(held_frame.valid,
+        "surface synchronized release-paced captures mid-hold frame");
+    if (!held_frame.valid) {
+        return ok;
+    }
+    ok &= check(
+        held_frame.report.captured_snapshot_sequence ==
+            baseline_snapshot->metadata.sequence,
+        "surface synchronized release-paced keeps the installed snapshot during first HELD");
+    ok &= check_frame_cursor_visibility(
+        held_frame,
+        true,
+        QStringLiteral("surface synchronized release-paced first HELD"));
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    QByteArray release_output =
+        QByteArrayLiteral("release-paced-frame\x1b[?2026l\x1b[?2026h");
+    release_output += QByteArray(
+        k_backend_output_drain_slice_contract_bytes - release_output.size(),
+        'x');
+    release_output += QByteArrayLiteral("release-paced-tail");
+    const term::Terminal_surface_backend_drain_stats_t stats_before_release =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(
+            fixture.surface);
+    backend_ptr->emit_output(release_output);
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+    const term::Terminal_surface_backend_drain_stats_t stats_after_release =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(
+            fixture.surface);
+    ok &= check(
+        stats_after_release.budget_exhausted_incomplete ==
+            stats_before_release.budget_exhausted_incomplete,
+        "surface synchronized release-paced does not count release-stable as budget-exhausted");
+    ok &= check(
+        stats_after_release.cursor_stable_incomplete ==
+            stats_before_release.cursor_stable_incomplete + 1U,
+        "surface synchronized release-paced counts release-stable as cursor-stable");
+    ok &= check(
+        stats_after_release.pending_callback_after_drain ==
+            stats_before_release.pending_callback_after_drain + 1U,
+        "surface synchronized release-paced records release-stable pending callbacks");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) > 0U,
+        "surface synchronized release-paced release-stable leaves callbacks pending");
+
+    Surface_frame_attempt release_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(release_frame.valid,
+        "surface synchronized release-paced captures release frame");
+    if (!release_frame.valid) {
+        return ok;
+    }
+    const std::shared_ptr<const term::Terminal_render_snapshot> release_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(release_snapshot != nullptr &&
+        snapshot_contains_text(*release_snapshot, QStringLiteral("release-paced-frame")) &&
+        !snapshot_contains_text(*release_snapshot, QStringLiteral("release-paced-tail")),
+        "surface synchronized release-paced publishes released whole frame only");
+    if (release_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(release_frame.report.captured_snapshot_cursor.visible,
+        "surface synchronized release-paced captures a visible released snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        release_frame,
+        true,
+        QStringLiteral("surface synchronized release-paced release-stable"));
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    const term::Terminal_surface_backend_drain_stats_t stats_before_second_held =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(
+            fixture.surface);
+    backend_ptr->emit_output(held_output(
+        QByteArrayLiteral("release-paced-held-b"),
+        QByteArrayLiteral("release-paced-held-b-tail")));
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+    const term::Terminal_surface_backend_drain_stats_t stats_after_second_held =
+        term::VNM_TerminalSurface_render_bridge::backend_drain_stats(
+            fixture.surface);
+    ok &= check(
+        stats_after_second_held.budget_exhausted_incomplete ==
+            stats_before_second_held.budget_exhausted_incomplete,
+        "surface synchronized release-paced does not count second HELD as budget-exhausted");
+    ok &= check(
+        stats_after_second_held.cursor_stable_incomplete ==
+            stats_before_second_held.cursor_stable_incomplete,
+        "surface synchronized release-paced does not count second HELD as cursor-stable");
+    ok &= check(
+        stats_after_second_held.pending_callback_after_drain ==
+            stats_before_second_held.pending_callback_after_drain + 1U,
+        "surface synchronized release-paced records second HELD pending callbacks");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) > 0U,
+        "surface synchronized release-paced second HELD leaves callbacks pending");
+    const Surface_frame_attempt held_after_release_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(held_after_release_frame.valid,
+        "surface synchronized release-paced captures post-release hold frame");
+    if (!held_after_release_frame.valid) {
+        return ok;
+    }
+    ok &= check(
+        held_after_release_frame.report.captured_snapshot_sequence ==
+            release_snapshot->metadata.sequence,
+        "surface synchronized release-paced keeps the release snapshot during second HELD");
+    ok &= check_frame_cursor_visibility(
+        held_after_release_frame,
+        true,
+        QStringLiteral("surface synchronized release-paced second HELD"));
+
+    return ok;
+}
+
+bool test_surface_recovery_force_release_resets_unsettled_drain_cursor_withhold(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("recovery-force-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface recovery force-release withhold surface starts",
+        "surface recovery force-release withhold publishes a baseline snapshot",
+        "surface recovery force-release withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    use_zero_frame_catchup_budget(fixture.surface);
+
+    const QByteArray held_bytes = QByteArrayLiteral("recovery-force-held");
+    const QByteArray tail_bytes = QByteArrayLiteral("recovery-force-tail");
+    const QString held_text = QString::fromLatin1(held_bytes);
+    const QString tail_text = QString::fromLatin1(tail_bytes);
+    const QByteArray sync_enter = QByteArrayLiteral("\x1b[?2026h");
+    const QByteArray held_position = QByteArrayLiteral("\x1b[1;1H\x1b[2K");
+    // publish_unsettled_drain_stop inserts "\r\n" before this delayed payload.
+    // Account for that prefix and the sync enter so the held marker stays in
+    // the first delayed slice, then recovery timeout can publish it as a forced
+    // release without also consuming the later tail marker.
+    const qsizetype first_payload_slice_prefix_bytes = 2 + sync_enter.size();
+    const qsizetype held_marker_bytes = held_position.size() + held_bytes.size();
+    const qsizetype filler_bytes =
+        k_backend_output_drain_slice_contract_bytes -
+        first_payload_slice_prefix_bytes -
+        held_marker_bytes;
+    QByteArray recovery_payload = sync_enter;
+    recovery_payload += QByteArray(filler_bytes, 'r');
+    recovery_payload += held_position;
+    recovery_payload += held_bytes;
+    recovery_payload += QByteArrayLiteral("\x1b[?2026h");
+    recovery_payload += tail_bytes;
+
+    std::shared_ptr<const term::Terminal_render_snapshot> unsettled_snapshot =
+        publish_unsettled_drain_stop(
+            fixture.surface,
+            *backend_ptr,
+            recovery_payload,
+            ok,
+            QStringLiteral("surface recovery force-release withhold unsettled stop"),
+            tail_bytes);
+    ok &= check(unsettled_snapshot != nullptr &&
+        unsettled_snapshot->metadata.sequence > baseline_snapshot->metadata.sequence,
+        "surface recovery force-release withhold creates an unsettled output stop");
+    if (unsettled_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(unsettled_snapshot->cursor.visible,
+        "surface recovery force-release withhold leaves snapshot cursor visible");
+    ok &= check(
+        !snapshot_contains_text(*unsettled_snapshot, held_text) &&
+        !snapshot_contains_text(*unsettled_snapshot, tail_text),
+        "surface recovery force-release withhold leaves synchronized payload pending");
+
+    const Surface_frame_attempt unsettled_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            false);
+    ok &= check(unsettled_frame.valid,
+        "surface recovery force-release withhold captures the unsettled frame");
+    if (!unsettled_frame.valid) {
+        return ok;
+    }
+    ok &= check(unsettled_frame.report.captured_snapshot_cursor.visible,
+        "surface recovery force-release withhold captures a visible unsettled snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        unsettled_frame,
+        false,
+        QStringLiteral("surface recovery force-release withhold unsettled frame"));
+
+    std::shared_ptr<const term::Terminal_render_snapshot> released_snapshot;
+    for (int attempt = 0; attempt < 12; ++attempt) {
+        term::VNM_TerminalSurface_render_bridge::handle_synchronized_output_recovery_timeout(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+        released_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        if (released_snapshot != nullptr &&
+            snapshot_contains_text(*released_snapshot, held_text))
+        {
+            break;
+        }
+    }
+
+    ok &= check(released_snapshot != nullptr &&
+        snapshot_contains_text(*released_snapshot, held_text),
+        "surface recovery force-release withhold publishes the forced release");
+    ok &= check(released_snapshot != nullptr &&
+        released_snapshot->cursor.visible,
+        "surface recovery force-release withhold publishes a visible snapshot cursor");
+    ok &= check(released_snapshot != nullptr &&
+        !snapshot_contains_text(*released_snapshot, tail_text),
+        "surface recovery force-release withhold leaves later tail output unpublished");
+    ok &= check(
+        !term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface recovery force-release withhold clears after release publication");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) > 0U,
+        "surface recovery force-release withhold leaves later tail output pending");
+
+    const Surface_frame_attempt release_frame =
+        capture_surface_cursor_frame_attempt(
+            app,
+            fixture.window,
+            fixture.surface,
+            true);
+    ok &= check(release_frame.valid,
+        "surface recovery force-release withhold captures the forced-release frame");
+    if (!release_frame.valid) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> captured_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(captured_snapshot != nullptr &&
+        release_frame.report.captured_snapshot_sequence ==
+            captured_snapshot->metadata.sequence &&
+        snapshot_contains_text(*captured_snapshot, held_text) &&
+        !snapshot_contains_text(*captured_snapshot, tail_text),
+        "surface recovery force-release withhold captures the release before the tail");
+    ok &= check(release_frame.report.captured_snapshot_cursor.visible,
+        "surface recovery force-release withhold captures a visible released snapshot cursor");
+    ok &= check_frame_cursor_visibility(
+        release_frame,
+        true,
+        QStringLiteral("surface recovery force-release withhold release frame"));
+
+    return ok;
+}
+
+bool test_surface_recovery_no_publication_paths_preserve_cursor_withhold(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("recovery-no-publication-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface recovery no-publication withhold starts",
+        "surface recovery no-publication withhold publishes baseline",
+        "surface recovery no-publication withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::optional<term::Cursor_withhold_content_id> content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(content_id.has_value(),
+        "surface recovery no-publication withhold has a protected content id");
+    if (!content_id.has_value()) {
+        return ok;
+    }
+
+    const std::uint64_t session_generation =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).session_generation;
+    term::VNM_TerminalSurface_render_bridge::apply_cursor_withhold_event_for_testing(
+        fixture.surface,
+        {
+            term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED,
+            content_id,
+            session_generation,
+        });
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface recovery no-publication withhold starts protected");
+
+    const std::uint64_t baseline_sequence = baseline_snapshot->metadata.sequence;
+    term::VNM_TerminalSurface_render_bridge::handle_synchronized_output_recovery_timeout(
+        fixture.surface,
+        std::chrono::steady_clock::duration::zero());
+    const std::shared_ptr<const term::Terminal_render_snapshot> timeout_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(timeout_snapshot != nullptr &&
+        timeout_snapshot->metadata.sequence == baseline_sequence,
+        "surface recovery no-publication timeout installs no release snapshot");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface recovery no-publication timeout preserves active withhold");
+
+    const bool release_result =
+        term::VNM_TerminalSurface_render_bridge::
+            force_release_synchronized_output_without_backend_drain_for_testing(
+                fixture.surface);
+    const std::shared_ptr<const term::Terminal_render_snapshot> release_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(release_result,
+        "surface recovery no-publication release request is accepted");
+    ok &= check(release_snapshot != nullptr &&
+        release_snapshot->metadata.sequence == baseline_sequence,
+        "surface recovery no-publication accepted release installs no content snapshot");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface recovery no-publication accepted release preserves active withhold");
+
+    return ok;
+}
+
+bool test_surface_recovery_no_publication_observation_preserves_cursor_withhold(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    Scripted_backend* backend_ptr = nullptr;
+    std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot;
+    ok &= start_cursor_withhold_surface(
+        app,
+        fixture,
+        QByteArrayLiteral("recovery-observation-baseline"),
+        &backend_ptr,
+        &baseline_snapshot,
+        "surface recovery observation withhold starts",
+        "surface recovery observation withhold publishes baseline",
+        "surface recovery observation withhold captures baseline");
+    if (backend_ptr == nullptr || baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    const std::optional<term::Cursor_withhold_content_id> content_id =
+        term::VNM_TerminalSurface_render_bridge::
+            installed_cursor_withhold_content_id_for_testing(fixture.surface);
+    ok &= check(content_id.has_value(),
+        "surface recovery observation withhold has a protected content id");
+    if (!content_id.has_value()) {
+        return ok;
+    }
+
+    const std::uint64_t session_generation =
+        term::VNM_TerminalSurface_render_bridge::
+            cursor_withhold_state_for_testing(fixture.surface).session_generation;
+    term::VNM_TerminalSurface_render_bridge::apply_cursor_withhold_event_for_testing(
+        fixture.surface,
+        {
+            term::Cursor_withhold_test_event_kind::UNSETTLED_CONTENT_PUBLISHED,
+            content_id,
+            session_generation,
+        });
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface recovery observation withhold starts protected");
+
+    term::VNM_TerminalSurface_render_bridge::
+        apply_no_publication_recovery_observation_for_testing(fixture.surface, true);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface recovery observation no-publication release preserves active withhold");
+
+    term::VNM_TerminalSurface_render_bridge::
+        apply_no_publication_recovery_observation_for_testing(fixture.surface, false);
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::cursor_withheld_for_testing(
+            fixture.surface),
+        "surface recovery observation stale no-publication release preserves active withhold");
 
     return ok;
 }
@@ -15149,9 +18108,33 @@ int main(int argc, char** argv)
     ok &= test_surface_frame_catchup_budget_env_config();
     ok &= test_surface_frame_catchup_cursor_stable_stop_extension_env_config();
     ok &= test_surface_epoch_catchup_uses_frame_budget_override(app);
-    ok &= test_surface_cursor_stable_extension_disabled_preserves_incomplete_boundary(app);
+    ok &= test_surface_cursor_stable_extension_disabled_preserves_observed_boundary(app);
     ok &= test_surface_synchronized_release_stable_with_extension_disabled_counts_cursor_stable(app);
     ok &= test_surface_synchronized_hold_stop_preserves_drain_stats(app);
+    ok &= test_surface_unsettled_drain_stop_withholds_cursor_primitive(app);
+    ok &= test_surface_cursor_only_backend_publication_withholds_cursor(app);
+    ok &= test_surface_held_drain_preserves_active_cursor_withhold(app);
+    ok &= test_cursor_withhold_transition_table_rows();
+    ok &= test_surface_cursor_withhold_content_id_tracks_production_content_boundary(app);
+    ok &= test_surface_no_publication_requires_settlement_proof_for_cursor_withhold(app);
+    ok &= test_surface_no_publication_settlement_proof_clears_cursor_withhold(app);
+    ok &= test_surface_unsettled_drain_stop_input_keeps_cursor_visible(app);
+    ok &= test_surface_stale_accepted_input_does_not_latch_replacement_session(app);
+    ok &= test_surface_unsettled_content_catchup_after_input_keeps_cursor_visible(app);
+    ok &= test_surface_unsettled_drain_stop_alternate_wheel_input_keeps_cursor_visible(app);
+    ok &= test_surface_unsettled_drain_stop_alternate_wheel_pending_callbacks_preserves_withhold(app);
+    ok &= test_surface_unsettled_drain_stop_mouse_report_preserves_cursor_withhold(app);
+    ok &= test_surface_unsettled_drain_stop_focus_report_is_not_terminal_input(app);
+    ok &= test_surface_unsettled_drain_stop_focus_report_observes_pending_mode_reset(app);
+    ok &= test_surface_unsettled_drain_stop_preedit_preserves_cursor_withhold(app);
+    ok &= test_surface_settled_drain_rearms_cursor_withhold_after_input(app);
+    ok &= test_surface_metadata_publication_preserves_cursor_withhold_until_catchup(app);
+    ok &= test_surface_selection_metadata_snapshot_preserves_cursor_withhold_until_content(app);
+    ok &= test_surface_session_replacement_resets_unsettled_drain_cursor_withhold(app);
+    ok &= test_surface_synchronized_release_paced_output_keeps_cursor_visible(app);
+    ok &= test_surface_recovery_force_release_resets_unsettled_drain_cursor_withhold(app);
+    ok &= test_surface_recovery_no_publication_paths_preserve_cursor_withhold(app);
+    ok &= test_surface_recovery_no_publication_observation_preserves_cursor_withhold(app);
     ok &= test_surface_epoch_catchup_pending_mouse_retry_stays_on_frame_path(app);
     ok &= test_surface_posted_backend_drain_uses_full_budget_without_frame_work(app);
     ok &= test_surface_posted_backend_drain_reconciles_completed_atlas_before_budget(app);

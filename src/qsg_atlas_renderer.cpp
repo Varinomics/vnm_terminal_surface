@@ -500,13 +500,11 @@ Qsg_atlas_cursor_report captured_render_cursor_report(
         return report;
     }
 
-    const bool cursor_blink_enabled =
-        frame.options.cursor_blink_enabled_override.value_or(
-            snapshot.cursor.blink_enabled);
     report.visible =
-        snapshot.cursor.visible                                      &&
-        cursor_position_inside_grid(snapshot.cursor.position, snapshot.grid_size) &&
-        (!cursor_blink_enabled || frame.cursor_blink_visible);
+        terminal_render_cursor_visible(
+            snapshot,
+            frame.options,
+            frame.cursor_blink_visible);
     return report;
 }
 
@@ -4333,6 +4331,7 @@ private:
             key,
             options.cursor_blink_enabled_override.has_value() &&
                 *options.cursor_blink_enabled_override);
+        append_key_bool(key, options.cursor_withheld);
         append_key_bool(key, options.visual_bell_enabled);
         append_key_bool(key, options.underline_hyperlinks);
         append_key_int(key, static_cast<int>(options.text_renderer_policy));
@@ -8612,6 +8611,52 @@ Captured_atlas_frame capture_qsg_atlas_frame(
     frame.publication_generation = publication_generation(frame);
     frame.cursor_blink_visible = cursor_blink_visible;
     return frame;
+}
+
+Qsg_atlas_frame_report capture_qsg_atlas_frame_for_testing(
+    std::shared_ptr<const Terminal_render_snapshot>
+                                  snapshot,
+    Ime_preedit_state             ime_preedit,
+    Terminal_render_options       options,
+    terminal_cell_metrics_t       cell_metrics,
+    QSizeF                        logical_size,
+    QFont                         font,
+    std::shared_ptr<Hierarchical_profiler>
+                                  render_profiler,
+    qreal                         device_pixel_ratio,
+    std::uint64_t                 font_epoch,
+    std::uint64_t                 capture_sequence,
+    bool                          cursor_blink_visible)
+{
+    Captured_atlas_frame captured_frame =
+        capture_qsg_atlas_frame(
+            std::move(snapshot),
+            std::move(ime_preedit),
+            std::move(options),
+            cell_metrics,
+            logical_size,
+            std::move(font),
+            std::move(render_profiler),
+            device_pixel_ratio,
+            font_epoch,
+            capture_sequence,
+            cursor_blink_visible);
+
+    Qsg_atlas_recorder recorder;
+    recorder.record_capture(captured_frame);
+    Qsg_atlas_frame_report report = recorder.snapshot();
+
+    const Terminal_render_frame render_frame =
+        build_terminal_render_frame(
+            captured_frame.snapshot.get(),
+            captured_frame.logical_size,
+            captured_frame.cell_metrics,
+            captured_frame.options,
+            captured_frame.cursor_blink_visible,
+            &captured_frame.ime_preedit);
+    report.frame_build.emitted_cursor =
+        emitted_cursor_report(render_frame, captured_frame.cell_metrics);
+    return report;
 }
 
 QColor qsg_atlas_diagnostic_color(const Captured_atlas_frame& frame)

@@ -167,6 +167,25 @@ public:
     Terminal_viewport_scroll_result scroll_published_viewport_to_offset_from_tail(
         int                        offset_from_tail);
 
+    struct Backend_callback_drain_observation
+    {
+        Backend_callback_drain_stop stop = Backend_callback_drain_stop::COMPLETE;
+        bool                        callbacks_pending_before = false;
+        bool                        callbacks_pending_after  = false;
+    };
+
+    struct Published_viewport_scroll_result
+    {
+        Terminal_viewport_scroll_result     scroll;
+        Backend_callback_drain_observation  backend_drain;
+    };
+
+    Published_viewport_scroll_result scroll_published_viewport_lines_with_drain_observation(
+        int                                line_delta);
+    Published_viewport_scroll_result
+        scroll_published_viewport_to_offset_from_tail_with_drain_observation(
+            int                            offset_from_tail);
+
     void set_selection_range(
         Terminal_selection_range   range);
     void set_selection_range_from_published_source(
@@ -276,7 +295,7 @@ public:
      * session state or taking pending notifications. Without a notifier the callback
      * path calls this method inline, preserving the synchronous test/backend contract.
      */
-    void process_backend_callback_events();
+    Backend_callback_drain_stop process_backend_callback_events();
     Backend_callback_drain_stop process_backend_callback_events_for(
         std::chrono::steady_clock::duration     budget);
     Backend_callback_drain_stop process_backend_callback_events_until_epoch(
@@ -550,7 +569,8 @@ private:
         QString                    message,
         Terminal_render_snapshot_purpose
                                    purpose = Terminal_render_snapshot_purpose::CONTENT,
-        Terminal_public_scroll_diagnostics public_scroll_diagnostics = {});
+        Terminal_public_scroll_diagnostics public_scroll_diagnostics = {},
+        bool                       backend_output_progress = false);
 
     bool publish_public_projection_scroll_snapshot(
         std::uint64_t                  sequence,
@@ -698,6 +718,7 @@ private:
     std::uint64_t                                          m_processing_backend_callback_epoch = 0U;
     std::uint64_t                                          m_incomplete_backend_output_callback_epoch = 0U;
     std::uint64_t                                          m_budgeted_backend_output_sequence = 0U;
+    std::uint64_t                                          m_backend_output_progress_generation = 0U;
     std::uint64_t                                          m_render_snapshot_generation = 0U;
     std::uint64_t                                          m_render_snapshot_installed_generation = 0U;
     std::uint64_t                                          m_render_snapshot_rendered_generation = 0U;

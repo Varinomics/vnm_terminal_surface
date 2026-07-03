@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 class VNM_TerminalSurface;
 
@@ -67,6 +68,62 @@ struct Render_profile_snapshot_t
 #endif
 };
 
+struct Cursor_withhold_content_id
+{
+    std::uint64_t                           session_generation = 0U;
+    std::uint64_t                           content_generation = 0U;
+    std::uint64_t                           backend_progress_generation = 0U;
+};
+
+inline bool operator==(
+    const Cursor_withhold_content_id& left,
+    const Cursor_withhold_content_id& right)
+{
+    return
+        left.session_generation == right.session_generation &&
+        left.content_generation == right.content_generation &&
+        left.backend_progress_generation == right.backend_progress_generation;
+}
+
+inline bool operator!=(
+    const Cursor_withhold_content_id& left,
+    const Cursor_withhold_content_id& right)
+{
+    return !(left == right);
+}
+
+enum class Cursor_withhold_test_event_kind
+{
+    UNSETTLED_CONTENT_PUBLISHED,
+    ACCEPTED_TERMINAL_INPUT,
+    SETTLED_CONTENT_PUBLISHED,
+    INSTALLED_CONTENT_SNAPSHOT_SETTLED,
+    NO_PUBLICATION_NO_SETTLEMENT,
+    HELD_NO_PUBLICATION,
+    METADATA_ONLY_PUBLICATION,
+    SUCCESSFUL_RECOVERY_RELEASE,
+    SESSION_RESET,
+    STALE_SESSION_EVENT,
+};
+
+struct Cursor_withhold_test_event
+{
+    Cursor_withhold_test_event_kind         kind =
+        Cursor_withhold_test_event_kind::NO_PUBLICATION_NO_SETTLEMENT;
+    std::optional<Cursor_withhold_content_id>
+                                             content_id;
+    std::uint64_t                           session_generation = 0U;
+};
+
+struct Cursor_withhold_state_snapshot
+{
+    std::uint64_t                           session_generation = 0U;
+    std::optional<Cursor_withhold_content_id>
+                                             protected_content_id;
+    bool                                    input_exemption = false;
+    bool                                    cursor_withheld = false;
+};
+
 class VNM_TerminalSurface_render_bridge
 {
 public:
@@ -92,6 +149,9 @@ public:
         bool                       enabled);
 
     static Qsg_atlas_frame_report qsg_atlas_frame(
+        const VNM_TerminalSurface& surface);
+
+    static Qsg_atlas_frame_report capture_qsg_atlas_frame_for_testing(
         const VNM_TerminalSurface& surface);
 
     static Terminal_screen_model_dirty_row_stats dirty_row_stats(
@@ -139,6 +199,12 @@ public:
     static void drain_backend_callback_events(
         VNM_TerminalSurface&       surface);
 
+    // Test-only path for stale-session drains that must deliver notifications
+    // even when the budgeted stop is UNSETTLED.
+    static Backend_callback_drain_stop drain_backend_callback_events_with_budget_for_testing(
+        VNM_TerminalSurface&                    surface,
+        std::chrono::steady_clock::duration     budget);
+
     static void drain_backend_callback_events_for_posted_work(
         VNM_TerminalSurface&       surface);
 
@@ -167,6 +233,12 @@ public:
     static void handle_synchronized_output_recovery_timeout(
         VNM_TerminalSurface&                    surface,
         std::chrono::steady_clock::duration     budget);
+
+    static bool force_release_synchronized_output_without_backend_drain_for_testing(
+        VNM_TerminalSurface&       surface);
+
+    static bool detach_selection_visual_attachment_for_testing(
+        VNM_TerminalSurface&       surface);
 
     static std::shared_ptr<const Terminal_render_snapshot> render_snapshot(
         const VNM_TerminalSurface& surface);
@@ -209,6 +281,28 @@ public:
 
     static terminal_renderer_lifecycle_stats_t lifecycle_stats(
         const VNM_TerminalSurface& surface);
+
+    static Cursor_withhold_state_snapshot cursor_withhold_state_for_testing(
+        const VNM_TerminalSurface& surface);
+
+    static void apply_cursor_withhold_event_for_testing(
+        VNM_TerminalSurface&           surface,
+        Cursor_withhold_test_event     event);
+
+    // Test-only semantic bridge for recovery observations that production
+    // cannot reach without either returning before recovery or installing a
+    // force-release publication. This still enters through the classifier and
+    // does not expose retired cursor-withhold counter authority.
+    static void apply_no_publication_recovery_observation_for_testing(
+        VNM_TerminalSurface&       surface,
+        bool                       active_session);
+
+    static bool cursor_withheld_for_testing(
+        const VNM_TerminalSurface& surface);
+
+    static std::optional<Cursor_withhold_content_id>
+        installed_cursor_withhold_content_id_for_testing(
+            const VNM_TerminalSurface& surface);
 
     static std::shared_ptr<Terminal_renderer_lifecycle_recorder> lifecycle_recorder(
         VNM_TerminalSurface&       surface);

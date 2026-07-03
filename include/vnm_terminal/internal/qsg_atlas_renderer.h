@@ -906,6 +906,21 @@ Captured_atlas_frame capture_qsg_atlas_frame(
     std::uint64_t                 capture_sequence,
     bool                          cursor_blink_visible);
 
+Qsg_atlas_frame_report capture_qsg_atlas_frame_for_testing(
+    std::shared_ptr<const Terminal_render_snapshot>
+                                  snapshot,
+    Ime_preedit_state             ime_preedit,
+    Terminal_render_options       options,
+    terminal_cell_metrics_t       cell_metrics,
+    QSizeF                        logical_size,
+    QFont                         font,
+    std::shared_ptr<Hierarchical_profiler>
+                                  render_profiler,
+    qreal                         device_pixel_ratio,
+    std::uint64_t                 font_epoch,
+    std::uint64_t                 capture_sequence,
+    bool                          cursor_blink_visible);
+
 QColor qsg_atlas_diagnostic_color(const Captured_atlas_frame& frame);
 
 QSGNode* update_qsg_atlas_node(
