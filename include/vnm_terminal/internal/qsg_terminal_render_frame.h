@@ -66,6 +66,7 @@ struct Terminal_render_options
     std::optional<Terminal_cursor_shape>
                                cursor_shape_override;
     std::optional<bool>        cursor_blink_enabled_override;
+    bool                       cursor_withheld = false;
     bool                       visual_bell_enabled  = true;
     bool                       underline_hyperlinks = false;
     Terminal_text_renderer_policy
@@ -75,6 +76,29 @@ struct Terminal_render_options
                                msdf_lcd_subpixel_order =
                                    Terminal_lcd_subpixel_order::NONE;
 };
+
+inline bool terminal_render_cursor_visible(
+    const Terminal_render_snapshot&    snapshot,
+    const Terminal_render_options&     options,
+    bool                               cursor_blink_visible)
+{
+    const bool valid_grid =
+        snapshot.grid_size.rows > 0 && snapshot.grid_size.columns > 0;
+    const bool cursor_in_grid =
+        valid_grid                              &&
+        snapshot.cursor.position.row    >= 0   &&
+        snapshot.cursor.position.column >= 0   &&
+        snapshot.cursor.position.row    < snapshot.grid_size.rows &&
+        snapshot.cursor.position.column < snapshot.grid_size.columns;
+    const bool cursor_blink_enabled =
+        options.cursor_blink_enabled_override.value_or(
+            snapshot.cursor.blink_enabled);
+    return
+        cursor_in_grid                         &&
+        snapshot.cursor.visible                &&
+        !options.cursor_withheld &&
+        (!cursor_blink_enabled || cursor_blink_visible);
+}
 
 struct Terminal_render_rect
 {

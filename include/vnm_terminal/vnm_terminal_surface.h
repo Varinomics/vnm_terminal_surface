@@ -589,6 +589,7 @@ private:
     void request_backend_callback_follow_up_after_incomplete_recorded_drain(
         vnm_terminal::internal::Terminal_session*
                                session,
+        std::uint64_t          session_generation,
         vnm_terminal::internal::Backend_callback_drain_stop
                                stop,
         Backend_callback_incomplete_follow_up
