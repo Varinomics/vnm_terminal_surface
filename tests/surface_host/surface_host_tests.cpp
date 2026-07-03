@@ -2841,6 +2841,285 @@ bool test_surface_synchronized_release_stable_with_extension_disabled_counts_cur
     return ok;
 }
 
+bool test_surface_cursor_withhold_arms_unsafe_publication_until_settlement(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+    fixture.surface.set_cursor_blink_enabled(false);
+    fixture.surface.set_synchronized_output_scroll_policy(
+        VNM_TerminalSurface::Synchronized_output_scroll_policy::
+            IMMEDIATE_PUBLIC_PROJECTION);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("cursor-withhold-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "cursor withhold unsafe publication surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("cursor-withhold-baseline")),
+        "cursor withhold unsafe publication publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "cursor withhold unsafe publication captures baseline");
+
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_budget_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+
+    const QByteArray frame_marker =
+        QByteArrayLiteral("\r\ncursor-withhold-frame");
+    QByteArray output(
+        k_backend_output_drain_slice_contract_bytes - frame_marker.size(),
+        'x');
+    output += frame_marker;
+    output += QByteArrayLiteral("\r\ncursor-withhold-tail");
+    ok &= check(
+        output.indexOf(QByteArrayLiteral("cursor-withhold-tail")) >=
+            k_backend_output_drain_slice_contract_bytes,
+        "cursor withhold unsafe publication leaves tail work outside the first slice");
+    backend_ptr->emit_output(output);
+
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> unsafe_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(unsafe_snapshot != nullptr &&
+        unsafe_snapshot->cursor.visible &&
+        snapshot_contains_text(*unsafe_snapshot, QStringLiteral("cursor-withhold-frame")) &&
+        !snapshot_contains_text(*unsafe_snapshot, QStringLiteral("cursor-withhold-tail")),
+        "cursor withhold unsafe publication publishes visible-cursor content");
+    if (unsafe_snapshot == nullptr) {
+        return ok;
+    }
+
+    const term::Cursor_withhold_state_snapshot unsafe_state =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(
+        unsafe_state.risk_episode_active &&
+        unsafe_state.cursor_withheld &&
+        !unsafe_state.visibility_forced &&
+        unsafe_state.successful_withheld_frame_count == 0U &&
+        unsafe_state.successful_withheld_frame_bound == 1U,
+        "cursor withhold unsafe publication arms one-frame restoration");
+
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> settled_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(settled_snapshot != nullptr &&
+        snapshot_contains_text(*settled_snapshot, QStringLiteral("cursor-withhold-tail")),
+        "cursor withhold unsafe publication publishes tail after complete drain");
+
+    const term::Cursor_withhold_state_snapshot settled_state =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(
+        !settled_state.risk_episode_active &&
+        !settled_state.visibility_forced &&
+        !settled_state.cursor_withheld &&
+        settled_state.successful_withheld_frame_count == 0U,
+        "cursor withhold unsafe publication clears after proof-bearing settlement");
+
+    return ok;
+}
+
+bool test_surface_cursor_withhold_restores_after_one_withheld_rendered_frame(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+    fixture.surface.set_cursor_blink_enabled(false);
+    fixture.surface.set_synchronized_output_scroll_policy(
+        VNM_TerminalSurface::Synchronized_output_scroll_policy::
+            IMMEDIATE_PUBLIC_PROJECTION);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {QByteArrayLiteral("cursor-restore-baseline")};
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "cursor withhold restoration surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> baseline_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(baseline_snapshot != nullptr &&
+        snapshot_contains_text(*baseline_snapshot, QStringLiteral("cursor-restore-baseline")),
+        "cursor withhold restoration publishes a baseline snapshot");
+    if (baseline_snapshot == nullptr) {
+        return ok;
+    }
+
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        baseline_snapshot->metadata.sequence),
+        "cursor withhold restoration captures baseline");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026h"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    backend_ptr->emit_output(
+        QByteArrayLiteral("cursor-restore-held\x1b[?2026l\x1b[?2026h"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> held_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(held_snapshot != nullptr &&
+        held_snapshot->cursor.visible &&
+        snapshot_contains_text(*held_snapshot, QStringLiteral("cursor-restore-held")),
+        "cursor withhold restoration publishes blocked visible-cursor content");
+    if (held_snapshot == nullptr) {
+        return ok;
+    }
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) == 0U,
+        "cursor withhold restoration has no pending callbacks before render");
+
+    const term::Cursor_withhold_state_snapshot held_state =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(
+        held_state.risk_episode_active &&
+        held_state.cursor_withheld &&
+        !held_state.visibility_forced &&
+        held_state.successful_withheld_frame_count == 0U &&
+        held_state.successful_withheld_frame_bound == 1U,
+        "cursor withhold restoration arms one-frame restoration");
+
+    const term::Qsg_atlas_frame_report report_before_withheld_frame =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
+    const std::optional<term::Qsg_atlas_frame_report> withheld_frame_report =
+        capture_next_surface_frame(
+            app,
+            fixture.window,
+            fixture.surface,
+            report_before_withheld_frame.capture_count);
+    ok &= check(withheld_frame_report.has_value(),
+        "cursor withhold restoration renders one withheld frame");
+    if (!withheld_frame_report.has_value()) {
+        return ok;
+    }
+
+    ok &= check_uint64_equal(
+        withheld_frame_report->captured_snapshot_sequence,
+        held_snapshot->metadata.sequence,
+        "cursor withhold restoration renders the blocked snapshot");
+    ok &= check(
+        withheld_frame_report->captured_snapshot_cursor.visible &&
+        withheld_frame_report->captured_render_cursor.valid       &&
+        !withheld_frame_report->captured_render_cursor.visible,
+        "cursor withhold restoration suppresses the first rendered cursor");
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::
+            mark_reported_atlas_completion_pending_for_testing(
+                fixture.surface,
+                held_snapshot->metadata.publication_generation,
+                true),
+        "cursor withhold restoration reports the withheld frame drawn");
+    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+
+    const term::Cursor_withhold_state_snapshot restored_state =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(
+        restored_state.risk_episode_active &&
+        restored_state.visibility_forced &&
+        !restored_state.cursor_withheld &&
+        restored_state.successful_withheld_frame_count == 1U,
+        "cursor withhold restoration forces visibility without settlement");
+
+    const std::optional<term::Qsg_atlas_frame_report> forced_visible_frame_report =
+        capture_next_surface_frame(
+            app,
+            fixture.window,
+            fixture.surface,
+            withheld_frame_report->capture_count);
+    ok &= check(forced_visible_frame_report.has_value(),
+        "cursor withhold restoration renders the forced-visible frame");
+    if (forced_visible_frame_report.has_value()) {
+        ok &= check_uint64_equal(
+            forced_visible_frame_report->captured_snapshot_sequence,
+            held_snapshot->metadata.sequence,
+            "cursor withhold restoration forced-visible frame uses blocked snapshot");
+        ok &= check(
+            forced_visible_frame_report->captured_snapshot_cursor.visible &&
+            forced_visible_frame_report->captured_render_cursor.visible,
+            "cursor withhold restoration makes the cursor visible before settlement");
+    }
+
+    const term::Cursor_withhold_state_snapshot active_forced_state =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(
+        active_forced_state.risk_episode_active &&
+        active_forced_state.visibility_forced &&
+        !active_forced_state.cursor_withheld,
+        "cursor withhold restoration keeps the risk episode active before release");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l"));
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+        fixture.surface);
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> settled_snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(settled_snapshot != nullptr &&
+        !settled_snapshot->modes.synchronized_output,
+        "cursor withhold restoration publishes proof-bearing release");
+
+    const term::Cursor_withhold_state_snapshot settled_state =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(
+        !settled_state.risk_episode_active &&
+        !settled_state.visibility_forced &&
+        !settled_state.cursor_withheld &&
+        settled_state.successful_withheld_frame_count == 0U,
+        "cursor withhold restoration clears after proof-bearing settlement");
+
+    return ok;
+}
+
 bool test_surface_synchronized_hold_stop_preserves_drain_stats(QGuiApplication& app)
 {
     bool ok = true;
@@ -15151,6 +15430,8 @@ int main(int argc, char** argv)
     ok &= test_surface_epoch_catchup_uses_frame_budget_override(app);
     ok &= test_surface_cursor_stable_extension_disabled_preserves_incomplete_boundary(app);
     ok &= test_surface_synchronized_release_stable_with_extension_disabled_counts_cursor_stable(app);
+    ok &= test_surface_cursor_withhold_arms_unsafe_publication_until_settlement(app);
+    ok &= test_surface_cursor_withhold_restores_after_one_withheld_rendered_frame(app);
     ok &= test_surface_synchronized_hold_stop_preserves_drain_stats(app);
     ok &= test_surface_epoch_catchup_pending_mouse_retry_stays_on_frame_path(app);
     ok &= test_surface_posted_backend_drain_uses_full_budget_without_frame_work(app);

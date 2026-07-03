@@ -109,6 +109,165 @@ constexpr unsigned int k_win_font_smoothing_orientation_bgr     = 0x0000U;
 constexpr unsigned int k_win_font_smoothing_orientation_rgb     = 0x0001U;
 #endif
 
+constexpr std::uint64_t k_cursor_withhold_successful_frame_bound = 1U;
+
+bool cursor_withhold_snapshot_is_live_content_publication(
+    const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot)
+{
+    return
+        snapshot != nullptr &&
+        snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT;
+}
+
+bool cursor_withhold_snapshot_has_settlement_proof(
+    const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot,
+    const term::Terminal_session&                                session)
+{
+    return
+        cursor_withhold_snapshot_is_live_content_publication(snapshot) &&
+        snapshot->metadata.processed_backend_callback_epoch >=
+            session.backend_callback_enqueue_epoch() &&
+        !session.has_pending_backend_callback_events() &&
+        !session.render_publication_blocked();
+}
+
+bool cursor_withhold_snapshot_is_unsafe_output(
+    const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot,
+    const term::Terminal_session&                                session)
+{
+    return
+        cursor_withhold_snapshot_is_live_content_publication(snapshot) &&
+        (snapshot->metadata.processed_backend_callback_epoch <
+            session.backend_callback_enqueue_epoch() ||
+            session.has_pending_backend_callback_events() ||
+            session.render_publication_blocked());
+}
+
+enum class Cursor_withhold_publication_state
+{
+    NO_PUBLICATION,
+    UNSAFE_PUBLICATION,
+    SETTLED_PUBLICATION,
+};
+
+Cursor_withhold_publication_state cursor_withhold_publication_state_from_session_facts(
+    const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot,
+    const term::Terminal_session&                                session)
+{
+    if (cursor_withhold_snapshot_has_settlement_proof(snapshot, session)) {
+        return Cursor_withhold_publication_state::SETTLED_PUBLICATION;
+    }
+
+    if (cursor_withhold_snapshot_is_unsafe_output(snapshot, session)) {
+        return Cursor_withhold_publication_state::UNSAFE_PUBLICATION;
+    }
+
+    return Cursor_withhold_publication_state::NO_PUBLICATION;
+}
+
+class Cursor_withhold_state_owner
+{
+public:
+    void reset_session(std::uint64_t session_generation)
+    {
+        m_session_generation = session_generation;
+        clear_episode();
+    }
+
+    bool sync_active_session(
+        std::uint64_t                       session_generation,
+        Cursor_withhold_publication_state  publication_state)
+    {
+        if (session_generation != m_session_generation) {
+            reset_session(session_generation);
+        }
+
+        const bool before = cursor_withheld();
+        switch (publication_state) {
+        case Cursor_withhold_publication_state::SETTLED_PUBLICATION:
+            clear_episode();
+            break;
+
+        case Cursor_withhold_publication_state::UNSAFE_PUBLICATION:
+            if (!m_risk_episode_active) {
+                m_risk_episode_active             = true;
+                m_visibility_forced               = false;
+                m_successful_withheld_frame_count = 0U;
+            }
+            break;
+
+        case Cursor_withhold_publication_state::NO_PUBLICATION:
+            break;
+        }
+
+        return cursor_withheld() != before;
+    }
+
+    bool reveal_for_accepted_terminal_input(std::uint64_t session_generation)
+    {
+        if (session_generation != m_session_generation ||
+            !m_risk_episode_active ||
+            m_visibility_forced)
+        {
+            return false;
+        }
+
+        m_visibility_forced = true;
+        return true;
+    }
+
+    bool record_successful_rendered_frame(bool cursor_was_withheld)
+    {
+        if (!cursor_was_withheld ||
+            !m_risk_episode_active ||
+            m_visibility_forced)
+        {
+            return false;
+        }
+
+        ++m_successful_withheld_frame_count;
+        if (m_successful_withheld_frame_count <
+            k_cursor_withhold_successful_frame_bound)
+        {
+            return false;
+        }
+
+        m_visibility_forced = true;
+        return true;
+    }
+
+    bool cursor_withheld() const
+    {
+        return m_risk_episode_active && !m_visibility_forced;
+    }
+
+    term::Cursor_withhold_state_snapshot snapshot() const
+    {
+        return {
+            m_session_generation,
+            m_successful_withheld_frame_count,
+            k_cursor_withhold_successful_frame_bound,
+            m_risk_episode_active,
+            m_visibility_forced,
+            cursor_withheld(),
+        };
+    }
+
+private:
+    void clear_episode()
+    {
+        m_risk_episode_active             = false;
+        m_visibility_forced               = false;
+        m_successful_withheld_frame_count = 0U;
+    }
+
+    std::uint64_t m_session_generation = 0U;
+    std::uint64_t m_successful_withheld_frame_count = 0U;
+    bool          m_risk_episode_active = false;
+    bool          m_visibility_forced = false;
+};
+
 bool flush_clipboard_after_terminal_write()
 {
 #if defined(_WIN32)
@@ -1075,34 +1234,45 @@ bool selection_drag_can_rebase_after_content_validation_failure(
         !drag_moved;
 }
 
-void cancel_selection_drag_after_content_validation_failure(
-    term::Terminal_session&                 session,
+enum class Selection_session_mutation
+{
+    CLEAR_SELECTION,
+    DETACH_SELECTION_VISUAL_ATTACHMENT,
+    SET_SELECTION_RANGE,
+};
+
+struct Selection_drag_session_mutation
+{
+    Selection_session_mutation              mutation =
+        Selection_session_mutation::CLEAR_SELECTION;
+    std::optional<term::Terminal_selection_range>
+                                             range;
+};
+
+Selection_session_mutation selection_drag_cancellation_mutation(
     Selection_drag_content_validation_status status,
     bool                                    drag_moved)
 {
     if (drag_moved && selection_drag_content_validation_allows_payload_detach(status)) {
-        session.detach_selection_visual_attachment();
-        return;
+        return Selection_session_mutation::DETACH_SELECTION_VISUAL_ATTACHMENT;
     }
 
-    session.clear_selection();
+    return Selection_session_mutation::CLEAR_SELECTION;
 }
 
-void set_selection_range_for_drag(
-    term::Terminal_session&        session,
+Selection_drag_session_mutation selection_drag_session_mutation_for_drag(
     term::terminal_grid_position_t anchor,
     term::terminal_grid_position_t current,
-    bool                           drag_moved,
-    const term::terminal_selection_source_identity_t& source)
+    bool                           drag_moved)
 {
     if (!drag_moved && current == anchor) {
-        session.clear_selection();
-        return;
+        return {};
     }
 
-    session.set_selection_range_from_drained_published_source(
+    return {
+        Selection_session_mutation::SET_SELECTION_RANGE,
         selection_range_for_drag(anchor, current),
-        source);
+    };
 }
 
 bool local_selection_override(Qt::KeyboardModifiers modifiers)
@@ -2097,13 +2267,14 @@ struct VNM_TerminalSurface::Private
 
     void reset_atlas_completion()
     {
-        atlas_completion_pending              = false;
-        atlas_completion_complete_for_testing = false;
-        atlas_completion_snapshot_sequence    = 0U;
-        atlas_completion_publication_generation = 0U;
-        atlas_completion_capture_sequence     = 0U;
+        atlas_completion_pending                       = false;
+        atlas_completion_complete_for_testing          = false;
+        atlas_completion_snapshot_sequence             = 0U;
+        atlas_completion_publication_generation        = 0U;
+        atlas_completion_capture_sequence              = 0U;
+        atlas_completion_cursor_was_withheld           = false;
         atlas_completion_report_generation_for_testing = 0U;
-        atlas_completion_report_drew_for_testing = false;
+        atlas_completion_report_drew_for_testing       = false;
     }
 
     void publish_renderer_stats(
@@ -2143,20 +2314,43 @@ struct VNM_TerminalSurface::Private
     }
 
     void wait_for_atlas_completion(
-        QQuickWindow*   window,
-        std::uint64_t   snapshot_sequence,
-        std::uint64_t   publication_generation,
-        std::uint64_t   capture_sequence)
+        VNM_TerminalSurface& surface,
+        QQuickWindow*        window,
+        std::uint64_t        snapshot_sequence,
+        std::uint64_t        publication_generation,
+        std::uint64_t        capture_sequence,
+        bool                 cursor_was_withheld)
     {
         if (!render_update_pending || render_update_window != window) {
             return;
         }
 
         consume_render_update(window);
-        atlas_completion_pending           = true;
-        atlas_completion_snapshot_sequence = snapshot_sequence;
+        atlas_completion_pending                = true;
+        atlas_completion_snapshot_sequence      = snapshot_sequence;
         atlas_completion_publication_generation = publication_generation;
-        atlas_completion_capture_sequence  = capture_sequence;
+        atlas_completion_capture_sequence       = capture_sequence;
+        atlas_completion_cursor_was_withheld    = cursor_was_withheld;
+
+        const auto reconcile_after_frame =
+            [surface_ptr = QPointer<VNM_TerminalSurface>(&surface)] {
+                if (surface_ptr == nullptr) {
+                    return;
+                }
+
+                VNM_TerminalSurface& surface = *surface_ptr;
+                auto& surface_private = *surface.m_private;
+                if (!surface_private.shutting_down.load()) {
+                    surface_private.reconcile_atlas_completion(surface);
+                }
+            };
+        (void)QObject::connect(
+            window,
+            &QQuickWindow::afterFrameEnd,
+            &surface,
+            reconcile_after_frame,
+            static_cast<Qt::ConnectionType>(
+                Qt::QueuedConnection | Qt::SingleShotConnection));
     }
 
     bool atlas_report_completes_pending_update(
@@ -2181,9 +2375,13 @@ struct VNM_TerminalSurface::Private
             report.render_snapshot_sequence >= renderer_stats_snapshot_sequence;
     }
 
-    void complete_atlas_completion(const term::Qsg_atlas_frame_report& report)
+    void complete_atlas_completion(
+        VNM_TerminalSurface&                     surface,
+        const term::Qsg_atlas_frame_report&      report)
     {
-        atlas_completion_pending = false;
+        const bool cursor_was_withheld = atlas_completion_cursor_was_withheld;
+        atlas_completion_pending             = false;
+        atlas_completion_cursor_was_withheld = false;
         ++render_invalidation_stats.consumed_updates;
         render_invalidation_stats.last_rendered_snapshot_sequence =
             report.render_snapshot_sequence;
@@ -2193,9 +2391,12 @@ struct VNM_TerminalSurface::Private
             session->mark_render_publication_rendered(
                 report.render_publication_generation);
         }
+        record_cursor_withhold_successful_rendered_frame(
+            surface,
+            cursor_was_withheld);
     }
 
-    void reconcile_atlas_completion()
+    void reconcile_atlas_completion(VNM_TerminalSurface& surface)
     {
         if (!atlas_completion_pending || qsg_atlas_recorder == nullptr) {
             if (!atlas_completion_complete_for_testing) {
@@ -2215,7 +2416,7 @@ struct VNM_TerminalSurface::Private
                 return;
             }
             atlas_completion_complete_for_testing = false;
-            complete_atlas_completion(synthetic_report);
+            complete_atlas_completion(surface, synthetic_report);
             return;
         }
 
@@ -2225,12 +2426,13 @@ struct VNM_TerminalSurface::Private
             return;
         }
 
-        complete_atlas_completion(atlas_report);
+        complete_atlas_completion(surface, atlas_report);
     }
 
-    term::terminal_renderer_stats_t current_renderer_stats()
+    term::terminal_renderer_stats_t current_renderer_stats(
+        VNM_TerminalSurface& surface)
     {
-        reconcile_atlas_completion();
+        reconcile_atlas_completion(surface);
         term::terminal_renderer_stats_t stats = renderer_stats_publisher.snapshot();
         if (qsg_atlas_recorder == nullptr) {
             stats.paint_completed = false;
@@ -2243,21 +2445,22 @@ struct VNM_TerminalSurface::Private
         return stats;
     }
 
-    term::Terminal_surface_render_invalidation_stats_t current_invalidation_stats()
+    term::Terminal_surface_render_invalidation_stats_t current_invalidation_stats(
+        VNM_TerminalSurface& surface)
     {
-        reconcile_atlas_completion();
+        reconcile_atlas_completion(surface);
         term::Terminal_surface_render_invalidation_stats_t stats = render_invalidation_stats;
         stats.render_snapshot_callback_epoch =
             render_snapshot != nullptr
                 ? render_snapshot->metadata.processed_backend_callback_epoch
                 : 0U;
-        stats.pending_update = frame_work_pending();
+        stats.pending_update = frame_work_pending(surface);
         return stats;
     }
 
-    bool frame_work_pending()
+    bool frame_work_pending(VNM_TerminalSurface& surface)
     {
-        reconcile_atlas_completion();
+        reconcile_atlas_completion(surface);
         return render_update_pending || atlas_completion_pending;
     }
 
@@ -2347,6 +2550,15 @@ struct VNM_TerminalSurface::Private
             session != nullptr                         &&
             session.get() == report.session             &&
             session_generation == report.session_generation;
+    }
+
+    bool active_session_matches(
+        const term::Terminal_session*   candidate,
+        std::uint64_t                   candidate_generation) const
+    {
+        return
+            session.get() == candidate &&
+            session_generation == candidate_generation;
     }
 
     Published_mouse_report_write_result encode_published_mouse_report(
@@ -2617,6 +2829,81 @@ struct VNM_TerminalSurface::Private
         return extension;
     }
 
+    void sync_cursor_withhold_from_session(
+        VNM_TerminalSurface&             surface,
+        Cursor_withhold_publication_state publication_state)
+    {
+        if (session == nullptr) {
+            return;
+        }
+
+        if (cursor_withhold_state.sync_active_session(
+                session_generation,
+                publication_state))
+        {
+            request_render_update(surface);
+        }
+    }
+
+    void reset_cursor_withhold_session(VNM_TerminalSurface& surface)
+    {
+        const bool cursor_withheld_before = cursor_withhold_state.cursor_withheld();
+        cursor_withhold_state.reset_session(session_generation);
+        if (cursor_withhold_state.cursor_withheld() != cursor_withheld_before) {
+            request_render_update(surface);
+        }
+    }
+
+    void reveal_cursor_after_accepted_terminal_input(
+        VNM_TerminalSurface& surface,
+        std::uint64_t        route_session_generation)
+    {
+        const bool cursor_withheld_before = cursor_withhold_state.cursor_withheld();
+        const bool changed =
+            cursor_withhold_state.reveal_for_accepted_terminal_input(
+                route_session_generation);
+        if (changed &&
+            cursor_withhold_state.cursor_withheld() != cursor_withheld_before)
+        {
+            request_render_update(surface);
+        }
+    }
+
+    void record_cursor_withhold_successful_rendered_frame(
+        VNM_TerminalSurface& surface,
+        bool                 cursor_was_withheld)
+    {
+        const bool cursor_withheld_before = cursor_withhold_state.cursor_withheld();
+        const bool changed =
+            cursor_withhold_state.record_successful_rendered_frame(
+                cursor_was_withheld);
+        if (changed &&
+            cursor_withhold_state.cursor_withheld() != cursor_withheld_before)
+        {
+            request_render_update(surface);
+        }
+    }
+
+    void clear_selection_with_sync(VNM_TerminalSurface& surface)
+    {
+        if (session == nullptr) {
+            return;
+        }
+
+        session->clear_selection();
+        surface.sync_from_session();
+    }
+
+    void detach_selection_visual_attachment_with_sync(VNM_TerminalSurface& surface)
+    {
+        if (session == nullptr) {
+            return;
+        }
+
+        session->detach_selection_visual_attachment();
+        surface.sync_from_session();
+    }
+
     term::Qt_grid_metrics_provider                         grid_metrics_provider;
     term::terminal_cell_metrics_t                          cell_metrics;
     QFont                                                  render_font;
@@ -2644,6 +2931,7 @@ struct VNM_TerminalSurface::Private
     std::optional<std::chrono::steady_clock::duration>     backend_callback_frame_catchup_budget_override;
     std::optional<std::chrono::steady_clock::duration>
         backend_callback_frame_catchup_cursor_stable_stop_extension_override;
+    Cursor_withhold_state_owner                            cursor_withhold_state;
     int                                                    pending_published_mouse_report_block_count_for_testing = 0;
     bool                                                   render_update_pending              = false;
     std::atomic_bool                                       backend_callback_frame_update_queued =
@@ -2658,6 +2946,7 @@ struct VNM_TerminalSurface::Private
     std::uint64_t                                          atlas_completion_snapshot_sequence = 0U;
     std::uint64_t                                          atlas_completion_publication_generation = 0U;
     std::uint64_t                                          atlas_completion_capture_sequence  = 0U;
+    bool                                                   atlas_completion_cursor_was_withheld = false;
     std::uint64_t                                          atlas_completion_report_generation_for_testing = 0U;
     bool                                                   atlas_completion_report_drew_for_testing = false;
     std::uint64_t                                          renderer_stats_snapshot_sequence   = 0U;
@@ -2935,7 +3224,8 @@ void VNM_TerminalSurface::set_color_scheme(const QString& color_scheme)
     m_color_scheme = scheme->name;
     emit color_scheme_changed();
     if (m_private->session != nullptr) {
-        m_private->session->set_color_state(term::make_terminal_color_state(*scheme));
+        m_private->session->set_color_state(
+            term::make_terminal_color_state(*scheme));
         sync_from_session();
     }
     m_private->request_render_update(*this);
@@ -3043,6 +3333,7 @@ void VNM_TerminalSurface::set_primary_repaint_recovery_enabled(bool enabled)
     emit primary_repaint_recovery_enabled_changed();
     if (m_private->session != nullptr) {
         m_private->session->set_primary_repaint_recovery_enabled(enabled);
+        sync_from_session();
     }
 }
 
@@ -3686,7 +3977,6 @@ void VNM_TerminalSurface::clear_selection()
     if (m_private->session == nullptr) {
         return;
     }
-
     record_surface_selection_drag_transcript(
         m_private->transcript_recorder,
         QStringLiteral("clear"),
@@ -3694,8 +3984,7 @@ void VNM_TerminalSurface::clear_selection()
         std::nullopt,
         std::nullopt,
         false);
-    m_private->session->clear_selection();
-    sync_from_session();
+    m_private->clear_selection_with_sync(*this);
 }
 
 bool VNM_TerminalSurface::paste_text(QString text)
@@ -3710,22 +3999,25 @@ bool VNM_TerminalSurface::paste_text(QString text)
         return false;
     }
 
+    term::Terminal_session* const route_session = m_private->session.get();
+    const std::uint64_t route_session_generation = m_private->session_generation;
     const term::Terminal_paste_text_result paste_result =
-        m_private->session->write_paste_text(
+        route_session->write_paste_text(
             std::move(text),
             paste_framing_policy(m_bracketed_paste_policy));
+    sync_from_session();
     if (!paste_result.handled) {
-        sync_from_session();
         return false;
     }
-
-    sync_from_session();
 
     if (!is_accepted(paste_result.result.code)) {
         report_result_failure(paste_result.result);
         return false;
     }
 
+    m_private->reveal_cursor_after_accepted_terminal_input(
+        *this,
+        route_session_generation);
     return true;
 }
 
@@ -3811,11 +4103,16 @@ VNM_TerminalSurface::scroll_viewport_lines_with_diagnostics(
         std::nullopt,
         viewport_before);
     diagnostic.local_scroll_intent_recorded = true;
+    term::Terminal_session* const route_session = m_private->session.get();
+    const std::uint64_t route_session_generation = m_private->session_generation;
     const term::Terminal_viewport_scroll_result scroll_result =
-        m_private->session->scroll_published_viewport_lines(line_delta);
+        route_session->scroll_published_viewport_lines(line_delta);
     diagnostic.scroll_action = public_scroll_action(scroll_result.action);
     diagnostic.applied_line_delta = scroll_result.applied_line_delta;
     sync_from_session();
+    if (!m_private->active_session_matches(route_session, route_session_generation)) {
+        return diagnostic;
+    }
     diagnostic.local_scroll_applied =
         scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED;
     diagnostic.deferred_intent_recorded =
@@ -3928,11 +4225,17 @@ VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
         offset_from_tail,
         viewport_before);
     diagnostic.local_scroll_intent_recorded = true;
+    term::Terminal_session* const route_session = m_private->session.get();
+    const std::uint64_t route_session_generation = m_private->session_generation;
     const term::Terminal_viewport_scroll_result scroll_result =
-        m_private->session->scroll_published_viewport_to_offset_from_tail(offset_from_tail);
+        route_session->scroll_published_viewport_to_offset_from_tail(
+            offset_from_tail);
     diagnostic.scroll_action = public_scroll_action(scroll_result.action);
     diagnostic.applied_line_delta = scroll_result.applied_line_delta;
     sync_from_session();
+    if (!m_private->active_session_matches(route_session, route_session_generation)) {
+        return diagnostic;
+    }
     diagnostic.local_scroll_applied =
         scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED;
     diagnostic.deferred_intent_recorded =
@@ -4054,7 +4357,8 @@ bool VNM_TerminalSurface::interrupt_process()
         return false;
     }
 
-    const term::Terminal_session_result result = m_private->session->interrupt();
+    const term::Terminal_session_result result =
+        m_private->session->interrupt();
     sync_from_session();
     if (!is_accepted(result.code)) {
         report_result_failure(result);
@@ -4076,7 +4380,8 @@ bool VNM_TerminalSurface::terminate_process()
         return false;
     }
 
-    const term::Terminal_session_result result = m_private->session->terminate();
+    const term::Terminal_session_result result =
+        m_private->session->terminate();
     sync_from_session();
     if (!is_accepted(result.code)) {
         report_result_failure(result);
@@ -4146,11 +4451,14 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
                 m_private->set_ime_preedit_state(*this, std::move(state));
                 return;
             }
+            term::Terminal_session* const route_session = m_private->session.get();
             const term::Terminal_focus_event_result focus_result =
-                m_private->session->write_focus_event(false);
-            m_private->session->cancel_ime_preedit();
+                route_session->write_focus_event(false);
+            route_session->cancel_ime_preedit();
             sync_from_session();
-            if (focus_result.handled && !is_accepted(focus_result.result.code)) {
+            if (focus_result.handled &&
+                !is_accepted(focus_result.result.code))
+            {
                 report_result_failure(focus_result.result);
             }
             return;
@@ -4166,10 +4474,13 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
             if (m_private->session == nullptr) {
                 return;
             }
+            term::Terminal_session* const route_session = m_private->session.get();
             const term::Terminal_focus_event_result focus_result =
-                m_private->session->write_focus_event(true);
+                route_session->write_focus_event(true);
             sync_from_session();
-            if (focus_result.handled && !is_accepted(focus_result.result.code)) {
+            if (focus_result.handled &&
+                !is_accepted(focus_result.result.code))
+            {
                 report_result_failure(focus_result.result);
             }
         }
@@ -4227,8 +4538,10 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             event->ignore();
             return;
         }
+        term::Terminal_session* const route_session = m_private->session.get();
+        const std::uint64_t route_session_generation = m_private->session_generation;
         const term::Terminal_key_event_result key_result =
-            m_private->session->write_key_event(*event);
+            route_session->write_key_event(*event);
         if (!key_result.handled) {
             event->ignore();
             return;
@@ -4238,7 +4551,11 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
         sync_from_session();
         if (!is_accepted(key_result.result.code)) {
             report_result_failure(key_result.result);
+            return;
         }
+        m_private->reveal_cursor_after_accepted_terminal_input(
+            *this,
+            route_session_generation);
         return;
     }
 
@@ -4358,7 +4675,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
                 std::nullopt,
                 false);
             if (m_private->session != nullptr) {
-                m_private->session->clear_selection();
+                m_private->clear_selection_with_sync(*this);
             }
             event->accept();
             if (mouse_write.status ==
@@ -4396,7 +4713,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
                 logical_position,
                 std::nullopt,
                 false);
-            m_private->session->clear_selection();
+            m_private->clear_selection_with_sync(*this);
             event->accept();
             sync_from_session();
             trace_decision(QStringLiteral("mouse-reporting"));
@@ -4469,7 +4786,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
         logical_position,
         std::nullopt,
         false);
-    m_private->session->clear_selection();
+    m_private->clear_selection_with_sync(*this);
     event->accept();
     sync_from_session();
     if (m_selection_trace_enabled) {
@@ -4583,7 +4900,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                     std::nullopt,
                     std::nullopt,
                     false);
-                m_private->session->clear_selection();
+                m_private->clear_selection_with_sync(*this);
                 event->accept();
                 sync_from_session();
                 if (!is_accepted(mouse_result->result.code)) {
@@ -4654,7 +4971,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
             std::nullopt,
             m_private->selection_drag_moved);
         m_private->clear_selection_drag_state();
-        m_private->session->clear_selection();
+        m_private->clear_selection_with_sync(*this);
         event->accept();
         sync_from_session();
         trace_decision(QStringLiteral("source-mismatch"));
@@ -4703,7 +5020,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
             logical_position,
             std::nullopt,
             m_private->selection_drag_moved);
-        m_private->session->clear_selection();
+        m_private->clear_selection_with_sync(*this);
         event->accept();
         sync_from_session();
         trace_decision(QStringLiteral("source-mismatch"));
@@ -4762,7 +5079,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                         logical_position,
                         std::nullopt,
                         false);
-                    m_private->session->clear_selection();
+                    m_private->clear_selection_with_sync(*this);
                     event->accept();
                     sync_from_session();
                     trace_decision(QStringLiteral("clear-on-rebased-click"));
@@ -4811,10 +5128,17 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
             logical_position,
             range,
             m_private->selection_drag_moved);
-        cancel_selection_drag_after_content_validation_failure(
-            *m_private->session,
-            content_validation,
-            m_private->selection_drag_moved);
+        if (selection_drag_cancellation_mutation(
+                content_validation,
+                m_private->selection_drag_moved) ==
+            Selection_session_mutation::DETACH_SELECTION_VISUAL_ATTACHMENT)
+        {
+            m_private->detach_selection_visual_attachment_with_sync(
+                *this);
+        }
+        else {
+            m_private->clear_selection_with_sync(*this);
+        }
         event->accept();
         sync_from_session();
         trace_decision(QStringLiteral("source-mismatch"));
@@ -4886,9 +5210,11 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 std::nullopt,
                 m_private->selection_drag_moved);
             if (!m_private->selection_drag_moved) {
-                m_private->session->clear_selection();
-            } else {
-                m_private->session->detach_selection_visual_attachment();
+                m_private->clear_selection_with_sync(*this);
+            }
+            else {
+                m_private->detach_selection_visual_attachment_with_sync(
+                    *this);
             }
             m_private->clear_selection_drag_state();
             event->accept();
@@ -4916,7 +5242,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 std::nullopt,
                 m_private->selection_drag_moved);
             m_private->clear_selection_drag_state();
-            m_private->session->clear_selection();
+            m_private->clear_selection_with_sync(*this);
             event->accept();
             sync_from_session();
             trace_decision(QStringLiteral("source-mismatch"));
@@ -4959,7 +5285,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 std::nullopt,
                 m_private->selection_drag_moved);
             m_private->clear_selection_drag_state();
-            m_private->session->clear_selection();
+            m_private->clear_selection_with_sync(*this);
             event->accept();
             sync_from_session();
             trace_decision(QStringLiteral("source-mismatch"));
@@ -5018,7 +5344,8 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                                 logical_position,
                                 std::nullopt,
                                 false);
-                            m_private->session->clear_selection();
+                            m_private->clear_selection_with_sync(
+                                *this);
                             m_private->clear_selection_drag_state();
                             event->accept();
                             sync_from_session();
@@ -5066,10 +5393,17 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                     logical_position,
                     range,
                     m_private->selection_drag_moved);
-                cancel_selection_drag_after_content_validation_failure(
-                    *m_private->session,
-                    content_validation,
-                    m_private->selection_drag_moved);
+                if (selection_drag_cancellation_mutation(
+                        content_validation,
+                        m_private->selection_drag_moved) ==
+                    Selection_session_mutation::DETACH_SELECTION_VISUAL_ATTACHMENT)
+                {
+                    m_private->detach_selection_visual_attachment_with_sync(
+                        *this);
+                }
+                else {
+                    m_private->clear_selection_with_sync(*this);
+                }
                 m_private->clear_selection_drag_state();
                 event->accept();
                 sync_from_session();
@@ -5083,12 +5417,20 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 logical_position,
                 range,
                 selection_range_needed);
-            set_selection_range_for_drag(
-                *m_private->session,
-                *m_private->selection_anchor,
-                *logical_position,
-                m_private->selection_drag_moved,
-                *source);
+            const Selection_drag_session_mutation mutation =
+                selection_drag_session_mutation_for_drag(
+                    *m_private->selection_anchor,
+                    *logical_position,
+                    m_private->selection_drag_moved);
+            if (mutation.mutation == Selection_session_mutation::SET_SELECTION_RANGE) {
+                Q_ASSERT(mutation.range.has_value());
+                m_private->session->set_selection_range_from_drained_published_source(
+                    *mutation.range,
+                    *source);
+            }
+            else {
+                m_private->clear_selection_with_sync(*this);
+            }
             decision_reason = QStringLiteral("selection-range-set");
         }
         else
@@ -5100,7 +5442,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 logical_position,
                 std::nullopt,
                 false);
-            m_private->session->clear_selection();
+            m_private->clear_selection_with_sync(*this);
             decision_reason = QStringLiteral("clear-on-click");
         }
 
@@ -5266,7 +5608,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
         std::nullopt,
         false);
     if (m_private->session != nullptr) {
-        m_private->session->clear_selection();
+        m_private->clear_selection_with_sync(*this);
     }
     event->accept();
     if (mouse_write.status == Published_mouse_report_attempt_status::CALLBACKS_PENDING) {
@@ -6052,6 +6394,7 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
     const int     preedit_cursor_position = preedit_cursor_position_from_event(*event);
 
     std::optional<term::Terminal_ime_commit_result> commit_result;
+    std::uint64_t commit_route_session_generation = 0U;
     if (m_private->session != nullptr) {
         if (!commit_text.isEmpty()) {
             m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
@@ -6059,12 +6402,14 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
                 event->ignore();
                 return;
             }
-            commit_result = m_private->session->write_ime_commit(commit_text);
+            commit_route_session_generation = m_private->session_generation;
+            commit_result =
+                m_private->session->write_ime_commit(commit_text);
         }
 
         const bool commit_blocks_empty_preedit_cancel =
-            commit_result.has_value()               &&
-            commit_result->handled                  &&
+            commit_result.has_value()                &&
+            commit_result->handled                   &&
             !is_accepted(commit_result->result.code);
         if (preedit_text.isEmpty()) {
             if (!commit_blocks_empty_preedit_cancel) {
@@ -6078,11 +6423,20 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
         }
 
         sync_from_session();
+
         if (commit_result.has_value() &&
             commit_result->handled &&
             !is_accepted(commit_result->result.code))
         {
             report_result_failure(commit_result->result);
+        }
+        if (commit_result.has_value() &&
+            commit_result->handled &&
+            is_accepted(commit_result->result.code))
+        {
+            m_private->reveal_cursor_after_accepted_terminal_input(
+                *this,
+                commit_route_session_generation);
         }
     }
     else {
@@ -6417,6 +6771,7 @@ bool VNM_TerminalSurface::start_process_with_backend(
     m_private->session =
         std::make_unique<term::Terminal_session>(std::move(backend), session_config);
     ++m_private->session_generation;
+    m_private->reset_cursor_withhold_session(*this);
     m_private->session->set_color_state(
         term::make_terminal_color_state(resolve_surface_color_scheme(*this)));
     m_private->resize_controller = std::make_unique<term::Terminal_resize_controller>(
@@ -6482,7 +6837,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_for_posted_work()
 {
     auto& drain_stats = m_private->backend_drain_stats;
     ++drain_stats.posted_drain_calls;
-    if (m_private->frame_work_pending()) {
+    if (m_private->frame_work_pending(*this)) {
         ++drain_stats.posted_frame_pending_small_budget_calls;
         drain_backend_callback_events_for(k_backend_callback_frame_pending_posted_drain_budget);
         return;
@@ -6532,6 +6887,7 @@ VNM_TerminalSurface::drain_backend_callback_events_until_epoch(
     }
 
     term::Terminal_session* const session = m_private->session.get();
+    const std::uint64_t session_generation = m_private->session_generation;
     const backend_callback_drain_result_t drain_result =
         process_backend_callback_events_recorded(
             session,
@@ -6543,6 +6899,7 @@ VNM_TerminalSurface::drain_backend_callback_events_until_epoch(
     if (budgets.budget.has_value()) {
         request_backend_callback_follow_up_after_incomplete_recorded_drain(
             session,
+            session_generation,
             drain_result.stop,
             incomplete_follow_up);
     }
@@ -6561,7 +6918,7 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     Q_ASSERT(thread() == QThread::currentThread());
 
     const auto drain_started = std::chrono::steady_clock::now();
-    m_private->reconcile_atlas_completion();
+    m_private->reconcile_atlas_completion(*this);
     const bool render_update_pending_before_drain = m_private->render_update_pending;
     const bool atlas_completion_pending_before_drain = m_private->atlas_completion_pending;
     const bool frame_work_pending_before_drain =
@@ -6613,6 +6970,7 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         return result;
     }
 
+    const std::uint64_t session_generation = m_private->session_generation;
     const auto session_processing_started = std::chrono::steady_clock::now();
     if (target_backend_callback_epoch.has_value()) {
         result.stop =
@@ -6639,15 +6997,22 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         !use_budget_notification_boundary ||
         !budget.has_value() ||
         backend_drain_reached_notification_boundary(result.stop, *session);
+    Cursor_withhold_publication_safety publication_safety =
+        Cursor_withhold_publication_safety::CLASSIFY_FROM_SESSION_FACTS;
+    if (result.stop == term::Backend_callback_drain_stop::CURSOR_STABLE) {
+        publication_safety =
+            Cursor_withhold_publication_safety::SETTLED_DRAIN_PUBLICATION_IF_INSTALLED;
+    }
     const auto sync_started = std::chrono::steady_clock::now();
-    sync_from_session(result.deliver_notifications);
+    sync_from_session(result.deliver_notifications, publication_safety);
     record_stage_elapsed(
         drain_stats.sync_from_session_calls,
         drain_stats.sync_from_session_elapsed_ns,
         drain_stats.sync_from_session_max_elapsed_ns,
         sync_started);
 
-    const bool session_still_active = m_private->session.get() == session;
+    const bool session_still_active =
+        m_private->active_session_matches(session, session_generation);
     result.callbacks_pending_after_drain =
         session_still_active && session->has_pending_backend_callback_events();
     if (budget.has_value()) {
@@ -6677,12 +7042,13 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
 void VNM_TerminalSurface::
 request_backend_callback_follow_up_after_incomplete_recorded_drain(
     term::Terminal_session*                         session,
+    std::uint64_t                                   session_generation,
     term::Backend_callback_drain_stop               stop,
     Backend_callback_incomplete_follow_up           follow_up)
 {
     if (stop != term::Backend_callback_drain_stop::COMPLETE &&
         session != nullptr &&
-        m_private->session.get() == session &&
+        m_private->active_session_matches(session, session_generation) &&
         session->has_pending_backend_callback_events())
     {
         if (follow_up == Backend_callback_incomplete_follow_up::FRAME_UPDATE) {
@@ -6710,6 +7076,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
     }
 
     term::Terminal_session* const session = m_private->session.get();
+    const std::uint64_t session_generation = m_private->session_generation;
     const bool trace_drain =
         m_selection_trace_enabled &&
         (m_private->selection_drag_active || session->has_selection());
@@ -6739,6 +7106,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
     if (budget.has_value()) {
         request_backend_callback_follow_up_after_incomplete_recorded_drain(
             session,
+            session_generation,
             drain_result.stop,
             Backend_callback_incomplete_follow_up::POSTED_DRAIN);
     }
@@ -6758,8 +7126,9 @@ void VNM_TerminalSurface::refresh_active_session_geometry()
     }
 
     term::Terminal_session* const session = m_private->session.get();
+    const std::uint64_t session_generation = m_private->session_generation;
     (void)process_backend_callback_events_recorded(session, std::nullopt, false);
-    if (m_private->session.get() != session ||
+    if (!m_private->active_session_matches(session, session_generation) ||
         !is_live_process_state(session->process_state()))
     {
         return;
@@ -6773,7 +7142,9 @@ void VNM_TerminalSurface::refresh_active_session_geometry()
     }
 }
 
-void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
+void VNM_TerminalSurface::sync_from_session(
+    bool                                deliver_notifications,
+    Cursor_withhold_publication_safety publication_safety)
 {
     Q_ASSERT(thread() == QThread::currentThread());
     VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session");
@@ -6782,35 +7153,121 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         return;
     }
 
+    term::Terminal_session* const session = m_private->session.get();
+    const std::uint64_t session_generation = m_private->session_generation;
+    const auto active_session_still_matches = [&] {
+        return m_private->active_session_matches(session, session_generation);
+    };
+
+    bool cursor_withhold_synced = false;
+    bool render_snapshot_installed = false;
+    std::shared_ptr<const term::Terminal_render_snapshot> installed_render_snapshot;
+    const auto installed_render_snapshot_still_current = [&] {
+        return m_private->render_snapshot == installed_render_snapshot;
+    };
+
+    {
+        VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::render_snapshot");
+
+        const std::uint64_t snapshot_generation =
+            session->render_snapshot_generation();
+        if (snapshot_generation !=
+            m_private->last_installed_render_publication_generation)
+        {
+            installed_render_snapshot = session->latest_render_snapshot_handle();
+            term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+                *this,
+                installed_render_snapshot);
+            if (!active_session_still_matches()) {
+                return;
+            }
+            session->mark_render_snapshot_installed(snapshot_generation);
+            m_private->last_installed_render_publication_generation =
+                snapshot_generation;
+
+            Cursor_withhold_publication_state cursor_publication_state =
+                Cursor_withhold_publication_state::NO_PUBLICATION;
+            if (publication_safety ==
+                Cursor_withhold_publication_safety::SETTLED_DRAIN_PUBLICATION_IF_INSTALLED)
+            {
+                cursor_publication_state =
+                    Cursor_withhold_publication_state::SETTLED_PUBLICATION;
+            }
+            else {
+                cursor_publication_state =
+                    cursor_withhold_publication_state_from_session_facts(
+                        installed_render_snapshot,
+                        *session);
+            }
+            m_private->sync_cursor_withhold_from_session(
+                *this,
+                cursor_publication_state);
+            cursor_withhold_synced = true;
+            render_snapshot_installed = true;
+        }
+    }
+
+    if (!cursor_withhold_synced) {
+        m_private->sync_cursor_withhold_from_session(
+            *this,
+            Cursor_withhold_publication_state::NO_PUBLICATION);
+    }
+
+    if (!active_session_still_matches()) {
+        return;
+    }
+
     {
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::session_state");
 
-        set_process_state(surface_process_state(m_private->session->process_state()));
-        set_backend_ready(m_private->session->backend_ready());
-        set_backend_geometry_in_sync(m_private->session->backend_geometry_in_sync());
-        set_selection_state(
-            m_private->session->has_selection()
+        if (!active_session_still_matches()) {
+            return;
+        }
+        set_process_state(surface_process_state(session->process_state()));
+        if (!active_session_still_matches()) {
+            return;
+        }
+        set_backend_ready(session->backend_ready());
+        if (!active_session_still_matches()) {
+            return;
+        }
+        set_backend_geometry_in_sync(session->backend_geometry_in_sync());
+        if (!active_session_still_matches()) {
+            return;
+        }
+        const Selection_state selection_state =
+            session->has_selection()
                 ? Selection_state::ACTIVE
-                : Selection_state::NONE);
+                : Selection_state::NONE;
+        set_selection_state(selection_state);
+        if (!active_session_still_matches()) {
+            return;
+        }
     }
 
-    bool live_mouse_reporting_active  = false;
-    bool live_alternate_scroll_active = false;
     {
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::grid_and_modes");
 
-        const term::terminal_grid_size_t grid_size = m_private->session->grid_size();
+        if (!active_session_still_matches()) {
+            return;
+        }
+        const term::terminal_grid_size_t grid_size = session->grid_size();
         set_grid_size(grid_size.rows, grid_size.columns);
+        if (!active_session_still_matches()) {
+            return;
+        }
 
-        live_mouse_reporting_active = m_private->session->mouse_reporting_active();
+        const bool live_mouse_reporting_active = session->mouse_reporting_active();
         if (live_mouse_reporting_active != m_private->last_sgr_mouse_reporting_active) {
             m_private->clear_mouse_wheel_remainders();
         }
         m_private->last_sgr_mouse_reporting_active = live_mouse_reporting_active;
 
-        live_alternate_scroll_active = m_private->session->alternate_scroll_active();
+        if (!active_session_still_matches()) {
+            return;
+        }
         const std::uint64_t alternate_scroll_mode_generation =
-            m_private->session->alternate_scroll_mode_generation();
+            session->alternate_scroll_mode_generation();
         if (alternate_scroll_mode_generation !=
             m_private->last_alternate_scroll_mode_generation)
         {
@@ -6818,35 +7275,42 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         }
         m_private->last_alternate_scroll_mode_generation = alternate_scroll_mode_generation;
 
+        if (!active_session_still_matches()) {
+            return;
+        }
+        const bool live_alternate_scroll_active = session->alternate_scroll_active();
         if (live_alternate_scroll_active != m_private->last_alternate_scroll_active) {
             m_private->clear_mouse_wheel_remainders();
         }
         m_private->last_alternate_scroll_active = live_alternate_scroll_active;
     }
 
-    {
-        VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::render_snapshot");
+    if (render_snapshot_installed) {
+        VNM_TERMINAL_PROFILE_SCOPE(
+            "VNM_TerminalSurface::sync_from_session::render_snapshot_bookkeeping");
 
-        const std::uint64_t snapshot_generation =
-            m_private->session->render_snapshot_generation();
-        if (snapshot_generation !=
-            m_private->last_installed_render_publication_generation)
+        if (!active_session_still_matches()) {
+            return;
+        }
+        if (installed_render_snapshot_still_current() &&
+            installed_render_snapshot != nullptr)
         {
-            term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
-                *this,
-                m_private->session->latest_render_snapshot_handle());
-            m_private->session->mark_render_snapshot_installed(snapshot_generation);
-            m_private->last_installed_render_publication_generation =
-                snapshot_generation;
-            if (m_private->render_snapshot != nullptr) {
-                set_viewport_state(m_private->render_snapshot->viewport);
+            set_viewport_state(installed_render_snapshot->viewport);
+            if (!active_session_still_matches()) {
+                return;
             }
+        }
 
+        if (!active_session_still_matches()) {
+            return;
+        }
+        if (installed_render_snapshot_still_current()) {
+            const bool live_mouse_reporting_active = session->mouse_reporting_active();
             const bool sgr_mouse_reporting_active =
-                snapshot_has_sgr_mouse_reporting(m_private->render_snapshot);
+                snapshot_has_sgr_mouse_reporting(installed_render_snapshot);
             const bool mouse_reporting_mode_changed =
-                m_private->render_snapshot != nullptr &&
-                m_private->render_snapshot->metadata.mouse_reporting_mode_changed;
+                installed_render_snapshot != nullptr &&
+                installed_render_snapshot->metadata.mouse_reporting_mode_changed;
             if (mouse_reporting_mode_changed ||
                 sgr_mouse_reporting_active != live_mouse_reporting_active)
             {
@@ -6859,9 +7323,12 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::ime_preedit");
 
         const std::uint64_t ime_preedit_generation =
-            m_private->session->ime_preedit_generation();
+            session->ime_preedit_generation();
         if (ime_preedit_generation != m_private->last_ime_preedit_generation) {
-            m_private->set_ime_preedit_state(*this, m_private->session->ime_preedit_state());
+            m_private->set_ime_preedit_state(*this, session->ime_preedit_state());
+            if (!active_session_still_matches()) {
+                return;
+            }
             m_private->last_ime_preedit_generation = ime_preedit_generation;
         }
     }
@@ -6870,9 +7337,12 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::notifications");
 
         const std::vector<term::Terminal_session_notification> notifications =
-            m_private->session->take_pending_notifications();
+            session->take_pending_notifications();
         for (const term::Terminal_session_notification& notification : notifications) {
             replay_session_notification(notification);
+            if (!active_session_still_matches()) {
+                return;
+            }
         }
     }
 
@@ -6918,15 +7388,17 @@ void VNM_TerminalSurface::handle_synchronized_output_recovery_timeout(
     }
 
     term::Terminal_session* const session = m_private->session.get();
+    const std::uint64_t session_generation = m_private->session_generation;
     const backend_callback_drain_result_t drain_result =
         process_backend_callback_events_recorded(session, budget, true);
-    if (m_private->session.get() != session) {
+    if (!m_private->active_session_matches(session, session_generation)) {
         return;
     }
 
     const auto queue_remaining_callbacks = [&] {
         request_backend_callback_follow_up_after_incomplete_recorded_drain(
             session,
+            session_generation,
             drain_result.stop,
             Backend_callback_incomplete_follow_up::POSTED_DRAIN);
     };
@@ -6939,7 +7411,7 @@ void VNM_TerminalSurface::handle_synchronized_output_recovery_timeout(
     const term::Terminal_session_result result =
         session->force_release_synchronized_output_without_backend_drain();
     sync_from_session(drain_result.deliver_notifications);
-    if (m_private->session.get() != session) {
+    if (!m_private->active_session_matches(session, session_generation)) {
         return;
     }
 
@@ -7067,6 +7539,7 @@ void VNM_TerminalSurface::reset_session()
     m_private->clear_selection_drag_state();
     m_private->pending_clipboard_write.reset();
     m_private->clear_wheel_remainders();
+    m_private->reset_cursor_withhold_session(*this);
     m_private->last_sgr_mouse_reporting_active       = false;
     m_private->last_alternate_scroll_active          = false;
     m_private->last_alternate_scroll_mode_generation = 0U;
@@ -7097,12 +7570,13 @@ void VNM_TerminalSurface::updatePolish()
         return;
     }
     term::Terminal_session* const session = m_private->session.get();
+    const std::uint64_t session_generation = m_private->session_generation;
     if (!session->has_pending_backend_callback_events()) {
         if (session->render_snapshot_generation() !=
             m_private->last_installed_render_publication_generation)
         {
             sync_from_session();
-            if (m_private->session.get() != session) {
+            if (!m_private->active_session_matches(session, session_generation)) {
                 return;
             }
         }
@@ -7188,6 +7662,9 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
         }
 
         term::Terminal_render_options options = render_options_for_surface(*this);
+        options.cursor_withheld =
+            m_private->cursor_withhold_state.cursor_withheld();
+        const bool cursor_was_withheld = options.cursor_withheld;
 
         term::Captured_atlas_frame captured_frame =
             term::capture_qsg_atlas_frame(
@@ -7234,10 +7711,12 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             captured_capture_sequence);
         if (updated_node != nullptr) {
             m_private->wait_for_atlas_completion(
+                *this,
                 window(),
                 captured_snapshot_sequence,
                 captured_publication_generation,
-                captured_capture_sequence);
+                captured_capture_sequence,
+                cursor_was_withheld);
         }
         else {
             m_private->reset_render_update_schedule();
@@ -7533,7 +8012,8 @@ term::VNM_TerminalSurface_render_bridge::invalidation_stats(
     const VNM_TerminalSurface& surface)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    return surface.m_private->current_invalidation_stats();
+    return surface.m_private->current_invalidation_stats(
+        const_cast<VNM_TerminalSurface&>(surface));
 }
 
 std::uint64_t
@@ -7595,6 +8075,8 @@ mark_reported_atlas_completion_pending_for_testing(
         surface.m_private->render_snapshot->metadata.publication_generation;
     surface.m_private->atlas_completion_capture_sequence  =
         std::max<std::uint64_t>(surface.m_private->qsg_atlas_capture_sequence, 1U);
+    surface.m_private->atlas_completion_cursor_was_withheld =
+        surface.m_private->cursor_withhold_state.cursor_withheld();
     surface.m_private->atlas_completion_report_generation_for_testing =
         reported_publication_generation;
     surface.m_private->atlas_completion_report_drew_for_testing = drew;
@@ -7606,7 +8088,8 @@ term::VNM_TerminalSurface_render_bridge::last_renderer_stats(
     const VNM_TerminalSurface& surface)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    return surface.m_private->current_renderer_stats();
+    return surface.m_private->current_renderer_stats(
+        const_cast<VNM_TerminalSurface&>(surface));
 }
 
 term::terminal_renderer_cumulative_stats_t
@@ -7626,6 +8109,14 @@ term::VNM_TerminalSurface_render_bridge::lifecycle_stats(
     return lifecycle_recorder != nullptr
         ? lifecycle_recorder->snapshot()
         : term::terminal_renderer_lifecycle_stats_t{};
+}
+
+term::Cursor_withhold_state_snapshot
+term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->cursor_withhold_state.snapshot();
 }
 
 std::shared_ptr<term::Terminal_renderer_lifecycle_recorder>
