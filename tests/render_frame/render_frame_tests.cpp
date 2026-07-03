@@ -987,6 +987,64 @@ bool test_selection_cursor_blink_and_shapes()
     return ok;
 }
 
+bool test_terminal_render_cursor_visible_truth_table()
+{
+    bool ok = true;
+    term::Terminal_render_snapshot snapshot = empty_snapshot({2, 4});
+    snapshot.cursor = {{0, 0}, term::Terminal_cursor_shape::BLOCK, true, true};
+    term::Terminal_render_options render_options = options();
+
+    ok &= check(
+        term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate accepts visible in-grid cursor");
+
+    render_options.cursor_withheld = true;
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate rejects unsettled drain-stop cursor");
+
+    render_options.cursor_withheld = false;
+    snapshot.cursor.visible = false;
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate rejects DECTCM-hidden cursor");
+
+    snapshot.cursor.visible = true;
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, false),
+        "cursor visibility predicate applies blink-hidden phase");
+
+    snapshot.cursor.blink_enabled = false;
+    ok &= check(
+        term::terminal_render_cursor_visible(snapshot, render_options, false),
+        "cursor visibility predicate keeps blink-disabled cursor visible");
+
+    snapshot.cursor.blink_enabled = true;
+    render_options.cursor_blink_enabled_override = false;
+    ok &= check(
+        term::terminal_render_cursor_visible(snapshot, render_options, false),
+        "cursor visibility predicate lets render options disable blink");
+
+    render_options.cursor_blink_enabled_override = true;
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, false),
+        "cursor visibility predicate lets render options force blink");
+
+    render_options.cursor_blink_enabled_override.reset();
+    snapshot.cursor.position = {3, 0};
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate rejects cursor outside the grid");
+
+    snapshot.grid_size = {0, 0};
+    snapshot.cursor.position = {0, 0};
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate rejects zero-grid cursor");
+
+    return ok;
+}
+
 bool test_decorations_preedit_hyperlink_and_bell()
 {
     bool ok = true;
@@ -2499,6 +2557,7 @@ int main()
     ok &= test_default_and_reverse_full_grid_background();
     ok &= test_styled_blank_cells_emit_background_rects();
     ok &= test_selection_cursor_blink_and_shapes();
+    ok &= test_terminal_render_cursor_visible_truth_table();
     ok &= test_decorations_preedit_hyperlink_and_bell();
     ok &= test_zero_grid_and_preedit_width();
     ok &= test_preedit_override_takes_precedence_over_snapshot();
