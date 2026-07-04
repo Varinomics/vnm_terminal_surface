@@ -1261,16 +1261,12 @@ private:
         Signal_targets targets;
         bool child_reaped         = false;
         bool reader_finished      = false;
-        bool close_master         = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_shutdown_started) {
                 return;
             }
 
-            const bool public_call_active       = m_public_call_depth != 0U;
-            const bool defer_master_close        =
-                public_call_active || m_post_exit_process_group_cleanup_pending;
             m_shutdown_started                   = true;
             m_stopping                           = true;
             m_process_stopping                   = true;
@@ -1288,13 +1284,6 @@ private:
                     master,
                     child_reaped,
                     reader_finished);
-                if (defer_master_close) {
-                    m_close_master_pending = true;
-                }
-                else {
-                    master = m_master.release();
-                    close_master = true;
-                }
             }
             else {
                 targets = shutdown_signal_targets(
@@ -1313,10 +1302,6 @@ private:
 
         if (!child_reaped && child_pid > 0) {
             ::kill(child_pid, SIGKILL);
-        }
-
-        if (close_master) {
-            ::close(master);
         }
     }
 
