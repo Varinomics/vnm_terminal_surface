@@ -26,7 +26,10 @@ DECLARE_HANDLE(HPCON);
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <exception>
+#include <latch>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -402,9 +405,38 @@ std::vector<std::byte> initialized_attribute_list_storage(
 class Windows_conpty_backend::Impl
 {
 public:
+    class Public_call_guard
+    {
+    public:
+        explicit Public_call_guard(Impl& impl)
+        :
+            m_impl(&impl)
+        {
+            m_impl->enter_public_call();
+        }
+
+        Public_call_guard(const Public_call_guard&) = delete;
+        Public_call_guard& operator=(const Public_call_guard&) = delete;
+
+        ~Public_call_guard()
+        {
+            if (m_impl != nullptr) {
+                m_impl->leave_public_call();
+            }
+        }
+
+    private:
+        Impl* m_impl = nullptr;
+    };
+
     ~Impl()
     {
         shutdown();
+    }
+
+    Public_call_guard public_call_guard()
+    {
+        return Public_call_guard(*this);
     }
 
     Terminal_backend_result start(
@@ -615,6 +647,7 @@ public:
             m_exit_reported      = false;
             m_reader_finished    = false;
             m_writer_failed      = false;
+            m_startup_aborted    = false;
             m_termination_policy = effective_config.termination_policy;
             m_exit_reason_override.reset();
             m_queued_write_bytes = 0U;
@@ -623,12 +656,34 @@ public:
             m_write_queue.clear();
         }
 
+        std::shared_ptr<std::latch> startup_gate;
         try {
-            m_reader_thread = std::thread([this] { register_worker_thread(); read_loop(); });
-            m_writer_thread = std::thread([this] { register_worker_thread(); write_loop(); });
-            m_wait_thread   = std::thread([this] { register_worker_thread(); wait_loop(); });
+            startup_gate = std::make_shared<std::latch>(1);
+            m_reader_thread = std::thread(
+                &Impl::run_worker_after_startup_gate,
+                this,
+                startup_gate,
+                &Impl::read_loop);
+            m_writer_thread = std::thread(
+                &Impl::run_worker_after_startup_gate,
+                this,
+                startup_gate,
+                &Impl::write_loop);
+            m_wait_thread = std::thread(
+                &Impl::run_worker_after_startup_gate,
+                this,
+                startup_gate,
+                &Impl::wait_loop);
+            startup_gate->count_down();
         }
-        catch (const std::system_error& error) {
+        catch (const std::exception& error) {
+            if (startup_gate) {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_startup_aborted = true;
+                }
+                startup_gate->count_down();
+            }
             const QString message = QStringLiteral("ConPTY worker thread startup failed: %1")
                 .arg(QString::fromLocal8Bit(error.what()));
             report_error(Terminal_backend_error_code::START_FAILED, message);
@@ -794,14 +849,22 @@ public:
         HANDLE                         process_job,
         Terminal_termination_policy    policy)
     {
+        std::shared_ptr<std::latch> startup_gate;
         try {
+            startup_gate = std::make_shared<std::latch>(1);
             m_termination_thread = std::thread(
-                [this, process, process_job, policy] {
-                    register_worker_thread();
-                    termination_escalation_loop(process, process_job, policy);
-                });
+                &Impl::run_termination_after_startup_gate,
+                this,
+                startup_gate,
+                process,
+                process_job,
+                policy);
+            startup_gate->count_down();
         }
-        catch (const std::system_error& error) {
+        catch (const std::exception& error) {
+            if (startup_gate) {
+                startup_gate->count_down();
+            }
             const QString message =
                 QStringLiteral("ConPTY termination escalation worker failed: %1")
                     .arg(QString::fromLocal8Bit(error.what()));
@@ -884,10 +947,9 @@ public:
     // this Impl while that worker is still on the stack.
     //
     // Each worker records its id (register_worker_thread, under m_mutex) before it
-    // runs any callback-capable work, so a callback-triggered destruction is
-    // recognised here even in the window before start() finishes move-assigning
-    // the std::thread members. Reading those members instead would both miss that
-    // window and race the assignment.
+    // runs any callback-capable work. The startup gate keeps those callbacks
+    // blocked until start() has committed the std::thread members, and the id set
+    // keeps destruction independent of unsynchronized std::thread member reads.
     bool is_worker_thread()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -896,19 +958,58 @@ public:
             m_worker_thread_ids.end();
     }
 
+    bool has_active_public_call()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_public_call_depth != 0U;
+    }
+
     void register_worker_thread()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_worker_thread_ids.insert(std::this_thread::get_id());
     }
 
+    void run_worker_after_startup_gate(
+        std::shared_ptr<std::latch> startup_gate,
+        void (Impl::*loop)())
+    {
+        register_worker_thread();
+        startup_gate->wait();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_startup_aborted) {
+                return;
+            }
+        }
+        (this->*loop)();
+    }
+
+    void run_termination_after_startup_gate(
+        std::shared_ptr<std::latch>     startup_gate,
+        HANDLE                          process,
+        HANDLE                          process_job,
+        Terminal_termination_policy     policy)
+    {
+        register_worker_thread();
+        startup_gate->wait();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_startup_aborted) {
+                return;
+            }
+        }
+        termination_escalation_loop(process, process_job, policy);
+    }
+
     // Run shutdown() and delete on a fresh, non-worker thread so join_threads()
-    // joins the worker thread that triggered destruction instead of detaching it
-    // and racing wait_loop into a freed Impl. Takes ownership of this Impl.
+    // can join worker threads and any public backend call already on the stack
+    // can return before the Impl is freed. Takes ownership of this Impl.
     void defer_shutdown_and_delete() noexcept
     {
         try {
             std::thread([this] {
+                wait_for_public_calls_to_finish();
                 shutdown();
                 delete this;
             }).detach();
@@ -970,6 +1071,29 @@ private:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_callbacks;
+    }
+
+    void enter_public_call()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ++m_public_call_depth;
+    }
+
+    void leave_public_call()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            --m_public_call_depth;
+        }
+        m_public_call_cv.notify_all();
+    }
+
+    void wait_for_public_calls_to_finish()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_public_call_cv.wait(lock, [this] {
+            return m_public_call_depth == 0U;
+        });
     }
 
     void report_error(Terminal_backend_error_code code, QString message)
@@ -1432,6 +1556,7 @@ private:
     std::condition_variable            m_output_cv;
     std::condition_variable            m_write_cv;
     std::condition_variable            m_reader_cv;
+    std::condition_variable            m_public_call_cv;
     Terminal_backend_callbacks         m_callbacks;
     Conpty_api                         m_api;
     HPCON                              m_conpty = nullptr;
@@ -1452,9 +1577,11 @@ private:
                                        m_exit_reason_override;
     Terminal_termination_policy        m_termination_policy;
     std::size_t                        m_queued_write_bytes = 0U;
+    std::size_t                        m_public_call_depth = 0U;
     bool                               m_running = false;
     bool                               m_start_attempted = false;
     bool                               m_start_in_progress = false;
+    bool                               m_startup_aborted = false;
     bool                               m_stopping = false;
     bool                               m_output_paused = false;
     bool                               m_exit_reported = false;
@@ -1470,12 +1597,11 @@ Windows_conpty_backend::Windows_conpty_backend()
 
 Windows_conpty_backend::~Windows_conpty_backend()
 {
-    // Use the same worker-thread ownership rule as the POSIX backend: when
-    // destruction is reached from one of this backend's callbacks, hand the Impl
-    // to a fresh thread for shutdown()+delete so join_threads() can join that
-    // worker instead of self-detaching and freeing the Impl underneath it.
-    // Off a worker thread, the unique_ptr deletes the Impl inline as before.
-    if (m_impl && m_impl->is_worker_thread()) {
+    // Defer when teardown is reached from a callback or while a public backend
+    // call is still unwinding, so the Impl is not freed under live stack frames.
+    if (m_impl &&
+        (m_impl->is_worker_thread() || m_impl->has_active_public_call()))
+    {
         Impl* impl = m_impl.release();
         impl->defer_shutdown_and_delete();
     }
@@ -1485,33 +1611,45 @@ Terminal_backend_result Windows_conpty_backend::start(
     const Terminal_launch_config&  config,
     Terminal_backend_callbacks     callbacks)
 {
-    return m_impl->start(config, std::move(callbacks));
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->start(config, std::move(callbacks));
 }
 
 Terminal_backend_result Windows_conpty_backend::write(QByteArray bytes)
 {
-    return m_impl->write(std::move(bytes));
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->write(std::move(bytes));
 }
 
 Terminal_backend_result Windows_conpty_backend::resize(
     Terminal_backend_resize_request request)
 {
-    return m_impl->resize(request);
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->resize(request);
 }
 
 Terminal_backend_result Windows_conpty_backend::set_output_paused(bool paused)
 {
-    return m_impl->set_output_paused(paused);
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->set_output_paused(paused);
 }
 
 Terminal_backend_result Windows_conpty_backend::interrupt()
 {
-    return m_impl->interrupt();
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->interrupt();
 }
 
 Terminal_backend_result Windows_conpty_backend::terminate()
 {
-    return m_impl->terminate();
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->terminate();
 }
 
 std::unique_ptr<Terminal_backend> make_windows_conpty_backend()
