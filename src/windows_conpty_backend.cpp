@@ -875,7 +875,77 @@ public:
         m_running = false;
     }
 
+    // True when the calling thread is one of this backend's own worker threads.
+    // Destruction reached from a worker callback (for example a process_exited
+    // delivered by wait_loop) must not tear down inline: shutdown() joins the
+    // worker threads, so join_or_detach would detach the calling thread and free
+    // this Impl while that worker is still on the stack.
+    bool is_worker_thread() const
+    {
+        const std::thread::id current_id = std::this_thread::get_id();
+        const auto matches_current_thread = [current_id](const std::thread& thread) {
+            return thread.joinable() && thread.get_id() == current_id;
+        };
+
+        return
+            matches_current_thread(m_reader_thread) ||
+            matches_current_thread(m_writer_thread) ||
+            matches_current_thread(m_wait_thread)   ||
+            matches_current_thread(m_termination_thread);
+    }
+
+    // Run shutdown() and delete on a fresh, non-worker thread so join_threads()
+    // joins the worker thread that triggered destruction instead of detaching it
+    // and racing wait_loop into a freed Impl. Takes ownership of this Impl.
+    void defer_shutdown_and_delete() noexcept
+    {
+        try {
+            std::thread([this] {
+                shutdown();
+                delete this;
+            }).detach();
+        }
+        catch (...) {
+            request_shutdown_without_cleanup();
+        }
+    }
+
 private:
+    // Best-effort teardown for the unreachable-in-practice case where the
+    // deferred-shutdown thread cannot be spawned. It must not join or delete: the
+    // worker threads are still running against this Impl, so the Impl is
+    // deliberately leaked (safe: no use-after-free) while the child process tree
+    // is force-terminated so no process is left running.
+    void request_shutdown_without_cleanup() noexcept
+    {
+        HANDLE process     = nullptr;
+        HANDLE process_job = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_shutdown_started) {
+                return;
+            }
+
+            m_shutdown_started = true;
+            m_stopping         = true;
+            m_output_paused    = false;
+            m_callbacks        = {};
+            process            = m_process.get();
+            process_job        = m_process_job.get();
+        }
+
+        m_output_cv.notify_all();
+        m_write_cv.notify_all();
+        cancel_blocking_io();
+
+        if (process_job != nullptr && process_job != INVALID_HANDLE_VALUE) {
+            TerminateJobObject(process_job, 1U);
+        }
+        else if (process != nullptr && process != INVALID_HANDLE_VALUE) {
+            TerminateProcess(process, 1U);
+        }
+    }
+
     Terminal_backend_callbacks callbacks_for_delivery()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1377,7 +1447,18 @@ Windows_conpty_backend::Windows_conpty_backend()
     m_impl(std::make_unique<Impl>())
 {}
 
-Windows_conpty_backend::~Windows_conpty_backend() = default;
+Windows_conpty_backend::~Windows_conpty_backend()
+{
+    // Use the same worker-thread ownership rule as the POSIX backend: when
+    // destruction is reached from one of this backend's callbacks, hand the Impl
+    // to a fresh thread for shutdown()+delete so join_threads() can join that
+    // worker instead of self-detaching and freeing the Impl underneath it.
+    // Off a worker thread, the unique_ptr deletes the Impl inline as before.
+    if (m_impl && m_impl->is_worker_thread()) {
+        Impl* impl = m_impl.release();
+        impl->defer_shutdown_and_delete();
+    }
+}
 
 Terminal_backend_result Windows_conpty_backend::start(
     const Terminal_launch_config&  config,
