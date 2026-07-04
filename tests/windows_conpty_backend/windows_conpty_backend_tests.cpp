@@ -1,5 +1,6 @@
 #include "helpers/decode_hex.h"
 #include "helpers/test_check.h"
+#include "../../src/native_backend_io_core.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
@@ -1750,6 +1751,53 @@ bool test_rejection_paths(const QString& fixture_path)
     return ok;
 }
 
+bool test_repeated_start_precheck_callback_runs_after_gate_unlock(const QString& fixture_path)
+{
+    bool ok = true;
+
+    std::mutex start_gate_mutex;
+    bool running           = true;
+    bool start_attempted   = true;
+    bool start_in_progress = false;
+    bool callback_ran_after_gate_unlock = false;
+    std::optional<term::Terminal_backend_error> callback_error;
+
+    term::Terminal_backend_callbacks callbacks;
+    callbacks.output_received = [](QByteArray) {};
+    callbacks.process_exited  = [](term::Terminal_backend_exit) {};
+    callbacks.error_reported  = [&](term::Terminal_backend_error error) {
+        std::thread lock_probe([&] {
+            callback_ran_after_gate_unlock = start_gate_mutex.try_lock();
+            if (callback_ran_after_gate_unlock) {
+                start_gate_mutex.unlock();
+            }
+        });
+        lock_probe.join();
+        callback_error = std::move(error);
+    };
+
+    const term::Native_backend_start_precheck precheck =
+        term::validate_native_backend_start_preconditions(
+            launch_config(fixture_path, {QStringLiteral("--hold-open")}),
+            callbacks,
+            {start_gate_mutex, running, start_attempted, start_in_progress},
+            QStringLiteral("ConPTY"));
+
+    ok &= check(callback_ran_after_gate_unlock,
+        "ConPTY repeated-start error callback runs after releasing start gate mutex");
+    ok &= check(precheck.result.code == term::Terminal_backend_result_code::REJECTED &&
+        precheck.result.error.has_value() &&
+        precheck.result.error->code == term::Terminal_backend_error_code::START_FAILED,
+        "ConPTY repeated-start precheck reports typed rejection");
+    ok &= check(callback_error.has_value() &&
+        callback_error->code == term::Terminal_backend_error_code::START_FAILED,
+        "ConPTY repeated-start precheck emits error callback");
+    ok &= check(running && start_attempted && !start_in_progress,
+        "ConPTY repeated-start precheck leaves start gate state unchanged");
+
+    return ok;
+}
+
 bool test_interrupt(const QString& fixture_path)
 {
     bool ok = true;
@@ -2114,6 +2162,8 @@ int main(int argc, char** argv)
     run_test("missing working directory", test_missing_working_directory(fixture_path));
     run_test("failed executable", test_failed_executable(fixture_path));
     run_test("rejection paths", test_rejection_paths(fixture_path));
+    run_test("repeated start precheck releases gate before callback",
+        test_repeated_start_precheck_callback_runs_after_gate_unlock(fixture_path));
     run_test("interrupt", test_interrupt(fixture_path));
     run_test("interrupt without stdin reader", test_interrupt_without_stdin_reader(fixture_path));
     run_test("terminate", test_terminate(fixture_path));

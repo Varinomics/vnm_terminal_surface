@@ -242,10 +242,17 @@ Linux. The drain wait is interruptible by shutdown so teardown is never delayed.
 
 ## Teardown
 
-`shutdown()` is idempotent (guarded by a shutdown-started flag) and is invoked
-from the backend destructor. It marks the backend stopping, clears paused state,
-detaches the callbacks, wakes the workers, kills the child (and its process
-group where established), and joins the worker threads.
+`shutdown()` is idempotent (guarded by a shutdown-started flag). It marks the
+backend stopping, clears paused state, detaches the callbacks, wakes the
+workers, kills the child (and its process group where established), and joins
+the worker threads.
+
+Backend destructors run shutdown inline when no backend-owned stack frame can
+still touch the implementation. If destruction is reached from a backend worker
+callback, or while a public backend call is still unwinding, the destructor
+releases the implementation and defers `shutdown(); delete this;` to a fresh
+thread. That keeps worker threads joined by a non-worker thread and keeps the
+implementation alive until active public-call frames have returned.
 
 The POSIX teardown ordering is load-bearing on macOS and is therefore explicit:
 
@@ -253,18 +260,24 @@ The POSIX teardown ordering is load-bearing on macOS and is therefore explicit:
   `ESRCH` during the brief window after `forkpty` before the child established
   its own group. To guarantee the wait thread's blocking `waitpid` returns, the
   child pid is also signaled directly with `kill(child_pid, SIGKILL)`.
-- The master fd is closed before joining the workers, not after. With output
-  paused the master is not drained, so a child can block in `write()` to the
-  slave and cannot act on a pending `SIGKILL`. Closing the master releases that
-  write (delivering `EIO`/`SIGHUP`) so the kill can land and the wait thread can
-  be joined.
+- In ordinary shutdown, the master fd is closed before joining the workers, not
+  after. With output paused the master is not drained, so a child can block in
+  `write()` to the slave and cannot act on a pending `SIGKILL`. Closing the
+  master releases that write (delivering `EIO`/`SIGHUP`) so the kill can land
+  and the wait thread can be joined. If the wait thread still needs the master
+  for post-exit foreground/process-group cleanup, the close is deferred until
+  that cleanup finishes.
 - The bounded reader and writer poll intervals (`k_native_master_poll_interval`)
   exist so the I/O threads re-check their stop flags rather than trusting a poll
   on the PTY master, which is unreliable on macOS once the child has exited while
   a descendant still holds the slave open.
 
-When the backend destructor runs on one of the backend's own worker threads, the
-POSIX backend defers shutdown and deletion to a detached thread so it does not
-join itself.
-</content>
-</invoke>
+The deferred-teardown fallback is leak-not-use-after-free. If the fresh thread
+cannot be started, the backend stops accepting callbacks, wakes its workers, and
+issues the best termination request still available without joining threads or
+deleting the leaked implementation. POSIX signals the known process groups and,
+when the direct child has not already been reaped, the child pid. It keeps the
+master fd open while a public backend call that may have copied it is still
+active, then closes it as that call unwinds. If the wait thread still needs the
+master for post-exit process-group and foreground-group cleanup, that cleanup
+runs before the pending close.

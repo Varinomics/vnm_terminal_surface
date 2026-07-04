@@ -863,61 +863,205 @@ bool test_destructor_from_output_callback_returns()
 {
     bool ok = true;
 
+    struct Destroy_from_output_state
+    {
+        std::mutex                 mutex;
+        std::condition_variable    cv;
+        QByteArray                 output;
+        term::Terminal_backend*    backend = nullptr;
+        std::atomic_bool           delete_started = false;
+        bool                       callback_returned = false;
+    };
+
     const QByteArray marker = QByteArrayLiteral("destroy-from-output-callback");
-    std::mutex callback_mutex;
-    std::condition_variable callback_cv;
-    bool callback_returned = false;
-    QByteArray callback_output;
-    std::atomic_bool delete_started     = false;
-    std::atomic_bool callback_timed_out = false;
+    auto state = std::make_shared<Destroy_from_output_state>();
+    state->backend = term::make_posix_pty_backend().release();
 
-    // The raw pointer keeps ownership on the callback thread for this destruction test.
-    term::Terminal_backend* backend = term::make_posix_pty_backend().release();
     term::Terminal_backend_callbacks callbacks;
-    callbacks.output_received = [&](QByteArray bytes) {
-        if (callback_timed_out) {
+    callbacks.output_received = [state, marker](QByteArray bytes) {
+        bool should_delete = false;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->output += bytes;
+            should_delete =
+                state->output.contains(marker) &&
+                !state->delete_started.exchange(true);
+        }
+
+        if (!should_delete) {
             return;
         }
 
-        callback_output += bytes;
-        if (!callback_output.contains(marker) || delete_started.exchange(true)) {
-            return;
+        delete state->backend;
+
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->callback_returned = true;
         }
-
-        delete backend;
-
-        std::lock_guard<std::mutex> lock(callback_mutex);
-        callback_returned = true;
-        callback_cv.notify_all();
+        state->cv.notify_all();
     };
     callbacks.process_exited = [](term::Terminal_backend_exit) {};
     callbacks.error_reported = [](term::Terminal_backend_error) {};
 
-    const term::Terminal_backend_result start_result = backend->start(
+    const term::Terminal_backend_result start_result = state->backend->start(
         shell_launch_config(
             QStringLiteral("sleep 0.2; echo destroy-from-output-callback; sleep 30")),
         callbacks);
     ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
         "destructor-from-callback shell starts");
     if (start_result.code != term::Terminal_backend_result_code::ACCEPTED) {
-        delete backend;
+        if (!state->delete_started.exchange(true)) {
+            delete state->backend;
+        }
         return false;
     }
 
+    bool callback_returned = false;
     {
-        std::unique_lock<std::mutex> lock(callback_mutex);
-        const bool returned = callback_cv.wait_for(lock, k_wait_timeout, [&] {
-            return callback_returned;
+        std::unique_lock<std::mutex> lock(state->mutex);
+        callback_returned = state->cv.wait_for(lock, k_wait_timeout, [&] {
+            return state->callback_returned;
         });
-        callback_returned = returned;
         ok &= check(
-            returned,
+            callback_returned,
             "backend destructor returns from output callback");
     }
 
-    if (!callback_returned && !delete_started.exchange(true)) {
-        callback_timed_out = true;
-        delete backend;
+    if (!callback_returned && !state->delete_started.exchange(true)) {
+        delete state->backend;
+    }
+
+    return ok;
+}
+
+bool test_destructor_from_process_exited_callback_returns()
+{
+    bool ok = true;
+
+    QTemporaryDir pid_dir;
+    ok &= check(pid_dir.isValid(), "process-exited-destroy pid directory is available");
+    if (!pid_dir.isValid()) {
+        return false;
+    }
+
+    struct Destroy_from_exit_state
+    {
+        std::mutex                                mutex;
+        std::condition_variable                   cv;
+        std::thread::id                           owner_thread_id = std::this_thread::get_id();
+        term::Terminal_backend*                   backend             = nullptr;
+        QByteArray                                output;
+        std::vector<term::Terminal_backend_error> errors;
+        std::atomic_bool                          delete_started      = false;
+        bool                                      callback_returned   = false;
+        bool                                      destroyed_off_owner = false;
+    };
+
+    const QString    pid_path     = pid_dir.filePath(QStringLiteral("descendant.pid"));
+    const QString    ready_path   = pid_dir.filePath(QStringLiteral("descendant.ready"));
+    const QByteArray ready_marker = QByteArrayLiteral("process-exited-destroy-ready");
+
+    auto state = std::make_shared<Destroy_from_exit_state>();
+    state->backend = term::make_posix_pty_backend().release();
+
+    term::Terminal_backend_callbacks callbacks;
+    callbacks.output_received = [state](QByteArray bytes) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->output += bytes;
+        }
+        state->cv.notify_all();
+    };
+    callbacks.error_reported = [state](term::Terminal_backend_error error) {
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->errors.push_back(std::move(error));
+        }
+        state->cv.notify_all();
+    };
+    callbacks.process_exited = [state](term::Terminal_backend_exit) {
+        const bool off_owner = std::this_thread::get_id() != state->owner_thread_id;
+        if (state->delete_started.exchange(true)) {
+            return;
+        }
+
+        delete state->backend;
+
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->destroyed_off_owner = off_owner;
+            state->callback_returned   = true;
+        }
+        state->cv.notify_all();
+    };
+
+    const term::Terminal_backend_result start_result = state->backend->start(
+        shell_launch_config(
+            QStringLiteral(
+                "trap '' HUP TERM INT; "
+                "echo process-exited-destroy-ready; "
+                "read line; "
+                "(trap '' HUP TERM INT; echo ready > %1; sleep 30) & "
+                "echo $! > %2; "
+                "while [ ! -f %1 ]; do sleep 0.01; done; "
+                "exit 0").arg(shell_quote(ready_path), shell_quote(pid_path))),
+        std::move(callbacks));
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "process-exited-destroy shell starts");
+
+    if (start_result.code == term::Terminal_backend_result_code::ACCEPTED) {
+        bool ready = false;
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            ready = state->cv.wait_for(lock, k_wait_timeout, [&] {
+                return state->output.contains(ready_marker);
+            });
+        }
+        ok &= check(ready,
+            "process-exited-destroy shell reaches ready marker after accepted start");
+
+        if (ready) {
+            const term::Terminal_backend_result write_result =
+                state->backend->write(QByteArrayLiteral("exit\r"));
+            ok &= check(write_result.code == term::Terminal_backend_result_code::ACCEPTED,
+                "process-exited-destroy shell accepts exit command");
+
+            if (write_result.code == term::Terminal_backend_result_code::ACCEPTED) {
+                ok &= check(wait_for_file(pid_path),
+                    "process-exited-destroy shell records descendant pid");
+                ok &= check(wait_for_file(ready_path),
+                    "process-exited-destroy descendant reaches ready marker");
+                const std::optional<pid_t> descendant_pid = read_pid_file(pid_path);
+                ok &= check(descendant_pid.has_value(),
+                    "process-exited-destroy descendant pid file is readable");
+
+                std::unique_lock<std::mutex> lock(state->mutex);
+                const bool returned = state->cv.wait_for(lock, k_wait_timeout, [&] {
+                    return state->callback_returned;
+                });
+                ok &= check(returned && state->callback_returned,
+                    "backend destructor returns from process_exited callback");
+                ok &= check(state->destroyed_off_owner,
+                    "process_exited destroys backend on a worker thread");
+                ok &= check(state->errors.empty(),
+                    "process-exited-destroy shell produces no backend errors");
+                lock.unlock();
+
+                if (descendant_pid.has_value()) {
+                    if (returned) {
+                        ok &= check(wait_for_process_absent(*descendant_pid),
+                            "process-exited-destroy wait loop cleans up descendant after callback");
+                    }
+                    if (process_is_alive(*descendant_pid)) {
+                        ::kill(*descendant_pid, SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!state->delete_started.exchange(true)) {
+        delete state->backend;
     }
 
     return ok;
@@ -1090,6 +1234,7 @@ int main(int argc, char** argv)
     ok &= test_process_exit_reports_with_descendant_slave_open();
     ok &= test_exit_drain_ignores_repause_and_delivers_buffered_output();
     ok &= test_destructor_from_output_callback_returns();
+    ok &= test_destructor_from_process_exited_callback_returns();
     ok &= test_terminate_kills_descendant_in_target_group();
     ok &= test_terminate(fixture_path);
     ok &= test_terminate_accepts_zero_grace_policy(fixture_path);

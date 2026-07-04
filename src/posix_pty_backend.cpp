@@ -1061,14 +1061,17 @@ public:
         pid_t child_pid           = -1;
         pid_t child_process_group = -1;
         int master                = -1;
+        Signal_targets targets;
         bool child_reaped         = false;
         bool reader_finished      = false;
+        bool close_master         = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_shutdown_started) {
                 return;
             }
 
+            const bool defer_master_close        = m_post_exit_process_group_cleanup_pending;
             m_shutdown_started                   = true;
             m_stopping                           = true;
             m_process_stopping                   = true;
@@ -1077,25 +1080,37 @@ public:
             m_callbacks                          = {};
             child_pid                            = m_child_pid;
             child_process_group                  = m_child_process_group;
-            // Take ownership of the master fd so we can close it before joining
-            // the workers (see below). m_master is now empty; its later reset()
-            // is a no-op.
-            master                               = m_master.release();
             child_reaped                         = m_child_reaped;
             reader_finished                      = m_reader_finished;
+            if (m_master) {
+                master = m_master.get();
+                targets = shutdown_signal_targets(
+                    child_process_group,
+                    master,
+                    child_reaped,
+                    reader_finished);
+                if (defer_master_close) {
+                    m_close_master_pending = true;
+                }
+                else {
+                    master = m_master.release();
+                    close_master = true;
+                }
+            }
+            else {
+                targets = shutdown_signal_targets(
+                    child_process_group,
+                    master,
+                    child_reaped,
+                    reader_finished);
+            }
         }
 
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
 
-        (void)send_signal_to_targets(
-            shutdown_signal_targets(
-                child_process_group,
-                master,
-                child_reaped,
-                reader_finished),
-            SIGKILL);
+        (void)send_signal_to_targets(targets, SIGKILL);
 
         // The signal above targets process groups (kill(-pgid)). During the
         // brief window after forkpty() but before the child has established its
@@ -1110,13 +1125,11 @@ public:
             ::kill(child_pid, SIGKILL);
         }
 
-        // Close the master now -- before join_threads(), not after -- so a child
-        // blocked writing to the slave is released. With output paused the master
-        // is not drained, so the child fills the slave's output buffer and blocks
-        // in write(); it then cannot act on the pending SIGKILL, so waitpid()
-        // never returns and join_threads() deadlocks. Closing the master delivers
-        // EIO/SIGHUP to that write, unblocking the child so the SIGKILL lands.
-        if (master >= 0) {
+        // In ordinary shutdown, close the master before join_threads() so a child
+        // blocked writing to the slave is released. If the wait thread still
+        // needs the master for post-exit cleanup, that path owns the pending
+        // close instead.
+        if (close_master) {
             ::close(master);
         }
 
@@ -1217,11 +1230,19 @@ private:
 
     void leave_public_call()
     {
+        int master_to_close = -1;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             --m_public_call_depth;
+            if (m_public_call_depth == 0U) {
+                master_to_close = take_pending_master_close_if_ready_locked();
+                m_public_call_cv.notify_all();
+            }
         }
-        m_public_call_cv.notify_all();
+
+        if (master_to_close >= 0) {
+            ::close(master_to_close);
+        }
     }
 
     void wait_for_public_calls_to_finish()
@@ -1237,14 +1258,19 @@ private:
         pid_t child_pid           = -1;
         pid_t child_process_group = -1;
         int master                = -1;
+        Signal_targets targets;
         bool child_reaped         = false;
         bool reader_finished      = false;
+        bool close_master         = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_shutdown_started) {
                 return;
             }
 
+            const bool public_call_active       = m_public_call_depth != 0U;
+            const bool defer_master_close        =
+                public_call_active || m_post_exit_process_group_cleanup_pending;
             m_shutdown_started                   = true;
             m_stopping                           = true;
             m_process_stopping                   = true;
@@ -1253,22 +1279,58 @@ private:
             m_callbacks                          = {};
             child_pid                            = m_child_pid;
             child_process_group                  = m_child_process_group;
-            master                               = m_master.get();
             child_reaped                         = m_child_reaped;
             reader_finished                      = m_reader_finished;
+            if (m_master) {
+                master = m_master.get();
+                targets = shutdown_signal_targets(
+                    child_process_group,
+                    master,
+                    child_reaped,
+                    reader_finished);
+                if (defer_master_close) {
+                    m_close_master_pending = true;
+                }
+                else {
+                    master = m_master.release();
+                    close_master = true;
+                }
+            }
+            else {
+                targets = shutdown_signal_targets(
+                    child_process_group,
+                    master,
+                    child_reaped,
+                    reader_finished);
+            }
         }
 
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
 
-        (void)send_signal_to_targets(
-            shutdown_signal_targets(
-                child_process_group,
-                master,
-                child_reaped,
-                reader_finished),
-            SIGKILL);
+        (void)send_signal_to_targets(targets, SIGKILL);
+
+        if (!child_reaped && child_pid > 0) {
+            ::kill(child_pid, SIGKILL);
+        }
+
+        if (close_master) {
+            ::close(master);
+        }
+    }
+
+    int take_pending_master_close_if_ready_locked()
+    {
+        if (!m_close_master_pending ||
+            m_public_call_depth != 0U ||
+            m_post_exit_process_group_cleanup_pending)
+        {
+            return -1;
+        }
+
+        m_close_master_pending = false;
+        return m_master.release();
     }
 
     Terminal_backend_callbacks callbacks_for_delivery()
@@ -1824,6 +1886,7 @@ private:
             m_child_pid        = -1;
             m_process_stopping = true;
             m_output_paused    = false;
+            m_post_exit_process_group_cleanup_pending = true;
             m_write_queue.clear();
             m_queued_write_bytes = 0U;
             if (!m_paused_output.isEmpty()) {
@@ -1873,20 +1936,27 @@ private:
         // kill(-pgid) is best effort and ignores ESRCH, so a clean exit with no
         // descendants is a harmless no-op.
         pid_t child_process_group = -1;
-        int master = -1;
+        Signal_targets targets;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             child_process_group = m_child_process_group;
-            master = m_master.get();
+            targets = process_signal_targets(child_process_group, m_master.get());
         }
 
-        (void)send_signal_to_targets(
-            process_signal_targets(child_process_group, master),
-            SIGKILL);
+        (void)send_signal_to_targets(targets, SIGKILL);
 
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_child_process_group == child_process_group) {
-            m_child_process_group = -1;
+        int master_to_close = -1;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_post_exit_process_group_cleanup_pending = false;
+            if (m_child_process_group == child_process_group) {
+                m_child_process_group = -1;
+            }
+            master_to_close = take_pending_master_close_if_ready_locked();
+        }
+
+        if (master_to_close >= 0) {
+            ::close(master_to_close);
         }
     }
 
@@ -1972,6 +2042,8 @@ private:
     bool                                m_paused_output_delivery_in_progress = false;
     bool                                m_exit_reported = false;
     bool                                m_shutdown_started = false;
+    bool                                m_close_master_pending = false;
+    bool                                m_post_exit_process_group_cleanup_pending = false;
     bool                                m_reader_finished = false;
     bool                                m_writer_failed = false;
     bool                                m_child_reaped = false;
