@@ -29,6 +29,7 @@ DECLARE_HANDLE(HPCON);
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -623,9 +624,9 @@ public:
         }
 
         try {
-            m_reader_thread = std::thread([this] { read_loop(); });
-            m_writer_thread = std::thread([this] { write_loop(); });
-            m_wait_thread   = std::thread([this] { wait_loop(); });
+            m_reader_thread = std::thread([this] { register_worker_thread(); read_loop(); });
+            m_writer_thread = std::thread([this] { register_worker_thread(); write_loop(); });
+            m_wait_thread   = std::thread([this] { register_worker_thread(); wait_loop(); });
         }
         catch (const std::system_error& error) {
             const QString message = QStringLiteral("ConPTY worker thread startup failed: %1")
@@ -796,6 +797,7 @@ public:
         try {
             m_termination_thread = std::thread(
                 [this, process, process_job, policy] {
+                    register_worker_thread();
                     termination_escalation_loop(process, process_job, policy);
                 });
         }
@@ -880,18 +882,24 @@ public:
     // delivered by wait_loop) must not tear down inline: shutdown() joins the
     // worker threads, so join_or_detach would detach the calling thread and free
     // this Impl while that worker is still on the stack.
-    bool is_worker_thread() const
+    //
+    // Each worker records its id (register_worker_thread, under m_mutex) before it
+    // runs any callback-capable work, so a callback-triggered destruction is
+    // recognised here even in the window before start() finishes move-assigning
+    // the std::thread members. Reading those members instead would both miss that
+    // window and race the assignment.
+    bool is_worker_thread()
     {
-        const std::thread::id current_id = std::this_thread::get_id();
-        const auto matches_current_thread = [current_id](const std::thread& thread) {
-            return thread.joinable() && thread.get_id() == current_id;
-        };
-
+        std::lock_guard<std::mutex> lock(m_mutex);
         return
-            matches_current_thread(m_reader_thread) ||
-            matches_current_thread(m_writer_thread) ||
-            matches_current_thread(m_wait_thread)   ||
-            matches_current_thread(m_termination_thread);
+            m_worker_thread_ids.find(std::this_thread::get_id()) !=
+            m_worker_thread_ids.end();
+    }
+
+    void register_worker_thread()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_worker_thread_ids.insert(std::this_thread::get_id());
     }
 
     // Run shutdown() and delete on a fresh, non-worker thread so join_threads()
@@ -937,12 +945,24 @@ private:
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         cancel_blocking_io();
+        request_conpty_close();
 
+        // Same job-then-root termination shape as shutdown(): the pseudoconsole is
+        // closed and, if the job cannot be terminated, the root process is killed
+        // directly, so leaking the Impl never leaves the child tree running.
+        bool process_tree_terminated = false;
         if (process_job != nullptr && process_job != INVALID_HANDLE_VALUE) {
-            TerminateJobObject(process_job, 1U);
+            process_tree_terminated = TerminateJobObject(process_job, 1U);
         }
-        else if (process != nullptr && process != INVALID_HANDLE_VALUE) {
-            TerminateProcess(process, 1U);
+
+        if (!process_tree_terminated &&
+            process != nullptr &&
+            process != INVALID_HANDLE_VALUE)
+        {
+            DWORD exit_code = 0;
+            if (GetExitCodeProcess(process, &exit_code) && exit_code == STILL_ACTIVE) {
+                TerminateProcess(process, 1U);
+            }
         }
     }
 
@@ -1425,6 +1445,7 @@ private:
     std::thread                        m_writer_thread;
     std::thread                        m_wait_thread;
     std::thread                        m_termination_thread;
+    std::set<std::thread::id>          m_worker_thread_ids;
     QByteArray                         m_paused_output;
     std::deque<Queued_write>           m_write_queue;
     std::optional<Terminal_exit_reason>
