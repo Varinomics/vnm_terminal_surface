@@ -277,7 +277,5 @@ cannot be started, the backend stops accepting callbacks, wakes its workers, and
 issues the best termination request still available without joining threads or
 deleting the leaked implementation. POSIX signals the known process groups and,
 when the direct child has not already been reaped, the child pid. It keeps the
-master fd open while a public backend call that may have copied it is still
-active, then closes it as that call unwinds. If the wait thread still needs the
-master for post-exit process-group and foreground-group cleanup, that cleanup
-runs before the pending close.
+master fd owned by the leaked implementation because worker threads may already
+have copied that fd before the fallback decided not to join them.
