@@ -1081,11 +1081,11 @@ private:
 
     void leave_public_call()
     {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            --m_public_call_depth;
+        std::lock_guard<std::mutex> lock(m_mutex);
+        --m_public_call_depth;
+        if (m_public_call_depth == 0U) {
+            m_public_call_cv.notify_all();
         }
-        m_public_call_cv.notify_all();
     }
 
     void wait_for_public_calls_to_finish()
