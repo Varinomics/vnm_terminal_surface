@@ -17,6 +17,7 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -1984,17 +1985,26 @@ bool test_destroy_from_process_exited_callback_on_worker_thread(const QString& f
     // Regression: destroying the backend from inside its own process_exited
     // callback runs ~Windows_conpty_backend on the wait thread, because that
     // callback is delivered from wait_loop(). The backend must defer its
-    // shutdown+delete onto a fresh thread (is_worker_thread/defer_shutdown_and_delete):
+    // shutdown+delete onto a fresh thread (is_worker_thread/defer_shutdown_and_delete);
     // running shutdown() inline there self-detaches the wait thread and frees the
     // Impl while wait_loop() is still on the stack, so the following
     // terminate_process_tree_after_root_exit() would touch freed memory.
     //
-    // The gated shell-like fixture is used deliberately: we wait for its prompt
-    // (so start() has returned and the child is parked reading stdin) and only
-    // then send the exit command. That keeps this focused on worker-thread
-    // destruction alone, never resetting the backend while start() is still
-    // unwinding on this thread. The loop widens the free/reuse window so a debug
-    // heap or sanitizer catches a regression instead of tolerating the freed block.
+    // Ownership mirrors the POSIX test_destructor_from_output_callback_returns: the
+    // backend is a raw pointer kept out of any owning shared_ptr chain (so no
+    // reference cycle can leak it), and delete_started hands the single
+    // destruction to either the wait-thread callback or, on any early return, the
+    // owner. The sync block is heap-owned so a late worker callback can never
+    // reference a destroyed local. The gated shell-like fixture is deliberate: we
+    // wait for the prompt (so start() has returned and the child is parked reading
+    // stdin) and only then send the exit command, so the callback fires strictly
+    // after start() and after our last use of the backend.
+    //
+    // The loop is load-bearing under a sanitizer: on the buggy inline-destruction
+    // path the use-after-free happens on the detached wait thread just after the
+    // callback returns, so a single iteration would race a clean process exit. An
+    // early iteration's fault instead fires while the owner is actively running a
+    // later iteration, so the sanitizer halts the process rather than exiting 0.
     bool ok = true;
 
     struct Destroy_from_exit_state
@@ -2002,9 +2012,10 @@ bool test_destroy_from_process_exited_callback_on_worker_thread(const QString& f
         std::mutex                                mutex;
         std::condition_variable                   cv;
         std::thread::id                           owner_thread_id = std::this_thread::get_id();
-        std::unique_ptr<term::Terminal_backend>   backend;
+        term::Terminal_backend*                   backend             = nullptr;
         QByteArray                                output;
         std::vector<term::Terminal_backend_error> errors;
+        std::atomic_bool                          delete_started      = false;
         bool                                      exit_delivered      = false;
         bool                                      destroyed_off_owner = false;
         int                                       exit_count          = 0;
@@ -2017,7 +2028,7 @@ bool test_destroy_from_process_exited_callback_on_worker_thread(const QString& f
     constexpr int k_iterations = 8;
     for (int iteration = 0; iteration < k_iterations; ++iteration) {
         auto state     = std::make_shared<Destroy_from_exit_state>();
-        state->backend = term::make_windows_conpty_backend();
+        state->backend = term::make_windows_conpty_backend().release();
 
         term::Terminal_backend_callbacks callbacks;
         callbacks.output_received = [state](QByteArray bytes) {
@@ -2030,13 +2041,13 @@ bool test_destroy_from_process_exited_callback_on_worker_thread(const QString& f
             state->errors.push_back(std::move(error));
         };
         callbacks.process_exited = [state](term::Terminal_backend_exit) {
-            // Runs on the wait thread. Dropping the sole owning reference here
-            // destroys the backend now (on that worker thread), which is the
-            // exact condition the deferral guards against. The executing callback
-            // is a copy held by report_exit_once, so it and this shared state
-            // outlive the Impl deletion.
+            // Runs on the wait thread. Destroy the backend here (on that worker
+            // thread) unless the owner already claimed the destruction on a timeout.
             const bool off_owner = std::this_thread::get_id() != state->owner_thread_id;
-            state->backend.reset();
+            if (state->delete_started.exchange(true)) {
+                return;
+            }
+            delete state->backend;
 
             std::lock_guard<std::mutex> lock(state->mutex);
             state->destroyed_off_owner = off_owner;
@@ -2045,65 +2056,53 @@ bool test_destroy_from_process_exited_callback_on_worker_thread(const QString& f
             state->cv.notify_all();
         };
 
-        const term::Terminal_backend_result start_result =
-            state->backend->start(
-                launch_config(fixture_path, {QStringLiteral("--shell-like-smoke")}),
-                std::move(callbacks));
+        const term::Terminal_backend_result start_result = state->backend->start(
+            launch_config(fixture_path, {QStringLiteral("--shell-like-smoke")}),
+            std::move(callbacks));
         ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
             "worker-thread-destroy fixture starts");
-        if (start_result.code != term::Terminal_backend_result_code::ACCEPTED) {
-            return false;
+
+        if (start_result.code == term::Terminal_backend_result_code::ACCEPTED) {
+            bool prompt_seen = false;
+            {
+                std::unique_lock<std::mutex> lock(state->mutex);
+                prompt_seen = state->cv.wait_for(lock, k_wait_timeout, [&] {
+                    return state->output.contains(prompt);
+                });
+            }
+            ok &= check(prompt_seen,
+                "shell-like fixture reaches prompt before exit is triggered");
+
+            // A delivered prompt proves the child is parked reading stdin (not
+            // exited), so process_exited cannot have fired and the backend is
+            // still alive: it is safe to write the exit command. On a prompt
+            // timeout, skip the write and let the owner-side cleanup tear down.
+            if (prompt_seen) {
+                const term::Terminal_backend_result exit_write =
+                    state->backend->write(shell_fixture_command(contract.exit_command));
+                ok &= check(exit_write.code == term::Terminal_backend_result_code::ACCEPTED,
+                    "shell-like fixture accepts exit command");
+
+                std::unique_lock<std::mutex> lock(state->mutex);
+                const bool delivered = state->cv.wait_for(lock, k_wait_timeout, [&] {
+                    return state->exit_delivered;
+                });
+                ok &= check(delivered && state->exit_delivered,
+                    "shell-like fixture delivers process exit while the backend is destroyed in-callback");
+                ok &= check(state->destroyed_off_owner,
+                    "backend is destroyed on a worker thread, not the owner thread");
+                ok &= check(state->exit_count == 1,
+                    "worker-thread-destroy fixture reports exactly one process exit callback");
+                ok &= check(state->errors.empty(),
+                    "worker-thread-destroy fixture produces no backend errors");
+            }
         }
 
-        // start() has fully returned. Read the raw pointer once here so writing the
-        // exit command never races the wait thread's reset() of the unique_ptr; the
-        // child is still parked at the prompt, so the object cannot be destroyed
-        // until we trigger the exit below.
-        term::Terminal_backend* const backend_ptr = state->backend.get();
-
-        bool prompt_seen = false;
-        {
-            std::unique_lock<std::mutex> lock(state->mutex);
-            prompt_seen = state->cv.wait_for(lock, k_wait_timeout, [&] {
-                return state->output.contains(prompt);
-            });
+        // Deterministic teardown on every path: if the wait-thread callback did
+        // not destroy the backend (start rejected, or a prompt timeout), do it.
+        if (!state->delete_started.exchange(true)) {
+            delete state->backend;
         }
-        ok &= check(prompt_seen,
-            "shell-like fixture reaches prompt before exit is triggered");
-        if (!prompt_seen) {
-            return false;
-        }
-
-        // Trigger a natural exit; process_exited then fires on the wait thread and
-        // destroys the backend there.
-        const term::Terminal_backend_result exit_write =
-            backend_ptr->write(shell_fixture_command(contract.exit_command));
-        ok &= check(exit_write.code == term::Terminal_backend_result_code::ACCEPTED,
-            "shell-like fixture accepts exit command");
-
-        bool                                      exit_delivered      = false;
-        bool                                      destroyed_off_owner = false;
-        int                                       exit_count          = 0;
-        std::vector<term::Terminal_backend_error> errors;
-        {
-            std::unique_lock<std::mutex> lock(state->mutex);
-            const bool delivered = state->cv.wait_for(lock, k_wait_timeout, [&] {
-                return state->exit_delivered;
-            });
-            exit_delivered      = delivered && state->exit_delivered;
-            destroyed_off_owner = state->destroyed_off_owner;
-            exit_count          = state->exit_count;
-            errors              = state->errors;
-        }
-
-        ok &= check(exit_delivered,
-            "shell-like fixture delivers process exit while the backend is destroyed in-callback");
-        ok &= check(destroyed_off_owner,
-            "backend is destroyed on a worker thread, not the owner thread");
-        ok &= check(exit_count == 1,
-            "worker-thread-destroy fixture reports exactly one process exit callback");
-        ok &= check(errors.empty(),
-            "worker-thread-destroy fixture produces no backend errors");
     }
 
     return ok;
