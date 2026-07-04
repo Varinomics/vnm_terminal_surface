@@ -75,6 +75,22 @@ Run the configured test suite:
 ctest --test-dir build -C Release --output-on-failure
 ```
 
+`vnm_terminal_windows_conpty_backend` and `vnm_terminal_compat_smoke` spawn real
+ConPTY child processes and are excluded from the default CI run, so their
+lifetime invariants are gated locally. Configure a separate AddressSanitizer
+build (only our library and tests are instrumented; Qt and the FetchContent
+dependencies are left uninstrumented) to deterministically catch the
+worker-thread backend-destruction use-after-free and similar defects:
+
+```powershell
+cmake -S . -B build-asan -DBUILD_TESTING=ON -DVNM_TERMINAL_SANITIZE_ADDRESS=ON
+cmake --build build-asan --target vnm_terminal_windows_conpty_backend --config Release
+ctest --test-dir build-asan -C Release -R vnm_terminal_windows_conpty_backend --output-on-failure
+```
+
+Run from an x64 MSVC Developer Command Prompt so the AddressSanitizer runtime is
+resolvable on `PATH`.
+
 On Linux and macOS, use the same configure step and the normal generated build
 command for the selected generator.
 

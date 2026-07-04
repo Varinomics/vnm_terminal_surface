@@ -153,6 +153,21 @@ function(vnm_terminal_configure_test_process target_name)
             /FS
         )
     endif()
+
+    if(VNM_TERMINAL_SANITIZE_ADDRESS)
+        if(MSVC)
+            target_compile_options(${target_name} PRIVATE /fsanitize=address)
+            # Match the library: no STL container annotations, since Qt and the
+            # FetchContent deps this test links are not instrumented.
+            target_compile_definitions(${target_name} PRIVATE
+                _DISABLE_VECTOR_ANNOTATION
+                _DISABLE_STRING_ANNOTATION
+            )
+        else()
+            target_compile_options(${target_name} PRIVATE -fsanitize=address)
+            target_link_options(${target_name} PRIVATE -fsanitize=address)
+        endif()
+    endif()
 endfunction()
 
 function(vnm_terminal_add_external_conformance_command test_name labels command_value)
