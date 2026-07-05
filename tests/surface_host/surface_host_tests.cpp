@@ -5062,7 +5062,7 @@ bool test_control_wheel_font_zoom(QGuiApplication& app)
             backpressure_states.push_back(active);
         });
 
-    QByteArray zoom_drain_output(70 * 1024, 'x');
+    QByteArray zoom_drain_output(1100 * 1024, 'x');
     zoom_drain_output += QByteArrayLiteral("\r\nzoom-drain-output");
     backend_ptr->emit_output_from_worker(std::move(zoom_drain_output));
     backend_ptr->join_worker();
@@ -15307,7 +15307,7 @@ bool test_surface_overflow_reports_error_and_exit(QGuiApplication& app)
         &started);
     ok &= check(started, "surface overflow test starts");
 
-    backend_ptr->emit_output(QByteArray(300000, 'x'));
+    backend_ptr->emit_output(QByteArray(3 * 1024 * 1024, 'x'));
     pump_events(app);
 
     ok &= check(overflow_error_count == 1,
