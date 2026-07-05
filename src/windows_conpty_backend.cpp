@@ -44,6 +44,10 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr std::chrono::milliseconds k_conpty_reader_close_grace(1000);
+// Keep the ConPTY pipe draining while session output is paused, but keep the
+// backend-side burst below the session callback/output queue hard limit when it
+// is released as one callback.
+constexpr qsizetype k_paused_output_high_watermark_bytes = 64 * 1024;
 
 DWORD wait_timeout_from_interval(std::chrono::milliseconds interval)
 {
@@ -644,6 +648,7 @@ public:
             m_start_in_progress  = false;
             m_stopping           = false;
             m_output_paused      = false;
+            m_paused_output_delivery_in_progress = false;
             m_exit_reported      = false;
             m_reader_finished    = false;
             m_writer_failed      = false;
@@ -653,6 +658,7 @@ public:
             m_queued_write_bytes = 0U;
             m_reader_thread_handle.reset();
             m_writer_thread_handle.reset();
+            m_paused_output.clear();
             m_write_queue.clear();
         }
 
@@ -764,19 +770,21 @@ public:
     Terminal_backend_result set_output_paused(bool paused)
     {
         QByteArray paused_output;
+        bool paused_output_delivery_started = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_output_paused = paused;
-            if (!paused && !m_paused_output.isEmpty()) {
-                paused_output = std::move(m_paused_output);
-                m_paused_output.clear();
+            if (!m_output_paused && !m_paused_output.isEmpty()) {
+                paused_output_delivery_started =
+                    take_paused_output_for_delivery_locked(paused_output);
             }
         }
 
-        if (!paused) {
-            if (!paused_output.isEmpty()) {
-                deliver_output(std::move(paused_output));
-            }
+        if (!paused_output.isEmpty()) {
+            deliver_output(std::move(paused_output));
+        }
+        finish_paused_output_delivery(paused_output_delivery_started);
+        if (!paused && !paused_output_delivery_started) {
             m_output_cv.notify_all();
         }
 
@@ -1135,24 +1143,66 @@ private:
         deliver_native_backend_output(callbacks, std::move(bytes));
     }
 
+    bool take_paused_output_for_delivery_locked(QByteArray& paused_output)
+    {
+        if (m_paused_output.isEmpty()) {
+            return false;
+        }
+
+        paused_output = std::move(m_paused_output);
+        m_paused_output.clear();
+        m_paused_output_delivery_in_progress = true;
+        return true;
+    }
+
+    void finish_paused_output_delivery(bool delivery_started)
+    {
+        if (!delivery_started) {
+            return;
+        }
+
+        for (;;) {
+            QByteArray next_paused_output;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_output_paused && !m_paused_output.isEmpty()) {
+                    next_paused_output = std::move(m_paused_output);
+                    m_paused_output.clear();
+                }
+                else {
+                    m_paused_output_delivery_in_progress = false;
+                    break;
+                }
+            }
+
+            deliver_output(std::move(next_paused_output));
+        }
+
+        m_output_cv.notify_all();
+    }
+
     void deliver_or_buffer_output(QByteArray bytes)
     {
-        // Always allow buffering. Unlike the POSIX backend -- which deliberately
-        // keeps draining a paused master up to a high-water mark so a child blocked
-        // in write() on macOS can still exit -- the ConPTY read_loop parks on
-        // m_output_cv while output is paused and does not read. So m_paused_output
-        // holds at most the single in-flight chunk captured when a pause raced an
-        // already-issued ReadFile, and that is drained on resume. It cannot grow
-        // unbounded, so no byte cap (and no can-buffer predicate) is needed here.
-        deliver_or_buffer_native_backend_output(
-            m_mutex,
-            m_callbacks,
-            m_paused_output,
-            m_output_paused,
-            std::move(bytes),
-            [] {
-                return true;
-            });
+        const qsizetype bytes_size = bytes.size();
+        bool should_deliver = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const bool should_buffer =
+                m_output_paused || m_paused_output_delivery_in_progress;
+            if (should_buffer &&
+                bytes_size <=
+                    k_paused_output_high_watermark_bytes - m_paused_output.size())
+            {
+                append_native_backend_paused_output(m_paused_output, std::move(bytes));
+            }
+            else {
+                should_deliver = true;
+            }
+        }
+
+        if (should_deliver) {
+            deliver_output(std::move(bytes));
+        }
     }
 
     void mark_reader_finished()
@@ -1217,15 +1267,31 @@ private:
 
         for (;;) {
             HANDLE output_read = nullptr;
+            DWORD bytes_to_read = static_cast<DWORD>(buffer.size());
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_output_cv.wait(lock, [&] {
-                    return m_stopping || !m_output_paused;
+                    return
+                        m_stopping ||
+                        (!m_paused_output_delivery_in_progress &&
+                            (!m_output_paused ||
+                             m_paused_output.size() <
+                                k_paused_output_high_watermark_bytes));
                 });
 
                 output_read = m_output_read.get();
                 if (output_read == nullptr || output_read == INVALID_HANDLE_VALUE) {
                     break;
+                }
+
+                if (m_output_paused &&
+                    m_paused_output.size() < k_paused_output_high_watermark_bytes)
+                {
+                    const qsizetype paused_output_room =
+                        k_paused_output_high_watermark_bytes - m_paused_output.size();
+                    bytes_to_read = static_cast<DWORD>(std::min<qsizetype>(
+                        static_cast<qsizetype>(buffer.size()),
+                        paused_output_room));
                 }
             }
 
@@ -1233,7 +1299,7 @@ private:
             const BOOL read_ok = ReadFile(
                 output_read,
                 buffer.data(),
-                static_cast<DWORD>(buffer.size()),
+                bytes_to_read,
                 &bytes_read,
                 nullptr);
             if (!read_ok) {
@@ -1420,18 +1486,22 @@ private:
         }
 
         QByteArray paused_output;
+        bool paused_output_delivery_started = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_output_paused = false;
             if (!m_paused_output.isEmpty()) {
-                paused_output = std::move(m_paused_output);
-                m_paused_output.clear();
+                paused_output_delivery_started =
+                    take_paused_output_for_delivery_locked(paused_output);
             }
         }
         if (!paused_output.isEmpty()) {
             deliver_output(std::move(paused_output));
         }
-        m_output_cv.notify_all();
+        finish_paused_output_delivery(paused_output_delivery_started);
+        if (!paused_output_delivery_started) {
+            m_output_cv.notify_all();
+        }
         request_conpty_close();
         if (!reader_finished_within(k_conpty_reader_close_grace)) {
             cancel_blocking_io();
@@ -1584,6 +1654,7 @@ private:
     bool                               m_startup_aborted = false;
     bool                               m_stopping = false;
     bool                               m_output_paused = false;
+    bool                               m_paused_output_delivery_in_progress = false;
     bool                               m_exit_reported = false;
     bool                               m_shutdown_started = false;
     bool                               m_reader_finished = false;

@@ -82,6 +82,8 @@ constexpr qreal       k_angle_delta_per_wheel_step               = 120.0;
 constexpr int         k_plain_scroll_lines_per_angle_step        = 3;
 constexpr int         k_min_synchronized_output_stale_timeout_ms = 1;
 constexpr int         k_row_timestamp_tooltip_delay_ms           = 1000;
+constexpr std::size_t k_surface_output_queue_high_water_bytes    = 1024U * 1024U;
+constexpr std::size_t k_surface_output_queue_hard_limit_bytes    = 2U * 1024U * 1024U;
 constexpr std::chrono::milliseconds k_backend_callback_drain_budget{4};
 // Posted drains are the primary backend-output pump; keep each wakeup bounded
 // but large enough that high-volume output does not depend on pointer redelivery.
@@ -6749,6 +6751,10 @@ bool VNM_TerminalSurface::start_process_with_backend(
 #endif
 
     term::Terminal_session_config session_config;
+    session_config.output_queue_limits.high_water_bytes =
+        k_surface_output_queue_high_water_bytes;
+    session_config.output_queue_limits.hard_limit_bytes =
+        k_surface_output_queue_hard_limit_bytes;
     session_config.trace_notification_limit              = k_surface_notification_trace_limit;
     session_config.scrollback_limit                      = m_scrollback_limit;
     session_config.backend_output_capture_path           = m_backend_output_capture_path;
