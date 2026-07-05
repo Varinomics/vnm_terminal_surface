@@ -34,6 +34,9 @@ option(VNM_TERMINAL_SURFACE_BUILD_TESTING
 option(VNM_TERMINAL_BUILD_REQUIRED_READINESS "Build vnm_terminal_surface readiness validation gates" OFF)
 option(VNM_TERMINAL_BUILD_BENCHMARKS "Build vnm_terminal_surface benchmark executables" OFF)
 option(VNM_TERMINAL_ENABLE_PROFILING "Compile vnm_terminal_surface profile scope instrumentation" OFF)
+option(VNM_TERMINAL_SANITIZE_ADDRESS
+    "Build vnm_terminal_surface and its tests with AddressSanitizer (our code only, not Qt/FetchContent deps)"
+    OFF)
 option(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER
     "Build the MSDF text renderer"
     ON)
@@ -252,6 +255,21 @@ if(MSVC)
     target_compile_options(vnm_terminal_surface PRIVATE
         /FS
     )
+endif()
+
+if(VNM_TERMINAL_SANITIZE_ADDRESS)
+    if(MSVC)
+        target_compile_options(vnm_terminal_surface PRIVATE /fsanitize=address)
+        # Only our code is instrumented (Qt and the FetchContent deps are not), so
+        # turn off STL container annotations to avoid cross-boundary false positives.
+        target_compile_definitions(vnm_terminal_surface PRIVATE
+            _DISABLE_VECTOR_ANNOTATION
+            _DISABLE_STRING_ANNOTATION
+        )
+    else()
+        target_compile_options(vnm_terminal_surface PRIVATE -fsanitize=address)
+        target_link_options(vnm_terminal_surface PUBLIC -fsanitize=address)
+    endif()
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")

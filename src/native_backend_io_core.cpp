@@ -25,20 +25,26 @@ Native_backend_start_precheck validate_native_backend_start_preconditions(
         return {config_result, std::nullopt};
     }
 
+    bool repeated_start = false;
     {
         std::lock_guard<std::mutex> lock(start_gate.mutex);
         if (start_gate.running ||
             start_gate.start_attempted ||
             start_gate.start_in_progress)
         {
-            const Terminal_backend_result result = reject_native_backend_start_with_report(
-                callbacks,
-                Terminal_backend_error_code::START_FAILED,
-                QStringLiteral("%1 backend can only be started once").arg(backend_label));
-            return {result, std::nullopt};
+            repeated_start = true;
         }
+        else {
+            start_gate.start_in_progress = true;
+        }
+    }
 
-        start_gate.start_in_progress = true;
+    if (repeated_start) {
+        const Terminal_backend_result result = reject_native_backend_start_with_report(
+            callbacks,
+            Terminal_backend_error_code::START_FAILED,
+            QStringLiteral("%1 backend can only be started once").arg(backend_label));
+        return {result, std::nullopt};
     }
 
     std::optional<Terminal_effective_launch_config> effective_config = make_effective_launch_config(
