@@ -200,6 +200,7 @@ public:
     bool backend_geometry_in_sync() const;
     bool output_backpressure_active() const;
     bool render_publication_blocked() const;
+    std::uint64_t settled_live_content_publication_generation();
     Terminal_synchronized_output_scroll_policy effective_synchronized_output_scroll_policy() const;
     bool has_pending_backend_callback_events() const;
     std::size_t pending_backend_callback_event_count() const;
@@ -335,6 +336,8 @@ private:
         std::optional<std::chrono::steady_clock::duration>
                                             cursor_stable_stop_extension =
             std::nullopt);
+    bool backend_output_publication_settled_locked() const;
+    void refresh_publication_settlement_frontier_locked();
 
     Terminal_session_result process_command(
         Terminal_session_command   command);
@@ -698,6 +701,7 @@ private:
     std::uint64_t                                          m_processing_backend_callback_epoch = 0U;
     std::uint64_t                                          m_incomplete_backend_output_callback_epoch = 0U;
     std::uint64_t                                          m_budgeted_backend_output_sequence = 0U;
+    std::uint64_t                                          m_settled_live_content_publication_generation = 0U;
     std::uint64_t                                          m_render_snapshot_generation = 0U;
     std::uint64_t                                          m_render_snapshot_installed_generation = 0U;
     std::uint64_t                                          m_render_snapshot_rendered_generation = 0U;

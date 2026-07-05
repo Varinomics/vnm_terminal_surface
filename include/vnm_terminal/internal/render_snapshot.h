@@ -519,6 +519,14 @@ struct Terminal_render_snapshot
     Terminal_mode_state                                modes;
 };
 
+inline bool render_snapshot_is_live_content_publication(
+    const Terminal_render_snapshot& snapshot)
+{
+    return
+        snapshot.basis == Terminal_render_snapshot_basis::LIVE_CONTENT &&
+        snapshot.purpose == Terminal_render_snapshot_purpose::CONTENT;
+}
+
 struct Terminal_render_snapshot_validation
 {
     Terminal_render_snapshot_status status = Terminal_render_snapshot_status::OK;
