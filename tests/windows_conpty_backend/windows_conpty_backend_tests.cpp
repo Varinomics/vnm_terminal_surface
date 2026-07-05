@@ -1,5 +1,6 @@
 #include "helpers/decode_hex.h"
 #include "helpers/test_check.h"
+#include "../../src/native_backend_io_core.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
@@ -17,6 +18,7 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -1749,6 +1751,53 @@ bool test_rejection_paths(const QString& fixture_path)
     return ok;
 }
 
+bool test_repeated_start_precheck_callback_runs_after_gate_unlock(const QString& fixture_path)
+{
+    bool ok = true;
+
+    std::mutex start_gate_mutex;
+    bool running           = true;
+    bool start_attempted   = true;
+    bool start_in_progress = false;
+    bool callback_ran_after_gate_unlock = false;
+    std::optional<term::Terminal_backend_error> callback_error;
+
+    term::Terminal_backend_callbacks callbacks;
+    callbacks.output_received = [](QByteArray) {};
+    callbacks.process_exited  = [](term::Terminal_backend_exit) {};
+    callbacks.error_reported  = [&](term::Terminal_backend_error error) {
+        std::thread lock_probe([&] {
+            callback_ran_after_gate_unlock = start_gate_mutex.try_lock();
+            if (callback_ran_after_gate_unlock) {
+                start_gate_mutex.unlock();
+            }
+        });
+        lock_probe.join();
+        callback_error = std::move(error);
+    };
+
+    const term::Native_backend_start_precheck precheck =
+        term::validate_native_backend_start_preconditions(
+            launch_config(fixture_path, {QStringLiteral("--hold-open")}),
+            callbacks,
+            {start_gate_mutex, running, start_attempted, start_in_progress},
+            QStringLiteral("ConPTY"));
+
+    ok &= check(callback_ran_after_gate_unlock,
+        "ConPTY repeated-start error callback runs after releasing start gate mutex");
+    ok &= check(precheck.result.code == term::Terminal_backend_result_code::REJECTED &&
+        precheck.result.error.has_value() &&
+        precheck.result.error->code == term::Terminal_backend_error_code::START_FAILED,
+        "ConPTY repeated-start precheck reports typed rejection");
+    ok &= check(callback_error.has_value() &&
+        callback_error->code == term::Terminal_backend_error_code::START_FAILED,
+        "ConPTY repeated-start precheck emits error callback");
+    ok &= check(running && start_attempted && !start_in_progress,
+        "ConPTY repeated-start precheck leaves start gate state unchanged");
+
+    return ok;
+}
+
 bool test_interrupt(const QString& fixture_path)
 {
     bool ok = true;
@@ -1979,6 +2028,101 @@ bool test_destructor_stops_running_process(const QString& fixture_path)
     return ok;
 }
 
+bool test_destroy_from_process_exited_callback_on_worker_thread(const QString& fixture_path)
+{
+    // Regression: destroying the backend from inside its own process_exited
+    // callback runs ~Windows_conpty_backend on the wait thread, because that
+    // callback is delivered from wait_loop(). The backend must defer its
+    // shutdown+delete onto a fresh thread (is_worker_thread/defer_shutdown_and_delete);
+    // running shutdown() inline there self-detaches the wait thread and frees the
+    // Impl while wait_loop() is still on the stack, so the following
+    // terminate_process_tree_after_root_exit() would touch freed memory.
+    //
+    // The backend is a raw pointer kept out of any owning shared_ptr chain (so no
+    // reference cycle can leak it), and delete_started hands the single
+    // destruction to either the wait-thread callback or, on any early return, the
+    // owner. The sync block is heap-owned so a late worker callback can never
+    // reference a destroyed local. The quick-exit fixture is deliberate: it lets
+    // process_exited race startup, and after an accepted start the owner only
+    // waits for the exit callback unless timeout cleanup has to claim destruction.
+    //
+    // The loop gives ASan several chances to observe the buggy path. The
+    // use-after-free happens after process_exited returns to wait_loop(), while
+    // the owner waits only for the in-callback exit_delivered flag, so this is a
+    // stress regression rather than a fully synchronized red-path oracle.
+    bool ok = true;
+
+    struct Destroy_from_exit_state
+    {
+        std::mutex                                mutex;
+        std::condition_variable                   cv;
+        std::thread::id                           owner_thread_id = std::this_thread::get_id();
+        term::Terminal_backend*                   backend             = nullptr;
+        std::vector<term::Terminal_backend_error> errors;
+        std::atomic_bool                          delete_started      = false;
+        bool                                      exit_delivered      = false;
+        bool                                      destroyed_off_owner = false;
+        int                                       exit_count          = 0;
+    };
+
+    constexpr int k_iterations = 8;
+    for (int iteration = 0; iteration < k_iterations; ++iteration) {
+        auto state     = std::make_shared<Destroy_from_exit_state>();
+        state->backend = term::make_windows_conpty_backend().release();
+
+        term::Terminal_backend_callbacks callbacks;
+        callbacks.output_received = [](QByteArray) {};
+        callbacks.error_reported = [state](term::Terminal_backend_error error) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->errors.push_back(std::move(error));
+        };
+        callbacks.process_exited = [state](term::Terminal_backend_exit) {
+            // Runs on the wait thread. Destroy the backend here (on that worker
+            // thread) unless the owner already claimed the destruction on a timeout.
+            const bool off_owner = std::this_thread::get_id() != state->owner_thread_id;
+            if (state->delete_started.exchange(true)) {
+                return;
+            }
+            delete state->backend;
+
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->destroyed_off_owner = off_owner;
+            state->exit_delivered      = true;
+            ++state->exit_count;
+            state->cv.notify_all();
+        };
+
+        const term::Terminal_backend_result start_result = state->backend->start(
+            launch_config(fixture_path, {QStringLiteral("--quick-exit")}),
+            std::move(callbacks));
+        ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+            "worker-thread-destroy fixture starts");
+
+        if (start_result.code == term::Terminal_backend_result_code::ACCEPTED) {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            const bool delivered = state->cv.wait_for(lock, k_wait_timeout, [&] {
+                return state->exit_delivered;
+            });
+            ok &= check(delivered && state->exit_delivered,
+                "quick-exit fixture delivers process exit while the backend is destroyed in-callback");
+            ok &= check(state->destroyed_off_owner,
+                "backend is destroyed on a worker thread, not the owner thread");
+            ok &= check(state->exit_count == 1,
+                "worker-thread-destroy fixture reports exactly one process exit callback");
+            ok &= check(state->errors.empty(),
+                "worker-thread-destroy fixture produces no backend errors");
+        }
+
+        // Deterministic teardown on every path: if the wait-thread callback did
+        // not destroy the backend (start rejected, or an exit timeout), do it.
+        if (!state->delete_started.exchange(true)) {
+            delete state->backend;
+        }
+    }
+
+    return ok;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -2018,6 +2162,8 @@ int main(int argc, char** argv)
     run_test("missing working directory", test_missing_working_directory(fixture_path));
     run_test("failed executable", test_failed_executable(fixture_path));
     run_test("rejection paths", test_rejection_paths(fixture_path));
+    run_test("repeated start precheck releases gate before callback",
+        test_repeated_start_precheck_callback_runs_after_gate_unlock(fixture_path));
     run_test("interrupt", test_interrupt(fixture_path));
     run_test("interrupt without stdin reader", test_interrupt_without_stdin_reader(fixture_path));
     run_test("terminate", test_terminate(fixture_path));
@@ -2026,5 +2172,7 @@ int main(int argc, char** argv)
     run_test("terminate returns before child exit",
         test_terminate_returns_before_child_exit(fixture_path));
     run_test("destructor stops running process", test_destructor_stops_running_process(fixture_path));
+    run_test("destroy from process exited callback on worker thread",
+        test_destroy_from_process_exited_callback_on_worker_thread(fixture_path));
     return ok ? 0 : 1;
 }

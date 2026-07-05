@@ -12,9 +12,13 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
+#include <latch>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -573,9 +577,38 @@ std::optional<int> send_signal_to_targets(const Signal_targets& targets, int sig
 class Posix_pty_backend::Impl
 {
 public:
+    class Public_call_guard
+    {
+    public:
+        explicit Public_call_guard(Impl& impl)
+        :
+            m_impl(&impl)
+        {
+            m_impl->enter_public_call();
+        }
+
+        Public_call_guard(const Public_call_guard&) = delete;
+        Public_call_guard& operator=(const Public_call_guard&) = delete;
+
+        ~Public_call_guard()
+        {
+            if (m_impl != nullptr) {
+                m_impl->leave_public_call();
+            }
+        }
+
+    private:
+        Impl* m_impl = nullptr;
+    };
+
     ~Impl()
     {
         shutdown();
+    }
+
+    Public_call_guard public_call_guard()
+    {
+        return Public_call_guard(*this);
     }
 
     Terminal_backend_result start(
@@ -739,6 +772,7 @@ public:
             m_exit_reported                      = false;
             m_reader_finished                    = false;
             m_writer_failed                      = false;
+            m_startup_aborted                    = false;
             m_child_reaped                       = false;
             m_paused_output_delivery_in_progress = false;
             m_termination_policy                 = effective_config.termination_policy;
@@ -747,12 +781,34 @@ public:
             m_write_queue.clear();
         }
 
+        std::shared_ptr<std::latch> startup_gate;
         try {
-            m_reader_thread = std::thread([this] { read_loop(); });
-            m_writer_thread = std::thread([this] { write_loop(); });
-            m_wait_thread   = std::thread([this] { wait_loop(); });
+            startup_gate = std::make_shared<std::latch>(1);
+            m_reader_thread = std::thread(
+                &Impl::run_worker_after_startup_gate,
+                this,
+                startup_gate,
+                &Impl::read_loop);
+            m_writer_thread = std::thread(
+                &Impl::run_worker_after_startup_gate,
+                this,
+                startup_gate,
+                &Impl::write_loop);
+            m_wait_thread = std::thread(
+                &Impl::run_worker_after_startup_gate,
+                this,
+                startup_gate,
+                &Impl::wait_loop);
+            startup_gate->count_down();
         }
-        catch (const std::system_error& error) {
+        catch (const std::exception& error) {
+            if (startup_gate) {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_startup_aborted = true;
+                }
+                startup_gate->count_down();
+            }
             const QString message = QStringLiteral("POSIX PTY worker thread startup failed: %1")
                 .arg(QString::fromLocal8Bit(error.what()));
             report_error(Terminal_backend_error_code::START_FAILED, message);
@@ -967,13 +1023,22 @@ public:
         Signal_targets                 targets,
         Terminal_termination_policy    policy)
     {
+        std::shared_ptr<std::latch> startup_gate;
         try {
+            startup_gate = std::make_shared<std::latch>(1);
             m_termination_thread = std::thread(
-                [this, child_pid, targets, policy] {
-                    termination_escalation_loop(child_pid, targets, policy);
-                });
+                &Impl::run_termination_after_startup_gate,
+                this,
+                startup_gate,
+                child_pid,
+                targets,
+                policy);
+            startup_gate->count_down();
         }
-        catch (const std::system_error& error) {
+        catch (const std::exception& error) {
+            if (startup_gate) {
+                startup_gate->count_down();
+            }
             const QString message =
                 QStringLiteral("POSIX PTY termination escalation worker failed: %1")
                     .arg(QString::fromLocal8Bit(error.what()));
@@ -996,14 +1061,17 @@ public:
         pid_t child_pid           = -1;
         pid_t child_process_group = -1;
         int master                = -1;
+        Signal_targets targets;
         bool child_reaped         = false;
         bool reader_finished      = false;
+        bool close_master         = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_shutdown_started) {
                 return;
             }
 
+            const bool defer_master_close        = m_post_exit_process_group_cleanup_pending;
             m_shutdown_started                   = true;
             m_stopping                           = true;
             m_process_stopping                   = true;
@@ -1012,25 +1080,37 @@ public:
             m_callbacks                          = {};
             child_pid                            = m_child_pid;
             child_process_group                  = m_child_process_group;
-            // Take ownership of the master fd so we can close it before joining
-            // the workers (see below). m_master is now empty; its later reset()
-            // is a no-op.
-            master                               = m_master.release();
             child_reaped                         = m_child_reaped;
             reader_finished                      = m_reader_finished;
+            if (m_master) {
+                master = m_master.get();
+                targets = shutdown_signal_targets(
+                    child_process_group,
+                    master,
+                    child_reaped,
+                    reader_finished);
+                if (defer_master_close) {
+                    m_close_master_pending = true;
+                }
+                else {
+                    master = m_master.release();
+                    close_master = true;
+                }
+            }
+            else {
+                targets = shutdown_signal_targets(
+                    child_process_group,
+                    master,
+                    child_reaped,
+                    reader_finished);
+            }
         }
 
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
 
-        (void)send_signal_to_targets(
-            shutdown_signal_targets(
-                child_process_group,
-                master,
-                child_reaped,
-                reader_finished),
-            SIGKILL);
+        (void)send_signal_to_targets(targets, SIGKILL);
 
         // The signal above targets process groups (kill(-pgid)). During the
         // brief window after forkpty() but before the child has established its
@@ -1045,13 +1125,11 @@ public:
             ::kill(child_pid, SIGKILL);
         }
 
-        // Close the master now -- before join_threads(), not after -- so a child
-        // blocked writing to the slave is released. With output paused the master
-        // is not drained, so the child fills the slave's output buffer and blocks
-        // in write(); it then cannot act on the pending SIGKILL, so waitpid()
-        // never returns and join_threads() deadlocks. Closing the master delivers
-        // EIO/SIGHUP to that write, unblocking the child so the SIGKILL lands.
-        if (master >= 0) {
+        // In ordinary shutdown, close the master before join_threads() so a child
+        // blocked writing to the slave is released. If the wait thread still
+        // needs the master for post-exit cleanup, that path owns the pending
+        // close instead.
+        if (close_master) {
             ::close(master);
         }
 
@@ -1070,24 +1148,70 @@ public:
         m_running             = false;
     }
 
-    bool is_worker_thread() const
+    // Each worker records its id (register_worker_thread, under m_mutex) before it
+    // runs any callback-capable work. The startup gate keeps those callbacks
+    // blocked until start() has committed the std::thread members, and the id set
+    // keeps destruction independent of unsynchronized std::thread member reads.
+    bool is_worker_thread()
     {
-        const std::thread::id current_id = std::this_thread::get_id();
-        const auto matches_current_thread = [current_id](const std::thread& thread) {
-            return thread.joinable() && thread.get_id() == current_id;
-        };
-
+        std::lock_guard<std::mutex> lock(m_mutex);
         return
-            matches_current_thread(m_reader_thread) ||
-            matches_current_thread(m_writer_thread) ||
-            matches_current_thread(m_wait_thread) || matches_current_thread(
-                m_termination_thread);
+            m_worker_thread_ids.find(std::this_thread::get_id()) !=
+            m_worker_thread_ids.end();
     }
 
+    bool has_active_public_call()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_public_call_depth != 0U;
+    }
+
+    void register_worker_thread()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_worker_thread_ids.insert(std::this_thread::get_id());
+    }
+
+    void run_worker_after_startup_gate(
+        std::shared_ptr<std::latch> startup_gate,
+        void (Impl::*loop)())
+    {
+        register_worker_thread();
+        startup_gate->wait();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_startup_aborted) {
+                return;
+            }
+        }
+        (this->*loop)();
+    }
+
+    void run_termination_after_startup_gate(
+        std::shared_ptr<std::latch>     startup_gate,
+        pid_t                           child_pid,
+        Signal_targets                  targets,
+        Terminal_termination_policy     policy)
+    {
+        register_worker_thread();
+        startup_gate->wait();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_startup_aborted) {
+                return;
+            }
+        }
+        termination_escalation_loop(child_pid, targets, policy);
+    }
+
+    // Run shutdown() and delete on a fresh, non-worker thread so join_threads()
+    // can join worker threads and any public backend call already on the stack
+    // can return before the Impl is freed. Takes ownership of this Impl.
     void defer_shutdown_and_delete() noexcept
     {
         try {
             std::thread([this] {
+                wait_for_public_calls_to_finish();
                 shutdown();
                 delete this;
             }).detach();
@@ -1098,11 +1222,43 @@ public:
     }
 
 private:
+    void enter_public_call()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ++m_public_call_depth;
+    }
+
+    void leave_public_call()
+    {
+        int master_to_close = -1;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            --m_public_call_depth;
+            if (m_public_call_depth == 0U) {
+                master_to_close = take_pending_master_close_if_ready_locked();
+                m_public_call_cv.notify_all();
+            }
+        }
+
+        if (master_to_close >= 0) {
+            ::close(master_to_close);
+        }
+    }
+
+    void wait_for_public_calls_to_finish()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_public_call_cv.wait(lock, [this] {
+            return m_public_call_depth == 0U;
+        });
+    }
+
     void request_shutdown_without_cleanup()
     {
         pid_t child_pid           = -1;
         pid_t child_process_group = -1;
         int master                = -1;
+        Signal_targets targets;
         bool child_reaped         = false;
         bool reader_finished      = false;
         {
@@ -1119,22 +1275,47 @@ private:
             m_callbacks                          = {};
             child_pid                            = m_child_pid;
             child_process_group                  = m_child_process_group;
-            master                               = m_master.get();
             child_reaped                         = m_child_reaped;
             reader_finished                      = m_reader_finished;
+            if (m_master) {
+                master = m_master.get();
+                targets = shutdown_signal_targets(
+                    child_process_group,
+                    master,
+                    child_reaped,
+                    reader_finished);
+            }
+            else {
+                targets = shutdown_signal_targets(
+                    child_process_group,
+                    master,
+                    child_reaped,
+                    reader_finished);
+            }
         }
 
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
 
-        (void)send_signal_to_targets(
-            shutdown_signal_targets(
-                child_process_group,
-                master,
-                child_reaped,
-                reader_finished),
-            SIGKILL);
+        (void)send_signal_to_targets(targets, SIGKILL);
+
+        if (!child_reaped && child_pid > 0) {
+            ::kill(child_pid, SIGKILL);
+        }
+    }
+
+    int take_pending_master_close_if_ready_locked()
+    {
+        if (!m_close_master_pending ||
+            m_public_call_depth != 0U ||
+            m_post_exit_process_group_cleanup_pending)
+        {
+            return -1;
+        }
+
+        m_close_master_pending = false;
+        return m_master.release();
     }
 
     Terminal_backend_callbacks callbacks_for_delivery()
@@ -1690,6 +1871,7 @@ private:
             m_child_pid        = -1;
             m_process_stopping = true;
             m_output_paused    = false;
+            m_post_exit_process_group_cleanup_pending = true;
             m_write_queue.clear();
             m_queued_write_bytes = 0U;
             if (!m_paused_output.isEmpty()) {
@@ -1739,20 +1921,27 @@ private:
         // kill(-pgid) is best effort and ignores ESRCH, so a clean exit with no
         // descendants is a harmless no-op.
         pid_t child_process_group = -1;
-        int master = -1;
+        Signal_targets targets;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             child_process_group = m_child_process_group;
-            master = m_master.get();
+            targets = process_signal_targets(child_process_group, m_master.get());
         }
 
-        (void)send_signal_to_targets(
-            process_signal_targets(child_process_group, master),
-            SIGKILL);
+        (void)send_signal_to_targets(targets, SIGKILL);
 
-        std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_child_process_group == child_process_group) {
-            m_child_process_group = -1;
+        int master_to_close = -1;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_post_exit_process_group_cleanup_pending = false;
+            if (m_child_process_group == child_process_group) {
+                m_child_process_group = -1;
+            }
+            master_to_close = take_pending_master_close_if_ready_locked();
+        }
+
+        if (master_to_close >= 0) {
+            ::close(master_to_close);
         }
     }
 
@@ -1808,6 +1997,7 @@ private:
     std::condition_variable             m_output_cv;
     std::condition_variable             m_write_cv;
     std::condition_variable             m_reader_cv;
+    std::condition_variable             m_public_call_cv;
     Terminal_backend_callbacks          m_callbacks;
     Unique_fd                           m_master;
     Unique_fd                           m_read_wake_read;
@@ -1818,22 +2008,27 @@ private:
     std::thread                         m_writer_thread;
     std::thread                         m_wait_thread;
     std::thread                         m_termination_thread;
+    std::set<std::thread::id>           m_worker_thread_ids;
     QByteArray                          m_paused_output;
     std::deque<Queued_write>            m_write_queue;
     std::optional<Terminal_exit_reason> m_exit_reason_override;
     Terminal_termination_policy         m_termination_policy;
     std::size_t                         m_queued_write_bytes = 0U;
+    std::size_t                         m_public_call_depth = 0U;
     pid_t                               m_child_pid = -1;
     pid_t                               m_child_process_group = -1;
     bool                                m_running = false;
     bool                                m_start_attempted = false;
     bool                                m_start_in_progress = false;
+    bool                                m_startup_aborted = false;
     bool                                m_process_stopping = false;
     bool                                m_stopping = false;
     bool                                m_output_paused = false;
     bool                                m_paused_output_delivery_in_progress = false;
     bool                                m_exit_reported = false;
     bool                                m_shutdown_started = false;
+    bool                                m_close_master_pending = false;
+    bool                                m_post_exit_process_group_cleanup_pending = false;
     bool                                m_reader_finished = false;
     bool                                m_writer_failed = false;
     bool                                m_child_reaped = false;
@@ -1846,7 +2041,11 @@ Posix_pty_backend::Posix_pty_backend()
 
 Posix_pty_backend::~Posix_pty_backend()
 {
-    if (m_impl && m_impl->is_worker_thread()) {
+    // Defer when teardown is reached from a callback or while a public backend
+    // call is still unwinding, so the Impl is not freed under live stack frames.
+    if (m_impl &&
+        (m_impl->is_worker_thread() || m_impl->has_active_public_call()))
+    {
         Impl* impl = m_impl.release();
         impl->defer_shutdown_and_delete();
     }
@@ -1856,33 +2055,45 @@ Terminal_backend_result Posix_pty_backend::start(
     const Terminal_launch_config&  config,
     Terminal_backend_callbacks     callbacks)
 {
-    return m_impl->start(config, std::move(callbacks));
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->start(config, std::move(callbacks));
 }
 
 Terminal_backend_result Posix_pty_backend::write(QByteArray bytes)
 {
-    return m_impl->write(std::move(bytes));
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->write(std::move(bytes));
 }
 
 Terminal_backend_result Posix_pty_backend::resize(
     Terminal_backend_resize_request request)
 {
-    return m_impl->resize(request);
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->resize(request);
 }
 
 Terminal_backend_result Posix_pty_backend::set_output_paused(bool paused)
 {
-    return m_impl->set_output_paused(paused);
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->set_output_paused(paused);
 }
 
 Terminal_backend_result Posix_pty_backend::interrupt()
 {
-    return m_impl->interrupt();
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->interrupt();
 }
 
 Terminal_backend_result Posix_pty_backend::terminate()
 {
-    return m_impl->terminate();
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->terminate();
 }
 
 std::unique_ptr<Terminal_backend> make_posix_pty_backend()

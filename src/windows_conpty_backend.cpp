@@ -26,9 +26,13 @@ DECLARE_HANDLE(HPCON);
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <exception>
+#include <latch>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -40,6 +44,10 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr std::chrono::milliseconds k_conpty_reader_close_grace(1000);
+// Keep the ConPTY pipe draining while session output is paused, but keep the
+// backend-side burst below the session callback/output queue hard limit when it
+// is released as one callback.
+constexpr qsizetype k_paused_output_high_watermark_bytes = 64 * 1024;
 
 DWORD wait_timeout_from_interval(std::chrono::milliseconds interval)
 {
@@ -401,9 +409,38 @@ std::vector<std::byte> initialized_attribute_list_storage(
 class Windows_conpty_backend::Impl
 {
 public:
+    class Public_call_guard
+    {
+    public:
+        explicit Public_call_guard(Impl& impl)
+        :
+            m_impl(&impl)
+        {
+            m_impl->enter_public_call();
+        }
+
+        Public_call_guard(const Public_call_guard&) = delete;
+        Public_call_guard& operator=(const Public_call_guard&) = delete;
+
+        ~Public_call_guard()
+        {
+            if (m_impl != nullptr) {
+                m_impl->leave_public_call();
+            }
+        }
+
+    private:
+        Impl* m_impl = nullptr;
+    };
+
     ~Impl()
     {
         shutdown();
+    }
+
+    Public_call_guard public_call_guard()
+    {
+        return Public_call_guard(*this);
     }
 
     Terminal_backend_result start(
@@ -611,23 +648,48 @@ public:
             m_start_in_progress  = false;
             m_stopping           = false;
             m_output_paused      = false;
+            m_paused_output_delivery_in_progress = false;
             m_exit_reported      = false;
             m_reader_finished    = false;
             m_writer_failed      = false;
+            m_startup_aborted    = false;
             m_termination_policy = effective_config.termination_policy;
             m_exit_reason_override.reset();
             m_queued_write_bytes = 0U;
             m_reader_thread_handle.reset();
             m_writer_thread_handle.reset();
+            m_paused_output.clear();
             m_write_queue.clear();
         }
 
+        std::shared_ptr<std::latch> startup_gate;
         try {
-            m_reader_thread = std::thread([this] { read_loop(); });
-            m_writer_thread = std::thread([this] { write_loop(); });
-            m_wait_thread   = std::thread([this] { wait_loop(); });
+            startup_gate = std::make_shared<std::latch>(1);
+            m_reader_thread = std::thread(
+                &Impl::run_worker_after_startup_gate,
+                this,
+                startup_gate,
+                &Impl::read_loop);
+            m_writer_thread = std::thread(
+                &Impl::run_worker_after_startup_gate,
+                this,
+                startup_gate,
+                &Impl::write_loop);
+            m_wait_thread = std::thread(
+                &Impl::run_worker_after_startup_gate,
+                this,
+                startup_gate,
+                &Impl::wait_loop);
+            startup_gate->count_down();
         }
-        catch (const std::system_error& error) {
+        catch (const std::exception& error) {
+            if (startup_gate) {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_startup_aborted = true;
+                }
+                startup_gate->count_down();
+            }
             const QString message = QStringLiteral("ConPTY worker thread startup failed: %1")
                 .arg(QString::fromLocal8Bit(error.what()));
             report_error(Terminal_backend_error_code::START_FAILED, message);
@@ -708,19 +770,21 @@ public:
     Terminal_backend_result set_output_paused(bool paused)
     {
         QByteArray paused_output;
+        bool paused_output_delivery_started = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_output_paused = paused;
-            if (!paused && !m_paused_output.isEmpty()) {
-                paused_output = std::move(m_paused_output);
-                m_paused_output.clear();
+            if (!m_output_paused && !m_paused_output.isEmpty()) {
+                paused_output_delivery_started =
+                    take_paused_output_for_delivery_locked(paused_output);
             }
         }
 
-        if (!paused) {
-            if (!paused_output.isEmpty()) {
-                deliver_output(std::move(paused_output));
-            }
+        if (!paused_output.isEmpty()) {
+            deliver_output(std::move(paused_output));
+        }
+        finish_paused_output_delivery(paused_output_delivery_started);
+        if (!paused && !paused_output_delivery_started) {
             m_output_cv.notify_all();
         }
 
@@ -793,13 +857,22 @@ public:
         HANDLE                         process_job,
         Terminal_termination_policy    policy)
     {
+        std::shared_ptr<std::latch> startup_gate;
         try {
+            startup_gate = std::make_shared<std::latch>(1);
             m_termination_thread = std::thread(
-                [this, process, process_job, policy] {
-                    termination_escalation_loop(process, process_job, policy);
-                });
+                &Impl::run_termination_after_startup_gate,
+                this,
+                startup_gate,
+                process,
+                process_job,
+                policy);
+            startup_gate->count_down();
         }
-        catch (const std::system_error& error) {
+        catch (const std::exception& error) {
+            if (startup_gate) {
+                startup_gate->count_down();
+            }
             const QString message =
                 QStringLiteral("ConPTY termination escalation worker failed: %1")
                     .arg(QString::fromLocal8Bit(error.what()));
@@ -875,11 +948,160 @@ public:
         m_running = false;
     }
 
+    // True when the calling thread is one of this backend's own worker threads.
+    // Destruction reached from a worker callback (for example a process_exited
+    // delivered by wait_loop) must not tear down inline: shutdown() joins the
+    // worker threads, so join_or_detach would detach the calling thread and free
+    // this Impl while that worker is still on the stack.
+    //
+    // Each worker records its id (register_worker_thread, under m_mutex) before it
+    // runs any callback-capable work. The startup gate keeps those callbacks
+    // blocked until start() has committed the std::thread members, and the id set
+    // keeps destruction independent of unsynchronized std::thread member reads.
+    bool is_worker_thread()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return
+            m_worker_thread_ids.find(std::this_thread::get_id()) !=
+            m_worker_thread_ids.end();
+    }
+
+    bool has_active_public_call()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_public_call_depth != 0U;
+    }
+
+    void register_worker_thread()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_worker_thread_ids.insert(std::this_thread::get_id());
+    }
+
+    void run_worker_after_startup_gate(
+        std::shared_ptr<std::latch> startup_gate,
+        void (Impl::*loop)())
+    {
+        register_worker_thread();
+        startup_gate->wait();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_startup_aborted) {
+                return;
+            }
+        }
+        (this->*loop)();
+    }
+
+    void run_termination_after_startup_gate(
+        std::shared_ptr<std::latch>     startup_gate,
+        HANDLE                          process,
+        HANDLE                          process_job,
+        Terminal_termination_policy     policy)
+    {
+        register_worker_thread();
+        startup_gate->wait();
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_startup_aborted) {
+                return;
+            }
+        }
+        termination_escalation_loop(process, process_job, policy);
+    }
+
+    // Run shutdown() and delete on a fresh, non-worker thread so join_threads()
+    // can join worker threads and any public backend call already on the stack
+    // can return before the Impl is freed. Takes ownership of this Impl.
+    void defer_shutdown_and_delete() noexcept
+    {
+        try {
+            std::thread([this] {
+                wait_for_public_calls_to_finish();
+                shutdown();
+                delete this;
+            }).detach();
+        }
+        catch (...) {
+            request_shutdown_without_cleanup();
+        }
+    }
+
 private:
+    // Best-effort teardown for the unreachable-in-practice case where the
+    // deferred-shutdown thread cannot be spawned. It must not join or delete: the
+    // worker threads are still running against this Impl, so the Impl is
+    // deliberately leaked (safe: no use-after-free) while the child process tree
+    // is force-terminated so no process is left running.
+    void request_shutdown_without_cleanup() noexcept
+    {
+        HANDLE process     = nullptr;
+        HANDLE process_job = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            if (m_shutdown_started) {
+                return;
+            }
+
+            m_shutdown_started = true;
+            m_stopping         = true;
+            m_output_paused    = false;
+            m_callbacks        = {};
+            process            = m_process.get();
+            process_job        = m_process_job.get();
+        }
+
+        m_output_cv.notify_all();
+        m_write_cv.notify_all();
+        cancel_blocking_io();
+        request_conpty_close();
+
+        // Same job-then-root termination shape as shutdown(): the pseudoconsole is
+        // closed and, if the job cannot be terminated, the root process is killed
+        // directly, so leaking the Impl never leaves the child tree running.
+        bool process_tree_terminated = false;
+        if (process_job != nullptr && process_job != INVALID_HANDLE_VALUE) {
+            process_tree_terminated = TerminateJobObject(process_job, 1U);
+        }
+
+        if (!process_tree_terminated &&
+            process != nullptr &&
+            process != INVALID_HANDLE_VALUE)
+        {
+            DWORD exit_code = 0;
+            if (GetExitCodeProcess(process, &exit_code) && exit_code == STILL_ACTIVE) {
+                TerminateProcess(process, 1U);
+            }
+        }
+    }
+
     Terminal_backend_callbacks callbacks_for_delivery()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_callbacks;
+    }
+
+    void enter_public_call()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ++m_public_call_depth;
+    }
+
+    void leave_public_call()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        --m_public_call_depth;
+        if (m_public_call_depth == 0U) {
+            m_public_call_cv.notify_all();
+        }
+    }
+
+    void wait_for_public_calls_to_finish()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_public_call_cv.wait(lock, [this] {
+            return m_public_call_depth == 0U;
+        });
     }
 
     void report_error(Terminal_backend_error_code code, QString message)
@@ -921,24 +1143,66 @@ private:
         deliver_native_backend_output(callbacks, std::move(bytes));
     }
 
+    bool take_paused_output_for_delivery_locked(QByteArray& paused_output)
+    {
+        if (m_paused_output.isEmpty()) {
+            return false;
+        }
+
+        paused_output = std::move(m_paused_output);
+        m_paused_output.clear();
+        m_paused_output_delivery_in_progress = true;
+        return true;
+    }
+
+    void finish_paused_output_delivery(bool delivery_started)
+    {
+        if (!delivery_started) {
+            return;
+        }
+
+        for (;;) {
+            QByteArray next_paused_output;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_output_paused && !m_paused_output.isEmpty()) {
+                    next_paused_output = std::move(m_paused_output);
+                    m_paused_output.clear();
+                }
+                else {
+                    m_paused_output_delivery_in_progress = false;
+                    break;
+                }
+            }
+
+            deliver_output(std::move(next_paused_output));
+        }
+
+        m_output_cv.notify_all();
+    }
+
     void deliver_or_buffer_output(QByteArray bytes)
     {
-        // Always allow buffering. Unlike the POSIX backend -- which deliberately
-        // keeps draining a paused master up to a high-water mark so a child blocked
-        // in write() on macOS can still exit -- the ConPTY read_loop parks on
-        // m_output_cv while output is paused and does not read. So m_paused_output
-        // holds at most the single in-flight chunk captured when a pause raced an
-        // already-issued ReadFile, and that is drained on resume. It cannot grow
-        // unbounded, so no byte cap (and no can-buffer predicate) is needed here.
-        deliver_or_buffer_native_backend_output(
-            m_mutex,
-            m_callbacks,
-            m_paused_output,
-            m_output_paused,
-            std::move(bytes),
-            [] {
-                return true;
-            });
+        const qsizetype bytes_size = bytes.size();
+        bool should_deliver = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            const bool should_buffer =
+                m_output_paused || m_paused_output_delivery_in_progress;
+            if (should_buffer &&
+                bytes_size <=
+                    k_paused_output_high_watermark_bytes - m_paused_output.size())
+            {
+                append_native_backend_paused_output(m_paused_output, std::move(bytes));
+            }
+            else {
+                should_deliver = true;
+            }
+        }
+
+        if (should_deliver) {
+            deliver_output(std::move(bytes));
+        }
     }
 
     void mark_reader_finished()
@@ -1003,15 +1267,31 @@ private:
 
         for (;;) {
             HANDLE output_read = nullptr;
+            DWORD bytes_to_read = static_cast<DWORD>(buffer.size());
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_output_cv.wait(lock, [&] {
-                    return m_stopping || !m_output_paused;
+                    return
+                        m_stopping ||
+                        (!m_paused_output_delivery_in_progress &&
+                            (!m_output_paused ||
+                             m_paused_output.size() <
+                                k_paused_output_high_watermark_bytes));
                 });
 
                 output_read = m_output_read.get();
                 if (output_read == nullptr || output_read == INVALID_HANDLE_VALUE) {
                     break;
+                }
+
+                if (m_output_paused &&
+                    m_paused_output.size() < k_paused_output_high_watermark_bytes)
+                {
+                    const qsizetype paused_output_room =
+                        k_paused_output_high_watermark_bytes - m_paused_output.size();
+                    bytes_to_read = static_cast<DWORD>(std::min<qsizetype>(
+                        static_cast<qsizetype>(buffer.size()),
+                        paused_output_room));
                 }
             }
 
@@ -1019,7 +1299,7 @@ private:
             const BOOL read_ok = ReadFile(
                 output_read,
                 buffer.data(),
-                static_cast<DWORD>(buffer.size()),
+                bytes_to_read,
                 &bytes_read,
                 nullptr);
             if (!read_ok) {
@@ -1206,18 +1486,22 @@ private:
         }
 
         QByteArray paused_output;
+        bool paused_output_delivery_started = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             m_output_paused = false;
             if (!m_paused_output.isEmpty()) {
-                paused_output = std::move(m_paused_output);
-                m_paused_output.clear();
+                paused_output_delivery_started =
+                    take_paused_output_for_delivery_locked(paused_output);
             }
         }
         if (!paused_output.isEmpty()) {
             deliver_output(std::move(paused_output));
         }
-        m_output_cv.notify_all();
+        finish_paused_output_delivery(paused_output_delivery_started);
+        if (!paused_output_delivery_started) {
+            m_output_cv.notify_all();
+        }
         request_conpty_close();
         if (!reader_finished_within(k_conpty_reader_close_grace)) {
             cancel_blocking_io();
@@ -1342,6 +1626,7 @@ private:
     std::condition_variable            m_output_cv;
     std::condition_variable            m_write_cv;
     std::condition_variable            m_reader_cv;
+    std::condition_variable            m_public_call_cv;
     Terminal_backend_callbacks         m_callbacks;
     Conpty_api                         m_api;
     HPCON                              m_conpty = nullptr;
@@ -1355,17 +1640,21 @@ private:
     std::thread                        m_writer_thread;
     std::thread                        m_wait_thread;
     std::thread                        m_termination_thread;
+    std::set<std::thread::id>          m_worker_thread_ids;
     QByteArray                         m_paused_output;
     std::deque<Queued_write>           m_write_queue;
     std::optional<Terminal_exit_reason>
                                        m_exit_reason_override;
     Terminal_termination_policy        m_termination_policy;
     std::size_t                        m_queued_write_bytes = 0U;
+    std::size_t                        m_public_call_depth = 0U;
     bool                               m_running = false;
     bool                               m_start_attempted = false;
     bool                               m_start_in_progress = false;
+    bool                               m_startup_aborted = false;
     bool                               m_stopping = false;
     bool                               m_output_paused = false;
+    bool                               m_paused_output_delivery_in_progress = false;
     bool                               m_exit_reported = false;
     bool                               m_shutdown_started = false;
     bool                               m_reader_finished = false;
@@ -1377,39 +1666,61 @@ Windows_conpty_backend::Windows_conpty_backend()
     m_impl(std::make_unique<Impl>())
 {}
 
-Windows_conpty_backend::~Windows_conpty_backend() = default;
+Windows_conpty_backend::~Windows_conpty_backend()
+{
+    // Defer when teardown is reached from a callback or while a public backend
+    // call is still unwinding, so the Impl is not freed under live stack frames.
+    if (m_impl &&
+        (m_impl->is_worker_thread() || m_impl->has_active_public_call()))
+    {
+        Impl* impl = m_impl.release();
+        impl->defer_shutdown_and_delete();
+    }
+}
 
 Terminal_backend_result Windows_conpty_backend::start(
     const Terminal_launch_config&  config,
     Terminal_backend_callbacks     callbacks)
 {
-    return m_impl->start(config, std::move(callbacks));
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->start(config, std::move(callbacks));
 }
 
 Terminal_backend_result Windows_conpty_backend::write(QByteArray bytes)
 {
-    return m_impl->write(std::move(bytes));
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->write(std::move(bytes));
 }
 
 Terminal_backend_result Windows_conpty_backend::resize(
     Terminal_backend_resize_request request)
 {
-    return m_impl->resize(request);
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->resize(request);
 }
 
 Terminal_backend_result Windows_conpty_backend::set_output_paused(bool paused)
 {
-    return m_impl->set_output_paused(paused);
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->set_output_paused(paused);
 }
 
 Terminal_backend_result Windows_conpty_backend::interrupt()
 {
-    return m_impl->interrupt();
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->interrupt();
 }
 
 Terminal_backend_result Windows_conpty_backend::terminate()
 {
-    return m_impl->terminate();
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->terminate();
 }
 
 std::unique_ptr<Terminal_backend> make_windows_conpty_backend()
