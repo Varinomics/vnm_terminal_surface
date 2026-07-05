@@ -70,10 +70,7 @@ struct Render_profile_snapshot_t
 struct Cursor_withhold_state_snapshot
 {
     std::uint64_t                           session_generation = 0U;
-    std::uint64_t                           successful_withheld_frame_count = 0U;
-    std::uint64_t                           successful_withheld_frame_bound = 0U;
-    bool                                    risk_episode_active = false;
-    bool                                    visibility_forced = false;
+    std::uint64_t                           protected_live_content_publication_generation = 0U;
     bool                                    cursor_withheld = false;
 };
 

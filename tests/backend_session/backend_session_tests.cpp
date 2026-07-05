@@ -10677,6 +10677,90 @@ bool test_reentrant_start_callbacks_preserve_order()
     return ok;
 }
 
+bool test_inline_callback_output_settles_after_callback_unwinds()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "inline callback settlement session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("inline-settled-output")),
+        "inline callback settlement backend emits output");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_contains_text(*snapshot, QStringLiteral("inline-settled-output")),
+        "inline callback settlement publishes output snapshot");
+    ok &= check(snapshot.has_value() &&
+        session->settled_live_content_publication_generation() ==
+            snapshot->metadata.publication_generation,
+        "inline callback settlement frontier reaches published output after callback unwinds");
+
+    return ok;
+}
+
+bool test_viewport_only_publication_inherits_settled_frontier_with_pending_callbacks()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "viewport-only settlement session starts");
+
+    ok &= check(backend->emit_output(numbered_scroll_lines(80)),
+        "viewport-only settlement queues scrollback fixture output");
+    session->process_backend_callback_events();
+
+    const std::optional<term::Terminal_render_snapshot> baseline_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(baseline_snapshot.has_value() &&
+        baseline_snapshot->viewport.scrollback_rows > 0,
+        "viewport-only settlement publishes a scrollback baseline");
+    if (!baseline_snapshot.has_value()) {
+        return ok;
+    }
+    ok &= check(
+        session->settled_live_content_publication_generation() ==
+            baseline_snapshot->metadata.publication_generation,
+        "viewport-only settlement baseline is settled before queued callback work");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("queued-after-scroll")),
+        "viewport-only settlement queues later backend work");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "viewport-only settlement leaves later backend work pending");
+
+    const term::Terminal_viewport_scroll_result scroll_result =
+        session->scroll_viewport_lines_from_published_state(
+            5,
+            baseline_snapshot->viewport);
+    const std::optional<term::Terminal_render_snapshot> scrolled_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(
+        scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+        "viewport-only settlement scrolls the published viewport");
+    ok &= check(scrolled_snapshot.has_value() &&
+        scrolled_snapshot->metadata.publication_generation >
+            baseline_snapshot->metadata.publication_generation,
+        "viewport-only settlement publishes a new viewport-only snapshot");
+    ok &= check(scrolled_snapshot.has_value() &&
+        session->settled_live_content_publication_generation() ==
+            scrolled_snapshot->metadata.publication_generation,
+        "viewport-only settlement advances frontier despite unrelated queued backend work");
+    ok &= check(session->has_pending_backend_callback_events(),
+        "viewport-only settlement does not drain unrelated backend work");
+
+    return ok;
+}
+
 bool test_callback_during_write_is_serialized()
 {
     bool ok = true;
@@ -14573,6 +14657,8 @@ int main()
     ok &= test_generated_reply_byte_enqueue_failure_reports_backend_error();
     ok &= test_generated_reply_command_enqueue_failure_reports_backend_error();
     ok &= test_reentrant_start_callbacks_preserve_order();
+    ok &= test_inline_callback_output_settles_after_callback_unwinds();
+    ok &= test_viewport_only_publication_inherits_settled_frontier_with_pending_callbacks();
     ok &= test_callback_during_write_is_serialized();
     ok &= test_destructor_ignores_late_backend_callbacks();
     ok &= test_worker_thread_callback_is_delivered();
