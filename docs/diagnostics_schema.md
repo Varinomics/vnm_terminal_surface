@@ -331,5 +331,6 @@ For an atlas counter:
 
 The JSON and TEXT serializers read their descriptor tables, so descriptor edits
 update both surfaces together. The golden test checks emitted profile text; the
-schema-sync test checks documented key presence. Keep order, units, and stability
-wording in this document aligned with the descriptor intent during review.
+schema-sync test checks each documented field table against the expected field
+sequence. Keep order, units, and stability wording in this document aligned with
+the descriptor intent during review.
