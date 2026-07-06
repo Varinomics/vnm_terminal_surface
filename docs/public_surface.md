@@ -70,9 +70,11 @@ Writable Qt properties:
   active.
 - `copyShortcutPolicy` controls plain Ctrl+C:
   `TERMINAL_INPUT` always sends terminal input,
-  `COPY_SELECTION_OR_TERMINAL_INPUT` copies a local selection when present and
-  otherwise sends terminal input, and `COPY_SELECTION_OR_IGNORE` never sends
-  Ctrl+C to the child process.
+  `COPY_SELECTION_OR_TERMINAL_INPUT` copies an attached local selection when
+  present and otherwise sends terminal input, and `COPY_SELECTION_OR_IGNORE`
+  never sends Ctrl+C to the child process. Retained `PAYLOAD_ONLY` text remains
+  readable through `selected_text()`, but it is not treated as copyable by the
+  built-in plain Ctrl+C shortcut.
 - `wheelEventPolicy` controls primary-screen wheel routing:
   `APPLICATION_CONTROLLED` tries terminal mouse or alternate-screen behavior
   before local scrollback, `LOCAL_SCROLLBACK_FIRST` prefers local scrollback
@@ -157,9 +159,10 @@ live process requests termination during teardown.
 
 Invokable methods:
 
-- `selected_text()` returns the local terminal selection. When synchronized
-  output is hiding unpublished model changes, it reads from the visible render
-  snapshot so host copy behavior matches what the user can see.
+- `selected_text()` returns the local terminal selection, including retained
+  payload-only text after a visual detachment. When synchronized output is
+  hiding unpublished model changes, it reads from the visible render snapshot
+  so host copy behavior matches what the user can see.
 - `clear_selection()` clears local selection and drag state.
 - `paste_text(QString text)` writes paste text through the terminal input path.
   Paste text is UTF-8 encoded, CR and CRLF are normalized to LF, C0/C1 controls

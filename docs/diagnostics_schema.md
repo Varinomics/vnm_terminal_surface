@@ -287,15 +287,18 @@ emitted outside the shared table (so they are not table rows below).
 
 The frame-report counter fields that overlap between the top-level JSON object
 and the TEXT `qsg_atlas` section, with the same name and a plain field read.
-They are emitted as two contiguous runs in each serializer (separated there by
-hand-written enum-string and boolean flags, and by the hand-written
-`max_glyph_instance_page` clamp, which are not table rows).
+They are emitted as two contiguous runs in each serializer, with hand-written
+enum-string and boolean flags outside the shared table rows. The rasterization
+run is followed by the hand-written `max_glyph_instance_page` clamp, which is
+not a table row.
 
 | Field | Kind | Unit | Stability |
 |-------|------|------|-----------|
 | `capture_count` | Counter | Count | Unstable |
 | `prepare_count` | Counter | Count | Unstable |
+| `prepare_elapsed_ns` | Counter | Nanoseconds | Unstable |
 | `render_count` | Counter | Count | Unstable |
+| `render_elapsed_ns` | Counter | Nanoseconds | Unstable |
 | `capture_sequence` | Counter | Count | Unstable |
 | `captured_snapshot_sequence` | Counter | Count | Unstable |
 | `captured_font_epoch` | Counter | Count | Unstable |
@@ -303,6 +306,8 @@ hand-written enum-string and boolean flags, and by the hand-written
 | `atlas_page_count` | Counter | Count | Unstable |
 
 ## Adding or changing a counter
+
+For a text-layout counter:
 
 1. Add the field to the stats struct in
    `include/vnm_terminal/internal/qsg_terminal_renderer.h`.
@@ -313,5 +318,18 @@ hand-written enum-string and boolean flags, and by the hand-written
    `tests/diagnostics_text_layout/diagnostics_text_layout_tests.cpp` and confirm
    the test still passes.
 
-Because both serializers read the one table, step 2 updates JSON and TEXT
-together; the golden test fails loudly if the doc, table, and output disagree.
+For an atlas counter:
+
+1. Add the field to the relevant atlas report struct, usually
+   `include/vnm_terminal/internal/qsg_atlas_renderer.h`.
+2. Add one row to the atlas descriptor table in
+   `src/diagnostics/atlas_metric_descriptors.h`, at the intended emit position.
+3. Add the matching row to the atlas table above.
+4. Extend the same diagnostics text-layout golden fixture/oracle if the counter
+   appears in profile text, and confirm the schema sync and diagnostics tests
+   still pass.
+
+The JSON and TEXT serializers read their descriptor tables, so descriptor edits
+update both surfaces together. The golden test checks emitted profile text; the
+schema-sync test checks documented key presence. Keep order, units, and stability
+wording in this document aligned with the descriptor intent during review.

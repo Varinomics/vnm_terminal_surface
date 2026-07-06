@@ -202,9 +202,10 @@ atlas_capabilities_metrics()
 // Atlas top-level frame-report counters that overlap between the JSON top-level
 // object and the TEXT top-level section with the same name and a plain field
 // read. These two runs are contiguous in both serializers but separated there
-// by bespoke fields (enum-string and boolean flags) that are NOT shared; the
-// max_glyph_instance_page between them stays hand-written because it is a
-// std::max(0, ...) transform rather than a plain field read.
+// by bespoke fields (enum-string and boolean flags) that are NOT shared. The
+// rasterization run is followed by the hand-written max_glyph_instance_page
+// clamp because it is a std::max(0, ...) transform rather than a plain field
+// read.
 namespace report_table {
 using Stats = internal::Qsg_atlas_frame_report;
 #define VNM_ATLAS_COUNTER(field) \
@@ -214,7 +215,9 @@ using Stats = internal::Qsg_atlas_frame_report;
 inline constexpr Metric_descriptor<Stats> k_sequence[] = {
     VNM_ATLAS_COUNTER(capture_count),
     VNM_ATLAS_COUNTER(prepare_count),
+    VNM_ATLAS_COUNTER(prepare_elapsed_ns),
     VNM_ATLAS_COUNTER(render_count),
+    VNM_ATLAS_COUNTER(render_elapsed_ns),
     VNM_ATLAS_COUNTER(capture_sequence),
     VNM_ATLAS_COUNTER(captured_snapshot_sequence),
     VNM_ATLAS_COUNTER(captured_font_epoch),

@@ -854,6 +854,17 @@ void Terminal_renderer_stats_publisher::publish(const terminal_renderer_stats_t&
     accumulate_renderer_stats(m_cumulative_stats, stats);
 }
 
+void Terminal_renderer_stats_publisher::mark_paint_completed()
+{
+    const std::lock_guard<std::mutex> lock(m_mutex);
+    if (m_stats.paint_completed) {
+        return;
+    }
+
+    m_stats.paint_completed = true;
+    ++m_cumulative_stats.paint_completed_frames;
+}
+
 terminal_renderer_stats_t Terminal_renderer_stats_publisher::snapshot() const
 {
     const std::lock_guard<std::mutex> lock(m_mutex);

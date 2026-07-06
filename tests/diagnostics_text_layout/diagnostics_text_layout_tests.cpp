@@ -636,12 +636,14 @@ term::Qsg_atlas_frame_report make_report_fixture()
     term::Qsg_atlas_frame_report r;
     r.capture_count              = 5400U;
     r.prepare_count              = 5401U;
-    r.render_count               = 5402U;
-    r.capture_sequence           = 5403U;
-    r.captured_snapshot_sequence = 5404U;
-    r.captured_font_epoch        = 5405U;
-    r.rasterized_glyphs          = 5406;
-    r.atlas_page_count           = 5407;
+    r.prepare_elapsed_ns         = 5402U;
+    r.render_count               = 5403U;
+    r.render_elapsed_ns          = 5404U;
+    r.capture_sequence           = 5405U;
+    r.captured_snapshot_sequence = 5406U;
+    r.captured_font_epoch        = 5407U;
+    r.rasterized_glyphs          = 5408;
+    r.atlas_page_count           = 5409;
     return r;
 }
 
@@ -652,14 +654,16 @@ bool test_report_overlap_golden()
     const std::vector<Oracle_field> sequence = {
         oracle_counter("capture_count",              5400U),
         oracle_counter("prepare_count",              5401U),
-        oracle_counter("render_count",               5402U),
-        oracle_counter("capture_sequence",           5403U),
-        oracle_counter("captured_snapshot_sequence", 5404U),
-        oracle_counter("captured_font_epoch",        5405U),
+        oracle_counter("prepare_elapsed_ns",         5402U),
+        oracle_counter("render_count",               5403U),
+        oracle_counter("render_elapsed_ns",          5404U),
+        oracle_counter("capture_sequence",           5405U),
+        oracle_counter("captured_snapshot_sequence", 5406U),
+        oracle_counter("captured_font_epoch",        5407U),
     };
     const std::vector<Oracle_field> rasterization = {
-        oracle_counter("rasterized_glyphs", 5406U),
-        oracle_counter("atlas_page_count",  5407U),
+        oracle_counter("rasterized_glyphs", 5408U),
+        oracle_counter("atlas_page_count",  5409U),
     };
 
     bool ok = true;

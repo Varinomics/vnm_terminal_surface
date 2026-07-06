@@ -75,14 +75,15 @@ Run the configured test suite:
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-`vnm_terminal_windows_conpty_backend` and `vnm_terminal_compat_smoke` spawn real
-ConPTY child processes and are excluded from the default CI run, so their
-lifetime invariants are gated locally. Configure a separate AddressSanitizer
-build (only our library and tests are instrumented; Qt and the FetchContent
-dependencies are left uninstrumented). This focused run exercises the
-worker-thread backend-destruction path under ASan; failures in that path can
-surface after the triggering callback returns, so repeat the command when
-chasing a suspected lifetime regression:
+Windows CI runs `vnm_terminal_windows_conpty_backend` in the normal test suite
+and in a focused AddressSanitizer job. `vnm_terminal_compat_smoke` is still a
+local Windows gate for the full native-surface fixture smoke. To reproduce the
+ASan job locally, configure a separate AddressSanitizer build (only our library
+and tests are instrumented; Qt and the FetchContent dependencies are left
+uninstrumented). This focused run exercises the worker-thread
+backend-destruction path under ASan; failures in that path can surface after
+the triggering callback returns, so repeat the command when chasing a suspected
+lifetime regression:
 
 ```powershell
 cmake -S . -B build-asan -DBUILD_TESTING=ON -DVNM_TERMINAL_SANITIZE_ADDRESS=ON

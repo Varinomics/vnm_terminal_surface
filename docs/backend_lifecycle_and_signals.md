@@ -4,8 +4,10 @@ This document is the per-platform contract for the native terminal backends:
 the Windows ConPTY backend in `src/windows_conpty_backend.cpp` and the POSIX
 forkpty backend in `src/posix_pty_backend.cpp`. Both implement the
 `Terminal_backend` interface in
-`include/vnm_terminal/internal/backend_contract.h` and share the read, write,
-and deliver-or-buffer plumbing in `src/native_backend_io_core.*`.
+`include/vnm_terminal/internal/backend_contract.h` and share start validation,
+launch environment construction, write-queue accounting, callback delivery, and
+thread-join helpers in `src/native_backend_io_core.*`. Backend-specific
+pause/backpressure paths are documented below.
 
 A backend hosts the child process, owns the OS handles and worker threads, and
 reports output bytes, process exit, and errors through
@@ -67,38 +69,56 @@ This lifecycle-dependent targeting is intentional, not an inconsistency.
 
 ## Output Read, Pause, And Backpressure
 
-Output bytes flow from the reader thread through
-`deliver_or_buffer_native_backend_output` in `src/native_backend_io_core.h`.
-Under the backend mutex, that helper either appends to a paused-output buffer
-(when output is paused and a backend-supplied `can_buffer` predicate allows it)
-or delivers the bytes to the `output_received` callback. The session activates
-backpressure through `Terminal_backend::set_output_paused`; the two backends
-behave differently while paused, and that difference is the central
-cross-platform contract here.
+Output bytes flow from each reader thread through a backend-local
+paused-output decision under the backend mutex. That decision either appends to
+a paused-output buffer (when output is paused or buffered bytes are already
+pending and the backend can still buffer) or delivers the bytes to the
+`output_received` callback. POSIX uses the shared
+`deliver_or_buffer_native_backend_output` helper in
+`src/native_backend_io_core.h`; ConPTY implements the same FIFO/backpressure
+contract in its local pipe-drain path. The session activates backpressure
+through `Terminal_backend::set_output_paused`; the two backends behave
+differently while paused, and that difference is the central cross-platform
+contract here.
 
-### Windows: park while paused
+### Windows: bounded drain while paused
 
-The ConPTY `read_loop` parks on its output condition variable while output is
-paused and does not read. As a result the paused buffer holds at most the
-single in-flight chunk captured when a pause races an already-issued `ReadFile`,
-and that chunk is delivered when output resumes. The paused buffer cannot grow
-unbounded, so the ConPTY `can_buffer` predicate is unconditionally true and no
-byte cap is applied. On resume, `set_output_paused(false)` delivers any buffered
-chunk and wakes the reader.
+The ConPTY `read_loop` keeps the output pipe draining while output is paused,
+but only until the paused buffer reaches
+`k_paused_output_high_watermark_bytes` (64 KiB). That cap keeps a resumed burst
+below the default session callback/output hard limit while avoiding a dead pipe
+when a final output chunk races a pause. Once the cap is reached, the reader
+parks on its output condition variable until output resumes or shutdown begins.
+On resume, `set_output_paused(false)` delivers the buffered bytes through the
+same paused-output delivery path and then wakes the reader. If a buffered
+delivery or buffered bytes are already pending, newly read bytes append behind
+that buffer up to the cap instead of bypassing it. During exit drain, buffered
+tail output is delivered before the process exit is reported. Once ConPTY has
+entered stop/exit-drain state, new pause requests are accepted but do not latch;
+otherwise a callback re-pause from a direct backend consumer could suppress the
+process exit callback indefinitely.
 
 ### POSIX: drain while paused up to a high-water mark
 
 The POSIX reader deliberately keeps draining the master while output is paused,
 buffering the bytes application-side in the paused buffer rather than leaving
 them in the kernel. It only parks for backpressure once the buffer reaches
-`k_paused_output_high_watermark_bytes` (1 MiB). This is required because macOS
-flow-controls a slave write almost immediately when the master is not being
-read: a child that emits a final line and exits while output is paused would
-otherwise block in `write()` forever and never exit, which would break
-exit-drain delivery. Draining application-side lets small final output through
-while still applying backpressure for genuinely high-volume output. The POSIX
-`can_buffer` predicate stops buffering once the process is stopping, so
-shutdown-time output is delivered rather than accumulated.
+the high-water mark derived from the owning session's output callback queue:
+hard limit minus high-water limit minus one maximum backend read callback. With
+the default queue limits this is 176 KiB (256 KiB hard limit, minus 64 KiB
+high-water, minus a 16 KiB maximum native read callback). This is required
+because macOS flow-controls a slave write almost immediately when the master is
+not being read: a child that emits a small final line and exits while output is
+paused would otherwise block in `write()` forever and never exit, which would
+break exit-drain delivery. Reserving one backend read callback under the
+session hard limit prevents exit-drain from enqueueing more callback output than
+that session can hold before it drains, even when the threshold-crossing
+callback overshoots high-water. If a buffered delivery or buffered bytes are
+already pending, newly read bytes append behind that buffer up to the cap
+instead of bypassing it. During running-state resume, the session may re-pause
+between bounded chunks. Once the direct child has exited or termination has
+begun, pause requests are accepted but do not latch; the wait thread reports
+exit after the paused buffer is empty and no paused-output delivery is active.
 
 ## Write Path
 
@@ -135,22 +155,22 @@ killed by `SIGINT` resolves to `INTERRUPTED`).
 ### Windows interrupt
 
 ConPTY has no signal channel, so `interrupt()` enqueues a single `\x03` byte on
-the write queue. Because the process-wait thread can observe the child's exit
-before the writer's delivery callback returns, `interrupt()` optimistically
-records an `INTERRUPTED` exit-reason override at request time so that an exit
-observed during interrupt delivery still classifies as interrupted. The write
-queue entry is tagged so the writer can confirm or retract that classification:
+the write queue. The queued entry does not classify process exit by itself. When
+the writer reaches that entry in stream order, it records a narrow in-flight
+`INTERRUPTED` override so the process-wait thread can still classify an exit
+that races with `WriteFile` completion as interrupted.
 
-- On successful delivery, the writer reasserts the `INTERRUPTED` override (only
-  while the backend is not stopping).
-- On delivery failure, the writer drops the optimistic `INTERRUPTED` override
-  and surfaces `INTERRUPT_FAILED` -- but only while the process is still running
-  (guarded by the exit-reported flag under the mutex). If the child has already
-  exited and been classified, that classification stands, because the exit may
-  well have been the interrupt.
-
-This prevents a later natural exit from being misreported as interrupted when
-the interrupt byte never reached the child.
+After successful delivery, the writer converts the in-flight override into a
+pending conventional Ctrl+C exit-code observation. Exit code 130 is then reported
+as `INTERRUPTED` unless the backend observes stronger evidence that the child
+continued past the interrupt. A successfully completed later non-interrupt write
+only arms that clear; the observation is cleared when child output is read during
+or after that successful write. `WriteFile` completion alone is not proof that
+the child processed the write, and a failed/stopped later write cannot clear the
+pending classification. On delivery failure, the writer drops the in-flight
+override and surfaces `INTERRUPT_FAILED` while the process is still running.
+Queued interrupt entries that the writer never reaches are discarded as ordinary
+queued writes and do not affect exit-reason resolution.
 
 ## Terminate And Escalation
 
@@ -163,13 +183,14 @@ the paused state, wakes the workers, and starts an escalation worker governed by
   up to the kill interval. A still-active group after forced termination, or a
   signal failure, is reported as `TERMINATE_FAILED`.
 - ConPTY escalation waits up to the graceful interval for the process to exit,
-  then calls `TerminateProcess`, then waits up to the kill interval. A process
-  still active after forced termination, or a `TerminateProcess` failure, is
-  reported as `TERMINATE_FAILED`.
+  then calls `TerminateJobObject` on the child process job, then waits up to the
+  kill interval for the root process to exit. A process still active after
+  forced termination, or a `TerminateJobObject` failure followed by a failed
+  root-process `TerminateProcess` fallback, is reported as `TERMINATE_FAILED`.
 
 If the escalation worker thread cannot be created, both backends fall back to an
-immediate forced kill (`SIGKILL` to the targets / `TerminateProcess`) and report
-`TERMINATE_FAILED`.
+immediate forced kill (`SIGKILL` to the targets / ConPTY job termination with
+root-process fallback) and report `TERMINATE_FAILED`.
 
 After the direct child exits and the exit drain completes, the POSIX backend
 also sends `SIGKILL` to the child's process group to reap any leftover
@@ -185,19 +206,22 @@ attempts return without delivering a second `process_exited` callback.
 
 The reason is resolved from the recorded override and the observed exit:
 
-- If an exit-reason override is present (`INTERRUPTED` from a confirmed/optimistic
-  ConPTY interrupt, or `TERMINATED` from a terminate request), that override is
+- If an exit-reason override is present (`INTERRUPTED` from an in-flight ConPTY
+  interrupt write, or `TERMINATED` from a terminate request), that override is
   the reported reason.
+- On Windows, if no override is present but a delivered ConPTY interrupt has a
+  pending conventional Ctrl+C exit-code observation, exit code 130 reports
+  `INTERRUPTED`.
 - Otherwise the reason is the natural exit. On POSIX,
   `exit_reason_from_wait_status` maps a `SIGINT` death to `INTERRUPTED`, any
   other signal death to `TERMINATED`, and a normal exit to `EXITED`. On Windows
   a natural exit reports `EXITED`.
 
-The override mechanism exists to resolve the race between a request (interrupt
-or terminate) and the process-wait thread observing the child's death: the
-request records the intended reason before the OS-level effect is confirmed, so
-an exit observed in that window is still classified by intent. The ConPTY
-interrupt path additionally retracts its optimistic override on delivery failure
+The override mechanism exists to resolve the race between an in-flight request
+and the process-wait thread observing the child's death: terminate records the
+intended reason at request time, while ConPTY interrupt records it only after the
+writer reaches the Ctrl+C byte. The ConPTY interrupt path additionally retracts
+its in-flight override on delivery failure
 (see Interrupt, above) so the override never outlives a failed request while the
 process is still running.
 
@@ -232,10 +256,14 @@ rejected as invalid state.
 
 When the process-wait thread reaps the child, the backend delivers any buffered
 paused output before reporting exit, so output produced up to the moment of exit
-is not lost. The POSIX backend additionally honors a consistent exit-drain
-window (`k_exit_output_drain_timeout`) before finalizing the exit: on Linux the
-master stays readable while a descendant holds the slave open, so the reader
-drains for the full window; on macOS the master EOFs the instant the
+is not lost. Delivery remains FIFO: reader tail bytes append behind existing
+paused bytes, and deferred-session backpressure can pause running-state drain
+between bounded chunks. Exit-drain itself does not latch new pause requests, so
+the process exit callback cannot be lost behind a callback re-pause. The POSIX
+backend additionally honors a consistent exit-drain window
+(`k_exit_output_drain_timeout`) before finalizing the exit: on Linux the master
+stays readable while a descendant holds the slave open, so the reader drains for
+the full window; on macOS the master EOFs the instant the
 session-leader child exits, so the reader finishes immediately and the wait
 thread waits out the remainder of the window so the observable behavior matches
 Linux. The drain wait is interruptible by shutdown so teardown is never delayed.
@@ -261,12 +289,13 @@ The POSIX teardown ordering is load-bearing on macOS and is therefore explicit:
   its own group. To guarantee the wait thread's blocking `waitpid` returns, the
   child pid is also signaled directly with `kill(child_pid, SIGKILL)`.
 - In ordinary shutdown, the master fd is closed before joining the workers, not
-  after. With output paused the master is not drained, so a child can block in
-  `write()` to the slave and cannot act on a pending `SIGKILL`. Closing the
-  master releases that write (delivering `EIO`/`SIGHUP`) so the kill can land
-  and the wait thread can be joined. If the wait thread still needs the master
-  for post-exit foreground/process-group cleanup, the close is deferred until
-  that cleanup finishes.
+  after. While output is paused, the reader drains only up to the paused-output
+  high-water mark and then parks; a high-volume child can still block in
+  `write()` to the slave and fail to act on a pending `SIGKILL`. Closing the
+  master releases that blocked write (delivering `EIO`/`SIGHUP`) so the kill can
+  land and the wait thread can be joined. If the wait thread still needs the
+  master for post-exit foreground/process-group cleanup, the close is deferred
+  until that cleanup finishes.
 - The bounded reader and writer poll intervals (`k_native_master_poll_interval`)
   exist so the I/O threads re-check their stop flags rather than trusting a poll
   on the PTY master, which is unreliable on macOS once the child has exited while

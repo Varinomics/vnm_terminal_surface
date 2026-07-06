@@ -1,6 +1,7 @@
 #include "helpers/decode_hex.h"
 #include "helpers/test_check.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
+#include "vnm_terminal/internal/session_contract.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 
 #include <QByteArray>
@@ -10,6 +11,7 @@
 #include <QString>
 #include <QStringList>
 #include <QTemporaryDir>
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -66,6 +68,12 @@ bool wait_for_file(const QString& path)
     while (std::chrono::steady_clock::now() < deadline);
 
     return false;
+}
+
+bool create_empty_file(const QString& path)
+{
+    QFile file(path);
+    return file.open(QIODevice::WriteOnly);
 }
 
 std::optional<QByteArray> posix_pty_observable_output_payload(
@@ -195,6 +203,17 @@ public:
         return !appeared;
     }
 
+    bool wait_for_output_size_to_stay_at_most(
+        std::size_t                 byte_count,
+        std::chrono::milliseconds   interval)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        const bool grew = m_cv.wait_for(lock, interval, [&] {
+            return static_cast<std::size_t>(m_output.size()) > byte_count;
+        });
+        return !grew;
+    }
+
     bool wait_for_exit()
     {
         return wait_until([&] {
@@ -218,6 +237,18 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         return m_errors;
+    }
+
+    std::vector<QByteArray> output_events_snapshot()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        std::vector<QByteArray> events;
+        events.reserve(m_output_events.size());
+        for (const Output_event& event : m_output_events) {
+            events.push_back(event.bytes);
+        }
+        return events;
     }
 
     bool output_precedes_exit(const QByteArray& needle)
@@ -804,6 +835,7 @@ bool test_exit_drain_ignores_repause_and_delivers_buffered_output()
     bool ok = true;
 
     const QByteArray marker            = QByteArrayLiteral("paused-exit-drain");
+    const QByteArray tail_marker       = QByteArrayLiteral("paused-exit-tail");
     std::atomic_bool repause_attempted = false;
     std::atomic_bool repause_accepted  = false;
 
@@ -815,7 +847,9 @@ bool test_exit_drain_ignores_repause_and_delivers_buffered_output()
             QStringLiteral(
                 "echo exit-drain-ready; "
                 "read line; "
-                "echo paused-exit-drain; "
+                "printf 'paused-exit-drain\\n'; "
+                "dd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\\000' A; "
+                "printf '\\npaused-exit-tail\\n'; "
                 "(trap 'exit 0' HUP TERM INT; sleep 30) & "
                 "exit 0")),
         capture.callbacks([&](const QByteArray& bytes) {
@@ -843,10 +877,14 @@ bool test_exit_drain_ignores_repause_and_delivers_buffered_output()
         "exit drain callback attempted to re-pause output");
     ok &= check(repause_accepted,
         "exit drain re-pause request remains accepted");
+    ok &= check(capture.wait_for_output(tail_marker),
+        "exit drain ignores callback re-pause and delivers buffered tail output");
     ok &= check(capture.wait_for_exit(),
         "exit drain re-pause does not block exit reporting");
     ok &= check(capture.output_precedes_exit(marker),
         "exit drain delivers buffered output before exit callback");
+    ok &= check(capture.output_precedes_exit(tail_marker),
+        "exit drain delivers tail output before exit callback");
 
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
     ok &= check(exit.has_value() &&
@@ -855,6 +893,170 @@ bool test_exit_drain_ignores_repause_and_delivers_buffered_output()
         "paused exit-drain shell reports direct child clean exit");
     ok &= check(capture.errors_snapshot().empty(),
         "paused exit-drain shell produces no backend errors");
+
+    return ok;
+}
+
+bool test_paused_release_preserves_marker_order_and_caps_callback_bursts()
+{
+    bool ok = true;
+
+    QTemporaryDir checkpoint_dir;
+    ok &= check(checkpoint_dir.isValid(), "paused-release checkpoint directory is available");
+    if (!checkpoint_dir.isValid()) {
+        return false;
+    }
+
+    const QString done_path =
+        checkpoint_dir.filePath(QStringLiteral("paused-release.done"));
+    const QString exit_gate_path =
+        checkpoint_dir.filePath(QStringLiteral("paused-release-exit.gate"));
+    const QByteArray old_marker   = QByteArrayLiteral("paused-old-marker");
+    const QByteArray fresh_marker = QByteArrayLiteral("paused-fresh-marker");
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    const term::Terminal_backend_result start_result = backend->start(
+        shell_launch_config(
+            QStringLiteral(
+                "echo paused-release-ready; "
+                "read line; "
+                "printf 'paused-old-marker\\n'; "
+                "dd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\\000' A; "
+                "printf '\\npaused-fresh-marker\\n'; "
+                "touch %1; "
+                "while [ ! -e %2 ]; do sleep 0.01; done").arg(
+                    shell_quote(done_path),
+                    shell_quote(exit_gate_path))),
+        capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "paused-release burst shell starts");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("paused-release-ready")),
+        "paused-release burst shell reaches ready marker");
+
+    const term::Terminal_backend_result pause_result = backend->set_output_paused(true);
+    ok &= check(pause_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "POSIX PTY backend accepts paused-release burst pause");
+    ok &= check(backend->write(QByteArrayLiteral("go\r")).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "paused-release burst shell receives release input");
+    ok &= check(wait_for_file(done_path),
+        "paused-release burst shell writes full paused payload");
+    ok &= check(!capture.output_snapshot().contains(old_marker),
+        "paused-release burst output stays held while paused");
+
+    const term::Terminal_backend_result resume_result = backend->set_output_paused(false);
+    ok &= check(resume_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "POSIX PTY backend accepts paused-release burst resume");
+    ok &= check(capture.wait_for_output(fresh_marker),
+        "paused-release burst delivers final marker after resume");
+    ok &= check(create_empty_file(exit_gate_path),
+        "paused-release burst shell exit gate opens after resume");
+    ok &= check(capture.wait_for_exit(),
+        "paused-release burst shell exits");
+
+    const QByteArray output = capture.output_snapshot();
+    const qsizetype old_index = output.indexOf(old_marker);
+    const qsizetype fresh_index = output.indexOf(fresh_marker);
+    ok &= check(old_index >= 0 && fresh_index > old_index,
+        "paused-release burst preserves marker order across resume");
+
+    std::size_t max_callback_bytes = 0U;
+    for (const QByteArray& event : capture.output_events_snapshot()) {
+        max_callback_bytes = std::max(
+            max_callback_bytes,
+            static_cast<std::size_t>(event.size()));
+    }
+    ok &= check(
+        max_callback_bytes <= term::k_terminal_default_output_queue_high_water_bytes,
+        "paused-release burst callback size stays within the default session high-water limit");
+
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::EXITED &&
+        exit->exit_code == 0,
+        "paused-release burst shell reports clean exit");
+    ok &= check(capture.errors_snapshot().empty(),
+        "paused-release burst shell produces no backend errors");
+
+    return ok;
+}
+
+bool test_paused_release_with_tight_delivery_limits_does_not_trap_output()
+{
+    bool ok = true;
+
+    QTemporaryDir checkpoint_dir;
+    ok &= check(checkpoint_dir.isValid(),
+        "tight paused-output checkpoint directory is available");
+    if (!checkpoint_dir.isValid()) {
+        return false;
+    }
+
+    const QString done_path =
+        checkpoint_dir.filePath(QStringLiteral("tight-paused.done"));
+    const QString exit_gate_path =
+        checkpoint_dir.filePath(QStringLiteral("tight-paused-exit.gate"));
+    const QByteArray marker = QByteArrayLiteral("M");
+    const QByteArray tail   = QByteArrayLiteral("Z");
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
+    term::Terminal_launch_config config =
+        shell_launch_config(QStringLiteral(
+            "echo tight-paused-ready; "
+            "stty -echo; "
+            "read line; "
+            "printf 'M'; "
+            "printf 'Z'; "
+            "touch %1; "
+            "while [ ! -e %2 ]; do sleep 0.01; done").arg(
+                shell_quote(done_path),
+                shell_quote(exit_gate_path)));
+    config.output_delivery_limits =
+        term::Terminal_backend_output_delivery_limits{4U, 4U};
+
+    const term::Terminal_backend_result start_result =
+        backend->start(config, capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "tight paused-output shell starts");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("tight-paused-ready")),
+        "tight paused-output shell reaches ready marker");
+
+    const term::Terminal_backend_result pause_result =
+        backend->set_output_paused(true);
+    ok &= check(pause_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "tight paused-output shell accepts pause");
+    const std::size_t output_size_before_release =
+        static_cast<std::size_t>(capture.output_snapshot().size());
+    ok &= check(backend->write(QByteArrayLiteral("go\r")).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "tight paused-output shell receives release input");
+    ok &= check(wait_for_file(done_path),
+        "tight paused-output shell writes payload while paused");
+    ok &= check(capture.wait_for_output_size_to_stay_at_most(
+            output_size_before_release,
+            std::chrono::milliseconds(150)),
+        "tight paused-output shell holds payload before resume");
+
+    const term::Terminal_backend_result resume_result =
+        backend->set_output_paused(false);
+    ok &= check(resume_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "tight paused-output shell accepts resume");
+    ok &= check(capture.wait_for_output(tail),
+        "tight paused-output shell drains buffered tail");
+    ok &= check(create_empty_file(exit_gate_path),
+        "tight paused-output shell exit gate opens after resume");
+    ok &= check(capture.wait_for_exit(),
+        "tight paused-output shell reports exit");
+
+    const QByteArray output = capture.output_snapshot();
+    const qsizetype marker_index = output.indexOf(marker);
+    const qsizetype tail_index   = output.indexOf(tail);
+    ok &= check(marker_index >= 0 && tail_index > marker_index,
+        "tight paused-output shell preserves marker order");
+    ok &= check(capture.errors_snapshot().empty(),
+        "tight paused-output shell produces no backend errors");
 
     return ok;
 }
@@ -1233,6 +1435,8 @@ int main(int argc, char** argv)
     ok &= test_interrupt_ignored_child_exits_normally();
     ok &= test_process_exit_reports_with_descendant_slave_open();
     ok &= test_exit_drain_ignores_repause_and_delivers_buffered_output();
+    ok &= test_paused_release_preserves_marker_order_and_caps_callback_bursts();
+    ok &= test_paused_release_with_tight_delivery_limits_does_not_trap_output();
     ok &= test_destructor_from_output_callback_returns();
     ok &= test_destructor_from_process_exited_callback_returns();
     ok &= test_terminate_kills_descendant_in_target_group();

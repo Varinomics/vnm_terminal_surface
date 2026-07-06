@@ -190,6 +190,13 @@ public:
         }
 
         output_paused = paused;
+        if (!paused) {
+            while (!outputs_during_output_resume.empty() && !output_paused) {
+                QByteArray output = std::move(outputs_during_output_resume.front());
+                outputs_during_output_resume.erase(outputs_during_output_resume.begin());
+                m_callbacks.output_received(std::move(output));
+            }
+        }
         return term::backend_accept();
     }
 
@@ -230,6 +237,16 @@ public:
     bool emit_output(QByteArray bytes)
     {
         if (!running || output_paused) {
+            return false;
+        }
+
+        m_callbacks.output_received(std::move(bytes));
+        return true;
+    }
+
+    bool emit_output_ignoring_pause(QByteArray bytes)
+    {
+        if (!running) {
             return false;
         }
 
@@ -285,6 +302,7 @@ public:
     std::vector<QByteArray>    outputs_before_start_failure;
     std::vector<QByteArray>    outputs_during_start;
     std::vector<QByteArray>    outputs_during_write;
+    std::vector<QByteArray>    outputs_during_output_resume;
     std::function<void()>      after_outputs_during_write;
     std::vector<term::Terminal_backend_error>
                                errors_during_start;
@@ -1113,6 +1131,13 @@ bool test_start_callback_ordering_and_output()
         backend->start_configs.front().initial_grid_size->rows == 24 &&
         backend->start_configs.front().initial_grid_size->columns == 80,
         "session forwards initial grid size");
+    ok &= check(
+        backend->start_configs.front().output_delivery_limits.has_value() &&
+        backend->start_configs.front().output_delivery_limits->high_water_bytes ==
+            term::k_terminal_default_output_queue_high_water_bytes &&
+        backend->start_configs.front().output_delivery_limits->hard_limit_bytes ==
+            term::k_terminal_default_output_queue_hard_limit_bytes,
+        "session forwards output delivery limits from its output queue");
     ok &= check(session->process_state() == term::Terminal_process_state::RUNNING,
         "session enters running state");
     ok &= check(session->backend_ready(), "session marks backend ready");
@@ -12205,22 +12230,35 @@ bool test_deferred_callback_ingress_pauses_backend_at_high_water()
         "deferred-ingress high-water pause emits below threshold");
     ok &= check(!backend->output_paused && backend->output_pause_requests.empty(),
         "deferred-ingress high-water pause does not pause below threshold");
-    ok &= check(backend->emit_output(QByteArrayLiteral("34")),
-        "deferred-ingress high-water pause emits threshold-crossing chunk");
+    ok &= check(backend->emit_output(QByteArrayLiteral("345")),
+        "deferred-ingress high-water pause emits non-aligned threshold-crossing chunk");
     ok &= check(backend->output_paused &&
         backend->output_pause_requests.size() == 1U &&
         backend->output_pause_requests.back(),
         "deferred-ingress high-water pause pauses backend from callback thread");
     ok &= check(!backend->emit_output(QByteArrayLiteral("blocked")),
         "deferred-ingress high-water pause blocks further scripted output before drain");
+    const std::size_t queued_output_bytes = 5U;
+    const QByteArray forced_shutdown_drain_output(
+        static_cast<int>(
+            config.output_queue_limits.hard_limit_bytes -
+            queued_output_bytes),
+        'x');
+    ok &= check(backend->emit_output_ignoring_pause(forced_shutdown_drain_output),
+        "deferred-ingress high-water pause receives hard-limit headroom forced shutdown-drain output");
+    ok &= check(backend->output_pause_requests.size() == 2U &&
+        backend->output_pause_requests[0] &&
+        backend->output_pause_requests[1],
+        "deferred-ingress high-water pause reasserts pause while already active");
 
     session->process_backend_callback_events();
 
     const std::vector<QByteArray> chunks = session->output_chunks();
-    ok &= check(chunks.size() == 1U && chunks.front() == QByteArrayLiteral("1234"),
-        "deferred-ingress high-water pause drains accepted output in order");
+    ok &= check(chunks.size() == 1U &&
+        chunks.front() == QByteArrayLiteral("12345") + forced_shutdown_drain_output,
+        "deferred-ingress high-water pause drains accepted non-aligned headroom output in order");
     ok &= check(!backend->output_paused &&
-        backend->output_pause_requests.size() == 2U &&
+        backend->output_pause_requests.size() == 3U &&
         !backend->output_pause_requests.back(),
         "deferred-ingress high-water pause resumes backend after owner drain");
     ok &= check(!has_backend_error_code(
@@ -12666,6 +12704,61 @@ bool test_output_backpressure_and_overflow()
         resume_failure->backend_error->code ==
             term::Terminal_backend_error_code::OUTPUT_OVERFLOW,
         "output resume failure reports typed backend error");
+
+    return ok;
+}
+
+bool test_output_backpressure_resume_callbacks_can_repause()
+{
+    bool ok = true;
+
+    const auto run_case = [&](bool deferred_callbacks, const char* label) {
+        term::Terminal_session_config config = tight_session_config();
+        if (deferred_callbacks) {
+            config.backend_event_notifier = [] {};
+        }
+
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        backend->outputs_during_output_resume = {
+            QByteArrayLiteral("abcd"),
+            QByteArrayLiteral("efgh"),
+            QByteArrayLiteral("ijkl"),
+        };
+
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "resume-callback backpressure session starts");
+        ok &= check(backend->emit_output(QByteArrayLiteral("1234")),
+            "resume-callback fake backend emits initial high-water output");
+        session->process_backend_callback_events();
+
+        const std::vector<QByteArray> output_chunks = session->output_chunks();
+        ok &= check(output_chunks.size() == 4U &&
+            output_chunks[0] == QByteArrayLiteral("1234") &&
+            output_chunks[1] == QByteArrayLiteral("abcd") &&
+            output_chunks[2] == QByteArrayLiteral("efgh") &&
+            output_chunks[3] == QByteArrayLiteral("ijkl"),
+            label);
+        ok &= check(backend->outputs_during_output_resume.empty(),
+            "resume-callback fake backend drains all resumed chunks");
+        ok &= check(!backend->output_paused && !session->output_backpressure_active(),
+            "resume-callback session ends with backend output unpaused");
+        ok &= check(notification_count(
+            *session,
+            term::Terminal_session_notification_kind::BACKEND_ERROR) == 0U,
+            "resume-callback backpressure does not overflow");
+        ok &= check(backend->output_pause_requests.size() == 8U,
+            "resume-callback backpressure pauses and resumes per chunk");
+        for (std::size_t i = 0U; i < backend->output_pause_requests.size(); ++i) {
+            const bool expected_paused = (i % 2U) == 0U;
+            ok &= check(backend->output_pause_requests[i] == expected_paused,
+                "resume-callback pause requests alternate active/released");
+        }
+    };
+
+    run_case(false, "no-notifier resume-callback chunks are delivered in order");
+    run_case(true, "deferred resume-callback chunks are delivered in order");
 
     return ok;
 }
@@ -14691,6 +14784,7 @@ int main()
     ok &= test_invalid_launch_config();
     ok &= test_write_and_reply_path();
     ok &= test_output_backpressure_and_overflow();
+    ok &= test_output_backpressure_resume_callbacks_can_repause();
     ok &= test_write_limits_and_failure();
     ok &= test_paste_policy_modes_and_drain();
     ok &= test_focus_reporting_mode_writes_and_drain();

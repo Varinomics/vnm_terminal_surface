@@ -6,6 +6,7 @@
 #include <QStringList>
 #include <QByteArray>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -83,6 +84,12 @@ struct Terminal_termination_policy
     std::chrono::milliseconds              kill_interval     = std::chrono::milliseconds(500);
 };
 
+struct Terminal_backend_output_delivery_limits
+{
+    std::size_t                            high_water_bytes = 0U;
+    std::size_t                            hard_limit_bytes = 0U;
+};
+
 struct Terminal_launch_config
 {
     QStringList                            argv;
@@ -94,6 +101,8 @@ struct Terminal_launch_config
     Terminal_process_group_policy          process_group_policy =
         Terminal_process_group_policy::BACKEND_DEFAULT;
     Terminal_termination_policy            termination_policy;
+    std::optional<Terminal_backend_output_delivery_limits>
+                                           output_delivery_limits;
 };
 
 struct Terminal_effective_launch_config
@@ -105,6 +114,8 @@ struct Terminal_effective_launch_config
     Terminal_process_group_policy process_group_policy =
         Terminal_process_group_policy::BACKEND_DEFAULT;
     Terminal_termination_policy            termination_policy;
+    std::optional<Terminal_backend_output_delivery_limits>
+                                           output_delivery_limits;
 };
 
 struct Terminal_backend_error
@@ -272,6 +283,7 @@ inline std::optional<Terminal_effective_launch_config> make_effective_launch_con
         *config.initial_grid_size,
         config.process_group_policy,
         config.termination_policy,
+        config.output_delivery_limits,
     };
 }
 

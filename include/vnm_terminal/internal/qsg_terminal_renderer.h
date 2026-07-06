@@ -450,6 +450,7 @@ public:
     // publish() runs from the scene graph update path; snapshot() is used by
     // GUI-thread diagnostics/tests and must remain safe across that boundary.
     void publish(const terminal_renderer_stats_t& stats);
+    void mark_paint_completed();
     terminal_renderer_stats_t snapshot() const;
     terminal_renderer_cumulative_stats_t cumulative_snapshot() const;
 

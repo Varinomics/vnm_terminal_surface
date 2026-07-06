@@ -80,13 +80,18 @@ void deliver_or_buffer_native_backend_output(
     Terminal_backend_callbacks&        callbacks,
     QByteArray&                        paused_output,
     bool&                              output_paused,
+    bool&                              paused_output_delivery_in_progress,
     QByteArray                         bytes,
     Can_buffer_paused_output_fn&&      can_buffer_paused_output)
 {
     bool should_deliver = false;
     {
         std::lock_guard<std::mutex> lock(mutex);
-        if (output_paused && can_buffer_paused_output()) {
+        if ((output_paused ||
+             paused_output_delivery_in_progress ||
+             !paused_output.isEmpty()) &&
+            can_buffer_paused_output())
+        {
             append_native_backend_paused_output(paused_output, std::move(bytes));
         }
         else {
