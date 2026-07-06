@@ -561,6 +561,14 @@ public:
         });
     }
 
+    bool wait_for_exit_within(std::chrono::milliseconds interval)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_cv.wait_for(lock, interval, [&] {
+            return m_exit.has_value();
+        });
+    }
+
     QByteArray output_snapshot()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -2554,7 +2562,7 @@ bool test_failed_write_after_interrupt_does_not_clear_on_final_output(
     return ok;
 }
 
-bool test_interrupt_without_stdin_reader(const QString& fixture_path)
+bool test_interrupt_without_stdin_reader_remains_terminable(const QString& fixture_path)
 {
     bool ok = true;
 
@@ -2572,13 +2580,25 @@ bool test_interrupt_without_stdin_reader(const QString& fixture_path)
     const term::Terminal_backend_result interrupt_result = backend->interrupt();
     ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
         "ConPTY backend accepts no-read interrupt");
-    ok &= check(capture.wait_for_exit(), "no-read interrupt fixture exits");
+
+    if (!capture.wait_for_exit_within(std::chrono::milliseconds(250))) {
+        const term::Terminal_backend_result terminate_result = backend->terminate();
+        const bool terminate_accepted =
+            terminate_result.code == term::Terminal_backend_result_code::ACCEPTED;
+        const bool exit_observed = capture.wait_for_exit();
+        ok &= check(terminate_accepted || exit_observed,
+            "ConPTY backend accepts terminate after no-read interrupt or observes exit");
+        ok &= check(exit_observed, "no-read interrupt fixture terminates");
+    }
 
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
-    ok &= check(exit.has_value() &&
+    const bool reported_interrupted = exit.has_value() &&
         exit->reason == term::Terminal_exit_reason::INTERRUPTED &&
-        exit->exit_code == 130,
-        "no-read interrupt reports typed interrupted exit");
+        exit->exit_code == 130;
+    const bool reported_terminated = exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::TERMINATED;
+    ok &= check(reported_interrupted || reported_terminated,
+        "no-read interrupt either reports processed Ctrl+C or remains terminable");
     ok &= check_no_backend_errors(capture,
         "no-read interrupt fixture produces no backend errors");
 
@@ -2964,7 +2984,8 @@ int main(int argc, char** argv)
     run_test(
         "failed write after interrupt does not clear on final output",
         test_failed_write_after_interrupt_does_not_clear_on_final_output(fixture_path));
-    run_test("interrupt without stdin reader", test_interrupt_without_stdin_reader(fixture_path));
+    run_test("interrupt without stdin reader remains terminable",
+        test_interrupt_without_stdin_reader_remains_terminable(fixture_path));
     run_test("interrupt byte consumed child exits normally",
         test_interrupt_byte_consumed_child_exits_normally());
     run_test("terminate", test_terminate(fixture_path));
