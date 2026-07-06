@@ -3,6 +3,7 @@
 #if defined(__linux__) || defined(__APPLE__)
 
 #include "native_backend_io_core.h"
+#include "vnm_terminal/internal/session_contract.h"
 #include <QFile>
 #include <QProcessEnvironment>
 #include <QStringList>
@@ -53,17 +54,87 @@ constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
 // wake pipe with this bound (see wait_for_write_capacity). The cost is one idle
 // wake-up per interval per thread when the terminal is silent.
 constexpr std::chrono::milliseconds k_native_master_poll_interval(100);
-// While output is paused the reader keeps draining the PTY master and buffers
-// the output application-side (m_paused_output) instead of leaving it in the
-// kernel and parking. It only parks for backpressure once the buffer reaches
-// this high-water mark. macOS flow-controls a slave write almost immediately
-// when the master is not being read (a ~19-byte write blocks), so a child that
-// emits a final line and exits while output is paused would otherwise block in
-// write() forever and never exit -- breaking exit-drain delivery. Buffering
-// app-side lets small output through (the child exits, the drain delivers it)
-// while still applying backpressure for genuinely high-volume output.
-constexpr qsizetype k_paused_output_high_watermark_bytes = 1 << 20; // 1 MiB
+static_assert(
+    k_native_backend_output_read_chunk_bytes <
+    k_terminal_default_output_queue_hard_limit_bytes -
+    k_terminal_default_output_queue_high_water_bytes);
 constexpr int k_waitpid_failure_exit_code = -1;
+
+struct Posix_paused_output_limits
+{
+    qsizetype high_watermark_bytes = 0;
+    qsizetype delivery_chunk_bytes = 0;
+    qsizetype read_chunk_bytes     = 1;
+};
+
+constexpr Terminal_backend_output_delivery_limits k_default_output_delivery_limits{
+    k_terminal_default_output_queue_high_water_bytes,
+    k_terminal_default_output_queue_hard_limit_bytes,
+};
+
+qsizetype clamped_qsizetype_byte_count(std::size_t byte_count)
+{
+    return static_cast<qsizetype>(std::min<std::size_t>(
+        byte_count,
+        static_cast<std::size_t>(std::numeric_limits<qsizetype>::max())));
+}
+
+std::size_t posix_callback_read_chunk_bytes(
+    Terminal_backend_output_delivery_limits limits)
+{
+    const std::size_t headroom =
+        limits.hard_limit_bytes > limits.high_water_bytes
+            ? limits.hard_limit_bytes - limits.high_water_bytes
+            : 1U;
+    if (headroom <= 1U) {
+        return 1U;
+    }
+
+    return std::max<std::size_t>(
+        1U,
+        std::min(k_native_backend_output_read_chunk_bytes, headroom - 1U));
+}
+
+std::size_t posix_paused_output_budget_bytes(
+    Terminal_backend_output_delivery_limits limits,
+    std::size_t                             callback_read_chunk_bytes)
+{
+    if (limits.hard_limit_bytes <= limits.high_water_bytes) {
+        return callback_read_chunk_bytes;
+    }
+
+    const std::size_t headroom =
+        limits.hard_limit_bytes - limits.high_water_bytes;
+    if (headroom <= callback_read_chunk_bytes) {
+        return 1U;
+    }
+
+    return headroom - callback_read_chunk_bytes;
+}
+
+Posix_paused_output_limits make_posix_paused_output_limits(
+    const std::optional<Terminal_backend_output_delivery_limits>& configured_limits)
+{
+    const Terminal_backend_output_delivery_limits limits =
+        configured_limits.value_or(k_default_output_delivery_limits);
+    const std::size_t read_chunk =
+        posix_callback_read_chunk_bytes(limits);
+    const std::size_t paused_budget =
+        posix_paused_output_budget_bytes(limits, read_chunk);
+    const std::size_t delivery_chunk =
+        paused_budget == 0U
+            ? 0U
+            : std::min(
+                  paused_budget,
+                  limits.high_water_bytes != 0U
+                      ? limits.high_water_bytes
+                      : paused_budget);
+    return {
+        clamped_qsizetype_byte_count(paused_budget),
+        clamped_qsizetype_byte_count(delivery_chunk),
+        clamped_qsizetype_byte_count(read_chunk),
+    };
+}
 
 QString posix_error_message(QStringView context, int code)
 {
@@ -776,6 +847,8 @@ public:
             m_child_reaped                       = false;
             m_paused_output_delivery_in_progress = false;
             m_termination_policy                 = effective_config.termination_policy;
+            m_paused_output_limits =
+                make_posix_paused_output_limits(effective_config.output_delivery_limits);
             m_exit_reason_override.reset();
             m_queued_write_bytes = 0U;
             m_write_queue.clear();
@@ -899,7 +972,10 @@ public:
                 should_wake_reader = !paused;
             }
 
-            if (!m_output_paused && !m_paused_output.isEmpty()) {
+            if (!m_output_paused &&
+                !m_paused_output_delivery_in_progress &&
+                !m_paused_output.isEmpty())
+            {
                 paused_output_delivery_started =
                     take_paused_output_for_delivery_locked(paused_output);
             }
@@ -997,7 +1073,7 @@ public:
             m_process_stopping     = true;
             m_output_paused        = false;
             m_exit_reason_override = Terminal_exit_reason::TERMINATED;
-            if (!m_paused_output.isEmpty()) {
+            if (!m_paused_output_delivery_in_progress && !m_paused_output.isEmpty()) {
                 paused_output_delivery_started =
                     take_paused_output_for_delivery_locked(paused_output);
             }
@@ -1375,12 +1451,24 @@ private:
 
     bool take_paused_output_for_delivery_locked(QByteArray& paused_output)
     {
-        if (m_paused_output.isEmpty()) {
+        if (m_paused_output_limits.delivery_chunk_bytes <= 0 ||
+            m_paused_output_delivery_in_progress             ||
+            m_paused_output.isEmpty())
+        {
             return false;
         }
 
-        paused_output = std::move(m_paused_output);
-        m_paused_output.clear();
+        const qsizetype byte_count = std::min(
+            m_paused_output.size(),
+            m_paused_output_limits.delivery_chunk_bytes);
+        if (byte_count == m_paused_output.size()) {
+            paused_output = std::move(m_paused_output);
+            m_paused_output.clear();
+        }
+        else {
+            paused_output = m_paused_output.sliced(0, byte_count);
+            m_paused_output.remove(0, byte_count);
+        }
         m_paused_output_delivery_in_progress = true;
         return true;
     }
@@ -1391,13 +1479,66 @@ private:
             return;
         }
 
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_paused_output_delivery_in_progress = false;
+        for (;;) {
+            QByteArray next_paused_output;
+            {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if ((!m_output_paused || m_process_stopping || m_stopping) &&
+                    !m_paused_output.isEmpty())
+                {
+                    const qsizetype byte_count = std::min(
+                        m_paused_output.size(),
+                        m_paused_output_limits.delivery_chunk_bytes);
+                    if (byte_count == m_paused_output.size()) {
+                        next_paused_output = std::move(m_paused_output);
+                        m_paused_output.clear();
+                    }
+                    else {
+                        next_paused_output = m_paused_output.sliced(0, byte_count);
+                        m_paused_output.remove(0, byte_count);
+                    }
+                }
+                else {
+                    m_paused_output_delivery_in_progress = false;
+                    break;
+                }
+            }
+
+            deliver_output(std::move(next_paused_output));
         }
 
         m_output_cv.notify_all();
         wake_io_threads();
+    }
+
+    void drain_paused_output_before_exit_report()
+    {
+        for (;;) {
+            QByteArray paused_output;
+            bool paused_output_delivery_started = false;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_output_cv.wait(lock, [&] {
+                    return
+                        !m_paused_output_delivery_in_progress &&
+                        (m_paused_output.isEmpty() ||
+                         !m_output_paused          ||
+                         m_process_stopping        ||
+                         m_stopping);
+                });
+                if (m_paused_output.isEmpty()) {
+                    return;
+                }
+
+                paused_output_delivery_started =
+                    take_paused_output_for_delivery_locked(paused_output);
+            }
+
+            if (!paused_output.isEmpty()) {
+                deliver_output(std::move(paused_output));
+            }
+            finish_paused_output_delivery(paused_output_delivery_started);
+        }
     }
 
     void deliver_or_buffer_output(QByteArray bytes)
@@ -1407,9 +1548,18 @@ private:
             m_callbacks,
             m_paused_output,
             m_output_paused,
+            m_paused_output_delivery_in_progress,
             std::move(bytes),
             [this] {
-                return !m_process_stopping && !m_stopping;
+                return
+                    !m_stopping                                      &&
+                    m_paused_output_limits.delivery_chunk_bytes > 0  &&
+                    m_paused_output.size() <
+                        m_paused_output_limits.high_watermark_bytes  &&
+                    (m_output_paused                         ||
+                     m_paused_output_delivery_in_progress    ||
+                     !m_paused_output.isEmpty()              ||
+                     !m_process_stopping);
             });
     }
 
@@ -1566,22 +1716,27 @@ private:
         std::optional<std::chrono::steady_clock::time_point> final_drain_deadline;
 
         for (;;) {
-            int master = -1;
-            int wake_read = -1;
+            int         master        = -1;
+            int         wake_read     = -1;
+            std::size_t bytes_to_read = buffer.size();
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 // Keep draining the master while output is paused (buffering
                 // app-side) until the paused buffer reaches the high-water mark;
                 // only then park for backpressure. This stops a child that emits
                 // a final line and exits while paused from blocking forever in
-                // write() on macOS (see k_paused_output_high_watermark_bytes).
+                // write() on macOS. The paused high-water mark is derived from
+                // the owning session's callback queue hard/high-water limits.
                 const auto reader_can_proceed = [&] {
-                    return m_stopping ||
+                    const bool direct_delivery_available =
+                        !m_output_paused && m_paused_output.isEmpty();
+                    const bool paused_buffer_room_available =
+                        m_paused_output.size() <
+                            m_paused_output_limits.high_watermark_bytes;
+                    return
+                        m_stopping ||
                         (!m_paused_output_delivery_in_progress &&
-                            (m_process_stopping ||
-                             !m_output_paused ||
-                             m_paused_output.size() <
-                                 k_paused_output_high_watermark_bytes));
+                         (direct_delivery_available || paused_buffer_room_available));
                 };
                 m_output_cv.wait(lock, reader_can_proceed);
 
@@ -1596,6 +1751,19 @@ private:
 
                 master = m_master.get();
                 wake_read = m_read_wake_read.get();
+                bytes_to_read =
+                    static_cast<std::size_t>(m_paused_output_limits.read_chunk_bytes);
+                if ((m_output_paused || !m_paused_output.isEmpty()) &&
+                    m_paused_output.size() <
+                        m_paused_output_limits.high_watermark_bytes)
+                {
+                    const qsizetype paused_output_room =
+                        m_paused_output_limits.high_watermark_bytes -
+                            m_paused_output.size();
+                    bytes_to_read = static_cast<std::size_t>(std::min<qsizetype>(
+                        static_cast<qsizetype>(bytes_to_read),
+                        paused_output_room));
+                }
             }
 
             pollfd fds[2] = {
@@ -1649,7 +1817,7 @@ private:
                 continue;
             }
 
-            const ssize_t bytes_read = ::read(master, buffer.data(), buffer.size());
+            const ssize_t bytes_read = ::read(master, buffer.data(), bytes_to_read);
             if (bytes_read < 0) {
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
                     continue;
@@ -1841,7 +2009,7 @@ private:
                 m_output_paused = false;
                 m_write_queue.clear();
                 m_queued_write_bytes = 0U;
-                if (!m_paused_output.isEmpty()) {
+                if (!m_paused_output_delivery_in_progress && !m_paused_output.isEmpty()) {
                     paused_output_delivery_started =
                         take_paused_output_for_delivery_locked(paused_output);
                 }
@@ -1854,6 +2022,7 @@ private:
             m_write_cv.notify_all();
             wake_io_threads();
             wait_for_reader_finished();
+            drain_paused_output_before_exit_report();
             report_error(
                 Terminal_backend_error_code::TERMINATE_FAILED,
                 posix_error_message(QStringLiteral("waitpid"), wait_error));
@@ -1874,7 +2043,7 @@ private:
             m_post_exit_process_group_cleanup_pending = true;
             m_write_queue.clear();
             m_queued_write_bytes = 0U;
-            if (!m_paused_output.isEmpty()) {
+            if (!m_paused_output_delivery_in_progress && !m_paused_output.isEmpty()) {
                 paused_output_delivery_started =
                     take_paused_output_for_delivery_locked(paused_output);
             }
@@ -1897,6 +2066,7 @@ private:
         // descendant alive -- diverging from Linux. Wait out the remainder of the
         // drain window (interruptibly, so shutdown is not delayed).
         wait_out_exit_drain_window(reap_time);
+        drain_paused_output_before_exit_report();
         // Report the child's exit BEFORE reaping leftover descendants. The
         // descendant must remain observable as alive until the backend reports
         // the direct child's exit (the contract a consumer relies on); the
@@ -2013,6 +2183,8 @@ private:
     std::deque<Queued_write>            m_write_queue;
     std::optional<Terminal_exit_reason> m_exit_reason_override;
     Terminal_termination_policy         m_termination_policy;
+    Posix_paused_output_limits          m_paused_output_limits =
+                                        make_posix_paused_output_limits(std::nullopt);
     std::size_t                         m_queued_write_bytes = 0U;
     std::size_t                         m_public_call_depth = 0U;
     pid_t                               m_child_pid = -1;

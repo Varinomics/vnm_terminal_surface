@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 class VNM_TerminalSurface;
@@ -167,6 +168,14 @@ public:
     static void set_pending_published_mouse_report_block_count_for_testing(
         VNM_TerminalSurface&       surface,
         int                        count);
+
+    static void set_backend_event_epoch_notifier_hook_for_testing(
+        VNM_TerminalSurface&       surface,
+        std::function<void()>      hook);
+
+    static void set_before_backend_callback_follow_up_hook_for_testing(
+        VNM_TerminalSurface&       surface,
+        std::function<void()>      hook);
 
     static void simulate_update_polish(
         VNM_TerminalSurface&       surface);

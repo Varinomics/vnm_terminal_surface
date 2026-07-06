@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstring>
@@ -416,6 +417,14 @@ std::uint64_t current_thread_id()
 {
     return static_cast<std::uint64_t>(
         reinterpret_cast<quintptr>(QThread::currentThreadId()));
+}
+
+std::uint64_t elapsed_ns_since(
+    std::chrono::steady_clock::time_point started)
+{
+    const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - started);
+    return static_cast<std::uint64_t>(elapsed_ns.count());
 }
 
 QShader load_shader(const char* path)
@@ -2093,6 +2102,7 @@ public:
 
     void prepare() override
     {
+        const auto prepare_started = std::chrono::steady_clock::now();
         Active_profiler_binding profiler_binding(m_frame.render_profiler.get());
         VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::prepare");
 
@@ -2191,10 +2201,8 @@ public:
                     return resources_ready;
                 };
 
-            bool retried_msdf_text_fallback     = false;
-            bool retried_populated_frame_upload = false;
-            bool force_populated_frame_upload   = false;
-            bool gpu_resources_ready            = prepare_gpu_resources(prepare_result);
+            bool retried_msdf_text_fallback = false;
+            bool gpu_resources_ready        = prepare_gpu_resources(prepare_result);
             std::optional<Qsg_atlas_render_summary> msdf_failure_render;
             const auto retry_without_msdf_text_ownership = [&]() {
                 record_msdf_text_resource_failure(prepare_result);
@@ -2202,25 +2210,11 @@ public:
                 m_msdf_text_resource_failure_disabled = true;
                 retried_msdf_text_fallback = true;
                 restore_prepare_layout_state(prepare_layout_state);
-                prepare_result =
-                    prepare_atlas_instances(rhi, force_populated_frame_upload);
+                prepare_result = prepare_atlas_instances(rhi);
                 publish_prepare_upload_directives(prepare_result.commit);
                 qsg_atlas_merge_msdf_text_failure_diagnostics(
                     *msdf_failure_render,
                     prepare_result.render);
-                gpu_resources_ready = prepare_gpu_resources(prepare_result);
-            };
-            const auto retry_with_populated_frame_upload = [&]() {
-                retried_populated_frame_upload = true;
-                force_populated_frame_upload   = true;
-                restore_prepare_layout_state(prepare_layout_state);
-                prepare_result = prepare_atlas_instances(rhi, true);
-                publish_prepare_upload_directives(prepare_result.commit);
-                if (msdf_failure_render.has_value()) {
-                    qsg_atlas_merge_msdf_text_failure_diagnostics(
-                        *msdf_failure_render,
-                        prepare_result.render);
-                }
                 gpu_resources_ready = prepare_gpu_resources(prepare_result);
             };
 
@@ -2248,14 +2242,6 @@ public:
             bool buffers_ready =
                 buffer_update_result == Qsg_atlas_buffer_update_result::READY;
             while (!buffers_ready) {
-                constexpr Qsg_atlas_buffer_update_result populated_frame_result =
-                    Qsg_atlas_buffer_update_result::FULL_UPLOAD_REQUIRES_POPULATED_FRAME;
-                const bool needs_populated_frame =
-                    buffer_update_result == populated_frame_result;
-                if (!retried_populated_frame_upload && needs_populated_frame) {
-                    retry_with_populated_frame_upload();
-                }
-                else
                 if (msdf_text_fallback_allowed &&
                     qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
                         retried_msdf_text_fallback,
@@ -2349,6 +2335,7 @@ public:
         if (m_recorder != nullptr) {
             m_recorder->record_prepare(
                 m_frame,
+                elapsed_ns_since(prepare_started),
                 command_buffer_non_null,
                 render_target_non_null,
                 rhi_non_null,
@@ -2369,6 +2356,7 @@ public:
 
     void render(const RenderState* state) override
     {
+        const auto render_started = std::chrono::steady_clock::now();
         QRect viewport_rect;
         bool  drew = false;
         {
@@ -2424,6 +2412,7 @@ public:
         if (m_recorder != nullptr) {
             m_recorder->record_render(
                 m_frame,
+                elapsed_ns_since(render_started),
                 viewport_rect,
                 drew);
         }
@@ -3887,9 +3876,7 @@ private:
             });
     }
 
-    Atlas_prepare_result prepare_atlas_instances(
-        QRhi* rhi,
-        bool  force_full_cell_walk = false)
+    Atlas_prepare_result prepare_atlas_instances(QRhi* rhi)
     {
         VNM_TERMINAL_PROFILE_SCOPE("Qsg_atlas_render_node::prepare_atlas_instances");
 
@@ -3950,20 +3937,6 @@ private:
             render_cursor_state_key(render_frame);
         std::vector<int> current_cursor_layer_rows =
             cursor_layer_rows(render_frame);
-        if (force_full_cell_walk ||
-            m_force_next_render_full_upload)
-        {
-            render_frame = build_terminal_render_frame(
-                m_frame.snapshot.get(),
-                m_frame.logical_size,
-                m_frame.cell_metrics,
-                m_frame.options,
-                m_frame.cursor_blink_visible,
-                &m_frame.ime_preedit);
-            m_render_row_count = render_frame.grid_size.rows;
-            current_cursor_key = render_cursor_state_key(render_frame);
-            current_cursor_layer_rows = cursor_layer_rows(render_frame);
-        }
         m_render_dirty_row_ranges = dirty_ranges_with_cursor_layer_rows(
             render_frame.dirty_row_ranges,
             current_cursor_key,
@@ -6479,13 +6452,6 @@ private:
             render_summary->glyph_buffer     = glyph_plan.summary;
             render_summary->msdf_text_buffer = msdf_text_plan.summary;
         }
-        if (rect_plan.summary.full_upload_requires_populated_frame ||
-            glyph_plan.summary.full_upload_requires_populated_frame ||
-            msdf_text_plan.summary.full_upload_requires_populated_frame)
-        {
-            return
-                Qsg_atlas_buffer_update_result::FULL_UPLOAD_REQUIRES_POPULATED_FRAME;
-        }
 
         QRhiResourceUpdateBatch* updates = rhi->nextResourceUpdateBatch();
         if (m_static_vertex_upload_needed) {
@@ -7637,6 +7603,7 @@ void Qsg_atlas_recorder::record_capture(const Captured_atlas_frame& frame)
 
 void Qsg_atlas_recorder::record_prepare(
     const Captured_atlas_frame&    frame,
+    std::uint64_t                  prepare_elapsed_ns,
     bool                           command_buffer_non_null,
     bool                           render_target_non_null,
     bool                           rhi_non_null,
@@ -7657,6 +7624,7 @@ void Qsg_atlas_recorder::record_prepare(
 
     const std::lock_guard<std::mutex> lock(m_mutex);
     ++m_report.prepare_count;
+    m_report.prepare_elapsed_ns            += prepare_elapsed_ns;
     m_report.command_buffer_non_null        = command_buffer_non_null;
     m_report.render_target_non_null         = render_target_non_null;
     m_report.rhi_non_null                   = rhi_non_null;
@@ -7727,11 +7695,13 @@ void Qsg_atlas_recorder::record_prepare(
 
 void Qsg_atlas_recorder::record_render(
     const Captured_atlas_frame& frame,
+    std::uint64_t               render_elapsed_ns,
     QRect                       viewport_rect,
     bool                        drew)
 {
     const std::lock_guard<std::mutex> lock(m_mutex);
     ++m_report.render_count;
+    m_report.render_elapsed_ns             += render_elapsed_ns;
     m_report.render_capture_sequence        = frame.capture_sequence;
     m_report.render_snapshot_sequence       = snapshot_sequence(frame);
     m_report.render_publication_generation  = publication_generation(frame);

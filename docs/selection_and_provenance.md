@@ -22,8 +22,8 @@ drag advances `Terminal_selection_internal_state`:
   rendered as selection spans.
 - `ATTACHED_HIDDEN`: the selection still exists but its rows are not
   currently representable in the viewport.
-- `PAYLOAD_ONLY`: the selected text payload is retained for copying, but the
-  visual attachment to rows has been dropped.
+- `PAYLOAD_ONLY`: the selected text payload is retained for host access, but
+  the visual attachment to rows has been dropped.
 
 `Terminal_selection_range` carries grid positions plus a
 `Terminal_selection_mode`. The production gesture produces `NORMAL` ranges;
@@ -81,9 +81,11 @@ cells read as spaces, wide-character continuation cells are skipped (the
 base cell contributes the text once), rows selected to the right edge trim
 trailing spaces, and rows join with `\n`. The
 `Selection_contract_controller` caches the extracted text with a payload
-identity, so copying remains possible in `PAYLOAD_ONLY` state; the copy
-shortcut is platform-dependent (see the app help text: Ctrl+C when a
-selection exists, Command+C on macOS).
+identity, so hosts can still read retained text through `selected_text()` in
+`PAYLOAD_ONLY` state. The built-in copy shortcut is narrower: it copies only an
+attached selection, including one scrolled offscreen but still backed by a
+visual lease. Detached payload-only text is host-accessible retained state, not
+plain-Ctrl+C copyable selection state.
 
 ## Diagnostics
 

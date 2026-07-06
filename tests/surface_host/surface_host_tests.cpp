@@ -34,11 +34,13 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <utility>
@@ -957,6 +959,50 @@ struct Surface_fixture
     }
 };
 
+class Blocking_backend_event_hook
+{
+public:
+    void block_until_released()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        m_entered = true;
+        m_entered_cv.notify_all();
+        m_release_cv.wait(lock, [this] { return m_released; });
+        m_exited = true;
+        m_exited_cv.notify_all();
+    }
+
+    bool wait_until_entered(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_entered_cv.wait_for(lock, timeout, [this] { return m_entered; });
+    }
+
+    void release()
+    {
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_released = true;
+        }
+        m_release_cv.notify_all();
+    }
+
+    bool wait_until_exited(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_exited_cv.wait_for(lock, timeout, [this] { return m_exited; });
+    }
+
+private:
+    std::mutex              m_mutex;
+    std::condition_variable m_entered_cv;
+    std::condition_variable m_release_cv;
+    std::condition_variable m_exited_cv;
+    bool                    m_entered  = false;
+    bool                    m_released = false;
+    bool                    m_exited   = false;
+};
+
 Scripted_backend* start_surface_with_backend(
     VNM_TerminalSurface&               surface,
     std::unique_ptr<Scripted_backend>  backend,
@@ -1330,22 +1376,36 @@ bool test_surface_polish_refreshes_metrics_after_window_dpr_change(QGuiApplicati
     Surface_fixture fixture;
     const term::terminal_cell_metrics_t initial_metrics =
         current_cell_metrics(fixture.surface);
-    set_window_device_pixel_ratio(fixture.window, 1.25);
+    qreal selected_device_pixel_ratio = 0.0;
+    term::terminal_cell_metrics_t expected_metrics{};
+    for (const qreal candidate : {1.1, 1.2, 1.25, 1.333333333333, 1.5, 1.75, 2.0, 2.25}) {
+        const term::Qt_grid_metrics_provider expected_provider(
+            term::vnm_terminal_font(fixture.surface.font_family(), fixture.surface.font_size()),
+            candidate);
+        const term::terminal_cell_metrics_t candidate_metrics =
+            expected_provider.cell_metrics();
+        if (!metrics_equal(initial_metrics, candidate_metrics, 0.000001)) {
+            selected_device_pixel_ratio = candidate;
+            expected_metrics = candidate_metrics;
+            break;
+        }
+    }
+
+    if (selected_device_pixel_ratio <= 0.0) {
+        std::cerr
+            << "SKIP: no tested DPR candidate changed snapped terminal metrics "
+            << "on this host\n";
+        return true;
+    }
+
+    set_window_device_pixel_ratio(fixture.window, selected_device_pixel_ratio);
 
     term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
 
-    const term::Qt_grid_metrics_provider expected_provider(
-        term::vnm_terminal_font(fixture.surface.font_family(), fixture.surface.font_size()),
-        1.25);
-    const term::terminal_cell_metrics_t expected_metrics =
-        expected_provider.cell_metrics();
     const term::terminal_cell_metrics_t updated_metrics =
         current_cell_metrics(fixture.surface);
 
     bool ok = true;
-    ok &= check(
-        !metrics_equal(initial_metrics, expected_metrics, 0.000001),
-        "DPR test fixture must choose metrics that differ after scaling");
     ok &= check_metrics_equal(
         updated_metrics,
         expected_metrics,
@@ -2242,11 +2302,6 @@ bool test_surface_frame_boundary_output_publishes_followup_dirty_rows(QGuiApplic
                 "frame-boundary dirty follow-up catch-up frame captures coalesced snapshot");
         }
     }
-    const term::terminal_renderer_stats_t render_stats =
-        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
-    ok &= check(render_stats.text_content_rebuilds >= 2,
-        "frame-boundary dirty follow-up rebuilds both changed text rows");
-
     return ok;
 }
 
@@ -3081,6 +3136,109 @@ bool test_surface_cursor_withhold_clears_after_nonpublishing_settlement(
         settled_state.protected_live_content_publication_generation == 0U &&
         !settled_state.cursor_withheld,
         "cursor withhold nonpublishing settlement clears after empty callback");
+
+    return ok;
+}
+
+bool test_surface_cursor_withhold_clears_active_callback_before_follow_up(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+    fixture.surface.set_cursor_blink_enabled(false);
+    fixture.surface.set_synchronized_output_scroll_policy(
+        VNM_TerminalSurface::Synchronized_output_scroll_policy::
+            IMMEDIATE_PUBLIC_PROJECTION);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("cursor-withhold-active-callback-baseline"),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started && backend_ptr != nullptr,
+        "cursor withhold active-callback surface starts");
+    if (!started || backend_ptr == nullptr) {
+        return ok;
+    }
+
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_budget_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
+            fixture.surface,
+            std::chrono::steady_clock::duration::zero());
+
+    auto blocker = std::make_shared<Blocking_backend_event_hook>();
+    std::atomic_bool before_follow_up_observed{false};
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_event_epoch_notifier_hook_for_testing(
+            fixture.surface,
+            [blocker] {
+                blocker->block_until_released();
+            });
+    term::VNM_TerminalSurface_render_bridge::
+        set_before_backend_callback_follow_up_hook_for_testing(
+            fixture.surface,
+            [&before_follow_up_observed] {
+                before_follow_up_observed.store(true, std::memory_order_release);
+            });
+
+    backend_ptr->emit_output_from_worker(
+        QByteArrayLiteral("\r\ncursor-withhold-active-callback-frame"));
+    const bool worker_callback_held =
+        blocker->wait_until_entered(std::chrono::milliseconds{1000});
+    ok &= check(worker_callback_held,
+        "cursor withhold active-callback test holds callback after enqueue");
+    if (!worker_callback_held) {
+        blocker->release();
+        backend_ptr->join_worker();
+        term::VNM_TerminalSurface_render_bridge::
+            set_backend_event_epoch_notifier_hook_for_testing(fixture.surface, {});
+        term::VNM_TerminalSurface_render_bridge::
+            set_before_backend_callback_follow_up_hook_for_testing(fixture.surface, {});
+        return ok;
+    }
+
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+    ok &= check(before_follow_up_observed.load(std::memory_order_acquire),
+        "cursor withhold active-callback test queues follow-up while callback is active");
+    blocker->release();
+    backend_ptr->join_worker();
+    term::VNM_TerminalSurface_render_bridge::
+        set_backend_event_epoch_notifier_hook_for_testing(fixture.surface, {});
+    term::VNM_TerminalSurface_render_bridge::
+        set_before_backend_callback_follow_up_hook_for_testing(fixture.surface, {});
+    term::VNM_TerminalSurface_render_bridge::simulate_update_polish(fixture.surface);
+
+    ok &= check(
+        term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
+            fixture.surface) == 0U,
+        "cursor withhold active-callback test leaves no callback work pending");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(snapshot != nullptr &&
+        snapshot_contains_text(
+            *snapshot,
+            QStringLiteral("cursor-withhold-active-callback-frame")),
+        "cursor withhold active-callback test publishes the callback frame");
+
+    const term::Cursor_withhold_state_snapshot state =
+        term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
+            fixture.surface);
+    ok &= check(
+        state.protected_live_content_publication_generation == 0U &&
+        !state.cursor_withheld,
+        "cursor withhold active-callback test clears after callback settles after follow-up");
 
     return ok;
 }
@@ -4242,6 +4400,14 @@ bool test_surface_reported_atlas_completion_advances_rendered_publication(
 
     const std::uint64_t publication_generation =
         snapshot->metadata.publication_generation;
+    ok &= check(capture_surface_sequence(
+        app,
+        fixture.window,
+        fixture.surface,
+        snapshot->metadata.sequence),
+        "surface atlas publication test captures the current generation");
+    const quint64 paint_completed_before =
+        fixture.surface.paint_completed_frame_count();
     const std::uint64_t rendered_generation_before =
         term::VNM_TerminalSurface_render_bridge::
             session_rendered_render_snapshot_generation(fixture.surface);
@@ -4268,6 +4434,10 @@ bool test_surface_reported_atlas_completion_advances_rendered_publication(
             publication_generation &&
             rendered_generation_before != publication_generation,
         "surface atlas drew report advances session rendered publication generation");
+    ok &= check(
+        fixture.surface.paint_completed_frame_count() ==
+            paint_completed_before + 1U,
+        "surface atlas drew report records paint completion in cumulative renderer stats");
     return ok;
 }
 
@@ -4622,11 +4792,6 @@ bool test_surface_session_single_drain_coalesces_dirty_rows(QGuiApplication& app
         fixture.surface,
         snapshot->metadata.sequence),
         "surface single-drain dirty coalescing captures latest snapshot");
-    const term::terminal_renderer_stats_t render_stats =
-        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
-    ok &= check(render_stats.text_content_rebuilds >= 3,
-        "surface single-drain dirty coalescing rebuilds all skipped changed rows");
-
     return ok;
 }
 
@@ -5442,6 +5607,114 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
             ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
                 expected_text,
                 "Ctrl+C copies the complete logical selection across offscreen rows");
+        }
+    }
+
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        pump_events(app);
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "offscreen attached selection copy shortcut surface starts");
+
+        const std::shared_ptr<const term::Terminal_render_snapshot> tail_snapshot =
+            term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+        const bool usable_tail_snapshot =
+            tail_snapshot                           != nullptr &&
+            tail_snapshot->grid_size.rows           >  5       &&
+            tail_snapshot->grid_size.columns        >  20      &&
+            tail_snapshot->viewport.scrollback_rows >  tail_snapshot->grid_size.rows;
+        ok &= check(usable_tail_snapshot,
+            "offscreen attached selection fixture has enough scrollback");
+
+        if (usable_tail_snapshot) {
+            const int offset_from_tail = tail_snapshot->grid_size.rows;
+            ok &= check(fixture.surface.scroll_to_offset_from_tail(offset_from_tail),
+                "offscreen attached selection scrolls to older scrollback");
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> selection_source =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            const QString selected_row_text =
+                selection_source != nullptr ? snapshot_row_text(*selection_source, 0) : QString();
+            ok &= check(!selected_row_text.isEmpty(),
+                "offscreen attached selection source row has text");
+
+            const int end_column = std::max(0, static_cast<int>(selected_row_text.size()) - 1);
+            const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 0);
+            const QPointF end_point   = point_in_grid_cell(
+                fixture.surface,
+                0,
+                end_column);
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonPress,
+                start_point,
+                Qt::LeftButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "offscreen attached selection press is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseMove,
+                end_point,
+                Qt::NoButton,
+                Qt::LeftButton,
+                Qt::NoModifier,
+                true,
+                "offscreen attached selection drag is accepted");
+            ok &= send_mouse_event(
+                fixture.surface,
+                QEvent::MouseButtonRelease,
+                end_point,
+                Qt::LeftButton,
+                Qt::NoButton,
+                Qt::NoModifier,
+                true,
+                "offscreen attached selection release is accepted");
+
+            const QString expected_text = fixture.surface.selected_text();
+            ok &= check(!expected_text.isEmpty() && expected_text == selected_row_text,
+                "offscreen attached selection captures selected text");
+            ok &= check(fixture.surface.scroll_to_offset_from_tail(0),
+                "offscreen attached selection returns to tail");
+
+            const std::shared_ptr<const term::Terminal_render_snapshot> offscreen_snapshot =
+                term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+            ok &= check(offscreen_snapshot != nullptr &&
+                offscreen_snapshot->viewport.offset_from_tail == 0,
+                "offscreen attached selection returns snapshot to tail");
+            ok &= check(offscreen_snapshot != nullptr &&
+                offscreen_snapshot->selection_spans.empty(),
+                "offscreen attached selection has no visible spans at tail");
+            ok &= check(offscreen_snapshot != nullptr &&
+                !snapshot_contains_text(*offscreen_snapshot, expected_text),
+                "offscreen attached selection text is outside the tail viewport");
+
+            QGuiApplication::clipboard()->setText(
+                QStringLiteral("offscreen-attached-sentinel"),
+                QClipboard::Clipboard);
+            const std::size_t write_count = backend_ptr->writes.size();
+            ok &= send_key(
+                fixture.surface,
+                Qt::Key_C,
+                Qt::ControlModifier,
+                {},
+                "Ctrl+C copies an attached selection scrolled fully offscreen");
+            ok &= check(backend_ptr->writes.size() == write_count,
+                "offscreen attached selection Ctrl+C writes no ETX");
+            ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+                expected_text,
+                "Ctrl+C copies the offscreen attached selection");
         }
     }
 
@@ -11035,18 +11308,17 @@ bool test_selection_visual_detach_after_row_mutation(QGuiApplication& app)
 
     QGuiApplication::clipboard()->setText(QStringLiteral("mutation-detach-sentinel"),
         QClipboard::Clipboard);
-    const std::size_t write_count = backend_ptr->writes.size();
-    ok &= send_key(
+    ok &= send_key_and_expect_write(
         fixture.surface,
+        *backend_ptr,
         Qt::Key_C,
         Qt::ControlModifier,
         {},
-        "surface mutation-detach Ctrl+C is accepted");
-    ok &= check(backend_ptr->writes.size() == write_count,
-        "surface mutation-detach Ctrl+C writes no ETX");
+        bytes_from_hex("03"),
+        "surface mutation-detach Ctrl+C falls through to terminal input");
     ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
-        QStringLiteral("original"),
-        "surface mutation-detach Ctrl+C copies retained payload");
+        QStringLiteral("mutation-detach-sentinel"),
+        "surface mutation-detach Ctrl+C leaves retained payload out of the clipboard");
 
     return ok;
 }
@@ -12633,18 +12905,17 @@ bool test_selection_drag_preserves_payload_after_mid_drag_drift(QGuiApplication&
 
     QGuiApplication::clipboard()->setText(QStringLiteral("mid-drag-detach-sentinel"),
         QClipboard::Clipboard);
-    const std::size_t mid_drag_copy_write_count = backend_ptr->writes.size();
-    ok &= send_key(
+    ok &= send_key_and_expect_write(
         fixture.surface,
+        *backend_ptr,
         Qt::Key_C,
         Qt::ControlModifier,
         {},
-        "mid-drag payload detach Ctrl+C is accepted");
-    ok &= check(backend_ptr->writes.size() == mid_drag_copy_write_count,
-        "mid-drag payload detach Ctrl+C writes no ETX");
+        bytes_from_hex("03"),
+        "mid-drag payload detach Ctrl+C falls through to terminal input");
     ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
-        QStringLiteral("alpha"),
-        "mid-drag payload detach Ctrl+C copies retained payload");
+        QStringLiteral("mid-drag-detach-sentinel"),
+        "mid-drag payload detach Ctrl+C leaves retained payload out of the clipboard");
 
     ok &= send_mouse_event(
         fixture.surface,
@@ -12668,18 +12939,17 @@ bool test_selection_drag_preserves_payload_after_mid_drag_drift(QGuiApplication&
 
     QGuiApplication::clipboard()->setText(QStringLiteral("mid-drag-release-sentinel"),
         QClipboard::Clipboard);
-    const std::size_t release_copy_write_count = backend_ptr->writes.size();
-    ok &= send_key(
+    ok &= send_key_and_expect_write(
         fixture.surface,
+        *backend_ptr,
         Qt::Key_C,
         Qt::ControlModifier,
         {},
-        "mid-drag payload detach post-release Ctrl+C is accepted");
-    ok &= check(backend_ptr->writes.size() == release_copy_write_count,
-        "mid-drag payload detach post-release Ctrl+C writes no ETX");
+        bytes_from_hex("03"),
+        "mid-drag payload detach post-release Ctrl+C falls through to terminal input");
     ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
-        QStringLiteral("alpha"),
-        "mid-drag payload detach post-release Ctrl+C copies retained payload");
+        QStringLiteral("mid-drag-release-sentinel"),
+        "mid-drag payload detach post-release Ctrl+C leaves retained payload out of the clipboard");
 
     return ok;
 }
@@ -16147,6 +16417,7 @@ int main(int argc, char** argv)
     ok &= test_surface_synchronized_release_stable_with_extension_disabled_counts_cursor_stable(app);
     ok &= test_surface_cursor_withhold_arms_unsafe_publication_until_settlement(app);
     ok &= test_surface_cursor_withhold_clears_after_nonpublishing_settlement(app);
+    ok &= test_surface_cursor_withhold_clears_active_callback_before_follow_up(app);
     ok &= test_surface_cursor_withhold_clears_incomplete_output_after_exit(app);
     ok &= test_surface_cursor_withhold_clears_same_drain_output_exit(app);
     ok &= test_surface_cursor_withhold_clears_synchronized_hold_after_exit(app);

@@ -28,7 +28,8 @@ against an app build that consumes this surface.
 | Surface / host API (scroll, selection, paste, focus, clipboard) | `vnm_terminal_surface_host` | surface |
 | Screen model, parser, and escape-sequence behavior | `vnm_terminal_screen_basic`, `vnm_terminal_screen_operations`, `vnm_terminal_screen_alternate`, `vnm_terminal_screen_sgr`, `vnm_terminal_terminal_modes`, `vnm_terminal_viewport`, `vnm_terminal_sequence_matrix`, `vnm_terminal_parser_ir`, `vnm_terminal_parser_randomized` | surface |
 | CLI / application behavior | `vnm_terminal_smoke`, `vnm_terminal_help_*`, `vnm_terminal_rejects_*` | application |
-| Metrics and diagnostics output | `vnm_terminal_metrics_json_smoke` | application |
+| Metrics and diagnostics output | `vnm_terminal_diagnostics_text_layout`, `vnm_terminal_diagnostics_schema_sync` | surface |
+| Application metrics output | `vnm_terminal_metrics_json_smoke` | application |
 | Transcript capture/replay | `vnm_terminal_transcript` | surface |
 
 ## Notes On Specific Targets
@@ -69,9 +70,10 @@ for local runs.
 
 - CI runs on Windows, Linux, and macOS.
 - Linux and macOS run the full `ctest` suite, including the POSIX backend tests.
-- Windows CI excludes `vnm_terminal_windows_conpty_backend` and
-  `vnm_terminal_compat_smoke`. Run those two locally on Windows, since CI does
-  not cover them.
+- Windows CI runs `vnm_terminal_windows_conpty_backend` in the normal test suite
+  and in a focused AddressSanitizer job.
+- Windows CI still excludes `vnm_terminal_compat_smoke`. Run it locally on
+  Windows for the full native-surface fixture compatibility smoke.
 - Benchmarks are not built in CI. Build with
   `-DVNM_TERMINAL_BUILD_BENCHMARKS=ON` locally to verify benchmark edits.
 - The application CI checks out this surface at `ref: master`. For a cross-repo
@@ -80,4 +82,3 @@ for local runs.
 - All tests run offscreen with `QT_QPA_PLATFORM=offscreen`.
 - `ctest` works without the Visual Studio developer shell; the developer shell is
   needed only to configure and build native MSVC targets.
-</content>

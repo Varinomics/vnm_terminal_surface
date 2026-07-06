@@ -64,10 +64,13 @@ enum class Terminal_session_result_code
     BACKEND_REJECTED,
 };
 
+constexpr std::size_t k_terminal_default_output_queue_high_water_bytes =  64U * 1024U;
+constexpr std::size_t k_terminal_default_output_queue_hard_limit_bytes = 256U * 1024U;
+
 struct Terminal_queue_limits
 {
-    std::size_t high_water_bytes       = 64U * 1024U;
-    std::size_t hard_limit_bytes       = 256U * 1024U;
+    std::size_t high_water_bytes       = k_terminal_default_output_queue_high_water_bytes;
+    std::size_t hard_limit_bytes       = k_terminal_default_output_queue_hard_limit_bytes;
     std::size_t high_water_commands    = 256U;
     std::size_t hard_limit_commands    = 1024U;
 };

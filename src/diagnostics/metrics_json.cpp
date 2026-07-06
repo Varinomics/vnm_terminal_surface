@@ -72,9 +72,6 @@ QJsonObject atlas_buffer_summary_json(
     object.insert(QStringLiteral("partial_upload"), summary.partial_upload);
     object.insert(QStringLiteral("skipped_upload"), summary.skipped_upload);
     object.insert(
-        QStringLiteral("full_upload_requires_populated_frame"),
-        summary.full_upload_requires_populated_frame);
-    object.insert(
         QStringLiteral("rotating_slot_seed_upload"),
         summary.rotating_slot_seed_upload);
     object.insert(

@@ -309,7 +309,6 @@ enum class Qsg_atlas_buffer_update_result
     RECT_BUFFER_FAILED,
     GLYPH_BUFFER_FAILED,
     MSDF_TEXT_BUFFER_FAILED,
-    FULL_UPLOAD_REQUIRES_POPULATED_FRAME,
 };
 
 bool qsg_atlas_should_retry_msdf_text_fallback_after_buffer_update(
@@ -353,7 +352,6 @@ struct Qsg_atlas_buffer_update_summary
     bool full_upload                   = false;
     bool partial_upload                = false;
     bool skipped_upload                = false;
-    bool full_upload_requires_populated_frame = false;
     bool rotating_slot_seed_upload     = false;
     bool buffer_recreated_upload       = false;
     bool instance_layout_changed_upload = false;
@@ -676,7 +674,9 @@ struct Qsg_atlas_frame_report
 {
     std::uint64_t capture_count                   = 0U;
     std::uint64_t prepare_count                   = 0U;
+    std::uint64_t prepare_elapsed_ns              = 0U;
     std::uint64_t render_count                    = 0U;
+    std::uint64_t render_elapsed_ns               = 0U;
     std::uint64_t capture_sequence                = 0U;
     std::uint64_t captured_snapshot_sequence      = 0U;
     std::uint64_t captured_publication_generation = 0U;
@@ -771,6 +771,7 @@ public:
     void record_capture(const Captured_atlas_frame& frame);
     void record_prepare(
         const Captured_atlas_frame&   frame,
+        std::uint64_t                 prepare_elapsed_ns,
         bool                          command_buffer_non_null,
         bool                          render_target_non_null,
         bool                          rhi_non_null,
@@ -788,6 +789,7 @@ public:
         const Qsg_atlas_warm_lazy_summary& warm_lazy_summary);
     void record_render(
         const Captured_atlas_frame& frame,
+        std::uint64_t               render_elapsed_ns,
         QRect                       viewport_rect,
         bool                        drew);
 

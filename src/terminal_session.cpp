@@ -1884,6 +1884,12 @@ Terminal_session_result Terminal_session::start(Terminal_launch_config launch_co
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     drain_backend_callback_commands();
 
+    launch_config.output_delivery_limits =
+        Terminal_backend_output_delivery_limits{
+            m_config.output_queue_limits.high_water_bytes,
+            m_config.output_queue_limits.hard_limit_bytes,
+        };
+
     const std::uint64_t sequence = next_sequence();
     return enqueue_and_process_synchronous_command(
         make_start_command(sequence, std::move(launch_config)));
@@ -4448,8 +4454,6 @@ Terminal_backend_callbacks Terminal_session::make_backend_callbacks()
     const std::function<void()> backend_event_notifier = m_config.backend_event_notifier;
     const std::function<void(std::uint64_t)> backend_event_epoch_notifier =
         m_config.backend_event_epoch_notifier;
-    const bool deferred_callback_delivery = uses_deferred_backend_callbacks(m_config);
-
     const auto notify_backend_event = [
         backend_event_notifier,
         backend_event_epoch_notifier](Terminal_session* session) {
@@ -4471,7 +4475,7 @@ Terminal_backend_callbacks Terminal_session::make_backend_callbacks()
 
     Terminal_backend_callbacks callbacks;
     callbacks.output_received =
-        [lifetime, notify_backend_event, deferred_callback_delivery](QByteArray bytes) {
+        [lifetime, notify_backend_event](QByteArray bytes) {
             Backend_callback_invocation callback(lifetime);
             if (Terminal_session* session = callback.session()) {
                 session->record_backend_output_capture_chunk(bytes);
@@ -4479,8 +4483,7 @@ Terminal_backend_callbacks Terminal_session::make_backend_callbacks()
             const Terminal_queue_result queue_result =
                 callback.enqueue(make_backend_output_command(0U, std::move(bytes)));
             if (Terminal_session* session = callback.session()) {
-                if (deferred_callback_delivery &&
-                    queue_result.code == Terminal_queue_result_code::ACCEPTED &&
+                if (queue_result.code == Terminal_queue_result_code::ACCEPTED &&
                     queue_result.high_water_reached)
                 {
                     session->pause_backend_output_from_callback_ingress();
@@ -4564,7 +4567,23 @@ void Terminal_session::pause_backend_output_from_callback_ingress()
         return;
     }
 
-    set_output_backpressure_active(true, next_sequence());
+    const std::uint64_t sequence = next_sequence();
+    if (m_output_backpressure_active) {
+        const bool backend_can_accept_pause =
+            m_backend != nullptr &&
+            (m_process_state == Terminal_process_state::RUNNING ||
+             m_process_state == Terminal_process_state::STARTING) &&
+            !m_stop_requested;
+        if (backend_can_accept_pause) {
+            const Terminal_backend_result pause_result = m_backend->set_output_paused(true);
+            if (is_backend_rejection(pause_result)) {
+                record_backend_error(sequence, *pause_result.error);
+            }
+        }
+        return;
+    }
+
+    set_output_backpressure_active(true, sequence);
 }
 
 void Terminal_session::drain_backend_callback_commands()
@@ -7215,33 +7234,67 @@ void Terminal_session::set_output_backpressure_active(
     bool           active,
     std::uint64_t  sequence)
 {
+    const bool backend_can_accept_pause =
+        m_backend != nullptr &&
+        (m_process_state == Terminal_process_state::RUNNING ||
+         m_process_state == Terminal_process_state::STARTING) &&
+        !m_stop_requested;
+
     if (m_output_backpressure_active == active) {
         return;
     }
 
-    if (m_backend           != nullptr                           &&
-        (m_process_state == Terminal_process_state::RUNNING ||
-         m_process_state == Terminal_process_state::STARTING) &&
-        !m_stop_requested)
+    if (!active) {
+        m_output_backpressure_active = false;
+        record_notification({
+            Terminal_session_notification_kind::OUTPUT_BACKPRESSURE_CHANGED,
+            sequence,
+            QStringLiteral("output backpressure released"),
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            false,
+        });
+
+        if (backend_can_accept_pause) {
+            const Terminal_backend_result pause_result = m_backend->set_output_paused(false);
+            if (is_backend_rejection(pause_result)) {
+                if (!m_output_backpressure_active) {
+                    m_output_backpressure_active = true;
+                    record_notification({
+                        Terminal_session_notification_kind::OUTPUT_BACKPRESSURE_CHANGED,
+                        sequence,
+                        QStringLiteral("output backpressure active"),
+                        std::nullopt,
+                        std::nullopt,
+                        std::nullopt,
+                        true,
+                    });
+                }
+                record_backend_error(sequence, *pause_result.error);
+            }
+        }
+        return;
+    }
+
+    if (backend_can_accept_pause)
     {
-        const Terminal_backend_result pause_result = m_backend->set_output_paused(active);
+        const Terminal_backend_result pause_result = m_backend->set_output_paused(true);
         if (is_backend_rejection(pause_result)) {
             record_backend_error(sequence, *pause_result.error);
             return;
         }
     }
 
-    m_output_backpressure_active = active;
+    m_output_backpressure_active = true;
     record_notification({
         Terminal_session_notification_kind::OUTPUT_BACKPRESSURE_CHANGED,
         sequence,
-        active
-            ? QStringLiteral("output backpressure active")
-            : QStringLiteral("output backpressure released"),
+        QStringLiteral("output backpressure active"),
         std::nullopt,
         std::nullopt,
         std::nullopt,
-        active,
+        true,
     });
 }
 

@@ -6,6 +6,7 @@
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 
 #include <QByteArray>
+#include <QFile>
 #include <QFileInfo>
 #include <QString>
 #include <QStringList>
@@ -104,6 +105,18 @@ bool wait_for_file(const QString& path)
     while (std::chrono::steady_clock::now() < deadline);
 
     return false;
+}
+
+bool write_gate_file(const QString& path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        std::cerr << "failed to open gate file: "
+            << file.errorString().toLocal8Bit().constData() << '\n';
+        return false;
+    }
+
+    return file.write(QByteArrayLiteral("go\n")) == 3;
 }
 
 std::vector<DWORD> current_process_conhost_children()
@@ -469,6 +482,7 @@ public:
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 m_output.append(bytes);
+                m_output_events.push_back({bytes, m_next_event_sequence++});
             }
 
             if (output_observer) {
@@ -480,6 +494,7 @@ public:
             std::lock_guard<std::mutex> lock(m_mutex);
             m_exit = exit;
             ++m_exit_count;
+            m_exit_event_sequence = m_next_event_sequence++;
             m_cv.notify_all();
         };
         callbacks.error_reported = [this](term::Terminal_backend_error error) {
@@ -568,14 +583,43 @@ public:
         return m_errors;
     }
 
+    bool output_precedes_exit(const QByteArray& needle)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_exit_event_sequence.has_value()) {
+            return false;
+        }
+
+        QByteArray output_prefix;
+        for (const Output_event& event : m_output_events) {
+            output_prefix += event.bytes;
+            if (output_prefix.contains(needle) &&
+                event.sequence < *m_exit_event_sequence)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 private:
+    struct Output_event
+    {
+        QByteArray     bytes;
+        std::size_t    sequence = 0U;
+    };
+
     std::mutex                 m_mutex;
     std::condition_variable    m_cv;
     QByteArray                 m_output;
+    std::vector<Output_event>  m_output_events;
     std::optional<term::Terminal_backend_exit>
                                m_exit;
+    std::optional<std::size_t> m_exit_event_sequence;
     std::vector<term::Terminal_backend_error>
                                m_errors;
+    std::size_t                m_next_event_sequence = 0U;
     int                        m_exit_count = 0;
 };
 
@@ -617,6 +661,38 @@ bool check_no_backend_errors(Backend_capture& capture, const char* message)
             << '\n';
     }
 
+    return check(false, message);
+}
+
+bool wait_for_in_flight_write(
+    term::Windows_conpty_backend& backend,
+    std::size_t                   minimum_bytes,
+    const char*                   message)
+{
+    term::Windows_conpty_backend_write_state_for_testing last_state;
+    const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+    do {
+        last_state = backend.write_state_for_testing();
+        if (last_state.in_flight_write_bytes >= minimum_bytes) {
+            return check(true, message);
+        }
+
+        if (last_state.stopping || last_state.writer_failed) {
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    while (std::chrono::steady_clock::now() < deadline);
+
+    std::cerr << message << ": write state queued_bytes="
+        << last_state.queued_write_bytes
+        << " queued_count=" << last_state.queued_write_count
+        << " in_flight_bytes=" << last_state.in_flight_write_bytes
+        << " running=" << last_state.running
+        << " stopping=" << last_state.stopping
+        << " writer_failed=" << last_state.writer_failed
+        << '\n';
     return check(false, message);
 }
 
@@ -845,6 +921,73 @@ QByteArray conpty_quick_exit_payload()
     return QByteArrayLiteral("quick-exit\r\n");
 }
 
+term::Terminal_launch_config powershell_script_launch_config(const QString& script_path)
+{
+    term::Terminal_launch_config config;
+    config.argv = {
+        QStringLiteral("powershell.exe"),
+        QStringLiteral("-NoLogo"),
+        QStringLiteral("-NoProfile"),
+        QStringLiteral("-ExecutionPolicy"),
+        QStringLiteral("Bypass"),
+        QStringLiteral("-File"),
+        script_path,
+    };
+    config.working_directory  = QFileInfo(script_path).absolutePath();
+    config.initial_grid_size  = term::terminal_grid_size_t{24, 80};
+    config.identity.term      = QStringLiteral("xterm-256color");
+    config.identity.colorterm = QStringLiteral("truecolor");
+    return config;
+}
+
+bool write_ignored_interrupt_powershell_script(const QString& script_path)
+{
+    const QByteArray script = QByteArrayLiteral(
+        "$ErrorActionPreference = 'Stop'\r\n"
+        "[Console]::TreatControlCAsInput = $true\r\n"
+        "[Console]::Out.WriteLine('ignore-int')\r\n"
+        "$deadline = [DateTime]::UtcNow.AddSeconds(5)\r\n"
+        "$caught = $false\r\n"
+        "while ([DateTime]::UtcNow -lt $deadline) {\r\n"
+        "    if ([Console]::KeyAvailable) {\r\n"
+        "        $key = [Console]::ReadKey($true)\r\n"
+        "        if ([int][char]$key.KeyChar -eq 3) {\r\n"
+        "            [Console]::Out.WriteLine('caught-int')\r\n"
+        "            $caught = $true\r\n"
+        "            break\r\n"
+        "        }\r\n"
+        "    }\r\n"
+        "    Start-Sleep -Milliseconds 10\r\n"
+        "}\r\n"
+        "if (-not $caught) {\r\n"
+        "    [Console]::Out.WriteLine('missed-int')\r\n"
+        "    exit 3\r\n"
+        "}\r\n"
+        "[Console]::Out.WriteLine('post-int-ready')\r\n"
+        "$key = [Console]::ReadKey($true)\r\n"
+        "if ($key.KeyChar -ne [char]'q') {\r\n"
+        "    [Console]::Out.WriteLine('unexpected-post-int-input')\r\n"
+        "    exit 4\r\n"
+        "}\r\n"
+        "[Console]::Out.WriteLine('natural-exit')\r\n"
+        "exit 130\r\n");
+
+    QFile file(script_path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        std::cerr << "failed to open ignored-interrupt script: "
+            << file.errorString().toLocal8Bit().constData() << '\n';
+        return false;
+    }
+
+    if (file.write(script) != script.size()) {
+        std::cerr << "failed to write ignored-interrupt script: "
+            << file.errorString().toLocal8Bit().constData() << '\n';
+        return false;
+    }
+
+    return true;
+}
+
 bool shell_fixture_stream_rows_are_exactly_ordered(
     const QByteArray&  output,
     int                stream_count,
@@ -929,7 +1072,7 @@ bool stop_shell_like_fixture(
         exit->reason == term::Terminal_exit_reason::EXITED &&
         exit->exit_code == 0,
         "shell-like fixture reports clean exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "shell-like fixture produces no backend errors");
 
     return ok;
@@ -1103,7 +1246,7 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
         "ConPTY output preserves high-volume stream rows");
     ok &= check(scripted_output_is_ordered(output),
         "ConPTY output contains the scripted fixture output in order");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "interactive fixture produces no backend errors");
 
     return ok;
@@ -1234,7 +1377,7 @@ bool test_scroll_region_scrollback_survives_conpty(const QString& fixture_path)
     ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
         "ConPTY starts scroll-region scrollback fixture");
     ok &= check(capture.wait_for_exit(), "scroll-region scrollback fixture exits");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "scroll-region scrollback fixture produces no backend errors");
 
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
@@ -1421,6 +1564,136 @@ bool test_fast_start_exit_loop(const QString& fixture_path)
     return ok;
 }
 
+bool test_exit_drain_ignores_repause_and_delivers_buffered_output(const QString& fixture_path)
+{
+    bool ok = true;
+
+    const QByteArray marker            = QByteArrayLiteral("paused-exit-drain");
+    std::atomic_bool repause_attempted = false;
+    std::atomic_bool repause_accepted  = false;
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend     = term::make_windows_conpty_backend();
+    term::Terminal_backend*                 backend_ptr = backend.get();
+    const term::Terminal_backend_result start_result =
+        backend->start(
+            launch_config(fixture_path, {QStringLiteral("--shell-like-smoke")}),
+            capture.callbacks([&](const QByteArray& bytes) {
+                if (bytes.contains(marker) && !repause_attempted.exchange(true)) {
+                    const term::Terminal_backend_result pause_result =
+                        backend_ptr->set_output_paused(true);
+                    repause_accepted =
+                        pause_result.code == term::Terminal_backend_result_code::ACCEPTED;
+                }
+            }));
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "paused exit-drain shell starts");
+    ok &= check(capture.wait_for_output(shell_fixture_prompt()),
+        "paused exit-drain shell reaches prompt");
+
+    const term::Terminal_backend_result pause_result = backend->set_output_paused(true);
+    ok &= check(pause_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "ConPTY backend accepts pre-exit output pause");
+    ok &= check(backend->write(QByteArrayLiteral("echo paused-exit-drain\r")).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "paused exit-drain shell receives marker command");
+    ok &= check(backend->write(QByteArrayLiteral("exit\r")).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "paused exit-drain shell receives exit command");
+    ok &= check(capture.wait_for_output(marker),
+        "exit drain delivers output buffered before child exit");
+    ok &= check(repause_attempted,
+        "exit drain callback attempted to re-pause output");
+    ok &= check(repause_accepted,
+        "exit drain re-pause request remains accepted");
+    ok &= check(capture.wait_for_exit(),
+        "exit drain re-pause does not block exit reporting");
+    ok &= check(capture.output_precedes_exit(marker),
+        "exit drain delivers buffered output before exit callback");
+
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::EXITED &&
+        exit->exit_code == 0,
+        "paused exit-drain shell reports direct child clean exit");
+    ok &= check_no_backend_errors(capture,
+        "paused exit-drain shell produces no backend errors");
+
+    return ok;
+}
+
+bool test_resize_races_natural_exit_close(const QString& fixture_path)
+{
+    bool ok = true;
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
+    const term::Terminal_backend_result start_result =
+        backend->start(
+            launch_config(fixture_path, {QStringLiteral("--shell-like-smoke")}),
+            capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "resize-close race shell starts");
+    ok &= check(capture.wait_for_output(shell_fixture_prompt()),
+        "resize-close race shell reaches prompt");
+    if (!ok) {
+        return false;
+    }
+
+    const std::vector<term::terminal_grid_size_t>& sizes = resize_storm_grid_sizes();
+    const term::Terminal_backend_result first_resize = backend->resize({
+        1U,
+        sizes.front(),
+    });
+    ok &= check(first_resize.code == term::Terminal_backend_result_code::ACCEPTED,
+        "resize-close race accepts deterministic resize before exit");
+    if (!ok) {
+        return false;
+    }
+
+    std::atomic_bool stop_resizes = false;
+    std::atomic_bool resize_results_valid = true;
+    std::thread resize_thread([&] {
+        std::uint64_t resize_id = 2U;
+        std::size_t size_index = 1U % sizes.size();
+        while (!stop_resizes.load(std::memory_order_acquire)) {
+            const term::Terminal_backend_result resize_result = backend->resize({
+                resize_id++,
+                sizes[size_index],
+            });
+            size_index = (size_index + 1U) % sizes.size();
+
+            if (resize_result.code != term::Terminal_backend_result_code::ACCEPTED &&
+                resize_result.code != term::Terminal_backend_result_code::REJECTED)
+            {
+                resize_results_valid = false;
+                stop_resizes = true;
+            }
+        }
+    });
+
+    ok &= check(backend->write(QByteArrayLiteral("exit\r")).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "resize-close race shell receives exit command");
+    ok &= check(capture.wait_for_exit(),
+        "resize-close race shell exits");
+
+    stop_resizes = true;
+    resize_thread.join();
+
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::EXITED &&
+        exit->exit_code == 0,
+        "resize-close race shell reports direct child clean exit");
+    ok &= check(resize_results_valid,
+        "resize-close race only accepts or rejects public resize calls");
+    ok &= check_no_backend_errors(capture,
+        "resize-close race shell produces no backend errors");
+
+    return ok;
+}
+
 bool test_start_resize_terminate_ordering(const QString& fixture_path)
 {
     bool ok = true;
@@ -1535,7 +1808,7 @@ bool test_terminate_after_resize_storm_stops_child_process(const QString& fixtur
     ok &= check(backend->write(QByteArrayLiteral("after")).code ==
         term::Terminal_backend_result_code::REJECTED,
         "ConPTY write after lifecycle termination rejects");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "terminate-after-resize-storm fixture produces no backend errors");
 
     return ok;
@@ -1737,7 +2010,10 @@ bool test_rejection_paths(const QString& fixture_path)
         ok &= check(backend->resize({1U, {0, 80}}).code ==
             term::Terminal_backend_result_code::REJECTED,
             "ConPTY invalid resize rejects");
-        ok &= check(backend->write(QByteArray(1024 * 1024 + 1, 'x')).code ==
+        ok &= check(backend->write(QByteArray(
+                static_cast<qsizetype>(
+                    term::k_native_backend_max_queued_write_bytes + 1U),
+                'x')).code ==
             term::Terminal_backend_result_code::REJECTED,
             "ConPTY oversized write rejects");
         ok &= check(backend->terminate().code == term::Terminal_backend_result_code::ACCEPTED,
@@ -1823,11 +2099,263 @@ bool test_interrupt(const QString& fixture_path)
         exit->reason == term::Terminal_exit_reason::INTERRUPTED &&
         exit->exit_code == 130,
         "interrupt reports typed interrupted exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "interrupt fixture produces no backend errors");
     ok &= check(backend->write(QByteArrayLiteral("after")).code ==
         term::Terminal_backend_result_code::REJECTED,
         "ConPTY write after interrupt exit rejects");
+
+    return ok;
+}
+
+bool test_queued_interrupt_after_exit_130_write_stays_natural(const QString& fixture_path)
+{
+    bool ok = true;
+
+    QTemporaryDir gate_dir;
+    ok &= check(gate_dir.isValid(), "exit-130 gate directory is available");
+    if (!gate_dir.isValid()) {
+        return false;
+    }
+    const QString gate_path = gate_dir.filePath(QStringLiteral("exit-130.gate"));
+
+    Backend_capture capture;
+    std::unique_ptr<term::Windows_conpty_backend> backend =
+        std::make_unique<term::Windows_conpty_backend>();
+    const term::Terminal_backend_result start_result =
+        backend->start(
+            launch_config(
+                fixture_path,
+                {
+                    QStringLiteral("--exit-130-after-blocked-input"),
+                    gate_path,
+                }),
+            capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "exit-130 blocked-input fixture starts");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("exit-130-after-input")),
+        "exit-130 blocked-input fixture ready marker reaches output");
+
+    constexpr std::size_t ordinary_input_size =
+        term::k_native_backend_max_queued_write_bytes - 1U;
+    QByteArray ordinary_input(static_cast<qsizetype>(ordinary_input_size), 'x');
+    ordinary_input[0] = 'q';
+    const term::Terminal_backend_result write_result =
+        backend->write(std::move(ordinary_input));
+    ok &= check(write_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "ConPTY backend accepts ordinary exit-triggering input");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("exit-130-input-read")),
+        "exit-130 blocked-input fixture consumes trigger byte and stops reading");
+    ok &= wait_for_in_flight_write(
+        *backend,
+        ordinary_input_size,
+        "exit-130 blocked-input ordinary write remains in flight");
+
+    const term::Terminal_backend_result interrupt_result = backend->interrupt();
+    ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "ConPTY backend accepts interrupt queued behind ordinary input");
+    ok &= check(write_gate_file(gate_path),
+        "exit-130 blocked-input fixture exit gate is released");
+    ok &= check(capture.wait_for_exit(), "exit-130 blocked-input fixture exits");
+
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::EXITED &&
+        exit->exit_code == 130,
+        "queued but undelivered interrupt does not classify ordinary code-130 exit");
+    ok &= check_no_backend_errors(capture,
+        "exit-130 blocked-input fixture produces no backend errors");
+
+    return ok;
+}
+
+bool test_future_queued_interrupt_does_not_keep_cleared_exit_130_observation(
+    const QString& fixture_path)
+{
+    bool ok = true;
+
+    QTemporaryDir gate_dir;
+    ok &= check(gate_dir.isValid(), "future-interrupt gate directory is available");
+    if (!gate_dir.isValid()) {
+        return false;
+    }
+    const QString gate_path = gate_dir.filePath(QStringLiteral("future-interrupt.gate"));
+
+    Backend_capture capture;
+    std::unique_ptr<term::Windows_conpty_backend> backend =
+        std::make_unique<term::Windows_conpty_backend>();
+    const term::Terminal_backend_result start_result =
+        backend->start(
+            launch_config(
+                fixture_path,
+                {
+                    QStringLiteral("--exit-130-after-interrupt-input-blocked"),
+                    gate_path,
+                }),
+            capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "future-interrupt fixture starts");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral(
+            "exit-130-after-interrupt-input")),
+        "future-interrupt fixture ready marker reaches output");
+
+    const term::Terminal_backend_result first_interrupt = backend->interrupt();
+    ok &= check(first_interrupt.code == term::Terminal_backend_result_code::ACCEPTED,
+        "future-interrupt fixture accepts first interrupt");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("exit-130-interrupt-read")),
+        "future-interrupt fixture consumes first interrupt byte");
+
+    const term::Terminal_backend_result clearing_write =
+        backend->write(QByteArrayLiteral("q"));
+    ok &= check(clearing_write.code == term::Terminal_backend_result_code::ACCEPTED,
+        "future-interrupt fixture accepts clearing ordinary write");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("exit-130-normal-read")),
+        "future-interrupt fixture consumes ordinary byte after interrupt");
+
+    constexpr std::size_t blocking_write_size =
+        term::k_native_backend_max_queued_write_bytes - 1U;
+    const term::Terminal_backend_result blocking_write =
+        backend->write(QByteArray(static_cast<qsizetype>(blocking_write_size), 'x'));
+    ok &= check(blocking_write.code == term::Terminal_backend_result_code::ACCEPTED,
+        "future-interrupt fixture accepts blocking ordinary write");
+    ok &= wait_for_in_flight_write(
+        *backend,
+        blocking_write_size,
+        "future-interrupt blocking ordinary write remains in flight");
+    const term::Terminal_backend_result future_interrupt = backend->interrupt();
+    ok &= check(future_interrupt.code == term::Terminal_backend_result_code::ACCEPTED,
+        "future-interrupt fixture accepts queued future interrupt");
+    ok &= check(write_gate_file(gate_path),
+        "future-interrupt fixture exit gate is released");
+    ok &= check(capture.wait_for_exit(), "future-interrupt fixture exits");
+
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::EXITED &&
+        exit->exit_code == 130,
+        "future queued interrupt does not keep cleared code-130 observation");
+    ok &= check_no_backend_errors(capture,
+        "future-interrupt fixture produces no backend errors");
+
+    return ok;
+}
+
+bool test_write_after_interrupt_does_not_clear_without_child_output(
+    const QString& fixture_path)
+{
+    bool ok = true;
+
+    QTemporaryDir gate_dir;
+    ok &= check(gate_dir.isValid(), "post-interrupt-write gate directory is available");
+    if (!gate_dir.isValid()) {
+        return false;
+    }
+    const QString gate_path = gate_dir.filePath(QStringLiteral("post-interrupt-write.gate"));
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
+    const term::Terminal_backend_result start_result =
+        backend->start(
+            launch_config(
+                fixture_path,
+                {
+                    QStringLiteral("--exit-130-from-interrupt-after-input"),
+                    gate_path,
+                }),
+            capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "post-interrupt-write fixture starts");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral(
+            "exit-130-from-interrupt-after-input")),
+        "post-interrupt-write fixture ready marker reaches output");
+
+    const term::Terminal_backend_result interrupt_result = backend->interrupt();
+    ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "post-interrupt-write fixture accepts interrupt");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("exit-130-from-interrupt-read")),
+        "post-interrupt-write fixture consumes interrupt byte");
+
+    const term::Terminal_backend_result ordinary_write =
+        backend->write(QByteArrayLiteral("q"));
+    ok &= check(ordinary_write.code == term::Terminal_backend_result_code::ACCEPTED,
+        "post-interrupt-write fixture accepts ordinary write after interrupt");
+    ok &= check(write_gate_file(gate_path),
+        "post-interrupt-write fixture exit gate is released");
+    ok &= check(capture.wait_for_exit(), "post-interrupt-write fixture exits");
+
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::INTERRUPTED &&
+        exit->exit_code == 130,
+        "ordinary write without following child output does not clear interrupt exit");
+    ok &= check_no_backend_errors(capture,
+        "post-interrupt-write fixture produces no backend errors");
+
+    return ok;
+}
+
+bool test_failed_write_after_interrupt_does_not_clear_on_final_output(
+    const QString& fixture_path)
+{
+    bool ok = true;
+
+    QTemporaryDir gate_dir;
+    ok &= check(gate_dir.isValid(), "blocked-post-interrupt gate directory is available");
+    if (!gate_dir.isValid()) {
+        return false;
+    }
+    const QString gate_path =
+        gate_dir.filePath(QStringLiteral("blocked-post-interrupt.gate"));
+
+    Backend_capture capture;
+    std::unique_ptr<term::Windows_conpty_backend> backend =
+        std::make_unique<term::Windows_conpty_backend>();
+    const term::Terminal_backend_result start_result =
+        backend->start(
+            launch_config(
+                fixture_path,
+                {
+                    QStringLiteral("--exit-130-from-interrupt-with-blocked-input"),
+                    gate_path,
+                }),
+            capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "blocked-post-interrupt fixture starts");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral(
+            "exit-130-from-interrupt-blocked-input")),
+        "blocked-post-interrupt fixture ready marker reaches output");
+
+    const term::Terminal_backend_result interrupt_result = backend->interrupt();
+    ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "blocked-post-interrupt fixture accepts interrupt");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral(
+            "exit-130-blocked-interrupt-read")),
+        "blocked-post-interrupt fixture consumes interrupt byte and stops reading");
+
+    constexpr std::size_t blocking_write_size =
+        term::k_native_backend_max_queued_write_bytes;
+    const term::Terminal_backend_result blocking_write =
+        backend->write(QByteArray(static_cast<qsizetype>(blocking_write_size), 'x'));
+    ok &= check(blocking_write.code == term::Terminal_backend_result_code::ACCEPTED,
+        "blocked-post-interrupt fixture accepts blocked ordinary write");
+    ok &= wait_for_in_flight_write(
+        *backend,
+        blocking_write_size,
+        "blocked-post-interrupt ordinary write remains in flight");
+    ok &= check(write_gate_file(gate_path),
+        "blocked-post-interrupt fixture exit gate is released");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral(
+            "exit-130-blocked-final-output")),
+        "blocked-post-interrupt fixture emits final output");
+    ok &= check(capture.wait_for_exit(), "blocked-post-interrupt fixture exits");
+
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::INTERRUPTED &&
+        exit->exit_code == 130,
+        "failed post-interrupt write does not clear on final child output");
+    ok &= check_no_backend_errors(capture,
+        "blocked-post-interrupt fixture produces no backend errors");
 
     return ok;
 }
@@ -1857,8 +2385,67 @@ bool test_interrupt_without_stdin_reader(const QString& fixture_path)
         exit->reason == term::Terminal_exit_reason::INTERRUPTED &&
         exit->exit_code == 130,
         "no-read interrupt reports typed interrupted exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "no-read interrupt fixture produces no backend errors");
+
+    return ok;
+}
+
+bool test_interrupt_byte_consumed_child_exits_normally()
+{
+    bool ok = true;
+
+    QTemporaryDir script_dir;
+    ok &= check(script_dir.isValid(), "ignored-interrupt script directory is available");
+    if (!script_dir.isValid()) {
+        return false;
+    }
+
+    const QString script_path =
+        script_dir.filePath(QStringLiteral("ignored_interrupt.ps1"));
+    ok &= check(write_ignored_interrupt_powershell_script(script_path),
+        "ignored-interrupt PowerShell script is writable");
+    if (!ok) {
+        return false;
+    }
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
+    const term::Terminal_backend_result start_result =
+        backend->start(
+            powershell_script_launch_config(script_path),
+            capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "ignored-interrupt PowerShell fixture starts");
+    if (start_result.code != term::Terminal_backend_result_code::ACCEPTED) {
+        return false;
+    }
+
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("ignore-int")),
+        "ignored-interrupt PowerShell fixture reaches ready marker");
+
+    const term::Terminal_backend_result interrupt_result = backend->interrupt();
+    ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "ConPTY backend accepts consumed interrupt");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("caught-int")),
+        "ignored-interrupt PowerShell fixture consumes Ctrl+C byte");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("post-int-ready")),
+        "ignored-interrupt PowerShell fixture waits for post-interrupt input");
+    ok &= check(backend->write(QByteArrayLiteral("q")).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "ignored-interrupt PowerShell fixture receives post-interrupt input");
+    ok &= check(capture.wait_for_output(QByteArrayLiteral("natural-exit")),
+        "ignored-interrupt PowerShell fixture reaches natural exit path");
+    ok &= check(capture.wait_for_exit(),
+        "ignored-interrupt PowerShell fixture exits");
+
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::EXITED &&
+        exit->exit_code == 130,
+        "consumed interrupt preserves normal child exit status");
+    ok &= check_no_backend_errors(capture,
+        "ignored-interrupt PowerShell fixture produces no backend errors");
 
     return ok;
 }
@@ -1887,7 +2474,7 @@ bool test_terminate(const QString& fixture_path)
     ok &= check(exit.has_value() &&
         exit->reason == term::Terminal_exit_reason::TERMINATED,
         "terminate reports typed terminated exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "terminate fixture produces no backend errors");
     ok &= check(backend->resize({1U, {24, 80}}).code ==
         term::Terminal_backend_result_code::REJECTED,
@@ -1923,7 +2510,7 @@ bool test_terminate_accepts_zero_grace_policy(const QString& fixture_path)
     ok &= check(exit.has_value() &&
         exit->reason == term::Terminal_exit_reason::TERMINATED,
         "zero-grace terminate reports typed terminated exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "zero-grace terminate fixture produces no backend errors");
 
     return ok;
@@ -1965,7 +2552,7 @@ bool test_terminate_returns_before_child_exit(const QString& fixture_path)
     ok &= check(exit.has_value() &&
         exit->reason == term::Terminal_exit_reason::TERMINATED,
         "nonblocking terminate reports typed terminated exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "nonblocking terminate fixture produces no backend errors");
     return ok;
 }
@@ -2022,7 +2609,7 @@ bool test_destructor_stops_running_process(const QString& fixture_path)
     const std::optional<DWORD> child_exit_code = process_exit_code(child_process.get());
     ok &= check(child_exit_code.has_value() && *child_exit_code == 1U,
         "ConPTY backend destructor force-terminates the running child process");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "destructor fixture produces no backend errors");
 
     return ok;
@@ -2153,6 +2740,10 @@ int main(int argc, char** argv)
     run_test("sync raw resize gate preserves order",
         test_sync_raw_resize_gate_preserves_order(fixture_path));
     run_test("fast start exit loop", test_fast_start_exit_loop(fixture_path));
+    run_test("exit drain ignores re-pause and delivers buffered output",
+        test_exit_drain_ignores_repause_and_delivers_buffered_output(fixture_path));
+    run_test("resize races natural exit close",
+        test_resize_races_natural_exit_close(fixture_path));
     run_test("start resize terminate ordering",
         test_start_resize_terminate_ordering(fixture_path));
     run_test("terminate after resize storm stops child process",
@@ -2165,7 +2756,21 @@ int main(int argc, char** argv)
     run_test("repeated start precheck releases gate before callback",
         test_repeated_start_precheck_callback_runs_after_gate_unlock(fixture_path));
     run_test("interrupt", test_interrupt(fixture_path));
+    run_test(
+        "queued interrupt after exit-130 write stays natural",
+        test_queued_interrupt_after_exit_130_write_stays_natural(fixture_path));
+    run_test(
+        "future queued interrupt does not keep cleared exit-130 observation",
+        test_future_queued_interrupt_does_not_keep_cleared_exit_130_observation(fixture_path));
+    run_test(
+        "write after interrupt does not clear without child output",
+        test_write_after_interrupt_does_not_clear_without_child_output(fixture_path));
+    run_test(
+        "failed write after interrupt does not clear on final output",
+        test_failed_write_after_interrupt_does_not_clear_on_final_output(fixture_path));
     run_test("interrupt without stdin reader", test_interrupt_without_stdin_reader(fixture_path));
+    run_test("interrupt byte consumed child exits normally",
+        test_interrupt_byte_consumed_child_exits_normally());
     run_test("terminate", test_terminate(fixture_path));
     run_test("terminate accepts zero grace policy",
         test_terminate_accepts_zero_grace_policy(fixture_path));

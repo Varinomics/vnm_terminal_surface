@@ -93,6 +93,10 @@ void print_usage()
         << "       vnm_terminal_canvas_fixture --hold-open-pid-no-read\n"
         << "       vnm_terminal_canvas_fixture --spawn-hold-open-child-pid-no-read\n"
         << "       vnm_terminal_canvas_fixture --hold-open-no-read\n"
+        << "       vnm_terminal_canvas_fixture --exit-130-after-blocked-input <exit-gate-path>\n"
+        << "       vnm_terminal_canvas_fixture --exit-130-after-interrupt-input-blocked <exit-gate-path>\n"
+        << "       vnm_terminal_canvas_fixture --exit-130-from-interrupt-after-input <exit-gate-path>\n"
+        << "       vnm_terminal_canvas_fixture --exit-130-from-interrupt-with-blocked-input <exit-gate-path>\n"
         << "       vnm_terminal_canvas_fixture --sleep-no-stdio\n"
         << "       vnm_terminal_canvas_fixture --utf8-payload\n"
         << "       vnm_terminal_canvas_fixture --sync-raw-resize-gate <checkpoint-path>\n"
@@ -580,6 +584,22 @@ bool write_checkpoint_file(const std::string& path)
     std::ofstream file(path, std::ios::binary);
     file << "ready\n";
     return file.good();
+}
+
+bool wait_for_gate_file(const std::string& path)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    do {
+        std::ifstream file(path, std::ios::binary);
+        if (file.good()) {
+            return true;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    while (std::chrono::steady_clock::now() < deadline);
+
+    return false;
 }
 
 int run_interactive_scenario(
@@ -1070,6 +1090,140 @@ int run_hold_open()
     return run_hold_open_until_input_closes_or_interrupt();
 }
 
+int run_exit_130_after_blocked_input(const std::string& exit_gate_path)
+{
+    if (!configure_interactive_console()) {
+        return 61;
+    }
+
+    const std::vector<unsigned char> ready = {
+        'e', 'x', 'i', 't', '-', '1', '3', '0', '-', 'a', 'f', 't', 'e', 'r',
+        '-', 'i', 'n', 'p', 'u', 't', '\n',
+    };
+    if (!write_all_stdout(ready)) {
+        return 62;
+    }
+
+    unsigned char byte = 0U;
+    if (std::fread(&byte, 1U, 1U, stdin) != 1U) {
+        return 63;
+    }
+    if (byte != static_cast<unsigned char>('q')) {
+        return 79;
+    }
+
+    if (!write_stdout_line("exit-130-input-read")) {
+        return 64;
+    }
+
+    if (!wait_for_gate_file(exit_gate_path)) {
+        return 65;
+    }
+
+    return 130;
+}
+
+int run_exit_130_after_interrupt_input_blocked(const std::string& exit_gate_path)
+{
+    if (!configure_interactive_console()) {
+        return 66;
+    }
+
+    if (!write_stdout_line("exit-130-after-interrupt-input")) {
+        return 67;
+    }
+
+    unsigned char interrupt_byte = 0U;
+    if (std::fread(&interrupt_byte, 1U, 1U, stdin) != 1U ||
+        interrupt_byte != 0x03U)
+    {
+        return 68;
+    }
+    if (!write_stdout_line("exit-130-interrupt-read")) {
+        return 69;
+    }
+
+    unsigned char ordinary_byte = 0U;
+    if (std::fread(&ordinary_byte, 1U, 1U, stdin) != 1U ||
+        ordinary_byte != static_cast<unsigned char>('q'))
+    {
+        return 70;
+    }
+    if (!write_stdout_line("exit-130-normal-read")) {
+        return 71;
+    }
+
+    if (!wait_for_gate_file(exit_gate_path)) {
+        return 72;
+    }
+
+    return 130;
+}
+
+int run_exit_130_from_interrupt_after_input(const std::string& exit_gate_path)
+{
+    if (!configure_interactive_console()) {
+        return 73;
+    }
+
+    if (!write_stdout_line("exit-130-from-interrupt-after-input")) {
+        return 74;
+    }
+
+    unsigned char interrupt_byte = 0U;
+    if (std::fread(&interrupt_byte, 1U, 1U, stdin) != 1U ||
+        interrupt_byte != 0x03U)
+    {
+        return 75;
+    }
+    if (!write_stdout_line("exit-130-from-interrupt-read")) {
+        return 76;
+    }
+
+    unsigned char ordinary_byte = 0U;
+    if (std::fread(&ordinary_byte, 1U, 1U, stdin) != 1U ||
+        ordinary_byte != static_cast<unsigned char>('q'))
+    {
+        return 77;
+    }
+
+    if (!wait_for_gate_file(exit_gate_path)) {
+        return 78;
+    }
+
+    return 130;
+}
+
+int run_exit_130_from_interrupt_with_blocked_input(const std::string& exit_gate_path)
+{
+    if (!configure_interactive_console()) {
+        return 80;
+    }
+
+    if (!write_stdout_line("exit-130-from-interrupt-blocked-input")) {
+        return 81;
+    }
+
+    unsigned char interrupt_byte = 0U;
+    if (std::fread(&interrupt_byte, 1U, 1U, stdin) != 1U ||
+        interrupt_byte != 0x03U)
+    {
+        return 82;
+    }
+    if (!write_stdout_line("exit-130-blocked-interrupt-read")) {
+        return 83;
+    }
+
+    if (!wait_for_gate_file(exit_gate_path)) {
+        return 84;
+    }
+    if (!write_stdout_line("exit-130-blocked-final-output")) {
+        return 85;
+    }
+
+    return 130;
+}
+
 int run_hold_open_pid()
 {
     if (!configure_interactive_console()) {
@@ -1424,6 +1578,22 @@ int main(int argc, char** argv)
 
     if (argc == 2 && argument_equals(argv[1], "--hold-open-no-read")) {
         return run_hold_open_no_read();
+    }
+
+    if (argc == 3 && argument_equals(argv[1], "--exit-130-after-blocked-input")) {
+        return run_exit_130_after_blocked_input(argv[2]);
+    }
+
+    if (argc == 3 && argument_equals(argv[1], "--exit-130-after-interrupt-input-blocked")) {
+        return run_exit_130_after_interrupt_input_blocked(argv[2]);
+    }
+
+    if (argc == 3 && argument_equals(argv[1], "--exit-130-from-interrupt-after-input")) {
+        return run_exit_130_from_interrupt_after_input(argv[2]);
+    }
+
+    if (argc == 3 && argument_equals(argv[1], "--exit-130-from-interrupt-with-blocked-input")) {
+        return run_exit_130_from_interrupt_with_blocked_input(argv[2]);
     }
 
     if (argc == 2 && argument_equals(argv[1], "--sleep-no-stdio")) {

@@ -6624,10 +6624,8 @@ bool test_source_posture()
             atlas_source.contains(QByteArrayLiteral(
                 "qsg_atlas_merge_msdf_text_failure_diagnostics(")) &&
             atlas_source.contains(QByteArrayLiteral(
-                "retry_with_populated_frame_upload();")) &&
-            atlas_source.contains(QByteArrayLiteral(
                 "retry_without_msdf_text_ownership();")),
-        "atlas buffer update retry loop preserves MSDF diagnostics across populated-frame retries");
+        "atlas buffer update retry loop preserves MSDF diagnostics across fallback retries");
     ok &= check(
         !atlas_source.contains(QByteArrayLiteral(
             "QByteArray qsg_layer_descriptor_key(")) &&

@@ -48,6 +48,7 @@ constexpr std::chrono::milliseconds k_conpty_reader_close_grace(1000);
 // backend-side burst below the session callback/output queue hard limit when it
 // is released as one callback.
 constexpr qsizetype k_paused_output_high_watermark_bytes = 64 * 1024;
+constexpr int k_interrupt_exit_code = 130;
 
 DWORD wait_timeout_from_interval(std::chrono::milliseconds interval)
 {
@@ -184,6 +185,7 @@ struct Queued_write
 {
     QByteArray bytes;
     bool       marks_interrupted_exit = false;
+    bool       clears_interrupted_exit = false;
 };
 
 struct Conpty_api
@@ -443,6 +445,19 @@ public:
         return Public_call_guard(*this);
     }
 
+    Windows_conpty_backend_write_state_for_testing write_state_for_testing()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return Windows_conpty_backend_write_state_for_testing{
+            m_queued_write_bytes,
+            m_write_queue.size(),
+            m_in_flight_write_bytes,
+            m_running,
+            m_stopping,
+            m_writer_failed,
+        };
+    }
+
     Terminal_backend_result start(
         const Terminal_launch_config&  config,
         Terminal_backend_callbacks     callbacks)
@@ -655,7 +670,13 @@ public:
             m_startup_aborted    = false;
             m_termination_policy = effective_config.termination_policy;
             m_exit_reason_override.reset();
-            m_queued_write_bytes = 0U;
+            m_queued_write_bytes                   = 0U;
+            m_conpty_active_calls                  = 0U;
+            m_pending_interrupt_writes             = 0U;
+            m_in_flight_write_bytes                = 0U;
+            m_child_output_sequence                = 0U;
+            m_interrupt_delivery_exit_code_pending = false;
+            m_interrupt_clear_waits_for_output     = false;
             m_reader_thread_handle.reset();
             m_writer_thread_handle.reset();
             m_paused_output.clear();
@@ -726,7 +747,7 @@ public:
         }
 
         add_native_backend_queued_write_bytes(m_queued_write_bytes, byte_count);
-        m_write_queue.push_back({std::move(bytes), false});
+        m_write_queue.push_back({std::move(bytes), false, true});
         m_write_cv.notify_one();
         return backend_accept();
     }
@@ -753,10 +774,12 @@ public:
 
             conpty = m_conpty;
             resize_conpty = m_api.resize;
+            ++m_conpty_active_calls;
         }
 
         const HRESULT result =
             resize_conpty(conpty, coord_from_grid_size(request.grid_size));
+        finish_conpty_call();
         if (FAILED(result)) {
             return
                 backend_reject(
@@ -771,9 +794,18 @@ public:
     {
         QByteArray paused_output;
         bool paused_output_delivery_started = false;
+        bool should_wake_reader = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_output_paused = paused;
+            if (m_stopping || m_shutdown_started) {
+                m_output_paused = false;
+                should_wake_reader = true;
+            }
+            else {
+                m_output_paused = paused;
+                should_wake_reader = !paused;
+            }
+
             if (!m_output_paused && !m_paused_output.isEmpty()) {
                 paused_output_delivery_started =
                     take_paused_output_for_delivery_locked(paused_output);
@@ -784,7 +816,7 @@ public:
             deliver_output(std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
-        if (!paused && !paused_output_delivery_started) {
+        if (should_wake_reader && !paused_output_delivery_started) {
             m_output_cv.notify_all();
         }
 
@@ -809,14 +841,7 @@ public:
         }
 
         add_native_backend_queued_write_bytes(m_queued_write_bytes, 1U);
-        // Optimistically record interrupt as the requested exit cause: the wait
-        // thread can observe process exit before the writer's delivery callback
-        // returns, and that exit should still classify as interrupted. If delivery
-        // instead fails while the process is still running,
-        // mark_writer_failed_after_write_failure() drops this override (in the same
-        // critical section that marks the writer failed) and surfaces the failure so
-        // a later natural exit is not misreported as interrupted.
-        m_exit_reason_override = Terminal_exit_reason::INTERRUPTED;
+        ++m_pending_interrupt_writes;
         m_write_queue.push_back({QByteArray(1, '\x03'), true});
         m_write_cv.notify_one();
         return backend_accept();
@@ -943,8 +968,7 @@ public:
         m_process_job.reset();
         m_reader_thread_handle.reset();
         m_writer_thread_handle.reset();
-        m_write_queue.clear();
-        m_queued_write_bytes = 0U;
+        clear_queued_writes_locked();
         m_running = false;
     }
 
@@ -1123,6 +1147,12 @@ private:
             if (m_exit_reason_override.has_value()) {
                 reason = *m_exit_reason_override;
             }
+            else
+            if (m_interrupt_delivery_exit_code_pending &&
+                exit_code == k_interrupt_exit_code)
+            {
+                reason = Terminal_exit_reason::INTERRUPTED;
+            }
 
             m_exit_reported = true;
             m_running       = false;
@@ -1145,7 +1175,7 @@ private:
 
     bool take_paused_output_for_delivery_locked(QByteArray& paused_output)
     {
-        if (m_paused_output.isEmpty()) {
+        if (m_paused_output_delivery_in_progress || m_paused_output.isEmpty()) {
             return false;
         }
 
@@ -1165,7 +1195,9 @@ private:
             QByteArray next_paused_output;
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
-                if (!m_output_paused && !m_paused_output.isEmpty()) {
+                if ((!m_output_paused || m_stopping || m_shutdown_started) &&
+                    !m_paused_output.isEmpty())
+                {
                     next_paused_output = std::move(m_paused_output);
                     m_paused_output.clear();
                 }
@@ -1181,6 +1213,36 @@ private:
         m_output_cv.notify_all();
     }
 
+    void drain_paused_output_before_exit_report()
+    {
+        for (;;) {
+            QByteArray paused_output;
+            bool paused_output_delivery_started = false;
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_output_cv.wait(lock, [&] {
+                    return
+                        !m_paused_output_delivery_in_progress &&
+                        (m_paused_output.isEmpty() ||
+                         !m_output_paused             ||
+                         m_stopping                  ||
+                         m_shutdown_started);
+                });
+                if (m_paused_output.isEmpty()) {
+                    return;
+                }
+
+                paused_output_delivery_started =
+                    take_paused_output_for_delivery_locked(paused_output);
+            }
+
+            if (!paused_output.isEmpty()) {
+                deliver_output(std::move(paused_output));
+            }
+            finish_paused_output_delivery(paused_output_delivery_started);
+        }
+    }
+
     void deliver_or_buffer_output(QByteArray bytes)
     {
         const qsizetype bytes_size = bytes.size();
@@ -1188,7 +1250,9 @@ private:
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             const bool should_buffer =
-                m_output_paused || m_paused_output_delivery_in_progress;
+                m_paused_output_delivery_in_progress ||
+                m_output_paused ||
+                !m_paused_output.isEmpty();
             if (should_buffer &&
                 bytes_size <=
                     k_paused_output_high_watermark_bytes - m_paused_output.size())
@@ -1215,6 +1279,15 @@ private:
         m_reader_cv.notify_all();
     }
 
+    void finish_conpty_call()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        --m_conpty_active_calls;
+        if (m_conpty_active_calls == 0U) {
+            m_conpty_cv.notify_all();
+        }
+    }
+
     void wait_for_reader_finished()
     {
         std::unique_lock<std::mutex> lock(m_mutex);
@@ -1236,10 +1309,15 @@ private:
         HPCON conpty = nullptr;
         Conpty_api::ClosePseudoConsole_fn close_conpty_api = nullptr;
         {
-            std::lock_guard<std::mutex> lock(m_mutex);
+            std::unique_lock<std::mutex> lock(m_mutex);
             conpty           = m_conpty;
             close_conpty_api = m_api.close;
             m_conpty         = nullptr;
+            if (conpty != nullptr) {
+                m_conpty_cv.wait(lock, [&] {
+                    return m_conpty_active_calls == 0U;
+                });
+            }
         }
 
         close_pseudoconsole_detached(close_conpty_api, conpty);
@@ -1271,20 +1349,26 @@ private:
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_output_cv.wait(lock, [&] {
+                    const bool direct_delivery_available =
+                        !m_output_paused && m_paused_output.isEmpty();
+                    const bool paused_buffer_room_available =
+                        m_paused_output.size() < k_paused_output_high_watermark_bytes;
                     return
-                        m_stopping ||
+                        m_shutdown_started ||
                         (!m_paused_output_delivery_in_progress &&
-                            (!m_output_paused ||
-                             m_paused_output.size() <
-                                k_paused_output_high_watermark_bytes));
+                         (direct_delivery_available || paused_buffer_room_available));
                 });
+
+                if (m_shutdown_started) {
+                    break;
+                }
 
                 output_read = m_output_read.get();
                 if (output_read == nullptr || output_read == INVALID_HANDLE_VALUE) {
                     break;
                 }
 
-                if (m_output_paused &&
+                if ((m_output_paused || !m_paused_output.isEmpty()) &&
                     m_paused_output.size() < k_paused_output_high_watermark_bytes)
                 {
                     const qsizetype paused_output_room =
@@ -1319,6 +1403,7 @@ private:
                 break;
             }
 
+            mark_child_output_observed();
             deliver_or_buffer_output(QByteArray(
                 buffer.data(),
                 static_cast<qsizetype>(bytes_read)));
@@ -1333,6 +1418,7 @@ private:
 
         for (;;) {
             Queued_write write;
+            std::uint64_t output_sequence_before_write = 0U;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_write_cv.wait(lock, [&] {
@@ -1348,16 +1434,47 @@ private:
                 remove_native_backend_queued_write_bytes(
                     m_queued_write_bytes,
                     static_cast<std::size_t>(write.bytes.size()));
+                m_in_flight_write_bytes =
+                    static_cast<std::size_t>(write.bytes.size());
+                output_sequence_before_write = m_child_output_sequence;
+            }
+
+            if (write.marks_interrupted_exit) {
+                mark_interrupt_write_started();
             }
 
             if (!write_all(write.bytes)) {
+                mark_write_completed();
                 mark_writer_failed_after_write_failure(write.marks_interrupted_exit);
                 return;
             }
+            mark_write_completed();
 
             if (write.marks_interrupted_exit) {
                 mark_interrupt_delivered();
             }
+            else
+            if (write.clears_interrupted_exit) {
+                mark_non_interrupt_write_delivered(output_sequence_before_write);
+            }
+        }
+    }
+
+    void mark_write_completed()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_in_flight_write_bytes = 0U;
+    }
+
+    void mark_interrupt_write_started()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_stopping && !m_exit_reported) {
+            // The writer has reached the Ctrl+C entry in stream order. From this
+            // point until write completion the wait thread may observe the child
+            // exit first, so classify that narrow race as an interrupt. Merely
+            // queued Ctrl+C bytes never set this override.
+            m_exit_reason_override = Terminal_exit_reason::INTERRUPTED;
         }
     }
 
@@ -1366,13 +1483,11 @@ private:
         bool should_report_interrupt_failed = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
-            // Mark the writer failed and drop the optimistic INTERRUPTED override in
+            // Mark the writer failed and drop the in-flight INTERRUPTED override in
             // the SAME critical section. The wait thread classifies exit by reading
             // m_exit_reason_override (report_exit_once). If the failed-writer mark
             // and the override clear were two separate locked steps, the wait thread
-            // could observe a stale INTERRUPTED override between them and misclassify
-            // a natural exit as interrupted even though the Ctrl+C byte was never
-            // delivered. One critical section closes that window.
+            // could observe a stale INTERRUPTED override between them.
             //
             // This race has no deterministic regression test: the backend test
             // harness drives a real ConPTY child through the public interface and
@@ -1387,17 +1502,20 @@ private:
                 m_input_write.reset();
             }
 
-            // The interrupt byte never reached the child. Drop the optimistic
-            // INTERRUPTED override taken at request time so a later natural exit is
-            // not misreported as interrupted -- but only while the process is still
-            // running. If it has already exited and been classified, that
-            // classification stands (the exit may well have been the interrupt).
+            // The interrupt byte never reached the child. Drop the in-flight
+            // INTERRUPTED override before exit reporting so a later natural exit
+            // is not misreported as interrupted. Suppress the public error once
+            // shutdown/exit drain is already underway.
+            if (failed_write_was_interrupt && m_pending_interrupt_writes > 0U) {
+                --m_pending_interrupt_writes;
+            }
+
             if (failed_write_was_interrupt &&
                 !m_exit_reported &&
                 m_exit_reason_override == Terminal_exit_reason::INTERRUPTED)
             {
                 m_exit_reason_override.reset();
-                should_report_interrupt_failed = true;
+                should_report_interrupt_failed = !m_stopping;
             }
         }
 
@@ -1411,8 +1529,60 @@ private:
     void mark_interrupt_delivered()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (!m_stopping) {
-            m_exit_reason_override = Terminal_exit_reason::INTERRUPTED;
+        if (m_pending_interrupt_writes > 0U) {
+            --m_pending_interrupt_writes;
+        }
+
+        if (!m_exit_reported) {
+            m_interrupt_delivery_exit_code_pending = true;
+            m_interrupt_clear_waits_for_output = false;
+            if (m_exit_reason_override == Terminal_exit_reason::INTERRUPTED) {
+                m_exit_reason_override.reset();
+            }
+        }
+    }
+
+    void mark_non_interrupt_write_delivered(
+        std::uint64_t output_sequence_before_write)
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_exit_reported &&
+            m_interrupt_delivery_exit_code_pending)
+        {
+            m_interrupt_clear_waits_for_output = true;
+            if (m_child_output_sequence != output_sequence_before_write) {
+                m_interrupt_delivery_exit_code_pending = false;
+                m_interrupt_clear_waits_for_output = false;
+            }
+        }
+    }
+
+    void mark_child_output_observed()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ++m_child_output_sequence;
+        if (!m_exit_reported &&
+            m_interrupt_delivery_exit_code_pending &&
+            m_interrupt_clear_waits_for_output)
+        {
+            m_interrupt_delivery_exit_code_pending = false;
+            m_interrupt_clear_waits_for_output = false;
+        }
+    }
+
+    void clear_queued_writes_locked()
+    {
+        for (const Queued_write& write : m_write_queue) {
+            if (write.marks_interrupted_exit && m_pending_interrupt_writes > 0U) {
+                --m_pending_interrupt_writes;
+            }
+        }
+        m_write_queue.clear();
+        m_queued_write_bytes = 0U;
+        if (m_pending_interrupt_writes == 0U &&
+            m_exit_reason_override == Terminal_exit_reason::INTERRUPTED)
+        {
+            m_exit_reason_override.reset();
         }
     }
 
@@ -1489,8 +1659,10 @@ private:
         bool paused_output_delivery_started = false;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
+            m_stopping      = true;
             m_output_paused = false;
-            if (!m_paused_output.isEmpty()) {
+            clear_queued_writes_locked();
+            if (!m_paused_output_delivery_in_progress && !m_paused_output.isEmpty()) {
                 paused_output_delivery_started =
                     take_paused_output_for_delivery_locked(paused_output);
             }
@@ -1499,14 +1671,14 @@ private:
             deliver_output(std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
-        if (!paused_output_delivery_started) {
-            m_output_cv.notify_all();
-        }
+        m_output_cv.notify_all();
+        drain_paused_output_before_exit_report();
         request_conpty_close();
         if (!reader_finished_within(k_conpty_reader_close_grace)) {
             cancel_blocking_io();
             wait_for_reader_finished();
         }
+        drain_paused_output_before_exit_report();
         report_exit_once(Terminal_exit_reason::EXITED, static_cast<int>(exit_code));
         terminate_process_tree_after_root_exit();
     }
@@ -1626,6 +1798,7 @@ private:
     std::condition_variable            m_output_cv;
     std::condition_variable            m_write_cv;
     std::condition_variable            m_reader_cv;
+    std::condition_variable            m_conpty_cv;
     std::condition_variable            m_public_call_cv;
     Terminal_backend_callbacks         m_callbacks;
     Conpty_api                         m_api;
@@ -1646,8 +1819,12 @@ private:
     std::optional<Terminal_exit_reason>
                                        m_exit_reason_override;
     Terminal_termination_policy        m_termination_policy;
-    std::size_t                        m_queued_write_bytes = 0U;
-    std::size_t                        m_public_call_depth = 0U;
+    std::size_t                        m_queued_write_bytes       = 0U;
+    std::size_t                        m_conpty_active_calls      = 0U;
+    std::size_t                        m_pending_interrupt_writes = 0U;
+    std::size_t                        m_public_call_depth        = 0U;
+    std::size_t                        m_in_flight_write_bytes    = 0U;
+    std::uint64_t                      m_child_output_sequence    = 0U;
     bool                               m_running = false;
     bool                               m_start_attempted = false;
     bool                               m_start_in_progress = false;
@@ -1659,6 +1836,8 @@ private:
     bool                               m_shutdown_started = false;
     bool                               m_reader_finished = false;
     bool                               m_writer_failed = false;
+    bool                               m_interrupt_delivery_exit_code_pending = false;
+    bool                               m_interrupt_clear_waits_for_output = false;
 };
 
 Windows_conpty_backend::Windows_conpty_backend()
@@ -1721,6 +1900,14 @@ Terminal_backend_result Windows_conpty_backend::terminate()
     Impl* impl = m_impl.get();
     auto guard = impl->public_call_guard();
     return impl->terminate();
+}
+
+Windows_conpty_backend_write_state_for_testing
+Windows_conpty_backend::write_state_for_testing()
+{
+    Impl* impl = m_impl.get();
+    auto guard = impl->public_call_guard();
+    return impl->write_state_for_testing();
 }
 
 std::unique_ptr<Terminal_backend> make_windows_conpty_backend()

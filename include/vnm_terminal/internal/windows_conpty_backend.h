@@ -1,11 +1,22 @@
 #pragma once
 
 #include "vnm_terminal/internal/backend_contract.h"
+#include <cstddef>
 #include <memory>
 
 namespace vnm_terminal::internal {
 
 #if defined(_WIN32)
+
+struct Windows_conpty_backend_write_state_for_testing
+{
+    std::size_t queued_write_bytes    = 0U;
+    std::size_t queued_write_count    = 0U;
+    std::size_t in_flight_write_bytes = 0U;
+    bool        running               = false;
+    bool        stopping              = false;
+    bool        writer_failed         = false;
+};
 
 class Windows_conpty_backend final : public Terminal_backend
 {
@@ -31,6 +42,8 @@ public:
 
     Terminal_backend_result interrupt() override;
     Terminal_backend_result terminate() override;
+
+    Windows_conpty_backend_write_state_for_testing write_state_for_testing();
 
 private:
     class Impl;

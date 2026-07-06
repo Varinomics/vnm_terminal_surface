@@ -46,7 +46,7 @@ jobs:
         working-directory: build
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ctest --output-on-failure -C ${CMAKE_BUILD_TYPE} -E "^(vnm_terminal_windows_conpty_backend|vnm_terminal_compat_smoke)$"
+        run: ctest --output-on-failure -C ${CMAKE_BUILD_TYPE} -E "^vnm_terminal_compat_smoke$"
 
       # The main build links vnm_msdf_text from source via FetchContent, which is
       # intentionally not an installable/exportable configuration (the MSDF install
@@ -76,3 +76,66 @@ jobs:
 
       - name: Build package smoke
         run: cmake --build package-smoke --config ${CMAKE_BUILD_TYPE} --parallel
+
+  conpty-asan:
+    name: Qt Quick Terminal Surface ConPTY ASan (Windows)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: '6.10.1'
+          arch: 'win64_msvc2022_64'
+          archives: 'qtbase qtdeclarative'
+          cache: 'true'
+
+      - name: Add MSVC AddressSanitizer runtime to PATH
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs_path = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vs_path) {
+            throw "Visual Studio installation with x64 C++ tools was not found."
+          }
+
+          $msvc_tools_path = Join-Path $vs_path "VC\Tools\MSVC"
+          $asan_runtime = Get-ChildItem -Path $msvc_tools_path `
+            -Recurse `
+            -Filter "clang_rt.asan_dynamic-x86_64.dll" |
+            Where-Object { $_.FullName -like "*\bin\Hostx64\x64\clang_rt.asan_dynamic-x86_64.dll" } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $asan_runtime) {
+            throw "MSVC AddressSanitizer runtime was not found."
+          }
+
+          $asan_runtime.Directory.FullName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Configure CMake
+        run: |
+          cmake -B build-asan -S . \
+            -G "Visual Studio 17 2022" \
+            -A x64 \
+            -DVNM_TERMINAL_BUILD_BENCHMARKS=OFF \
+            -DVNM_TERMINAL_ENABLE_PROFILING=OFF \
+            -DVNM_TERMINAL_SANITIZE_ADDRESS=ON \
+            -DBUILD_TESTING=ON
+
+      - name: Build ConPTY backend ASan test
+        run: >
+          cmake --build build-asan
+          --config ${CMAKE_BUILD_TYPE}
+          --target vnm_terminal_windows_conpty_backend
+          --parallel
+
+      - name: Run ConPTY backend ASan test
+        working-directory: build-asan
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --output-on-failure -C ${CMAKE_BUILD_TYPE} -R "^vnm_terminal_windows_conpty_backend$"
