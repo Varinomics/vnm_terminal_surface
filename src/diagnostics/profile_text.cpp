@@ -571,8 +571,9 @@ void append_session_profile_stats_section(
         stats.max_unrendered_snapshot_generations);
     stream << "  consumer_materialization_counters_available=true\n";
     stream << "  consumer_materialization_counters_schema_semantics="
-        << "batch_6_materialization_boundaries\n";
-    stream << "  consumer_materialization_counters_owner_batch=Batch 6\n";
+        << "geometry_derived_snapshot_materialization_counters\n";
+    stream << "  consumer_materialization_counters_owner_semantics="
+        << "terminal_session_profile_stats\n";
     append_profile_counter(
         stream,
         "consumer_materialization_counters_geometry_derived_snapshot_calls",

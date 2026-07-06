@@ -173,11 +173,12 @@ bool test_profile_text_sections(QGuiApplication& app)
         "session_profile_stats reports available consumer materialization counters");
     ok &= check(text.contains(QStringLiteral(
             "  consumer_materialization_counters_schema_semantics="
-            "batch_6_materialization_boundaries")),
-        "session_profile_stats reports consumer materialization counter owner semantics");
+            "geometry_derived_snapshot_materialization_counters")),
+        "session_profile_stats reports consumer materialization counter schema semantics");
     ok &= check(text.contains(QStringLiteral(
-            "  consumer_materialization_counters_owner_batch=Batch 6")),
-        "session_profile_stats reports consumer materialization counter owner batch");
+            "  consumer_materialization_counters_owner_semantics="
+            "terminal_session_profile_stats")),
+        "session_profile_stats reports consumer materialization counter owner semantics");
     ok &= check(text.contains(QStringLiteral(
             "  consumer_materialization_counters_geometry_derived_snapshot_calls=")),
         "session_profile_stats reports geometry-derived materialization calls");

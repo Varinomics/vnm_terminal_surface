@@ -232,31 +232,31 @@ and `--require-requested-grid`.
 Profile flags such as `--profile`, `--profile-json`, and `--profile-text`
 require a `VNM_TERMINAL_ENABLE_PROFILING=ON` build.
 
-Benchmark JSON uses `schema_version` 25. Profile JSON uses
-`profile_schema_version` 3, `time_unit` `ns`, and
+Benchmark JSON uses `schema_version` 26. Profile JSON uses
+`profile_schema_version` 4, `time_unit` `ns`, and
 `thread_semantics` `separate_thread_trees`, with separate GUI and render thread
-trees. Schema 25 includes sparse dirty-row sweep metadata
+trees. Schema 26 includes sparse dirty-row sweep metadata
 `sparse_dirty_row_sweep_applicable`, `configured_sparse_dirty_rows`, and
 `configured_sparse_dirty_row_stride`; per-scenario requested and actual grid
 metadata through `requested_rows`, `requested_columns`, `rows`, `columns`,
 `actual_grid_matches_request`, and `grid_semantics`; root
 `requested_grid_required`; and the exact
-Batch 7 descriptor counter object. Sparse dirty-row validation requires the
+frame descriptor-reuse counter object. Sparse dirty-row validation requires the
 observed frame and profile dirty-row counts to cover the requested dirty rows,
 rejects full repaint, and allows at most one cursor carry-over row per measured
 frame.
 
-The schema 25 `descriptor_counters` object has exactly
+The schema 26 `descriptor_counters` object has exactly
 `available=true`,
-`schema_semantics="batch_7_frame_qsg_descriptor_reuse"`,
+`schema_semantics="frame_qsg_descriptor_reuse_counters"`,
 numeric `frame_row_descriptors`, numeric `frame_layer_descriptors`, and
 numeric `qsg_layer_descriptors`. `qsg_layer_descriptors` is zero until QSG
 layer descriptor-key work is wired back in.
 
-The schema 25 `session_profile_stats.consumer_materialization_counters` object
+The schema 26 `session_profile_stats.consumer_materialization_counters` object
 has exactly `available=true`,
-`schema_semantics="batch_6_materialization_boundaries"`,
-`owner_batch="Batch 6"`, and numeric counters
+`schema_semantics="geometry_derived_snapshot_materialization_counters"`,
+`owner_semantics="terminal_session_profile_stats"`, and numeric counters
 `geometry_derived_snapshot_calls`, `geometry_derived_snapshot_rows`, and
 `geometry_derived_snapshot_cells`. Geometry-derived
 counters are produced by geometry-derived snapshot direct-output boundaries.
@@ -269,8 +269,8 @@ counters. The `surface_session_resize_smoke_boundary`,
 `surface_session_viewport_change_smoke_boundary`,
 `surface_session_alternate_buffer_smoke_boundary`,
 `surface_session_style_color_mode_smoke_boundary`, and
-`surface_session_hyperlink_smoke_boundary` scenarios are Batch 1 smoke
-boundaries. Schema 25 includes text coalescing
+`surface_session_hyperlink_smoke_boundary` scenarios are decision-boundary
+smoke scenarios. Schema 26 includes text coalescing
 counters:
 `text_coalescing_candidate_groups`, `text_coalescing_enabled_groups`,
 `text_resource_runs_before_coalescing`, and
@@ -305,13 +305,13 @@ configured Qt runtime path, not a performance comparison.
 `vnm_terminal_embedded_benchmark_require_requested_grid_rejects_mismatch`
 expects a deliberate requested-grid mismatch to fail and validates the emitted
 schema fields and diagnostic.
-`vnm_terminal_embedded_benchmark_profile_validate` covers the Batch 1 sparse,
+`vnm_terminal_embedded_benchmark_profile_validate` covers sparse text output,
 selection, public projection, resize, viewport, alternate-buffer,
-style/color/mode, and hyperlink smoke-boundary scenarios for schema, profile,
-route-count, and scope-timing validation. It is not an interleaved A/B
-performance decision run. Use no-profile Release benchmark runs for
-user-visible timing. Use profiling-enabled Release runs only for attribution,
-route counts, and scope timing.
+style/color/mode, and hyperlink scenarios for schema, profile, route-count, and
+scope-timing validation. It is not an interleaved A/B performance decision run.
+Use no-profile Release benchmark runs for user-visible timing. Use
+profiling-enabled Release runs only for attribution, route counts, and scope
+timing.
 
 Benchmark comparisons should record the build directory, profiling state,
 renderer backend, scenario list, grid, window size, warmup count, iteration
