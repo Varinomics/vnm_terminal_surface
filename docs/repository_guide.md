@@ -232,28 +232,37 @@ and `--require-requested-grid`.
 Profile flags such as `--profile`, `--profile-json`, and `--profile-text`
 require a `VNM_TERMINAL_ENABLE_PROFILING=ON` build.
 
-Benchmark JSON uses `schema_version` 26. Profile JSON uses
+Benchmark JSON uses `schema_version` 27. Profile JSON uses
 `profile_schema_version` 4, `time_unit` `ns`, and
 `thread_semantics` `separate_thread_trees`, with separate GUI and render thread
-trees. Schema 26 includes sparse dirty-row sweep metadata
+trees. Schema 27 includes sparse dirty-row sweep metadata
 `sparse_dirty_row_sweep_applicable`, `configured_sparse_dirty_rows`, and
 `configured_sparse_dirty_row_stride`; per-scenario requested and actual grid
 metadata through `requested_rows`, `requested_columns`, `rows`, `columns`,
 `actual_grid_matches_request`, and `grid_semantics`; root
 `requested_grid_required`; and the exact
-frame descriptor-reuse counter object. Sparse dirty-row validation requires the
-observed frame and profile dirty-row counts to cover the requested dirty rows,
-rejects full repaint, and allows at most one cursor carry-over row per measured
-frame.
+frame descriptor-reuse counter object. It also includes measured atlas elapsed
+evidence through `atlas_prepare_elapsed_ns_delta` and
+`atlas_render_elapsed_ns_delta`, computed between the post-warmup baseline and
+the final measured report. Schema 27 also includes measured atlas sparse-row
+evidence through `atlas_frame_dirty_rows_total` and
+`atlas_frame_full_dirty_rows_total`. Sparse dirty-row validation requires
+measured dirty-row evidence to cover the requested dirty rows: legacy
+`frame_dirty_rows` / `frame_full_dirty_rows` counters are used when present,
+otherwise the atlas dirty-row totals are used. Full repaint is rejected, and at
+most one cursor carry-over row is allowed per measured frame. Profiling builds
+also require the profile dirty-row counts to satisfy the same bounds.
 
-The schema 26 `descriptor_counters` object has exactly
+The schema 27 `descriptor_counters` object has exactly
 `available=true`,
 `schema_semantics="frame_qsg_descriptor_reuse_counters"`,
 numeric `frame_row_descriptors`, numeric `frame_layer_descriptors`, and
 numeric `qsg_layer_descriptors`. `qsg_layer_descriptors` is zero until QSG
-layer descriptor-key work is wired back in.
+layer descriptor-key work is wired back in. Descriptor counters are schema
+fields; readiness evidence comes from the atlas render and elapsed signals
+listed below, not from requiring nonzero descriptor counters.
 
-The schema 26 `session_profile_stats.consumer_materialization_counters` object
+The schema 27 `session_profile_stats.consumer_materialization_counters` object
 has exactly `available=true`,
 `schema_semantics="geometry_derived_snapshot_materialization_counters"`,
 `owner_semantics="terminal_session_profile_stats"`, and numeric counters
@@ -270,7 +279,7 @@ counters. The `surface_session_resize_smoke_boundary`,
 `surface_session_alternate_buffer_smoke_boundary`,
 `surface_session_style_color_mode_smoke_boundary`, and
 `surface_session_hyperlink_smoke_boundary` scenarios are decision-boundary
-smoke scenarios. Schema 26 includes text coalescing
+smoke scenarios. Schema 27 includes text coalescing
 counters:
 `text_coalescing_candidate_groups`, `text_coalescing_enabled_groups`,
 `text_resource_runs_before_coalescing`, and
@@ -292,11 +301,15 @@ from the benchmark working directory that supplies the Qt runtime path, the
 `windows` QPA platform, D3D11 RHI, and scale-factor environment. Launching the
 benchmark executable directly from PowerShell without that wrapper/environment
 is not a supported benchmark lane.
-Readback readiness validation also requires visible pixels and atlas render
+Readback readiness validation also requires visible pixels, atlas render
 signals (`atlas_frame_observed`, `atlas_render_observed`,
 `atlas_instances_observed`, `atlas_budget_valid`, and
-`atlas_failures_zero`). Profiling validation waits for the atlas render-thread
-sequence and requires `Qsg_atlas_render_node::prepare`,
+`atlas_failures_zero`), and measured atlas elapsed evidence
+(`atlas_elapsed_observed`, `atlas_prepare_elapsed_ns_delta`, and
+`atlas_render_elapsed_ns_delta`). The elapsed deltas come from top-level
+recorder-lifetime counters; nested atlas instance, budget, and failure signals
+are latest report summaries. Profiling validation waits for the atlas
+render-thread sequence and requires `Qsg_atlas_render_node::prepare`,
 `Qsg_atlas_render_node::prepare_atlas_instances`, and
 `Qsg_atlas_render_node::render` scopes before accepting a scenario profile.
 

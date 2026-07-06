@@ -743,6 +743,10 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
         "append_atlas_metrics_json fills the qsg_atlas object");
     ok &= check(atlas.contains(QStringLiteral("render_count")),
         "atlas metrics include render_count");
+    ok &= check(atlas.value(QStringLiteral("prepare_elapsed_ns")).isString(),
+        "atlas metrics include prepare elapsed counter");
+    ok &= check(atlas.value(QStringLiteral("render_elapsed_ns")).isString(),
+        "atlas metrics include render elapsed counter");
     ok &= check(atlas.value(QStringLiteral("renderer")).toString() == QStringLiteral("atlas"),
         "atlas metrics tag the renderer as atlas");
     ok &= check(atlas.contains(QStringLiteral("frame_row_descriptors")),

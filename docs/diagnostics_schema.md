@@ -220,7 +220,13 @@ These blocks come from the QSG atlas renderer's per-frame report
 key (e.g. `"producer"`); TEXT emits the field run under a header line (e.g.
 `  producer`). Only the flat field run is table-driven, in
 `src/diagnostics/atlas_metric_descriptors.h`; the surrounding nesting/header is
-hand-written in the serializers. All atlas diagnostics here are `UNSTABLE`.
+hand-written in the serializers. Top-level count and elapsed fields on
+`Qsg_atlas_frame_report` are recorder-lifetime cumulative counters. Nested
+sub-summaries such as `producer`, frame-build-derived fields, `coverage`, and
+`buffer_upload` generally describe the latest recorded report snapshot.
+`warm_lazy` is the persistent warm/lazy summary for the current atlas epoch,
+and any field name or row that explicitly states cumulative semantics remains
+cumulative. All atlas diagnostics here are `UNSTABLE`.
 
 ### Atlas producer block (JSON key `producer`, TEXT header `producer`)
 
@@ -251,7 +257,10 @@ hand-written in the serializers. All atlas diagnostics here are `UNSTABLE`.
 ### Atlas warm-lazy block (JSON key `warm_lazy`, TEXT header `warm_lazy`)
 
 Emitted in field order; the two `*_elapsed_ms` durations are `double` values
-emitted outside the shared table (so they are not table rows below).
+emitted outside the shared table (so they are not table rows below). This block
+is copied from the renderer's persistent warm/lazy summary: `warm_*` fields
+summarize the current atlas warm epoch, while `lazy_*` counters and
+`incomplete_frames` accumulate within that summary until the renderer resets it.
 
 | Field | Kind | Unit | Stability |
 |-------|------|------|-----------|
@@ -308,7 +317,11 @@ and the TEXT `qsg_atlas` section, with the same name and a plain field read.
 They are emitted as two contiguous runs in each serializer, with hand-written
 enum-string and boolean flags outside the shared table rows. The rasterization
 run is followed by the hand-written `max_glyph_instance_page` clamp, which is
-not a table row.
+not a table row. `capture_count`, `prepare_count`, `prepare_elapsed_ns`,
+`render_count`, and `render_elapsed_ns` are cumulative recorder counters and are
+the atlas phase evidence to use when a consumer needs run-level prepare/render
+timing. Sequence, color, cursor, and nested-summary fields describe the latest
+captured or rendered report state.
 
 | Field | Kind | Unit | Stability |
 |-------|------|------|-----------|

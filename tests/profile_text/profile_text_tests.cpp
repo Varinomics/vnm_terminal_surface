@@ -271,6 +271,10 @@ bool test_profile_text_sections(QGuiApplication& app)
         QStringLiteral("slow_text_layouts threshold_ns="));
     ok &= check(qsg_atlas.contains(QStringLiteral("  renderer=atlas\n")),
         "qsg_atlas section tags the renderer as atlas");
+    ok &= check(profile_text_contains_counter(qsg_atlas, "prepare_elapsed_ns"),
+        "qsg_atlas section reports prepare elapsed counter");
+    ok &= check(profile_text_contains_counter(qsg_atlas, "render_elapsed_ns"),
+        "qsg_atlas section reports render elapsed counter");
     ok &= check(profile_text_contains_counter(qsg_atlas, "frame_row_descriptors"),
         "qsg_atlas section reports frame row descriptors");
     ok &= check(profile_text_contains_counter(qsg_atlas, "frame_layer_descriptors"),

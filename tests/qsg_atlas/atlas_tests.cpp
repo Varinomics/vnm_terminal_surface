@@ -9300,6 +9300,55 @@ bool atlas_report_render_state_ready(const term::Qsg_atlas_frame_report& report)
         report.rhi_non_null;
 }
 
+bool test_atlas_recorder_accumulates_elapsed_counters()
+{
+    term::Qsg_atlas_recorder recorder;
+    const term::Captured_atlas_frame frame;
+    const term::Glyph_atlas_cache_stats cache;
+    const term::Qsg_atlas_frame_build_summary frame_build;
+    const term::Qsg_atlas_render_summary render_summary;
+    const term::Qsg_atlas_producer_summary producer_summary;
+    const term::Qsg_atlas_warm_lazy_summary warm_lazy_summary;
+
+    const auto record_prepare = [&](std::uint64_t elapsed_ns) {
+        recorder.record_prepare(
+            frame,
+            elapsed_ns,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            0,
+            0U,
+            0U,
+            cache,
+            frame_build,
+            render_summary,
+            producer_summary,
+            warm_lazy_summary);
+    };
+
+    record_prepare(11U);
+    record_prepare(13U);
+    recorder.record_render(frame, 17U, QRect(0, 0, 1, 1), true);
+    recorder.record_render(frame, 19U, QRect(0, 0, 1, 1), true);
+
+    const term::Qsg_atlas_frame_report report = recorder.snapshot();
+    bool ok = true;
+    ok &= check(report.prepare_count == 2U,
+        "atlas recorder counts prepare records");
+    ok &= check(report.prepare_elapsed_ns == 24U,
+        "atlas recorder accumulates prepare elapsed time");
+    ok &= check(report.render_count == 2U,
+        "atlas recorder counts render records");
+    ok &= check(report.render_elapsed_ns == 36U,
+        "atlas recorder accumulates render elapsed time");
+    return ok;
+}
+
 bool pump_until(
     QGuiApplication&    app,
     QQuickWindow&       window,
@@ -19713,6 +19762,7 @@ bool run_unit_tests()
     ok &= test_msdf_text_failure_diagnostics_merge();
     ok &= test_atlas_msdf_text_path_adapter_skip_predicate();
     ok &= test_text_renderer_report_names();
+    ok &= test_atlas_recorder_accumulates_elapsed_counters();
     ok &= test_atlas_budget_stats();
     ok &= test_atlas_warm_set_table_and_shaping();
     ok &= test_atlas_warm_set_representative_family_coverage();
