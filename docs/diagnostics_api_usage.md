@@ -36,7 +36,12 @@ exported include directories and asserts the public headers are present
   renderer compatibility metadata and frame counters. New consumers should use
   `append_atlas_metrics_json` for renderer diagnostics.
 - `append_atlas_metrics_json(surface, out)` fills `out` with the QSG atlas
-  frame-report metrics.
+  frame-report metrics. Its top-level count and elapsed fields, including
+  `prepare_elapsed_ns` and `render_elapsed_ns`, are recorder-lifetime cumulative
+  counters. Nested atlas blocks generally describe the latest recorded report
+  snapshot, while `warm_lazy` is the persistent warm/lazy summary for the
+  current atlas epoch and fields that explicitly name cumulative totals remain
+  cumulative.
 - `append_render_invalidation_metrics_json(surface, out)` fills `out` with
   GUI-thread render invalidation counters.
 - `append_backend_drain_metrics_json(surface, out)` fills `out` with backend
