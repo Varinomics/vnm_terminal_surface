@@ -14,10 +14,13 @@
 #include <QQuickWindow>
 #include <QThread>
 #include <cmath>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -613,6 +616,80 @@ bool test_dpr_expectation(const QStringList& arguments, qreal observed_dpr)
     return true;
 }
 
+std::string metric_message(
+    std::string_view object_name,
+    std::string_view expectation,
+    const char*      key)
+{
+    std::string message(object_name);
+    message += expectation;
+    message += key;
+    return message;
+}
+
+bool expected_runtime_metric_key(
+    const QString&                    key,
+    std::initializer_list<const char*> string_keys,
+    std::initializer_list<const char*> bool_keys)
+{
+    for (const char* expected_key : string_keys) {
+        if (key == QString::fromLatin1(expected_key)) {
+            return true;
+        }
+    }
+    for (const char* expected_key : bool_keys) {
+        if (key == QString::fromLatin1(expected_key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool check_runtime_metric_object(
+    const QJsonObject&                 object,
+    std::string_view                   object_name,
+    std::initializer_list<const char*> string_keys,
+    std::initializer_list<const char*> bool_keys)
+{
+    bool ok = true;
+
+    const int expected_size =
+        static_cast<int>(string_keys.size() + bool_keys.size());
+    ok &= check(
+        object.size() == expected_size,
+        std::string(object_name) + " metrics expose the expected field count");
+
+    for (const char* key : string_keys) {
+        const QString json_key = QString::fromLatin1(key);
+        ok &= check(
+            object.contains(json_key),
+            metric_message(object_name, " metrics include string counter ", key));
+        ok &= check(
+            object.value(json_key).isString(),
+            metric_message(object_name, " metrics type string counter ", key));
+    }
+
+    for (const char* key : bool_keys) {
+        const QString json_key = QString::fromLatin1(key);
+        ok &= check(
+            object.contains(json_key),
+            metric_message(object_name, " metrics include bool field ", key));
+        ok &= check(
+            object.value(json_key).isBool(),
+            metric_message(object_name, " metrics type bool field ", key));
+    }
+
+    for (auto it = object.constBegin(); it != object.constEnd(); ++it) {
+        ok &= check(
+            expected_runtime_metric_key(it.key(), string_keys, bool_keys),
+            std::string(object_name) +
+                " metrics do not include unexpected field " +
+                it.key().toStdString());
+    }
+
+    return ok;
+}
+
 bool test_diagnostics_metrics_json(QGuiApplication& app)
 {
     bool ok = true;
@@ -702,16 +779,21 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
         render_invalidation);
     ok &= check(!render_invalidation.isEmpty(),
         "append_render_invalidation_metrics_json fills the runtime object");
-    ok &= check(
-        render_invalidation.value(QStringLiteral("update_requests")).isString(),
-        "render invalidation metrics include update request counter");
-    ok &= check(
-        render_invalidation.value(
-            QStringLiteral("last_rendered_publication_generation")).isString(),
-        "render invalidation metrics include rendered publication generation");
-    ok &= check(
-        render_invalidation.value(QStringLiteral("pending_update")).isBool(),
-        "render invalidation metrics include pending-update flag");
+    ok &= check_runtime_metric_object(
+        render_invalidation,
+        "render invalidation",
+        {
+            "update_requests",
+            "scheduled_updates",
+            "coalesced_requests",
+            "consumed_updates",
+            "render_snapshot_callback_epoch",
+            "last_rendered_snapshot_sequence",
+            "last_rendered_publication_generation",
+        },
+        {
+            "pending_update",
+        });
 
     QJsonObject backend_drain;
     vnm_terminal::diagnostics::append_backend_drain_metrics_json(
@@ -719,25 +801,35 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
         backend_drain);
     ok &= check(!backend_drain.isEmpty(),
         "append_backend_drain_metrics_json fills the runtime object");
-    ok &= check(
-        backend_drain.value(QStringLiteral("total_drain_calls")).isString(),
-        "backend drain metrics include total drain calls counter");
-    ok &= check(
-        backend_drain.value(QStringLiteral("session_processing_elapsed_ns")).isString(),
-        "backend drain metrics include session processing elapsed counter");
-    ok &= check(
-        backend_drain.value(QStringLiteral("sync_from_session_elapsed_ns")).isString(),
-        "backend drain metrics include surface sync elapsed counter");
-    ok &= check(
-        backend_drain.value(
-            QStringLiteral("posted_frame_pending_small_budget_calls")).isString(),
-        "backend drain metrics include frame-pending posted budget counter");
-    ok &= check(
-        backend_drain.value(QStringLiteral("frame_work_pending_elapsed_ns")).isString(),
-        "backend drain metrics include frame-pending elapsed counter");
-    ok &= check(
-        backend_drain.value(QStringLiteral("pending_callback_after_drain")).isString(),
-        "backend drain metrics include pending callback counter");
+    ok &= check_runtime_metric_object(
+        backend_drain,
+        "backend drain",
+        {
+            "total_drain_calls",
+            "budgeted_drain_calls",
+            "unbudgeted_drain_calls",
+            "posted_drain_calls",
+            "posted_full_budget_calls",
+            "posted_frame_pending_small_budget_calls",
+            "budget_exhausted_incomplete",
+            "cursor_stable_incomplete",
+            "total_elapsed_ns",
+            "max_elapsed_ns",
+            "session_processing_calls",
+            "session_processing_elapsed_ns",
+            "session_processing_max_elapsed_ns",
+            "sync_from_session_calls",
+            "sync_from_session_elapsed_ns",
+            "sync_from_session_max_elapsed_ns",
+            "frame_work_pending_drain_calls",
+            "frame_work_pending_elapsed_ns",
+            "render_update_pending_drain_calls",
+            "atlas_completion_pending_drain_calls",
+            "requeue_count",
+            "pending_callback_after_drain",
+            "output_backpressure_after_drain",
+        },
+        {});
 
     return ok;
 }
