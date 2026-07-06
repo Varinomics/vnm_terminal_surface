@@ -1,11 +1,67 @@
 #include "native_backend_io_core.h"
 
+#include "vnm_terminal/internal/session_contract.h"
 #include <QDir>
 #include <QProcessEnvironment>
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace vnm_terminal::internal {
+
+namespace {
+
+constexpr Terminal_backend_output_delivery_limits k_default_output_delivery_limits{
+    k_terminal_default_output_queue_high_water_bytes,
+    k_terminal_default_output_queue_hard_limit_bytes,
+};
+
+static_assert(
+    k_native_backend_output_read_chunk_bytes <
+    k_terminal_default_output_queue_hard_limit_bytes -
+    k_terminal_default_output_queue_high_water_bytes);
+
+qsizetype clamped_qsizetype_byte_count(std::size_t byte_count)
+{
+    return static_cast<qsizetype>(std::min<std::size_t>(
+        byte_count,
+        static_cast<std::size_t>(std::numeric_limits<qsizetype>::max())));
+}
+
+std::size_t native_backend_callback_read_chunk_bytes(
+    Terminal_backend_output_delivery_limits limits)
+{
+    const std::size_t headroom =
+        limits.hard_limit_bytes > limits.high_water_bytes
+            ? limits.hard_limit_bytes - limits.high_water_bytes
+            : 1U;
+    if (headroom <= 1U) {
+        return 1U;
+    }
+
+    return std::max<std::size_t>(
+        1U,
+        std::min(k_native_backend_output_read_chunk_bytes, headroom - 1U));
+}
+
+std::size_t native_backend_paused_output_budget_bytes(
+    Terminal_backend_output_delivery_limits limits,
+    std::size_t                             callback_read_chunk_bytes)
+{
+    if (limits.hard_limit_bytes <= limits.high_water_bytes) {
+        return callback_read_chunk_bytes;
+    }
+
+    const std::size_t headroom =
+        limits.hard_limit_bytes - limits.high_water_bytes;
+    if (headroom <= callback_read_chunk_bytes) {
+        return 1U;
+    }
+
+    return headroom - callback_read_chunk_bytes;
+}
+
+}
 
 Native_backend_start_precheck validate_native_backend_start_preconditions(
     const Terminal_launch_config&      config,
@@ -121,6 +177,39 @@ void remove_native_backend_queued_write_bytes(
     std::size_t    completed_write_bytes)
 {
     queued_write_bytes -= std::min(queued_write_bytes, completed_write_bytes);
+}
+
+native_backend_output_delivery_limits_t derive_native_backend_output_delivery_limits(
+    const std::optional<Terminal_backend_output_delivery_limits>& configured_limits,
+    std::optional<std::size_t> paused_output_high_watermark_ceiling_bytes)
+{
+    const Terminal_backend_output_delivery_limits limits =
+        configured_limits.value_or(k_default_output_delivery_limits);
+    const std::size_t read_chunk =
+        native_backend_callback_read_chunk_bytes(limits);
+    const std::size_t paused_budget =
+        native_backend_paused_output_budget_bytes(limits, read_chunk);
+    std::size_t delivery_chunk =
+        paused_budget == 0U
+            ? 0U
+            : std::min(
+                  paused_budget,
+                  limits.high_water_bytes != 0U
+                      ? limits.high_water_bytes
+                      : paused_budget);
+    std::size_t high_watermark = paused_budget;
+    if (paused_output_high_watermark_ceiling_bytes.has_value()) {
+        high_watermark =
+            std::min(high_watermark, *paused_output_high_watermark_ceiling_bytes);
+        delivery_chunk =
+            std::min(delivery_chunk, *paused_output_high_watermark_ceiling_bytes);
+    }
+
+    return {
+        clamped_qsizetype_byte_count(high_watermark),
+        clamped_qsizetype_byte_count(delivery_chunk),
+        clamped_qsizetype_byte_count(read_chunk),
+    };
 }
 
 void append_native_backend_paused_output(

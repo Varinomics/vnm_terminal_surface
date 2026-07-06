@@ -3,7 +3,6 @@
 #if defined(__linux__) || defined(__APPLE__)
 
 #include "native_backend_io_core.h"
-#include "vnm_terminal/internal/session_contract.h"
 #include <QFile>
 #include <QProcessEnvironment>
 #include <QStringList>
@@ -54,87 +53,7 @@ constexpr std::chrono::milliseconds k_exit_output_drain_timeout(250);
 // wake pipe with this bound (see wait_for_write_capacity). The cost is one idle
 // wake-up per interval per thread when the terminal is silent.
 constexpr std::chrono::milliseconds k_native_master_poll_interval(100);
-static_assert(
-    k_native_backend_output_read_chunk_bytes <
-    k_terminal_default_output_queue_hard_limit_bytes -
-    k_terminal_default_output_queue_high_water_bytes);
 constexpr int k_waitpid_failure_exit_code = -1;
-
-struct Posix_paused_output_limits
-{
-    qsizetype high_watermark_bytes = 0;
-    qsizetype delivery_chunk_bytes = 0;
-    qsizetype read_chunk_bytes     = 1;
-};
-
-constexpr Terminal_backend_output_delivery_limits k_default_output_delivery_limits{
-    k_terminal_default_output_queue_high_water_bytes,
-    k_terminal_default_output_queue_hard_limit_bytes,
-};
-
-qsizetype clamped_qsizetype_byte_count(std::size_t byte_count)
-{
-    return static_cast<qsizetype>(std::min<std::size_t>(
-        byte_count,
-        static_cast<std::size_t>(std::numeric_limits<qsizetype>::max())));
-}
-
-std::size_t posix_callback_read_chunk_bytes(
-    Terminal_backend_output_delivery_limits limits)
-{
-    const std::size_t headroom =
-        limits.hard_limit_bytes > limits.high_water_bytes
-            ? limits.hard_limit_bytes - limits.high_water_bytes
-            : 1U;
-    if (headroom <= 1U) {
-        return 1U;
-    }
-
-    return std::max<std::size_t>(
-        1U,
-        std::min(k_native_backend_output_read_chunk_bytes, headroom - 1U));
-}
-
-std::size_t posix_paused_output_budget_bytes(
-    Terminal_backend_output_delivery_limits limits,
-    std::size_t                             callback_read_chunk_bytes)
-{
-    if (limits.hard_limit_bytes <= limits.high_water_bytes) {
-        return callback_read_chunk_bytes;
-    }
-
-    const std::size_t headroom =
-        limits.hard_limit_bytes - limits.high_water_bytes;
-    if (headroom <= callback_read_chunk_bytes) {
-        return 1U;
-    }
-
-    return headroom - callback_read_chunk_bytes;
-}
-
-Posix_paused_output_limits make_posix_paused_output_limits(
-    const std::optional<Terminal_backend_output_delivery_limits>& configured_limits)
-{
-    const Terminal_backend_output_delivery_limits limits =
-        configured_limits.value_or(k_default_output_delivery_limits);
-    const std::size_t read_chunk =
-        posix_callback_read_chunk_bytes(limits);
-    const std::size_t paused_budget =
-        posix_paused_output_budget_bytes(limits, read_chunk);
-    const std::size_t delivery_chunk =
-        paused_budget == 0U
-            ? 0U
-            : std::min(
-                  paused_budget,
-                  limits.high_water_bytes != 0U
-                      ? limits.high_water_bytes
-                      : paused_budget);
-    return {
-        clamped_qsizetype_byte_count(paused_budget),
-        clamped_qsizetype_byte_count(delivery_chunk),
-        clamped_qsizetype_byte_count(read_chunk),
-    };
-}
 
 QString posix_error_message(QStringView context, int code)
 {
@@ -848,7 +767,8 @@ public:
             m_paused_output_delivery_in_progress = false;
             m_termination_policy                 = effective_config.termination_policy;
             m_paused_output_limits =
-                make_posix_paused_output_limits(effective_config.output_delivery_limits);
+                derive_native_backend_output_delivery_limits(
+                    effective_config.output_delivery_limits);
             m_exit_reason_override.reset();
             m_queued_write_bytes = 0U;
             m_write_queue.clear();
@@ -2183,8 +2103,10 @@ private:
     std::deque<Queued_write>            m_write_queue;
     std::optional<Terminal_exit_reason> m_exit_reason_override;
     Terminal_termination_policy         m_termination_policy;
-    Posix_paused_output_limits          m_paused_output_limits =
-                                        make_posix_paused_output_limits(std::nullopt);
+    native_backend_output_delivery_limits_t
+                                        m_paused_output_limits =
+                                            derive_native_backend_output_delivery_limits(
+                                                std::nullopt);
     std::size_t                         m_queued_write_bytes = 0U;
     std::size_t                         m_public_call_depth = 0U;
     pid_t                               m_child_pid = -1;

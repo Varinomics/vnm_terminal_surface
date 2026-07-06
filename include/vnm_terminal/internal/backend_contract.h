@@ -84,6 +84,16 @@ struct Terminal_termination_policy
     std::chrono::milliseconds              kill_interval     = std::chrono::milliseconds(500);
 };
 
+/**
+ * Session output queue limits supplied to native backends at process start.
+ *
+ * Backends use these values to derive bounded read sizes, paused-output buffer
+ * budgets, and paused-replay callback chunks. `hard_limit_bytes` is the maximum
+ * downstream output queue budget; `high_water_bytes` is the threshold where the
+ * session asks the backend to pause output delivery. When the hard limit leaves
+ * room above high-water, native backends reserve space for at least one read
+ * callback while deriving paused-output budgets.
+ */
 struct Terminal_backend_output_delivery_limits
 {
     std::size_t                            high_water_bytes = 0U;

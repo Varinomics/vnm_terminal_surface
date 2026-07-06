@@ -45,9 +45,9 @@ namespace {
 
 constexpr std::chrono::milliseconds k_conpty_reader_close_grace(1000);
 // Keep the ConPTY pipe draining while session output is paused, but keep the
-// backend-side burst below the session callback/output queue hard limit when it
-// is released as one callback.
-constexpr qsizetype k_paused_output_high_watermark_bytes = 64 * 1024;
+// existing backend-side paused buffer ceiling for default session limits.
+constexpr std::size_t k_conpty_paused_output_high_watermark_ceiling_bytes =
+    64U * 1024U;
 constexpr int k_interrupt_exit_code = 130;
 
 DWORD wait_timeout_from_interval(std::chrono::milliseconds interval)
@@ -669,6 +669,10 @@ public:
             m_writer_failed      = false;
             m_startup_aborted    = false;
             m_termination_policy = effective_config.termination_policy;
+            m_output_delivery_limits =
+                derive_native_backend_output_delivery_limits(
+                    effective_config.output_delivery_limits,
+                    k_conpty_paused_output_high_watermark_ceiling_bytes);
             m_exit_reason_override.reset();
             m_queued_write_bytes                   = 0U;
             m_conpty_active_calls                  = 0U;
@@ -1175,12 +1179,24 @@ private:
 
     bool take_paused_output_for_delivery_locked(QByteArray& paused_output)
     {
-        if (m_paused_output_delivery_in_progress || m_paused_output.isEmpty()) {
+        if (m_output_delivery_limits.delivery_chunk_bytes <= 0 ||
+            m_paused_output_delivery_in_progress                ||
+            m_paused_output.isEmpty())
+        {
             return false;
         }
 
-        paused_output = std::move(m_paused_output);
-        m_paused_output.clear();
+        const qsizetype byte_count = std::min(
+            m_paused_output.size(),
+            m_output_delivery_limits.delivery_chunk_bytes);
+        if (byte_count == m_paused_output.size()) {
+            paused_output = std::move(m_paused_output);
+            m_paused_output.clear();
+        }
+        else {
+            paused_output = m_paused_output.sliced(0, byte_count);
+            m_paused_output.remove(0, byte_count);
+        }
         m_paused_output_delivery_in_progress = true;
         return true;
     }
@@ -1198,8 +1214,17 @@ private:
                 if ((!m_output_paused || m_stopping || m_shutdown_started) &&
                     !m_paused_output.isEmpty())
                 {
-                    next_paused_output = std::move(m_paused_output);
-                    m_paused_output.clear();
+                    const qsizetype byte_count = std::min(
+                        m_paused_output.size(),
+                        m_output_delivery_limits.delivery_chunk_bytes);
+                    if (byte_count == m_paused_output.size()) {
+                        next_paused_output = std::move(m_paused_output);
+                        m_paused_output.clear();
+                    }
+                    else {
+                        next_paused_output = m_paused_output.sliced(0, byte_count);
+                        m_paused_output.remove(0, byte_count);
+                    }
                 }
                 else {
                     m_paused_output_delivery_in_progress = false;
@@ -1254,8 +1279,10 @@ private:
                 m_output_paused ||
                 !m_paused_output.isEmpty();
             if (should_buffer &&
+                m_output_delivery_limits.delivery_chunk_bytes > 0 &&
                 bytes_size <=
-                    k_paused_output_high_watermark_bytes - m_paused_output.size())
+                    m_output_delivery_limits.high_watermark_bytes -
+                        m_paused_output.size())
             {
                 append_native_backend_paused_output(m_paused_output, std::move(bytes));
             }
@@ -1345,14 +1372,15 @@ private:
 
         for (;;) {
             HANDLE output_read = nullptr;
-            DWORD bytes_to_read = static_cast<DWORD>(buffer.size());
+            DWORD bytes_to_read = 1U;
             {
                 std::unique_lock<std::mutex> lock(m_mutex);
                 m_output_cv.wait(lock, [&] {
                     const bool direct_delivery_available =
                         !m_output_paused && m_paused_output.isEmpty();
                     const bool paused_buffer_room_available =
-                        m_paused_output.size() < k_paused_output_high_watermark_bytes;
+                        m_paused_output.size() <
+                            m_output_delivery_limits.high_watermark_bytes;
                     return
                         m_shutdown_started ||
                         (!m_paused_output_delivery_in_progress &&
@@ -1368,13 +1396,22 @@ private:
                     break;
                 }
 
+                bytes_to_read = static_cast<DWORD>(std::max<qsizetype>(
+                    1,
+                    std::min(
+                        std::min(
+                            m_output_delivery_limits.read_chunk_bytes,
+                            m_output_delivery_limits.high_watermark_bytes),
+                        m_output_delivery_limits.delivery_chunk_bytes)));
                 if ((m_output_paused || !m_paused_output.isEmpty()) &&
-                    m_paused_output.size() < k_paused_output_high_watermark_bytes)
+                    m_paused_output.size() <
+                        m_output_delivery_limits.high_watermark_bytes)
                 {
                     const qsizetype paused_output_room =
-                        k_paused_output_high_watermark_bytes - m_paused_output.size();
+                        m_output_delivery_limits.high_watermark_bytes -
+                            m_paused_output.size();
                     bytes_to_read = static_cast<DWORD>(std::min<qsizetype>(
-                        static_cast<qsizetype>(buffer.size()),
+                        static_cast<qsizetype>(bytes_to_read),
                         paused_output_room));
                 }
             }
@@ -1819,6 +1856,11 @@ private:
     std::optional<Terminal_exit_reason>
                                        m_exit_reason_override;
     Terminal_termination_policy        m_termination_policy;
+    native_backend_output_delivery_limits_t
+                                       m_output_delivery_limits =
+                                           derive_native_backend_output_delivery_limits(
+                                               std::nullopt,
+                                               k_conpty_paused_output_high_watermark_ceiling_bytes);
     std::size_t                        m_queued_write_bytes       = 0U;
     std::size_t                        m_conpty_active_calls      = 0U;
     std::size_t                        m_pending_interrupt_writes = 0U;
