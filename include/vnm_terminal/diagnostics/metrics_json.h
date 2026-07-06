@@ -6,9 +6,10 @@ class VNM_TerminalSurface;
 
 namespace vnm_terminal::diagnostics {
 
-// Fill `out` with the renderer cumulative-counter metrics for `surface`. The
-// caller owns the surrounding object: production places this content under the
-// "renderer" key of the runtime metrics document.
+// Fill `out` with legacy renderer compatibility metadata and frame counters for
+// `surface`. New renderer diagnostics should use append_atlas_metrics_json and
+// the public frame counters on VNM_TerminalSurface; this helper remains for
+// source compatibility with hosts that still frame a "renderer" object.
 void append_renderer_metrics_json(const VNM_TerminalSurface& surface, QJsonObject& out);
 
 // Fill `out` with the QSG atlas frame-report metrics for `surface`. The caller

@@ -663,10 +663,10 @@ bool check_runtime_metric_object(
         const QString json_key = QString::fromLatin1(key);
         ok &= check(
             object.contains(json_key),
-            metric_message(object_name, " metrics include string counter ", key));
+            metric_message(object_name, " metrics include string field ", key));
         ok &= check(
             object.value(json_key).isString(),
-            metric_message(object_name, " metrics type string counter ", key));
+            metric_message(object_name, " metrics type string field ", key));
     }
 
     for (const char* key : bool_keys) {
@@ -710,31 +710,32 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
     QJsonObject renderer;
     vnm_terminal::diagnostics::append_renderer_metrics_json(surface, renderer);
     ok &= check(!renderer.isEmpty(),
-        "append_renderer_metrics_json fills the renderer object");
-    ok &= check(renderer.contains(QStringLiteral("frames_published")),
-        "renderer metrics include frames_published");
-    ok &= check(renderer.contains(QStringLiteral("paint_completed_frames")),
-        "renderer metrics include paint_completed_frames");
-    ok &= check(renderer.contains(QStringLiteral("frame")),
-        "renderer metrics include the nested frame object");
-    const QJsonObject renderer_frame =
-        renderer.value(QStringLiteral("frame")).toObject();
-    ok &= check(renderer_frame.contains(QStringLiteral("row_descriptors_built")),
-        "renderer frame metrics include row descriptor builds");
-    ok &= check(renderer_frame.contains(QStringLiteral("layer_descriptors_built")),
-        "renderer frame metrics include layer descriptor builds");
-    ok &= check(renderer.contains(QStringLiteral("text_resource_descriptor_builds")),
-        "renderer metrics include text resource descriptor builds");
-    ok &= check(renderer.contains(QStringLiteral("text_resource_descriptor_builds_avoided")),
-        "renderer metrics include avoided text resource descriptor builds");
-    ok &= check(renderer.contains(QStringLiteral("text_resource_descriptor_reuses")),
-        "renderer metrics include text resource descriptor reuses");
-    const auto renderer_qsg_layer_descriptors =
-        renderer.value(QStringLiteral("qsg_layer_descriptors"));
+        "append_renderer_metrics_json fills the legacy compatibility object");
+    ok &= check_runtime_metric_object(
+        renderer,
+        "renderer compatibility",
+        {
+            "compatibility_scope",
+            "canonical_renderer_metrics",
+            "frames_published",
+            "paint_completed_frames",
+            "qsg_atlas_render_count",
+        },
+        {});
     ok &= check(
-        renderer_qsg_layer_descriptors.isString() &&
-            renderer_qsg_layer_descriptors.toString() == QStringLiteral("0"),
-        "renderer metrics report zero QSG layer descriptors");
+        renderer.value(QStringLiteral("compatibility_scope")).toString() ==
+            QStringLiteral("legacy_renderer_frame_counters"),
+        "renderer compatibility metrics declare their scope");
+    ok &= check(
+        renderer.value(QStringLiteral("canonical_renderer_metrics")).toString() ==
+            QStringLiteral("qsg_atlas"),
+        "renderer compatibility metrics point to qsg_atlas");
+    ok &= check(renderer.value(QStringLiteral("frames_published")).isString(),
+        "renderer compatibility metrics include frames_published");
+    ok &= check(renderer.value(QStringLiteral("paint_completed_frames")).isString(),
+        "renderer compatibility metrics include paint_completed_frames");
+    ok &= check(renderer.value(QStringLiteral("qsg_atlas_render_count")).isString(),
+        "renderer compatibility metrics include atlas render count");
 
     QJsonObject atlas;
     vnm_terminal::diagnostics::append_atlas_metrics_json(surface, atlas);

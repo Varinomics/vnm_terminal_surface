@@ -333,6 +333,9 @@ the install tree, and the public install interface exposes only
 `vnm_terminal/diagnostics/` subtree. Embedders that consume the installed
 package therefore cannot include internal headers and must rely on the public
 surface, the public `diagnostics/` serializers, and the public font/metrics API.
+Renderer-detail diagnostics are exposed through the public `qsg_atlas`
+serializer; the older renderer serializer is retained only as a compatibility
+frame-counter helper.
 Internal headers carry no source- or binary-stability guarantee and may change
 without notice.
 

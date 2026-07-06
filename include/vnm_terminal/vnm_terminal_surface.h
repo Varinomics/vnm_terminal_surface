@@ -398,11 +398,10 @@ public:
     bool viewport_at_tail() const;
     Selection_state selection_state() const;
 
-    // Cumulative renderer/atlas frame counts the diagnostics metrics builder
-    // pairs with host-side timing to derive frame rate. These mirror the
-    // counters in vnm_terminal::diagnostics::append_renderer_metrics_json and
-    // append_atlas_metrics_json so a host can read the counts without including
-    // surface internal headers.
+    // Cumulative frame counts for host-side timing and frame evidence. The
+    // atlas counter is the canonical renderer frame count; the paint-completed
+    // counter reflects GUI/render completion bookkeeping without requiring
+    // internal headers.
     quint64 paint_completed_frame_count() const;
     quint64 qsg_atlas_render_frame_count() const;
 

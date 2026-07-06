@@ -14,7 +14,9 @@ exported include directories and asserts the public headers are present
 - Stable public API: the JSON metric serializers
   (`diagnostics/metrics_json.h`), the surface toggles and frame counters on
   `VNM_TerminalSurface`, the typed scroll-diagnostic enums, and
-  `font_metrics.h`. Compiled in every build.
+  `font_metrics.h`. Compiled in every build. Renderer-detail diagnostics are
+  reported by the `qsg_atlas` serializer; the older `renderer` serializer is a
+  compatibility frame-counter helper.
 - Profiling-gated API: the profile-text serializers
   (`diagnostics/profile_text.h`) exist only when the surface is built with
   `VNM_TERMINAL_ENABLE_PROFILING=ON`; the declarations are compiled out
@@ -30,8 +32,9 @@ exported include directories and asserts the public headers are present
 
 `vnm_terminal/diagnostics/metrics_json.h` declares fill-in-place builders:
 
-- `append_renderer_metrics_json(surface, out)` fills `out` with the renderer
-  cumulative-counter metrics.
+- `append_renderer_metrics_json(surface, out)` fills `out` with legacy
+  renderer compatibility metadata and frame counters. New consumers should use
+  `append_atlas_metrics_json` for renderer diagnostics.
 - `append_atlas_metrics_json(surface, out)` fills `out` with the QSG atlas
   frame-report metrics.
 - `append_render_invalidation_metrics_json(surface, out)` fills `out` with
@@ -43,11 +46,14 @@ exported include directories and asserts the public headers are present
 The caller owns the surrounding document and chooses the enclosing keys; the
 first-party app nests these under `"renderer"`, `"qsg_atlas"`,
 `"render_invalidation"`, and `"backend_drain"` in its runtime metrics
-document. The render invalidation and backend drain sections are runtime
-JSON-only sections: they are not descriptor-backed JSON/TEXT metric blocks and
-do not have matching profile-text output. The descriptor-backed key sets and
-their units and stability classes are recorded in `diagnostics_schema.md`; the
-structural expectations are pinned by the app's `metrics_json_smoke` test.
+document for compatibility. Treat `"qsg_atlas"` as the canonical renderer
+diagnostics object. The render invalidation and backend drain sections are
+runtime JSON-only sections: they are not descriptor-backed JSON/TEXT metric
+blocks and do not have matching profile-text output. The descriptor-backed key
+sets and their units and stability classes are recorded in
+`diagnostics_schema.md`; the structural expectations are pinned by
+`tests/qt_metrics/qt_metrics_tests.cpp` and the `vnm_terminal_qt_metrics`
+CTest entries.
 
 Frame counters pair with the serialized metrics for host-level framing (FPS,
 frame-evidence):
@@ -58,13 +64,14 @@ frame-evidence):
 ## Profile Text
 
 `vnm_terminal/diagnostics/profile_text.h` declares one builder per report
-section (dirty-row stats and timeline, model/session profile stats, renderer
-stats, cumulative renderer stats, atlas profile, slow-text-layout
-diagnostics, surface geometry, render-thread profile). Each call appends
-exactly the bytes of one section to a `QTextStream`, with no leading or
-trailing blank line; the caller frames the document and writes the
-inter-section separators. Section content is profiling data, so the whole
-header body is `#if VNM_TERMINAL_PROFILING_ENABLED`.
+section (dirty-row stats and timeline, model/session profile stats, legacy
+renderer compatibility sections, atlas profile, slow-text-layout diagnostics,
+surface geometry, render-thread profile). Each call appends exactly the bytes
+of one section to a `QTextStream`, with no leading or trailing blank line; the
+caller frames the document and writes the inter-section separators. Section
+content is profiling data, so the whole header body is
+`#if VNM_TERMINAL_PROFILING_ENABLED`. New renderer-detail diagnostics should
+come from the atlas profile section.
 
 ## Diagnostic Toggles
 
@@ -99,9 +106,6 @@ render on.
 ```cpp
 // Runtime metrics document (stable, every build).
 QJsonObject metrics;
-QJsonObject renderer;
-vnm_terminal::diagnostics::append_renderer_metrics_json(*surface, renderer);
-metrics.insert("renderer", renderer);
 QJsonObject atlas;
 vnm_terminal::diagnostics::append_atlas_metrics_json(*surface, atlas);
 metrics.insert("qsg_atlas", atlas);
@@ -115,6 +119,8 @@ vnm_terminal::diagnostics::append_backend_drain_metrics_json(
 metrics.insert("backend_drain", backend_drain);
 metrics.insert("paint_completed_frames",
     static_cast<qint64>(surface->paint_completed_frame_count()));
+metrics.insert("qsg_atlas_render_frames",
+    static_cast<qint64>(surface->qsg_atlas_render_frame_count()));
 
 // Cell-aligned window sizing.
 const QString family = vnm_terminal::default_monospace_font_family();
@@ -125,6 +131,7 @@ if (vnm_terminal::cell_metrics_valid(cell)) {
 }
 ```
 
-The first-party `vnm_terminal` app is the reference consumer:
-`src/app_metrics.cpp` (JSON framing) and `src/app_profile_text.cpp`
-(profile-text framing) contain complete production usage.
+Surface-side JSON and profile-text framing are pinned by
+`tests/qt_metrics/qt_metrics_tests.cpp` and
+`tests/profile_text/profile_text_tests.cpp`; keep host framing changes aligned
+with those contract checks.

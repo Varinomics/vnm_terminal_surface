@@ -16,13 +16,12 @@
 
 // Golden characterization test for the text-layout diagnostics block.
 //
-// The block is serialized twice in production: once as JSON
-// (metrics_json.cpp) and once as TEXT (profile_text.cpp). Both call the shared
-// detail emitters. This test feeds a fabricated stats struct -- distinct,
-// non-zero value per field -- through those emitters and asserts the output
-// byte-for-byte (text) and key/value-string-exact (JSON), against an
-// independently-spelled-out oracle. A dropped, renamed, or reordered field, or
-// any change to the number formatting, is caught here.
+// The block is retained as legacy renderer compatibility schema. This test
+// feeds a fabricated stats struct -- distinct, non-zero value per field --
+// through the shared detail emitters and asserts the output byte-for-byte
+// (text) and key/value-string-exact (JSON), against an independently-spelled-out
+// oracle. A dropped, renamed, or reordered field, or any change to the number
+// formatting, is caught here.
 //
 // The oracle below is the EXACT field list and order the block emits. It is
 // duplicated on purpose: if it drifts from the production table the test fails,

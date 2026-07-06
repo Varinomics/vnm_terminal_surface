@@ -44,12 +44,32 @@ bool profile_text_contains_counter(const QString& text, const char* key)
         QStringLiteral("  ") + QString::fromLatin1(key) + QStringLiteral("="));
 }
 
+qsizetype profile_text_line_marker_index(
+    const QString& text,
+    const QString& marker,
+    qsizetype      from)
+{
+    qsizetype cursor = from;
+    while (cursor < text.size()) {
+        const qsizetype marker_index = text.indexOf(marker, cursor);
+        if (marker_index < 0) {
+            return -1;
+        }
+        if (marker_index == 0 ||
+            text.at(marker_index - 1) == QLatin1Char('\n')) {
+            return marker_index;
+        }
+        cursor = marker_index + 1;
+    }
+    return -1;
+}
+
 QString profile_text_section(
     const QString& text,
     const QString& begin_marker,
     const QString& end_marker)
 {
-    const qsizetype begin = text.indexOf(begin_marker);
+    const qsizetype begin = profile_text_line_marker_index(text, begin_marker, 0);
     if (begin < 0) {
         return {};
     }
@@ -57,7 +77,7 @@ QString profile_text_section(
     const qsizetype content_begin = begin + begin_marker.size();
     const qsizetype end = end_marker.isEmpty()
         ? text.size()
-        : text.indexOf(end_marker, content_begin);
+        : profile_text_line_marker_index(text, end_marker, content_begin);
     if (end < 0) {
         return text.mid(content_begin);
     }
@@ -199,32 +219,50 @@ bool test_profile_text_sections(QGuiApplication& app)
     ok &= check(text.contains(QStringLiteral("  public_projection_scroll_publications=")),
         "session_profile_stats reports public_projection_scroll_publications");
     ok &= check(text.contains(QStringLiteral("last_renderer_stats\n")),
-        "append_renderer_stats_text emits the last_renderer_stats header");
+        "append_renderer_stats_text emits the legacy renderer header");
     const QString last_renderer_stats = profile_text_section(
         text,
         QStringLiteral("last_renderer_stats\n"),
         QStringLiteral("cumulative_renderer_stats\n"));
-    ok &= check(last_renderer_stats.contains(QStringLiteral("  frame_visible_rows=")),
-        "last_renderer_stats reports frame_visible_rows");
     ok &= check(
-        last_renderer_stats.contains(QStringLiteral("  frame_dirty_row_lookup_count=")),
-        "last_renderer_stats reports frame_dirty_row_lookup_count");
+        last_renderer_stats.contains(
+            QStringLiteral("  compatibility_scope=legacy_renderer_frame_counters\n")),
+        "last_renderer_stats reports legacy compatibility scope");
     ok &= check(
-        profile_text_contains_counter(last_renderer_stats, "frame_row_descriptors_built"),
-        "last_renderer_stats reports frame row descriptor builds");
+        last_renderer_stats.contains(
+            QStringLiteral("  canonical_renderer_section=qsg_atlas\n")),
+        "last_renderer_stats points to qsg_atlas as canonical");
     ok &= check(
-        profile_text_contains_counter(last_renderer_stats, "frame_layer_descriptors_built"),
-        "last_renderer_stats reports frame layer descriptor builds");
-    ok &= check(last_renderer_stats.contains(QStringLiteral("  qsg_layer_descriptors=0\n")),
-        "last_renderer_stats reports zero QSG layer descriptors");
+        last_renderer_stats.contains(QStringLiteral("  paint_completed=")),
+        "last_renderer_stats reports paint completion compatibility state");
+    ok &= check(
+        !profile_text_contains_counter(last_renderer_stats, "frame_row_descriptors_built"),
+        "last_renderer_stats does not expose legacy frame descriptor details");
     ok &= check(text.contains(QStringLiteral("cumulative_renderer_stats\n")),
-        "append_cumulative_renderer_stats_text emits the cumulative_renderer_stats header");
+        "append_cumulative_renderer_stats_text emits the legacy cumulative renderer header");
     const QString cumulative_renderer_stats = profile_text_section(
         text,
         QStringLiteral("cumulative_renderer_stats\n"),
         QStringLiteral("qsg_atlas\n"));
-    ok &= check(cumulative_renderer_stats.contains(QStringLiteral("  qsg_layer_descriptors=0\n")),
-        "cumulative_renderer_stats reports zero QSG layer descriptors");
+    ok &= check(
+        cumulative_renderer_stats.contains(
+            QStringLiteral("  compatibility_scope=legacy_renderer_frame_counters\n")),
+        "cumulative_renderer_stats reports legacy compatibility scope");
+    ok &= check(
+        cumulative_renderer_stats.contains(
+            QStringLiteral("  canonical_renderer_section=qsg_atlas\n")),
+        "cumulative_renderer_stats points to qsg_atlas as canonical");
+    ok &= check(profile_text_contains_counter(cumulative_renderer_stats, "frames_published"),
+        "cumulative_renderer_stats reports frame publication count");
+    ok &= check(
+        profile_text_contains_counter(cumulative_renderer_stats, "paint_completed_frames"),
+        "cumulative_renderer_stats reports paint completion count");
+    ok &= check(
+        profile_text_contains_counter(cumulative_renderer_stats, "qsg_atlas_render_count"),
+        "cumulative_renderer_stats reports atlas render count");
+    ok &= check(
+        !profile_text_contains_counter(cumulative_renderer_stats, "qsg_layer_descriptors"),
+        "cumulative_renderer_stats does not expose legacy QSG layer descriptor details");
     ok &= check(text.contains(QStringLiteral("qsg_atlas\n")),
         "append_qsg_atlas_profile_text emits the qsg_atlas header");
     const QString qsg_atlas = profile_text_section(
