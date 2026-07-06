@@ -92,8 +92,8 @@ constexpr int k_surface_session_write_high_water_bytes        = 64 * 1024;
 constexpr int k_surface_session_resize_boundary_width_delta   = 16;
 constexpr int k_surface_session_geometry_boundary_height_delta = 16;
 
-constexpr int k_schema_version              = 25;
-constexpr int k_profile_schema_version      = 3;
+constexpr int k_schema_version              = 26;
+constexpr int k_profile_schema_version      = 4;
 constexpr int k_profile_text_format         = 2;
 constexpr int k_flat_rect_vertices_per_rect = 6;
 
@@ -117,7 +117,7 @@ const QString k_surface_session_resize_smoke_boundary_execution_mode =
 const QString k_surface_session_geometry_derived_boundary_execution_mode =
     QStringLiteral("surface_session_geometry_derived_boundary");
 const QString k_surface_session_decision_boundary_execution_mode =
-    QStringLiteral("surface_session_batch1_smoke_boundary");
+    QStringLiteral("surface_session_decision_boundary");
 const QString k_surface_session_public_projection_boundary_execution_mode =
     QStringLiteral("surface_session_public_projection_boundary");
 const QString k_surface_session_scrollback_limit_execution_mode = QStringLiteral(
@@ -133,9 +133,11 @@ const QString k_output_high_water_queue_pressure_semantics = QStringLiteral(
 const QString k_surface_session_write_high_water_execution_mode = QStringLiteral(
     "surface_session_write_high_water_reservation_pressure");
 const QString k_descriptor_counter_schema_semantics = QStringLiteral(
-    "batch_7_frame_qsg_descriptor_reuse");
+    "frame_qsg_descriptor_reuse_counters");
 const QString k_consumer_materialization_counter_schema_semantics = QStringLiteral(
-    "batch_6_materialization_boundaries");
+    "geometry_derived_snapshot_materialization_counters");
+const QString k_consumer_materialization_counter_owner_semantics = QStringLiteral(
+    "terminal_session_profile_stats");
 const QString k_requested_grid_semantics = QStringLiteral("requested_grid_validated");
 const QString k_surface_session_actual_grid_semantics = QStringLiteral(
     "surface_session_actual_grid_from_qquick_surface_metrics");
@@ -5777,7 +5779,9 @@ QJsonObject consumer_materialization_counters_json(
     object.insert(
         QStringLiteral("schema_semantics"),
         k_consumer_materialization_counter_schema_semantics);
-    object.insert(QStringLiteral("owner_batch"), QStringLiteral("Batch 6"));
+    object.insert(
+        QStringLiteral("owner_semantics"),
+        k_consumer_materialization_counter_owner_semantics);
     insert_profile_counter(
         object,
         QStringLiteral("geometry_derived_snapshot_calls"),
@@ -8559,7 +8563,7 @@ bool validate_consumer_materialization_counters_json(
             {
                 QStringLiteral("available"),
                 QStringLiteral("schema_semantics"),
-                QStringLiteral("owner_batch"),
+                QStringLiteral("owner_semantics"),
                 QStringLiteral("geometry_derived_snapshot_calls"),
                 QStringLiteral("geometry_derived_snapshot_rows"),
                 QStringLiteral("geometry_derived_snapshot_cells"),
@@ -8574,7 +8578,8 @@ bool validate_consumer_materialization_counters_json(
         !counters.value(QStringLiteral("available")).toBool() ||
         counters.value(QStringLiteral("schema_semantics")).toString() !=
             k_consumer_materialization_counter_schema_semantics ||
-        counters.value(QStringLiteral("owner_batch")).toString() != QStringLiteral("Batch 6"))
+        counters.value(QStringLiteral("owner_semantics")).toString() !=
+            k_consumer_materialization_counter_owner_semantics)
     {
         *out_error = QStringLiteral("consumer materialization counter schema changed");
         return false;
@@ -9037,7 +9042,7 @@ bool validate_scenario_json(
             observed_frame_full_dirty_rows != 0)
         {
             *out_error = QStringLiteral(
-                "sparse dirty-row frame counters exceeded the Batch 1 cursor allowance: %1")
+                "sparse dirty-row frame counters exceeded the cursor-row allowance: %1")
                 .arg(scenario_name);
             return false;
         }
@@ -9061,7 +9066,7 @@ bool validate_scenario_json(
                 observed_full_repaint_fallbacks != 0)
             {
                 *out_error = QStringLiteral(
-                    "sparse dirty-row profile counters exceeded the Batch 1 cursor allowance: %1")
+                    "sparse dirty-row profile counters exceeded the cursor-row allowance: %1")
                     .arg(scenario_name);
                 return false;
             }

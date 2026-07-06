@@ -41,7 +41,7 @@ if(NOT benchmark_output MATCHES "frame_row_descriptor_counters_available=true")
 endif()
 
 if(NOT benchmark_output MATCHES
-    "frame_row_descriptor_counter_semantics=batch_7_frame_qsg_descriptor_reuse")
+    "frame_row_descriptor_counter_semantics=frame_qsg_descriptor_reuse_counters")
     message(FATAL_ERROR
         "surface stress descriptor semantics contract missing\n"
         "stdout:\n${benchmark_output}")

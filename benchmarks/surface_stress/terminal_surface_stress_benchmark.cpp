@@ -18,7 +18,7 @@ namespace term = vnm_terminal::internal;
 namespace {
 
 constexpr const char* k_frame_descriptor_counter_semantics =
-    "batch_7_frame_qsg_descriptor_reuse";
+    "frame_qsg_descriptor_reuse_counters";
 
 enum class Text_pattern
 {
