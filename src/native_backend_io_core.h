@@ -29,6 +29,13 @@ struct Native_backend_start_precheck
     std::optional<Terminal_effective_launch_config> effective_config;
 };
 
+struct native_backend_output_delivery_limits_t
+{
+    qsizetype                             high_watermark_bytes = 0;
+    qsizetype                             delivery_chunk_bytes = 0;
+    qsizetype                             read_chunk_bytes     = 1;
+};
+
 Native_backend_start_precheck validate_native_backend_start_preconditions(
     const Terminal_launch_config&      config,
     const Terminal_backend_callbacks&  callbacks,
@@ -60,6 +67,12 @@ void add_native_backend_queued_write_bytes(
 void remove_native_backend_queued_write_bytes(
     std::size_t&                       queued_write_bytes,
     std::size_t                        completed_write_bytes);
+
+native_backend_output_delivery_limits_t derive_native_backend_output_delivery_limits(
+    const std::optional<Terminal_backend_output_delivery_limits>&
+                                       configured_limits,
+    std::optional<std::size_t>         paused_output_high_watermark_ceiling_bytes =
+                                           std::nullopt);
 
 void append_native_backend_paused_output(
     QByteArray&                        paused_output,

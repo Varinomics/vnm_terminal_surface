@@ -8,6 +8,7 @@
 #include <QByteArray>
 #include <QFile>
 #include <QFileInfo>
+#include <QIODevice>
 #include <QString>
 #include <QStringList>
 #include <QTemporaryDir>
@@ -19,6 +20,7 @@
 #endif
 #include <windows.h>
 #include <tlhelp32.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -583,6 +585,24 @@ public:
         return m_errors;
     }
 
+    std::vector<QByteArray> output_events_snapshot()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        std::vector<QByteArray> events;
+        events.reserve(m_output_events.size());
+        for (const Output_event& event : m_output_events) {
+            events.push_back(event.bytes);
+        }
+        return events;
+    }
+
+    std::size_t output_event_count_snapshot()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_output_events.size();
+    }
+
     bool output_precedes_exit(const QByteArray& needle)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -938,6 +958,53 @@ term::Terminal_launch_config powershell_script_launch_config(const QString& scri
     config.identity.term      = QStringLiteral("xterm-256color");
     config.identity.colorterm = QStringLiteral("truecolor");
     return config;
+}
+
+QString powershell_single_quoted_string(QString text)
+{
+    text.replace(QStringLiteral("'"), QStringLiteral("''"));
+    return QStringLiteral("'") + text + QStringLiteral("'");
+}
+
+bool write_tight_paused_output_powershell_script(
+    const QString& script_path,
+    const QString& ready_path,
+    const QString& done_path,
+    const QString& exit_gate_path)
+{
+    const QByteArray script = QStringLiteral(
+        "$ErrorActionPreference = 'Stop'\r\n"
+        "[System.IO.File]::WriteAllText(%1, 'ready')\r\n"
+        "$key = [Console]::ReadKey($true)\r\n"
+        "if ($key.KeyChar -ne [char]'g') {\r\n"
+        "    [Console]::Out.WriteLine('tight-paused-unexpected-input')\r\n"
+        "    exit 3\r\n"
+        "}\r\n"
+        "[Console]::Out.Write('~~~~~~~~~~~~~~')\r\n"
+        "[Console]::Out.Flush()\r\n"
+        "[System.IO.File]::WriteAllText(%2, 'done')\r\n"
+        "while (-not [System.IO.File]::Exists(%3)) {\r\n"
+        "    Start-Sleep -Milliseconds 10\r\n"
+        "}\r\n"
+        "exit 0\r\n").arg(
+            powershell_single_quoted_string(ready_path),
+            powershell_single_quoted_string(done_path),
+            powershell_single_quoted_string(exit_gate_path)).toUtf8();
+
+    QFile file(script_path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        std::cerr << "failed to open tight paused-output script: "
+            << file.errorString().toLocal8Bit().constData() << '\n';
+        return false;
+    }
+
+    if (file.write(script) != script.size()) {
+        std::cerr << "failed to write tight paused-output script: "
+            << file.errorString().toLocal8Bit().constData() << '\n';
+        return false;
+    }
+
+    return true;
 }
 
 bool write_ignored_interrupt_powershell_script(const QString& script_path)
@@ -1560,6 +1627,133 @@ bool test_fast_start_exit_loop(const QString& fixture_path)
         ok &= check_no_backend_errors(capture,
             "quick-exit fixture produces no backend errors");
     }
+
+    return ok;
+}
+
+bool test_paused_release_with_tight_delivery_limits_chunks_conpty_output()
+{
+    bool ok = true;
+
+    QTemporaryDir checkpoint_dir;
+    ok &= check(checkpoint_dir.isValid(),
+        "tight ConPTY paused-output checkpoint directory is available");
+    if (!checkpoint_dir.isValid()) {
+        return false;
+    }
+
+    const QString script_path =
+        checkpoint_dir.filePath(QStringLiteral("tight-paused-output.ps1"));
+    const QString ready_path =
+        checkpoint_dir.filePath(QStringLiteral("tight-paused-output.ready"));
+    const QString done_path =
+        checkpoint_dir.filePath(QStringLiteral("tight-paused-output.done"));
+    const QString exit_gate_path =
+        checkpoint_dir.filePath(QStringLiteral("tight-paused-output-exit.gate"));
+    const QByteArray payload = QByteArrayLiteral("~~~~~~~~~~~~~~");
+
+    ok &= check(
+        write_tight_paused_output_powershell_script(
+            script_path,
+            ready_path,
+            done_path,
+            exit_gate_path),
+        "tight ConPTY paused-output PowerShell script is writable");
+    if (!ok) {
+        return false;
+    }
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
+    term::Terminal_launch_config config = powershell_script_launch_config(script_path);
+    constexpr std::size_t k_replay_chunk_bytes = 4U;
+    constexpr std::size_t k_paused_budget_bytes = 20U;
+    config.output_delivery_limits =
+        term::Terminal_backend_output_delivery_limits{
+            k_replay_chunk_bytes,
+            term::k_native_backend_output_read_chunk_bytes +
+                k_replay_chunk_bytes +
+                k_paused_budget_bytes};
+
+    const term::Terminal_backend_result start_result =
+        backend->start(config, capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "tight ConPTY paused-output fixture starts");
+    ok &= check(wait_for_file(ready_path),
+        "tight ConPTY paused-output fixture reaches ready marker");
+
+    const term::Terminal_backend_result pause_result =
+        backend->set_output_paused(true);
+    ok &= check(pause_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "tight ConPTY paused-output fixture accepts pause");
+    const std::size_t output_events_before_release =
+        capture.output_event_count_snapshot();
+    ok &= check(backend->write(QByteArrayLiteral("g")).code ==
+        term::Terminal_backend_result_code::ACCEPTED,
+        "tight ConPTY paused-output fixture receives release input");
+    ok &= check(wait_for_file(done_path),
+        "tight ConPTY paused-output fixture writes payload while paused");
+    ok &= check(!capture.wait_for_output_within(
+            payload.left(1),
+            std::chrono::milliseconds(250)),
+        "tight ConPTY paused-output fixture holds payload before resume");
+
+    const term::Terminal_backend_result resume_result =
+        backend->set_output_paused(false);
+    ok &= check(resume_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "tight ConPTY paused-output fixture accepts resume");
+    ok &= check(capture.wait_for_output(payload),
+        "tight ConPTY paused-output fixture delivers ordered paused payload");
+    ok &= check(write_gate_file(exit_gate_path),
+        "tight ConPTY paused-output fixture exit gate opens after resume");
+    ok &= check(capture.wait_for_exit(),
+        "tight ConPTY paused-output fixture reports exit");
+
+    std::size_t max_payload_callback_bytes = 0U;
+    std::size_t payload_callback_count = 0U;
+    const std::vector<QByteArray> output_events = capture.output_events_snapshot();
+    for (std::size_t index = output_events_before_release;
+         index < output_events.size();
+         ++index)
+    {
+        const QByteArray& event = output_events[index];
+        const bool contains_payload_byte = std::any_of(
+            event.cbegin(),
+            event.cend(),
+            [&payload](char byte) { return payload.contains(byte); });
+        if (contains_payload_byte) {
+            max_payload_callback_bytes = std::max(
+                max_payload_callback_bytes,
+                static_cast<std::size_t>(event.size()));
+            ++payload_callback_count;
+        }
+    }
+    if (max_payload_callback_bytes > k_replay_chunk_bytes) {
+        std::cerr << "tight ConPTY paused-output payload callback sizes:";
+        for (std::size_t index = output_events_before_release;
+             index < output_events.size();
+             ++index)
+        {
+            const QByteArray& event = output_events[index];
+            if (event.contains('~')) {
+                std::cerr << ' ' << event.size()
+                    << ':' << event.toHex().constData();
+            }
+        }
+        std::cerr << '\n';
+    }
+    ok &= check(max_payload_callback_bytes <= k_replay_chunk_bytes,
+        "tight ConPTY paused-output callback size stays within configured limit");
+    ok &= check(payload_callback_count >= 4U,
+        "tight ConPTY paused-output fixture delivers payload across multiple callbacks");
+
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::EXITED &&
+        exit->exit_code == 0,
+        "tight ConPTY paused-output fixture reports clean exit");
+    ok &= check_no_backend_errors(capture,
+        "tight ConPTY paused-output fixture produces no backend errors");
 
     return ok;
 }
@@ -2740,6 +2934,8 @@ int main(int argc, char** argv)
     run_test("sync raw resize gate preserves order",
         test_sync_raw_resize_gate_preserves_order(fixture_path));
     run_test("fast start exit loop", test_fast_start_exit_loop(fixture_path));
+    run_test("tight paused output limits chunk conpty delivery",
+        test_paused_release_with_tight_delivery_limits_chunks_conpty_output());
     run_test("exit drain ignores re-pause and delivers buffered output",
         test_exit_drain_ignores_repause_and_delivers_buffered_output(fixture_path));
     run_test("resize races natural exit close",

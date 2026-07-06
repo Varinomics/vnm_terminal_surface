@@ -73,7 +73,10 @@ Output bytes flow from each reader thread through a backend-local
 paused-output decision under the backend mutex. That decision either appends to
 a paused-output buffer (when output is paused or buffered bytes are already
 pending and the backend can still buffer) or delivers the bytes to the
-`output_received` callback. POSIX uses the shared
+`output_received` callback. Both native backends derive their read chunk,
+paused-buffer high-water, and paused-replay chunk sizes from
+`derive_native_backend_output_delivery_limits` in
+`src/native_backend_io_core.*`. POSIX uses the shared
 `deliver_or_buffer_native_backend_output` helper in
 `src/native_backend_io_core.h`; ConPTY implements the same FIFO/backpressure
 contract in its local pipe-drain path. The session activates backpressure
@@ -84,19 +87,22 @@ contract here.
 ### Windows: bounded drain while paused
 
 The ConPTY `read_loop` keeps the output pipe draining while output is paused,
-but only until the paused buffer reaches
-`k_paused_output_high_watermark_bytes` (64 KiB). That cap keeps a resumed burst
-below the default session callback/output hard limit while avoiding a dead pipe
-when a final output chunk races a pause. Once the cap is reached, the reader
-parks on its output condition variable until output resumes or shutdown begins.
-On resume, `set_output_paused(false)` delivers the buffered bytes through the
-same paused-output delivery path and then wakes the reader. If a buffered
-delivery or buffered bytes are already pending, newly read bytes append behind
-that buffer up to the cap instead of bypassing it. During exit drain, buffered
-tail output is delivered before the process exit is reported. Once ConPTY has
-entered stop/exit-drain state, new pause requests are accepted but do not latch;
-otherwise a callback re-pause from a direct backend consumer could suppress the
-process exit callback indefinitely.
+but only until the paused buffer reaches the derived high-water mark. ConPTY
+also applies its local 64 KiB paused-output ceiling to that derived high-water
+mark and to the derived paused-replay chunk. With the default session queue
+limits, this preserves the existing 64 KiB paused-output cap; smaller configured
+delivery limits can lower the effective ConPTY read request, paused-buffer
+high-water mark, and replay chunk. Once the cap is reached, the reader parks on
+its output condition variable until output resumes or shutdown begins.
+On resume, `set_output_paused(false)` delivers buffered bytes through the same
+paused-output delivery path in chunks no larger than the effective replay
+chunk, then wakes the reader. If a callback re-pauses output during a normal
+resume, delivery stops after the current chunk. If a buffered delivery or
+buffered bytes are already pending, newly read bytes append behind that buffer
+up to the cap instead of bypassing it. During exit drain, buffered tail output
+is delivered in order before the process exit is reported, and callback
+re-pause requests are ignored so the `process_exited` callback cannot be
+suppressed indefinitely.
 
 ### POSIX: drain while paused up to a high-water mark
 
@@ -106,7 +112,8 @@ them in the kernel. It only parks for backpressure once the buffer reaches
 the high-water mark derived from the owning session's output callback queue:
 hard limit minus high-water limit minus one maximum backend read callback. With
 the default queue limits this is 176 KiB (256 KiB hard limit, minus 64 KiB
-high-water, minus a 16 KiB maximum native read callback). This is required
+high-water, minus a 16 KiB maximum native read callback), and paused replay is
+chunked to the default 64 KiB high-water threshold. This is required
 because macOS flow-controls a slave write almost immediately when the master is
 not being read: a child that emits a small final line and exits while output is
 paused would otherwise block in `write()` forever and never exit, which would
