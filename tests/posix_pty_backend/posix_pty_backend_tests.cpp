@@ -993,6 +993,8 @@ bool test_paused_release_with_tight_delivery_limits_does_not_trap_output()
         return false;
     }
 
+    const QString ready_path =
+        checkpoint_dir.filePath(QStringLiteral("tight-paused.ready"));
     const QString done_path =
         checkpoint_dir.filePath(QStringLiteral("tight-paused.done"));
     const QString exit_gate_path =
@@ -1004,13 +1006,14 @@ bool test_paused_release_with_tight_delivery_limits_does_not_trap_output()
     std::unique_ptr<term::Terminal_backend> backend = term::make_posix_pty_backend();
     term::Terminal_launch_config config =
         shell_launch_config(QStringLiteral(
-            "echo tight-paused-ready; "
+            "touch %1; "
             "stty -echo; "
             "read line; "
             "printf 'M'; "
             "printf 'Z'; "
-            "touch %1; "
-            "while [ ! -e %2 ]; do sleep 0.01; done").arg(
+            "touch %2; "
+            "while [ ! -e %3 ]; do sleep 0.01; done").arg(
+                shell_quote(ready_path),
                 shell_quote(done_path),
                 shell_quote(exit_gate_path)));
     config.output_delivery_limits =
@@ -1020,7 +1023,7 @@ bool test_paused_release_with_tight_delivery_limits_does_not_trap_output()
         backend->start(config, capture.callbacks());
     ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
         "tight paused-output shell starts");
-    ok &= check(capture.wait_for_output(QByteArrayLiteral("tight-paused-ready")),
+    ok &= check(wait_for_file(ready_path),
         "tight paused-output shell reaches ready marker");
 
     const term::Terminal_backend_result pause_result =
