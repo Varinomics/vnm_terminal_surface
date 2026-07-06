@@ -44,9 +44,9 @@ std::vector<std::string> text_layout_keys()
 {
     std::vector<std::string> keys;
 
-    // The text-layout tables are templates; instantiate them with the same
-    // stats type the production JSON serializer feeds them
-    // (append_renderer_metrics_json passes the cumulative renderer stats).
+    // The legacy text-layout descriptor tables are templates; instantiate them
+    // with the cumulative renderer stats type they were originally serialized
+    // from so schema coverage continues to validate the compatibility block.
     using Renderer_stats = term::terminal_renderer_cumulative_stats_t;
     append_table_keys<Renderer_stats>(
         keys, detail::text_layout_metrics_before_optional<Renderer_stats>());
@@ -95,6 +95,17 @@ std::vector<std::string> atlas_top_level_overlap_keys()
     append_table_keys(keys, detail::atlas_report_sequence_metrics());
     append_table_keys(keys, detail::atlas_report_rasterization_metrics());
     return keys;
+}
+
+std::vector<std::string> renderer_compatibility_keys()
+{
+    return {
+        "compatibility_scope",
+        "canonical_renderer_metrics",
+        "frames_published",
+        "paint_completed_frames",
+        "qsg_atlas_render_count",
+    };
 }
 
 std::vector<std::string> render_invalidation_keys()
@@ -335,6 +346,11 @@ int main(int argc, char** argv)
     ok &= check(text_keys.size() > 50U,
         "text-layout tables enumerate the expected field volume");
 
+    ok &= check_documented_section(
+        document,
+        3,
+        "Renderer compatibility block (JSON key `renderer`)",
+        renderer_compatibility_keys());
     ok &= check_documented_section(
         document,
         3,

@@ -1520,18 +1520,30 @@ void append_session_profile_stats_text(const VNM_TerminalSurface& surface, QText
 
 void append_renderer_stats_text(const VNM_TerminalSurface& surface, QTextStream& out)
 {
-    append_renderer_stats_section(
-        out,
-        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface));
+    const term::terminal_renderer_stats_t stats =
+        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
+
+    out << "last_renderer_stats\n";
+    out << "  compatibility_scope=legacy_renderer_frame_counters\n";
+    out << "  canonical_renderer_section=qsg_atlas\n";
+    out << "  paint_completed=" << (stats.paint_completed ? "true" : "false") << '\n';
 }
 
 void append_cumulative_renderer_stats_text(
     const VNM_TerminalSurface& surface,
     QTextStream&               out)
 {
-    append_cumulative_renderer_stats_section(
-        out,
-        term::VNM_TerminalSurface_render_bridge::cumulative_renderer_stats(surface));
+    const term::terminal_renderer_cumulative_stats_t stats =
+        term::VNM_TerminalSurface_render_bridge::cumulative_renderer_stats(surface);
+    const term::Qsg_atlas_frame_report atlas_report =
+        term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
+
+    out << "cumulative_renderer_stats\n";
+    out << "  compatibility_scope=legacy_renderer_frame_counters\n";
+    out << "  canonical_renderer_section=qsg_atlas\n";
+    append_profile_counter(out, "frames_published", stats.frames_published);
+    append_profile_counter(out, "paint_completed_frames", stats.paint_completed_frames);
+    append_profile_counter(out, "qsg_atlas_render_count", atlas_report.render_count);
 }
 
 void append_qsg_atlas_profile_text(const VNM_TerminalSurface& surface, QTextStream& out)

@@ -1,16 +1,17 @@
 # Diagnostics Schema
 
-This document describes the renderer diagnostics counters that the surface
-serializes for inspection. It is kept in sync with the descriptor tables in
+This document describes the active QSG atlas diagnostics counters, runtime
+JSON-only helpers, and the legacy text-layout descriptor table retained for
+compatibility checks. It is kept in sync with the descriptor tables in
 `src/diagnostics/metric_descriptor.h` (the text-layout block) and
 `src/diagnostics/atlas_metric_descriptors.h` (the atlas blocks); those tables
-are the single source of truth for the field lists, and the byte-golden test
+are the single source of truth for the listed fields, and the byte-golden test
 `tests/diagnostics_text_layout/diagnostics_text_layout_tests.cpp` pins the
-output against them.
+descriptor output against them.
 
 ## Descriptor-backed serializations
 
-Descriptor-backed counter blocks are emitted in two forms:
+Descriptor-backed atlas counter blocks are emitted in two forms:
 
 - **JSON** (`src/diagnostics/metrics_json.cpp`, always built): the runtime
   metrics document. Counters are emitted as decimal **strings** (so a 64-bit
@@ -23,11 +24,13 @@ Descriptor-backed counter blocks are emitted in two forms:
   report is read top to bottom and diffed line by line.
 
 Historically each serializer hand-wrote its own copy of the field list, so the
-two could drift (a counter added to JSON but not TEXT, or reordered). The
-text-layout block and several atlas blocks now flow through one shared
-descriptor table each, consumed by both `emit_metrics_json` and
-`emit_metrics_text`, so the field set and order cannot diverge. For every
-table-driven block the JSON key is also the TEXT label.
+two could drift (a counter added to JSON but not TEXT, or reordered). The active
+atlas blocks now flow through one shared descriptor table each, consumed by both
+`emit_metrics_json` and `emit_metrics_text`, so the field set and order cannot
+diverge. For every active table-driven atlas block the JSON key is also the TEXT
+label. The text-layout descriptor table remains documented and golden-tested as
+legacy renderer compatibility schema, but the canonical renderer diagnostics
+surface is now the `qsg_atlas` block.
 
 The runtime metrics document also contains hand-written JSON-only sections such
 as `render_invalidation` and `backend_drain`. Those sections are public runtime
@@ -46,7 +49,21 @@ the shared tables.
 
 These sections are emitted only by the runtime JSON helpers in
 `vnm_terminal/diagnostics/metrics_json.h`. Counter values are decimal strings;
-boolean values are JSON booleans. These diagnostics are `UNSTABLE`.
+string metadata values are JSON strings; boolean values are JSON booleans.
+These diagnostics are `UNSTABLE`.
+
+### Renderer compatibility block (JSON key `renderer`)
+
+This legacy block is retained for hosts that still frame a `renderer` object.
+New renderer diagnostics should read the `qsg_atlas` block.
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `compatibility_scope` | String | None | Unstable |
+| `canonical_renderer_metrics` | String | None | Unstable |
+| `frames_published` | Counter | Count | Unstable |
+| `paint_completed_frames` | Counter | Count | Unstable |
+| `qsg_atlas_render_count` | Counter | Count | Unstable |
 
 ### Render invalidation block (JSON key `render_invalidation`)
 
@@ -123,12 +140,13 @@ name, its meaning, or its presence across versions. They are not a public API.
 
 ## Text-layout block
 
-Counters describing the QTextLayout slow path and the ASCII-replacement fast
-path. Run counters tally text runs; `*_code_units` counters tally UTF-16 code
-units. All are `COUNTER` / `COUNT` / `UNSTABLE`. The block is emitted in the
-order below; `text_ascii_replacement_add_glyphs_calls` is optional (emitted only
-when the stats type carries it) and is the one field handled outside the shared
-table loop.
+Legacy compatibility counters describing the QTextLayout slow path and the
+ASCII-replacement fast path. Run counters tally text runs; `*_code_units`
+counters tally UTF-16 code units. All are `COUNTER` / `COUNT` / `UNSTABLE`. The
+block is emitted in the order below by the retained descriptor emitters;
+`text_ascii_replacement_add_glyphs_calls` is optional (emitted only when the
+stats type carries it) and is the one field handled outside the shared table
+loop.
 
 | Field | Kind | Unit | Stability |
 |-------|------|------|-----------|
@@ -307,7 +325,7 @@ not a table row.
 
 ## Adding or changing a counter
 
-For a text-layout counter:
+For a legacy text-layout compatibility counter:
 
 1. Add the field to the stats struct in
    `include/vnm_terminal/internal/qsg_terminal_renderer.h`.
@@ -325,9 +343,9 @@ For an atlas counter:
 2. Add one row to the atlas descriptor table in
    `src/diagnostics/atlas_metric_descriptors.h`, at the intended emit position.
 3. Add the matching row to the atlas table above.
-4. Extend the same diagnostics text-layout golden fixture/oracle if the counter
-   appears in profile text, and confirm the schema sync and diagnostics tests
-   still pass.
+4. Extend the relevant atlas/profile diagnostics fixture or oracle if the
+   counter appears in profile text, and confirm the schema sync and diagnostics
+   tests still pass.
 
 The JSON and TEXT serializers read their descriptor tables, so descriptor edits
 update both surfaces together. The golden test checks emitted profile text; the

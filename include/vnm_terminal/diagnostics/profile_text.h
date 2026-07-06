@@ -25,6 +25,9 @@ void append_model_profile_stats_text(const VNM_TerminalSurface& surface, QTextSt
 
 void append_session_profile_stats_text(const VNM_TerminalSurface& surface, QTextStream& out);
 
+// Legacy renderer compatibility sections. New renderer diagnostics should use
+// append_qsg_atlas_profile_text; these remain so existing report framers can
+// migrate without a source break.
 void append_renderer_stats_text(const VNM_TerminalSurface& surface, QTextStream& out);
 
 void append_cumulative_renderer_stats_text(
