@@ -8645,12 +8645,12 @@ bool validate_descriptor_counters_json(
     const qint64 visible_row_budget =
         object.value(QStringLiteral("frame_visible_rows")).toInteger();
     if (render_expected && completed_frames > 0) {
-        const bool row_descriptors_expected =
+        const bool descriptor_evidence_expected =
             object.value(QStringLiteral("frame_cell_pass_input_cells")).toInteger() > 0 ||
             object.value(QStringLiteral("frame_dirty_rows")).toInteger() > 0;
-        if (row_descriptors_expected && frame_row_descriptors <= 0) {
+        if (descriptor_evidence_expected && frame_layer_descriptors <= 0) {
             *out_error = QStringLiteral(
-                "scenario descriptor row counter is missing evidence");
+                "scenario descriptor layer counter is missing evidence");
             return false;
         }
     }

@@ -45,6 +45,8 @@ constexpr qsizetype   k_max_cached_ascii_replacement_shape_length =
 constexpr std::size_t k_cached_ascii_replacement_shape_slot_count =
     static_cast<std::size_t>(k_max_cached_ascii_replacement_shape_length) + 1U;
 constexpr std::size_t k_eager_render_style_attribute_limit  = 256U;
+constexpr int         k_terminal_render_frame_full_layer_descriptor_count  = 13;
+constexpr int         k_terminal_render_frame_state_layer_descriptor_count = 5;
 
 std::size_t bounded_frame_reserve(
     std::size_t cell_count,
@@ -1913,40 +1915,55 @@ void build_terminal_render_frame_descriptors(
     const Terminal_render_snapshot&              snapshot,
     const Terminal_render_options&               options,
     const Ime_preedit_state&                     ime_preedit,
-    const std::vector<int>&                      descriptor_rows)
+    const std::vector<int>&                      descriptor_rows,
+    bool                                         build_row_descriptors,
+    bool                                         build_content_layer_descriptors)
 {
     Terminal_render_layer_descriptors& layers = frame.layer_descriptors;
-    append_frame_key_vector(
-        layers.text_key,
-        frame.text_runs,
-        append_frame_key_text_run);
-    append_frame_key_vector(
-        layers.background_key,
-        frame.background_rects,
-        append_frame_key_render_rect);
-    append_frame_key_vector(
-        layers.graphic_key,
-        frame.graphic_rects,
-        append_frame_key_render_rect);
-    append_frame_key_vector(
-        layers.graphic_key,
-        frame.graphic_arcs,
-        append_frame_key_arc);
-    append_frame_key_vector(
-        layers.decoration_key,
-        frame.decorations,
-        append_frame_key_decoration);
-    append_frame_key_vector(
-        layers.cursor_inverse_text_key,
-        frame.cursor_text_runs,
-        append_frame_key_text_run);
-    append_frame_key_vector(
-        layers.selection_key,
-        frame.selection_rects,
-        append_frame_key_render_rect);
-    append_frame_key_string(layers.ime_preedit_key, ime_preedit.text);
-    append_frame_key_int(layers.ime_preedit_key, ime_preedit.cursor_position);
-    append_frame_key_bool(layers.ime_preedit_key, ime_preedit.active);
+    if (build_content_layer_descriptors) {
+        append_frame_key_vector(
+            layers.text_key,
+            frame.text_runs,
+            append_frame_key_text_run);
+        append_frame_key_vector(
+            layers.background_key,
+            frame.background_rects,
+            append_frame_key_render_rect);
+        append_frame_key_vector(
+            layers.graphic_key,
+            frame.graphic_rects,
+            append_frame_key_render_rect);
+        append_frame_key_vector(
+            layers.graphic_key,
+            frame.graphic_arcs,
+            append_frame_key_arc);
+        append_frame_key_vector(
+            layers.decoration_key,
+            frame.decorations,
+            append_frame_key_decoration);
+        append_frame_key_vector(
+            layers.cursor_inverse_text_key,
+            frame.cursor_text_runs,
+            append_frame_key_text_run);
+        append_frame_key_vector(
+            layers.selection_key,
+            frame.selection_rects,
+            append_frame_key_render_rect);
+        append_frame_key_string(layers.ime_preedit_key, ime_preedit.text);
+        append_frame_key_int(layers.ime_preedit_key, ime_preedit.cursor_position);
+        append_frame_key_bool(layers.ime_preedit_key, ime_preedit.active);
+        append_frame_key_bool(
+            layers.hyperlink_underline_key,
+            options.underline_hyperlinks);
+        append_frame_key_vector(
+            layers.hyperlink_underline_key,
+            frame.text_runs,
+            [](QByteArray& key, const Terminal_render_text_run& run) {
+                append_frame_key_int(key, run.row);
+                append_frame_key_int(key, run.column);
+                append_frame_key_uint64(key, run.hyperlink_id);
+            });
+    }
     append_frame_key_vector(
         layers.visual_bell_key,
         frame.overlay_rects,
@@ -1955,17 +1972,6 @@ void build_terminal_render_frame_descriptors(
         layers.visual_bell_key,
         snapshot.metadata.visual_bell_active);
     append_frame_key_bool(layers.visual_bell_key, options.visual_bell_enabled);
-    append_frame_key_bool(
-        layers.hyperlink_underline_key,
-        options.underline_hyperlinks);
-    append_frame_key_vector(
-        layers.hyperlink_underline_key,
-        frame.text_runs,
-        [](QByteArray& key, const Terminal_render_text_run& run) {
-            append_frame_key_int(key, run.row);
-            append_frame_key_int(key, run.column);
-            append_frame_key_uint64(key, run.hyperlink_id);
-        });
     append_frame_key_color_state(layers.style_color_key, snapshot.color_state);
     append_frame_key_int(
         layers.style_color_key,
@@ -1977,6 +1983,15 @@ void build_terminal_render_frame_descriptors(
     append_frame_key_render_options(layers.render_options_key, options);
     append_frame_key_cell_metrics(layers.cell_metrics_key, frame.cell_metrics);
     frame.text_style_key = layers.style_color_key;
+
+    if (!build_row_descriptors) {
+        frame.row_descriptors.clear();
+        frame.stats.row_descriptors_built   = 0;
+        frame.stats.layer_descriptors_built = build_content_layer_descriptors
+            ? k_terminal_render_frame_full_layer_descriptor_count
+            : k_terminal_render_frame_state_layer_descriptor_count;
+        return;
+    }
 
     std::vector<int> rows = descriptor_rows;
     const int row_count = frame.grid_size.rows;
@@ -2125,7 +2140,9 @@ void build_terminal_render_frame_descriptors(
 
     frame.stats.row_descriptors_built =
         static_cast<int>(frame.row_descriptors.size());
-    frame.stats.layer_descriptors_built = 13;
+    frame.stats.layer_descriptors_built = build_content_layer_descriptors
+        ? k_terminal_render_frame_full_layer_descriptor_count
+        : k_terminal_render_frame_state_layer_descriptor_count;
 }
 
 } // namespace
@@ -2136,7 +2153,8 @@ Terminal_render_frame build_terminal_render_frame(
     terminal_cell_metrics_t            cell_metrics,
     const Terminal_render_options&     options,
     bool                               cursor_blink_visible,
-    const Ime_preedit_state*           ime_preedit_override)
+    const Ime_preedit_state*           ime_preedit_override,
+    Terminal_render_frame_build_options build_options)
 {
     VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame");
 
@@ -2763,17 +2781,21 @@ Terminal_render_frame build_terminal_render_frame(
     }
 
     std::vector<int> descriptor_rows;
-    descriptor_rows.reserve(
-        static_cast<std::size_t>(std::max(0, snapshot->grid_size.rows)));
-    for (int row = 0; row < snapshot->grid_size.rows; ++row) {
-        descriptor_rows.push_back(row);
+    if (build_options.build_row_descriptors) {
+        descriptor_rows.reserve(
+            static_cast<std::size_t>(std::max(0, snapshot->grid_size.rows)));
+        for (int row = 0; row < snapshot->grid_size.rows; ++row) {
+            descriptor_rows.push_back(row);
+        }
     }
     build_terminal_render_frame_descriptors(
         frame,
         *snapshot,
         options,
         ime_preedit,
-        descriptor_rows);
+        descriptor_rows,
+        build_options.build_row_descriptors,
+        build_options.build_content_layer_descriptors);
 
     frame.stats.background_rects_emitted = static_cast<int>(frame.background_rects.size());
     frame.stats.selection_rects_emitted  = static_cast<int>(frame.selection_rects.size());
