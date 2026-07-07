@@ -8379,6 +8379,7 @@ bool validate_scenario_profile_value(
     bool render_thread_has_update_paint_node = false;
     bool profile_has_atlas_prepare_scope      = false;
     bool profile_has_atlas_instances_scope    = false;
+    bool profile_has_atlas_render_scope       = false;
     bool profile_has_render_frame_scope       = false;
     bool profile_has_render_frame_cells_scope = false;
     for (int index = 0; index < threads.size(); ++index) {
@@ -8445,6 +8446,11 @@ bool validate_scenario_profile_value(
             profile_node_has_descendant(
                 root.toObject(),
                 QStringLiteral("Qsg_atlas_render_node::prepare_atlas_instances"));
+        profile_has_atlas_render_scope =
+            profile_has_atlas_render_scope ||
+            profile_node_has_descendant(
+                root.toObject(),
+                QStringLiteral("Qsg_atlas_render_node::render"));
         profile_has_render_frame_scope =
             profile_has_render_frame_scope ||
             profile_node_has_descendant(
@@ -8471,6 +8477,7 @@ bool validate_scenario_profile_value(
         !render_thread_has_update_paint_node ||
         !profile_has_atlas_prepare_scope ||
         !profile_has_atlas_instances_scope ||
+        !profile_has_atlas_render_scope ||
         !profile_has_render_frame_scope ||
         !profile_has_render_frame_cells_scope)
     {

@@ -361,6 +361,10 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_history_phase8_benchmark>"
 )
 
+set_tests_properties(vnm_terminal_history_phase8_benchmark PROPERTIES
+    LABELS "readiness;benchmark;structural"
+)
+
 add_executable(vnm_terminal_sequence_matrix
     sequence_matrix/sequence_matrix_tests.cpp
 )

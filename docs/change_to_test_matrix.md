@@ -75,7 +75,10 @@ for local runs.
 - Windows CI still excludes `vnm_terminal_compat_smoke`. Run it locally on
   Windows for the full native-surface fixture compatibility smoke.
 - Benchmarks are not built in CI. Build with
-  `-DVNM_TERMINAL_BUILD_BENCHMARKS=ON` locally to verify benchmark edits.
+  `-DVNM_TERMINAL_BUILD_BENCHMARKS=ON` locally to verify benchmark edits. For
+  measurement-recipe or evidence-runner edits, include the Windows-only
+  `vnm_terminal_benchmark_evidence_smoke` lane when available; it is
+  structural schema/matrix validation, not performance evidence.
 - The application CI checks out this surface at `ref: master`. For a cross-repo
   change, push the surface before the application so the application build sees
   the surface change.

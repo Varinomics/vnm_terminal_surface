@@ -300,7 +300,9 @@ function Get-NumericSummary {
 
     $values = @()
     foreach ($record in $Records) {
-        if ($record.Contains($MetricName) -and $record[$MetricName] -is [ValueType]) {
+        if ($record.Contains($MetricName) -and
+            (Test-NumericMetricValue $record[$MetricName]))
+        {
             $values += [double] $record[$MetricName]
         }
     }
@@ -342,6 +344,23 @@ function Get-NumericSummary {
         outlier_rule = "abs(value - median) > 3 * median_absolute_deviation; if MAD is zero, report non-median values"
         outliers = $outliers
     }
+}
+
+function Test-NumericMetricValue {
+    param([object] $Value)
+
+    return (
+        $Value -is [byte]    -or
+        $Value -is [sbyte]   -or
+        $Value -is [int16]   -or
+        $Value -is [uint16]  -or
+        $Value -is [int32]   -or
+        $Value -is [uint32]  -or
+        $Value -is [int64]   -or
+        $Value -is [uint64]  -or
+        $Value -is [single]  -or
+        $Value -is [double]  -or
+        $Value -is [decimal])
 }
 
 function Get-InputEchoConfig {
@@ -710,29 +729,130 @@ function Invoke-SurfaceStressEvidence {
                 -StdoutPath $stdout | Out-Null
 
             $metrics = Read-KeyValueMetrics $stdout
-            foreach ($required in @(
+            $requiredMetrics = @(
                     "scenario",
+                    "recipe_id",
+                    "workload_case",
                     "frames",
                     "warmup_frames",
                     "rows",
                     "columns",
                     "dirty_rows_requested",
+                    "dirty_row_stride",
                     "dirty_row_seed",
+                    "graphics_every",
+                    "style_period",
                     "text_pattern",
+                    "total_ms",
+                    "frames_per_second",
+                    "ingest_ms_per_frame",
                     "snapshot_ms_per_frame",
                     "render_frame_ms_per_frame",
                     "snapshot_cells_per_frame",
                     "snapshot_dirty_rows_visible_per_frame",
-                    "checksum"))
-            {
+                    "frame_dirty_rows",
+                    "frame_full_dirty_rows",
+                    "frame_cells_considered",
+                    "checksum")
+            $missingRequiredMetric = $false
+            foreach ($required in $requiredMetrics) {
                 if (!$metrics.Contains($required)) {
                     Add-Failure "Surface stress output missing '$required' for $caseId repeat $repeat"
+                    $missingRequiredMetric = $true
                 }
+            }
+            if ($missingRequiredMetric) {
+                continue
+            }
+
+            $numericMetrics = @(
+                "frames",
+                "warmup_frames",
+                "rows",
+                "columns",
+                "dirty_rows_requested",
+                "dirty_row_stride",
+                "dirty_row_seed",
+                "graphics_every",
+                "style_period",
+                "total_ms",
+                "frames_per_second",
+                "ingest_ms_per_frame",
+                "snapshot_ms_per_frame",
+                "render_frame_ms_per_frame",
+                "snapshot_cells_per_frame",
+                "snapshot_dirty_rows_visible_per_frame",
+                "frame_dirty_rows",
+                "frame_full_dirty_rows",
+                "frame_cells_considered",
+                "checksum")
+            $invalidNumericMetric = $false
+            foreach ($metricName in $numericMetrics) {
+                if (!(Test-NumericMetricValue $metrics[$metricName])) {
+                    Add-Failure "Surface stress output metric '$metricName' is not numeric for $caseId repeat $repeat"
+                    $invalidNumericMetric = $true
+                }
+            }
+            if ($invalidNumericMetric) {
+                continue
+            }
+
+            $expectedScenario = "surface_stress_model_snapshot_frame"
+            $expectedWorkloadCase =
+                "rows_$($case.rows)_columns_$($case.columns)_dirty_$($case.dirty_rows)" +
+                "_stride_$($case.dirty_row_stride)_seed_${DirtyRowSeed}" +
+                "_pattern_$($case.text_pattern)_graphics_0_style_8"
+            $metadataMismatch = $false
+            if ([string] $metrics["scenario"] -ne $expectedScenario) {
+                Add-Failure "Surface stress scenario mismatch for $caseId repeat ${repeat}: $($metrics["scenario"])"
+                $metadataMismatch = $true
+            }
+            if ([string] $metrics["recipe_id"] -ne $expectedWorkloadCase) {
+                Add-Failure "Surface stress recipe_id mismatch for $caseId repeat ${repeat}: $($metrics["recipe_id"])"
+                $metadataMismatch = $true
+            }
+            if ([string] $metrics["workload_case"] -ne $expectedWorkloadCase) {
+                Add-Failure "Surface stress workload_case mismatch for $caseId repeat ${repeat}: $($metrics["workload_case"])"
+                $metadataMismatch = $true
+            }
+            if ([string] $metrics["text_pattern"] -ne [string] $case.text_pattern) {
+                Add-Failure "Surface stress text_pattern mismatch for $caseId repeat ${repeat}: $($metrics["text_pattern"])"
+                $metadataMismatch = $true
+            }
+
+            $expectedIntegerMetrics = [ordered]@{
+                frames = $frames
+                warmup_frames = $warmupFrames
+                rows = [int] $case.rows
+                columns = [int] $case.columns
+                dirty_rows_requested = [int] $case.dirty_rows
+                dirty_row_stride = [int] $case.dirty_row_stride
+                dirty_row_seed = $DirtyRowSeed
+                graphics_every = 0
+                style_period = 8
+            }
+            foreach ($metricName in $expectedIntegerMetrics.Keys) {
+                $actualValue = [double] $metrics[$metricName]
+                $expectedValue = [double] $expectedIntegerMetrics[$metricName]
+                if ([double]::IsNaN($actualValue)      -or
+                    [double]::IsInfinity($actualValue) -or
+                    [Math]::Floor($actualValue) -ne $actualValue -or
+                    $actualValue -ne $expectedValue)
+                {
+                    Add-Failure "Surface stress metadata '$metricName' mismatch for $caseId repeat ${repeat}: $($metrics[$metricName])"
+                    $metadataMismatch = $true
+                }
+            }
+            if ($metadataMismatch) {
+                continue
             }
 
             $records.Add([ordered]@{
                 repeat_index = $repeat
                 case_id = $caseId
+                scenario = [string] $metrics["scenario"]
+                recipe_id = [string] $metrics["recipe_id"]
+                workload_case = [string] $metrics["workload_case"]
                 category = $case.category
                 raw_stdout_path = $stdout
                 rows = [int] $case.rows

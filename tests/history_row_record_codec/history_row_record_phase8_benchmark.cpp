@@ -767,9 +767,9 @@ bool write_report(
     }
 
     output << "{\n";
+    output << "  \"schema\": \"vnm_terminal_history_phase8_benchmark_report\",\n";
+    output << "  \"schema_version\": 1,\n";
     output << "  \"phase\": \"8\",\n";
-    output << "  \"generated_date\": \"2026-05-30\",\n";
-    output << "  \"configuration\": \"MSVC x64 focused benchmark target\",\n";
     output << "  \"representation_decision\": \"keep_dense_encoding\",\n";
     output << "  \"ring_limits\": {\n";
     output << "    \"retained_history_ring_capacity_bytes\": "
