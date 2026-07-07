@@ -3925,13 +3925,17 @@ private:
             ? qsg_atlas_face_id_for_raw_font(base_raw_font)
             : QString();
         ensure_atlas_warm_set(result, rhi);
+        Terminal_render_frame_build_options frame_build_options;
+        frame_build_options.build_row_descriptors           = false;
+        frame_build_options.build_content_layer_descriptors = false;
         Terminal_render_frame render_frame = build_terminal_render_frame(
             m_frame.snapshot.get(),
             m_frame.logical_size,
             m_frame.cell_metrics,
             m_frame.options,
             m_frame.cursor_blink_visible,
-            &m_frame.ime_preedit);
+            &m_frame.ime_preedit,
+            frame_build_options);
         m_render_row_count = render_frame.grid_size.rows;
         QByteArray current_cursor_key =
             render_cursor_state_key(render_frame);

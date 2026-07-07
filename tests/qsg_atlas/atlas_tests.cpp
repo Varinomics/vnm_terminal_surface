@@ -11962,9 +11962,10 @@ bool test_atlas_rect_row_stable_dense_graphic_update(QGuiApplication& app)
             rect_buffer.uploaded_bytes > 0 &&
             rect_buffer.uploaded_bytes < rect_buffer.buffer_bytes,
         "atlas rect row-stable dense graphic update patches dirty-row rect bytes");
-    ok &= check(report.frame_build.frame_row_descriptors > 0 &&
+    ok &= check(report.frame_build.frame_row_descriptors == 0 &&
+            report.frame_build.frame_layer_descriptors == 5 &&
             report.frame_build.qsg_layer_descriptors == 0,
-        "atlas rect row-stable dense graphic update reports honest descriptor evidence");
+        "atlas rect row-stable dense graphic update skips unused descriptors");
     return ok;
 }
 
@@ -12154,8 +12155,9 @@ bool test_atlas_rect_row_stable_styled_blank_background_update(QGuiApplication& 
             report.render.rect_row_capacity >= 8,
         "atlas rect row-stable styled blank background update reserves stable row slots");
     ok &= check(report.frame_build.frame_background_rects > 1 &&
-            report.frame_build.frame_row_descriptors >= 1,
-        "atlas rect row-stable styled blank background update builds the dirty blank row");
+            report.frame_build.frame_row_descriptors == 0 &&
+            report.frame_build.frame_layer_descriptors == 5,
+        "atlas rect row-stable styled blank background update skips unused descriptors");
     ok &= check(rect_buffer.partial_upload &&
             !rect_buffer.full_upload &&
             !rect_buffer.non_dirty_state_upload &&
@@ -12900,8 +12902,8 @@ bool test_atlas_failed_prepare_forces_next_sparse_full_upload(
     ok &= check(glyph_buffer.full_upload &&
             glyph_buffer.full_repaint_upload &&
             !glyph_buffer.partial_upload &&
-            next_report.frame_build.frame_row_descriptors ==
-                next_sparse.grid_size.rows,
+            next_report.frame_build.frame_row_descriptors == 0 &&
+            next_report.frame_build.frame_layer_descriptors == 5,
         "atlas sparse frame after failed prepare uses a conservative full upload");
     term::qsg_atlas_clear_resource_prepare_failure_for_testing();
     return ok;

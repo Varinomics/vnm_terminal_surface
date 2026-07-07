@@ -306,6 +306,9 @@ numeric `qsg_layer_descriptors`. `qsg_layer_descriptors` is zero until QSG
 layer descriptor-key work is wired back in. Descriptor counters are schema
 fields; readiness evidence comes from the atlas render and elapsed signals
 listed below, not from requiring nonzero descriptor counters.
+On the atlas path, `frame_row_descriptors` may be zero and
+`frame_layer_descriptors` may count only state-key descriptors because unused
+row and content descriptor materialization is skipped.
 
 The schema 27 `session_profile_stats.consumer_materialization_counters` object
 has exactly `available=true`,

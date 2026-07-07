@@ -2515,6 +2515,107 @@ bool test_descriptor_keys_are_mutation_sensitive()
     return ok;
 }
 
+bool test_row_descriptor_build_can_be_skipped_for_layer_only_frame()
+{
+    bool ok = true;
+
+    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 6});
+    snapshot.cursor.visible   = false;
+    snapshot.dirty_row_ranges = {{0, 3}};
+    snapshot.cells.push_back({
+        .position = {1, 1},
+        .text     = QStringLiteral("A"),
+    });
+
+    const term::Terminal_render_frame full_frame = build(snapshot);
+
+    term::Terminal_render_frame_build_options build_options;
+    build_options.build_row_descriptors = false;
+    const term::Terminal_render_frame layer_only_frame =
+        term::build_terminal_render_frame(
+            &snapshot,
+            QSizeF(160.0, 100.0),
+            metrics(),
+            options(),
+            true,
+            nullptr,
+            build_options);
+
+    ok &= check(full_frame.row_descriptors.size() == 3U &&
+            full_frame.stats.row_descriptors_built == 3 &&
+            full_frame.stats.layer_descriptors_built == 13,
+        "default frame build still materializes row descriptors");
+    ok &= check(layer_only_frame.row_descriptors.empty() &&
+            layer_only_frame.stats.row_descriptors_built == 0 &&
+            layer_only_frame.stats.layer_descriptors_built == 13,
+        "layer-only frame build skips row descriptors");
+    ok &= check(layer_only_frame.layer_descriptors.text_key ==
+                full_frame.layer_descriptors.text_key &&
+            layer_only_frame.layer_descriptors.background_key ==
+                full_frame.layer_descriptors.background_key &&
+            layer_only_frame.layer_descriptors.style_color_key ==
+                full_frame.layer_descriptors.style_color_key &&
+            layer_only_frame.text_style_key == full_frame.text_style_key,
+        "layer-only frame build preserves layer descriptor keys");
+    return ok;
+}
+
+bool test_content_layer_descriptor_build_can_be_skipped_for_state_only_frame()
+{
+    bool ok = true;
+
+    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 6});
+    snapshot.cursor.visible   = false;
+    snapshot.dirty_row_ranges = {{0, 3}};
+    snapshot.cells.push_back({
+        .position = {1, 1},
+        .text     = QStringLiteral("A"),
+    });
+    snapshot.metadata.visual_bell_active = true;
+
+    const term::Terminal_render_frame full_frame = build(snapshot);
+
+    term::Terminal_render_frame_build_options build_options;
+    build_options.build_row_descriptors           = false;
+    build_options.build_content_layer_descriptors = false;
+    const term::Terminal_render_frame state_only_frame =
+        term::build_terminal_render_frame(
+            &snapshot,
+            QSizeF(160.0, 100.0),
+            metrics(),
+            options(),
+            true,
+            nullptr,
+            build_options);
+
+    ok &= check(state_only_frame.row_descriptors.empty() &&
+            state_only_frame.stats.row_descriptors_built == 0 &&
+            state_only_frame.stats.layer_descriptors_built == 5,
+        "state-only frame build skips row and content layer descriptors");
+    ok &= check(state_only_frame.layer_descriptors.text_key.isEmpty() &&
+            state_only_frame.layer_descriptors.background_key.isEmpty() &&
+            state_only_frame.layer_descriptors.graphic_key.isEmpty() &&
+            state_only_frame.layer_descriptors.decoration_key.isEmpty() &&
+            state_only_frame.layer_descriptors.cursor_inverse_text_key.isEmpty() &&
+            state_only_frame.layer_descriptors.selection_key.isEmpty() &&
+            state_only_frame.layer_descriptors.ime_preedit_key.isEmpty() &&
+            state_only_frame.layer_descriptors.hyperlink_underline_key.isEmpty(),
+        "state-only frame build leaves unused content layer keys empty");
+    ok &= check(state_only_frame.layer_descriptors.visual_bell_key ==
+                full_frame.layer_descriptors.visual_bell_key &&
+            state_only_frame.layer_descriptors.style_color_key ==
+                full_frame.layer_descriptors.style_color_key &&
+            state_only_frame.layer_descriptors.reverse_video_key ==
+                full_frame.layer_descriptors.reverse_video_key &&
+            state_only_frame.layer_descriptors.render_options_key ==
+                full_frame.layer_descriptors.render_options_key &&
+            state_only_frame.layer_descriptors.cell_metrics_key ==
+                full_frame.layer_descriptors.cell_metrics_key &&
+            state_only_frame.text_style_key == full_frame.text_style_key,
+        "state-only frame build preserves atlas state layer keys");
+    return ok;
+}
+
 bool test_viewport_empty_and_dirty_ranges()
 {
     bool ok = true;
@@ -2586,6 +2687,8 @@ int main()
     ok &= test_cell_pass_simple_content_classification();
     ok &= test_snapshot_cells_are_row_major_column_sorted();
     ok &= test_descriptor_keys_are_mutation_sensitive();
+    ok &= test_row_descriptor_build_can_be_skipped_for_layer_only_frame();
+    ok &= test_content_layer_descriptor_build_can_be_skipped_for_state_only_frame();
     ok &= test_viewport_empty_and_dirty_ranges();
     return ok ? 0 : 1;
 }
