@@ -24,7 +24,8 @@ It is the quick operational reference after `docs/developer_orientation.md`,
   tools and Unicode data.
 - `tests` contains contract, model, backend, renderer, surface,
   conformance, randomized, and lifecycle tests.
-- `benchmarks/embedded_terminal` contains the embedded terminal benchmark.
+- `benchmarks` contains embedded-terminal, input-echo, public-scroll,
+  surface-stress, and evidence-runner benchmark lanes.
 - `docs` contains first-read orientation and stable reference material.
 - `THIRD_PARTY` and `THIRD_PARTY_NOTICES.md` record dependency and provenance
   information.
@@ -49,9 +50,9 @@ surface; source-tree consumers rebuild the surface against their own Qt.
   `ON` when the surface is the top-level project and `OFF` when it is included
   as a subproject. Test executables are configured only when both this option
   and `BUILD_TESTING` are `ON`.
-- `VNM_TERMINAL_BUILD_BENCHMARKS` is `OFF` by default. It adds the embedded
-  benchmark target and adds benchmark CTest validation tests when both test
-  gates are enabled.
+- `VNM_TERMINAL_BUILD_BENCHMARKS` is `OFF` by default. It adds benchmark
+  targets and benchmark CTest validation tests when both test gates are
+  enabled.
 - `VNM_TERMINAL_BUILD_REQUIRED_READINESS` is `OFF` by default. It requires both
   test gates to be `ON` and also enables benchmarks and profiling validation.
 - `VNM_TERMINAL_ENABLE_PROFILING` is `OFF` by default. Turning it on compiles
@@ -99,7 +100,11 @@ The root CMake project builds:
   surface, and conformance tests;
 - `vnm_terminal_transcript_replay`, only when
   `VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY=ON`;
-- `vnm_terminal_embedded_benchmark`, when benchmarks are enabled;
+- benchmark executables such as `vnm_terminal_embedded_benchmark`,
+  `vnm_terminal_input_echo_catchup_benchmark`,
+  `vnm_terminal_input_echo_ordering_benchmark`,
+  `vnm_terminal_phase7_public_scroll_benchmark`, and
+  `vnm_terminal_surface_stress_benchmark`, when benchmarks are enabled;
 - test executables named after their CTest entries when both test gates are on;
 - optional conformance targets created by CMake cache variables under
   `tests/CMakeLists.txt`;
@@ -149,8 +154,11 @@ CTest names are the stable way to find a test. The main families are:
 - `vnm_terminal_*_conformance`, `vnm_terminal_parser_fuzz_smoke`, and
   `vnm_terminal_libvterm_differential`: optional conformance and differential
   tests controlled by CMake cache variables.
-- `vnm_terminal_embedded_benchmark_*`: readiness benchmark validation tests when
-  benchmarks are enabled.
+- benchmark CTest lanes such as `vnm_terminal_*_benchmark_validate`,
+  `vnm_terminal_embedded_benchmark_*` readiness gates,
+  `vnm_terminal_surface_stress_descriptor_contract`, and Windows-only
+  `vnm_terminal_benchmark_evidence_smoke`: structural benchmark validation
+  tests when benchmarks are enabled.
 
 Run the configured suite:
 
@@ -208,12 +216,21 @@ and each argument in its own element.
 
 ## Benchmarks
 
-Configure without profiling for user-visible timing and structural validation:
+Configure without profiling for structural benchmark validation. Multi-config
+generators select `Release` at build and CTest time:
 
 ```powershell
 cmake -S . -B build -DVNM_TERMINAL_BUILD_BENCHMARKS=ON -DBUILD_TESTING=ON
 cmake --build build --target vnm_terminal_embedded_benchmark --config Release
 ctest --test-dir build -C Release -R "^vnm_terminal_embedded_benchmark_validate$" --output-on-failure
+```
+
+Single-config generators must set the build type at configure time:
+
+```powershell
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVNM_TERMINAL_BUILD_BENCHMARKS=ON -DBUILD_TESTING=ON
+cmake --build build --target vnm_terminal_embedded_benchmark
+ctest --test-dir build -R "^vnm_terminal_embedded_benchmark_validate$" --output-on-failure
 ```
 
 Configure a separate profiling build only for attribution and scope timing:
@@ -223,6 +240,34 @@ cmake -S . -B build-profile -DVNM_TERMINAL_BUILD_BENCHMARKS=ON -DVNM_TERMINAL_EN
 cmake --build build-profile --target vnm_terminal_embedded_benchmark --config Release
 ctest --test-dir build-profile -C Release -R "^vnm_terminal_embedded_benchmark_profile_validate$" --output-on-failure
 ```
+
+The CTest lanes above are structural validation, not user-visible timing
+evidence. For timing evidence, run the benchmark executable from a no-profile
+Release build with an explicit scenario list, warmup, iteration count, grid,
+window size, font setup, renderer mode, Qt/QPA/RHI environment, and output JSON
+path. On Windows, use the same `cmake -E env ... cmd.exe /d /c call` wrapper
+shape printed by `ctest --test-dir build -C Release -N -V` so Qt runtime,
+scale-factor, render-loop, and RHI settings match the recorded recipe.
+
+The Windows-only benchmark evidence runner lives at
+`benchmarks/evidence/run_benchmark_evidence.ps1`. When benchmarks and tests are
+enabled, CMake adds `vnm_terminal_benchmark_evidence_smoke` if the input-echo
+and surface-stress benchmark executables and PowerShell are available. Run it
+as structural smoke validation:
+
+```powershell
+cmake --build build --target vnm_terminal_benchmark_evidence_smoke --config Release
+ctest --test-dir build -C Release -R "^vnm_terminal_benchmark_evidence_smoke$" --output-on-failure
+```
+
+The script can also be run directly with built
+`vnm_terminal_input_echo_catchup_benchmark` and
+`vnm_terminal_surface_stress_benchmark` executables. `-Mode smoke` is the
+small local/CI structural lane; `-Mode evidence` runs the repeated matrix for a
+decision artifact. Both modes emit `vnm_terminal_benchmark_evidence_run`
+schema version 2 with `metric_summaries`, MAD outlier reporting, and no removed
+samples. Pass/fail means structural execution, schema, queue-contract,
+dirty-row, and matrix coverage only; it is not a performance verdict.
 
 The benchmark supports `--list-scenarios`, repeated `--scenario <name>`,
 `--iterations`, `--warmup`, `--grid`, `--window-size`, sparse
@@ -326,9 +371,13 @@ Use no-profile Release benchmark runs for user-visible timing. Use
 profiling-enabled Release runs only for attribution, route counts, and scope
 timing.
 
-Benchmark comparisons should record the build directory, profiling state,
-renderer backend, scenario list, grid, window size, warmup count, iteration
-count, command line, output JSON, and any profile artifacts.
+Benchmark comparisons should record the generator, build directory, build
+type/configuration, relevant CMake cache flags, profiling state, Qt version,
+Qt/QPA/RHI/render-loop/scale environment, text renderer mode and effective
+glyph/MSDF path, resolved font family, font pixel size, device pixel ratio,
+native backend identity, scenario list, grid, window size, warmup count,
+iteration count, command line, output JSON, any profile artifacts, and machine
+state notes such as power mode and competing process load.
 
 Sparse surface-session settlement evidence must use the sparse surface-session
 scenarios with `--require-requested-grid` so a window-manager clamp cannot

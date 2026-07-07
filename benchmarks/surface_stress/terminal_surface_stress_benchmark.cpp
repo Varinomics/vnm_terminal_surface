@@ -116,6 +116,20 @@ QString text_pattern_name(Text_pattern pattern)
     return QStringLiteral("unknown");
 }
 
+QString workload_case_id(const Benchmark_options& options)
+{
+    return QStringLiteral(
+        "rows_%1_columns_%2_dirty_%3_stride_%4_seed_%5_pattern_%6_graphics_%7_style_%8")
+        .arg(options.rows)
+        .arg(options.columns)
+        .arg(options.dirty_rows)
+        .arg(options.dirty_row_stride)
+        .arg(options.dirty_row_seed)
+        .arg(text_pattern_name(options.text_pattern))
+        .arg(options.graphics_every)
+        .arg(options.style_period);
+}
+
 std::optional<Text_pattern> parse_text_pattern(const std::string& value)
 {
     if (value == "ascii") {
@@ -888,7 +902,10 @@ int main(int argc, char** argv)
     }
 
     const double frames = static_cast<double>(options.frames);
-    std::cout << "scenario=nelostie_like_model_snapshot_frame\n";
+    const QString workload_case = workload_case_id(options);
+    std::cout << "scenario=surface_stress_model_snapshot_frame\n";
+    std::cout << "recipe_id=" << workload_case.toUtf8().constData() << '\n';
+    std::cout << "workload_case=" << workload_case.toUtf8().constData() << '\n';
     print_metric("frames", static_cast<std::uint64_t>(options.frames));
     print_metric("warmup_frames", static_cast<std::uint64_t>(options.warmup_frames));
     print_metric("rows", static_cast<std::uint64_t>(options.rows));

@@ -109,7 +109,9 @@ render on.
 ## Worked Example
 
 ```cpp
-// Runtime metrics document (stable, every build).
+// Runtime metrics document (builders available in every build). Field names,
+// values, and counter semantics are unstable diagnostics; compare deltas only
+// under a documented workload and measurement recipe.
 QJsonObject metrics;
 QJsonObject atlas;
 vnm_terminal::diagnostics::append_atlas_metrics_json(*surface, atlas);

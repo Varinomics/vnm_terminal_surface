@@ -21,6 +21,9 @@ if(WIN32)
         "PATH=$<TARGET_FILE_DIR:Qt6::Core>$<SEMICOLON>$ENV{PATH}")
 endif()
 
+# Structural smoke for the evidence runner. This validates runner schema,
+# matrix coverage, and benchmark contract plumbing; it encodes no performance
+# thresholds and is not decision-grade timing evidence.
 add_test(
     NAME vnm_terminal_benchmark_evidence_smoke
     COMMAND
@@ -47,7 +50,7 @@ add_test(
 )
 
 set_tests_properties(vnm_terminal_benchmark_evidence_smoke PROPERTIES
-    LABELS "readiness;benchmark;evidence;smoke"
+    LABELS "readiness;benchmark;smoke;structural"
     TIMEOUT 120
 )
 
