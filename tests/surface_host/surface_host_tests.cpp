@@ -16190,6 +16190,304 @@ bool test_terminal_icon_name_notifications(QGuiApplication& app)
     return ok;
 }
 
+bool test_audible_bell_policy_requests_platform_bell(QGuiApplication& app)
+{
+    bool ok = true;
+
+    auto run_case = [&](
+                        VNM_TerminalSurface::Bell_policy audible_policy,
+                        VNM_TerminalSurface::Bell_policy visual_policy,
+                        int                              expected_audible_bell_count,
+                        int                              expected_bell_signal_count,
+                        const char*                      start_message,
+                        const char*                      audible_message,
+                        const char*                      signal_message) {
+        Surface_fixture fixture;
+        fixture.surface.set_audible_bell_policy(audible_policy);
+        fixture.surface.set_visual_bell_policy(visual_policy);
+        pump_events(app);
+
+        int audible_bell_count = 0;
+        int bell_signal_count  = 0;
+        term::VNM_TerminalSurface_render_bridge::set_audible_bell_handler_for_testing(
+            fixture.surface,
+            [&] {
+                ++audible_bell_count;
+            });
+        QObject::connect(
+            &fixture.surface,
+            &VNM_TerminalSurface::bell_requested,
+            &fixture.surface,
+            [&] {
+                ++bell_signal_count;
+            });
+
+        auto backend = std::make_unique<Scripted_backend>();
+        bool started = false;
+        Scripted_backend* backend_ptr = start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, start_message);
+
+        backend_ptr->emit_output(QByteArrayLiteral("\a"));
+        pump_events(app);
+        ok &= check(
+            audible_bell_count == expected_audible_bell_count,
+            audible_message);
+        ok &= check(
+            bell_signal_count == expected_bell_signal_count,
+            signal_message);
+    };
+
+    run_case(
+        VNM_TerminalSurface::Bell_policy::ENABLED,
+        VNM_TerminalSurface::Bell_policy::ENABLED,
+        1,
+        1,
+        "audible-bell enabled surface starts",
+        "enabled audible bell invokes platform bell handler",
+        "enabled audible bell emits surface bell_requested signal");
+    run_case(
+        VNM_TerminalSurface::Bell_policy::DISABLED,
+        VNM_TerminalSurface::Bell_policy::ENABLED,
+        0,
+        1,
+        "audible-bell disabled surface starts",
+        "disabled audible bell does not invoke platform bell handler",
+        "visual-only bell still emits surface bell_requested signal");
+    run_case(
+        VNM_TerminalSurface::Bell_policy::DISABLED,
+        VNM_TerminalSurface::Bell_policy::DISABLED,
+        0,
+        0,
+        "audible-bell fully disabled surface starts",
+        "fully disabled bell does not invoke platform bell handler",
+        "fully disabled bell emits no surface bell_requested signal");
+
+    Surface_fixture fixture;
+    fixture.surface.set_audible_bell_policy(VNM_TerminalSurface::Bell_policy::DISABLED);
+    fixture.surface.set_visual_bell_policy(VNM_TerminalSurface::Bell_policy::DISABLED);
+    pump_events(app);
+
+    int audible_bell_count = 0;
+    int bell_signal_count  = 0;
+    term::VNM_TerminalSurface_render_bridge::set_audible_bell_handler_for_testing(
+        fixture.surface,
+        [&] {
+            ++audible_bell_count;
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::bell_requested,
+        &fixture.surface,
+        [&] {
+            ++bell_signal_count;
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "live bell-policy toggle surface starts");
+
+    backend_ptr->emit_output(QByteArrayLiteral("\a"));
+    pump_events(app);
+    ok &= check(audible_bell_count == 0,
+        "initially disabled live bell policy suppresses platform bell handler");
+    ok &= check(bell_signal_count == 0,
+        "initially disabled live bell policy suppresses surface bell signal");
+
+    fixture.surface.set_audible_bell_policy(VNM_TerminalSurface::Bell_policy::ENABLED);
+    backend_ptr->emit_output(QByteArrayLiteral("\a"));
+    pump_events(app);
+    ok &= check(audible_bell_count == 1,
+        "live audible bell enable invokes platform bell handler");
+    ok &= check(bell_signal_count == 1,
+        "live audible bell enable emits surface bell signal");
+
+    fixture.surface.set_audible_bell_policy(VNM_TerminalSurface::Bell_policy::DISABLED);
+    backend_ptr->emit_output(QByteArrayLiteral("\a"));
+    pump_events(app);
+    ok &= check(audible_bell_count == 1,
+        "live audible bell disable suppresses platform bell handler");
+    ok &= check(bell_signal_count == 1,
+        "live audible bell disable suppresses surface bell signal");
+
+    fixture.surface.set_visual_bell_policy(VNM_TerminalSurface::Bell_policy::ENABLED);
+    backend_ptr->emit_output(QByteArrayLiteral("\a"));
+    pump_events(app);
+    ok &= check(audible_bell_count == 1,
+        "live visual-only bell policy keeps platform bell handler suppressed");
+    ok &= check(bell_signal_count == 2,
+        "live visual-only bell policy emits surface bell signal");
+
+    {
+        Surface_fixture delayed_fixture;
+        delayed_fixture.surface.set_audible_bell_policy(
+            VNM_TerminalSurface::Bell_policy::DISABLED);
+        delayed_fixture.surface.set_visual_bell_policy(
+            VNM_TerminalSurface::Bell_policy::ENABLED);
+        pump_events(app);
+
+        int delayed_audible_count = 0;
+        int delayed_signal_count  = 0;
+        term::VNM_TerminalSurface_render_bridge::set_audible_bell_handler_for_testing(
+            delayed_fixture.surface,
+            [&] {
+                ++delayed_audible_count;
+            });
+        QObject::connect(
+            &delayed_fixture.surface,
+            &VNM_TerminalSurface::bell_requested,
+            &delayed_fixture.surface,
+            [&] {
+                ++delayed_signal_count;
+            });
+
+        auto delayed_backend = std::make_unique<Scripted_backend>();
+        bool delayed_started = false;
+        Scripted_backend* delayed_backend_ptr = start_surface_with_backend(
+            delayed_fixture.surface,
+            std::move(delayed_backend),
+            { QStringLiteral("scripted-terminal") },
+            &delayed_started);
+        ok &= check(delayed_started, "delayed visual-only bell surface starts");
+
+        delayed_backend_ptr->emit_output(QByteArrayLiteral("\a"));
+        term::VNM_TerminalSurface_render_bridge::
+            process_backend_callbacks_without_notification_delivery_for_testing(
+                delayed_fixture.surface);
+        ok &= check(delayed_audible_count == 0,
+            "delayed visual-only bell is not audible before notification delivery");
+        ok &= check(delayed_signal_count == 0,
+            "delayed visual-only bell signal is pending before notification delivery");
+
+        delayed_fixture.surface.set_audible_bell_policy(
+            VNM_TerminalSurface::Bell_policy::ENABLED);
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            delayed_fixture.surface);
+        ok &= check(delayed_audible_count == 0,
+            "delayed visual-only bell does not become audible after live policy enable");
+        ok &= check(delayed_signal_count == 1,
+            "delayed visual-only bell still emits pending surface bell signal");
+    }
+
+    {
+        Surface_fixture delayed_fixture;
+        delayed_fixture.surface.set_audible_bell_policy(
+            VNM_TerminalSurface::Bell_policy::ENABLED);
+        delayed_fixture.surface.set_visual_bell_policy(
+            VNM_TerminalSurface::Bell_policy::DISABLED);
+        pump_events(app);
+
+        int delayed_audible_count = 0;
+        int delayed_signal_count  = 0;
+        term::VNM_TerminalSurface_render_bridge::set_audible_bell_handler_for_testing(
+            delayed_fixture.surface,
+            [&] {
+                ++delayed_audible_count;
+            });
+        QObject::connect(
+            &delayed_fixture.surface,
+            &VNM_TerminalSurface::bell_requested,
+            &delayed_fixture.surface,
+            [&] {
+                ++delayed_signal_count;
+            });
+
+        auto delayed_backend = std::make_unique<Scripted_backend>();
+        bool delayed_started = false;
+        Scripted_backend* delayed_backend_ptr = start_surface_with_backend(
+            delayed_fixture.surface,
+            std::move(delayed_backend),
+            { QStringLiteral("scripted-terminal") },
+            &delayed_started);
+        ok &= check(delayed_started, "delayed audible-only bell surface starts");
+
+        delayed_backend_ptr->emit_output(QByteArrayLiteral("\a"));
+        term::VNM_TerminalSurface_render_bridge::
+            process_backend_callbacks_without_notification_delivery_for_testing(
+                delayed_fixture.surface);
+        ok &= check(delayed_audible_count == 0,
+            "delayed audible-only bell is pending before notification delivery");
+        ok &= check(delayed_signal_count == 0,
+            "delayed audible-only bell signal is pending before notification delivery");
+
+        delayed_fixture.surface.set_audible_bell_policy(
+            VNM_TerminalSurface::Bell_policy::DISABLED);
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            delayed_fixture.surface);
+        ok &= check(delayed_audible_count == 1,
+            "delayed audible-only bell remains audible after live policy disable");
+        ok &= check(delayed_signal_count == 1,
+            "delayed audible-only bell emits pending surface bell signal");
+    }
+
+    {
+        Surface_fixture delayed_fixture;
+        delayed_fixture.surface.set_audible_bell_policy(
+            VNM_TerminalSurface::Bell_policy::ENABLED);
+        delayed_fixture.surface.set_visual_bell_policy(
+            VNM_TerminalSurface::Bell_policy::DISABLED);
+        pump_events(app);
+
+        int delayed_audible_count = 0;
+        int delayed_signal_count  = 0;
+        term::VNM_TerminalSurface_render_bridge::set_audible_bell_handler_for_testing(
+            delayed_fixture.surface,
+            [&] {
+                ++delayed_audible_count;
+            });
+        QObject::connect(
+            &delayed_fixture.surface,
+            &VNM_TerminalSurface::bell_requested,
+            &delayed_fixture.surface,
+            [&] {
+                ++delayed_signal_count;
+            });
+
+        auto delayed_backend = std::make_unique<Scripted_backend>();
+        bool delayed_started = false;
+        Scripted_backend* delayed_backend_ptr = start_surface_with_backend(
+            delayed_fixture.surface,
+            std::move(delayed_backend),
+            { QStringLiteral("scripted-terminal") },
+            &delayed_started);
+        ok &= check(delayed_started, "delayed mixed-intent bell surface starts");
+
+        delayed_backend_ptr->emit_output(QByteArrayLiteral("\a"));
+        term::VNM_TerminalSurface_render_bridge::
+            process_backend_callbacks_without_notification_delivery_for_testing(
+                delayed_fixture.surface);
+        delayed_fixture.surface.set_audible_bell_policy(
+            VNM_TerminalSurface::Bell_policy::DISABLED);
+        delayed_fixture.surface.set_visual_bell_policy(
+            VNM_TerminalSurface::Bell_policy::ENABLED);
+        delayed_backend_ptr->emit_output(QByteArrayLiteral("\a"));
+        term::VNM_TerminalSurface_render_bridge::
+            process_backend_callbacks_without_notification_delivery_for_testing(
+                delayed_fixture.surface);
+        ok &= check(delayed_audible_count == 0,
+            "delayed mixed-intent bell is pending before notification delivery");
+        ok &= check(delayed_signal_count == 0,
+            "delayed mixed-intent bell signal is pending before notification delivery");
+
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
+            delayed_fixture.surface);
+        ok &= check(delayed_audible_count == 1,
+            "delayed mixed-intent bell preserves coalesced audible intent");
+        ok &= check(delayed_signal_count == 1,
+            "delayed mixed-intent bell emits one coalesced surface bell signal");
+    }
+
+    return ok;
+}
+
 bool test_notification_burst_uses_durable_channel(QGuiApplication& app)
 {
     bool ok = true;
@@ -16515,6 +16813,7 @@ int main(int argc, char** argv)
     ok &= test_backend_exit_updates_surface(app);
     ok &= test_public_lifecycle_methods(app);
     ok &= test_terminal_icon_name_notifications(app);
+    ok &= test_audible_bell_policy_requests_platform_bell(app);
     ok &= test_notification_burst_uses_durable_channel(app);
     ok &= test_surface_overflow_reports_error_and_exit(app);
     ok &= test_invalid_argv_reports_backend_error(app);

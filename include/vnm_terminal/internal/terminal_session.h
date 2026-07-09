@@ -248,6 +248,7 @@ public:
         scroll_public_projection_viewport_to_tail_for_testing();
     void invalidate_public_projection_for_testing(
         Terminal_public_projection_disable_reason reason);
+    void set_bell_policy(Terminal_bell_policy policy);
     void set_synchronized_output_scroll_policy(
         Terminal_synchronized_output_scroll_policy policy);
     void set_synchronized_output_scroll_policy_for_testing(

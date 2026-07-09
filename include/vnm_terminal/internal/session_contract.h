@@ -139,6 +139,8 @@ struct Terminal_session_notification
     bool                                           backpressure_active = false;
     std::optional<Terminal_osc52_write_request>    clipboard_write_request;
     std::optional<terminal_grid_size_t>            text_area_resize_request;
+    bool                                           bell_audible = false;
+    bool                                           bell_visual  = false;
 };
 
 struct Terminal_bell_policy

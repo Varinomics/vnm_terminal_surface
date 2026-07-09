@@ -191,11 +191,11 @@ if(WIN32)
     target_sources(vnm_terminal_surface PRIVATE
         src/windows_conpty_backend.cpp
     )
-    # DirectWrite (resolve an installed font family to its font file for MSDF;
-    # see src/qsg_atlas_font_bytes.cpp).
+    # Windows system APIs used by font discovery, clipboard, and audible bell support.
     target_link_libraries(vnm_terminal_surface PRIVATE
         dwrite
         ole32
+        user32
     )
 endif()
 
