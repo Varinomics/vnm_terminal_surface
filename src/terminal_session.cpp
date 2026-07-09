@@ -3176,6 +3176,16 @@ void Terminal_session::invalidate_public_projection_for_testing(
     invalidate_public_projection(reason);
 }
 
+void Terminal_session::set_bell_policy(Terminal_bell_policy policy)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    m_config.bell_policy          = policy;
+    m_bell_state.policy           = policy;
+    m_bell_state.window_start_ms  = 0U;
+    m_bell_state.events_in_window = 0U;
+}
+
 void Terminal_session::set_synchronized_output_scroll_policy(
     Terminal_synchronized_output_scroll_policy policy)
 {
@@ -4683,9 +4693,22 @@ void Terminal_session::record_pending_notification(
         case Terminal_session_notification_kind::SNAPSHOT_READY:
         case Terminal_session_notification_kind::RESIZE_TRANSACTION:
             return;
+        case Terminal_session_notification_kind::BELL_REQUESTED:
+            if (auto it = std::find_if(
+                    m_pending_notifications.begin(),
+                    m_pending_notifications.end(),
+                    same_kind);
+                it != m_pending_notifications.end())
+            {
+                it->sequence      = notification.sequence;
+                it->message       = std::move(notification.message);
+                it->bell_audible  = it->bell_audible || notification.bell_audible;
+                it->bell_visual   = it->bell_visual  || notification.bell_visual;
+                return;
+            }
+            break;
         case Terminal_session_notification_kind::OUTPUT_ACTIVITY:
         case Terminal_session_notification_kind::OUTPUT_BACKPRESSURE_CHANGED:
-        case Terminal_session_notification_kind::BELL_REQUESTED:
         case Terminal_session_notification_kind::TITLE_CHANGED:
         case Terminal_session_notification_kind::ICON_NAME_CHANGED:
         case Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED:
@@ -5351,11 +5374,13 @@ void Terminal_session::handle_bell_request(std::uint64_t sequence)
         return;
     }
 
-    record_notification({
-        Terminal_session_notification_kind::BELL_REQUESTED,
-        sequence,
-        QStringLiteral("bell requested"),
-    });
+    Terminal_session_notification notification;
+    notification.kind         = Terminal_session_notification_kind::BELL_REQUESTED;
+    notification.sequence     = sequence;
+    notification.message      = QStringLiteral("bell requested");
+    notification.bell_audible = request.audible;
+    notification.bell_visual  = request.visual;
+    record_notification(std::move(notification));
     if (request.visual) {
         m_visual_bell_active = true;
     }

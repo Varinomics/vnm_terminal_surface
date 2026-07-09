@@ -68,6 +68,7 @@ extern "C" __declspec(dllimport) int __stdcall SystemParametersInfoW(
     void*        value,
     unsigned int update_flags);
 extern "C" __declspec(dllimport) long __stdcall OleFlushClipboard();
+extern "C" __declspec(dllimport) int __stdcall MessageBeep(unsigned int type);
 #endif
 
 namespace {
@@ -110,6 +111,17 @@ constexpr unsigned int k_win_font_smoothing_cleartype           = 0x0002U;
 constexpr unsigned int k_win_font_smoothing_orientation_bgr     = 0x0000U;
 constexpr unsigned int k_win_font_smoothing_orientation_rgb     = 0x0001U;
 #endif
+
+void play_platform_bell()
+{
+#if defined(_WIN32)
+    constexpr unsigned int k_default_beep = 0U;
+    (void)MessageBeep(k_default_beep);
+#else
+    std::fputc('\a', stderr);
+    std::fflush(stderr);
+#endif
+}
 
 std::optional<std::uint64_t> live_content_publication_generation_from_snapshot(
     const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot)
@@ -1525,6 +1537,16 @@ QString mouse_reporting_policy_name(VNM_TerminalSurface::Mouse_reporting_policy 
     return QStringLiteral("unknown");
 }
 
+term::Terminal_bell_policy terminal_bell_policy_for_surface(
+    VNM_TerminalSurface::Bell_policy audible_policy,
+    VNM_TerminalSurface::Bell_policy visual_policy)
+{
+    term::Terminal_bell_policy policy;
+    policy.audible_enabled = audible_policy == VNM_TerminalSurface::Bell_policy::ENABLED;
+    policy.visual_enabled  = visual_policy  == VNM_TerminalSurface::Bell_policy::ENABLED;
+    return policy;
+}
+
 term::Terminal_synchronized_output_scroll_policy terminal_synchronized_output_scroll_policy(
     VNM_TerminalSurface::Synchronized_output_scroll_policy policy)
 {
@@ -2731,6 +2753,16 @@ struct VNM_TerminalSurface::Private
         surface.sync_from_session();
     }
 
+    void play_audible_bell()
+    {
+        if (audible_bell_handler) {
+            audible_bell_handler();
+            return;
+        }
+
+        play_platform_bell();
+    }
+
     term::Qt_grid_metrics_provider                         grid_metrics_provider;
     term::terminal_cell_metrics_t                          cell_metrics;
     QFont                                                  render_font;
@@ -2762,6 +2794,7 @@ struct VNM_TerminalSurface::Private
     int                                                    pending_published_mouse_report_block_count_for_testing = 0;
     std::function<void()>                                  backend_event_epoch_notifier_hook_for_testing;
     std::function<void()>                                  before_backend_callback_follow_up_hook_for_testing;
+    std::function<void()>                                  audible_bell_handler;
     bool                                                   render_update_pending              = false;
     std::atomic_bool                                       backend_callback_frame_update_queued =
                                                            false;
@@ -3473,6 +3506,10 @@ void VNM_TerminalSurface::set_audible_bell_policy(Bell_policy policy)
     }
 
     m_audible_bell_policy = policy;
+    if (m_private->session) {
+        m_private->session->set_bell_policy(
+            terminal_bell_policy_for_surface(m_audible_bell_policy, m_visual_bell_policy));
+    }
     emit audible_bell_policy_changed();
 }
 
@@ -3488,6 +3525,10 @@ void VNM_TerminalSurface::set_visual_bell_policy(Bell_policy policy)
     }
 
     m_visual_bell_policy = policy;
+    if (m_private->session) {
+        m_private->session->set_bell_policy(
+            terminal_bell_policy_for_surface(m_audible_bell_policy, m_visual_bell_policy));
+    }
     emit visual_bell_policy_changed();
     m_private->request_render_update(*this);
 }
@@ -6589,10 +6630,8 @@ bool VNM_TerminalSurface::start_process_with_backend(
         terminal_synchronized_output_scroll_policy(m_synchronized_output_scroll_policy);
     session_config.recover_scrollback_from_primary_repaints =
         m_primary_repaint_recovery_enabled;
-    session_config.bell_policy.audible_enabled =
-        m_audible_bell_policy == Bell_policy::ENABLED;
-    session_config.bell_policy.visual_enabled =
-        m_visual_bell_policy == Bell_policy::ENABLED;
+    session_config.bell_policy =
+        terminal_bell_policy_for_surface(m_audible_bell_policy, m_visual_bell_policy);
     session_config.backend_event_epoch_notifier = [this](std::uint64_t) {
         if (m_private->backend_event_epoch_notifier_hook_for_testing) {
             m_private->backend_event_epoch_notifier_hook_for_testing();
@@ -7267,7 +7306,12 @@ void VNM_TerminalSurface::replay_session_notification(
             }
             break;
         case term::Terminal_session_notification_kind::BELL_REQUESTED:
-            emit bell_requested();
+            if (notification.bell_audible) {
+                m_private->play_audible_bell();
+            }
+            if (notification.bell_audible || notification.bell_visual) {
+                emit bell_requested();
+            }
             break;
         case term::Terminal_session_notification_kind::TITLE_CHANGED:
             if (m_terminal_title != notification.message) {
@@ -7727,6 +7771,19 @@ void term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events_for_
     surface.drain_backend_callback_events_for_posted_work();
 }
 
+void term::VNM_TerminalSurface_render_bridge::
+process_backend_callbacks_without_notification_delivery_for_testing(
+    VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    if (surface.m_private->session == nullptr) {
+        return;
+    }
+
+    surface.m_private->session->process_backend_callback_events();
+    surface.sync_from_session(false);
+}
+
 void term::VNM_TerminalSurface_render_bridge::set_backend_callback_frame_catchup_budget_for_benchmark(
     VNM_TerminalSurface&                    surface,
     std::chrono::steady_clock::duration     budget)
@@ -7798,6 +7855,14 @@ set_before_backend_callback_follow_up_hook_for_testing(
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.m_private->before_backend_callback_follow_up_hook_for_testing =
         std::move(hook);
+}
+
+void term::VNM_TerminalSurface_render_bridge::set_audible_bell_handler_for_testing(
+    VNM_TerminalSurface&   surface,
+    std::function<void()>  handler)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    surface.m_private->audible_bell_handler = std::move(handler);
 }
 
 void term::VNM_TerminalSurface_render_bridge::simulate_update_polish(

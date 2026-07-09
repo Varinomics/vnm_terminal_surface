@@ -150,6 +150,9 @@ public:
     static void drain_backend_callback_events_for_posted_work(
         VNM_TerminalSurface&       surface);
 
+    static void process_backend_callbacks_without_notification_delivery_for_testing(
+        VNM_TerminalSurface&       surface);
+
     static void set_backend_callback_frame_catchup_budget_for_benchmark(
         VNM_TerminalSurface&                    surface,
         std::chrono::steady_clock::duration     budget);
@@ -176,6 +179,10 @@ public:
     static void set_before_backend_callback_follow_up_hook_for_testing(
         VNM_TerminalSurface&       surface,
         std::function<void()>      hook);
+
+    static void set_audible_bell_handler_for_testing(
+        VNM_TerminalSurface&       surface,
+        std::function<void()>      handler);
 
     static void simulate_update_polish(
         VNM_TerminalSurface&       surface);
