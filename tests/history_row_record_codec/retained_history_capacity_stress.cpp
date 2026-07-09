@@ -77,8 +77,8 @@ term::Terminal_history_row_record make_full_width_ascii_record(int columns)
     record.provenance.source =
         term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE;
     record.metadata.source_width = columns;
-    record.metadata.style_lifetime =
-        term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID;
+    record.metadata.style_reference =
+        term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE;
     record.metadata.wrap_state =
         term::Terminal_retained_row_wrap_state::HARD_BOUNDARY;
 
@@ -95,8 +95,8 @@ term::Terminal_history_row_record make_full_width_single_style_record(int column
     record.provenance.source =
         term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE;
     record.metadata.source_width = columns;
-    record.metadata.style_lifetime =
-        term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID;
+    record.metadata.style_reference =
+        term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE;
     record.metadata.wrap_state =
         term::Terminal_retained_row_wrap_state::HARD_BOUNDARY;
     record.style_table.push_back(capacity_style());
@@ -116,8 +116,8 @@ term::Terminal_history_row_record make_full_width_hyperlink_heavy_record(int col
     record.provenance.source =
         term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE;
     record.metadata.source_width = columns;
-    record.metadata.style_lifetime =
-        term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID;
+    record.metadata.style_reference =
+        term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE;
     record.metadata.wrap_state =
         term::Terminal_retained_row_wrap_state::HARD_BOUNDARY;
 

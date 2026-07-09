@@ -1375,13 +1375,13 @@ bool test_flat_ring_phase3_retained_record_producer_contract()
         0,
         0,
         3U,
-        "flat-ring Phase 3 normal retained record keeps session style id");
+        "flat-ring Phase 3 normal retained record keeps row-local style value");
     ok &= check_cell_background_palette(
         recovered_snapshot,
         0,
         0,
         3U,
-        "flat-ring Phase 3 recovered retained record keeps session style id");
+        "flat-ring Phase 3 recovered retained record keeps row-local style value");
 
     const term::Terminal_retained_line_provenance normal_provenance =
         normal_model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
@@ -1411,11 +1411,11 @@ bool test_flat_ring_phase3_retained_record_producer_contract()
         "flat-ring Phase 3 producer records retained source width");
     ok &= check(normal_metadata.has_value() &&
             recovered_metadata.has_value() &&
-            normal_metadata->style_lifetime ==
-                term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID &&
-            recovered_metadata->style_lifetime ==
-                term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID,
-        "flat-ring Phase 3 producer records session-lifetime style policy");
+            normal_metadata->style_reference ==
+                term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE &&
+            recovered_metadata->style_reference ==
+                term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE,
+        "flat-ring Phase 3 producer records row-local resolved style policy");
     ok &= check(normal_metadata.has_value() &&
             recovered_metadata.has_value() &&
             normal_metadata->wrap_state ==
@@ -1497,8 +1497,8 @@ bool test_flat_ring_phase7_recovery_shared_producer_boundary()
             0);
     ok &= check(recovered_metadata.has_value() &&
             recovered_metadata->source_width == 8 &&
-            recovered_metadata->style_lifetime ==
-                term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID &&
+            recovered_metadata->style_reference ==
+                term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE &&
             recovered_metadata->wrap_state ==
                 term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
         "flat-ring Phase 7 recovered row carries shared-producer metadata in ring storage");

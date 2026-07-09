@@ -13,7 +13,6 @@
 #include <QString>
 #include <QStringView>
 #include <QtGlobal>
-#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -30,7 +29,6 @@ class Terminal_history_ring;
 class Terminal_history_row_traversal;
 struct Terminal_history_row_record;
 
-using terminal_text_style_lookup_key_t = std::array<std::uint64_t, 7>;
 using terminal_snapshot_style_id_map_t =
     std::map<terminal_text_style_lookup_key_t, Terminal_style_id>;
 using terminal_hyperlink_identity_by_id_t = std::map<Terminal_hyperlink_id, QByteArray>;
@@ -92,9 +90,9 @@ struct Terminal_retained_line_provenance
     qint64                                   content_stamp_ms   = 0;
 };
 
-enum class Terminal_retained_row_style_lifetime
+enum class Terminal_retained_row_style_reference
 {
-    SESSION_LIFETIME_STYLE_ID,
+    ROW_LOCAL_RESOLVED_STYLE,
 };
 
 enum class Terminal_retained_row_wrap_state
@@ -105,9 +103,9 @@ enum class Terminal_retained_row_wrap_state
 struct terminal_retained_row_record_metadata_t
 {
     int                                   source_width = 0;
-    Terminal_retained_row_style_lifetime style_lifetime =
-        Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID;
-    Terminal_retained_row_wrap_state     wrap_state =
+    Terminal_retained_row_style_reference style_reference =
+        Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE;
+    Terminal_retained_row_wrap_state      wrap_state =
         Terminal_retained_row_wrap_state::HARD_BOUNDARY;
 };
 
@@ -292,6 +290,14 @@ struct Terminal_screen_model_profile_stats
     std::uint64_t              max_render_snapshot_fallback_text_units_per_cell = 0U;
 };
 
+struct terminal_screen_model_style_table_stats_t
+{
+    std::uint64_t              current_style_count = 0U;
+    std::uint64_t              peak_style_count    = 0U;
+    std::uint64_t              compaction_count    = 0U;
+    std::uint64_t              reclaimed_styles    = 0U;
+};
+
 class Terminal_screen_model
 {
 public:
@@ -360,6 +366,10 @@ public:
     Terminal_hyperlink_id current_hyperlink_id_for_testing() const;
     Terminal_hyperlink_id next_hyperlink_id_for_testing() const;
     terminal_hyperlink_identity_by_id_t active_hyperlink_identity_keys_by_id_for_testing() const;
+    void set_style_table_limits_for_testing(
+        std::size_t                  compaction_threshold,
+        std::size_t                  count_cap);
+    terminal_screen_model_style_table_stats_t style_table_stats() const;
     void set_dirty_row_stats_enabled(bool enabled);
     Terminal_screen_model_dirty_row_stats dirty_row_stats() const;
     Terminal_screen_model_dirty_row_timeline dirty_row_timeline() const;
@@ -685,10 +695,16 @@ private:
         const Terminal_sgr_sequence&   sequence);
 
     void apply_sgr_operation(
+        Terminal_text_style&           style,
         const Terminal_sgr_operation&  operation);
 
-    Terminal_style_id intern_style(
+    void set_current_style(
         const Terminal_text_style&     style);
+
+    void compact_styles(
+        const Terminal_text_style&     pending_style);
+
+    void validate_live_style_ids() const;
 
     Parser_action make_color_query_reply(
         const Terminal_color_query&    query) const;
@@ -1119,6 +1135,15 @@ private:
     Terminal_style_id               m_current_style_id = k_default_terminal_style_id;
     std::vector<Terminal_text_style>
                                     m_styles;
+    std::map<terminal_text_style_lookup_key_t, Terminal_style_id>
+                                    m_style_ids_by_value;
+    std::size_t                     m_style_compaction_threshold =
+                                        k_terminal_style_compaction_threshold;
+    std::size_t                     m_style_count_cap = k_terminal_style_count_cap;
+    std::size_t                     m_next_style_compaction_count =
+                                        k_terminal_style_compaction_threshold;
+    terminal_screen_model_style_table_stats_t
+                                    m_style_table_stats{1U, 1U, 0U, 0U};
     Primary_backing_buffer          m_primary_backing;
     Alternate_active_grid           m_alternate_grid;
     std::set<int>                   m_dirty_rows;

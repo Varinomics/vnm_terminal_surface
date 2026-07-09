@@ -27,8 +27,8 @@ term::Terminal_history_row_record make_record(std::uint64_t row_sequence)
     record.provenance.source =
         term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE;
     record.metadata.source_width = 1;
-    record.metadata.style_lifetime =
-        term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID;
+    record.metadata.style_reference =
+        term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE;
     record.metadata.wrap_state =
         term::Terminal_retained_row_wrap_state::HARD_BOUNDARY;
     record.cells.push_back(make_cell(QStringLiteral("x")));

@@ -125,8 +125,8 @@ term::Terminal_history_row_record make_base_record(
     record.provenance.content_generation = content_generation;
     record.provenance.source             = source;
     record.metadata.source_width         = source_width;
-    record.metadata.style_lifetime =
-        term::Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID;
+    record.metadata.style_reference =
+        term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE;
     record.metadata.wrap_state =
         term::Terminal_retained_row_wrap_state::HARD_BOUNDARY;
     return record;
@@ -175,7 +175,7 @@ bool records_equal(
         left.provenance.source             == right.provenance.source &&
         left.hyperlink_identity_keys       == right.hyperlink_identity_keys &&
         left.metadata.source_width         == right.metadata.source_width &&
-        left.metadata.style_lifetime       == right.metadata.style_lifetime &&
+        left.metadata.style_reference      == right.metadata.style_reference &&
         left.metadata.wrap_state           == right.metadata.wrap_state;
 }
 
