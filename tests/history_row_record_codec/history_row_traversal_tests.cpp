@@ -70,35 +70,65 @@ bool test_forward_and_backward_traversal_across_wrap()
     handles.reserve(10U);
 
     term::terminal_history_handle_t previous_handle;
-    for (std::uint64_t row_sequence = 1U; row_sequence <= 10U; ++row_sequence) {
+    bool fixture_reached_wrap_state = false;
+    for (std::uint64_t row_sequence = 1U; row_sequence <= 64U; ++row_sequence) {
         const term::Terminal_history_row_record_append_result append =
             append_row(ring, row_sequence, previous_handle);
         ok &= check(append.status == term::Terminal_history_row_record_codec_status::OK,
             "Phase 4C traversal wrap fixture row encodes");
         handles.push_back(append.history_handle);
         previous_handle = append.history_handle;
+
+        const term::terminal_history_handle_t latest_handle = handles.back();
+        const bool latest_wraps =
+            latest_handle.byte_sequence % ring.capacity_bytes() +
+                latest_handle.record_bytes >
+            ring.capacity_bytes();
+        const bool first_evicted =
+            ring.read_record(handles.front().byte_sequence).status() ==
+                term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE;
+        if (latest_wraps && first_evicted) {
+            fixture_reached_wrap_state = true;
+            break;
+        }
     }
 
     const term::terminal_history_handle_t latest_handle = handles.back();
-    ok &= check(
-        latest_handle.byte_sequence % ring.capacity_bytes() + latest_handle.record_bytes >
-            ring.capacity_bytes(),
+    ok &= check(fixture_reached_wrap_state &&
+        latest_handle.byte_sequence % ring.capacity_bytes() +
+            latest_handle.record_bytes > ring.capacity_bytes(),
         "Phase 4C fixture produces a physically wrapped live row record");
     ok &= check(ring.read_record(handles.front().byte_sequence).status() ==
             term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE,
         "Phase 4C fixture evicts the first row before traversal");
 
+    std::vector<term::terminal_history_handle_t> live_handles;
+    for (const term::terminal_history_handle_t& handle : handles) {
+        if (ring.read_record(handle.byte_sequence).status() ==
+            term::Terminal_history_ring_status::OK)
+        {
+            live_handles.push_back(handle);
+        }
+    }
+    ok &= check(live_handles.size() >= 2U,
+        "Phase 4C fixture keeps multiple live rows after wrap eviction");
+    if (live_handles.size() < 2U) {
+        return ok;
+    }
+
     term::Terminal_history_row_traversal traversal(ring);
 
     term::Terminal_history_row_traversal_result current = traversal.oldest_live_row();
     ok &= check(current.status == term::Terminal_history_row_traversal_status::OK &&
-            current.row.history_handle.row_sequence == 2U,
+            current.row.history_handle.row_sequence ==
+                live_handles.front().row_sequence,
         "Phase 4C oldest live row resolves after wrap eviction");
 
-    for (std::uint64_t expected_row = 3U; expected_row <= 10U; ++expected_row) {
+    for (std::size_t index = 1U; index < live_handles.size(); ++index) {
         current = traversal.next_row_after(current.row.history_handle);
         ok &= check(current.status == term::Terminal_history_row_traversal_status::OK &&
-                current.row.history_handle.row_sequence == expected_row,
+                current.row.history_handle.row_sequence ==
+                    live_handles[index].row_sequence,
             "Phase 4C forward traversal advances by live record length");
     }
 
@@ -109,13 +139,15 @@ bool test_forward_and_backward_traversal_across_wrap()
 
     current = traversal.latest_live_row();
     ok &= check(current.status == term::Terminal_history_row_traversal_status::OK &&
-            current.row.history_handle.row_sequence == 10U,
+            current.row.history_handle.row_sequence ==
+                live_handles.back().row_sequence,
         "Phase 4C latest live row resolves from the rebuildable directory");
 
-    for (std::uint64_t expected_row = 9U; expected_row >= 2U; --expected_row) {
+    for (std::size_t index = live_handles.size() - 1U; index > 0U; --index) {
         current = traversal.previous_row_before(current.row.history_handle);
         ok &= check(current.status == term::Terminal_history_row_traversal_status::OK &&
-                current.row.history_handle.row_sequence == expected_row,
+                current.row.history_handle.row_sequence ==
+                    live_handles[index - 1U].row_sequence,
             "Phase 4C backward traversal follows previous row byte and row sequence");
     }
 

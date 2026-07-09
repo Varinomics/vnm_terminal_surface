@@ -1,5 +1,6 @@
 #include "helpers/test_check.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
+#include "vnm_terminal/internal/terminal_public_projection.h"
 #include "vnm_terminal/internal/terminal_session.h"
 
 #include <QByteArray>
@@ -265,7 +266,7 @@ bool snapshot_cells_are_row_major_column_ascending(
 
 const term::Terminal_render_hyperlink_metadata* hyperlink_by_id(
     const term::Terminal_render_snapshot&  snapshot,
-    std::uint64_t                          hyperlink_id)
+    term::Terminal_hyperlink_id            hyperlink_id)
 {
     for (const term::Terminal_render_hyperlink_metadata& hyperlink : snapshot.hyperlinks) {
         if (hyperlink.hyperlink_id == hyperlink_id) {
@@ -276,12 +277,94 @@ const term::Terminal_render_hyperlink_metadata* hyperlink_by_id(
     return nullptr;
 }
 
+const term::Terminal_render_hyperlink_metadata* projection_hyperlink_by_id(
+    const term::Terminal_public_projection& projection,
+    term::Terminal_hyperlink_id             hyperlink_id)
+{
+    for (const term::Terminal_render_hyperlink_metadata& hyperlink :
+         projection.hyperlinks())
+    {
+        if (hyperlink.hyperlink_id == hyperlink_id) {
+            return &hyperlink;
+        }
+    }
+
+    return nullptr;
+}
+
+bool snapshot_has_hyperlink_uri(
+    const term::Terminal_render_snapshot& snapshot,
+    const QByteArray&                     uri)
+{
+    return std::any_of(
+        snapshot.hyperlinks.begin(),
+        snapshot.hyperlinks.end(),
+        [&](const term::Terminal_render_hyperlink_metadata& hyperlink) {
+            return hyperlink.uri == uri;
+        });
+}
+
+bool projection_has_hyperlink_uri(
+    const term::Terminal_public_projection& projection,
+    const QByteArray&                       uri)
+{
+    return std::any_of(
+        projection.hyperlinks().begin(),
+        projection.hyperlinks().end(),
+        [&](const term::Terminal_render_hyperlink_metadata& hyperlink) {
+            return hyperlink.uri == uri;
+        });
+}
+
+bool active_hyperlink_identity_contains_uri(
+    const term::Terminal_screen_model& model,
+    term::Terminal_hyperlink_id        hyperlink_id,
+    const QByteArray&                  uri)
+{
+    const term::terminal_hyperlink_identity_by_id_t identities =
+        model.active_hyperlink_identity_keys_by_id_for_testing();
+    const auto found = identities.find(hyperlink_id);
+    return found != identities.end() && found->second.contains(uri);
+}
+
+const term::Terminal_render_cell* projection_cell_with_text(
+    const term::Terminal_public_projection& projection,
+    QString                                 text)
+{
+    for (const term::Terminal_public_projection_row& row : projection.rows()) {
+        for (const term::Terminal_render_cell& cell : row.cells) {
+            if (cell.text == text) {
+                return &cell;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+std::optional<std::uint16_t> foreground_palette_index(
+    const std::vector<term::Terminal_text_style>& styles,
+    term::Terminal_style_id                       style_id)
+{
+    const std::size_t style_index = static_cast<std::size_t>(style_id);
+    if (style_index >= styles.size()) {
+        return std::nullopt;
+    }
+
+    const term::Terminal_color_ref& foreground = styles[style_index].foreground;
+    if (foreground.kind != term::Terminal_color_ref_kind::PALETTE_INDEX) {
+        return std::nullopt;
+    }
+
+    return foreground.palette_index;
+}
+
 term::Terminal_render_cell render_cell(
     int                         row,
     int                         column,
     QString                     text,
     term::Terminal_style_id     style_id = term::k_default_terminal_style_id,
-    std::uint64_t               hyperlink_id = 0U)
+    term::Terminal_hyperlink_id hyperlink_id = term::k_no_terminal_hyperlink_id)
 {
     term::Terminal_render_cell cell;
     cell.position      = {row, column};
@@ -474,7 +557,8 @@ bool test_owned_styled_wide_hyperlink_scrollback_snapshot()
 
     const term::Terminal_render_cell* link_cell =
         cell_with_text(snapshot, QStringLiteral("L"));
-    ok &= check(link_cell != nullptr && link_cell->hyperlink_id != 0U,
+    ok &= check(link_cell != nullptr &&
+        link_cell->hyperlink_id != term::k_no_terminal_hyperlink_id,
         "scrollback cell retains hyperlink id");
     if (link_cell != nullptr) {
         const term::Terminal_render_hyperlink_metadata* hyperlink =
@@ -513,6 +597,652 @@ bool test_owned_styled_wide_hyperlink_scrollback_snapshot()
             retained_hyperlink->uri == QByteArrayLiteral("https://example.test"),
             "scrollback hyperlink metadata resolves from retained row after active model mutation");
     }
+    return ok;
+}
+
+bool test_retained_row_local_metadata_remaps_snapshot_values()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({3, 20});
+
+    model.ingest(
+        QByteArrayLiteral("\x1b[31m")
+        + QByteArrayLiteral("\x1b]8;id=one;https://one.example\x1b\\")
+        + QByteArrayLiteral("A\x1b]8;;\x1b\\\x1b[0m\r\n")
+        + QByteArrayLiteral("\x1b[32m")
+        + QByteArrayLiteral("\x1b]8;id=two;https://two.example\x1b\\")
+        + QByteArrayLiteral("B\x1b]8;;\x1b\\\x1b[0m\r\n")
+        + QByteArrayLiteral("\x1b]8;id=one;https://one.example\x1b\\")
+        + QByteArrayLiteral("C\x1b]8;;\x1b\\\r\nD\r\nE"));
+
+    ok &= check(model.scrollback_size() == 2,
+        "row-local metadata fixture creates two retained rows");
+
+    const term::Terminal_render_snapshot snapshot =
+        model.render_snapshot(request_for_model(model, 18U, model.scrollback_size()));
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "row-local metadata snapshot validates");
+    ok &= check(row_text(snapshot, 0) == QStringLiteral("A") &&
+        row_text(snapshot, 1) == QStringLiteral("B") &&
+        row_text(snapshot, 2) == QStringLiteral("C"),
+        "row-local metadata snapshot spans retained and active rows");
+
+    const term::Terminal_render_cell* retained_one =
+        cell_with_text(snapshot, QStringLiteral("A"));
+    const term::Terminal_render_cell* retained_two =
+        cell_with_text(snapshot, QStringLiteral("B"));
+    const term::Terminal_render_cell* active_same =
+        cell_with_text(snapshot, QStringLiteral("C"));
+    ok &= check(retained_one != nullptr &&
+        retained_two != nullptr &&
+        active_same != nullptr,
+        "row-local metadata fixture exposes all probe cells");
+    if (retained_one != nullptr &&
+        retained_two != nullptr &&
+        active_same != nullptr)
+    {
+        const std::optional<std::uint16_t> retained_one_palette =
+            foreground_palette_index(snapshot.styles, retained_one->style_id);
+        const std::optional<std::uint16_t> retained_two_palette =
+            foreground_palette_index(snapshot.styles, retained_two->style_id);
+        ok &= check(retained_one->style_id != retained_two->style_id &&
+            retained_one_palette == 1U &&
+            retained_two_palette == 2U,
+            "retained row-local style refs remap by style value in snapshots");
+
+        const term::Terminal_render_hyperlink_metadata* retained_one_link =
+            hyperlink_by_id(snapshot, retained_one->hyperlink_id);
+        const term::Terminal_render_hyperlink_metadata* retained_two_link =
+            hyperlink_by_id(snapshot, retained_two->hyperlink_id);
+        const term::Terminal_render_hyperlink_metadata* active_same_link =
+            hyperlink_by_id(snapshot, active_same->hyperlink_id);
+        ok &= check(retained_one->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            retained_two->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            active_same->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            retained_one->hyperlink_id == active_same->hyperlink_id &&
+            retained_one->hyperlink_id != retained_two->hyperlink_id,
+            "snapshot remaps row-local hyperlink refs by identity");
+        ok &= check(retained_one_link != nullptr &&
+            retained_two_link != nullptr &&
+            active_same_link != nullptr &&
+            retained_one_link == active_same_link &&
+            retained_one_link->uri == QByteArrayLiteral("https://one.example") &&
+            retained_two_link->uri == QByteArrayLiteral("https://two.example") &&
+            snapshot.hyperlinks.size() == 2U,
+            "snapshot deduplicates same hyperlink identity across retained and active rows");
+    }
+
+    const term::Terminal_selection_range selection_range = {
+        {0, 0},
+        {2, 1},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    const term::Terminal_selection_result selection =
+        term::selected_text_from_render_snapshot(snapshot, selection_range);
+    ok &= check(selection.code == term::Terminal_selection_result_code::OK &&
+        selection.text == QStringLiteral("A\nB\nC"),
+        "selection extraction spans retained and active snapshot rows");
+
+    return ok;
+}
+
+bool test_retained_row_local_hyperlink_ref_one_stays_distinct_from_active_id_one()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({2, 20});
+
+    model.ingest(
+        QByteArrayLiteral("\x1b[2;1H")
+        + QByteArrayLiteral("\x1b]8;id=active;https://active.example\x1b\\")
+        + QByteArrayLiteral("A\x1b]8;;\x1b\\")
+        + QByteArrayLiteral("\x1b[1;1H")
+        + QByteArrayLiteral("\x1b]8;id=retained;https://retained.example\x1b\\")
+        + QByteArrayLiteral("R\x1b]8;;\x1b\\")
+        + QByteArrayLiteral("\x1b[2;1H\r\n"));
+
+    ok &= check(model.scrollback_size() == 1,
+        "hyperlink ref collision fixture creates one retained row");
+
+    const term::Terminal_render_snapshot snapshot =
+        model.render_snapshot(request_for_model(model, 19U, model.scrollback_size()));
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "hyperlink ref collision snapshot validates");
+    ok &= check(row_text(snapshot, 0) == QStringLiteral("R") &&
+        row_text(snapshot, 1) == QStringLiteral("A"),
+        "hyperlink ref collision snapshot spans retained and active rows");
+
+    const term::Terminal_render_cell* retained =
+        cell_with_text(snapshot, QStringLiteral("R"));
+    const term::Terminal_render_cell* active =
+        cell_with_text(snapshot, QStringLiteral("A"));
+    ok &= check(retained != nullptr && active != nullptr,
+        "hyperlink ref collision snapshot exposes retained and active cells");
+    if (retained != nullptr && active != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* retained_link =
+            hyperlink_by_id(snapshot, retained->hyperlink_id);
+        const term::Terminal_render_hyperlink_metadata* active_link =
+            hyperlink_by_id(snapshot, active->hyperlink_id);
+        ok &= check(retained->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            active->hyperlink_id   != term::k_no_terminal_hyperlink_id &&
+            retained->hyperlink_id != active->hyperlink_id,
+            "retained row-local ref 1 does not collide with active hyperlink id 1");
+        ok &= check(retained_link != nullptr &&
+            active_link != nullptr &&
+            retained_link->uri == QByteArrayLiteral("https://retained.example") &&
+            active_link->uri   == QByteArrayLiteral("https://active.example") &&
+            snapshot.hyperlinks.size() == 2U,
+            "snapshot keeps different retained and active hyperlink identities distinct");
+    }
+
+    const term::Terminal_render_snapshot safe_basis =
+        model.render_snapshot(request_for_model(model, 20U));
+    const term::Terminal_public_projection projection =
+        term::Terminal_public_projection::capture_primary_full_rows_from_safe_model(
+            21U,
+            safe_basis,
+            {},
+            22U,
+            model);
+    const term::Terminal_render_cell* projection_retained =
+        projection_cell_with_text(projection, QStringLiteral("R"));
+    const term::Terminal_render_cell* projection_active =
+        projection_cell_with_text(projection, QStringLiteral("A"));
+    ok &= check(projection_retained != nullptr && projection_active != nullptr,
+        "hyperlink ref collision projection exposes retained and active cells");
+    if (projection_retained != nullptr && projection_active != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* retained_link =
+            projection_hyperlink_by_id(projection, projection_retained->hyperlink_id);
+        const term::Terminal_render_hyperlink_metadata* active_link =
+            projection_hyperlink_by_id(projection, projection_active->hyperlink_id);
+        ok &= check(
+            projection_retained->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            projection_active->hyperlink_id   != term::k_no_terminal_hyperlink_id &&
+            projection_retained->hyperlink_id != projection_active->hyperlink_id,
+            "projection keeps retained row-local ref 1 distinct from active hyperlink id 1");
+        ok &= check(retained_link != nullptr &&
+            active_link != nullptr &&
+            retained_link->uri == QByteArrayLiteral("https://retained.example") &&
+            active_link->uri   == QByteArrayLiteral("https://active.example") &&
+            projection.hyperlinks().size() == 2U,
+            "projection keeps different retained and active hyperlink metadata distinct");
+    }
+
+    return ok;
+}
+
+bool test_retained_row_local_hyperlink_ref_one_dedupes_across_retained_rows()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({2, 20});
+
+    model.ingest(
+        QByteArrayLiteral("\x1b]8;id=same;https://same.example\x1b\\")
+        + QByteArrayLiteral("A\x1b]8;;\x1b\\\r\n")
+        + QByteArrayLiteral("\x1b]8;id=same;https://same.example\x1b\\")
+        + QByteArrayLiteral("B\x1b]8;;\x1b\\\r\n")
+        + QByteArrayLiteral("C\r\nD"));
+
+    ok &= check(model.scrollback_size() == 2,
+        "retained hyperlink dedupe fixture creates two retained rows");
+
+    const term::Terminal_render_snapshot snapshot =
+        model.render_snapshot(request_for_model(model, 23U, model.scrollback_size()));
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "retained hyperlink dedupe snapshot validates");
+    ok &= check(row_text(snapshot, 0) == QStringLiteral("A") &&
+        row_text(snapshot, 1) == QStringLiteral("B"),
+        "retained hyperlink dedupe snapshot spans both retained rows");
+
+    const term::Terminal_render_cell* retained_one =
+        cell_with_text(snapshot, QStringLiteral("A"));
+    const term::Terminal_render_cell* retained_two =
+        cell_with_text(snapshot, QStringLiteral("B"));
+    ok &= check(retained_one != nullptr && retained_two != nullptr,
+        "retained hyperlink dedupe snapshot exposes both retained cells");
+    if (retained_one != nullptr && retained_two != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* retained_link =
+            hyperlink_by_id(snapshot, retained_one->hyperlink_id);
+        ok &= check(retained_one->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            retained_one->hyperlink_id == retained_two->hyperlink_id,
+            "snapshot deduplicates matching retained row-local hyperlink refs");
+        ok &= check(retained_link != nullptr &&
+            retained_link->uri == QByteArrayLiteral("https://same.example") &&
+            snapshot.hyperlinks.size() == 1U,
+            "snapshot stores one metadata entry for matching retained identities");
+    }
+
+    const term::Terminal_render_snapshot safe_basis =
+        model.render_snapshot(request_for_model(model, 24U));
+    const term::Terminal_public_projection projection =
+        term::Terminal_public_projection::capture_primary_full_rows_from_safe_model(
+            25U,
+            safe_basis,
+            {},
+            26U,
+            model);
+    const term::Terminal_render_cell* projection_one =
+        projection_cell_with_text(projection, QStringLiteral("A"));
+    const term::Terminal_render_cell* projection_two =
+        projection_cell_with_text(projection, QStringLiteral("B"));
+    ok &= check(projection_one != nullptr && projection_two != nullptr,
+        "retained hyperlink dedupe projection exposes both retained cells");
+    if (projection_one != nullptr && projection_two != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* retained_link =
+            projection_hyperlink_by_id(projection, projection_one->hyperlink_id);
+        ok &= check(projection_one->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            projection_one->hyperlink_id == projection_two->hyperlink_id,
+            "projection deduplicates matching retained row-local hyperlink refs");
+        ok &= check(retained_link != nullptr &&
+            retained_link->uri == QByteArrayLiteral("https://same.example") &&
+            projection.hyperlinks().size() == 1U,
+            "projection stores one metadata entry for matching retained identities");
+    }
+
+    return ok;
+}
+
+bool test_full_projection_remaps_row_local_metadata_across_snapshots()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({2, 20});
+
+    model.ingest(
+        QByteArrayLiteral("\x1b[31m")
+        + QByteArrayLiteral("\x1b]8;id=one;https://one.example\x1b\\")
+        + QByteArrayLiteral("A\x1b]8;;\x1b\\\x1b[0m\r\n")
+        + QByteArrayLiteral("B\r\n")
+        + QByteArrayLiteral("\x1b[32m")
+        + QByteArrayLiteral("\x1b]8;id=two;https://two.example\x1b\\")
+        + QByteArrayLiteral("C\x1b]8;;\x1b\\\x1b[0m\r\n")
+        + QByteArrayLiteral("\x1b]8;id=one;https://one.example\x1b\\")
+        + QByteArrayLiteral("D\x1b]8;;\x1b\\\r\nE"));
+
+    ok &= check(model.scrollback_size() == 3,
+        "full projection fixture creates retained rows across capture batches");
+
+    const term::Terminal_render_snapshot safe_basis =
+        model.render_snapshot(request_for_model(model, 28U));
+    const term::Terminal_public_projection projection =
+        term::Terminal_public_projection::capture_primary_full_rows_from_safe_model(
+            29U,
+            safe_basis,
+            {},
+            30U,
+            model);
+
+    ok &= check(!projection.rows_are_safe_basis_viewport_only() &&
+        projection.stored_row_count() == 5U &&
+        projection.row_capture_snapshot_count() >= 2U,
+        "full projection captures retained rows from multiple row snapshots");
+
+    const term::Terminal_render_cell* retained_one =
+        projection_cell_with_text(projection, QStringLiteral("A"));
+    const term::Terminal_render_cell* retained_two =
+        projection_cell_with_text(projection, QStringLiteral("C"));
+    const term::Terminal_render_cell* active_same =
+        projection_cell_with_text(projection, QStringLiteral("D"));
+    ok &= check(retained_one != nullptr &&
+        retained_two != nullptr &&
+        active_same != nullptr,
+        "full projection exposes retained and active probe cells");
+    if (retained_one != nullptr &&
+        retained_two != nullptr &&
+        active_same != nullptr)
+    {
+        const std::optional<std::uint16_t> retained_one_palette =
+            foreground_palette_index(projection.styles(), retained_one->style_id);
+        const std::optional<std::uint16_t> retained_two_palette =
+            foreground_palette_index(projection.styles(), retained_two->style_id);
+        ok &= check(retained_one->style_id != retained_two->style_id &&
+            retained_one_palette == 1U &&
+            retained_two_palette == 2U,
+            "projection remaps retained row-local style refs by style value");
+
+        const term::Terminal_render_hyperlink_metadata* retained_one_link =
+            projection_hyperlink_by_id(projection, retained_one->hyperlink_id);
+        const term::Terminal_render_hyperlink_metadata* retained_two_link =
+            projection_hyperlink_by_id(projection, retained_two->hyperlink_id);
+        ok &= check(retained_one->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            retained_two->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            active_same->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+            retained_one->hyperlink_id == active_same->hyperlink_id &&
+            retained_one->hyperlink_id != retained_two->hyperlink_id,
+            "projection remaps retained row-local hyperlink refs by identity");
+        ok &= check(retained_one_link != nullptr &&
+            retained_two_link != nullptr &&
+            retained_one_link->uri == QByteArrayLiteral("https://one.example") &&
+            retained_two_link->uri == QByteArrayLiteral("https://two.example") &&
+            projection.hyperlinks().size() == 2U,
+            "projection keeps identity-correct hyperlink metadata");
+    }
+
+    return ok;
+}
+
+bool test_hyperlink_compaction_preserves_snapshot_and_projection_metadata()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({1, 16});
+    model.set_next_hyperlink_id_for_testing(term::k_max_terminal_hyperlink_id);
+
+    model.ingest(
+        QByteArrayLiteral("\x1b]8;id=old;https://old.example\x1b\\A")
+        + QByteArrayLiteral("\x1b]8;id=new;https://new.example\x1b\\B"));
+
+    term::Terminal_render_snapshot snapshot =
+        model.render_snapshot(request_for_model(model, 31U));
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "hyperlink compaction metadata snapshot validates");
+
+    const term::Terminal_render_cell* old_cell =
+        cell_with_text(snapshot, QStringLiteral("A"));
+    const term::Terminal_render_cell* new_cell =
+        cell_with_text(snapshot, QStringLiteral("B"));
+    ok &= check(old_cell != nullptr &&
+        new_cell != nullptr &&
+        old_cell->hyperlink_id == 1U &&
+        new_cell->hyperlink_id == 2U,
+        "hyperlink compaction remaps old and new visible cells to dense ids");
+    ok &= check(snapshot_has_hyperlink_uri(
+            snapshot,
+            QByteArrayLiteral("https://old.example")) &&
+        snapshot_has_hyperlink_uri(
+            snapshot,
+            QByteArrayLiteral("https://new.example")),
+        "hyperlink compaction snapshot carries old and new hyperlink metadata");
+    if (old_cell != nullptr && new_cell != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* old_link =
+            hyperlink_by_id(snapshot, old_cell->hyperlink_id);
+        const term::Terminal_render_hyperlink_metadata* new_link =
+            hyperlink_by_id(snapshot, new_cell->hyperlink_id);
+        ok &= check(old_link != nullptr &&
+            new_link != nullptr &&
+            old_link->uri == QByteArrayLiteral("https://old.example") &&
+            new_link->uri == QByteArrayLiteral("https://new.example"),
+            "hyperlink compaction preserves old and new render metadata");
+    }
+
+    snapshot.hyperlinks.push_back({
+        9U,
+        QByteArrayLiteral("id:hidden\x1fhttps://hidden.example"),
+        QByteArrayLiteral("https://hidden.example"),
+    });
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "hyperlink compaction projection fixture permits unreferenced metadata");
+
+    const term::Terminal_public_projection projection =
+        term::Terminal_public_projection::capture_from_safe_model(
+            32U,
+            snapshot,
+            {},
+            33U);
+    ok &= check(projection_has_hyperlink_uri(
+            projection,
+            QByteArrayLiteral("https://old.example")) &&
+        projection_has_hyperlink_uri(
+            projection,
+            QByteArrayLiteral("https://new.example")) &&
+        !projection_has_hyperlink_uri(
+            projection,
+            QByteArrayLiteral("https://hidden.example")) &&
+        projection.hyperlinks().size() == 2U,
+        "public projection after hyperlink compaction filters unreferenced hyperlink metadata");
+
+    return ok;
+}
+
+bool test_hyperlink_compaction_remaps_inactive_primary_and_alternate_roots()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({1, 16});
+    model.set_next_hyperlink_id_for_testing(term::k_max_terminal_hyperlink_id - 1U);
+
+    model.ingest(
+        QByteArrayLiteral("\x1b]8;id=primary;https://primary.example\x1b\\P")
+        + QByteArrayLiteral("\x1b]8;;\x1b\\"));
+    model.ingest(QByteArrayLiteral("\x1b[?47h"));
+    model.ingest(
+        QByteArrayLiteral("\x1b]8;id=alternate;https://alternate.example\x1b\\A")
+        + QByteArrayLiteral("\x1b]8;;\x1b\\"));
+    model.ingest(
+        QByteArrayLiteral("\x1b]8;id=trigger;https://trigger.example\x1b\\T")
+        + QByteArrayLiteral("\x1b]8;;\x1b\\"));
+    ok &= check(active_hyperlink_identity_contains_uri(
+            model,
+            1U,
+            QByteArrayLiteral("https://primary.example")) &&
+        active_hyperlink_identity_contains_uri(
+            model,
+            2U,
+            QByteArrayLiteral("https://alternate.example")) &&
+        active_hyperlink_identity_contains_uri(
+            model,
+            3U,
+            QByteArrayLiteral("https://trigger.example")),
+        "inactive-primary compaction rewrites model hyperlink identity roots");
+
+    const term::Terminal_render_snapshot alternate_snapshot =
+        model.render_snapshot(request_for_model(model, 34U));
+    ok &= check(term::validate_render_snapshot(alternate_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "inactive-root compaction alternate snapshot validates");
+
+    const term::Terminal_render_cell* alternate_cell =
+        cell_with_text(alternate_snapshot, QStringLiteral("A"));
+    const term::Terminal_render_cell* trigger_cell =
+        cell_with_text(alternate_snapshot, QStringLiteral("T"));
+    ok &= check(alternate_cell != nullptr &&
+        trigger_cell != nullptr &&
+        alternate_cell->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+        trigger_cell->hyperlink_id   != term::k_no_terminal_hyperlink_id &&
+        alternate_cell->hyperlink_id != trigger_cell->hyperlink_id,
+        "inactive-root compaction keeps active alternate cells linked after primary root");
+    if (alternate_cell != nullptr && trigger_cell != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* alternate_link =
+            hyperlink_by_id(alternate_snapshot, alternate_cell->hyperlink_id);
+        const term::Terminal_render_hyperlink_metadata* trigger_link =
+            hyperlink_by_id(alternate_snapshot, trigger_cell->hyperlink_id);
+        ok &= check(alternate_link != nullptr &&
+            trigger_link != nullptr &&
+            alternate_link->uri == QByteArrayLiteral("https://alternate.example") &&
+            trigger_link->uri   == QByteArrayLiteral("https://trigger.example"),
+            "inactive-root compaction preserves alternate metadata after remap");
+    }
+
+    model.ingest(QByteArrayLiteral("\x1b[?47l"));
+    const term::Terminal_render_snapshot primary_snapshot =
+        model.render_snapshot(request_for_model(model, 35U));
+    ok &= check(term::validate_render_snapshot(primary_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "inactive-root compaction primary snapshot validates");
+
+    const term::Terminal_render_cell* primary_cell =
+        cell_with_text(primary_snapshot, QStringLiteral("P"));
+    ok &= check(primary_cell != nullptr &&
+        primary_cell->hyperlink_id == 1U,
+        "inactive-root compaction remaps inactive primary cell");
+    if (primary_cell != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* primary_link =
+            hyperlink_by_id(primary_snapshot, primary_cell->hyperlink_id);
+        ok &= check(primary_link != nullptr &&
+            primary_link->uri == QByteArrayLiteral("https://primary.example"),
+            "inactive-root compaction preserves inactive primary metadata");
+    }
+
+    model.ingest(QByteArrayLiteral("\x1b[?47h"));
+    const term::Terminal_render_snapshot alternate_again_snapshot =
+        model.render_snapshot(request_for_model(model, 36U));
+    ok &= check(term::validate_render_snapshot(alternate_again_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "inactive-root compaction alternate materialization snapshot validates");
+
+    const term::Terminal_render_cell* alternate_again_cell =
+        cell_with_text(alternate_again_snapshot, QStringLiteral("A"));
+    ok &= check(alternate_again_cell != nullptr &&
+        alternate_again_cell->hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "inactive-root compaction keeps alternate link after switching back");
+    if (alternate_again_cell != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* alternate_again_link =
+            hyperlink_by_id(alternate_again_snapshot, alternate_again_cell->hyperlink_id);
+        ok &= check(alternate_again_link != nullptr &&
+            alternate_again_link->uri == QByteArrayLiteral("https://alternate.example"),
+            "inactive-root compaction keeps alternate metadata after switching back");
+    }
+
+    term::Terminal_screen_model primary_model = make_model({1, 16});
+    primary_model.set_next_hyperlink_id_for_testing(term::k_max_terminal_hyperlink_id - 1U);
+
+    primary_model.ingest(QByteArrayLiteral("\x1b[?47h"));
+    primary_model.ingest(
+        QByteArrayLiteral("\x1b]8;id=alternate;https://inactive-alternate.example\x1b\\A")
+        + QByteArrayLiteral("\x1b]8;;\x1b\\"));
+    primary_model.ingest(QByteArrayLiteral("\x1b[?47l"));
+    primary_model.ingest(
+        QByteArrayLiteral("\x1b]8;id=primary;https://active-primary.example\x1b\\P")
+        + QByteArrayLiteral("\x1b]8;;\x1b\\"));
+    primary_model.ingest(
+        QByteArrayLiteral("\x1b]8;id=trigger;https://primary-trigger.example\x1b\\T")
+        + QByteArrayLiteral("\x1b]8;;\x1b\\"));
+    ok &= check(active_hyperlink_identity_contains_uri(
+            primary_model,
+            1U,
+            QByteArrayLiteral("https://inactive-alternate.example")) &&
+        active_hyperlink_identity_contains_uri(
+            primary_model,
+            2U,
+            QByteArrayLiteral("https://active-primary.example")) &&
+        active_hyperlink_identity_contains_uri(
+            primary_model,
+            3U,
+            QByteArrayLiteral("https://primary-trigger.example")),
+        "inactive-alternate compaction rewrites model hyperlink identity roots");
+
+    const term::Terminal_render_snapshot active_primary_snapshot =
+        primary_model.render_snapshot(request_for_model(primary_model, 39U));
+    ok &= check(term::validate_render_snapshot(active_primary_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "inactive-alternate compaction primary snapshot validates");
+
+    const term::Terminal_render_cell* active_primary_cell =
+        cell_with_text(active_primary_snapshot, QStringLiteral("P"));
+    const term::Terminal_render_cell* primary_trigger_cell =
+        cell_with_text(active_primary_snapshot, QStringLiteral("T"));
+    ok &= check(active_primary_cell != nullptr &&
+        primary_trigger_cell != nullptr &&
+        active_primary_cell->hyperlink_id  != term::k_no_terminal_hyperlink_id &&
+        primary_trigger_cell->hyperlink_id != term::k_no_terminal_hyperlink_id &&
+        active_primary_cell->hyperlink_id  != primary_trigger_cell->hyperlink_id,
+        "inactive-alternate compaction keeps active primary cells linked after alternate root");
+    if (active_primary_cell != nullptr && primary_trigger_cell != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* active_primary_link =
+            hyperlink_by_id(active_primary_snapshot, active_primary_cell->hyperlink_id);
+        const term::Terminal_render_hyperlink_metadata* primary_trigger_link =
+            hyperlink_by_id(active_primary_snapshot, primary_trigger_cell->hyperlink_id);
+        ok &= check(active_primary_link != nullptr &&
+            primary_trigger_link != nullptr &&
+            active_primary_link->uri == QByteArrayLiteral("https://active-primary.example") &&
+            primary_trigger_link->uri == QByteArrayLiteral("https://primary-trigger.example"),
+            "inactive-alternate compaction preserves active primary metadata");
+    }
+
+    primary_model.ingest(QByteArrayLiteral("\x1b[?47h"));
+    const term::Terminal_render_snapshot inactive_alternate_snapshot =
+        primary_model.render_snapshot(request_for_model(primary_model, 40U));
+    ok &= check(term::validate_render_snapshot(inactive_alternate_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "inactive-alternate compaction materialized alternate snapshot validates");
+
+    const term::Terminal_render_cell* inactive_alternate_cell =
+        cell_with_text(inactive_alternate_snapshot, QStringLiteral("A"));
+    ok &= check(inactive_alternate_cell != nullptr &&
+        inactive_alternate_cell->hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "inactive-alternate compaction keeps alternate cell linked after switching back");
+    if (inactive_alternate_cell != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* inactive_alternate_link =
+            hyperlink_by_id(inactive_alternate_snapshot, inactive_alternate_cell->hyperlink_id);
+        ok &= check(inactive_alternate_link != nullptr &&
+            inactive_alternate_link->uri ==
+                QByteArrayLiteral("https://inactive-alternate.example"),
+            "inactive-alternate compaction preserves alternate metadata after materialization");
+    }
+
+    return ok;
+}
+
+bool test_hyperlink_compaction_remaps_primary_repaint_recovery_candidate()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model_config config;
+    config.grid_size                                = {3, 16};
+    config.scrollback_limit                         = 8;
+    config.tab_width                                = 8;
+    config.recover_scrollback_from_primary_repaints = true;
+    term::Terminal_screen_model model(config);
+    model.set_next_hyperlink_id_for_testing(term::k_max_terminal_hyperlink_id);
+
+    model.ingest(
+        QByteArrayLiteral("\x1b]8;id=recovered;https://recovered.example\x1b\\aa")
+        + QByteArrayLiteral("\x1b]8;;\x1b\\\r\nbb\r\ncc"));
+    model.ingest(QByteArrayLiteral("\x1b[?25l\x1b[H"));
+    model.ingest(
+        QByteArrayLiteral("bb\x1b[K\r\n")
+        + QByteArrayLiteral("cc\x1b[K\r\n")
+        + QByteArrayLiteral("\x1b]8;id=current;https://current.example\x1b\\dd")
+        + QByteArrayLiteral("\x1b]8;;\x1b\\\x1b[K"));
+
+    ok &= check(model.next_hyperlink_id_for_testing() == 3U,
+        "primary-repaint candidate compaction remaps before recovery closes");
+
+    const term::Terminal_screen_model_result recovery_result =
+        model.ingest(QByteArrayLiteral("\x1b[?25h"));
+    ok &= check(recovery_result.recovery_proposals.size() == 1U &&
+            model.scrollback_size() == 1,
+        "primary-repaint candidate compaction still accepts recovered row");
+
+    const term::Terminal_render_snapshot recovered_snapshot =
+        model.render_snapshot(request_for_model(model, 37U, 1));
+    ok &= check(term::validate_render_snapshot(recovered_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "primary-repaint candidate compaction recovered snapshot validates");
+
+    const term::Terminal_render_cell* recovered_cell =
+        cell_with_text(recovered_snapshot, QStringLiteral("a"));
+    ok &= check(recovered_cell != nullptr &&
+        recovered_cell->hyperlink_id == 1U,
+        "primary-repaint candidate compaction remaps recovered row hyperlink id");
+    if (recovered_cell != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* recovered_link =
+            hyperlink_by_id(recovered_snapshot, recovered_cell->hyperlink_id);
+        ok &= check(recovered_link != nullptr &&
+            recovered_link->uri == QByteArrayLiteral("https://recovered.example"),
+            "primary-repaint candidate compaction preserves recovered row metadata");
+    }
+
+    const term::Terminal_render_snapshot tail_snapshot =
+        model.render_snapshot(request_for_model(model, 38U));
+    ok &= check(term::validate_render_snapshot(tail_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "primary-repaint candidate compaction tail snapshot validates");
+
+    const term::Terminal_render_cell* current_cell =
+        cell_with_text(tail_snapshot, QStringLiteral("d"));
+    ok &= check(current_cell != nullptr &&
+        current_cell->hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "primary-repaint candidate compaction keeps current row linked");
+    if (current_cell != nullptr) {
+        const term::Terminal_render_hyperlink_metadata* current_link =
+            hyperlink_by_id(tail_snapshot, current_cell->hyperlink_id);
+        ok &= check(current_link != nullptr &&
+            current_link->uri == QByteArrayLiteral("https://current.example"),
+            "primary-repaint candidate compaction preserves current row metadata");
+    }
+
     return ok;
 }
 
@@ -2550,6 +3280,13 @@ int main()
 {
     bool ok = true;
     ok &= test_owned_styled_wide_hyperlink_scrollback_snapshot();
+    ok &= test_retained_row_local_metadata_remaps_snapshot_values();
+    ok &= test_retained_row_local_hyperlink_ref_one_stays_distinct_from_active_id_one();
+    ok &= test_retained_row_local_hyperlink_ref_one_dedupes_across_retained_rows();
+    ok &= test_full_projection_remaps_row_local_metadata_across_snapshots();
+    ok &= test_hyperlink_compaction_preserves_snapshot_and_projection_metadata();
+    ok &= test_hyperlink_compaction_remaps_inactive_primary_and_alternate_roots();
+    ok &= test_hyperlink_compaction_remaps_primary_repaint_recovery_candidate();
     ok &= test_scrollback_wide_rows_are_repaired_on_resize();
     ok &= test_snapshot_rows_cover_primary_retained_and_alternate_sources();
     ok &= test_snapshot_cells_cache_text_category();

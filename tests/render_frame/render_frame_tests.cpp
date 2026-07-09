@@ -738,7 +738,7 @@ bool test_coalesced_ascii_text_runs_split_at_guard_boundaries()
         int                       column,
         const QString&            text,
         term::Terminal_style_id   style_id = 0U,
-        std::uint64_t             hyperlink_id = 0U) {
+        term::Terminal_hyperlink_id hyperlink_id = term::k_no_terminal_hyperlink_id) {
         term::Terminal_render_cell cell;
         cell.position     = {row, column};
         cell.text         = text;
@@ -1809,7 +1809,7 @@ bool test_classify_terminal_simple_content_cell_unicode_property()
         const char*       message       = "";
         QString           text;
         int               display_width = 1;
-        std::uint64_t     hyperlink_id  = 0U;
+        term::Terminal_hyperlink_id hyperlink_id = term::k_no_terminal_hyperlink_id;
         bool              has_decoration = false;
         bool              check_reason   = false;
         term::Terminal_simple_content_rejection_reason
@@ -2057,7 +2057,7 @@ bool test_cell_pass_simple_content_classification()
         const char*    message               = "";
         QString        text;
         decoration_t   decoration           = decoration_t::NONE;
-        std::uint64_t  hyperlink_id          = 0U;
+        term::Terminal_hyperlink_id hyperlink_id = term::k_no_terminal_hyperlink_id;
         bool           dirty_row             = true;
         term::Terminal_simple_content_route
                        expected_route        = term::Terminal_simple_content_route::FAST_TEXT;

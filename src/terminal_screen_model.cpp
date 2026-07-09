@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -115,6 +116,48 @@ Terminal_render_cell_text_category render_cell_text_category(QStringView text)
         ? Terminal_render_cell_text_category::NON_ASCII
         : Terminal_render_cell_text_category::OTHER_ASCII;
 }
+
+struct Terminal_color_ref_less
+{
+    bool operator()(const Terminal_color_ref& left, const Terminal_color_ref& right) const
+    {
+        if (left.kind != right.kind) {
+            return static_cast<int>(left.kind) < static_cast<int>(right.kind);
+        }
+
+        switch (left.kind) {
+            case Terminal_color_ref_kind::DEFAULT:
+                return false;
+            case Terminal_color_ref_kind::PALETTE_INDEX:
+                return left.palette_index < right.palette_index;
+            case Terminal_color_ref_kind::RGB:
+                return left.rgba < right.rgba;
+        }
+
+        return false;
+    }
+};
+
+struct Terminal_text_style_less
+{
+    bool operator()(const Terminal_text_style& left, const Terminal_text_style& right) const
+    {
+        const Terminal_color_ref_less color_less;
+        if (color_less(left.foreground, right.foreground)) {
+            return true;
+        }
+        if (color_less(right.foreground, left.foreground)) {
+            return false;
+        }
+        if (color_less(left.background, right.background)) {
+            return true;
+        }
+        if (color_less(right.background, left.background)) {
+            return false;
+        }
+        return left.attributes < right.attributes;
+    }
+};
 
 terminal_history_handle_t retained_history_handle_from_provenance(
     const Terminal_retained_line_provenance& provenance)
@@ -477,7 +520,6 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
             else {
                 publish_pending_changes(publication);
             }
-            retain_referenced_active_hyperlink_ids();
         }
     }
 
@@ -496,7 +538,6 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
     overrides.dirty_rows_have_stable_mutation_identity =
         publication.dirty_rows_have_stable_mutation_identity;
     adopt_publication_changes(std::move(publication));
-    retain_referenced_active_hyperlink_ids();
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::finalize_ingest_result");
@@ -520,7 +561,6 @@ Terminal_screen_model_result Terminal_screen_model::force_release_synchronized_o
     overrides.dirty_rows_have_stable_mutation_identity =
         publication.dirty_rows_have_stable_mutation_identity;
     adopt_publication_changes(std::move(publication));
-    retain_referenced_active_hyperlink_ids();
 
     return finalize_result(std::move(result), overrides);
 }
@@ -1596,6 +1636,27 @@ Terminal_screen_model::retained_history_decode_live_row_call_count_for_testing()
 {
     return m_primary_backing.retained_history.traversal->
         decode_live_row_call_count_for_testing();
+}
+
+void Terminal_screen_model::set_next_hyperlink_id_for_testing(Terminal_hyperlink_id id)
+{
+    m_next_hyperlink_id = id;
+}
+
+Terminal_hyperlink_id Terminal_screen_model::current_hyperlink_id_for_testing() const
+{
+    return m_current_hyperlink_id;
+}
+
+Terminal_hyperlink_id Terminal_screen_model::next_hyperlink_id_for_testing() const
+{
+    return m_next_hyperlink_id;
+}
+
+terminal_hyperlink_identity_by_id_t
+Terminal_screen_model::active_hyperlink_identity_keys_by_id_for_testing() const
+{
+    return active_hyperlink_identity_keys_by_id();
 }
 
 void Terminal_screen_model::invalidate_retained_lookup_caches() const
@@ -3294,8 +3355,8 @@ void Terminal_screen_model::append_zero_width_scalar(QString text)
             display_width = 1;
         }
         else {
-            const Terminal_style_id style_id     = cell.style_id;
-            const std::uint64_t     hyperlink_id = cell.hyperlink_id;
+            const Terminal_style_id     style_id     = cell.style_id;
+            const Terminal_hyperlink_id hyperlink_id = cell.hyperlink_id;
             Terminal_screen_row& screen_row =
                 active_grid_rows()[static_cast<std::size_t>(target.row)];
             const bool selection_content_changed =
@@ -3333,7 +3394,7 @@ void Terminal_screen_model::install_cell_span(
     QString                    text,
     int                        display_width,
     Terminal_style_id          style_id,
-    std::uint64_t              hyperlink_id)
+    Terminal_hyperlink_id      hyperlink_id)
 {
     mark_terminal_content_changed();
     Terminal_screen_row& screen_row =
@@ -3903,9 +3964,8 @@ void Terminal_screen_model::set_application_keypad_mode(bool enabled)
 
 void Terminal_screen_model::set_hyperlink(QByteArray identity_key)
 {
-    retain_referenced_active_hyperlink_ids();
     m_current_hyperlink_id = identity_key.isEmpty()
-        ? 0U
+        ? k_no_terminal_hyperlink_id
         : active_hyperlink_id_for_identity(identity_key);
 }
 
@@ -4198,7 +4258,7 @@ void Terminal_screen_model::clear_all_tab_stops()
 void Terminal_screen_model::append_scrollback_row(
     const Terminal_screen_row&               row,
     Terminal_retained_line_provenance_source source,
-    const std::map<std::uint64_t, QByteArray>* hyperlink_identity_keys)
+    const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys)
 {
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled && m_text_span_profile_depth > 0) {
@@ -4355,13 +4415,20 @@ void Terminal_screen_model::begin_primary_repaint_recovery_candidate()
 
     m_primary_repaint_recovery_candidate.rows                         = active_grid_rows();
     m_primary_repaint_recovery_candidate.hyperlink_identity_keys.clear();
+    const terminal_hyperlink_identity_by_id_t active_identity_keys_by_id =
+        active_hyperlink_identity_keys_by_id();
     for (const Terminal_screen_row& row : m_primary_repaint_recovery_candidate.rows) {
-        retained_row_record_t retained_record;
-        retained_record.row = row;
-        materialize_retained_row_hyperlinks(retained_record);
-        m_primary_repaint_recovery_candidate.hyperlink_identity_keys.insert(
-            retained_record.hyperlink_identity_keys.begin(),
-            retained_record.hyperlink_identity_keys.end());
+        for (const Cell& cell : row.cells) {
+            if (cell.hyperlink_id == k_no_terminal_hyperlink_id) {
+                continue;
+            }
+
+            const auto found = active_identity_keys_by_id.find(cell.hyperlink_id);
+            if (found != active_identity_keys_by_id.end()) {
+                m_primary_repaint_recovery_candidate.hyperlink_identity_keys[
+                    cell.hyperlink_id] = found->second;
+            }
+        }
     }
     m_primary_repaint_recovery_candidate.scrollback_rows              = scrollback_size();
     m_primary_repaint_recovery_candidate.unmatched_finish_budget      = 1;
@@ -5082,16 +5149,24 @@ void Terminal_screen_model::release_synchronized_changes(ingest_publication_t& p
     m_synchronized_alternate_scroll_mode_changed = false;
 }
 
-std::uint64_t Terminal_screen_model::next_hyperlink_id()
+Terminal_hyperlink_id Terminal_screen_model::next_hyperlink_id()
 {
-    const std::uint64_t id = m_next_hyperlink_id++;
-    if (m_next_hyperlink_id == 0U) {
-        m_next_hyperlink_id = 1U;
+    if (m_next_hyperlink_id == k_no_terminal_hyperlink_id) {
+        compact_hyperlink_ids();
     }
-    return id == 0U ? next_hyperlink_id() : id;
+
+    if (m_next_hyperlink_id == k_no_terminal_hyperlink_id) {
+        throw std::overflow_error("terminal hyperlink id space exhausted");
+    }
+
+    const Terminal_hyperlink_id id = m_next_hyperlink_id;
+    m_next_hyperlink_id = id == k_max_terminal_hyperlink_id
+        ? k_no_terminal_hyperlink_id
+        : static_cast<Terminal_hyperlink_id>(id + 1U);
+    return id;
 }
 
-std::uint64_t Terminal_screen_model::active_hyperlink_id_for_identity(
+Terminal_hyperlink_id Terminal_screen_model::active_hyperlink_id_for_identity(
     const QByteArray& identity_key)
 {
     const auto found = m_active_hyperlink_ids.find(identity_key);
@@ -5099,42 +5174,42 @@ std::uint64_t Terminal_screen_model::active_hyperlink_id_for_identity(
         return found->second;
     }
 
-    const std::uint64_t hyperlink_id = next_hyperlink_id();
+    const Terminal_hyperlink_id hyperlink_id = next_hyperlink_id();
     m_active_hyperlink_ids.emplace(identity_key, hyperlink_id);
     return hyperlink_id;
 }
 
-const QByteArray* Terminal_screen_model::active_hyperlink_identity_key(
-    std::uint64_t hyperlink_id) const
+terminal_hyperlink_identity_by_id_t
+Terminal_screen_model::active_hyperlink_identity_keys_by_id() const
 {
-    const auto found = std::find_if(
-        m_active_hyperlink_ids.begin(),
-        m_active_hyperlink_ids.end(),
-        [hyperlink_id](const auto& entry) {
-            return entry.second == hyperlink_id;
-        });
-    return found != m_active_hyperlink_ids.end() ? &found->first : nullptr;
+    terminal_hyperlink_identity_by_id_t identity_keys_by_id;
+    for (const auto& entry : m_active_hyperlink_ids) {
+        identity_keys_by_id.emplace(entry.second, entry.first);
+    }
+    return identity_keys_by_id;
 }
 
 void Terminal_screen_model::retain_referenced_active_hyperlink_ids()
 {
-    if (m_current_hyperlink_id == 0U && m_active_hyperlink_ids.empty()) {
+    if (m_current_hyperlink_id == k_no_terminal_hyperlink_id &&
+        m_active_hyperlink_ids.empty())
+    {
         return;
     }
 
-    std::set<std::uint64_t> live_ids;
+    std::set<Terminal_hyperlink_id> live_ids;
 
     const auto collect_cells = [&](const std::vector<Terminal_screen_row>& rows) {
         for (const Terminal_screen_row& row : rows) {
             for (const Cell& cell : row.cells) {
-                if (cell.hyperlink_id != 0U) {
+                if (cell.hyperlink_id != k_no_terminal_hyperlink_id) {
                     live_ids.insert(cell.hyperlink_id);
                 }
             }
         }
     };
 
-    if (m_current_hyperlink_id != 0U) {
+    if (m_current_hyperlink_id != k_no_terminal_hyperlink_id) {
         live_ids.insert(m_current_hyperlink_id);
     }
     collect_cells(active_grid_rows());
@@ -5154,10 +5229,132 @@ void Terminal_screen_model::retain_referenced_active_hyperlink_ids()
     }
 }
 
+void Terminal_screen_model::compact_hyperlink_ids()
+{
+    retain_referenced_active_hyperlink_ids();
+
+    std::map<Terminal_hyperlink_id, QByteArray> identity_by_old_id;
+    for (const auto& entry : m_active_hyperlink_ids) {
+        identity_by_old_id.emplace(entry.second, entry.first);
+    }
+    if (m_primary_repaint_recovery_candidate.active) {
+        for (const auto& entry : m_primary_repaint_recovery_candidate.hyperlink_identity_keys) {
+            identity_by_old_id.emplace(entry.first, entry.second);
+        }
+    }
+
+    std::set<Terminal_hyperlink_id> referenced_ids;
+    const auto collect_id = [&](Terminal_hyperlink_id id) {
+        if (id != k_no_terminal_hyperlink_id) {
+            referenced_ids.insert(id);
+        }
+    };
+    const auto collect_rows = [&](const std::vector<Terminal_screen_row>& rows) {
+        for (const Terminal_screen_row& row : rows) {
+            for (const Cell& cell : row.cells) {
+                collect_id(cell.hyperlink_id);
+            }
+        }
+    };
+
+    collect_id(m_current_hyperlink_id);
+    for (const auto& entry : m_active_hyperlink_ids) {
+        collect_id(entry.second);
+    }
+    collect_rows(m_primary_backing.active_grid_state().rows);
+    collect_rows(m_alternate_grid.active_grid_state().rows);
+    if (m_primary_repaint_recovery_candidate.active) {
+        collect_rows(m_primary_repaint_recovery_candidate.rows);
+        for (const auto& entry : m_primary_repaint_recovery_candidate.hyperlink_identity_keys) {
+            collect_id(entry.first);
+        }
+    }
+
+    std::map<QByteArray, Terminal_hyperlink_id> new_ids_by_identity;
+    std::map<Terminal_hyperlink_id, Terminal_hyperlink_id> remap_by_old_id;
+    for (Terminal_hyperlink_id old_id : referenced_ids) {
+        const auto identity = identity_by_old_id.find(old_id);
+        if (identity == identity_by_old_id.end() || identity->second.isEmpty()) {
+            throw std::runtime_error("terminal hyperlink id compaction missing identity metadata");
+        }
+
+        const auto existing_new_id = new_ids_by_identity.find(identity->second);
+        if (existing_new_id != new_ids_by_identity.end()) {
+            remap_by_old_id.emplace(old_id, existing_new_id->second);
+            continue;
+        }
+
+        if (new_ids_by_identity.size() >=
+            static_cast<std::size_t>(k_max_terminal_hyperlink_id))
+        {
+            m_next_hyperlink_id = k_no_terminal_hyperlink_id;
+            throw std::overflow_error("terminal hyperlink id space exhausted");
+        }
+
+        const Terminal_hyperlink_id new_id =
+            static_cast<Terminal_hyperlink_id>(new_ids_by_identity.size() + 1U);
+        new_ids_by_identity.emplace(identity->second, new_id);
+        remap_by_old_id.emplace(old_id, new_id);
+    }
+
+    const auto rewritten_id = [&](Terminal_hyperlink_id old_id) -> Terminal_hyperlink_id {
+        if (old_id == k_no_terminal_hyperlink_id) {
+            return k_no_terminal_hyperlink_id;
+        }
+
+        const auto found = remap_by_old_id.find(old_id);
+        if (found == remap_by_old_id.end()) {
+            throw std::runtime_error("terminal hyperlink id compaction missing live remap");
+        }
+        return found->second;
+    };
+
+    const auto rewrite_rows = [&](std::vector<Terminal_screen_row>& rows) {
+        for (Terminal_screen_row& row : rows) {
+            for (Cell& cell : row.cells) {
+                cell.hyperlink_id = rewritten_id(cell.hyperlink_id);
+            }
+        }
+    };
+
+    m_current_hyperlink_id = rewritten_id(m_current_hyperlink_id);
+    rewrite_rows(m_primary_backing.active_grid_state().rows);
+    rewrite_rows(m_alternate_grid.active_grid_state().rows);
+
+    std::map<QByteArray, Terminal_hyperlink_id> active_hyperlink_ids;
+    for (const auto& entry : m_active_hyperlink_ids) {
+        const Terminal_hyperlink_id new_id = rewritten_id(entry.second);
+        active_hyperlink_ids.emplace(entry.first, new_id);
+    }
+    m_active_hyperlink_ids = std::move(active_hyperlink_ids);
+
+    if (m_primary_repaint_recovery_candidate.active) {
+        rewrite_rows(m_primary_repaint_recovery_candidate.rows);
+
+        std::map<Terminal_hyperlink_id, QByteArray> candidate_identity_keys;
+        for (const auto& entry : m_primary_repaint_recovery_candidate.hyperlink_identity_keys) {
+            const Terminal_hyperlink_id new_id = rewritten_id(entry.first);
+            candidate_identity_keys.emplace(new_id, entry.second);
+        }
+        m_primary_repaint_recovery_candidate.hyperlink_identity_keys =
+            std::move(candidate_identity_keys);
+    }
+
+    if (new_ids_by_identity.size() >=
+        static_cast<std::size_t>(k_max_terminal_hyperlink_id))
+    {
+        m_next_hyperlink_id = k_no_terminal_hyperlink_id;
+        return;
+    }
+
+    m_next_hyperlink_id =
+        static_cast<Terminal_hyperlink_id>(new_ids_by_identity.size() + 1U);
+}
+
 Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retained_row_record(
     const Terminal_screen_row&               screen_row,
     Terminal_retained_line_provenance_source source,
-    const std::map<std::uint64_t, QByteArray>* hyperlink_identity_keys)
+    const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys)
 {
     retained_row_record_t record;
     record.row                   = screen_row;
@@ -5165,6 +5362,7 @@ Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retaine
     if (source != Terminal_retained_line_provenance_source::TERMINAL_STORAGE) {
         rebase_retained_line_id_preserving_content(record.row, source);
     }
+    materialize_retained_row_styles(record);
     materialize_retained_row_hyperlinks(record, hyperlink_identity_keys);
     return record;
 }
@@ -5174,6 +5372,7 @@ Terminal_history_row_record Terminal_screen_model::history_row_record_from_retai
 {
     Terminal_history_row_record history_record;
     history_record.provenance = retained_record.row.retained_line_provenance;
+    history_record.style_table = retained_record.style_table;
     history_record.hyperlink_identity_keys = retained_record.hyperlink_identity_keys;
     history_record.metadata = retained_record.metadata;
     history_record.cells.reserve(retained_record.row.cells.size());
@@ -5198,6 +5397,7 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
 {
     retained_row_record_t retained_record;
     retained_record.row.retained_line_provenance = history_record.provenance;
+    retained_record.style_table = history_record.style_table;
     retained_record.hyperlink_identity_keys = history_record.hyperlink_identity_keys;
     retained_record.metadata = history_record.metadata;
     retained_record.row.cells.reserve(history_record.cells.size());
@@ -5217,40 +5417,101 @@ Terminal_screen_model::retained_row_record_from_history_row_record(
     return retained_record;
 }
 
+void Terminal_screen_model::materialize_retained_row_styles(
+    retained_row_record_t& row) const
+{
+    row.style_table.clear();
+
+    std::map<Terminal_text_style, Terminal_style_id, Terminal_text_style_less>
+        row_refs_by_style;
+    for (Cell& cell : row.row.cells) {
+        if (cell.style_id == k_default_terminal_style_id) {
+            continue;
+        }
+
+        const std::size_t source_style_index =
+            static_cast<std::size_t>(cell.style_id);
+        if (source_style_index >= m_styles.size()) {
+            throw_retained_history_storage_failure();
+        }
+
+        const Terminal_text_style& style = m_styles[source_style_index];
+        if (style == make_default_terminal_text_style()) {
+            cell.style_id = k_default_terminal_style_id;
+            continue;
+        }
+
+        const auto found = row_refs_by_style.find(style);
+        if (found != row_refs_by_style.end()) {
+            cell.style_id = found->second;
+            continue;
+        }
+
+        const Terminal_style_id row_ref =
+            static_cast<Terminal_style_id>(row.style_table.size() + 1U);
+        row_refs_by_style.emplace(style, row_ref);
+        row.style_table.push_back(style);
+        cell.style_id = row_ref;
+    }
+}
+
 void Terminal_screen_model::materialize_retained_row_hyperlinks(
     retained_row_record_t& row,
-    const std::map<std::uint64_t, QByteArray>* preserved_identity_keys) const
+    const std::map<Terminal_hyperlink_id, QByteArray>* preserved_identity_keys) const
 {
-    std::map<std::uint64_t, QByteArray> old_identity_keys =
+    std::map<Terminal_hyperlink_id, QByteArray> old_identity_keys =
         std::move(row.hyperlink_identity_keys);
     row.hyperlink_identity_keys.clear();
 
-    for (const Cell& cell : row.row.cells) {
-        if (cell.hyperlink_id == 0U) {
+    std::map<QByteArray, Terminal_hyperlink_id> row_refs_by_identity_key;
+    std::optional<terminal_hyperlink_identity_by_id_t> active_identity_keys_by_id;
+    for (Cell& cell : row.row.cells) {
+        if (cell.hyperlink_id == k_no_terminal_hyperlink_id) {
             continue;
         }
+
+        const Terminal_hyperlink_id source_hyperlink_id = cell.hyperlink_id;
+        const QByteArray* identity_key = nullptr;
 
         auto old_found = old_identity_keys.find(cell.hyperlink_id);
         if (old_found != old_identity_keys.end()) {
-            row.hyperlink_identity_keys[cell.hyperlink_id] = old_found->second;
-            continue;
+            identity_key = &old_found->second;
         }
-
-        if (preserved_identity_keys != nullptr) {
+        else if (preserved_identity_keys != nullptr) {
             auto preserved_found =
                 preserved_identity_keys->find(cell.hyperlink_id);
             if (preserved_found != preserved_identity_keys->end()) {
-                row.hyperlink_identity_keys[cell.hyperlink_id] =
-                    preserved_found->second;
-                continue;
+                identity_key = &preserved_found->second;
             }
         }
 
-        const QByteArray* active_identity_key =
-            active_hyperlink_identity_key(cell.hyperlink_id);
-        if (active_identity_key != nullptr) {
-            row.hyperlink_identity_keys[cell.hyperlink_id] = *active_identity_key;
+        if (identity_key == nullptr) {
+            if (!active_identity_keys_by_id.has_value()) {
+                active_identity_keys_by_id = active_hyperlink_identity_keys_by_id();
+            }
+
+            const auto active_found =
+                active_identity_keys_by_id->find(source_hyperlink_id);
+            if (active_found != active_identity_keys_by_id->end()) {
+                identity_key = &active_found->second;
+            }
         }
+
+        if (identity_key == nullptr || identity_key->isEmpty()) {
+            throw_retained_history_storage_failure();
+        }
+
+        const auto found = row_refs_by_identity_key.find(*identity_key);
+        if (found != row_refs_by_identity_key.end()) {
+            cell.hyperlink_id = found->second;
+            continue;
+        }
+
+        const Terminal_hyperlink_id row_ref =
+            static_cast<Terminal_hyperlink_id>(row_refs_by_identity_key.size()) + 1U;
+        row_refs_by_identity_key.emplace(*identity_key, row_ref);
+        row.hyperlink_identity_keys.emplace(row_ref, *identity_key);
+        cell.hyperlink_id = row_ref;
     }
 }
 

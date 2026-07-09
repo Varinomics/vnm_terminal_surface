@@ -14163,8 +14163,8 @@ Pixel_parity_fixture make_lcd_fragmented_x_probe_fixture(
             foreground,
             k_lcd_w_probe_background_rgba));
 
-        const std::uint64_t hyperlink_id =
-            1000U + static_cast<std::uint64_t>(column_index);
+        const term::Terminal_hyperlink_id hyperlink_id =
+            static_cast<term::Terminal_hyperlink_id>(1000U + column_index);
         term::Terminal_render_hyperlink_metadata hyperlink;
         hyperlink.hyperlink_id = hyperlink_id;
         hyperlink.identity_key =

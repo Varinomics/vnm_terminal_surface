@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/ime_contract.h"
 #include "vnm_terminal/internal/metrics_contract.h"
 #include "vnm_terminal/internal/selection_contract.h"
+#include "vnm_terminal/internal/terminal_hyperlink.h"
 #include "vnm_terminal/internal/terminal_render_cell_text.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/viewport_contract.h"
@@ -369,7 +370,7 @@ struct Terminal_render_cell
 {
     terminal_grid_position_t   position;
     Terminal_render_cell_text  text;
-    std::uint64_t              hyperlink_id      = 0U;
+    Terminal_hyperlink_id      hyperlink_id      = k_no_terminal_hyperlink_id;
     int                        display_width     = 1;
     bool                       wide_continuation = false;
     Terminal_style_id          style_id          = k_default_terminal_style_id;
@@ -435,7 +436,7 @@ inline bool operator==(
 
 struct Terminal_render_hyperlink_metadata
 {
-    std::uint64_t              hyperlink_id                 = 0U;
+    Terminal_hyperlink_id      hyperlink_id = k_no_terminal_hyperlink_id;
     QByteArray                 identity_key;
     QByteArray                 uri;
 };
@@ -805,11 +806,11 @@ inline bool render_snapshot_row_is_dirty(
 
 inline bool collect_render_snapshot_hyperlink_ids(
     const Terminal_render_snapshot& snapshot,
-    std::set<std::uint64_t>&        hyperlink_ids)
+    std::set<Terminal_hyperlink_id>& hyperlink_ids)
 {
     hyperlink_ids.clear();
     for (const Terminal_render_hyperlink_metadata& hyperlink : snapshot.hyperlinks) {
-        if (hyperlink.hyperlink_id                     == 0U ||
+        if (hyperlink.hyperlink_id == k_no_terminal_hyperlink_id ||
             hyperlink_ids.find(hyperlink.hyperlink_id) != hyperlink_ids.end())
         {
             return false;
@@ -1404,10 +1405,10 @@ inline Terminal_render_snapshot_validation validate_render_snapshot_wide_cells(
 
 inline Terminal_render_snapshot_validation validate_render_snapshot_cell_hyperlinks(
     const Terminal_render_snapshot&  snapshot,
-    const std::set<std::uint64_t>&   hyperlink_ids)
+    const std::set<Terminal_hyperlink_id>& hyperlink_ids)
 {
     for (const Terminal_render_cell& cell : snapshot.cells) {
-        if (cell.hyperlink_id                     != 0U &&
+        if (cell.hyperlink_id != k_no_terminal_hyperlink_id &&
             hyperlink_ids.find(cell.hyperlink_id) == hyperlink_ids.end())
         {
             return {Terminal_render_snapshot_status::INVALID_HYPERLINK_METADATA};
@@ -1443,7 +1444,7 @@ inline Terminal_render_snapshot_validation validate_render_snapshot_overlay_meta
 inline Terminal_render_snapshot_validation validate_render_snapshot(
     const Terminal_render_snapshot& snapshot)
 {
-    std::set<std::uint64_t> hyperlink_ids;
+    std::set<Terminal_hyperlink_id> hyperlink_ids;
     const Terminal_render_snapshot_validation metadata =
         validate_render_snapshot_metadata(snapshot);
     if (metadata.status != Terminal_render_snapshot_status::OK) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/internal/qsg_terminal_render_frame.h"
+#include "vnm_terminal/internal/terminal_hyperlink.h"
 #include <QFont>
 #include <QString>
 #include <cstdint>
@@ -27,7 +28,7 @@ struct terminal_text_layout_slow_diagnostic_t
     int            logical_row                = 0;
     int            column                     = 0;
     int            style_id                   = 0;
-    std::uint64_t  hyperlink_id               = 0U;
+    Terminal_hyperlink_id hyperlink_id = k_no_terminal_hyperlink_id;
     qreal          rect_width                 = 0.0;
     qreal          rect_height                = 0.0;
     qreal          font_point_size            = 0.0;

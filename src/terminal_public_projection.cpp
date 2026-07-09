@@ -4,7 +4,7 @@
 #include <QtGlobal>
 #include <algorithm>
 #include <map>
-#include <set>
+#include <optional>
 #include <utility>
 
 namespace vnm_terminal::internal {
@@ -172,114 +172,215 @@ Terminal_public_projection_row copied_projection_row(
     return row;
 }
 
-std::vector<Terminal_text_style> compact_styles_for_copied_rows(
-    const std::vector<Terminal_text_style>&       source_styles,
-    std::vector<Terminal_public_projection_row>&  rows)
+terminal_text_style_lookup_key_t color_ref_lookup_key(
+    const Terminal_color_ref& color)
 {
-    std::set<Terminal_style_id> referenced_style_ids;
-    for (const Terminal_public_projection_row& row : rows) {
-        for (const Terminal_render_cell& cell : row.cells) {
-            referenced_style_ids.insert(cell.style_id);
-        }
+    terminal_text_style_lookup_key_t key{};
+    key[0] = static_cast<std::uint64_t>(color.kind);
+    switch (color.kind) {
+        case Terminal_color_ref_kind::DEFAULT:
+            break;
+        case Terminal_color_ref_kind::PALETTE_INDEX:
+            key[1] = color.palette_index;
+            break;
+        case Terminal_color_ref_kind::RGB:
+            key[2] = color.rgba;
+            break;
+    }
+    return key;
+}
+
+terminal_text_style_lookup_key_t terminal_text_style_lookup_key(
+    const Terminal_text_style& style)
+{
+    const terminal_text_style_lookup_key_t foreground =
+        color_ref_lookup_key(style.foreground);
+    const terminal_text_style_lookup_key_t background =
+        color_ref_lookup_key(style.background);
+    return {
+        foreground[0],
+        foreground[1],
+        foreground[2],
+        background[0],
+        background[1],
+        background[2],
+        style.attributes,
+    };
+}
+
+struct Projection_style_remapper
+{
+    explicit Projection_style_remapper(
+        const std::vector<Terminal_text_style>& source_styles)
+    {
+        styles.push_back(
+            source_styles.empty()
+                ? Terminal_text_style{}
+                : source_styles[static_cast<std::size_t>(k_default_terminal_style_id)]);
+        ids_by_style.emplace(
+            terminal_text_style_lookup_key(styles.back()),
+            k_default_terminal_style_id);
     }
 
-    std::vector<std::optional<Terminal_style_id>> remapped_style_ids(source_styles.size());
-    std::vector<Terminal_text_style> compact_styles;
-    compact_styles.reserve(referenced_style_ids.size() + 1U);
-    compact_styles.push_back(
-        source_styles.empty()
-            ? Terminal_text_style{}
-            : source_styles[static_cast<std::size_t>(k_default_terminal_style_id)]);
-    if (!remapped_style_ids.empty()) {
-        remapped_style_ids[static_cast<std::size_t>(k_default_terminal_style_id)] =
-            k_default_terminal_style_id;
-    }
-
-    for (Terminal_style_id source_style_id : referenced_style_ids) {
+    Terminal_style_id id_for(
+        Terminal_style_id                        source_style_id,
+        const std::vector<Terminal_text_style>&  source_styles)
+    {
         if (source_style_id == k_default_terminal_style_id) {
-            continue;
+            return k_default_terminal_style_id;
         }
 
         const std::size_t source_style_index =
             static_cast<std::size_t>(source_style_id);
         if (source_style_index >= source_styles.size()) {
+            return k_default_terminal_style_id;
+        }
+
+        const Terminal_text_style& style = source_styles[source_style_index];
+        const terminal_text_style_lookup_key_t key =
+            terminal_text_style_lookup_key(style);
+        const auto found = ids_by_style.find(key);
+        if (found != ids_by_style.end()) {
+            return found->second;
+        }
+
+        styles.push_back(style);
+        const Terminal_style_id projection_style_id =
+            static_cast<Terminal_style_id>(styles.size() - 1U);
+        ids_by_style.emplace(key, projection_style_id);
+        return projection_style_id;
+    }
+
+    std::optional<Terminal_style_id> existing_id_for(
+        Terminal_style_id                        source_style_id,
+        const std::vector<Terminal_text_style>&  source_styles) const
+    {
+        if (source_style_id == k_default_terminal_style_id) {
+            return k_default_terminal_style_id;
+        }
+
+        const std::size_t source_style_index =
+            static_cast<std::size_t>(source_style_id);
+        if (source_style_index >= source_styles.size()) {
+            return k_default_terminal_style_id;
+        }
+
+        const auto found = ids_by_style.find(
+            terminal_text_style_lookup_key(source_styles[source_style_index]));
+        if (found == ids_by_style.end()) {
+            return std::nullopt;
+        }
+
+        return found->second;
+    }
+
+    std::vector<Terminal_text_style> styles;
+    std::map<terminal_text_style_lookup_key_t, Terminal_style_id> ids_by_style;
+};
+
+struct Projection_hyperlink_remapper
+{
+    Terminal_hyperlink_id id_for(const Terminal_render_hyperlink_metadata& source)
+    {
+        const auto found = ids_by_identity_key.find(source.identity_key);
+        if (found != ids_by_identity_key.end()) {
+            return found->second;
+        }
+
+        const Terminal_hyperlink_id projection_id =
+            static_cast<Terminal_hyperlink_id>(ids_by_identity_key.size() + 1U);
+        ids_by_identity_key.emplace(source.identity_key, projection_id);
+        hyperlinks.push_back({
+            projection_id,
+            source.identity_key,
+            source.uri,
+        });
+        return projection_id;
+    }
+
+    std::optional<Terminal_hyperlink_id> existing_id_for(
+        const Terminal_render_hyperlink_metadata& source) const
+    {
+        const auto found = ids_by_identity_key.find(source.identity_key);
+        if (found == ids_by_identity_key.end()) {
+            return std::nullopt;
+        }
+
+        return found->second;
+    }
+
+    std::map<QByteArray, Terminal_hyperlink_id> ids_by_identity_key;
+    std::vector<Terminal_render_hyperlink_metadata> hyperlinks;
+};
+
+using Hyperlink_metadata_by_id =
+    std::map<Terminal_hyperlink_id, const Terminal_render_hyperlink_metadata*>;
+
+Hyperlink_metadata_by_id hyperlink_metadata_by_id_map(
+    const std::vector<Terminal_render_hyperlink_metadata>& source_hyperlinks)
+{
+    Hyperlink_metadata_by_id metadata_by_id;
+    for (const Terminal_render_hyperlink_metadata& hyperlink : source_hyperlinks) {
+        metadata_by_id.emplace(hyperlink.hyperlink_id, &hyperlink);
+    }
+    return metadata_by_id;
+}
+
+void remap_projection_row(
+    Terminal_public_projection_row&                       row,
+    const std::vector<Terminal_text_style>&               source_styles,
+    const Hyperlink_metadata_by_id&                       source_hyperlinks_by_id,
+    Projection_style_remapper&                            style_remapper,
+    Projection_hyperlink_remapper&                        hyperlink_remapper)
+{
+    for (Terminal_render_cell& cell : row.cells) {
+        cell.style_id = style_remapper.id_for(cell.style_id, source_styles);
+
+        if (cell.hyperlink_id == k_no_terminal_hyperlink_id) {
             continue;
         }
 
-        remapped_style_ids[source_style_index] =
-            static_cast<Terminal_style_id>(compact_styles.size());
-        compact_styles.push_back(source_styles[source_style_index]);
+        const auto hyperlink = source_hyperlinks_by_id.find(cell.hyperlink_id);
+        cell.hyperlink_id = hyperlink != source_hyperlinks_by_id.end()
+            ? hyperlink_remapper.id_for(*hyperlink->second)
+            : k_no_terminal_hyperlink_id;
     }
-
-    for (Terminal_public_projection_row& row : rows) {
-        for (Terminal_render_cell& cell : row.cells) {
-            const std::size_t source_style_index =
-                static_cast<std::size_t>(cell.style_id);
-            if (source_style_index < remapped_style_ids.size() &&
-                remapped_style_ids[source_style_index].has_value())
-            {
-                cell.style_id = *remapped_style_ids[source_style_index];
-            }
-            else {
-                cell.style_id = k_default_terminal_style_id;
-            }
-        }
-    }
-
-    return compact_styles;
 }
 
-std::vector<Terminal_render_hyperlink_metadata> compact_hyperlinks_for_copied_rows(
-    const std::vector<Terminal_render_hyperlink_metadata>& source_hyperlinks,
-    std::vector<Terminal_public_projection_row>&           rows)
+bool remap_projection_row_existing(
+    Terminal_public_projection_row&                       row,
+    const std::vector<Terminal_text_style>&               source_styles,
+    const Hyperlink_metadata_by_id&                       source_hyperlinks_by_id,
+    const Projection_style_remapper&                      style_remapper,
+    const Projection_hyperlink_remapper&                  hyperlink_remapper)
 {
-    std::set<std::uint64_t> referenced_hyperlink_ids;
-    for (const Terminal_public_projection_row& row : rows) {
-        for (const Terminal_render_cell& cell : row.cells) {
-            if (cell.hyperlink_id != 0U) {
-                referenced_hyperlink_ids.insert(cell.hyperlink_id);
-            }
+    for (Terminal_render_cell& cell : row.cells) {
+        const std::optional<Terminal_style_id> style_id =
+            style_remapper.existing_id_for(cell.style_id, source_styles);
+        if (!style_id.has_value()) {
+            return false;
         }
+        cell.style_id = *style_id;
+
+        if (cell.hyperlink_id == k_no_terminal_hyperlink_id) {
+            continue;
+        }
+
+        const auto hyperlink = source_hyperlinks_by_id.find(cell.hyperlink_id);
+        if (hyperlink == source_hyperlinks_by_id.end()) {
+            cell.hyperlink_id = k_no_terminal_hyperlink_id;
+            continue;
+        }
+
+        const std::optional<Terminal_hyperlink_id> hyperlink_id =
+            hyperlink_remapper.existing_id_for(*hyperlink->second);
+        if (!hyperlink_id.has_value()) {
+            return false;
+        }
+        cell.hyperlink_id = *hyperlink_id;
     }
 
-    std::vector<Terminal_render_hyperlink_metadata> compact_hyperlinks;
-    compact_hyperlinks.reserve(referenced_hyperlink_ids.size());
-    std::set<std::uint64_t> compact_hyperlink_ids;
-    for (const Terminal_render_hyperlink_metadata& hyperlink : source_hyperlinks) {
-        if (referenced_hyperlink_ids.contains(hyperlink.hyperlink_id)) {
-            compact_hyperlinks.push_back(hyperlink);
-            compact_hyperlink_ids.insert(hyperlink.hyperlink_id);
-        }
-    }
-
-    for (Terminal_public_projection_row& row : rows) {
-        for (Terminal_render_cell& cell : row.cells) {
-            if (cell.hyperlink_id != 0U &&
-                !compact_hyperlink_ids.contains(cell.hyperlink_id))
-            {
-                cell.hyperlink_id = 0U;
-            }
-        }
-    }
-
-    return compact_hyperlinks;
-}
-
-void append_unique_hyperlink_metadata(
-    std::vector<Terminal_render_hyperlink_metadata>&       target,
-    const std::vector<Terminal_render_hyperlink_metadata>& source)
-{
-    for (const Terminal_render_hyperlink_metadata& hyperlink : source) {
-        const auto duplicate = std::find_if(
-            target.begin(),
-            target.end(),
-            [&hyperlink](const Terminal_render_hyperlink_metadata& candidate) {
-                return candidate.hyperlink_id == hyperlink.hyperlink_id;
-            });
-        if (duplicate == target.end()) {
-            target.push_back(hyperlink);
-        }
-    }
+    return true;
 }
 
 Terminal_render_snapshot_request public_projection_row_snapshot_request(
@@ -322,7 +423,8 @@ std::pair<std::uint64_t, std::uint64_t> fragment_count_key(
 std::vector<Terminal_public_projection_row> copied_primary_projection_rows(
     const Terminal_screen_model&                         safe_model,
     const Terminal_render_snapshot&                      safe_basis,
-    std::vector<Terminal_render_hyperlink_metadata>&     source_hyperlinks,
+    Projection_style_remapper&                           style_remapper,
+    Projection_hyperlink_remapper&                       hyperlink_remapper,
     std::size_t&                                         row_capture_snapshot_count,
     bool&                                                safe_basis_matches_entry_boundary)
 {
@@ -350,8 +452,8 @@ std::vector<Terminal_public_projection_row> copied_primary_projection_rows(
             return {};
         }
 
-        append_unique_hyperlink_metadata(source_hyperlinks, row_snapshot.hyperlinks);
-
+        const Hyperlink_metadata_by_id row_snapshot_hyperlinks_by_id =
+            hyperlink_metadata_by_id_map(row_snapshot.hyperlinks);
         const int first_public_row = first_public_row_for_snapshot(row_snapshot);
         const Terminal_render_snapshot_row_content_view row_snapshot_rows(row_snapshot);
         for (int snapshot_row = 0; snapshot_row < row_snapshot.grid_size.rows; ++snapshot_row) {
@@ -370,6 +472,12 @@ std::vector<Terminal_public_projection_row> copied_primary_projection_rows(
                     public_row,
                     0,
                     false);
+            remap_projection_row(
+                copied_row,
+                row_snapshot.styles,
+                row_snapshot_hyperlinks_by_id,
+                style_remapper,
+                hyperlink_remapper);
             const std::optional<terminal_history_handle_t> history_handle =
                 safe_model.retained_history_handle_at_logical_row(
                     Terminal_buffer_id::PRIMARY,
@@ -395,6 +503,8 @@ std::vector<Terminal_public_projection_row> copied_primary_projection_rows(
     const int first_safe_basis_row = first_safe_basis_public_row(safe_basis);
     const int safe_basis_row_count = safe_basis_projection_row_count(safe_basis);
     const Terminal_render_snapshot_row_content_view safe_basis_rows(safe_basis);
+    const Hyperlink_metadata_by_id safe_basis_hyperlinks_by_id =
+        hyperlink_metadata_by_id_map(safe_basis.hyperlinks);
     for (int snapshot_row = 0; snapshot_row < safe_basis_row_count; ++snapshot_row) {
         const int public_row = first_safe_basis_row + snapshot_row;
         if (public_row < 0 || public_row >= public_row_count ||
@@ -404,12 +514,22 @@ std::vector<Terminal_public_projection_row> copied_primary_projection_rows(
             return {};
         }
 
-        const Terminal_public_projection_row expected =
+        Terminal_public_projection_row expected =
             copied_projection_row(
                 safe_basis_rows.row_at(snapshot_row),
                 public_row,
                 0,
                 false);
+        if (!remap_projection_row_existing(
+                expected,
+                safe_basis.styles,
+                safe_basis_hyperlinks_by_id,
+                style_remapper,
+                hyperlink_remapper))
+        {
+            safe_basis_matches_entry_boundary = false;
+            return {};
+        }
         if (!projection_row_cells_match(
                 copied_by_public_row[static_cast<std::size_t>(public_row)],
                 expected))
@@ -475,6 +595,10 @@ Terminal_public_projection Terminal_public_projection::capture_from_safe_model(
 
     projection.m_rows.reserve(projection.m_copied_row_bound);
     const Terminal_render_snapshot_row_content_view safe_basis_rows(safe_basis);
+    const Hyperlink_metadata_by_id safe_basis_hyperlinks_by_id =
+        hyperlink_metadata_by_id_map(safe_basis.hyperlinks);
+    Projection_style_remapper style_remapper(safe_basis.styles);
+    Projection_hyperlink_remapper hyperlink_remapper;
 
     // Rows are copied from the safe-basis viewport only. Off-viewport public
     // scrollback requires a safe row store; this projection must not reconstruct
@@ -485,18 +609,23 @@ Terminal_public_projection Terminal_public_projection::capture_from_safe_model(
     {
         const int visual_fragment_index =
             visual_fragment_index_for_snapshot_row(safe_basis, snapshot_row);
-        projection.m_rows.push_back(
+        Terminal_public_projection_row row =
             copied_projection_row(
                 safe_basis_rows.row_at(snapshot_row),
                 projection.m_first_copied_public_row + snapshot_row,
                 visual_fragment_index,
-                false));
+                false);
+        remap_projection_row(
+            row,
+            safe_basis.styles,
+            safe_basis_hyperlinks_by_id,
+            style_remapper,
+            hyperlink_remapper);
+        projection.m_rows.push_back(std::move(row));
     }
 
-    projection.m_styles =
-        compact_styles_for_copied_rows(safe_basis.styles, projection.m_rows);
-    projection.m_hyperlinks =
-        compact_hyperlinks_for_copied_rows(safe_basis.hyperlinks, projection.m_rows);
+    projection.m_styles = std::move(style_remapper.styles);
+    projection.m_hyperlinks = std::move(hyperlink_remapper.hyperlinks);
     projection.m_ime_preedit = safe_basis.ime_preedit;
 
     return projection;
@@ -520,15 +649,16 @@ Terminal_public_projection::capture_primary_full_rows_from_safe_model(
         return projection;
     }
 
-    std::vector<Terminal_render_hyperlink_metadata> source_hyperlinks =
-        safe_basis.hyperlinks;
+    Projection_style_remapper style_remapper(safe_basis.styles);
+    Projection_hyperlink_remapper hyperlink_remapper;
     std::size_t row_capture_snapshot_count = 0U;
     bool        safe_basis_matches_entry_boundary = false;
     std::vector<Terminal_public_projection_row> rows =
         copied_primary_projection_rows(
             safe_model,
             safe_basis,
-            source_hyperlinks,
+            style_remapper,
+            hyperlink_remapper,
             row_capture_snapshot_count,
             safe_basis_matches_entry_boundary);
     if (!safe_basis_matches_entry_boundary) {
@@ -539,10 +669,8 @@ Terminal_public_projection::capture_primary_full_rows_from_safe_model(
     projection.m_first_copied_public_row = 0;
     projection.m_copied_row_bound        = projection.m_rows.size();
     projection.m_row_capture_snapshot_count = row_capture_snapshot_count;
-    projection.m_styles =
-        compact_styles_for_copied_rows(safe_basis.styles, projection.m_rows);
-    projection.m_hyperlinks =
-        compact_hyperlinks_for_copied_rows(source_hyperlinks, projection.m_rows);
+    projection.m_styles = std::move(style_remapper.styles);
+    projection.m_hyperlinks = std::move(hyperlink_remapper.hyperlinks);
     projection.m_rows_are_safe_basis_viewport_only = false;
     return projection;
 }

@@ -6,6 +6,7 @@
 #include <QString>
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -22,19 +23,17 @@ namespace {
 
 constexpr std::size_t k_phase8_retained_history_ring_capacity_bytes =
     64U * 1024U * 1024U;
+constexpr std::size_t k_row_record_header_flags_offset = 20U;
+constexpr std::uint32_t k_payload_kind_mask = 0x0fU;
+constexpr std::uint32_t k_payload_kind_generic_compact = 0U;
+constexpr std::uint32_t k_payload_kind_prefix_plain_ascii = 1U;
 constexpr int k_phase8_columns = 120;
 constexpr int k_phase8_row_count = 2000;
-
-constexpr std::uint64_t k_codec_header_bytes = 116U;
-constexpr std::uint64_t k_codec_footer_bytes = 32U;
-constexpr std::uint64_t k_dense_cell_base_bytes = 24U;
-constexpr std::uint64_t k_hyperlink_base_bytes = 12U;
-constexpr std::uint64_t k_projected_run_base_bytes = 32U;
 
 enum class Phase8_row_pattern
 {
     BLANK,
-    DENSE_ASCII,
+    ASCII_SEQUENCE,
     REPEATED_ASCII,
     HYPERLINK_HEAVY,
 };
@@ -63,8 +62,8 @@ struct row_size_projection_t
     std::string                  scenario;
     std::uint64_t                cells = 0U;
     std::uint64_t                hyperlinks = 0U;
-    std::uint64_t                dense_record_bytes = 0U;
-    std::uint64_t                projected_run_length_record_bytes = 0U;
+    std::uint64_t                encoded_record_bytes = 0U;
+    std::uint32_t                payload_kind = k_payload_kind_generic_compact;
 };
 
 bool report_failure(const char* message)
@@ -99,7 +98,7 @@ benchmark_measurement_t measure_case(
 term::Terminal_history_row_cell make_cell(
     QString                 text,
     term::Terminal_style_id style_id = term::k_default_terminal_style_id,
-    std::uint64_t           hyperlink_id = 0U)
+    term::Terminal_hyperlink_id hyperlink_id = term::k_no_terminal_hyperlink_id)
 {
     term::Terminal_history_row_cell cell;
     cell.text         = std::move(text);
@@ -138,11 +137,14 @@ term::Terminal_history_row_record make_record(
         }
 
         if (pattern == Phase8_row_pattern::HYPERLINK_HEAVY) {
-            const std::uint64_t hyperlink_id =
-                (row_sequence * 1000U) + static_cast<std::uint64_t>(column + 1);
-            record.cells.push_back(make_cell(QStringLiteral("L"), 1U, hyperlink_id));
+            const term::Terminal_hyperlink_id row_ref =
+                static_cast<term::Terminal_hyperlink_id>(column + 1);
+            record.cells.push_back(make_cell(
+                QStringLiteral("L"),
+                term::k_default_terminal_style_id,
+                row_ref));
             record.hyperlink_identity_keys.emplace(
-                hyperlink_id,
+                row_ref,
                 QByteArrayLiteral("uri:https://example.test/phase8/") +
                     QByteArray::number(static_cast<qlonglong>(row_sequence)) +
                     QByteArrayLiteral("/") +
@@ -209,76 +211,71 @@ bool append_fixture_rows(
     return true;
 }
 
-std::uint64_t dense_record_bytes(const term::Terminal_history_row_record& record)
+std::uint32_t row_record_payload_kind(std::span<const std::byte> payload)
 {
-    std::uint64_t bytes =
-        term::terminal_history_ring_record_overhead_bytes() +
-        k_codec_header_bytes +
-        k_codec_footer_bytes;
-
-    for (const term::Terminal_history_row_cell& cell : record.cells) {
-        bytes += k_dense_cell_base_bytes;
-        bytes += static_cast<std::uint64_t>(cell.text.toUtf8().size());
+    std::uint32_t flags = 0U;
+    for (std::size_t i = 0U; i < 4U; ++i) {
+        flags |= static_cast<std::uint32_t>(
+            payload[k_row_record_header_flags_offset + i]) << (i * 8U);
     }
-
-    for (const auto& hyperlink : record.hyperlink_identity_keys) {
-        bytes += k_hyperlink_base_bytes;
-        bytes += static_cast<std::uint64_t>(hyperlink.second.size());
-    }
-
-    return bytes;
+    return flags & k_payload_kind_mask;
 }
 
-bool cells_share_projected_run(
-    const term::Terminal_history_row_cell& left,
-    const term::Terminal_history_row_cell& right)
+const char* payload_kind_name(std::uint32_t payload_kind)
 {
-    return
-        left.text              == right.text              &&
-        left.display_width     == right.display_width     &&
-        left.wide_continuation == right.wide_continuation &&
-        left.occupied          == right.occupied          &&
-        left.style_id          == right.style_id          &&
-        left.hyperlink_id      == right.hyperlink_id;
+    switch (payload_kind) {
+        case k_payload_kind_generic_compact:
+            return "generic_compact";
+        case k_payload_kind_prefix_plain_ascii:
+            return "prefix_plain_ascii";
+        default:
+            return "reserved";
+    }
 }
 
-std::uint64_t projected_run_length_record_bytes(
+row_size_projection_t encoded_record_projection(
+    std::string                              scenario,
     const term::Terminal_history_row_record& record)
 {
-    std::uint64_t bytes =
-        term::terminal_history_ring_record_overhead_bytes() +
-        k_codec_header_bytes +
-        k_codec_footer_bytes;
-
-    std::size_t index = 0U;
-    while (index < record.cells.size()) {
-        const term::Terminal_history_row_cell& first = record.cells[index];
-        bytes += k_projected_run_base_bytes;
-        bytes += static_cast<std::uint64_t>(first.text.toUtf8().size());
-
-        ++index;
-        while (index < record.cells.size() &&
-            cells_share_projected_run(first, record.cells[index]))
-        {
-            ++index;
-        }
+    term::Terminal_history_ring ring({
+        k_phase8_retained_history_ring_capacity_bytes,
+        0U,
+    });
+    if (!ring.ok()) {
+        return {std::move(scenario)};
     }
 
-    for (const auto& hyperlink : record.hyperlink_identity_keys) {
-        bytes += k_hyperlink_base_bytes;
-        bytes += static_cast<std::uint64_t>(hyperlink.second.size());
+    const term::Terminal_history_row_record_append_result append =
+        term::encode_terminal_history_row_record_to_ring(
+            ring,
+            record,
+            make_identity(record.provenance.retained_line_id, {}));
+    if (append.status != term::Terminal_history_row_record_codec_status::OK) {
+        return {std::move(scenario)};
     }
 
-    return bytes;
+    const term::Terminal_history_ring_read_scope read =
+        ring.read_record(append.commit.byte_sequence);
+    if (read.status() != term::Terminal_history_ring_status::OK) {
+        return {std::move(scenario)};
+    }
+
+    return {
+        std::move(scenario),
+        static_cast<std::uint64_t>(record.cells.size()),
+        static_cast<std::uint64_t>(record.hyperlink_identity_keys.size()),
+        append.commit.record_bytes,
+        row_record_payload_kind(read.payload()),
+    };
 }
 
 std::vector<row_size_projection_t> row_size_projections()
 {
     const std::vector<std::pair<std::string, Phase8_row_pattern>> scenarios = {
-        {"blank_120_columns",           Phase8_row_pattern::BLANK},
-        {"dense_ascii_120_columns",     Phase8_row_pattern::DENSE_ASCII},
-        {"repeated_ascii_120_columns",  Phase8_row_pattern::REPEATED_ASCII},
-        {"hyperlink_120_columns",       Phase8_row_pattern::HYPERLINK_HEAVY},
+        {"blank_120_columns",          Phase8_row_pattern::BLANK},
+        {"ascii_120_columns",          Phase8_row_pattern::ASCII_SEQUENCE},
+        {"repeated_ascii_120_columns", Phase8_row_pattern::REPEATED_ASCII},
+        {"hyperlink_120_columns",      Phase8_row_pattern::HYPERLINK_HEAVY},
     };
 
     std::vector<row_size_projection_t> projections;
@@ -286,13 +283,7 @@ std::vector<row_size_projection_t> row_size_projections()
     for (const auto& scenario : scenarios) {
         const term::Terminal_history_row_record record =
             make_record(1U, k_phase8_columns, scenario.second);
-        projections.push_back({
-            scenario.first,
-            static_cast<std::uint64_t>(record.cells.size()),
-            static_cast<std::uint64_t>(record.hyperlink_identity_keys.size()),
-            dense_record_bytes(record),
-            projected_run_length_record_bytes(record),
-        });
+        projections.push_back(encoded_record_projection(scenario.first, record));
     }
     return projections;
 }
@@ -365,7 +356,7 @@ bool result_has_diagnostic(const term::Terminal_screen_model_result& result)
 benchmark_measurement_t benchmark_append()
 {
     return measure_case(
-        "append_dense_rows",
+        "append_ascii_rows",
         k_phase8_row_count,
         [] {
             benchmark_payload_t payload;
@@ -385,7 +376,7 @@ benchmark_measurement_t benchmark_append()
                     append_record(
                         ring,
                         row_sequence,
-                        Phase8_row_pattern::DENSE_ASCII,
+                        Phase8_row_pattern::ASCII_SEQUENCE,
                         previous_handle);
                 if (append.status != term::Terminal_history_row_record_codec_status::OK) {
                     payload.ok = report_failure("Phase 8 append benchmark append failed");
@@ -415,11 +406,11 @@ benchmark_measurement_t benchmark_materialization()
             ring,
             handles,
             k_phase8_row_count,
-            Phase8_row_pattern::DENSE_ASCII,
+            Phase8_row_pattern::ASCII_SEQUENCE,
             fixture_bytes);
 
     return measure_case(
-        "materialization_dense_rows",
+        "materialization_ascii_rows",
         handles.size(),
         [&] {
             benchmark_payload_t payload;
@@ -461,7 +452,7 @@ benchmark_measurement_t benchmark_traversal()
             ring,
             handles,
             k_phase8_row_count,
-            Phase8_row_pattern::DENSE_ASCII,
+            Phase8_row_pattern::ASCII_SEQUENCE,
             fixture_bytes);
 
     term::Terminal_history_row_traversal traversal(ring);
@@ -527,7 +518,7 @@ benchmark_measurement_t benchmark_cache_rebuild()
             ring,
             handles,
             k_phase8_row_count,
-            Phase8_row_pattern::DENSE_ASCII,
+            Phase8_row_pattern::ASCII_SEQUENCE,
             fixture_bytes);
 
     term::Terminal_history_row_traversal traversal(ring);
@@ -770,7 +761,7 @@ bool write_report(
     output << "  \"schema\": \"vnm_terminal_history_phase8_benchmark_report\",\n";
     output << "  \"schema_version\": 1,\n";
     output << "  \"phase\": \"8\",\n";
-    output << "  \"representation_decision\": \"keep_dense_encoding\",\n";
+    output << "  \"retained_row_codec\": \"compact_row_record_with_prefix_plain_ascii\",\n";
     output << "  \"ring_limits\": {\n";
     output << "    \"retained_history_ring_capacity_bytes\": "
            << limits_ring.capacity_bytes() << ",\n";
@@ -792,10 +783,11 @@ bool write_report(
         output << ",\n";
         output << "      \"cells\": " << projection.cells << ",\n";
         output << "      \"hyperlinks\": " << projection.hyperlinks << ",\n";
-        output << "      \"dense_record_bytes\": "
-               << projection.dense_record_bytes << ",\n";
-        output << "      \"projected_run_length_record_bytes\": "
-               << projection.projected_run_length_record_bytes << "\n";
+        output << "      \"encoded_record_bytes\": "
+               << projection.encoded_record_bytes << ",\n";
+        output << "      \"payload_kind\": ";
+        write_json_string(output, payload_kind_name(projection.payload_kind));
+        output << "\n";
         output << "    }" << (i + 1U == projections.size() ? "\n" : ",\n");
     }
     output << "  ],\n";
@@ -828,15 +820,15 @@ void print_summary(
     const term::Terminal_history_ring&          limits_ring)
 {
     std::cout << "Phase 8 benchmark summary\n";
-    std::cout << "representation_decision=keep_dense_encoding\n";
+    std::cout << "retained_row_codec=compact_row_record_with_prefix_plain_ascii\n";
     std::cout << "ring_capacity_bytes=" << limits_ring.capacity_bytes()
               << " max_record_bytes=" << limits_ring.max_record_bytes()
               << " max_payload_bytes=" << limits_ring.max_payload_bytes() << '\n';
     for (const row_size_projection_t& projection : projections) {
         std::cout << "projection " << projection.scenario
-                  << " dense_record_bytes=" << projection.dense_record_bytes
-                  << " projected_run_length_record_bytes="
-                  << projection.projected_run_length_record_bytes << '\n';
+                  << " encoded_record_bytes=" << projection.encoded_record_bytes
+                  << " payload_kind=" << payload_kind_name(projection.payload_kind)
+                  << '\n';
     }
     for (const benchmark_measurement_t& measurement : measurements) {
         std::cout << "benchmark " << measurement.name

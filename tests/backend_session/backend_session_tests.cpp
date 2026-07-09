@@ -554,7 +554,7 @@ bool projection_cells_reference_owned_metadata(
                 return false;
             }
 
-            if (cell.hyperlink_id == 0U) {
+            if (cell.hyperlink_id == term::k_no_terminal_hyperlink_id) {
                 continue;
             }
 
@@ -4637,7 +4637,7 @@ bool test_public_projection_phase1_copy_is_immutable_after_hidden_mutation()
         projection_cell_with_text(*captured, QStringLiteral("L"));
     ok &= check(link_cell != nullptr &&
         link_cell->style_id     != term::k_default_terminal_style_id &&
-        link_cell->hyperlink_id != 0U,
+        link_cell->hyperlink_id != term::k_no_terminal_hyperlink_id,
         "Phase 1 projection copies public style and hyperlink cell metadata");
     ok &= check(projection_cells_reference_owned_metadata(*captured),
         "Phase 1 projection cells resolve style and hyperlink IDs within owned metadata arrays");
@@ -4786,7 +4786,7 @@ bool test_public_projection_phase1_compacts_copied_metadata()
         "Phase 1 compact projection stores only copied viewport rows");
     ok &= check(visible_cell != nullptr &&
         visible_cell->style_id     != term::k_default_terminal_style_id &&
-        visible_cell->hyperlink_id != 0U,
+        visible_cell->hyperlink_id != term::k_no_terminal_hyperlink_id,
         "Phase 1 compact projection keeps visible styled hyperlink cell metadata");
     ok &= check(projection->styles().size() == 2U &&
         projection->hyperlinks().size() == 1U,
@@ -4874,7 +4874,7 @@ bool test_public_projection_phase1_compacts_copied_metadata()
         projection_cell_with_text(invalid_metadata_projection, QStringLiteral("X"));
     ok &= check(invalid_metadata_cell != nullptr &&
         invalid_metadata_cell->style_id == term::k_default_terminal_style_id &&
-        invalid_metadata_cell->hyperlink_id == 0U &&
+        invalid_metadata_cell->hyperlink_id == term::k_no_terminal_hyperlink_id &&
         projection_cells_reference_owned_metadata(invalid_metadata_projection),
         "Phase 1 compact projection defensively defaults unmapped style and hyperlink ids");
 
@@ -6212,7 +6212,7 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
         public_safe_cell_style.foreground.palette_index == 2U;
     ok &= check(public_safe_cell_style_resolves &&
         public_safe_cell->style_id     != term::k_default_terminal_style_id &&
-        public_safe_cell->hyperlink_id != 0U &&
+        public_safe_cell->hyperlink_id != term::k_no_terminal_hyperlink_id &&
         public_safe_cell_uses_safe_red &&
         !public_safe_cell_uses_hidden_green &&
         snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://safe.example")) &&
@@ -7682,7 +7682,7 @@ bool test_public_projection_phase8_public_scroll_uses_safe_projection_fields()
         "Phase 8 safe-field public scroll uses safe text and selection spans");
     ok &= check(public_safe_cell != nullptr &&
         public_safe_cell->style_id     != term::k_default_terminal_style_id &&
-        public_safe_cell->hyperlink_id != 0U &&
+        public_safe_cell->hyperlink_id != term::k_no_terminal_hyperlink_id &&
         public_safe_cell_uses_safe_red &&
         !public_safe_cell_uses_hidden_green &&
         snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://safe.example")) &&
@@ -7823,7 +7823,7 @@ bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
         public_safe_cell_style.foreground.palette_index == 2U;
     ok &= check(public_safe_cell_style_resolves &&
         public_safe_cell->style_id     != term::k_default_terminal_style_id &&
-        public_safe_cell->hyperlink_id != 0U &&
+        public_safe_cell->hyperlink_id != term::k_no_terminal_hyperlink_id &&
         public_safe_cell_uses_safe_red &&
         !public_safe_cell_uses_hidden_green &&
         snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://safe.example")) &&

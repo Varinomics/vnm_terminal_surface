@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/selection_contract.h"
 #include "vnm_terminal/internal/terminal_history_ring.h"
+#include "vnm_terminal/internal/terminal_hyperlink.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include <QByteArray>
@@ -26,7 +27,6 @@ enum class Terminal_history_row_record_codec_status
     TRUNCATED_RECORD,
     INVALID_HEADER,
     INVALID_PAYLOAD,
-    INVALID_FOOTER,
     INVALID_ENUM,
     EPOCH_MISMATCH,
     BYTE_SEQUENCE_MISMATCH,
@@ -42,16 +42,18 @@ struct Terminal_history_row_cell
     bool                           wide_continuation = false;
     bool                           occupied = false;
     Terminal_style_id              style_id = k_default_terminal_style_id;
-    std::uint64_t                  hyperlink_id = 0U;
+    Terminal_hyperlink_id          hyperlink_id = k_no_terminal_hyperlink_id;
 };
 
 struct Terminal_history_row_record
 {
     std::vector<Terminal_history_row_cell>
                                    cells;
+    std::vector<Terminal_text_style>
+                                   style_table;
     Terminal_retained_line_provenance
                                    provenance;
-    std::map<std::uint64_t, QByteArray>
+    std::map<Terminal_hyperlink_id, QByteArray>
                                    hyperlink_identity_keys;
     terminal_retained_row_record_metadata_t
                                    metadata;

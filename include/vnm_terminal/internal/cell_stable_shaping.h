@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/internal/metrics_contract.h"
+#include "vnm_terminal/internal/terminal_hyperlink.h"
 #include "vnm_terminal/internal/terminal_style.h"
 #include "vnm_terminal/internal/unicode_width.h"
 
@@ -54,7 +55,7 @@ struct Terminal_cell_shaping_input
     int                                            display_width     = 1;
     bool                                           wide_continuation = false;
     Terminal_style_id                              style_id          = k_default_terminal_style_id;
-    std::uint64_t                                  hyperlink_id      = 0U;
+    Terminal_hyperlink_id                          hyperlink_id      = k_no_terminal_hyperlink_id;
     Terminal_shaped_presentation_mode  presentation_mode =
         Terminal_shaped_presentation_mode::DEFAULT_TEXT;
     Terminal_shaped_payload_identity               payload_identity;
@@ -94,7 +95,7 @@ struct Terminal_shaped_cell_run
     QString                                        text_payload;
     Terminal_shaped_payload_identity               payload_identity;
     Terminal_style_id                              style_id = k_default_terminal_style_id;
-    std::uint64_t                                  hyperlink_id = 0U;
+    Terminal_hyperlink_id                          hyperlink_id = k_no_terminal_hyperlink_id;
     Terminal_shaped_presentation_mode  presentation_mode =
         Terminal_shaped_presentation_mode::DEFAULT_TEXT;
     std::vector<Terminal_shaped_cluster>           clusters;

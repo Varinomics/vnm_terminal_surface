@@ -1115,7 +1115,7 @@ std::vector<Terminal_render_cell> cells_adapted_to_grid(
 
 bool snapshot_cells_reference_hyperlink(
     const std::vector<Terminal_render_cell>&           cells,
-    std::uint64_t                                      hyperlink_id)
+    Terminal_hyperlink_id                              hyperlink_id)
 {
     return std::any_of(
         cells.begin(),

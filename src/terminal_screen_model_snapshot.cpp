@@ -8,7 +8,6 @@
 #include <algorithm>
 #include <map>
 #include <optional>
-#include <span>
 #include <utility>
 #include <vector>
 
@@ -56,6 +55,42 @@ QByteArray uri_from_hyperlink_identity_key(const QByteArray& identity_key)
     }
 
     return {};
+}
+
+terminal_text_style_lookup_key_t color_ref_lookup_key(
+    const Terminal_color_ref& color)
+{
+    terminal_text_style_lookup_key_t key{};
+    key[0] = static_cast<std::uint64_t>(color.kind);
+    switch (color.kind) {
+        case Terminal_color_ref_kind::DEFAULT:
+            break;
+        case Terminal_color_ref_kind::PALETTE_INDEX:
+            key[1] = color.palette_index;
+            break;
+        case Terminal_color_ref_kind::RGB:
+            key[2] = color.rgba;
+            break;
+    }
+    return key;
+}
+
+terminal_text_style_lookup_key_t terminal_text_style_lookup_key(
+    const Terminal_text_style& style)
+{
+    const terminal_text_style_lookup_key_t foreground =
+        color_ref_lookup_key(style.foreground);
+    const terminal_text_style_lookup_key_t background =
+        color_ref_lookup_key(style.background);
+    return {
+        foreground[0],
+        foreground[1],
+        foreground[2],
+        background[0],
+        background[1],
+        background[2],
+        style.attributes,
+    };
 }
 
 }
@@ -188,12 +223,14 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
             snapshot.visible_line_provenance.reserve(
                 static_cast<std::size_t>(m_config.grid_size.rows));
         }
-        std::vector<std::uint64_t> row_referenced_hyperlink_ids;
+        std::map<QByteArray, Terminal_hyperlink_id> snapshot_hyperlink_ids;
+        std::optional<terminal_snapshot_style_id_map_t> snapshot_style_ids;
+        std::optional<terminal_hyperlink_identity_by_id_t>
+            active_identity_keys_by_id;
         for (int row = 0; row < m_config.grid_size.rows; ++row) {
 #if VNM_TERMINAL_PROFILING_ENABLED
             ++rows_visited;
 #endif
-            row_referenced_hyperlink_ids.clear();
             const viewport_row_t viewport_row{row};
             const snapshot_row_t snapshot_row = [&]() {
                 VNM_TERMINAL_PROFILE_SCOPE(
@@ -226,17 +263,11 @@ Terminal_render_snapshot Terminal_screen_model::render_snapshot(
                     snapshot,
                     row_cells->cells(),
                     snapshot_row.value,
-                    row_referenced_hyperlink_ids);
-            }
-
-            if (row_cells.has_value() && !row_referenced_hyperlink_ids.empty()) {
-                VNM_TERMINAL_PROFILE_SCOPE(
-                    "Terminal_screen_model::render_snapshot::append_rows::hyperlink_metadata::append");
-
-                append_hyperlink_metadata_for_ids(
-                    snapshot.hyperlinks,
-                    row_referenced_hyperlink_ids,
-                    row_cells->hyperlink_identity_keys());
+                    row_cells->style_table(),
+                    row_cells->hyperlink_identity_keys(),
+                    snapshot_style_ids,
+                    snapshot_hyperlink_ids,
+                    active_identity_keys_by_id);
             }
 
             std::optional<Terminal_retained_line_provenance> provenance;
@@ -451,10 +482,16 @@ std::vector<int> Terminal_screen_model::viewport_dirty_rows(
 }
 
 void Terminal_screen_model::append_snapshot_cells_from_row(
-    Terminal_render_snapshot&  snapshot,
-    const std::vector<Cell>&   row,
-    int                        snapshot_row,
-    std::vector<std::uint64_t>& row_referenced_hyperlink_ids) const
+    Terminal_render_snapshot&                  snapshot,
+    const std::vector<Cell>&                   row,
+    int                                        snapshot_row,
+    const std::vector<Terminal_text_style>*    row_local_styles,
+    const std::map<Terminal_hyperlink_id, QByteArray>* row_local_identity_keys,
+    std::optional<terminal_snapshot_style_id_map_t>&
+                                             snapshot_style_ids,
+    std::map<QByteArray, Terminal_hyperlink_id>& snapshot_hyperlink_ids,
+    std::optional<terminal_hyperlink_identity_by_id_t>&
+                                             active_identity_keys_by_id) const
 {
     VNM_TERMINAL_PROFILE_SCOPE(
         "Terminal_screen_model::append_snapshot_cells_from_row");
@@ -554,25 +591,27 @@ void Terminal_screen_model::append_snapshot_cells_from_row(
                 }
 #endif
 
-                if (cell.hyperlink_id != 0U) {
-                    const auto insert_position = std::lower_bound(
-                        row_referenced_hyperlink_ids.begin(),
-                        row_referenced_hyperlink_ids.end(),
-                        cell.hyperlink_id);
-                    if (insert_position == row_referenced_hyperlink_ids.end() ||
-                        *insert_position != cell.hyperlink_id)
-                    {
-                        row_referenced_hyperlink_ids.insert(insert_position, cell.hyperlink_id);
-                    }
-                }
+                const Terminal_style_id style_id =
+                    snapshot_style_id_for_cell(
+                        snapshot,
+                        cell.style_id,
+                        row_local_styles,
+                        snapshot_style_ids);
+                const Terminal_hyperlink_id hyperlink_id =
+                    snapshot_hyperlink_id_for_cell(
+                        snapshot.hyperlinks,
+                        snapshot_hyperlink_ids,
+                        cell.hyperlink_id,
+                        row_local_identity_keys,
+                        active_identity_keys_by_id);
 
                 snapshot.cells.push_back({
                     { snapshot_row, column },
                     std::move(snapshot_text),
-                    cell.hyperlink_id,
+                    hyperlink_id,
                     cell.display_width,
                     cell.wide_continuation,
-                    cell.style_id,
+                    style_id,
                     snapshot_text_category,
                 });
             }
@@ -618,6 +657,8 @@ Terminal_screen_model::viewport_row_cells(
 
         Viewport_row_cells result;
         result.owned_cells = std::move(retained_record->row.cells);
+        result.owned_style_table =
+            std::move(retained_record->style_table);
         result.owned_hyperlink_identity_keys =
             std::move(retained_record->hyperlink_identity_keys);
         return result;
@@ -631,41 +672,108 @@ Terminal_screen_model::viewport_row_cells(
     return Viewport_row_cells{&active.cells};
 }
 
-void Terminal_screen_model::append_hyperlink_metadata_for_ids(
-    std::vector<Terminal_render_hyperlink_metadata>& metadata,
-    std::span<const std::uint64_t>                   hyperlink_ids,
-    const std::map<std::uint64_t, QByteArray>*       row_local_identity_keys) const
+Terminal_style_id Terminal_screen_model::snapshot_style_id_for_cell(
+    Terminal_render_snapshot&                  snapshot,
+    Terminal_style_id                          source_style_id,
+    const std::vector<Terminal_text_style>*    row_local_styles,
+    std::optional<terminal_snapshot_style_id_map_t>&
+                                             snapshot_style_ids) const
 {
-    for (std::uint64_t hyperlink_id : hyperlink_ids) {
-        const bool already_materialized = std::any_of(
-            metadata.begin(),
-            metadata.end(),
-            [hyperlink_id](const Terminal_render_hyperlink_metadata& candidate) {
-                return candidate.hyperlink_id == hyperlink_id;
-            });
-        if (already_materialized) {
-            continue;
+    if (source_style_id == k_default_terminal_style_id) {
+        return k_default_terminal_style_id;
+    }
+
+    if (row_local_styles == nullptr) {
+        if (static_cast<std::size_t>(source_style_id) < snapshot.styles.size()) {
+            return source_style_id;
         }
 
-        const QByteArray* identity_key = nullptr;
-        if (row_local_identity_keys != nullptr) {
-            const auto row_local_found = row_local_identity_keys->find(hyperlink_id);
-            if (row_local_found != row_local_identity_keys->end()) {
-                identity_key = &row_local_found->second;
-            }
-        }
-        else {
-            identity_key = active_hyperlink_identity_key(hyperlink_id);
-        }
+        Q_ASSERT(false);
+        return k_default_terminal_style_id;
+    }
 
-        if (identity_key != nullptr) {
-            metadata.push_back({
-                hyperlink_id,
-                *identity_key,
-                uri_from_hyperlink_identity_key(*identity_key),
-            });
+    const std::size_t row_local_index =
+        static_cast<std::size_t>(source_style_id - 1U);
+    if (row_local_index >= row_local_styles->size()) {
+        Q_ASSERT(false);
+        return k_default_terminal_style_id;
+    }
+
+    const Terminal_text_style& style = (*row_local_styles)[row_local_index];
+    if (!snapshot_style_ids.has_value()) {
+        snapshot_style_ids.emplace();
+        for (std::size_t index = 0U; index < snapshot.styles.size(); ++index) {
+            snapshot_style_ids->emplace(
+                terminal_text_style_lookup_key(snapshot.styles[index]),
+                static_cast<Terminal_style_id>(index));
         }
     }
+
+    const terminal_text_style_lookup_key_t key =
+        terminal_text_style_lookup_key(style);
+    const auto found = snapshot_style_ids->find(key);
+    if (found != snapshot_style_ids->end()) {
+        return found->second;
+    }
+
+    snapshot.styles.push_back(style);
+    const Terminal_style_id snapshot_style_id =
+        static_cast<Terminal_style_id>(snapshot.styles.size() - 1U);
+    snapshot_style_ids->emplace(key, snapshot_style_id);
+    return snapshot_style_id;
+}
+
+Terminal_hyperlink_id Terminal_screen_model::snapshot_hyperlink_id_for_cell(
+    std::vector<Terminal_render_hyperlink_metadata>& metadata,
+    std::map<QByteArray, Terminal_hyperlink_id>&     snapshot_hyperlink_ids,
+    Terminal_hyperlink_id                            source_hyperlink_id,
+    const std::map<Terminal_hyperlink_id, QByteArray>* row_local_identity_keys,
+    std::optional<terminal_hyperlink_identity_by_id_t>&
+                                                       active_identity_keys_by_id) const
+{
+    if (source_hyperlink_id == k_no_terminal_hyperlink_id) {
+        return k_no_terminal_hyperlink_id;
+    }
+
+    const QByteArray* identity_key = nullptr;
+    if (row_local_identity_keys != nullptr) {
+        const auto row_local_found =
+            row_local_identity_keys->find(source_hyperlink_id);
+        if (row_local_found != row_local_identity_keys->end()) {
+            identity_key = &row_local_found->second;
+        }
+    }
+    else {
+        if (!active_identity_keys_by_id.has_value()) {
+            active_identity_keys_by_id = active_hyperlink_identity_keys_by_id();
+        }
+
+        const auto active_found =
+            active_identity_keys_by_id->find(source_hyperlink_id);
+        if (active_found != active_identity_keys_by_id->end()) {
+            identity_key = &active_found->second;
+        }
+    }
+
+    if (identity_key == nullptr) {
+        Q_ASSERT(false);
+        return k_no_terminal_hyperlink_id;
+    }
+
+    const auto found = snapshot_hyperlink_ids.find(*identity_key);
+    if (found != snapshot_hyperlink_ids.end()) {
+        return found->second;
+    }
+
+    const Terminal_hyperlink_id snapshot_hyperlink_id =
+        static_cast<Terminal_hyperlink_id>(snapshot_hyperlink_ids.size() + 1U);
+    snapshot_hyperlink_ids.emplace(*identity_key, snapshot_hyperlink_id);
+    metadata.push_back({
+        snapshot_hyperlink_id,
+        *identity_key,
+        uri_from_hyperlink_identity_key(*identity_key),
+    });
+    return snapshot_hyperlink_id;
 }
 
 }

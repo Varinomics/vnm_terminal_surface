@@ -1544,7 +1544,7 @@ bool snapshot_contains_hyperlink(const term::Terminal_render_snapshot& snapshot)
     const term::Terminal_render_snapshot_row_content_view rows(snapshot);
     for (const term::Terminal_render_snapshot_row_content row : rows) {
         for (const term::Terminal_render_cell& cell : row) {
-            if (cell.hyperlink_id != 0U) {
+            if (cell.hyperlink_id != term::k_no_terminal_hyperlink_id) {
                 return true;
             }
         }
