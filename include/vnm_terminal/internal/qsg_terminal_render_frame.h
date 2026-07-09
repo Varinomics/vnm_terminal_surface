@@ -129,7 +129,7 @@ struct Terminal_render_text_run
     QColor                     foreground;
     QColor                     background;
     Terminal_style_id          style_id     = k_default_terminal_style_id;
-    std::uint64_t              hyperlink_id = 0U;
+    Terminal_hyperlink_id      hyperlink_id = k_no_terminal_hyperlink_id;
     bool                       underline    = false;
     bool                       strike       = false;
 };

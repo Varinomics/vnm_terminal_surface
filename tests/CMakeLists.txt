@@ -365,6 +365,31 @@ set_tests_properties(vnm_terminal_history_phase8_benchmark PROPERTIES
     LABELS "readiness;benchmark;structural"
 )
 
+add_executable(vnm_terminal_retained_history_capacity_stress
+    history_row_record_codec/retained_history_capacity_stress.cpp
+)
+
+target_link_libraries(vnm_terminal_retained_history_capacity_stress PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_retained_history_capacity_stress PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_retained_history_capacity_stress
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_retained_history_capacity_stress>"
+)
+
+set_tests_properties(vnm_terminal_retained_history_capacity_stress PROPERTIES
+    LABELS "readiness;capacity;structural"
+    TIMEOUT 120
+)
+
 add_executable(vnm_terminal_sequence_matrix
     sequence_matrix/sequence_matrix_tests.cpp
 )
@@ -1786,6 +1811,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_history_row_record_codec
     vnm_terminal_history_row_traversal
     vnm_terminal_history_phase8_benchmark
+    vnm_terminal_retained_history_capacity_stress
     vnm_terminal_sequence_matrix
     vnm_terminal_canvas_fixture_contract
     vnm_terminal_qt_render_smoke

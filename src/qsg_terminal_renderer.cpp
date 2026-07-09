@@ -236,7 +236,7 @@ terminal_text_layout_slow_diagnostic_t make_slow_text_layout_diagnostic(
     diagnostic.logical_row              = run.logical_row;
     diagnostic.column                   = run.column;
     diagnostic.style_id                 = static_cast<int>(run.style_id);
-    diagnostic.hyperlink_id             = static_cast<std::uint64_t>(run.hyperlink_id);
+    diagnostic.hyperlink_id             = run.hyperlink_id;
     diagnostic.rect_width               = run.rect.width();
     diagnostic.rect_height              = run.rect.height();
     diagnostic.font_point_size          = font.pointSizeF();
@@ -983,7 +983,7 @@ Terminal_simple_content_rejection_reason unrepresented_simple_cell_semantics_rej
     const Terminal_render_cell&    cell,
     bool                           has_decoration)
 {
-    if (cell.hyperlink_id != 0U) {
+    if (cell.hyperlink_id != k_no_terminal_hyperlink_id) {
         return Terminal_simple_content_rejection_reason::HYPERLINK;
     }
 
@@ -1004,7 +1004,7 @@ bool strict_printable_ascii_classifier_bypass_eligible(
         cell.text.single_printable_ascii_code_unit().has_value() &&
         cell.display_width == 1                 &&
         !cell.wide_continuation                 &&
-        cell.hyperlink_id == 0U                 &&
+        cell.hyperlink_id == k_no_terminal_hyperlink_id &&
         !has_decoration;
 }
 
@@ -1626,6 +1626,11 @@ void append_frame_key_uint32(QByteArray& key, quint32 value)
     append_frame_key_scalar(key, value);
 }
 
+void append_frame_key_hyperlink_id(QByteArray& key, Terminal_hyperlink_id value)
+{
+    append_frame_key_uint32(key, value);
+}
+
 void append_frame_key_bool(QByteArray& key, bool value)
 {
     const unsigned char byte = value ? 1U : 0U;
@@ -1748,7 +1753,7 @@ void append_frame_key_cell(
     append_frame_key_int(key, cell.display_width);
     append_frame_key_bool(key, cell.wide_continuation);
     append_frame_key_uint32(key, cell.style_id);
-    append_frame_key_uint64(key, cell.hyperlink_id);
+    append_frame_key_hyperlink_id(key, cell.hyperlink_id);
     append_frame_key_int(key, static_cast<int>(cell.text_category));
     QString text;
     text.reserve(static_cast<qsizetype>(cell.text.code_unit_count()));
@@ -1792,7 +1797,7 @@ void append_frame_key_text_run(
     append_frame_key_color(key, run.foreground);
     append_frame_key_color(key, run.background);
     append_frame_key_uint32(key, run.style_id);
-    append_frame_key_uint64(key, run.hyperlink_id);
+    append_frame_key_hyperlink_id(key, run.hyperlink_id);
     append_frame_key_bool(key, run.underline);
     append_frame_key_bool(key, run.strike);
 }
@@ -1961,7 +1966,7 @@ void build_terminal_render_frame_descriptors(
             [](QByteArray& key, const Terminal_render_text_run& run) {
                 append_frame_key_int(key, run.row);
                 append_frame_key_int(key, run.column);
-                append_frame_key_uint64(key, run.hyperlink_id);
+                append_frame_key_hyperlink_id(key, run.hyperlink_id);
             });
     }
     append_frame_key_vector(
@@ -2046,9 +2051,9 @@ void build_terminal_render_frame_descriptors(
         Terminal_render_row_descriptor& row =
             frame.row_descriptors[static_cast<std::size_t>(descriptor)];
         append_frame_key_text_run(row.text_key, run);
-        if (run.hyperlink_id != 0U) {
+        if (run.hyperlink_id != k_no_terminal_hyperlink_id) {
             append_frame_key_int(row.hyperlink_underline_key, run.column);
-            append_frame_key_uint64(row.hyperlink_underline_key, run.hyperlink_id);
+            append_frame_key_hyperlink_id(row.hyperlink_underline_key, run.hyperlink_id);
         }
     }
 
@@ -2468,7 +2473,7 @@ Terminal_render_frame build_terminal_render_frame(
                         ++frame.stats.text_cells_other_ascii;
                     }
 
-                    if (cell.hyperlink_id != 0U) {
+                    if (cell.hyperlink_id != k_no_terminal_hyperlink_id) {
                         ++frame.stats.text_cells_with_hyperlink;
                     }
                 }
@@ -2494,7 +2499,7 @@ Terminal_render_frame build_terminal_render_frame(
                             decoration_run.underline ||
                             decoration_run.strike    ||
                             (options.underline_hyperlinks &&
-                                decoration_run.hyperlink_id != 0U);
+                                decoration_run.hyperlink_id != k_no_terminal_hyperlink_id);
                         if (has_decoration) {
                             ++frame.stats.text_cells_with_decorations;
                         }
@@ -2519,7 +2524,7 @@ Terminal_render_frame build_terminal_render_frame(
                             });
                         }
                         if (options.underline_hyperlinks &&
-                            decoration_run.hyperlink_id != 0U)
+                            decoration_run.hyperlink_id != k_no_terminal_hyperlink_id)
                         {
                             frame.decorations.push_back({
                                 Terminal_render_decoration_kind::HYPERLINK_UNDERLINE,
@@ -2617,7 +2622,7 @@ Terminal_render_frame build_terminal_render_frame(
                         printable_ascii_code_unit.has_value()                      &&
                         !run.underline                                            &&
                         !run.strike                                               &&
-                        run.hyperlink_id == 0U                                    &&
+                        run.hyperlink_id == k_no_terminal_hyperlink_id            &&
                         !block_cursor_cell                                        &&
                         !ime_preedit_cell;
                     const QRgb foreground_rgba = foreground.rgba();

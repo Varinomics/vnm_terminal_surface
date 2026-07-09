@@ -121,6 +121,17 @@ bool snapshot_valid(const term::Terminal_screen_model& model, std::uint64_t sequ
         term::Terminal_render_snapshot_status::OK;
 }
 
+bool active_hyperlink_identity_contains_uri(
+    const term::Terminal_screen_model& model,
+    term::Terminal_hyperlink_id        hyperlink_id,
+    const QByteArray&                  uri)
+{
+    const term::terminal_hyperlink_identity_by_id_t identities =
+        model.active_hyperlink_identity_keys_by_id_for_testing();
+    const auto found = identities.find(hyperlink_id);
+    return found != identities.end() && found->second.contains(uri);
+}
+
 bool test_mode_state_and_decrqm()
 {
     bool ok = true;
@@ -479,22 +490,27 @@ bool test_osc8_hyperlinks()
     ok &= check(term::validate_render_snapshot(snapshot).status ==
         term::Terminal_render_snapshot_status::OK,
         "OSC 8 snapshot validates");
-    const std::uint64_t explicit_hyperlink_id = cell_at(snapshot, 0, 0).hyperlink_id;
-    ok &= check(explicit_hyperlink_id != 0U, "A carries hyperlink id");
+    const term::Terminal_hyperlink_id explicit_hyperlink_id =
+        cell_at(snapshot, 0, 0).hyperlink_id;
+    ok &= check(explicit_hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "A carries hyperlink id");
     ok &= check(cell_at(snapshot, 0, 1).hyperlink_id == explicit_hyperlink_id,
         "B carries same hyperlink id");
-    ok &= check(cell_at(snapshot, 0, 2).hyperlink_id == 0U, "C is unlinked after close");
+    ok &= check(cell_at(snapshot, 0, 2).hyperlink_id == term::k_no_terminal_hyperlink_id,
+        "C is unlinked after close");
 
     model     = make_model(1, 8);
     result    = model.ingest(
         QByteArrayLiteral("\x1b]8;;https://example.test\x1b\\XY\x1b]8;id=close;\x1b\\Z"));
     ok       &= check(diagnostic_count(result) == 0, "OSC 8 implicit id has no diagnostics");
     snapshot  = model.render_snapshot(22U);
-    const std::uint64_t implicit_hyperlink_id = cell_at(snapshot, 0, 0).hyperlink_id;
-    ok       &= check(implicit_hyperlink_id != 0U, "implicit OSC 8 assigns nonzero id");
+    const term::Terminal_hyperlink_id implicit_hyperlink_id =
+        cell_at(snapshot, 0, 0).hyperlink_id;
+    ok       &= check(implicit_hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "implicit OSC 8 assigns nonzero id");
     ok       &= check(cell_at(snapshot, 0, 1).hyperlink_id == implicit_hyperlink_id,
         "implicit OSC 8 linked cells share id");
-    ok       &= check(cell_at(snapshot, 0, 2).hyperlink_id == 0U,
+    ok       &= check(cell_at(snapshot, 0, 2).hyperlink_id == term::k_no_terminal_hyperlink_id,
         "parameterized OSC 8 close clears active id");
 
     model     = make_model(1, 8);
@@ -506,7 +522,7 @@ bool test_osc8_hyperlinks()
             "\x1b]8;id=string-key;https://different.test\x1b\\U"));
     ok       &= check(diagnostic_count(result) == 0, "OSC 8 string id has no diagnostics");
     snapshot  = model.render_snapshot(23U);
-    ok       &= check(cell_at(snapshot, 0, 0).hyperlink_id != 0U,
+    ok       &= check(cell_at(snapshot, 0, 0).hyperlink_id != term::k_no_terminal_hyperlink_id,
         "string OSC 8 id assigns nonzero id");
     ok       &= check(cell_at(snapshot, 0, 1).hyperlink_id == cell_at(snapshot, 0, 0).hyperlink_id,
         "same string OSC 8 id and URI reuses stable id");
@@ -517,47 +533,114 @@ bool test_osc8_hyperlinks()
     result   = model.ingest(
         QByteArrayLiteral("\x1b]8;;https://example.test\x1b\\A\x1b]8;;\x1b\\"));
     snapshot = model.render_snapshot(24U);
-    const std::uint64_t first_hyperlink_id = cell_at(snapshot, 0, 0).hyperlink_id;
-    ok &= check(first_hyperlink_id != 0U, "referenced OSC 8 id is assigned");
+    const term::Terminal_hyperlink_id first_hyperlink_id =
+        cell_at(snapshot, 0, 0).hyperlink_id;
+    const term::Terminal_hyperlink_id first_live_hyperlink_id =
+        model.active_hyperlink_identity_keys_by_id_for_testing().begin()->first;
+    ok &= check(first_hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "referenced OSC 8 id is assigned");
 
     result    = model.ingest(QByteArrayLiteral("\x1b[1;1H "));
     snapshot  = model.render_snapshot(25U);
-    ok       &= check(cell_at(snapshot, 0, 0).hyperlink_id == 0U,
+    ok       &= check(cell_at(snapshot, 0, 0).hyperlink_id == term::k_no_terminal_hyperlink_id,
         "overwriting linked cell clears hyperlink id");
 
     result    = model.ingest(
         QByteArrayLiteral("\x1b[1;2H\x1b]8;;https://example.test\x1b\\B"));
     snapshot  = model.render_snapshot(26U);
-    ok       &= check(cell_at(snapshot, 0, 1).hyperlink_id != 0U,
-        "same OSC 8 URI can be reopened after pruning");
-    ok       &= check(cell_at(snapshot, 0, 1).hyperlink_id != first_hyperlink_id,
-        "unreferenced OSC 8 identity is pruned");
+    ok       &= check(cell_at(snapshot, 0, 1).hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "same OSC 8 URI can be reopened");
+    ok       &= check(model.current_hyperlink_id_for_testing() == first_live_hyperlink_id,
+        "same OSC 8 identity reuses its active metadata before compaction");
 
     model    = make_model(1, 8);
     result   = model.ingest(
         QByteArrayLiteral("\x1b]8;;https://example.test\x1b\\A\x1b]8;;\x1b\\"));
     snapshot = model.render_snapshot(27U);
-    const std::uint64_t same_chunk_first_hyperlink_id =
+    const term::Terminal_hyperlink_id same_chunk_first_hyperlink_id =
         cell_at(snapshot, 0, 0).hyperlink_id;
-    ok &= check(same_chunk_first_hyperlink_id != 0U,
-        "same-chunk OSC 8 prune setup assigns id");
+    const term::Terminal_hyperlink_id same_chunk_first_live_hyperlink_id =
+        model.active_hyperlink_identity_keys_by_id_for_testing().begin()->first;
+    ok &= check(same_chunk_first_hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "same-chunk OSC 8 reuse setup assigns id");
 
     result    = model.ingest(
         QByteArrayLiteral("\x1b[1;1H \x1b]8;;https://example.test\x1b\\B"));
     snapshot  = model.render_snapshot(28U);
-    ok       &= check(cell_at(snapshot, 0, 0).hyperlink_id == 0U,
+    ok       &= check(cell_at(snapshot, 0, 0).hyperlink_id == term::k_no_terminal_hyperlink_id,
         "same-chunk overwrite clears linked cell");
-    ok       &= check(cell_at(snapshot, 0, 1).hyperlink_id != 0U,
+    ok       &= check(cell_at(snapshot, 0, 1).hyperlink_id != term::k_no_terminal_hyperlink_id,
         "same-chunk reopen assigns id");
-    ok       &= check(cell_at(snapshot, 0, 1).hyperlink_id != same_chunk_first_hyperlink_id,
-        "same-chunk unreferenced OSC 8 identity is pruned before reopen");
+    ok       &= check(
+        model.current_hyperlink_id_for_testing() == same_chunk_first_live_hyperlink_id,
+        "same-chunk reopen reuses active metadata before compaction");
 
     model     = make_model(1, 8);
     result    = model.ingest(QByteArrayLiteral("\x1b]8;bad\x1b\\M"));
     ok       &= check(diagnostic_count(result) == 1, "malformed OSC 8 diagnoses");
     snapshot  = model.render_snapshot(21U);
-    ok       &= check(cell_at(snapshot, 0, 0).hyperlink_id == 0U,
+    ok       &= check(cell_at(snapshot, 0, 0).hyperlink_id == term::k_no_terminal_hyperlink_id,
         "malformed OSC 8 does not link following text");
+
+    return ok;
+}
+
+bool test_osc8_hyperlink_allocator_compacts_near_overflow()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(1, 8);
+    model.set_next_hyperlink_id_for_testing(term::k_max_terminal_hyperlink_id - 1U);
+
+    term::Terminal_screen_model_result result = model.ingest(
+        QByteArrayLiteral("\x1b]8;id=old;https://old.example\x1b\\A")
+        + QByteArrayLiteral("\x1b]8;id=last;https://last.example\x1b\\B"));
+    ok &= check(diagnostic_count(result) == 0,
+        "near-overflow OSC 8 setup has no diagnostics");
+
+    ok &= check(active_hyperlink_identity_contains_uri(
+            model,
+            term::k_max_terminal_hyperlink_id - 1U,
+            QByteArrayLiteral("https://old.example")) &&
+        active_hyperlink_identity_contains_uri(
+            model,
+            term::k_max_terminal_hyperlink_id,
+            QByteArrayLiteral("https://last.example")) &&
+        model.current_hyperlink_id_for_testing() == term::k_max_terminal_hyperlink_id &&
+        model.next_hyperlink_id_for_testing() == term::k_no_terminal_hyperlink_id,
+        "near-overflow allocator uses final valid id and arms compaction sentinel without wrapping");
+
+    result = model.ingest(
+        QByteArrayLiteral("\x1b]8;id=new;https://new.example\x1b\\C"));
+    ok &= check(diagnostic_count(result) == 0,
+        "post-overflow-compaction OSC 8 allocation has no diagnostics");
+
+    term::Terminal_render_snapshot snapshot = model.render_snapshot(30U);
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "post-overflow-compaction snapshot validates");
+
+    const term::Terminal_hyperlink_id old_id = cell_at(snapshot, 0, 0).hyperlink_id;
+    const term::Terminal_hyperlink_id last_id = cell_at(snapshot, 0, 1).hyperlink_id;
+    const term::Terminal_hyperlink_id new_id = cell_at(snapshot, 0, 2).hyperlink_id;
+    ok &= check(old_id == 1U && last_id == 2U && new_id == 3U,
+        "near-overflow compaction rewrites live cells to dense nonzero ids");
+    ok &= check(model.current_hyperlink_id_for_testing() == new_id &&
+        model.next_hyperlink_id_for_testing() == 4U,
+        "near-overflow compaction rewrites current id and resumes allocation after dense live ids");
+    ok &= check(active_hyperlink_identity_contains_uri(
+            model,
+            old_id,
+            QByteArrayLiteral("https://old.example")) &&
+        active_hyperlink_identity_contains_uri(
+            model,
+            last_id,
+            QByteArrayLiteral("https://last.example")) &&
+        active_hyperlink_identity_contains_uri(
+            model,
+            new_id,
+            QByteArrayLiteral("https://new.example")),
+        "near-overflow compaction rewrites the active hyperlink identity map");
 
     return ok;
 }
@@ -678,6 +761,7 @@ int main()
     ok &= test_origin_mode_snapshot_and_restore();
     ok &= test_ignored_and_rejected_modes();
     ok &= test_osc8_hyperlinks();
+    ok &= test_osc8_hyperlink_allocator_compacts_near_overflow();
     ok &= test_bell_and_synchronized_output_mutation();
     return ok ? 0 : 1;
 }

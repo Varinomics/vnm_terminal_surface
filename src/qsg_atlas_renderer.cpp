@@ -861,6 +861,14 @@ void append_key_uint64(QByteArray& key, std::uint64_t value)
         static_cast<int>(sizeof(value)));
 }
 
+void append_key_uint32(QByteArray& key, std::uint32_t value)
+{
+    append_key_bytes(
+        key,
+        reinterpret_cast<const char*>(&value),
+        static_cast<int>(sizeof(value)));
+}
+
 void append_key_qreal(QByteArray& key, qreal value)
 {
     const double stored = static_cast<double>(value);
@@ -927,7 +935,7 @@ void append_key_text_run(QByteArray& key, const Terminal_render_text_run& run)
     append_key_color(key, run.foreground);
     append_key_color(key, run.background);
     append_key_uint64(key, run.style_id);
-    append_key_uint64(key, run.hyperlink_id);
+    append_key_uint32(key, run.hyperlink_id);
     append_key_bool(key, run.underline);
     append_key_bool(key, run.strike);
 }
@@ -1301,7 +1309,7 @@ bool qsg_atlas_simple_text_run_candidate(
         !std::isfinite(cell_metrics.height)          ||
         cell_metrics.height <= 0.0                   ||
         !std::isfinite(cell_metrics.ascent)          ||
-        run.hyperlink_id != 0U                       ||
+        run.hyperlink_id != k_no_terminal_hyperlink_id ||
         run.underline                                ||
         run.strike                                   ||
         !std::isfinite(run.baseline_origin.x())      ||
@@ -1338,7 +1346,7 @@ bool qsg_atlas_msdf_text_run_candidate(
         !std::isfinite(cell_metrics.height)          ||
         cell_metrics.height <= 0.0                   ||
         !std::isfinite(cell_metrics.ascent)          ||
-        run.hyperlink_id != 0U                       ||
+        run.hyperlink_id != k_no_terminal_hyperlink_id ||
         run.underline                                ||
         run.strike                                   ||
         !std::isfinite(run.baseline_origin.x())      ||

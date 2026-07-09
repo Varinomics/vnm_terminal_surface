@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/parser_action.h"
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/terminal_byte_stream_parser.h"
+#include "vnm_terminal/internal/terminal_hyperlink.h"
 #include "vnm_terminal/internal/utf8_scan.h"
 #include "vnm_terminal/internal/terminal_input_mode.h"
 #include "vnm_terminal/internal/terminal_style.h"
@@ -12,6 +13,7 @@
 #include <QString>
 #include <QStringView>
 #include <QtGlobal>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -27,6 +29,11 @@ namespace vnm_terminal::internal {
 class Terminal_history_ring;
 class Terminal_history_row_traversal;
 struct Terminal_history_row_record;
+
+using terminal_text_style_lookup_key_t = std::array<std::uint64_t, 7>;
+using terminal_snapshot_style_id_map_t =
+    std::map<terminal_text_style_lookup_key_t, Terminal_style_id>;
+using terminal_hyperlink_identity_by_id_t = std::map<Terminal_hyperlink_id, QByteArray>;
 
 constexpr int         k_terminal_screen_model_max_rows    = 4096;
 constexpr int         k_terminal_screen_model_max_columns = 4096;
@@ -349,6 +356,10 @@ public:
         retained_row_record_metadata_for_testing(
             Terminal_buffer_id         buffer_id,
             int                        logical_row) const;
+    void set_next_hyperlink_id_for_testing(Terminal_hyperlink_id id);
+    Terminal_hyperlink_id current_hyperlink_id_for_testing() const;
+    Terminal_hyperlink_id next_hyperlink_id_for_testing() const;
+    terminal_hyperlink_identity_by_id_t active_hyperlink_identity_keys_by_id_for_testing() const;
     void set_dirty_row_stats_enabled(bool enabled);
     Terminal_screen_model_dirty_row_stats dirty_row_stats() const;
     Terminal_screen_model_dirty_row_timeline dirty_row_timeline() const;
@@ -365,7 +376,7 @@ private:
         bool                           wide_continuation = false;
         bool                           occupied          = false;
         Terminal_style_id              style_id          = k_default_terminal_style_id;
-        std::uint64_t                  hyperlink_id      = 0U;
+        Terminal_hyperlink_id          hyperlink_id      = k_no_terminal_hyperlink_id;
     };
 
     struct Terminal_screen_row
@@ -377,7 +388,8 @@ private:
     struct retained_row_record_t
     {
         Terminal_screen_row                         row;
-        std::map<std::uint64_t, QByteArray>          hyperlink_identity_keys;
+        std::vector<Terminal_text_style>            style_table;
+        std::map<Terminal_hyperlink_id, QByteArray> hyperlink_identity_keys;
         terminal_retained_row_record_metadata_t      metadata;
     };
 
@@ -406,7 +418,9 @@ private:
     {
         const std::vector<Cell>*                  borrowed_cells = nullptr;
         std::vector<Cell>                         owned_cells;
-        std::optional<std::map<std::uint64_t, QByteArray>>
+        std::optional<std::vector<Terminal_text_style>>
+                                                owned_style_table;
+        std::optional<std::map<Terminal_hyperlink_id, QByteArray>>
                                                 owned_hyperlink_identity_keys;
 
         const std::vector<Cell>& cells() const
@@ -414,10 +428,17 @@ private:
             return borrowed_cells != nullptr ? *borrowed_cells : owned_cells;
         }
 
-        const std::map<std::uint64_t, QByteArray>* hyperlink_identity_keys() const
+        const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys() const
         {
             return owned_hyperlink_identity_keys.has_value()
                 ? &*owned_hyperlink_identity_keys
+                : nullptr;
+        }
+
+        const std::vector<Terminal_text_style>* style_table() const
+        {
+            return owned_style_table.has_value()
+                ? &*owned_style_table
                 : nullptr;
         }
 
@@ -559,7 +580,7 @@ private:
     struct primary_repaint_recovery_candidate_t
     {
         std::vector<Terminal_screen_row> rows;
-        std::map<std::uint64_t, QByteArray>
+        std::map<Terminal_hyperlink_id, QByteArray>
                                      hyperlink_identity_keys;
         int                              scrollback_rows                 = 0;
         int                              unmatched_finish_budget         = 0;
@@ -573,7 +594,7 @@ private:
     struct primary_repaint_recovery_proposal_t
     {
         std::vector<Terminal_screen_row> rows;
-        std::map<std::uint64_t, QByteArray>
+        std::map<Terminal_hyperlink_id, QByteArray>
                                      hyperlink_identity_keys;
         terminal_recovery_proposal_t     metadata;
     };
@@ -740,7 +761,7 @@ private:
         QString                        text,
         int                            display_width,
         Terminal_style_id              style_id,
-        std::uint64_t                  hyperlink_id);
+        Terminal_hyperlink_id          hyperlink_id);
 
     void place_cell_text(
         terminal_grid_position_t       position,
@@ -870,7 +891,7 @@ private:
         const Terminal_screen_row&     row,
         Terminal_retained_line_provenance_source source =
             Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
-        const std::map<std::uint64_t, QByteArray>* hyperlink_identity_keys =
+        const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys =
             nullptr);
     void scroll_up_region(int top, int bottom, bool append_scrollback, int count = 1);
     void scroll_down_region(int top, int bottom, int count = 1);
@@ -941,15 +962,16 @@ private:
     void collect_synchronized_changes();
     void publish_pending_changes(ingest_publication_t& publication);
     void release_synchronized_changes(ingest_publication_t& publication);
-    std::uint64_t next_hyperlink_id();
-    std::uint64_t active_hyperlink_id_for_identity(const QByteArray& identity_key);
-    const QByteArray* active_hyperlink_identity_key(std::uint64_t hyperlink_id) const;
+    Terminal_hyperlink_id next_hyperlink_id();
+    Terminal_hyperlink_id active_hyperlink_id_for_identity(const QByteArray& identity_key);
+    terminal_hyperlink_identity_by_id_t active_hyperlink_identity_keys_by_id() const;
     void retain_referenced_active_hyperlink_ids();
+    void compact_hyperlink_ids();
 
     retained_row_record_t seal_retained_row_record(
         const Terminal_screen_row&     screen_row,
         Terminal_retained_line_provenance_source source,
-        const std::map<std::uint64_t, QByteArray>* hyperlink_identity_keys);
+        const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys);
 
     static Terminal_history_row_record history_row_record_from_retained_record(
         const retained_row_record_t&   retained_record);
@@ -959,8 +981,11 @@ private:
 
     void materialize_retained_row_hyperlinks(
         retained_row_record_t&         row,
-        const std::map<std::uint64_t, QByteArray>* preserved_identity_keys =
+        const std::map<Terminal_hyperlink_id, QByteArray>* preserved_identity_keys =
             nullptr) const;
+
+    void materialize_retained_row_styles(
+        retained_row_record_t&         row) const;
 
     int active_grid_row_count() const;
     int primary_backing_row_count() const;
@@ -1000,10 +1025,31 @@ private:
         std::vector<Cell>&             visual_projection) const;
 
     void append_snapshot_cells_from_row(
-        Terminal_render_snapshot&      snapshot,
-        const std::vector<Cell>&       row,
-        int                            snapshot_row,
-        std::vector<std::uint64_t>&    row_referenced_hyperlink_ids) const;
+        Terminal_render_snapshot&                      snapshot,
+        const std::vector<Cell>&                       row,
+        int                                            snapshot_row,
+        const std::vector<Terminal_text_style>*        row_local_styles,
+        const std::map<Terminal_hyperlink_id, QByteArray>* row_local_identity_keys,
+        std::optional<terminal_snapshot_style_id_map_t>&
+                                                       snapshot_style_ids,
+        std::map<QByteArray, Terminal_hyperlink_id>&   snapshot_hyperlink_ids,
+        std::optional<terminal_hyperlink_identity_by_id_t>&
+                                                       active_identity_keys_by_id) const;
+
+    Terminal_style_id snapshot_style_id_for_cell(
+        Terminal_render_snapshot&                      snapshot,
+        Terminal_style_id                              source_style_id,
+        const std::vector<Terminal_text_style>*        row_local_styles,
+        std::optional<terminal_snapshot_style_id_map_t>&
+                                                       snapshot_style_ids) const;
+
+    Terminal_hyperlink_id snapshot_hyperlink_id_for_cell(
+        std::vector<Terminal_render_hyperlink_metadata>& metadata,
+        std::map<QByteArray, Terminal_hyperlink_id>&   snapshot_hyperlink_ids,
+        Terminal_hyperlink_id                          source_hyperlink_id,
+        const std::map<Terminal_hyperlink_id, QByteArray>* row_local_identity_keys,
+        std::optional<terminal_hyperlink_identity_by_id_t>&
+                                                       active_identity_keys_by_id) const;
 
     QString row_text_from_cells(
         const std::vector<Cell>&       row,
@@ -1061,12 +1107,6 @@ private:
         Terminal_buffer_id             buffer_id,
         std::vector<int>&              logical_rows) const;
 
-    void append_hyperlink_metadata_for_ids(
-        std::vector<Terminal_render_hyperlink_metadata>& metadata,
-        std::span<const std::uint64_t>                   hyperlink_ids,
-        const std::map<std::uint64_t, QByteArray>*       row_local_identity_keys)
-        const;
-
     Terminal_screen_model_config    m_config;
     Terminal_byte_stream_parser     m_parser;
     Terminal_color_state            m_color_state;
@@ -1093,12 +1133,12 @@ private:
     // the render snapshot mode state and do not invalidate render output.
     bool                            m_application_keypad = false;
     int                             m_active_alternate_mode = 0;
-    std::uint64_t                   m_current_hyperlink_id = 0U;
-    std::uint64_t                   m_next_hyperlink_id = 1U;
+    Terminal_hyperlink_id           m_current_hyperlink_id = k_no_terminal_hyperlink_id;
+    Terminal_hyperlink_id           m_next_hyperlink_id = 1U;
     std::uint64_t                   m_next_retained_line_id = 1U;
     mutable retained_lookup_cache_t m_primary_retained_lookup_cache;
     mutable retained_lookup_cache_t m_alternate_retained_lookup_cache;
-    std::map<QByteArray, std::uint64_t>
+    std::map<QByteArray, Terminal_hyperlink_id>
                                      m_active_hyperlink_ids;
     int                             m_scroll_top = 0;
     int                             m_scroll_bottom = 0;
