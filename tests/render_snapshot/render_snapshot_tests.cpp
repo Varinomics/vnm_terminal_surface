@@ -39,6 +39,15 @@ term::Terminal_screen_model make_model(term::terminal_grid_size_t grid_size)
     return term::Terminal_screen_model({grid_size, 16, 8});
 }
 
+QByteArray set_truecolor_foreground(int red, int green, int blue)
+{
+    return
+        QByteArrayLiteral("\x1b[38;2;") +
+        QByteArray::number(red)          + ';' +
+        QByteArray::number(green)        + ';' +
+        QByteArray::number(blue)         + 'm';
+}
+
 QByteArray visible_row_write_stream(
     std::initializer_list<QByteArray>  rows,
     bool                               cursor_hidden)
@@ -357,6 +366,23 @@ std::optional<std::uint16_t> foreground_palette_index(
     }
 
     return foreground.palette_index;
+}
+
+std::optional<quint32> foreground_rgb_value(
+    const std::vector<term::Terminal_text_style>& styles,
+    term::Terminal_style_id                       style_id)
+{
+    const std::size_t style_index = static_cast<std::size_t>(style_id);
+    if (style_index >= styles.size()) {
+        return std::nullopt;
+    }
+
+    const term::Terminal_color_ref& foreground = styles[style_index].foreground;
+    if (foreground.kind != term::Terminal_color_ref_kind::RGB) {
+        return std::nullopt;
+    }
+
+    return foreground.rgba;
 }
 
 term::Terminal_render_cell render_cell(
@@ -1242,6 +1268,163 @@ bool test_hyperlink_compaction_remaps_primary_repaint_recovery_candidate()
             current_link->uri == QByteArrayLiteral("https://current.example"),
             "primary-repaint candidate compaction preserves current row metadata");
     }
+
+    return ok;
+}
+
+bool test_style_compaction_preserves_retained_rows_selection_and_projection()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model({2, 8});
+    model.set_style_table_limits_for_testing(4U, 8U);
+
+    model.ingest(
+        set_truecolor_foreground(10, 20, 30) +
+        set_truecolor_foreground(40, 50, 60) +
+        QByteArrayLiteral("A\x1b[0m\r\nB\r\nC"));
+    ok &= check(model.scrollback_size() == 1,
+        "style-compaction fixture creates one retained row");
+
+    const std::optional<term::terminal_history_handle_t> retained_handle_before =
+        model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    ok &= check(retained_handle_before.has_value(),
+        "style-compaction fixture captures the retained row handle");
+
+    model.ingest(
+        QByteArrayLiteral("\r") +
+        set_truecolor_foreground(70, 80, 90) +
+        QByteArrayLiteral("X"));
+    model.ingest(
+        QByteArrayLiteral("\r") +
+        set_truecolor_foreground(100, 110, 120) +
+        QByteArrayLiteral("D"));
+
+    const term::terminal_screen_model_style_table_stats_t stats =
+        model.style_table_stats();
+    ok &= check(stats.current_style_count == 3U &&
+            stats.compaction_count == 1U &&
+            stats.reclaimed_styles == 2U,
+        "style compaction excludes dead and retained-only global style ids");
+
+    const std::optional<term::terminal_history_handle_t> retained_handle_after =
+        model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    ok &= check(retained_handle_before.has_value() &&
+            retained_handle_after == retained_handle_before,
+        "style compaction does not rewrite the retained-history record");
+
+    const term::Terminal_render_snapshot retained_snapshot =
+        model.render_snapshot(request_for_model(model, 41U, 1));
+    const term::Terminal_render_snapshot tail_snapshot =
+        model.render_snapshot(request_for_model(model, 46U));
+    ok &= check(term::validate_render_snapshot(retained_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK &&
+        term::validate_render_snapshot(tail_snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+        "style-compaction retained and tail snapshots validate");
+
+    const term::Terminal_render_cell* retained_cell =
+        cell_with_text(retained_snapshot, QStringLiteral("A"));
+    const term::Terminal_render_cell* active_cell =
+        cell_with_text(tail_snapshot, QStringLiteral("D"));
+    ok &= check(retained_cell != nullptr &&
+            foreground_rgb_value(retained_snapshot.styles, retained_cell->style_id) ==
+                term::rgba_from_components(40, 50, 60),
+        "retained row keeps its row-local truecolor after global style compaction");
+    ok &= check(active_cell != nullptr &&
+            foreground_rgb_value(tail_snapshot.styles, active_cell->style_id) ==
+                term::rgba_from_components(100, 110, 120),
+        "visible row keeps its live truecolor after global style compaction");
+
+    const term::Terminal_selection_range selection_range = {
+        {0, 0},
+        {2, 1},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    const term::Terminal_selection_result selection =
+        model.selected_text(selection_range);
+    ok &= check(selection.code == term::Terminal_selection_result_code::OK &&
+            selection.text == QStringLiteral("A\nB\nD"),
+        "selection spans retained and active rows after style compaction");
+
+    const term::Terminal_public_projection projection =
+        term::Terminal_public_projection::capture_primary_full_rows_from_safe_model(
+            47U,
+            tail_snapshot,
+            {},
+            48U,
+            model);
+    const term::Terminal_render_cell* projected_retained =
+        projection_cell_with_text(projection, QStringLiteral("A"));
+    const term::Terminal_render_cell* projected_active =
+        projection_cell_with_text(projection, QStringLiteral("D"));
+    ok &= check(projection.stored_row_count() == 3U &&
+            projected_retained != nullptr &&
+            projected_active != nullptr,
+        "full public projection spans retained and active compacted rows");
+    if (projected_retained != nullptr && projected_active != nullptr) {
+        ok &= check(
+            foreground_rgb_value(
+                projection.styles(),
+                projected_retained->style_id) == term::rgba_from_components(40, 50, 60) &&
+            foreground_rgb_value(
+                projection.styles(),
+                projected_active->style_id) == term::rgba_from_components(100, 110, 120),
+            "public projection remaps retained and active styles by value after compaction");
+    }
+
+    return ok;
+}
+
+bool test_style_compaction_remaps_primary_repaint_recovery_candidate()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model_config config;
+    config.grid_size                                = {3, 16};
+    config.scrollback_limit                         = 8;
+    config.tab_width                                = 8;
+    config.recover_scrollback_from_primary_repaints = true;
+    term::Terminal_screen_model model(config);
+    model.set_style_table_limits_for_testing(4U, 8U);
+
+    model.ingest(
+        set_truecolor_foreground(11, 21, 31) +
+        set_truecolor_foreground(41, 51, 61) +
+        QByteArrayLiteral("aa\x1b[0m\r\nbb\r\ncc"));
+    model.ingest(QByteArrayLiteral("\x1b[?25l\x1b[H"));
+    model.ingest(
+        QByteArrayLiteral("bb\x1b[K\r\n") +
+        set_truecolor_foreground(71, 81, 91) +
+        set_truecolor_foreground(101, 111, 121) +
+        QByteArrayLiteral("\x1b[0mcc\x1b[K\r\ndd\x1b[K"));
+
+    const term::terminal_screen_model_style_table_stats_t stats =
+        model.style_table_stats();
+    ok &= check(stats.compaction_count == 1U && stats.reclaimed_styles == 2U,
+        "style compaction runs while the repaint-recovery candidate is active");
+
+    const term::Terminal_screen_model_result recovery_result =
+        model.ingest(QByteArrayLiteral("\x1b[?25h"));
+    ok &= check(recovery_result.recovery_proposals.size() == 1U &&
+            model.scrollback_size() == 1,
+        "style compaction preserves the repaint candidate through recovery acceptance");
+
+    const term::Terminal_render_snapshot recovered_snapshot =
+        model.render_snapshot(request_for_model(model, 45U, 1));
+    ok &= check(term::validate_render_snapshot(recovered_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "style-compacted repaint recovery snapshot validates");
+
+    const term::Terminal_render_cell* recovered_cell =
+        cell_with_text(recovered_snapshot, QStringLiteral("a"));
+    ok &= check(recovered_cell != nullptr &&
+            foreground_rgb_value(recovered_snapshot.styles, recovered_cell->style_id) ==
+                term::rgba_from_components(41, 51, 61),
+        "repaint recovery candidate keeps its truecolor through style-id remapping");
 
     return ok;
 }
@@ -3287,6 +3470,8 @@ int main()
     ok &= test_hyperlink_compaction_preserves_snapshot_and_projection_metadata();
     ok &= test_hyperlink_compaction_remaps_inactive_primary_and_alternate_roots();
     ok &= test_hyperlink_compaction_remaps_primary_repaint_recovery_candidate();
+    ok &= test_style_compaction_preserves_retained_rows_selection_and_projection();
+    ok &= test_style_compaction_remaps_primary_repaint_recovery_candidate();
     ok &= test_scrollback_wide_rows_are_repaired_on_resize();
     ok &= test_snapshot_rows_cover_primary_retained_and_alternate_sources();
     ok &= test_snapshot_cells_cache_text_category();

@@ -2,16 +2,23 @@
 
 #include <QtGlobal>
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace vnm_terminal::internal {
 
 using Terminal_style_id = std::uint32_t;
 
-constexpr Terminal_style_id k_default_terminal_style_id        = 0U;
-constexpr quint32           k_terminal_default_foreground_rgba = 0xffffffffU;
-constexpr quint32           k_terminal_default_background_rgba = 0xff000000U;
-constexpr quint32           k_terminal_default_cursor_rgba     = 0xffffffffU;
+constexpr Terminal_style_id k_default_terminal_style_id          = 0U;
+constexpr std::size_t       k_terminal_style_compaction_threshold = 4096U;
+constexpr std::size_t       k_terminal_style_count_cap            = 65536U;
+constexpr quint32           k_terminal_default_foreground_rgba    = 0xffffffffU;
+constexpr quint32           k_terminal_default_background_rgba    = 0xff000000U;
+constexpr quint32           k_terminal_default_cursor_rgba        = 0xffffffffU;
+
+using terminal_color_ref_lookup_key_t = std::array<std::uint64_t, 3>;
+using terminal_text_style_lookup_key_t = std::array<std::uint64_t, 7>;
 
 enum class Terminal_color_ref_kind
 {
@@ -163,6 +170,44 @@ constexpr bool operator==(const Terminal_text_style& left, const Terminal_text_s
         left.foreground == right.foreground &&
         left.background == right.background &&
         left.attributes == right.attributes;
+}
+
+constexpr terminal_color_ref_lookup_key_t terminal_color_ref_lookup_key(
+    const Terminal_color_ref& color)
+{
+    terminal_color_ref_lookup_key_t key{};
+    key[0] = static_cast<std::uint64_t>(color.kind);
+    switch (color.kind) {
+        case Terminal_color_ref_kind::DEFAULT:
+            break;
+        case Terminal_color_ref_kind::PALETTE_INDEX:
+            key[1] = color.palette_index;
+            break;
+        case Terminal_color_ref_kind::RGB:
+            key[2] = color.rgba;
+            break;
+        default:
+            throw std::invalid_argument("invalid terminal color reference kind");
+    }
+    return key;
+}
+
+constexpr terminal_text_style_lookup_key_t terminal_text_style_lookup_key(
+    const Terminal_text_style& style)
+{
+    const terminal_color_ref_lookup_key_t foreground =
+        terminal_color_ref_lookup_key(style.foreground);
+    const terminal_color_ref_lookup_key_t background =
+        terminal_color_ref_lookup_key(style.background);
+    return {
+        foreground[0],
+        foreground[1],
+        foreground[2],
+        background[0],
+        background[1],
+        background[2],
+        style.attributes,
+    };
 }
 
 }

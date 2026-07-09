@@ -57,42 +57,6 @@ QByteArray uri_from_hyperlink_identity_key(const QByteArray& identity_key)
     return {};
 }
 
-terminal_text_style_lookup_key_t color_ref_lookup_key(
-    const Terminal_color_ref& color)
-{
-    terminal_text_style_lookup_key_t key{};
-    key[0] = static_cast<std::uint64_t>(color.kind);
-    switch (color.kind) {
-        case Terminal_color_ref_kind::DEFAULT:
-            break;
-        case Terminal_color_ref_kind::PALETTE_INDEX:
-            key[1] = color.palette_index;
-            break;
-        case Terminal_color_ref_kind::RGB:
-            key[2] = color.rgba;
-            break;
-    }
-    return key;
-}
-
-terminal_text_style_lookup_key_t terminal_text_style_lookup_key(
-    const Terminal_text_style& style)
-{
-    const terminal_text_style_lookup_key_t foreground =
-        color_ref_lookup_key(style.foreground);
-    const terminal_text_style_lookup_key_t background =
-        color_ref_lookup_key(style.background);
-    return {
-        foreground[0],
-        foreground[1],
-        foreground[2],
-        background[0],
-        background[1],
-        background[2],
-        style.attributes,
-    };
-}
-
 }
 
 Terminal_render_snapshot Terminal_screen_model::render_snapshot(std::uint64_t sequence) const

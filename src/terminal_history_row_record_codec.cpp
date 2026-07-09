@@ -5,7 +5,6 @@
 
 #include <QByteArrayView>
 #include <algorithm>
-#include <array>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -86,7 +85,7 @@ struct row_record_header_t
     std::uint32_t                 source_width = 0U;
     std::uint32_t                 cell_count = 0U;
     std::uint32_t                 hyperlink_count = 0U;
-    std::uint16_t                 style_lifetime = 0U;
+    std::uint16_t                 style_reference = 0U;
     std::uint16_t                 wrap_state = 0U;
     std::uint16_t                 provenance_source = 0U;
     std::uint16_t                 style_count = 0U;
@@ -210,42 +209,6 @@ bool text_style_is_canonical(const Terminal_text_style& style)
         color_ref_is_canonical(style.foreground) &&
         color_ref_is_canonical(style.background) &&
         (style.attributes & ~k_terminal_style_attribute_known_mask) == 0U;
-}
-
-terminal_text_style_lookup_key_t color_ref_lookup_key(
-    const Terminal_color_ref& color)
-{
-    terminal_text_style_lookup_key_t key{};
-    key[0] = static_cast<std::uint64_t>(color.kind);
-    switch (color.kind) {
-        case Terminal_color_ref_kind::DEFAULT:
-            break;
-        case Terminal_color_ref_kind::PALETTE_INDEX:
-            key[1] = color.palette_index;
-            break;
-        case Terminal_color_ref_kind::RGB:
-            key[2] = color.rgba;
-            break;
-    }
-    return key;
-}
-
-terminal_text_style_lookup_key_t terminal_text_style_lookup_key(
-    const Terminal_text_style& style)
-{
-    const terminal_text_style_lookup_key_t foreground =
-        color_ref_lookup_key(style.foreground);
-    const terminal_text_style_lookup_key_t background =
-        color_ref_lookup_key(style.background);
-    return {
-        foreground[0],
-        foreground[1],
-        foreground[2],
-        background[0],
-        background[1],
-        background[2],
-        style.attributes,
-    };
 }
 
 bool style_table_entry_is_canonical(
@@ -470,22 +433,23 @@ std::optional<Terminal_retained_line_provenance_source> provenance_source_from_c
     }
 }
 
-std::optional<std::uint16_t> style_lifetime_code(Terminal_retained_row_style_lifetime lifetime)
+std::optional<std::uint16_t> style_reference_code(
+    Terminal_retained_row_style_reference reference)
 {
-    switch (lifetime) {
-        case Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID:
+    switch (reference) {
+        case Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE:
             return 0U;
+        default:
+            return std::nullopt;
     }
-
-    return std::nullopt;
 }
 
-std::optional<Terminal_retained_row_style_lifetime> style_lifetime_from_code(
+std::optional<Terminal_retained_row_style_reference> style_reference_from_code(
     std::uint16_t code)
 {
     switch (code) {
         case 0U:
-            return Terminal_retained_row_style_lifetime::SESSION_LIFETIME_STYLE_ID;
+            return Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE;
         default:
             return std::nullopt;
     }
@@ -634,7 +598,7 @@ bool write_header(Byte_writer& writer, const row_record_header_t& header)
         writer.write_u32(header.source_width) &&
         writer.write_u32(header.cell_count) &&
         writer.write_u32(header.hyperlink_count) &&
-        writer.write_u16(header.style_lifetime) &&
+        writer.write_u16(header.style_reference) &&
         writer.write_u16(header.wrap_state) &&
         writer.write_u16(header.provenance_source) &&
         writer.write_u16(header.style_count);
@@ -662,7 +626,7 @@ bool read_header(Byte_reader& reader, row_record_header_t& header)
         reader.read_u32(header.source_width) &&
         reader.read_u32(header.cell_count) &&
         reader.read_u32(header.hyperlink_count) &&
-        reader.read_u16(header.style_lifetime) &&
+        reader.read_u16(header.style_reference) &&
         reader.read_u16(header.wrap_state) &&
         reader.read_u16(header.provenance_source) &&
         reader.read_u16(header.style_count);
@@ -1044,7 +1008,7 @@ Terminal_history_row_record_codec_status prepare_encoded_record_parts(
         return Terminal_history_row_record_codec_status::INVALID_ARGUMENT;
     }
 
-    if (!style_lifetime_code(record.metadata.style_lifetime).has_value() ||
+    if (!style_reference_code(record.metadata.style_reference).has_value() ||
         !wrap_state_code(record.metadata.wrap_state).has_value() ||
         !provenance_source_code(record.provenance.source).has_value())
     {
@@ -1355,7 +1319,7 @@ Terminal_history_row_record_codec_status write_row_record_payload(
     const std::optional<std::uint16_t> provenance =
         provenance_source_code(record.provenance.source);
     const std::optional<std::uint16_t> style =
-        style_lifetime_code(record.metadata.style_lifetime);
+        style_reference_code(record.metadata.style_reference);
     const std::optional<std::uint16_t> wrap =
         wrap_state_code(record.metadata.wrap_state);
     if (!provenance.has_value() || !style.has_value() || !wrap.has_value()) {
@@ -1379,7 +1343,7 @@ Terminal_history_row_record_codec_status write_row_record_payload(
     header.cell_count = static_cast<std::uint32_t>(record.cells.size());
     header.hyperlink_count = static_cast<std::uint32_t>(
         record.hyperlink_identity_keys.size());
-    header.style_lifetime = *style;
+    header.style_reference = *style;
     header.wrap_state = *wrap;
     header.provenance_source = *provenance;
     header.style_count = static_cast<std::uint16_t>(record.style_table.size());
@@ -2020,8 +1984,8 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record_pay
 
     const std::optional<Terminal_retained_line_provenance_source> provenance =
         provenance_source_from_code(header.provenance_source);
-    const std::optional<Terminal_retained_row_style_lifetime> style =
-        style_lifetime_from_code(header.style_lifetime);
+    const std::optional<Terminal_retained_row_style_reference> style =
+        style_reference_from_code(header.style_reference);
     const std::optional<Terminal_retained_row_wrap_state> wrap =
         wrap_state_from_code(header.wrap_state);
     if (!provenance.has_value() || !style.has_value() || !wrap.has_value()) {
@@ -2037,7 +2001,7 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record_pay
         static_cast<qint64>(header.content_stamp_ms),
     };
     record.metadata.source_width = static_cast<int>(header.source_width);
-    record.metadata.style_lifetime = *style;
+    record.metadata.style_reference = *style;
     record.metadata.wrap_state = *wrap;
 
     {

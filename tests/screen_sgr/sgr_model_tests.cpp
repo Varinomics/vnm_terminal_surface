@@ -5,6 +5,7 @@
 #include <QString>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <variant>
 
 namespace term = vnm_terminal::internal;
@@ -44,6 +45,15 @@ term::Terminal_screen_model make_model(int rows = 3, int columns = 32)
         4,
         4,
     });
+}
+
+QByteArray set_truecolor_foreground(int red, int green, int blue)
+{
+    return
+        QByteArrayLiteral("\x1b[38;2;") +
+        QByteArray::number(red)          + ';' +
+        QByteArray::number(green)        + ';' +
+        QByteArray::number(blue)         + 'm';
 }
 
 int diagnostic_count(const term::Terminal_screen_model_result& result)
@@ -411,6 +421,180 @@ bool test_style_persistence_and_style_ids()
     return ok;
 }
 
+bool test_style_table_compaction_and_capacity_policy()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(1, 2);
+    model.set_style_table_limits_for_testing(64U, 64U);
+    for (int index = 1; index <= 63; ++index) {
+        model.ingest(
+            QByteArrayLiteral("\r") +
+            set_truecolor_foreground(index, index + 32, index + 64) +
+            QByteArrayLiteral("X"));
+    }
+
+    term::terminal_screen_model_style_table_stats_t stats = model.style_table_stats();
+    ok &= check(stats.current_style_count == 64U &&
+        stats.peak_style_count == 64U &&
+        stats.compaction_count == 0U,
+        "truecolor churn reaches the style cap before compaction");
+
+    model.ingest(
+        QByteArrayLiteral("\r") +
+        set_truecolor_foreground(64, 96, 128) +
+        QByteArrayLiteral("Y"));
+    stats = model.style_table_stats();
+    ok &= check(stats.current_style_count == 3U &&
+        stats.peak_style_count == 64U &&
+        stats.compaction_count == 1U &&
+        stats.reclaimed_styles == 62U,
+        "cap-triggered compaction reclaims overwritten truecolor styles");
+
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(12U);
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "style table compaction snapshot validates");
+    ok &= check(foreground_rgba_for_cell(snapshot, cell_at(snapshot, 0, 0)) ==
+        term::rgba_from_components(64, 96, 128),
+        "style table compaction preserves the surviving truecolor value");
+
+    term::Terminal_screen_model threshold_model = make_model(1, 2);
+    threshold_model.set_style_table_limits_for_testing(4U, 16U);
+    for (int index = 1; index <= 9; ++index) {
+        threshold_model.ingest(
+            QByteArrayLiteral("\r") +
+            set_truecolor_foreground(index, index + 16, index + 32) +
+            QByteArrayLiteral("T"));
+    }
+    const term::terminal_screen_model_style_table_stats_t threshold_stats =
+        threshold_model.style_table_stats();
+    ok &= check(threshold_stats.current_style_count == 3U &&
+            threshold_stats.peak_style_count == 7U &&
+            threshold_stats.compaction_count == 2U &&
+            threshold_stats.reclaimed_styles == 7U,
+        "soft style threshold schedules another compaction after bounded growth");
+
+    term::Terminal_screen_model current_transition_model = make_model(1, 2);
+    current_transition_model.set_style_table_limits_for_testing(3U, 3U);
+    current_transition_model.ingest(
+        set_truecolor_foreground(14, 24, 34) + QByteArrayLiteral("A"));
+    current_transition_model.ingest(set_truecolor_foreground(44, 54, 64));
+    current_transition_model.ingest(
+        set_truecolor_foreground(74, 84, 94) + QByteArrayLiteral("C"));
+
+    const term::terminal_screen_model_style_table_stats_t current_transition_stats =
+        current_transition_model.style_table_stats();
+    ok &= check(current_transition_stats.current_style_count == 3U &&
+            current_transition_stats.peak_style_count == 3U &&
+            current_transition_stats.compaction_count == 1U &&
+            current_transition_stats.reclaimed_styles == 1U,
+        "hard-cap transition reclaims an otherwise unreferenced outgoing current style");
+
+    const term::Terminal_render_snapshot current_transition_snapshot =
+        current_transition_model.render_snapshot(16U);
+    ok &= check(term::validate_render_snapshot(current_transition_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "outgoing-current reclamation snapshot validates");
+    ok &= check(foreground_rgba_for_cell(
+            current_transition_snapshot,
+            cell_at(current_transition_snapshot, 0, 0)) ==
+                term::rgba_from_components(14, 24, 34) &&
+        foreground_rgba_for_cell(
+            current_transition_snapshot,
+            cell_at(current_transition_snapshot, 0, 1)) ==
+                term::rgba_from_components(74, 84, 94),
+        "outgoing-current reclamation preserves the cell root and installs the pending style");
+
+    term::Terminal_screen_model capped_model = make_model(1, 2);
+    capped_model.set_style_table_limits_for_testing(3U, 3U);
+    capped_model.ingest(set_truecolor_foreground(41, 51, 61) + QByteArrayLiteral("A"));
+    capped_model.ingest(set_truecolor_foreground(46, 56, 66) + QByteArrayLiteral("B"));
+
+    bool exhausted = false;
+    try {
+        capped_model.ingest(set_truecolor_foreground(43, 53, 63));
+    }
+    catch (const std::overflow_error&) {
+        exhausted = true;
+    }
+    ok &= check(exhausted,
+        "style table allocation fails explicitly when every capped slot is live");
+
+    const term::terminal_screen_model_style_table_stats_t capped_stats =
+        capped_model.style_table_stats();
+    ok &= check(capped_stats.current_style_count == 3U &&
+        capped_stats.peak_style_count == 3U &&
+        capped_stats.compaction_count == 0U,
+        "failed style table compaction leaves diagnostics and table state unchanged");
+
+    const term::Terminal_render_snapshot capped_snapshot = capped_model.render_snapshot(13U);
+    ok &= check(term::validate_render_snapshot(capped_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "style table exhaustion preserves a valid prior snapshot");
+    ok &= check(foreground_rgba_for_cell(capped_snapshot, cell_at(capped_snapshot, 0, 0)) ==
+            term::rgba_from_components(41, 51, 61) &&
+        foreground_rgba_for_cell(capped_snapshot, cell_at(capped_snapshot, 0, 1)) ==
+            term::rgba_from_components(46, 56, 66),
+        "style table exhaustion preserves previously written style values");
+
+    capped_model.ingest(QByteArrayLiteral("\rZ"));
+    const term::Terminal_render_snapshot post_failure_snapshot =
+        capped_model.render_snapshot(17U);
+    ok &= check(foreground_rgba_for_cell(
+            post_failure_snapshot,
+            cell_at(post_failure_snapshot, 0, 0)) ==
+                term::rgba_from_components(46, 56, 66),
+        "style table exhaustion preserves the outgoing current style atomically");
+    return ok;
+}
+
+bool test_style_table_compaction_remaps_saved_buffer_cursors()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(1, 8);
+    model.set_style_table_limits_for_testing(4U, 8U);
+
+    model.ingest(set_truecolor_foreground(71, 81, 91));
+    model.ingest(set_truecolor_foreground(72, 82, 92) + QByteArrayLiteral("P\x1b" "7"));
+    model.ingest(QByteArrayLiteral("\x1b[?47h") +
+        set_truecolor_foreground(73, 83, 93) + QByteArrayLiteral("A\x1b" "7"));
+    model.ingest(QByteArrayLiteral("\x1b[?47l") +
+        set_truecolor_foreground(74, 84, 94));
+
+    const term::terminal_screen_model_style_table_stats_t stats = model.style_table_stats();
+    ok &= check(stats.compaction_count == 1U && stats.reclaimed_styles == 1U,
+        "style compaction remaps buffer roots after reclaiming an unused style");
+
+    model.ingest(QByteArrayLiteral("\x1b[?47h\x1b" "8B"));
+    const term::Terminal_render_snapshot alternate_snapshot = model.render_snapshot(14U);
+    ok &= check(term::validate_render_snapshot(alternate_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "style compaction alternate saved-cursor snapshot validates");
+    ok &= check(foreground_rgba_for_cell(
+            alternate_snapshot,
+            cell_at(alternate_snapshot, 0, 0)) == term::rgba_from_components(73, 83, 93) &&
+        foreground_rgba_for_cell(
+            alternate_snapshot,
+            cell_at(alternate_snapshot, 0, 1)) == term::rgba_from_components(73, 83, 93),
+        "style compaction preserves alternate row and saved-cursor styles");
+
+    model.ingest(QByteArrayLiteral("\x1b[?47l\x1b" "8Q"));
+    const term::Terminal_render_snapshot primary_snapshot = model.render_snapshot(15U);
+    ok &= check(term::validate_render_snapshot(primary_snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "style compaction primary saved-cursor snapshot validates");
+    ok &= check(foreground_rgba_for_cell(
+            primary_snapshot,
+            cell_at(primary_snapshot, 0, 0)) == term::rgba_from_components(72, 82, 92) &&
+        foreground_rgba_for_cell(
+            primary_snapshot,
+            cell_at(primary_snapshot, 0, 1)) == term::rgba_from_components(72, 82, 92),
+        "style compaction preserves primary row and saved-cursor styles");
+    return ok;
+}
+
 bool test_malformed_sgr_is_atomic()
 {
     bool ok = true;
@@ -569,6 +753,8 @@ int main()
     ok &= test_partial_attribute_resets();
     ok &= test_color_modes();
     ok &= test_style_persistence_and_style_ids();
+    ok &= test_style_table_compaction_and_capacity_policy();
+    ok &= test_style_table_compaction_remaps_saved_buffer_cursors();
     ok &= test_malformed_sgr_is_atomic();
     ok &= test_sgr_boundaries_and_c1_recovery();
     ok &= test_osc_color_queries();
