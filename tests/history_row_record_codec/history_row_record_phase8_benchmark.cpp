@@ -43,6 +43,8 @@ struct benchmark_payload_t
     bool                         ok = true;
     std::uint64_t                records = 0U;
     std::uint64_t                bytes = 0U;
+    std::uint64_t                cells = 0U;
+    std::uint64_t                hyperlinks = 0U;
     std::uint64_t                checksum = 0U;
 };
 
@@ -53,6 +55,8 @@ struct benchmark_measurement_t
     std::uint64_t                elapsed_ns = 0U;
     std::uint64_t                records = 0U;
     std::uint64_t                bytes = 0U;
+    std::uint64_t                cells = 0U;
+    std::uint64_t                hyperlinks = 0U;
     std::uint64_t                checksum = 0U;
     bool                         ok = true;
 };
@@ -88,11 +92,67 @@ benchmark_measurement_t measure_case(
     measurement.elapsed_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             finished - started).count());
-    measurement.records  = payload.records;
-    measurement.bytes    = payload.bytes;
-    measurement.checksum = payload.checksum;
-    measurement.ok       = payload.ok;
+    measurement.records    = payload.records;
+    measurement.bytes      = payload.bytes;
+    measurement.cells      = payload.cells;
+    measurement.hyperlinks = payload.hyperlinks;
+    measurement.checksum   = payload.checksum;
+    measurement.ok         = payload.ok;
     return measurement;
+}
+
+std::uint64_t checksum_mix_byte(
+    std::uint64_t checksum,
+    std::uint8_t  byte)
+{
+    constexpr std::uint64_t k_fnv_prime = 1099511628211ULL;
+    return (checksum ^ byte) * k_fnv_prime;
+}
+
+std::uint64_t checksum_mix_u64(
+    std::uint64_t checksum,
+    std::uint64_t value)
+{
+    for (int byte_index = 0; byte_index < 8; ++byte_index) {
+        checksum = checksum_mix_byte(
+            checksum,
+            static_cast<std::uint8_t>((value >> (byte_index * 8)) & 0xffU));
+    }
+    return checksum;
+}
+
+std::uint64_t checksum_mix_text(
+    std::uint64_t  checksum,
+    const QString& text)
+{
+    checksum = checksum_mix_u64(
+        checksum,
+        static_cast<std::uint64_t>(text.size()));
+    for (qsizetype index = 0; index < text.size(); ++index) {
+        checksum = checksum_mix_u64(
+            checksum,
+            static_cast<std::uint64_t>(text.at(index).unicode()));
+    }
+    return checksum;
+}
+
+std::uint64_t record_content_checksum(
+    const term::Terminal_history_row_record& record)
+{
+    constexpr std::uint64_t k_fnv_offset = 1469598103934665603ULL;
+    std::uint64_t checksum = checksum_mix_u64(
+        k_fnv_offset,
+        static_cast<std::uint64_t>(record.cells.size()));
+    for (const term::Terminal_history_row_cell& cell : record.cells) {
+        checksum = checksum_mix_text(checksum, cell.text);
+        checksum = checksum_mix_u64(checksum, static_cast<std::uint64_t>(
+            std::max(cell.display_width, 0)));
+        checksum = checksum_mix_u64(checksum, cell.wide_continuation ? 1U : 0U);
+        checksum = checksum_mix_u64(checksum, cell.occupied ? 1U : 0U);
+        checksum = checksum_mix_u64(checksum, cell.style_id);
+        checksum = checksum_mix_u64(checksum, cell.hyperlink_id);
+    }
+    return checksum;
 }
 
 term::Terminal_history_row_cell make_cell(
@@ -430,7 +490,10 @@ benchmark_measurement_t benchmark_materialization()
                     return payload;
                 }
 
-                payload.checksum += decoded.record.cells.size();
+                payload.cells += static_cast<std::uint64_t>(decoded.record.cells.size());
+                payload.checksum = checksum_mix_u64(
+                    payload.checksum,
+                    record_content_checksum(decoded.record));
                 payload.bytes += handle.record_bytes;
             }
 
@@ -600,7 +663,7 @@ benchmark_measurement_t benchmark_resize_projection()
 
                     ++payload.records;
                     payload.checksum += snapshot.cells.size();
-                    payload.bytes += static_cast<std::uint64_t>(snapshot.cells.size());
+                    payload.cells += static_cast<std::uint64_t>(snapshot.cells.size());
                 }
             }
 
@@ -699,10 +762,11 @@ benchmark_measurement_t benchmark_hyperlink_heavy_output()
             }
 
             payload.records = hyperlink_rows;
-            payload.bytes = static_cast<std::uint64_t>(snapshot.hyperlinks.size());
-            payload.checksum =
-                static_cast<std::uint64_t>(snapshot.cells.size()) +
-                static_cast<std::uint64_t>(snapshot.hyperlinks.size());
+            payload.cells = static_cast<std::uint64_t>(snapshot.cells.size());
+            payload.hyperlinks = static_cast<std::uint64_t>(snapshot.hyperlinks.size());
+            payload.checksum = checksum_mix_u64(
+                checksum_mix_u64(0U, payload.cells),
+                payload.hyperlinks);
             return payload;
         });
 }
@@ -805,6 +869,8 @@ bool write_report(
         output.unsetf(std::ios::floatfield);
         output << "      \"records\": " << measurement.records << ",\n";
         output << "      \"bytes\": " << measurement.bytes << ",\n";
+        output << "      \"cells\": " << measurement.cells << ",\n";
+        output << "      \"hyperlinks\": " << measurement.hyperlinks << ",\n";
         output << "      \"checksum\": " << measurement.checksum << ",\n";
         output << "      \"ok\": " << (measurement.ok ? "true" : "false") << "\n";
         output << "    }" << (i + 1U == measurements.size() ? "\n" : ",\n");
@@ -838,6 +904,8 @@ void print_summary(
                   << ns_per_operation(measurement)
                   << " records=" << measurement.records
                   << " bytes=" << measurement.bytes
+                  << " cells=" << measurement.cells
+                  << " hyperlinks=" << measurement.hyperlinks
                   << " checksum=" << measurement.checksum
                   << " ok=" << (measurement.ok ? "true" : "false") << '\n';
         std::cout.unsetf(std::ios::floatfield);
