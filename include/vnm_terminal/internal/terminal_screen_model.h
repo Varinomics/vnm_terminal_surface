@@ -892,6 +892,8 @@ private:
         Terminal_retained_line_provenance_source source =
             Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
         const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys =
+            nullptr,
+        const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id =
             nullptr);
     void scroll_up_region(int top, int bottom, bool append_scrollback, int count = 1);
     void scroll_down_region(int top, int bottom, int count = 1);
@@ -971,7 +973,8 @@ private:
     retained_row_record_t seal_retained_row_record(
         const Terminal_screen_row&     screen_row,
         Terminal_retained_line_provenance_source source,
-        const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys);
+        const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys,
+        const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id);
 
     static Terminal_history_row_record history_row_record_from_retained_record(
         const retained_row_record_t&   retained_record);
@@ -982,6 +985,8 @@ private:
     void materialize_retained_row_hyperlinks(
         retained_row_record_t&         row,
         const std::map<Terminal_hyperlink_id, QByteArray>* preserved_identity_keys =
+            nullptr,
+        const terminal_hyperlink_identity_by_id_t* active_identity_keys_by_id =
             nullptr) const;
 
     void materialize_retained_row_styles(

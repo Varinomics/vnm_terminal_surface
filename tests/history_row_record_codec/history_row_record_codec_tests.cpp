@@ -171,6 +171,7 @@ bool records_equal(
         left.style_table == right.style_table &&
         left.provenance.retained_line_id   == right.provenance.retained_line_id &&
         left.provenance.content_generation == right.provenance.content_generation &&
+        left.provenance.content_stamp_ms   == right.provenance.content_stamp_ms &&
         left.provenance.source             == right.provenance.source &&
         left.hyperlink_identity_keys       == right.hyperlink_identity_keys &&
         left.metadata.source_width         == right.metadata.source_width &&
@@ -437,6 +438,36 @@ bool test_extended_styles_hyperlinks_and_wide_cells_round_trip()
     const std::vector<std::byte> payload = payload_bytes(ring, append);
     ok &= check(payload.back() == static_cast<std::byte>(0x01U),
         "wide continuation is encoded only with the inherited continuation opcode");
+
+    return ok;
+}
+
+bool test_generic_compact_default_ascii_after_blank_round_trip()
+{
+    bool ok = true;
+
+    term::Terminal_history_ring ring({4096U, 4096U});
+    term::Terminal_history_row_record record = make_base_record(
+        96U,
+        32U,
+        term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+        3);
+    record.provenance.content_stamp_ms = 123456789LL;
+    record.cells.resize(1U);
+    record.cells.push_back(make_cell(QStringLiteral("A"), 1, true));
+    record.cells.resize(3U);
+
+    term::Terminal_history_row_record_append_result append;
+    const term::Terminal_history_row_record_decode_result decoded =
+        append_and_decode(ring, record, make_identity(5U, 96U), append);
+    ok &= check(append.status == term::Terminal_history_row_record_codec_status::OK,
+        "generic compact blank-prefix ASCII fixture encodes");
+    ok &= check(decoded.status == term::Terminal_history_row_record_codec_status::OK,
+        "generic compact blank-prefix ASCII fixture decodes");
+    ok &= check(records_equal(decoded.record, record),
+        "generic compact ASCII opcode after a blank round-trips with provenance stamp");
+    ok &= check(payload_kind(payload_bytes(ring, append)) == k_payload_kind_generic_compact,
+        "generic compact blank-prefix ASCII fixture uses payload kind 0");
 
     return ok;
 }
@@ -1522,6 +1553,7 @@ int main()
     bool ok = true;
     ok &= test_prefix_plain_ascii_rows_use_prefix_payload();
     ok &= test_extended_styles_hyperlinks_and_wide_cells_round_trip();
+    ok &= test_generic_compact_default_ascii_after_blank_round_trip();
     ok &= test_self_contained_tables_are_required();
     ok &= test_style_payload_canonicality_is_required();
     ok &= test_encode_rejects_malformed_cell_states();

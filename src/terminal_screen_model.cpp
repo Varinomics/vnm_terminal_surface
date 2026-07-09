@@ -4258,7 +4258,8 @@ void Terminal_screen_model::clear_all_tab_stops()
 void Terminal_screen_model::append_scrollback_row(
     const Terminal_screen_row&               row,
     Terminal_retained_line_provenance_source source,
-    const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys)
+    const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys,
+    const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id)
 {
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled && m_text_span_profile_depth > 0) {
@@ -4273,7 +4274,11 @@ void Terminal_screen_model::append_scrollback_row(
             VNM_TERMINAL_PROFILE_SCOPE(
                 "Terminal_screen_model::append_scrollback_row::retained_history_append");
             append = m_primary_backing.append_retained_history_record(
-                seal_retained_row_record(row, source, hyperlink_identity_keys));
+                seal_retained_row_record(
+                    row,
+                    source,
+                    hyperlink_identity_keys,
+                    active_hyperlink_identity_keys_by_id));
         }
         m_scrollback_evicted_rows += append.evicted_rows;
         record_primary_history_delta(
@@ -4309,9 +4314,37 @@ void Terminal_screen_model::scroll_up_region(
 {
     mark_terminal_content_changed();
     count = std::clamp(count, 1, bottom - top + 1);
+    std::optional<terminal_hyperlink_identity_by_id_t> active_identity_keys_by_id;
+    if (append_scrollback) {
+        bool scrolled_rows_have_hyperlinks = false;
+        for (int row = top; row < top + count; ++row) {
+            for (const Cell& cell : active_grid_rows()[static_cast<std::size_t>(row)].cells) {
+                if (cell.hyperlink_id != k_no_terminal_hyperlink_id) {
+                    scrolled_rows_have_hyperlinks = true;
+                    break;
+                }
+            }
+            if (scrolled_rows_have_hyperlinks) {
+                break;
+            }
+        }
+
+        if (scrolled_rows_have_hyperlinks) {
+            active_identity_keys_by_id = active_hyperlink_identity_keys_by_id();
+        }
+    }
+
+    const terminal_hyperlink_identity_by_id_t* active_identity_keys =
+        active_identity_keys_by_id.has_value()
+            ? &*active_identity_keys_by_id
+            : nullptr;
     for (int step = 0; step < count; ++step) {
         if (append_scrollback) {
-            append_scrollback_row(active_grid_rows()[static_cast<std::size_t>(top)]);
+            append_scrollback_row(
+                active_grid_rows()[static_cast<std::size_t>(top)],
+                Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
+                nullptr,
+                active_identity_keys);
         }
 
         for (int row = top + 1; row <= bottom; ++row) {
@@ -4494,11 +4527,36 @@ void Terminal_screen_model::cancel_primary_repaint_recovery_candidate()
 void Terminal_screen_model::accept_primary_repaint_recovery_proposal(
     const primary_repaint_recovery_proposal_t& proposal)
 {
+    std::optional<terminal_hyperlink_identity_by_id_t> active_identity_keys_by_id;
+    bool needs_active_identity_lookup = false;
+    for (const Terminal_screen_row& row : proposal.rows) {
+        for (const Cell& cell : row.cells) {
+            if (cell.hyperlink_id != k_no_terminal_hyperlink_id &&
+                proposal.hyperlink_identity_keys.find(cell.hyperlink_id) ==
+                    proposal.hyperlink_identity_keys.end())
+            {
+                needs_active_identity_lookup = true;
+                break;
+            }
+        }
+        if (needs_active_identity_lookup) {
+            break;
+        }
+    }
+    if (needs_active_identity_lookup) {
+        active_identity_keys_by_id = active_hyperlink_identity_keys_by_id();
+    }
+
+    const terminal_hyperlink_identity_by_id_t* active_identity_keys =
+        active_identity_keys_by_id.has_value()
+            ? &*active_identity_keys_by_id
+            : nullptr;
     for (Terminal_screen_row recovered_row : proposal.rows) {
         append_scrollback_row(
             recovered_row,
             proposal.metadata.provenance_source,
-            &proposal.hyperlink_identity_keys);
+            &proposal.hyperlink_identity_keys,
+            active_identity_keys);
     }
     m_recovery_proposals.push_back(proposal.metadata);
 }
@@ -5354,7 +5412,8 @@ void Terminal_screen_model::compact_hyperlink_ids()
 Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retained_row_record(
     const Terminal_screen_row&               screen_row,
     Terminal_retained_line_provenance_source source,
-    const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys)
+    const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys,
+    const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id)
 {
     retained_row_record_t record;
     record.row                   = screen_row;
@@ -5363,7 +5422,10 @@ Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retaine
         rebase_retained_line_id_preserving_content(record.row, source);
     }
     materialize_retained_row_styles(record);
-    materialize_retained_row_hyperlinks(record, hyperlink_identity_keys);
+    materialize_retained_row_hyperlinks(
+        record,
+        hyperlink_identity_keys,
+        active_hyperlink_identity_keys_by_id);
     return record;
 }
 
@@ -5457,14 +5519,17 @@ void Terminal_screen_model::materialize_retained_row_styles(
 
 void Terminal_screen_model::materialize_retained_row_hyperlinks(
     retained_row_record_t& row,
-    const std::map<Terminal_hyperlink_id, QByteArray>* preserved_identity_keys) const
+    const std::map<Terminal_hyperlink_id, QByteArray>* preserved_identity_keys,
+    const terminal_hyperlink_identity_by_id_t* active_identity_keys_by_id) const
 {
     std::map<Terminal_hyperlink_id, QByteArray> old_identity_keys =
         std::move(row.hyperlink_identity_keys);
     row.hyperlink_identity_keys.clear();
 
     std::map<QByteArray, Terminal_hyperlink_id> row_refs_by_identity_key;
-    std::optional<terminal_hyperlink_identity_by_id_t> active_identity_keys_by_id;
+    const terminal_hyperlink_identity_by_id_t* active_identity_keys =
+        active_identity_keys_by_id;
+    std::optional<terminal_hyperlink_identity_by_id_t> lazy_active_identity_keys_by_id;
     for (Cell& cell : row.row.cells) {
         if (cell.hyperlink_id == k_no_terminal_hyperlink_id) {
             continue;
@@ -5486,13 +5551,14 @@ void Terminal_screen_model::materialize_retained_row_hyperlinks(
         }
 
         if (identity_key == nullptr) {
-            if (!active_identity_keys_by_id.has_value()) {
-                active_identity_keys_by_id = active_hyperlink_identity_keys_by_id();
+            if (active_identity_keys == nullptr) {
+                lazy_active_identity_keys_by_id = active_hyperlink_identity_keys_by_id();
+                active_identity_keys = &*lazy_active_identity_keys_by_id;
             }
 
             const auto active_found =
-                active_identity_keys_by_id->find(source_hyperlink_id);
-            if (active_found != active_identity_keys_by_id->end()) {
+                active_identity_keys->find(source_hyperlink_id);
+            if (active_found != active_identity_keys->end()) {
                 identity_key = &active_found->second;
             }
         }

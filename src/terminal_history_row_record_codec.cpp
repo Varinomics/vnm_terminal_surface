@@ -1051,14 +1051,8 @@ Terminal_history_row_record_codec_status prepare_encoded_record_parts(
         return Terminal_history_row_record_codec_status::INVALID_ENUM;
     }
 
-    std::size_t payload_bytes = k_row_record_header_bytes;
-    const Terminal_history_row_record_codec_status table_status =
-        validate_and_measure_tables(record, payload_bytes);
-    if (table_status != Terminal_history_row_record_codec_status::OK) {
-        return table_status;
-    }
-
     parts = {};
+    std::size_t payload_bytes = k_row_record_header_bytes;
     if (try_prepare_prefix_plain_ascii_stream(record, parts, payload_bytes)) {
         if (!size_fits_u32(payload_bytes)) {
             return Terminal_history_row_record_codec_status::SIZE_OVERFLOW;
@@ -1069,10 +1063,10 @@ Terminal_history_row_record_codec_status prepare_encoded_record_parts(
     }
 
     payload_bytes = k_row_record_header_bytes;
-    const Terminal_history_row_record_codec_status generic_table_status =
+    const Terminal_history_row_record_codec_status table_status =
         validate_and_measure_tables(record, payload_bytes);
-    if (generic_table_status != Terminal_history_row_record_codec_status::OK) {
-        return generic_table_status;
+    if (table_status != Terminal_history_row_record_codec_status::OK) {
+        return table_status;
     }
 
     parts.cell_parts.clear();

@@ -645,6 +645,76 @@ bool test_osc8_hyperlink_allocator_compacts_near_overflow()
     return ok;
 }
 
+bool test_osc8_hyperlink_compaction_prunes_overwritten_ids()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(1, 8);
+    model.set_next_hyperlink_id_for_testing(term::k_max_terminal_hyperlink_id - 1U);
+
+    term::Terminal_screen_model_result result = model.ingest(
+        QByteArrayLiteral("\x1b]8;id=a;https://a.example\x1b\\A\x1b]8;;\x1b\\"));
+    ok &= check(diagnostic_count(result) == 0,
+        "prune-overwritten OSC 8 setup has no diagnostics");
+    ok &= check(active_hyperlink_identity_contains_uri(
+            model,
+            term::k_max_terminal_hyperlink_id - 1U,
+            QByteArrayLiteral("https://a.example")),
+        "prune-overwritten setup assigns the first near-overflow id");
+
+    result = model.ingest(QByteArrayLiteral("\x1b[1;1H "));
+    ok &= check(diagnostic_count(result) == 0,
+        "prune-overwritten replacement has no diagnostics");
+    term::Terminal_render_snapshot snapshot = model.render_snapshot(31U);
+    ok &= check(cell_at(snapshot, 0, 0).hyperlink_id == term::k_no_terminal_hyperlink_id,
+        "prune-overwritten replacement clears link A from live cells");
+
+    result = model.ingest(
+        QByteArrayLiteral("\x1b[1;2H\x1b]8;id=b;https://b.example\x1b\\B\x1b]8;;\x1b\\"));
+    ok &= check(diagnostic_count(result) == 0,
+        "prune-overwritten survivor setup has no diagnostics");
+    ok &= check(active_hyperlink_identity_contains_uri(
+            model,
+            term::k_max_terminal_hyperlink_id,
+            QByteArrayLiteral("https://b.example")) &&
+        model.next_hyperlink_id_for_testing() == term::k_no_terminal_hyperlink_id,
+        "prune-overwritten survivor consumes the final id before compaction");
+
+    result = model.ingest(
+        QByteArrayLiteral("\x1b[1;3H\x1b]8;id=c;https://c.example\x1b\\C\x1b]8;;\x1b\\"));
+    ok &= check(diagnostic_count(result) == 0,
+        "prune-overwritten compaction trigger has no diagnostics");
+
+    const term::terminal_hyperlink_identity_by_id_t identities =
+        model.active_hyperlink_identity_keys_by_id_for_testing();
+    bool contains_a = false;
+    for (const auto& entry : identities) {
+        contains_a = contains_a || entry.second.contains(QByteArrayLiteral("https://a.example"));
+    }
+    ok &= check(!contains_a && identities.size() == 2U,
+        "prune-overwritten compaction drops unreferenced link A metadata");
+    ok &= check(active_hyperlink_identity_contains_uri(
+            model,
+            1U,
+            QByteArrayLiteral("https://b.example")) &&
+        active_hyperlink_identity_contains_uri(
+            model,
+            2U,
+            QByteArrayLiteral("https://c.example")) &&
+        model.next_hyperlink_id_for_testing() == 3U,
+        "prune-overwritten compaction remaps surviving links densely");
+
+    snapshot = model.render_snapshot(32U);
+    ok &= check(term::validate_render_snapshot(snapshot).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "prune-overwritten compaction snapshot validates");
+    ok &= check(cell_at(snapshot, 0, 1).hyperlink_id == 1U &&
+            cell_at(snapshot, 0, 2).hyperlink_id == 2U,
+        "prune-overwritten compaction remaps live cells to dense snapshot ids");
+
+    return ok;
+}
+
 bool test_bell_and_synchronized_output_mutation()
 {
     bool ok = true;
@@ -762,6 +832,7 @@ int main()
     ok &= test_ignored_and_rejected_modes();
     ok &= test_osc8_hyperlinks();
     ok &= test_osc8_hyperlink_allocator_compacts_near_overflow();
+    ok &= test_osc8_hyperlink_compaction_prunes_overwritten_ids();
     ok &= test_bell_and_synchronized_output_mutation();
     return ok ? 0 : 1;
 }
