@@ -6,8 +6,6 @@ int main()
 {
     // Prove the installed public diagnostics header is includable and that its
     // builders link from the packaged library, without constructing a surface.
-    void (*append_renderer)(const VNM_TerminalSurface&, QJsonObject&) =
-        &vnm_terminal::diagnostics::append_renderer_metrics_json;
     void (*append_atlas)(const VNM_TerminalSurface&, QJsonObject&) =
         &vnm_terminal::diagnostics::append_atlas_metrics_json;
     void (*append_render_invalidation)(const VNM_TerminalSurface&, QJsonObject&) =
@@ -23,7 +21,7 @@ int main()
     bool (*metrics_valid)(const vnm_terminal::Cell_metrics&) =
         &vnm_terminal::cell_metrics_valid;
 
-    return (append_renderer != nullptr && append_atlas != nullptr &&
+    return (append_atlas != nullptr &&
             append_render_invalidation != nullptr &&
             append_backend_drain != nullptr &&
             default_family != nullptr && metrics_for_font != nullptr &&

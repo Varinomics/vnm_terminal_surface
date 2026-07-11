@@ -770,36 +770,6 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
         "retained-history metrics fixture emits retained rows");
     term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(surface);
 
-    QJsonObject renderer;
-    vnm_terminal::diagnostics::append_renderer_metrics_json(surface, renderer);
-    ok &= check(!renderer.isEmpty(),
-        "append_renderer_metrics_json fills the legacy compatibility object");
-    ok &= check_runtime_metric_object(
-        renderer,
-        "renderer compatibility",
-        {
-            "compatibility_scope",
-            "canonical_renderer_metrics",
-            "frames_published",
-            "paint_completed_frames",
-            "qsg_atlas_render_count",
-        },
-        {});
-    ok &= check(
-        renderer.value(QStringLiteral("compatibility_scope")).toString() ==
-            QStringLiteral("legacy_renderer_frame_counters"),
-        "renderer compatibility metrics declare their scope");
-    ok &= check(
-        renderer.value(QStringLiteral("canonical_renderer_metrics")).toString() ==
-            QStringLiteral("qsg_atlas"),
-        "renderer compatibility metrics point to qsg_atlas");
-    ok &= check(renderer.value(QStringLiteral("frames_published")).isString(),
-        "renderer compatibility metrics include frames_published");
-    ok &= check(renderer.value(QStringLiteral("paint_completed_frames")).isString(),
-        "renderer compatibility metrics include paint_completed_frames");
-    ok &= check(renderer.value(QStringLiteral("qsg_atlas_render_count")).isString(),
-        "renderer compatibility metrics include atlas render count");
-
     QJsonObject atlas;
     vnm_terminal::diagnostics::append_atlas_metrics_json(surface, atlas);
     ok &= check(!atlas.isEmpty(),

@@ -1,11 +1,9 @@
 # Diagnostics Schema
 
 This document describes the active QSG atlas diagnostics counters,
-descriptor-backed retained-history measurements, runtime JSON-only helpers,
-and the legacy text-layout descriptor table retained for compatibility checks.
+descriptor-backed retained-history measurements, and runtime JSON-only helpers.
 It is kept in sync with the descriptor tables in
-`src/diagnostics/metric_descriptor.h` (the retained-history and text-layout
-blocks) and
+`src/diagnostics/metric_descriptor.h` (the retained-history block) and
 `src/diagnostics/atlas_metric_descriptors.h` (the atlas blocks); those tables
 are the single source of truth for the listed fields, and the byte-golden test
 `tests/diagnostics_text_layout/diagnostics_text_layout_tests.cpp` pins the
@@ -31,9 +29,7 @@ two could drift (a counter added to JSON but not TEXT, or reordered). The active
 atlas blocks now flow through one shared descriptor table each, consumed by both
 `emit_metrics_json` and `emit_metrics_text`, so the field set and order cannot
 diverge. For every active table-driven atlas block the JSON key is also the TEXT
-label. The text-layout descriptor table remains documented and golden-tested as
-legacy renderer compatibility schema, but the canonical renderer diagnostics
-surface is now the `qsg_atlas` block.
+label.
 
 The runtime metrics document also contains hand-written JSON-only sections such
 as `render_invalidation` and `backend_drain`. Those sections are public runtime
@@ -98,19 +94,6 @@ These sections are emitted only by the runtime JSON helpers in
 `vnm_terminal/diagnostics/metrics_json.h`. Counter values are decimal strings;
 string metadata values are JSON strings; boolean values are JSON booleans.
 These diagnostics are `UNSTABLE`.
-
-### Renderer compatibility block (JSON key `renderer`)
-
-This legacy block is retained for hosts that still frame a `renderer` object.
-New renderer diagnostics should read the `qsg_atlas` block.
-
-| Field | Kind | Unit | Stability |
-|-------|------|------|-----------|
-| `compatibility_scope` | String | None | Unstable |
-| `canonical_renderer_metrics` | String | None | Unstable |
-| `frames_published` | Counter | Count | Unstable |
-| `paint_completed_frames` | Counter | Count | Unstable |
-| `qsg_atlas_render_count` | Counter | Count | Unstable |
 
 ### Render invalidation block (JSON key `render_invalidation`)
 
@@ -183,81 +166,6 @@ These are debug/diagnostic counters. They reflect internal renderer accounting
 change as the renderer evolves. They are therefore treated as unstable: tools
 may read them for investigation, but no external contract guarantees a counter
 name, its meaning, or its presence across versions. They are not a public API.
-
-## Text-layout block
-
-Legacy compatibility counters describing the QTextLayout slow path and the
-ASCII-replacement fast path. Run counters tally text runs; `*_code_units`
-counters tally UTF-16 code units. All are `COUNTER` / `COUNT` / `UNSTABLE`. The
-block is emitted in the order below by the retained descriptor emitters;
-`text_ascii_replacement_add_glyphs_calls` is optional (emitted only when the
-stats type carries it) and is the one field handled outside the shared table
-loop.
-
-| Field | Kind | Unit | Stability |
-|-------|------|------|-----------|
-| `qt_text_layout_calls` | Counter | Count | Unstable |
-| `text_layout_runs_single_code_unit` | Counter | Count | Unstable |
-| `text_layout_runs_multi_code_unit` | Counter | Count | Unstable |
-| `text_layout_runs_all_space` | Counter | Count | Unstable |
-| `text_layout_runs_printable_ascii` | Counter | Count | Unstable |
-| `text_layout_runs_printable_ascii_with_space` | Counter | Count | Unstable |
-| `text_layout_runs_other_ascii` | Counter | Count | Unstable |
-| `text_layout_runs_non_ascii` | Counter | Count | Unstable |
-| `text_layout_runs_clipped` | Counter | Count | Unstable |
-| `text_layout_runs_ascii_layout_font` | Counter | Count | Unstable |
-| `text_layout_runs_force_blended_order` | Counter | Count | Unstable |
-| `text_layout_runs_with_hyperlink` | Counter | Count | Unstable |
-| `text_layout_runs_with_decoration` | Counter | Count | Unstable |
-| `text_layout_runs_mixed_ascii_non_ascii` | Counter | Count | Unstable |
-| `text_layout_runs_pure_non_ascii` | Counter | Count | Unstable |
-| `text_layout_runs_plain_unclipped` | Counter | Count | Unstable |
-| `text_layout_runs_plain_unclipped_ascii_font` | Counter | Count | Unstable |
-| `text_layout_runs_all_space_plain_unclipped` | Counter | Count | Unstable |
-| `text_layout_runs_printable_ascii_plain_unclipped` | Counter | Count | Unstable |
-| `text_layout_runs_non_ascii_plain_unclipped` | Counter | Count | Unstable |
-| `text_layout_runs_mixed_ascii_non_ascii_plain_unclipped` | Counter | Count | Unstable |
-| `text_layout_runs_pure_non_ascii_plain_unclipped` | Counter | Count | Unstable |
-| `text_layout_runs_fast_space_candidate` | Counter | Count | Unstable |
-| `text_layout_runs_fast_ascii_candidate` | Counter | Count | Unstable |
-| `text_layout_runs_fast_ascii_no_space_candidate` | Counter | Count | Unstable |
-| `text_layout_runs_fast_ascii_single_candidate` | Counter | Count | Unstable |
-| `text_layout_runs_fast_ascii_multi_candidate` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_screened` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_eligible` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_attempted` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_trusted_fast_path` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_succeeded` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_all_space_succeeded` | Counter | Count | Unstable |
-| `text_ascii_replacement_add_glyphs_calls` (optional) | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_fallback` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_rejected_clipped` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_rejected_force_blended_order` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_rejected_decoration` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_rejected_hyperlink` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_rejected_non_printable_ascii` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_rejected_non_ascii` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_rejected_geometry` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_rejected_unsupported_font` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_rejected_internal_node` | Counter | Count | Unstable |
-| `text_ascii_replacement_runs_rejected_glyph_mapping` | Counter | Count | Unstable |
-| `text_layout_code_units` | Counter | Count | Unstable |
-| `text_layout_space_code_units` | Counter | Count | Unstable |
-| `text_layout_printable_ascii_code_units` | Counter | Count | Unstable |
-| `text_layout_other_ascii_code_units` | Counter | Count | Unstable |
-| `text_layout_non_ascii_code_units` | Counter | Count | Unstable |
-| `text_layout_plain_unclipped_code_units` | Counter | Count | Unstable |
-| `text_layout_all_space_plain_unclipped_code_units` | Counter | Count | Unstable |
-| `text_layout_printable_ascii_plain_unclipped_code_units` | Counter | Count | Unstable |
-| `text_layout_non_ascii_plain_unclipped_code_units` | Counter | Count | Unstable |
-| `text_layout_fast_space_candidate_code_units` | Counter | Count | Unstable |
-| `text_layout_fast_ascii_candidate_code_units` | Counter | Count | Unstable |
-| `text_ascii_replacement_code_units_screened` | Counter | Count | Unstable |
-| `text_ascii_replacement_code_units_eligible` | Counter | Count | Unstable |
-| `text_ascii_replacement_code_units_attempted` | Counter | Count | Unstable |
-| `text_ascii_replacement_code_units_trusted_fast_path` | Counter | Count | Unstable |
-| `text_ascii_replacement_code_units_succeeded` | Counter | Count | Unstable |
-| `text_ascii_replacement_code_units_fallback` | Counter | Count | Unstable |
 
 ## Atlas blocks
 

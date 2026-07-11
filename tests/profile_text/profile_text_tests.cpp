@@ -154,10 +154,6 @@ bool test_profile_text_sections(QGuiApplication& app)
     stream << '\n';
     diag::append_session_profile_stats_text(surface, stream);
     stream << '\n';
-    diag::append_renderer_stats_text(surface, stream);
-    stream << '\n';
-    diag::append_cumulative_renderer_stats_text(surface, stream);
-    stream << '\n';
     diag::append_qsg_atlas_profile_text(surface, stream);
     stream << '\n';
     diag::append_slow_text_layout_diagnostics_text(surface, stream);
@@ -232,51 +228,6 @@ bool test_profile_text_sections(QGuiApplication& app)
         "session_profile_stats reports max_retained_snapshot_generation_count");
     ok &= check(text.contains(QStringLiteral("  public_projection_scroll_publications=")),
         "session_profile_stats reports public_projection_scroll_publications");
-    ok &= check(text.contains(QStringLiteral("last_renderer_stats\n")),
-        "append_renderer_stats_text emits the legacy renderer header");
-    const QString last_renderer_stats = profile_text_section(
-        text,
-        QStringLiteral("last_renderer_stats\n"),
-        QStringLiteral("cumulative_renderer_stats\n"));
-    ok &= check(
-        last_renderer_stats.contains(
-            QStringLiteral("  compatibility_scope=legacy_renderer_frame_counters\n")),
-        "last_renderer_stats reports legacy compatibility scope");
-    ok &= check(
-        last_renderer_stats.contains(
-            QStringLiteral("  canonical_renderer_section=qsg_atlas\n")),
-        "last_renderer_stats points to qsg_atlas as canonical");
-    ok &= check(
-        last_renderer_stats.contains(QStringLiteral("  paint_completed=")),
-        "last_renderer_stats reports paint completion compatibility state");
-    ok &= check(
-        !profile_text_contains_counter(last_renderer_stats, "frame_row_descriptors_built"),
-        "last_renderer_stats does not expose legacy frame descriptor details");
-    ok &= check(text.contains(QStringLiteral("cumulative_renderer_stats\n")),
-        "append_cumulative_renderer_stats_text emits the legacy cumulative renderer header");
-    const QString cumulative_renderer_stats = profile_text_section(
-        text,
-        QStringLiteral("cumulative_renderer_stats\n"),
-        QStringLiteral("qsg_atlas\n"));
-    ok &= check(
-        cumulative_renderer_stats.contains(
-            QStringLiteral("  compatibility_scope=legacy_renderer_frame_counters\n")),
-        "cumulative_renderer_stats reports legacy compatibility scope");
-    ok &= check(
-        cumulative_renderer_stats.contains(
-            QStringLiteral("  canonical_renderer_section=qsg_atlas\n")),
-        "cumulative_renderer_stats points to qsg_atlas as canonical");
-    ok &= check(profile_text_contains_counter(cumulative_renderer_stats, "frames_published"),
-        "cumulative_renderer_stats reports frame publication count");
-    ok &= check(
-        profile_text_contains_counter(cumulative_renderer_stats, "paint_completed_frames"),
-        "cumulative_renderer_stats reports paint completion count");
-    ok &= check(
-        profile_text_contains_counter(cumulative_renderer_stats, "qsg_atlas_render_count"),
-        "cumulative_renderer_stats reports atlas render count");
-    ok &= check(
-        !profile_text_contains_counter(cumulative_renderer_stats, "qsg_layer_descriptors"),
-        "cumulative_renderer_stats does not expose legacy QSG layer descriptor details");
     ok &= check(text.contains(QStringLiteral("qsg_atlas\n")),
         "append_qsg_atlas_profile_text emits the qsg_atlas header");
     const QString qsg_atlas = profile_text_section(
