@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <new>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -281,6 +282,83 @@ bool test_explicit_discard_advances_live_bounds()
     return ok;
 }
 
+bool test_descriptor_allocation_failure_does_not_start_commit()
+{
+    bool ok = true;
+
+    term::Terminal_history_ring ring({512U, 512U});
+    constexpr std::string_view records[] = {
+        "record-00-abcdef",
+        "record-01-abcdef",
+        "record-02-abcdef",
+        "record-03-abcdef",
+        "record-04-abcdef",
+        "record-05-abcdef",
+        "record-06-abcdef",
+        "record-07-abcdef",
+        "record-08-abcdef",
+    };
+    for (std::string_view record : records) {
+        const term::terminal_history_ring_commit_result_t commit =
+            append_record(ring, record);
+        ok &= check(commit.status == term::Terminal_history_ring_status::OK,
+            "ring allocation-failure fixture commit succeeds");
+    }
+
+    const std::uint64_t tail_before_failure = ring.oldest_live_byte_sequence();
+    const std::uint64_t head_before_failure = ring.head_byte_sequence();
+    const term::Terminal_history_ring_record_index_result descriptors_before_failure =
+        ring.live_record_descriptors();
+    ok &= check(descriptors_before_failure.status == term::Terminal_history_ring_status::OK &&
+            descriptors_before_failure.records.size() == std::size(records) &&
+            !descriptors_before_failure.records.empty(),
+        "ring allocation-failure fixture captures the live descriptor index");
+    if (descriptors_before_failure.records.empty()) {
+        return false;
+    }
+
+    bool allocation_failed = false;
+    try {
+        term::Terminal_history_ring_record_reservation reservation =
+            ring.reserve_record(std::string_view("record-09-abcdef").size());
+        fill_payload(reservation, "record-09-abcdef");
+        ring.fail_next_record_descriptor_allocation_for_testing();
+        (void)ring.commit(std::move(reservation));
+    }
+    catch (const std::bad_alloc&) {
+        allocation_failed = true;
+    }
+    ok &= check(allocation_failed,
+        "ring descriptor allocation failure propagates before commit");
+
+    const term::Terminal_history_ring_record_index_result descriptors_after_failure =
+        ring.live_record_descriptors();
+    ok &= check(ring.oldest_live_byte_sequence() == tail_before_failure &&
+            ring.head_byte_sequence() == head_before_failure,
+        "ring descriptor allocation failure preserves published byte bounds");
+    ok &= check(descriptors_after_failure.status == term::Terminal_history_ring_status::OK &&
+            !descriptors_after_failure.records.empty() &&
+            descriptors_after_failure.records.size() == descriptors_before_failure.records.size() &&
+            descriptors_after_failure.records.front().byte_sequence ==
+                descriptors_before_failure.records.front().byte_sequence &&
+            descriptors_after_failure.records.back().byte_sequence ==
+                descriptors_before_failure.records.back().byte_sequence,
+        "ring descriptor allocation failure preserves the live descriptor index");
+
+    const term::Terminal_history_ring_read_scope oldest_after_failure =
+        ring.read_record(tail_before_failure);
+    ok &= check(oldest_after_failure.ok() && payload_equal(oldest_after_failure, records[0]),
+        "ring descriptor allocation failure preserves the oldest live payload");
+
+    const term::terminal_history_ring_commit_result_t retry =
+        append_record(ring, "record-09-abcdef");
+    ok &= check(retry.status == term::Terminal_history_ring_status::OK &&
+            retry.tail_advanced,
+        "ring descriptor allocation failure releases the reservation for a later commit");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -291,5 +369,6 @@ int main()
     ok &= test_wrap_traversal_tail_boundaries_and_rebuild();
     ok &= test_read_scope_failure_translation();
     ok &= test_explicit_discard_advances_live_bounds();
+    ok &= test_descriptor_allocation_failure_does_not_start_commit();
     return ok ? 0 : 1;
 }

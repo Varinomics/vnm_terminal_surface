@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <new>
 #include <numeric>
 #include <utility>
 
@@ -137,12 +138,12 @@ Terminal_history_ring_status terminal_history_ring_status_from_backend_snapshot(
     Terminal_history_ring_backend_snapshot_status backend_status)
 {
     switch (backend_status) {
-    case Terminal_history_ring_backend_snapshot_status::OK:
-        return Terminal_history_ring_status::OK;
-    case Terminal_history_ring_backend_snapshot_status::STALE:
-        return Terminal_history_ring_status::SNAPSHOT_STALE;
-    case Terminal_history_ring_backend_snapshot_status::RETRY:
-        return Terminal_history_ring_status::SNAPSHOT_RETRY;
+        case Terminal_history_ring_backend_snapshot_status::OK:
+            return Terminal_history_ring_status::OK;
+        case Terminal_history_ring_backend_snapshot_status::STALE:
+            return Terminal_history_ring_status::SNAPSHOT_STALE;
+        case Terminal_history_ring_backend_snapshot_status::RETRY:
+            return Terminal_history_ring_status::SNAPSHOT_RETRY;
     }
 
     return Terminal_history_ring_status::SNAPSHOT_RETRY;
@@ -411,15 +412,6 @@ terminal_history_ring_commit_result_t Terminal_history_ring::commit(
         return result;
     }
 
-    bool tail_advanced = false;
-    const Terminal_history_ring_status room_status =
-        make_room_for(reservation.m_record_bytes, tail_advanced);
-    if (room_status != Terminal_history_ring_status::OK) {
-        result.status = room_status;
-        reservation.release();
-        return result;
-    }
-
     terminal_history_ring_record_descriptor_t descriptor;
     const Terminal_history_ring_status validation_status = validate_record_bytes(
         reservation.m_bytes,
@@ -431,11 +423,36 @@ terminal_history_ring_commit_result_t Terminal_history_ring::commit(
         return result;
     }
 
+    std::size_t   records_to_discard            = 0U;
+    std::uint64_t new_oldest_live_byte_sequence = oldest_live_byte_sequence();
+    const Terminal_history_ring_status room_status = plan_room_for(
+        reservation.m_record_bytes,
+        records_to_discard,
+        new_oldest_live_byte_sequence);
+    if (room_status != Terminal_history_ring_status::OK) {
+        result.status = room_status;
+        reservation.release();
+        return result;
+    }
+
+    if (std::exchange(m_fail_next_record_descriptor_allocation_for_testing, false)) {
+        throw std::bad_alloc();
+    }
+    m_records.push_back(descriptor);
+
+    for (std::size_t record_index = 0U; record_index < records_to_discard; ++record_index) {
+        m_records.pop_front();
+    }
+    if (records_to_discard > 0U) {
+        m_oldest_live_byte_sequence.store(
+            new_oldest_live_byte_sequence,
+            std::memory_order_release);
+    }
+
     write_record_bytes(reservation.m_byte_sequence, reservation.m_bytes);
 
     const std::uint64_t new_head =
         reservation.m_byte_sequence + reservation.m_record_bytes;
-    m_records.push_back(descriptor);
     m_record_index_valid = true;
     m_head_byte_sequence.store(new_head, std::memory_order_release);
 
@@ -444,7 +461,7 @@ terminal_history_ring_commit_result_t Terminal_history_ring::commit(
     result.record_bytes              = reservation.m_record_bytes;
     result.oldest_live_byte_sequence = oldest_live_byte_sequence();
     result.head_byte_sequence        = new_head;
-    result.tail_advanced             = tail_advanced;
+    result.tail_advanced             = records_to_discard > 0U;
 
     reservation.release();
     return result;
@@ -631,13 +648,15 @@ void Terminal_history_ring::release_reservation() noexcept
     m_reservation_open = false;
 }
 
-Terminal_history_ring_status Terminal_history_ring::make_room_for(
-    std::uint32_t record_bytes,
-    bool&         out_tail_advanced)
+Terminal_history_ring_status Terminal_history_ring::plan_room_for(
+    std::uint32_t  record_bytes,
+    std::size_t&   out_records_to_discard,
+    std::uint64_t& out_new_oldest_live_byte_sequence)
 {
-    VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_ring::make_room_for");
+    VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_ring::plan_room_for");
 
-    out_tail_advanced = false;
+    out_records_to_discard            = 0U;
+    out_new_oldest_live_byte_sequence = oldest_live_byte_sequence();
 
     if (record_bytes > max_record_bytes()) {
         return Terminal_history_ring_status::OVERSIZE_RECORD;
@@ -654,17 +673,15 @@ Terminal_history_ring_status Terminal_history_ring::make_room_for(
     }
 
     const std::uint64_t required_head = head + record_bytes;
-    while (required_head - oldest_live_byte_sequence() > m_capacity_bytes) {
-        if (m_records.empty()) {
+    while (required_head - out_new_oldest_live_byte_sequence > m_capacity_bytes) {
+        if (out_records_to_discard >= m_records.size()) {
             return Terminal_history_ring_status::INVALID_RECORD;
         }
 
-        const terminal_history_ring_record_descriptor_t oldest = m_records.front();
-        m_records.pop_front();
-        m_oldest_live_byte_sequence.store(
-            oldest.byte_sequence + oldest.record_bytes,
-            std::memory_order_release);
-        out_tail_advanced = true;
+        const terminal_history_ring_record_descriptor_t oldest =
+            m_records[out_records_to_discard];
+        out_new_oldest_live_byte_sequence = oldest.byte_sequence + oldest.record_bytes;
+        ++out_records_to_discard;
     }
 
     return Terminal_history_ring_status::OK;
@@ -732,10 +749,8 @@ Terminal_history_ring_status Terminal_history_ring::validate_record_bytes(
 
 void Terminal_history_ring::write_record_bytes(
     std::uint64_t              byte_sequence,
-    std::span<const std::byte> bytes)
+    std::span<const std::byte> bytes) noexcept
 {
-    VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_ring::write_record_bytes");
-
     const std::size_t start = static_cast<std::size_t>(byte_sequence % m_capacity_bytes);
     const std::size_t first = std::min(bytes.size(), m_capacity_bytes - start);
 
