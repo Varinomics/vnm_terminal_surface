@@ -15,12 +15,18 @@
 #include <new>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
 namespace term = vnm_terminal::internal;
 
 namespace {
+
+static_assert(!std::is_copy_constructible_v<term::Terminal_screen_model>);
+static_assert(!std::is_copy_assignable_v<term::Terminal_screen_model>);
+static_assert(std::is_nothrow_move_constructible_v<term::Terminal_screen_model>);
+static_assert(std::is_nothrow_move_assignable_v<term::Terminal_screen_model>);
 
 using vnm_terminal::test_helpers::check;
 using vnm_terminal::test_helpers::Primary_backing_observation_classification;
