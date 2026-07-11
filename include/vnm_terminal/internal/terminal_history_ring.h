@@ -197,14 +197,20 @@ public:
     Terminal_history_ring_status rebuild_record_index();
     Terminal_history_ring_record_index_result live_record_descriptors();
 
+    void fail_next_record_descriptor_allocation_for_testing()
+    {
+        m_fail_next_record_descriptor_allocation_for_testing = true;
+    }
+
 private:
     friend class Terminal_history_ring_record_reservation;
 
     void release_reservation() noexcept;
 
-    Terminal_history_ring_status make_room_for(
-        std::uint32_t record_bytes,
-        bool&         out_tail_advanced);
+    Terminal_history_ring_status plan_room_for(
+        std::uint32_t  record_bytes,
+        std::size_t&   out_records_to_discard,
+        std::uint64_t& out_new_oldest_live_byte_sequence);
     Terminal_history_ring_status ensure_record_index();
     Terminal_history_ring_status validate_record_bytes(
         std::span<const std::byte>                    bytes,
@@ -213,7 +219,7 @@ private:
 
     void write_record_bytes(
         std::uint64_t              byte_sequence,
-        std::span<const std::byte> bytes);
+        std::span<const std::byte> bytes) noexcept;
     std::vector<std::byte> copy_record_bytes(
         std::uint64_t byte_sequence,
         std::uint32_t record_bytes) const;
@@ -227,6 +233,7 @@ private:
     Terminal_history_ring_status   m_status = Terminal_history_ring_status::INVALID_CAPACITY;
     bool                           m_record_index_valid = true;
     bool                           m_reservation_open   = false;
+    bool                           m_fail_next_record_descriptor_allocation_for_testing = false;
 };
 
 }
