@@ -411,6 +411,7 @@ public:
     void discard_retained_lookup_cache_for_testing() const;
     void reset_retained_history_decode_live_row_call_count_for_testing() const;
     std::uint64_t retained_history_decode_live_row_call_count_for_testing() const;
+    bool retained_history_storage_allocated_for_testing() const;
     Terminal_retained_line_provenance retained_line_provenance_for_testing(
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
@@ -554,6 +555,7 @@ private:
         Retained_history_storage(Retained_history_storage&&) noexcept;
         Retained_history_storage& operator=(Retained_history_storage&&) noexcept;
 
+        void ensure_allocated();
         void reset();
         void track_record_in_reserved_index_slot(
             terminal_history_handle_t                history_handle,
