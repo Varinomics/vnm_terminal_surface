@@ -316,6 +316,7 @@ struct terminal_history_prefix_plain_ascii_retention_estimate_t
 struct terminal_screen_model_hyperlink_table_stats_t
 {
     std::uint64_t              compaction_count        = 0U;
+    // Number of known IDs removed by pruning and identity deduplication.
     std::uint64_t              reclaimed_hyperlink_ids = 0U;
 };
 
@@ -335,6 +336,7 @@ struct terminal_retained_history_diagnostics_t
     std::uint64_t              reclaimed_styles       = 0U;
 
     std::uint64_t              hyperlink_compaction_count = 0U;
+    // Number of known IDs removed by pruning and identity deduplication.
     std::uint64_t              reclaimed_hyperlink_ids    = 0U;
 
     terminal_history_prefix_plain_ascii_retention_estimate_t
@@ -527,15 +529,10 @@ private:
         bool                      valid = false;
         std::map<std::uint64_t, retained_lookup_cache_entry_t>
                                   by_row_sequence;
-        std::vector<terminal_history_handle_t>
-                                  by_logical_row;
 
         bool invalidated() const
         {
-            return
-                !valid                 &&
-                by_row_sequence.empty() &&
-                by_logical_row.empty();
+            return !valid && by_row_sequence.empty();
         }
     };
 
@@ -559,7 +556,6 @@ private:
         void reset();
         void track_record_in_reserved_index_slot(
             terminal_history_handle_t                history_handle,
-            std::uint32_t                            record_bytes,
             Terminal_history_row_record_payload_kind payload_kind) noexcept;
         void discard_index_prefix(std::size_t record_count) const noexcept;
 
@@ -569,8 +565,6 @@ private:
                                   traversal;
         mutable std::deque<retained_history_index_entry_t>
                                   index;
-        mutable std::uint64_t     retained_record_bytes   = 0U;
-        mutable std::uint64_t     generic_compact_rows    = 0U;
         mutable std::uint64_t     prefix_plain_ascii_rows = 0U;
     };
 
@@ -1186,9 +1180,6 @@ private:
     Terminal_history_resolution_status retained_lookup_cache_entry_status(
         Terminal_buffer_id             buffer_id,
         const retained_lookup_cache_entry_t& entry) const;
-    std::optional<terminal_history_handle_t> retained_lookup_cache_handle_at_logical_row(
-        Terminal_buffer_id             buffer_id,
-        int                            logical_row) const;
 
     bool selection_line_lease_logical_rows(
         Terminal_buffer_id             buffer_id,
