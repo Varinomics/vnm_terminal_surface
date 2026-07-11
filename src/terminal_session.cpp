@@ -3364,6 +3364,15 @@ Terminal_screen_model_profile_stats Terminal_session::model_profile_stats() cons
         : Terminal_screen_model_profile_stats{};
 }
 
+terminal_retained_history_diagnostics_t Terminal_session::retained_history_diagnostics() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_screen_model.has_value()
+        ? m_screen_model->retained_history_diagnostics()
+        : terminal_retained_history_diagnostics_t{};
+}
+
 Terminal_session_profile_stats Terminal_session::profile_stats() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);

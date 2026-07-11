@@ -47,14 +47,18 @@ exported include directories and asserts the public headers are present
 - `append_backend_drain_metrics_json(surface, out)` fills `out` with backend
   callback drain/pump counters, including stage timings and frame-pending
   scheduling counters.
+- `append_retained_history_metrics_json(surface, out)` fills `out` with live
+  ring measurements, compaction counters, and the nested codec-owned
+  `prefix_plain_ascii_estimate` value.
 
 The caller owns the surrounding document and chooses the enclosing keys; the
 first-party app nests these under `"renderer"`, `"qsg_atlas"`,
-`"render_invalidation"`, and `"backend_drain"` in its runtime metrics
-document for compatibility. Treat `"qsg_atlas"` as the canonical renderer
+`"render_invalidation"`, `"backend_drain"`, and `"retained_history"` in its
+runtime metrics document. Treat `"qsg_atlas"` as the canonical renderer
 diagnostics object. The render invalidation and backend drain sections are
 runtime JSON-only sections: they are not descriptor-backed JSON/TEXT metric
-blocks and do not have matching profile-text output. The descriptor-backed key
+blocks and do not have matching profile-text output. Retained history is a
+descriptor-backed JSON/TEXT block. The descriptor-backed key
 sets and their units and stability classes are recorded in
 `diagnostics_schema.md`; the structural expectations are pinned by
 `tests/qt_metrics/qt_metrics_tests.cpp` and the `vnm_terminal_qt_metrics`
@@ -69,9 +73,10 @@ frame-evidence):
 ## Profile Text
 
 `vnm_terminal/diagnostics/profile_text.h` declares one builder per report
-section (dirty-row stats and timeline, model/session profile stats, legacy
-renderer compatibility sections, atlas profile, slow-text-layout diagnostics,
-surface geometry, render-thread profile). Each call appends exactly the bytes
+section (dirty-row stats and timeline, model/session profile stats,
+retained-history diagnostics, legacy renderer compatibility sections, atlas
+profile, slow-text-layout diagnostics, surface geometry, render-thread
+profile). Each call appends exactly the bytes
 of one section to a `QTextStream`, with no leading or trailing blank line; the
 caller frames the document and writes the inter-section separators. Section
 content is profiling data, so the whole header body is
@@ -124,6 +129,10 @@ QJsonObject backend_drain;
 vnm_terminal::diagnostics::append_backend_drain_metrics_json(
     *surface, backend_drain);
 metrics.insert("backend_drain", backend_drain);
+QJsonObject retained_history;
+vnm_terminal::diagnostics::append_retained_history_metrics_json(
+    *surface, retained_history);
+metrics.insert("retained_history", retained_history);
 metrics.insert("paint_completed_frames",
     static_cast<qint64>(surface->paint_completed_frame_count()));
 metrics.insert("qsg_atlas_render_frames",

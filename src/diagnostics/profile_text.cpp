@@ -535,6 +535,25 @@ void append_model_profile_stats_section(
         stats.max_render_snapshot_fallback_text_units_per_cell);
 }
 
+void append_retained_history_profile_section(
+    QTextStream&                                         stream,
+    const term::terminal_retained_history_diagnostics_t& diagnostics)
+{
+    stream << "retained_history\n";
+    detail::emit_metrics_text(
+        stream,
+        diagnostics,
+        detail::retained_history_metrics<
+            term::terminal_retained_history_diagnostics_t>());
+    stream << "  prefix_plain_ascii_estimate\n";
+    detail::emit_metrics_text(
+        stream,
+        diagnostics.prefix_plain_ascii_estimate,
+        detail::retained_history_estimate_metrics<
+            term::terminal_history_prefix_plain_ascii_retention_estimate_t>(),
+        "    ");
+}
+
 void append_session_profile_stats_section(
     QTextStream&                              stream,
     const term::Terminal_session_profile_stats& stats)
@@ -1509,6 +1528,15 @@ void append_model_profile_stats_text(const VNM_TerminalSurface& surface, QTextSt
     append_model_profile_stats_section(
         out,
         term::VNM_TerminalSurface_render_bridge::model_profile_stats(surface));
+}
+
+void append_retained_history_profile_text(
+    const VNM_TerminalSurface& surface,
+    QTextStream&               out)
+{
+    append_retained_history_profile_section(
+        out,
+        term::VNM_TerminalSurface_render_bridge::retained_history_diagnostics(surface));
 }
 
 void append_session_profile_stats_text(const VNM_TerminalSurface& surface, QTextStream& out)
