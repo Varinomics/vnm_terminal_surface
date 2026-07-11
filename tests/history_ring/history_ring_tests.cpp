@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <new>
 #include <span>
 #include <string_view>
@@ -338,17 +339,28 @@ bool test_descriptor_allocation_failure_does_not_start_commit()
         "ring descriptor allocation failure preserves published byte bounds");
     ok &= check(descriptors_after_failure.status == term::Terminal_history_ring_status::OK &&
             !descriptors_after_failure.records.empty() &&
-            descriptors_after_failure.records.size() == descriptors_before_failure.records.size() &&
-            descriptors_after_failure.records.front().byte_sequence ==
-                descriptors_before_failure.records.front().byte_sequence &&
-            descriptors_after_failure.records.back().byte_sequence ==
-                descriptors_before_failure.records.back().byte_sequence,
+            descriptors_after_failure.records.size() == descriptors_before_failure.records.size(),
         "ring descriptor allocation failure preserves the live descriptor index");
 
-    const term::Terminal_history_ring_read_scope oldest_after_failure =
-        ring.read_record(tail_before_failure);
-    ok &= check(oldest_after_failure.ok() && payload_equal(oldest_after_failure, records[0]),
-        "ring descriptor allocation failure preserves the oldest live payload");
+    if (descriptors_after_failure.records.size() == descriptors_before_failure.records.size()) {
+        for (std::size_t index = 0U; index < descriptors_before_failure.records.size(); ++index) {
+            const term::terminal_history_ring_record_descriptor_t& before =
+                descriptors_before_failure.records[index];
+            const term::terminal_history_ring_record_descriptor_t& after =
+                descriptors_after_failure.records[index];
+            ok &= check(
+                after.byte_sequence == before.byte_sequence &&
+                    after.record_bytes == before.record_bytes &&
+                    after.payload_bytes == before.payload_bytes,
+                "ring descriptor allocation failure preserves every descriptor field");
+
+            const term::Terminal_history_ring_read_scope read_after_failure =
+                ring.read_record(after.byte_sequence);
+            ok &= check(read_after_failure.ok() &&
+                    payload_equal(read_after_failure, records[index]),
+                "ring descriptor allocation failure preserves every live payload");
+        }
+    }
 
     const term::terminal_history_ring_commit_result_t retry =
         append_record(ring, "record-09-abcdef");

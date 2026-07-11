@@ -1349,6 +1349,25 @@ bool test_hyperlink_compaction_allocation_failure_is_transactional()
             ok &= check(model.next_hyperlink_id_for_testing() == 3U,
                 "hyperlink compaction retry succeeds after bad_alloc at phase " +
                     std::to_string(phase_index));
+
+            const term::Terminal_screen_model_result recovery_result =
+                model.ingest(QByteArrayLiteral("\x1b[?25h"));
+            const term::Terminal_render_snapshot recovered_snapshot =
+                model.render_snapshot(request_for_model(model, 39U + phase_index, 1));
+            const term::Terminal_render_cell* recovered_cell =
+                cell_with_text(recovered_snapshot, QStringLiteral("a"));
+            const term::Terminal_render_hyperlink_metadata* recovered_link =
+                recovered_cell == nullptr
+                    ? nullptr
+                    : hyperlink_by_id(recovered_snapshot, recovered_cell->hyperlink_id);
+            ok &= check(
+                recovery_result.recovery_proposals.size() == 1U &&
+                    recovered_cell != nullptr &&
+                    recovered_cell->hyperlink_id == 1U &&
+                    recovered_link != nullptr &&
+                    recovered_link->uri == QByteArrayLiteral("https://recovered.example"),
+                "failed hyperlink compaction preserves recovery-candidate link id and URI at phase " +
+                    std::to_string(phase_index));
         }
     }
 
