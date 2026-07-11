@@ -255,9 +255,7 @@ public:
     Q_ENUM(Scroll_action)
 
     // Diagnostic schema strings for the scroll-diagnostic enums. NONE maps to an
-    // empty string, matching the unset QString these fields previously held, so
-    // transcript and wheel-trace output is byte-for-byte unchanged. Hosts should
-    // branch on the enum values, not on these strings.
+    // empty string. Hosts should branch on the enum values, not on these strings.
     static QString scroll_noop_cause_name(Scroll_noop_cause cause);
     static QString scroll_action_name(Scroll_action action);
 

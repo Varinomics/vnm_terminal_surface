@@ -233,9 +233,8 @@ The C++ diagnostic scroll overloads (`scroll_viewport_lines_with_diagnostics()`,
 (for example, the bundled scrollbar distinguishing a `BOUNDARY_OR_CLAMP` no-op
 from a real movement) MUST branch on these enum values. `scroll_noop_cause_name()`
 and `scroll_action_name()` exist ONLY to format those enums for transcript/debug
-output (`NONE` maps to an empty string, matching the unset field these diagnostics
-formerly carried); they are not control-flow API, and their string spellings are
-diagnostic schema, not a stability contract.
+output (`NONE` maps to an empty string); they are not control-flow API, and their
+string spellings are diagnostic schema, not a stability contract.
 
 ## Clipboard Policy
 

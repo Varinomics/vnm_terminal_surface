@@ -22,7 +22,7 @@ namespace detail = vnm_terminal::diagnostics::detail;
 namespace term   = vnm_terminal::internal;
 
 // ---------------------------------------------------------------------------
-// Atlas diagnostics blocks (R2.3 Slice 2).
+// Atlas diagnostics blocks.
 //
 // Each atlas block is emitted by the shared detail emitters over a dedicated
 // descriptor table. The oracle below is independently spelled out: for each

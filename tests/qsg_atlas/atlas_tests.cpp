@@ -11356,9 +11356,8 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         color_report,
         Atlas_msdf_steady_buffer_expectation::PARTIAL);
 
-    // Batch 1 instrumentation assertions. The baseline frame builds and uploads
-    // exactly one MSDF atlas; the steady same-size frames reuse it with no extra
-    // build or upload. Cross-size reuse is not enabled until Batch 3.
+    // The baseline frame builds and uploads exactly one MSDF atlas; steady
+    // same-size frames reuse it without another build or upload.
     ok &= check(
         baseline_report.render.msdf_text_cache_miss &&
             baseline_report.render.msdf_text_atlas_build_attempted &&
@@ -11368,10 +11367,9 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         baseline_report.render.msdf_text_atlas_build_attempts_total == 1U &&
             baseline_report.render.msdf_text_atlas_texture_uploads_total == 1U,
         "atlas MSDF resource stability builds and uploads the atlas exactly once at baseline");
-    // Batch 2: the library bakes at max(draw_pixel_height,
-    // ceil(min_atlas_font_size)). The renderer's min_atlas_font_size is 48 and the
-    // 18px test font draws below it, so the baked height is the 48px floor and is
-    // deliberately distinct from the draw height.
+    // The library bakes at max(draw_pixel_height, ceil(min_atlas_font_size)).
+    // The renderer's minimum is 48 and the 18px test font draws below it, so the
+    // baked height is deliberately distinct from the draw height.
     constexpr int k_msdf_min_bake_pixel_height = 48;
     ok &= check(
         baseline_report.render.msdf_text_baked_pixel_height ==
@@ -11389,13 +11387,9 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
             color_report.render.msdf_text_atlas_texture_uploads_total == 1U,
         "atlas MSDF resource stability does not rebuild or re-upload for steady same-size frames");
 
-    // Batch 3 cache-identity check: a font-size change that stays in the same
-    // bake bucket (the 18px and 30px draw heights both fall at or below the 48px
-    // floor) reuses the baked atlas. The draw layout changes, but there is no
-    // rebuild and no re-upload, so the cumulative build/upload counts stay at one
-    // and the baked generation is stable. This also exercises the resource-
-    // lifetime split: the MSDF pipelines, shader-resource bindings, and atlas
-    // texture all survive the font-size change.
+    // A font-size change within the same bake bucket reuses the baked atlas. The
+    // draw layout changes, but the build/upload counts and baked generation stay
+    // stable; pipelines, shader-resource bindings, and the texture survive.
     const Msdf_text_draw_identity baseline_draw_identity =
         msdf_text_draw_identity(baseline_report.render);
     surface.set_font_size(30.0);
@@ -18555,8 +18549,8 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     const bool msdf_text_renderer_active =
         atlas.atlas_report.render.msdf_text_renderer_active;
 
-    // Batch 1 targets the pinned Windows D3D11 hardware path; missing
-    // dual-source probing or sample-family glyph images is a gate failure here.
+    // The pinned Windows D3D11 hardware path requires dual-source probing and
+    // sample-family glyph images.
     bool ok = true;
     ok &= check(
         lcd_probe_image_has_pixels(atlas.image),

@@ -1610,13 +1610,13 @@ bool test_snapshot_rows_cover_primary_retained_and_alternate_sources()
     ok &= check(stats.render_snapshots_constructed == 3U &&
         stats.render_snapshot_rows_visited == 6U &&
         stats.render_snapshot_rows_materialized == 6U,
-        "row-source snapshots preserve historical visited/materialized profile counts");
+        "row-source snapshots report the expected visited/materialized profile counts");
     ok &= check(stats.render_snapshot_rows_borrowed == 5U &&
         stats.render_snapshot_rows_owned == 1U,
         "row-source snapshots split borrowed and owned row-cell sources");
     ok &= check(stats.render_snapshot_rows_built_from_model_storage == 6U &&
         stats.render_snapshot_model_row_accessor_borrows == 5U,
-        "row-source snapshots expose explicit Batch 1 row-source counters");
+        "row-source snapshots expose explicit row-source counters");
     ok &= check(stats.render_snapshot_compact_ascii_text_cells == 17U &&
         stats.render_snapshot_compact_empty_text_cells == 0U &&
         stats.render_snapshot_fallback_qstring_copies == 0U,

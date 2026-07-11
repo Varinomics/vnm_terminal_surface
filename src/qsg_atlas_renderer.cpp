@@ -339,9 +339,8 @@ struct Msdf_terminal_draw_layout_state
     std::unordered_map<char32_t, msdf_text::scaled_glyph_t> scaled_glyphs;
 };
 
-// Lifetime-cumulative MSDF instrumentation counters (Batch 1). These persist
-// across frames so a zoom gesture's atlas build/upload churn cannot be hidden
-// by a later clean frame before metrics are captured.
+// These lifetime-cumulative counters persist across frames so a zoom gesture's
+// atlas build/upload churn cannot be hidden by a later clean frame.
 struct Msdf_text_zoom_counters
 {
     std::uint64_t atlas_build_attempts  = 0U;
@@ -5595,9 +5594,8 @@ private:
         const std::array<float, 4>&       background_color,
         qreal                             normalized_device_pixel_ratio)
     {
-        // Batch 3: the scaled glyph is precomputed once per draw-layout state in
-        // m_msdf_draw_layout.scaled_glyphs, so the per-cell path does no scaling
-        // division here.
+        // The draw-layout state precomputes scaled glyphs, so the per-cell path
+        // does no scaling division here.
         const qreal physical_origin_x = physical_baseline_origin.x();
         const qreal physical_origin_y = physical_baseline_origin.y();
         const qreal physical_left =

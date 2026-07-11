@@ -519,8 +519,7 @@ QByteArray encode_terminal_mouse_event(
 {
     VNM_TERMINAL_PROFILE_SCOPE("encode_terminal_mouse_event");
 
-    // This phase only emits SGR 1006 mouse reports. Legacy coordinate encodings
-    // are deliberately unsupported until the backend/input contract needs them.
+    // Mouse output uses SGR 1006. Other coordinate encodings are unsupported.
     if (!modes.sgr_mouse_encoding ||
         modes.mouse_tracking == Terminal_input_mouse_tracking_mode::NONE ||
         modes.mouse_tracking == Terminal_input_mouse_tracking_mode::X10  ||

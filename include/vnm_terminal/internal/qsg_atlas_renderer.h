@@ -499,10 +499,8 @@ struct Qsg_atlas_render_summary
     int           msdf_text_pixel_height             = 0;
     int           msdf_text_atlas_size               = 0;
     float         msdf_text_px_range                 = 0.0f;
-    // Zoom-validation instrumentation (Batch 1). In Batch 1 the baked pixel
-    // height equals the draw pixel height; baked/draw separation arrives in
-    // Batch 3. Cross-size atlas reuse is not yet enabled, so
-    // msdf_text_baked_atlas_reused is diagnostic-only until then.
+    // Zoom diagnostics distinguish draw size from baked atlas size and report
+    // whether compatible baked atlas content was reused.
     int           msdf_text_baked_pixel_height       = 0;
     std::uint64_t msdf_text_atlas_generation         = 0U;
     bool          msdf_text_cache_hit                = false;
