@@ -227,11 +227,8 @@ public:
         std::uint64_t              reported_publication_generation,
         bool                       drew);
 
-    static terminal_renderer_stats_t last_renderer_stats(
-        const VNM_TerminalSurface& surface);
-
-    static terminal_renderer_cumulative_stats_t cumulative_renderer_stats(
-        const VNM_TerminalSurface& surface);
+    static void reconcile_atlas_completion_for_testing(
+        VNM_TerminalSurface& surface);
 
     static terminal_renderer_lifecycle_stats_t lifecycle_stats(
         const VNM_TerminalSurface& surface);

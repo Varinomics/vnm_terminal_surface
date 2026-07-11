@@ -976,11 +976,8 @@ std::optional<term::Qsg_atlas_frame_report> capture_next_surface_frame(
         const QImage image = window.grabWindow();
         const term::Qsg_atlas_frame_report report =
             term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-        const term::terminal_renderer_stats_t renderer_stats =
-            term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
         if (!image.isNull() &&
-            report.capture_count > previous_capture_count &&
-            renderer_stats.text_content_failures == 0)
+            report.capture_count > previous_capture_count)
         {
             return report;
         }

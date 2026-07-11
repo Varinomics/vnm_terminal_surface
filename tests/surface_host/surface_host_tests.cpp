@@ -439,11 +439,8 @@ std::optional<term::Qsg_atlas_frame_report> capture_next_surface_frame(
         const QImage image = window.grabWindow();
         const term::Qsg_atlas_frame_report atlas_report =
             term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-        const term::terminal_renderer_stats_t renderer_stats =
-            term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
         if (!image.isNull() &&
-            atlas_report.capture_count > previous_capture_count &&
-            renderer_stats.text_content_failures == 0)
+            atlas_report.capture_count > previous_capture_count)
         {
             return atlas_report;
         }
@@ -468,12 +465,8 @@ Surface_frame_attempt capture_surface_frame_attempt(
     pump_events(app, 1);
 
     const QImage image = window.grabWindow();
-    const term::terminal_renderer_stats_t renderer_stats =
-        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
     Surface_frame_attempt attempt;
-    attempt.valid =
-        !image.isNull() &&
-        renderer_stats.text_content_failures == 0;
+    attempt.valid = !image.isNull();
     attempt.report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
     return attempt;
@@ -486,14 +479,11 @@ bool capture_surface_sequence(
     std::uint64_t                  sequence)
 {
     return window_render_matches(app, window, surface, [&] {
-        const term::terminal_renderer_stats_t renderer_stats =
-            term::VNM_TerminalSurface_render_bridge::last_renderer_stats(surface);
         const term::Qsg_atlas_frame_report atlas_report =
             term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
         return
-            atlas_report.capture_count > 0U                         &&
-            atlas_report.captured_snapshot_sequence == sequence      &&
-            renderer_stats.text_content_failures == 0;
+            atlas_report.capture_count > 0U                     &&
+            atlas_report.captured_snapshot_sequence == sequence;
     });
 }
 
@@ -1658,7 +1648,8 @@ bool test_surface_no_echo_input_keeps_cursor_visible(QGuiApplication& app)
                 baseline_snapshot->metadata.publication_generation,
                 true),
         "no-echo cursor visibility reports baseline rendered");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
 
     ok &= check(!term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
             fixture.surface),
@@ -1739,7 +1730,8 @@ bool test_surface_unrendered_publication_input_keeps_cursor_visible(
                 baseline_snapshot->metadata.publication_generation,
                 true),
         "unrendered publication input reports baseline rendered");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
 
     backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b[2;1Hunrendered> "));
     backend_ptr->join_worker();
@@ -1845,7 +1837,8 @@ bool test_surface_undrawn_publication_keeps_atlas_completion_pending(
                 baseline_snapshot->metadata.publication_generation,
                 true),
         "undrawn publication pending reports baseline rendered");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
 
     backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b[2;1Hpending> "));
     backend_ptr->join_worker();
@@ -1884,7 +1877,8 @@ bool test_surface_undrawn_publication_keeps_atlas_completion_pending(
                 undrawn_snapshot->metadata.publication_generation,
                 false),
         "undrawn publication pending reports the publication without draw");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     ok &= check(
         term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
             fixture.surface),
@@ -1958,7 +1952,8 @@ bool test_surface_undrawn_publication_keeps_atlas_completion_pending(
                 completion_snapshot->metadata.publication_generation,
                 true),
         "undrawn publication pending reports the publication rendered");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     ok &= check(
         !term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
             fixture.surface),
@@ -2011,7 +2006,8 @@ bool test_surface_undrawn_publication_restores_cursor_after_render(
                 baseline_snapshot->metadata.publication_generation,
                 true),
         "undrawn publication cursor reports baseline rendered");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
 
     backend_ptr->emit_output_from_worker(QByteArrayLiteral("\x1b[2;1Hnodraw> "));
     backend_ptr->join_worker();
@@ -2042,7 +2038,8 @@ bool test_surface_undrawn_publication_restores_cursor_after_render(
                 undrawn_snapshot->metadata.publication_generation,
                 false),
         "undrawn publication cursor reports the publication without draw");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     ok &= check(
         term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
             fixture.surface),
@@ -2112,7 +2109,8 @@ bool test_surface_undrawn_publication_restores_cursor_after_render(
                 completion_snapshot->metadata.publication_generation,
                 true),
         "undrawn publication cursor reports the publication rendered");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     ok &= check(
         !term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
             fixture.surface),
@@ -2199,7 +2197,8 @@ bool test_surface_frame_boundary_output_publishes_followup_dirty_rows(QGuiApplic
                 baseline_snapshot->metadata.publication_generation,
                 true),
         "frame-boundary dirty follow-up reports baseline rendered");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     const std::uint64_t baseline_rendered_generation =
         term::VNM_TerminalSurface_render_bridge::
             session_rendered_render_snapshot_generation(fixture.surface);
@@ -4418,7 +4417,8 @@ bool test_surface_reported_atlas_completion_advances_rendered_publication(
                 publication_generation,
                 true),
         "surface atlas publication test reports the current drawn generation");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     const term::Terminal_surface_render_invalidation_stats_t stats =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(fixture.surface);
     ok &= check(
@@ -4488,7 +4488,8 @@ bool test_surface_stale_atlas_completion_does_not_advance_rendered_publication(
                 stale_generation,
                 true),
         "surface stale atlas completion test reports an older rendered generation");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     ok &= check(
         term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
             fixture.surface),
@@ -4511,7 +4512,8 @@ bool test_surface_stale_atlas_completion_does_not_advance_rendered_publication(
                 current_generation,
                 false),
         "surface stale atlas completion test reports current generation without draw");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     ok &= check(
         term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
             fixture.surface),
@@ -4529,7 +4531,8 @@ bool test_surface_stale_atlas_completion_does_not_advance_rendered_publication(
                 current_generation,
                 true),
         "surface stale atlas completion test reports current drawn generation");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     ok &= check(
         !term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
             fixture.surface),
@@ -4667,7 +4670,8 @@ bool test_surface_qsg_capture_without_draw_preserves_dirty_rows(QGuiApplication&
                 baseline_snapshot->metadata.publication_generation,
                 true),
         "surface no-draw capture reports baseline rendered");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     ok &= check(
         term::VNM_TerminalSurface_render_bridge::
             session_rendered_render_snapshot_generation(fixture.surface) ==
@@ -4694,7 +4698,8 @@ bool test_surface_qsg_capture_without_draw_preserves_dirty_rows(QGuiApplication&
                 cleared_snapshot->metadata.publication_generation,
                 false),
         "surface no-draw capture reports the cleared publication without draw");
-    (void)term::VNM_TerminalSurface_render_bridge::last_renderer_stats(fixture.surface);
+    term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+        fixture.surface);
     ok &= check(
         term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
             fixture.surface),

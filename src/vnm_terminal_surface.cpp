@@ -2146,14 +2146,14 @@ struct VNM_TerminalSurface::Private
         atlas_completion_report_drew_for_testing       = false;
     }
 
-    void publish_renderer_stats(
-        const term::terminal_renderer_stats_t&   stats,
-        std::uint64_t                            snapshot_sequence,
-        std::uint64_t                            capture_sequence)
+    void publish_renderer_frame(
+        std::uint64_t snapshot_sequence,
+        std::uint64_t capture_sequence)
     {
-        renderer_stats_snapshot_sequence = snapshot_sequence;
-        renderer_stats_capture_sequence  = capture_sequence;
-        renderer_stats_publisher.publish(stats);
+        const std::lock_guard<std::mutex> lock(paint_completion_mutex);
+        published_frame_snapshot_sequence = snapshot_sequence;
+        published_frame_capture_sequence  = capture_sequence;
+        published_frame_paint_completed   = false;
     }
 
     void request_render_node_release(VNM_TerminalSurface& surface)
@@ -2231,22 +2231,31 @@ struct VNM_TerminalSurface::Private
                 atlas_completion_publication_generation;
     }
 
-    bool atlas_report_completes_published_stats(
-        const term::Qsg_atlas_frame_report& report) const
+    void record_paint_completion(
+        const term::Qsg_atlas_frame_report& report)
     {
-        return
-            renderer_stats_capture_sequence > 0U &&
-            report.render_count             > 0U &&
-            report.drew                          &&
-            report.render_capture_sequence  >= renderer_stats_capture_sequence &&
-            report.render_snapshot_sequence >= renderer_stats_snapshot_sequence;
+        const std::lock_guard<std::mutex> lock(paint_completion_mutex);
+        if (!published_frame_paint_completed                     &&
+            published_frame_capture_sequence > 0U                &&
+            report.render_count > 0U                              &&
+            report.drew                                           &&
+            report.render_capture_sequence >= published_frame_capture_sequence &&
+            report.render_snapshot_sequence >= published_frame_snapshot_sequence)
+        {
+            published_frame_paint_completed = true;
+            ++paint_completed_frame_count;
+        }
+    }
+
+    std::uint64_t current_paint_completed_frame_count() const
+    {
+        const std::lock_guard<std::mutex> lock(paint_completion_mutex);
+        return paint_completed_frame_count;
     }
 
     void complete_atlas_completion(const term::Qsg_atlas_frame_report& report)
     {
-        if (atlas_report_completes_published_stats(report)) {
-            renderer_stats_publisher.mark_paint_completed();
-        }
+        record_paint_completion(report);
         atlas_completion_pending = false;
         ++render_invalidation_stats.consumed_updates;
         render_invalidation_stats.last_rendered_snapshot_sequence =
@@ -2290,22 +2299,6 @@ struct VNM_TerminalSurface::Private
         }
 
         complete_atlas_completion(atlas_report);
-    }
-
-    term::terminal_renderer_stats_t current_renderer_stats(
-        VNM_TerminalSurface& surface)
-    {
-        reconcile_atlas_completion(surface);
-        term::terminal_renderer_stats_t stats = renderer_stats_publisher.snapshot();
-        if (qsg_atlas_recorder == nullptr) {
-            stats.paint_completed = false;
-            return stats;
-        }
-
-        const term::Qsg_atlas_frame_report atlas_report =
-            qsg_atlas_recorder->snapshot();
-        stats.paint_completed = atlas_report_completes_published_stats(atlas_report);
-        return stats;
     }
 
     term::Terminal_surface_render_invalidation_stats_t current_invalidation_stats(
@@ -2771,7 +2764,11 @@ struct VNM_TerminalSurface::Private
     term::Ime_preedit_state                                ime_preedit;
     bool                                                   cursor_blink_visible                  = true;
     std::shared_ptr<term::Qsg_atlas_recorder>              qsg_atlas_recorder;
-    term::Terminal_renderer_stats_publisher                renderer_stats_publisher;
+    mutable std::mutex                                     paint_completion_mutex;
+    std::uint64_t                                          paint_completed_frame_count = 0U;
+    std::uint64_t                                          published_frame_snapshot_sequence = 0U;
+    std::uint64_t                                          published_frame_capture_sequence = 0U;
+    bool                                                   published_frame_paint_completed = false;
 #if VNM_TERMINAL_PROFILING_ENABLED
     mutable std::mutex                                     render_profiler_mutex;
     std::shared_ptr<term::Hierarchical_profiler>           render_profiler;
@@ -2810,8 +2807,6 @@ struct VNM_TerminalSurface::Private
     std::uint64_t                                          atlas_completion_capture_sequence  = 0U;
     std::uint64_t                                          atlas_completion_report_generation_for_testing = 0U;
     bool                                                   atlas_completion_report_drew_for_testing = false;
-    std::uint64_t                                          renderer_stats_snapshot_sequence   = 0U;
-    std::uint64_t                                          renderer_stats_capture_sequence    = 0U;
     QString                                                qsg_atlas_font_epoch_key;
     qreal                                                  wheel_scroll_angle_remainder       = 0.0;
     qreal                                                  wheel_scroll_pixel_remainder       = 0.0;
@@ -3691,7 +3686,7 @@ quint64 VNM_TerminalSurface::paint_completed_frame_count() const
     Q_ASSERT(thread() == QThread::currentThread());
     m_private->reconcile_atlas_completion(
         const_cast<VNM_TerminalSurface&>(*this));
-    return m_private->renderer_stats_publisher.cumulative_snapshot().paint_completed_frames;
+    return m_private->current_paint_completed_frame_count();
 }
 
 quint64 VNM_TerminalSurface::qsg_atlas_render_frame_count() const
@@ -7474,7 +7469,7 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             m_private->render_node_release_requeue_update = false;
             m_private->reset_render_update_schedule();
             m_private->reset_atlas_completion();
-            m_private->publish_renderer_stats({}, 0U, 0U);
+            m_private->publish_renderer_frame(0U, 0U);
             if (old_node != nullptr) {
                 if (m_private->qsg_atlas_render_node_live) {
                     if (auto lifecycle_recorder = m_private->lifecycle_recorder();
@@ -7496,7 +7491,7 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             m_private->render_node_release_requeue_update = false;
             m_private->reset_render_update_schedule();
             m_private->reset_atlas_completion();
-            m_private->publish_renderer_stats({}, 0U, 0U);
+            m_private->publish_renderer_frame(0U, 0U);
             if (old_node != nullptr) {
                 if (m_private->qsg_atlas_render_node_live) {
                     if (auto lifecycle_recorder = m_private->lifecycle_recorder();
@@ -7546,14 +7541,12 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             atlas_frame_publication_generation(captured_frame);
         const std::uint64_t captured_capture_sequence =
             captured_frame.capture_sequence;
-        term::terminal_renderer_stats_t renderer_stats;
         const bool created_render_node = old_node == nullptr;
         QSGNode* updated_node = term::update_qsg_atlas_node(
             old_node,
             std::move(captured_frame),
             m_private->qsg_atlas_recorder);
         if (created_render_node && updated_node != nullptr) {
-            renderer_stats.qsg_nodes_created = 1;
             if (auto lifecycle_recorder = m_private->lifecycle_recorder();
                 lifecycle_recorder != nullptr)
             {
@@ -7561,8 +7554,7 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
             }
             m_private->qsg_atlas_render_node_live = true;
         }
-        m_private->publish_renderer_stats(
-            renderer_stats,
+        m_private->publish_renderer_frame(
             captured_snapshot_sequence,
             captured_capture_sequence);
         if (updated_node != nullptr) {
@@ -7987,23 +7979,11 @@ mark_reported_atlas_completion_pending_for_testing(
     return true;
 }
 
-term::terminal_renderer_stats_t
-term::VNM_TerminalSurface_render_bridge::last_renderer_stats(
-    const VNM_TerminalSurface& surface)
+void term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
+    VNM_TerminalSurface& surface)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
-    return surface.m_private->current_renderer_stats(
-        const_cast<VNM_TerminalSurface&>(surface));
-}
-
-term::terminal_renderer_cumulative_stats_t
-term::VNM_TerminalSurface_render_bridge::cumulative_renderer_stats(
-    const VNM_TerminalSurface& surface)
-{
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    surface.m_private->reconcile_atlas_completion(
-        const_cast<VNM_TerminalSurface&>(surface));
-    return surface.m_private->renderer_stats_publisher.cumulative_snapshot();
+    surface.m_private->reconcile_atlas_completion(surface);
 }
 
 term::terminal_renderer_lifecycle_stats_t
