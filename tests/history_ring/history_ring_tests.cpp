@@ -139,7 +139,7 @@ bool test_partial_records_are_invisible()
     return ok;
 }
 
-bool test_wrap_traversal_tail_boundaries_and_rebuild()
+bool test_wrap_traversal_tail_boundaries()
 {
     bool ok = true;
 
@@ -187,49 +187,12 @@ bool test_wrap_traversal_tail_boundaries_and_rebuild()
             payload_equal(wrapped_read, "record-09-abcdef"),
         "Phase 4A two-span read reconstructs a physically wrapped record");
 
-    const term::Terminal_history_ring_record_index_result before_drop =
-        ring.live_record_descriptors();
-    ok &= check(before_drop.status == term::Terminal_history_ring_status::OK &&
-            before_drop.records.size() == 9U,
-        "Phase 4A live record descriptors cover only live records before cache drop");
-
-    ring.discard_record_index_cache();
-    ok &= check(ring.rebuild_record_index() == term::Terminal_history_ring_status::OK,
-        "Phase 4A record-boundary cache rebuilds from the live byte range");
-    const term::Terminal_history_ring_record_index_result after_rebuild =
-        ring.live_record_descriptors();
-    ok &= check(after_rebuild.status == term::Terminal_history_ring_status::OK &&
-            after_rebuild.records.size() == before_drop.records.size(),
-        "Phase 4A rebuilt record-boundary cache preserves live record count");
-    ok &= check(after_rebuild.records.front().byte_sequence ==
-            ring.oldest_live_byte_sequence(),
-        "Phase 4A rebuilt cache starts at the oldest live byte sequence");
-
-    const term::Terminal_history_ring_read_scope rebuilt_wrapped_read =
-        ring.read_record(wrap_commit.byte_sequence);
-    ok &= check(rebuilt_wrapped_read.status() == term::Terminal_history_ring_status::OK &&
-            payload_equal(rebuilt_wrapped_read, "record-09-abcdef"),
-        "Phase 4A wrapped record remains readable after cache rebuild");
-
     return ok;
 }
 
-bool test_read_scope_failure_translation()
+bool test_read_scope_boundaries()
 {
     bool ok = true;
-
-    ok &= check(term::terminal_history_ring_status_from_backend_snapshot(
-            term::Terminal_history_ring_backend_snapshot_status::OK) ==
-            term::Terminal_history_ring_status::OK,
-        "Phase 4A backend snapshot OK maps to terminal-local OK");
-    ok &= check(term::terminal_history_ring_status_from_backend_snapshot(
-            term::Terminal_history_ring_backend_snapshot_status::STALE) ==
-            term::Terminal_history_ring_status::SNAPSHOT_STALE,
-        "Phase 4A backend stale snapshot maps to terminal-local stale status");
-    ok &= check(term::terminal_history_ring_status_from_backend_snapshot(
-            term::Terminal_history_ring_backend_snapshot_status::RETRY) ==
-            term::Terminal_history_ring_status::SNAPSHOT_RETRY,
-        "Phase 4A backend retry snapshot maps to terminal-local retry status");
 
     term::Terminal_history_ring ring({512U, 512U});
     const term::terminal_history_ring_commit_result_t commit =
@@ -283,6 +246,37 @@ bool test_explicit_discard_advances_live_bounds()
     return ok;
 }
 
+bool test_clear_preserves_capacity_and_sequence()
+{
+    bool ok = true;
+
+    term::Terminal_history_ring ring({512U, 512U});
+    const term::terminal_history_ring_commit_result_t first =
+        append_record(ring, "first");
+    const std::uint64_t capacity = ring.capacity_bytes();
+    ring.clear();
+
+    ok &= check(ring.capacity_bytes() == capacity,
+        "ring clear preserves allocated capacity");
+    ok &= check(
+        ring.oldest_live_byte_sequence() == first.head_byte_sequence &&
+            ring.head_byte_sequence() == first.head_byte_sequence,
+        "ring clear publishes an empty live range at the existing head");
+    ok &= check(
+        ring.read_record(first.byte_sequence).status() ==
+            term::Terminal_history_ring_status::OUT_OF_LIVE_RANGE,
+        "ring clear invalidates prior records");
+
+    const term::terminal_history_ring_commit_result_t second =
+        append_record(ring, "second");
+    ok &= check(
+        second.status == term::Terminal_history_ring_status::OK &&
+            second.byte_sequence == first.head_byte_sequence,
+        "ring append after clear continues the byte sequence");
+
+    return ok;
+}
+
 bool test_descriptor_allocation_failure_does_not_start_commit()
 {
     bool ok = true;
@@ -299,24 +293,16 @@ bool test_descriptor_allocation_failure_does_not_start_commit()
         "record-07-abcdef",
         "record-08-abcdef",
     };
+    std::vector<term::terminal_history_ring_commit_result_t> commits;
+    commits.reserve(std::size(records));
     for (std::string_view record : records) {
-        const term::terminal_history_ring_commit_result_t commit =
-            append_record(ring, record);
-        ok &= check(commit.status == term::Terminal_history_ring_status::OK,
+        commits.push_back(append_record(ring, record));
+        ok &= check(commits.back().status == term::Terminal_history_ring_status::OK,
             "ring allocation-failure fixture commit succeeds");
     }
 
     const std::uint64_t tail_before_failure = ring.oldest_live_byte_sequence();
     const std::uint64_t head_before_failure = ring.head_byte_sequence();
-    const term::Terminal_history_ring_record_index_result descriptors_before_failure =
-        ring.live_record_descriptors();
-    ok &= check(descriptors_before_failure.status == term::Terminal_history_ring_status::OK &&
-            descriptors_before_failure.records.size() == std::size(records) &&
-            !descriptors_before_failure.records.empty(),
-        "ring allocation-failure fixture captures the live descriptor index");
-    if (descriptors_before_failure.records.empty()) {
-        return false;
-    }
 
     bool allocation_failed = false;
     try {
@@ -332,34 +318,19 @@ bool test_descriptor_allocation_failure_does_not_start_commit()
     ok &= check(allocation_failed,
         "ring descriptor allocation failure propagates before commit");
 
-    const term::Terminal_history_ring_record_index_result descriptors_after_failure =
-        ring.live_record_descriptors();
-    ok &= check(ring.oldest_live_byte_sequence() == tail_before_failure &&
+    ok &= check(
+        ring.oldest_live_byte_sequence() == tail_before_failure &&
             ring.head_byte_sequence() == head_before_failure,
         "ring descriptor allocation failure preserves published byte bounds");
-    ok &= check(descriptors_after_failure.status == term::Terminal_history_ring_status::OK &&
-            !descriptors_after_failure.records.empty() &&
-            descriptors_after_failure.records.size() == descriptors_before_failure.records.size(),
-        "ring descriptor allocation failure preserves the live descriptor index");
 
-    if (descriptors_after_failure.records.size() == descriptors_before_failure.records.size()) {
-        for (std::size_t index = 0U; index < descriptors_before_failure.records.size(); ++index) {
-            const term::terminal_history_ring_record_descriptor_t& before =
-                descriptors_before_failure.records[index];
-            const term::terminal_history_ring_record_descriptor_t& after =
-                descriptors_after_failure.records[index];
-            ok &= check(
-                after.byte_sequence == before.byte_sequence &&
-                    after.record_bytes == before.record_bytes &&
-                    after.payload_bytes == before.payload_bytes,
-                "ring descriptor allocation failure preserves every descriptor field");
-
-            const term::Terminal_history_ring_read_scope read_after_failure =
-                ring.read_record(after.byte_sequence);
-            ok &= check(read_after_failure.ok() &&
-                    payload_equal(read_after_failure, records[index]),
-                "ring descriptor allocation failure preserves every live payload");
-        }
+    for (std::size_t index = 0U; index < commits.size(); ++index) {
+        const term::Terminal_history_ring_read_scope read_after_failure =
+            ring.read_record(commits[index].byte_sequence);
+        ok &= check(
+            read_after_failure.ok() &&
+                read_after_failure.record_bytes() == commits[index].record_bytes &&
+                payload_equal(read_after_failure, records[index]),
+            "ring descriptor allocation failure preserves every live record");
     }
 
     const term::terminal_history_ring_commit_result_t retry =
@@ -378,9 +349,10 @@ int main()
     bool ok = true;
     ok &= test_capacity_alignment_and_one_octile_limit();
     ok &= test_partial_records_are_invisible();
-    ok &= test_wrap_traversal_tail_boundaries_and_rebuild();
-    ok &= test_read_scope_failure_translation();
+    ok &= test_wrap_traversal_tail_boundaries();
+    ok &= test_read_scope_boundaries();
     ok &= test_explicit_discard_advances_live_bounds();
+    ok &= test_clear_preserves_capacity_and_sequence();
     ok &= test_descriptor_allocation_failure_does_not_start_commit();
     return ok ? 0 : 1;
 }

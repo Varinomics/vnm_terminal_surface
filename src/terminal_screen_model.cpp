@@ -1844,13 +1844,6 @@ void Terminal_screen_model::fail_next_hyperlink_compaction_allocation_for_testin
     m_fail_next_hyperlink_compaction_allocation_phase_for_testing = phase;
 }
 
-void Terminal_screen_model::
-    fail_next_retained_history_reset_traversal_allocation_for_testing()
-{
-    m_primary_backing.retained_history.
-        fail_next_reset_traversal_allocation_for_testing = true;
-}
-
 void Terminal_screen_model::set_style_table_limits_for_testing(
     std::size_t compaction_threshold,
     std::size_t count_cap)
@@ -2248,16 +2241,8 @@ Terminal_screen_model::Retained_history_storage::operator=(
 
 void Terminal_screen_model::Retained_history_storage::reset()
 {
-    std::unique_ptr<Terminal_history_ring> replacement_ring =
-        make_retained_history_ring();
-    if (std::exchange(fail_next_reset_traversal_allocation_for_testing, false)) {
-        throw std::bad_alloc();
-    }
-    std::unique_ptr<Terminal_history_row_traversal> replacement_traversal =
-        make_retained_history_traversal(*replacement_ring);
-
-    ring      = std::move(replacement_ring);
-    traversal = std::move(replacement_traversal);
+    traversal->discard_directory_cache();
+    ring->clear();
     index.clear();
     retained_record_bytes   = 0U;
     generic_compact_rows    = 0U;
