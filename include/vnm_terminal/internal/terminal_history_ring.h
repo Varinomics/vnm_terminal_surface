@@ -31,15 +31,6 @@ enum class Terminal_history_ring_status
     NOT_RECORD_BOUNDARY,
     PARTIAL_RECORD,
     INVALID_RECORD,
-    SNAPSHOT_STALE,
-    SNAPSHOT_RETRY,
-};
-
-enum class Terminal_history_ring_backend_snapshot_status
-{
-    OK,
-    STALE,
-    RETRY,
 };
 
 struct terminal_history_ring_config_t
@@ -73,19 +64,10 @@ struct terminal_history_ring_discard_result_t
     std::uint64_t                head_byte_sequence        = 0U;
 };
 
-struct Terminal_history_ring_record_index_result
-{
-    Terminal_history_ring_status                         status = Terminal_history_ring_status::OK;
-    std::vector<terminal_history_ring_record_descriptor_t> records;
-};
-
 std::size_t terminal_history_ring_backend_alignment_bytes();
 std::size_t terminal_history_ring_aligned_capacity(
     std::size_t requested_capacity_bytes,
     std::size_t alignment_bytes = 0U);
-
-Terminal_history_ring_status terminal_history_ring_status_from_backend_snapshot(
-    Terminal_history_ring_backend_snapshot_status backend_status);
 
 class Terminal_history_ring;
 
@@ -190,12 +172,9 @@ public:
         Terminal_history_ring_record_reservation&& reservation);
     terminal_history_ring_discard_result_t discard_oldest_records(
         std::size_t record_count);
+    void clear() noexcept;
 
     Terminal_history_ring_read_scope read_record(std::uint64_t byte_sequence);
-
-    void discard_record_index_cache();
-    Terminal_history_ring_status rebuild_record_index();
-    Terminal_history_ring_record_index_result live_record_descriptors();
 
     void fail_next_record_descriptor_allocation_for_testing()
     {
@@ -211,7 +190,6 @@ private:
         std::uint32_t  record_bytes,
         std::size_t&   out_records_to_discard,
         std::uint64_t& out_new_oldest_live_byte_sequence);
-    Terminal_history_ring_status ensure_record_index();
     Terminal_history_ring_status validate_record_bytes(
         std::span<const std::byte>                    bytes,
         std::uint64_t                                 expected_byte_sequence,
@@ -231,7 +209,6 @@ private:
     std::atomic<std::uint64_t>     m_oldest_live_byte_sequence{0U};
     std::atomic<std::uint64_t>     m_head_byte_sequence{0U};
     Terminal_history_ring_status   m_status = Terminal_history_ring_status::INVALID_CAPACITY;
-    bool                           m_record_index_valid = true;
     bool                           m_reservation_open   = false;
     bool                           m_fail_next_record_descriptor_allocation_for_testing = false;
 };

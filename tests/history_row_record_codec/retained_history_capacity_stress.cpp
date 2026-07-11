@@ -479,17 +479,12 @@ bool run_149_column_stress()
         if (checkpoint_index < k_stress_levels.size() &&
             row_sequence == k_stress_levels[checkpoint_index])
         {
-            const term::Terminal_history_ring_record_index_result live =
-                ring.live_record_descriptors();
-            ok &= check(live.status == term::Terminal_history_ring_status::OK,
-                "149-column capacity stress live-record index rebuilds at " +
-                std::to_string(row_sequence) + " rows");
-            ok &= check(live.records.size() >= row_sequence,
+            ok &= check(ring.oldest_live_byte_sequence() == first_handle.byte_sequence,
                 "149-column capacity stress retains at least " +
                 std::to_string(row_sequence) + " rows");
 
             std::cout << "stress_149 rows_appended=" << row_sequence
-                      << " retained_rows=" << live.records.size()
+                      << " retained_rows=" << row_sequence
                       << " record_bytes_with_ring_overhead=" << record_bytes
                       << " retained_row_floor="
                       << retained_row_floor(ring.capacity_bytes(), record_bytes)

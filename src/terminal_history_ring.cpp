@@ -134,21 +134,6 @@ std::size_t terminal_history_ring_aligned_capacity(
     return requested_capacity_bytes + padding;
 }
 
-Terminal_history_ring_status terminal_history_ring_status_from_backend_snapshot(
-    Terminal_history_ring_backend_snapshot_status backend_status)
-{
-    switch (backend_status) {
-        case Terminal_history_ring_backend_snapshot_status::OK:
-            return Terminal_history_ring_status::OK;
-        case Terminal_history_ring_backend_snapshot_status::STALE:
-            return Terminal_history_ring_status::SNAPSHOT_STALE;
-        case Terminal_history_ring_backend_snapshot_status::RETRY:
-            return Terminal_history_ring_status::SNAPSHOT_RETRY;
-    }
-
-    return Terminal_history_ring_status::SNAPSHOT_RETRY;
-}
-
 Terminal_history_ring_record_reservation::Terminal_history_ring_record_reservation(
     Terminal_history_ring_status status)
 :
@@ -453,7 +438,6 @@ terminal_history_ring_commit_result_t Terminal_history_ring::commit(
 
     const std::uint64_t new_head =
         reservation.m_byte_sequence + reservation.m_record_bytes;
-    m_record_index_valid = true;
     m_head_byte_sequence.store(new_head, std::memory_order_release);
 
     result.status                    = Terminal_history_ring_status::OK;
@@ -479,12 +463,6 @@ terminal_history_ring_discard_result_t Terminal_history_ring::discard_oldest_rec
         return result;
     }
 
-    const Terminal_history_ring_status index_status = ensure_record_index();
-    if (index_status != Terminal_history_ring_status::OK) {
-        result.status = index_status;
-        return result;
-    }
-
     const std::size_t records_to_discard = std::min(record_count, m_records.size());
     for (std::size_t index = 0U; index < records_to_discard; ++index) {
         const terminal_history_ring_record_descriptor_t oldest = m_records.front();
@@ -494,13 +472,17 @@ terminal_history_ring_discard_result_t Terminal_history_ring::discard_oldest_rec
             std::memory_order_release);
     }
 
-    m_record_index_valid = true;
-
     result.status                    = Terminal_history_ring_status::OK;
     result.discarded_records         = records_to_discard;
     result.oldest_live_byte_sequence = oldest_live_byte_sequence();
     result.head_byte_sequence        = head_byte_sequence();
     return result;
+}
+
+void Terminal_history_ring::clear() noexcept
+{
+    m_records.clear();
+    m_oldest_live_byte_sequence.store(head_byte_sequence(), std::memory_order_release);
 }
 
 Terminal_history_ring_read_scope Terminal_history_ring::read_record(std::uint64_t byte_sequence)
@@ -509,11 +491,6 @@ Terminal_history_ring_read_scope Terminal_history_ring::read_record(std::uint64_
 
     if (!ok()) {
         return Terminal_history_ring_read_scope(m_status);
-    }
-
-    const Terminal_history_ring_status index_status = ensure_record_index();
-    if (index_status != Terminal_history_ring_status::OK) {
-        return Terminal_history_ring_read_scope(index_status);
     }
 
     const std::uint64_t tail = oldest_live_byte_sequence();
@@ -547,102 +524,6 @@ Terminal_history_ring_read_scope Terminal_history_ring::read_record(std::uint64_
     return Terminal_history_ring_read_scope(descriptor, std::move(bytes));
 }
 
-void Terminal_history_ring::discard_record_index_cache()
-{
-    VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_ring::discard_record_index_cache");
-
-    m_records.clear();
-    m_record_index_valid = false;
-}
-
-Terminal_history_ring_status Terminal_history_ring::rebuild_record_index()
-{
-    VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_ring::rebuild_record_index");
-
-    if (!ok()) {
-        return m_status;
-    }
-
-    std::deque<terminal_history_ring_record_descriptor_t> rebuilt_records;
-    std::uint64_t sequence = oldest_live_byte_sequence();
-    const std::uint64_t head = head_byte_sequence();
-
-    while (sequence < head) {
-        const std::uint64_t remaining = head - sequence;
-        if (remaining < terminal_history_ring_record_overhead_bytes()) {
-            m_records.clear();
-            m_record_index_valid = false;
-            return Terminal_history_ring_status::PARTIAL_RECORD;
-        }
-
-        std::vector<std::byte> header_bytes = copy_record_bytes(
-            sequence,
-            k_terminal_history_ring_record_header_bytes);
-        const ring_record_header_t header = read_plain<ring_record_header_t>(
-            std::span<const std::byte>(header_bytes));
-
-        if (header.magic        != k_record_magic ||
-            header.version      != k_record_version ||
-            header.header_bytes != k_terminal_history_ring_record_header_bytes ||
-            header.byte_sequence != sequence)
-        {
-            m_records.clear();
-            m_record_index_valid = false;
-            return Terminal_history_ring_status::INVALID_RECORD;
-        }
-
-        if (header.record_bytes < terminal_history_ring_record_overhead_bytes()) {
-            m_records.clear();
-            m_record_index_valid = false;
-            return Terminal_history_ring_status::INVALID_RECORD;
-        }
-        if (header.record_bytes > max_record_bytes()) {
-            m_records.clear();
-            m_record_index_valid = false;
-            return Terminal_history_ring_status::INVALID_RECORD;
-        }
-        if (header.record_bytes > remaining) {
-            m_records.clear();
-            m_record_index_valid = false;
-            return Terminal_history_ring_status::PARTIAL_RECORD;
-        }
-
-        std::vector<std::byte> record_bytes = copy_record_bytes(
-            sequence,
-            header.record_bytes);
-
-        terminal_history_ring_record_descriptor_t descriptor;
-        const Terminal_history_ring_status validation_status =
-            validate_record_bytes(record_bytes, sequence, &descriptor);
-        if (validation_status != Terminal_history_ring_status::OK) {
-            m_records.clear();
-            m_record_index_valid = false;
-            return validation_status;
-        }
-
-        rebuilt_records.push_back(descriptor);
-        sequence += descriptor.record_bytes;
-    }
-
-    m_records            = std::move(rebuilt_records);
-    m_record_index_valid = true;
-    return Terminal_history_ring_status::OK;
-}
-
-Terminal_history_ring_record_index_result Terminal_history_ring::live_record_descriptors()
-{
-    VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_ring::live_record_descriptors");
-
-    Terminal_history_ring_record_index_result result;
-    result.status = ensure_record_index();
-    if (result.status != Terminal_history_ring_status::OK) {
-        return result;
-    }
-
-    result.records.assign(m_records.begin(), m_records.end());
-    return result;
-}
-
 void Terminal_history_ring::release_reservation() noexcept
 {
     m_reservation_open = false;
@@ -660,11 +541,6 @@ Terminal_history_ring_status Terminal_history_ring::plan_room_for(
 
     if (record_bytes > max_record_bytes()) {
         return Terminal_history_ring_status::OVERSIZE_RECORD;
-    }
-
-    const Terminal_history_ring_status index_status = ensure_record_index();
-    if (index_status != Terminal_history_ring_status::OK) {
-        return index_status;
     }
 
     const std::uint64_t head = head_byte_sequence();
@@ -685,17 +561,6 @@ Terminal_history_ring_status Terminal_history_ring::plan_room_for(
     }
 
     return Terminal_history_ring_status::OK;
-}
-
-Terminal_history_ring_status Terminal_history_ring::ensure_record_index()
-{
-    VNM_TERMINAL_PROFILE_SCOPE("Terminal_history_ring::ensure_record_index");
-
-    if (m_record_index_valid) {
-        return Terminal_history_ring_status::OK;
-    }
-
-    return rebuild_record_index();
 }
 
 Terminal_history_ring_status Terminal_history_ring::validate_record_bytes(
