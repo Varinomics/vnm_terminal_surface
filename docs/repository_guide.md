@@ -363,7 +363,7 @@ state notes such as power mode and competing process load.
 
 Sparse surface-session settlement evidence must use the sparse surface-session
 scenarios with `--require-requested-grid` so a window-manager clamp cannot
-silently substitute another grid. The historical full-size matrix is
+silently substitute another grid. The decision-grade full-size matrix is
 `--grid 235x873 --window-size 6984x3760 --dirty-rows 8 --dirty-row-stride 7`
 for both `surface_session_sparse_ascii_output` and
 `surface_session_sparse_block_graphics_output`. If the machine cannot create

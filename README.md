@@ -76,8 +76,8 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 Windows CI runs `vnm_terminal_windows_conpty_backend` in the normal test suite
-and in a focused AddressSanitizer job. `vnm_terminal_compat_smoke` is still a
-local Windows gate for the full native-surface fixture smoke. To reproduce the
+and in a focused AddressSanitizer job. `vnm_terminal_compat_smoke` is a local
+Windows gate for the full native-surface fixture smoke. To reproduce the
 ASan job locally, configure a separate AddressSanitizer build (only our library
 and tests are instrumented; Qt and the FetchContent dependencies are left
 uninstrumented). This focused run exercises the worker-thread

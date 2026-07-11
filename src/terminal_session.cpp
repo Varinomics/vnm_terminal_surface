@@ -6867,9 +6867,8 @@ void Terminal_session::publish_render_snapshot(
     const bool has_live_visible_basis =
         snapshot_handle->basis == Terminal_render_snapshot_basis::LIVE_CONTENT;
     if (!has_live_visible_basis) {
-        // This helper owns the live visible publication channel. Future public
-        // projection or scroll snapshots need a separate non-advancing path so
-        // release builds cannot replace the latest visible live-content basis.
+        // This helper owns the live visible publication channel. Public
+        // projection and scroll snapshots use a separate non-advancing path.
         Q_ASSERT(has_live_visible_basis);
         return;
     }

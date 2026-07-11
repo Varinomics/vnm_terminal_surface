@@ -22,10 +22,9 @@ exported include directories and asserts the public headers are present
   otherwise, so a host must guard its calls with
   `#if VNM_TERMINAL_PROFILING_ENABLED`.
 - Debug-only strings: `scroll_noop_cause_name()` and `scroll_action_name()`
-  exist for transcript and debug rendering and their spellings preserve the
-  historical transcript output. Hosts branch on the `Scroll_noop_cause` and
-  `Scroll_action` enum values, never on the strings (`public_surface.md`,
-  "Host Operations").
+  exist for transcript and debug rendering. Hosts branch on the
+  `Scroll_noop_cause` and `Scroll_action` enum values, never on the strings
+  (`public_surface.md`, "Host Operations").
 
 ## JSON Metrics
 

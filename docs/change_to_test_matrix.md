@@ -72,7 +72,7 @@ for local runs.
 - Linux and macOS run the full `ctest` suite, including the POSIX backend tests.
 - Windows CI runs `vnm_terminal_windows_conpty_backend` in the normal test suite
   and in a focused AddressSanitizer job.
-- Windows CI still excludes `vnm_terminal_compat_smoke`. Run it locally on
+- Windows CI excludes `vnm_terminal_compat_smoke`. Run it locally on
   Windows for the full native-surface fixture compatibility smoke.
 - Benchmarks are not built in CI. Build with
   `-DVNM_TERMINAL_BUILD_BENCHMARKS=ON` locally to verify benchmark edits. For

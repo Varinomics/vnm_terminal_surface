@@ -13770,9 +13770,6 @@ bool test_metrics_driven_resize_interleaves_with_output()
     return ok;
 }
 
-// Phase 0 evidence shim ownership: Phase 4D owns promotion/reuse if these
-// helpers become parity-harness helpers; Phase 6B owns deletion/replacement if
-// cutover tests supersede them.
 bool flat_ring_phase0_snapshot_has_hyperlink_uri(
     const term::Terminal_render_snapshot& snapshot,
     const QByteArray&                     uri)

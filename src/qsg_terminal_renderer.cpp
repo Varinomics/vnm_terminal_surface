@@ -2030,8 +2030,8 @@ Terminal_render_frame build_terminal_render_frame(
                 const bool classification_has_decoration =
                     style_or_null != nullptr &&
                     (style_or_null->underline || style_or_null->strike);
-                // This legacy counter is intentionally per-cell for profile
-                // comparability; the actual dirty-row lookup is cached per row.
+                // Count classified cells; the dirty-row lookup itself is cached
+                // per row.
                 ++frame.stats.dirty_row_lookup_count;
                 ++frame.stats.cell_pass_classification_calls;
                 const terminal_simple_content_classification_t classification = classify_terminal_simple_content_cell(

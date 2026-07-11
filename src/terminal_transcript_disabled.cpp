@@ -12,8 +12,7 @@ void insert_wheel_trace_scroll_publication_fields(
     bool         deferred_intent_recorded)
 {
     object.insert(QStringLiteral("local_scroll_applied"), local_scroll_applied);
-    // The default is the Phase 3 deferred-publication trace value. Public
-    // projection scroll publication must pass an explicit visible result.
+    // Public-projection scroll publication passes an explicit visible result.
     object.insert(
         QStringLiteral("visible_scroll_applied"),
         visible_scroll_applied.value_or(

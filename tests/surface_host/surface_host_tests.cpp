@@ -11008,9 +11008,8 @@ bool test_scroll_diagnostic_enum_name_table(QGuiApplication& app)
     using Surface = VNM_TerminalSurface;
     bool ok = true;
 
-    // Lock the Batch 1.2 converter contract: NONE maps to an empty QString
-    // (byte-compatible with the unset QString these diagnostic fields formerly
-    // held) and every other enumerator maps to its stable diagnostic spelling.
+    // NONE maps to an empty QString; every other enumerator maps to its
+    // diagnostic spelling.
     ok &= check(Surface::scroll_noop_cause_name(Surface::Scroll_noop_cause::NONE).isEmpty(),
         "scroll_noop_cause_name(NONE) is empty");
     ok &= check(Surface::scroll_noop_cause_name(Surface::Scroll_noop_cause::ZERO_LINE_DELTA) ==

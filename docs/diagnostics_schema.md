@@ -24,12 +24,9 @@ forms:
   counter is one line, `  <label>=<value>`, and **order is significant** -- the
   report is read top to bottom and diffed line by line.
 
-Historically each serializer hand-wrote its own copy of the field list, so the
-two could drift (a counter added to JSON but not TEXT, or reordered). The active
-atlas blocks now flow through one shared descriptor table each, consumed by both
-`emit_metrics_json` and `emit_metrics_text`, so the field set and order cannot
-diverge. For every active table-driven atlas block the JSON key is also the TEXT
-label.
+Each descriptor-backed block flows through one shared table consumed by both
+`emit_metrics_json` and `emit_metrics_text`. For every table-driven atlas block,
+the JSON key is also the TEXT label.
 
 The runtime metrics document also contains hand-written JSON-only sections such
 as `render_invalidation` and `backend_drain`. Those sections are public runtime
@@ -291,17 +288,6 @@ captured or rendered report state.
 | `atlas_page_count` | Counter | Count | Unstable |
 
 ## Adding or changing a counter
-
-For a legacy text-layout compatibility counter:
-
-1. Add the field to the stats struct in
-   `include/vnm_terminal/internal/qsg_terminal_renderer.h`.
-2. Add one `VNM_TL_COUNTER(field)` row to the text-layout table in
-   `src/diagnostics/metric_descriptor.h`, at the intended emit position.
-3. Add the matching row to the table above.
-4. Extend the golden fixture/oracle in
-   `tests/diagnostics_text_layout/diagnostics_text_layout_tests.cpp` and confirm
-   the test still passes.
 
 For an atlas counter:
 
