@@ -1806,15 +1806,24 @@ void Terminal_screen_model::discard_retained_lookup_cache_for_testing() const
 
 void Terminal_screen_model::reset_retained_history_decode_live_row_call_count_for_testing() const
 {
-    m_primary_backing.retained_history.traversal->
-        reset_decode_live_row_call_count_for_testing();
+    const auto& traversal = m_primary_backing.retained_history.traversal;
+    if (traversal != nullptr) {
+        traversal->reset_decode_live_row_call_count_for_testing();
+    }
 }
 
 std::uint64_t
 Terminal_screen_model::retained_history_decode_live_row_call_count_for_testing() const
 {
-    return m_primary_backing.retained_history.traversal->
-        decode_live_row_call_count_for_testing();
+    const auto& traversal = m_primary_backing.retained_history.traversal;
+    return traversal == nullptr
+        ? 0U
+        : traversal->decode_live_row_call_count_for_testing();
+}
+
+bool Terminal_screen_model::retained_history_storage_allocated_for_testing() const
+{
+    return m_primary_backing.retained_history.ring != nullptr;
 }
 
 void Terminal_screen_model::set_next_hyperlink_id_for_testing(Terminal_hyperlink_id id)
@@ -1872,7 +1881,7 @@ Terminal_screen_model::retained_history_diagnostics() const
     const Retained_history_storage& retained = m_primary_backing.retained_history;
 
     terminal_retained_history_diagnostics_t diagnostics;
-    diagnostics.byte_budget                          = retained.ring->capacity_bytes();
+    diagnostics.byte_budget                          = k_retained_history_ring_capacity_bytes;
     diagnostics.retained_rows                        = retained.index.size();
     diagnostics.retained_record_bytes                = retained.retained_record_bytes;
     diagnostics.average_retained_row_bytes           = diagnostics.retained_rows == 0U
@@ -2226,11 +2235,7 @@ Terminal_screen_model::screen_buffer_state_t Terminal_screen_model::make_empty_b
     return state;
 }
 
-Terminal_screen_model::Retained_history_storage::Retained_history_storage()
-:
-    ring(make_retained_history_ring()),
-    traversal(make_retained_history_traversal(*ring))
-{}
+Terminal_screen_model::Retained_history_storage::Retained_history_storage() = default;
 
 Terminal_screen_model::Retained_history_storage::~Retained_history_storage() = default;
 Terminal_screen_model::Retained_history_storage::Retained_history_storage(
@@ -2239,10 +2244,25 @@ Terminal_screen_model::Retained_history_storage&
 Terminal_screen_model::Retained_history_storage::operator=(
     Retained_history_storage&&) noexcept = default;
 
+void Terminal_screen_model::Retained_history_storage::ensure_allocated()
+{
+    if (ring != nullptr) {
+        return;
+    }
+
+    std::unique_ptr<Terminal_history_ring> new_ring = make_retained_history_ring();
+    std::unique_ptr<Terminal_history_row_traversal> new_traversal =
+        make_retained_history_traversal(*new_ring);
+    ring      = std::move(new_ring);
+    traversal = std::move(new_traversal);
+}
+
 void Terminal_screen_model::Retained_history_storage::reset()
 {
-    traversal->discard_directory_cache();
-    ring->clear();
+    if (ring != nullptr) {
+        traversal->discard_directory_cache();
+        ring->clear();
+    }
     index.clear();
     retained_record_bytes   = 0U;
     generic_compact_rows    = 0U;
@@ -2399,6 +2419,7 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
             retained_history.index.back().history_handle.row_sequence;
     }
 
+    retained_history.ensure_allocated();
     retained_history.index.emplace_back();
     Terminal_history_row_record_append_result append;
     try {

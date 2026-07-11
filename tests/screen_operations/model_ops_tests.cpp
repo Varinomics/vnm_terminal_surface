@@ -2292,6 +2292,38 @@ bool test_scroll_region_and_origin_mode()
     return ok;
 }
 
+bool test_retained_history_storage_is_lazy()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model idle_model = make_model(2, 4, 8);
+    ok &= check(!idle_model.retained_history_storage_allocated_for_testing(),
+        "idle model does not allocate retained-history storage");
+    ok &= check(idle_model.retained_history_diagnostics().byte_budget > 0U,
+        "idle model diagnostics report the retained-history byte budget");
+
+    term::Terminal_screen_model zero_limit_model = make_model(2, 4, 0);
+    zero_limit_model.ingest(QByteArrayLiteral("1\r\n2\r\n3\r\n4"));
+    ok &= check(
+        zero_limit_model.scrollback_size() == 0 &&
+            !zero_limit_model.retained_history_storage_allocated_for_testing(),
+        "zero-limit model stays unallocated after scrolling output");
+
+    term::Terminal_screen_model retained_model = make_model(2, 4, 8);
+    retained_model.ingest(QByteArrayLiteral("1\r\n2\r\n3\r\n4"));
+    ok &= check(
+        retained_model.scrollback_size() > 0 &&
+            retained_model.retained_history_storage_allocated_for_testing(),
+        "first retained append allocates retained-history storage");
+    retained_model.ingest(QByteArrayLiteral("\x1b[3J"));
+    ok &= check(
+        retained_model.scrollback_size() == 0 &&
+            retained_model.retained_history_storage_allocated_for_testing(),
+        "retained-history clear reuses allocated storage");
+
+    return ok;
+}
+
 bool test_top_anchored_scroll_region_appends_scrollback()
 {
     bool ok = true;
@@ -4114,6 +4146,7 @@ int main()
     ok &= test_phase_r_ed3_clears_scrollback_after_resize_repaint_visible_clear();
     ok &= test_erase_operations_and_wide_damage();
     ok &= test_scroll_region_and_origin_mode();
+    ok &= test_retained_history_storage_is_lazy();
     ok &= test_top_anchored_scroll_region_appends_scrollback();
     ok &= test_alternate_top_anchored_scroll_region_does_not_append_scrollback();
     ok &= test_escape_index_controls();
