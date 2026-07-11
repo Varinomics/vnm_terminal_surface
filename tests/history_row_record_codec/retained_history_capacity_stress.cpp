@@ -17,7 +17,7 @@ namespace {
 using vnm_terminal::test_helpers::check;
 
 constexpr std::size_t k_retained_history_ring_capacity_bytes = 64U * 1024U * 1024U;
-constexpr std::uint32_t k_149_column_record_bytes_with_ring_overhead = 305U;
+constexpr std::uint32_t k_149_column_record_bytes_with_ring_overhead = 289U;
 constexpr std::uint64_t k_min_149_column_single_style_retained_rows = 80000U;
 constexpr std::uint64_t k_min_149_column_hyperlink_heavy_retained_rows = 9000U;
 constexpr int k_capacity_gate_columns = 149;
@@ -35,8 +35,8 @@ constexpr std::array<int, 8U> k_width_sweep_columns = {
     80,
     120,
     149,
-    171,
-    172,
+    187,
+    188,
     200,
     250,
     4096,
@@ -149,28 +149,24 @@ void set_row_provenance(
 }
 
 term::terminal_history_row_record_identity_t make_identity(
-    std::uint64_t                   row_sequence,
-    term::terminal_history_handle_t previous_handle)
+    std::uint64_t row_sequence)
 {
     return {
         29U,
         row_sequence,
-        previous_handle.byte_sequence,
-        previous_handle.row_sequence,
     };
 }
 
 term::Terminal_history_row_record_append_result append_record(
     term::Terminal_history_ring&            ring,
     term::Terminal_history_row_record&      record,
-    std::uint64_t                           row_sequence,
-    term::terminal_history_handle_t         previous_handle)
+    std::uint64_t                           row_sequence)
 {
     set_row_provenance(record, row_sequence);
     return term::encode_terminal_history_row_record_to_ring(
         ring,
         record,
-        make_identity(row_sequence, previous_handle));
+        make_identity(row_sequence));
 }
 
 encoded_record_projection_t encoded_record_projection(
@@ -188,7 +184,7 @@ encoded_record_projection_t encoded_record_projection(
     }
 
     const term::Terminal_history_row_record_append_result append =
-        append_record(ring, record, 1U, {});
+        append_record(ring, record, 1U);
     projection.status = append.status;
     if (append.status == term::Terminal_history_row_record_codec_status::OK) {
         projection.record_bytes = append.commit.record_bytes;
@@ -268,25 +264,25 @@ bool run_width_sweep()
             ok &= check(projection.record_bytes <=
                     k_149_column_record_bytes_with_ring_overhead,
                 "149-column width sweep record bytes include the 40-byte ring overhead "
-                "and stay <= 305 bytes");
+                "and stay <= 289 bytes");
             ok &= check(
                 estimate.contract_version ==
                     term::k_terminal_history_retention_estimate_contract_version &&
                 estimate.source_width_columns == 149U &&
-                estimate.record_bytes == 305U &&
-                estimate.retained_rows == 220029U &&
+                estimate.record_bytes == 289U &&
+                estimate.retained_rows == 232210U &&
                 estimate.target_rows == 205000U &&
-                estimate.max_columns_at_target_rows == 171U,
+                estimate.max_columns_at_target_rows == 187U,
                 "149-column estimate pins the versioned retained-capacity contract tuple");
         }
 
-        if (columns == 171) {
+        if (columns == 187) {
             ok &= check(reaches_target,
-                "actual committed 171-column records retain at least 205000 rows");
+                "actual committed 187-column records retain at least 205000 rows");
         }
-        if (columns == 172) {
+        if (columns == 188) {
             ok &= check(!reaches_target,
-                "actual committed 172-column records retain fewer than 205000 rows");
+                "actual committed 188-column records retain fewer than 205000 rows");
         }
 
         ok &= check(reaches_target == expected_reaches_target,
@@ -411,10 +407,10 @@ bool run_model_sustained_cap_eviction_stress()
         diagnostics.prefix_plain_ascii_estimate.contract_version ==
             term::k_terminal_history_retention_estimate_contract_version &&
         diagnostics.prefix_plain_ascii_estimate.source_width_columns == 1U &&
-        diagnostics.prefix_plain_ascii_estimate.record_bytes == 157U &&
-        diagnostics.prefix_plain_ascii_estimate.retained_rows == 427444U &&
+        diagnostics.prefix_plain_ascii_estimate.record_bytes == 141U &&
+        diagnostics.prefix_plain_ascii_estimate.retained_rows == 475949U &&
         diagnostics.prefix_plain_ascii_estimate.target_rows == 205000U &&
-        diagnostics.prefix_plain_ascii_estimate.max_columns_at_target_rows == 171U,
+        diagnostics.prefix_plain_ascii_estimate.max_columns_at_target_rows == 187U,
         "model supplies the live ring budget and current width to the codec estimate");
     ok &= check(oldest_after == expected_oldest_after &&
             newest_after->row_sequence ==
@@ -448,7 +444,6 @@ bool run_149_column_stress()
 
     term::Terminal_history_row_record record =
         make_full_width_ascii_record(k_capacity_gate_columns);
-    term::terminal_history_handle_t previous_handle;
     term::terminal_history_handle_t first_handle;
     std::uint32_t record_bytes = 0U;
     std::size_t checkpoint_index = 0U;
@@ -458,7 +453,7 @@ bool run_149_column_stress()
          ++row_sequence)
     {
         const term::Terminal_history_row_record_append_result append =
-            append_record(ring, record, row_sequence, previous_handle);
+            append_record(ring, record, row_sequence);
         if (append.status != term::Terminal_history_row_record_codec_status::OK) {
             std::cerr << "FAIL: 149-column capacity stress append failed at row "
                       << row_sequence << " status="
@@ -471,10 +466,8 @@ bool run_149_column_stress()
             record_bytes = append.commit.record_bytes;
             ok &= check(record_bytes <= k_149_column_record_bytes_with_ring_overhead,
                 "149-column capacity stress record bytes include the 40-byte ring "
-                "overhead and stay <= 305 bytes");
+                "overhead and stay <= 289 bytes");
         }
-
-        previous_handle = append.history_handle;
 
         if (checkpoint_index < k_stress_levels.size() &&
             row_sequence == k_stress_levels[checkpoint_index])

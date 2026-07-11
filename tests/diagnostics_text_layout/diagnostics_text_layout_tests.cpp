@@ -464,12 +464,12 @@ bool test_retained_history_golden()
     diagnostics.hyperlink_compaction_count           = 1010U;
     diagnostics.reclaimed_hyperlink_ids              = 1011U;
     diagnostics.prefix_plain_ascii_estimate = {
-        1U,
-        171U,
+        2U,
+        187U,
         327U,
         205225U,
         205000U,
-        171U,
+        187U,
     };
 
     QString     text;
@@ -502,12 +502,12 @@ bool test_retained_history_golden()
         "  hyperlink_compaction_count=1010\n"
         "  reclaimed_hyperlink_ids=1011\n"
         "  prefix_plain_ascii_estimate\n"
-        "    contract_version=1\n"
-        "    source_width_columns=171\n"
+        "    contract_version=2\n"
+        "    source_width_columns=187\n"
         "    record_bytes=327\n"
         "    retained_rows=205225\n"
         "    target_rows=205000\n"
-        "    max_columns_at_target_rows=171\n");
+        "    max_columns_at_target_rows=187\n");
 
     QJsonObject actual;
     detail::emit_metrics_json(
@@ -532,9 +532,9 @@ bool test_retained_history_golden()
         "retained-history descriptor emits exact JSON values and types");
     ok &= check(
         estimate.size() == 6 &&
-        estimate.value(QStringLiteral("contract_version")).toString() == QStringLiteral("1") &&
+        estimate.value(QStringLiteral("contract_version")).toString() == QStringLiteral("2") &&
         estimate.value(QStringLiteral("max_columns_at_target_rows")).toString() ==
-            QStringLiteral("171"),
+            QStringLiteral("187"),
         "retained-history estimate descriptor emits versioned JSON values");
     return ok;
 }

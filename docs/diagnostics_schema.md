@@ -70,7 +70,7 @@ content.
 
 ### Prefix plain ASCII estimate block
 
-Contract version `1` projects homogeneous full-width rows eligible for the
+Contract version `2` projects homogeneous full-width rows eligible for the
 prefix-plain-ASCII codec. It uses the live ring byte budget, current model
 width, exact encoded record size including ring overhead, and the codec-owned
 target of 205,000 rows. Styled, linked, non-ASCII, or otherwise generic-compact
