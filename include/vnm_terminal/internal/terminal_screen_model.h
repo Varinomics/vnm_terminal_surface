@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <optional>
@@ -28,6 +29,7 @@ namespace vnm_terminal::internal {
 class Terminal_history_ring;
 class Terminal_history_row_traversal;
 struct Terminal_history_row_record;
+enum class Terminal_history_row_record_payload_kind : std::uint32_t;
 
 using terminal_snapshot_style_id_map_t =
     std::map<terminal_text_style_lookup_key_t, Terminal_style_id>;
@@ -298,6 +300,47 @@ struct terminal_screen_model_style_table_stats_t
     std::uint64_t              reclaimed_styles    = 0U;
 };
 
+constexpr std::uint32_t k_terminal_history_retention_estimate_contract_version = 1U;
+constexpr std::uint64_t k_terminal_history_retention_target_rows = 205000U;
+
+struct terminal_history_prefix_plain_ascii_retention_estimate_t
+{
+    std::uint32_t contract_version           = 0U;
+    std::uint64_t source_width_columns       = 0U;
+    std::uint64_t record_bytes               = 0U;
+    std::uint64_t retained_rows              = 0U;
+    std::uint64_t target_rows                = 0U;
+    std::uint64_t max_columns_at_target_rows = 0U;
+};
+
+struct terminal_screen_model_hyperlink_table_stats_t
+{
+    std::uint64_t              compaction_count        = 0U;
+    std::uint64_t              reclaimed_hyperlink_ids = 0U;
+};
+
+struct terminal_retained_history_diagnostics_t
+{
+    std::uint64_t              byte_budget                = 0U;
+    std::uint64_t              retained_rows              = 0U;
+    std::uint64_t              retained_record_bytes      = 0U;
+    double                     average_retained_row_bytes = 0.0;
+
+    std::uint64_t              payload_kind_generic_compact_rows    = 0U;
+    std::uint64_t              payload_kind_prefix_plain_ascii_rows = 0U;
+
+    std::uint64_t              current_style_count    = 0U;
+    std::uint64_t              peak_style_count       = 0U;
+    std::uint64_t              style_compaction_count = 0U;
+    std::uint64_t              reclaimed_styles       = 0U;
+
+    std::uint64_t              hyperlink_compaction_count = 0U;
+    std::uint64_t              reclaimed_hyperlink_ids    = 0U;
+
+    terminal_history_prefix_plain_ascii_retention_estimate_t
+                               prefix_plain_ascii_estimate;
+};
+
 enum class Terminal_hyperlink_compaction_allocation_phase
 {
     IDENTITY_TO_NEW_ID,
@@ -380,6 +423,7 @@ public:
         std::size_t                  compaction_threshold,
         std::size_t                  count_cap);
     terminal_screen_model_style_table_stats_t style_table_stats() const;
+    terminal_retained_history_diagnostics_t retained_history_diagnostics() const;
     void set_dirty_row_stats_enabled(bool enabled);
     Terminal_screen_model_dirty_row_stats dirty_row_stats() const;
     Terminal_screen_model_dirty_row_timeline dirty_row_timeline() const;
@@ -491,6 +535,12 @@ private:
 
     struct Retained_history_storage
     {
+        struct retained_history_index_entry_t
+        {
+            terminal_history_handle_t history_handle;
+            Terminal_history_row_record_payload_kind payload_kind{};
+        };
+
         Retained_history_storage();
         ~Retained_history_storage();
 
@@ -498,15 +548,21 @@ private:
         Retained_history_storage& operator=(const Retained_history_storage& other);
 
         void reset();
+        void track_record_in_reserved_index_slot(
+            terminal_history_handle_t                history_handle,
+            std::uint32_t                            record_bytes,
+            Terminal_history_row_record_payload_kind payload_kind) noexcept;
+        void discard_index_prefix(std::size_t record_count) const noexcept;
 
         std::unique_ptr<Terminal_history_ring>
                                   ring;
         std::unique_ptr<Terminal_history_row_traversal>
                                   traversal;
-        mutable std::vector<terminal_history_handle_t>
-                                  logical_rows;
-        mutable terminal_history_handle_t
-                                  latest_history_handle;
+        mutable std::deque<retained_history_index_entry_t>
+                                  index;
+        mutable std::uint64_t     retained_record_bytes   = 0U;
+        mutable std::uint64_t     generic_compact_rows    = 0U;
+        mutable std::uint64_t     prefix_plain_ascii_rows = 0U;
     };
 
     struct snapshot_row_t
@@ -1156,6 +1212,8 @@ private:
                                         k_terminal_style_compaction_threshold;
     terminal_screen_model_style_table_stats_t
                                     m_style_table_stats{1U, 1U, 0U, 0U};
+    terminal_screen_model_hyperlink_table_stats_t
+                                    m_hyperlink_table_stats;
     Primary_backing_buffer          m_primary_backing;
     Alternate_active_grid           m_alternate_grid;
     std::set<int>                   m_dirty_rows;

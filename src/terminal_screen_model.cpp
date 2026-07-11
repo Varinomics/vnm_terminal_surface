@@ -1863,6 +1863,35 @@ terminal_screen_model_style_table_stats_t Terminal_screen_model::style_table_sta
     return m_style_table_stats;
 }
 
+terminal_retained_history_diagnostics_t
+Terminal_screen_model::retained_history_diagnostics() const
+{
+    const Retained_history_storage& retained = m_primary_backing.retained_history;
+
+    terminal_retained_history_diagnostics_t diagnostics;
+    diagnostics.byte_budget                          = retained.ring->capacity_bytes();
+    diagnostics.retained_rows                        = retained.index.size();
+    diagnostics.retained_record_bytes                = retained.retained_record_bytes;
+    diagnostics.average_retained_row_bytes           = diagnostics.retained_rows == 0U
+        ? 0.0
+        : static_cast<double>(diagnostics.retained_record_bytes) /
+            static_cast<double>(diagnostics.retained_rows);
+    diagnostics.payload_kind_generic_compact_rows    = retained.generic_compact_rows;
+    diagnostics.payload_kind_prefix_plain_ascii_rows = retained.prefix_plain_ascii_rows;
+    diagnostics.current_style_count                  = m_style_table_stats.current_style_count;
+    diagnostics.peak_style_count                     = m_style_table_stats.peak_style_count;
+    diagnostics.style_compaction_count               = m_style_table_stats.compaction_count;
+    diagnostics.reclaimed_styles                     = m_style_table_stats.reclaimed_styles;
+    diagnostics.hyperlink_compaction_count           = m_hyperlink_table_stats.compaction_count;
+    diagnostics.reclaimed_hyperlink_ids =
+        m_hyperlink_table_stats.reclaimed_hyperlink_ids;
+    diagnostics.prefix_plain_ascii_estimate =
+        make_terminal_history_prefix_plain_ascii_retention_estimate(
+            diagnostics.byte_budget,
+            m_config.grid_size.columns);
+    return diagnostics;
+}
+
 void Terminal_screen_model::invalidate_retained_lookup_caches() const
 {
     if (m_primary_retained_lookup_cache.invalidated() &&
@@ -2207,7 +2236,8 @@ Terminal_screen_model::Retained_history_storage::Retained_history_storage(
 :
     Retained_history_storage()
 {
-    for (terminal_history_handle_t source_handle : other.logical_rows) {
+    for (const retained_history_index_entry_t& source_entry : other.index) {
+        const terminal_history_handle_t source_handle = source_entry.history_handle;
         const Terminal_history_ring_read_scope read =
             other.ring->read_record(source_handle.byte_sequence);
         if (!read.ok()) {
@@ -2223,22 +2253,32 @@ Terminal_screen_model::Retained_history_storage::Retained_history_storage(
         terminal_history_row_record_identity_t identity;
         identity.epoch        = decoded.history_handle.epoch;
         identity.row_sequence = decoded.history_handle.row_sequence;
-        if (terminal_history_handle_has_identity(latest_history_handle)) {
-            identity.previous_row_byte_sequence = latest_history_handle.byte_sequence;
-            identity.previous_row_sequence      = latest_history_handle.row_sequence;
+        if (!index.empty()) {
+            identity.previous_row_byte_sequence = index.back().history_handle.byte_sequence;
+            identity.previous_row_sequence      = index.back().history_handle.row_sequence;
         }
 
-        Terminal_history_row_record_append_result append =
-            encode_terminal_history_row_record_to_ring(
+        index.emplace_back();
+        Terminal_history_row_record_append_result append;
+        try {
+            append = encode_terminal_history_row_record_to_ring(
                 *ring,
                 decoded.record,
                 identity);
+        }
+        catch (...) {
+            index.pop_back();
+            throw;
+        }
         if (append.status != Terminal_history_row_record_codec_status::OK) {
+            index.pop_back();
             throw_retained_history_storage_failure();
         }
 
-        latest_history_handle = append.history_handle;
-        logical_rows.push_back(append.history_handle);
+        track_record_in_reserved_index_slot(
+            append.history_handle,
+            append.commit.record_bytes,
+            append.payload_kind);
     }
 }
 
@@ -2248,10 +2288,12 @@ Terminal_screen_model::Retained_history_storage::operator=(
 {
     if (this != &other) {
         Retained_history_storage replacement(other);
-        ring                  = std::move(replacement.ring);
-        traversal             = std::move(replacement.traversal);
-        logical_rows          = std::move(replacement.logical_rows);
-        latest_history_handle = replacement.latest_history_handle;
+        ring                    = std::move(replacement.ring);
+        traversal               = std::move(replacement.traversal);
+        index                   = std::move(replacement.index);
+        retained_record_bytes   = replacement.retained_record_bytes;
+        generic_compact_rows    = replacement.generic_compact_rows;
+        prefix_plain_ascii_rows = replacement.prefix_plain_ascii_rows;
     }
 
     return *this;
@@ -2261,8 +2303,59 @@ void Terminal_screen_model::Retained_history_storage::reset()
 {
     ring = make_retained_history_ring();
     traversal = make_retained_history_traversal(*ring);
-    logical_rows.clear();
-    latest_history_handle = {};
+    index.clear();
+    retained_record_bytes   = 0U;
+    generic_compact_rows    = 0U;
+    prefix_plain_ascii_rows = 0U;
+}
+
+void Terminal_screen_model::Retained_history_storage::
+    track_record_in_reserved_index_slot(
+        terminal_history_handle_t                history_handle,
+        std::uint32_t                            record_bytes,
+        Terminal_history_row_record_payload_kind payload_kind) noexcept
+{
+    Q_ASSERT(!index.empty());
+    Q_ASSERT(history_handle.record_bytes == record_bytes);
+
+    index.back().history_handle = history_handle;
+    index.back().payload_kind   = payload_kind;
+    retained_record_bytes += record_bytes;
+
+    switch (payload_kind) {
+        case Terminal_history_row_record_payload_kind::GENERIC_COMPACT:
+            ++generic_compact_rows;
+            break;
+        case Terminal_history_row_record_payload_kind::PREFIX_PLAIN_ASCII:
+            ++prefix_plain_ascii_rows;
+            break;
+        default:
+            std::terminate();
+    }
+}
+
+void Terminal_screen_model::Retained_history_storage::discard_index_prefix(
+    std::size_t record_count) const noexcept
+{
+    Q_ASSERT(record_count <= index.size());
+
+    for (std::size_t entry_index = 0U; entry_index < record_count; ++entry_index) {
+        const retained_history_index_entry_t& entry = index.front();
+        retained_record_bytes -= entry.history_handle.record_bytes;
+
+        switch (entry.payload_kind) {
+            case Terminal_history_row_record_payload_kind::GENERIC_COMPACT:
+                --generic_compact_rows;
+                break;
+            case Terminal_history_row_record_payload_kind::PREFIX_PLAIN_ASCII:
+                --prefix_plain_ascii_rows;
+                break;
+            default:
+                std::terminate();
+        }
+
+        index.pop_front();
+    }
 }
 
 Terminal_screen_model::Primary_backing_buffer::Primary_backing_buffer() = default;
@@ -2301,18 +2394,18 @@ Terminal_screen_model::Primary_backing_buffer::active_grid_state() const
 
 bool Terminal_screen_model::Primary_backing_buffer::retained_history_empty() const
 {
-    return retained_history.logical_rows.empty();
+    return retained_history.index.empty();
 }
 
 int Terminal_screen_model::Primary_backing_buffer::retained_history_size() const
 {
-    if (retained_history.logical_rows.size() >
+    if (retained_history.index.size() >
         static_cast<std::size_t>(std::numeric_limits<int>::max()))
     {
         throw std::overflow_error("terminal retained history row count exceeds int range");
     }
 
-    return static_cast<int>(retained_history.logical_rows.size());
+    return static_cast<int>(retained_history.index.size());
 }
 
 std::optional<Terminal_screen_model::retained_row_record_t>
@@ -2323,13 +2416,13 @@ Terminal_screen_model::Primary_backing_buffer::materialize_retained_history_reco
         "Terminal_screen_model::Primary_backing_buffer::materialize_retained_history_record");
 
     for (int attempt = 0; attempt < 2; ++attempt) {
-        if (index >= retained_history.logical_rows.size()) {
+        if (index >= retained_history.index.size()) {
             return std::nullopt;
         }
 
         Terminal_history_row_traversal_result row =
             retained_history.traversal->resolve_cached_row(
-                retained_history.logical_rows[index]);
+                retained_history.index[index].history_handle);
         if (row.status == Terminal_history_row_traversal_status::OK) {
             return Terminal_screen_model::retained_row_record_from_history_row_record(
                 row.row.record);
@@ -2353,11 +2446,11 @@ Terminal_screen_model::Primary_backing_buffer::retained_history_handle_at_index(
     VNM_TERMINAL_PROFILE_SCOPE(
         "Terminal_screen_model::Primary_backing_buffer::retained_history_handle_at_index");
 
-    if (index >= retained_history.logical_rows.size()) {
+    if (index >= retained_history.index.size()) {
         return std::nullopt;
     }
 
-    return retained_history.logical_rows[index];
+    return retained_history.index[index].history_handle;
 }
 
 Terminal_screen_model::retained_history_append_result_t
@@ -2373,24 +2466,34 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
     terminal_history_row_record_identity_t identity;
     identity.epoch        = k_terminal_history_retained_identity_epoch;
     identity.row_sequence = history_record.provenance.retained_line_id;
-    if (terminal_history_handle_has_identity(retained_history.latest_history_handle)) {
+    if (!retained_history.index.empty()) {
         identity.previous_row_byte_sequence =
-            retained_history.latest_history_handle.byte_sequence;
+            retained_history.index.back().history_handle.byte_sequence;
         identity.previous_row_sequence =
-            retained_history.latest_history_handle.row_sequence;
+            retained_history.index.back().history_handle.row_sequence;
     }
 
-    Terminal_history_row_record_append_result append =
-        encode_terminal_history_row_record_to_ring(
+    retained_history.index.emplace_back();
+    Terminal_history_row_record_append_result append;
+    try {
+        append = encode_terminal_history_row_record_to_ring(
             *retained_history.ring,
             history_record,
             identity);
+    }
+    catch (...) {
+        retained_history.index.pop_back();
+        throw;
+    }
     if (append.status != Terminal_history_row_record_codec_status::OK) {
+        retained_history.index.pop_back();
         throw_retained_history_storage_failure();
     }
 
-    retained_history.latest_history_handle = append.history_handle;
-    retained_history.logical_rows.push_back(append.history_handle);
+    retained_history.track_record_in_reserved_index_slot(
+        append.history_handle,
+        append.commit.record_bytes,
+        append.payload_kind);
     retained_history.traversal->discard_directory_cache();
 
     retained_history_append_result_t result;
@@ -2407,27 +2510,20 @@ int Terminal_screen_model::Primary_backing_buffer::discard_oldest_retained_histo
     VNM_TERMINAL_PROFILE_SCOPE(
         "Terminal_screen_model::Primary_backing_buffer::discard_oldest_retained_history_records");
 
-    if (row_count <= 0 || retained_history.logical_rows.empty()) {
+    if (row_count <= 0 || retained_history.index.empty()) {
         return 0;
     }
 
     const std::size_t rows_to_discard = std::min(
         static_cast<std::size_t>(row_count),
-        retained_history.logical_rows.size());
+        retained_history.index.size());
     const terminal_history_ring_discard_result_t discard =
         retained_history.ring->discard_oldest_records(rows_to_discard);
     if (discard.status != Terminal_history_ring_status::OK) {
         throw_retained_history_storage_failure();
     }
 
-    retained_history.logical_rows.erase(
-        retained_history.logical_rows.begin(),
-        retained_history.logical_rows.begin() +
-            static_cast<std::ptrdiff_t>(discard.discarded_records));
-    retained_history.latest_history_handle =
-        retained_history.logical_rows.empty()
-            ? terminal_history_handle_t{}
-            : retained_history.logical_rows.back();
+    retained_history.discard_index_prefix(discard.discarded_records);
     retained_history.traversal->discard_directory_cache();
 
     if (discard.discarded_records >
@@ -2452,18 +2548,40 @@ void Terminal_screen_model::Primary_backing_buffer::rebuild_retained_history_row
     VNM_TERMINAL_PROFILE_SCOPE(
         "Terminal_screen_model::Primary_backing_buffer::rebuild_retained_history_rows");
 
-    retained_history.logical_rows.clear();
+    std::deque<Retained_history_storage::retained_history_index_entry_t>
+        rebuilt_index;
+    std::uint64_t rebuilt_record_bytes = 0U;
+    std::uint64_t rebuilt_generic_rows = 0U;
+    std::uint64_t rebuilt_prefix_rows  = 0U;
 
     Terminal_history_row_traversal_result current =
         retained_history.traversal->oldest_live_row();
     if (current.status == Terminal_history_row_traversal_status::EMPTY) {
-        retained_history.latest_history_handle = {};
+        retained_history.index.swap(rebuilt_index);
+        retained_history.retained_record_bytes   = 0U;
+        retained_history.generic_compact_rows    = 0U;
+        retained_history.prefix_plain_ascii_rows = 0U;
         return;
     }
 
     while (current.status == Terminal_history_row_traversal_status::OK) {
-        retained_history.logical_rows.push_back(current.row.history_handle);
-        retained_history.latest_history_handle = current.row.history_handle;
+        Retained_history_storage::retained_history_index_entry_t entry;
+        entry.history_handle = current.row.history_handle;
+        entry.payload_kind   = current.row.payload_kind;
+        rebuilt_index.push_back(entry);
+        rebuilt_record_bytes += current.row.history_handle.record_bytes;
+
+        switch (current.row.payload_kind) {
+            case Terminal_history_row_record_payload_kind::GENERIC_COMPACT:
+                ++rebuilt_generic_rows;
+                break;
+            case Terminal_history_row_record_payload_kind::PREFIX_PLAIN_ASCII:
+                ++rebuilt_prefix_rows;
+                break;
+            default:
+                throw_retained_history_storage_failure();
+        }
+
         current = retained_history.traversal->next_row_after(current.row.history_handle);
     }
 
@@ -2471,9 +2589,10 @@ void Terminal_screen_model::Primary_backing_buffer::rebuild_retained_history_row
         throw_retained_history_storage_failure();
     }
 
-    if (retained_history.logical_rows.empty()) {
-        retained_history.latest_history_handle = {};
-    }
+    retained_history.index.swap(rebuilt_index);
+    retained_history.retained_record_bytes   = rebuilt_record_bytes;
+    retained_history.generic_compact_rows    = rebuilt_generic_rows;
+    retained_history.prefix_plain_ascii_rows = rebuilt_prefix_rows;
 }
 
 int Terminal_screen_model::Primary_backing_buffer::
@@ -2485,22 +2604,16 @@ int Terminal_screen_model::Primary_backing_buffer::
     const std::uint64_t oldest_live =
         retained_history.ring->oldest_live_byte_sequence();
 
-    auto first_live = retained_history.logical_rows.begin();
-    while (first_live != retained_history.logical_rows.end() &&
-        first_live->byte_sequence < oldest_live)
+    auto first_live = retained_history.index.begin();
+    while (first_live != retained_history.index.end() &&
+        first_live->history_handle.byte_sequence < oldest_live)
     {
         ++first_live;
     }
 
     const std::size_t pruned_rows = static_cast<std::size_t>(
-        first_live - retained_history.logical_rows.begin());
-    retained_history.logical_rows.erase(
-        retained_history.logical_rows.begin(),
-        first_live);
-    retained_history.latest_history_handle =
-        retained_history.logical_rows.empty()
-            ? terminal_history_handle_t{}
-            : retained_history.logical_rows.back();
+        first_live - retained_history.index.begin());
+    retained_history.discard_index_prefix(pruned_rows);
     retained_history.traversal->discard_directory_cache();
 
     if (pruned_rows > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
@@ -5502,9 +5615,11 @@ void Terminal_screen_model::fail_hyperlink_compaction_allocation_if_requested(
 
 void Terminal_screen_model::compact_hyperlink_ids()
 {
+    std::set<Terminal_hyperlink_id> known_ids_before_compaction;
     std::map<Terminal_hyperlink_id, QByteArray> identity_by_old_id;
 
     const auto record_identity = [&](Terminal_hyperlink_id id, const QByteArray& identity) {
+        known_ids_before_compaction.insert(id);
         const auto [found, inserted] = identity_by_old_id.emplace(id, identity);
         if (!inserted && found->second != identity) {
             throw std::runtime_error(
@@ -5662,6 +5777,11 @@ void Terminal_screen_model::compact_hyperlink_ids()
         queue_row_rewrites(m_primary_repaint_recovery_candidate.rows);
     }
 
+    const std::uint64_t reclaimed_hyperlink_ids =
+        known_ids_before_compaction.size() > new_ids_by_identity.size()
+            ? known_ids_before_compaction.size() - new_ids_by_identity.size()
+            : 0U;
+
     const Terminal_hyperlink_id next_hyperlink_id =
         new_ids_by_identity.size() >= static_cast<std::size_t>(k_max_terminal_hyperlink_id)
             ? k_no_terminal_hyperlink_id
@@ -5675,6 +5795,9 @@ void Terminal_screen_model::compact_hyperlink_ids()
         m_primary_repaint_recovery_candidate.hyperlink_identity_keys.swap(
             candidate_identity_keys);
     }
+
+    ++m_hyperlink_table_stats.compaction_count;
+    m_hyperlink_table_stats.reclaimed_hyperlink_ids += reclaimed_hyperlink_ids;
     m_next_hyperlink_id = next_hyperlink_id;
 }
 

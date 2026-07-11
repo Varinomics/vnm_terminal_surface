@@ -1,4 +1,5 @@
 #include "vnm_terminal/internal/terminal_history_row_record_codec.h"
+#include "vnm_terminal/internal/terminal_screen_model.h"
 #include "helpers/test_check.h"
 
 #include <QByteArray>
@@ -16,11 +17,11 @@ namespace {
 using vnm_terminal::test_helpers::check;
 
 constexpr std::size_t k_retained_history_ring_capacity_bytes = 64U * 1024U * 1024U;
-constexpr std::uint64_t k_target_retained_rows = 205000U;
 constexpr std::uint32_t k_149_column_record_bytes_with_ring_overhead = 305U;
 constexpr std::uint64_t k_min_149_column_single_style_retained_rows = 80000U;
 constexpr std::uint64_t k_min_149_column_hyperlink_heavy_retained_rows = 9000U;
 constexpr int k_capacity_gate_columns = 149;
+constexpr int k_model_eviction_rows = 25000;
 
 constexpr std::array<std::uint64_t, 5U> k_stress_levels = {
     20000U,
@@ -30,11 +31,12 @@ constexpr std::array<std::uint64_t, 5U> k_stress_levels = {
     205000U,
 };
 
-constexpr std::array<int, 7U> k_width_sweep_columns = {
+constexpr std::array<int, 8U> k_width_sweep_columns = {
     80,
     120,
     149,
     171,
+    172,
     200,
     250,
     4096,
@@ -208,37 +210,6 @@ std::uint64_t retained_row_floor(const encoded_record_projection_t& projection)
     return retained_row_floor(projection.capacity_bytes, projection.record_bytes);
 }
 
-std::uint64_t max_record_bytes_for_target(std::size_t capacity_bytes)
-{
-    return static_cast<std::uint64_t>(capacity_bytes) / k_target_retained_rows;
-}
-
-std::uint64_t max_full_width_ascii_columns_for_target(std::size_t capacity_bytes)
-{
-    const encoded_record_projection_t one_column =
-        encoded_record_projection(make_full_width_ascii_record(1));
-    const encoded_record_projection_t two_columns =
-        encoded_record_projection(make_full_width_ascii_record(2));
-    if (one_column.status != term::Terminal_history_row_record_codec_status::OK ||
-        two_columns.status != term::Terminal_history_row_record_codec_status::OK ||
-        two_columns.record_bytes <= one_column.record_bytes)
-    {
-        return 0U;
-    }
-
-    const std::uint64_t bytes_per_column =
-        static_cast<std::uint64_t>(two_columns.record_bytes - one_column.record_bytes);
-    const std::uint64_t fixed_record_bytes =
-        static_cast<std::uint64_t>(one_column.record_bytes) - bytes_per_column;
-    const std::uint64_t max_record_bytes =
-        max_record_bytes_for_target(capacity_bytes);
-    if (max_record_bytes <= fixed_record_bytes) {
-        return 0U;
-    }
-
-    return (max_record_bytes - fixed_record_bytes) / bytes_per_column;
-}
-
 bool run_width_sweep()
 {
     bool ok = true;
@@ -254,21 +225,29 @@ bool run_width_sweep()
     }
 
     const std::size_t capacity_bytes = limits_ring.capacity_bytes();
-    const std::uint64_t ascii_target_max_columns =
-        max_full_width_ascii_columns_for_target(capacity_bytes);
+    const term::terminal_history_prefix_plain_ascii_retention_estimate_t width_bound =
+        term::make_terminal_history_prefix_plain_ascii_retention_estimate(
+            capacity_bytes,
+            k_capacity_gate_columns);
+    const std::uint64_t ascii_target_max_columns = width_bound.max_columns_at_target_rows;
 
     std::cout << "ascii_width_sweep capacity_bytes="
               << capacity_bytes
-              << " target_rows=" << k_target_retained_rows
+              << " target_rows=" << term::k_terminal_history_retention_target_rows
               << " target_max_columns=" << ascii_target_max_columns << '\n';
 
     for (int columns : k_width_sweep_columns) {
         const encoded_record_projection_t projection =
             encoded_record_projection(make_full_width_ascii_record(columns));
         const std::uint64_t retained_floor = retained_row_floor(projection);
-        const bool reaches_target = retained_floor >= k_target_retained_rows;
+        const bool reaches_target =
+            retained_floor >= term::k_terminal_history_retention_target_rows;
         const bool expected_reaches_target =
             static_cast<std::uint64_t>(columns) <= ascii_target_max_columns;
+        const term::terminal_history_prefix_plain_ascii_retention_estimate_t estimate =
+            term::make_terminal_history_prefix_plain_ascii_retention_estimate(
+                capacity_bytes,
+                columns);
 
         std::cout << "ascii_width_sweep columns=" << columns
                   << " record_bytes_with_ring_overhead=" << projection.record_bytes
@@ -280,12 +259,34 @@ bool run_width_sweep()
                 projection.record_bytes > 0U,
             "width sweep full-width ASCII row encodes for " + std::to_string(columns) +
             " columns");
+        ok &= check(estimate.record_bytes == projection.record_bytes &&
+                estimate.retained_rows == retained_floor,
+            "codec estimate matches actual committed bytes for " +
+            std::to_string(columns) + " columns");
 
         if (columns == k_capacity_gate_columns) {
             ok &= check(projection.record_bytes <=
                     k_149_column_record_bytes_with_ring_overhead,
                 "149-column width sweep record bytes include the 40-byte ring overhead "
                 "and stay <= 305 bytes");
+            ok &= check(
+                estimate.contract_version ==
+                    term::k_terminal_history_retention_estimate_contract_version &&
+                estimate.source_width_columns == 149U &&
+                estimate.record_bytes == 305U &&
+                estimate.retained_rows == 220029U &&
+                estimate.target_rows == 205000U &&
+                estimate.max_columns_at_target_rows == 171U,
+                "149-column estimate pins the versioned retained-capacity contract tuple");
+        }
+
+        if (columns == 171) {
+            ok &= check(reaches_target,
+                "actual committed 171-column records retain at least 205000 rows");
+        }
+        if (columns == 172) {
+            ok &= check(!reaches_target,
+                "actual committed 172-column records retain fewer than 205000 rows");
         }
 
         ok &= check(reaches_target == expected_reaches_target,
@@ -306,7 +307,8 @@ bool run_styled_and_hyperlink_capacity_floor_report()
         const encoded_record_projection_t projection =
             encoded_record_projection(record);
         const std::uint64_t retained_floor = retained_row_floor(projection);
-        const bool reaches_ascii_target = retained_floor >= k_target_retained_rows;
+        const bool reaches_ascii_target =
+            retained_floor >= term::k_terminal_history_retention_target_rows;
 
         std::cout << "styled_hyperlink_ascii_floor scenario=" << scenario
                   << " record_bytes_with_ring_overhead=" << projection.record_bytes
@@ -331,6 +333,101 @@ bool run_styled_and_hyperlink_capacity_floor_report()
         "hyperlink_heavy_149_columns",
         make_full_width_hyperlink_heavy_record(k_capacity_gate_columns),
         k_min_149_column_hyperlink_heavy_retained_rows);
+
+    return ok;
+}
+
+QString snapshot_text_at_offset(
+    term::Terminal_screen_model& model,
+    int                          offset_from_tail)
+{
+    term::Terminal_render_snapshot_request request;
+    request.sequence                  = 1U;
+    request.viewport.active_buffer    = term::Terminal_buffer_id::PRIMARY;
+    request.viewport.visible_rows     = 1;
+    request.viewport.scrollback_rows  = model.scrollback_size();
+    request.viewport.offset_from_tail = offset_from_tail;
+    request.viewport.follow_tail      = false;
+
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(request);
+    QString text;
+    for (const term::Terminal_render_cell& cell : snapshot.cells) {
+        if (cell.position.row == 0 && !cell.wide_continuation) {
+            cell.text.append_to(text);
+        }
+    }
+    return text;
+}
+
+bool run_model_sustained_cap_eviction_stress()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model_config config;
+    config.grid_size        = {1, 1};
+    config.scrollback_limit = static_cast<int>(
+        term::k_terminal_history_retention_target_rows);
+    term::Terminal_screen_model model(config);
+
+    model.ingest(QByteArrayLiteral("x\r\n").repeated(config.scrollback_limit));
+    ok &= check(model.scrollback_size() == config.scrollback_limit,
+        "model sustained-output fixture reaches the configured retained-row cap");
+
+    const std::optional<term::terminal_history_handle_t> oldest_before =
+        model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, 0);
+    const std::optional<term::terminal_history_handle_t> expected_oldest_after =
+        model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            k_model_eviction_rows);
+    if (!oldest_before.has_value() || !expected_oldest_after.has_value()) {
+        return check(false, "model sustained-output fixture captures exact eviction handles");
+    }
+
+    model.ingest(QByteArrayLiteral("y\r\n").repeated(k_model_eviction_rows));
+
+    const term::terminal_retained_history_diagnostics_t diagnostics =
+        model.retained_history_diagnostics();
+    const std::optional<term::terminal_history_handle_t> oldest_after =
+        model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, 0);
+    const std::optional<term::terminal_history_handle_t> newest_after =
+        model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            config.scrollback_limit - 1);
+
+    if (!oldest_after.has_value() || !newest_after.has_value()) {
+        return check(false, "model sustained output exposes exact retained boundary handles");
+    }
+
+    ok &= check(diagnostics.retained_rows ==
+            term::k_terminal_history_retention_target_rows &&
+            diagnostics.payload_kind_generic_compact_rows == 0U &&
+            diagnostics.payload_kind_prefix_plain_ascii_rows == diagnostics.retained_rows &&
+            oldest_after->record_bytes == newest_after->record_bytes &&
+            diagnostics.retained_record_bytes ==
+                diagnostics.retained_rows * oldest_after->record_bytes &&
+            diagnostics.average_retained_row_bytes == oldest_after->record_bytes,
+        "model sustained output reports exact retained storage after 25000 replacements");
+    ok &= check(
+        diagnostics.prefix_plain_ascii_estimate.contract_version ==
+            term::k_terminal_history_retention_estimate_contract_version &&
+        diagnostics.prefix_plain_ascii_estimate.source_width_columns == 1U &&
+        diagnostics.prefix_plain_ascii_estimate.record_bytes == 157U &&
+        diagnostics.prefix_plain_ascii_estimate.retained_rows == 427444U &&
+        diagnostics.prefix_plain_ascii_estimate.target_rows == 205000U &&
+        diagnostics.prefix_plain_ascii_estimate.max_columns_at_target_rows == 171U,
+        "model supplies the live ring budget and current width to the codec estimate");
+    ok &= check(oldest_after == expected_oldest_after &&
+            newest_after->row_sequence ==
+                oldest_after->row_sequence +
+                    term::k_terminal_history_retention_target_rows - 1U,
+        "model sustained output retains the exact oldest handle and contiguous sequence span");
+    ok &= check(
+        model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, *oldest_before).
+                resolution_status == term::Terminal_history_resolution_status::STALE_ROW_SEQUENCE,
+        "model sustained output rejects the exact evicted oldest handle");
+    ok &= check(snapshot_text_at_offset(model, config.scrollback_limit) == QStringLiteral("x") &&
+            snapshot_text_at_offset(model, 1) == QStringLiteral("y"),
+        "model sustained output preserves exact oldest and newest retained content");
 
     return ok;
 }
@@ -416,5 +513,6 @@ int main()
     ok &= run_width_sweep();
     ok &= run_styled_and_hyperlink_capacity_floor_report();
     ok &= run_149_column_stress();
+    ok &= run_model_sustained_cap_eviction_stress();
     return ok ? 0 : 1;
 }

@@ -375,6 +375,18 @@ bool test_prefix_plain_ascii_rows_use_prefix_payload()
             k_149_column_prefix_ascii_record_bytes_with_ring_overhead,
         "149-column prefix printable ASCII record is measured including the 40-byte "
         "ring overhead and stays <= 305 bytes");
+    const term::terminal_history_prefix_plain_ascii_retention_estimate_t estimate =
+        term::make_terminal_history_prefix_plain_ascii_retention_estimate(
+            budget_ring.capacity_bytes(),
+            149);
+    ok &= check(
+        estimate.contract_version ==
+            term::k_terminal_history_retention_estimate_contract_version &&
+        estimate.source_width_columns == 149U &&
+        estimate.record_bytes == budget_append.commit.record_bytes &&
+        estimate.target_rows == term::k_terminal_history_retention_target_rows &&
+        estimate.max_columns_at_target_rows == 0U,
+        "prefix plain-ASCII retention estimate owns its version, target, and byte arithmetic");
     ok &= check(payload_kind(payload_bytes(budget_ring, budget_append)) ==
             k_payload_kind_prefix_plain_ascii,
         "149-column budget row uses prefix plain ASCII payload kind 1");

@@ -1852,6 +1852,37 @@ Terminal_history_row_record_codec_status read_cell_stream(
 
 }
 
+terminal_history_prefix_plain_ascii_retention_estimate_t
+make_terminal_history_prefix_plain_ascii_retention_estimate(
+    std::uint64_t byte_budget,
+    int           source_width_columns)
+{
+    if (!source_width_is_supported(source_width_columns)) {
+        return {};
+    }
+
+    terminal_history_prefix_plain_ascii_retention_estimate_t estimate;
+    estimate.contract_version     = k_terminal_history_retention_estimate_contract_version;
+    estimate.source_width_columns = static_cast<std::uint64_t>(source_width_columns);
+    estimate.record_bytes =
+        k_row_record_header_bytes                +
+        estimate.source_width_columns            +
+        terminal_history_ring_record_overhead_bytes();
+    estimate.retained_rows = byte_budget / estimate.record_bytes;
+    estimate.target_rows   = k_terminal_history_retention_target_rows;
+
+    const std::uint64_t fixed_record_bytes =
+        k_row_record_header_bytes + terminal_history_ring_record_overhead_bytes();
+    const std::uint64_t target_record_bytes = byte_budget / estimate.target_rows;
+    if (target_record_bytes > fixed_record_bytes) {
+        estimate.max_columns_at_target_rows = std::min<std::uint64_t>(
+            target_record_bytes - fixed_record_bytes,
+            k_terminal_screen_model_max_columns);
+    }
+
+    return estimate;
+}
+
 Terminal_history_row_record_append_result encode_terminal_history_row_record_to_ring(
     Terminal_history_ring&                      ring,
     const Terminal_history_row_record&          record,
@@ -1870,6 +1901,10 @@ Terminal_history_row_record_append_result encode_terminal_history_row_record_to_
     if (result.status != Terminal_history_row_record_codec_status::OK) {
         return result;
     }
+
+    result.payload_kind = parts.payload_kind == k_payload_kind_prefix_plain_ascii
+        ? Terminal_history_row_record_payload_kind::PREFIX_PLAIN_ASCII
+        : Terminal_history_row_record_payload_kind::GENERIC_COMPACT;
 
     Terminal_history_ring_record_reservation reservation;
     {
@@ -2048,6 +2083,10 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record_pay
     }
 
     result.history_handle = actual_handle;
+    result.payload_kind = payload_kind_from_flags(header.flags) ==
+            k_payload_kind_prefix_plain_ascii
+        ? Terminal_history_row_record_payload_kind::PREFIX_PLAIN_ASCII
+        : Terminal_history_row_record_payload_kind::GENERIC_COMPACT;
     result.previous_row_byte_sequence = header.previous_row_byte_sequence;
     result.previous_row_sequence = header.previous_row_sequence;
     result.record = std::move(record);
