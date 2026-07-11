@@ -439,9 +439,6 @@ Terminal_screen_model::Terminal_screen_model(Terminal_screen_model_config config
     reset_grid();
 }
 
-Terminal_screen_model::Terminal_screen_model(Terminal_screen_model&&) noexcept            = default;
-Terminal_screen_model& Terminal_screen_model::operator=(Terminal_screen_model&&) noexcept = default;
-
 Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::ingest");
@@ -2172,11 +2169,9 @@ Terminal_screen_model::screen_buffer_state_t Terminal_screen_model::make_empty_b
 Terminal_screen_model::Retained_history_storage::Retained_history_storage() = default;
 
 Terminal_screen_model::Retained_history_storage::~Retained_history_storage() = default;
-Terminal_screen_model::Retained_history_storage::Retained_history_storage(
-    Retained_history_storage&&) noexcept = default;
 Terminal_screen_model::Retained_history_storage&
 Terminal_screen_model::Retained_history_storage::operator=(
-    Retained_history_storage&&) noexcept = default;
+    Retained_history_storage&&) = default;
 
 void Terminal_screen_model::Retained_history_storage::ensure_allocated()
 {
@@ -2241,11 +2236,9 @@ void Terminal_screen_model::Retained_history_storage::discard_index_prefix(
 
 Terminal_screen_model::Primary_backing_buffer::Primary_backing_buffer() = default;
 Terminal_screen_model::Primary_backing_buffer::~Primary_backing_buffer() = default;
-Terminal_screen_model::Primary_backing_buffer::Primary_backing_buffer(
-    Primary_backing_buffer&&) noexcept = default;
 Terminal_screen_model::Primary_backing_buffer&
 Terminal_screen_model::Primary_backing_buffer::operator=(
-    Primary_backing_buffer&&) noexcept = default;
+    Primary_backing_buffer&&) = default;
 
 Terminal_screen_model::screen_buffer_state_t&
 Terminal_screen_model::Primary_backing_buffer::active_grid_state()

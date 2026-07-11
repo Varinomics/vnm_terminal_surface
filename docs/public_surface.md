@@ -274,6 +274,10 @@ Process and runtime signals:
 - `clipboard_write_requested(quint64 request_id, QString target_selection,
   QByteArray payload)`.
 
+`bell_requested()` reports a policy-enabled bell event. The surface has already
+handled audible playback; hosts must not treat the signal as a request to play
+sound.
+
 `Exit_reason` is `EXITED`, `INTERRUPTED`, `TERMINATED`, or
 `FAILED_TO_START`. `Backend_error_code` mirrors backend and session failure
 classes such as invalid launch config, unavailable working directory, start,

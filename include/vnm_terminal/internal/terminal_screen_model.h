@@ -357,8 +357,8 @@ public:
 
     Terminal_screen_model(const Terminal_screen_model&)            = delete;
     Terminal_screen_model& operator=(const Terminal_screen_model&) = delete;
-    Terminal_screen_model(Terminal_screen_model&&) noexcept;
-    Terminal_screen_model& operator=(Terminal_screen_model&&) noexcept;
+    Terminal_screen_model(Terminal_screen_model&&)            = default;
+    Terminal_screen_model& operator=(Terminal_screen_model&&) = default;
 
     Terminal_screen_model_result ingest(QByteArrayView bytes);
     Terminal_screen_model_result resize(terminal_grid_size_t grid_size);
@@ -546,8 +546,8 @@ private:
 
         Retained_history_storage(const Retained_history_storage&)            = delete;
         Retained_history_storage& operator=(const Retained_history_storage&) = delete;
-        Retained_history_storage(Retained_history_storage&&) noexcept;
-        Retained_history_storage& operator=(Retained_history_storage&&) noexcept;
+        Retained_history_storage(Retained_history_storage&&)            = default;
+        Retained_history_storage& operator=(Retained_history_storage&&);
 
         void ensure_allocated();
         void reset();
@@ -596,8 +596,8 @@ private:
 
         Primary_backing_buffer(const Primary_backing_buffer&)            = delete;
         Primary_backing_buffer& operator=(const Primary_backing_buffer&) = delete;
-        Primary_backing_buffer(Primary_backing_buffer&&) noexcept;
-        Primary_backing_buffer& operator=(Primary_backing_buffer&&) noexcept;
+        Primary_backing_buffer(Primary_backing_buffer&&)            = default;
+        Primary_backing_buffer& operator=(Primary_backing_buffer&&);
 
         screen_buffer_state_t& active_grid_state();
         const screen_buffer_state_t& active_grid_state() const;
