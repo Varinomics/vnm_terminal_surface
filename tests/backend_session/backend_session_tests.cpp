@@ -1536,9 +1536,9 @@ bool test_selection_snapshot_and_visible_text()
     Scripted_backend* partial_space_backend = make_session(partial_space_session);
     ok &= check(partial_space_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 bounded-space selection session starts");
+        "bounded-space selection session starts");
     ok &= check(partial_space_backend->emit_output(QByteArrayLiteral("A B")),
-        "Phase 4 bounded-space backend emits visible text");
+        "bounded-space backend emits visible text");
     partial_space_session->set_selection_range({
         { 0, 0 },
         { 0, 2 },
@@ -1548,7 +1548,7 @@ bool test_selection_snapshot_and_visible_text()
         partial_space_session->selected_text();
     ok &= check(partial_space_payload.code == term::Terminal_selection_result_code::OK &&
         partial_space_payload.text == QStringLiteral("A "),
-        "Phase 4 snapshot payload preserves bounded trailing space");
+        "snapshot payload preserves bounded trailing space");
 
     const std::uint64_t selected_generation = session->render_snapshot_generation();
     session->set_selection_range({
@@ -1844,7 +1844,7 @@ bool test_selection_snapshot_and_visible_text()
     const std::optional<term::terminal_selection_source_identity_t> eviction_source =
         eviction_session->published_selection_source_identity();
     ok &= check(eviction_source.has_value(),
-        "Phase 4 offscreen scrollback selection has a published source identity");
+        "offscreen scrollback selection has a published source identity");
     eviction_session->set_selection_range_from_published_source({
         { 0, 0 },
         { 2, 15 },
@@ -1855,7 +1855,7 @@ bool test_selection_snapshot_and_visible_text()
     ok &= check(offscreen_scrollback_payload.code == term::Terminal_selection_result_code::OK &&
         offscreen_scrollback_payload.text ==
             QStringLiteral("scroll-line-000\nscroll-line-001\nscroll-line-002"),
-        "Phase 4 offscreen scrollback payload is complete instead of visible-snapshot-truncated");
+        "offscreen scrollback payload is complete instead of visible-snapshot-truncated");
     eviction_session->clear_selection();
     eviction_session->set_selection_range({
         { 0, 0 },
@@ -1982,15 +1982,15 @@ bool test_selection_snapshot_and_visible_text()
     Scripted_backend* sync_source_backend = make_session(sync_source_session);
     ok &= check(sync_source_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 synchronized payload-source session starts");
+        "synchronized payload-source session starts");
     ok &= check(sync_source_backend->emit_output(QByteArrayLiteral("alpha")),
-        "Phase 4 synchronized payload-source backend emits visible text");
+        "synchronized payload-source backend emits visible text");
     const std::optional<term::terminal_selection_source_identity_t> visible_source =
         sync_source_session->published_selection_source_identity();
     ok &= check(visible_source.has_value(),
-        "Phase 4 visible published source identity is available");
+        "visible published source identity is available");
     ok &= check(sync_source_backend->emit_output(QByteArrayLiteral("\x1b[?2026h\rbravo")),
-        "Phase 4 synchronized payload-source backend mutates hidden text");
+        "synchronized payload-source backend mutates hidden text");
     sync_source_session->set_selection_range_from_published_source({
         { 0, 0 },
         { 0, 5 },
@@ -2000,29 +2000,29 @@ bool test_selection_snapshot_and_visible_text()
         sync_source_session->selected_text();
     ok &= check(hidden_source_payload.code == term::Terminal_selection_result_code::OK &&
         hidden_source_payload.text == QStringLiteral("alpha"),
-        "Phase 4 selection payload is extracted from the published source, not hidden synchronized state");
+        "selection payload is extracted from the published source, not hidden synchronized state");
     ok &= check(sync_source_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 synchronized payload-source backend releases hidden text");
+        "synchronized payload-source backend releases hidden text");
     const std::optional<term::Terminal_render_snapshot> released_source_snapshot =
         sync_source_session->latest_render_snapshot();
     const term::Terminal_selection_result released_source_payload =
         sync_source_session->selected_text();
     ok &= check(released_source_snapshot.has_value() &&
         snapshot_row_text(*released_source_snapshot, 0) == QStringLiteral("bravo"),
-        "Phase 4 synchronized payload-source release publishes hidden replacement text");
+        "synchronized payload-source release publishes hidden replacement text");
     ok &= check(released_source_payload.code == term::Terminal_selection_result_code::OK &&
         released_source_payload.text == QStringLiteral("alpha"),
-        "Phase 4 synchronized payload-source release retains the published-source payload");
+        "synchronized payload-source release retains the published-source payload");
 
     std::unique_ptr<term::Terminal_session> hidden_offscreen_session;
     Scripted_backend* hidden_offscreen_backend = make_session(hidden_offscreen_session);
     ok &= check(hidden_offscreen_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 hidden offscreen selection session starts");
+        "hidden offscreen selection session starts");
     ok &= check(hidden_offscreen_backend->emit_output(numbered_scroll_lines(80)),
-        "Phase 4 hidden offscreen backend creates scrollback");
+        "hidden offscreen backend creates scrollback");
     ok &= check(hidden_offscreen_backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
-        "Phase 4 hidden offscreen backend enters synchronized output with hidden text");
+        "hidden offscreen backend enters synchronized output with hidden text");
     hidden_offscreen_session->set_selection_range({
         { 0, 0 },
         { 0, 5 },
@@ -2031,7 +2031,7 @@ bool test_selection_snapshot_and_visible_text()
     const term::Terminal_selection_result hidden_offscreen_payload =
         hidden_offscreen_session->selected_text();
     ok &= check(hidden_offscreen_payload.code == term::Terminal_selection_result_code::NO_SELECTION,
-        "Phase 4 hidden synchronized output blocks offscreen model fallback");
+        "hidden synchronized output blocks offscreen model fallback");
 
     return ok;
 }
@@ -2234,7 +2234,7 @@ bool test_blocked_detach_resize_snapshot_metadata_coherence()
     return ok;
 }
 
-term::terminal_selection_visual_lease_t make_phase2_selection_lease(
+term::terminal_selection_visual_lease_t make_selection_lease(
     term::Terminal_selection_range range)
 {
     term::terminal_selection_visual_lease_t lease;
@@ -2262,7 +2262,7 @@ term::terminal_selection_visual_lease_t make_phase2_selection_lease(
     return lease;
 }
 
-bool test_selection_phase2_internal_state_and_lease()
+bool test_selection_internal_state_and_lease()
 {
     bool ok = true;
 
@@ -2272,7 +2272,7 @@ bool test_selection_phase2_internal_state_and_lease()
         selection.anchor_domain() ==
             term::Terminal_selection_anchor_domain::NONE &&
         !selection.has_selection(),
-        "Phase 2 selection starts with internal NONE state");
+        "selection starts with internal NONE state");
 
     selection.begin({1, 2});
     ok &= check(selection.internal_state() ==
@@ -2283,7 +2283,7 @@ bool test_selection_phase2_internal_state_and_lease()
         selection.has_internal_selection() &&
         selection.provisional_payload_identity() != 0U &&
         selection.durable_payload_identity() == 0U,
-        "Phase 2 drag begin arms a non-copyable provisional selection and clears durable payload");
+        "drag begin arms a non-copyable provisional selection and clears durable payload");
 
     selection.extend({1, 6});
     const std::vector<QString> rows = {
@@ -2296,14 +2296,14 @@ bool test_selection_phase2_internal_state_and_lease()
             term::Terminal_selection_internal_state::DRAG_PREVIEW &&
         preview_text.code == term::Terminal_selection_result_code::OK &&
         preview_text.text == QStringLiteral("cdef"),
-        "Phase 2 drag extend records DRAG_PREVIEW without durable payload storage");
+        "drag extend records DRAG_PREVIEW without durable payload storage");
 
     const term::Terminal_selection_range range = {
         {1, 2},
         {1, 6},
         term::Terminal_selection_mode::NORMAL,
     };
-    selection.set_range(range, QStringLiteral("cdef"), make_phase2_selection_lease(range));
+    selection.set_range(range, QStringLiteral("cdef"), make_selection_lease(range));
     const std::uint64_t durable_identity = selection.durable_payload_identity();
     const term::Terminal_selection_result durable_text = selection.selected_text();
     ok &= check(selection.internal_state() ==
@@ -2314,7 +2314,7 @@ bool test_selection_phase2_internal_state_and_lease()
         selection.provisional_payload_identity() == 0U &&
         durable_text.code == term::Terminal_selection_result_code::OK &&
         durable_text.text == QStringLiteral("cdef"),
-        "Phase 2 finalize stores durable payload separately from provisional drag state");
+        "finalize stores durable payload separately from provisional drag state");
 
     const std::optional<term::terminal_selection_visual_lease_t>& lease =
         selection.visual_lease();
@@ -2330,9 +2330,9 @@ bool test_selection_phase2_internal_state_and_lease()
         lease->selected_range == range &&
         lease->anchor == range.start &&
         lease->extent == range.end &&
-        lease->selected_lines == make_phase2_selection_lease(range).selected_lines &&
+        lease->selected_lines == make_selection_lease(range).selected_lines &&
         lease->durable_payload_identity == durable_identity,
-        "Phase 2 visual lease records content basis, grid, viewport, endpoints, and payload identity");
+        "visual lease records content basis, grid, viewport, endpoints, and payload identity");
 
     selection.hide_visual_attachment();
     ok &= check(selection.internal_state() ==
@@ -2341,7 +2341,7 @@ bool test_selection_phase2_internal_state_and_lease()
             term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         selection.visual_lease().has_value() &&
         selection.selected_text().text == QStringLiteral("cdef"),
-        "Phase 2 hidden attachment keeps the lease and durable payload");
+        "hidden attachment keeps the lease and durable payload");
 
     selection.detach_visual_attachment();
     ok &= check(selection.internal_state() ==
@@ -2351,7 +2351,7 @@ bool test_selection_phase2_internal_state_and_lease()
         !selection.visual_lease().has_value() &&
         selection.has_selection() &&
         selection.selected_text().text == QStringLiteral("cdef"),
-        "Phase 2 visual detach keeps copyability as PAYLOAD_ONLY");
+        "visual detach keeps copyability as PAYLOAD_ONLY");
 
     selection.clear();
     ok &= check(selection.internal_state() ==
@@ -2360,12 +2360,12 @@ bool test_selection_phase2_internal_state_and_lease()
             term::Terminal_selection_anchor_domain::NONE &&
         !selection.has_selection() &&
         selection.selected_text().code == term::Terminal_selection_result_code::NO_SELECTION,
-        "Phase 2 clear removes payload and visual lease data");
+        "clear removes payload and visual lease data");
 
     return ok;
 }
 
-bool test_selection_phase2_replacement_empty_cancel_and_payload_detach()
+bool test_selection_replacement_empty_cancel_and_payload_detach()
 {
     bool ok = true;
 
@@ -2378,7 +2378,7 @@ bool test_selection_phase2_replacement_empty_cancel_and_payload_detach()
     selection.set_range(
         original_range,
         QStringLiteral("alpha"),
-        make_phase2_selection_lease(original_range));
+        make_selection_lease(original_range));
     const std::uint64_t original_identity = selection.durable_payload_identity();
 
     selection.begin({3, 1});
@@ -2390,7 +2390,7 @@ bool test_selection_phase2_replacement_empty_cancel_and_payload_detach()
         selection.has_internal_selection() &&
         selection.durable_payload_identity() == 0U &&
         selection.selected_text().code == term::Terminal_selection_result_code::INVALID_RANGE,
-        "Phase 2 replacement mouse-down clears the old durable payload immediately");
+        "replacement mouse-down clears the old durable payload immediately");
 
     selection.clear();
     ok &= check(selection.internal_state() ==
@@ -2398,14 +2398,14 @@ bool test_selection_phase2_replacement_empty_cancel_and_payload_detach()
         selection.anchor_domain() ==
             term::Terminal_selection_anchor_domain::NONE &&
         selection.selected_text().code == term::Terminal_selection_result_code::NO_SELECTION,
-        "Phase 2 cancelled replacement returns to NONE without restoring old payload");
+        "cancelled replacement returns to NONE without restoring old payload");
 
     const term::Terminal_selection_range empty_range = {
         {4, 6},
         {4, 6},
         term::Terminal_selection_mode::NORMAL,
     };
-    selection.set_range(empty_range, QString(), make_phase2_selection_lease(empty_range));
+    selection.set_range(empty_range, QString(), make_selection_lease(empty_range));
     const std::uint64_t empty_identity = selection.durable_payload_identity();
     const term::Terminal_selection_result empty_text = selection.selected_text();
     ok &= check(selection.internal_state() ==
@@ -2415,7 +2415,7 @@ bool test_selection_phase2_replacement_empty_cancel_and_payload_detach()
         selection.has_selection() &&
         empty_text.code == term::Terminal_selection_result_code::OK &&
         empty_text.text.isEmpty(),
-        "Phase 2 committed empty selection remains an active durable payload");
+        "committed empty selection remains an active durable payload");
 
     const term::Terminal_selection_range replacement_range = {
         {5, 0},
@@ -2429,16 +2429,16 @@ bool test_selection_phase2_replacement_empty_cancel_and_payload_detach()
             term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
         !selection.visual_lease().has_value() &&
         selection.selected_text().text == QStringLiteral("beta"),
-        "Phase 7C controller payload without visual proof is explicitly payload-only");
+        "controller payload without visual proof is explicitly payload-only");
 
     selection.set_range(
         replacement_range,
         QStringLiteral("beta"),
-        make_phase2_selection_lease(replacement_range));
+        make_selection_lease(replacement_range));
     ok &= check(selection.durable_payload_identity() != original_identity &&
         selection.durable_payload_identity() != empty_identity &&
         selection.selected_text().text == QStringLiteral("beta"),
-        "Phase 2 non-empty replacement creates a new durable payload identity");
+        "non-empty replacement creates a new durable payload identity");
 
     selection.detach_visual_attachment();
     ok &= check(selection.internal_state() ==
@@ -2448,12 +2448,12 @@ bool test_selection_phase2_replacement_empty_cancel_and_payload_detach()
         !selection.visual_lease().has_value() &&
         selection.selected_text().code == term::Terminal_selection_result_code::OK &&
         selection.selected_text().text == QStringLiteral("beta"),
-        "Phase 2A stale-policy detach preserves payload as payload-only");
+        "stale-policy detach preserves payload as payload-only");
 
     return ok;
 }
 
-bool test_selection_phase2_model_semantic_flags()
+bool test_selection_model_semantic_flags()
 {
     bool ok = true;
 
@@ -2466,7 +2466,7 @@ bool test_selection_phase2_model_semantic_flags()
     ok &= check(text_result.terminal_content_changed &&
         !text_result.active_buffer_changed &&
         !text_result.grid_reflow_changed,
-        "Phase 2 model marks printable output as semantic content change");
+        "model marks printable output as semantic content change");
 
     const term::Terminal_screen_model_result cursor_result =
         model.ingest(QByteArrayLiteral("\r"));
@@ -2474,24 +2474,24 @@ bool test_selection_phase2_model_semantic_flags()
         !cursor_result.terminal_content_changed &&
         !cursor_result.active_buffer_changed &&
         !cursor_result.grid_reflow_changed,
-        "Phase 2 model does not treat cursor-only dirty rows as semantic content identity");
+        "model does not treat cursor-only dirty rows as semantic content identity");
 
     const term::Terminal_screen_model_result resize_result =
         model.resize({4, 10});
     ok &= check(!resize_result.terminal_content_changed &&
         !resize_result.active_buffer_changed &&
         resize_result.grid_reflow_changed,
-        "Phase 2 model reports resize/reflow through an explicit grid flag");
+        "model reports resize/reflow through an explicit grid flag");
 
     const term::Terminal_screen_model_result alternate_result =
         model.ingest(QByteArrayLiteral("\x1b[?1049h"));
     ok &= check(alternate_result.active_buffer_changed,
-        "Phase 2 model reports alternate-buffer transitions through an explicit buffer flag");
+        "model reports alternate-buffer transitions through an explicit buffer flag");
 
     return ok;
 }
 
-bool test_selection_phase2_session_lease_basis_advances()
+bool test_selection_session_lease_basis_advances()
 {
     bool ok = true;
 
@@ -2499,9 +2499,9 @@ bool test_selection_phase2_session_lease_basis_advances()
     Scripted_backend* backend = make_session(session);
     ok &= check(session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 2 lease-basis session starts");
+        "lease-basis session starts");
     ok &= check(backend->emit_output(QByteArrayLiteral("alpha")),
-        "Phase 2 lease-basis backend publishes initial content");
+        "lease-basis backend publishes initial content");
 
     session->set_selection_range({
         { 0, 0 },
@@ -2516,11 +2516,11 @@ bool test_selection_phase2_session_lease_basis_advances()
         session->selection_anchor_domain() ==
             term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         initial_lease->source_content_basis.content_generation > 0U,
-        "Phase 2 initial lease captures primary backing domain and advanced content basis");
+        "initial lease captures primary backing domain and advanced content basis");
 
     session->clear_selection();
     ok &= check(backend->emit_output(QByteArrayLiteral("\ralpha!")),
-        "Phase 2 lease-basis backend publishes content mutation");
+        "lease-basis backend publishes content mutation");
     session->set_selection_range({
         { 0, 0 },
         { 0, 6 },
@@ -2534,11 +2534,11 @@ bool test_selection_phase2_session_lease_basis_advances()
             term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         mutated_lease->source_content_basis.content_generation >
             initial_lease->source_content_basis.content_generation,
-        "Phase 2 lease keeps primary backing domain across content-generation advancement");
+        "lease keeps primary backing domain across content-generation advancement");
 
     session->clear_selection();
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1049h")),
-        "Phase 2 lease-basis backend enters alternate buffer");
+        "lease-basis backend enters alternate buffer");
     session->set_selection_range({
         { 0, 0 },
         { 0, 0 },
@@ -2555,7 +2555,7 @@ bool test_selection_phase2_session_lease_basis_advances()
         alternate_lease->buffer_id == term::Terminal_buffer_id::ALTERNATE &&
         alternate_lease->source_content_basis.content_generation >
             mutated_lease->source_content_basis.content_generation,
-        "Phase 2 lease captures alternate-grid domain and content-basis advancement");
+        "lease captures alternate-grid domain and content-basis advancement");
 
     session->clear_selection();
     const term::Terminal_session_result resize_result =
@@ -2568,31 +2568,31 @@ bool test_selection_phase2_session_lease_basis_advances()
     const std::optional<term::terminal_selection_visual_lease_t> resized_lease =
         session->selection_visual_lease();
     ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
-        "Phase 2 lease-basis resize is accepted");
+        "lease-basis resize is accepted");
     ok &= check(alternate_lease.has_value() &&
         resized_lease.has_value() &&
         resized_lease->source_content_basis.grid_reflow_generation >
             alternate_lease->source_content_basis.grid_reflow_generation,
-        "Phase 2 lease captures grid-reflow basis advancement");
+        "lease captures grid-reflow basis advancement");
 
     std::unique_ptr<term::Terminal_session> synchronized_resize_session;
     Scripted_backend* synchronized_resize_backend =
         make_session(synchronized_resize_session);
     ok &= check(synchronized_resize_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 2 synchronized resize lease-basis session starts");
+        "synchronized resize lease-basis session starts");
     ok &= check(synchronized_resize_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 2 synchronized resize enters synchronized output");
+        "synchronized resize enters synchronized output");
     const term::Terminal_session_result synchronized_resize_result =
         synchronized_resize_session->resize(QSizeF(640.0, 300.0), {15, 64});
     const std::optional<term::Terminal_render_snapshot> synchronized_resize_snapshot =
         synchronized_resize_session->latest_render_snapshot();
     ok &= check(synchronized_resize_result.code == term::Terminal_session_result_code::ACCEPTED,
-        "Phase 2 synchronized resize is accepted");
+        "synchronized resize is accepted");
     ok &= check(synchronized_resize_snapshot.has_value() &&
         synchronized_resize_snapshot->grid_size.rows    == 15 &&
         synchronized_resize_snapshot->grid_size.columns == 64,
-        "Phase 2 synchronized resize publishes a geometry snapshot");
+        "synchronized resize publishes a geometry snapshot");
     synchronized_resize_session->set_selection_range({
         { 0, 0 },
         { 0, 0 },
@@ -2603,12 +2603,12 @@ bool test_selection_phase2_session_lease_basis_advances()
             synchronized_resize_session->selection_visual_lease();
     ok &= check(synchronized_resize_lease.has_value() &&
         synchronized_resize_lease->source_content_basis.grid_reflow_generation > 0U,
-        "Phase 2 lease captures synchronized resize grid-reflow basis advancement");
+        "lease captures synchronized resize grid-reflow basis advancement");
 
     return ok;
 }
 
-bool test_selection_phase3_line_lease_provenance_capture()
+bool test_selection_line_lease_provenance_capture()
 {
     bool ok = true;
 
@@ -2618,9 +2618,9 @@ bool test_selection_phase3_line_lease_provenance_capture()
     launch_config.initial_grid_size = {4, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 line lease session starts");
+        "line lease session starts");
     ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma")),
-        "Phase 3 line lease backend emits selectable rows");
+        "line lease backend emits selectable rows");
     const std::optional<term::Terminal_render_snapshot> source_snapshot =
         session->latest_render_snapshot();
     const std::optional<term::terminal_selection_source_identity_t> source =
@@ -2639,18 +2639,18 @@ bool test_selection_phase3_line_lease_provenance_capture()
         session->selection_visual_lease();
     ok &= check(payload.code == term::Terminal_selection_result_code::OK &&
         payload.text == QStringLiteral("lpha\nbeta\ngam"),
-        "Phase 3 line lease payload is extracted from the selected source rows");
+        "line lease payload is extracted from the selected source rows");
     ok &= check(source_snapshot.has_value() && source.has_value() && lease.has_value() &&
         lease->selected_lines ==
             expected_line_leases_from_snapshot(*source_snapshot, range),
-        "Phase 3 line lease descriptors match the source snapshot provenance");
+        "line lease descriptors match the source snapshot provenance");
     ok &= check(lease.has_value() && lease->selected_lines.size() == 3U,
-        "Phase 3 multi-row selection stores one descriptor per selected logical row");
+        "multi-row selection stores one descriptor per selected logical row");
     if (lease.has_value() && lease->selected_lines.size() == 3U) {
         ok &= check(lease->selected_lines[0].row_offset == 0 &&
             lease->selected_lines[1].row_offset == 1 &&
             lease->selected_lines[2].row_offset == 2,
-            "Phase 3 multi-row line lease row offsets are normalized from the selected start row");
+            "multi-row line lease row offsets are normalized from the selected start row");
     }
     if (source_snapshot.has_value() &&
         lease.has_value()          &&
@@ -2662,7 +2662,7 @@ bool test_selection_phase3_line_lease_provenance_capture()
         ok &= check(provenance[0].logical_row == 0 &&
             provenance[1].logical_row == 1 &&
             provenance[2].logical_row == 2,
-            "Phase 3 source snapshot independently exposes the selected logical rows");
+            "source snapshot independently exposes the selected logical rows");
         ok &= check(lease->selected_lines[0].history_handle ==
                 term::terminal_history_handle_from_retained_identity(
                     provenance[0].retained_line_id,
@@ -2675,7 +2675,7 @@ bool test_selection_phase3_line_lease_provenance_capture()
                 term::terminal_history_handle_from_retained_identity(
                     provenance[2].retained_line_id,
                     provenance[2].content_generation),
-            "Phase 3 line lease handles match snapshot provenance fields directly");
+            "line lease handles match snapshot provenance fields directly");
     }
 
     term::Terminal_session_config drained_config;
@@ -2686,11 +2686,11 @@ bool test_selection_phase3_line_lease_provenance_capture()
     drained_launch_config.initial_grid_size = {3, 20};
     ok &= check(drained_session->start(drained_launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 drained line lease session starts");
+        "drained line lease session starts");
     ok &= check(drained_backend->emit_output(QByteArrayLiteral("drained\r\nsource")),
-        "Phase 3 drained line lease backend queues selectable rows");
+        "drained line lease backend queues selectable rows");
     ok &= check(drained_session->output_chunks().empty(),
-        "Phase 3 drained line lease fixture holds queued output before owner drain");
+        "drained line lease fixture holds queued output before owner drain");
     drained_session->process_backend_callback_events();
     const std::optional<term::Terminal_render_snapshot> drained_snapshot =
         drained_session->latest_render_snapshot();
@@ -2705,7 +2705,7 @@ bool test_selection_phase3_line_lease_provenance_capture()
         drained_source.has_value() &&
         snapshot_row_text(*drained_snapshot, 0) == QStringLiteral("drained") &&
         snapshot_row_text(*drained_snapshot, 1) == QStringLiteral("source"),
-        "Phase 3 owner drain publishes queued source rows before selection");
+        "owner drain publishes queued source rows before selection");
     if (drained_snapshot.has_value() && drained_source.has_value()) {
         drained_session->set_selection_range_from_drained_published_source(
             drained_range,
@@ -2716,10 +2716,10 @@ bool test_selection_phase3_line_lease_provenance_capture()
             drained_session->selection_visual_lease();
         ok &= check(drained_payload.code == term::Terminal_selection_result_code::OK &&
             drained_payload.text == QStringLiteral("source"),
-            "Phase 3 drained published source payload comes from queued output");
+            "drained published source payload comes from queued output");
         ok &= check(drained_lease.has_value() &&
             drained_lease->selected_lines.size() == 1U,
-            "Phase 3 drained published source captures one retained-line descriptor");
+            "drained published source captures one retained-line descriptor");
         if (drained_lease.has_value() &&
             drained_lease->selected_lines.size() == 1U &&
             drained_snapshot->visible_line_provenance.size() >= 2U)
@@ -2734,18 +2734,18 @@ bool test_selection_phase3_line_lease_provenance_capture()
                     term::terminal_history_handle_from_retained_identity(
                         provenance.retained_line_id,
                         provenance.content_generation),
-                "Phase 3 drained descriptor handle matches drained snapshot provenance directly");
+                "drained descriptor handle matches drained snapshot provenance directly");
         }
         else {
             ok &= check(false,
-                "Phase 3 drained published source fixture exposes selected row provenance");
+                "drained published source fixture exposes selected row provenance");
         }
     }
 
     return ok;
 }
 
-bool test_selection_phase3_line_lease_negative_source_paths()
+bool test_selection_line_lease_negative_source_paths()
 {
     bool ok = true;
 
@@ -2756,9 +2756,9 @@ bool test_selection_phase3_line_lease_negative_source_paths()
         launch_config.initial_grid_size = {4, 20};
         ok &= check(session->start(launch_config).code ==
             term::Terminal_session_result_code::ACCEPTED,
-            "Phase 3 reversed line lease session starts");
+            "reversed line lease session starts");
         ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma")),
-            "Phase 3 reversed line lease backend emits selectable rows");
+            "reversed line lease backend emits selectable rows");
         const std::optional<term::Terminal_render_snapshot> source_snapshot =
             session->latest_render_snapshot();
         const std::optional<term::terminal_selection_source_identity_t> source =
@@ -2777,12 +2777,12 @@ bool test_selection_phase3_line_lease_negative_source_paths()
             session->selection_visual_lease();
         ok &= check(payload.code == term::Terminal_selection_result_code::OK &&
             payload.text == QStringLiteral("lpha\nbeta\ngam"),
-            "Phase 3 reversed multi-row selection normalizes payload row order");
+            "reversed multi-row selection normalizes payload row order");
         ok &= check(source_snapshot.has_value() && source.has_value() && lease.has_value() &&
             lease->selected_range == reversed_range &&
             lease->anchor == reversed_range.start &&
             lease->extent == reversed_range.end,
-            "Phase 3 reversed visual lease preserves caller endpoints");
+            "reversed visual lease preserves caller endpoints");
         if (source_snapshot.has_value() &&
             lease.has_value()          &&
             lease->selected_lines.size() == 3U &&
@@ -2805,11 +2805,11 @@ bool test_selection_phase3_line_lease_negative_source_paths()
                     term::terminal_history_handle_from_retained_identity(
                         provenance[2].retained_line_id,
                         provenance[2].content_generation),
-                "Phase 3 reversed multi-row descriptor handles normalize to source row order");
+                "reversed multi-row descriptor handles normalize to source row order");
         }
         else {
             ok &= check(false,
-                "Phase 3 reversed multi-row fixture exposes three source descriptors");
+                "reversed multi-row fixture exposes three source descriptors");
         }
     }
 
@@ -2818,24 +2818,24 @@ bool test_selection_phase3_line_lease_negative_source_paths()
         Scripted_backend* backend = make_session(session);
         ok &= check(session->start(valid_launch_config()).code ==
             term::Terminal_session_result_code::ACCEPTED,
-            "Phase 3 stale source session starts");
+            "stale source session starts");
         ok &= check(backend->emit_output(QByteArrayLiteral("alpha")),
-            "Phase 3 stale source backend emits original content");
+            "stale source backend emits original content");
         const std::optional<term::terminal_selection_source_identity_t> stale_source =
             session->published_selection_source_identity();
         ok &= check(stale_source.has_value(),
-            "Phase 3 stale source fixture publishes a real source before mutation");
+            "stale source fixture publishes a real source before mutation");
 
         if (stale_source.has_value()) {
             ok &= check(backend->emit_output(QByteArrayLiteral("\ralpha!")),
-                "Phase 3 stale source backend mutates published content");
+                "stale source backend mutates published content");
 
             session->set_selection_range_from_published_source(
                 {{0, 0}, {0, 5}, term::Terminal_selection_mode::NORMAL},
                 *stale_source);
             ok &= check(!session->has_selection() &&
                 !session->selection_visual_lease().has_value(),
-                "Phase 3 stale source selection attempt captures no visual lease descriptors");
+                "stale source selection attempt captures no visual lease descriptors");
         }
     }
 
@@ -2844,9 +2844,9 @@ bool test_selection_phase3_line_lease_negative_source_paths()
         Scripted_backend* backend = make_session(session);
         ok &= check(session->start(valid_launch_config()).code ==
             term::Terminal_session_result_code::ACCEPTED,
-            "Phase 3 stale-source clear session starts");
+            "stale-source clear session starts");
         ok &= check(backend->emit_output(QByteArrayLiteral("alpha")),
-            "Phase 3 stale-source clear backend emits original content");
+            "stale-source clear backend emits original content");
         const std::optional<term::terminal_selection_source_identity_t> stale_source =
             session->published_selection_source_identity();
         const term::Terminal_selection_range range = {
@@ -2855,7 +2855,7 @@ bool test_selection_phase3_line_lease_negative_source_paths()
             term::Terminal_selection_mode::NORMAL,
         };
         ok &= check(stale_source.has_value(),
-            "Phase 3 stale-source clear fixture publishes a real source before mutation");
+            "stale-source clear fixture publishes a real source before mutation");
 
         if (stale_source.has_value()) {
             session->set_selection_range_from_published_source(range, *stale_source);
@@ -2864,19 +2864,19 @@ bool test_selection_phase3_line_lease_negative_source_paths()
             ok &= check(session->has_selection() &&
                 initial_payload.code == term::Terminal_selection_result_code::OK &&
                 initial_payload.text == QStringLiteral("alpha"),
-                "Phase 3 stale-source clear fixture creates an initial selection");
+                "stale-source clear fixture creates an initial selection");
 
             ok &= check(backend->emit_output(QByteArrayLiteral("\ralpha!")),
-                "Phase 3 stale-source clear backend mutates selected content");
+                "stale-source clear backend mutates selected content");
             const bool had_selection_before_stale_attempt = session->has_selection();
             ok &= check(had_selection_before_stale_attempt,
-                "Phase 3 stale-source clear fixture retains a selection before stale replacement");
+                "stale-source clear fixture retains a selection before stale replacement");
 
             session->set_selection_range_from_published_source(range, *stale_source);
             ok &= check(had_selection_before_stale_attempt &&
                 !session->has_selection() &&
                 !session->selection_visual_lease().has_value(),
-                "Phase 3 stale source attempt clears an existing selection");
+                "stale source attempt clears an existing selection");
         }
     }
 
@@ -2887,9 +2887,9 @@ bool test_selection_phase3_line_lease_negative_source_paths()
         launch_config.initial_grid_size = {3, 20};
         ok &= check(session->start(launch_config).code ==
             term::Terminal_session_result_code::ACCEPTED,
-            "Phase 3 mismatched source session starts");
+            "mismatched source session starts");
         ok &= check(backend->emit_output(numbered_scroll_lines(6)),
-            "Phase 3 mismatched source backend creates scrollback");
+            "mismatched source backend creates scrollback");
         const std::optional<term::Terminal_render_snapshot> source_snapshot =
             session->latest_render_snapshot();
         const std::optional<term::terminal_selection_source_identity_t> source =
@@ -2912,15 +2912,15 @@ bool test_selection_phase3_line_lease_negative_source_paths()
             ok &= check(payload.code == term::Terminal_selection_result_code::OK &&
                 payload.text == QStringLiteral("scroll-line-%1")
                     .arg(first_visible_logical_row, 3, 10, QLatin1Char('0')),
-                "Phase 3 mismatched viewport source still uses active-model selection fallback");
+                "mismatched viewport source still uses active-model selection fallback");
             ok &= check(session->has_selection(),
-                "Phase 3 mismatched viewport source may create a fallback selection");
+                "mismatched viewport source may create a fallback selection");
             ok &= check(lease.has_value() && !lease->selected_lines.empty(),
-                "Phase 2A mismatched snapshot identity resolves retained-line descriptors through handles");
+                "mismatched snapshot identity resolves retained-line descriptors through handles");
         }
         else {
             ok &= check(false,
-                "Phase 3 mismatched source fixture publishes a selectable source");
+                "mismatched source fixture publishes a selectable source");
         }
     }
 
@@ -2931,9 +2931,9 @@ bool test_selection_phase3_line_lease_negative_source_paths()
         launch_config.initial_grid_size = {3, 20};
         ok &= check(session->start(launch_config).code ==
             term::Terminal_session_result_code::ACCEPTED,
-            "Phase 3 offscreen source session starts");
+            "offscreen source session starts");
         ok &= check(backend->emit_output(numbered_scroll_lines(6)),
-            "Phase 3 offscreen source backend creates scrollback");
+            "offscreen source backend creates scrollback");
         const std::optional<term::Terminal_render_snapshot> source_snapshot =
             session->latest_render_snapshot();
         const std::optional<term::terminal_selection_source_identity_t> source =
@@ -2957,16 +2957,16 @@ bool test_selection_phase3_line_lease_negative_source_paths()
                 payload.code == term::Terminal_selection_result_code::OK &&
                 payload.text == QStringLiteral("scroll-line-%1")
                     .arg(offscreen_logical_row, 3, 10, QLatin1Char('0')),
-                "Phase 3 offscreen range keeps selection payload through active-model fallback");
+                "offscreen range keeps selection payload through active-model fallback");
             ok &= check(lease.has_value() && !lease->selected_lines.empty(),
-                "Phase 2A offscreen range resolves retained-line descriptors through handles");
+                "offscreen range resolves retained-line descriptors through handles");
             ok &= check(selected_snapshot.has_value() &&
                 selected_snapshot->selection_spans.empty(),
-                "Phase 3 offscreen selection emits no visible spans");
+                "offscreen selection emits no visible spans");
         }
         else {
             ok &= check(false,
-                "Phase 3 offscreen source fixture publishes a selectable source");
+                "offscreen source fixture publishes a selectable source");
         }
     }
 
@@ -2977,11 +2977,11 @@ bool test_selection_phase3_line_lease_negative_source_paths()
         launch_config.initial_grid_size = {3, 12};
         ok &= check(session->start(launch_config).code ==
             term::Terminal_session_result_code::ACCEPTED,
-            "Phase 3 missing provenance session starts");
+            "missing provenance session starts");
         ok &= check(backend->emit_output(QByteArrayLiteral("visible")),
-            "Phase 3 missing provenance backend emits base content");
+            "missing provenance backend emits base content");
         ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
-            "Phase 3 missing provenance backend holds synchronized output");
+            "missing provenance backend holds synchronized output");
         const term::Terminal_session_result resize_result =
             session->resize(QSizeF(120.0, 80.0), {4, 12});
         const std::optional<term::Terminal_render_snapshot> geometry_snapshot =
@@ -2989,10 +2989,10 @@ bool test_selection_phase3_line_lease_negative_source_paths()
         const std::optional<term::terminal_selection_source_identity_t> geometry_source =
             session->published_selection_source_identity();
         ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
-            "Phase 3 missing provenance synchronized resize is accepted");
+            "missing provenance synchronized resize is accepted");
         ok &= check(geometry_snapshot.has_value() &&
             geometry_snapshot->visible_line_provenance.empty(),
-            "Phase 3 missing provenance fixture publishes geometry without line descriptors");
+            "missing provenance fixture publishes geometry without line descriptors");
 
         session->set_selection_range_from_published_source(
             {{0, 0}, {0, 4}, term::Terminal_selection_mode::NORMAL},
@@ -3004,27 +3004,27 @@ bool test_selection_phase3_line_lease_negative_source_paths()
             session->latest_render_snapshot();
         ok &= check(payload.code == term::Terminal_selection_result_code::OK &&
             payload.text == QStringLiteral("visi"),
-            "Phase 3 missing provenance path keeps selection payload behavior");
+            "missing provenance path keeps selection payload behavior");
         ok &= check(lease.has_value() && lease->selected_lines.empty(),
-            "Phase 3 missing provenance path captures no retained-line descriptors");
+            "missing provenance path captures no retained-line descriptors");
         ok &= check(selected_snapshot.has_value() &&
             selected_snapshot->selection_spans.empty(),
-            "Phase 3 missing provenance path suppresses visible spans fail-closed");
+            "missing provenance path suppresses visible spans fail-closed");
         ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-            "Phase 5 missing retained-line proof backend releases synchronized output");
+            "missing retained-line proof backend releases synchronized output");
         const std::optional<term::Terminal_render_snapshot> released_snapshot =
             session->latest_render_snapshot();
         ok &= check(!session->selection_visual_lease().has_value(),
-            "Phase 5 missing retained-line proof detaches the visual lease fail-closed");
+            "missing retained-line proof detaches the visual lease fail-closed");
         ok &= check(released_snapshot.has_value() &&
             released_snapshot->selection_spans.empty(),
-            "Phase 5 missing retained-line proof suppresses spans after release");
+            "missing retained-line proof suppresses spans after release");
     }
 
     return ok;
 }
 
-bool test_selection_phase5_visual_lease_span_compatibility()
+bool test_selection_visual_lease_span_compatibility()
 {
     bool ok = true;
 
@@ -3032,9 +3032,9 @@ bool test_selection_phase5_visual_lease_span_compatibility()
     Scripted_backend* backend = make_session(session);
     ok &= check(session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 5 compatible visual lease session starts");
+        "compatible visual lease session starts");
     ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta")),
-        "Phase 5 compatible visual lease backend emits visible rows");
+        "compatible visual lease backend emits visible rows");
 
     session->set_selection_range({
         { 0, 0 },
@@ -3051,29 +3051,29 @@ bool test_selection_phase5_visual_lease_span_compatibility()
             : term::terminal_selection_content_basis_t{};
     ok &= check(selected_snapshot.has_value() &&
         snapshot_has_selection_span(*selected_snapshot, 0, 0, 5),
-        "Phase 5 attached visible lease initially emits selection spans");
+        "attached visible lease initially emits selection spans");
     ok &= check(selected_lease.has_value(),
-        "Phase 5 attached visible selection records a visual lease");
+        "attached visible selection records a visual lease");
     const std::vector<term::terminal_selection_line_lease_t> selected_lines =
         selected_lease.has_value()
             ? selected_lease->selected_lines
             : std::vector<term::terminal_selection_line_lease_t>{};
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\r")),
-        "Phase 5 cursor-only backend output is accepted");
+        "cursor-only backend output is accepted");
     const std::optional<term::Terminal_render_snapshot> cursor_snapshot =
         session->latest_render_snapshot();
     const std::optional<term::terminal_selection_visual_lease_t> cursor_lease =
         session->selection_visual_lease();
     ok &= check(cursor_snapshot.has_value() &&
         snapshot_has_selection_span(*cursor_snapshot, 0, 0, 5),
-        "Phase 5 cursor-only snapshot preserves compatible selection spans");
+        "cursor-only snapshot preserves compatible selection spans");
     ok &= check(cursor_lease.has_value() &&
         cursor_lease->source_content_basis == selected_basis,
-        "Phase 5 cursor-only snapshot preserves the visual lease basis");
+        "cursor-only snapshot preserves the visual lease basis");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?25l")),
-        "Phase 5 paint-only cursor-visibility update is accepted");
+        "paint-only cursor-visibility update is accepted");
     const std::optional<term::Terminal_render_snapshot> paint_snapshot =
         session->latest_render_snapshot();
     const std::optional<term::terminal_selection_visual_lease_t> paint_lease =
@@ -3081,13 +3081,13 @@ bool test_selection_phase5_visual_lease_span_compatibility()
     ok &= check(paint_snapshot.has_value()                         &&
         !paint_snapshot->modes.cursor_visible                      &&
         snapshot_has_selection_span(*paint_snapshot, 0, 0, 5),
-        "Phase 5 paint-only cursor-visibility snapshot preserves compatible selection spans");
+        "paint-only cursor-visibility snapshot preserves compatible selection spans");
     ok &= check(paint_lease.has_value() &&
         paint_lease->source_content_basis == selected_basis,
-        "Phase 5 paint-only cursor-visibility snapshot preserves the visual lease basis");
+        "paint-only cursor-visibility snapshot preserves the visual lease basis");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[2;1Hunrelated")),
-        "Phase 5 unrelated row backend output is accepted");
+        "unrelated row backend output is accepted");
     const std::optional<term::Terminal_render_snapshot> unrelated_snapshot =
         session->latest_render_snapshot();
     const std::optional<term::terminal_selection_visual_lease_t> unrelated_lease =
@@ -3095,14 +3095,14 @@ bool test_selection_phase5_visual_lease_span_compatibility()
     ok &= check(unrelated_snapshot.has_value() &&
         snapshot_row_text(*unrelated_snapshot, 1) == QStringLiteral("unrelated") &&
         snapshot_has_selection_span(*unrelated_snapshot, 0, 0, 5),
-        "Phase 5 unrelated row output keeps committed selection spans renderable");
+        "unrelated row output keeps committed selection spans renderable");
     ok &= check(unrelated_lease.has_value() &&
         unrelated_lease->source_content_basis.content_generation >
             selected_basis.content_generation,
-        "Phase 5 unrelated row output advances the visual lease by retained-line proof");
+        "unrelated row output advances the visual lease by retained-line proof");
     ok &= check(unrelated_lease.has_value() &&
         unrelated_lease->selected_lines == selected_lines,
-        "Phase 5 unrelated row output keeps retained-line descriptors stable");
+        "unrelated row output keeps retained-line descriptors stable");
 
     term::Terminal_session_config disabled_projection_config;
     disabled_projection_config.selection_viewport_projection_enabled = false;
@@ -3113,12 +3113,12 @@ bool test_selection_phase5_visual_lease_span_compatibility()
         disabled_projection_config);
     ok &= check(boundary_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4b boundary viewport-scroll lease session starts");
+        "boundary viewport-scroll lease session starts");
     ok &= check(boundary_backend->emit_output(numbered_scroll_lines(80)),
-        "Phase 4b boundary viewport-scroll backend creates scrollback");
+        "boundary viewport-scroll backend creates scrollback");
     ok &= check(boundary_session->scroll_viewport_lines(5).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 4b boundary viewport-scroll fixture scrolls into scrollback");
+        "boundary viewport-scroll fixture scrolls into scrollback");
     const std::optional<term::Terminal_render_snapshot> boundary_anchor_snapshot =
         boundary_session->latest_render_snapshot();
     if (!boundary_anchor_snapshot.has_value()) {
@@ -3143,39 +3143,39 @@ bool test_selection_phase5_visual_lease_span_compatibility()
         boundary_session->latest_render_snapshot();
     ok &= check(boundary_payload.code == term::Terminal_selection_result_code::OK &&
         boundary_payload.text == boundary_payload_text,
-        "Phase 4b boundary viewport-scroll selection captures durable payload");
+        "boundary viewport-scroll selection captures durable payload");
     ok &= check(boundary_selected_snapshot.has_value() &&
         snapshot_has_selection_span(*boundary_selected_snapshot, 0, 0, 15),
-        "Phase 4b boundary viewport-scroll selection emits spans while visible");
+        "boundary viewport-scroll selection emits spans while visible");
 
     ok &= check(boundary_session->scroll_viewport_lines(-5).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 4b boundary viewport-scroll fixture returns to tail");
+        "boundary viewport-scroll fixture returns to tail");
     ok &= check(boundary_session->scroll_viewport_lines(6).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 4b boundary viewport-scroll fixture makes selection visible through a new mapping");
+        "boundary viewport-scroll fixture makes selection visible through a new mapping");
     const std::optional<term::Terminal_render_snapshot> boundary_remapped_snapshot =
         boundary_session->latest_render_snapshot();
     ok &= check(boundary_remapped_snapshot.has_value() &&
         boundary_remapped_snapshot->selection_spans.empty(),
-        "Phase 4b boundary viewport remap does not project spans when projection is disabled");
+        "boundary viewport remap does not project spans when projection is disabled");
     ok &= check(boundary_session->selection_visual_lease().has_value() &&
         boundary_session->selected_text().text == boundary_payload.text,
-        "Phase 4b boundary viewport remap keeps lease and payload available");
+        "boundary viewport remap keeps lease and payload available");
 
     std::unique_ptr<term::Terminal_session> scroll_session;
-    term::Terminal_session_config phase5_projection_config;
-    phase5_projection_config.selection_viewport_projection_enabled = true;
+    term::Terminal_session_config projection_config;
+    projection_config.selection_viewport_projection_enabled = true;
     Scripted_backend* scroll_backend =
-        make_session(scroll_session, phase5_projection_config);
+        make_session(scroll_session, projection_config);
     ok &= check(scroll_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 5 viewport-projection lease session starts");
+        "viewport-projection lease session starts");
     ok &= check(scroll_backend->emit_output(numbered_scroll_lines(80)),
-        "Phase 5 viewport-projection backend creates scrollback");
+        "viewport-projection backend creates scrollback");
     ok &= check(scroll_session->scroll_viewport_lines(5).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 5 viewport-projection fixture scrolls into scrollback");
+        "viewport-projection fixture scrolls into scrollback");
     const std::optional<term::Terminal_render_snapshot> scroll_anchor_snapshot =
         scroll_session->latest_render_snapshot();
     if (!scroll_anchor_snapshot.has_value()) {
@@ -3198,31 +3198,31 @@ bool test_selection_phase5_visual_lease_span_compatibility()
     ok &= check(scroll_payload.code == term::Terminal_selection_result_code::OK &&
         scroll_payload.text == QStringLiteral("scroll-line-%1")
             .arg(selection_row, 3, 10, QLatin1Char('0')),
-        "Phase 5 viewport-projection selection captures durable payload");
+        "viewport-projection selection captures durable payload");
     ok &= check(scroll_selected_snapshot.has_value() &&
         snapshot_has_selection_span(*scroll_selected_snapshot, 0, 0, 15),
-        "Phase 5 viewport-projection selection emits spans while visible");
+        "viewport-projection selection emits spans while visible");
 
     ok &= check(scroll_session->scroll_viewport_lines(-5).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 5 viewport-projection fixture returns to tail");
+        "viewport-projection fixture returns to tail");
     const std::optional<term::Terminal_render_snapshot> scroll_hidden_snapshot =
         scroll_session->latest_render_snapshot();
     ok &= check(scroll_hidden_snapshot.has_value() &&
         scroll_hidden_snapshot->selection_spans.empty(),
-        "Phase 5 compatible viewport scroll hides offscreen spans");
+        "compatible viewport scroll hides offscreen spans");
     ok &= check(scroll_session->selection_visual_lease().has_value() &&
         scroll_session->selected_text().text == scroll_payload.text,
-        "Phase 5 compatible viewport scroll keeps lease and payload while hidden");
+        "compatible viewport scroll keeps lease and payload while hidden");
 
     ok &= check(scroll_session->scroll_viewport_lines(6).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 5 viewport-projection fixture makes selected rows visible through a new mapping");
+        "viewport-projection fixture makes selected rows visible through a new mapping");
     const std::optional<term::Terminal_render_snapshot> scroll_shown_snapshot =
         scroll_session->latest_render_snapshot();
     ok &= check(scroll_shown_snapshot.has_value() &&
         snapshot_has_selection_span(*scroll_shown_snapshot, 1, 0, 15),
-        "Phase 5 compatible viewport projection re-emits spans when visible again");
+        "compatible viewport projection re-emits spans when visible again");
 
     return ok;
 }
@@ -3303,17 +3303,17 @@ bool test_selection_spans_preserve_during_scrollback_growth_with_retained_lines(
     launch_config.initial_grid_size = {4, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4a scrollback-growth selection session starts");
+        "scrollback-growth selection session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(32)),
-        "Phase 4a scrollback-growth backend creates retained scrollback");
+        "scrollback-growth backend creates retained scrollback");
     ok &= check(session->scroll_viewport_lines(4).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 4a scrollback-growth fixture detaches viewport from tail");
+        "scrollback-growth fixture detaches viewport from tail");
 
     const std::optional<term::Terminal_render_snapshot> anchor_snapshot =
         session->latest_render_snapshot();
     if (!anchor_snapshot.has_value()) {
-        return check(false, "Phase 4a scrollback-growth anchor snapshot is available");
+        return check(false, "scrollback-growth anchor snapshot is available");
     }
 
     const int first_visible_logical_row =
@@ -3335,15 +3335,15 @@ bool test_selection_spans_preserve_during_scrollback_growth_with_retained_lines(
         session->selection_visual_lease();
     ok &= check(selected_payload.code == term::Terminal_selection_result_code::OK &&
         selected_payload.text == expected_payload,
-        "Phase 4a scrollback-growth selection captures the retained row payload");
+        "scrollback-growth selection captures the retained row payload");
     ok &= check(selected_snapshot.has_value() &&
         snapshot_has_selection_span(*selected_snapshot, 1, 0, 15),
-        "Phase 4a scrollback-growth selection initially emits a visible span");
+        "scrollback-growth selection initially emits a visible span");
     ok &= check(selected_lease.has_value() && selected_lease->selected_lines.size() == 1U,
-        "Phase 4a scrollback-growth selection starts with complete retained-line proof");
+        "scrollback-growth selection starts with complete retained-line proof");
 
     ok &= check(backend->emit_output(numbered_scroll_lines(3)),
-        "Phase 4a scrollback-growth backend appends unrelated tail output");
+        "scrollback-growth backend appends unrelated tail output");
     const term::Terminal_selection_result preserved_payload =
         session->selected_text();
     const std::optional<term::Terminal_render_snapshot> grown_snapshot =
@@ -3352,16 +3352,16 @@ bool test_selection_spans_preserve_during_scrollback_growth_with_retained_lines(
         session->selection_visual_lease();
     ok &= check(preserved_payload.code == term::Terminal_selection_result_code::OK &&
         preserved_payload.text == expected_payload,
-        "Phase 4a scrollback-growth preserves the finalized copy payload");
+        "scrollback-growth preserves the finalized copy payload");
     ok &= check(grown_snapshot.has_value() &&
         term::render_snapshot_first_visible_logical_row(*grown_snapshot) ==
             first_visible_logical_row,
-        "Phase 4a scrollback-growth keeps the detached viewport on the selected content");
+        "scrollback-growth keeps the detached viewport on the selected content");
     ok &= check(grown_lease.has_value(),
-        "Phase 4a scrollback-growth preserves the visual lease by retained-line proof");
+        "scrollback-growth preserves the visual lease by retained-line proof");
     ok &= check(grown_snapshot.has_value() &&
         snapshot_has_selection_span(*grown_snapshot, 1, 0, 15),
-        "Phase 4a scrollback-growth preserves visible selection spans");
+        "scrollback-growth preserves visible selection spans");
 
     return ok;
 }
@@ -3397,7 +3397,7 @@ bool test_selection_spans_detach_when_selected_row_mutates()
         session->selection_visual_lease();
     ok &= check(selected_snapshot.has_value() && selected_lease.has_value() &&
         !selected_lease->selected_lines.empty(),
-        "Phase 3 selected-row mutation fixture starts with captured descriptors");
+        "selected-row mutation fixture starts with captured descriptors");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[1;1Hmutated!")),
         "mutating selection backend rewrites the selected row");
@@ -3757,7 +3757,7 @@ bool test_selection_spans_detach_when_synchronized_release_moves_retained_row()
     return ok;
 }
 
-bool test_selection_spans_fail_closed_at_phase4c_boundaries()
+bool test_selection_spans_fail_closed_at_boundaries()
 {
     bool ok = true;
 
@@ -3765,9 +3765,9 @@ bool test_selection_spans_fail_closed_at_phase4c_boundaries()
     Scripted_backend* alternate_backend = make_session(alternate_session);
     ok &= check(alternate_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4c active-buffer boundary session starts");
+        "active-buffer boundary session starts");
     ok &= check(alternate_backend->emit_output(QByteArrayLiteral("primary")),
-        "Phase 4c active-buffer boundary backend emits primary text");
+        "active-buffer boundary backend emits primary text");
 
     alternate_session->set_selection_range({
         { 0, 0 },
@@ -3780,53 +3780,53 @@ bool test_selection_spans_fail_closed_at_phase4c_boundaries()
         alternate_session->latest_render_snapshot();
     ok &= check(alternate_original_payload.code == term::Terminal_selection_result_code::OK &&
         alternate_original_payload.text == QStringLiteral("prim"),
-        "Phase 4c active-buffer boundary captures the primary payload");
+        "active-buffer boundary captures the primary payload");
     ok &= check(alternate_selected_snapshot.has_value() &&
         snapshot_has_selection_span(*alternate_selected_snapshot, 0, 0, 4),
-        "Phase 4c active-buffer boundary initially publishes a primary span");
+        "active-buffer boundary initially publishes a primary span");
 
     ok &= check(alternate_backend->emit_output(QByteArrayLiteral("\x1b[?1049halternate")),
-        "Phase 4c active-buffer boundary enters alternate screen");
+        "active-buffer boundary enters alternate screen");
     const term::Terminal_selection_result alternate_hidden_payload =
         alternate_session->selected_text();
     const std::optional<term::Terminal_render_snapshot> alternate_snapshot =
         alternate_session->latest_render_snapshot();
     ok &= check(alternate_hidden_payload.code == term::Terminal_selection_result_code::OK &&
         alternate_hidden_payload.text == QStringLiteral("prim"),
-        "Phase 4c active-buffer boundary keeps the finalized primary payload in alternate");
+        "active-buffer boundary keeps the finalized primary payload in alternate");
     ok &= check(!alternate_session->selection_visual_lease().has_value(),
-        "Phase 4c active-buffer boundary detaches the visual lease on alternate entry");
+        "active-buffer boundary detaches the visual lease on alternate entry");
     ok &= check(alternate_snapshot.has_value() &&
         alternate_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE &&
         alternate_snapshot->selection_spans.empty(),
-        "Phase 4c active-buffer boundary emits no primary spans in alternate");
+        "active-buffer boundary emits no primary spans in alternate");
 
     ok &= check(alternate_backend->emit_output(QByteArrayLiteral("\x1b[?1049l")),
-        "Phase 4c active-buffer boundary returns to primary screen");
+        "active-buffer boundary returns to primary screen");
     const term::Terminal_selection_result alternate_return_payload =
         alternate_session->selected_text();
     const std::optional<term::Terminal_render_snapshot> alternate_return_snapshot =
         alternate_session->latest_render_snapshot();
     ok &= check(alternate_return_payload.code == term::Terminal_selection_result_code::OK &&
         alternate_return_payload.text == QStringLiteral("prim"),
-        "Phase 4c active-buffer boundary keeps the finalized payload after return");
+        "active-buffer boundary keeps the finalized payload after return");
     ok &= check(!alternate_session->selection_visual_lease().has_value(),
-        "Phase 4c active-buffer boundary does not reattach after returning to primary");
+        "active-buffer boundary does not reattach after returning to primary");
     ok &= check(alternate_return_snapshot.has_value() &&
         alternate_return_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
         alternate_return_snapshot->selection_spans.empty(),
-        "Phase 4c active-buffer boundary emits no stale spans after return");
+        "active-buffer boundary emits no stale spans after return");
 
     std::unique_ptr<term::Terminal_session> reverse_alternate_session;
     Scripted_backend* reverse_alternate_backend =
         make_session(reverse_alternate_session);
     ok &= check(reverse_alternate_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4c reverse active-buffer boundary session starts");
+        "reverse active-buffer boundary session starts");
     ok &= check(reverse_alternate_backend->emit_output(QByteArrayLiteral("primary")),
-        "Phase 4c reverse active-buffer boundary emits primary text");
+        "reverse active-buffer boundary emits primary text");
     ok &= check(reverse_alternate_backend->emit_output(QByteArrayLiteral("\x1b[?1049halternate")),
-        "Phase 4c reverse active-buffer boundary enters alternate screen");
+        "reverse active-buffer boundary enters alternate screen");
 
     reverse_alternate_session->set_selection_range({
         { 0, 0 },
@@ -3842,17 +3842,17 @@ bool test_selection_spans_fail_closed_at_phase4c_boundaries()
         reverse_alternate_session->latest_render_snapshot();
     ok &= check(reverse_alternate_payload.code == term::Terminal_selection_result_code::OK &&
         reverse_alternate_payload.text == QStringLiteral("alte"),
-        "Phase 4c reverse active-buffer boundary captures the alternate payload");
+        "reverse active-buffer boundary captures the alternate payload");
     ok &= check(reverse_alternate_attached_lease.has_value() &&
         reverse_alternate_attached_lease->buffer_id == term::Terminal_buffer_id::ALTERNATE,
-        "Phase 4c reverse active-buffer boundary attaches an alternate visual lease");
+        "reverse active-buffer boundary attaches an alternate visual lease");
     ok &= check(reverse_alternate_snapshot.has_value() &&
         reverse_alternate_snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE &&
         snapshot_has_selection_span(*reverse_alternate_snapshot, 0, 0, 4),
-        "Phase 4c reverse active-buffer boundary initially publishes an alternate span");
+        "reverse active-buffer boundary initially publishes an alternate span");
 
     ok &= check(reverse_alternate_backend->emit_output(QByteArrayLiteral("\x1b[?1049l")),
-        "Phase 4c reverse active-buffer boundary returns to primary screen");
+        "reverse active-buffer boundary returns to primary screen");
     const term::Terminal_selection_result reverse_alternate_return_payload =
         reverse_alternate_session->selected_text();
     const std::optional<term::Terminal_render_snapshot> reverse_alternate_return_snapshot =
@@ -3860,23 +3860,23 @@ bool test_selection_spans_fail_closed_at_phase4c_boundaries()
     ok &= check(reverse_alternate_return_payload.code ==
             term::Terminal_selection_result_code::OK &&
         reverse_alternate_return_payload.text == QStringLiteral("alte"),
-        "Phase 4c reverse active-buffer boundary keeps the finalized alternate payload");
+        "reverse active-buffer boundary keeps the finalized alternate payload");
     ok &= check(!reverse_alternate_session->selection_visual_lease().has_value(),
-        "Phase 4c reverse active-buffer boundary clears the alternate visual lease");
+        "reverse active-buffer boundary clears the alternate visual lease");
     ok &= check(reverse_alternate_return_snapshot.has_value() &&
         reverse_alternate_return_snapshot->viewport.active_buffer ==
             term::Terminal_buffer_id::PRIMARY &&
         reverse_alternate_return_snapshot->selection_spans.empty(),
-        "Phase 4c reverse active-buffer boundary emits no stale primary spans after return");
+        "reverse active-buffer boundary emits no stale primary spans after return");
 
     std::unique_ptr<term::Terminal_session> synchronized_alternate_session;
     Scripted_backend* synchronized_alternate_backend =
         make_session(synchronized_alternate_session);
     ok &= check(synchronized_alternate_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4c synchronized active-buffer boundary session starts");
+        "synchronized active-buffer boundary session starts");
     ok &= check(synchronized_alternate_backend->emit_output(QByteArrayLiteral("primary")),
-        "Phase 4c synchronized active-buffer boundary emits primary text");
+        "synchronized active-buffer boundary emits primary text");
 
     synchronized_alternate_session->set_selection_range({
         { 0, 0 },
@@ -3888,31 +3888,31 @@ bool test_selection_spans_fail_closed_at_phase4c_boundaries()
             synchronized_alternate_session->selection_visual_lease();
     ok &= check(synchronized_alternate_attached_lease.has_value() &&
         synchronized_alternate_attached_lease->buffer_id == term::Terminal_buffer_id::PRIMARY,
-        "Phase 4c synchronized active-buffer boundary starts with an attached visual lease");
+        "synchronized active-buffer boundary starts with an attached visual lease");
     ok &= check(synchronized_alternate_backend->emit_output(
             QByteArrayLiteral("\x1b[?2026h\x1b[?1049halternate\x1b[?1049l\x1b[?2026l")),
-        "Phase 4c synchronized active-buffer boundary releases an alternate round trip");
+        "synchronized active-buffer boundary releases an alternate round trip");
     const term::Terminal_selection_result synchronized_alternate_payload =
         synchronized_alternate_session->selected_text();
     const std::optional<term::Terminal_render_snapshot> synchronized_alternate_snapshot =
         synchronized_alternate_session->latest_render_snapshot();
     ok &= check(synchronized_alternate_payload.code == term::Terminal_selection_result_code::OK &&
         synchronized_alternate_payload.text == QStringLiteral("prim"),
-        "Phase 4c synchronized active-buffer boundary keeps the finalized payload");
+        "synchronized active-buffer boundary keeps the finalized payload");
     ok &= check(!synchronized_alternate_session->selection_visual_lease().has_value(),
-        "Phase 4c synchronized active-buffer boundary detaches despite matching primary provenance");
+        "synchronized active-buffer boundary detaches despite matching primary provenance");
     ok &= check(synchronized_alternate_snapshot.has_value() &&
         synchronized_alternate_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
         synchronized_alternate_snapshot->selection_spans.empty(),
-        "Phase 4c synchronized active-buffer boundary emits no stale returned primary spans");
+        "synchronized active-buffer boundary emits no stale returned primary spans");
 
     std::unique_ptr<term::Terminal_session> region_session;
     Scripted_backend* region_backend = make_session(region_session);
     ok &= check(region_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4c partial-region discard session starts");
+        "partial-region discard session starts");
     ok &= check(region_backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma\r\ndelta")),
-        "Phase 4c partial-region discard backend emits visible rows");
+        "partial-region discard backend emits visible rows");
 
     region_session->set_selection_range({
         { 1, 0 },
@@ -3925,40 +3925,40 @@ bool test_selection_spans_fail_closed_at_phase4c_boundaries()
         region_session->latest_render_snapshot();
     ok &= check(region_original_payload.code == term::Terminal_selection_result_code::OK &&
         region_original_payload.text == QStringLiteral("beta"),
-        "Phase 4c partial-region discard captures the selected row payload");
+        "partial-region discard captures the selected row payload");
     ok &= check(region_selected_snapshot.has_value() &&
         snapshot_has_selection_span(*region_selected_snapshot, 1, 0, 4),
-        "Phase 4c partial-region discard initially publishes a visible span");
+        "partial-region discard initially publishes a visible span");
 
     ok &= check(region_backend->emit_output(
             QByteArrayLiteral("\x1b[2;3r\x1b[3;1H\x1b" "D\x1b[r")),
-        "Phase 4c partial-region discard scrolls the selected row out of the region");
+        "partial-region discard scrolls the selected row out of the region");
     const term::Terminal_selection_result region_retained_payload =
         region_session->selected_text();
     const std::optional<term::Terminal_render_snapshot> region_discard_snapshot =
         region_session->latest_render_snapshot();
     ok &= check(region_retained_payload.code == term::Terminal_selection_result_code::OK &&
         region_retained_payload.text == QStringLiteral("beta"),
-        "Phase 4c partial-region discard keeps the finalized copy payload");
+        "partial-region discard keeps the finalized copy payload");
     ok &= check(!region_session->selection_visual_lease().has_value(),
-        "Phase 4c partial-region discard detaches the stale visual lease");
+        "partial-region discard detaches the stale visual lease");
     ok &= check(region_discard_snapshot.has_value() &&
         snapshot_row_text(*region_discard_snapshot, 1) == QStringLiteral("gamma"),
-        "Phase 4c partial-region discard moves replacement content into the selected row");
+        "partial-region discard moves replacement content into the selected row");
     ok &= check(region_discard_snapshot.has_value() &&
         region_discard_snapshot->selection_spans.empty(),
-        "Phase 4c partial-region discard suppresses stale spans");
+        "partial-region discard suppresses stale spans");
 
     std::unique_ptr<term::Terminal_session> clear_scrollback_session;
     Scripted_backend* clear_scrollback_backend = make_session(clear_scrollback_session);
     ok &= check(clear_scrollback_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4c clear-scrollback boundary session starts");
+        "clear-scrollback boundary session starts");
     ok &= check(clear_scrollback_backend->emit_output(numbered_scroll_lines(80)),
-        "Phase 4c clear-scrollback boundary backend creates scrollback");
+        "clear-scrollback boundary backend creates scrollback");
     ok &= check(clear_scrollback_session->scroll_viewport_lines(3).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 4c clear-scrollback boundary exposes scrollback rows");
+        "clear-scrollback boundary exposes scrollback rows");
 
     const std::optional<term::Terminal_render_snapshot> clear_scrollback_source_snapshot =
         clear_scrollback_session->latest_render_snapshot();
@@ -3982,13 +3982,13 @@ bool test_selection_spans_fail_closed_at_phase4c_boundaries()
         ok &= check(clear_scrollback_original_payload.code ==
                 term::Terminal_selection_result_code::OK &&
             clear_scrollback_original_payload.text == expected_text,
-            "Phase 4c clear-scrollback boundary captures the scrollback payload");
+            "clear-scrollback boundary captures the scrollback payload");
         ok &= check(clear_scrollback_selected_snapshot.has_value() &&
             snapshot_has_selection_span(*clear_scrollback_selected_snapshot, 1, 0, 15),
-            "Phase 4c clear-scrollback boundary initially publishes a scrollback span");
+            "clear-scrollback boundary initially publishes a scrollback span");
 
         ok &= check(clear_scrollback_backend->emit_output(QByteArrayLiteral("\x1b[3J")),
-            "Phase 4c clear-scrollback boundary clears retained scrollback");
+            "clear-scrollback boundary clears retained scrollback");
         const term::Terminal_selection_result clear_scrollback_retained_payload =
             clear_scrollback_session->selected_text();
         const std::optional<term::Terminal_render_snapshot> clear_scrollback_cleared_snapshot =
@@ -3996,15 +3996,15 @@ bool test_selection_spans_fail_closed_at_phase4c_boundaries()
         ok &= check(clear_scrollback_retained_payload.code ==
                 term::Terminal_selection_result_code::OK &&
             clear_scrollback_retained_payload.text == expected_text,
-            "Phase 4c clear-scrollback boundary keeps the finalized copy payload");
+            "clear-scrollback boundary keeps the finalized copy payload");
         ok &= check(!clear_scrollback_session->selection_visual_lease().has_value(),
-            "Phase 4c clear-scrollback boundary detaches the purged retained-line proof");
+            "clear-scrollback boundary detaches the purged retained-line proof");
         ok &= check(clear_scrollback_cleared_snapshot.has_value() &&
             clear_scrollback_cleared_snapshot->selection_spans.empty(),
-            "Phase 4c clear-scrollback boundary suppresses purged scrollback spans");
+            "clear-scrollback boundary suppresses purged scrollback spans");
     }
     else {
-        ok &= check(false, "Phase 4c clear-scrollback boundary source snapshot is available");
+        ok &= check(false, "clear-scrollback boundary source snapshot is available");
     }
 
     return ok;
@@ -4056,12 +4056,12 @@ bool test_selection_spans_detach_when_resize_invalidates_selected_columns()
         "resize-invalidated columns clear retained-line visual proof");
     ok &= check(session->selection_anchor_domain() ==
             term::Terminal_selection_anchor_domain::PAYLOAD_ONLY,
-        "Phase 7C resize-invalidated columns mark the preserved payload as payload-only");
+        "resize-invalidated columns mark the preserved payload as payload-only");
 
     return ok;
 }
 
-bool test_selection_phase7c_anchor_domains_and_invalidation_events()
+bool test_selection_anchor_domains_and_invalidation_events()
 {
     bool ok = true;
 
@@ -4069,16 +4069,16 @@ bool test_selection_phase7c_anchor_domains_and_invalidation_events()
     Scripted_backend* domain_backend = make_session(domain_session);
     ok &= check(domain_session->start(valid_launch_config()).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 7C domain session starts");
+        "domain session starts");
     ok &= check(domain_backend->emit_output(QByteArrayLiteral("primary")),
-        "Phase 7C domain session emits primary content");
+        "domain session emits primary content");
 
     const std::optional<term::terminal_selection_source_identity_t> primary_source =
         domain_session->published_selection_source_identity();
     ok &= check(primary_source.has_value() &&
         primary_source->anchor_domain ==
             term::Terminal_selection_anchor_domain::PRIMARY_BACKING,
-        "Phase 7C published primary source states the primary backing domain");
+        "published primary source states the primary backing domain");
     domain_session->set_selection_range({
         { 0, 0 },
         { 0, 4 },
@@ -4091,10 +4091,10 @@ bool test_selection_phase7c_anchor_domains_and_invalidation_events()
         primary_lease.has_value() &&
         primary_lease->anchor_domain ==
             term::Terminal_selection_anchor_domain::PRIMARY_BACKING,
-        "Phase 7C committed primary selection exposes the primary backing domain");
+        "committed primary selection exposes the primary backing domain");
 
     ok &= check(domain_backend->emit_output(QByteArrayLiteral("\x1b[?1049halternate")),
-        "Phase 7C domain session enters alternate content");
+        "domain session enters alternate content");
     domain_session->set_selection_range({
         { 0, 0 },
         { 0, 4 },
@@ -4107,10 +4107,10 @@ bool test_selection_phase7c_anchor_domains_and_invalidation_events()
         alternate_lease.has_value() &&
         alternate_lease->anchor_domain ==
             term::Terminal_selection_anchor_domain::ALTERNATE_ACTIVE_GRID,
-        "Phase 7C committed alternate selection exposes the alternate active-grid domain");
+        "committed alternate selection exposes the alternate active-grid domain");
 
     ok &= check(domain_backend->emit_output(QByteArrayLiteral("\x1b[?1049l")),
-        "Phase 7C domain session leaves alternate content");
+        "domain session leaves alternate content");
     const term::Terminal_selection_result alternate_payload =
         domain_session->selected_text();
     ok &= check(alternate_payload.code == term::Terminal_selection_result_code::OK &&
@@ -4118,13 +4118,13 @@ bool test_selection_phase7c_anchor_domains_and_invalidation_events()
         domain_session->selection_anchor_domain() ==
             term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
         !domain_session->selection_visual_lease().has_value(),
-        "Phase 7C alternate transition detaches to explicit payload-only domain");
+        "alternate transition detaches to explicit payload-only domain");
 
     domain_session->clear_selection();
     ok &= check(domain_session->selection_anchor_domain() ==
             term::Terminal_selection_anchor_domain::NONE &&
         !domain_session->has_selection(),
-        "Phase 7C clear selection resets the anchor domain");
+        "clear selection resets the anchor domain");
 
     std::unique_ptr<term::Terminal_session> eviction_session;
     Scripted_backend* eviction_backend = make_session(eviction_session);
@@ -4132,16 +4132,16 @@ bool test_selection_phase7c_anchor_domains_and_invalidation_events()
     eviction_launch_config.initial_grid_size = {4, 20};
     ok &= check(eviction_session->start(eviction_launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 7C surviving-eviction session starts");
+        "surviving-eviction session starts");
     ok &= check(eviction_backend->emit_output(numbered_scroll_lines(10)),
-        "Phase 7C surviving-eviction backend creates scrollback");
+        "surviving-eviction backend creates scrollback");
     const std::optional<term::Terminal_render_snapshot> eviction_snapshot =
         eviction_session->latest_render_snapshot();
     const std::optional<term::terminal_selection_source_identity_t> eviction_source =
         eviction_session->published_selection_source_identity();
     ok &= check(eviction_snapshot.has_value() &&
         eviction_snapshot->viewport.scrollback_rows > 1,
-        "Phase 7C surviving-eviction fixture has multiple scrollback rows");
+        "surviving-eviction fixture has multiple scrollback rows");
     if (eviction_snapshot.has_value() && eviction_source.has_value()) {
         const int scrollback_before =
             eviction_snapshot->viewport.scrollback_rows;
@@ -4156,7 +4156,7 @@ bool test_selection_phase7c_anchor_domains_and_invalidation_events()
             original_payload.text == QStringLiteral("scroll-line-001") &&
             eviction_session->selection_anchor_domain() ==
                 term::Terminal_selection_anchor_domain::PRIMARY_BACKING,
-            "Phase 7C surviving-eviction selection starts in primary backing domain");
+            "surviving-eviction selection starts in primary backing domain");
 
         eviction_session->set_scrollback_limit(scrollback_before - 1);
         const term::Terminal_selection_result retained_payload =
@@ -4166,7 +4166,7 @@ bool test_selection_phase7c_anchor_domains_and_invalidation_events()
             eviction_session->selection_anchor_domain() ==
                 term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
             !eviction_session->selection_visual_lease().has_value(),
-            "Phase 7C oldest-row eviction preserves payload and detaches domain");
+            "oldest-row eviction preserves payload and detaches domain");
     }
 
     std::unique_ptr<term::Terminal_session> clear_session;
@@ -4175,9 +4175,9 @@ bool test_selection_phase7c_anchor_domains_and_invalidation_events()
     clear_launch_config.initial_grid_size = {4, 20};
     ok &= check(clear_session->start(clear_launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 7C clear-scrollback session starts");
+        "clear-scrollback session starts");
     ok &= check(clear_backend->emit_output(numbered_scroll_lines(10)),
-        "Phase 7C clear-scrollback backend creates scrollback");
+        "clear-scrollback backend creates scrollback");
     const std::optional<term::terminal_selection_source_identity_t> clear_source =
         clear_session->published_selection_source_identity();
     if (clear_source.has_value()) {
@@ -4189,7 +4189,7 @@ bool test_selection_phase7c_anchor_domains_and_invalidation_events()
         const term::Terminal_selection_result original_payload =
             clear_session->selected_text();
         ok &= check(clear_backend->emit_output(QByteArrayLiteral("\x1b[3J")),
-            "Phase 7C clear-scrollback backend clears retained history");
+            "clear-scrollback backend clears retained history");
         const term::Terminal_selection_result retained_payload =
             clear_session->selected_text();
         ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
@@ -4198,7 +4198,7 @@ bool test_selection_phase7c_anchor_domains_and_invalidation_events()
             clear_session->selection_anchor_domain() ==
                 term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
             !clear_session->selection_visual_lease().has_value(),
-            "Phase 7C clear-scrollback preserves payload and marks payload-only domain");
+            "clear-scrollback preserves payload and marks payload-only domain");
     }
 
     return ok;
@@ -4365,7 +4365,7 @@ bool test_output_activity_notifications_are_session_level()
     return ok;
 }
 
-bool test_public_projection_phase1_copies_public_rows_and_metadata()
+bool test_public_projection_copies_public_rows_and_metadata()
 {
     bool ok = true;
 
@@ -4378,26 +4378,26 @@ bool test_public_projection_phase1_copies_public_rows_and_metadata()
     launch_config.initial_grid_size = {3, 16};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 1 projection row-universe session starts");
+        "projection row-universe session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("row-0\r\nrow-1\r\nrow-2\r\nrow-3\r\nrow-4")),
-        "Phase 1 projection row-universe backend publishes public rows");
+        "projection row-universe backend publishes public rows");
 
     const std::optional<term::Terminal_public_projection> projection =
         session->capture_public_projection_for_testing();
-    ok &= check(projection.has_value(), "Phase 1 projection capture succeeds");
+    ok &= check(projection.has_value(), "projection capture succeeds");
     if (!projection.has_value()) {
         return ok;
     }
 
     ok &= check(projection->generation() == 1U,
-        "Phase 1 projection generation starts at one");
+        "projection generation starts at one");
     ok &= check(projection->source_basis() == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         projection->source_purpose() == term::Terminal_render_snapshot_purpose::CONTENT,
-        "Phase 1 projection records live-content content source basis");
+        "projection records live-content content source basis");
     ok &= check(projection->basis_validation_status() ==
         term::Terminal_render_snapshot_status::OK,
-        "Phase 1 projection records valid safe-basis metadata");
+        "projection records valid safe-basis metadata");
     ok &= check(projection->safe_basis_scrollback_depth() == 2 &&
         projection->safe_basis_active_grid_rows() == 3 &&
         projection->stored_row_count() == 3U &&
@@ -4405,38 +4405,38 @@ bool test_public_projection_phase1_copies_public_rows_and_metadata()
         projection->copied_row_bound() == 3U &&
         projection->first_copied_public_row() == 2 &&
         projection->rows_are_safe_basis_viewport_only(),
-        "Phase 1 projection separates safe-basis dimensions from stored viewport rows");
+        "projection separates safe-basis dimensions from stored viewport rows");
     ok &= check(projection->rows()[0].public_row == 2 &&
         projection->rows()[1].public_row == 3 &&
         projection->rows()[2].public_row == 4 &&
         projection_row_cells_are_row_relative(projection->rows()[0]) &&
         projection_row_cells_are_row_relative(projection->rows()[1]) &&
         projection_row_cells_are_row_relative(projection->rows()[2]),
-        "Phase 1 projection stores row-relative cells and preserves public row identities");
+        "projection stores row-relative cells and preserves public row identities");
     ok &= check(projection_row_text(*projection, 0) == QStringLiteral("row-2") &&
         projection_row_text(*projection, 1) == QStringLiteral("row-3") &&
         projection_row_text(*projection, 2) == QStringLiteral("row-4"),
-        "Phase 1 projection includes copied safe-basis viewport rows only");
+        "projection includes copied safe-basis viewport rows only");
     ok &= check(projection->public_scroll_diagnostics().public_projection_generation ==
             projection->generation() &&
         projection->active_buffer_epoch() == 0U,
-        "Phase 1 projection records coherent diagnostics and initial buffer epoch");
+        "projection records coherent diagnostics and initial buffer epoch");
     ok &= check(projection->metadata().processed_backend_callback_epoch ==
             session->backend_callback_processed_epoch() &&
         projection->metadata().processed_backend_callback_epoch != 0U,
-        "Phase 1 projection metadata preserves the processed backend callback epoch");
+        "projection metadata preserves the processed backend callback epoch");
 
     const std::optional<term::Terminal_public_projection> next_projection =
         session->capture_public_projection_for_testing();
     ok &= check(next_projection.has_value() &&
         next_projection->generation() == 2U &&
         next_projection->public_scroll_diagnostics().public_projection_generation == 2U,
-        "Phase 1 projection generation advances monotonically");
+        "projection generation advances monotonically");
 
     return ok;
 }
 
-bool test_public_projection_phase1_copies_only_offset_viewport_window()
+bool test_public_projection_copies_only_offset_viewport_window()
 {
     bool ok = true;
 
@@ -4449,20 +4449,20 @@ bool test_public_projection_phase1_copies_only_offset_viewport_window()
     launch_config.initial_grid_size = {3, 16};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 1 offset-window projection session starts");
+        "offset-window projection session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("row-0\r\nrow-1\r\nrow-2\r\nrow-3\r\n")
         + QByteArrayLiteral("row-4\r\nrow-5\r\nrow-6\r\nrow-7")),
-        "Phase 1 offset-window backend publishes public rows");
+        "offset-window backend publishes public rows");
 
     const term::Terminal_viewport_scroll_result scroll_result =
         session->scroll_published_viewport_to_offset_from_tail(2);
     ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 1 offset-window safe basis scrolls away from tail");
+        "offset-window safe basis scrolls away from tail");
 
     const std::optional<term::Terminal_public_projection> projection =
         session->capture_public_projection_for_testing();
-    ok &= check(projection.has_value(), "Phase 1 offset-window projection capture succeeds");
+    ok &= check(projection.has_value(), "offset-window projection capture succeeds");
     if (!projection.has_value()) {
         return ok;
     }
@@ -4472,23 +4472,23 @@ bool test_public_projection_phase1_copies_only_offset_viewport_window()
         projection->stored_row_count() == 3U &&
         projection->copied_row_bound() == 3U &&
         projection->first_copied_public_row() == 3,
-        "Phase 1 offset-window projection records safe-basis bounds but copies only the viewport");
+        "offset-window projection records safe-basis bounds but copies only the viewport");
     ok &= check(projection->rows()[0].public_row == 3 &&
         projection->rows()[1].public_row == 4 &&
         projection->rows()[2].public_row == 5 &&
         projection_row_cells_are_row_relative(projection->rows()[0]) &&
         projection_row_cells_are_row_relative(projection->rows()[1]) &&
         projection_row_cells_are_row_relative(projection->rows()[2]),
-        "Phase 1 offset-window projection keeps copied public row identities on row-relative cells");
+        "offset-window projection keeps copied public row identities on row-relative cells");
     ok &= check(projection_row_text(*projection, 0) == QStringLiteral("row-3") &&
         projection_row_text(*projection, 1) == QStringLiteral("row-4") &&
         projection_row_text(*projection, 2) == QStringLiteral("row-5"),
-        "Phase 1 offset-window projection does not backfill full public scrollback");
+        "offset-window projection does not backfill full public scrollback");
 
     return ok;
 }
 
-bool test_public_projection_phase1_storage_stays_viewport_bounded_after_scrollback_growth()
+bool test_public_projection_storage_stays_viewport_bounded_after_scrollback_growth()
 {
     bool ok = true;
 
@@ -4501,16 +4501,16 @@ bool test_public_projection_phase1_storage_stays_viewport_bounded_after_scrollba
     launch_config.initial_grid_size = {3, 18};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 1 viewport-bound projection session starts");
+        "viewport-bound projection session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("row-0\r\nrow-1\r\nrow-2\r\nrow-3\r\n")
         + QByteArrayLiteral("row-4\r\nrow-5\r\nrow-6\r\nrow-7\r\n")
         + QByteArrayLiteral("row-8\r\nrow-9\r\nrow-10")),
-        "Phase 1 viewport-bound backend grows public scrollback beyond the viewport");
+        "viewport-bound backend grows public scrollback beyond the viewport");
 
     const std::optional<term::Terminal_public_projection> projection =
         session->capture_public_projection_for_testing();
-    ok &= check(projection.has_value(), "Phase 1 viewport-bound projection capture succeeds");
+    ok &= check(projection.has_value(), "viewport-bound projection capture succeeds");
     if (!projection.has_value()) {
         return ok;
     }
@@ -4519,25 +4519,25 @@ bool test_public_projection_phase1_storage_stays_viewport_bounded_after_scrollba
         projection->safe_basis_active_grid_rows() == 3 &&
         projection->stored_row_count() == 3U &&
         projection->copied_row_bound() == 3U,
-        "Phase 1 viewport-bound projection records scrollback depth without storing scrollback");
+        "viewport-bound projection records scrollback depth without storing scrollback");
     ok &= check(projection->stored_row_count() <=
             static_cast<std::size_t>(projection->safe_basis_active_grid_rows()) &&
         projection->safe_basis_scrollback_depth() >
             static_cast<int>(projection->stored_row_count()),
-        "Phase 1 viewport-bound stored rows stay bounded by visible grid rows");
+        "viewport-bound stored rows stay bounded by visible grid rows");
     ok &= check(projection_row_cells_are_row_relative(projection->rows()[0]) &&
         projection_row_cells_are_row_relative(projection->rows()[1]) &&
         projection_row_cells_are_row_relative(projection->rows()[2]),
-        "Phase 1 viewport-bound projection stores copied cells with row-relative coordinates");
+        "viewport-bound projection stores copied cells with row-relative coordinates");
     ok &= check(projection_row_text(*projection, 0) == QStringLiteral("row-8") &&
         projection_row_text(*projection, 1) == QStringLiteral("row-9") &&
         projection_row_text(*projection, 2) == QStringLiteral("row-10"),
-        "Phase 1 viewport-bound projection stores only the safe-basis tail viewport");
+        "viewport-bound projection stores only the safe-basis tail viewport");
 
     return ok;
 }
 
-bool test_public_projection_phase1_tracks_active_buffer_epoch()
+bool test_public_projection_tracks_active_buffer_epoch()
 {
     bool ok = true;
 
@@ -4547,34 +4547,34 @@ bool test_public_projection_phase1_tracks_active_buffer_epoch()
     launch_config.initial_grid_size = {3, 16};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 1 projection buffer-epoch session starts");
+        "projection buffer-epoch session starts");
     ok &= check(backend->emit_output(QByteArrayLiteral("primary")),
-        "Phase 1 projection buffer-epoch backend publishes primary text");
+        "projection buffer-epoch backend publishes primary text");
 
     const std::optional<term::Terminal_public_projection> primary_projection =
         session->capture_public_projection_for_testing();
     ok &= check(primary_projection.has_value() &&
         primary_projection->active_buffer() == term::Terminal_buffer_id::PRIMARY &&
         primary_projection->active_buffer_epoch() == 0U,
-        "Phase 1 projection starts with primary buffer epoch zero");
+        "projection starts with primary buffer epoch zero");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1049halternate")),
-        "Phase 1 projection buffer-epoch backend enters alternate screen");
+        "projection buffer-epoch backend enters alternate screen");
     const std::optional<term::Terminal_public_projection> alternate_projection =
         session->capture_public_projection_for_testing();
     ok &= check(alternate_projection.has_value() &&
         alternate_projection->active_buffer() == term::Terminal_buffer_id::ALTERNATE &&
         alternate_projection->active_buffer_epoch() == 1U,
-        "Phase 1 projection increments buffer epoch on alternate entry");
+        "projection increments buffer epoch on alternate entry");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1049l")),
-        "Phase 1 projection buffer-epoch backend returns to primary screen");
+        "projection buffer-epoch backend returns to primary screen");
     const std::optional<term::Terminal_public_projection> return_projection =
         session->capture_public_projection_for_testing();
     ok &= check(return_projection.has_value() &&
         return_projection->active_buffer() == term::Terminal_buffer_id::PRIMARY &&
         return_projection->active_buffer_epoch() == 2U,
-        "Phase 1 projection increments buffer epoch on primary return");
+        "projection increments buffer epoch on primary return");
     if (!return_projection.has_value()) {
         return ok;
     }
@@ -4582,30 +4582,30 @@ bool test_public_projection_phase1_tracks_active_buffer_epoch()
     const std::uint64_t pre_hidden_transition_epoch =
         return_projection->active_buffer_epoch();
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 1 projection buffer-epoch backend enters synchronized output");
+        "projection buffer-epoch backend enters synchronized output");
     ok &= check(backend->emit_output(
             QByteArrayLiteral("\x1b[?1049hhidden-alternate\x1b[?1049l")),
-        "Phase 1 projection buffer-epoch backend drives hidden alternate transition");
+        "projection buffer-epoch backend drives hidden alternate transition");
     const std::optional<term::Terminal_public_projection> held_hidden_projection =
         session->public_projection_for_testing();
     ok &= check(held_hidden_projection.has_value() &&
         held_hidden_projection->active_buffer() == term::Terminal_buffer_id::PRIMARY &&
         held_hidden_projection->active_buffer_epoch() == pre_hidden_transition_epoch,
-        "Phase 1 projection retains public buffer epoch while hidden transition is held");
+        "projection retains public buffer epoch while hidden transition is held");
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 1 projection buffer-epoch backend releases synchronized output");
+        "projection buffer-epoch backend releases synchronized output");
     const std::optional<term::Terminal_public_projection> released_hidden_projection =
         session->capture_public_projection_for_testing();
     ok &= check(released_hidden_projection.has_value() &&
         released_hidden_projection->active_buffer() == term::Terminal_buffer_id::PRIMARY &&
         released_hidden_projection->active_buffer_epoch() ==
             pre_hidden_transition_epoch + 1U,
-        "Phase 1 projection advances buffer epoch once for released hidden transition");
+        "projection advances buffer epoch once for released hidden transition");
 
     return ok;
 }
 
-bool test_public_projection_phase1_copy_is_immutable_after_hidden_mutation()
+bool test_public_projection_copy_is_immutable_after_hidden_mutation()
 {
     bool ok = true;
 
@@ -4618,17 +4618,17 @@ bool test_public_projection_phase1_copy_is_immutable_after_hidden_mutation()
     launch_config.initial_grid_size = {4, 24};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 1 projection immutability session starts");
+        "projection immutability session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("plain-0\r\n")
         + QByteArrayLiteral("\x1b]8;id=safe;https://safe.example\x1b\\")
         + QByteArrayLiteral("\x1b[31mLINK\x1b[0m")
         + QByteArrayLiteral("\x1b]8;;\x1b\\\r\nplain-2\r\nplain-3")),
-        "Phase 1 projection immutability backend publishes safe styled link rows");
+        "projection immutability backend publishes safe styled link rows");
 
     const std::optional<term::Terminal_public_projection> captured =
         session->capture_public_projection_for_testing();
-    ok &= check(captured.has_value(), "Phase 1 projection immutability capture succeeds");
+    ok &= check(captured.has_value(), "projection immutability capture succeeds");
     if (!captured.has_value()) {
         return ok;
     }
@@ -4638,13 +4638,13 @@ bool test_public_projection_phase1_copy_is_immutable_after_hidden_mutation()
     ok &= check(link_cell != nullptr &&
         link_cell->style_id     != term::k_default_terminal_style_id &&
         link_cell->hyperlink_id != term::k_no_terminal_hyperlink_id,
-        "Phase 1 projection copies public style and hyperlink cell metadata");
+        "projection copies public style and hyperlink cell metadata");
     ok &= check(projection_cells_reference_owned_metadata(*captured),
-        "Phase 1 projection cells resolve style and hyperlink IDs within owned metadata arrays");
+        "projection cells resolve style and hyperlink IDs within owned metadata arrays");
     ok &= check(projection_has_hyperlink_uri(
         *captured,
         QByteArrayLiteral("https://safe.example")),
-        "Phase 1 projection copies public hyperlink identity metadata");
+        "projection copies public hyperlink identity metadata");
 
     const std::size_t pre_hidden_style_count = captured->styles().size();
     const term::Terminal_style_id pre_hidden_link_style_id =
@@ -4673,51 +4673,51 @@ bool test_public_projection_phase1_copy_is_immutable_after_hidden_mutation()
         pre_hidden_colors.default_background_rgba ==
             default_scheme_colors.default_background_rgba &&
         pre_hidden_colors.cursor_rgba == default_scheme_colors.cursor_rgba,
-        "Phase 1 projection immutability captures known pre-hidden cursor, mode, color, and style state");
+        "projection immutability captures known pre-hidden cursor, mode, color, and style state");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\r\nPUBLIC-MUTATION")),
-        "Phase 1 projection immutability backend publishes later public mutation");
+        "projection immutability backend publishes later public mutation");
     const std::optional<term::Terminal_public_projection> after_public_mutation =
         session->public_projection_for_testing();
     ok &= check(after_public_mutation.has_value() &&
         after_public_mutation->generation() == captured->generation() &&
         projection_contains_text(*after_public_mutation, QStringLiteral("LINK")) &&
         !projection_contains_text(*after_public_mutation, QStringLiteral("PUBLIC-MUTATION")),
-        "Phase 1 copied projection is immutable after later public publication");
+        "copied projection is immutable after later public publication");
 
     ok &= check(backend->emit_output(
         QByteArrayLiteral("\x1b[?2026h")
         + QByteArrayLiteral("\x1b[?25l\x1b[?7l\x1b[4;12H")
         + QByteArrayLiteral("\x1b[32mHIDDEN\x1b[0m")
         + QByteArrayLiteral("\x1b]8;id=hidden;https://hidden.example\x1b\\X\x1b]8;;\x1b\\")),
-        "Phase 1 projection immutability backend mutates hidden live state");
+        "projection immutability backend mutates hidden live state");
 
     const std::optional<term::Terminal_public_projection> retained =
         session->public_projection_for_testing();
     ok &= check(retained.has_value() &&
         retained->generation() == captured->generation(),
-        "Phase 1 session retains copied projection after hidden live mutation");
+        "session retains copied projection after hidden live mutation");
     if (!retained.has_value()) {
         return ok;
     }
 
     ok &= check(projection_contains_text(*retained, QStringLiteral("LINK")) &&
         !projection_contains_text(*retained, QStringLiteral("HIDDEN")),
-        "Phase 1 copied projection content is immutable after hidden mutation");
+        "copied projection content is immutable after hidden mutation");
     ok &= check(projection_cells_reference_owned_metadata(*retained),
-        "Phase 1 retained projection cells still resolve through owned metadata arrays");
+        "retained projection cells still resolve through owned metadata arrays");
     ok &= check(projection_has_hyperlink_uri(
             *retained,
             QByteArrayLiteral("https://safe.example")) &&
         !projection_has_hyperlink_uri(
             *retained,
             QByteArrayLiteral("https://hidden.example")),
-        "Phase 1 copied projection hyperlink metadata is immutable after hidden mutation");
+        "copied projection hyperlink metadata is immutable after hidden mutation");
     ok &= check(retained->styles().size() == pre_hidden_style_count &&
         static_cast<std::size_t>(pre_hidden_link_style_id) < retained->styles().size() &&
         retained->styles()[static_cast<std::size_t>(pre_hidden_link_style_id)] ==
             pre_hidden_link_style,
-        "Phase 1 copied projection style vector and selected link style are immutable after hidden SGR mutation");
+        "copied projection style vector and selected link style are immutable after hidden SGR mutation");
     ok &= check(retained->cursor().position.row == pre_hidden_cursor.position.row &&
         retained->cursor().position.column      == pre_hidden_cursor.position.column &&
         retained->cursor().visible              == pre_hidden_cursor.visible &&
@@ -4728,26 +4728,26 @@ bool test_public_projection_phase1_copy_is_immutable_after_hidden_mutation()
         retained->color_state().default_background_rgba ==
             pre_hidden_colors.default_background_rgba &&
         retained->color_state().cursor_rgba == pre_hidden_colors.cursor_rgba,
-        "Phase 1 copied projection cursor, mode, and color state stay on the safe basis");
+        "copied projection cursor, mode, and color state stay on the safe basis");
     ok &= check(retained->safe_basis_scrollback_depth() ==
             captured->safe_basis_scrollback_depth() &&
         retained->safe_basis_active_grid_rows() ==
             captured->safe_basis_active_grid_rows() &&
         retained->first_copied_public_row() == captured->first_copied_public_row() &&
         retained->stored_row_count() == captured->stored_row_count(),
-        "Phase 1 copied projection row metadata stays on the safe basis after hidden mutation");
+        "copied projection row metadata stays on the safe basis after hidden mutation");
     const std::optional<term::Terminal_render_snapshot> latest_safe_snapshot =
         session->latest_render_snapshot();
     ok &= check(latest_safe_snapshot.has_value() &&
         !snapshot_contains_text(*latest_safe_snapshot, QStringLiteral("HIDDEN")),
-        "Phase 1 hidden mutation stays outside the latest safe live-content basis");
+        "hidden mutation stays outside the latest safe live-content basis");
     ok &= check(!session->capture_public_projection_for_testing().has_value(),
-        "Phase 1 test-only projection capture refuses synchronized-output hidden basis");
+        "test-only projection capture refuses synchronized-output hidden basis");
 
     return ok;
 }
 
-bool test_public_projection_phase1_compacts_copied_metadata()
+bool test_public_projection_compacts_copied_metadata()
 {
     bool ok = true;
 
@@ -4760,7 +4760,7 @@ bool test_public_projection_phase1_compacts_copied_metadata()
     launch_config.initial_grid_size = {3, 24};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 1 compact projection metadata session starts");
+        "compact projection metadata session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("\x1b[31m")
         + QByteArrayLiteral("\x1b]8;id=off;https://off.example\x1b\\")
@@ -4770,11 +4770,11 @@ bool test_public_projection_phase1_compacts_copied_metadata()
         + QByteArrayLiteral("\x1b]8;id=visible;https://visible.example\x1b\\")
         + QByteArrayLiteral("VISIBLE")
         + QByteArrayLiteral("\x1b]8;;\x1b\\\x1b[0m\r\ntail")),
-        "Phase 1 compact projection metadata backend publishes offscreen and visible metadata");
+        "compact projection metadata backend publishes offscreen and visible metadata");
 
     const std::optional<term::Terminal_public_projection> projection =
         session->capture_public_projection_for_testing();
-    ok &= check(projection.has_value(), "Phase 1 compact projection metadata capture succeeds");
+    ok &= check(projection.has_value(), "compact projection metadata capture succeeds");
     if (!projection.has_value()) {
         return ok;
     }
@@ -4783,23 +4783,23 @@ bool test_public_projection_phase1_compacts_copied_metadata()
         projection_cell_with_text(*projection, QStringLiteral("V"));
     ok &= check(projection_contains_text(*projection, QStringLiteral("VISIBLE")) &&
         !projection_contains_text(*projection, QStringLiteral("OFFSTYLE")),
-        "Phase 1 compact projection stores only copied viewport rows");
+        "compact projection stores only copied viewport rows");
     ok &= check(visible_cell != nullptr &&
         visible_cell->style_id     != term::k_default_terminal_style_id &&
         visible_cell->hyperlink_id != term::k_no_terminal_hyperlink_id,
-        "Phase 1 compact projection keeps visible styled hyperlink cell metadata");
+        "compact projection keeps visible styled hyperlink cell metadata");
     ok &= check(projection->styles().size() == 2U &&
         projection->hyperlinks().size() == 1U,
-        "Phase 1 compact projection omits unreferenced off-viewport style and hyperlink metadata");
+        "compact projection omits unreferenced off-viewport style and hyperlink metadata");
     ok &= check(projection_cells_reference_owned_metadata(*projection),
-        "Phase 1 compact projection remaps copied cell metadata to owned compact tables");
+        "compact projection remaps copied cell metadata to owned compact tables");
     ok &= check(projection_has_hyperlink_uri(
             *projection,
             QByteArrayLiteral("https://visible.example")) &&
         !projection_has_hyperlink_uri(
             *projection,
             QByteArrayLiteral("https://off.example")),
-        "Phase 1 compact projection filters hyperlink metadata to copied cells");
+        "compact projection filters hyperlink metadata to copied cells");
 
     std::unique_ptr<term::Terminal_session> style_only_session;
     Scripted_backend* style_only_backend = make_session(style_only_session, config);
@@ -4807,9 +4807,9 @@ bool test_public_projection_phase1_compacts_copied_metadata()
     style_only_launch.initial_grid_size = {1, 24};
     ok &= check(style_only_session->start(style_only_launch).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 1 compact style-only projection session starts");
+        "compact style-only projection session starts");
     ok &= check(style_only_backend->emit_output(QByteArrayLiteral("\x1b[32mONLYSTYLE")),
-        "Phase 1 compact style-only projection publishes non-default styled cells");
+        "compact style-only projection publishes non-default styled cells");
     const std::optional<term::Terminal_public_projection> style_only_projection =
         style_only_session->capture_public_projection_for_testing();
     const term::Terminal_render_cell* style_only_cell =
@@ -4826,7 +4826,7 @@ bool test_public_projection_phase1_compacts_copied_metadata()
         style_only_projection->styles()[0] == term::Terminal_text_style{} &&
         style_only_cell_style_resolves &&
         style_only_cell->style_id != term::k_default_terminal_style_id,
-        "Phase 1 compact projection keeps default style at index zero when copied cells are all non-default");
+        "compact projection keeps default style at index zero when copied cells are all non-default");
     const std::optional<term::Terminal_render_snapshot> style_only_snapshot =
         style_only_session->latest_render_snapshot();
     const term::Terminal_render_cell* source_style_only_cell =
@@ -4843,7 +4843,7 @@ bool test_public_projection_phase1_compacts_copied_metadata()
             style_only_snapshot->styles.size() &&
         style_only_projection->styles()[static_cast<std::size_t>(style_only_cell->style_id)] ==
             style_only_snapshot->styles[static_cast<std::size_t>(source_style_only_cell->style_id)],
-        "Phase 1 compact projection preserves remapped style content");
+        "compact projection preserves remapped style content");
 
     term::Terminal_viewport_state invalid_metadata_viewport;
     invalid_metadata_viewport.active_buffer    = term::Terminal_buffer_id::PRIMARY;
@@ -4876,12 +4876,12 @@ bool test_public_projection_phase1_compacts_copied_metadata()
         invalid_metadata_cell->style_id == term::k_default_terminal_style_id &&
         invalid_metadata_cell->hyperlink_id == term::k_no_terminal_hyperlink_id &&
         projection_cells_reference_owned_metadata(invalid_metadata_projection),
-        "Phase 1 compact projection defensively defaults unmapped style and hyperlink ids");
+        "compact projection defensively defaults unmapped style and hyperlink ids");
 
     return ok;
 }
 
-bool test_public_projection_phase2_controller_diagnostic_precedence()
+bool test_public_projection_controller_diagnostic_precedence()
 {
     bool ok = true;
 
@@ -4916,7 +4916,7 @@ bool test_public_projection_phase2_controller_diagnostic_precedence()
     ok &= check(controller.release_intent().diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::
                 SELECTION_PUBLIC_PROJECTION_UNSUPPORTED,
-        "Phase 2 controller records selection-unsupported diagnostic");
+        "controller records selection-unsupported diagnostic");
 
     const term::Terminal_public_viewport_scroll_result deferred_scroll =
         controller.scroll_lines(1);
@@ -4927,7 +4927,7 @@ bool test_public_projection_phase2_controller_diagnostic_precedence()
         controller.release_intent().diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::
                 PUBLIC_PROJECTION_INVALIDATED_DEFERRED_INTENT,
-        "Phase 2 deferred public scroll diagnostic supersedes selection-unsupported diagnostic");
+        "deferred public scroll diagnostic supersedes selection-unsupported diagnostic");
 
     term::Terminal_public_viewport_controller unsupported_buffer_controller;
     unsupported_buffer_controller.initialize_from_copied_rows(
@@ -4944,12 +4944,12 @@ bool test_public_projection_phase2_controller_diagnostic_precedence()
             term::Terminal_public_projection_disable_reason::UNSUPPORTED_BUFFER &&
         unsupported_buffer_controller.release_intent().diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::NONE,
-        "Phase 2 controller records unsupported-buffer disable reason without synthetic diagnostic");
+        "controller records unsupported-buffer disable reason without synthetic diagnostic");
 
     return ok;
 }
 
-bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
+bool test_public_projection_controller_mutates_copied_viewport_only()
 {
     bool ok = true;
 
@@ -4979,7 +4979,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         !controller.release_intent().sticky_tail &&
         controller.release_intent().detached_anchor.has_value() &&
         controller.release_intent().detached_anchor->history_handle.row_sequence == 1002U,
-        "Phase 2 public viewport initializes detached release intent from copied rows");
+        "public viewport initializes detached release intent from copied rows");
 
     const term::Terminal_public_viewport_scroll_result detached_scroll =
         controller.scroll_lines(1);
@@ -4990,7 +4990,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         !controller.release_intent().sticky_tail &&
         controller.release_intent().detached_anchor.has_value() &&
         controller.release_intent().detached_anchor->history_handle.row_sequence == 1001U,
-        "Phase 2 public viewport scroll refreshes detached first-visible-row anchor");
+        "public viewport scroll refreshes detached first-visible-row anchor");
 
     const term::Terminal_public_viewport_scroll_result clamped_tail_scroll =
         controller.scroll_lines(-99);
@@ -5001,7 +5001,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         !controller.release_intent().sticky_tail &&
         controller.release_intent().detached_anchor.has_value() &&
         controller.release_intent().detached_anchor->history_handle.row_sequence == 1004U,
-        "Phase 2 public viewport clamp to offset zero does not create sticky-tail intent");
+        "public viewport clamp to offset zero does not create sticky-tail intent");
 
     term::Terminal_public_viewport_controller negative_offset_controller;
     negative_offset_controller.initialize_from_copied_rows(
@@ -5020,7 +5020,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         !negative_offset_controller.release_intent().sticky_tail &&
         negative_offset_controller.release_intent().detached_anchor.has_value() &&
         negative_offset_controller.release_intent().detached_anchor->history_handle.row_sequence == 1004U,
-        "Phase 2 explicit negative offset clamps to tail without sticky-tail intent");
+        "explicit negative offset clamps to tail without sticky-tail intent");
 
     const term::Terminal_public_viewport_scroll_result explicit_tail =
         controller.scroll_to_tail();
@@ -5029,7 +5029,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         controller.viewport().offset_from_tail == 0 &&
         controller.release_intent().sticky_tail &&
         !controller.release_intent().detached_anchor.has_value(),
-        "Phase 2 explicit public scroll-to-bottom sets sticky-tail intent");
+        "explicit public scroll-to-bottom sets sticky-tail intent");
 
     const term::Terminal_public_viewport_scroll_result explicit_detach =
         controller.scroll_to_offset_from_tail(2);
@@ -5039,7 +5039,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
         !controller.release_intent().sticky_tail &&
         controller.release_intent().detached_anchor.has_value() &&
         controller.release_intent().detached_anchor->history_handle.row_sequence == 1002U,
-        "Phase 2 explicit non-tail public offset restores detached release anchoring");
+        "explicit non-tail public offset restores detached release anchoring");
 
     const term::Terminal_public_viewport_scroll_result off_copied_scroll =
         controller.scroll_to_offset_from_tail(4);
@@ -5057,7 +5057,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
             term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED &&
         controller.release_intent().diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::PUBLIC_PROJECTION_INVALIDATED_DEFERRED_INTENT,
-        "Phase 2 public viewport invalidates off-copied-row requests into deferred intent");
+        "public viewport invalidates off-copied-row requests into deferred intent");
 
     term::Terminal_viewport_state fragment_viewport;
     fragment_viewport.scrollback_rows  = 2;
@@ -5080,7 +5080,7 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
     ok &= check(fragment_projection.rows().size() == 2U &&
         fragment_projection.rows()[1].visual_fragment_index == 1 &&
         !fragment_projection.rows()[1].visual_fragment_index_is_exact,
-        "Phase 2 viewport-only projection capture records inexact retained-line visual fragment index");
+        "viewport-only projection capture records inexact retained-line visual fragment index");
 
     term::Terminal_public_viewport_controller fragment_controller;
     fragment_viewport.scrollback_rows  = 4;
@@ -5116,12 +5116,12 @@ bool test_public_projection_phase2_controller_mutates_copied_viewport_only()
     ok &= check(fragment_controller.release_intent().detached_anchor.has_value() &&
         fragment_controller.release_intent().detached_anchor->history_handle.row_sequence == 900U &&
         fragment_controller.release_intent().detached_anchor->visual_fragment_index == 1,
-        "Phase 2 detached anchor preserves retained-line visual fragment index");
+        "detached anchor preserves retained-line visual fragment index");
 
     return ok;
 }
 
-bool test_public_projection_phase2_session_invalidates_phase1_off_viewport_scroll()
+bool test_public_projection_session_invalidates_off_viewport_scroll()
 {
     bool ok = true;
 
@@ -5134,16 +5134,16 @@ bool test_public_projection_phase2_session_invalidates_phase1_off_viewport_scrol
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 2 off-viewport invalidation session starts");
+        "off-viewport invalidation session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(12)),
-        "Phase 2 off-viewport invalidation backend publishes scrollback");
+        "off-viewport invalidation backend publishes scrollback");
 
     const std::optional<term::Terminal_public_projection> projection =
         session->capture_public_projection_for_testing();
     ok &= check(projection.has_value() &&
         projection->rows_are_safe_basis_viewport_only() &&
         projection->stored_row_count() == 3U,
-        "Phase 2 session starts from the Phase 1 viewport-only projection gate");
+        "session starts from the viewport-only projection gate");
     if (!projection.has_value()) {
         return ok;
     }
@@ -5154,9 +5154,9 @@ bool test_public_projection_phase2_session_invalidates_phase1_off_viewport_scrol
         session->latest_render_snapshot();
     ok &= check(backend->emit_output(
             QByteArrayLiteral("\x1b[?2026hhidden-0\r\nhidden-1\r\nhidden-2")),
-        "Phase 2 off-viewport invalidation backend enters synchronized-output hold");
+        "off-viewport invalidation backend enters synchronized-output hold");
     ok &= check(session->render_snapshot_generation() == public_generation,
-        "Phase 2 internal public viewport state does not publish on synchronized-output entry");
+        "internal public viewport state does not publish on synchronized-output entry");
 
     const term::Terminal_public_viewport_scroll_result scroll_result =
         session->scroll_public_projection_viewport_lines_for_testing(1);
@@ -5164,7 +5164,7 @@ bool test_public_projection_phase2_session_invalidates_phase1_off_viewport_scrol
         session->public_release_intent_for_testing();
     ok &= check(scroll_result.invalidated_public_projection &&
         scroll_result.deferred_release_intent_recorded,
-        "Phase 2 off-viewport public scroll is invalidated into deferred release intent");
+        "off-viewport public scroll is invalidated into deferred release intent");
     ok &= check(intent.has_value() &&
         viewport_states_equal(intent->public_viewport, frozen_public_viewport) &&
         intent->public_viewport.scrollback_rows == projection->safe_basis_scrollback_depth() &&
@@ -5181,11 +5181,11 @@ bool test_public_projection_phase2_session_invalidates_phase1_off_viewport_scrol
             term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED &&
         intent->diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::PUBLIC_PROJECTION_INVALIDATED_DEFERRED_INTENT,
-        "Phase 2 deferred intent stays on frozen public bounds instead of hidden live bounds");
+        "deferred intent stays on frozen public bounds instead of hidden live bounds");
     ok &= check(!session->public_projection_for_testing().has_value(),
-        "Phase 2 off-viewport invalidation drops the copied projection row source");
+        "off-viewport invalidation drops the copied projection row source");
     ok &= check(session->render_snapshot_generation() == public_generation,
-        "Phase 2 off-viewport invalidation emits no visible public-projection scroll snapshot");
+        "off-viewport invalidation emits no visible public-projection scroll snapshot");
     const std::optional<term::Terminal_render_snapshot> held_snapshot =
         session->latest_render_snapshot();
     ok &= check(held_snapshot.has_value() &&
@@ -5194,7 +5194,7 @@ bool test_public_projection_phase2_session_invalidates_phase1_off_viewport_scrol
         held_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         held_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         !snapshot_contains_text(*held_snapshot, QStringLiteral("hidden-")),
-        "Phase 2 off-viewport invalidation keeps the visible snapshot publication unchanged while held");
+        "off-viewport invalidation keeps the visible snapshot publication unchanged while held");
 
     const term::Terminal_public_viewport_scroll_result repeated_scroll =
         session->scroll_public_projection_viewport_lines_for_testing(1);
@@ -5213,9 +5213,9 @@ bool test_public_projection_phase2_session_invalidates_phase1_off_viewport_scrol
             term::Terminal_hidden_row_eligibility::INELIGIBLE &&
         repeated_intent->hidden_row_clamp_reason ==
             term::Terminal_hidden_row_clamp_reason::PUBLIC_VIEWPORT_BOUNDARY,
-        "Phase 2 repeated post-invalidation relative scroll accumulates deferred intent without moving frozen public viewport");
+        "repeated post-invalidation relative scroll accumulates deferred intent without moving frozen public viewport");
     ok &= check(session->render_snapshot_generation() == public_generation,
-        "Phase 2 repeated post-invalidation scroll leaves visible snapshot generation unchanged");
+        "repeated post-invalidation scroll leaves visible snapshot generation unchanged");
 
     const term::Terminal_public_viewport_scroll_result explicit_tail =
         session->scroll_public_projection_viewport_to_tail_for_testing();
@@ -5230,30 +5230,30 @@ bool test_public_projection_phase2_session_invalidates_phase1_off_viewport_scrol
         tail_intent->deferred_line_delta == 0 &&
         tail_intent->public_projection_disable_reason ==
             term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED,
-        "Phase 2 post-invalidation explicit tail scroll records sticky deferred intent");
+        "post-invalidation explicit tail scroll records sticky deferred intent");
     ok &= check(session->render_snapshot_generation() == public_generation,
-        "Phase 2 post-invalidation explicit tail scroll leaves visible snapshot generation unchanged");
+        "post-invalidation explicit tail scroll leaves visible snapshot generation unchanged");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 2 off-viewport invalidation backend releases synchronized output");
+        "off-viewport invalidation backend releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> released_snapshot =
         session->latest_render_snapshot();
     ok &= check(released_snapshot.has_value() &&
         released_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         released_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         session->render_snapshot_generation() == public_generation + 1U,
-        "Phase 2 release after test-only deferred scroll publishes normal live content");
+        "release after test-only deferred scroll publishes normal live content");
     ok &= check(released_snapshot.has_value() &&
         snapshot_contains_text(*released_snapshot, QStringLiteral("hidden-")) &&
         !session->public_projection_for_testing().has_value() &&
         !session->public_viewport_for_testing().has_value() &&
         !session->public_release_intent_for_testing().has_value(),
-        "Phase 2 release does not leak public-projection state into the visible snapshot");
+        "release does not leak public-projection state into the visible snapshot");
 
     return ok;
 }
 
-bool test_public_projection_phase2_resize_and_memory_invalidation()
+bool test_public_projection_resize_and_memory_invalidation()
 {
     bool ok = true;
 
@@ -5266,22 +5266,22 @@ bool test_public_projection_phase2_resize_and_memory_invalidation()
     resize_launch.initial_grid_size = {3, 18};
     ok &= check(resize_session->start(resize_launch).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 2 resize invalidation session starts");
+        "resize invalidation session starts");
     ok &= check(resize_backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 2 resize invalidation backend publishes public rows");
+        "resize invalidation backend publishes public rows");
     const std::optional<term::Terminal_public_projection> resize_projection =
         resize_session->capture_public_projection_for_testing();
     ok &= check(resize_projection.has_value(),
-        "Phase 2 resize invalidation captures public projection");
+        "resize invalidation captures public projection");
     const term::Terminal_viewport_state resize_frozen_viewport =
         resize_projection.has_value()
             ? resize_projection->viewport()
             : term::Terminal_viewport_state{};
     ok &= check(resize_backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
-        "Phase 2 resize invalidation enters synchronized-output hold");
+        "resize invalidation enters synchronized-output hold");
     ok &= check(resize_session->resize(QSizeF(200.0, 80.0), {4, 18}).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 2 resize invalidation applies synchronized-output resize");
+        "resize invalidation applies synchronized-output resize");
 
     const std::optional<term::Terminal_public_release_intent> resize_intent =
         resize_session->public_release_intent_for_testing();
@@ -5292,9 +5292,9 @@ bool test_public_projection_phase2_resize_and_memory_invalidation()
             term::Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED &&
         resize_intent->diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::PUBLIC_PROJECTION_GEOMETRY_INVALIDATED,
-        "Phase 2 synchronized-output resize invalidates public projection geometry while freezing public viewport");
+        "synchronized-output resize invalidates public projection geometry while freezing public viewport");
     ok &= check(!resize_session->public_projection_for_testing().has_value(),
-        "Phase 2 resize invalidation removes copied projection rows");
+        "resize invalidation removes copied projection rows");
 
     term::Terminal_session_config memory_config;
     memory_config.scrollback_limit = 6;
@@ -5305,18 +5305,18 @@ bool test_public_projection_phase2_resize_and_memory_invalidation()
     memory_launch.initial_grid_size = {3, 18};
     ok &= check(memory_session->start(memory_launch).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 2 memory invalidation session starts");
+        "memory invalidation session starts");
     ok &= check(memory_backend->emit_output(numbered_scroll_lines(12)),
-        "Phase 2 memory invalidation backend publishes public rows");
+        "memory invalidation backend publishes public rows");
     ok &= check(memory_session->scroll_published_viewport_to_offset_from_tail(2).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 2 memory invalidation detaches safe public viewport before capture");
+        "memory invalidation detaches safe public viewport before capture");
     const std::optional<term::Terminal_public_projection> projection =
         memory_session->capture_public_projection_for_testing();
     ok &= check(projection.has_value(),
-        "Phase 2 memory invalidation captures detached public projection");
+        "memory invalidation captures detached public projection");
     ok &= check(memory_backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
-        "Phase 2 memory invalidation enters synchronized-output hold");
+        "memory invalidation enters synchronized-output hold");
     const std::uint64_t memory_public_generation =
         memory_session->render_snapshot_generation();
 
@@ -5325,7 +5325,7 @@ bool test_public_projection_phase2_resize_and_memory_invalidation()
     ok &= check(before_memory.has_value() &&
         !before_memory->sticky_tail &&
         before_memory->detached_anchor.has_value(),
-        "Phase 2 memory invalidation starts with detached release anchor");
+        "memory invalidation starts with detached release anchor");
     memory_session->invalidate_public_projection_for_testing(
         term::Terminal_public_projection_disable_reason::MEMORY_PRESSURE);
     const std::optional<term::Terminal_public_release_intent> after_memory =
@@ -5346,11 +5346,11 @@ bool test_public_projection_phase2_resize_and_memory_invalidation()
         after_memory->diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::
                 PUBLIC_PROJECTION_MEMORY_PRESSURE_INVALIDATED,
-        "Phase 2 memory invalidation preserves diagnostic release-intent metadata before any follow-up scroll");
+        "memory invalidation preserves diagnostic release-intent metadata before any follow-up scroll");
     ok &= check(!memory_session->public_projection_for_testing().has_value(),
-        "Phase 2 memory invalidation removes copied projection rows");
+        "memory invalidation removes copied projection rows");
     ok &= check(memory_session->render_snapshot_generation() == memory_public_generation,
-        "Phase 2 memory invalidation emits no visible snapshot before follow-up scroll");
+        "memory invalidation emits no visible snapshot before follow-up scroll");
 
     memory_session->set_selection_range({
         {0, 0},
@@ -5365,7 +5365,7 @@ bool test_public_projection_phase2_resize_and_memory_invalidation()
         after_memory_selection->diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::
                 PUBLIC_PROJECTION_MEMORY_PRESSURE_INVALIDATED,
-        "Phase 2 memory invalidation diagnostic survives later selection mutation");
+        "memory invalidation diagnostic survives later selection mutation");
 
     const term::Terminal_public_viewport_scroll_result deferred_scroll =
         memory_session->scroll_public_projection_viewport_lines_for_testing(1);
@@ -5381,10 +5381,10 @@ bool test_public_projection_phase2_resize_and_memory_invalidation()
         after_deferred->deferred_line_delta == 1 &&
         after_deferred->diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::PUBLIC_PROJECTION_INVALIDATED_DEFERRED_INTENT,
-        "Phase 2 post-invalidation memory scroll records deferred-intent diagnostic");
+        "post-invalidation memory scroll records deferred-intent diagnostic");
 
     ok &= check(memory_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 2 memory invalidation backend releases synchronized output");
+        "memory invalidation backend releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> memory_released_snapshot =
         memory_session->latest_render_snapshot();
     ok &= check(memory_released_snapshot.has_value() &&
@@ -5393,12 +5393,12 @@ bool test_public_projection_phase2_resize_and_memory_invalidation()
         !memory_session->public_projection_for_testing().has_value() &&
         !memory_session->public_viewport_for_testing().has_value() &&
         !memory_session->public_release_intent_for_testing().has_value(),
-        "Phase 2 memory invalidation release clears public projection controller state");
+        "memory invalidation release clears public projection controller state");
 
     return ok;
 }
 
-bool test_public_projection_phase2_release_clears_hold_lifecycle()
+bool test_public_projection_release_clears_hold_lifecycle()
 {
     const auto exercise_release = [](bool force_release) {
         bool ok = true;
@@ -5412,32 +5412,32 @@ bool test_public_projection_phase2_release_clears_hold_lifecycle()
         launch_config.initial_grid_size = {3, 20};
         ok &= check(session->start(launch_config).code ==
             term::Terminal_session_result_code::ACCEPTED,
-            "Phase 2 release lifecycle session starts");
+            "release lifecycle session starts");
         ok &= check(backend->emit_output(QByteArrayLiteral("base-0\r\nbase-1\r\nbase-2")),
-            "Phase 2 release lifecycle publishes public rows");
+            "release lifecycle publishes public rows");
         ok &= check(session->capture_public_projection_for_testing().has_value(),
-            "Phase 2 release lifecycle captures public projection");
+            "release lifecycle captures public projection");
         ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
-            "Phase 2 release lifecycle enters synchronized-output hold");
+            "release lifecycle enters synchronized-output hold");
         ok &= check(session->public_projection_for_testing().has_value() &&
             session->public_viewport_for_testing().has_value() &&
             session->public_release_intent_for_testing().has_value(),
-            "Phase 2 release lifecycle owns hold metadata before release");
+            "release lifecycle owns hold metadata before release");
 
         if (force_release) {
             ok &= check(session->force_release_synchronized_output().code ==
                 term::Terminal_session_result_code::ACCEPTED,
-                "Phase 2 release lifecycle force release is accepted");
+                "release lifecycle force release is accepted");
         }
         else {
             ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-                "Phase 2 release lifecycle normal release is accepted");
+                "release lifecycle normal release is accepted");
         }
 
         ok &= check(!session->public_projection_for_testing().has_value() &&
             !session->public_viewport_for_testing().has_value() &&
             !session->public_release_intent_for_testing().has_value(),
-            "Phase 2 synchronized-output release clears public projection lifecycle state");
+            "synchronized-output release clears public projection lifecycle state");
         return ok;
     };
 
@@ -5447,7 +5447,7 @@ bool test_public_projection_phase2_release_clears_hold_lifecycle()
     return ok;
 }
 
-bool test_public_projection_phase2_selection_mutation_is_ignored_during_hold()
+bool test_public_projection_selection_mutation_is_ignored_during_hold()
 {
     bool ok = true;
 
@@ -5460,9 +5460,9 @@ bool test_public_projection_phase2_selection_mutation_is_ignored_during_hold()
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 2 selection hold session starts");
+        "selection hold session starts");
     ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma")),
-        "Phase 2 selection hold backend publishes selectable rows");
+        "selection hold backend publishes selectable rows");
 
     session->set_selection_range({
         {0, 0},
@@ -5473,13 +5473,13 @@ bool test_public_projection_phase2_selection_mutation_is_ignored_during_hold()
         session->selected_text();
     ok &= check(selected_before.code == term::Terminal_selection_result_code::OK &&
         selected_before.text == QStringLiteral("alpha"),
-        "Phase 2 selection hold captures public selected payload before hold");
+        "selection hold captures public selected payload before hold");
     ok &= check(session->capture_public_projection_for_testing().has_value(),
-        "Phase 2 selection hold captures public projection");
+        "selection hold captures public projection");
     ok &= check(backend->emit_output(
             QByteArrayLiteral("\x1b[?2026h\x1b[Hhidden-alpha\r\n") +
             numbered_scroll_lines(12)),
-        "Phase 2 selection hold mutates, scrolls, and evicts hidden selected live row");
+        "selection hold mutates, scrolls, and evicts hidden selected live row");
 
     session->set_selection_range({
         {1, 0},
@@ -5496,16 +5496,16 @@ bool test_public_projection_phase2_selection_mutation_is_ignored_during_hold()
     ok &= check(session->has_selection() &&
         selected_after.code == term::Terminal_selection_result_code::OK &&
         selected_after.text == QStringLiteral("alpha"),
-        "Phase 2 selection mutation paths are ignored while cached payload remains copyable");
+        "selection mutation paths are ignored while cached payload remains copyable");
     ok &= check(intent.has_value() &&
         intent->diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::SELECTION_PUBLIC_PROJECTION_UNSUPPORTED,
-        "Phase 2 ignored selection mutation records public-projection unsupported diagnostic");
+        "ignored selection mutation records public-projection unsupported diagnostic");
 
     return ok;
 }
 
-bool test_public_projection_phase3_entry_and_release_boundaries()
+bool test_public_projection_entry_and_release_boundaries()
 {
     bool ok = true;
 
@@ -5517,9 +5517,9 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     QTemporaryDir transcript_dir;
     ok &= check(transcript_dir.isValid(),
-        "Phase 3 boundary transcript directory is valid");
+        "boundary transcript directory is valid");
     const QString transcript_path =
-        transcript_dir.filePath(QStringLiteral("phase3-boundaries.ndjson"));
+        transcript_dir.filePath(QStringLiteral("entry-release-boundaries.ndjson"));
     QString transcript_error;
     session_config.transcript_recorder =
         term::Terminal_transcript_recorder::create(
@@ -5527,7 +5527,7 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
             true,
             &transcript_error);
     ok &= check(session_config.transcript_recorder != nullptr,
-        "Phase 3 boundary transcript recorder opens");
+        "boundary transcript recorder opens");
 #endif
 
     std::unique_ptr<term::Terminal_session> session;
@@ -5536,9 +5536,9 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
     launch_config.initial_grid_size = {3, 24};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 boundary split session starts");
+        "boundary split session starts");
     ok &= check(backend->emit_output(QByteArrayLiteral("prefix\x1b[?2026hhidden")),
-        "Phase 3 entry boundary backend emits prefix and hidden suffix");
+        "entry boundary backend emits prefix and hidden suffix");
 
     const std::optional<term::Terminal_render_snapshot> held_snapshot =
         session->latest_render_snapshot();
@@ -5549,30 +5549,30 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
         held_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         snapshot_contains_text(*held_snapshot, QStringLiteral("prefix")) &&
         !snapshot_contains_text(*held_snapshot, QStringLiteral("hidden")),
-        "Phase 3 entry publishes safe prefix before synchronized-output hold");
+        "entry publishes safe prefix before synchronized-output hold");
     ok &= check(projection.has_value() &&
         projection_contains_text(*projection, QStringLiteral("prefix")) &&
         !projection_contains_text(*projection, QStringLiteral("hidden")),
-        "Phase 3 entry projection is captured from the safe prefix basis only");
+        "entry projection is captured from the safe prefix basis only");
     ok &= check(session->render_snapshot_generation() == 1U,
-        "Phase 3 entry emits no visible public-projection scroll snapshot");
+        "entry emits no visible public-projection scroll snapshot");
 
     const std::uint64_t before_release_generation =
         session->render_snapshot_generation();
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026lpost")),
-        "Phase 3 release boundary backend emits release and suffix");
+        "release boundary backend emits release and suffix");
     const std::optional<term::Terminal_render_snapshot> after_suffix =
         session->latest_render_snapshot();
     ok &= check(after_suffix.has_value() &&
         session->render_snapshot_generation() == before_release_generation + 2U,
-        "Phase 3 release snapshot is published before same-chunk suffix bytes");
+        "release snapshot is published before same-chunk suffix bytes");
     ok &= check(after_suffix.has_value() &&
         after_suffix->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         after_suffix->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         snapshot_contains_text(*after_suffix, QStringLiteral("prefixhiddenpost")) &&
         !session->public_projection_for_testing().has_value() &&
         !session->public_viewport_for_testing().has_value(),
-        "Phase 3 suffix publishes after release and public projection state is cleaned");
+        "suffix publishes after release and public projection state is cleaned");
 
     session.reset();
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
@@ -5580,7 +5580,7 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
     const std::optional<std::vector<term::Terminal_transcript_event>> events =
         term::read_terminal_transcript(transcript_path, &transcript_error);
     ok &= check(events.has_value(),
-        "Phase 3 boundary transcript parses release and suffix snapshots");
+        "boundary transcript parses release and suffix snapshots");
     if (events.has_value()) {
         std::vector<QJsonObject> snapshots;
         for (const term::Terminal_transcript_event& event : *events) {
@@ -5606,7 +5606,7 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
                 QStringLiteral("CONTENT") &&
             release_text.contains(QStringLiteral("prefixhidden")) &&
             !release_text.contains(QStringLiteral("post")),
-            "Phase 3 same-chunk DECRST transcript release snapshot excludes suffix bytes");
+            "same-chunk DECRST transcript release snapshot excludes suffix bytes");
     }
 #endif
 
@@ -5614,14 +5614,14 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
     Scripted_backend* force_backend = make_session(force_session, config);
     ok &= check(force_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 forced-release boundary session starts");
+        "forced-release boundary session starts");
     ok &= check(force_backend->emit_output(QByteArrayLiteral("base\x1b[?2026hheld")),
-        "Phase 3 forced-release session enters hold");
+        "forced-release session enters hold");
     const std::uint64_t force_hold_generation =
         force_session->render_snapshot_generation();
     ok &= check(force_session->force_release_synchronized_output().code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 forced release is accepted");
+        "forced release is accepted");
     const std::optional<term::Terminal_render_snapshot> forced_release =
         force_session->latest_render_snapshot();
     ok &= check(forced_release.has_value() &&
@@ -5629,9 +5629,9 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
         snapshot_contains_text(*forced_release, QStringLiteral("baseheld")) &&
         !snapshot_contains_text(*forced_release, QStringLiteral("after")) &&
         !force_session->public_projection_for_testing().has_value(),
-        "Phase 3 forced release publishes held content before later output can coalesce");
+        "forced release publishes held content before later output can coalesce");
     ok &= check(force_backend->emit_output(QByteArrayLiteral("after")),
-        "Phase 3 forced-release suffix emits after release");
+        "forced-release suffix emits after release");
     const std::optional<term::Terminal_render_snapshot> forced_suffix =
         force_session->latest_render_snapshot();
     ok &= check(forced_suffix.has_value() &&
@@ -5639,12 +5639,12 @@ bool test_public_projection_phase3_entry_and_release_boundaries()
         snapshot_contains_text(*forced_suffix, QStringLiteral("baseheldafter")) &&
         forced_suffix->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         forced_suffix->purpose == term::Terminal_render_snapshot_purpose::CONTENT,
-        "Phase 3 forced-release suffix publishes after release without public scroll snapshots");
+        "forced-release suffix publishes after release without public scroll snapshots");
 
     return ok;
 }
 
-bool test_public_projection_phase3_release_reconciliation()
+bool test_public_projection_release_reconciliation()
 {
     bool ok = true;
 
@@ -5659,12 +5659,12 @@ bool test_public_projection_phase3_release_reconciliation()
     launch_config.initial_grid_size = {3, 16};
     ok &= check(exact_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 exact reconciliation session starts");
+        "exact reconciliation session starts");
     ok &= check(exact_backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 3 exact reconciliation publishes retained rows");
+        "exact reconciliation publishes retained rows");
     ok &= check(exact_session->scroll_published_viewport_to_offset_from_tail(1).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 3 exact reconciliation detaches public viewport before hold");
+        "exact reconciliation detaches public viewport before hold");
     const std::optional<term::Terminal_render_snapshot> exact_anchor =
         exact_session->latest_render_snapshot();
     const QString exact_anchor_text =
@@ -5673,7 +5673,7 @@ bool test_public_projection_phase3_release_reconciliation()
             : QString{};
     ok &= check(exact_backend->emit_output(
             QByteArrayLiteral("\x1b[?2026h\r\nexact-growth\x1b[?2026l")),
-        "Phase 3 exact reconciliation releases after hidden scrollback growth");
+        "exact reconciliation releases after hidden scrollback growth");
     const std::optional<term::Terminal_render_snapshot> exact_release =
         exact_session->latest_render_snapshot();
     ok &= check(exact_release.has_value() &&
@@ -5682,18 +5682,18 @@ bool test_public_projection_phase3_release_reconciliation()
             term::Terminal_release_reconciliation_result::EXACT_ANCHOR &&
         exact_release->public_scroll_diagnostics.effective_policy ==
             term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION,
-        "Phase 3 exact retained anchor reconciliation restores the detached row");
+        "exact retained anchor reconciliation restores the detached row");
 
     std::unique_ptr<term::Terminal_session> no_payload_session;
     Scripted_backend* no_payload_backend = make_session(no_payload_session, config);
     ok &= check(no_payload_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 no-payload reconciliation session starts");
+        "no-payload reconciliation session starts");
     ok &= check(no_payload_backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 3 no-payload reconciliation publishes retained rows");
+        "no-payload reconciliation publishes retained rows");
     ok &= check(no_payload_session->scroll_published_viewport_to_offset_from_tail(1).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 3 no-payload reconciliation detaches public viewport before hold");
+        "no-payload reconciliation detaches public viewport before hold");
     const std::optional<term::Terminal_render_snapshot> no_payload_anchor =
         no_payload_session->latest_render_snapshot();
     const QString no_payload_anchor_text =
@@ -5701,11 +5701,11 @@ bool test_public_projection_phase3_release_reconciliation()
             ? snapshot_row_text(*no_payload_anchor, 0)
             : QString{};
     ok &= check(no_payload_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 3 no-payload reconciliation enters empty synchronized-output hold");
+        "no-payload reconciliation enters empty synchronized-output hold");
     const std::uint64_t no_payload_hold_generation =
         no_payload_session->render_snapshot_generation();
     ok &= check(no_payload_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 3 no-payload reconciliation releases empty hold");
+        "no-payload reconciliation releases empty hold");
     const std::optional<term::Terminal_render_snapshot> no_payload_release =
         no_payload_session->latest_render_snapshot();
     ok &= check(no_payload_release.has_value() &&
@@ -5713,18 +5713,18 @@ bool test_public_projection_phase3_release_reconciliation()
         snapshot_row_text(*no_payload_release, 0) == no_payload_anchor_text &&
         no_payload_release->public_scroll_diagnostics.release_reconciliation_result ==
             term::Terminal_release_reconciliation_result::EXACT_ANCHOR,
-        "Phase 3 no-payload hold preserves detached release intent");
+        "no-payload hold preserves detached release intent");
 
     std::unique_ptr<term::Terminal_session> geometry_session;
     Scripted_backend* geometry_backend = make_session(geometry_session, config);
     ok &= check(geometry_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 geometry best-effort reconciliation session starts");
+        "geometry best-effort reconciliation session starts");
     ok &= check(geometry_backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 3 geometry best-effort reconciliation publishes retained rows");
+        "geometry best-effort reconciliation publishes retained rows");
     ok &= check(geometry_session->scroll_published_viewport_to_offset_from_tail(1).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 3 geometry best-effort reconciliation detaches public viewport before hold");
+        "geometry best-effort reconciliation detaches public viewport before hold");
     const std::optional<term::Terminal_render_snapshot> geometry_anchor =
         geometry_session->latest_render_snapshot();
     const QString geometry_anchor_text =
@@ -5732,12 +5732,12 @@ bool test_public_projection_phase3_release_reconciliation()
             ? snapshot_row_text(*geometry_anchor, 0)
             : QString{};
     ok &= check(geometry_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 3 geometry best-effort reconciliation enters synchronized-output hold");
+        "geometry best-effort reconciliation enters synchronized-output hold");
     ok &= check(geometry_session->resize(QSizeF(200.0, 80.0), {4, 16}).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 geometry best-effort reconciliation invalidates geometry while held");
+        "geometry best-effort reconciliation invalidates geometry while held");
     ok &= check(geometry_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 3 geometry best-effort reconciliation releases after resize");
+        "geometry best-effort reconciliation releases after resize");
     const std::optional<term::Terminal_render_snapshot> geometry_release =
         geometry_session->latest_render_snapshot();
     ok &= check(geometry_release.has_value() &&
@@ -5748,18 +5748,18 @@ bool test_public_projection_phase3_release_reconciliation()
             term::Terminal_release_reconciliation_result::RETAINED_ID_BEST_EFFORT &&
         geometry_release->public_scroll_diagnostics.public_projection_disable_reason ==
             term::Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED,
-        "Phase 3 geometry invalidation release reports retained-id best-effort anchor placement");
+        "geometry invalidation release reports retained-id best-effort anchor placement");
 
     std::unique_ptr<term::Terminal_session> sticky_session;
     Scripted_backend* sticky_backend = make_session(sticky_session, config);
     ok &= check(sticky_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 sticky reconciliation session starts");
+        "sticky reconciliation session starts");
     ok &= check(sticky_backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 3 sticky reconciliation publishes retained rows");
+        "sticky reconciliation publishes retained rows");
     ok &= check(sticky_backend->emit_output(
             QByteArrayLiteral("\x1b[?2026h\r\nsticky-tail\x1b[?2026l")),
-        "Phase 3 sticky reconciliation releases after hidden tail growth");
+        "sticky reconciliation releases after hidden tail growth");
     const std::optional<term::Terminal_render_snapshot> sticky_release =
         sticky_session->latest_render_snapshot();
     ok &= check(sticky_release.has_value() &&
@@ -5767,22 +5767,22 @@ bool test_public_projection_phase3_release_reconciliation()
         snapshot_contains_text(*sticky_release, QStringLiteral("sticky-tail")) &&
         sticky_release->public_scroll_diagnostics.release_reconciliation_result ==
             term::Terminal_release_reconciliation_result::STICKY_TAIL,
-        "Phase 3 sticky-tail release follows the live tail");
+        "sticky-tail release follows the live tail");
 
     std::unique_ptr<term::Terminal_session> detached_tail_session;
     Scripted_backend* detached_tail_backend = make_session(detached_tail_session, config);
     ok &= check(detached_tail_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 detached-at-tail reconciliation session starts");
+        "detached-at-tail reconciliation session starts");
     ok &= check(detached_tail_backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 3 detached-at-tail reconciliation publishes retained rows");
+        "detached-at-tail reconciliation publishes retained rows");
     ok &= check(detached_tail_session->scroll_published_viewport_to_offset_from_tail(1).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 3 detached-at-tail reconciliation detaches before hold");
+        "detached-at-tail reconciliation detaches before hold");
     const std::optional<term::Terminal_render_snapshot> detached_tail_safe =
         detached_tail_session->latest_render_snapshot();
     ok &= check(detached_tail_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 3 detached-at-tail reconciliation enters synchronized-output hold");
+        "detached-at-tail reconciliation enters synchronized-output hold");
     if (detached_tail_safe.has_value()) {
         const term::Terminal_viewport_scroll_result public_tail_scroll =
             detached_tail_session->scroll_viewport_lines_from_published_state(
@@ -5795,34 +5795,34 @@ bool test_public_projection_phase3_release_reconciliation()
             public_tail_intent->public_viewport.offset_from_tail == 0 &&
             public_tail_intent->public_viewport.follow_tail &&
             !public_tail_intent->sticky_tail,
-            "Phase 3 clamped public viewport at tail keeps detached sticky intent false");
+            "clamped public viewport at tail keeps detached sticky intent false");
     }
     else {
-        ok &= check(false, "Phase 3 detached-at-tail safe snapshot is available");
+        ok &= check(false, "detached-at-tail safe snapshot is available");
     }
     ok &= check(detached_tail_backend->emit_output(
             QByteArrayLiteral("\r\nhidden-detached-tail\x1b[?2026l")),
-        "Phase 3 detached-at-tail reconciliation releases after hidden growth");
+        "detached-at-tail reconciliation releases after hidden growth");
     const std::optional<term::Terminal_render_snapshot> detached_tail_release =
         detached_tail_session->latest_render_snapshot();
     ok &= check(detached_tail_release.has_value() &&
         detached_tail_release->viewport.offset_from_tail > 0 &&
         detached_tail_release->public_scroll_diagnostics.release_reconciliation_result ==
             term::Terminal_release_reconciliation_result::EXACT_ANCHOR,
-        "Phase 3 viewportAtTail with sticky_tail=false releases through detached anchor");
+        "viewportAtTail with sticky_tail=false releases through detached anchor");
 
     std::unique_ptr<term::Terminal_session> explicit_tail_session;
     Scripted_backend* explicit_tail_backend = make_session(explicit_tail_session, config);
     ok &= check(explicit_tail_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 explicit-tail reconciliation session starts");
+        "explicit-tail reconciliation session starts");
     ok &= check(explicit_tail_backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 3 explicit-tail reconciliation publishes retained rows");
+        "explicit-tail reconciliation publishes retained rows");
     ok &= check(explicit_tail_session->scroll_published_viewport_to_offset_from_tail(1).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 3 explicit-tail reconciliation detaches before hold");
+        "explicit-tail reconciliation detaches before hold");
     ok &= check(explicit_tail_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 3 explicit-tail reconciliation enters synchronized-output hold");
+        "explicit-tail reconciliation enters synchronized-output hold");
     const term::Terminal_public_viewport_scroll_result explicit_public_tail =
         explicit_tail_session->scroll_public_projection_viewport_to_tail_for_testing();
     const std::optional<term::Terminal_public_release_intent> explicit_tail_intent =
@@ -5832,10 +5832,10 @@ bool test_public_projection_phase3_release_reconciliation()
         explicit_tail_intent.has_value() &&
         explicit_tail_intent->sticky_tail &&
         explicit_tail_intent->public_viewport.offset_from_tail == 0,
-        "Phase 3 explicit public scroll-to-bottom sets sticky release intent mid-hold");
+        "explicit public scroll-to-bottom sets sticky release intent mid-hold");
     ok &= check(explicit_tail_backend->emit_output(
             QByteArrayLiteral("\r\nhidden-tail\x1b[?2026l")),
-        "Phase 3 explicit-tail reconciliation releases after hidden growth");
+        "explicit-tail reconciliation releases after hidden growth");
     const std::optional<term::Terminal_render_snapshot> explicit_tail_release =
         explicit_tail_session->latest_render_snapshot();
     const bool explicit_tail_release_matches =
@@ -5859,31 +5859,31 @@ bool test_public_projection_phase3_release_reconciliation()
             << '\n';
     }
     ok &= check(explicit_tail_release_matches,
-        "Phase 3 explicit scroll-to-bottom follows the live tail across hidden growth");
+        "explicit scroll-to-bottom follows the live tail across hidden growth");
 
     std::unique_ptr<term::Terminal_session> rapid_session;
     Scripted_backend* rapid_backend = make_session(rapid_session, config);
     ok &= check(rapid_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 rapid generation session starts");
+        "rapid generation session starts");
     ok &= check(rapid_backend->emit_output(QByteArrayLiteral("rapid-base")),
-        "Phase 3 rapid generation publishes base content");
+        "rapid generation publishes base content");
     ok &= check(rapid_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 3 rapid generation enters first hold");
+        "rapid generation enters first hold");
     const std::optional<term::Terminal_public_projection> rapid_first =
         rapid_session->public_projection_for_testing();
     ok &= check(rapid_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 3 rapid generation releases first hold");
+        "rapid generation releases first hold");
     ok &= check(rapid_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 3 rapid generation enters second hold");
+        "rapid generation enters second hold");
     const std::optional<term::Terminal_public_projection> rapid_second =
         rapid_session->public_projection_for_testing();
     ok &= check(rapid_first.has_value() &&
         rapid_second.has_value() &&
         rapid_second->generation() > rapid_first->generation(),
-        "Phase 3 rapid enter/release/enter creates a fresh public projection generation");
+        "rapid enter/release/enter creates a fresh public projection generation");
     ok &= check(rapid_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 3 rapid generation releases second hold");
+        "rapid generation releases second hold");
 
     term::Terminal_session_config successor_config = config;
     successor_config.scrollback_limit = 6;
@@ -5891,12 +5891,12 @@ bool test_public_projection_phase3_release_reconciliation()
     Scripted_backend* successor_backend = make_session(successor_session, successor_config);
     ok &= check(successor_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 successor reconciliation session starts");
+        "successor reconciliation session starts");
     ok &= check(successor_backend->emit_output(numbered_scroll_lines(12)),
-        "Phase 3 successor reconciliation fills bounded scrollback");
+        "successor reconciliation fills bounded scrollback");
     ok &= check(successor_session->scroll_published_viewport_to_offset_from_tail(5).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 3 successor reconciliation detaches near oldest retained rows");
+        "successor reconciliation detaches near oldest retained rows");
     const std::optional<term::Terminal_render_snapshot> successor_anchor =
         successor_session->latest_render_snapshot();
     const QString successor_text =
@@ -5905,7 +5905,7 @@ bool test_public_projection_phase3_release_reconciliation()
             : QString{};
     ok &= check(successor_backend->emit_output(
             QByteArrayLiteral("\x1b[?2026h\r\nnew-a\r\nnew-b\x1b[?2026l")),
-        "Phase 3 successor reconciliation evicts the exact anchor while held");
+        "successor reconciliation evicts the exact anchor while held");
     const std::optional<term::Terminal_render_snapshot> successor_release =
         successor_session->latest_render_snapshot();
     ok &= check(successor_release.has_value() &&
@@ -5918,15 +5918,15 @@ bool test_public_projection_phase3_release_reconciliation()
             term::Terminal_public_scroll_diagnostic_reason::DETACHED_ANCHOR_NOT_RETAINED &&
         successor_release->public_scroll_diagnostics.release_reconciliation_result ==
             term::Terminal_release_reconciliation_result::NEAREST_SUCCESSOR,
-        "Phase 3 successor fallback restores the nearest surviving retained row at the oldest live offset");
+        "successor fallback restores the nearest surviving retained row at the oldest live offset");
 
     std::unique_ptr<term::Terminal_session> invalidated_session;
     Scripted_backend* invalidated_backend = make_session(invalidated_session, successor_config);
     ok &= check(invalidated_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 invalidated deferred-intent session starts");
+        "invalidated deferred-intent session starts");
     ok &= check(invalidated_backend->emit_output(numbered_scroll_lines(12)),
-        "Phase 3 invalidated deferred-intent session publishes scrollback");
+        "invalidated deferred-intent session publishes scrollback");
     const std::optional<term::Terminal_render_snapshot> invalidated_anchor =
         invalidated_session->latest_render_snapshot();
     const QString invalidated_anchor_text =
@@ -5940,11 +5940,11 @@ bool test_public_projection_phase3_release_reconciliation()
     const std::uint64_t invalidated_public_generation =
         invalidated_session->render_snapshot_generation();
     ok &= check(invalidated_backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
-        "Phase 3 installed-seam invalidated deferred-intent session enters hold");
+        "installed-seam invalidated deferred-intent session enters hold");
     const std::optional<term::Terminal_public_projection> invalidated_projection =
         invalidated_session->public_projection_for_testing();
     ok &= check(invalidated_projection.has_value(),
-        "Phase 3 installed-seam invalidated deferred-intent session captures projection");
+        "installed-seam invalidated deferred-intent session captures projection");
     if (invalidated_projection.has_value()) {
         const int invalidated_first_public_row =
             first_public_row_for_viewport(invalidated_projection->viewport());
@@ -5966,21 +5966,21 @@ bool test_public_projection_phase3_release_reconciliation()
         after_noop_scroll.has_value() &&
         after_noop_scroll->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         after_noop_scroll->purpose == term::Terminal_render_snapshot_purpose::CONTENT,
-        "Phase 3 installed-seam no-op public scroll during hold leaves render generation unchanged");
+        "installed-seam no-op public scroll during hold leaves render generation unchanged");
     const term::Terminal_public_viewport_scroll_result invalidated_scroll =
         invalidated_session->scroll_public_projection_viewport_lines_for_testing(1);
     ok &= check(invalidated_scroll.invalidated_public_projection &&
         invalidated_scroll.deferred_release_intent_recorded &&
         invalidated_session->render_snapshot_generation() == invalidated_public_generation,
-        "Phase 3 installed-seam off-copied-viewport scroll records deferred intent without publishing");
+        "installed-seam off-copied-viewport scroll records deferred intent without publishing");
     const std::optional<term::Terminal_render_snapshot> after_inbounds_scroll =
         invalidated_session->latest_render_snapshot();
     ok &= check(after_inbounds_scroll.has_value() &&
         after_inbounds_scroll->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         after_inbounds_scroll->purpose == term::Terminal_render_snapshot_purpose::CONTENT,
-        "Phase 3 off-copied invalidation emits no PUBLIC_PROJECTION/SCROLL snapshot");
+        "off-copied invalidation emits no PUBLIC_PROJECTION/SCROLL snapshot");
     ok &= check(invalidated_backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 3 installed-seam invalidated deferred-intent session releases hold");
+        "installed-seam invalidated deferred-intent session releases hold");
     const std::optional<term::Terminal_render_snapshot> invalidated_release =
         invalidated_session->latest_render_snapshot();
     ok &= check(invalidated_release.has_value() &&
@@ -5997,18 +5997,18 @@ bool test_public_projection_phase3_release_reconciliation()
         invalidated_release->public_scroll_diagnostics.public_projection_disable_reason ==
             term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED &&
         !invalidated_session->public_projection_for_testing().has_value(),
-        "Phase 4 invalidated off-copied release applies deferred offset instead of stale anchor");
+        "invalidated off-copied release applies deferred offset instead of stale anchor");
 
     std::unique_ptr<term::Terminal_session> epoch_session;
     Scripted_backend* epoch_backend = make_session(epoch_session, config);
     ok &= check(epoch_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 epoch mismatch session starts");
+        "epoch mismatch session starts");
     ok &= check(epoch_backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 3 epoch mismatch publishes retained rows");
+        "epoch mismatch publishes retained rows");
     ok &= check(epoch_session->scroll_published_viewport_to_offset_from_tail(1).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 3 epoch mismatch detaches public viewport before hold");
+        "epoch mismatch detaches public viewport before hold");
     const std::optional<term::Terminal_render_snapshot> epoch_anchor =
         epoch_session->latest_render_snapshot();
     const QString epoch_anchor_text =
@@ -6021,7 +6021,7 @@ bool test_public_projection_phase3_release_reconciliation()
             : 0;
     ok &= check(epoch_backend->emit_output(
             QByteArrayLiteral("\x1b[?2026h\x1b[?1049hALT\x1b[?1049l\x1b[?2026l")),
-        "Phase 3 epoch mismatch switches buffers while held");
+        "epoch mismatch switches buffers while held");
     const std::optional<term::Terminal_render_snapshot> epoch_release =
         epoch_session->latest_render_snapshot();
     ok &= check(epoch_release.has_value() &&
@@ -6037,18 +6037,18 @@ bool test_public_projection_phase3_release_reconciliation()
             term::Terminal_release_reconciliation_result::INCOMPATIBLE_BUFFER &&
         !epoch_session->public_projection_for_testing().has_value() &&
         !epoch_session->public_viewport_for_testing().has_value(),
-        "Phase 3 epoch mismatch records deterministic release result and cleans projection state");
+        "epoch mismatch records deterministic release result and cleans projection state");
 
     std::unique_ptr<term::Terminal_session> alternate_session;
     Scripted_backend* alternate_backend = make_session(alternate_session, config);
     ok &= check(alternate_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 alternate-release session starts");
+        "alternate-release session starts");
     ok &= check(alternate_backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 3 alternate-release publishes retained rows");
+        "alternate-release publishes retained rows");
     ok &= check(alternate_session->scroll_published_viewport_to_offset_from_tail(1).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 3 alternate-release detaches public viewport before hold");
+        "alternate-release detaches public viewport before hold");
     const std::optional<term::Terminal_render_snapshot> alternate_anchor =
         alternate_session->latest_render_snapshot();
     const int alternate_anchor_offset =
@@ -6057,7 +6057,7 @@ bool test_public_projection_phase3_release_reconciliation()
             : 0;
     ok &= check(alternate_backend->emit_output(
             QByteArrayLiteral("\x1b[?2026h\x1b[?1049hALT\x1b[?2026l")),
-        "Phase 3 alternate-release leaves hidden alternate screen active");
+        "alternate-release leaves hidden alternate screen active");
     const std::optional<term::Terminal_render_snapshot> alternate_release =
         alternate_session->latest_render_snapshot();
     ok &= check(alternate_release.has_value() &&
@@ -6073,19 +6073,19 @@ bool test_public_projection_phase3_release_reconciliation()
             term::Terminal_release_reconciliation_result::INCOMPATIBLE_BUFFER &&
         !alternate_session->public_projection_for_testing().has_value() &&
         !alternate_session->public_viewport_for_testing().has_value(),
-        "Phase 3 hidden alternate-screen release records deterministic buffer transition result");
+        "hidden alternate-screen release records deterministic buffer transition result");
 
     std::unique_ptr<term::Terminal_session> sticky_alternate_session;
     Scripted_backend* sticky_alternate_backend =
         make_session(sticky_alternate_session, config);
     ok &= check(sticky_alternate_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 3 sticky alternate-release session starts");
+        "sticky alternate-release session starts");
     ok &= check(sticky_alternate_backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 3 sticky alternate-release publishes retained rows");
+        "sticky alternate-release publishes retained rows");
     ok &= check(sticky_alternate_backend->emit_output(
             QByteArrayLiteral("\x1b[?2026h\x1b[?1049hALT\x1b[?2026l")),
-        "Phase 3 sticky alternate-release leaves hidden alternate screen active");
+        "sticky alternate-release leaves hidden alternate screen active");
     const std::optional<term::Terminal_render_snapshot> sticky_alternate_release =
         sticky_alternate_session->latest_render_snapshot();
     ok &= check(sticky_alternate_release.has_value() &&
@@ -6096,12 +6096,12 @@ bool test_public_projection_phase3_release_reconciliation()
             term::Terminal_public_scroll_diagnostic_reason::BUFFER_TRANSITION_RELEASED &&
         sticky_alternate_release->public_scroll_diagnostics.release_reconciliation_result ==
             term::Terminal_release_reconciliation_result::INCOMPATIBLE_BUFFER,
-        "Phase 3 sticky-tail release does not apply primary tail action to alternate buffer");
+        "sticky-tail release does not apply primary tail action to alternate buffer");
 
     return ok;
 }
 
-bool test_public_projection_phase4_publishes_natural_full_row_scroll()
+bool test_public_projection_publishes_natural_full_row_scroll()
 {
     bool ok = true;
 
@@ -6116,13 +6116,13 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
     launch_config.initial_grid_size = {3, 24};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 natural full-row public scroll session starts");
+        "natural full-row public scroll session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("row-0\r\n")
         + QByteArrayLiteral("\x1b]8;id=safe;https://safe.example\x1b\\")
         + QByteArrayLiteral("\x1b[31mSAFE\x1b[0m")
         + QByteArrayLiteral("\x1b]8;;\x1b\\\r\nrow-2\r\nrow-3")),
-        "Phase 4 natural full-row public scroll publishes base rows");
+        "natural full-row public scroll publishes base rows");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
@@ -6133,7 +6133,7 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
         snapshot_row_text(*safe_content, 0) == QStringLiteral("SAFE") &&
         snapshot_row_text(*safe_content, 1) == QStringLiteral("row-2") &&
         snapshot_row_text(*safe_content, 2) == QStringLiteral("row-3"),
-        "Phase 4 natural full-row fixture starts at the public tail with scrollback above it");
+        "natural full-row fixture starts at the public tail with scrollback above it");
     if (!safe_content.has_value()) {
         return ok;
     }
@@ -6146,7 +6146,7 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
             + QByteArrayLiteral("\x1b]8;id=hidden;https://hidden.example\x1b\\")
             + QByteArrayLiteral("\x1b[32mhidden-safe\x1b[0m")
             + QByteArrayLiteral("\x1b]8;;\x1b\\")),
-        "Phase 4 natural full-row public scroll enters hold and rewrites a safe-basis row hidden");
+        "natural full-row public scroll enters hold and rewrites a safe-basis row hidden");
     const std::optional<term::Terminal_public_projection> captured_projection =
         session->public_projection_for_testing();
     ok &= check(captured_projection.has_value() &&
@@ -6158,7 +6158,7 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
         projection_contains_text(*captured_projection, QStringLiteral("row-0")) &&
         projection_contains_text(*captured_projection, QStringLiteral("SAFE")) &&
         !projection_contains_text(*captured_projection, QStringLiteral("hidden-safe")),
-        "Phase 4 production hold capture stores copied primary public rows without hidden rewrites");
+        "production hold capture stores copied primary public rows without hidden rewrites");
 
     const term::Terminal_render_cursor safe_cursor = safe_content->cursor;
     const term::Terminal_mode_state    safe_modes  = safe_content->modes;
@@ -6171,9 +6171,9 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
         session->latest_content_render_snapshot_for_testing();
     ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
         scroll_result.applied_line_delta == 1,
-        "Phase 4 natural full-row public scroll applies a non-zero session scroll request");
+        "natural full-row public scroll applies a non-zero session scroll request");
     ok &= check(session->render_snapshot_generation() == generation_before_hold + 1U,
-        "Phase 4 natural full-row public scroll publishes immediately during hold");
+        "natural full-row public scroll publishes immediately during hold");
     ok &= check(public_scroll.has_value() &&
         public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
         public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
@@ -6188,7 +6188,7 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
         snapshot_cells_are_row_major_column_ascending(*public_scroll) &&
         term::validate_render_snapshot(*public_scroll).status ==
             term::Terminal_render_snapshot_status::OK,
-        "Phase 4 natural full-row public scroll publishes a valid PUBLIC_PROJECTION/SCROLL snapshot");
+        "natural full-row public scroll publishes a valid PUBLIC_PROJECTION/SCROLL snapshot");
 
     const term::Terminal_render_cell* public_safe_cell =
         public_scroll.has_value()
@@ -6217,7 +6217,7 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
         !public_safe_cell_uses_hidden_green &&
         snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://safe.example")) &&
         !snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://hidden.example")),
-        "Phase 4 natural full-row public scroll uses original copied style and hyperlink metadata");
+        "natural full-row public scroll uses original copied style and hyperlink metadata");
     const int expected_public_cursor_row =
         public_scroll.has_value()
             ? safe_cursor.position.row +
@@ -6234,7 +6234,7 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
         public_scroll->modes.cursor_visible   == safe_modes.cursor_visible &&
         public_scroll->color_state.palette_rgba[1U] ==
             safe_content->color_state.palette_rgba[1U],
-        "Phase 4 natural full-row public scroll keeps safe cursor, mode, and palette state");
+        "natural full-row public scroll keeps safe cursor, mode, and palette state");
     ok &= check(public_scroll.has_value() &&
         public_scroll->public_scroll_diagnostics.effective_policy ==
             term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION &&
@@ -6247,16 +6247,16 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
         public_scroll->public_scroll_diagnostics.live_content_publication_blocked &&
         public_scroll->public_scroll_diagnostics.diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::NONE,
-        "Phase 4 natural full-row public scroll records scroll-only diagnostics");
+        "natural full-row public scroll records scroll-only diagnostics");
     ok &= check(content_after_scroll.has_value() &&
         content_after_scroll->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         content_after_scroll->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         content_after_scroll->metadata.sequence == safe_content->metadata.sequence &&
         content_after_scroll->viewport.offset_from_tail == 0,
-        "Phase 4 natural full-row public scroll does not advance the safe live-content basis");
+        "natural full-row public scroll does not advance the safe live-content basis");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 natural full-row public scroll releases synchronized output");
+        "natural full-row public scroll releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -6270,12 +6270,12 @@ bool test_public_projection_phase4_publishes_natural_full_row_scroll()
             term::Terminal_release_reconciliation_result::EXACT_ANCHOR &&
         !session->public_projection_for_testing().has_value() &&
         !session->public_release_intent_for_testing().has_value(),
-        "Phase 4 natural full-row release reconciles the detached public anchor");
+        "natural full-row release reconciles the detached public anchor");
 
     return ok;
 }
 
-bool test_public_projection_phase4_natural_wrapped_capture_fragment_ordinals()
+bool test_public_projection_natural_wrapped_capture_fragment_ordinals()
 {
     bool ok = true;
 
@@ -6290,21 +6290,21 @@ bool test_public_projection_phase4_natural_wrapped_capture_fragment_ordinals()
     launch_config.initial_grid_size = {3, 8};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 natural wrapped capture session starts");
+        "natural wrapped capture session starts");
     ok &= check(backend->emit_output(QByteArrayLiteral("abcdefghijklmnopqrstuvwxy")),
-        "Phase 4 natural wrapped capture publishes autowrapped content");
+        "natural wrapped capture publishes autowrapped content");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
     ok &= check(safe_content.has_value() &&
         safe_content->viewport.scrollback_rows > 0,
-        "Phase 4 natural wrapped capture fixture has public wrapped scrollback");
+        "natural wrapped capture fixture has public wrapped scrollback");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 4 natural wrapped capture enters synchronized-output hold");
+        "natural wrapped capture enters synchronized-output hold");
     const std::optional<term::Terminal_public_projection> projection =
         session->public_projection_for_testing();
     ok &= check(projection.has_value() &&
@@ -6313,21 +6313,21 @@ bool test_public_projection_phase4_natural_wrapped_capture_fragment_ordinals()
             static_cast<std::size_t>(
                 safe_content->viewport.scrollback_rows + safe_content->grid_size.rows) &&
         projection_fragment_indices_match_running_counts(*projection),
-        "Phase 4 natural wrapped full-row capture stores exact retained fragment ordinals");
+        "natural wrapped full-row capture stores exact retained fragment ordinals");
     if (projection.has_value()) {
         ok &= check(projection_row_text(*projection, 0) == QStringLiteral("abcdefgh") &&
             projection_row_text(*projection, 1) == QStringLiteral("ijklmnop") &&
             projection_row_text(*projection, 2) == QStringLiteral("qrstuvwx"),
-            "Phase 4 natural wrapped full-row capture stores actual autowrapped content");
+            "natural wrapped full-row capture stores actual autowrapped content");
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 natural wrapped capture releases synchronized-output hold");
+        "natural wrapped capture releases synchronized-output hold");
 
     return ok;
 }
 
-bool test_public_projection_phase4_wrapped_fragment_release_reconciles_fragment_index()
+bool test_public_projection_wrapped_fragment_release_reconciles_fragment_index()
 {
     bool ok = true;
 
@@ -6342,28 +6342,28 @@ bool test_public_projection_phase4_wrapped_fragment_release_reconciles_fragment_
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 wrapped-fragment release session starts");
+        "wrapped-fragment release session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("fragment-zero\r\nlive-one\r\ntail-0\r\ntail-1\r\ntail-2")),
-        "Phase 4 wrapped-fragment fixture publishes retained rows");
+        "wrapped-fragment fixture publishes retained rows");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
     ok &= check(safe_content.has_value() &&
         safe_content->viewport.scrollback_rows >= 2 &&
         snapshot_row_text(*safe_content, 0) == QStringLiteral("tail-0"),
-        "Phase 4 wrapped-fragment fixture starts at tail with two retained rows above");
+        "wrapped-fragment fixture starts at tail with two retained rows above");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 4 wrapped-fragment fixture enters synchronized-output hold");
+        "wrapped-fragment fixture enters synchronized-output hold");
     const std::optional<term::Terminal_public_projection> captured_projection =
         session->public_projection_for_testing();
     ok &= check(captured_projection.has_value() &&
         captured_projection->stored_row_count() >= 5U,
-        "Phase 4 wrapped-fragment seam captures full public rows");
+        "wrapped-fragment seam captures full public rows");
     if (!captured_projection.has_value()) {
         return ok;
     }
@@ -6371,7 +6371,7 @@ bool test_public_projection_phase4_wrapped_fragment_release_reconciles_fragment_
     std::vector<term::Terminal_public_projection_row> copied_rows =
         captured_projection->rows();
     ok &= check(copied_rows.size() >= 5U,
-        "Phase 4 wrapped-fragment seam has retained source rows");
+        "wrapped-fragment seam has retained source rows");
     if (copied_rows.size() < 5U) {
         return ok;
     }
@@ -6408,17 +6408,17 @@ bool test_public_projection_phase4_wrapped_fragment_release_reconciles_fragment_
         public_scroll.has_value() &&
         public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
         snapshot_row_text(*public_scroll, 0) == QStringLiteral("fragment-one"),
-        "Phase 4 wrapped-fragment public scroll anchors on retained fragment 1");
+        "wrapped-fragment public scroll anchors on retained fragment 1");
 
     const std::optional<term::Terminal_public_release_intent> release_intent =
         session->public_release_intent_for_testing();
     ok &= check(release_intent.has_value() &&
         release_intent->detached_anchor.has_value() &&
         release_intent->detached_anchor->visual_fragment_index == 1,
-        "Phase 4 wrapped-fragment release intent stores retained fragment index 1");
+        "wrapped-fragment release intent stores retained fragment index 1");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 wrapped-fragment fixture releases synchronized output");
+        "wrapped-fragment fixture releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -6428,12 +6428,12 @@ bool test_public_projection_phase4_wrapped_fragment_release_reconciles_fragment_
         snapshot_row_text(*release, 0) == QStringLiteral("live-one") &&
         release->public_scroll_diagnostics.release_reconciliation_result ==
             term::Terminal_release_reconciliation_result::EXACT_ANCHOR,
-        "Phase 4 wrapped-fragment release restores fragment 1, not retained fragment 0");
+        "wrapped-fragment release restores fragment 1, not retained fragment 0");
 
     return ok;
 }
 
-bool test_public_projection_phase4_viewport_only_fragment_release_avoids_false_exact()
+bool test_public_projection_viewport_only_fragment_release_avoids_false_exact()
 {
     bool ok = true;
 
@@ -6448,27 +6448,27 @@ bool test_public_projection_phase4_viewport_only_fragment_release_avoids_false_e
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 viewport-only fragment fallback session starts");
+        "viewport-only fragment fallback session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("fragment-zero\r\nfragment-one\r\ntail-0\r\ntail-1\r\ntail-2")),
-        "Phase 4 viewport-only fragment fallback publishes retained rows");
+        "viewport-only fragment fallback publishes retained rows");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
     ok &= check(safe_content.has_value() &&
         safe_content->viewport.scrollback_rows >= 2,
-        "Phase 4 viewport-only fragment fallback has retained rows above tail");
+        "viewport-only fragment fallback has retained rows above tail");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 4 viewport-only fragment fallback enters synchronized-output hold");
+        "viewport-only fragment fallback enters synchronized-output hold");
     const std::optional<term::Terminal_public_projection> captured_projection =
         session->public_projection_for_testing();
     ok &= check(captured_projection.has_value() &&
         captured_projection->stored_row_count() >= 5U,
-        "Phase 4 viewport-only fragment fallback captures production source rows");
+        "viewport-only fragment fallback captures production source rows");
     if (!captured_projection.has_value()) {
         return ok;
     }
@@ -6476,7 +6476,7 @@ bool test_public_projection_phase4_viewport_only_fragment_release_avoids_false_e
     std::vector<term::Terminal_public_projection_row> copied_rows =
         projection_rows_for_public_window(*captured_projection, 1, safe_content->grid_size.rows);
     ok &= check(copied_rows.size() == static_cast<std::size_t>(safe_content->grid_size.rows),
-        "Phase 4 viewport-only fragment fallback extracts copied viewport rows");
+        "viewport-only fragment fallback extracts copied viewport rows");
     if (copied_rows.size() != static_cast<std::size_t>(safe_content->grid_size.rows)) {
         return ok;
     }
@@ -6510,15 +6510,15 @@ bool test_public_projection_phase4_viewport_only_fragment_release_avoids_false_e
         public_scroll.has_value() &&
         public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
         snapshot_row_text(*public_scroll, 0) == QStringLiteral("fragment-one"),
-        "Phase 4 viewport-only fallback public scroll shows copied fragment one");
+        "viewport-only fallback public scroll shows copied fragment one");
     ok &= check(release_intent.has_value() &&
         release_intent->detached_anchor.has_value() &&
         release_intent->detached_anchor->visual_fragment_index == 0 &&
         !release_intent->detached_anchor->visual_fragment_index_is_exact,
-        "Phase 4 viewport-only fallback marks fragment ordinal inexact");
+        "viewport-only fallback marks fragment ordinal inexact");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 viewport-only fragment fallback releases synchronized output");
+        "viewport-only fragment fallback releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -6533,12 +6533,12 @@ bool test_public_projection_phase4_viewport_only_fragment_release_avoids_false_e
                 PUBLIC_PROJECTION_INVALIDATED_DEFERRED_INTENT &&
         release->viewport.offset_from_tail == 1 &&
         snapshot_row_text(*release, 0) == QStringLiteral("fragment-one"),
-        "Phase 4 viewport-only fallback release refuses false exact fragment-zero reconciliation");
+        "viewport-only fallback release refuses false exact fragment-zero reconciliation");
 
     return ok;
 }
 
-bool test_public_projection_phase4_full_row_capture_batches_scrollback()
+bool test_public_projection_full_row_capture_batches_scrollback()
 {
     bool ok = true;
 
@@ -6553,21 +6553,21 @@ bool test_public_projection_phase4_full_row_capture_batches_scrollback()
     launch_config.initial_grid_size = {24, 32};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 batched full-row capture session starts");
+        "batched full-row capture session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(1060)),
-        "Phase 4 batched full-row capture publishes large scrollback");
+        "batched full-row capture publishes large scrollback");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
     ok &= check(safe_content.has_value() &&
         safe_content->viewport.scrollback_rows >= 1024,
-        "Phase 4 batched full-row capture fixture has at least 1024 scrollback rows");
+        "batched full-row capture fixture has at least 1024 scrollback rows");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden-suffix")),
-        "Phase 4 batched full-row capture enters hold with same-segment hidden suffix");
+        "batched full-row capture enters hold with same-segment hidden suffix");
     const std::optional<term::Terminal_public_projection> projection =
         session->public_projection_for_testing();
     const std::size_t expected_snapshot_count =
@@ -6581,12 +6581,12 @@ bool test_public_projection_phase4_full_row_capture_batches_scrollback()
                 safe_content->viewport.scrollback_rows + safe_content->grid_size.rows) &&
         projection->row_capture_snapshot_count() == expected_snapshot_count &&
         !projection_contains_text(*projection, QStringLiteral("hidden-suffix")),
-        "Phase 4 full-row capture uses the deterministic stride batch count and excludes hidden suffix");
+        "full-row capture uses the deterministic stride batch count and excludes hidden suffix");
 
     return ok;
 }
 
-bool test_public_projection_phase4_deferred_to_immediate_policy_latch_next_hold()
+bool test_public_projection_deferred_to_immediate_policy_latch_next_hold()
 {
     bool ok = true;
 
@@ -6599,23 +6599,23 @@ bool test_public_projection_phase4_deferred_to_immediate_policy_latch_next_hold(
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 deferred-to-immediate policy latch session starts");
+        "deferred-to-immediate policy latch session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("row-0\r\nrow-1\r\nrow-2\r\nrow-3")),
-        "Phase 4 deferred-to-immediate policy latch publishes base rows");
+        "deferred-to-immediate policy latch publishes base rows");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
     const std::uint64_t generation_before_hold =
         session->render_snapshot_generation();
     ok &= check(safe_content.has_value(),
-        "Phase 4 deferred-to-immediate policy latch has safe content basis");
+        "deferred-to-immediate policy latch has safe content basis");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
-        "Phase 4 deferred-to-immediate policy latch enters deferred hold");
+        "deferred-to-immediate policy latch enters deferred hold");
     session->set_synchronized_output_scroll_policy_for_testing(
         term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION);
 
@@ -6624,16 +6624,16 @@ bool test_public_projection_phase4_deferred_to_immediate_policy_latch_next_hold(
     const std::optional<term::Terminal_render_snapshot> held_snapshot =
         session->latest_render_snapshot();
     ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 4 deferred-to-immediate current hold records local scroll");
+        "deferred-to-immediate current hold records local scroll");
     ok &= check(session->render_snapshot_generation() == generation_before_hold &&
         held_snapshot.has_value() &&
         held_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         !snapshot_contains_text(*held_snapshot, QStringLiteral("hidden")) &&
         !session->public_projection_for_testing().has_value(),
-        "Phase 4 deferred-to-immediate current hold publishes no public projection");
+        "deferred-to-immediate current hold publishes no public projection");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 deferred-to-immediate policy latch releases deferred hold");
+        "deferred-to-immediate policy latch releases deferred hold");
     const std::optional<term::Terminal_render_snapshot> first_release =
         session->latest_render_snapshot();
     ok &= check(first_release.has_value() &&
@@ -6644,19 +6644,19 @@ bool test_public_projection_phase4_deferred_to_immediate_policy_latch_next_hold(
             term::Terminal_public_scroll_diagnostic_reason::
                 SYNCHRONIZED_OUTPUT_SCROLL_POLICY_CHANGED_MID_HOLD &&
         !session->public_projection_for_testing().has_value(),
-        "Phase 4 deferred-to-immediate release records policy-change diagnostics without projection");
+        "deferred-to-immediate release records policy-change diagnostics without projection");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hnext-hidden")),
-        "Phase 4 deferred-to-immediate policy latch enters next hold");
+        "deferred-to-immediate policy latch enters next hold");
     ok &= check(session->public_projection_for_testing().has_value(),
-        "Phase 4 deferred-to-immediate policy latch applies immediate policy to next hold");
+        "deferred-to-immediate policy latch applies immediate policy to next hold");
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 deferred-to-immediate policy latch releases next hold");
+        "deferred-to-immediate policy latch releases next hold");
 
     return ok;
 }
 
-bool test_public_projection_phase4_multi_scroll_accumulates_and_release_dirty_without_hidden_mutation()
+bool test_public_projection_multi_scroll_accumulates_and_release_dirty_without_hidden_mutation()
 {
     bool ok = true;
 
@@ -6671,9 +6671,9 @@ bool test_public_projection_phase4_multi_scroll_accumulates_and_release_dirty_wi
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 multi-scroll clean-release session starts");
+        "multi-scroll clean-release session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(7)),
-        "Phase 4 multi-scroll clean-release publishes public scrollback");
+        "multi-scroll clean-release publishes public scrollback");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
@@ -6682,17 +6682,17 @@ bool test_public_projection_phase4_multi_scroll_accumulates_and_release_dirty_wi
     ok &= check(safe_content.has_value() &&
         safe_content->viewport.offset_from_tail == 0 &&
         safe_content->viewport.scrollback_rows >= 2,
-        "Phase 4 multi-scroll clean-release starts at public tail");
+        "multi-scroll clean-release starts at public tail");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "Phase 4 multi-scroll clean-release enters hold without hidden mutations");
+        "multi-scroll clean-release enters hold without hidden mutations");
     const std::optional<term::Terminal_public_projection> captured_projection =
         session->public_projection_for_testing();
     ok &= check(captured_projection.has_value(),
-        "Phase 4 multi-scroll clean-release captures public projection");
+        "multi-scroll clean-release captures public projection");
     if (!captured_projection.has_value()) {
         return ok;
     }
@@ -6718,7 +6718,7 @@ bool test_public_projection_phase4_multi_scroll_accumulates_and_release_dirty_wi
         first_public_scroll->public_scroll_diagnostics.public_viewport_after.offset_from_tail == 1 &&
         first_public_scroll->public_scroll_diagnostics.public_projection_generation ==
             captured_projection->generation(),
-        "Phase 4 multi-scroll first public projection snapshot advances to offset one");
+        "multi-scroll first public projection snapshot advances to offset one");
     ok &= check(second_scroll.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
         second_public_scroll.has_value() &&
         second_public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
@@ -6728,10 +6728,10 @@ bool test_public_projection_phase4_multi_scroll_accumulates_and_release_dirty_wi
         second_public_scroll->public_scroll_diagnostics.public_projection_generation ==
             captured_projection->generation() &&
         session->render_snapshot_generation() == generation_before_hold + 2U,
-        "Phase 4 multi-scroll second public projection snapshot accumulates to offset two");
+        "multi-scroll second public projection snapshot accumulates to offset two");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 multi-scroll clean-release releases hold without hidden live mutations");
+        "multi-scroll clean-release releases hold without hidden live mutations");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -6743,7 +6743,7 @@ bool test_public_projection_phase4_multi_scroll_accumulates_and_release_dirty_wi
         release->dirty_row_ranges.front().row_count == release->grid_size.rows &&
         release->public_scroll_diagnostics.release_reconciliation_result ==
             term::Terminal_release_reconciliation_result::EXACT_ANCHOR,
-        "Phase 4 clean release after public projection scroll dirties the full viewport");
+        "clean release after public projection scroll dirties the full viewport");
 
     return ok;
 }
@@ -7137,7 +7137,7 @@ bool test_selection_clear_overrides_public_projection_safe_basis_spans()
     return ok;
 }
 
-bool test_public_projection_phase4_policy_latch_ignores_mid_hold_change()
+bool test_public_projection_policy_latch_ignores_mid_hold_change()
 {
     bool ok = true;
 
@@ -7152,21 +7152,21 @@ bool test_public_projection_phase4_policy_latch_ignores_mid_hold_change()
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 policy latch session starts");
+        "policy latch session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("row-0\r\nrow-1\r\nrow-2\r\nrow-3")),
-        "Phase 4 policy latch publishes base rows");
+        "policy latch publishes base rows");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
     ok &= check(safe_content.has_value(),
-        "Phase 4 policy latch has safe content basis");
+        "policy latch has safe content basis");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden")),
-        "Phase 4 policy latch enters immediate hold");
+        "policy latch enters immediate hold");
     session->set_synchronized_output_scroll_policy_for_testing(
         term::Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION);
 
@@ -7184,10 +7184,10 @@ bool test_public_projection_phase4_policy_latch_ignores_mid_hold_change()
         public_scroll->public_scroll_diagnostics.diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::
                 SYNCHRONIZED_OUTPUT_SCROLL_POLICY_CHANGED_MID_HOLD,
-        "Phase 4 policy latch keeps immediate projection active after mid-hold defer change");
+        "policy latch keeps immediate projection active after mid-hold defer change");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 policy latch releases first hold");
+        "policy latch releases first hold");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -7195,19 +7195,19 @@ bool test_public_projection_phase4_policy_latch_ignores_mid_hold_change()
             term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION &&
         release->public_scroll_diagnostics.policy_change_event ==
             term::Terminal_synchronized_output_policy_change_event::CHANGED_MID_HOLD,
-        "Phase 4 policy latch reports changed-mid-hold release diagnostics");
+        "policy latch reports changed-mid-hold release diagnostics");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hnext-hidden")),
-        "Phase 4 policy latch enters second hold after policy change");
+        "policy latch enters second hold after policy change");
     ok &= check(!session->public_projection_for_testing().has_value(),
-        "Phase 4 policy latch applies deferred policy only to the next hold");
+        "policy latch applies deferred policy only to the next hold");
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 policy latch releases second hold");
+        "policy latch releases second hold");
 
     return ok;
 }
 
-bool test_public_projection_phase5_public_scroll_apis_and_deferred_intent()
+bool test_public_projection_public_scroll_apis_and_deferred_intent()
 {
     bool ok = true;
 
@@ -7222,16 +7222,16 @@ bool test_public_projection_phase5_public_scroll_apis_and_deferred_intent()
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 5 public scroll API session starts");
+        "public scroll API session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 5 public scroll API publishes public scrollback");
+        "public scroll API publishes public scrollback");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
-        "Phase 5 public scroll API enters immediate hold");
+        "public scroll API enters immediate hold");
     const std::optional<term::Terminal_public_projection> projection =
         session->public_projection_for_testing();
     ok &= check(projection.has_value(),
-        "Phase 5 public scroll API captures public projection");
+        "public scroll API captures public projection");
     if (!projection.has_value()) {
         return ok;
     }
@@ -7246,21 +7246,21 @@ bool test_public_projection_phase5_public_scroll_apis_and_deferred_intent()
         valid_public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
         valid_public_scroll->viewport.offset_from_tail == 1 &&
         valid_public_scroll->public_scroll_diagnostics.visible_scroll_applied,
-        "Phase 5 public scroll_viewport_lines publishes public projection scroll snapshot");
+        "public scroll_viewport_lines publishes public projection scroll snapshot");
     if (!valid_public_scroll.has_value()) {
         return ok;
     }
 
     const int public_scrollback_rows = valid_public_scroll->viewport.scrollback_rows;
     ok &= check(backend->emit_output(numbered_scroll_lines(20)),
-        "Phase 5 public scroll API grows hidden live scrollback during hold");
+        "public scroll API grows hidden live scrollback during hold");
     const std::optional<term::Terminal_render_snapshot> after_hidden_growth =
         session->latest_render_snapshot();
     ok &= check(after_hidden_growth.has_value() &&
         after_hidden_growth->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
         after_hidden_growth->viewport.scrollback_rows == public_scrollback_rows &&
         after_hidden_growth->viewport.offset_from_tail == 1,
-        "Phase 5 hidden live growth leaves public projection range and thumb state frozen");
+        "hidden live growth leaves public projection range and thumb state frozen");
 
     session->invalidate_public_projection_for_testing(
         term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED);
@@ -7279,12 +7279,12 @@ bool test_public_projection_phase5_public_scroll_apis_and_deferred_intent()
             term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED &&
         deferred_offset_scroll.action ==
             term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED,
-        "Phase 5 invalidated public APIs record deferred intents");
+        "invalidated public APIs record deferred intents");
     ok &= check(after_deferred_intent.has_value() &&
         after_deferred_intent->metadata.sequence == frozen_sequence &&
         after_deferred_intent->viewport.scrollback_rows == public_scrollback_rows &&
         after_deferred_intent->viewport.offset_from_tail == 1,
-        "Phase 5 invalidated public APIs leave frozen public projection properties unchanged");
+        "invalidated public APIs leave frozen public projection properties unchanged");
     ok &= check(release_intent.has_value() &&
         release_intent->deferred_intent_recorded &&
         release_intent->public_projection_disable_reason ==
@@ -7293,35 +7293,35 @@ bool test_public_projection_phase5_public_scroll_apis_and_deferred_intent()
             term::Terminal_hidden_row_eligibility::INELIGIBLE &&
         release_intent->hidden_row_clamp_reason ==
             term::Terminal_hidden_row_clamp_reason::PUBLIC_VIEWPORT_BOUNDARY,
-        "Phase 5 invalidated deferred intent is recorded without hidden live bounds");
+        "invalidated deferred intent is recorded without hidden live bounds");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 5 public scroll API releases hold");
+        "public scroll API releases hold");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
-    ok &= check(release.has_value(), "Phase 5 release publishes a live snapshot");
+    ok &= check(release.has_value(), "release publishes a live snapshot");
     if (release.has_value()) {
         ok &= check(
             release->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT,
-            "Phase 5 release returns to live-content basis");
+            "release returns to live-content basis");
         ok &= check(
             release->viewport.scrollback_rows >= public_scrollback_rows,
-            "Phase 5 release exposes reconciled live scrollback bounds");
+            "release exposes reconciled live scrollback bounds");
         ok &= check(
             release->public_scroll_diagnostics.diagnostic_reason ==
                 term::Terminal_public_scroll_diagnostic_reason::
                     PUBLIC_PROJECTION_INVALIDATED_DEFERRED_INTENT,
-            "Phase 5 release reports invalidated deferred intent diagnostic");
+            "release reports invalidated deferred intent diagnostic");
         ok &= check(
             release->public_scroll_diagnostics.public_projection_disable_reason ==
                 term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED,
-            "Phase 5 release reports projection invalidation reason");
+            "release reports projection invalidation reason");
     }
 
     return ok;
 }
 
-bool test_public_projection_phase7b_scroll_bounds_ignore_hidden_live_growth()
+bool test_public_projection_scroll_bounds_ignore_hidden_live_growth()
 {
     bool ok = true;
 
@@ -7336,18 +7336,18 @@ bool test_public_projection_phase7b_scroll_bounds_ignore_hidden_live_growth()
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 7B public bounds session starts");
+        "public bounds session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 7B public bounds fixture publishes public scrollback");
+        "public bounds fixture publishes public scrollback");
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
-        "Phase 7B public bounds fixture enters immediate hold");
+        "public bounds fixture enters immediate hold");
 
     const std::optional<term::Terminal_public_projection> projection =
         session->public_projection_for_testing();
     ok &= check(projection.has_value() &&
         projection->viewport().scrollback_rows > 0 &&
         projection->viewport().offset_from_tail == 0,
-        "Phase 7B public bounds fixture captures tail public projection");
+        "public bounds fixture captures tail public projection");
     if (!projection.has_value()) {
         return ok;
     }
@@ -7364,7 +7364,7 @@ bool test_public_projection_phase7b_scroll_bounds_ignore_hidden_live_growth()
             term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
         scroll_to_public_top.applied_line_delta ==
             public_tail_viewport.scrollback_rows,
-        "Phase 7B public bounds scroll clamps at public projection top");
+        "public bounds scroll clamps at public projection top");
     ok &= check(public_top_snapshot.has_value() &&
         public_top_snapshot->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
         public_top_snapshot->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
@@ -7372,13 +7372,13 @@ bool test_public_projection_phase7b_scroll_bounds_ignore_hidden_live_growth()
             public_tail_viewport.scrollback_rows &&
         public_top_snapshot->viewport.offset_from_tail ==
             public_tail_viewport.scrollback_rows,
-        "Phase 7B public bounds publishes the public top viewport");
+        "public bounds publishes the public top viewport");
     if (!public_top_snapshot.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(numbered_scroll_lines(20)),
-        "Phase 7B public bounds grows hidden live scrollback");
+        "public bounds grows hidden live scrollback");
     const std::optional<term::Terminal_render_snapshot> after_hidden_growth =
         session->latest_render_snapshot();
     ok &= check(after_hidden_growth.has_value() &&
@@ -7386,7 +7386,7 @@ bool test_public_projection_phase7b_scroll_bounds_ignore_hidden_live_growth()
             public_tail_viewport.scrollback_rows &&
         after_hidden_growth->viewport.offset_from_tail ==
             public_tail_viewport.scrollback_rows,
-        "Phase 7B public bounds keeps the frozen public top after hidden growth");
+        "public bounds keeps the frozen public top after hidden growth");
     if (!after_hidden_growth.has_value()) {
         return ok;
     }
@@ -7402,10 +7402,10 @@ bool test_public_projection_phase7b_scroll_bounds_ignore_hidden_live_growth()
     ok &= check(boundary_scroll.action ==
             term::Terminal_viewport_scroll_action::AT_BOUNDARY &&
         boundary_scroll.applied_line_delta == 0,
-        "Phase 7B public bounds do not scroll into hidden live rows");
+        "public bounds do not scroll into hidden live rows");
     ok &= check(after_boundary_scroll.has_value() &&
         after_boundary_scroll->metadata.sequence == sequence_before_boundary,
-        "Phase 7B public bounds boundary scroll does not publish a new snapshot");
+        "public bounds boundary scroll does not publish a new snapshot");
 
     session->invalidate_public_projection_for_testing(
         term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED);
@@ -7419,12 +7419,12 @@ bool test_public_projection_phase7b_scroll_bounds_ignore_hidden_live_growth()
         release_intent->deferred_offset_from_tail.has_value() &&
         *release_intent->deferred_offset_from_tail ==
             public_tail_viewport.scrollback_rows,
-        "Phase 7B invalidated public bounds defer at the public top");
+        "invalidated public bounds defer at the public top");
 
     return ok;
 }
 
-bool test_public_projection_phase7b_default_hold_bounds_to_published_viewport()
+bool test_public_projection_default_hold_bounds_to_published_viewport()
 {
     bool ok = true;
 
@@ -7437,9 +7437,9 @@ bool test_public_projection_phase7b_default_hold_bounds_to_published_viewport()
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 7B default hold bounds session starts");
+        "default hold bounds session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(8)),
-        "Phase 7B default hold bounds publishes public scrollback");
+        "default hold bounds publishes public scrollback");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
@@ -7447,15 +7447,15 @@ bool test_public_projection_phase7b_default_hold_bounds_to_published_viewport()
         safe_content->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
         safe_content->viewport.scrollback_rows > 0 &&
         safe_content->viewport.offset_from_tail == 0,
-        "Phase 7B default hold bounds fixture starts at published tail");
+        "default hold bounds fixture starts at published tail");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld")),
-        "Phase 7B default hold bounds enters synchronized output");
+        "default hold bounds enters synchronized output");
     ok &= check(backend->emit_output(numbered_scroll_lines(25)),
-        "Phase 7B default hold bounds grows hidden live scrollback");
+        "default hold bounds grows hidden live scrollback");
 
     const term::Terminal_viewport_scroll_result scroll_to_published_top =
         session->scroll_viewport_lines_from_published_state(
@@ -7465,7 +7465,7 @@ bool test_public_projection_phase7b_default_hold_bounds_to_published_viewport()
             term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
         scroll_to_published_top.applied_line_delta ==
             safe_content->viewport.scrollback_rows,
-        "Phase 7B default hold bounds clamps movement at the published top");
+        "default hold bounds clamps movement at the published top");
 
     const term::Terminal_viewport_scroll_result boundary_scroll =
         session->scroll_viewport_lines_from_published_state(
@@ -7474,20 +7474,20 @@ bool test_public_projection_phase7b_default_hold_bounds_to_published_viewport()
     ok &= check(boundary_scroll.action ==
             term::Terminal_viewport_scroll_action::AT_BOUNDARY &&
         boundary_scroll.applied_line_delta == 0,
-        "Phase 7B default hold bounds reject hidden-only movement");
+        "default hold bounds reject hidden-only movement");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 7B default hold bounds releases synchronized output");
+        "default hold bounds releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
         release->viewport.scrollback_rows > safe_content->viewport.scrollback_rows,
-        "Phase 7B default hold bounds exposes live scrollback after release");
+        "default hold bounds exposes live scrollback after release");
 
     return ok;
 }
 
-bool test_public_projection_phase8_combined_hold_scroll_and_release()
+bool test_public_projection_combined_hold_scroll_and_release()
 {
     bool ok = true;
 
@@ -7502,10 +7502,10 @@ bool test_public_projection_phase8_combined_hold_scroll_and_release()
     launch_config.initial_grid_size = {4, 24};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 8 combined publication session starts");
+        "combined publication session starts");
     ok &= check(backend->emit_output(
             QByteArrayLiteral("safe-0\r\nsafe-1\r\nsafe-2\r\nsafe-3\r\nsafe-4")),
-        "Phase 8 combined publication fixture publishes public scrollback");
+        "combined publication fixture publishes public scrollback");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
@@ -7515,7 +7515,7 @@ bool test_public_projection_phase8_combined_hold_scroll_and_release()
         safe_content->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
         safe_content->viewport.scrollback_rows > 0 &&
         safe_content->viewport.offset_from_tail == 0,
-        "Phase 8 combined publication fixture starts at a public tail basis");
+        "combined publication fixture starts at a public tail basis");
     if (!safe_content.has_value()) {
         return ok;
     }
@@ -7525,7 +7525,7 @@ bool test_public_projection_phase8_combined_hold_scroll_and_release()
             + QByteArrayLiteral("\x1b[1;1HHIDDEN-REWRITE")
             + numbered_scroll_lines(8)
             + QByteArrayLiteral("\x1b[4;1HHIDDEN-TAIL")),
-        "Phase 8 combined publication mutates hidden rows during synchronized output");
+        "combined publication mutates hidden rows during synchronized output");
     const std::optional<term::Terminal_render_snapshot> held_snapshot =
         session->latest_render_snapshot();
     const std::optional<term::Terminal_render_snapshot> held_content_basis =
@@ -7537,7 +7537,7 @@ bool test_public_projection_phase8_combined_hold_scroll_and_release()
         held_content_basis->metadata.sequence == safe_content->metadata.sequence &&
         !snapshot_contains_text(*held_snapshot, QStringLiteral("HIDDEN")) &&
         !snapshot_contains_text(*held_content_basis, QStringLiteral("HIDDEN")),
-        "Phase 8 combined publication keeps hidden live mutations unpublished before public scroll");
+        "combined publication keeps hidden live mutations unpublished before public scroll");
 
     const term::Terminal_viewport_scroll_result public_scroll_result =
         session->scroll_viewport_lines_from_published_state(1, safe_content->viewport);
@@ -7548,25 +7548,25 @@ bool test_public_projection_phase8_combined_hold_scroll_and_release()
     ok &= check(public_scroll_result.action ==
             term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
         session->render_snapshot_generation() == generation_before_hold + 1U,
-        "Phase 8 combined publication publishes one public scroll snapshot during hold");
+        "combined publication publishes one public scroll snapshot during hold");
     ok &= check(public_scroll.has_value() &&
         public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
         public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
         public_scroll->viewport.offset_from_tail == 1 &&
         !snapshot_contains_text(*public_scroll, QStringLiteral("HIDDEN")),
-        "Phase 8 combined publication public scroll uses only public projection rows");
+        "combined publication public scroll uses only public projection rows");
     ok &= check(content_after_public_scroll.has_value() &&
         content_after_public_scroll->metadata.sequence == safe_content->metadata.sequence &&
         content_after_public_scroll->viewport.offset_from_tail == 0 &&
         !snapshot_contains_text(*content_after_public_scroll, QStringLiteral("HIDDEN")),
-        "Phase 8 combined publication public scroll does not advance the live-content basis");
+        "combined publication public scroll does not advance the live-content basis");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[4;1HHIDDEN-TAIL")),
-        "Phase 8 combined publication keeps final hidden content pending before release");
+        "combined publication keeps final hidden content pending before release");
     const std::uint64_t generation_before_release =
         session->render_snapshot_generation();
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 8 combined publication releases synchronized output");
+        "combined publication releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     const std::optional<term::Terminal_render_snapshot> content_after_release =
@@ -7578,19 +7578,19 @@ bool test_public_projection_phase8_combined_hold_scroll_and_release()
         snapshot_contains_text(*release, QStringLiteral("HIDDEN-REWRITE")) &&
         release->public_scroll_diagnostics.release_reconciliation_result !=
             term::Terminal_release_reconciliation_result::NONE,
-        "Phase 8 combined publication releases hidden live content exactly once");
+        "combined publication releases hidden live content exactly once");
     ok &= check(content_after_release.has_value() &&
         release.has_value() &&
         content_after_release->metadata.sequence == release->metadata.sequence &&
         snapshot_contains_text(*content_after_release, QStringLiteral("HIDDEN-REWRITE")) &&
         !session->public_projection_for_testing().has_value() &&
         !session->public_release_intent_for_testing().has_value(),
-        "Phase 8 combined publication advances live content and clears public projection lifecycle on release");
+        "combined publication advances live content and clears public projection lifecycle on release");
 
     return ok;
 }
 
-bool test_public_projection_phase8_public_scroll_uses_safe_projection_fields()
+bool test_public_projection_public_scroll_uses_safe_projection_fields()
 {
     bool ok = true;
 
@@ -7606,13 +7606,13 @@ bool test_public_projection_phase8_public_scroll_uses_safe_projection_fields()
     launch_config.initial_grid_size = {3, 24};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 8 safe-field projection session starts");
+        "safe-field projection session starts");
     ok &= check(backend->emit_output(
             QByteArrayLiteral("row-0\r\n")
             + QByteArrayLiteral("\x1b]8;id=safe;https://safe.example\x1b\\")
             + QByteArrayLiteral("\x1b[31mSAFE\x1b[0m")
             + QByteArrayLiteral("\x1b]8;;\x1b\\\r\nrow-2\r\nrow-3")),
-        "Phase 8 safe-field fixture publishes styled public rows");
+        "safe-field fixture publishes styled public rows");
 
     session->set_selection_range({
         { 1, 0 },
@@ -7626,7 +7626,7 @@ bool test_public_projection_phase8_public_scroll_uses_safe_projection_fields()
     ok &= check(selected_public_snapshot.has_value() &&
         safe_content.has_value() &&
         snapshot_has_selection_span(*selected_public_snapshot, 0, 0, 4),
-        "Phase 8 safe-field fixture has a safe selected public row");
+        "safe-field fixture has a safe selected public row");
     if (!selected_public_snapshot.has_value() || !safe_content.has_value()) {
         return ok;
     }
@@ -7640,7 +7640,7 @@ bool test_public_projection_phase8_public_scroll_uses_safe_projection_fields()
             + QByteArrayLiteral("\x1b]8;id=hidden;https://hidden.example\x1b\\")
             + QByteArrayLiteral("\x1b[32mhidden-live\x1b[0m")
             + QByteArrayLiteral("\x1b]8;;\x1b\\")),
-        "Phase 8 safe-field fixture mutates hidden live fields");
+        "safe-field fixture mutates hidden live fields");
 
     const term::Terminal_viewport_scroll_result scroll_result =
         session->scroll_viewport_lines_from_published_state(1, safe_content->viewport);
@@ -7650,7 +7650,7 @@ bool test_public_projection_phase8_public_scroll_uses_safe_projection_fields()
         public_scroll.has_value() &&
         public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
         public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL,
-        "Phase 8 safe-field fixture publishes a public projection scroll snapshot");
+        "safe-field fixture publishes a public projection scroll snapshot");
     if (!public_scroll.has_value()) {
         return ok;
     }
@@ -7679,7 +7679,7 @@ bool test_public_projection_phase8_public_scroll_uses_safe_projection_fields()
         snapshot_row_text(*public_scroll, 1) == QStringLiteral("SAFE") &&
         !snapshot_contains_text(*public_scroll, QStringLiteral("hidden-live")) &&
         snapshot_has_selection_span(*public_scroll, 1, 0, 4),
-        "Phase 8 safe-field public scroll uses safe text and selection spans");
+        "safe-field public scroll uses safe text and selection spans");
     ok &= check(public_safe_cell != nullptr &&
         public_safe_cell->style_id     != term::k_default_terminal_style_id &&
         public_safe_cell->hyperlink_id != term::k_no_terminal_hyperlink_id &&
@@ -7687,7 +7687,7 @@ bool test_public_projection_phase8_public_scroll_uses_safe_projection_fields()
         !public_safe_cell_uses_hidden_green &&
         snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://safe.example")) &&
         !snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://hidden.example")),
-        "Phase 8 safe-field public scroll uses copied safe style and hyperlink metadata");
+        "safe-field public scroll uses copied safe style and hyperlink metadata");
     ok &= check(!public_scroll->cursor.visible &&
         public_scroll->cursor.position.row            == expected_public_cursor_row &&
         public_scroll->cursor.position.column         == safe_cursor.position.column &&
@@ -7697,12 +7697,12 @@ bool test_public_projection_phase8_public_scroll_uses_safe_projection_fields()
         public_scroll->modes.cursor_visible           == safe_modes.cursor_visible &&
         public_scroll->metadata.row_origin_generation ==
             selected_public_snapshot->metadata.row_origin_generation,
-        "Phase 8 safe-field public scroll uses safe cursor, mode, and row-origin metadata");
+        "safe-field public scroll uses safe cursor, mode, and row-origin metadata");
 
     return ok;
 }
 
-bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
+bool test_public_projection_installed_projection_seam_publishes_scroll()
 {
     bool ok = true;
 
@@ -7717,16 +7717,16 @@ bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 installed projection seam public scroll session starts");
+        "installed projection seam public scroll session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("row-0\r\n")
         + QByteArrayLiteral("\x1b]8;id=safe;https://safe.example\x1b\\")
         + QByteArrayLiteral("\x1b[31mSAFE\x1b[0m")
         + QByteArrayLiteral("\x1b]8;;\x1b\\\r\nrow-2\r\nrow-3")),
-        "Phase 4 installed projection seam publishes base rows");
+        "installed projection seam publishes base rows");
     ok &= check(session->scroll_published_viewport_to_offset_from_tail(1).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 4 installed projection seam starts detached from tail");
+        "installed projection seam starts detached from tail");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
@@ -7734,7 +7734,7 @@ bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
         safe_content->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         safe_content->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         safe_content->viewport.offset_from_tail == 1,
-        "Phase 4 installed projection seam records safe live-content basis");
+        "installed projection seam records safe live-content basis");
     if (!safe_content.has_value()) {
         return ok;
     }
@@ -7747,11 +7747,11 @@ bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
             + QByteArrayLiteral("\x1b]8;id=hidden;https://hidden.example\x1b\\")
             + QByteArrayLiteral("\x1b[32mhidden-live\x1b[0m")
             + QByteArrayLiteral("\x1b]8;;\x1b\\")),
-        "Phase 4 installed projection seam enters synchronized-output hold");
+        "installed projection seam enters synchronized-output hold");
     const std::optional<term::Terminal_public_projection> captured_projection =
         session->public_projection_for_testing();
     ok &= check(captured_projection.has_value(),
-        "Phase 4 installed projection seam captures hold projection");
+        "installed projection seam captures hold projection");
     if (!captured_projection.has_value()) {
         return ok;
     }
@@ -7785,9 +7785,9 @@ bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
         session->latest_content_render_snapshot_for_testing();
     ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED &&
         scroll_result.applied_line_delta == -1,
-        "Phase 4 installed projection seam applies public viewport movement");
+        "installed projection seam applies public viewport movement");
     ok &= check(session->render_snapshot_generation() == generation_before_scroll + 1U,
-        "Phase 4 installed projection seam advances visible snapshot generation");
+        "installed projection seam advances visible snapshot generation");
     ok &= check(public_scroll.has_value() &&
         public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
         public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
@@ -7800,7 +7800,7 @@ bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
         public_scroll->dirty_row_ranges.front().row_count == public_scroll->grid_size.rows &&
         term::validate_render_snapshot(*public_scroll).status ==
             term::Terminal_render_snapshot_status::OK,
-        "Phase 4 installed projection seam publishes a valid PUBLIC_PROJECTION/SCROLL snapshot");
+        "installed projection seam publishes a valid PUBLIC_PROJECTION/SCROLL snapshot");
     const term::Terminal_render_cell* public_safe_cell =
         public_scroll.has_value()
             ? snapshot_cell_with_text(*public_scroll, QStringLiteral("S"))
@@ -7828,7 +7828,7 @@ bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
         !public_safe_cell_uses_hidden_green &&
         snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://safe.example")) &&
         !snapshot_has_hyperlink_uri(*public_scroll, QByteArrayLiteral("https://hidden.example")),
-        "Phase 4 public scroll snapshot uses copied safe style and hyperlink metadata only");
+        "public scroll snapshot uses copied safe style and hyperlink metadata only");
     const int seam_expected_cursor_row =
         safe_cursor.position.row +
         first_public_row_for_viewport(safe_content->viewport) -
@@ -7857,7 +7857,7 @@ bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
             << '\n';
     }
     ok &= check(seam_cursor_matches,
-        "Phase 4 public scroll snapshot repositions the copied safe cursor and mode state only");
+        "public scroll snapshot repositions the copied safe cursor and mode state only");
     const term::Terminal_viewport_state default_viewport;
     ok &= check(public_scroll.has_value() &&
         public_scroll->public_scroll_diagnostics.effective_policy ==
@@ -7880,16 +7880,16 @@ bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
             term::Terminal_release_reconciliation_result::NONE &&
         public_scroll->public_scroll_diagnostics.public_projection_disable_reason ==
             term::Terminal_public_projection_disable_reason::NONE,
-        "Phase 4 installed projection seam records scroll-only diagnostics without release leakage");
+        "installed projection seam records scroll-only diagnostics without release leakage");
     ok &= check(content_after_scroll.has_value() &&
         content_after_scroll->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         content_after_scroll->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         content_after_scroll->metadata.sequence == safe_content->metadata.sequence &&
         content_after_scroll->viewport.offset_from_tail == 1,
-        "Phase 4 public scroll does not advance the safe live-content basis");
+        "public scroll does not advance the safe live-content basis");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 installed projection seam releases synchronized output");
+        "installed projection seam releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -7903,12 +7903,12 @@ bool test_public_projection_phase4_installed_projection_seam_publishes_scroll()
             term::Terminal_release_reconciliation_result::EXACT_ANCHOR &&
         !session->public_projection_for_testing().has_value() &&
         !session->public_release_intent_for_testing().has_value(),
-        "Phase 4 release after public scroll reconciles and clears projection lifecycle");
+        "release after public scroll reconciles and clears projection lifecycle");
 
     return ok;
 }
 
-bool test_public_projection_phase4_failed_scroll_publication_rolls_back()
+bool test_public_projection_failed_scroll_publication_rolls_back()
 {
     bool ok = true;
 
@@ -7923,28 +7923,28 @@ bool test_public_projection_phase4_failed_scroll_publication_rolls_back()
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 failed-publication installed seam session starts");
+        "failed-publication installed seam session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("row-0\r\nrow-1\r\nrow-2\r\nrow-3")),
-        "Phase 4 failed-publication installed seam publishes base rows");
+        "failed-publication installed seam publishes base rows");
     ok &= check(session->scroll_published_viewport_to_offset_from_tail(1).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 4 failed-publication installed seam starts detached from tail");
+        "failed-publication installed seam starts detached from tail");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
     ok &= check(safe_content.has_value(),
-        "Phase 4 failed-publication installed seam records safe content basis");
+        "failed-publication installed seam records safe content basis");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden-live")),
-        "Phase 4 failed-publication installed seam enters synchronized-output hold");
+        "failed-publication installed seam enters synchronized-output hold");
     const std::optional<term::Terminal_public_projection> captured_projection =
         session->public_projection_for_testing();
     ok &= check(captured_projection.has_value(),
-        "Phase 4 failed-publication installed seam captures hold projection");
+        "failed-publication installed seam captures hold projection");
     if (!captured_projection.has_value()) {
         return ok;
     }
@@ -7967,7 +7967,7 @@ bool test_public_projection_phase4_failed_scroll_publication_rolls_back()
         break;
     }
     ok &= check(invalid_row_installed,
-        "Phase 4 failed-publication installed seam corrupts the target public row");
+        "failed-publication installed seam corrupts the target public row");
     session->install_public_projection_for_testing(
         term::Terminal_public_projection::with_copied_rows_for_testing(
             *captured_projection,
@@ -7986,7 +7986,7 @@ bool test_public_projection_phase4_failed_scroll_publication_rolls_back()
         session->public_release_intent_for_testing();
     ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::AT_BOUNDARY &&
         scroll_result.applied_line_delta == 0,
-        "Phase 4 failed public scroll publication reports no visible movement");
+        "failed public scroll publication reports no visible movement");
     ok &= check(session->render_snapshot_generation() == generation_before_scroll &&
         after_failed_scroll.has_value() &&
         after_failed_scroll->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
@@ -7994,7 +7994,7 @@ bool test_public_projection_phase4_failed_scroll_publication_rolls_back()
         after_failed_scroll->viewport.offset_from_tail == safe_content->viewport.offset_from_tail &&
         !snapshot_contains_text(*after_failed_scroll, QStringLiteral("hidden-live")) &&
         !snapshot_contains_text(*after_failed_scroll, QStringLiteral("invalid-tail")),
-        "Phase 4 failed public scroll publication leaves visible snapshot unchanged");
+        "failed public scroll publication leaves visible snapshot unchanged");
     ok &= check(release_intent.has_value() &&
         release_intent->public_viewport.offset_from_tail == safe_content->viewport.offset_from_tail &&
         !release_intent->public_projection_valid &&
@@ -8005,10 +8005,10 @@ bool test_public_projection_phase4_failed_scroll_publication_rolls_back()
             term::Terminal_public_scroll_diagnostic_reason::
                 PUBLIC_PROJECTION_SCROLL_PUBLICATION_FAILED &&
         !session->public_projection_for_testing().has_value(),
-        "Phase 4 failed public scroll publication rolls controller state back before invalidating");
+        "failed public scroll publication rolls controller state back before invalidating");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 failed-publication installed seam releases synchronized output");
+        "failed-publication installed seam releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -8026,12 +8026,12 @@ bool test_public_projection_phase4_failed_scroll_publication_rolls_back()
             term::Terminal_release_reconciliation_result::EXACT_ANCHOR &&
         !session->public_projection_for_testing().has_value() &&
         !session->public_release_intent_for_testing().has_value(),
-        "Phase 4 failed-publication release reconciles the rolled-back anchor with diagnostics");
+        "failed-publication release reconciles the rolled-back anchor with diagnostics");
 
     return ok;
 }
 
-bool test_public_projection_phase4_installed_projection_seam_off_copied_scroll_stays_deferred()
+bool test_public_projection_installed_projection_seam_off_copied_scroll_stays_deferred()
 {
     bool ok = true;
 
@@ -8046,26 +8046,26 @@ bool test_public_projection_phase4_installed_projection_seam_off_copied_scroll_s
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 installed off-copied public scroll seam session starts");
+        "installed off-copied public scroll seam session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(5)),
-        "Phase 4 installed off-copied public scroll seam publishes base rows");
+        "installed off-copied public scroll seam publishes base rows");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
     const std::uint64_t generation_before_hold =
         session->render_snapshot_generation();
     ok &= check(safe_content.has_value(),
-        "Phase 4 installed off-copied public scroll seam has safe content basis");
+        "installed off-copied public scroll seam has safe content basis");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden-live")),
-        "Phase 4 installed off-copied public scroll seam enters synchronized-output hold");
+        "installed off-copied public scroll seam enters synchronized-output hold");
     const std::optional<term::Terminal_public_projection> captured_projection =
         session->public_projection_for_testing();
     ok &= check(captured_projection.has_value(),
-        "Phase 4 installed off-copied public scroll seam captures production projection");
+        "installed off-copied public scroll seam captures production projection");
     if (!captured_projection.has_value()) {
         return ok;
     }
@@ -8094,13 +8094,13 @@ bool test_public_projection_phase4_installed_projection_seam_off_copied_scroll_s
             scroll_result.action ==
                 term::Terminal_viewport_scroll_action::DEFERRED_INTENT_RECORDED) &&
         scroll_result.applied_line_delta == 0,
-        "Phase 4 installed off-copied public scroll seam does not report visible movement");
+        "installed off-copied public scroll seam does not report visible movement");
     ok &= check(session->render_snapshot_generation() == generation_before_hold &&
         after_scroll.has_value() &&
         after_scroll->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         after_scroll->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         !snapshot_contains_text(*after_scroll, QStringLiteral("hidden-live")),
-        "Phase 4 installed off-copied public scroll seam emits no public scroll snapshot");
+        "installed off-copied public scroll seam emits no public scroll snapshot");
     ok &= check(release_intent.has_value() &&
         release_intent->deferred_intent_recorded &&
         release_intent->diagnostic_reason ==
@@ -8109,10 +8109,10 @@ bool test_public_projection_phase4_installed_projection_seam_off_copied_scroll_s
         release_intent->public_projection_disable_reason ==
             term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED &&
         !session->public_projection_for_testing().has_value(),
-        "Phase 4 installed off-copied public scroll seam records deferred release intent");
+        "installed off-copied public scroll seam records deferred release intent");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 installed off-copied public scroll seam releases synchronized output");
+        "installed off-copied public scroll seam releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -8128,12 +8128,12 @@ bool test_public_projection_phase4_installed_projection_seam_off_copied_scroll_s
             term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED &&
         !session->public_projection_for_testing().has_value() &&
         !session->public_release_intent_for_testing().has_value(),
-        "Phase 4 installed off-copied seam deferred public scroll offset is authoritative on release");
+        "installed off-copied seam deferred public scroll offset is authoritative on release");
 
     return ok;
 }
 
-bool test_public_projection_phase4_alternate_safe_basis_disables_projection()
+bool test_public_projection_alternate_safe_basis_disables_projection()
 {
     bool ok = true;
 
@@ -8147,14 +8147,14 @@ bool test_public_projection_phase4_alternate_safe_basis_disables_projection()
     launch_config.initial_grid_size = {2, 16};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 alternate safe-basis session starts");
+        "alternate safe-basis session starts");
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1049hALT")),
-        "Phase 4 alternate safe-basis publishes alternate content before hold");
+        "alternate safe-basis publishes alternate content before hold");
     const std::optional<term::Terminal_render_snapshot> alternate_safe =
         session->latest_content_render_snapshot_for_testing();
     ok &= check(alternate_safe.has_value() &&
         alternate_safe->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE,
-        "Phase 4 alternate safe-basis fixture starts from alternate live content");
+        "alternate safe-basis fixture starts from alternate live content");
     if (!alternate_safe.has_value()) {
         return ok;
     }
@@ -8162,7 +8162,7 @@ bool test_public_projection_phase4_alternate_safe_basis_disables_projection()
     const std::uint64_t generation_before_hold =
         session->render_snapshot_generation();
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hhidden-alt")),
-        "Phase 4 alternate safe-basis enters synchronized-output hold");
+        "alternate safe-basis enters synchronized-output hold");
     const std::optional<term::Terminal_public_release_intent> held_intent =
         session->public_release_intent_for_testing();
     ok &= check(!session->public_projection_for_testing().has_value() &&
@@ -8170,7 +8170,7 @@ bool test_public_projection_phase4_alternate_safe_basis_disables_projection()
         !held_intent->public_projection_valid &&
         held_intent->public_projection_disable_reason ==
             term::Terminal_public_projection_disable_reason::UNSUPPORTED_BUFFER,
-        "Phase 4 alternate safe-basis records unsupported-buffer release intent without usable projection");
+        "alternate safe-basis records unsupported-buffer release intent without usable projection");
 
     const term::Terminal_viewport_scroll_result scroll_result =
         session->scroll_viewport_lines_from_published_state(
@@ -8187,7 +8187,7 @@ bool test_public_projection_phase4_alternate_safe_basis_disables_projection()
         after_scroll->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         !(after_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
             after_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL),
-        "Phase 4 alternate safe-basis emits no public scroll snapshot while held");
+        "alternate safe-basis emits no public scroll snapshot while held");
     ok &= check(after_scroll_intent.has_value() &&
         !after_scroll_intent->public_projection_valid &&
         !after_scroll_intent->deferred_intent_recorded &&
@@ -8195,10 +8195,10 @@ bool test_public_projection_phase4_alternate_safe_basis_disables_projection()
             term::Terminal_public_projection_disable_reason::UNSUPPORTED_BUFFER &&
         after_scroll_intent->diagnostic_reason ==
             term::Terminal_public_scroll_diagnostic_reason::NONE,
-        "Phase 4 alternate safe-basis preserves unsupported release intent after attempted scroll");
+        "alternate safe-basis preserves unsupported release intent after attempted scroll");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 alternate safe-basis releases synchronized output");
+        "alternate safe-basis releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -8212,12 +8212,12 @@ bool test_public_projection_phase4_alternate_safe_basis_disables_projection()
             term::Terminal_release_reconciliation_result::STICKY_TAIL &&
         !session->public_projection_for_testing().has_value() &&
         !session->public_release_intent_for_testing().has_value(),
-        "Phase 4 alternate safe-basis release keeps unsupported-buffer diagnostic and clears lifecycle");
+        "alternate safe-basis release keeps unsupported-buffer diagnostic and clears lifecycle");
 
     return ok;
 }
 
-bool test_public_projection_phase4_default_text_area_scroll_remains_deferred()
+bool test_public_projection_default_text_area_scroll_remains_deferred()
 {
     bool ok = true;
 
@@ -8230,23 +8230,23 @@ bool test_public_projection_phase4_default_text_area_scroll_remains_deferred()
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 4 default deferred text-area scroll session starts");
+        "default deferred text-area scroll session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("row-0\r\nrow-1\r\nrow-2\r\nrow-3")),
-        "Phase 4 default deferred text-area scroll publishes base rows");
+        "default deferred text-area scroll publishes base rows");
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_render_snapshot();
     const std::uint64_t generation_before_hold =
         session->render_snapshot_generation();
     ok &= check(safe_content.has_value(),
-        "Phase 4 default deferred text-area scroll has safe content snapshot");
+        "default deferred text-area scroll has safe content snapshot");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(
             QByteArrayLiteral("\x1b[?2026h\r\nhidden-live\r\ntail")),
-        "Phase 4 default deferred text-area scroll enters synchronized-output hold");
+        "default deferred text-area scroll enters synchronized-output hold");
     const term::Terminal_viewport_scroll_result scroll_result =
         session->scroll_viewport_lines_from_published_state(
             1,
@@ -8254,17 +8254,17 @@ bool test_public_projection_phase4_default_text_area_scroll_remains_deferred()
     const std::optional<term::Terminal_render_snapshot> after_scroll =
         session->latest_render_snapshot();
     ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "Phase 4 default deferred text-area scroll still records internal local movement");
+        "default deferred text-area scroll still records internal local movement");
     ok &= check(session->render_snapshot_generation() == generation_before_hold &&
         after_scroll.has_value() &&
         after_scroll->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         after_scroll->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         !snapshot_contains_text(*after_scroll, QStringLiteral("hidden-live")) &&
         !session->public_projection_for_testing().has_value(),
-        "Phase 4 default deferred text-area scroll leaves visible publication deferred");
+        "default deferred text-area scroll leaves visible publication deferred");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 4 default deferred text-area scroll releases synchronized output");
+        "default deferred text-area scroll releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -8273,12 +8273,12 @@ bool test_public_projection_phase4_default_text_area_scroll_remains_deferred()
         release->viewport.offset_from_tail == 1 &&
         snapshot_contains_text(*release, QStringLiteral("hidden-live")) &&
         session->render_snapshot_generation() == generation_before_hold + 1U,
-        "Phase 4 default deferred release publishes the deferred internal scroll and hidden content");
+        "default deferred release publishes the deferred internal scroll and hidden content");
 
     return ok;
 }
 
-bool test_public_projection_phase1_default_deferred_path_is_runtime_inert()
+bool test_public_projection_default_deferred_path_is_runtime_inert()
 {
     bool ok = true;
 
@@ -8291,10 +8291,10 @@ bool test_public_projection_phase1_default_deferred_path_is_runtime_inert()
     launch_config.initial_grid_size = {3, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "Phase 1 deferred-inert session starts");
+        "deferred-inert session starts");
     ok &= check(backend->emit_output(
         QByteArrayLiteral("base-0\r\nbase-1\r\nbase-2\r\nbase-3")),
-        "Phase 1 deferred-inert backend publishes public base rows");
+        "deferred-inert backend publishes public base rows");
     const std::uint64_t public_generation = session->render_snapshot_generation();
 
     const std::optional<term::Terminal_render_snapshot> public_snapshot =
@@ -8302,18 +8302,18 @@ bool test_public_projection_phase1_default_deferred_path_is_runtime_inert()
     ok &= check(public_snapshot.has_value() &&
         public_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         public_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT,
-        "Phase 1 deferred-inert starts from a live content snapshot");
+        "deferred-inert starts from a live content snapshot");
 
     ok &= check(backend->emit_output(
         QByteArrayLiteral("\x1b[?2026hhidden-deferred")),
-        "Phase 1 deferred-inert backend enters synchronized-output hold");
+        "deferred-inert backend enters synchronized-output hold");
     const term::Terminal_viewport_scroll_result scroll_result =
         session->scroll_published_viewport_lines(1);
     ok &= check(scroll_result.action == term::Terminal_viewport_scroll_action::AT_BOUNDARY &&
         scroll_result.applied_line_delta == 0,
-        "Phase 1 default deferred path refuses public scroll while publication is blocked");
+        "default deferred path refuses public scroll while publication is blocked");
     ok &= check(session->render_snapshot_generation() == public_generation,
-        "Phase 1 default deferred path leaves snapshot generation unchanged");
+        "default deferred path leaves snapshot generation unchanged");
 
     const std::optional<term::Terminal_render_snapshot> held_snapshot =
         session->latest_render_snapshot();
@@ -8321,16 +8321,16 @@ bool test_public_projection_phase1_default_deferred_path_is_runtime_inert()
         held_snapshot->basis == term::Terminal_render_snapshot_basis::LIVE_CONTENT &&
         held_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         !snapshot_contains_text(*held_snapshot, QStringLiteral("hidden-deferred")),
-        "Phase 1 default deferred path emits no public-projection scroll snapshot");
+        "default deferred path emits no public-projection scroll snapshot");
     ok &= check(!session->public_projection_for_testing().has_value(),
-        "Phase 1 default deferred path creates no public projection");
+        "default deferred path creates no public projection");
     ok &= check(!session->public_release_intent_for_testing().has_value(),
-        "Phase 2 default deferred path creates no public release intent");
+        "default deferred path creates no public release intent");
     ok &= check(!session->capture_public_projection_for_testing().has_value(),
-        "Phase 1 projection helper remains inert during default deferred hold");
+        "projection helper remains inert during default deferred hold");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "Phase 1 deferred-inert backend releases synchronized output");
+        "deferred-inert backend releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> released_snapshot =
         session->latest_render_snapshot();
     ok &= check(released_snapshot.has_value() &&
@@ -8338,7 +8338,7 @@ bool test_public_projection_phase1_default_deferred_path_is_runtime_inert()
         released_snapshot->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         snapshot_contains_text(*released_snapshot, QStringLiteral("hidden")) &&
         session->render_snapshot_generation() == public_generation + 1U,
-        "Phase 1 default deferred release publishes normal live content without projection state");
+        "default deferred release publishes normal live content without projection state");
 
     return ok;
 }
@@ -9584,7 +9584,7 @@ bool test_viewport_scroll_public_session_path()
         live_limit_snapshot->viewport.scrollback_rows == 2 &&
         live_limit_snapshot->viewport.offset_from_tail == 2 &&
         live_limit_session->render_snapshot_generation() == live_limit_generation + 1U,
-        "Phase 9 live scrollback-limit shrink preserves the detached viewport at the new top");
+        "live scrollback-limit shrink preserves the detached viewport at the new top");
 
     return ok;
 }
@@ -13770,7 +13770,7 @@ bool test_metrics_driven_resize_interleaves_with_output()
     return ok;
 }
 
-bool flat_ring_phase0_snapshot_has_hyperlink_uri(
+bool flat_ring_snapshot_has_hyperlink_uri(
     const term::Terminal_render_snapshot& snapshot,
     const QByteArray&                     uri)
 {
@@ -13782,7 +13782,7 @@ bool flat_ring_phase0_snapshot_has_hyperlink_uri(
         });
 }
 
-bool flat_ring_phase0_projection_has_hyperlink_uri(
+bool flat_ring_projection_has_hyperlink_uri(
     const term::Terminal_public_projection& projection,
     const QByteArray&                       uri)
 {
@@ -13794,12 +13794,12 @@ bool flat_ring_phase0_projection_has_hyperlink_uri(
         });
 }
 
-bool test_flat_ring_phase0_retained_history_contract_baseline()
+bool test_flat_ring_retained_history_contract_baseline()
 {
     bool ok = true;
 
     const QByteArray retained_uri =
-        QByteArrayLiteral("https://phase0.varinomics.example/retained-link");
+        QByteArrayLiteral("https://retained.varinomics.example/retained-link");
 
     std::unique_ptr<Scripted_backend> backend_owner = std::make_unique<Scripted_backend>();
     Scripted_backend* backend                       = backend_owner.get();
@@ -13808,26 +13808,26 @@ bool test_flat_ring_phase0_retained_history_contract_baseline()
     term::Terminal_launch_config launch = valid_launch_config();
     launch.initial_grid_size = {4, 12};
     ok &= check(session.start(launch).code == term::Terminal_session_result_code::ACCEPTED,
-        "flat-ring Phase 0 retained-history baseline session starts");
+        "flat-ring retained-history baseline session starts");
 
     QByteArray output;
-    output += QByteArrayLiteral("\x1b]8;id=phase0;");
+    output += QByteArrayLiteral("\x1b]8;id=retained;");
     output += retained_uri;
     output += QByteArrayLiteral("\x1b\\LINK\x1b]8;;\x1b\\\r\nROW2\r\nROW3\r\nROW4\r\nTAIL");
     ok &= check(backend->emit_output(output),
-        "flat-ring Phase 0 scrollout fixture is accepted");
+        "flat-ring scrollout fixture is accepted");
 
     const std::optional<term::Terminal_render_snapshot> tail_snapshot =
         session.latest_render_snapshot();
     ok &= check(tail_snapshot.has_value() &&
         tail_snapshot->viewport.scrollback_rows == 1 &&
         snapshot_row_text(*tail_snapshot, 0) == QStringLiteral("ROW2"),
-        "flat-ring Phase 0 scrollout baseline appends one retained row at tail");
+        "flat-ring scrollout baseline appends one retained row at tail");
 
     const term::Terminal_viewport_scroll_result retained_scroll =
         session.scroll_published_viewport_to_offset_from_tail(1);
     ok &= check(retained_scroll.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "flat-ring Phase 0 retained-row viewport scroll detaches from tail");
+        "flat-ring retained-row viewport scroll detaches from tail");
 
     const std::optional<term::Terminal_render_snapshot> retained_snapshot =
         session.latest_render_snapshot();
@@ -13842,10 +13842,10 @@ bool test_flat_ring_phase0_retained_history_contract_baseline()
     ok &= check(retained_snapshot.has_value() &&
         snapshot_row_text(*retained_snapshot, 0) == QStringLiteral("LINK") &&
         retained_snapshot_has_first_provenance,
-        "flat-ring Phase 0 scrollout baseline exposes retained row provenance");
+        "flat-ring scrollout baseline exposes retained row provenance");
     ok &= check(retained_snapshot.has_value() &&
-        flat_ring_phase0_snapshot_has_hyperlink_uri(*retained_snapshot, retained_uri),
-        "flat-ring Phase 0 retained hyperlink baseline materializes from retained history");
+        flat_ring_snapshot_has_hyperlink_uri(*retained_snapshot, retained_uri),
+        "flat-ring retained hyperlink baseline materializes from retained history");
 
     session.set_selection_range({{0, 0}, {0, 4}, term::Terminal_selection_mode::NORMAL});
     const term::Terminal_selection_result retained_selection = session.selected_text();
@@ -13853,7 +13853,7 @@ bool test_flat_ring_phase0_retained_history_contract_baseline()
         session.selection_visual_lease();
     ok &= check(retained_selection.code == term::Terminal_selection_result_code::OK &&
         retained_selection.text == QStringLiteral("LINK"),
-        "flat-ring Phase 0 selection baseline extracts retained row payload");
+        "flat-ring selection baseline extracts retained row payload");
     ok &= check(retained_selection_lease.has_value() &&
         retained_selection_lease->anchor_domain ==
             term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
@@ -13862,28 +13862,28 @@ bool test_flat_ring_phase0_retained_history_contract_baseline()
             term::terminal_history_handle_from_retained_identity(
                 retained_row_provenance.retained_line_id,
                 retained_row_provenance.content_generation),
-        "flat-ring Phase 0 selection baseline records retained-row lease handle");
+        "flat-ring selection baseline records retained-row lease handle");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\r\nNEXT")),
-        "flat-ring Phase 0 detached viewport append fixture is accepted");
+        "flat-ring detached viewport append fixture is accepted");
     const std::optional<term::Terminal_render_snapshot> after_append_snapshot =
         session.latest_render_snapshot();
     ok &= check(after_append_snapshot.has_value() &&
         after_append_snapshot->viewport.scrollback_rows == 2 &&
         after_append_snapshot->viewport.offset_from_tail == 2 &&
         snapshot_row_text(*after_append_snapshot, 0) == QStringLiteral("LINK"),
-        "flat-ring Phase 0 viewport baseline keeps detached anchor stable across append");
+        "flat-ring viewport baseline keeps detached anchor stable across append");
 
     const term::Terminal_session_result resize_result =
         session.resize(QSizeF(160.0, 80.0), {4, 16});
     ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
-        "flat-ring Phase 0 resize baseline accepts retained-history resize");
+        "flat-ring resize baseline accepts retained-history resize");
     const std::optional<term::Terminal_render_snapshot> after_resize_snapshot =
         session.latest_render_snapshot();
     ok &= check(after_resize_snapshot.has_value() &&
         snapshot_row_text(*after_resize_snapshot, 0) == QStringLiteral("LINK") &&
-        flat_ring_phase0_snapshot_has_hyperlink_uri(*after_resize_snapshot, retained_uri),
-        "flat-ring Phase 0 resize baseline preserves retained text and hyperlink projection");
+        flat_ring_snapshot_has_hyperlink_uri(*after_resize_snapshot, retained_uri),
+        "flat-ring resize baseline preserves retained text and hyperlink projection");
 
     const std::optional<term::Terminal_public_projection> projection =
         session.capture_public_projection_for_testing();
@@ -13892,8 +13892,8 @@ bool test_flat_ring_phase0_retained_history_contract_baseline()
         !projection->rows().empty() &&
         projection->rows().front().provenance.retained_line_id ==
             retained_row_provenance.retained_line_id &&
-        flat_ring_phase0_projection_has_hyperlink_uri(*projection, retained_uri),
-        "flat-ring Phase 0 public projection baseline copies retained row identity and hyperlink metadata");
+        flat_ring_projection_has_hyperlink_uri(*projection, retained_uri),
+        "flat-ring public projection baseline copies retained row identity and hyperlink metadata");
 
     session.set_scrollback_limit(1);
     const std::optional<term::Terminal_render_snapshot> after_eviction_snapshot =
@@ -13901,30 +13901,30 @@ bool test_flat_ring_phase0_retained_history_contract_baseline()
     ok &= check(after_eviction_snapshot.has_value() &&
         after_eviction_snapshot->viewport.scrollback_rows == 1 &&
         after_eviction_snapshot->viewport.offset_from_tail <= 1,
-        "flat-ring Phase 0 eviction baseline clamps detached viewport to live retained bounds");
+        "flat-ring eviction baseline clamps detached viewport to live retained bounds");
     const term::Terminal_selection_result evicted_selection = session.selected_text();
     ok &= check(evicted_selection.code == term::Terminal_selection_result_code::OK &&
         evicted_selection.text == QStringLiteral("LINK") &&
         session.selection_anchor_domain() ==
             term::Terminal_selection_anchor_domain::PAYLOAD_ONLY,
-        "flat-ring Phase 0 selection baseline keeps payload after retained row eviction");
+        "flat-ring selection baseline keeps payload after retained row eviction");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[3J")),
-        "flat-ring Phase 0 clear-history fixture is accepted");
+        "flat-ring clear-history fixture is accepted");
     const std::optional<term::Terminal_render_snapshot> after_clear_snapshot =
         session.latest_render_snapshot();
     ok &= check(after_clear_snapshot.has_value() &&
         after_clear_snapshot->viewport.scrollback_rows == 0 &&
         after_clear_snapshot->viewport.offset_from_tail == 0,
-        "flat-ring Phase 0 clear baseline clears live retained history and clamps viewport");
+        "flat-ring clear baseline clears live retained history and clamps viewport");
     ok &= check(projection.has_value() &&
-        flat_ring_phase0_projection_has_hyperlink_uri(*projection, retained_uri),
-        "flat-ring Phase 0 copied public projection baseline survives live eviction and clear");
+        flat_ring_projection_has_hyperlink_uri(*projection, retained_uri),
+        "flat-ring copied public projection baseline survives live eviction and clear");
 
     return ok;
 }
 
-bool test_flat_ring_phase0_recovered_provenance_baseline()
+bool test_flat_ring_recovered_provenance_baseline()
 {
     bool ok = true;
 
@@ -13937,7 +13937,7 @@ bool test_flat_ring_phase0_recovered_provenance_baseline()
         model.ingest(QByteArrayLiteral("ROW1\r\nROW2\r\nROW3\r\nROW4"));
     ok &= check(model.scrollback_size() == 0 &&
         initial_result.recovery_proposals.empty(),
-        "flat-ring Phase 0 recovery baseline starts without recovered history");
+        "flat-ring recovery baseline starts without recovered history");
 
     const term::Terminal_screen_model_result recovery_result =
         model.ingest(QByteArrayLiteral("\x1b[?25l\x1b[HROW2\r\nROW3\r\nROW4\r\nROW5\x1b[?25h"));
@@ -13947,16 +13947,16 @@ bool test_flat_ring_phase0_recovered_provenance_baseline()
         recovery_result.recovery_proposals.front().provenance_source ==
             term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT &&
         recovery_result.recovery_proposals.front().recovered_row_count == 1,
-        "flat-ring Phase 0 recovery baseline records accepted recovered provenance");
+        "flat-ring recovery baseline records accepted recovered provenance");
     ok &= check(model.scrollback_size() == 1,
-        "flat-ring Phase 0 recovery baseline appends recovered row to retained history");
+        "flat-ring recovery baseline appends recovered row to retained history");
 
     const term::Terminal_retained_line_provenance recovered_provenance =
         model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
     ok &= check(recovered_provenance.retained_line_id != 0U &&
         recovered_provenance.source ==
             term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
-        "flat-ring Phase 0 recovery baseline stores recovered provenance on retained row");
+        "flat-ring recovery baseline stores recovered provenance on retained row");
 
     const term::Terminal_retained_line_lookup_result recovered_lookup =
         model.retained_line_lookup(
@@ -13967,12 +13967,12 @@ bool test_flat_ring_phase0_recovered_provenance_baseline()
     ok &= check(recovered_lookup.exact_match &&
         recovered_lookup.resolution_status == term::Terminal_history_resolution_status::OK &&
         recovered_lookup.exact_logical_row == 0,
-        "flat-ring Phase 0 recovered provenance resolves through retained lookup seam");
+        "flat-ring recovered provenance resolves through retained lookup seam");
 
     return ok;
 }
 
-bool test_flat_ring_phase1_history_handle_resolution_statuses()
+bool test_flat_ring_history_handle_resolution_statuses()
 {
     bool ok = true;
 
@@ -13983,7 +13983,7 @@ bool test_flat_ring_phase1_history_handle_resolution_statuses()
     term::Terminal_screen_model model(config);
     model.ingest(QByteArrayLiteral("ROW1\r\nROW2\r\nROW3\r\nROW4"));
     ok &= check(model.scrollback_size() == 1,
-        "flat-ring Phase 1 handle fixture creates retained history");
+        "flat-ring handle fixture creates retained history");
 
     const term::Terminal_retained_line_provenance provenance =
         model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
@@ -13997,7 +13997,7 @@ bool test_flat_ring_phase1_history_handle_resolution_statuses()
     ok &= check(exact_lookup.resolution_status == term::Terminal_history_resolution_status::OK &&
         exact_lookup.exact_match &&
         exact_lookup.exact_logical_row == 0,
-        "flat-ring Phase 1 exact retained-history handle resolves");
+        "flat-ring exact retained-history handle resolves");
 
     term::terminal_history_handle_t generation_mismatch = handle;
     ++generation_mismatch.content_generation;
@@ -14008,7 +14008,7 @@ bool test_flat_ring_phase1_history_handle_resolution_statuses()
         generation_lookup.retained_line_id_found &&
         generation_lookup.retained_line_content_generation_mismatch &&
         !generation_lookup.exact_match,
-        "flat-ring Phase 1 retained-history handle reports content generation mismatch");
+        "flat-ring retained-history handle reports content generation mismatch");
 
     term::terminal_history_handle_t byte_mismatch = handle;
     ++byte_mismatch.byte_sequence;
@@ -14018,7 +14018,7 @@ bool test_flat_ring_phase1_history_handle_resolution_statuses()
             term::Terminal_history_resolution_status::STALE_BYTE_SEQUENCE &&
         byte_lookup.retained_line_id_found &&
         !byte_lookup.exact_match,
-        "flat-ring Phase 1 retained-history handle reports byte sequence mismatch");
+        "flat-ring retained-history handle reports byte sequence mismatch");
 
     term::terminal_history_handle_t record_mismatch = handle;
     record_mismatch.record_bytes = 1U;
@@ -14028,7 +14028,7 @@ bool test_flat_ring_phase1_history_handle_resolution_statuses()
             term::Terminal_history_resolution_status::RECORD_SIZE_MISMATCH &&
         record_lookup.retained_line_id_found &&
         !record_lookup.exact_match,
-        "flat-ring Phase 1 retained-history handle reports record size mismatch");
+        "flat-ring retained-history handle reports record size mismatch");
 
     term::terminal_history_handle_t epoch_mismatch = handle;
     ++epoch_mismatch.epoch;
@@ -14038,7 +14038,7 @@ bool test_flat_ring_phase1_history_handle_resolution_statuses()
             term::Terminal_history_resolution_status::STALE_EPOCH &&
         !epoch_lookup.retained_line_id_found &&
         !epoch_lookup.exact_match,
-        "flat-ring Phase 1 retained-history handle reports epoch mismatch");
+        "flat-ring retained-history handle reports epoch mismatch");
 
     const term::Terminal_retained_line_lookup_result invalid_lookup =
         model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, {});
@@ -14046,7 +14046,7 @@ bool test_flat_ring_phase1_history_handle_resolution_statuses()
             term::Terminal_history_resolution_status::INVALID_HANDLE &&
         !invalid_lookup.retained_line_id_found &&
         !invalid_lookup.exact_match,
-        "flat-ring Phase 1 retained-history handle rejects an empty handle");
+        "flat-ring retained-history handle rejects an empty handle");
 
     model.set_scrollback_limit(0);
     const term::Terminal_retained_line_lookup_result stale_lookup =
@@ -14055,12 +14055,12 @@ bool test_flat_ring_phase1_history_handle_resolution_statuses()
             term::Terminal_history_resolution_status::STALE_ROW_SEQUENCE &&
         !stale_lookup.retained_line_id_found &&
         !stale_lookup.exact_match,
-        "flat-ring Phase 1 retained-history handle reports evicted row sequence stale");
+        "flat-ring retained-history handle reports evicted row sequence stale");
 
     return ok;
 }
 
-bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
+bool test_flat_ring_retained_lookup_cache_rebuild_and_validation()
 {
     bool ok = true;
 
@@ -14071,7 +14071,7 @@ bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
     term::Terminal_screen_model model(config);
     model.ingest(numbered_scroll_lines(8));
     ok &= check(model.scrollback_size() >= 3,
-        "flat-ring Phase 5C lookup-cache fixture creates retained rows");
+        "flat-ring lookup-cache fixture creates retained rows");
     if (model.scrollback_size() < 3) {
         return ok;
     }
@@ -14096,7 +14096,7 @@ bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
         exact_lookup.exact_match &&
         exact_lookup.exact_logical_row == 1 &&
         exact_lookup.retained_line_id_match_count == 1,
-        "flat-ring Phase 5C exact retained-line lookup resolves from cache");
+        "flat-ring exact retained-line lookup resolves from cache");
 
     const std::optional<term::terminal_history_handle_t> ordinal_handle =
         model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, 1);
@@ -14105,7 +14105,7 @@ bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
             ordinal_handle->content_generation == middle_handle.content_generation &&
             ordinal_handle->record_bytes >
                 term::k_terminal_history_retained_identity_record_bytes,
-        "flat-ring Phase 6B ordinal lookup resolves to an authoritative ring handle");
+        "flat-ring ordinal lookup resolves to an authoritative ring handle");
 
     term::terminal_history_handle_t generation_mismatch = middle_handle;
     ++generation_mismatch.content_generation;
@@ -14118,7 +14118,7 @@ bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
         generation_lookup.retained_line_id_found &&
         generation_lookup.retained_line_content_generation_mismatch &&
         !generation_lookup.exact_match,
-        "flat-ring Phase 5C cache hit validates retained-line generation mismatch");
+        "flat-ring cache hit validates retained-line generation mismatch");
 
     model.discard_retained_lookup_cache_for_testing();
     const term::Terminal_retained_line_lookup_result rebuilt_lookup =
@@ -14132,7 +14132,7 @@ bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
         rebuilt_ordinal_handle->content_generation == middle_handle.content_generation &&
         rebuilt_ordinal_handle->record_bytes >
             term::k_terminal_history_retained_identity_record_bytes,
-        "flat-ring Phase 5C dropped lookup caches rebuild without losing retained rows");
+        "flat-ring dropped lookup caches rebuild without losing retained rows");
     const int scrollback_before_evict = model.scrollback_size();
     model.set_scrollback_limit(scrollback_before_evict - 1);
     const term::Terminal_retained_line_lookup_result stale_first_lookup =
@@ -14143,7 +14143,7 @@ bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
         !stale_first_lookup.exact_match &&
         stale_first_lookup.nearest_successor &&
         stale_first_lookup.nearest_successor_logical_row == 0,
-        "flat-ring Phase 5C stale retained handle reconciles to nearest successor");
+        "flat-ring stale retained handle reconciles to nearest successor");
 
     const int latest_logical_row =
         model.scrollback_size() + config.grid_size.rows - 1;
@@ -14152,7 +14152,7 @@ bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
             term::Terminal_buffer_id::PRIMARY,
             latest_logical_row);
     ok &= check(latest_handle.has_value(),
-        "flat-ring Phase 5C predecessor fixture captures latest live handle");
+        "flat-ring predecessor fixture captures latest live handle");
     if (latest_handle.has_value()) {
         term::terminal_history_handle_t future_handle = *latest_handle;
         future_handle.byte_sequence += 100U;
@@ -14166,13 +14166,13 @@ bool test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation()
             !future_lookup.exact_match &&
             future_lookup.nearest_predecessor &&
             future_lookup.nearest_predecessor_logical_row == latest_logical_row,
-            "flat-ring Phase 5C missing retained handle reconciles to nearest predecessor");
+            "flat-ring missing retained handle reconciles to nearest predecessor");
     }
 
     return ok;
 }
 
-bool test_flat_ring_phase2a_selection_handle_resolution_policy()
+bool test_flat_ring_selection_handle_resolution_policy()
 {
     bool ok = true;
 
@@ -14182,9 +14182,9 @@ bool test_flat_ring_phase2a_selection_handle_resolution_policy()
     launch_config.initial_grid_size = {4, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "flat-ring Phase 2A selection-handle session starts");
+        "flat-ring selection-handle session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(10)),
-        "flat-ring Phase 2A fixture creates retained scrollback");
+        "flat-ring fixture creates retained scrollback");
 
     const std::optional<term::Terminal_render_snapshot> source_snapshot =
         session->latest_render_snapshot();
@@ -14193,7 +14193,7 @@ bool test_flat_ring_phase2a_selection_handle_resolution_policy()
     ok &= check(source_snapshot.has_value() &&
         source_snapshot->viewport.scrollback_rows > 1 &&
         source.has_value(),
-        "flat-ring Phase 2A fixture publishes a retained source with evictable rows");
+        "flat-ring fixture publishes a retained source with evictable rows");
 
     if (source_snapshot.has_value() && source.has_value()) {
         const int scrollback_before = source_snapshot->viewport.scrollback_rows;
@@ -14209,12 +14209,12 @@ bool test_flat_ring_phase2a_selection_handle_resolution_policy()
             session->selection_visual_lease();
         ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
             original_payload.text == QStringLiteral("scroll-line-000"),
-            "flat-ring Phase 2A selection extracts retained payload through handle proof");
+            "flat-ring selection extracts retained payload through handle proof");
         ok &= check(original_lease.has_value() &&
             original_lease->selected_lines.size() == 1U &&
             term::terminal_history_handle_has_identity(
                 original_lease->selected_lines.front().history_handle),
-            "flat-ring Phase 2A selection stores a retained history handle");
+            "flat-ring selection stores a retained history handle");
 
         session->set_scrollback_limit(scrollback_before - 1);
         const term::Terminal_selection_result stale_payload =
@@ -14226,16 +14226,16 @@ bool test_flat_ring_phase2a_selection_handle_resolution_policy()
             session->selection_anchor_domain() ==
                 term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
             !session->selection_visual_lease().has_value(),
-            "flat-ring Phase 2A stale retained handle preserves finalized payload only");
+            "flat-ring stale retained handle preserves finalized payload only");
         ok &= check(stale_snapshot.has_value() &&
             stale_snapshot->selection_spans.empty(),
-            "flat-ring Phase 2A stale retained handle emits no visual selection proof");
+            "flat-ring stale retained handle emits no visual selection proof");
     }
 
     return ok;
 }
 
-bool test_flat_ring_phase2b_viewport_handle_resolution_policy()
+bool test_flat_ring_viewport_handle_resolution_policy()
 {
     bool ok = true;
 
@@ -14245,30 +14245,30 @@ bool test_flat_ring_phase2b_viewport_handle_resolution_policy()
     launch_config.initial_grid_size = {4, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "flat-ring Phase 2B viewport-handle session starts");
+        "flat-ring viewport-handle session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(10)),
-        "flat-ring Phase 2B fixture creates retained scrollback");
+        "flat-ring fixture creates retained scrollback");
 
     const std::optional<term::Terminal_render_snapshot> tail_snapshot =
         session->latest_render_snapshot();
     ok &= check(tail_snapshot.has_value() &&
         tail_snapshot->viewport.follow_tail &&
         tail_snapshot->viewport.offset_from_tail == 0,
-        "flat-ring Phase 2B tail-following starts unchanged");
+        "flat-ring tail-following starts unchanged");
 
-    ok &= check(backend->emit_output(QByteArrayLiteral("\r\nphase2b-tail")),
-        "flat-ring Phase 2B tail-follow append is accepted");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r\nviewport-tail")),
+        "flat-ring tail-follow append is accepted");
     const std::optional<term::Terminal_render_snapshot> followed_snapshot =
         session->latest_render_snapshot();
     ok &= check(followed_snapshot.has_value() &&
         followed_snapshot->viewport.follow_tail &&
         followed_snapshot->viewport.offset_from_tail == 0,
-        "flat-ring Phase 2B tail-following stays at tail after append");
+        "flat-ring tail-following stays at tail after append");
 
     if (!followed_snapshot.has_value() ||
         followed_snapshot->viewport.scrollback_rows <= 2)
     {
-        ok &= check(false, "flat-ring Phase 2B fixture has evictable retained rows");
+        ok &= check(false, "flat-ring fixture has evictable retained rows");
         return ok;
     }
 
@@ -14276,21 +14276,21 @@ bool test_flat_ring_phase2b_viewport_handle_resolution_policy()
         session->scroll_published_viewport_to_offset_from_tail(
             followed_snapshot->viewport.scrollback_rows);
     ok &= check(detach_result.action == term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "flat-ring Phase 2B viewport detaches to oldest retained row");
+        "flat-ring viewport detaches to oldest retained row");
     const std::optional<term::Terminal_render_snapshot> detached_snapshot =
         session->latest_render_snapshot();
     ok &= check(detached_snapshot.has_value() &&
         detached_snapshot->viewport.offset_from_tail ==
             detached_snapshot->viewport.scrollback_rows &&
         snapshot_row_text(*detached_snapshot, 0) == QStringLiteral("scroll-line-000"),
-        "flat-ring Phase 2B detached viewport captures retained top-row handle");
+        "flat-ring detached viewport captures retained top-row handle");
 
     const int scrollback_before_detached_append =
         detached_snapshot.has_value()
             ? detached_snapshot->viewport.scrollback_rows
             : 0;
-    ok &= check(backend->emit_output(QByteArrayLiteral("\r\nphase2b-detached")),
-        "flat-ring Phase 2B detached append is accepted");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r\nviewport-detached")),
+        "flat-ring detached append is accepted");
     const std::optional<term::Terminal_render_snapshot> after_append_snapshot =
         session->latest_render_snapshot();
     ok &= check(after_append_snapshot.has_value() &&
@@ -14298,23 +14298,23 @@ bool test_flat_ring_phase2b_viewport_handle_resolution_policy()
         after_append_snapshot->viewport.offset_from_tail ==
             after_append_snapshot->viewport.scrollback_rows &&
         snapshot_row_text(*after_append_snapshot, 0) == QStringLiteral("scroll-line-000"),
-        "flat-ring Phase 2B exact viewport handle preserves detached anchor across append");
+        "flat-ring exact viewport handle preserves detached anchor across append");
 
     ok &= check(session->resize(QSizeF(240.0, 80.0), {4, 24}).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "flat-ring Phase 2B resize is accepted");
+        "flat-ring resize is accepted");
     const std::optional<term::Terminal_render_snapshot> after_resize_snapshot =
         session->latest_render_snapshot();
     ok &= check(after_resize_snapshot.has_value() &&
         after_resize_snapshot->viewport.offset_from_tail ==
             after_resize_snapshot->viewport.scrollback_rows &&
         snapshot_row_text(*after_resize_snapshot, 0) == QStringLiteral("scroll-line-000"),
-        "flat-ring Phase 2B resize keeps detached viewport baseline without projection migration");
+        "flat-ring resize keeps detached viewport baseline without projection migration");
 
     if (!after_resize_snapshot.has_value() ||
         after_resize_snapshot->viewport.scrollback_rows <= 1)
     {
-        ok &= check(false, "flat-ring Phase 2B shrink fixture has evictable scrollback");
+        ok &= check(false, "flat-ring shrink fixture has evictable scrollback");
         return ok;
     }
 
@@ -14327,22 +14327,22 @@ bool test_flat_ring_phase2b_viewport_handle_resolution_policy()
         after_shrink_snapshot->viewport.offset_from_tail ==
             after_shrink_snapshot->viewport.scrollback_rows &&
         snapshot_row_text(*after_shrink_snapshot, 0) == QStringLiteral("scroll-line-001"),
-        "flat-ring Phase 2B stale viewport handle clamps to oldest live retained row");
+        "flat-ring stale viewport handle clamps to oldest live retained row");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[3J")),
-        "flat-ring Phase 2B clear-history fixture is accepted");
+        "flat-ring clear-history fixture is accepted");
     const std::optional<term::Terminal_render_snapshot> after_clear_snapshot =
         session->latest_render_snapshot();
     ok &= check(after_clear_snapshot.has_value() &&
         after_clear_snapshot->viewport.scrollback_rows == 0 &&
         after_clear_snapshot->viewport.offset_from_tail == 0 &&
         after_clear_snapshot->viewport.follow_tail,
-        "flat-ring Phase 2B clear clamps stale detached viewport to tail");
+        "flat-ring clear clamps stale detached viewport to tail");
 
     return ok;
 }
 
-bool test_flat_ring_phase2c_public_projection_handle_resolution_policy()
+bool test_flat_ring_public_projection_handle_resolution_policy()
 {
     bool ok = true;
 
@@ -14357,22 +14357,22 @@ bool test_flat_ring_phase2c_public_projection_handle_resolution_policy()
     launch_config.initial_grid_size = {4, 20};
     ok &= check(session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "flat-ring Phase 2C public projection handle session starts");
+        "flat-ring public projection handle session starts");
     ok &= check(backend->emit_output(numbered_scroll_lines(8)),
-        "flat-ring Phase 2C fixture creates public scrollback");
+        "flat-ring fixture creates public scrollback");
 
     const std::optional<term::Terminal_render_snapshot> safe_content =
         session->latest_content_render_snapshot_for_testing();
     ok &= check(safe_content.has_value() &&
         safe_content->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
         safe_content->viewport.scrollback_rows > 0,
-        "flat-ring Phase 2C fixture publishes a primary public basis");
+        "flat-ring fixture publishes a primary public basis");
     if (!safe_content.has_value()) {
         return ok;
     }
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026hheld-hidden")),
-        "flat-ring Phase 2C fixture enters synchronized-output hold");
+        "flat-ring fixture enters synchronized-output hold");
     const std::optional<term::Terminal_public_projection> projection =
         session->public_projection_for_testing();
     bool projection_rows_have_handles = projection.has_value() && !projection->rows().empty();
@@ -14384,7 +14384,7 @@ bool test_flat_ring_phase2c_public_projection_handle_resolution_policy()
         }
     }
     ok &= check(projection_rows_have_handles,
-        "flat-ring Phase 2C projection capture stores retained-history handles");
+        "flat-ring projection capture stores retained-history handles");
 
     const term::Terminal_viewport_scroll_result public_scroll_result =
         session->scroll_published_viewport_lines(1);
@@ -14398,15 +14398,15 @@ bool test_flat_ring_phase2c_public_projection_handle_resolution_policy()
         public_scroll->basis == term::Terminal_render_snapshot_basis::PUBLIC_PROJECTION &&
         public_scroll->purpose == term::Terminal_render_snapshot_purpose::SCROLL &&
         !snapshot_contains_text(*public_scroll, QStringLiteral("held-hidden")),
-        "flat-ring Phase 2C public scroll during hold uses copied projection payload only");
+        "flat-ring public scroll during hold uses copied projection payload only");
     ok &= check(release_intent.has_value() &&
         release_intent->detached_anchor.has_value() &&
         term::terminal_history_handle_has_identity(
             release_intent->detached_anchor->history_handle),
-        "flat-ring Phase 2C public release intent stores a retained-history anchor handle");
+        "flat-ring public release intent stores a retained-history anchor handle");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\r\nhidden-live-growth")),
-        "flat-ring Phase 2C fixture grows hidden live scrollback");
+        "flat-ring fixture grows hidden live scrollback");
     const std::optional<term::Terminal_render_snapshot> after_hidden_growth =
         session->latest_render_snapshot();
     ok &= check(after_hidden_growth.has_value() &&
@@ -14415,10 +14415,10 @@ bool test_flat_ring_phase2c_public_projection_handle_resolution_policy()
         after_hidden_growth->viewport.scrollback_rows == public_scroll->viewport.scrollback_rows &&
         after_hidden_growth->viewport.offset_from_tail == public_scroll->viewport.offset_from_tail &&
         !snapshot_contains_text(*after_hidden_growth, QStringLiteral("hidden-live-growth")),
-        "flat-ring Phase 2C hidden live growth stays isolated from the public projection");
+        "flat-ring hidden live growth stays isolated from the public projection");
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "flat-ring Phase 2C fixture releases synchronized output");
+        "flat-ring fixture releases synchronized output");
     const std::optional<term::Terminal_render_snapshot> release =
         session->latest_render_snapshot();
     ok &= check(release.has_value() &&
@@ -14426,7 +14426,7 @@ bool test_flat_ring_phase2c_public_projection_handle_resolution_policy()
         release->purpose == term::Terminal_render_snapshot_purpose::CONTENT &&
         release->public_scroll_diagnostics.release_reconciliation_result ==
             term::Terminal_release_reconciliation_result::EXACT_ANCHOR,
-        "flat-ring Phase 2C exact public anchor resolves by retained-history handle");
+        "flat-ring exact public anchor resolves by retained-history handle");
 
     term::Terminal_session_config stale_config = config;
     stale_config.scrollback_limit = 6;
@@ -14435,12 +14435,12 @@ bool test_flat_ring_phase2c_public_projection_handle_resolution_policy()
     Scripted_backend* stale_backend = make_session(stale_session, stale_config);
     ok &= check(stale_session->start(launch_config).code ==
         term::Terminal_session_result_code::ACCEPTED,
-        "flat-ring Phase 2C stale public anchor session starts");
+        "flat-ring stale public anchor session starts");
     ok &= check(stale_backend->emit_output(numbered_scroll_lines(12)),
-        "flat-ring Phase 2C stale fixture fills bounded scrollback");
+        "flat-ring stale fixture fills bounded scrollback");
     ok &= check(stale_session->scroll_published_viewport_to_offset_from_tail(5).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
-        "flat-ring Phase 2C stale fixture detaches public viewport");
+        "flat-ring stale fixture detaches public viewport");
     const std::optional<term::Terminal_render_snapshot> stale_anchor =
         stale_session->latest_render_snapshot();
     const QString expected_successor =
@@ -14449,18 +14449,18 @@ bool test_flat_ring_phase2c_public_projection_handle_resolution_policy()
             : QString{};
 
     ok &= check(stale_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
-        "flat-ring Phase 2C stale fixture enters synchronized-output hold");
+        "flat-ring stale fixture enters synchronized-output hold");
     const std::optional<term::Terminal_public_release_intent> stale_intent =
         stale_session->public_release_intent_for_testing();
     ok &= check(stale_intent.has_value() &&
         stale_intent->detached_anchor.has_value() &&
         term::terminal_history_handle_has_identity(
             stale_intent->detached_anchor->history_handle),
-        "flat-ring Phase 2C stale fixture stores a public anchor handle before eviction");
+        "flat-ring stale fixture stores a public anchor handle before eviction");
 
     ok &= check(stale_backend->emit_output(
-            QByteArrayLiteral("\r\nphase2c-new-a\r\nphase2c-new-b\x1b[?2026l")),
-        "flat-ring Phase 2C stale fixture evicts the public anchor and releases");
+            QByteArrayLiteral("\r\nprojection-new-a\r\nprojection-new-b\x1b[?2026l")),
+        "flat-ring stale fixture evicts the public anchor and releases");
     const std::optional<term::Terminal_render_snapshot> stale_release =
         stale_session->latest_render_snapshot();
     ok &= check(stale_release.has_value() &&
@@ -14470,7 +14470,7 @@ bool test_flat_ring_phase2c_public_projection_handle_resolution_policy()
             term::Terminal_public_scroll_diagnostic_reason::DETACHED_ANCHOR_NOT_RETAINED &&
         stale_release->public_scroll_diagnostics.release_reconciliation_result ==
             term::Terminal_release_reconciliation_result::NEAREST_SUCCESSOR,
-        "flat-ring Phase 2C stale public anchor reconciles to nearest surviving live row");
+        "flat-ring stale public anchor reconciles to nearest surviving live row");
 
     return ok;
 }
@@ -14653,13 +14653,13 @@ int main()
     ok &= test_selection_snapshot_and_visible_text();
     ok &= test_selection_snapshot_during_blocked_publication();
     ok &= test_blocked_detach_resize_snapshot_metadata_coherence();
-    ok &= test_selection_phase2_internal_state_and_lease();
-    ok &= test_selection_phase2_replacement_empty_cancel_and_payload_detach();
-    ok &= test_selection_phase2_model_semantic_flags();
-    ok &= test_selection_phase2_session_lease_basis_advances();
-    ok &= test_selection_phase3_line_lease_provenance_capture();
-    ok &= test_selection_phase3_line_lease_negative_source_paths();
-    ok &= test_selection_phase5_visual_lease_span_compatibility();
+    ok &= test_selection_internal_state_and_lease();
+    ok &= test_selection_replacement_empty_cancel_and_payload_detach();
+    ok &= test_selection_model_semantic_flags();
+    ok &= test_selection_session_lease_basis_advances();
+    ok &= test_selection_line_lease_provenance_capture();
+    ok &= test_selection_line_lease_negative_source_paths();
+    ok &= test_selection_visual_lease_span_compatibility();
     ok &= test_selection_spans_preserve_after_same_viewport_idempotent_selected_row_rewrite();
     ok &= test_selection_spans_preserve_during_scrollback_growth_with_retained_lines();
     ok &= test_selection_spans_detach_when_selected_row_mutates();
@@ -14667,48 +14667,48 @@ int main()
     ok &= test_selection_spans_preserve_after_unchanged_synchronized_output_release();
     ok &= test_selection_spans_detach_when_synchronized_release_mutates_selected_row();
     ok &= test_selection_spans_detach_when_synchronized_release_moves_retained_row();
-    ok &= test_selection_spans_fail_closed_at_phase4c_boundaries();
+    ok &= test_selection_spans_fail_closed_at_boundaries();
     ok &= test_selection_spans_detach_when_resize_invalidates_selected_columns();
-    ok &= test_selection_phase7c_anchor_domains_and_invalidation_events();
+    ok &= test_selection_anchor_domains_and_invalidation_events();
     ok &= test_selection_unicode_cluster_payloads();
     ok &= test_output_activity_notifications_are_session_level();
-    ok &= test_public_projection_phase1_copies_public_rows_and_metadata();
-    ok &= test_public_projection_phase1_copies_only_offset_viewport_window();
-    ok &= test_public_projection_phase1_storage_stays_viewport_bounded_after_scrollback_growth();
-    ok &= test_public_projection_phase1_tracks_active_buffer_epoch();
-    ok &= test_public_projection_phase1_copy_is_immutable_after_hidden_mutation();
-    ok &= test_public_projection_phase1_compacts_copied_metadata();
-    ok &= test_public_projection_phase2_controller_diagnostic_precedence();
-    ok &= test_public_projection_phase2_controller_mutates_copied_viewport_only();
-    ok &= test_public_projection_phase2_session_invalidates_phase1_off_viewport_scroll();
-    ok &= test_public_projection_phase2_resize_and_memory_invalidation();
-    ok &= test_public_projection_phase2_release_clears_hold_lifecycle();
-    ok &= test_public_projection_phase2_selection_mutation_is_ignored_during_hold();
-    ok &= test_public_projection_phase3_entry_and_release_boundaries();
-    ok &= test_public_projection_phase3_release_reconciliation();
-    ok &= test_public_projection_phase4_publishes_natural_full_row_scroll();
-    ok &= test_public_projection_phase4_natural_wrapped_capture_fragment_ordinals();
-    ok &= test_public_projection_phase4_wrapped_fragment_release_reconciles_fragment_index();
-    ok &= test_public_projection_phase4_viewport_only_fragment_release_avoids_false_exact();
-    ok &= test_public_projection_phase4_full_row_capture_batches_scrollback();
-    ok &= test_public_projection_phase4_deferred_to_immediate_policy_latch_next_hold();
-    ok &= test_public_projection_phase4_multi_scroll_accumulates_and_release_dirty_without_hidden_mutation();
+    ok &= test_public_projection_copies_public_rows_and_metadata();
+    ok &= test_public_projection_copies_only_offset_viewport_window();
+    ok &= test_public_projection_storage_stays_viewport_bounded_after_scrollback_growth();
+    ok &= test_public_projection_tracks_active_buffer_epoch();
+    ok &= test_public_projection_copy_is_immutable_after_hidden_mutation();
+    ok &= test_public_projection_compacts_copied_metadata();
+    ok &= test_public_projection_controller_diagnostic_precedence();
+    ok &= test_public_projection_controller_mutates_copied_viewport_only();
+    ok &= test_public_projection_session_invalidates_off_viewport_scroll();
+    ok &= test_public_projection_resize_and_memory_invalidation();
+    ok &= test_public_projection_release_clears_hold_lifecycle();
+    ok &= test_public_projection_selection_mutation_is_ignored_during_hold();
+    ok &= test_public_projection_entry_and_release_boundaries();
+    ok &= test_public_projection_release_reconciliation();
+    ok &= test_public_projection_publishes_natural_full_row_scroll();
+    ok &= test_public_projection_natural_wrapped_capture_fragment_ordinals();
+    ok &= test_public_projection_wrapped_fragment_release_reconciles_fragment_index();
+    ok &= test_public_projection_viewport_only_fragment_release_avoids_false_exact();
+    ok &= test_public_projection_full_row_capture_batches_scrollback();
+    ok &= test_public_projection_deferred_to_immediate_policy_latch_next_hold();
+    ok &= test_public_projection_multi_scroll_accumulates_and_release_dirty_without_hidden_mutation();
     ok &= test_selection_spans_live_public_prefix_viewport_offsets();
     ok &= test_selection_spans_remap_across_public_prefix_viewport_offsets();
     ok &= test_selection_spans_remap_public_prefix_small_grid_straddles_safe_basis_viewport();
     ok &= test_selection_clear_overrides_public_projection_safe_basis_spans();
-    ok &= test_public_projection_phase4_policy_latch_ignores_mid_hold_change();
-    ok &= test_public_projection_phase5_public_scroll_apis_and_deferred_intent();
-    ok &= test_public_projection_phase7b_scroll_bounds_ignore_hidden_live_growth();
-    ok &= test_public_projection_phase7b_default_hold_bounds_to_published_viewport();
-    ok &= test_public_projection_phase8_combined_hold_scroll_and_release();
-    ok &= test_public_projection_phase8_public_scroll_uses_safe_projection_fields();
-    ok &= test_public_projection_phase4_installed_projection_seam_publishes_scroll();
-    ok &= test_public_projection_phase4_failed_scroll_publication_rolls_back();
-    ok &= test_public_projection_phase4_installed_projection_seam_off_copied_scroll_stays_deferred();
-    ok &= test_public_projection_phase4_alternate_safe_basis_disables_projection();
-    ok &= test_public_projection_phase4_default_text_area_scroll_remains_deferred();
-    ok &= test_public_projection_phase1_default_deferred_path_is_runtime_inert();
+    ok &= test_public_projection_policy_latch_ignores_mid_hold_change();
+    ok &= test_public_projection_public_scroll_apis_and_deferred_intent();
+    ok &= test_public_projection_scroll_bounds_ignore_hidden_live_growth();
+    ok &= test_public_projection_default_hold_bounds_to_published_viewport();
+    ok &= test_public_projection_combined_hold_scroll_and_release();
+    ok &= test_public_projection_public_scroll_uses_safe_projection_fields();
+    ok &= test_public_projection_installed_projection_seam_publishes_scroll();
+    ok &= test_public_projection_failed_scroll_publication_rolls_back();
+    ok &= test_public_projection_installed_projection_seam_off_copied_scroll_stays_deferred();
+    ok &= test_public_projection_alternate_safe_basis_disables_projection();
+    ok &= test_public_projection_default_text_area_scroll_remains_deferred();
+    ok &= test_public_projection_default_deferred_path_is_runtime_inert();
     ok &= test_primary_crlf_blank_rows_are_retained_in_scrollback();
     ok &= test_codex_synchronized_el_blank_row_is_retained_after_release();
     ok &= test_codex_unsynchronized_el_blank_row_is_retained_after_publication();
@@ -14724,13 +14724,13 @@ int main()
     ok &= test_cursor_home_line_repaint_does_not_synthesize_primary_scrollback();
     ok &= test_cursor_home_blank_row_partial_repaint_does_not_synthesize_primary_scrollback();
     ok &= test_primary_repaint_recovery_toggle_propagates_to_model();
-    ok &= test_flat_ring_phase0_retained_history_contract_baseline();
-    ok &= test_flat_ring_phase0_recovered_provenance_baseline();
-    ok &= test_flat_ring_phase1_history_handle_resolution_statuses();
-    ok &= test_flat_ring_phase5c_retained_lookup_cache_rebuild_and_validation();
-    ok &= test_flat_ring_phase2a_selection_handle_resolution_policy();
-    ok &= test_flat_ring_phase2b_viewport_handle_resolution_policy();
-    ok &= test_flat_ring_phase2c_public_projection_handle_resolution_policy();
+    ok &= test_flat_ring_retained_history_contract_baseline();
+    ok &= test_flat_ring_recovered_provenance_baseline();
+    ok &= test_flat_ring_history_handle_resolution_statuses();
+    ok &= test_flat_ring_retained_lookup_cache_rebuild_and_validation();
+    ok &= test_flat_ring_selection_handle_resolution_policy();
+    ok &= test_flat_ring_viewport_handle_resolution_policy();
+    ok &= test_flat_ring_public_projection_handle_resolution_policy();
     ok &= test_parser_notifications_reach_session_notifications();
     ok &= test_bell_policy_coalesces_with_deterministic_clock();
     ok &= test_parser_state_crosses_backend_output_chunks();

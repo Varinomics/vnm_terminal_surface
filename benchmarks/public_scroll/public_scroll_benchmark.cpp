@@ -44,7 +44,7 @@ constexpr int k_default_scrollback_limit = 10000;
 constexpr int k_default_wheel_events     = 240;
 constexpr int k_schema_version           = 1;
 constexpr const char* k_hidden_text_marker = "HIDDEN";
-constexpr const char* k_hidden_hyperlink_uri_marker = "phase7.hidden.invalid";
+constexpr const char* k_hidden_hyperlink_uri_marker = "public-scroll.hidden.invalid";
 constexpr const char* k_expected_release_reconciliation_result = "exact_anchor";
 constexpr const char* k_expected_release_snapshot_basis        = "LIVE_CONTENT";
 constexpr const char* k_expected_release_snapshot_purpose      = "CONTENT";
@@ -236,7 +236,7 @@ QString command_line_from_arguments(const QStringList& arguments)
 void print_usage()
 {
     std::cout
-        << "usage: vnm_terminal_phase7_public_scroll_benchmark [options]\n"
+        << "usage: vnm_terminal_public_scroll_benchmark [options]\n"
         << "  --iterations <n>          measured attempts, default 7\n"
         << "  --warmup <n>              unreported warmup attempts, default 2\n"
         << "  --scrollback-limit <n>    public scrollback rows, default 10000\n"
@@ -474,7 +474,7 @@ qint64 elapsed_nanoseconds(steady_clock_t::time_point start, steady_clock_t::tim
 term::Terminal_launch_config launch_config_for_options(const App_options& options)
 {
     term::Terminal_launch_config config;
-    config.argv              = {QStringLiteral("phase7-benchmark-fixture")};
+    config.argv              = {QStringLiteral("public-scroll-benchmark-fixture")};
     config.working_directory = QStringLiteral("C:/workspace");
     config.initial_grid_size = term::terminal_grid_size_t{options.rows, options.columns};
     return config;
@@ -515,7 +515,7 @@ QByteArray make_public_seed_output(const App_options& options)
     }
     output += QByteArrayLiteral(
         "\x1b[38;2;34;168;96m"
-        "\x1b]8;id=phase7-safe;https://phase7.safe.invalid/public\x1b\\");
+        "\x1b]8;id=public-scroll-safe;https://public-scroll.safe.invalid/public\x1b\\");
     output += padded_line(QStringLiteral("public-safe-style-link "), options.columns);
     output += QByteArrayLiteral(
         "\x1b]8;;\x1b\\"
@@ -550,7 +550,7 @@ QByteArray make_hidden_hold_output(const App_options& options)
         "\x1b[?1007h"
         "\x1b[?2004h"
         "\x1b[1;4;38;2;240;32;80;48;2;8;16;24m"
-        "\x1b]8;id=phase7-hidden;https://phase7.hidden.invalid/hold\x1b\\");
+        "\x1b]8;id=public-scroll-hidden;https://public-scroll.hidden.invalid/hold\x1b\\");
     const int line_count = options.rows * 4;
     for (int row = 0; row < line_count; ++row) {
         output += padded_line(
@@ -1302,7 +1302,7 @@ QJsonObject make_root_json(
     root.insert(QStringLiteral("schema_version"), k_schema_version);
     root.insert(
         QStringLiteral("benchmark"),
-        QStringLiteral("vnm_terminal_phase7_public_scroll_benchmark"));
+        QStringLiteral("vnm_terminal_public_scroll_benchmark"));
     root.insert(
         QStringLiteral("status"),
         ok && warmup_ok ? QStringLiteral("ok") : QStringLiteral("failed"));
@@ -1337,7 +1337,7 @@ bool validate_json_output(const QByteArray& json, const App_options& options, QS
     const QJsonObject root = document.object();
     if (root.value(QStringLiteral("schema_version")).toInt() != k_schema_version ||
         root.value(QStringLiteral("benchmark")).toString() !=
-            QStringLiteral("vnm_terminal_phase7_public_scroll_benchmark") ||
+            QStringLiteral("vnm_terminal_public_scroll_benchmark") ||
         root.value(QStringLiteral("status")).toString() != QStringLiteral("ok"))
     {
         *out_error = QStringLiteral("benchmark root metadata changed or status failed");
@@ -1501,7 +1501,7 @@ int emit_json_and_status(const App_options& options, const QJsonObject& root, bo
     if (options.validate_json) {
         QString validation_error;
         if (!validate_json_output(json, options, &validation_error)) {
-            std::cerr << "vnm_terminal_phase7_public_scroll_benchmark: "
+            std::cerr << "vnm_terminal_public_scroll_benchmark: "
                 << validation_error.toUtf8().constData() << '\n';
             ok = false;
         }
@@ -1510,7 +1510,7 @@ int emit_json_and_status(const App_options& options, const QJsonObject& root, bo
     if (!options.output_path.isEmpty()) {
         QString output_error;
         if (!write_output_file(options.output_path, json, &output_error)) {
-            std::cerr << "vnm_terminal_phase7_public_scroll_benchmark: "
+            std::cerr << "vnm_terminal_public_scroll_benchmark: "
                 << output_error.toUtf8().constData() << '\n';
             ok = false;
         }
@@ -1534,7 +1534,7 @@ int main(int argc, char** argv)
     }
 
     if (!parse_result.error.isEmpty()) {
-        std::cerr << "vnm_terminal_phase7_public_scroll_benchmark: "
+        std::cerr << "vnm_terminal_public_scroll_benchmark: "
             << parse_result.error.toUtf8().constData() << '\n';
         print_usage();
         return 2;

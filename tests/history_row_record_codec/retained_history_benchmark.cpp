@@ -20,16 +20,16 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
-constexpr std::size_t k_phase8_retained_history_ring_capacity_bytes =
+constexpr std::size_t k_retained_history_ring_capacity_bytes =
     64U * 1024U * 1024U;
 constexpr std::size_t k_row_record_header_flags_offset = 20U;
 constexpr std::uint32_t k_payload_kind_mask = 0x0fU;
 constexpr std::uint32_t k_payload_kind_generic_compact = 0U;
 constexpr std::uint32_t k_payload_kind_prefix_plain_ascii = 1U;
-constexpr int k_phase8_columns = 120;
-constexpr int k_phase8_row_count = 2000;
+constexpr int k_columns = 120;
+constexpr int k_row_count = 2000;
 
-enum class Phase8_row_pattern
+enum class Retained_history_row_pattern
 {
     BLANK,
     ASCII_SEQUENCE,
@@ -170,7 +170,7 @@ term::Terminal_history_row_cell make_cell(
 term::Terminal_history_row_record make_record(
     std::uint64_t       row_sequence,
     int                 columns,
-    Phase8_row_pattern  pattern)
+    Retained_history_row_pattern  pattern)
 {
     term::Terminal_history_row_record record;
     record.provenance.retained_line_id   = row_sequence;
@@ -183,19 +183,19 @@ term::Terminal_history_row_record make_record(
     record.metadata.wrap_state =
         term::Terminal_retained_row_wrap_state::HARD_BOUNDARY;
 
-    if (pattern == Phase8_row_pattern::BLANK) {
+    if (pattern == Retained_history_row_pattern::BLANK) {
         record.cells.resize(static_cast<std::size_t>(columns));
         return record;
     }
 
     record.cells.reserve(static_cast<std::size_t>(columns));
     for (int column = 0; column < columns; ++column) {
-        if (pattern == Phase8_row_pattern::REPEATED_ASCII) {
+        if (pattern == Retained_history_row_pattern::REPEATED_ASCII) {
             record.cells.push_back(make_cell(QStringLiteral("x")));
             continue;
         }
 
-        if (pattern == Phase8_row_pattern::HYPERLINK_HEAVY) {
+        if (pattern == Retained_history_row_pattern::HYPERLINK_HEAVY) {
             const term::Terminal_hyperlink_id row_ref =
                 static_cast<term::Terminal_hyperlink_id>(column + 1);
             record.cells.push_back(make_cell(
@@ -204,7 +204,7 @@ term::Terminal_history_row_record make_record(
                 row_ref));
             record.hyperlink_identity_keys.emplace(
                 row_ref,
-                QByteArrayLiteral("uri:https://example.test/phase8/") +
+                QByteArrayLiteral("uri:https://example.test/retained-history/") +
                     QByteArray::number(static_cast<qlonglong>(row_sequence)) +
                     QByteArrayLiteral("/") +
                     QByteArray::number(column));
@@ -230,11 +230,11 @@ term::terminal_history_row_record_identity_t make_identity(
 term::Terminal_history_row_record_append_result append_record(
     term::Terminal_history_ring&    ring,
     std::uint64_t                   row_sequence,
-    Phase8_row_pattern              pattern)
+    Retained_history_row_pattern              pattern)
 {
     return term::encode_terminal_history_row_record_to_ring(
         ring,
-        make_record(row_sequence, k_phase8_columns, pattern),
+        make_record(row_sequence, k_columns, pattern),
         make_identity(row_sequence));
 }
 
@@ -242,7 +242,7 @@ bool append_fixture_rows(
     term::Terminal_history_ring&                    ring,
     std::vector<term::terminal_history_handle_t>&    handles,
     int                                             row_count,
-    Phase8_row_pattern                              pattern,
+    Retained_history_row_pattern                              pattern,
     std::uint64_t&                                  bytes)
 {
     handles.clear();
@@ -254,7 +254,7 @@ bool append_fixture_rows(
         const term::Terminal_history_row_record_append_result append =
             append_record(ring, row_sequence, pattern);
         if (append.status != term::Terminal_history_row_record_codec_status::OK) {
-            return report_failure("Phase 8 fixture row append failed");
+            return report_failure("fixture row append failed");
         }
 
         handles.push_back(append.history_handle);
@@ -291,7 +291,7 @@ row_size_projection_t encoded_record_projection(
     const term::Terminal_history_row_record& record)
 {
     term::Terminal_history_ring ring({
-        k_phase8_retained_history_ring_capacity_bytes,
+        k_retained_history_ring_capacity_bytes,
         0U,
     });
     if (!ring.ok()) {
@@ -324,18 +324,18 @@ row_size_projection_t encoded_record_projection(
 
 std::vector<row_size_projection_t> row_size_projections()
 {
-    const std::vector<std::pair<std::string, Phase8_row_pattern>> scenarios = {
-        {"blank_120_columns",          Phase8_row_pattern::BLANK},
-        {"ascii_120_columns",          Phase8_row_pattern::ASCII_SEQUENCE},
-        {"repeated_ascii_120_columns", Phase8_row_pattern::REPEATED_ASCII},
-        {"hyperlink_120_columns",      Phase8_row_pattern::HYPERLINK_HEAVY},
+    const std::vector<std::pair<std::string, Retained_history_row_pattern>> scenarios = {
+        {"blank_120_columns",          Retained_history_row_pattern::BLANK},
+        {"ascii_120_columns",          Retained_history_row_pattern::ASCII_SEQUENCE},
+        {"repeated_ascii_120_columns", Retained_history_row_pattern::REPEATED_ASCII},
+        {"hyperlink_120_columns",      Retained_history_row_pattern::HYPERLINK_HEAVY},
     };
 
     std::vector<row_size_projection_t> projections;
     projections.reserve(scenarios.size());
     for (const auto& scenario : scenarios) {
         const term::Terminal_history_row_record record =
-            make_record(1U, k_phase8_columns, scenario.second);
+            make_record(1U, k_columns, scenario.second);
         projections.push_back(encoded_record_projection(scenario.first, record));
     }
     return projections;
@@ -367,7 +367,7 @@ QByteArray plain_output_stream(int row_count, int columns)
 {
     QByteArray stream;
     for (int row = 0; row < row_count; ++row) {
-        QByteArray text = QByteArrayLiteral("phase8-row-") + QByteArray::number(row);
+        QByteArray text = QByteArrayLiteral("retained-row-") + QByteArray::number(row);
         while (text.size() < columns - 1) {
             text += QByteArrayLiteral("x");
         }
@@ -381,10 +381,10 @@ QByteArray hyperlink_output_stream(int row_count, int columns)
 {
     QByteArray stream;
     for (int row = 0; row < row_count; ++row) {
-        const QByteArray row_id = QByteArrayLiteral("phase8-") + QByteArray::number(row);
+        const QByteArray row_id = QByteArrayLiteral("retained-") + QByteArray::number(row);
         stream += QByteArrayLiteral("\x1b]8;id=");
         stream += row_id;
-        stream += QByteArrayLiteral(";https://example.test/phase8/");
+        stream += QByteArrayLiteral(";https://example.test/retained-history/");
         stream += QByteArray::number(row);
         stream += QByteArrayLiteral("\x1b\\");
         for (int column = 0; column < columns - 1; ++column) {
@@ -410,27 +410,27 @@ benchmark_measurement_t benchmark_append()
 {
     return measure_case(
         "append_ascii_rows",
-        k_phase8_row_count,
+        k_row_count,
         [] {
             benchmark_payload_t payload;
             term::Terminal_history_ring ring({
-                k_phase8_retained_history_ring_capacity_bytes,
+                k_retained_history_ring_capacity_bytes,
                 0U,
             });
             if (!ring.ok()) {
-                payload.ok = report_failure("Phase 8 append benchmark ring failed");
+                payload.ok = report_failure("append benchmark ring failed");
                 return payload;
             }
 
-            for (int row = 0; row < k_phase8_row_count; ++row) {
+            for (int row = 0; row < k_row_count; ++row) {
                 const std::uint64_t row_sequence = static_cast<std::uint64_t>(row + 1);
                 const term::Terminal_history_row_record_append_result append =
                     append_record(
                         ring,
                         row_sequence,
-                        Phase8_row_pattern::ASCII_SEQUENCE);
+                        Retained_history_row_pattern::ASCII_SEQUENCE);
                 if (append.status != term::Terminal_history_row_record_codec_status::OK) {
-                    payload.ok = report_failure("Phase 8 append benchmark append failed");
+                    payload.ok = report_failure("append benchmark append failed");
                     return payload;
                 }
 
@@ -438,7 +438,7 @@ benchmark_measurement_t benchmark_append()
                 payload.checksum += append.history_handle.row_sequence;
             }
 
-            payload.records = k_phase8_row_count;
+            payload.records = k_row_count;
             return payload;
         });
 }
@@ -446,7 +446,7 @@ benchmark_measurement_t benchmark_append()
 benchmark_measurement_t benchmark_materialization()
 {
     term::Terminal_history_ring ring({
-        k_phase8_retained_history_ring_capacity_bytes,
+        k_retained_history_ring_capacity_bytes,
         0U,
     });
     std::vector<term::terminal_history_handle_t> handles;
@@ -455,8 +455,8 @@ benchmark_measurement_t benchmark_materialization()
         append_fixture_rows(
             ring,
             handles,
-            k_phase8_row_count,
-            Phase8_row_pattern::ASCII_SEQUENCE,
+            k_row_count,
+            Retained_history_row_pattern::ASCII_SEQUENCE,
             fixture_bytes);
 
     return measure_case(
@@ -476,7 +476,7 @@ benchmark_measurement_t benchmark_materialization()
                     term::decode_terminal_history_row_record(read, handle);
                 if (decoded.status != term::Terminal_history_row_record_codec_status::OK) {
                     payload.ok = report_failure(
-                        "Phase 8 materialization benchmark decode failed");
+                        "materialization benchmark decode failed");
                     return payload;
                 }
 
@@ -498,12 +498,12 @@ benchmark_measurement_t benchmark_resize_projection()
     const std::vector<int> widths = {80, 120, 160, 96};
 
     term::Terminal_screen_model model({
-        term::terminal_grid_size_t{24, k_phase8_columns},
+        term::terminal_grid_size_t{24, k_columns},
         768,
         8,
     });
     const term::Terminal_screen_model_result ingest =
-        model.ingest(plain_output_stream(640, k_phase8_columns));
+        model.ingest(plain_output_stream(640, k_columns));
     const bool fixture_ok = !result_has_diagnostic(ingest) && model.scrollback_size() > 0;
 
     return measure_case(
@@ -521,7 +521,7 @@ benchmark_measurement_t benchmark_resize_projection()
                     const term::Terminal_screen_model_result resize =
                         model.resize({24, width});
                     if (!resize.grid_reflow_changed) {
-                        payload.ok = report_failure("Phase 8 resize projection did not reflow");
+                        payload.ok = report_failure("resize projection did not reflow");
                         return payload;
                     }
 
@@ -536,7 +536,7 @@ benchmark_measurement_t benchmark_resize_projection()
                         term::Terminal_render_snapshot_status::OK)
                     {
                         payload.ok = report_failure(
-                            "Phase 8 resize projection snapshot failed validation");
+                            "resize projection snapshot failed validation");
                         return payload;
                     }
 
@@ -555,12 +555,12 @@ benchmark_measurement_t benchmark_selection_extraction()
     constexpr int selection_repetitions = 200;
 
     term::Terminal_screen_model model({
-        term::terminal_grid_size_t{24, k_phase8_columns},
+        term::terminal_grid_size_t{24, k_columns},
         768,
         8,
     });
     const term::Terminal_screen_model_result ingest =
-        model.ingest(plain_output_stream(640, k_phase8_columns));
+        model.ingest(plain_output_stream(640, k_columns));
 
     const int first_row = std::max(0, model.scrollback_size() / 3);
     const int last_row = std::min(
@@ -592,7 +592,7 @@ benchmark_measurement_t benchmark_selection_extraction()
                         selection,
                         std::span<const term::terminal_selection_line_lease_t>(leases));
                 if (selected.code != term::Terminal_selection_result_code::OK) {
-                    payload.ok = report_failure("Phase 8 selection extraction failed");
+                    payload.ok = report_failure("selection extraction failed");
                     return payload;
                 }
 
@@ -625,7 +625,7 @@ benchmark_measurement_t benchmark_hyperlink_heavy_output()
             const term::Terminal_screen_model_result ingest =
                 model.ingest(hyperlink_output_stream(hyperlink_rows, hyperlink_columns));
             if (result_has_diagnostic(ingest) || model.scrollback_size() == 0) {
-                payload.ok = report_failure("Phase 8 hyperlink-heavy output ingest failed");
+                payload.ok = report_failure("hyperlink-heavy output ingest failed");
                 return payload;
             }
 
@@ -636,7 +636,7 @@ benchmark_measurement_t benchmark_hyperlink_heavy_output()
                 term::Terminal_render_snapshot_status::OK)
             {
                 payload.ok = report_failure(
-                    "Phase 8 hyperlink-heavy output snapshot failed validation");
+                    "hyperlink-heavy output snapshot failed validation");
                 return payload;
             }
 
@@ -696,14 +696,13 @@ bool write_report(
 {
     std::ofstream output(path, std::ios::binary);
     if (!output) {
-        std::cerr << "FAIL: unable to write Phase 8 benchmark report: " << path << '\n';
+        std::cerr << "FAIL: unable to write benchmark report: " << path << '\n';
         return false;
     }
 
     output << "{\n";
-    output << "  \"schema\": \"vnm_terminal_history_phase8_benchmark_report\",\n";
+    output << "  \"schema\": \"vnm_terminal_retained_history_benchmark_report\",\n";
     output << "  \"schema_version\": 1,\n";
-    output << "  \"phase\": \"8\",\n";
     output << "  \"retained_row_codec\": \"compact_row_record_with_prefix_plain_ascii\",\n";
     output << "  \"ring_limits\": {\n";
     output << "    \"retained_history_ring_capacity_bytes\": "
@@ -764,7 +763,7 @@ void print_summary(
     const std::vector<row_size_projection_t>&   projections,
     const term::Terminal_history_ring&          limits_ring)
 {
-    std::cout << "Phase 8 benchmark summary\n";
+    std::cout << "Retained history benchmark summary\n";
     std::cout << "retained_row_codec=compact_row_record_with_prefix_plain_ascii\n";
     std::cout << "ring_capacity_bytes=" << limits_ring.capacity_bytes()
               << " max_record_bytes=" << limits_ring.max_record_bytes()
@@ -796,11 +795,11 @@ void print_summary(
 int main(int argc, char** argv)
 {
     term::Terminal_history_ring limits_ring({
-        k_phase8_retained_history_ring_capacity_bytes,
+        k_retained_history_ring_capacity_bytes,
         0U,
     });
     if (!limits_ring.ok()) {
-        report_failure("Phase 8 limits ring failed to initialize");
+        report_failure("limits ring failed to initialize");
         return 1;
     }
 
