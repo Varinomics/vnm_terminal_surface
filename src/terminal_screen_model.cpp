@@ -446,6 +446,9 @@ Terminal_screen_model::Terminal_screen_model(Terminal_screen_model_config config
     reset_grid();
 }
 
+Terminal_screen_model::Terminal_screen_model(Terminal_screen_model&&) noexcept            = default;
+Terminal_screen_model& Terminal_screen_model::operator=(Terminal_screen_model&&) noexcept = default;
+
 Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::ingest");
@@ -2237,74 +2240,11 @@ Terminal_screen_model::Retained_history_storage::Retained_history_storage()
 {}
 
 Terminal_screen_model::Retained_history_storage::~Retained_history_storage() = default;
-
 Terminal_screen_model::Retained_history_storage::Retained_history_storage(
-    const Retained_history_storage& other)
-:
-    Retained_history_storage()
-{
-    for (const retained_history_index_entry_t& source_entry : other.index) {
-        const terminal_history_handle_t source_handle = source_entry.history_handle;
-        const Terminal_history_ring_read_scope read =
-            other.ring->read_record(source_handle.byte_sequence);
-        if (!read.ok()) {
-            throw_retained_history_storage_failure();
-        }
-
-        Terminal_history_row_record_decode_result decoded =
-            decode_terminal_history_row_record(read, source_handle);
-        if (decoded.status != Terminal_history_row_record_codec_status::OK) {
-            throw_retained_history_storage_failure();
-        }
-
-        terminal_history_row_record_identity_t identity;
-        identity.epoch        = decoded.history_handle.epoch;
-        identity.row_sequence = decoded.history_handle.row_sequence;
-        if (!index.empty()) {
-            identity.previous_row_byte_sequence = index.back().history_handle.byte_sequence;
-            identity.previous_row_sequence      = index.back().history_handle.row_sequence;
-        }
-
-        index.emplace_back();
-        Terminal_history_row_record_append_result append;
-        try {
-            append = encode_terminal_history_row_record_to_ring(
-                *ring,
-                decoded.record,
-                identity);
-        }
-        catch (...) {
-            index.pop_back();
-            throw;
-        }
-        if (append.status != Terminal_history_row_record_codec_status::OK) {
-            index.pop_back();
-            throw_retained_history_storage_failure();
-        }
-
-        track_record_in_reserved_index_slot(
-            append.history_handle,
-            append.commit.record_bytes,
-            append.payload_kind);
-    }
-}
-
+    Retained_history_storage&&) noexcept = default;
 Terminal_screen_model::Retained_history_storage&
 Terminal_screen_model::Retained_history_storage::operator=(
-    const Retained_history_storage& other)
-{
-    if (this != &other) {
-        Retained_history_storage replacement(other);
-        ring                    = std::move(replacement.ring);
-        traversal               = std::move(replacement.traversal);
-        index                   = std::move(replacement.index);
-        retained_record_bytes   = replacement.retained_record_bytes;
-        generic_compact_rows    = replacement.generic_compact_rows;
-        prefix_plain_ascii_rows = replacement.prefix_plain_ascii_rows;
-    }
-
-    return *this;
-}
+    Retained_history_storage&&) noexcept = default;
 
 void Terminal_screen_model::Retained_history_storage::reset()
 {
@@ -2375,25 +2315,11 @@ void Terminal_screen_model::Retained_history_storage::discard_index_prefix(
 
 Terminal_screen_model::Primary_backing_buffer::Primary_backing_buffer() = default;
 Terminal_screen_model::Primary_backing_buffer::~Primary_backing_buffer() = default;
-
 Terminal_screen_model::Primary_backing_buffer::Primary_backing_buffer(
-    const Primary_backing_buffer& other)
-:
-    active_grid(other.active_grid),
-    retained_history(other.retained_history)
-{}
-
+    Primary_backing_buffer&&) noexcept = default;
 Terminal_screen_model::Primary_backing_buffer&
 Terminal_screen_model::Primary_backing_buffer::operator=(
-    const Primary_backing_buffer& other)
-{
-    if (this != &other) {
-        active_grid       = other.active_grid;
-        retained_history  = other.retained_history;
-    }
-
-    return *this;
-}
+    Primary_backing_buffer&&) noexcept = default;
 
 Terminal_screen_model::screen_buffer_state_t&
 Terminal_screen_model::Primary_backing_buffer::active_grid_state()

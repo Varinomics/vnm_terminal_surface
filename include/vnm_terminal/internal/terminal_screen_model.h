@@ -354,6 +354,11 @@ class Terminal_screen_model
 public:
     explicit Terminal_screen_model(Terminal_screen_model_config config);
 
+    Terminal_screen_model(const Terminal_screen_model&)            = delete;
+    Terminal_screen_model& operator=(const Terminal_screen_model&) = delete;
+    Terminal_screen_model(Terminal_screen_model&&) noexcept;
+    Terminal_screen_model& operator=(Terminal_screen_model&&) noexcept;
+
     Terminal_screen_model_result ingest(QByteArrayView bytes);
     Terminal_screen_model_result resize(terminal_grid_size_t grid_size);
     Terminal_screen_model_result set_scrollback_limit(int limit);
@@ -545,8 +550,10 @@ private:
         Retained_history_storage();
         ~Retained_history_storage();
 
-        Retained_history_storage(const Retained_history_storage& other);
-        Retained_history_storage& operator=(const Retained_history_storage& other);
+        Retained_history_storage(const Retained_history_storage&)            = delete;
+        Retained_history_storage& operator=(const Retained_history_storage&) = delete;
+        Retained_history_storage(Retained_history_storage&&) noexcept;
+        Retained_history_storage& operator=(Retained_history_storage&&) noexcept;
 
         void reset();
         void track_record_in_reserved_index_slot(
@@ -598,8 +605,10 @@ private:
         Primary_backing_buffer();
         ~Primary_backing_buffer();
 
-        Primary_backing_buffer(const Primary_backing_buffer& other);
-        Primary_backing_buffer& operator=(const Primary_backing_buffer& other);
+        Primary_backing_buffer(const Primary_backing_buffer&)            = delete;
+        Primary_backing_buffer& operator=(const Primary_backing_buffer&) = delete;
+        Primary_backing_buffer(Primary_backing_buffer&&) noexcept;
+        Primary_backing_buffer& operator=(Primary_backing_buffer&&) noexcept;
 
         screen_buffer_state_t& active_grid_state();
         const screen_buffer_state_t& active_grid_state() const;
