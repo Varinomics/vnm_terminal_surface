@@ -321,26 +321,6 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_history_row_record_codec>"
 )
 
-add_executable(vnm_terminal_history_row_traversal
-    history_row_record_codec/history_row_traversal_tests.cpp
-)
-
-target_link_libraries(vnm_terminal_history_row_traversal PRIVATE
-    vnm_terminal_surface::vnm_terminal_surface
-)
-
-set_target_properties(vnm_terminal_history_row_traversal PROPERTIES
-    AUTOMOC OFF
-)
-
-add_test(
-    NAME vnm_terminal_history_row_traversal
-    COMMAND
-        "${CMAKE_COMMAND}" -E env
-        "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_history_row_traversal>"
-)
-
 add_executable(vnm_terminal_history_phase8_benchmark
     history_row_record_codec/history_row_record_phase8_benchmark.cpp
 )
@@ -1809,7 +1789,6 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_unicode_width_tables
     vnm_terminal_history_ring
     vnm_terminal_history_row_record_codec
-    vnm_terminal_history_row_traversal
     vnm_terminal_history_phase8_benchmark
     vnm_terminal_retained_history_capacity_stress
     vnm_terminal_sequence_matrix

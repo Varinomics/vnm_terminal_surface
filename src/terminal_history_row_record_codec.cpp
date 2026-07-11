@@ -17,9 +17,9 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr std::uint32_t k_row_record_magic = 0x56524852U;
-constexpr std::uint16_t k_row_record_version = 2U;
+constexpr std::uint16_t k_row_record_version = 3U;
 constexpr std::uint16_t k_row_record_kind_row = 1U;
-constexpr std::uint32_t k_row_record_header_bytes = 116U;
+constexpr std::uint32_t k_row_record_header_bytes = 100U;
 constexpr std::uint32_t k_payload_kind_mask = 0x0fU;
 constexpr std::uint32_t k_payload_kind_generic_compact = 0U;
 constexpr std::uint32_t k_payload_kind_prefix_plain_ascii = 1U;
@@ -76,8 +76,6 @@ struct row_record_header_t
     std::uint64_t                 epoch = 0U;
     std::uint64_t                 byte_sequence = 0U;
     std::uint64_t                 row_sequence = 0U;
-    std::uint64_t                 previous_row_byte_sequence = 0U;
-    std::uint64_t                 previous_row_sequence = 0U;
     std::uint64_t                 content_generation = 0U;
     std::uint64_t                 retained_line_id = 0U;
     std::uint64_t                 retained_line_content_generation = 0U;
@@ -589,8 +587,6 @@ bool write_header(Byte_writer& writer, const row_record_header_t& header)
         writer.write_u64(header.epoch) &&
         writer.write_u64(header.byte_sequence) &&
         writer.write_u64(header.row_sequence) &&
-        writer.write_u64(header.previous_row_byte_sequence) &&
-        writer.write_u64(header.previous_row_sequence) &&
         writer.write_u64(header.content_generation) &&
         writer.write_u64(header.retained_line_id) &&
         writer.write_u64(header.retained_line_content_generation) &&
@@ -617,8 +613,6 @@ bool read_header(Byte_reader& reader, row_record_header_t& header)
         reader.read_u64(header.epoch) &&
         reader.read_u64(header.byte_sequence) &&
         reader.read_u64(header.row_sequence) &&
-        reader.read_u64(header.previous_row_byte_sequence) &&
-        reader.read_u64(header.previous_row_sequence) &&
         reader.read_u64(header.content_generation) &&
         reader.read_u64(header.retained_line_id) &&
         reader.read_u64(header.retained_line_content_generation) &&
@@ -1333,8 +1327,6 @@ Terminal_history_row_record_codec_status write_row_record_payload(
     header.epoch = identity.epoch;
     header.byte_sequence = byte_sequence;
     header.row_sequence = identity.row_sequence;
-    header.previous_row_byte_sequence = identity.previous_row_byte_sequence;
-    header.previous_row_sequence = identity.previous_row_sequence;
     header.content_generation = record.provenance.content_generation;
     header.retained_line_id = record.provenance.retained_line_id;
     header.retained_line_content_generation = record.provenance.content_generation;
@@ -2087,8 +2079,6 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record_pay
             k_payload_kind_prefix_plain_ascii
         ? Terminal_history_row_record_payload_kind::PREFIX_PLAIN_ASCII
         : Terminal_history_row_record_payload_kind::GENERIC_COMPACT;
-    result.previous_row_byte_sequence = header.previous_row_byte_sequence;
-    result.previous_row_sequence = header.previous_row_sequence;
     result.record = std::move(record);
     result.status = Terminal_history_row_record_codec_status::OK;
     return result;

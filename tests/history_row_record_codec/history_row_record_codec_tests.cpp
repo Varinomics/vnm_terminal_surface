@@ -17,19 +17,19 @@ namespace {
 
 using vnm_terminal::test_helpers::check;
 
-constexpr std::size_t k_header_bytes = 116U;
+constexpr std::size_t k_header_bytes = 100U;
 constexpr std::size_t k_header_payload_bytes_offset = 12U;
 constexpr std::size_t k_header_record_bytes_offset = 16U;
 constexpr std::size_t k_header_flags_offset = 20U;
-constexpr std::size_t k_header_source_width_offset = 96U;
-constexpr std::size_t k_header_cell_count_offset = 100U;
-constexpr std::size_t k_header_hyperlink_count_offset = 104U;
-constexpr std::size_t k_header_style_count_offset = 114U;
+constexpr std::size_t k_header_source_width_offset = 80U;
+constexpr std::size_t k_header_cell_count_offset = 84U;
+constexpr std::size_t k_header_hyperlink_count_offset = 88U;
+constexpr std::size_t k_header_style_count_offset = 98U;
 constexpr std::size_t k_encoded_style_bytes = 16U;
 constexpr std::uint32_t k_payload_kind_mask = 0x0fU;
 constexpr std::uint32_t k_payload_kind_generic_compact = 0U;
 constexpr std::uint32_t k_payload_kind_prefix_plain_ascii = 1U;
-constexpr std::uint32_t k_149_column_prefix_ascii_record_bytes_with_ring_overhead = 305U;
+constexpr std::uint32_t k_149_column_prefix_ascii_record_bytes_with_ring_overhead = 289U;
 constexpr term::Terminal_hyperlink_id k_first_hyperlink_ref = 1U;
 constexpr term::Terminal_hyperlink_id k_second_hyperlink_ref = 2U;
 
@@ -139,8 +139,6 @@ term::terminal_history_row_record_identity_t make_identity(
     return {
         epoch,
         row_sequence,
-        0U,
-        0U,
     };
 }
 
@@ -374,7 +372,7 @@ bool test_prefix_plain_ascii_rows_use_prefix_payload()
     ok &= check(budget_append.commit.record_bytes <=
             k_149_column_prefix_ascii_record_bytes_with_ring_overhead,
         "149-column prefix printable ASCII record is measured including the 40-byte "
-        "ring overhead and stays <= 305 bytes");
+        "ring overhead and stays <= 289 bytes");
     const term::terminal_history_prefix_plain_ascii_retention_estimate_t estimate =
         term::make_terminal_history_prefix_plain_ascii_retention_estimate(
             budget_ring.capacity_bytes(),
@@ -428,9 +426,7 @@ bool test_extended_styles_hyperlinks_and_wide_cells_round_trip()
         k_first_hyperlink_ref));
     record.cells.push_back(make_wide_continuation(1U, k_first_hyperlink_ref));
 
-    term::terminal_history_row_record_identity_t identity = make_identity(4U, 91U);
-    identity.previous_row_byte_sequence = 640U;
-    identity.previous_row_sequence      = 90U;
+    const term::terminal_history_row_record_identity_t identity = make_identity(4U, 91U);
 
     term::Terminal_history_row_record_append_result append;
     const term::Terminal_history_row_record_decode_result decoded =
@@ -441,9 +437,6 @@ bool test_extended_styles_hyperlinks_and_wide_cells_round_trip()
         "extended styled hyperlink row decodes");
     ok &= check(records_equal(decoded.record, record),
         "extended row preserves style values, hyperlink identity keys, wide spans, and provenance");
-    ok &= check(decoded.previous_row_byte_sequence == identity.previous_row_byte_sequence &&
-            decoded.previous_row_sequence == identity.previous_row_sequence,
-        "extended row preserves previous-row traversal metadata");
     ok &= check(decoded.history_handle == append.history_handle,
         "extended row decoded handle matches the committed ring identity");
 

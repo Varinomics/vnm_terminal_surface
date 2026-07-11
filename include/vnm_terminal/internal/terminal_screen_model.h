@@ -27,7 +27,6 @@
 namespace vnm_terminal::internal {
 
 class Terminal_history_ring;
-class Terminal_history_row_traversal;
 struct Terminal_history_row_record;
 enum class Terminal_history_row_record_payload_kind : std::uint32_t;
 
@@ -300,7 +299,7 @@ struct terminal_screen_model_style_table_stats_t
     std::uint64_t              reclaimed_styles    = 0U;
 };
 
-constexpr std::uint32_t k_terminal_history_retention_estimate_contract_version = 1U;
+constexpr std::uint32_t k_terminal_history_retention_estimate_contract_version = 2U;
 constexpr std::uint64_t k_terminal_history_retention_target_rows = 205000U;
 
 struct terminal_history_prefix_plain_ascii_retention_estimate_t
@@ -411,8 +410,6 @@ public:
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
     void discard_retained_lookup_cache_for_testing() const;
-    void reset_retained_history_decode_live_row_call_count_for_testing() const;
-    std::uint64_t retained_history_decode_live_row_call_count_for_testing() const;
     bool retained_history_storage_allocated_for_testing() const;
     Terminal_retained_line_provenance retained_line_provenance_for_testing(
         Terminal_buffer_id             buffer_id,
@@ -561,8 +558,6 @@ private:
 
         std::unique_ptr<Terminal_history_ring>
                                   ring;
-        std::unique_ptr<Terminal_history_row_traversal>
-                                  traversal;
         mutable std::deque<retained_history_index_entry_t>
                                   index;
         mutable std::uint64_t     prefix_plain_ascii_rows = 0U;
@@ -617,7 +612,6 @@ private:
             retained_row_record_t row);
         int discard_oldest_retained_history_records(int row_count);
         void clear_retained_history();
-        void rebuild_retained_history_rows() const;
         int prune_retained_history_rows_outside_live_window() const;
 
         screen_buffer_state_t          active_grid;

@@ -114,7 +114,6 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/terminal_canvas_fixture_contract.h
     include/vnm_terminal/internal/terminal_history_ring.h
     include/vnm_terminal/internal/terminal_history_row_record_codec.h
-    include/vnm_terminal/internal/terminal_history_row_traversal.h
     include/vnm_terminal/internal/terminal_byte_stream_parser.h
     include/vnm_terminal/internal/terminal_input_mode.h
     include/vnm_terminal/internal/terminal_input_encoder.h
@@ -145,7 +144,6 @@ add_library(vnm_terminal_surface STATIC
     src/font_metrics.cpp
     src/terminal_history_ring.cpp
     src/terminal_history_row_record_codec.cpp
-    src/terminal_history_row_traversal.cpp
     src/terminal_input_encoder.cpp
     src/terminal_public_projection.cpp
     src/terminal_repaint_recovery.cpp

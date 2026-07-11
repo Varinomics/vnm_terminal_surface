@@ -1,5 +1,4 @@
 #include "vnm_terminal/internal/terminal_history_row_record_codec.h"
-#include "vnm_terminal/internal/terminal_history_row_traversal.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 
 #include <QByteArray>
@@ -220,27 +219,23 @@ term::Terminal_history_row_record make_record(
 }
 
 term::terminal_history_row_record_identity_t make_identity(
-    std::uint64_t                   row_sequence,
-    term::terminal_history_handle_t previous_handle)
+    std::uint64_t row_sequence)
 {
     return {
         11U,
         row_sequence,
-        previous_handle.byte_sequence,
-        previous_handle.row_sequence,
     };
 }
 
 term::Terminal_history_row_record_append_result append_record(
     term::Terminal_history_ring&    ring,
     std::uint64_t                   row_sequence,
-    Phase8_row_pattern              pattern,
-    term::terminal_history_handle_t previous_handle)
+    Phase8_row_pattern              pattern)
 {
     return term::encode_terminal_history_row_record_to_ring(
         ring,
         make_record(row_sequence, k_phase8_columns, pattern),
-        make_identity(row_sequence, previous_handle));
+        make_identity(row_sequence));
 }
 
 bool append_fixture_rows(
@@ -254,17 +249,15 @@ bool append_fixture_rows(
     handles.reserve(static_cast<std::size_t>(row_count));
     bytes = 0U;
 
-    term::terminal_history_handle_t previous_handle;
     for (int row = 0; row < row_count; ++row) {
         const std::uint64_t row_sequence = static_cast<std::uint64_t>(row + 1);
         const term::Terminal_history_row_record_append_result append =
-            append_record(ring, row_sequence, pattern, previous_handle);
+            append_record(ring, row_sequence, pattern);
         if (append.status != term::Terminal_history_row_record_codec_status::OK) {
             return report_failure("Phase 8 fixture row append failed");
         }
 
         handles.push_back(append.history_handle);
-        previous_handle = append.history_handle;
         bytes += append.commit.record_bytes;
     }
 
@@ -309,7 +302,7 @@ row_size_projection_t encoded_record_projection(
         term::encode_terminal_history_row_record_to_ring(
             ring,
             record,
-            make_identity(record.provenance.retained_line_id, {}));
+            make_identity(record.provenance.retained_line_id));
     if (append.status != term::Terminal_history_row_record_codec_status::OK) {
         return {std::move(scenario)};
     }
@@ -429,21 +422,18 @@ benchmark_measurement_t benchmark_append()
                 return payload;
             }
 
-            term::terminal_history_handle_t previous_handle;
             for (int row = 0; row < k_phase8_row_count; ++row) {
                 const std::uint64_t row_sequence = static_cast<std::uint64_t>(row + 1);
                 const term::Terminal_history_row_record_append_result append =
                     append_record(
                         ring,
                         row_sequence,
-                        Phase8_row_pattern::ASCII_SEQUENCE,
-                        previous_handle);
+                        Phase8_row_pattern::ASCII_SEQUENCE);
                 if (append.status != term::Terminal_history_row_record_codec_status::OK) {
                     payload.ok = report_failure("Phase 8 append benchmark append failed");
                     return payload;
                 }
 
-                previous_handle = append.history_handle;
                 payload.bytes += append.commit.record_bytes;
                 payload.checksum += append.history_handle.row_sequence;
             }
@@ -498,117 +488,6 @@ benchmark_measurement_t benchmark_materialization()
             }
 
             payload.records = static_cast<std::uint64_t>(handles.size());
-            return payload;
-        });
-}
-
-benchmark_measurement_t benchmark_traversal()
-{
-    term::Terminal_history_ring ring({
-        k_phase8_retained_history_ring_capacity_bytes,
-        0U,
-    });
-    std::vector<term::terminal_history_handle_t> handles;
-    std::uint64_t fixture_bytes = 0U;
-    const bool fixture_ok = ring.ok() &&
-        append_fixture_rows(
-            ring,
-            handles,
-            k_phase8_row_count,
-            Phase8_row_pattern::ASCII_SEQUENCE,
-            fixture_bytes);
-
-    term::Terminal_history_row_traversal traversal(ring);
-    const term::Terminal_history_row_traversal_rebuild_result rebuild =
-        traversal.rebuild_directory();
-    const bool rebuild_ok =
-        rebuild.status == term::Terminal_history_row_traversal_status::OK;
-
-    return measure_case(
-        "traversal_forward_rows",
-        handles.size(),
-        [&] {
-            benchmark_payload_t payload;
-            payload.ok = fixture_ok && rebuild_ok;
-            if (!payload.ok) {
-                return payload;
-            }
-
-            term::Terminal_history_row_traversal_result current =
-                traversal.oldest_live_row();
-            if (current.status != term::Terminal_history_row_traversal_status::OK) {
-                payload.ok = report_failure("Phase 8 traversal oldest row failed");
-                return payload;
-            }
-
-            payload.records = 1U;
-            payload.bytes += current.row.history_handle.record_bytes;
-            payload.checksum += current.row.history_handle.row_sequence;
-
-            while (true) {
-                term::Terminal_history_row_traversal_result next =
-                    traversal.next_row_after(current.row.history_handle);
-                if (next.status == term::Terminal_history_row_traversal_status::NOT_FOUND) {
-                    break;
-                }
-                if (next.status != term::Terminal_history_row_traversal_status::OK) {
-                    payload.ok = report_failure("Phase 8 traversal next row failed");
-                    return payload;
-                }
-
-                current = std::move(next);
-                ++payload.records;
-                payload.bytes += current.row.history_handle.record_bytes;
-                payload.checksum += current.row.history_handle.row_sequence;
-            }
-
-            return payload;
-        });
-}
-
-benchmark_measurement_t benchmark_cache_rebuild()
-{
-    constexpr int rebuild_count = 10;
-
-    term::Terminal_history_ring ring({
-        k_phase8_retained_history_ring_capacity_bytes,
-        0U,
-    });
-    std::vector<term::terminal_history_handle_t> handles;
-    std::uint64_t fixture_bytes = 0U;
-    const bool fixture_ok = ring.ok() &&
-        append_fixture_rows(
-            ring,
-            handles,
-            k_phase8_row_count,
-            Phase8_row_pattern::ASCII_SEQUENCE,
-            fixture_bytes);
-
-    term::Terminal_history_row_traversal traversal(ring);
-    return measure_case(
-        "cache_rebuild_row_directory",
-        static_cast<std::uint64_t>(handles.size() * rebuild_count),
-        [&] {
-            benchmark_payload_t payload;
-            payload.ok = fixture_ok;
-            if (!payload.ok) {
-                return payload;
-            }
-
-            for (int rebuild_index = 0; rebuild_index < rebuild_count; ++rebuild_index) {
-                traversal.discard_directory_cache();
-                const term::Terminal_history_row_traversal_rebuild_result rebuild =
-                    traversal.rebuild_directory();
-                if (rebuild.status != term::Terminal_history_row_traversal_status::OK) {
-                    payload.ok = report_failure("Phase 8 cache rebuild failed");
-                    return payload;
-                }
-
-                payload.records += static_cast<std::uint64_t>(rebuild.row_count);
-                payload.checksum += static_cast<std::uint64_t>(rebuild.row_count);
-            }
-
-            payload.bytes = fixture_bytes * rebuild_count;
             return payload;
         });
 }
@@ -928,8 +807,6 @@ int main(int argc, char** argv)
     std::vector<benchmark_measurement_t> measurements;
     measurements.push_back(benchmark_append());
     measurements.push_back(benchmark_materialization());
-    measurements.push_back(benchmark_traversal());
-    measurements.push_back(benchmark_cache_rebuild());
     measurements.push_back(benchmark_resize_projection());
     measurements.push_back(benchmark_selection_extraction());
     measurements.push_back(benchmark_hyperlink_heavy_output());

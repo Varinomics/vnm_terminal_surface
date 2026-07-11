@@ -69,8 +69,6 @@ struct terminal_history_row_record_identity_t
 {
     std::uint64_t                  epoch = 0U;
     std::uint64_t                  row_sequence = 0U;
-    std::uint64_t                  previous_row_byte_sequence = 0U;
-    std::uint64_t                  previous_row_sequence = 0U;
 };
 
 struct terminal_history_row_record_payload_view_t
@@ -102,8 +100,6 @@ struct Terminal_history_row_record_decode_result
     Terminal_history_row_record_payload_kind
                                    payload_kind =
                                        Terminal_history_row_record_payload_kind::GENERIC_COMPACT;
-    std::uint64_t                  previous_row_byte_sequence = 0U;
-    std::uint64_t                  previous_row_sequence = 0U;
     Terminal_history_row_record    record;
 };
 
