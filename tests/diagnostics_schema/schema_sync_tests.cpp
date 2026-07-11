@@ -41,23 +41,6 @@ void append_key(std::vector<std::string>& keys, const char* key)
     keys.push_back(key);
 }
 
-std::vector<std::string> text_layout_keys()
-{
-    std::vector<std::string> keys;
-
-    // The legacy text-layout descriptor tables are templates; instantiate them
-    // with the cumulative renderer stats type they were originally serialized
-    // from so schema coverage continues to validate the compatibility block.
-    using Renderer_stats = term::terminal_renderer_cumulative_stats_t;
-    append_table_keys<Renderer_stats>(
-        keys, detail::text_layout_metrics_before_optional<Renderer_stats>());
-    append_key(keys, "text_ascii_replacement_add_glyphs_calls");
-    append_table_keys<Renderer_stats>(
-        keys, detail::text_layout_metrics_after_optional<Renderer_stats>());
-
-    return keys;
-}
-
 std::vector<std::string> retained_history_keys()
 {
     using Stats = term::terminal_retained_history_diagnostics_t;
@@ -113,17 +96,6 @@ std::vector<std::string> atlas_top_level_overlap_keys()
     append_table_keys(keys, detail::atlas_report_sequence_metrics());
     append_table_keys(keys, detail::atlas_report_rasterization_metrics());
     return keys;
-}
-
-std::vector<std::string> renderer_compatibility_keys()
-{
-    return {
-        "compatibility_scope",
-        "canonical_renderer_metrics",
-        "frames_published",
-        "paint_completed_frames",
-        "qsg_atlas_render_count",
-    };
 }
 
 std::vector<std::string> render_invalidation_keys()
@@ -360,15 +332,6 @@ int main(int argc, char** argv)
 
     const std::string document(doc_bytes.constData(), doc_bytes.size());
 
-    const std::vector<std::string> text_keys = text_layout_keys();
-    ok &= check(text_keys.size() > 50U,
-        "text-layout tables enumerate the expected field volume");
-
-    ok &= check_documented_section(
-        document,
-        3,
-        "Renderer compatibility block (JSON key `renderer`)",
-        renderer_compatibility_keys());
     ok &= check_documented_section(
         document,
         3,
@@ -389,11 +352,6 @@ int main(int argc, char** argv)
         3,
         "Prefix plain ASCII estimate block",
         retained_history_estimate_keys());
-    ok &= check_documented_section(
-        document,
-        2,
-        "Text-layout block",
-        text_keys);
     ok &= check_documented_section(
         document,
         3,

@@ -457,27 +457,6 @@ QJsonObject qsg_atlas_metrics_json(const internal::Qsg_atlas_frame_report& repor
 
 }
 
-void append_renderer_metrics_json(const VNM_TerminalSurface& surface, QJsonObject& out)
-{
-    const internal::terminal_renderer_cumulative_stats_t cumulative_stats =
-        internal::VNM_TerminalSurface_render_bridge::cumulative_renderer_stats(surface);
-    const internal::Qsg_atlas_frame_report atlas_report =
-        internal::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
-
-    out.insert(
-        QStringLiteral("compatibility_scope"),
-        QStringLiteral("legacy_renderer_frame_counters"));
-    out.insert(
-        QStringLiteral("canonical_renderer_metrics"),
-        QStringLiteral("qsg_atlas"));
-    insert_json_counter(out, "frames_published", cumulative_stats.frames_published);
-    insert_json_counter(
-        out,
-        "paint_completed_frames",
-        cumulative_stats.paint_completed_frames);
-    insert_json_counter(out, "qsg_atlas_render_count", atlas_report.render_count);
-}
-
 void append_atlas_metrics_json(const VNM_TerminalSurface& surface, QJsonObject& out)
 {
     const internal::Qsg_atlas_frame_report report =

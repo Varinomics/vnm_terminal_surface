@@ -14,9 +14,8 @@ exported include directories and asserts the public headers are present
 - Stable public API: the JSON metric serializers
   (`diagnostics/metrics_json.h`), the surface toggles and frame counters on
   `VNM_TerminalSurface`, the typed scroll-diagnostic enums, and
-  `font_metrics.h`. Compiled in every build. Renderer-detail diagnostics are
-  reported by the `qsg_atlas` serializer; the older `renderer` serializer is a
-  compatibility frame-counter helper.
+  `font_metrics.h`. Compiled in every build. Renderer diagnostics are reported
+  by the `qsg_atlas` serializer.
 - Profiling-gated API: the profile-text serializers
   (`diagnostics/profile_text.h`) exist only when the surface is built with
   `VNM_TERMINAL_ENABLE_PROFILING=ON`; the declarations are compiled out
@@ -32,9 +31,6 @@ exported include directories and asserts the public headers are present
 
 `vnm_terminal/diagnostics/metrics_json.h` declares fill-in-place builders:
 
-- `append_renderer_metrics_json(surface, out)` fills `out` with legacy
-  renderer compatibility metadata and frame counters. New consumers should use
-  `append_atlas_metrics_json` for renderer diagnostics.
 - `append_atlas_metrics_json(surface, out)` fills `out` with the QSG atlas
   frame-report metrics. Its top-level count and elapsed fields, including
   `prepare_elapsed_ns` and `render_elapsed_ns`, are recorder-lifetime cumulative
@@ -52,7 +48,7 @@ exported include directories and asserts the public headers are present
   `prefix_plain_ascii_estimate` value.
 
 The caller owns the surrounding document and chooses the enclosing keys; the
-first-party app nests these under `"renderer"`, `"qsg_atlas"`,
+first-party app nests these under `"qsg_atlas"`,
 `"render_invalidation"`, `"backend_drain"`, and `"retained_history"` in its
 runtime metrics document. Treat `"qsg_atlas"` as the canonical renderer
 diagnostics object. The render invalidation and backend drain sections are
@@ -74,9 +70,8 @@ frame-evidence):
 
 `vnm_terminal/diagnostics/profile_text.h` declares one builder per report
 section (dirty-row stats and timeline, model/session profile stats,
-retained-history diagnostics, legacy renderer compatibility sections, atlas
-profile, slow-text-layout diagnostics, surface geometry, render-thread
-profile). Each call appends exactly the bytes
+retained-history diagnostics, atlas profile, slow-text-layout diagnostics,
+surface geometry, render-thread profile). Each call appends exactly the bytes
 of one section to a `QTextStream`, with no leading or trailing blank line; the
 caller frames the document and writes the inter-section separators. Section
 content is profiling data, so the whole header body is
