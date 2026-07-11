@@ -17,6 +17,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <new>
 #include <optional>
 #include <set>
 #include <span>
@@ -1832,6 +1833,12 @@ terminal_hyperlink_identity_by_id_t
 Terminal_screen_model::active_hyperlink_identity_keys_by_id_for_testing() const
 {
     return active_hyperlink_identity_keys_by_id();
+}
+
+void Terminal_screen_model::fail_next_hyperlink_compaction_allocation_for_testing(
+    Terminal_hyperlink_compaction_allocation_phase phase)
+{
+    m_fail_next_hyperlink_compaction_allocation_phase_for_testing = phase;
 }
 
 void Terminal_screen_model::set_style_table_limits_for_testing(
@@ -5484,72 +5491,103 @@ void Terminal_screen_model::retain_referenced_active_hyperlink_ids()
     }
 }
 
+void Terminal_screen_model::fail_hyperlink_compaction_allocation_if_requested(
+    Terminal_hyperlink_compaction_allocation_phase phase)
+{
+    if (m_fail_next_hyperlink_compaction_allocation_phase_for_testing == phase) {
+        m_fail_next_hyperlink_compaction_allocation_phase_for_testing.reset();
+        throw std::bad_alloc();
+    }
+}
+
 void Terminal_screen_model::compact_hyperlink_ids()
 {
-    retain_referenced_active_hyperlink_ids();
-
     std::map<Terminal_hyperlink_id, QByteArray> identity_by_old_id;
+
+    const auto record_identity = [&](Terminal_hyperlink_id id, const QByteArray& identity) {
+        const auto [found, inserted] = identity_by_old_id.emplace(id, identity);
+        if (!inserted && found->second != identity) {
+            throw std::runtime_error(
+                "terminal hyperlink id compaction found conflicting identity metadata");
+        }
+    };
+
     for (const auto& entry : m_active_hyperlink_ids) {
-        identity_by_old_id.emplace(entry.second, entry.first);
+        record_identity(entry.second, entry.first);
     }
     if (m_primary_repaint_recovery_candidate.active) {
         for (const auto& entry : m_primary_repaint_recovery_candidate.hyperlink_identity_keys) {
-            identity_by_old_id.emplace(entry.first, entry.second);
+            record_identity(entry.first, entry.second);
         }
     }
 
-    std::set<Terminal_hyperlink_id> referenced_ids;
-    const auto collect_id = [&](Terminal_hyperlink_id id) {
+    std::set<Terminal_hyperlink_id> live_active_ids;
+    const auto collect_live_active_id = [&](Terminal_hyperlink_id id) {
         if (id != k_no_terminal_hyperlink_id) {
-            referenced_ids.insert(id);
+            live_active_ids.insert(id);
         }
     };
-    const auto collect_rows = [&](const std::vector<Terminal_screen_row>& rows) {
+
+    const auto collect_active_cells = [&](const std::vector<Terminal_screen_row>& rows) {
         for (const Terminal_screen_row& row : rows) {
             for (const Cell& cell : row.cells) {
-                collect_id(cell.hyperlink_id);
+                collect_live_active_id(cell.hyperlink_id);
             }
         }
     };
 
-    collect_id(m_current_hyperlink_id);
-    for (const auto& entry : m_active_hyperlink_ids) {
-        collect_id(entry.second);
-    }
-    collect_rows(m_primary_backing.active_grid_state().rows);
-    collect_rows(m_alternate_grid.active_grid_state().rows);
+    collect_live_active_id(m_current_hyperlink_id);
+    collect_active_cells(m_primary_backing.active_grid_state().rows);
+    collect_active_cells(m_alternate_grid.active_grid_state().rows);
+
+    std::set<Terminal_hyperlink_id> referenced_ids = live_active_ids;
+    const auto collect_referenced_id = [&](Terminal_hyperlink_id id) {
+        if (id != k_no_terminal_hyperlink_id) {
+            referenced_ids.insert(id);
+        }
+    };
+    const auto collect_candidate_rows = [&](const std::vector<Terminal_screen_row>& rows) {
+        for (const Terminal_screen_row& row : rows) {
+            for (const Cell& cell : row.cells) {
+                collect_referenced_id(cell.hyperlink_id);
+            }
+        }
+    };
+
     if (m_primary_repaint_recovery_candidate.active) {
-        collect_rows(m_primary_repaint_recovery_candidate.rows);
+        collect_candidate_rows(m_primary_repaint_recovery_candidate.rows);
         for (const auto& entry : m_primary_repaint_recovery_candidate.hyperlink_identity_keys) {
-            collect_id(entry.first);
+            collect_referenced_id(entry.first);
         }
     }
 
     std::map<QByteArray, Terminal_hyperlink_id> new_ids_by_identity;
-    std::map<Terminal_hyperlink_id, Terminal_hyperlink_id> remap_by_old_id;
+    fail_hyperlink_compaction_allocation_if_requested(
+        Terminal_hyperlink_compaction_allocation_phase::IDENTITY_TO_NEW_ID);
     for (Terminal_hyperlink_id old_id : referenced_ids) {
         const auto identity = identity_by_old_id.find(old_id);
         if (identity == identity_by_old_id.end() || identity->second.isEmpty()) {
             throw std::runtime_error("terminal hyperlink id compaction missing identity metadata");
         }
 
-        const auto existing_new_id = new_ids_by_identity.find(identity->second);
-        if (existing_new_id != new_ids_by_identity.end()) {
-            remap_by_old_id.emplace(old_id, existing_new_id->second);
-            continue;
-        }
+        if (new_ids_by_identity.find(identity->second) == new_ids_by_identity.end()) {
+            if (new_ids_by_identity.size() >=
+                static_cast<std::size_t>(k_max_terminal_hyperlink_id))
+            {
+                throw std::overflow_error("terminal hyperlink id space exhausted");
+            }
 
-        if (new_ids_by_identity.size() >=
-            static_cast<std::size_t>(k_max_terminal_hyperlink_id))
-        {
-            m_next_hyperlink_id = k_no_terminal_hyperlink_id;
-            throw std::overflow_error("terminal hyperlink id space exhausted");
+            const Terminal_hyperlink_id new_id =
+                static_cast<Terminal_hyperlink_id>(new_ids_by_identity.size() + 1U);
+            new_ids_by_identity.emplace(identity->second, new_id);
         }
+    }
 
-        const Terminal_hyperlink_id new_id =
-            static_cast<Terminal_hyperlink_id>(new_ids_by_identity.size() + 1U);
-        new_ids_by_identity.emplace(identity->second, new_id);
-        remap_by_old_id.emplace(old_id, new_id);
+    std::map<Terminal_hyperlink_id, Terminal_hyperlink_id> remap_by_old_id;
+    fail_hyperlink_compaction_allocation_if_requested(
+        Terminal_hyperlink_compaction_allocation_phase::OLD_TO_NEW_ID);
+    for (Terminal_hyperlink_id old_id : referenced_ids) {
+        remap_by_old_id.emplace(old_id, new_ids_by_identity.at(identity_by_old_id.at(old_id)));
     }
 
     const auto rewritten_id = [&](Terminal_hyperlink_id old_id) -> Terminal_hyperlink_id {
@@ -5564,46 +5602,80 @@ void Terminal_screen_model::compact_hyperlink_ids()
         return found->second;
     };
 
-    const auto rewrite_rows = [&](std::vector<Terminal_screen_row>& rows) {
-        for (Terminal_screen_row& row : rows) {
-            for (Cell& cell : row.cells) {
-                cell.hyperlink_id = rewritten_id(cell.hyperlink_id);
-            }
-        }
-    };
-
-    m_current_hyperlink_id = rewritten_id(m_current_hyperlink_id);
-    rewrite_rows(m_primary_backing.active_grid_state().rows);
-    rewrite_rows(m_alternate_grid.active_grid_state().rows);
-
     std::map<QByteArray, Terminal_hyperlink_id> active_hyperlink_ids;
+    fail_hyperlink_compaction_allocation_if_requested(
+        Terminal_hyperlink_compaction_allocation_phase::ACTIVE_IDENTITY_REPLACEMENT);
     for (const auto& entry : m_active_hyperlink_ids) {
-        const Terminal_hyperlink_id new_id = rewritten_id(entry.second);
-        active_hyperlink_ids.emplace(entry.first, new_id);
+        if (live_active_ids.find(entry.second) != live_active_ids.end()) {
+            active_hyperlink_ids.emplace(entry.first, rewritten_id(entry.second));
+        }
     }
-    m_active_hyperlink_ids = std::move(active_hyperlink_ids);
 
+    std::map<Terminal_hyperlink_id, QByteArray> candidate_identity_keys;
     if (m_primary_repaint_recovery_candidate.active) {
-        rewrite_rows(m_primary_repaint_recovery_candidate.rows);
-
-        std::map<Terminal_hyperlink_id, QByteArray> candidate_identity_keys;
+        fail_hyperlink_compaction_allocation_if_requested(
+            Terminal_hyperlink_compaction_allocation_phase::
+                RECOVERY_CANDIDATE_IDENTITY_REPLACEMENT);
         for (const auto& entry : m_primary_repaint_recovery_candidate.hyperlink_identity_keys) {
             const Terminal_hyperlink_id new_id = rewritten_id(entry.first);
             candidate_identity_keys.emplace(new_id, entry.second);
         }
-        m_primary_repaint_recovery_candidate.hyperlink_identity_keys =
-            std::move(candidate_identity_keys);
     }
 
-    if (new_ids_by_identity.size() >=
-        static_cast<std::size_t>(k_max_terminal_hyperlink_id))
+    struct hyperlink_id_rewrite_t
     {
-        m_next_hyperlink_id = k_no_terminal_hyperlink_id;
-        return;
+        Terminal_hyperlink_id* target = nullptr;
+        Terminal_hyperlink_id  value  = k_no_terminal_hyperlink_id;
+    };
+
+    std::size_t rewrite_count = 1U;
+    const auto count_row_cells = [&](const std::vector<Terminal_screen_row>& rows) {
+        for (const Terminal_screen_row& row : rows) {
+            rewrite_count += row.cells.size();
+        }
+    };
+    count_row_cells(m_primary_backing.active_grid_state().rows);
+    count_row_cells(m_alternate_grid.active_grid_state().rows);
+    if (m_primary_repaint_recovery_candidate.active) {
+        count_row_cells(m_primary_repaint_recovery_candidate.rows);
     }
 
-    m_next_hyperlink_id =
-        static_cast<Terminal_hyperlink_id>(new_ids_by_identity.size() + 1U);
+    std::vector<hyperlink_id_rewrite_t> rewrites;
+    rewrites.reserve(rewrite_count);
+    rewrites.push_back({
+        &m_current_hyperlink_id,
+        rewritten_id(m_current_hyperlink_id),
+    });
+    const auto queue_row_rewrites = [&](std::vector<Terminal_screen_row>& rows) {
+        for (Terminal_screen_row& row : rows) {
+            for (Cell& cell : row.cells) {
+                rewrites.push_back({
+                    &cell.hyperlink_id,
+                    rewritten_id(cell.hyperlink_id),
+                });
+            }
+        }
+    };
+    queue_row_rewrites(m_primary_backing.active_grid_state().rows);
+    queue_row_rewrites(m_alternate_grid.active_grid_state().rows);
+    if (m_primary_repaint_recovery_candidate.active) {
+        queue_row_rewrites(m_primary_repaint_recovery_candidate.rows);
+    }
+
+    const Terminal_hyperlink_id next_hyperlink_id =
+        new_ids_by_identity.size() >= static_cast<std::size_t>(k_max_terminal_hyperlink_id)
+            ? k_no_terminal_hyperlink_id
+            : static_cast<Terminal_hyperlink_id>(new_ids_by_identity.size() + 1U);
+
+    for (const hyperlink_id_rewrite_t& rewrite : rewrites) {
+        *rewrite.target = rewrite.value;
+    }
+    m_active_hyperlink_ids.swap(active_hyperlink_ids);
+    if (m_primary_repaint_recovery_candidate.active) {
+        m_primary_repaint_recovery_candidate.hyperlink_identity_keys.swap(
+            candidate_identity_keys);
+    }
+    m_next_hyperlink_id = next_hyperlink_id;
 }
 
 Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retained_row_record(

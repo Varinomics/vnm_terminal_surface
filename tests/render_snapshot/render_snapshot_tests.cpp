@@ -9,10 +9,12 @@
 #include <QString>
 #include <QtGlobal>
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -1267,6 +1269,87 @@ bool test_hyperlink_compaction_remaps_primary_repaint_recovery_candidate()
         ok &= check(current_link != nullptr &&
             current_link->uri == QByteArrayLiteral("https://current.example"),
             "primary-repaint candidate compaction preserves current row metadata");
+    }
+
+    return ok;
+}
+
+bool test_hyperlink_compaction_allocation_failure_is_transactional()
+{
+    bool ok = true;
+
+    constexpr std::array<term::Terminal_hyperlink_compaction_allocation_phase, 4U>
+        k_allocation_phases = {
+            term::Terminal_hyperlink_compaction_allocation_phase::IDENTITY_TO_NEW_ID,
+            term::Terminal_hyperlink_compaction_allocation_phase::OLD_TO_NEW_ID,
+            term::Terminal_hyperlink_compaction_allocation_phase::ACTIVE_IDENTITY_REPLACEMENT,
+            term::Terminal_hyperlink_compaction_allocation_phase::
+                RECOVERY_CANDIDATE_IDENTITY_REPLACEMENT,
+        };
+
+    for (std::size_t phase_index = 0U;
+        phase_index < k_allocation_phases.size();
+        ++phase_index)
+    {
+        term::Terminal_screen_model_config config;
+        config.grid_size                                = {3, 16};
+        config.scrollback_limit                         = 8;
+        config.tab_width                                = 8;
+        config.recover_scrollback_from_primary_repaints = true;
+        term::Terminal_screen_model model(config);
+        model.set_next_hyperlink_id_for_testing(term::k_max_terminal_hyperlink_id);
+
+        model.ingest(
+            QByteArrayLiteral("\x1b]8;id=recovered;https://recovered.example\x1b\\aa")
+            + QByteArrayLiteral("\x1b]8;;\x1b\\\r\nbb\r\ncc"));
+        model.ingest(QByteArrayLiteral("\x1b[?25l\x1b[H"));
+        model.ingest(
+            QByteArrayLiteral("bb\x1b[K\r\n")
+            + QByteArrayLiteral("cc\x1b[K\r\n"));
+
+        const term::terminal_hyperlink_identity_by_id_t identities_before =
+            model.active_hyperlink_identity_keys_by_id_for_testing();
+        const term::Terminal_render_snapshot snapshot_before =
+            model.render_snapshot(request_for_model(model, 37U));
+
+        model.fail_next_hyperlink_compaction_allocation_for_testing(
+            k_allocation_phases[phase_index]);
+        bool allocation_failed = false;
+        try {
+            model.ingest(
+                QByteArrayLiteral("\x1b]8;id=current;https://current.example\x1b\\dd")
+                + QByteArrayLiteral("\x1b]8;;\x1b\\\x1b[K"));
+        }
+        catch (const std::bad_alloc&) {
+            allocation_failed = true;
+        }
+
+        const term::Terminal_render_snapshot snapshot_after_failure =
+            model.render_snapshot(request_for_model(model, 38U));
+        const bool state_unchanged =
+            model.active_hyperlink_identity_keys_by_id_for_testing() == identities_before &&
+            model.current_hyperlink_id_for_testing() == term::k_no_terminal_hyperlink_id &&
+            model.next_hyperlink_id_for_testing() == term::k_no_terminal_hyperlink_id &&
+            term::validate_render_snapshot(snapshot_after_failure).status ==
+                term::Terminal_render_snapshot_status::OK &&
+            row_text(snapshot_after_failure, 0) == row_text(snapshot_before, 0) &&
+            row_text(snapshot_after_failure, 1) == row_text(snapshot_before, 1) &&
+            row_text(snapshot_after_failure, 2) == row_text(snapshot_before, 2);
+        ok &= check(allocation_failed,
+            "hyperlink compaction injects bad_alloc at allocation phase " +
+                std::to_string(phase_index));
+        ok &= check(state_unchanged,
+            "failed hyperlink compaction leaves cells, cursor, and metadata unchanged at phase " +
+                std::to_string(phase_index));
+
+        if (state_unchanged) {
+            model.ingest(
+                QByteArrayLiteral("\x1b]8;id=current;https://current.example\x1b\\dd")
+                + QByteArrayLiteral("\x1b]8;;\x1b\\\x1b[K"));
+            ok &= check(model.next_hyperlink_id_for_testing() == 3U,
+                "hyperlink compaction retry succeeds after bad_alloc at phase " +
+                    std::to_string(phase_index));
+        }
     }
 
     return ok;
@@ -3470,6 +3553,7 @@ int main()
     ok &= test_hyperlink_compaction_preserves_snapshot_and_projection_metadata();
     ok &= test_hyperlink_compaction_remaps_inactive_primary_and_alternate_roots();
     ok &= test_hyperlink_compaction_remaps_primary_repaint_recovery_candidate();
+    ok &= test_hyperlink_compaction_allocation_failure_is_transactional();
     ok &= test_style_compaction_preserves_retained_rows_selection_and_projection();
     ok &= test_style_compaction_remaps_primary_repaint_recovery_candidate();
     ok &= test_scrollback_wide_rows_are_repaired_on_resize();
