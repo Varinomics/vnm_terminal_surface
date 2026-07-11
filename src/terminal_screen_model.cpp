@@ -5684,44 +5684,18 @@ void Terminal_screen_model::compact_hyperlink_ids()
         }
     }
 
-    struct hyperlink_id_rewrite_t
-    {
-        Terminal_hyperlink_id* target = nullptr;
-        Terminal_hyperlink_id  value  = k_no_terminal_hyperlink_id;
-    };
-
-    std::size_t rewrite_count = 1U;
-    const auto count_row_cells = [&](const std::vector<Terminal_screen_row>& rows) {
+    const auto validate_row_ids = [&](const std::vector<Terminal_screen_row>& rows) {
         for (const Terminal_screen_row& row : rows) {
-            rewrite_count += row.cells.size();
-        }
-    };
-    count_row_cells(m_primary_backing.active_grid_state().rows);
-    count_row_cells(m_alternate_grid.active_grid_state().rows);
-    if (m_primary_repaint_recovery_candidate.active) {
-        count_row_cells(m_primary_repaint_recovery_candidate.rows);
-    }
-
-    std::vector<hyperlink_id_rewrite_t> rewrites;
-    rewrites.reserve(rewrite_count);
-    rewrites.push_back({
-        &m_current_hyperlink_id,
-        rewritten_id(m_current_hyperlink_id),
-    });
-    const auto queue_row_rewrites = [&](std::vector<Terminal_screen_row>& rows) {
-        for (Terminal_screen_row& row : rows) {
-            for (Cell& cell : row.cells) {
-                rewrites.push_back({
-                    &cell.hyperlink_id,
-                    rewritten_id(cell.hyperlink_id),
-                });
+            for (const Cell& cell : row.cells) {
+                (void)rewritten_id(cell.hyperlink_id);
             }
         }
     };
-    queue_row_rewrites(m_primary_backing.active_grid_state().rows);
-    queue_row_rewrites(m_alternate_grid.active_grid_state().rows);
+    (void)rewritten_id(m_current_hyperlink_id);
+    validate_row_ids(m_primary_backing.active_grid_state().rows);
+    validate_row_ids(m_alternate_grid.active_grid_state().rows);
     if (m_primary_repaint_recovery_candidate.active) {
-        queue_row_rewrites(m_primary_repaint_recovery_candidate.rows);
+        validate_row_ids(m_primary_repaint_recovery_candidate.rows);
     }
 
     const std::uint64_t reclaimed_hyperlink_ids =
@@ -5734,8 +5708,28 @@ void Terminal_screen_model::compact_hyperlink_ids()
             ? k_no_terminal_hyperlink_id
             : static_cast<Terminal_hyperlink_id>(new_ids_by_identity.size() + 1U);
 
-    for (const hyperlink_id_rewrite_t& rewrite : rewrites) {
-        *rewrite.target = rewrite.value;
+    const auto rewrite_id = [&](Terminal_hyperlink_id& id) {
+        if (id == k_no_terminal_hyperlink_id) {
+            return;
+        }
+
+        const auto found = remap_by_old_id.find(id);
+        Q_ASSERT(found != remap_by_old_id.end());
+        id = found->second;
+    };
+    const auto rewrite_row_ids = [&](std::vector<Terminal_screen_row>& rows) {
+        for (Terminal_screen_row& row : rows) {
+            for (Cell& cell : row.cells) {
+                rewrite_id(cell.hyperlink_id);
+            }
+        }
+    };
+
+    rewrite_id(m_current_hyperlink_id);
+    rewrite_row_ids(m_primary_backing.active_grid_state().rows);
+    rewrite_row_ids(m_alternate_grid.active_grid_state().rows);
+    if (m_primary_repaint_recovery_candidate.active) {
+        rewrite_row_ids(m_primary_repaint_recovery_candidate.rows);
     }
     m_active_hyperlink_ids.swap(active_hyperlink_ids);
     if (m_primary_repaint_recovery_candidate.active) {
