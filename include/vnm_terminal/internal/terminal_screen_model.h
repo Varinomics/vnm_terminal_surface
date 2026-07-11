@@ -298,6 +298,14 @@ struct terminal_screen_model_style_table_stats_t
     std::uint64_t              reclaimed_styles    = 0U;
 };
 
+enum class Terminal_hyperlink_compaction_allocation_phase
+{
+    IDENTITY_TO_NEW_ID,
+    OLD_TO_NEW_ID,
+    ACTIVE_IDENTITY_REPLACEMENT,
+    RECOVERY_CANDIDATE_IDENTITY_REPLACEMENT,
+};
+
 class Terminal_screen_model
 {
 public:
@@ -366,6 +374,8 @@ public:
     Terminal_hyperlink_id current_hyperlink_id_for_testing() const;
     Terminal_hyperlink_id next_hyperlink_id_for_testing() const;
     terminal_hyperlink_identity_by_id_t active_hyperlink_identity_keys_by_id_for_testing() const;
+    void fail_next_hyperlink_compaction_allocation_for_testing(
+        Terminal_hyperlink_compaction_allocation_phase phase);
     void set_style_table_limits_for_testing(
         std::size_t                  compaction_threshold,
         std::size_t                  count_cap);
@@ -985,6 +995,8 @@ private:
     terminal_hyperlink_identity_by_id_t active_hyperlink_identity_keys_by_id() const;
     void retain_referenced_active_hyperlink_ids();
     void compact_hyperlink_ids();
+    void fail_hyperlink_compaction_allocation_if_requested(
+        Terminal_hyperlink_compaction_allocation_phase phase);
 
     retained_row_record_t seal_retained_row_record(
         const Terminal_screen_row&     screen_row,
@@ -1165,6 +1177,8 @@ private:
     int                             m_active_alternate_mode = 0;
     Terminal_hyperlink_id           m_current_hyperlink_id = k_no_terminal_hyperlink_id;
     Terminal_hyperlink_id           m_next_hyperlink_id = 1U;
+    std::optional<Terminal_hyperlink_compaction_allocation_phase>
+                                     m_fail_next_hyperlink_compaction_allocation_phase_for_testing;
     std::uint64_t                   m_next_retained_line_id = 1U;
     mutable retained_lookup_cache_t m_primary_retained_lookup_cache;
     mutable retained_lookup_cache_t m_alternate_retained_lookup_cache;
