@@ -1,9 +1,11 @@
 # Diagnostics Schema
 
-This document describes the active QSG atlas diagnostics counters, runtime
-JSON-only helpers, and the legacy text-layout descriptor table retained for
-compatibility checks. It is kept in sync with the descriptor tables in
-`src/diagnostics/metric_descriptor.h` (the text-layout block) and
+This document describes the active QSG atlas diagnostics counters,
+descriptor-backed retained-history measurements, runtime JSON-only helpers,
+and the legacy text-layout descriptor table retained for compatibility checks.
+It is kept in sync with the descriptor tables in
+`src/diagnostics/metric_descriptor.h` (the retained-history and text-layout
+blocks) and
 `src/diagnostics/atlas_metric_descriptors.h` (the atlas blocks); those tables
 are the single source of truth for the listed fields, and the byte-golden test
 `tests/diagnostics_text_layout/diagnostics_text_layout_tests.cpp` pins the
@@ -11,13 +13,14 @@ descriptor output against them.
 
 ## Descriptor-backed serializations
 
-Descriptor-backed atlas counter blocks are emitted in two forms:
+Descriptor-backed atlas and retained-history metric blocks are emitted in two
+forms:
 
 - **JSON** (`src/diagnostics/metrics_json.cpp`, always built): the runtime
   metrics document. Counters are emitted as decimal **strings** (so a 64-bit
-  value is never silently narrowed to a JSON `double`); booleans are emitted as
-  native JSON `true`/`false`. JSON object keys are unordered; consumers must
-  look counters up by name, not by position.
+  value is never silently narrowed to a JSON `double`); doubles are emitted as
+  native JSON numbers and booleans as native JSON `true`/`false`. JSON object
+  keys are unordered; consumers must look metrics up by name, not by position.
 - **TEXT** (`src/diagnostics/profile_text.cpp`, built only when
   `VNM_TERMINAL_ENABLE_PROFILING=ON`): the human-readable profile report. Each
   counter is one line, `  <label>=<value>`, and **order is significant** -- the
@@ -44,6 +47,50 @@ because they are not plain counter/bool field reads: the `warm_elapsed_ms` and
 (text-renderer policy, sampler mode, LCD order), the nested `first_glyph_miss`
 diagnostic, and the `msdf_text` doubles. These stay in the serializers, around
 the shared tables.
+
+### Retained history block (JSON key `retained_history`, TEXT header `retained_history`)
+
+This block reports live retained-history ring measurements and style/hyperlink
+compaction counters. `average_retained_row_bytes` is
+`retained_record_bytes / retained_rows`, or zero when the ring is empty. The
+nested estimate is a codec-owned projection, not a measurement of retained
+content.
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `byte_budget` | Counter | Bytes | Unstable |
+| `retained_rows` | Counter | Count | Unstable |
+| `retained_record_bytes` | Counter | Bytes | Unstable |
+| `average_retained_row_bytes` | Double | Bytes | Unstable |
+| `payload_kind_generic_compact_rows` | Counter | Count | Unstable |
+| `payload_kind_prefix_plain_ascii_rows` | Counter | Count | Unstable |
+| `current_style_count` | Counter | Count | Unstable |
+| `peak_style_count` | Counter | Count | Unstable |
+| `style_compaction_count` | Counter | Count | Unstable |
+| `reclaimed_styles` | Counter | Count | Unstable |
+| `hyperlink_compaction_count` | Counter | Count | Unstable |
+| `reclaimed_hyperlink_ids` | Counter | Count | Unstable |
+| `prefix_plain_ascii_estimate` | Object | None | Unstable |
+
+### Prefix plain ASCII estimate block
+
+Contract version `1` projects homogeneous full-width rows eligible for the
+prefix-plain-ASCII codec. It uses the live ring byte budget, current model
+width, exact encoded record size including ring overhead, and the codec-owned
+target of 205,000 rows. Styled, linked, non-ASCII, or otherwise generic-compact
+rows may consume more bytes.
+
+JSON path: `retained_history.prefix_plain_ascii_estimate`. TEXT header:
+`prefix_plain_ascii_estimate`.
+
+| Field | Kind | Unit | Stability |
+|-------|------|------|-----------|
+| `contract_version` | Counter | Version | Unstable |
+| `source_width_columns` | Counter | Columns | Unstable |
+| `record_bytes` | Counter | Bytes | Unstable |
+| `retained_rows` | Counter | Count | Unstable |
+| `target_rows` | Counter | Count | Unstable |
+| `max_columns_at_target_rows` | Counter | Columns | Unstable |
 
 ## Runtime JSON-only sections
 
@@ -120,12 +167,11 @@ A `Metric_descriptor<Stats>` row carries:
 | Column     | Meaning                                                              |
 |------------|----------------------------------------------------------------------|
 | `json_key` | JSON object key and TEXT report label.                               |
-| `kind`     | `COUNTER` (numeric) or `BOOL`.                                       |
-| reader     | A stateless function pointer that reads the field from `Stats` (one reader per kind; the other is null). |
+| `kind`     | `COUNTER` (integer), `BOOL`, or `DOUBLE`.                             |
+| readers    | Stateless function pointers that read the field from `Stats`; the row's kind selects one. |
 
-Each reader casts its field to `std::uint64_t`, which lets one table serve both
-the `int`-typed per-frame stats struct and the `std::uint64_t`-typed cumulative
-stats struct.
+Counter readers cast their fields to `std::uint64_t`; bool and double readers
+preserve their native types.
 
 The `Unit` and `Stability` columns in the tables below are schema
 documentation, not stored descriptor fields.

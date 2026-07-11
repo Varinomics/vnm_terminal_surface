@@ -588,4 +588,25 @@ void append_backend_drain_metrics_json(
         stats.output_backpressure_after_drain);
 }
 
+void append_retained_history_metrics_json(
+    const VNM_TerminalSurface& surface,
+    QJsonObject&               out)
+{
+    const internal::terminal_retained_history_diagnostics_t diagnostics =
+        internal::VNM_TerminalSurface_render_bridge::retained_history_diagnostics(surface);
+    detail::emit_metrics_json(
+        out,
+        diagnostics,
+        detail::retained_history_metrics<
+            internal::terminal_retained_history_diagnostics_t>());
+
+    QJsonObject estimate;
+    detail::emit_metrics_json(
+        estimate,
+        diagnostics.prefix_plain_ascii_estimate,
+        detail::retained_history_estimate_metrics<
+            internal::terminal_history_prefix_plain_ascii_retention_estimate_t>());
+    out.insert(QStringLiteral("prefix_plain_ascii_estimate"), estimate);
+}
+
 }

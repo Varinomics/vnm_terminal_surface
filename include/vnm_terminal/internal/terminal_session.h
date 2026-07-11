@@ -266,6 +266,7 @@ public:
     Terminal_screen_model_dirty_row_timeline dirty_row_timeline() const;
     void set_profile_stats_enabled(bool enabled);
     Terminal_screen_model_profile_stats model_profile_stats() const;
+    terminal_retained_history_diagnostics_t retained_history_diagnostics() const;
     Terminal_session_profile_stats profile_stats() const;
     std::optional<Terminal_backend_exit> exit_status() const;
 

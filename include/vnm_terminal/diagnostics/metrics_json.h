@@ -31,4 +31,10 @@ void append_backend_drain_metrics_json(
     const VNM_TerminalSurface&  surface,
     QJsonObject&                out);
 
+// Fill `out` with retained-history storage measurements, live compaction
+// counters, and the codec-owned prefix-plain-ASCII retention estimate.
+void append_retained_history_metrics_json(
+    const VNM_TerminalSurface& surface,
+    QJsonObject&               out);
+
 }

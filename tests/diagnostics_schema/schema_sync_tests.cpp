@@ -3,6 +3,7 @@
 // section must match the expected field sequence exactly. The doc path arrives
 // as argv[1] from the CTest definition.
 #include "diagnostics/atlas_metric_descriptors.h"
+#include "vnm_terminal/internal/terminal_screen_model.h"
 #include "helpers/test_check.h"
 
 #include <QByteArray>
@@ -54,6 +55,23 @@ std::vector<std::string> text_layout_keys()
     append_table_keys<Renderer_stats>(
         keys, detail::text_layout_metrics_after_optional<Renderer_stats>());
 
+    return keys;
+}
+
+std::vector<std::string> retained_history_keys()
+{
+    using Stats = term::terminal_retained_history_diagnostics_t;
+    std::vector<std::string> keys;
+    append_table_keys(keys, detail::retained_history_metrics<Stats>());
+    append_key(keys, "prefix_plain_ascii_estimate");
+    return keys;
+}
+
+std::vector<std::string> retained_history_estimate_keys()
+{
+    using Stats = term::terminal_history_prefix_plain_ascii_retention_estimate_t;
+    std::vector<std::string> keys;
+    append_table_keys(keys, detail::retained_history_estimate_metrics<Stats>());
     return keys;
 }
 
@@ -361,6 +379,16 @@ int main(int argc, char** argv)
         3,
         "Backend drain block (JSON key `backend_drain`)",
         backend_drain_keys());
+    ok &= check_documented_section(
+        document,
+        3,
+        "Retained history block (JSON key `retained_history`, TEXT header `retained_history`)",
+        retained_history_keys());
+    ok &= check_documented_section(
+        document,
+        3,
+        "Prefix plain ASCII estimate block",
+        retained_history_estimate_keys());
     ok &= check_documented_section(
         document,
         2,

@@ -2,6 +2,7 @@
 #include "vnm_terminal/internal/terminal_resize_controller.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
+#include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/diagnostics/metrics_json.h"
 #include "vnm_terminal/font_metrics.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
@@ -105,6 +106,7 @@ public:
         }
 
         running = true;
+        m_callbacks = std::move(callbacks);
         return term::backend_accept();
     }
 
@@ -146,6 +148,15 @@ public:
         return term::backend_accept();
     }
 
+    bool emit_output(QByteArray bytes)
+    {
+        if (!running || !m_callbacks.output_received) {
+            return false;
+        }
+        m_callbacks.output_received(std::move(bytes));
+        return true;
+    }
+
     bool                       running = false;
     std::vector<term::Terminal_launch_config>
                                start_configs;
@@ -153,6 +164,9 @@ public:
                                resize_requests;
     std::vector<QByteArray>    writes;
     std::vector<bool>          pause_requests;
+
+private:
+    term::Terminal_backend_callbacks m_callbacks;
 };
 
 term::Terminal_metrics_result expected_grid(
@@ -630,7 +644,9 @@ std::string metric_message(
 bool expected_runtime_metric_key(
     const QString&                    key,
     std::initializer_list<const char*> string_keys,
-    std::initializer_list<const char*> bool_keys)
+    std::initializer_list<const char*> bool_keys,
+    std::initializer_list<const char*> double_keys,
+    std::initializer_list<const char*> object_keys)
 {
     for (const char* expected_key : string_keys) {
         if (key == QString::fromLatin1(expected_key)) {
@@ -642,6 +658,16 @@ bool expected_runtime_metric_key(
             return true;
         }
     }
+    for (const char* expected_key : double_keys) {
+        if (key == QString::fromLatin1(expected_key)) {
+            return true;
+        }
+    }
+    for (const char* expected_key : object_keys) {
+        if (key == QString::fromLatin1(expected_key)) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -649,12 +675,15 @@ bool check_runtime_metric_object(
     const QJsonObject&                 object,
     std::string_view                   object_name,
     std::initializer_list<const char*> string_keys,
-    std::initializer_list<const char*> bool_keys)
+    std::initializer_list<const char*> bool_keys,
+    std::initializer_list<const char*> double_keys = {},
+    std::initializer_list<const char*> object_keys = {})
 {
     bool ok = true;
 
     const int expected_size =
-        static_cast<int>(string_keys.size() + bool_keys.size());
+        static_cast<int>(
+            string_keys.size() + bool_keys.size() + double_keys.size() + object_keys.size());
     ok &= check(
         object.size() == expected_size,
         std::string(object_name) + " metrics expose the expected field count");
@@ -679,9 +708,24 @@ bool check_runtime_metric_object(
             metric_message(object_name, " metrics type bool field ", key));
     }
 
+    for (const char* key : double_keys) {
+        const QString json_key = QString::fromLatin1(key);
+        ok &= check(
+            object.value(json_key).isDouble(),
+            metric_message(object_name, " metrics type double field ", key));
+    }
+
+    for (const char* key : object_keys) {
+        const QString json_key = QString::fromLatin1(key);
+        ok &= check(
+            object.value(json_key).isObject(),
+            metric_message(object_name, " metrics type object field ", key));
+    }
+
     for (auto it = object.constBegin(); it != object.constEnd(); ++it) {
         ok &= check(
-            expected_runtime_metric_key(it.key(), string_keys, bool_keys),
+            expected_runtime_metric_key(
+                it.key(), string_keys, bool_keys, double_keys, object_keys),
             std::string(object_name) +
                 " metrics do not include unexpected field " +
                 it.key().toStdString());
@@ -706,6 +750,25 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
 
     window.show();
     pump_events(app);
+
+    auto               backend     = std::make_unique<Recording_backend>();
+    Recording_backend* backend_ptr = backend.get();
+    const bool started = term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
+        surface,
+        std::move(backend),
+        {QStringLiteral("metrics-fixture")});
+    ok &= check(started, "retained-history metrics surface starts a session");
+    if (!started) {
+        return false;
+    }
+
+    QByteArray output;
+    for (int row = 0; row < 64; ++row) {
+        output += QByteArrayLiteral("metrics-row\r\n");
+    }
+    ok &= check(backend_ptr->emit_output(output),
+        "retained-history metrics fixture emits retained rows");
+    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(surface);
 
     QJsonObject renderer;
     vnm_terminal::diagnostics::append_renderer_metrics_json(surface, renderer);
@@ -835,6 +898,78 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
             "output_backpressure_after_drain",
         },
         {});
+
+    const term::terminal_retained_history_diagnostics_t expected =
+        term::VNM_TerminalSurface_render_bridge::retained_history_diagnostics(surface);
+    QJsonObject retained_history;
+    vnm_terminal::diagnostics::append_retained_history_metrics_json(
+        surface,
+        retained_history);
+    ok &= check_runtime_metric_object(
+        retained_history,
+        "retained history",
+        {
+            "byte_budget",
+            "retained_rows",
+            "retained_record_bytes",
+            "payload_kind_generic_compact_rows",
+            "payload_kind_prefix_plain_ascii_rows",
+            "current_style_count",
+            "peak_style_count",
+            "style_compaction_count",
+            "reclaimed_styles",
+            "hyperlink_compaction_count",
+            "reclaimed_hyperlink_ids",
+        },
+        {},
+        {"average_retained_row_bytes"},
+        {"prefix_plain_ascii_estimate"});
+
+    const QJsonObject estimate =
+        retained_history.value(QStringLiteral("prefix_plain_ascii_estimate")).toObject();
+    ok &= check_runtime_metric_object(
+        estimate,
+        "prefix plain ASCII estimate",
+        {
+            "contract_version",
+            "source_width_columns",
+            "record_bytes",
+            "retained_rows",
+            "target_rows",
+            "max_columns_at_target_rows",
+        },
+        {});
+    const bool retained_values_exact =
+        expected.retained_rows > 0U &&
+        expected.retained_record_bytes > 0U &&
+        retained_history.value(QStringLiteral("retained_rows")).toString() ==
+            QString::number(expected.retained_rows) &&
+        retained_history.value(QStringLiteral("retained_record_bytes")).toString() ==
+            QString::number(expected.retained_record_bytes) &&
+        estimate.value(QStringLiteral("contract_version")).toString() ==
+            QString::number(term::k_terminal_history_retention_estimate_contract_version) &&
+        estimate.value(QStringLiteral("source_width_columns")).toString() ==
+            QString::number(expected.prefix_plain_ascii_estimate.source_width_columns);
+    if (!retained_values_exact) {
+        std::cerr
+            << "retained rows=" << expected.retained_rows
+            << " bytes=" << expected.retained_record_bytes
+            << " version=" << expected.prefix_plain_ascii_estimate.contract_version
+            << " width=" << expected.prefix_plain_ascii_estimate.source_width_columns
+            << " json_rows="
+            << retained_history.value(QStringLiteral("retained_rows")).toString().toStdString()
+            << " json_bytes="
+            << retained_history.value(
+                QStringLiteral("retained_record_bytes")).toString().toStdString()
+            << " json_version="
+            << estimate.value(QStringLiteral("contract_version")).toString().toStdString()
+            << " json_width="
+            << estimate.value(QStringLiteral("source_width_columns")).toString().toStdString()
+            << '\n';
+    }
+    ok &= check(
+        retained_values_exact,
+        "model-session-bridge retained-history values stay exact in JSON");
 
     return ok;
 }

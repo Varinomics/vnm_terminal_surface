@@ -23,6 +23,10 @@ void append_dirty_row_timeline_text(const VNM_TerminalSurface& surface, QTextStr
 
 void append_model_profile_stats_text(const VNM_TerminalSurface& surface, QTextStream& out);
 
+void append_retained_history_profile_text(
+    const VNM_TerminalSurface& surface,
+    QTextStream&               out);
+
 void append_session_profile_stats_text(const VNM_TerminalSurface& surface, QTextStream& out);
 
 // Legacy renderer compatibility sections. New renderer diagnostics should use

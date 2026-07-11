@@ -1,6 +1,7 @@
 #include "helpers/test_check.h"
 
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
+#include "vnm_terminal/internal/terminal_screen_model.h"
 #include "diagnostics/atlas_metric_descriptors.h"
 #include "diagnostics/metric_descriptor.h"
 
@@ -689,6 +690,97 @@ bool test_report_overlap_golden()
     return ok;
 }
 
+bool test_retained_history_golden()
+{
+    term::terminal_retained_history_diagnostics_t diagnostics;
+    diagnostics.byte_budget                          = 1001U;
+    diagnostics.retained_rows                        = 1002U;
+    diagnostics.retained_record_bytes                = 1003U;
+    diagnostics.average_retained_row_bytes           = 12.5;
+    diagnostics.payload_kind_generic_compact_rows    = 1004U;
+    diagnostics.payload_kind_prefix_plain_ascii_rows = 1005U;
+    diagnostics.current_style_count                  = 1006U;
+    diagnostics.peak_style_count                     = 1007U;
+    diagnostics.style_compaction_count               = 1008U;
+    diagnostics.reclaimed_styles                     = 1009U;
+    diagnostics.hyperlink_compaction_count           = 1010U;
+    diagnostics.reclaimed_hyperlink_ids              = 1011U;
+    diagnostics.prefix_plain_ascii_estimate = {
+        1U,
+        171U,
+        327U,
+        205225U,
+        205000U,
+        171U,
+    };
+
+    QString     text;
+    QTextStream stream(&text);
+    detail::emit_metrics_text(
+        stream,
+        diagnostics,
+        detail::retained_history_metrics<
+            term::terminal_retained_history_diagnostics_t>());
+    stream << "  prefix_plain_ascii_estimate\n";
+    detail::emit_metrics_text(
+        stream,
+        diagnostics.prefix_plain_ascii_estimate,
+        detail::retained_history_estimate_metrics<
+            term::terminal_history_prefix_plain_ascii_retention_estimate_t>(),
+        "    ");
+    stream.flush();
+
+    const QString expected = QStringLiteral(
+        "  byte_budget=1001\n"
+        "  retained_rows=1002\n"
+        "  retained_record_bytes=1003\n"
+        "  average_retained_row_bytes=12.5\n"
+        "  payload_kind_generic_compact_rows=1004\n"
+        "  payload_kind_prefix_plain_ascii_rows=1005\n"
+        "  current_style_count=1006\n"
+        "  peak_style_count=1007\n"
+        "  style_compaction_count=1008\n"
+        "  reclaimed_styles=1009\n"
+        "  hyperlink_compaction_count=1010\n"
+        "  reclaimed_hyperlink_ids=1011\n"
+        "  prefix_plain_ascii_estimate\n"
+        "    contract_version=1\n"
+        "    source_width_columns=171\n"
+        "    record_bytes=327\n"
+        "    retained_rows=205225\n"
+        "    target_rows=205000\n"
+        "    max_columns_at_target_rows=171\n");
+
+    QJsonObject actual;
+    detail::emit_metrics_json(
+        actual,
+        diagnostics,
+        detail::retained_history_metrics<
+            term::terminal_retained_history_diagnostics_t>());
+    QJsonObject estimate;
+    detail::emit_metrics_json(
+        estimate,
+        diagnostics.prefix_plain_ascii_estimate,
+        detail::retained_history_estimate_metrics<
+            term::terminal_history_prefix_plain_ascii_retention_estimate_t>());
+
+    bool ok = true;
+    ok &= check(text == expected,
+        "retained-history descriptor emits exact nested profile-text order");
+    ok &= check(
+        actual.size() == 12 &&
+        actual.value(QStringLiteral("byte_budget")).toString() == QStringLiteral("1001") &&
+        actual.value(QStringLiteral("average_retained_row_bytes")).toDouble() == 12.5,
+        "retained-history descriptor emits exact JSON values and types");
+    ok &= check(
+        estimate.size() == 6 &&
+        estimate.value(QStringLiteral("contract_version")).toString() == QStringLiteral("1") &&
+        estimate.value(QStringLiteral("max_columns_at_target_rows")).toString() ==
+            QStringLiteral("171"),
+        "retained-history estimate descriptor emits versioned JSON values");
+    return ok;
+}
+
 }
 
 int main()
@@ -701,5 +793,6 @@ int main()
     ok &= test_capabilities_golden();
     ok &= test_warm_lazy_golden();
     ok &= test_report_overlap_golden();
+    ok &= test_retained_history_golden();
     return ok ? 0 : 1;
 }

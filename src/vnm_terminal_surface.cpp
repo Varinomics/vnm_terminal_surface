@@ -7673,6 +7673,16 @@ term::VNM_TerminalSurface_render_bridge::model_profile_stats(
         : term::Terminal_screen_model_profile_stats{};
 }
 
+term::terminal_retained_history_diagnostics_t
+term::VNM_TerminalSurface_render_bridge::retained_history_diagnostics(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->session != nullptr
+        ? surface.m_private->session->retained_history_diagnostics()
+        : term::terminal_retained_history_diagnostics_t{};
+}
+
 term::Terminal_session_profile_stats
 term::VNM_TerminalSurface_render_bridge::session_profile_stats(
     const VNM_TerminalSurface& surface)

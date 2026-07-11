@@ -150,6 +150,8 @@ bool test_profile_text_sections(QGuiApplication& app)
     stream << '\n';
     diag::append_model_profile_stats_text(surface, stream);
     stream << '\n';
+    diag::append_retained_history_profile_text(surface, stream);
+    stream << '\n';
     diag::append_session_profile_stats_text(surface, stream);
     stream << '\n';
     diag::append_renderer_stats_text(surface, stream);
@@ -183,6 +185,18 @@ bool test_profile_text_sections(QGuiApplication& app)
         "model_profile_stats reports render_snapshot_model_row_accessor_borrows");
     ok &= check(text.contains(QStringLiteral("  render_snapshot_inline_single_bmp_text_cells=")),
         "model_profile_stats reports render_snapshot_inline_single_bmp_text_cells");
+    const QString retained_history = profile_text_section(
+        text,
+        QStringLiteral("retained_history\n"),
+        QStringLiteral("session_profile_stats\n"));
+    ok &= check(
+        retained_history.contains(QStringLiteral("  byte_budget=0\n")) &&
+        retained_history.contains(QStringLiteral("  average_retained_row_bytes=0\n")) &&
+        retained_history.contains(QStringLiteral("  prefix_plain_ascii_estimate\n")) &&
+        retained_history.contains(QStringLiteral("    contract_version=0\n")) &&
+        retained_history.contains(QStringLiteral("    source_width_columns=0\n")) &&
+        retained_history.contains(QStringLiteral("    max_columns_at_target_rows=0\n")),
+        "retained-history profile text preserves the nested descriptor shape");
     ok &= check(text.contains(QStringLiteral("session_profile_stats\n")),
         "append_session_profile_stats_text emits the session_profile_stats header");
     ok &= check(text.contains(QStringLiteral("  full_snapshot_publications=")),
