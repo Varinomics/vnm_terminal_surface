@@ -35,6 +35,12 @@ enum class Terminal_history_row_record_codec_status
     CONTENT_GENERATION_MISMATCH,
 };
 
+enum class Terminal_history_row_record_payload_kind : std::uint32_t
+{
+    GENERIC_COMPACT    = 0U,
+    PREFIX_PLAIN_ASCII = 1U,
+};
+
 struct Terminal_history_row_cell
 {
     QString                        text = QStringLiteral(" ");
@@ -82,6 +88,9 @@ struct Terminal_history_row_record_append_result
     terminal_history_ring_commit_result_t
                                    commit;
     terminal_history_handle_t      history_handle;
+    Terminal_history_row_record_payload_kind
+                                   payload_kind =
+                                       Terminal_history_row_record_payload_kind::GENERIC_COMPACT;
 };
 
 struct Terminal_history_row_record_decode_result
@@ -90,6 +99,9 @@ struct Terminal_history_row_record_decode_result
                                    status = Terminal_history_row_record_codec_status::OK;
     Terminal_history_ring_status   ring_status = Terminal_history_ring_status::OK;
     terminal_history_handle_t      history_handle;
+    Terminal_history_row_record_payload_kind
+                                   payload_kind =
+                                       Terminal_history_row_record_payload_kind::GENERIC_COMPACT;
     std::uint64_t                  previous_row_byte_sequence = 0U;
     std::uint64_t                  previous_row_sequence = 0U;
     Terminal_history_row_record    record;
@@ -107,5 +119,10 @@ Terminal_history_row_record_decode_result decode_terminal_history_row_record(
 Terminal_history_row_record_decode_result decode_terminal_history_row_record_payload(
     terminal_history_row_record_payload_view_t   payload_view,
     std::optional<terminal_history_handle_t>     expected_handle = std::nullopt);
+
+terminal_history_prefix_plain_ascii_retention_estimate_t
+make_terminal_history_prefix_plain_ascii_retention_estimate(
+    std::uint64_t                                byte_budget,
+    int                                          source_width_columns);
 
 }
