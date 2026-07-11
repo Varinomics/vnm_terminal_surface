@@ -116,7 +116,7 @@ QByteArray styled_hyperlink_row_bytes(
 {
     QByteArray row;
     row += QByteArrayLiteral("\x1b[43m");
-    row += QByteArrayLiteral("\x1b]8;id=phase3;");
+    row += QByteArrayLiteral("\x1b]8;id=retained;");
     row += uri;
     row += QByteArrayLiteral("\x1b\\");
     row += text;
@@ -943,7 +943,7 @@ bool test_scrollback_growth_observer_seam()
     return ok;
 }
 
-bool test_phase_r_primary_repaint_recovery_accepts_distinct_shift()
+bool test_primary_repaint_recovery_accepts_distinct_shift()
 {
     bool ok = true;
 
@@ -965,9 +965,9 @@ bool test_phase_r_primary_repaint_recovery_accepts_distinct_shift()
         }, true));
 
     ok &= check(model.scrollback_size() == 1,
-        "Phase R recovery accepts one provable shifted repaint row");
+        "recovery accepts one provable shifted repaint row");
     ok &= check(result.scrollback_rows == 1,
-        "Phase R recovery result reports recovered retained row");
+        "recovery result reports recovered retained row");
     ok &= check(result.backing_deltas.size() == 1U &&
             primary_backing_delta_matches(
                 result.backing_deltas[0],
@@ -976,7 +976,7 @@ bool test_phase_r_primary_repaint_recovery_accepts_distinct_shift()
                 1,
                 1,
                 0),
-        "Phase R recovery emits a primary-history append delta");
+        "recovery emits a primary-history append delta");
     ok &= check(result.recovery_proposals.size() == 1U &&
             result.recovery_proposals[0].reason ==
                 term::Terminal_recovery_proposal_reason::PRIMARY_REPAINT_SHIFTED_VISIBLE_ROWS &&
@@ -987,18 +987,18 @@ bool test_phase_r_primary_repaint_recovery_accepts_distinct_shift()
             result.recovery_proposals[0].candidate_visible_rows == 4 &&
             result.recovery_proposals[0].recovered_row_count == 1 &&
             result.recovery_proposals[0].visible_row_identity_ambiguous,
-        "Phase R recovery records accepted proposal metadata");
+        "recovery records accepted proposal metadata");
     ok &= check(model.row_text(0) == QStringLiteral("bb") &&
             model.row_text(1) == QStringLiteral("cc") &&
             model.row_text(2) == QStringLiteral("dd") &&
             model.row_text(3) == QStringLiteral("ee"),
-        "Phase R recovery keeps the repainted active grid");
+        "recovery keeps the repainted active grid");
     ok &= check(primary_retained_line_provenance(model, 0).source ==
             term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
-        "Phase R recovery stamps recovered retained-row provenance");
+        "recovery stamps recovered retained-row provenance");
     ok &= check(primary_retained_line_provenance(model, 1).source ==
             term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
-        "Phase R recovery keeps repainted active rows on terminal-storage provenance");
+        "recovery keeps repainted active rows on terminal-storage provenance");
 
     const term::Terminal_render_snapshot scrollback_snapshot =
         model.render_snapshot(request_for_model(model, 80U, 1));
@@ -1006,12 +1006,12 @@ bool test_phase_r_primary_repaint_recovery_accepts_distinct_shift()
             snapshot_row_text(scrollback_snapshot, 1) == QStringLiteral("bb") &&
             snapshot_row_text(scrollback_snapshot, 2) == QStringLiteral("cc") &&
             snapshot_row_text(scrollback_snapshot, 3) == QStringLiteral("dd"),
-        "Phase R recovery exposes the recovered row through primary backing");
+        "recovery exposes the recovered row through primary backing");
 
     const term::Terminal_screen_model_result non_recovery_result =
         model.ingest(QByteArrayLiteral("z"));
     ok &= check(non_recovery_result.recovery_proposals.empty(),
-        "Phase R recovery proposal metadata clears on later non-recovery ingest");
+        "recovery proposal metadata clears on later non-recovery ingest");
 
     return ok;
 }
@@ -1026,7 +1026,7 @@ void wait_for_wall_clock_after_ms(qint64 reference_ms)
     }
 }
 
-bool test_phase_r_primary_repaint_recovery_preserves_row_content_stamps()
+bool test_primary_repaint_recovery_preserves_row_content_stamps()
 {
     bool ok = true;
 
@@ -1049,7 +1049,7 @@ bool test_phase_r_primary_repaint_recovery_preserves_row_content_stamps()
             written_stamps.begin(),
             written_stamps.end(),
             [](qint64 stamp) { return stamp > 0; }),
-        "Phase R stamp fixture rows carry write stamps");
+        "stamp fixture rows carry write stamps");
 
     wait_for_wall_clock_after_ms(
         *std::max_element(written_stamps.begin(), written_stamps.end()));
@@ -1064,7 +1064,7 @@ bool test_phase_r_primary_repaint_recovery_preserves_row_content_stamps()
     const qint64 repaint_end_ms = QDateTime::currentMSecsSinceEpoch();
 
     ok &= check(model.scrollback_size() == 1,
-        "Phase R stamp fixture accepts the shifted repaint");
+        "stamp fixture accepts the shifted repaint");
 
     // The recovered scrollback row ("aa") was rekeyed onto recovered
     // provenance; the rekey renames the line, but the content is the same
@@ -1090,7 +1090,7 @@ bool test_phase_r_primary_repaint_recovery_preserves_row_content_stamps()
     return ok;
 }
 
-bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row()
+bool test_primary_repaint_recovery_recovers_blank_separator_row()
 {
     bool ok = true;
 
@@ -1116,9 +1116,9 @@ bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row()
         }, true));
 
     ok &= check(model.scrollback_size() == 1,
-        "Phase R recovery recovers a blank separator row displaced by a proven shift");
+        "recovery recovers a blank separator row displaced by a proven shift");
     ok &= check(result.scrollback_rows == 1,
-        "Phase R recovery result reports the recovered blank retained row");
+        "recovery result reports the recovered blank retained row");
     ok &= check(result.backing_deltas.size() == 1U &&
             primary_backing_delta_matches(
                 result.backing_deltas[0],
@@ -1127,7 +1127,7 @@ bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row()
                 1,
                 1,
                 0),
-        "Phase R recovery emits a primary-history append delta for the blank row");
+        "recovery emits a primary-history append delta for the blank row");
     ok &= check(result.recovery_proposals.size() == 1U &&
             result.recovery_proposals[0].reason ==
                 term::Terminal_recovery_proposal_reason::PRIMARY_REPAINT_SHIFTED_VISIBLE_ROWS &&
@@ -1137,15 +1137,15 @@ bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row()
                 term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT &&
             result.recovery_proposals[0].candidate_visible_rows == 4 &&
             result.recovery_proposals[0].recovered_row_count == 1,
-        "Phase R recovery records accepted proposal metadata for the blank row");
+        "recovery records accepted proposal metadata for the blank row");
     ok &= check(model.row_text(0) == QStringLiteral("bb") &&
             model.row_text(1) == QStringLiteral("cc") &&
             model.row_text(2) == QStringLiteral("dd") &&
             model.row_text(3) == QStringLiteral("ee"),
-        "Phase R recovery keeps the repainted active grid after a blank recovery");
+        "recovery keeps the repainted active grid after a blank recovery");
     ok &= check(primary_retained_line_provenance(model, 0).source ==
             term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
-        "Phase R recovery stamps recovered provenance on the blank retained row");
+        "recovery stamps recovered provenance on the blank retained row");
 
     const term::Terminal_render_snapshot scrollback_snapshot =
         model.render_snapshot(request_for_model(model, 80U, 1));
@@ -1153,12 +1153,12 @@ bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row()
             snapshot_row_text(scrollback_snapshot, 1) == QStringLiteral("bb") &&
             snapshot_row_text(scrollback_snapshot, 2) == QStringLiteral("cc") &&
             snapshot_row_text(scrollback_snapshot, 3) == QStringLiteral("dd"),
-        "Phase R recovery exposes the recovered blank separator through primary backing");
+        "recovery exposes the recovered blank separator through primary backing");
 
     return ok;
 }
 
-bool test_phase_r_primary_repaint_recovery_preserves_styled_blank_separator_row()
+bool test_primary_repaint_recovery_preserves_styled_blank_separator_row()
 {
     bool ok = true;
 
@@ -1180,10 +1180,10 @@ bool test_phase_r_primary_repaint_recovery_preserves_styled_blank_separator_row(
         }, true));
 
     ok &= check(model.scrollback_size() == 1,
-        "Phase R recovery recovers a styled blank separator row");
+        "recovery recovers a styled blank separator row");
     ok &= check(result.recovery_proposals.size() == 1U &&
             result.recovery_proposals[0].recovered_row_count == 1,
-        "Phase R recovery accepts the styled blank-row shift");
+        "recovery accepts the styled blank-row shift");
 
     const term::Terminal_render_snapshot scrollback_snapshot =
         model.render_snapshot(request_for_model(model, 82U, 1));
@@ -1191,19 +1191,19 @@ bool test_phase_r_primary_repaint_recovery_preserves_styled_blank_separator_row(
             snapshot_row_text(scrollback_snapshot, 1) == QStringLiteral("bb") &&
             snapshot_row_text(scrollback_snapshot, 2) == QStringLiteral("cc") &&
             snapshot_row_text(scrollback_snapshot, 3) == QStringLiteral("dd"),
-        "Phase R recovery exposes the styled blank separator through primary backing");
+        "recovery exposes the styled blank separator through primary backing");
     ok &= check_row_background_palette(
         scrollback_snapshot,
         0,
         0,
         8,
         1U,
-        "Phase R recovery preserves the styled blank separator background");
+        "recovery preserves the styled blank separator background");
 
     return ok;
 }
 
-bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_tail()
+bool test_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_tail()
 {
     bool ok = true;
 
@@ -1233,9 +1233,9 @@ bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row_with_rew
         }, true));
 
     ok &= check(model.scrollback_size() == 1,
-        "Phase R recovery recovers a blank separator row when the shifted tail is rewritten");
+        "recovery recovers a blank separator row when the shifted tail is rewritten");
     ok &= check(result.scrollback_rows == 1,
-        "Phase R recovery result reports the partial-match recovered blank retained row");
+        "recovery result reports the partial-match recovered blank retained row");
     ok &= check(result.backing_deltas.size() == 1U &&
             primary_backing_delta_matches(
                 result.backing_deltas[0],
@@ -1244,21 +1244,21 @@ bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row_with_rew
                 1,
                 1,
                 0),
-        "Phase R recovery emits a primary-history append delta for the partial-match blank row");
+        "recovery emits a primary-history append delta for the partial-match blank row");
     ok &= check(result.recovery_proposals.size() == 1U &&
             result.recovery_proposals[0].reason ==
                 term::Terminal_recovery_proposal_reason::PRIMARY_REPAINT_SHIFTED_VISIBLE_ROWS &&
             result.recovery_proposals[0].status ==
                 term::Terminal_recovery_proposal_status::ACCEPTED &&
             result.recovery_proposals[0].recovered_row_count == 1,
-        "Phase R recovery accepts the strong partial blank-shift proposal");
+        "recovery accepts the strong partial blank-shift proposal");
     ok &= check(model.row_text(0) == QStringLiteral("bb") &&
             model.row_text(1) == QStringLiteral("cc") &&
             model.row_text(2) == QStringLiteral("dd") &&
             model.row_text(3) == QStringLiteral("new") &&
             model.row_text(4) == QStringLiteral("tail2") &&
             model.row_text(5) == QStringLiteral("tail3"),
-        "Phase R recovery keeps the rewritten active tail after accepting the blank shift");
+        "recovery keeps the rewritten active tail after accepting the blank shift");
 
     const term::Terminal_render_snapshot scrollback_snapshot =
         model.render_snapshot(request_for_model(model, 81U, 1));
@@ -1266,12 +1266,12 @@ bool test_phase_r_primary_repaint_recovery_recovers_blank_separator_row_with_rew
             snapshot_row_text(scrollback_snapshot, 1) == QStringLiteral("bb") &&
             snapshot_row_text(scrollback_snapshot, 2) == QStringLiteral("cc") &&
             snapshot_row_text(scrollback_snapshot, 3) == QStringLiteral("dd"),
-        "Phase R recovery exposes the partial-match recovered blank through primary backing");
+        "recovery exposes the partial-match recovered blank through primary backing");
 
     return ok;
 }
 
-bool test_phase_r_primary_repaint_recovery_suppresses_broad_blank_layout_repaint()
+bool test_primary_repaint_recovery_suppresses_broad_blank_layout_repaint()
 {
     bool ok = true;
 
@@ -1319,17 +1319,17 @@ bool test_phase_r_primary_repaint_recovery_suppresses_broad_blank_layout_repaint
     ok &= check(model.scrollback_size() == 0 &&
             result.backing_deltas.empty() &&
             result.recovery_proposals.empty(),
-        "Phase R recovery suppresses broad blank-spacer layout repaints");
+        "recovery suppresses broad blank-spacer layout repaints");
 
     return ok;
 }
 
-bool test_flat_ring_phase3_retained_record_producer_contract()
+bool test_flat_ring_retained_record_producer_contract()
 {
     bool ok = true;
 
     const QByteArray uri =
-        QByteArrayLiteral("https://phase3.varinomics.example/retained");
+        QByteArrayLiteral("https://retained.varinomics.example/retained");
     const QByteArray styled_row =
         styled_hyperlink_row_bytes(QByteArrayLiteral("aa"), uri);
 
@@ -1362,10 +1362,10 @@ bool test_flat_ring_phase3_retained_record_producer_contract()
 
     ok &= check(normal_model.scrollback_size() == 1 &&
             normal_result.recovery_proposals.empty(),
-        "flat-ring Phase 3 normal scrollout seals one retained row without recovery");
+        "flat-ring normal scrollout seals one retained row without recovery");
     ok &= check(recovered_model.scrollback_size() == 1 &&
             recovered_result.recovery_proposals.size() == 1U,
-        "flat-ring Phase 3 accepted recovery seals one retained row");
+        "flat-ring accepted recovery seals one retained row");
 
     const term::Terminal_render_snapshot normal_snapshot =
         normal_model.render_snapshot(request_for_model(normal_model, 90U, 1));
@@ -1373,22 +1373,22 @@ bool test_flat_ring_phase3_retained_record_producer_contract()
         recovered_model.render_snapshot(request_for_model(recovered_model, 91U, 1));
     ok &= check(snapshot_row_text(normal_snapshot, 0) == QStringLiteral("aa") &&
             snapshot_row_text(recovered_snapshot, 0) == QStringLiteral("aa"),
-        "flat-ring Phase 3 normal and recovered retained records carry canonical content");
+        "flat-ring normal and recovered retained records carry canonical content");
     ok &= check(snapshot_has_hyperlink_uri(normal_snapshot, uri) &&
             snapshot_has_hyperlink_uri(recovered_snapshot, uri),
-        "flat-ring Phase 3 normal and recovered retained records materialize row-local hyperlinks");
+        "flat-ring normal and recovered retained records materialize row-local hyperlinks");
     ok &= check_cell_background_palette(
         normal_snapshot,
         0,
         0,
         3U,
-        "flat-ring Phase 3 normal retained record keeps row-local style value");
+        "flat-ring normal retained record keeps row-local style value");
     ok &= check_cell_background_palette(
         recovered_snapshot,
         0,
         0,
         3U,
-        "flat-ring Phase 3 recovered retained record keeps row-local style value");
+        "flat-ring recovered retained record keeps row-local style value");
 
     const term::Terminal_retained_line_provenance normal_provenance =
         normal_model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
@@ -1397,11 +1397,11 @@ bool test_flat_ring_phase3_retained_record_producer_contract()
     ok &= check(normal_provenance.retained_line_id != 0U &&
             normal_provenance.source ==
                 term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
-        "flat-ring Phase 3 normal retained record keeps terminal-storage provenance");
+        "flat-ring normal retained record keeps terminal-storage provenance");
     ok &= check(recovered_provenance.retained_line_id != 0U &&
             recovered_provenance.source ==
                 term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
-        "flat-ring Phase 3 recovered retained record keeps recovered provenance");
+        "flat-ring recovered retained record keeps recovered provenance");
 
     const std::optional<term::terminal_retained_row_record_metadata_t> normal_metadata =
         normal_model.retained_row_record_metadata_for_testing(
@@ -1415,31 +1415,31 @@ bool test_flat_ring_phase3_retained_record_producer_contract()
             recovered_metadata.has_value() &&
             normal_metadata->source_width == 8 &&
             recovered_metadata->source_width == 8,
-        "flat-ring Phase 3 producer records retained source width");
+        "flat-ring producer records retained source width");
     ok &= check(normal_metadata.has_value() &&
             recovered_metadata.has_value() &&
             normal_metadata->style_reference ==
                 term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE &&
             recovered_metadata->style_reference ==
                 term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE,
-        "flat-ring Phase 3 producer records row-local resolved style policy");
+        "flat-ring producer records row-local resolved style policy");
     ok &= check(normal_metadata.has_value() &&
             recovered_metadata.has_value() &&
             normal_metadata->wrap_state ==
                 term::Terminal_retained_row_wrap_state::HARD_BOUNDARY &&
             recovered_metadata->wrap_state ==
                 term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
-        "flat-ring Phase 3 producer records current hard-boundary wrap metadata");
+        "flat-ring producer records current hard-boundary wrap metadata");
 
     return ok;
 }
 
-bool test_flat_ring_phase7_recovery_shared_producer_boundary()
+bool test_flat_ring_recovery_shared_producer_boundary()
 {
     bool ok = true;
 
     const QByteArray uri =
-        QByteArrayLiteral("https://phase7.varinomics.example/recovered-ring");
+        QByteArrayLiteral("https://recovery.varinomics.example/recovered-ring");
     const QByteArray styled_row =
         styled_hyperlink_row_bytes(QByteArrayLiteral("aa"), uri);
 
@@ -1471,7 +1471,7 @@ bool test_flat_ring_phase7_recovery_shared_producer_boundary()
             recovered_result.recovery_proposals.size() == 1U &&
             recovered_result.recovery_proposals[0].provenance_source ==
                 term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
-        "flat-ring Phase 7 recovery appends one retained row through the primary-history delta path");
+        "flat-ring recovery appends one retained row through the primary-history delta path");
 
     const std::optional<term::terminal_history_handle_t> recovered_handle =
         recovered_model.retained_history_handle_at_logical_row(
@@ -1489,14 +1489,14 @@ bool test_flat_ring_phase7_recovery_shared_producer_boundary()
                 term::Terminal_history_resolution_status::OK &&
             recovered_lookup.exact_match &&
             recovered_lookup.exact_logical_row == 0,
-        "flat-ring Phase 7 recovered row resolves through an authoritative ring handle");
+        "flat-ring recovered row resolves through an authoritative ring handle");
 
     const term::Terminal_retained_line_provenance recovered_provenance =
         primary_retained_line_provenance(recovered_model, 0);
     ok &= check(recovered_provenance.retained_line_id != 0U &&
             recovered_provenance.source ==
                 term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT,
-        "flat-ring Phase 7 recovered ring materialization carries recovered provenance");
+        "flat-ring recovered ring materialization carries recovered provenance");
 
     const std::optional<term::terminal_retained_row_record_metadata_t> recovered_metadata =
         recovered_model.retained_row_record_metadata_for_testing(
@@ -1508,19 +1508,19 @@ bool test_flat_ring_phase7_recovery_shared_producer_boundary()
                 term::Terminal_retained_row_style_reference::ROW_LOCAL_RESOLVED_STYLE &&
             recovered_metadata->wrap_state ==
                 term::Terminal_retained_row_wrap_state::HARD_BOUNDARY,
-        "flat-ring Phase 7 recovered row carries shared-producer metadata in ring storage");
+        "flat-ring recovered row carries shared-producer metadata in ring storage");
 
     const term::Terminal_render_snapshot recovered_snapshot =
         recovered_model.render_snapshot(request_for_model(recovered_model, 92U, 1));
     ok &= check(snapshot_row_text(recovered_snapshot, 0) == QStringLiteral("aa") &&
             snapshot_has_hyperlink_uri(recovered_snapshot, uri),
-        "flat-ring Phase 7 recovered row materializes shared-producer content and hyperlinks");
+        "flat-ring recovered row materializes shared-producer content and hyperlinks");
     ok &= check_cell_background_palette(
         recovered_snapshot,
         0,
         0,
         3U,
-        "flat-ring Phase 7 recovered row materializes shared-producer style ids");
+        "flat-ring recovered row materializes shared-producer style ids");
 
     term::Terminal_screen_model disabled_model =
         make_recovery_disabled_primary_backing_model(4, 8, 8);
@@ -1543,7 +1543,7 @@ bool test_flat_ring_phase7_recovery_shared_producer_boundary()
                 1,
                 1,
                 0),
-        "flat-ring Phase 7 recovery-disabled normal scrollout appends through normal history");
+        "flat-ring recovery-disabled normal scrollout appends through normal history");
 
     const std::optional<term::terminal_history_handle_t> disabled_handle =
         disabled_model.retained_history_handle_at_logical_row(
@@ -1572,12 +1572,12 @@ bool test_flat_ring_phase7_recovery_shared_producer_boundary()
                 term::Terminal_retained_line_provenance_source::TERMINAL_STORAGE &&
             disabled_metadata.has_value() &&
             disabled_metadata->source_width == 8,
-        "flat-ring Phase 7 recovery-disabled normal scrollout remains terminal-storage ring history");
+        "flat-ring recovery-disabled normal scrollout remains terminal-storage ring history");
 
     return ok;
 }
 
-bool test_flat_ring_phase5a_resize_projects_retained_history_without_mutation()
+bool test_flat_ring_resize_projects_retained_history_without_mutation()
 {
     bool ok = true;
 
@@ -1591,7 +1591,7 @@ bool test_flat_ring_phase5a_resize_projects_retained_history_without_mutation()
         model.ingest(QByteArrayLiteral("\r\nnext"));
     ok &= check(model.scrollback_size() == 1 &&
             scroll_result.viewport_changed,
-        "flat-ring Phase 5A fixture creates one retained row");
+        "flat-ring fixture creates one retained row");
 
     const term::Terminal_retained_line_provenance before_provenance =
         model.retained_line_provenance_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
@@ -1608,7 +1608,7 @@ bool test_flat_ring_phase5a_resize_projects_retained_history_without_mutation()
             before_metadata.has_value() &&
             before_metadata->source_width == 8 &&
             prefix_leases.size() == 1U,
-        "flat-ring Phase 5A fixture captures source-width retained row and lease");
+        "flat-ring fixture captures source-width retained row and lease");
     if (!before_metadata.has_value()) {
         return ok;
     }
@@ -1629,21 +1629,21 @@ bool test_flat_ring_phase5a_resize_projects_retained_history_without_mutation()
                 prefix_leases.size()));
     ok &= check(narrow_resize.grid_reflow_changed &&
             !narrow_resize.terminal_content_changed,
-        "flat-ring Phase 5A resize advances geometry without reporting content mutation");
+        "flat-ring resize advances geometry without reporting content mutation");
     ok &= check(narrow_metadata.has_value() &&
             narrow_provenance.content_generation ==
                 before_provenance.content_generation &&
             narrow_metadata->source_width == before_metadata->source_width,
-        "flat-ring Phase 5A narrow resize leaves retained record content immutable");
+        "flat-ring narrow resize leaves retained record content immutable");
     ok &= check(term::validate_render_snapshot(narrow_snapshot).status ==
             term::Terminal_render_snapshot_status::OK &&
             narrow_snapshot.grid_size.rows == 3 &&
             narrow_snapshot.grid_size.columns == 7 &&
             snapshot_row_text(narrow_snapshot, 0) == QStringLiteral("123456"),
-        "flat-ring Phase 5A narrow projection repairs wide cell geometry at the edge");
+        "flat-ring narrow projection repairs wide cell geometry at the edge");
     ok &= check(prefix_after_resize.code == term::Terminal_selection_result_code::OK &&
             prefix_after_resize.text == QStringLiteral("123456"),
-        "flat-ring Phase 5A retained selection lease resolves after geometry-only resize");
+        "flat-ring retained selection lease resolves after geometry-only resize");
 
     const term::Terminal_screen_model_result wide_resize = model.resize({2, 10});
     const term::Terminal_retained_line_provenance wide_provenance =
@@ -1670,27 +1670,27 @@ bool test_flat_ring_phase5a_resize_projects_retained_history_without_mutation()
                 trailing_blank_leases.size()));
     ok &= check(wide_resize.grid_reflow_changed &&
             !wide_resize.terminal_content_changed,
-        "flat-ring Phase 5A width growth remains geometry-only");
+        "flat-ring width growth remains geometry-only");
     ok &= check(wide_metadata.has_value() &&
             wide_provenance.content_generation ==
                 before_provenance.content_generation &&
             wide_metadata->source_width == before_metadata->source_width,
-        "flat-ring Phase 5A width growth leaves retained record content immutable");
+        "flat-ring width growth leaves retained record content immutable");
     ok &= check(term::validate_render_snapshot(wide_snapshot).status ==
             term::Terminal_render_snapshot_status::OK &&
             wide_snapshot.grid_size.rows == 2 &&
             wide_snapshot.grid_size.columns == 10 &&
             snapshot_row_text(wide_snapshot, 0) == QStringLiteral("123456") +
                 QString::fromUtf8(bytes_from_hex("e7958c")),
-        "flat-ring Phase 5A width growth projects retained content into wider geometry");
+        "flat-ring width growth projects retained content into wider geometry");
     ok &= check(trailing_blank.code == term::Terminal_selection_result_code::OK &&
             trailing_blank.text == QStringLiteral(" "),
-        "flat-ring Phase 5A selection projection exposes widened trailing blanks");
+        "flat-ring selection projection exposes widened trailing blanks");
 
     return ok;
 }
 
-bool test_flat_ring_phase5b_retained_hyperlink_metadata_authority()
+bool test_flat_ring_retained_hyperlink_metadata_authority()
 {
     bool ok = true;
 
@@ -1699,7 +1699,7 @@ bool test_flat_ring_phase5b_retained_hyperlink_metadata_authority()
     std::vector<QByteArray> retained_uris;
     for (int index = 0; index < 7; ++index) {
         const QByteArray uri =
-            QByteArrayLiteral("https://phase5b.varinomics.example/retained/") +
+            QByteArrayLiteral("https://retained-hyperlink.varinomics.example/retained/") +
             QByteArray::number(index);
         const QByteArray label = QByteArrayLiteral("L") + QByteArray::number(index);
         retained_uris.push_back(uri);
@@ -1708,7 +1708,7 @@ bool test_flat_ring_phase5b_retained_hyperlink_metadata_authority()
 
     const int scrollback_before_active_clear = model.scrollback_size();
     ok &= check(scrollback_before_active_clear >= 4,
-        "flat-ring Phase 5B fixture creates hyperlink-heavy retained history");
+        "flat-ring fixture creates hyperlink-heavy retained history");
 
     const term::Terminal_render_snapshot retained_snapshot =
         model.render_snapshot(
@@ -1723,7 +1723,7 @@ bool test_flat_ring_phase5b_retained_hyperlink_metadata_authority()
                     retained_uris.data(),
                     static_cast<std::size_t>(visible_retained_rows))) ==
                 static_cast<std::size_t>(visible_retained_rows),
-        "flat-ring Phase 5B hyperlink-heavy retained snapshot materializes row-local metadata");
+        "flat-ring hyperlink-heavy retained snapshot materializes row-local metadata");
 
     model.ingest(QByteArrayLiteral("\x1b]8;;\x1b\\\x1b[2Jplain"));
     const term::Terminal_render_snapshot after_active_clear_snapshot =
@@ -1732,7 +1732,7 @@ bool test_flat_ring_phase5b_retained_hyperlink_metadata_authority()
     ok &= check(term::validate_render_snapshot(after_active_clear_snapshot).status ==
             term::Terminal_render_snapshot_status::OK &&
             snapshot_has_hyperlink_uri(after_active_clear_snapshot, retained_uris.front()),
-        "flat-ring Phase 5B retained hyperlinks survive after active hyperlinks are gone");
+        "flat-ring retained hyperlinks survive after active hyperlinks are gone");
 
     model.set_scrollback_limit(2);
     const int first_surviving_uri =
@@ -1748,7 +1748,7 @@ bool test_flat_ring_phase5b_retained_hyperlink_metadata_authority()
                     retained_uris.data() + first_surviving_uri,
                     static_cast<std::size_t>(model.scrollback_size()))) ==
                 static_cast<std::size_t>(model.scrollback_size()),
-        "flat-ring Phase 5B eviction leaves surviving retained hyperlinks self-contained");
+        "flat-ring eviction leaves surviving retained hyperlinks self-contained");
 
     model.ingest(QByteArrayLiteral("\x1b[3J"));
     const term::Terminal_render_snapshot after_clear_snapshot =
@@ -1759,12 +1759,12 @@ bool test_flat_ring_phase5b_retained_hyperlink_metadata_authority()
             snapshot_has_hyperlink_uri(
                 after_eviction_snapshot,
                 retained_uris[static_cast<std::size_t>(first_surviving_uri)]),
-        "flat-ring Phase 5B clear needs no retained hyperlink pre-reclaim cleanup for correctness");
+        "flat-ring clear needs no retained hyperlink pre-reclaim cleanup for correctness");
 
     return ok;
 }
 
-bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
+bool test_repaint_recovery_shift_helper_matches_policy()
 {
     bool ok = true;
 
@@ -1785,7 +1785,7 @@ bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("ee"),
     };
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 1,
-        "Phase R recovery helper accepts distinct shifted repaint");
+        "recovery helper accepts distinct shifted repaint");
 
     input.candidate_rows = {
         QStringLiteral("aa"),
@@ -1800,7 +1800,7 @@ bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("zz"),
     };
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
-        "Phase R recovery helper suppresses repeated-row ambiguous repaint");
+        "recovery helper suppresses repeated-row ambiguous repaint");
 
     input.candidate_rows = {
         QString(),
@@ -1815,7 +1815,7 @@ bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("ee"),
     };
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 1,
-        "Phase R recovery helper recovers a strongly-proven blank displaced row");
+        "recovery helper recovers a strongly-proven blank displaced row");
 
     input.candidate_rows = {
         QString(),
@@ -1830,7 +1830,7 @@ bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("zz"),
     };
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
-        "Phase R recovery helper rejects a blank displaced row above ambiguous survivors");
+        "recovery helper rejects a blank displaced row above ambiguous survivors");
 
     input.candidate_rows = {
         QString(),
@@ -1845,7 +1845,7 @@ bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("x"),
     };
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
-        "Phase R recovery helper rejects an all-blank displaced repaint");
+        "recovery helper rejects an all-blank displaced repaint");
 
     input.candidate_rows = {
         QString(),
@@ -1862,7 +1862,7 @@ bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("yy"),
     };
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
-        "Phase R recovery helper rejects a blank displaced row on a weak partial-suffix match");
+        "recovery helper rejects a blank displaced row on a weak partial-suffix match");
 
     input.candidate_rows = {
         QString(),
@@ -1881,7 +1881,7 @@ bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("tail3"),
     };
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 1,
-        "Phase R recovery helper accepts a blank displaced row on a strong partial-suffix match");
+        "recovery helper accepts a blank displaced row on a strong partial-suffix match");
 
     input.candidate_rows = {
         QString(),
@@ -1920,7 +1920,7 @@ bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("footer"),
     };
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
-        "Phase R recovery helper suppresses broad blank-spacer layout repaints");
+        "recovery helper suppresses broad blank-spacer layout repaints");
 
     input.candidate_rows = {
         QStringLiteral("aa"),
@@ -1937,12 +1937,12 @@ bool test_phase_r_repaint_recovery_shift_helper_matches_policy()
     input.line_start_clear_before_text      = true;
     input.explicit_non_home_repaint_address = true;
     ok &= check(term::primary_repaint_recovery_shift_rows(input) == 0,
-        "Phase R recovery helper suppresses explicit non-home repaint");
+        "recovery helper suppresses explicit non-home repaint");
 
     return ok;
 }
 
-bool test_phase_r_primary_repaint_recovery_suppresses_false_positives()
+bool test_primary_repaint_recovery_suppresses_false_positives()
 {
     bool ok = true;
 
@@ -1964,7 +1964,7 @@ bool test_phase_r_primary_repaint_recovery_suppresses_false_positives()
     ok &= check(repeated_model.scrollback_size() == 0 &&
             repeated_result.backing_deltas.empty() &&
             repeated_result.recovery_proposals.empty(),
-        "Phase R recovery suppresses repeated-row ambiguous repaint shifts");
+        "recovery suppresses repeated-row ambiguous repaint shifts");
 
     term::Terminal_screen_model blank_ambiguous_model =
         make_recovery_enabled_primary_repaint_model(4, 8, 8);
@@ -1984,7 +1984,7 @@ bool test_phase_r_primary_repaint_recovery_suppresses_false_positives()
     ok &= check(blank_ambiguous_model.scrollback_size() == 0 &&
             blank_ambiguous_result.backing_deltas.empty() &&
             blank_ambiguous_result.recovery_proposals.empty(),
-        "Phase R recovery suppresses a blank displaced row above ambiguous survivors");
+        "recovery suppresses a blank displaced row above ambiguous survivors");
 
     term::Terminal_screen_model resize_model =
         make_recovery_enabled_primary_repaint_model(4, 8, 8);
@@ -2006,12 +2006,12 @@ bool test_phase_r_primary_repaint_recovery_suppresses_false_positives()
     ok &= check(resize_model.scrollback_size() == 0 &&
             resize_result.backing_deltas.empty() &&
             resize_result.recovery_proposals.empty(),
-        "Phase R recovery suppresses resize-adjacent repaint shifts");
+        "recovery suppresses resize-adjacent repaint shifts");
 
     return ok;
 }
 
-bool test_phase_r_primary_repaint_recovery_toggle_cancels_candidate()
+bool test_primary_repaint_recovery_toggle_cancels_candidate()
 {
     bool ok = true;
 
@@ -2035,16 +2035,16 @@ bool test_phase_r_primary_repaint_recovery_toggle_cancels_candidate()
             "\x1b[?25h"));
 
     ok &= check(model.scrollback_size() == 0,
-        "Phase R recovery toggle off cancels in-flight candidate");
+        "recovery toggle off cancels in-flight candidate");
     ok &= check(result.recovery_proposals.empty(),
-        "Phase R recovery toggle off leaves no accepted proposal");
+        "recovery toggle off leaves no accepted proposal");
     ok &= check(result.backing_deltas.empty(),
-        "Phase R recovery toggle off emits no recovered history delta");
+        "recovery toggle off emits no recovered history delta");
     ok &= check(model.row_text(0) == QStringLiteral("bb") &&
             model.row_text(1) == QStringLiteral("cc") &&
             model.row_text(2) == QStringLiteral("dd") &&
             model.row_text(3) == QStringLiteral("ee"),
-        "Phase R recovery toggle off keeps the repainted active grid");
+        "recovery toggle off keeps the repainted active grid");
 
     model.set_primary_repaint_recovery_enabled(true);
     model.ingest(visible_row_write_stream({
@@ -2054,12 +2054,12 @@ bool test_phase_r_primary_repaint_recovery_toggle_cancels_candidate()
         QByteArrayLiteral("ff"),
     }, true));
     ok &= check(model.scrollback_size() == 1,
-        "Phase R recovery toggle on re-enables later recovery");
+        "recovery toggle on re-enables later recovery");
 
     return ok;
 }
 
-bool test_phase_r_ed3_cancels_active_primary_repaint_recovery_candidate()
+bool test_ed3_cancels_active_primary_repaint_recovery_candidate()
 {
     bool ok = true;
 
@@ -2072,7 +2072,7 @@ bool test_phase_r_ed3_cancels_active_primary_repaint_recovery_candidate()
         QByteArrayLiteral("dd"),
     }, false));
     ok &= check(model.scrollback_size() == 0,
-        "Phase R ED3 active-candidate fixture starts without retained scrollback");
+        "ED3 active-candidate fixture starts without retained scrollback");
 
     const term::Terminal_screen_model_result ed3_result =
         model.ingest(QByteArrayLiteral(
@@ -2084,9 +2084,9 @@ bool test_phase_r_ed3_cancels_active_primary_repaint_recovery_candidate()
             "\x1b[3J"));
 
     ok &= check(model.scrollback_size() == 0,
-        "Phase R ED3 active-candidate clear leaves retained scrollback empty");
+        "ED3 active-candidate clear leaves retained scrollback empty");
     ok &= check(ed3_result.recovery_proposals.empty(),
-        "Phase R ED3 active-candidate clear accepts no recovery proposal");
+        "ED3 active-candidate clear accepts no recovery proposal");
     ok &= check(ed3_result.backing_deltas.size() == 1U &&
             primary_backing_delta_matches(
                 ed3_result.backing_deltas[0],
@@ -2095,21 +2095,21 @@ bool test_phase_r_ed3_cancels_active_primary_repaint_recovery_candidate()
                 0,
                 0,
                 0),
-        "Phase R ED3 active-candidate clear emits an empty-history no-op delta");
+        "ED3 active-candidate clear emits an empty-history no-op delta");
 
     const term::Terminal_screen_model_result finish_result =
         model.ingest(QByteArrayLiteral("\x1b[?25h"));
     ok &= check(model.scrollback_size() == 0,
-        "Phase R ED3 active-candidate finish trigger does not resurrect scrollback");
+        "ED3 active-candidate finish trigger does not resurrect scrollback");
     ok &= check(finish_result.recovery_proposals.empty(),
-        "Phase R ED3 active-candidate finish trigger accepts no recovery proposal");
+        "ED3 active-candidate finish trigger accepts no recovery proposal");
     ok &= check(finish_result.backing_deltas.empty(),
-        "Phase R ED3 active-candidate finish trigger emits no recovered history delta");
+        "ED3 active-candidate finish trigger emits no recovered history delta");
 
     return ok;
 }
 
-bool test_phase_r_ed3_clears_scrollback_after_resize_repaint_visible_clear()
+bool test_ed3_clears_scrollback_after_resize_repaint_visible_clear()
 {
     bool ok = true;
 
@@ -2117,29 +2117,29 @@ bool test_phase_r_ed3_clears_scrollback_after_resize_repaint_visible_clear()
         make_recovery_enabled_primary_repaint_model(2, 8, 8);
     model.ingest(QByteArrayLiteral("aa\r\nbb\r\ncc"));
     ok &= check(model.scrollback_size() > 0,
-        "Phase R ED3 resize fixture creates retained scrollback");
+        "ED3 resize fixture creates retained scrollback");
 
     const term::Terminal_screen_model_result resize_result =
         model.resize(term::terminal_grid_size_t{3, 8});
     ok &= check(resize_result.grid_reflow_changed,
-        "Phase R ED3 resize fixture applies a public row-count resize");
+        "ED3 resize fixture applies a public row-count resize");
 
     // This preserves the former resize-repaint clear-guard precondition:
     // resize, home-visible ED2, then explicit ED3.
     model.ingest(QByteArrayLiteral("\x1b[H\x1b[2J"));
     const int scrollback_rows_before_ed3 = model.scrollback_size();
     ok &= check(scrollback_rows_before_ed3 > 0,
-        "Phase R ED3 visible clear precondition leaves retained scrollback");
+        "ED3 visible clear precondition leaves retained scrollback");
 
     const term::Terminal_screen_model_result result =
         model.ingest(QByteArrayLiteral("\x1b[3J"));
 
     ok &= check(model.scrollback_size() == 0,
-        "Phase R ED3 clears retained scrollback after resize repaint visible clear");
+        "ED3 clears retained scrollback after resize repaint visible clear");
     ok &= check(result.scrollback_rows == 0,
-        "Phase R ED3 result reports cleared retained scrollback");
+        "ED3 result reports cleared retained scrollback");
     ok &= check(result.evicted_scrollback_rows == scrollback_rows_before_ed3,
-        "Phase R ED3 result reports evicted retained rows");
+        "ED3 result reports evicted retained rows");
     ok &= check(result.backing_deltas.size() == 1U &&
             primary_backing_delta_matches(
                 result.backing_deltas[0],
@@ -2148,7 +2148,7 @@ bool test_phase_r_ed3_clears_scrollback_after_resize_repaint_visible_clear()
                 0,
                 0,
                 scrollback_rows_before_ed3),
-        "Phase R ED3 emits a retained-history clear delta");
+        "ED3 emits a retained-history clear delta");
 
     return ok;
 }
@@ -4129,21 +4129,21 @@ int main()
     bool ok = true;
     ok &= test_cursor_addressing_and_split_csi();
     ok &= test_scrollback_growth_observer_seam();
-    ok &= test_phase_r_repaint_recovery_shift_helper_matches_policy();
-    ok &= test_phase_r_primary_repaint_recovery_accepts_distinct_shift();
-    ok &= test_phase_r_primary_repaint_recovery_preserves_row_content_stamps();
-    ok &= test_phase_r_primary_repaint_recovery_recovers_blank_separator_row();
-    ok &= test_phase_r_primary_repaint_recovery_preserves_styled_blank_separator_row();
-    ok &= test_phase_r_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_tail();
-    ok &= test_phase_r_primary_repaint_recovery_suppresses_broad_blank_layout_repaint();
-    ok &= test_flat_ring_phase3_retained_record_producer_contract();
-    ok &= test_flat_ring_phase7_recovery_shared_producer_boundary();
-    ok &= test_flat_ring_phase5a_resize_projects_retained_history_without_mutation();
-    ok &= test_flat_ring_phase5b_retained_hyperlink_metadata_authority();
-    ok &= test_phase_r_primary_repaint_recovery_suppresses_false_positives();
-    ok &= test_phase_r_primary_repaint_recovery_toggle_cancels_candidate();
-    ok &= test_phase_r_ed3_cancels_active_primary_repaint_recovery_candidate();
-    ok &= test_phase_r_ed3_clears_scrollback_after_resize_repaint_visible_clear();
+    ok &= test_repaint_recovery_shift_helper_matches_policy();
+    ok &= test_primary_repaint_recovery_accepts_distinct_shift();
+    ok &= test_primary_repaint_recovery_preserves_row_content_stamps();
+    ok &= test_primary_repaint_recovery_recovers_blank_separator_row();
+    ok &= test_primary_repaint_recovery_preserves_styled_blank_separator_row();
+    ok &= test_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_tail();
+    ok &= test_primary_repaint_recovery_suppresses_broad_blank_layout_repaint();
+    ok &= test_flat_ring_retained_record_producer_contract();
+    ok &= test_flat_ring_recovery_shared_producer_boundary();
+    ok &= test_flat_ring_resize_projects_retained_history_without_mutation();
+    ok &= test_flat_ring_retained_hyperlink_metadata_authority();
+    ok &= test_primary_repaint_recovery_suppresses_false_positives();
+    ok &= test_primary_repaint_recovery_toggle_cancels_candidate();
+    ok &= test_ed3_cancels_active_primary_repaint_recovery_candidate();
+    ok &= test_ed3_clears_scrollback_after_resize_repaint_visible_clear();
     ok &= test_erase_operations_and_wide_damage();
     ok &= test_scroll_region_and_origin_mode();
     ok &= test_retained_history_storage_is_lazy();

@@ -103,7 +103,7 @@ The root CMake project builds:
 - benchmark executables such as `vnm_terminal_embedded_benchmark`,
   `vnm_terminal_input_echo_catchup_benchmark`,
   `vnm_terminal_input_echo_ordering_benchmark`,
-  `vnm_terminal_phase7_public_scroll_benchmark`, and
+  `vnm_terminal_public_scroll_benchmark`, and
   `vnm_terminal_surface_stress_benchmark`, when benchmarks are enabled;
 - test executables named after their CTest entries when both test gates are on;
 - optional conformance targets created by CMake cache variables under

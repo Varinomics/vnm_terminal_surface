@@ -321,27 +321,27 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_history_row_record_codec>"
 )
 
-add_executable(vnm_terminal_history_phase8_benchmark
-    history_row_record_codec/history_row_record_phase8_benchmark.cpp
+add_executable(vnm_terminal_retained_history_benchmark
+    history_row_record_codec/retained_history_benchmark.cpp
 )
 
-target_link_libraries(vnm_terminal_history_phase8_benchmark PRIVATE
+target_link_libraries(vnm_terminal_retained_history_benchmark PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
 )
 
-set_target_properties(vnm_terminal_history_phase8_benchmark PROPERTIES
+set_target_properties(vnm_terminal_retained_history_benchmark PROPERTIES
     AUTOMOC OFF
 )
 
 add_test(
-    NAME vnm_terminal_history_phase8_benchmark
+    NAME vnm_terminal_retained_history_benchmark
     COMMAND
         "${CMAKE_COMMAND}" -E env
         "${vnm_terminal_qt_runtime_path}"
-        "$<TARGET_FILE:vnm_terminal_history_phase8_benchmark>"
+        "$<TARGET_FILE:vnm_terminal_retained_history_benchmark>"
 )
 
-set_tests_properties(vnm_terminal_history_phase8_benchmark PROPERTIES
+set_tests_properties(vnm_terminal_retained_history_benchmark PROPERTIES
     LABELS "readiness;benchmark;structural"
 )
 
@@ -766,7 +766,7 @@ if(WIN32)
     set_tests_properties(
         vnm_terminal_qsg_atlas_dense_grid_d3d11
         PROPERTIES
-            LABELS "qsg;hardware;atlas;cutover;dense-grid"
+            LABELS "qsg;hardware;atlas;dense-grid"
             SKIP_RETURN_CODE 77
             TIMEOUT 90
     )
@@ -816,7 +816,7 @@ if(WIN32)
     set_tests_properties(
         vnm_terminal_qsg_atlas_host_state_d3d11
         PROPERTIES
-            LABELS "qsg;hardware;atlas;host-state;cutover"
+            LABELS "qsg;hardware;atlas;host-state"
             SKIP_RETURN_CODE 77
             TIMEOUT 120
     )
@@ -1788,7 +1788,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_unicode_width_tables
     vnm_terminal_history_ring
     vnm_terminal_history_row_record_codec
-    vnm_terminal_history_phase8_benchmark
+    vnm_terminal_retained_history_benchmark
     vnm_terminal_retained_history_capacity_stress
     vnm_terminal_sequence_matrix
     vnm_terminal_canvas_fixture_contract
