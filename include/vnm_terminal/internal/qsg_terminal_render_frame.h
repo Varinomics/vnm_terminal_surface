@@ -343,46 +343,6 @@ struct terminal_render_frame_stats_t
     int                                            layer_descriptors_built         = 0;
 };
 
-struct terminal_render_frame_cumulative_stats_t
-{
-    terminal_simple_content_cumulative_stats_t     simple_content;
-    std::uint64_t                                  visible_rows                     = 0U;
-    std::uint64_t                                  dirty_rows                       = 0U;
-    std::uint64_t                                  full_dirty_rows                  = 0U;
-    std::uint64_t                                  cell_pass_input_cells            = 0U;
-    std::uint64_t                                  cell_pass_classification_calls   = 0U;
-    std::uint64_t                                  dirty_row_lookup_count           = 0U;
-    std::uint64_t                                  cells_considered                = 0U;
-    std::uint64_t                                  cells_skipped_invalid           = 0U;
-    std::uint64_t                                  cells_skipped_wide_continuation = 0U;
-    std::uint64_t                                  cells_rendered                  = 0U;
-    std::uint64_t                                  text_cells_empty                = 0U;
-    std::uint64_t                                  text_cells_rendered_as_text     = 0U;
-    std::uint64_t                                  text_cells_printable_ascii      = 0U;
-    std::uint64_t                                  text_cells_other_ascii          = 0U;
-    std::uint64_t                                  text_cells_non_ascii            = 0U;
-    std::uint64_t                                  text_cells_simple_ascii         = 0U;
-    std::uint64_t                                  text_cells_single_width         = 0U;
-    std::uint64_t                                  text_cells_multi_width          = 0U;
-    std::uint64_t                                  text_cells_with_decorations     = 0U;
-    std::uint64_t                                  text_cells_with_hyperlink       = 0U;
-    std::uint64_t                                  compact_ascii_cells_seen        = 0U;
-    std::uint64_t                                  compact_ascii_text_direct_appends = 0U;
-    std::uint64_t                                  compact_ascii_qstring_materializations = 0U;
-    std::uint64_t                                  text_style_changes              = 0U;
-    std::uint64_t                                  text_distinct_styles            = 0U;
-    std::uint64_t                                  background_rects_emitted        = 0U;
-    std::uint64_t                                  selection_rects_emitted         = 0U;
-    std::uint64_t                                  graphic_rects_emitted           = 0U;
-    std::uint64_t                                  graphic_arcs_emitted            = 0U;
-    std::uint64_t                                  text_runs_emitted               = 0U;
-    std::uint64_t                                  cursor_text_runs_emitted        = 0U;
-    std::uint64_t                                  decoration_rects_emitted        = 0U;
-    std::uint64_t                                  cursor_rects_emitted            = 0U;
-    std::uint64_t                                  overlay_rects_emitted           = 0U;
-    std::uint64_t                                  row_descriptors_built           = 0U;
-    std::uint64_t                                  layer_descriptors_built         = 0U;
-};
 
 struct Terminal_render_frame
 {

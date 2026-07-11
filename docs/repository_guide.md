@@ -277,40 +277,27 @@ and `--require-requested-grid`.
 Profile flags such as `--profile`, `--profile-json`, and `--profile-text`
 require a `VNM_TERMINAL_ENABLE_PROFILING=ON` build.
 
-Benchmark JSON uses `schema_version` 27. Profile JSON uses
+Benchmark JSON uses `schema_version` 28. Profile JSON uses
 `profile_schema_version` 4, `time_unit` `ns`, and
 `thread_semantics` `separate_thread_trees`, with separate GUI and render thread
-trees. Schema 27 includes sparse dirty-row sweep metadata
+trees. Schema 28 includes sparse dirty-row sweep metadata
 `sparse_dirty_row_sweep_applicable`, `configured_sparse_dirty_rows`, and
 `configured_sparse_dirty_row_stride`; per-scenario requested and actual grid
 metadata through `requested_rows`, `requested_columns`, `rows`, `columns`,
 `actual_grid_matches_request`, and `grid_semantics`; root
 `requested_grid_required`; and the exact
-frame descriptor-reuse counter object. It also includes measured atlas elapsed
-evidence through `atlas_prepare_elapsed_ns_delta` and
+atlas renderer evidence. It includes measured atlas elapsed evidence through
+`atlas_prepare_elapsed_ns_delta` and
 `atlas_render_elapsed_ns_delta`, computed between the post-warmup baseline and
-the final measured report. Schema 27 also includes measured atlas sparse-row
+the final measured report. Schema 28 also includes measured atlas sparse-row
 evidence through `atlas_frame_dirty_rows_total` and
 `atlas_frame_full_dirty_rows_total`. Sparse dirty-row validation requires
-measured dirty-row evidence to cover the requested dirty rows: legacy
-`frame_dirty_rows` / `frame_full_dirty_rows` counters are used when present,
-otherwise the atlas dirty-row totals are used. Full repaint is rejected, and at
-most one cursor carry-over row is allowed per measured frame. Profiling builds
-also require the profile dirty-row counts to satisfy the same bounds.
+measured atlas dirty-row evidence to cover the requested dirty rows. Full
+repaint is rejected, and at most one cursor carry-over row is allowed per
+measured frame. Profiling builds also require the profile dirty-row counts to
+satisfy the same bounds.
 
-The schema 27 `descriptor_counters` object has exactly
-`available=true`,
-`schema_semantics="frame_qsg_descriptor_reuse_counters"`,
-numeric `frame_row_descriptors`, numeric `frame_layer_descriptors`, and
-numeric `qsg_layer_descriptors`. `qsg_layer_descriptors` is zero until QSG
-layer descriptor-key work is wired back in. Descriptor counters are schema
-fields; readiness evidence comes from the atlas render and elapsed signals
-listed below, not from requiring nonzero descriptor counters.
-On the atlas path, `frame_row_descriptors` may be zero and
-`frame_layer_descriptors` may count only state-key descriptors because unused
-row and content descriptor materialization is skipped.
-
-The schema 27 `session_profile_stats.consumer_materialization_counters` object
+The schema 28 `session_profile_stats.consumer_materialization_counters` object
 has exactly `available=true`,
 `schema_semantics="geometry_derived_snapshot_materialization_counters"`,
 `owner_semantics="terminal_session_profile_stats"`, and numeric counters
@@ -327,14 +314,7 @@ counters. The `surface_session_resize_smoke_boundary`,
 `surface_session_alternate_buffer_smoke_boundary`,
 `surface_session_style_color_mode_smoke_boundary`, and
 `surface_session_hyperlink_smoke_boundary` scenarios are decision-boundary
-smoke scenarios. Schema 27 includes text coalescing
-counters:
-`text_coalescing_candidate_groups`, `text_coalescing_enabled_groups`,
-`text_resource_runs_before_coalescing`, and
-`text_resource_runs_after_coalescing`. Validation enforces
-`text_coalescing_enabled_groups <= text_coalescing_candidate_groups` and
-`text_resource_runs_after_coalescing <= text_resource_runs_before_coalescing`.
-The public-projection boundary scenario is validated in profiling builds by
+smoke scenarios. The public-projection boundary scenario is validated in profiling builds by
 requiring nonzero `public_projection_scroll_requests` and
 `public_projection_scroll_publications`. Geometry-derived direct-output
 counting is validated separately by the
@@ -368,11 +348,10 @@ expects a deliberate requested-grid mismatch to fail and validates the emitted
 schema fields and diagnostic.
 `vnm_terminal_embedded_benchmark_profile_validate` covers sparse text output,
 selection, public projection, resize, viewport, alternate-buffer,
-style/color/mode, and hyperlink scenarios for schema, profile, route-count, and
-scope-timing validation. It is not an interleaved A/B performance decision run.
+style/color/mode, and hyperlink scenarios for schema, profile, and scope-timing
+validation. It is not an interleaved A/B performance decision run.
 Use no-profile Release benchmark runs for user-visible timing. Use
-profiling-enabled Release runs only for attribution, route counts, and scope
-timing.
+profiling-enabled Release runs only for attribution and scope timing.
 
 Benchmark comparisons should record the generator, build directory, build
 type/configuration, relevant CMake cache flags, profiling state, Qt version,

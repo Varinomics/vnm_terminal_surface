@@ -94,7 +94,7 @@ constexpr int k_surface_session_write_high_water_bytes        = 64 * 1024;
 constexpr int k_surface_session_resize_boundary_width_delta   = 16;
 constexpr int k_surface_session_geometry_boundary_height_delta = 16;
 
-constexpr int k_schema_version              = 27;
+constexpr int k_schema_version              = 28;
 constexpr int k_profile_schema_version      = 4;
 constexpr int k_profile_text_format         = 2;
 constexpr int k_flat_rect_vertices_per_rect = 6;
@@ -134,8 +134,6 @@ const QString k_output_high_water_queue_pressure_semantics = QStringLiteral(
     "output_queue_byte_high_water_observed_by_backend_pause");
 const QString k_surface_session_write_high_water_execution_mode = QStringLiteral(
     "surface_session_write_high_water_reservation_pressure");
-const QString k_descriptor_counter_schema_semantics = QStringLiteral(
-    "frame_qsg_descriptor_reuse_counters");
 const QString k_consumer_materialization_counter_schema_semantics = QStringLiteral(
     "geometry_derived_snapshot_materialization_counters");
 const QString k_consumer_materialization_counter_owner_semantics = QStringLiteral(
@@ -155,8 +153,6 @@ const QString k_memory_sample_semantics = QStringLiteral(
     "best_effort_process_resident_memory_bytes_sampled_after_completed_measured_attempts");
 const QString k_memory_unsupported_semantics = QStringLiteral(
     "unsupported_platform_or_unavailable_sampler_emits_sample_count_zero");
-const QString k_per_consumed_update_counter_semantics = QStringLiteral(
-    "counter_total_divided_by_bridge_consumed_updates_delta_when_nonzero");
 const QString k_per_consumed_update_timing_semantics = QStringLiteral(
     "scene_graph_update_latency_median_per_attempt_exact_for_single_update_attempts_"
     "approximate_divided_by_mean_consumed_updates_for_multi_update_attempts");
@@ -169,7 +165,6 @@ const QString k_latency_normalization_multi_update_approximate = QStringLiteral(
 const QString k_profile_time_unit        = QStringLiteral("ns");
 const QString k_profile_thread_semantics = QStringLiteral("separate_thread_trees");
 const QColor  k_surface_background       = QColor(16, 20, 24);
-constexpr qint64 k_descriptor_layer_count = 13;
 
 struct grid_size_t
 {
@@ -194,157 +189,6 @@ struct memory_summary_t
     QString                metric    = QStringLiteral("resident_set_bytes");
     QString                semantics = k_memory_sample_semantics;
     sample_summary_t       resident_bytes;
-};
-
-struct renderer_totals_t
-{
-    qint64                 text_content_rebuilds                                = 0;
-    qint64                 text_content_reused                                  = 0;
-    qint64                 text_content_removed                                 = 0;
-    qint64                 text_content_failures                                = 0;
-    qint64                 atlas_work_created                                  = 0;
-    qint64                 atlas_work_reused                                   = 0;
-    qint64                 text_cache_entry_child_nodes_cleared_for_replacement = 0;
-    qint64                 text_cache_entry_child_nodes_cleared_for_removal     = 0;
-    qint64                 text_cache_entry_max_child_nodes_cleared             = 0;
-    qint64                 text_clean_reuse_skips                               = 0;
-    qint64                 text_resource_descriptor_builds                      = 0;
-    qint64                 text_resource_descriptor_builds_avoided              = 0;
-    qint64                 text_resource_descriptor_reuses                      = 0;
-    qint64                 frame_row_descriptors_built                          = 0;
-    qint64                 frame_layer_descriptors_built                        = 0;
-    qint64                 qsg_layer_descriptors                                = 0;
-    qint64                 text_coalescing_candidate_groups                     = 0;
-    qint64                 text_coalescing_enabled_groups                       = 0;
-    qint64                 text_resource_runs_before_coalescing                 = 0;
-    qint64                 text_resource_runs_after_coalescing                  = 0;
-    qint64                 simple_content_cells_considered                      = 0;
-    qint64                 simple_content_eligible_cells                        = 0;
-    qint64                 simple_content_eligible_after_all_gates_cells        = 0;
-    qint64                 simple_content_rows_with_eligible_cells              = 0;
-    qint64                 simple_content_styles_with_eligible_cells            = 0;
-    qint64                 simple_content_dirty_eligible_cells                  = 0;
-    qint64                 simple_content_clean_eligible_cells                  = 0;
-    qint64                 simple_content_text_category_empty_cells             = 0;
-    qint64                 simple_content_text_category_printable_ascii_cells   = 0;
-    qint64                 simple_content_text_category_other_ascii_cells       = 0;
-    qint64                 simple_content_text_category_non_ascii_cells         = 0;
-    qint64                 simple_content_route_none_cells                      = 0;
-    qint64                 simple_content_route_fast_text_cells                 = 0;
-    qint64                 simple_content_route_qt_text_layout_cells            = 0;
-    qint64                 simple_content_route_fallback_cells                  = 0;
-    qint64                 simple_content_rejection_none_cells                  = 0;
-    qint64                 simple_content_rejection_empty_text_cells            = 0;
-    qint64                 simple_content_rejection_invalid_grid_cells          = 0;
-    qint64                 simple_content_rejection_invalid_position_cells      = 0;
-    qint64                 simple_content_rejection_invalid_style_id_cells      = 0;
-    qint64                 simple_content_rejection_wide_continuation_cells     = 0;
-    qint64                 simple_content_rejection_invalid_display_width_cells = 0;
-    qint64                 simple_content_rejection_invalid_text_encoding_cells = 0;
-    qint64                 simple_content_rejection_invalid_text_width_cells    = 0;
-    qint64                 simple_content_rejection_multi_cell_text_cells       = 0;
-    qint64                 simple_content_rejection_non_printable_ascii_cells   = 0;
-    qint64                 simple_content_rejection_non_ascii_text_cells        = 0;
-    qint64                 simple_content_rejection_decoration_cells            = 0;
-    qint64                 simple_content_rejection_hyperlink_cells             = 0;
-    qint64                 route_fast_text_cells                                = 0;
-    qint64                 route_qt_text_layout_runs                            = 0;
-    qint64                 route_fallback_cells                                 = 0;
-    qint64                 qt_text_layout_calls                                 = 0;
-    qint64                 text_ascii_replacement_runs_screened                = 0;
-    qint64                 text_ascii_replacement_runs_eligible                = 0;
-    qint64                 text_ascii_replacement_runs_attempted                = 0;
-    qint64                 text_ascii_replacement_runs_trusted_fast_path        = 0;
-    qint64                 text_ascii_replacement_runs_succeeded                = 0;
-    qint64                 text_ascii_replacement_runs_all_space_succeeded      = 0;
-    qint64                 text_ascii_replacement_add_glyphs_calls              = 0;
-    qint64                 text_ascii_replacement_runs_fallback                 = 0;
-    qint64                 text_ascii_replacement_runs_rejected_clipped         = 0;
-    qint64                 text_ascii_replacement_runs_rejected_force_blended_order = 0;
-    qint64                 text_ascii_replacement_runs_rejected_decoration      = 0;
-    qint64                 text_ascii_replacement_runs_rejected_hyperlink       = 0;
-    qint64                 text_ascii_replacement_runs_rejected_non_printable_ascii = 0;
-    qint64                 text_ascii_replacement_runs_rejected_non_ascii       = 0;
-    qint64                 text_ascii_replacement_runs_rejected_geometry        = 0;
-    qint64                 text_ascii_replacement_runs_rejected_unsupported_font = 0;
-    qint64                 text_ascii_replacement_runs_rejected_internal_node   = 0;
-    qint64                 text_ascii_replacement_runs_rejected_glyph_mapping   = 0;
-    std::uint64_t          text_ascii_replacement_code_units_screened           = 0U;
-    std::uint64_t          text_ascii_replacement_code_units_eligible           = 0U;
-    std::uint64_t          text_ascii_replacement_code_units_attempted          = 0U;
-    std::uint64_t          text_ascii_replacement_code_units_trusted_fast_path  = 0U;
-    std::uint64_t          text_ascii_replacement_code_units_succeeded          = 0U;
-    std::uint64_t          text_ascii_replacement_code_units_fallback           = 0U;
-    qint64                 qsg_nodes_created                                    = 0;
-    qint64                 qsg_nodes_replaced                                   = 0;
-    qint64                 qsg_nodes_destroyed                                  = 0;
-    qint64                 background_qsg_nodes_created                         = 0;
-    qint64                 background_qsg_nodes_replaced                        = 0;
-    qint64                 background_qsg_nodes_destroyed                       = 0;
-    qint64                 text_key_builds                                      = 0;
-    std::uint64_t          text_key_bytes                                       = 0U;
-    qint64                 rect_key_builds                                      = 0;
-    std::uint64_t          rect_key_bytes                                       = 0U;
-    qint64                 cache_key_builds                                     = 0;
-    std::uint64_t          cache_key_bytes                                      = 0U;
-    qint64                 text_cache_entries_created                           = 0;
-    qint64                 text_cache_entries_replaced                          = 0;
-    qint64                 text_cache_entries_removed                           = 0;
-    qint64                 frame_background_rects                               = 0;
-    qint64                 frame_selection_rects                                = 0;
-    qint64                 frame_graphic_rects                                  = 0;
-    qint64                 frame_graphic_arcs                                   = 0;
-    qint64                 frame_text_runs                                      = 0;
-    qint64                 frame_cursor_text_runs                               = 0;
-    qint64                 frame_decorations                                    = 0;
-    qint64                 frame_cursors                                        = 0;
-    qint64                 frame_overlay_rects                                  = 0;
-    qint64                 frame_dirty_row_ranges                               = 0;
-    qint64                 frame_visible_rows                                   = 0;
-    qint64                 frame_dirty_rows                                     = 0;
-    qint64                 frame_full_dirty_rows                                = 0;
-    qint64                 frame_cell_pass_input_cells                          = 0;
-    qint64                 frame_cells_considered                               = 0;
-    qint64                 frame_dirty_row_lookup_count                         = 0;
-    qint64                 frame_dirty_row_range_lookup_count                   = 0;
-    qint64                 frame_dirty_row_range_scan_steps                     = 0;
-    qint64                 row_cache_hits                                       = 0;
-    qint64                 row_cache_clean_skips                                = 0;
-    qint64                 background_row_rects_before_coalescing               = 0;
-    qint64                 background_row_rects_after_coalescing                = 0;
-    qint64                 background_batched_rects                             = 0;
-    qint64                 background_batched_vertices                          = 0;
-    qint64                 selection_batched_rects                              = 0;
-    qint64                 selection_batched_vertices                           = 0;
-    qint64                 graphic_batched_rects                                = 0;
-    qint64                 graphic_batched_vertices                             = 0;
-    qint64                 decoration_batched_rects                             = 0;
-    qint64                 decoration_batched_vertices                          = 0;
-    qint64                 background_rows_rebuilt                              = 0;
-    qint64                 background_rows_reused                               = 0;
-    qint64                 background_row_clean_reuse_skips                     = 0;
-    qint64                 background_rows_removed                              = 0;
-    qint64                 background_row_cache_fallbacks                       = 0;
-    qint64                 selection_rows_rebuilt                               = 0;
-    qint64                 selection_rows_reused                                = 0;
-    qint64                 selection_row_clean_reuse_skips                      = 0;
-    qint64                 selection_rows_removed                               = 0;
-    qint64                 selection_row_cache_fallbacks                        = 0;
-    qint64                 decoration_rows_rebuilt                              = 0;
-    qint64                 decoration_rows_reused                               = 0;
-    qint64                 decoration_row_clean_reuse_skips                     = 0;
-    qint64                 decoration_rows_removed                              = 0;
-    qint64                 decoration_row_cache_fallbacks                       = 0;
-    qint64                 graphic_rect_rows_rebuilt                            = 0;
-    qint64                 graphic_rect_rows_reused                             = 0;
-    qint64                 graphic_rect_row_clean_reuse_skips                   = 0;
-    qint64                 graphic_rect_rows_removed                            = 0;
-    qint64                 graphic_rect_row_cache_fallbacks                     = 0;
-    qint64                 graphic_arc_rows_rebuilt                             = 0;
-    qint64                 graphic_arc_rows_reused                              = 0;
-    qint64                 graphic_arc_row_clean_reuse_skips                    = 0;
-    qint64                 graphic_arc_rows_removed                             = 0;
-    qint64                 graphic_arc_row_cache_fallbacks                      = 0;
 };
 
 struct bridge_delta_t
@@ -406,8 +250,6 @@ struct Structural_checks
     bool                   snapshot_valid                  = true;
     bool                   last_rendered_snapshot_sequence = true;
     bool                   pending_update_clear            = true;
-    bool                   paint_completed                 = true;
-    bool                   text_content_failures_zero      = true;
     bool                   text_work_observed              = true;
     bool                   visible_pixels_observed         = true;
     bool                   no_child_qquick_items           = true;
@@ -469,7 +311,6 @@ struct Attempt_result
     qint64                                            scene_graph_render_wait_ns    = 0;
     qint64                                            readback_ns                   = 0;
     std::uint64_t                                     sequence                      = 0U;
-    term::terminal_renderer_stats_t                   renderer_stats;
     term::Terminal_surface_render_invalidation_stats_t
                                                       invalidation_stats;
     bool                                              visible_pixels_observed       = false;
@@ -560,7 +401,6 @@ struct Scenario_result
     sample_summary_t       scene_graph_render_wait_ns;
     sample_summary_t       readback_ns;
     memory_summary_t       process_memory;
-    renderer_totals_t      renderer_totals;
     atlas_renderer_observation_t
                            atlas_renderer;
     qint64                 atlas_prepare_elapsed_ns_delta  = 0;
@@ -678,18 +518,6 @@ QStringList scenario_names()
         QStringLiteral("surface_session_mixed_non_ascii_output"),
     });
     return names;
-}
-
-bool is_measurement_reuse_only_scenario(const QString& scenario_name)
-{
-    return
-        scenario_name == QStringLiteral("ascii_full_dirty_reuse_only")        ||
-        scenario_name == QStringLiteral("styled_ascii_full_dirty_reuse_only") ||
-        scenario_name == QStringLiteral("mixed_text_full_dirty_reuse_only")   ||
-        scenario_name == QStringLiteral("block_graphics_full_dirty_reuse_only") ||
-        scenario_name == QStringLiteral("box_graphics_full_dirty_reuse_only") ||
-        scenario_name == QStringLiteral("cjk_full_dirty_reuse_only")          ||
-        scenario_name == QStringLiteral("mixed_non_ascii_full_dirty_reuse_only");
 }
 
 bool is_surface_session_scenario(const QString& scenario_name)
@@ -2672,15 +2500,11 @@ bool render_completion_reached(
 {
     const term::Terminal_surface_render_invalidation_stats_t invalidation_stats =
         term::VNM_TerminalSurface_render_bridge::invalidation_stats(surface);
-    const term::terminal_renderer_stats_t renderer_stats = term::VNM_TerminalSurface_render_bridge::last_renderer_stats(
-        surface);
     const term::Qsg_atlas_frame_report atlas_report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
     return
         invalidation_stats.last_rendered_snapshot_sequence >= sequence &&
         !invalidation_stats.pending_update                             &&
-        renderer_stats.paint_completed                                 &&
-        renderer_stats.text_content_failures == 0                       &&
         atlas_report.render_count > 0U                                  &&
         atlas_report.drew                                               &&
         atlas_report.render_snapshot_sequence >= sequence;
@@ -2762,265 +2586,6 @@ QImage grab_window_with_timing(Benchmark_context& context, qint64* out_readback_
     return image;
 }
 
-void add_simple_content_stats(
-    term::terminal_simple_content_stats_t&         totals,
-    const term::terminal_simple_content_stats_t&   stats)
-{
-    totals.cells_considered               += stats.cells_considered;
-    totals.eligible_cells                 += stats.eligible_cells;
-    totals.eligible_after_all_gates_cells += stats.eligible_after_all_gates_cells;
-    totals.rows_with_eligible_cells       += stats.rows_with_eligible_cells;
-    totals.styles_with_eligible_cells     += stats.styles_with_eligible_cells;
-    totals.dirty_eligible_cells           += stats.dirty_eligible_cells;
-    totals.clean_eligible_cells           += stats.clean_eligible_cells;
-    totals.text_category_empty_cells      += stats.text_category_empty_cells;
-    totals.text_category_printable_ascii_cells +=
-        stats.text_category_printable_ascii_cells;
-    totals.text_category_other_ascii_cells  += stats.text_category_other_ascii_cells;
-    totals.text_category_non_ascii_cells    += stats.text_category_non_ascii_cells;
-    totals.route_none_cells                 += stats.route_none_cells;
-    totals.route_fast_text_cells            += stats.route_fast_text_cells;
-    totals.route_qt_text_layout_cells       += stats.route_qt_text_layout_cells;
-    totals.route_fallback_cells             += stats.route_fallback_cells;
-    totals.rejection_none_cells             += stats.rejection_none_cells;
-    totals.rejection_empty_text_cells       += stats.rejection_empty_text_cells;
-    totals.rejection_invalid_grid_cells     += stats.rejection_invalid_grid_cells;
-    totals.rejection_invalid_position_cells += stats.rejection_invalid_position_cells;
-    totals.rejection_invalid_style_id_cells += stats.rejection_invalid_style_id_cells;
-    totals.rejection_wide_continuation_cells   +=
-        stats.rejection_wide_continuation_cells;
-    totals.rejection_invalid_display_width_cells +=
-        stats.rejection_invalid_display_width_cells;
-    totals.rejection_invalid_text_encoding_cells +=
-        stats.rejection_invalid_text_encoding_cells;
-    totals.rejection_invalid_text_width_cells  +=
-        stats.rejection_invalid_text_width_cells;
-    totals.rejection_multi_cell_text_cells     += stats.rejection_multi_cell_text_cells;
-    totals.rejection_non_printable_ascii_cells +=
-        stats.rejection_non_printable_ascii_cells;
-    totals.rejection_non_ascii_text_cells   += stats.rejection_non_ascii_text_cells;
-    totals.rejection_decoration_cells       += stats.rejection_decoration_cells;
-    totals.rejection_hyperlink_cells        += stats.rejection_hyperlink_cells;
-}
-
-void add_simple_content_stats(
-    renderer_totals_t&                             totals,
-    const term::terminal_simple_content_stats_t&   stats)
-{
-    totals.simple_content_cells_considered += stats.cells_considered;
-    totals.simple_content_eligible_cells   += stats.eligible_cells;
-    totals.simple_content_eligible_after_all_gates_cells      +=
-        stats.eligible_after_all_gates_cells;
-    totals.simple_content_rows_with_eligible_cells            +=
-        stats.rows_with_eligible_cells;
-    totals.simple_content_styles_with_eligible_cells          +=
-        stats.styles_with_eligible_cells;
-    totals.simple_content_dirty_eligible_cells += stats.dirty_eligible_cells;
-    totals.simple_content_clean_eligible_cells += stats.clean_eligible_cells;
-    totals.simple_content_text_category_empty_cells           +=
-        stats.text_category_empty_cells;
-    totals.simple_content_text_category_printable_ascii_cells +=
-        stats.text_category_printable_ascii_cells;
-    totals.simple_content_text_category_other_ascii_cells     +=
-        stats.text_category_other_ascii_cells;
-    totals.simple_content_text_category_non_ascii_cells       +=
-        stats.text_category_non_ascii_cells;
-    totals.simple_content_route_none_cells      += stats.route_none_cells;
-    totals.simple_content_route_fast_text_cells += stats.route_fast_text_cells;
-    totals.simple_content_route_qt_text_layout_cells          +=
-        stats.route_qt_text_layout_cells;
-    totals.simple_content_route_fallback_cells += stats.route_fallback_cells;
-    totals.simple_content_rejection_none_cells += stats.rejection_none_cells;
-    totals.simple_content_rejection_empty_text_cells          +=
-        stats.rejection_empty_text_cells;
-    totals.simple_content_rejection_invalid_grid_cells        +=
-        stats.rejection_invalid_grid_cells;
-    totals.simple_content_rejection_invalid_position_cells    +=
-        stats.rejection_invalid_position_cells;
-    totals.simple_content_rejection_invalid_style_id_cells    +=
-        stats.rejection_invalid_style_id_cells;
-    totals.simple_content_rejection_wide_continuation_cells   +=
-        stats.rejection_wide_continuation_cells;
-    totals.simple_content_rejection_invalid_display_width_cells +=
-        stats.rejection_invalid_display_width_cells;
-    totals.simple_content_rejection_invalid_text_encoding_cells +=
-        stats.rejection_invalid_text_encoding_cells;
-    totals.simple_content_rejection_invalid_text_width_cells  +=
-        stats.rejection_invalid_text_width_cells;
-    totals.simple_content_rejection_multi_cell_text_cells     +=
-        stats.rejection_multi_cell_text_cells;
-    totals.simple_content_rejection_non_printable_ascii_cells +=
-        stats.rejection_non_printable_ascii_cells;
-    totals.simple_content_rejection_non_ascii_text_cells      +=
-        stats.rejection_non_ascii_text_cells;
-    totals.simple_content_rejection_decoration_cells          +=
-        stats.rejection_decoration_cells;
-    totals.simple_content_rejection_hyperlink_cells           +=
-        stats.rejection_hyperlink_cells;
-}
-
-void add_renderer_stats(
-    term::terminal_renderer_stats_t&       totals,
-    const term::terminal_renderer_stats_t& stats)
-{
-    totals.paint_completed = totals.paint_completed && stats.paint_completed;
-    add_simple_content_stats(totals.frame.simple_content, stats.frame.simple_content);
-    totals.frame.visible_rows                   += stats.frame.visible_rows;
-    totals.frame.dirty_rows                     += stats.frame.dirty_rows;
-    totals.frame.full_dirty_rows                += stats.frame.full_dirty_rows;
-    totals.frame.cell_pass_input_cells          += stats.frame.cell_pass_input_cells;
-    totals.frame.cell_pass_classification_calls +=
-        stats.frame.cell_pass_classification_calls;
-    totals.frame.dirty_row_lookup_count += stats.frame.dirty_row_lookup_count;
-    totals.frame.cells_considered       += stats.frame.cells_considered;
-    totals.frame.row_descriptors_built  += stats.frame.row_descriptors_built;
-    totals.frame.layer_descriptors_built += stats.frame.layer_descriptors_built;
-    totals.text_content_rebuilds   += stats.text_content_rebuilds;
-    totals.text_content_reused     += stats.text_content_reused;
-    totals.text_content_removed    += stats.text_content_removed;
-    totals.text_content_failures   += stats.text_content_failures;
-    totals.atlas_work_created      += stats.atlas_work_created;
-    totals.atlas_work_reused       += stats.atlas_work_reused;
-    totals.text_cache_entry_child_nodes_cleared_for_replacement +=
-        stats.text_cache_entry_child_nodes_cleared_for_replacement;
-    totals.text_cache_entry_child_nodes_cleared_for_removal +=
-        stats.text_cache_entry_child_nodes_cleared_for_removal;
-    totals.text_cache_entry_max_child_nodes_cleared  = std::max(
-        totals.text_cache_entry_max_child_nodes_cleared,
-        stats.text_cache_entry_max_child_nodes_cleared);
-    totals.text_clean_reuse_skips                   += stats.text_clean_reuse_skips;
-    totals.text_resource_descriptor_builds +=
-        stats.text_resource_descriptor_builds;
-    totals.text_resource_descriptor_builds_avoided +=
-        stats.text_resource_descriptor_builds_avoided;
-    totals.text_resource_descriptor_reuses +=
-        stats.text_resource_descriptor_reuses;
-    totals.qsg_layer_descriptors += stats.qsg_layer_descriptors;
-    totals.text_coalescing_candidate_groups += stats.text_coalescing_candidate_groups;
-    totals.text_coalescing_enabled_groups   += stats.text_coalescing_enabled_groups;
-    totals.text_resource_runs_before_coalescing +=
-        stats.text_resource_runs_before_coalescing;
-    totals.text_resource_runs_after_coalescing +=
-        stats.text_resource_runs_after_coalescing;
-    totals.route_fast_text_cells          += stats.route_fast_text_cells;
-    totals.route_qt_text_layout_runs      += stats.route_qt_text_layout_runs;
-    totals.route_fallback_cells           += stats.route_fallback_cells;
-    totals.qt_text_layout_calls           += stats.qt_text_layout_calls;
-    totals.text_ascii_replacement_runs_screened +=
-        stats.text_ascii_replacement_runs_screened;
-    totals.text_ascii_replacement_runs_eligible +=
-        stats.text_ascii_replacement_runs_eligible;
-    totals.text_ascii_replacement_runs_attempted +=
-        stats.text_ascii_replacement_runs_attempted;
-    totals.text_ascii_replacement_runs_trusted_fast_path +=
-        stats.text_ascii_replacement_runs_trusted_fast_path;
-    totals.text_ascii_replacement_runs_succeeded +=
-        stats.text_ascii_replacement_runs_succeeded;
-    totals.text_ascii_replacement_runs_all_space_succeeded +=
-        stats.text_ascii_replacement_runs_all_space_succeeded;
-    totals.text_ascii_replacement_add_glyphs_calls +=
-        stats.text_ascii_replacement_add_glyphs_calls;
-    totals.text_ascii_replacement_runs_fallback +=
-        stats.text_ascii_replacement_runs_fallback;
-    totals.text_ascii_replacement_runs_rejected_clipped +=
-        stats.text_ascii_replacement_runs_rejected_clipped;
-    totals.text_ascii_replacement_runs_rejected_force_blended_order +=
-        stats.text_ascii_replacement_runs_rejected_force_blended_order;
-    totals.text_ascii_replacement_runs_rejected_decoration +=
-        stats.text_ascii_replacement_runs_rejected_decoration;
-    totals.text_ascii_replacement_runs_rejected_hyperlink +=
-        stats.text_ascii_replacement_runs_rejected_hyperlink;
-    totals.text_ascii_replacement_runs_rejected_non_printable_ascii +=
-        stats.text_ascii_replacement_runs_rejected_non_printable_ascii;
-    totals.text_ascii_replacement_runs_rejected_non_ascii +=
-        stats.text_ascii_replacement_runs_rejected_non_ascii;
-    totals.text_ascii_replacement_runs_rejected_geometry +=
-        stats.text_ascii_replacement_runs_rejected_geometry;
-    totals.text_ascii_replacement_runs_rejected_unsupported_font +=
-        stats.text_ascii_replacement_runs_rejected_unsupported_font;
-    totals.text_ascii_replacement_runs_rejected_internal_node +=
-        stats.text_ascii_replacement_runs_rejected_internal_node;
-    totals.text_ascii_replacement_runs_rejected_glyph_mapping +=
-        stats.text_ascii_replacement_runs_rejected_glyph_mapping;
-    totals.text_ascii_replacement_code_units_screened +=
-        stats.text_ascii_replacement_code_units_screened;
-    totals.text_ascii_replacement_code_units_eligible +=
-        stats.text_ascii_replacement_code_units_eligible;
-    totals.text_ascii_replacement_code_units_attempted +=
-        stats.text_ascii_replacement_code_units_attempted;
-    totals.text_ascii_replacement_code_units_trusted_fast_path +=
-        stats.text_ascii_replacement_code_units_trusted_fast_path;
-    totals.text_ascii_replacement_code_units_succeeded +=
-        stats.text_ascii_replacement_code_units_succeeded;
-    totals.text_ascii_replacement_code_units_fallback +=
-        stats.text_ascii_replacement_code_units_fallback;
-    totals.qsg_nodes_created              += stats.qsg_nodes_created;
-    totals.qsg_nodes_replaced             += stats.qsg_nodes_replaced;
-    totals.qsg_nodes_destroyed            += stats.qsg_nodes_destroyed;
-    totals.background_qsg_nodes_created   += stats.background_qsg_nodes_created;
-    totals.background_qsg_nodes_replaced  += stats.background_qsg_nodes_replaced;
-    totals.background_qsg_nodes_destroyed += stats.background_qsg_nodes_destroyed;
-    totals.text_key_builds                += stats.text_key_builds;
-    totals.text_key_bytes                 += stats.text_key_bytes;
-    totals.rect_key_builds                += stats.rect_key_builds;
-    totals.rect_key_bytes                 += stats.rect_key_bytes;
-    totals.cache_key_builds               += stats.cache_key_builds;
-    totals.cache_key_bytes                += stats.cache_key_bytes;
-    totals.text_cache_entries_created     += stats.text_cache_entries_created;
-    totals.text_cache_entries_replaced    += stats.text_cache_entries_replaced;
-    totals.text_cache_entries_removed     += stats.text_cache_entries_removed;
-    totals.frame_background_rects         += stats.frame_background_rects;
-    totals.frame_selection_rects          += stats.frame_selection_rects;
-    totals.frame_graphic_rects            += stats.frame_graphic_rects;
-    totals.frame_graphic_arcs             += stats.frame_graphic_arcs;
-    totals.frame_text_runs                += stats.frame_text_runs;
-    totals.frame_cursor_text_runs         += stats.frame_cursor_text_runs;
-    totals.frame_decorations              += stats.frame_decorations;
-    totals.frame_cursors                  += stats.frame_cursors;
-    totals.frame_overlay_rects            += stats.frame_overlay_rects;
-    totals.frame_dirty_row_ranges         += stats.frame_dirty_row_ranges;
-    totals.row_cache_hits                 += stats.row_cache_hits;
-    totals.row_cache_clean_skips          += stats.row_cache_clean_skips;
-    totals.background_row_rects_before_coalescing +=
-        stats.background_row_rects_before_coalescing;
-    totals.background_row_rects_after_coalescing  +=
-        stats.background_row_rects_after_coalescing;
-    totals.background_batched_rects         += stats.background_batched_rects;
-    totals.background_batched_vertices      += stats.background_batched_vertices;
-    totals.selection_batched_rects          += stats.selection_batched_rects;
-    totals.selection_batched_vertices       += stats.selection_batched_vertices;
-    totals.graphic_batched_rects            += stats.graphic_batched_rects;
-    totals.graphic_batched_vertices         += stats.graphic_batched_vertices;
-    totals.decoration_batched_rects         += stats.decoration_batched_rects;
-    totals.decoration_batched_vertices      += stats.decoration_batched_vertices;
-    totals.background_rows_rebuilt          += stats.background_rows_rebuilt;
-    totals.background_rows_reused           += stats.background_rows_reused;
-    totals.background_row_clean_reuse_skips += stats.background_row_clean_reuse_skips;
-    totals.background_rows_removed          += stats.background_rows_removed;
-    totals.background_row_cache_fallbacks   += stats.background_row_cache_fallbacks;
-    totals.selection_rows_rebuilt           += stats.selection_rows_rebuilt;
-    totals.selection_rows_reused            += stats.selection_rows_reused;
-    totals.selection_row_clean_reuse_skips  += stats.selection_row_clean_reuse_skips;
-    totals.selection_rows_removed           += stats.selection_rows_removed;
-    totals.selection_row_cache_fallbacks    += stats.selection_row_cache_fallbacks;
-    totals.decoration_rows_rebuilt          += stats.decoration_rows_rebuilt;
-    totals.decoration_rows_reused           += stats.decoration_rows_reused;
-    totals.decoration_row_clean_reuse_skips += stats.decoration_row_clean_reuse_skips;
-    totals.decoration_rows_removed          += stats.decoration_rows_removed;
-    totals.decoration_row_cache_fallbacks   += stats.decoration_row_cache_fallbacks;
-    totals.graphic_rect_rows_rebuilt        += stats.graphic_rect_rows_rebuilt;
-    totals.graphic_rect_rows_reused         += stats.graphic_rect_rows_reused;
-    totals.graphic_rect_row_clean_reuse_skips +=
-        stats.graphic_rect_row_clean_reuse_skips;
-    totals.graphic_rect_rows_removed         += stats.graphic_rect_rows_removed;
-    totals.graphic_rect_row_cache_fallbacks  += stats.graphic_rect_row_cache_fallbacks;
-    totals.graphic_arc_rows_rebuilt          += stats.graphic_arc_rows_rebuilt;
-    totals.graphic_arc_rows_reused           += stats.graphic_arc_rows_reused;
-    totals.graphic_arc_row_clean_reuse_skips += stats.graphic_arc_row_clean_reuse_skips;
-    totals.graphic_arc_rows_removed          += stats.graphic_arc_rows_removed;
-    totals.graphic_arc_row_cache_fallbacks   += stats.graphic_arc_row_cache_fallbacks;
-}
-
 render_wait_result_t wait_for_render_completion(
     Benchmark_context&     context,
     std::uint64_t          sequence,
@@ -3079,7 +2644,6 @@ Attempt_result submit_snapshots_and_wait(
     const qint64 render_start_ns            = elapsed_timer.nsecsElapsed();
     qint64       last_completion_elapsed_ns = render_start_ns;
     result.completed = true;
-    result.renderer_stats.paint_completed = true;
     for (std::size_t index = 0; index < snapshots.size(); ++index) {
         const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot =
             snapshots[index];
@@ -3099,9 +2663,6 @@ Attempt_result submit_snapshots_and_wait(
         if (wait_result.completed) {
             last_completion_elapsed_ns = wait_result.completion_elapsed_ns;
         }
-        add_renderer_stats(
-            result.renderer_stats,
-            term::VNM_TerminalSurface_render_bridge::last_renderer_stats(context.surface));
         result.atlas_report =
             term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(context.surface);
         if (!wait_result.completed) {
@@ -3231,8 +2792,6 @@ Attempt_result wait_for_session_snapshot(
     result.readback_ns                = wait_result.readback_ns;
     result.visible_pixels_observed    = wait_result.visible_pixels_observed;
     result.rendered_image             = wait_result.rendered_image;
-    result.renderer_stats =
-        term::VNM_TerminalSurface_render_bridge::last_renderer_stats(context.surface);
     result.atlas_report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(context.surface);
     result.invalidation_stats =
@@ -3460,169 +3019,6 @@ lifecycle_delta_t lifecycle_delta(
     };
 }
 
-void add_renderer_stats(
-    renderer_totals_t&                                 totals,
-    const term::terminal_renderer_stats_t&             stats)
-{
-    add_simple_content_stats(totals, stats.frame.simple_content);
-    totals.text_content_rebuilds   += stats.text_content_rebuilds;
-    totals.text_content_reused     += stats.text_content_reused;
-    totals.text_content_removed    += stats.text_content_removed;
-    totals.text_content_failures   += stats.text_content_failures;
-    totals.atlas_work_created      += stats.atlas_work_created;
-    totals.atlas_work_reused       += stats.atlas_work_reused;
-    totals.text_cache_entry_child_nodes_cleared_for_replacement +=
-        stats.text_cache_entry_child_nodes_cleared_for_replacement;
-    totals.text_cache_entry_child_nodes_cleared_for_removal +=
-        stats.text_cache_entry_child_nodes_cleared_for_removal;
-    totals.text_cache_entry_max_child_nodes_cleared  = std::max(
-        totals.text_cache_entry_max_child_nodes_cleared,
-        static_cast<qint64>(stats.text_cache_entry_max_child_nodes_cleared));
-    totals.text_clean_reuse_skips                   += stats.text_clean_reuse_skips;
-    totals.text_resource_descriptor_builds +=
-        stats.text_resource_descriptor_builds;
-    totals.text_resource_descriptor_builds_avoided +=
-        stats.text_resource_descriptor_builds_avoided;
-    totals.text_resource_descriptor_reuses +=
-        stats.text_resource_descriptor_reuses;
-    totals.frame_row_descriptors_built += stats.frame.row_descriptors_built;
-    totals.frame_layer_descriptors_built += stats.frame.layer_descriptors_built;
-    totals.qsg_layer_descriptors += stats.qsg_layer_descriptors;
-    totals.text_coalescing_candidate_groups += stats.text_coalescing_candidate_groups;
-    totals.text_coalescing_enabled_groups   += stats.text_coalescing_enabled_groups;
-    totals.text_resource_runs_before_coalescing +=
-        stats.text_resource_runs_before_coalescing;
-    totals.text_resource_runs_after_coalescing +=
-        stats.text_resource_runs_after_coalescing;
-    totals.route_fast_text_cells          += stats.route_fast_text_cells;
-    totals.route_qt_text_layout_runs      += stats.route_qt_text_layout_runs;
-    totals.route_fallback_cells           += stats.route_fallback_cells;
-    totals.qt_text_layout_calls           += stats.qt_text_layout_calls;
-    totals.text_ascii_replacement_runs_screened +=
-        stats.text_ascii_replacement_runs_screened;
-    totals.text_ascii_replacement_runs_eligible +=
-        stats.text_ascii_replacement_runs_eligible;
-    totals.text_ascii_replacement_runs_attempted +=
-        stats.text_ascii_replacement_runs_attempted;
-    totals.text_ascii_replacement_runs_trusted_fast_path +=
-        stats.text_ascii_replacement_runs_trusted_fast_path;
-    totals.text_ascii_replacement_runs_succeeded +=
-        stats.text_ascii_replacement_runs_succeeded;
-    totals.text_ascii_replacement_runs_all_space_succeeded +=
-        stats.text_ascii_replacement_runs_all_space_succeeded;
-    totals.text_ascii_replacement_add_glyphs_calls +=
-        stats.text_ascii_replacement_add_glyphs_calls;
-    totals.text_ascii_replacement_runs_fallback +=
-        stats.text_ascii_replacement_runs_fallback;
-    totals.text_ascii_replacement_runs_rejected_clipped +=
-        stats.text_ascii_replacement_runs_rejected_clipped;
-    totals.text_ascii_replacement_runs_rejected_force_blended_order +=
-        stats.text_ascii_replacement_runs_rejected_force_blended_order;
-    totals.text_ascii_replacement_runs_rejected_decoration +=
-        stats.text_ascii_replacement_runs_rejected_decoration;
-    totals.text_ascii_replacement_runs_rejected_hyperlink +=
-        stats.text_ascii_replacement_runs_rejected_hyperlink;
-    totals.text_ascii_replacement_runs_rejected_non_printable_ascii +=
-        stats.text_ascii_replacement_runs_rejected_non_printable_ascii;
-    totals.text_ascii_replacement_runs_rejected_non_ascii +=
-        stats.text_ascii_replacement_runs_rejected_non_ascii;
-    totals.text_ascii_replacement_runs_rejected_geometry +=
-        stats.text_ascii_replacement_runs_rejected_geometry;
-    totals.text_ascii_replacement_runs_rejected_unsupported_font +=
-        stats.text_ascii_replacement_runs_rejected_unsupported_font;
-    totals.text_ascii_replacement_runs_rejected_internal_node +=
-        stats.text_ascii_replacement_runs_rejected_internal_node;
-    totals.text_ascii_replacement_runs_rejected_glyph_mapping +=
-        stats.text_ascii_replacement_runs_rejected_glyph_mapping;
-    totals.text_ascii_replacement_code_units_screened +=
-        stats.text_ascii_replacement_code_units_screened;
-    totals.text_ascii_replacement_code_units_eligible +=
-        stats.text_ascii_replacement_code_units_eligible;
-    totals.text_ascii_replacement_code_units_attempted +=
-        stats.text_ascii_replacement_code_units_attempted;
-    totals.text_ascii_replacement_code_units_trusted_fast_path +=
-        stats.text_ascii_replacement_code_units_trusted_fast_path;
-    totals.text_ascii_replacement_code_units_succeeded +=
-        stats.text_ascii_replacement_code_units_succeeded;
-    totals.text_ascii_replacement_code_units_fallback +=
-        stats.text_ascii_replacement_code_units_fallback;
-    totals.qsg_nodes_created              += stats.qsg_nodes_created;
-    totals.qsg_nodes_replaced             += stats.qsg_nodes_replaced;
-    totals.qsg_nodes_destroyed            += stats.qsg_nodes_destroyed;
-    totals.background_qsg_nodes_created   += stats.background_qsg_nodes_created;
-    totals.background_qsg_nodes_replaced  += stats.background_qsg_nodes_replaced;
-    totals.background_qsg_nodes_destroyed += stats.background_qsg_nodes_destroyed;
-    totals.text_key_builds                += stats.text_key_builds;
-    totals.text_key_bytes                 += stats.text_key_bytes;
-    totals.rect_key_builds                += stats.rect_key_builds;
-    totals.rect_key_bytes                 += stats.rect_key_bytes;
-    totals.cache_key_builds               += stats.cache_key_builds;
-    totals.cache_key_bytes                += stats.cache_key_bytes;
-    totals.text_cache_entries_created     += stats.text_cache_entries_created;
-    totals.text_cache_entries_replaced    += stats.text_cache_entries_replaced;
-    totals.text_cache_entries_removed     += stats.text_cache_entries_removed;
-    totals.frame_background_rects         += stats.frame_background_rects;
-    totals.frame_selection_rects          += stats.frame_selection_rects;
-    totals.frame_graphic_rects            += stats.frame_graphic_rects;
-    totals.frame_graphic_arcs             += stats.frame_graphic_arcs;
-    totals.frame_text_runs                += stats.frame_text_runs;
-    totals.frame_cursor_text_runs         += stats.frame_cursor_text_runs;
-    totals.frame_decorations              += stats.frame_decorations;
-    totals.frame_cursors                  += stats.frame_cursors;
-    totals.frame_overlay_rects            += stats.frame_overlay_rects;
-    totals.frame_dirty_row_ranges         += stats.frame_dirty_row_ranges;
-    totals.frame_visible_rows             += stats.frame.visible_rows;
-    totals.frame_dirty_rows               += stats.frame.dirty_rows;
-    totals.frame_full_dirty_rows          += stats.frame.full_dirty_rows;
-    totals.frame_cell_pass_input_cells    += stats.frame.cell_pass_input_cells;
-    totals.frame_cells_considered         += stats.frame.cells_considered;
-    totals.frame_dirty_row_lookup_count   += stats.frame.dirty_row_lookup_count;
-    totals.frame_dirty_row_range_lookup_count +=
-        dirty_row_range_lookup_count(stats.frame);
-    totals.frame_dirty_row_range_scan_steps +=
-        dirty_row_range_scan_steps(stats.frame);
-    totals.row_cache_hits                 += stats.row_cache_hits;
-    totals.row_cache_clean_skips          += stats.row_cache_clean_skips;
-    totals.background_row_rects_before_coalescing +=
-        stats.background_row_rects_before_coalescing;
-    totals.background_row_rects_after_coalescing  +=
-        stats.background_row_rects_after_coalescing;
-    totals.background_batched_rects         += stats.background_batched_rects;
-    totals.background_batched_vertices      += stats.background_batched_vertices;
-    totals.selection_batched_rects          += stats.selection_batched_rects;
-    totals.selection_batched_vertices       += stats.selection_batched_vertices;
-    totals.graphic_batched_rects            += stats.graphic_batched_rects;
-    totals.graphic_batched_vertices         += stats.graphic_batched_vertices;
-    totals.decoration_batched_rects         += stats.decoration_batched_rects;
-    totals.decoration_batched_vertices      += stats.decoration_batched_vertices;
-    totals.background_rows_rebuilt          += stats.background_rows_rebuilt;
-    totals.background_rows_reused           += stats.background_rows_reused;
-    totals.background_row_clean_reuse_skips += stats.background_row_clean_reuse_skips;
-    totals.background_rows_removed          += stats.background_rows_removed;
-    totals.background_row_cache_fallbacks   += stats.background_row_cache_fallbacks;
-    totals.selection_rows_rebuilt           += stats.selection_rows_rebuilt;
-    totals.selection_rows_reused            += stats.selection_rows_reused;
-    totals.selection_row_clean_reuse_skips  += stats.selection_row_clean_reuse_skips;
-    totals.selection_rows_removed           += stats.selection_rows_removed;
-    totals.selection_row_cache_fallbacks    += stats.selection_row_cache_fallbacks;
-    totals.decoration_rows_rebuilt          += stats.decoration_rows_rebuilt;
-    totals.decoration_rows_reused           += stats.decoration_rows_reused;
-    totals.decoration_row_clean_reuse_skips += stats.decoration_row_clean_reuse_skips;
-    totals.decoration_rows_removed          += stats.decoration_rows_removed;
-    totals.decoration_row_cache_fallbacks   += stats.decoration_row_cache_fallbacks;
-    totals.graphic_rect_rows_rebuilt        += stats.graphic_rect_rows_rebuilt;
-    totals.graphic_rect_rows_reused         += stats.graphic_rect_rows_reused;
-    totals.graphic_rect_row_clean_reuse_skips +=
-        stats.graphic_rect_row_clean_reuse_skips;
-    totals.graphic_rect_rows_removed         += stats.graphic_rect_rows_removed;
-    totals.graphic_rect_row_cache_fallbacks  += stats.graphic_rect_row_cache_fallbacks;
-    totals.graphic_arc_rows_rebuilt          += stats.graphic_arc_rows_rebuilt;
-    totals.graphic_arc_rows_reused           += stats.graphic_arc_rows_reused;
-    totals.graphic_arc_row_clean_reuse_skips += stats.graphic_arc_row_clean_reuse_skips;
-    totals.graphic_arc_rows_removed          += stats.graphic_arc_rows_removed;
-    totals.graphic_arc_row_cache_fallbacks   += stats.graphic_arc_row_cache_fallbacks;
-}
-
 QString dominant_latency_component(const Scenario_result& result)
 {
     struct latency_component_t
@@ -3659,22 +3055,6 @@ QString primary_pressure(const Scenario_result& result)
 
     if (result.workload_actions_expected_count > 0) {
         return QStringLiteral("backend_output_ingest");
-    }
-
-    if (result.renderer_totals.background_rows_rebuilt   > 0 ||
-        result.renderer_totals.selection_rows_rebuilt    > 0 ||
-        result.renderer_totals.decoration_rows_rebuilt   > 0 ||
-        result.renderer_totals.graphic_rect_rows_rebuilt > 0 ||
-        result.renderer_totals.graphic_arc_rows_rebuilt  > 0)
-    {
-        return QStringLiteral("renderer_geometry_row_cache");
-    }
-
-    if (result.renderer_totals.text_content_rebuilds >=
-        result.renderer_totals.text_content_reused &&
-        result.renderer_totals.text_content_rebuilds > 0)
-    {
-        return QStringLiteral("renderer_text_rebuild");
     }
 
     if (result.bridge_delta.coalesced_requests > 0U) {
@@ -3726,60 +3106,9 @@ bool atlas_render_work_observed(const atlas_renderer_observation_t& observation)
         observation.draw_calls_max          > 0;
 }
 
-bool text_work_observed_for_scenario(
-    const QString&                         scenario_name,
-    const term::terminal_renderer_stats_t& stats,
-    const term::Qsg_atlas_frame_report&    atlas_report)
+bool text_work_observed_for_scenario(const term::Qsg_atlas_frame_report& atlas_report)
 {
-    const bool frame_render_work_observed =
-        stats.frame_background_rects   > 0 ||
-        stats.frame_selection_rects    > 0 ||
-        stats.frame_graphic_rects      > 0 ||
-        stats.frame_graphic_arcs       > 0 ||
-        stats.frame_text_runs          > 0 ||
-        stats.frame_cursor_text_runs   > 0 ||
-        stats.frame_decorations        > 0 ||
-        stats.frame_cursors            > 0;
-    const bool atlas_work_observed = atlas_render_work_observed(atlas_report);
-
-    if (scenario_name == QStringLiteral("block_graphics_full_dirty_reuse_only") ||
-        scenario_name == QStringLiteral("box_graphics_full_dirty_reuse_only")   ||
-        scenario_name == QStringLiteral("surface_session_block_graphics_output") ||
-        scenario_name == QStringLiteral("surface_session_box_graphics_output"))
-    {
-        return
-            stats.graphic_rect_rows_rebuilt > 0 ||
-            stats.graphic_rect_rows_reused  > 0 ||
-            stats.atlas_work_created         > 0 ||
-            stats.atlas_work_reused          > 0 ||
-            stats.frame_text_runs            > 0 ||
-            atlas_work_observed;
-    }
-
-    if (is_surface_session_text_output_scenario(scenario_name)) {
-        return
-            stats.atlas_work_created > 0 ||
-            stats.atlas_work_reused  > 0 ||
-            stats.frame_text_runs         > 0 ||
-            atlas_work_observed;
-    }
-
-    if (!is_measurement_reuse_only_scenario(scenario_name)) {
-        return
-            stats.atlas_work_created > 0 ||
-            stats.atlas_work_reused  > 0 ||
-            atlas_work_observed ||
-            (is_surface_session_scenario(scenario_name) && frame_render_work_observed);
-    }
-
-    return
-        stats.atlas_work_created             > 0 ||
-        stats.atlas_work_reused              > 0 ||
-        stats.text_content_reused             > 0 ||
-        stats.text_resource_descriptor_reuses > 0 ||
-        stats.graphic_rect_rows_reused        > 0 ||
-        stats.graphic_arc_rows_reused         > 0 ||
-        atlas_work_observed;
+    return atlas_render_work_observed(atlas_report);
 }
 
 qint64 atlas_counter_value(std::uint64_t value)
@@ -3982,17 +3311,9 @@ void update_structural_checks(
     result.structural_checks.pending_update_clear =
         result.structural_checks.pending_update_clear &&
         !attempt.invalidation_stats.pending_update;
-    result.structural_checks.paint_completed =
-        result.structural_checks.paint_completed && attempt.renderer_stats.paint_completed;
-    result.structural_checks.text_content_failures_zero =
-        result.structural_checks.text_content_failures_zero &&
-        attempt.renderer_stats.text_content_failures == 0;
     result.structural_checks.text_work_observed =
         result.structural_checks.text_work_observed &&
-        text_work_observed_for_scenario(
-            result.name,
-            attempt.renderer_stats,
-            attempt.atlas_report);
+        text_work_observed_for_scenario(attempt.atlas_report);
     result.structural_checks.visible_pixels_observed =
         result.structural_checks.visible_pixels_observed &&
         attempt.visible_pixels_observed;
@@ -4030,8 +3351,6 @@ void finish_scenario_status(Scenario_result& result)
         (!result.structural_checks.snapshot_valid ||
             !result.structural_checks.last_rendered_snapshot_sequence ||
             !result.structural_checks.pending_update_clear ||
-            !result.structural_checks.paint_completed ||
-            !result.structural_checks.text_content_failures_zero ||
             !result.structural_checks.text_work_observed ||
             !result.structural_checks.visible_pixels_observed ||
             !result.structural_checks.atlas_frame_observed ||
@@ -4537,7 +3856,6 @@ Scenario_result run_surface_session_scroll_scenario(
                 bridge_delta(attempt_bridge_before, attempt_bridge_after)));
         }
 
-        add_renderer_stats(result.renderer_totals, attempt.renderer_stats);
         update_atlas_renderer_observation(result.atlas_renderer, attempt.atlas_report);
         update_structural_checks(result, attempt);
         update_surface_session_viewport_checks(result, burst);
@@ -4836,7 +4154,6 @@ Attempt_result run_surface_session_action_attempt(
         attempt.snapshot_valid                 = true;
         attempt.elapsed_ns                     = elapsed_timer.nsecsElapsed();
         attempt.workload_action_ns             = action_ns;
-        attempt.renderer_stats.paint_completed = true;
         attempt.selection_snapshot_spans_observed =
             selection_snapshot_spans_observed;
         return attempt;
@@ -5098,7 +4415,6 @@ Scenario_result run_surface_session_action_scenario(
                 bridge_delta(attempt_bridge_before, attempt_bridge_after)));
         }
 
-        add_renderer_stats(result.renderer_totals, attempt.renderer_stats);
         result.selection_snapshot_spans_observed +=
             attempt.selection_snapshot_spans_observed;
         if (attempt.resize_boundary_observed) {
@@ -5183,9 +4499,7 @@ Scenario_result run_surface_session_action_scenario(
             result.output_high_water_observed;
         result.structural_checks.text_work_observed =
             result.structural_checks.text_work_observed &&
-            (result.renderer_totals.atlas_work_created > 0 ||
-                result.renderer_totals.atlas_work_reused  > 0 ||
-                atlas_render_work_observed(result.atlas_renderer));
+            atlas_render_work_observed(result.atlas_renderer);
     }
     else
     if (profile.write_high_water_pressure) {
@@ -5266,7 +4580,6 @@ Scenario_result run_scenario_impl(
                 bridge_delta(attempt_bridge_before, attempt_bridge_after)));
         }
 
-        add_renderer_stats(result.renderer_totals, attempt.renderer_stats);
         update_atlas_renderer_observation(result.atlas_renderer, attempt.atlas_report);
         update_structural_checks(result, attempt);
 
@@ -5427,15 +4740,6 @@ QJsonObject summary_json(const sample_summary_t& summary)
     return object;
 }
 
-QJsonValue normalized_per_consumed_update_value(qint64 total, std::uint64_t consumed_updates)
-{
-    if (consumed_updates == 0U) {
-        return QJsonValue(QJsonValue::Null);
-    }
-
-    return static_cast<double>(total) / static_cast<double>(consumed_updates);
-}
-
 QJsonValue normalized_per_completed_update_latency_value(const Scenario_result& result)
 {
     if (result.completed_frames <= 0 || result.bridge_delta.consumed_updates == 0U) {
@@ -5474,94 +4778,6 @@ QJsonObject normalized_per_consumed_update_json(const Scenario_result& result)
 {
     const std::uint64_t denominator = result.bridge_delta.consumed_updates;
 
-    QJsonObject counters;
-    counters.insert(
-        QStringLiteral("qt_text_layout_calls"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.qt_text_layout_calls,
-            denominator));
-    counters.insert(
-        QStringLiteral("atlas_work_created"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.atlas_work_created,
-            denominator));
-    counters.insert(
-        QStringLiteral("atlas_work_reused"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.atlas_work_reused,
-            denominator));
-    counters.insert(
-        QStringLiteral("text_key_builds"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.text_key_builds,
-            denominator));
-    counters.insert(
-        QStringLiteral("text_key_bytes"),
-        normalized_per_consumed_update_value(
-            static_cast<qint64>(result.renderer_totals.text_key_bytes),
-            denominator));
-    counters.insert(
-        QStringLiteral("renderer_text_rebuilds_total"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.text_content_rebuilds,
-            denominator));
-    counters.insert(
-        QStringLiteral("renderer_text_reused_total"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.text_content_reused,
-            denominator));
-    counters.insert(
-        QStringLiteral("text_resource_descriptor_reuses"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.text_resource_descriptor_reuses,
-            denominator));
-    counters.insert(
-        QStringLiteral("text_resource_descriptor_builds"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.text_resource_descriptor_builds,
-            denominator));
-    counters.insert(
-        QStringLiteral("text_resource_descriptor_builds_avoided"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.text_resource_descriptor_builds_avoided,
-            denominator));
-    counters.insert(
-        QStringLiteral("frame_input_cells_considered"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.frame_cell_pass_input_cells,
-            denominator));
-    counters.insert(
-        QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.text_ascii_replacement_runs_trusted_fast_path,
-            denominator));
-    counters.insert(
-        QStringLiteral("text_ascii_replacement_add_glyphs_calls"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.text_ascii_replacement_add_glyphs_calls,
-            denominator));
-    counters.insert(
-        QStringLiteral("text_ascii_replacement_code_units_trusted_fast_path"),
-        normalized_per_consumed_update_value(
-            static_cast<qint64>(
-                result.renderer_totals.text_ascii_replacement_code_units_trusted_fast_path),
-            denominator));
-    counters.insert(
-        QStringLiteral("qsg_nodes_created"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.qsg_nodes_created,
-            denominator));
-    counters.insert(
-        QStringLiteral("qsg_nodes_replaced"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.qsg_nodes_replaced,
-            denominator));
-    counters.insert(
-        QStringLiteral("qsg_nodes_destroyed"),
-        normalized_per_consumed_update_value(
-            result.renderer_totals.qsg_nodes_destroyed,
-            denominator));
-
     QJsonObject timing;
     timing.insert(QStringLiteral("semantics"), k_per_consumed_update_timing_semantics);
     timing.insert(
@@ -5584,12 +4800,9 @@ QJsonObject normalized_per_consumed_update_json(const Scenario_result& result)
     object.insert(
         QStringLiteral("consumed_updates_per_completed_attempt"),
         consumed_updates_per_completed_attempt_value(result));
-    object.insert(QStringLiteral("counter_semantics"), k_per_consumed_update_counter_semantics);
-    object.insert(QStringLiteral("counters"),          counters);
-    object.insert(QStringLiteral("timing"),            timing);
+    object.insert(QStringLiteral("timing"), timing);
     return object;
 }
-
 QJsonObject structural_checks_json(const Structural_checks& checks)
 {
     QJsonObject object;
@@ -5599,10 +4812,6 @@ QJsonObject structural_checks_json(const Structural_checks& checks)
         QStringLiteral("last_rendered_snapshot_sequence"),
         checks.last_rendered_snapshot_sequence);
     object.insert(QStringLiteral("pending_update_clear"), checks.pending_update_clear);
-    object.insert(QStringLiteral("paint_completed"),      checks.paint_completed);
-    object.insert(
-        QStringLiteral("text_content_failures_zero"),
-        checks.text_content_failures_zero);
     object.insert(QStringLiteral("text_work_observed"),        checks.text_work_observed);
     object.insert(QStringLiteral("visible_pixels_observed"),   checks.visible_pixels_observed);
     object.insert(QStringLiteral("rendered_pixels_changed"),   checks.rendered_pixels_changed);
@@ -6071,23 +5280,6 @@ QJsonValue scenario_profile_value(const Scenario_result& result)
         : QJsonValue(scenario_profile_json(result.profile_threads));
 }
 
-QJsonObject descriptor_counters_json(const Scenario_result& result)
-{
-    QJsonObject object;
-    object.insert(QStringLiteral("available"), true);
-    object.insert(QStringLiteral("schema_semantics"), k_descriptor_counter_schema_semantics);
-    object.insert(
-        QStringLiteral("frame_row_descriptors"),
-        result.renderer_totals.frame_row_descriptors_built);
-    object.insert(
-        QStringLiteral("frame_layer_descriptors"),
-        result.renderer_totals.frame_layer_descriptors_built);
-    object.insert(
-        QStringLiteral("qsg_layer_descriptors"),
-        result.renderer_totals.qsg_layer_descriptors);
-    return object;
-}
-
 QJsonObject raw_attempt_sample_json(
     const QString&               scenario_name,
     const raw_attempt_sample_t&  sample)
@@ -6136,18 +5328,6 @@ QJsonObject scenario_profile_summary_json(const Scenario_result& result)
     object.insert(
         QStringLiteral("geometry_derived_boundary_adapted_cells_observed"),
         result.geometry_derived_boundary_adapted_cells_observed);
-    object.insert(
-        QStringLiteral("background_batched_rects"),
-        result.renderer_totals.background_batched_rects);
-    object.insert(
-        QStringLiteral("selection_batched_rects"),
-        result.renderer_totals.selection_batched_rects);
-    object.insert(
-        QStringLiteral("graphic_batched_rects"),
-        result.renderer_totals.graphic_batched_rects);
-    object.insert(
-        QStringLiteral("decoration_batched_rects"),
-        result.renderer_totals.decoration_batched_rects);
     object.insert(
         QStringLiteral("model_profile_stats"),
         model_profile_stats_json(
@@ -6209,7 +5389,6 @@ QJsonObject scenario_json(
     object.insert(
         QStringLiteral("configured_sparse_dirty_row_stride"),
         options.sparse_dirty_row_stride);
-    object.insert(QStringLiteral("descriptor_counters"), descriptor_counters_json(result));
     object.insert(QStringLiteral("elapsed_ns"),        summary_json(result.elapsed_ns));
     object.insert(
         QStringLiteral("snapshot_prep_ns"),
@@ -6229,18 +5408,6 @@ QJsonObject scenario_json(
     object.insert(QStringLiteral("readback_ns"),      summary_json(result.readback_ns));
     object.insert(QStringLiteral("completed_frames"), result.completed_frames);
     object.insert(QStringLiteral("timeout_count"),    result.timeout_count);
-    object.insert(
-        QStringLiteral("renderer_text_rebuilds_total"),
-        result.renderer_totals.text_content_rebuilds);
-    object.insert(
-        QStringLiteral("renderer_text_reused_total"),
-        result.renderer_totals.text_content_reused);
-    object.insert(
-        QStringLiteral("renderer_text_removed_total"),
-        result.renderer_totals.text_content_removed);
-    object.insert(
-        QStringLiteral("renderer_text_failures_total"),
-        result.renderer_totals.text_content_failures);
     object.insert(
         QStringLiteral("atlas_capture_count_max"),
         result.atlas_renderer.capture_count_max);
@@ -6301,435 +5468,11 @@ QJsonObject scenario_json(
         QStringLiteral("atlas_glyph_atlas_insert_failures_max"),
         result.atlas_renderer.glyph_atlas_insert_failures_max);
     object.insert(
-        QStringLiteral("atlas_work_created"),
-        result.renderer_totals.atlas_work_created);
-    object.insert(
-        QStringLiteral("atlas_work_reused"),
-        result.renderer_totals.atlas_work_reused);
-    object.insert(
-        QStringLiteral("text_cache_entry_child_nodes_cleared_for_replacement"),
-        result.renderer_totals.text_cache_entry_child_nodes_cleared_for_replacement);
-    object.insert(
-        QStringLiteral("text_cache_entry_child_nodes_cleared_for_removal"),
-        result.renderer_totals.text_cache_entry_child_nodes_cleared_for_removal);
-    object.insert(
-        QStringLiteral("text_cache_entry_max_child_nodes_cleared"),
-        result.renderer_totals.text_cache_entry_max_child_nodes_cleared);
-    object.insert(
-        QStringLiteral("text_clean_reuse_skips"),
-        result.renderer_totals.text_clean_reuse_skips);
-    object.insert(
-        QStringLiteral("text_resource_descriptor_builds"),
-        result.renderer_totals.text_resource_descriptor_builds);
-    object.insert(
-        QStringLiteral("text_resource_descriptor_builds_avoided"),
-        result.renderer_totals.text_resource_descriptor_builds_avoided);
-    object.insert(
-        QStringLiteral("text_resource_descriptor_reuses"),
-        result.renderer_totals.text_resource_descriptor_reuses);
-    object.insert(
-        QStringLiteral("text_coalescing_candidate_groups"),
-        result.renderer_totals.text_coalescing_candidate_groups);
-    object.insert(
-        QStringLiteral("text_coalescing_enabled_groups"),
-        result.renderer_totals.text_coalescing_enabled_groups);
-    object.insert(
-        QStringLiteral("text_resource_runs_before_coalescing"),
-        result.renderer_totals.text_resource_runs_before_coalescing);
-    object.insert(
-        QStringLiteral("text_resource_runs_after_coalescing"),
-        result.renderer_totals.text_resource_runs_after_coalescing);
-    object.insert(
-        QStringLiteral("simple_content_cells_considered"),
-        result.renderer_totals.simple_content_cells_considered);
-    object.insert(
-        QStringLiteral("simple_content_eligible_cells"),
-        result.renderer_totals.simple_content_eligible_cells);
-    object.insert(
-        QStringLiteral("simple_content_eligible_after_all_gates_cells"),
-        result.renderer_totals.simple_content_eligible_after_all_gates_cells);
-    object.insert(
-        QStringLiteral("simple_content_rows_with_eligible_cells"),
-        result.renderer_totals.simple_content_rows_with_eligible_cells);
-    object.insert(
-        QStringLiteral("simple_content_styles_with_eligible_cells"),
-        result.renderer_totals.simple_content_styles_with_eligible_cells);
-    object.insert(
-        QStringLiteral("simple_content_dirty_eligible_cells"),
-        result.renderer_totals.simple_content_dirty_eligible_cells);
-    object.insert(
-        QStringLiteral("simple_content_clean_eligible_cells"),
-        result.renderer_totals.simple_content_clean_eligible_cells);
-    object.insert(
-        QStringLiteral("simple_content_text_category_empty_cells"),
-        result.renderer_totals.simple_content_text_category_empty_cells);
-    object.insert(
-        QStringLiteral("simple_content_text_category_printable_ascii_cells"),
-        result.renderer_totals.simple_content_text_category_printable_ascii_cells);
-    object.insert(
-        QStringLiteral("simple_content_text_category_other_ascii_cells"),
-        result.renderer_totals.simple_content_text_category_other_ascii_cells);
-    object.insert(
-        QStringLiteral("simple_content_text_category_non_ascii_cells"),
-        result.renderer_totals.simple_content_text_category_non_ascii_cells);
-    object.insert(
-        QStringLiteral("simple_content_route_none_cells"),
-        result.renderer_totals.simple_content_route_none_cells);
-    object.insert(
-        QStringLiteral("simple_content_route_fast_text_cells"),
-        result.renderer_totals.simple_content_route_fast_text_cells);
-    object.insert(
-        QStringLiteral("simple_content_route_qt_text_layout_cells"),
-        result.renderer_totals.simple_content_route_qt_text_layout_cells);
-    object.insert(
-        QStringLiteral("simple_content_route_fallback_cells"),
-        result.renderer_totals.simple_content_route_fallback_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_none_cells"),
-        result.renderer_totals.simple_content_rejection_none_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_empty_text_cells"),
-        result.renderer_totals.simple_content_rejection_empty_text_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_invalid_grid_cells"),
-        result.renderer_totals.simple_content_rejection_invalid_grid_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_invalid_position_cells"),
-        result.renderer_totals.simple_content_rejection_invalid_position_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_invalid_style_id_cells"),
-        result.renderer_totals.simple_content_rejection_invalid_style_id_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_wide_continuation_cells"),
-        result.renderer_totals.simple_content_rejection_wide_continuation_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_invalid_display_width_cells"),
-        result.renderer_totals.simple_content_rejection_invalid_display_width_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_invalid_text_encoding_cells"),
-        result.renderer_totals.simple_content_rejection_invalid_text_encoding_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_invalid_text_width_cells"),
-        result.renderer_totals.simple_content_rejection_invalid_text_width_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_multi_cell_text_cells"),
-        result.renderer_totals.simple_content_rejection_multi_cell_text_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_non_printable_ascii_cells"),
-        result.renderer_totals.simple_content_rejection_non_printable_ascii_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_non_ascii_text_cells"),
-        result.renderer_totals.simple_content_rejection_non_ascii_text_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_decoration_cells"),
-        result.renderer_totals.simple_content_rejection_decoration_cells);
-    object.insert(
-        QStringLiteral("simple_content_rejection_hyperlink_cells"),
-        result.renderer_totals.simple_content_rejection_hyperlink_cells);
-    object.insert(
-        QStringLiteral("route_fast_text_cells"),
-        result.renderer_totals.route_fast_text_cells);
-    object.insert(
-        QStringLiteral("route_qt_text_layout_runs"),
-        result.renderer_totals.route_qt_text_layout_runs);
-    object.insert(
-        QStringLiteral("route_fallback_cells"),
-        result.renderer_totals.route_fallback_cells);
-    object.insert(
-        QStringLiteral("qt_text_layout_calls"),
-        result.renderer_totals.qt_text_layout_calls);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_screened"),
-        result.renderer_totals.text_ascii_replacement_runs_screened);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_eligible"),
-        result.renderer_totals.text_ascii_replacement_runs_eligible);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_attempted"),
-        result.renderer_totals.text_ascii_replacement_runs_attempted);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"),
-        result.renderer_totals.text_ascii_replacement_runs_trusted_fast_path);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_succeeded"),
-        result.renderer_totals.text_ascii_replacement_runs_succeeded);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_all_space_succeeded"),
-        result.renderer_totals.text_ascii_replacement_runs_all_space_succeeded);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_add_glyphs_calls"),
-        result.renderer_totals.text_ascii_replacement_add_glyphs_calls);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_fallback"),
-        result.renderer_totals.text_ascii_replacement_runs_fallback);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_rejected_clipped"),
-        result.renderer_totals.text_ascii_replacement_runs_rejected_clipped);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_rejected_force_blended_order"),
-        result.renderer_totals.text_ascii_replacement_runs_rejected_force_blended_order);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_rejected_decoration"),
-        result.renderer_totals.text_ascii_replacement_runs_rejected_decoration);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_rejected_hyperlink"),
-        result.renderer_totals.text_ascii_replacement_runs_rejected_hyperlink);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_rejected_non_printable_ascii"),
-        result.renderer_totals.text_ascii_replacement_runs_rejected_non_printable_ascii);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_rejected_non_ascii"),
-        result.renderer_totals.text_ascii_replacement_runs_rejected_non_ascii);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_rejected_geometry"),
-        result.renderer_totals.text_ascii_replacement_runs_rejected_geometry);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_rejected_unsupported_font"),
-        result.renderer_totals.text_ascii_replacement_runs_rejected_unsupported_font);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_rejected_internal_node"),
-        result.renderer_totals.text_ascii_replacement_runs_rejected_internal_node);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_runs_rejected_glyph_mapping"),
-        result.renderer_totals.text_ascii_replacement_runs_rejected_glyph_mapping);
-    object.insert(
-        QStringLiteral("text_ascii_replacement_code_units_screened"),
-        static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_screened));
-    object.insert(
-        QStringLiteral("text_ascii_replacement_code_units_eligible"),
-        static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_eligible));
-    object.insert(
-        QStringLiteral("text_ascii_replacement_code_units_attempted"),
-        static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_attempted));
-    object.insert(
-        QStringLiteral("text_ascii_replacement_code_units_trusted_fast_path"),
-        static_cast<qint64>(
-            result.renderer_totals.text_ascii_replacement_code_units_trusted_fast_path));
-    object.insert(
-        QStringLiteral("text_ascii_replacement_code_units_succeeded"),
-        static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_succeeded));
-    object.insert(
-        QStringLiteral("text_ascii_replacement_code_units_fallback"),
-        static_cast<qint64>(result.renderer_totals.text_ascii_replacement_code_units_fallback));
-    object.insert(
-        QStringLiteral("qsg_nodes_created"),
-        result.renderer_totals.qsg_nodes_created);
-    object.insert(
-        QStringLiteral("qsg_nodes_replaced"),
-        result.renderer_totals.qsg_nodes_replaced);
-    object.insert(
-        QStringLiteral("qsg_nodes_destroyed"),
-        result.renderer_totals.qsg_nodes_destroyed);
-    object.insert(
-        QStringLiteral("background_qsg_nodes_created"),
-        result.renderer_totals.background_qsg_nodes_created);
-    object.insert(
-        QStringLiteral("background_qsg_nodes_replaced"),
-        result.renderer_totals.background_qsg_nodes_replaced);
-    object.insert(
-        QStringLiteral("background_qsg_nodes_destroyed"),
-        result.renderer_totals.background_qsg_nodes_destroyed);
-    object.insert(
-        QStringLiteral("text_key_builds"),
-        result.renderer_totals.text_key_builds);
-    object.insert(
-        QStringLiteral("text_key_bytes"),
-        static_cast<qint64>(result.renderer_totals.text_key_bytes));
-    object.insert(
-        QStringLiteral("rect_key_builds"),
-        result.renderer_totals.rect_key_builds);
-    object.insert(
-        QStringLiteral("rect_key_bytes"),
-        static_cast<qint64>(result.renderer_totals.rect_key_bytes));
-    object.insert(
-        QStringLiteral("cache_key_builds"),
-        result.renderer_totals.cache_key_builds);
-    object.insert(
-        QStringLiteral("cache_key_bytes"),
-        static_cast<qint64>(result.renderer_totals.cache_key_bytes));
-    object.insert(
-        QStringLiteral("text_cache_entries_created"),
-        result.renderer_totals.text_cache_entries_created);
-    object.insert(
-        QStringLiteral("text_cache_entries_replaced"),
-        result.renderer_totals.text_cache_entries_replaced);
-    object.insert(
-        QStringLiteral("text_cache_entries_removed"),
-        result.renderer_totals.text_cache_entries_removed);
-    object.insert(
-        QStringLiteral("frame_background_rects"),
-        result.renderer_totals.frame_background_rects);
-    object.insert(
-        QStringLiteral("frame_selection_rects"),
-        result.renderer_totals.frame_selection_rects);
-    object.insert(
-        QStringLiteral("frame_graphic_rects"),
-        result.renderer_totals.frame_graphic_rects);
-    object.insert(
-        QStringLiteral("frame_graphic_arcs"),
-        result.renderer_totals.frame_graphic_arcs);
-    object.insert(
-        QStringLiteral("frame_text_runs"),
-        result.renderer_totals.frame_text_runs);
-    object.insert(
-        QStringLiteral("frame_cursor_text_runs"),
-        result.renderer_totals.frame_cursor_text_runs);
-    object.insert(
-        QStringLiteral("frame_decorations"),
-        result.renderer_totals.frame_decorations);
-    object.insert(
-        QStringLiteral("frame_cursors"),
-        result.renderer_totals.frame_cursors);
-    object.insert(
-        QStringLiteral("frame_overlay_rects"),
-        result.renderer_totals.frame_overlay_rects);
-    object.insert(
-        QStringLiteral("frame_dirty_row_ranges"),
-        result.renderer_totals.frame_dirty_row_ranges);
-    object.insert(
-        QStringLiteral("frame_visible_rows"),
-        result.renderer_totals.frame_visible_rows);
-    object.insert(
-        QStringLiteral("frame_dirty_rows"),
-        result.renderer_totals.frame_dirty_rows);
-    object.insert(
-        QStringLiteral("frame_full_dirty_rows"),
-        result.renderer_totals.frame_full_dirty_rows);
-    object.insert(
         QStringLiteral("atlas_frame_dirty_rows_total"),
         result.atlas_frame_dirty_rows_total);
     object.insert(
         QStringLiteral("atlas_frame_full_dirty_rows_total"),
         result.atlas_frame_full_dirty_rows_total);
-    object.insert(
-        QStringLiteral("frame_cell_pass_input_cells"),
-        result.renderer_totals.frame_cell_pass_input_cells);
-    object.insert(
-        QStringLiteral("frame_cells_considered"),
-        result.renderer_totals.frame_cells_considered);
-    object.insert(
-        QStringLiteral("frame_input_cells_considered"),
-        result.renderer_totals.frame_cell_pass_input_cells);
-    object.insert(
-        QStringLiteral("frame_dirty_row_lookup_count"),
-        result.renderer_totals.frame_dirty_row_lookup_count);
-    object.insert(
-        QStringLiteral("frame_dirty_row_range_lookup_count"),
-        result.renderer_totals.frame_dirty_row_range_lookup_count);
-    object.insert(
-        QStringLiteral("frame_dirty_row_range_scan_steps"),
-        result.renderer_totals.frame_dirty_row_range_scan_steps);
-    object.insert(
-        QStringLiteral("row_cache_hits"),
-        result.renderer_totals.row_cache_hits);
-    object.insert(
-        QStringLiteral("row_cache_clean_skips"),
-        result.renderer_totals.row_cache_clean_skips);
-    object.insert(
-        QStringLiteral("background_row_rects_before_coalescing"),
-        result.renderer_totals.background_row_rects_before_coalescing);
-    object.insert(
-        QStringLiteral("background_row_rects_after_coalescing"),
-        result.renderer_totals.background_row_rects_after_coalescing);
-    object.insert(
-        QStringLiteral("background_batched_rects"),
-        result.renderer_totals.background_batched_rects);
-    object.insert(
-        QStringLiteral("background_batched_vertices"),
-        result.renderer_totals.background_batched_vertices);
-    object.insert(
-        QStringLiteral("selection_batched_rects"),
-        result.renderer_totals.selection_batched_rects);
-    object.insert(
-        QStringLiteral("selection_batched_vertices"),
-        result.renderer_totals.selection_batched_vertices);
-    object.insert(
-        QStringLiteral("graphic_batched_rects"),
-        result.renderer_totals.graphic_batched_rects);
-    object.insert(
-        QStringLiteral("graphic_batched_vertices"),
-        result.renderer_totals.graphic_batched_vertices);
-    object.insert(
-        QStringLiteral("decoration_batched_rects"),
-        result.renderer_totals.decoration_batched_rects);
-    object.insert(
-        QStringLiteral("decoration_batched_vertices"),
-        result.renderer_totals.decoration_batched_vertices);
-    object.insert(
-        QStringLiteral("background_rows_rebuilt"),
-        result.renderer_totals.background_rows_rebuilt);
-    object.insert(
-        QStringLiteral("background_rows_reused"),
-        result.renderer_totals.background_rows_reused);
-    object.insert(
-        QStringLiteral("background_row_clean_reuse_skips"),
-        result.renderer_totals.background_row_clean_reuse_skips);
-    object.insert(
-        QStringLiteral("background_rows_removed"),
-        result.renderer_totals.background_rows_removed);
-    object.insert(
-        QStringLiteral("background_row_cache_fallbacks"),
-        result.renderer_totals.background_row_cache_fallbacks);
-    object.insert(
-        QStringLiteral("selection_rows_rebuilt"),
-        result.renderer_totals.selection_rows_rebuilt);
-    object.insert(
-        QStringLiteral("selection_rows_reused"),
-        result.renderer_totals.selection_rows_reused);
-    object.insert(
-        QStringLiteral("selection_row_clean_reuse_skips"),
-        result.renderer_totals.selection_row_clean_reuse_skips);
-    object.insert(
-        QStringLiteral("selection_rows_removed"),
-        result.renderer_totals.selection_rows_removed);
-    object.insert(
-        QStringLiteral("selection_row_cache_fallbacks"),
-        result.renderer_totals.selection_row_cache_fallbacks);
-    object.insert(
-        QStringLiteral("decoration_rows_rebuilt"),
-        result.renderer_totals.decoration_rows_rebuilt);
-    object.insert(
-        QStringLiteral("decoration_rows_reused"),
-        result.renderer_totals.decoration_rows_reused);
-    object.insert(
-        QStringLiteral("decoration_row_clean_reuse_skips"),
-        result.renderer_totals.decoration_row_clean_reuse_skips);
-    object.insert(
-        QStringLiteral("decoration_rows_removed"),
-        result.renderer_totals.decoration_rows_removed);
-    object.insert(
-        QStringLiteral("decoration_row_cache_fallbacks"),
-        result.renderer_totals.decoration_row_cache_fallbacks);
-    object.insert(
-        QStringLiteral("graphic_rect_rows_rebuilt"),
-        result.renderer_totals.graphic_rect_rows_rebuilt);
-    object.insert(
-        QStringLiteral("graphic_rect_rows_reused"),
-        result.renderer_totals.graphic_rect_rows_reused);
-    object.insert(
-        QStringLiteral("graphic_rect_row_clean_reuse_skips"),
-        result.renderer_totals.graphic_rect_row_clean_reuse_skips);
-    object.insert(
-        QStringLiteral("graphic_rect_rows_removed"),
-        result.renderer_totals.graphic_rect_rows_removed);
-    object.insert(
-        QStringLiteral("graphic_rect_row_cache_fallbacks"),
-        result.renderer_totals.graphic_rect_row_cache_fallbacks);
-    object.insert(
-        QStringLiteral("graphic_arc_rows_rebuilt"),
-        result.renderer_totals.graphic_arc_rows_rebuilt);
-    object.insert(
-        QStringLiteral("graphic_arc_rows_reused"),
-        result.renderer_totals.graphic_arc_rows_reused);
-    object.insert(
-        QStringLiteral("graphic_arc_row_clean_reuse_skips"),
-        result.renderer_totals.graphic_arc_row_clean_reuse_skips);
-    object.insert(
-        QStringLiteral("graphic_arc_rows_removed"),
-        result.renderer_totals.graphic_arc_rows_removed);
-    object.insert(
-        QStringLiteral("graphic_arc_row_cache_fallbacks"),
-        result.renderer_totals.graphic_arc_row_cache_fallbacks);
     object.insert(
         QStringLiteral("bridge_update_requests_delta"),
         static_cast<qint64>(result.bridge_delta.update_requests));
@@ -6907,8 +5650,6 @@ bool required_structural_checks_passed(const QJsonObject& object)
         (!checks.value(QStringLiteral("snapshot_valid")).toBool() ||
             !checks.value(QStringLiteral("last_rendered_snapshot_sequence")).toBool() ||
             !checks.value(QStringLiteral("pending_update_clear")).toBool()            ||
-            !checks.value(QStringLiteral("paint_completed")).toBool()                 ||
-            !checks.value(QStringLiteral("text_content_failures_zero")).toBool()      ||
             !checks.value(QStringLiteral("text_work_observed")).toBool()              ||
             !checks.value(QStringLiteral("visible_pixels_observed")).toBool()         ||
             !checks.value(QStringLiteral("atlas_frame_observed")).toBool()            ||
@@ -7264,159 +6005,6 @@ bool validate_lifecycle_json(const QJsonObject& object, QString* out_error)
     return true;
 }
 
-bool validate_renderer_counter_json(const QJsonObject& object, QString* out_error)
-{
-    const QStringList counter_keys = {
-        QStringLiteral("text_clean_reuse_skips"),
-        QStringLiteral("text_resource_descriptor_builds"),
-        QStringLiteral("text_resource_descriptor_builds_avoided"),
-        QStringLiteral("text_resource_descriptor_reuses"),
-        QStringLiteral("text_coalescing_candidate_groups"),
-        QStringLiteral("text_coalescing_enabled_groups"),
-        QStringLiteral("text_resource_runs_before_coalescing"),
-        QStringLiteral("text_resource_runs_after_coalescing"),
-        QStringLiteral("simple_content_cells_considered"),
-        QStringLiteral("simple_content_eligible_cells"),
-        QStringLiteral("simple_content_eligible_after_all_gates_cells"),
-        QStringLiteral("simple_content_rows_with_eligible_cells"),
-        QStringLiteral("simple_content_styles_with_eligible_cells"),
-        QStringLiteral("simple_content_dirty_eligible_cells"),
-        QStringLiteral("simple_content_clean_eligible_cells"),
-        QStringLiteral("simple_content_text_category_empty_cells"),
-        QStringLiteral("simple_content_text_category_printable_ascii_cells"),
-        QStringLiteral("simple_content_text_category_other_ascii_cells"),
-        QStringLiteral("simple_content_text_category_non_ascii_cells"),
-        QStringLiteral("simple_content_route_none_cells"),
-        QStringLiteral("simple_content_route_fast_text_cells"),
-        QStringLiteral("simple_content_route_qt_text_layout_cells"),
-        QStringLiteral("simple_content_route_fallback_cells"),
-        QStringLiteral("simple_content_rejection_none_cells"),
-        QStringLiteral("simple_content_rejection_empty_text_cells"),
-        QStringLiteral("simple_content_rejection_invalid_grid_cells"),
-        QStringLiteral("simple_content_rejection_invalid_position_cells"),
-        QStringLiteral("simple_content_rejection_invalid_style_id_cells"),
-        QStringLiteral("simple_content_rejection_wide_continuation_cells"),
-        QStringLiteral("simple_content_rejection_invalid_display_width_cells"),
-        QStringLiteral("simple_content_rejection_invalid_text_encoding_cells"),
-        QStringLiteral("simple_content_rejection_invalid_text_width_cells"),
-        QStringLiteral("simple_content_rejection_multi_cell_text_cells"),
-        QStringLiteral("simple_content_rejection_non_printable_ascii_cells"),
-        QStringLiteral("simple_content_rejection_non_ascii_text_cells"),
-        QStringLiteral("simple_content_rejection_decoration_cells"),
-        QStringLiteral("simple_content_rejection_hyperlink_cells"),
-        QStringLiteral("route_fast_text_cells"),
-        QStringLiteral("route_qt_text_layout_runs"),
-        QStringLiteral("route_fallback_cells"),
-        QStringLiteral("qt_text_layout_calls"),
-        QStringLiteral("text_ascii_replacement_runs_screened"),
-        QStringLiteral("text_ascii_replacement_runs_eligible"),
-        QStringLiteral("text_ascii_replacement_runs_attempted"),
-        QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"),
-        QStringLiteral("text_ascii_replacement_runs_succeeded"),
-        QStringLiteral("text_ascii_replacement_runs_all_space_succeeded"),
-        QStringLiteral("text_ascii_replacement_add_glyphs_calls"),
-        QStringLiteral("text_ascii_replacement_runs_fallback"),
-        QStringLiteral("text_ascii_replacement_runs_rejected_clipped"),
-        QStringLiteral("text_ascii_replacement_runs_rejected_force_blended_order"),
-        QStringLiteral("text_ascii_replacement_runs_rejected_decoration"),
-        QStringLiteral("text_ascii_replacement_runs_rejected_hyperlink"),
-        QStringLiteral("text_ascii_replacement_runs_rejected_non_printable_ascii"),
-        QStringLiteral("text_ascii_replacement_runs_rejected_non_ascii"),
-        QStringLiteral("text_ascii_replacement_runs_rejected_geometry"),
-        QStringLiteral("text_ascii_replacement_runs_rejected_unsupported_font"),
-        QStringLiteral("text_ascii_replacement_runs_rejected_internal_node"),
-        QStringLiteral("text_ascii_replacement_runs_rejected_glyph_mapping"),
-        QStringLiteral("text_ascii_replacement_code_units_screened"),
-        QStringLiteral("text_ascii_replacement_code_units_eligible"),
-        QStringLiteral("text_ascii_replacement_code_units_attempted"),
-        QStringLiteral("text_ascii_replacement_code_units_trusted_fast_path"),
-        QStringLiteral("text_ascii_replacement_code_units_succeeded"),
-        QStringLiteral("text_ascii_replacement_code_units_fallback"),
-        QStringLiteral("qsg_nodes_created"),
-        QStringLiteral("qsg_nodes_replaced"),
-        QStringLiteral("qsg_nodes_destroyed"),
-        QStringLiteral("background_qsg_nodes_created"),
-        QStringLiteral("background_qsg_nodes_replaced"),
-        QStringLiteral("background_qsg_nodes_destroyed"),
-        QStringLiteral("text_key_builds"),
-        QStringLiteral("text_key_bytes"),
-        QStringLiteral("rect_key_builds"),
-        QStringLiteral("rect_key_bytes"),
-        QStringLiteral("cache_key_builds"),
-        QStringLiteral("cache_key_bytes"),
-        QStringLiteral("text_cache_entries_created"),
-        QStringLiteral("text_cache_entries_replaced"),
-        QStringLiteral("text_cache_entries_removed"),
-        QStringLiteral("frame_background_rects"),
-        QStringLiteral("frame_selection_rects"),
-        QStringLiteral("frame_graphic_rects"),
-        QStringLiteral("frame_graphic_arcs"),
-        QStringLiteral("frame_text_runs"),
-        QStringLiteral("frame_cursor_text_runs"),
-        QStringLiteral("frame_decorations"),
-        QStringLiteral("frame_cursors"),
-        QStringLiteral("frame_overlay_rects"),
-        QStringLiteral("frame_dirty_row_ranges"),
-        QStringLiteral("frame_visible_rows"),
-        QStringLiteral("frame_dirty_rows"),
-        QStringLiteral("frame_full_dirty_rows"),
-        QStringLiteral("atlas_frame_dirty_rows_total"),
-        QStringLiteral("atlas_frame_full_dirty_rows_total"),
-        QStringLiteral("frame_cell_pass_input_cells"),
-        QStringLiteral("frame_cells_considered"),
-        QStringLiteral("frame_input_cells_considered"),
-        QStringLiteral("frame_dirty_row_lookup_count"),
-        QStringLiteral("frame_dirty_row_range_lookup_count"),
-        QStringLiteral("frame_dirty_row_range_scan_steps"),
-        QStringLiteral("row_cache_hits"),
-        QStringLiteral("row_cache_clean_skips"),
-        QStringLiteral("background_row_rects_before_coalescing"),
-        QStringLiteral("background_row_rects_after_coalescing"),
-        QStringLiteral("background_batched_rects"),
-        QStringLiteral("background_batched_vertices"),
-        QStringLiteral("selection_batched_rects"),
-        QStringLiteral("selection_batched_vertices"),
-        QStringLiteral("graphic_batched_rects"),
-        QStringLiteral("graphic_batched_vertices"),
-        QStringLiteral("decoration_batched_rects"),
-        QStringLiteral("decoration_batched_vertices"),
-        QStringLiteral("background_rows_rebuilt"),
-        QStringLiteral("background_rows_reused"),
-        QStringLiteral("background_row_clean_reuse_skips"),
-        QStringLiteral("background_rows_removed"),
-        QStringLiteral("background_row_cache_fallbacks"),
-        QStringLiteral("selection_rows_rebuilt"),
-        QStringLiteral("selection_rows_reused"),
-        QStringLiteral("selection_row_clean_reuse_skips"),
-        QStringLiteral("selection_rows_removed"),
-        QStringLiteral("selection_row_cache_fallbacks"),
-        QStringLiteral("decoration_rows_rebuilt"),
-        QStringLiteral("decoration_rows_reused"),
-        QStringLiteral("decoration_row_clean_reuse_skips"),
-        QStringLiteral("decoration_rows_removed"),
-        QStringLiteral("decoration_row_cache_fallbacks"),
-        QStringLiteral("graphic_rect_rows_rebuilt"),
-        QStringLiteral("graphic_rect_rows_reused"),
-        QStringLiteral("graphic_rect_row_clean_reuse_skips"),
-        QStringLiteral("graphic_rect_rows_removed"),
-        QStringLiteral("graphic_rect_row_cache_fallbacks"),
-        QStringLiteral("graphic_arc_rows_rebuilt"),
-        QStringLiteral("graphic_arc_rows_reused"),
-        QStringLiteral("graphic_arc_row_clean_reuse_skips"),
-        QStringLiteral("graphic_arc_rows_removed"),
-        QStringLiteral("graphic_arc_row_cache_fallbacks"),
-    };
-    for (const QString& counter_key : counter_keys) {
-        if (!validate_nonnegative_integer_json_field(
-                object, counter_key, QStringLiteral("scenario"), out_error))
-        {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 qint64 json_counter(const QJsonObject& object, const QString& key)
 {
     return object.value(key).toInteger();
@@ -7475,230 +6063,6 @@ bool validate_inline_single_bmp_model_profile_stats(
     return true;
 }
 
-bool validate_renderer_counter_invariants(
-    const QJsonObject& object,
-    QString*           out_error)
-{
-    const qint64 simple_cells =
-        json_counter(object, QStringLiteral("simple_content_cells_considered"));
-    const qint64 text_category_cells =
-        json_counter(object, QStringLiteral("simple_content_text_category_empty_cells")) +
-        json_counter(
-            object,
-            QStringLiteral("simple_content_text_category_printable_ascii_cells")) +
-        json_counter(object, QStringLiteral("simple_content_text_category_other_ascii_cells")) +
-        json_counter(object, QStringLiteral("simple_content_text_category_non_ascii_cells"));
-    const qint64 route_cells =
-        json_counter(object, QStringLiteral("simple_content_route_none_cells")) +
-        json_counter(object, QStringLiteral("simple_content_route_fast_text_cells")) +
-        json_counter(object, QStringLiteral("simple_content_route_qt_text_layout_cells")) +
-        json_counter(object, QStringLiteral("simple_content_route_fallback_cells"));
-    const qint64 rejection_cells =
-        json_counter(object, QStringLiteral("simple_content_rejection_none_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_empty_text_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_invalid_grid_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_invalid_position_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_invalid_style_id_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_wide_continuation_cells")) +
-        json_counter(
-            object,
-            QStringLiteral("simple_content_rejection_invalid_display_width_cells")) +
-        json_counter(
-            object,
-            QStringLiteral("simple_content_rejection_invalid_text_encoding_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_invalid_text_width_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_multi_cell_text_cells")) +
-        json_counter(
-            object,
-            QStringLiteral("simple_content_rejection_non_printable_ascii_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_non_ascii_text_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_decoration_cells")) +
-        json_counter(object, QStringLiteral("simple_content_rejection_hyperlink_cells"));
-
-    if (text_category_cells != simple_cells ||
-        route_cells         != simple_cells ||
-        rejection_cells     != simple_cells)
-    {
-        *out_error = QStringLiteral("simple-content classifier totals are inconsistent");
-        return false;
-    }
-
-    const qint64 eligible_cells =
-        json_counter(object, QStringLiteral("simple_content_eligible_cells"));
-    const qint64 candidate_fast_text_cells = json_counter(
-        object,
-        QStringLiteral("simple_content_route_fast_text_cells"));
-    const qint64 candidate_rejection_none_cells = json_counter(
-        object,
-        QStringLiteral("simple_content_rejection_none_cells"));
-    if (json_counter(
-            object,
-            QStringLiteral("simple_content_eligible_after_all_gates_cells")) >
-            eligible_cells                               ||
-        candidate_fast_text_cells      != eligible_cells ||
-        candidate_rejection_none_cells != eligible_cells ||
-        json_counter(object, QStringLiteral("simple_content_dirty_eligible_cells")) +
-            json_counter(object, QStringLiteral("simple_content_clean_eligible_cells")) !=
-            eligible_cells)
-    {
-        *out_error = QStringLiteral("simple-content eligibility counters are inconsistent");
-        return false;
-    }
-
-    if (json_counter(object, QStringLiteral("route_fast_text_cells")) <
-            candidate_fast_text_cells ||
-        json_counter(object, QStringLiteral("route_fallback_cells")) <
-            json_counter(object, QStringLiteral("simple_content_route_fallback_cells")) ||
-        json_counter(object, QStringLiteral("qt_text_layout_calls")) !=
-            json_counter(object, QStringLiteral("route_qt_text_layout_runs")))
-    {
-        *out_error = QStringLiteral("renderer route counters are inconsistent");
-        return false;
-    }
-
-    const qint64 ascii_replacement_screened =
-        json_counter(object, QStringLiteral("text_ascii_replacement_runs_screened"));
-    const qint64 ascii_replacement_eligible =
-        json_counter(object, QStringLiteral("text_ascii_replacement_runs_eligible"));
-    const qint64 ascii_replacement_attempted =
-        json_counter(object, QStringLiteral("text_ascii_replacement_runs_attempted"));
-    const qint64 ascii_replacement_trusted =
-        json_counter(object, QStringLiteral("text_ascii_replacement_runs_trusted_fast_path"));
-    const qint64 ascii_replacement_succeeded =
-        json_counter(object, QStringLiteral("text_ascii_replacement_runs_succeeded"));
-    const qint64 ascii_replacement_all_space =
-        json_counter(object, QStringLiteral("text_ascii_replacement_runs_all_space_succeeded"));
-    const qint64 ascii_replacement_add_glyphs =
-        json_counter(object, QStringLiteral("text_ascii_replacement_add_glyphs_calls"));
-    const qint64 ascii_replacement_fallback =
-        json_counter(object, QStringLiteral("text_ascii_replacement_runs_fallback"));
-    if (ascii_replacement_screened != ascii_replacement_succeeded + ascii_replacement_fallback ||
-        ascii_replacement_eligible > ascii_replacement_screened                                ||
-        ascii_replacement_attempted > ascii_replacement_eligible                               ||
-        ascii_replacement_trusted > ascii_replacement_attempted                                ||
-        ascii_replacement_succeeded > ascii_replacement_attempted                              ||
-        ascii_replacement_all_space > ascii_replacement_succeeded                              ||
-        ascii_replacement_add_glyphs >
-            ascii_replacement_succeeded - ascii_replacement_all_space)
-    {
-        *out_error = QStringLiteral("ASCII replacement route counters are inconsistent");
-        return false;
-    }
-
-    if (json_counter(object, QStringLiteral("background_qsg_nodes_created")) >
-        json_counter(object, QStringLiteral("qsg_nodes_created")) ||
-        json_counter(object, QStringLiteral("background_qsg_nodes_replaced")) >
-        json_counter(object, QStringLiteral("qsg_nodes_replaced")) ||
-        json_counter(object, QStringLiteral("background_qsg_nodes_destroyed")) >
-        json_counter(object, QStringLiteral("qsg_nodes_destroyed")))
-    {
-        *out_error = QStringLiteral("background QSG node counters exceed global counters");
-        return false;
-    }
-
-    if (json_counter(object, QStringLiteral("background_batched_vertices")) !=
-        json_counter(object, QStringLiteral("background_batched_rects")) *
-            k_flat_rect_vertices_per_rect)
-    {
-        *out_error = QStringLiteral("background batched-geometry counters are inconsistent");
-        return false;
-    }
-    if (json_counter(object, QStringLiteral("selection_batched_vertices")) !=
-        json_counter(object, QStringLiteral("selection_batched_rects")) *
-            k_flat_rect_vertices_per_rect)
-    {
-        *out_error = QStringLiteral("selection batched-geometry counters are inconsistent");
-        return false;
-    }
-    if (json_counter(object, QStringLiteral("graphic_batched_vertices")) !=
-        json_counter(object, QStringLiteral("graphic_batched_rects")) *
-            k_flat_rect_vertices_per_rect)
-    {
-        *out_error = QStringLiteral("graphic batched-geometry counters are inconsistent");
-        return false;
-    }
-    if (json_counter(object, QStringLiteral("decoration_batched_vertices")) !=
-        json_counter(object, QStringLiteral("decoration_batched_rects")) *
-            k_flat_rect_vertices_per_rect)
-    {
-        *out_error = QStringLiteral("decoration batched-geometry counters are inconsistent");
-        return false;
-    }
-
-    if (json_counter(object, QStringLiteral("cache_key_builds")) !=
-        json_counter(object, QStringLiteral("text_key_builds")) +
-            json_counter(object, QStringLiteral("rect_key_builds")) ||
-        json_counter(object, QStringLiteral("cache_key_bytes")) !=
-        json_counter(object, QStringLiteral("text_key_bytes")) +
-            json_counter(object, QStringLiteral("rect_key_bytes")))
-    {
-        *out_error = QStringLiteral("renderer cache-key counters are inconsistent");
-        return false;
-    }
-
-    const qint64 text_resource_descriptor_reuses =
-        json_counter(object, QStringLiteral("text_resource_descriptor_reuses"));
-    const qint64 text_row_cache_hits =
-        json_counter(object, QStringLiteral("renderer_text_reused_total")) -
-        json_counter(object, QStringLiteral("text_clean_reuse_skips"));
-    if (text_resource_descriptor_reuses > text_row_cache_hits)
-    {
-        *out_error = QStringLiteral(
-            "text resource descriptor reuses exceed text row-cache hits");
-        return false;
-    }
-
-    const qint64 atlas_work_reused =
-        json_counter(object, QStringLiteral("atlas_work_reused"));
-    if (atlas_work_reused >
-        json_counter(object, QStringLiteral("renderer_text_rebuilds_total")))
-    {
-        *out_error = QStringLiteral("atlas work reuse counters are inconsistent");
-        return false;
-    }
-
-    const qint64 text_resource_descriptor_builds_avoided =
-        json_counter(object, QStringLiteral("text_resource_descriptor_builds_avoided"));
-    if (text_resource_descriptor_builds_avoided > text_resource_descriptor_reuses)
-    {
-        *out_error = QStringLiteral("text resource descriptor counters are inconsistent");
-        return false;
-    }
-
-    if (json_counter(object, QStringLiteral("text_coalescing_enabled_groups")) >
-        json_counter(object, QStringLiteral("text_coalescing_candidate_groups")) ||
-        json_counter(object, QStringLiteral("text_resource_runs_after_coalescing")) >
-        json_counter(object, QStringLiteral("text_resource_runs_before_coalescing")))
-    {
-        *out_error = QStringLiteral("text coalescing counters are inconsistent");
-        return false;
-    }
-
-    const qint64 row_cache_hits =
-        text_row_cache_hits +
-        json_counter(object, QStringLiteral("background_rows_reused")) +
-        json_counter(object, QStringLiteral("selection_rows_reused")) +
-        json_counter(object, QStringLiteral("decoration_rows_reused")) +
-        json_counter(object, QStringLiteral("graphic_rect_rows_reused")) +
-        json_counter(object, QStringLiteral("graphic_arc_rows_reused"));
-    const qint64 row_cache_clean_skips =
-        json_counter(object, QStringLiteral("text_clean_reuse_skips")) +
-        json_counter(object, QStringLiteral("background_row_clean_reuse_skips")) +
-        json_counter(object, QStringLiteral("selection_row_clean_reuse_skips")) +
-        json_counter(object, QStringLiteral("decoration_row_clean_reuse_skips")) +
-        json_counter(object, QStringLiteral("graphic_rect_row_clean_reuse_skips")) +
-        json_counter(object, QStringLiteral("graphic_arc_row_clean_reuse_skips"));
-    if (json_counter(object, QStringLiteral("row_cache_hits")) != row_cache_hits ||
-        json_counter(object, QStringLiteral("row_cache_clean_skips")) !=
-            row_cache_clean_skips)
-    {
-        *out_error = QStringLiteral("renderer row-cache aggregate counters are inconsistent");
-        return false;
-    }
-
-    return true;
-}
-
 bool json_numbers_match(double observed, double expected)
 {
     const double tolerance = std::max(1.0e-9, std::abs(expected) * 1.0e-9);
@@ -7723,30 +6087,6 @@ bool validate_normalized_json_number(
     }
 
     return true;
-}
-
-bool validate_normalized_json_value(
-    const QJsonValue&  value,
-    qint64             total,
-    qint64             denominator,
-    const QString&     label,
-    QString*           out_error)
-{
-    if (denominator == 0) {
-        if (!value.isNull()) {
-            *out_error = QStringLiteral("scenario normalized value must be null: %1")
-                .arg(label);
-            return false;
-        }
-        return true;
-    }
-
-    return
-        validate_normalized_json_number(
-            value,
-            static_cast<double>(total) / static_cast<double>(denominator),
-            label,
-            out_error);
 }
 
 QString expected_latency_normalization(
@@ -7780,8 +6120,6 @@ bool validate_per_consumed_update_json(
         QStringLiteral("denominator"),
         QStringLiteral("completed_attempts"),
         QStringLiteral("consumed_updates_per_completed_attempt"),
-        QStringLiteral("counter_semantics"),
-        QStringLiteral("counters"),
         QStringLiteral("timing"),
     };
     for (const QString& key : required_keys) {
@@ -7802,9 +6140,7 @@ bool validate_per_consumed_update_json(
             QStringLiteral("bridge_consumed_updates_delta")                                    ||
         per_update.value(QStringLiteral("denominator")).toInteger() != consumed_updates        ||
         per_update.value(QStringLiteral("completed_attempts")).toInteger() !=
-            completed_frames ||
-        per_update.value(QStringLiteral("counter_semantics")).toString() !=
-            k_per_consumed_update_counter_semantics)
+            completed_frames)
     {
         *out_error = QStringLiteral("scenario per_consumed_update metadata is inconsistent");
         return false;
@@ -7825,40 +6161,6 @@ bool validate_per_consumed_update_json(
             QStringLiteral("per_consumed_update.consumed_updates_per_completed_attempt"), out_error))
     {
         return false;
-    }
-
-    const QJsonValue counters_value = per_update.value(QStringLiteral("counters"));
-    if (!counters_value.isObject()) {
-        *out_error = QStringLiteral("scenario per_consumed_update.counters is not an object");
-        return false;
-    }
-
-    const QJsonObject counters = counters_value.toObject();
-    const QStringList counter_keys = {
-        QStringLiteral("qt_text_layout_calls"),
-        QStringLiteral("atlas_work_created"),
-        QStringLiteral("atlas_work_reused"),
-        QStringLiteral("text_key_builds"),
-        QStringLiteral("text_key_bytes"),
-        QStringLiteral("renderer_text_rebuilds_total"),
-        QStringLiteral("renderer_text_reused_total"),
-        QStringLiteral("text_resource_descriptor_reuses"),
-        QStringLiteral("text_resource_descriptor_builds"),
-        QStringLiteral("text_resource_descriptor_builds_avoided"),
-        QStringLiteral("frame_input_cells_considered"),
-        QStringLiteral("text_ascii_replacement_add_glyphs_calls"),
-        QStringLiteral("qsg_nodes_created"),
-        QStringLiteral("qsg_nodes_replaced"),
-        QStringLiteral("qsg_nodes_destroyed"),
-    };
-    for (const QString& counter_key : counter_keys) {
-        if (!counters.contains(counter_key) ||
-            !validate_normalized_json_value(
-                counters.value(counter_key), json_counter(object, counter_key), consumed_updates,
-                QStringLiteral("per_consumed_update.counters.%1").arg(counter_key), out_error))
-        {
-            return false;
-        }
     }
 
     const QJsonValue timing_value = per_update.value(QStringLiteral("timing"));
@@ -8574,109 +6876,6 @@ bool validate_exact_json_key_set(
     return true;
 }
 
-bool validate_descriptor_counters_json(
-    const QJsonObject& object,
-    QString*           out_error)
-{
-    const QJsonValue value = object.value(QStringLiteral("descriptor_counters"));
-    if (!value.isObject()) {
-        *out_error = QStringLiteral("scenario descriptor_counters is not an object");
-        return false;
-    }
-
-    const QJsonObject counters = value.toObject();
-    if (!validate_exact_json_key_set(
-            counters,
-            {
-                QStringLiteral("available"),
-                QStringLiteral("schema_semantics"),
-                QStringLiteral("frame_row_descriptors"),
-                QStringLiteral("frame_layer_descriptors"),
-                QStringLiteral("qsg_layer_descriptors"),
-            },
-            QStringLiteral("descriptor_counters"),
-            out_error))
-    {
-        return false;
-    }
-
-    if (!counters.value(QStringLiteral("available")).isBool() ||
-        !counters.value(QStringLiteral("available")).toBool() ||
-        counters.value(QStringLiteral("schema_semantics")).toString() !=
-            k_descriptor_counter_schema_semantics)
-    {
-        *out_error = QStringLiteral("scenario descriptor counter schema changed");
-        return false;
-    }
-    for (const QString& key : {
-            QStringLiteral("frame_row_descriptors"),
-            QStringLiteral("frame_layer_descriptors"),
-            QStringLiteral("qsg_layer_descriptors"),
-        })
-    {
-        if (!counters.value(key).isDouble() || counters.value(key).toInteger() < 0) {
-            *out_error = QStringLiteral("scenario descriptor counter is invalid");
-            return false;
-        }
-    }
-
-    const qint64 frame_row_descriptors =
-        counters.value(QStringLiteral("frame_row_descriptors")).toInteger();
-    const qint64 frame_layer_descriptors =
-        counters.value(QStringLiteral("frame_layer_descriptors")).toInteger();
-    const qint64 qsg_layer_descriptors =
-        counters.value(QStringLiteral("qsg_layer_descriptors")).toInteger();
-    if (qsg_layer_descriptors != 0) {
-        *out_error = QStringLiteral(
-            "scenario QSG layer descriptor counter must remain zero");
-        return false;
-    }
-
-    const bool render_expected =
-        object.value(QStringLiteral("render_expected")).toBool(true);
-    const qint64 completed_frames =
-        object.value(QStringLiteral("completed_frames")).toInteger();
-    const qint64 consumed_updates =
-        object.value(QStringLiteral("bridge_consumed_updates_delta")).toInteger();
-    const qint64 descriptor_frame_budget =
-        std::max(completed_frames, consumed_updates);
-    const qint64 actual_rows =
-        object.value(QStringLiteral("rows")).toInteger();
-    const qint64 visible_row_budget =
-        object.value(QStringLiteral("frame_visible_rows")).toInteger();
-    if (render_expected && completed_frames > 0) {
-        const bool descriptor_evidence_expected =
-            object.value(QStringLiteral("frame_cell_pass_input_cells")).toInteger() > 0 ||
-            object.value(QStringLiteral("frame_dirty_rows")).toInteger() > 0;
-        if (descriptor_evidence_expected && frame_layer_descriptors <= 0) {
-            *out_error = QStringLiteral(
-                "scenario descriptor layer counter is missing evidence");
-            return false;
-        }
-    }
-
-    if (descriptor_frame_budget > 0 && actual_rows > 0) {
-        const qint64 row_descriptor_limit =
-            std::max(
-                descriptor_frame_budget * actual_rows,
-                visible_row_budget);
-        const qint64 layer_descriptor_limit =
-            descriptor_frame_budget * k_descriptor_layer_count;
-        if (frame_row_descriptors > row_descriptor_limit) {
-            *out_error = QStringLiteral(
-                "scenario frame row descriptor counter exceeded frame-row bound");
-            return false;
-        }
-        if (frame_layer_descriptors > layer_descriptor_limit) {
-            *out_error = QStringLiteral(
-                "scenario descriptor layer counter exceeded frame-layer bound");
-            return false;
-        }
-    }
-
-    return true;
-}
-
 bool validate_consumer_materialization_counters_json(
     const QJsonObject& object,
     QString*           out_error)
@@ -8843,7 +7042,6 @@ bool validate_scenario_json(
         QStringLiteral("sparse_dirty_row_sweep_applicable"),
         QStringLiteral("configured_sparse_dirty_rows"),
         QStringLiteral("configured_sparse_dirty_row_stride"),
-        QStringLiteral("descriptor_counters"),
         QStringLiteral("elapsed_ns"),
         QStringLiteral("snapshot_prep_ns"),
         QStringLiteral("session_scroll_ns"),
@@ -8853,10 +7051,6 @@ bool validate_scenario_json(
         QStringLiteral("readback_ns"),
         QStringLiteral("completed_frames"),
         QStringLiteral("timeout_count"),
-        QStringLiteral("renderer_text_rebuilds_total"),
-        QStringLiteral("renderer_text_reused_total"),
-        QStringLiteral("renderer_text_removed_total"),
-        QStringLiteral("renderer_text_failures_total"),
         QStringLiteral("atlas_capture_count_max"),
         QStringLiteral("atlas_prepare_count_max"),
         QStringLiteral("atlas_render_count_max"),
@@ -8882,117 +7076,6 @@ bool validate_scenario_json(
         QStringLiteral("atlas_glyph_missed_instances_max"),
         QStringLiteral("atlas_glyph_coverage_failures_max"),
         QStringLiteral("atlas_glyph_atlas_insert_failures_max"),
-        QStringLiteral("atlas_work_created"),
-        QStringLiteral("atlas_work_reused"),
-        QStringLiteral("text_cache_entry_child_nodes_cleared_for_replacement"),
-        QStringLiteral("text_cache_entry_child_nodes_cleared_for_removal"),
-        QStringLiteral("text_cache_entry_max_child_nodes_cleared"),
-        QStringLiteral("text_clean_reuse_skips"),
-        QStringLiteral("text_resource_descriptor_builds"),
-        QStringLiteral("text_resource_descriptor_builds_avoided"),
-        QStringLiteral("text_resource_descriptor_reuses"),
-        QStringLiteral("text_coalescing_candidate_groups"),
-        QStringLiteral("text_coalescing_enabled_groups"),
-        QStringLiteral("text_resource_runs_before_coalescing"),
-        QStringLiteral("text_resource_runs_after_coalescing"),
-        QStringLiteral("simple_content_cells_considered"),
-        QStringLiteral("simple_content_eligible_cells"),
-        QStringLiteral("simple_content_eligible_after_all_gates_cells"),
-        QStringLiteral("simple_content_rows_with_eligible_cells"),
-        QStringLiteral("simple_content_styles_with_eligible_cells"),
-        QStringLiteral("simple_content_dirty_eligible_cells"),
-        QStringLiteral("simple_content_clean_eligible_cells"),
-        QStringLiteral("simple_content_text_category_empty_cells"),
-        QStringLiteral("simple_content_text_category_printable_ascii_cells"),
-        QStringLiteral("simple_content_text_category_other_ascii_cells"),
-        QStringLiteral("simple_content_text_category_non_ascii_cells"),
-        QStringLiteral("simple_content_route_none_cells"),
-        QStringLiteral("simple_content_route_fast_text_cells"),
-        QStringLiteral("simple_content_route_qt_text_layout_cells"),
-        QStringLiteral("simple_content_route_fallback_cells"),
-        QStringLiteral("simple_content_rejection_none_cells"),
-        QStringLiteral("simple_content_rejection_empty_text_cells"),
-        QStringLiteral("simple_content_rejection_invalid_grid_cells"),
-        QStringLiteral("simple_content_rejection_invalid_position_cells"),
-        QStringLiteral("simple_content_rejection_invalid_style_id_cells"),
-        QStringLiteral("simple_content_rejection_wide_continuation_cells"),
-        QStringLiteral("simple_content_rejection_invalid_display_width_cells"),
-        QStringLiteral("simple_content_rejection_invalid_text_encoding_cells"),
-        QStringLiteral("simple_content_rejection_invalid_text_width_cells"),
-        QStringLiteral("simple_content_rejection_multi_cell_text_cells"),
-        QStringLiteral("simple_content_rejection_non_printable_ascii_cells"),
-        QStringLiteral("simple_content_rejection_non_ascii_text_cells"),
-        QStringLiteral("simple_content_rejection_decoration_cells"),
-        QStringLiteral("simple_content_rejection_hyperlink_cells"),
-        QStringLiteral("route_fast_text_cells"),
-        QStringLiteral("route_qt_text_layout_runs"),
-        QStringLiteral("route_fallback_cells"),
-        QStringLiteral("qt_text_layout_calls"),
-        QStringLiteral("qsg_nodes_created"),
-        QStringLiteral("qsg_nodes_replaced"),
-        QStringLiteral("qsg_nodes_destroyed"),
-        QStringLiteral("background_qsg_nodes_created"),
-        QStringLiteral("background_qsg_nodes_replaced"),
-        QStringLiteral("background_qsg_nodes_destroyed"),
-        QStringLiteral("text_key_builds"),
-        QStringLiteral("text_key_bytes"),
-        QStringLiteral("rect_key_builds"),
-        QStringLiteral("rect_key_bytes"),
-        QStringLiteral("cache_key_builds"),
-        QStringLiteral("cache_key_bytes"),
-        QStringLiteral("text_cache_entries_created"),
-        QStringLiteral("text_cache_entries_replaced"),
-        QStringLiteral("text_cache_entries_removed"),
-        QStringLiteral("frame_background_rects"),
-        QStringLiteral("frame_selection_rects"),
-        QStringLiteral("frame_graphic_rects"),
-        QStringLiteral("frame_graphic_arcs"),
-        QStringLiteral("frame_text_runs"),
-        QStringLiteral("frame_cursor_text_runs"),
-        QStringLiteral("frame_decorations"),
-        QStringLiteral("frame_cursors"),
-        QStringLiteral("frame_overlay_rects"),
-        QStringLiteral("frame_dirty_row_ranges"),
-        QStringLiteral("frame_dirty_row_lookup_count"),
-        QStringLiteral("frame_dirty_row_range_lookup_count"),
-        QStringLiteral("frame_dirty_row_range_scan_steps"),
-        QStringLiteral("row_cache_hits"),
-        QStringLiteral("row_cache_clean_skips"),
-        QStringLiteral("background_row_rects_before_coalescing"),
-        QStringLiteral("background_row_rects_after_coalescing"),
-        QStringLiteral("background_batched_rects"),
-        QStringLiteral("background_batched_vertices"),
-        QStringLiteral("selection_batched_rects"),
-        QStringLiteral("selection_batched_vertices"),
-        QStringLiteral("graphic_batched_rects"),
-        QStringLiteral("graphic_batched_vertices"),
-        QStringLiteral("decoration_batched_rects"),
-        QStringLiteral("decoration_batched_vertices"),
-        QStringLiteral("background_rows_rebuilt"),
-        QStringLiteral("background_rows_reused"),
-        QStringLiteral("background_row_clean_reuse_skips"),
-        QStringLiteral("background_rows_removed"),
-        QStringLiteral("background_row_cache_fallbacks"),
-        QStringLiteral("selection_rows_rebuilt"),
-        QStringLiteral("selection_rows_reused"),
-        QStringLiteral("selection_row_clean_reuse_skips"),
-        QStringLiteral("selection_rows_removed"),
-        QStringLiteral("selection_row_cache_fallbacks"),
-        QStringLiteral("decoration_rows_rebuilt"),
-        QStringLiteral("decoration_rows_reused"),
-        QStringLiteral("decoration_row_clean_reuse_skips"),
-        QStringLiteral("decoration_rows_removed"),
-        QStringLiteral("decoration_row_cache_fallbacks"),
-        QStringLiteral("graphic_rect_rows_rebuilt"),
-        QStringLiteral("graphic_rect_rows_reused"),
-        QStringLiteral("graphic_rect_row_clean_reuse_skips"),
-        QStringLiteral("graphic_rect_rows_removed"),
-        QStringLiteral("graphic_rect_row_cache_fallbacks"),
-        QStringLiteral("graphic_arc_rows_rebuilt"),
-        QStringLiteral("graphic_arc_rows_reused"),
-        QStringLiteral("graphic_arc_row_clean_reuse_skips"),
-        QStringLiteral("graphic_arc_rows_removed"),
-        QStringLiteral("graphic_arc_row_cache_fallbacks"),
         QStringLiteral("bridge_update_requests_delta"),
         QStringLiteral("bridge_scheduled_updates_delta"),
         QStringLiteral("bridge_coalesced_requests_delta"),
@@ -9069,9 +7152,6 @@ bool validate_scenario_json(
         !validate_process_memory_json(object, out_error)                                         ||
         !validate_window_size_json(object, out_error)                                            ||
         !validate_lifecycle_json(object, out_error)                                              ||
-        !validate_descriptor_counters_json(object, out_error)                                     ||
-        !validate_renderer_counter_json(object, out_error)                                       ||
-        !validate_renderer_counter_invariants(object, out_error)                                 ||
         !validate_atlas_renderer_json(object, out_error)                                         ||
         !validate_per_consumed_update_json(object, out_error)                                    ||
         !validate_profile_stats_json_object(
@@ -9166,19 +7246,10 @@ bool validate_scenario_json(
         const qint64 requested_dirty_rows =
             static_cast<qint64>(completed_frames) * options.sparse_dirty_rows;
         const qint64 accounted_cursor_rows = completed_frames;
-        const qint64 observed_frame_dirty_rows =
-            json_counter(object, QStringLiteral("frame_dirty_rows"));
-        const qint64 observed_frame_full_dirty_rows =
-            json_counter(object, QStringLiteral("frame_full_dirty_rows"));
-        const bool frame_dirty_row_counters_present =
-            observed_frame_dirty_rows      > 0 ||
-            observed_frame_full_dirty_rows > 0;
-        const qint64 observed_dirty_rows = frame_dirty_row_counters_present
-            ? observed_frame_dirty_rows
-            : json_counter(object, QStringLiteral("atlas_frame_dirty_rows_total"));
-        const qint64 observed_full_dirty_rows = frame_dirty_row_counters_present
-            ? observed_frame_full_dirty_rows
-            : json_counter(object, QStringLiteral("atlas_frame_full_dirty_rows_total"));
+        const qint64 observed_dirty_rows =
+            json_counter(object, QStringLiteral("atlas_frame_dirty_rows_total"));
+        const qint64 observed_full_dirty_rows =
+            json_counter(object, QStringLiteral("atlas_frame_full_dirty_rows_total"));
         if (observed_dirty_rows < requested_dirty_rows ||
             observed_dirty_rows > requested_dirty_rows + accounted_cursor_rows ||
             observed_full_dirty_rows != 0)
@@ -9346,8 +7417,7 @@ bool validate_scenario_json(
     }
 
     const int iterations       = object.value(QStringLiteral("iterations")).toInt();
-    if (json_counter(object, QStringLiteral("renderer_text_failures_total")) != 0 ||
-        completed_frames                                                     != iterations)
+    if (completed_frames != iterations)
     {
         *out_error = QStringLiteral("scenario renderer counters failed: %1")
             .arg(object.value(QStringLiteral("name")).toString());
@@ -9363,36 +7433,13 @@ bool validate_scenario_json(
             object.value(QStringLiteral("bridge_coalesced_requests_delta")).toInteger();
         const qint64 bridge_consumed_updates =
             object.value(QStringLiteral("bridge_consumed_updates_delta")).toInteger();
-        const bool graphic_work_observed =
-            json_counter(object, QStringLiteral("graphic_rect_rows_rebuilt")) > 0 ||
-            json_counter(object, QStringLiteral("graphic_rect_rows_reused"))  > 0;
         const bool atlas_render_work_observed =
             json_counter(object, QStringLiteral("atlas_rect_instances_max"))  > 0 ||
             json_counter(object, QStringLiteral("atlas_glyph_instances_max")) > 0 ||
             json_counter(object, QStringLiteral("atlas_rect_draw_calls_max")) > 0 ||
             json_counter(object, QStringLiteral("atlas_glyph_draw_calls_max")) > 0 ||
             json_counter(object, QStringLiteral("atlas_draw_calls_max"))      > 0;
-        const bool frame_render_work_observed =
-            json_counter(object, QStringLiteral("frame_background_rects")) > 0 ||
-            json_counter(object, QStringLiteral("frame_selection_rects"))  > 0 ||
-            json_counter(object, QStringLiteral("frame_graphic_rects"))    > 0 ||
-            json_counter(object, QStringLiteral("frame_graphic_arcs"))     > 0 ||
-            json_counter(object, QStringLiteral("frame_text_runs"))        > 0 ||
-            json_counter(object, QStringLiteral("frame_cursor_text_runs")) > 0 ||
-            json_counter(object, QStringLiteral("frame_decorations"))      > 0 ||
-            json_counter(object, QStringLiteral("frame_cursors"))          > 0;
-        const bool text_work_observed = is_measurement_reuse_only_scenario(scenario_name)
-            ? json_counter(object, QStringLiteral("renderer_text_reused_total")) > 0 ||
-                json_counter(object, QStringLiteral("atlas_work_created")) > 0 ||
-                json_counter(object, QStringLiteral("atlas_work_reused"))  > 0 ||
-                graphic_work_observed ||
-                atlas_render_work_observed
-            : json_counter(object, QStringLiteral("atlas_work_created")) > 0 ||
-                json_counter(object, QStringLiteral("atlas_work_reused"))  > 0 ||
-                atlas_render_work_observed ||
-                (is_surface_session_scenario(scenario_name) &&
-                    (graphic_work_observed || frame_render_work_observed));
-        if (!text_work_observed ||
+        if (!atlas_render_work_observed ||
             bridge_update_requests   < completed_frames              ||
             bridge_consumed_updates  < completed_frames              ||
             bridge_update_requests !=
@@ -9405,11 +7452,7 @@ bool validate_scenario_json(
         }
     }
     else {
-        if (json_counter(object, QStringLiteral("atlas_work_created"))             != 0 ||
-            json_counter(object, QStringLiteral("atlas_work_reused"))              != 0 ||
-            json_counter(object, QStringLiteral("renderer_text_rebuilds_total"))        != 0 ||
-            json_counter(object, QStringLiteral("renderer_text_reused_total"))          != 0 ||
-            object.value(QStringLiteral("bridge_update_requests_delta")).toInteger()    != 0 ||
+        if (object.value(QStringLiteral("bridge_update_requests_delta")).toInteger()    != 0 ||
             object.value(QStringLiteral("bridge_scheduled_updates_delta")).toInteger()  != 0 ||
             object.value(QStringLiteral("bridge_coalesced_requests_delta")).toInteger() != 0 ||
             object.value(QStringLiteral("bridge_consumed_updates_delta")).toInteger()   != 0 ||
@@ -9520,15 +7563,6 @@ bool validate_scenario_json(
 
     const QJsonObject lifecycle =
         object.value(QStringLiteral("lifecycle_delta")).toObject();
-    const bool frame_work_observed =
-        json_counter(object, QStringLiteral("frame_background_rects"))     > 0 ||
-        json_counter(object, QStringLiteral("frame_selection_rects"))      > 0 ||
-        json_counter(object, QStringLiteral("frame_graphic_rects"))        > 0 ||
-        json_counter(object, QStringLiteral("frame_graphic_arcs"))         > 0 ||
-        json_counter(object, QStringLiteral("frame_text_runs"))            > 0 ||
-        json_counter(object, QStringLiteral("frame_cursor_text_runs"))     > 0 ||
-        json_counter(object, QStringLiteral("frame_decorations"))          > 0 ||
-        json_counter(object, QStringLiteral("frame_cursors"))              > 0;
     const bool atlas_render_work_observed =
         json_counter(object, QStringLiteral("atlas_rect_instances_max"))   > 0 ||
         json_counter(object, QStringLiteral("atlas_glyph_instances_max"))  > 0 ||
@@ -9540,7 +7574,7 @@ bool validate_scenario_json(
     if (live_root_nodes > 1 ||
         (render_expected &&
             (live_root_nodes <= 0 ||
-                (!frame_work_observed && !atlas_render_work_observed))))
+                !atlas_render_work_observed)))
     {
         *out_error = QStringLiteral("scenario lifecycle counters failed: %1")
             .arg(object.value(QStringLiteral("name")).toString());
@@ -9948,36 +7982,8 @@ bool validate_profile_json_output(
             return false;
         }
 
-        const QJsonObject scenario                 = scenarios[index].toObject();
-        const QString     name                     = scenario.value(QStringLiteral("name")).toString();
-        qint64            background_batched_rects = 0;
-        qint64            selection_batched_rects  = 0;
-        qint64            graphic_batched_rects    = 0;
-        qint64            decoration_batched_rects = 0;
-        if (!profile_nonnegative_integer_field(
-                scenario, QStringLiteral("background_batched_rects"),
-                QStringLiteral("profile.scenarios[%1]").arg(index), &background_batched_rects, out_error))
-        {
-            return false;
-        }
-        if (!profile_nonnegative_integer_field(
-                scenario, QStringLiteral("selection_batched_rects"),
-                QStringLiteral("profile.scenarios[%1]").arg(index), &selection_batched_rects, out_error))
-        {
-            return false;
-        }
-        if (!profile_nonnegative_integer_field(
-                scenario, QStringLiteral("graphic_batched_rects"),
-                QStringLiteral("profile.scenarios[%1]").arg(index), &graphic_batched_rects, out_error))
-        {
-            return false;
-        }
-        if (!profile_nonnegative_integer_field(
-                scenario, QStringLiteral("decoration_batched_rects"),
-                QStringLiteral("profile.scenarios[%1]").arg(index), &decoration_batched_rects, out_error))
-        {
-            return false;
-        }
+        const QJsonObject scenario = scenarios[index].toObject();
+        const QString name = scenario.value(QStringLiteral("name")).toString();
 
         if (!is_known_scenario(name) ||
             scenario.value(QStringLiteral("source_mode")).toString() != scenario_source_mode(name) ||
