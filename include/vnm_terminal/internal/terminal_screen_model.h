@@ -419,6 +419,7 @@ public:
     terminal_hyperlink_identity_by_id_t active_hyperlink_identity_keys_by_id_for_testing() const;
     void fail_next_hyperlink_compaction_allocation_for_testing(
         Terminal_hyperlink_compaction_allocation_phase phase);
+    void fail_next_retained_history_reset_traversal_allocation_for_testing();
     void set_style_table_limits_for_testing(
         std::size_t                  compaction_threshold,
         std::size_t                  count_cap);
@@ -563,6 +564,7 @@ private:
         mutable std::uint64_t     retained_record_bytes   = 0U;
         mutable std::uint64_t     generic_compact_rows    = 0U;
         mutable std::uint64_t     prefix_plain_ascii_rows = 0U;
+        bool                      fail_next_reset_traversal_allocation_for_testing = false;
     };
 
     struct snapshot_row_t

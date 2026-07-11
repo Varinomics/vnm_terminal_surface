@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <iostream>
+#include <new>
 #include <optional>
 #include <span>
 #include <variant>
@@ -2245,6 +2246,74 @@ bool test_erase_operations_and_wide_damage()
     return ok;
 }
 
+bool test_retained_history_reset_allocation_failure_is_transactional()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(2, 4, 8);
+    model.ingest(QByteArrayLiteral("1\r\n2\r\n3\r\n4"));
+    const term::terminal_retained_history_diagnostics_t diagnostics_before =
+        model.retained_history_diagnostics();
+    const std::optional<term::terminal_history_handle_t> oldest_before =
+        model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, 0);
+    const std::optional<term::terminal_history_handle_t> newest_before =
+        model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            model.scrollback_size() - 1);
+    const std::optional<term::terminal_retained_row_record_metadata_t> metadata_before =
+        model.retained_row_record_metadata_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+    ok &= check(diagnostics_before.retained_rows > 0U && metadata_before.has_value(),
+        "retained-history reset failure fixture has stored ring records");
+
+    model.fail_next_retained_history_reset_traversal_allocation_for_testing();
+    bool allocation_failed = false;
+    try {
+        model.ingest(QByteArrayLiteral("\x1b[3J"));
+    }
+    catch (const std::bad_alloc&) {
+        allocation_failed = true;
+    }
+
+    const term::terminal_retained_history_diagnostics_t diagnostics_after =
+        model.retained_history_diagnostics();
+    const std::optional<term::terminal_history_handle_t> oldest_after =
+        model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, 0);
+    const std::optional<term::terminal_history_handle_t> newest_after =
+        model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            model.scrollback_size() - 1);
+    const std::optional<term::terminal_retained_row_record_metadata_t> metadata_after =
+        model.retained_row_record_metadata_for_testing(term::Terminal_buffer_id::PRIMARY, 0);
+
+    ok &= check(allocation_failed,
+        "retained-history reset injects traversal allocation failure");
+    ok &= check(
+        diagnostics_before.retained_rows == diagnostics_after.retained_rows &&
+        diagnostics_before.retained_record_bytes == diagnostics_after.retained_record_bytes &&
+        diagnostics_before.payload_kind_generic_compact_rows ==
+            diagnostics_after.payload_kind_generic_compact_rows &&
+        diagnostics_before.payload_kind_prefix_plain_ascii_rows ==
+            diagnostics_after.payload_kind_prefix_plain_ascii_rows,
+        "failed retained-history reset preserves index counters");
+    ok &= check(
+        oldest_before == oldest_after &&
+        newest_before == newest_after,
+        "failed retained-history reset preserves index handles");
+    ok &= check(
+        metadata_before.has_value() && metadata_after.has_value() &&
+        metadata_before->source_width == metadata_after->source_width,
+        "failed retained-history reset preserves ring records");
+
+    const term::Terminal_screen_model_result retry =
+        model.ingest(QByteArrayLiteral("\x1b[3J"));
+    ok &= check(
+        model.scrollback_size() == 0 &&
+        retry.evicted_scrollback_rows == static_cast<int>(diagnostics_before.retained_rows),
+        "retained-history reset retry clears the preserved records");
+
+    return ok;
+}
+
 bool test_scroll_region_and_origin_mode()
 {
     bool ok = true;
@@ -4106,6 +4175,7 @@ int main()
     ok &= test_phase_r_ed3_cancels_active_primary_repaint_recovery_candidate();
     ok &= test_phase_r_ed3_clears_scrollback_after_resize_repaint_visible_clear();
     ok &= test_erase_operations_and_wide_damage();
+    ok &= test_retained_history_reset_allocation_failure_is_transactional();
     ok &= test_scroll_region_and_origin_mode();
     ok &= test_top_anchored_scroll_region_appends_scrollback();
     ok &= test_alternate_top_anchored_scroll_region_does_not_append_scrollback();
