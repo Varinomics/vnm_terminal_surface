@@ -7,6 +7,7 @@
 #include <QStringList>
 #include <QVariant>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -307,6 +308,12 @@ public:
 
     int scrollback_limit() const;
     void set_scrollback_limit(int limit);
+
+    static std::size_t default_retained_history_capacity_bytes();
+    static std::size_t minimum_retained_history_capacity_bytes();
+    static std::size_t maximum_retained_history_capacity_bytes();
+    std::size_t retained_history_capacity_bytes() const;
+    void set_retained_history_capacity_bytes(std::size_t capacity_bytes);
 
     bool primary_repaint_recovery_enabled() const;
     void set_primary_repaint_recovery_enabled(bool enabled);
@@ -636,6 +643,7 @@ private:
     Cursor_style             m_cursor_style                         = Cursor_style::BLOCK;
     bool                     m_cursor_blink_enabled                 = true;
     int                      m_scrollback_limit                     = 10000;
+    std::size_t              m_retained_history_capacity_bytes     = 0U;
 #if defined(Q_OS_WIN)
     bool                     m_primary_repaint_recovery_enabled     = true;
 #else

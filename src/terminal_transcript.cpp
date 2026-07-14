@@ -606,6 +606,8 @@ QJsonObject session_config_object(const Terminal_session_config& config)
             config.selection_viewport_projection_enabled},
         {QStringLiteral("scrollback_limit"),           effective_scrollback_limit},
         {QStringLiteral("effective_scrollback_limit"), effective_scrollback_limit},
+        {QStringLiteral("retained_history_capacity_bytes"),
+            static_cast<qint64>(config.retained_history_capacity_bytes)},
         {QStringLiteral("synchronized_output_scroll_policy"),
             synchronized_output_scroll_policy_name(config.synchronized_output_scroll_policy)},
     };
@@ -1044,8 +1046,43 @@ bool validate_optional_session_config_object(
     }
 
     QJsonObject config;
+    if (!require_object_field(
+            object,
+            QStringLiteral("session_config"),
+            line_number,
+            out_error,
+            &config))
+    {
+        return false;
+    }
+
+    if (config.contains(QStringLiteral("retained_history_capacity_bytes"))) {
+        qint64 retained_history_capacity_bytes = 0;
+        if (!require_nonnegative_integral_field(
+                config,
+                QStringLiteral("retained_history_capacity_bytes"),
+                line_number,
+                out_error,
+                &retained_history_capacity_bytes))
+        {
+            return false;
+        }
+        const std::uint64_t retained_capacity =
+            static_cast<std::uint64_t>(retained_history_capacity_bytes);
+        if (retained_capacity < k_terminal_min_retained_history_capacity_bytes ||
+            retained_capacity > k_terminal_max_retained_history_capacity_bytes)
+        {
+            return fail_read(
+                out_error,
+                QStringLiteral(
+                    "transcript line %1 retained_history_capacity_bytes is outside [%2, %3]")
+                    .arg(line_number)
+                    .arg(k_terminal_min_retained_history_capacity_bytes)
+                    .arg(k_terminal_max_retained_history_capacity_bytes));
+        }
+    }
+
     return
-        require_object_field(object, QStringLiteral("session_config"), line_number, out_error, &config) &&
         (!config.contains(QStringLiteral("recover_scrollback_from_primary_repaints")) ||
             require_bool_field(
                 config,

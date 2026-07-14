@@ -343,6 +343,24 @@ bool test_config_validation()
         }) == term::Terminal_screen_model_config_status::INVALID_TAB_WIDTH,
         "invalid tab width rejected");
 
+    term::Terminal_screen_model_config insufficient_capacity_config;
+    insufficient_capacity_config.grid_size = {3, 6};
+    insufficient_capacity_config.retained_history_capacity_bytes =
+        term::k_terminal_min_retained_history_capacity_bytes - 1U;
+    ok &= check(
+        term::validate_terminal_screen_model_config(insufficient_capacity_config) ==
+            term::Terminal_screen_model_config_status::INVALID_RETAINED_HISTORY_CAPACITY,
+        "retained-history capacity below the supported minimum is rejected");
+
+    term::Terminal_screen_model_config excessive_capacity_config;
+    excessive_capacity_config.grid_size = {3, 6};
+    excessive_capacity_config.retained_history_capacity_bytes =
+        term::k_terminal_max_retained_history_capacity_bytes + 1U;
+    ok &= check(
+        term::validate_terminal_screen_model_config(excessive_capacity_config) ==
+            term::Terminal_screen_model_config_status::INVALID_RETAINED_HISTORY_CAPACITY,
+        "retained-history capacity above the supported maximum is rejected");
+
     bool threw = false;
     try {
         term::Terminal_screen_model invalid(
@@ -357,6 +375,96 @@ bool test_config_validation()
     }
     ok &= check(threw, "invalid model config fails construction");
 
+    return ok;
+}
+
+bool test_retained_history_capacity_override()
+{
+    constexpr std::size_t capacity_bytes = 2U * 1024U * 1024U;
+    constexpr int emitted_rows = 700;
+
+    term::Terminal_screen_model_config config;
+    config.grid_size                       = {1, 4096};
+    config.scrollback_limit                = 1000;
+    config.retained_history_capacity_bytes = capacity_bytes;
+    term::Terminal_screen_model model(config);
+
+    QByteArray output;
+    output.reserve(emitted_rows * 4098);
+    const QByteArray row(4096, 'x');
+    for (int i = 0; i < emitted_rows; ++i) {
+        output.append(row);
+        output.append("\r\n");
+    }
+    (void)model.ingest(output);
+
+    const term::terminal_retained_history_diagnostics_t diagnostics =
+        model.retained_history_diagnostics();
+    bool ok = true;
+    ok &= check(diagnostics.byte_budget == capacity_bytes,
+        "2 MiB override reaches the screen model byte budget");
+    ok &= check(diagnostics.retained_record_bytes <= capacity_bytes,
+        "retained records stay within the overridden byte budget");
+    ok &= check(diagnostics.retained_rows > 0U && diagnostics.retained_rows < emitted_rows,
+        "2 MiB override evicts history before the row limit");
+    return ok;
+}
+
+bool test_oversize_retained_history_row_is_discarded()
+{
+    term::Terminal_screen_model_config config;
+    config.grid_size                       = {1, 8};
+    config.scrollback_limit                = 10;
+    config.retained_history_capacity_bytes =
+        term::k_terminal_min_retained_history_capacity_bytes;
+    term::Terminal_screen_model model(config);
+
+    (void)model.ingest(QByteArrayLiteral("older\r\n"));
+    const std::optional<term::terminal_history_handle_t> older_handle =
+        model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+
+    QByteArray oversized_row = QByteArrayLiteral("\x1b]8;;");
+    oversized_row.append(QByteArray(192 * 1024, 'u'));
+    oversized_row.append(QByteArrayLiteral("\x07x\x1b]8;;\x07\r\n"));
+
+    term::Terminal_screen_model_result result;
+    bool threw = false;
+    try {
+        result = model.ingest(oversized_row);
+    }
+    catch (const std::exception&) {
+        threw = true;
+    }
+
+    bool recorded_discard = false;
+    for (const term::terminal_backing_delta_t& delta : result.backing_deltas) {
+        recorded_discard |=
+            delta.kind == term::Terminal_backing_delta_kind::PRIMARY_HISTORY_DISCARDED &&
+            delta.discarded_scrollback_rows == 1;
+    }
+
+    bool ok = true;
+    ok &= check(!threw,
+        "oversize retained-history row does not escape model ingest");
+    ok &= check(model.scrollback_size() == 1,
+        "oversize retained-history row is omitted without clearing older history");
+    ok &= check(recorded_discard,
+        "oversize retained-history row records an explicit discard delta");
+    const term::Terminal_retained_line_lookup_result older_lookup =
+        older_handle.has_value()
+            ? model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, *older_handle)
+            : term::Terminal_retained_line_lookup_result{};
+    ok &= check(
+        older_handle.has_value() &&
+            older_lookup.exact_match &&
+            older_lookup.exact_logical_row == 0,
+        "oversize retained-history discard preserves older row addressability");
+
+    (void)model.ingest(QByteArrayLiteral("after\r\n"));
+    ok &= check(model.scrollback_size() == 2,
+        "retained history continues accepting rows after an oversize discard");
     return ok;
 }
 
@@ -1907,6 +2015,8 @@ int main()
 {
     bool ok = true;
     ok &= test_config_validation();
+    ok &= test_retained_history_capacity_override();
+    ok &= test_oversize_retained_history_row_is_discarded();
     ok &= test_structural_action_retention_can_be_disabled();
     ok &= test_printable_controls_wrap_and_scrollback();
     ok &= test_printable_ascii_span_semantics();

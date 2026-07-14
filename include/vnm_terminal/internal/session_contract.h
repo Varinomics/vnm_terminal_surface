@@ -3,6 +3,7 @@
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/parser_action.h"
 #include "vnm_terminal/internal/render_snapshot.h"
+#include "vnm_terminal/internal/terminal_history_ring.h"
 #include "vnm_terminal/internal/viewport_contract.h"
 #include <QByteArray>
 #include <QSizeF>
@@ -183,6 +184,8 @@ struct Terminal_session_config
     std::size_t                     trace_output_chunk_limit                 = 0U;
     QString                         backend_output_capture_path;
     int                             scrollback_limit                         = 1000;
+    std::size_t                     retained_history_capacity_bytes =
+        k_terminal_default_retained_history_capacity_bytes;
     bool                            capture_last_model_ingest_result         = false;
     bool                            capture_dirty_row_stats                  = false;
     bool                            recover_scrollback_from_primary_repaints = false;

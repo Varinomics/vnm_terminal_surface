@@ -1154,9 +1154,61 @@ bool check_surface_snapshot_for_smoke(
     return ok;
 }
 
-bool run_surface_behavior_smokes(QGuiApplication& app)
+bool test_surface_retained_history_capacity()
 {
     bool ok = true;
+
+    Surface_fixture fixture;
+    constexpr std::size_t capacity_bytes = 2U * 1024U * 1024U;
+    ok &= check(
+        fixture.surface.retained_history_capacity_bytes() ==
+            VNM_TerminalSurface::default_retained_history_capacity_bytes(),
+        "surface defaults to the public retained-history capacity");
+
+    const std::size_t unaligned_capacity =
+        VNM_TerminalSurface::minimum_retained_history_capacity_bytes() + 1U;
+    const std::size_t aligned_capacity =
+        term::terminal_history_ring_aligned_capacity(unaligned_capacity);
+    fixture.surface.set_retained_history_capacity_bytes(unaligned_capacity);
+    ok &= check(fixture.surface.retained_history_capacity_bytes() == aligned_capacity,
+        "surface rounds retained-history capacity up to ring alignment");
+
+    fixture.surface.set_retained_history_capacity_bytes(
+        VNM_TerminalSurface::minimum_retained_history_capacity_bytes() - 1U);
+    ok &= check(fixture.surface.retained_history_capacity_bytes() == aligned_capacity,
+        "surface rejects retained-history capacity below the public minimum");
+    fixture.surface.set_retained_history_capacity_bytes(
+        VNM_TerminalSurface::maximum_retained_history_capacity_bytes() + 1U);
+    ok &= check(fixture.surface.retained_history_capacity_bytes() == aligned_capacity,
+        "surface rejects retained-history capacity above the public maximum");
+
+    fixture.surface.set_retained_history_capacity_bytes(capacity_bytes);
+    ok &= check(fixture.surface.retained_history_capacity_bytes() == capacity_bytes,
+        "surface accepts retained-history capacity before session start");
+
+    auto backend = std::make_unique<Surface_smoke_backend>();
+    const bool started = term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
+        fixture.surface,
+        std::move(backend),
+        {QStringLiteral("surface-retained-history-capacity")});
+    const term::terminal_retained_history_diagnostics_t diagnostics =
+        term::VNM_TerminalSurface_render_bridge::retained_history_diagnostics(
+            fixture.surface);
+    ok &= check(started,
+        "surface retained-history capacity fixture starts");
+    ok &= check(diagnostics.byte_budget == capacity_bytes,
+        "surface retained-history capacity reaches the session screen model");
+
+    fixture.surface.set_retained_history_capacity_bytes(
+        VNM_TerminalSurface::default_retained_history_capacity_bytes());
+    ok &= check(fixture.surface.retained_history_capacity_bytes() == capacity_bytes,
+        "surface ignores retained-history capacity changes after session start");
+    return ok;
+}
+
+bool run_surface_behavior_smokes(QGuiApplication& app)
+{
+    bool ok = test_surface_retained_history_capacity();
 
     for (const term::terminal_canvas_fixture_behavior_smoke_case_t& smoke_case :
         term::terminal_canvas_fixture_behavior_smoke_cases())

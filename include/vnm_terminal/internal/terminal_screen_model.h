@@ -4,6 +4,7 @@
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/terminal_byte_stream_parser.h"
 #include "vnm_terminal/internal/terminal_hyperlink.h"
+#include "vnm_terminal/internal/terminal_history_ring.h"
 #include "vnm_terminal/internal/utf8_scan.h"
 #include "vnm_terminal/internal/terminal_input_mode.h"
 #include "vnm_terminal/internal/terminal_style.h"
@@ -62,6 +63,8 @@ struct Terminal_screen_model_config
     int                    tab_width                                = 8;
     bool                   recover_scrollback_from_primary_repaints = false;
     bool                   retain_structural_actions                = true;
+    std::size_t            retained_history_capacity_bytes =
+                               k_terminal_default_retained_history_capacity_bytes;
 };
 
 enum class Terminal_screen_model_config_status
@@ -69,6 +72,7 @@ enum class Terminal_screen_model_config_status
     OK,
     INVALID_GRID_SIZE,
     INVALID_SCROLLBACK_LIMIT,
+    INVALID_RETAINED_HISTORY_CAPACITY,
     INVALID_TAB_WIDTH,
 };
 
@@ -464,8 +468,8 @@ private:
 
     struct retained_history_append_result_t
     {
-        terminal_history_handle_t       history_handle;
-        int                             evicted_rows = 0;
+        int  evicted_rows    = 0;
+        bool record_discarded = false;
     };
 
     struct active_grid_row_t
@@ -561,6 +565,8 @@ private:
         mutable std::deque<retained_history_index_entry_t>
                                   index;
         mutable std::uint64_t     prefix_plain_ascii_rows = 0U;
+        std::size_t               capacity_bytes =
+                                      k_terminal_default_retained_history_capacity_bytes;
     };
 
     struct snapshot_row_t

@@ -1087,6 +1087,10 @@ term::Terminal_session_config replay_session_config(
             session_config.contains(QStringLiteral("effective_scrollback_limit"))
                 ? session_config.value(QStringLiteral("effective_scrollback_limit")).toInt()
                 : session_config.value(QStringLiteral("scrollback_limit")).toInt();
+        if (session_config.contains(QStringLiteral("retained_history_capacity_bytes"))) {
+            config.retained_history_capacity_bytes = static_cast<std::size_t>(
+                session_config.value(QStringLiteral("retained_history_capacity_bytes")).toInteger());
+        }
         config.recover_scrollback_from_primary_repaints =
             session_config.value(QStringLiteral("recover_scrollback_from_primary_repaints")).toBool();
         config.selection_viewport_projection_enabled =
@@ -1426,6 +1430,7 @@ bool test_writer_reader_schema_roundtrip()
     term::Terminal_launch_config launch_config = valid_launch_config();
     term::Terminal_session_config session_config;
     session_config.scrollback_limit = 32;
+    session_config.retained_history_capacity_bytes = 2U * 1024U * 1024U;
     ok &= check(recorder->record_session_start(1U, launch_config, session_config), "session.start writes");
     ok &= check(recorder->record_backend_output(2U, QByteArrayLiteral("out")), "backend.output writes");
     ok &= check(recorder->record_host_write(3U, QStringLiteral("user"), QByteArrayLiteral("in")),
@@ -1658,6 +1663,12 @@ bool test_writer_reader_schema_roundtrip()
     for (std::size_t i = 0U; i < events->size(); ++i) {
         ok &= check((*events)[i].event_index == i, "event_index is contiguous in writer output");
     }
+
+    const term::Terminal_session_config replay_config = replay_session_config(*events);
+    ok &= check(
+        replay_config.retained_history_capacity_bytes ==
+            session_config.retained_history_capacity_bytes,
+        "retained history capacity roundtrips through transcript replay config");
 
     const std::optional<term::Terminal_transcript_event> backend_output =
         first_event(*events, QStringLiteral("backend.output"));
@@ -2233,6 +2244,46 @@ bool test_reader_accepts_session_config_without_recovery_flag()
     if (!events.has_value()) {
         std::cerr << error.toStdString() << '\n';
     }
+    else {
+        const term::Terminal_session_config replay_config = replay_session_config(*events);
+        ok &= check(
+            replay_config.retained_history_capacity_bytes ==
+                term::k_terminal_default_retained_history_capacity_bytes,
+            "replay defaults a missing retained-history capacity");
+    }
+    return ok;
+}
+
+bool test_reader_rejects_invalid_retained_history_capacity()
+{
+    QTemporaryDir temp_dir;
+    if (!check(temp_dir.isValid(), "temporary invalid retained-capacity directory is valid")) {
+        return false;
+    }
+
+    QJsonObject session_config;
+    session_config.insert(QStringLiteral("scrollback_limit"), 8);
+    session_config.insert(QStringLiteral("effective_scrollback_limit"), 8);
+    session_config.insert(QStringLiteral("retained_history_capacity_bytes"), 0);
+
+    QJsonObject start = valid_session_start_object(1U);
+    start.insert(QStringLiteral("session_config"), session_config);
+
+    bool ok = expect_reader_failure(
+        temp_dir,
+        QStringLiteral("invalid-retained-history-capacity.ndjson"),
+        {json_line(valid_header_object()), json_line(start)},
+        QStringLiteral("retained_history_capacity_bytes is outside"));
+
+    session_config.insert(
+        QStringLiteral("retained_history_capacity_bytes"),
+        static_cast<qint64>(term::k_terminal_max_retained_history_capacity_bytes + 1U));
+    start.insert(QStringLiteral("session_config"), session_config);
+    ok &= expect_reader_failure(
+        temp_dir,
+        QStringLiteral("excessive-retained-history-capacity.ndjson"),
+        {json_line(valid_header_object()), json_line(start)},
+        QStringLiteral("retained_history_capacity_bytes is outside"));
     return ok;
 }
 
@@ -4219,6 +4270,7 @@ int main(int argc, char** argv)
     ok &= test_reader_rejects_malformed_transcripts();
     ok &= test_reader_rejects_invalid_leading_event_fields();
     ok &= test_reader_accepts_session_config_without_recovery_flag();
+    ok &= test_reader_rejects_invalid_retained_history_capacity();
     ok &= test_reader_defaults_missing_row_provenance_source();
     ok &= test_reader_rejects_invalid_row_provenance_source();
     ok &= test_reader_rejects_compact_snapshots_missing_required_diagnostics();
