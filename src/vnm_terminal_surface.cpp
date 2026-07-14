@@ -2898,6 +2898,7 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
 {
     m_font_family = term::vnm_terminal_default_monospace_font_family();
     m_font_size = term::k_vnm_terminal_default_font_pixel_size;
+    m_retained_history_capacity_bytes = default_retained_history_capacity_bytes();
     // The header default claims MSDF optimistically; start from the compiled
     // truth so a build without the MSDF renderer never reports it available.
     // The first set_font_family() refines this with the per-font async check.
@@ -3172,6 +3173,48 @@ void VNM_TerminalSurface::set_scrollback_limit(int limit)
         m_private->session->set_scrollback_limit(m_scrollback_limit);
         sync_from_session();
     }
+}
+
+std::size_t VNM_TerminalSurface::default_retained_history_capacity_bytes()
+{
+    return term::k_terminal_default_retained_history_capacity_bytes;
+}
+
+std::size_t VNM_TerminalSurface::minimum_retained_history_capacity_bytes()
+{
+    return term::k_terminal_min_retained_history_capacity_bytes;
+}
+
+std::size_t VNM_TerminalSurface::maximum_retained_history_capacity_bytes()
+{
+    return term::k_terminal_max_retained_history_capacity_bytes;
+}
+
+std::size_t VNM_TerminalSurface::retained_history_capacity_bytes() const
+{
+    return m_retained_history_capacity_bytes;
+}
+
+void VNM_TerminalSurface::set_retained_history_capacity_bytes(
+    std::size_t capacity_bytes)
+{
+    if (capacity_bytes < minimum_retained_history_capacity_bytes() ||
+        capacity_bytes > maximum_retained_history_capacity_bytes())
+    {
+        qWarning(
+            "retained-history capacity must be between %zu and %zu bytes",
+            minimum_retained_history_capacity_bytes(),
+            maximum_retained_history_capacity_bytes());
+        return;
+    }
+
+    if (m_private->session != nullptr) {
+        qWarning("retained-history capacity must be set before starting a session");
+        return;
+    }
+
+    m_retained_history_capacity_bytes =
+        term::terminal_history_ring_aligned_capacity(capacity_bytes);
 }
 
 bool VNM_TerminalSurface::primary_repaint_recovery_enabled() const
@@ -6616,6 +6659,7 @@ bool VNM_TerminalSurface::start_process_with_backend(
         k_surface_output_queue_hard_limit_bytes;
     session_config.trace_notification_limit              = k_surface_notification_trace_limit;
     session_config.scrollback_limit                      = m_scrollback_limit;
+    session_config.retained_history_capacity_bytes       = m_retained_history_capacity_bytes;
     session_config.backend_output_capture_path           = m_backend_output_capture_path;
     session_config.capture_dirty_row_stats               = m_private->dirty_row_stats_enabled;
     session_config.selection_trace_enabled               = m_selection_trace_enabled;

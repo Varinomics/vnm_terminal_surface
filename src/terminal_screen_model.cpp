@@ -32,7 +32,6 @@ namespace {
 constexpr std::size_t k_printable_ascii_count =
     k_printable_ascii_last - k_printable_ascii_first + 1U;
 constexpr int k_primary_repaint_recovery_resize_guard_action_budget = 64;
-constexpr std::size_t k_retained_history_ring_capacity_bytes = 64U * 1024U * 1024U;
 
 template <typename T>
 constexpr bool k_unhandled_screen_mutation = false;
@@ -177,11 +176,12 @@ Terminal_history_resolution_status retained_history_handle_match_status(
     return Terminal_history_resolution_status::OK;
 }
 
-std::unique_ptr<Terminal_history_ring> make_retained_history_ring()
+std::unique_ptr<Terminal_history_ring> make_retained_history_ring(
+    std::size_t capacity_bytes)
 {
     auto ring = std::make_unique<Terminal_history_ring>(
         terminal_history_ring_config_t{
-            k_retained_history_ring_capacity_bytes,
+            capacity_bytes,
             0U,
         });
     if (!ring->ok()) {
@@ -412,6 +412,13 @@ Terminal_screen_model_config_status validate_terminal_screen_model_config(
         return Terminal_screen_model_config_status::INVALID_SCROLLBACK_LIMIT;
     }
 
+    const std::size_t retained_capacity = config.retained_history_capacity_bytes;
+    if (retained_capacity < k_terminal_min_retained_history_capacity_bytes ||
+        retained_capacity > k_terminal_max_retained_history_capacity_bytes)
+    {
+        return Terminal_screen_model_config_status::INVALID_RETAINED_HISTORY_CAPACITY;
+    }
+
     if (config.tab_width <= 0) {
         return Terminal_screen_model_config_status::INVALID_TAB_WIDTH;
     }
@@ -435,6 +442,10 @@ Terminal_screen_model::Terminal_screen_model(Terminal_screen_model_config config
     {
         throw std::invalid_argument("invalid Terminal_screen_model_config");
     }
+
+    m_primary_backing.retained_history.capacity_bytes =
+        terminal_history_ring_aligned_capacity(
+            m_config.retained_history_capacity_bytes);
 
     reset_grid();
 }
@@ -1854,7 +1865,7 @@ Terminal_screen_model::retained_history_diagnostics() const
     const Retained_history_storage& retained = m_primary_backing.retained_history;
 
     terminal_retained_history_diagnostics_t diagnostics;
-    diagnostics.byte_budget                          = k_retained_history_ring_capacity_bytes;
+    diagnostics.byte_budget                          = retained.capacity_bytes;
     diagnostics.retained_rows                        = retained.index.size();
     diagnostics.retained_record_bytes                = retained.ring == nullptr
         ? 0U
@@ -2179,7 +2190,7 @@ void Terminal_screen_model::Retained_history_storage::ensure_allocated()
         return;
     }
 
-    ring = make_retained_history_ring();
+    ring = make_retained_history_ring(capacity_bytes);
 }
 
 void Terminal_screen_model::Retained_history_storage::reset()
@@ -2336,6 +2347,13 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
     }
     if (append.status != Terminal_history_row_record_codec_status::OK) {
         retained_history.index.pop_back();
+        if (append.status == Terminal_history_row_record_codec_status::RING_RESERVE_FAILED &&
+            append.ring_status == Terminal_history_ring_status::OVERSIZE_RECORD)
+        {
+            retained_history_append_result_t result;
+            result.record_discarded = true;
+            return result;
+        }
         throw_retained_history_storage_failure();
     }
 
@@ -2343,7 +2361,6 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
         append.history_handle,
         append.payload_kind);
     retained_history_append_result_t result;
-    result.history_handle = append.history_handle;
     if (append.commit.tail_advanced) {
         result.evicted_rows = prune_retained_history_rows_outside_live_window();
     }
@@ -4389,14 +4406,26 @@ void Terminal_screen_model::append_scrollback_row(
                     hyperlink_identity_keys,
                     active_hyperlink_identity_keys_by_id));
         }
-        m_scrollback_evicted_rows += append.evicted_rows;
-        record_primary_history_delta(
-            Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
-            scrollback_rows_before,
-            scrollback_size(),
-            1,
-            append.evicted_rows,
-            0);
+        if (append.record_discarded) {
+            ++m_scrollback_evicted_rows;
+            record_primary_history_delta(
+                Terminal_backing_delta_kind::PRIMARY_HISTORY_DISCARDED,
+                scrollback_rows_before,
+                scrollback_size(),
+                0,
+                0,
+                1);
+        }
+        else {
+            m_scrollback_evicted_rows += append.evicted_rows;
+            record_primary_history_delta(
+                Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
+                scrollback_rows_before,
+                scrollback_size(),
+                1,
+                append.evicted_rows,
+                0);
+        }
         while (scrollback_size() > m_config.scrollback_limit) {
             evict_oldest_scrollback_rows(
                 scrollback_size() - m_config.scrollback_limit);

@@ -4954,6 +4954,10 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     Terminal_screen_model_config screen_config;
     screen_config.grid_size                 = grid_size;
     screen_config.scrollback_limit          = m_config.scrollback_limit;
+
+    screen_config.retained_history_capacity_bytes =
+        m_config.retained_history_capacity_bytes;
+
     screen_config.retain_structural_actions = m_config.capture_last_model_ingest_result;
     screen_config.recover_scrollback_from_primary_repaints =
         m_config.recover_scrollback_from_primary_repaints;

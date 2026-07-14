@@ -11,6 +11,14 @@ namespace vnm_terminal::internal {
 
 constexpr std::uint32_t k_terminal_history_ring_record_header_bytes = 24U;
 constexpr std::uint32_t k_terminal_history_ring_record_footer_bytes = 16U;
+constexpr std::size_t k_terminal_default_retained_history_capacity_bytes =
+    64U * 1024U * 1024U;
+constexpr std::size_t k_terminal_min_retained_history_capacity_bytes =
+    1U * 1024U * 1024U;
+// Capacity is a host-controlled memory reduction knob, not an unbounded-growth
+// control, so the default is intentionally also the supported ceiling.
+constexpr std::size_t k_terminal_max_retained_history_capacity_bytes =
+    k_terminal_default_retained_history_capacity_bytes;
 
 constexpr std::uint32_t terminal_history_ring_record_overhead_bytes()
 {

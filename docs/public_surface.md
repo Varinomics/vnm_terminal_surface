@@ -99,6 +99,19 @@ favors crash-safety and external-reader visibility over write throughput, so a
 concurrent reader and a post-crash inspection both observe every chunk the
 session has delivered.
 
+`retained_history_capacity_bytes()` and
+`set_retained_history_capacity_bytes()` are C++ pre-session configuration
+accessors for the retained-history byte ring. The default, minimum, and maximum
+supported capacities are available from
+`default_retained_history_capacity_bytes()`,
+`minimum_retained_history_capacity_bytes()`, and
+`maximum_retained_history_capacity_bytes()`. The requested capacity is rounded
+up to the native ring alignment. A smaller capacity can evict retained rows
+before `scrollbackLimit` is reached; the row limit and byte capacity are
+independent bounds. If one encoded row exceeds the ring's bounded per-record
+size, that row is discarded from retained history and the live session
+continues. Capacity changes are ignored after a session has started.
+
 ## Published State
 
 Read-only Qt properties expose the host-visible state:
