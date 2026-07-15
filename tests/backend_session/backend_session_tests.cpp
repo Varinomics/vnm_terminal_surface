@@ -42,6 +42,26 @@ using vnm_terminal::test_helpers::check;
 using vnm_terminal::test_helpers::decode_hex;
 using vnm_terminal::test_helpers::recovery_disabled_primary_backing_session_config;
 
+QByteArray recovered_backend_output_capture_bytes(
+    const vnm_terminal::Backend_output_capture_config& config)
+{
+    QByteArray bytes;
+    const vnm_terminal::Backend_output_capture_recovery recovery =
+        vnm_terminal::recover_backend_output_capture(config);
+    if (!recovery.valid()) {
+        return {};
+    }
+
+    for (const vnm_terminal::Backend_output_capture_segment& segment : recovery.segments) {
+        QFile file(segment.path);
+        if (!file.open(QIODevice::ReadOnly)) {
+            return {};
+        }
+        bytes += file.readAll();
+    }
+    return bytes;
+}
+
 term::Terminal_launch_config valid_launch_config()
 {
     term::Terminal_launch_config config;
@@ -1194,10 +1214,13 @@ bool test_backend_output_capture_file()
 
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "backend output capture temp dir is valid");
-    const QString capture_path = temp_dir.filePath(QStringLiteral("backend-output.raw"));
+    const vnm_terminal::Backend_output_capture_config capture_config{
+        temp_dir.filePath(QStringLiteral("backend-output")),
+        1024U,
+    };
 
     term::Terminal_session_config config;
-    config.backend_output_capture_path = capture_path;
+    config.backend_output_capture_config = capture_config;
     std::unique_ptr<term::Terminal_session> session;
     Scripted_backend* backend     = make_session(session, config);
     backend->outputs_during_start = {
@@ -1211,10 +1234,8 @@ bool test_backend_output_capture_file()
     ok &= check(backend->emit_output(QByteArrayLiteral("tail")),
         "backend output capture accepts later output");
 
-    QFile capture_file(capture_path);
-    ok &= check(capture_file.open(QIODevice::ReadOnly),
-        "backend output capture file opens for verification");
-    const QByteArray captured_bytes = capture_file.readAll();
+    const QByteArray captured_bytes =
+        recovered_backend_output_capture_bytes(capture_config);
     ok &= check(captured_bytes == QByteArray("ready\0", 6) + QByteArrayLiteral("prompt> tail"),
         "backend output capture preserves raw backend byte stream");
 
@@ -1229,7 +1250,10 @@ bool test_backend_output_capture_open_failure_reports_backend_error()
     ok &= check(temp_dir.isValid(), "capture failure temp dir is valid");
 
     term::Terminal_session_config config;
-    config.backend_output_capture_path = temp_dir.path();
+    config.backend_output_capture_config = vnm_terminal::Backend_output_capture_config{
+        temp_dir.path(),
+        1024U,
+    };
 
     std::unique_ptr<term::Terminal_session> session;
     Scripted_backend* backend = make_session(session, config);
@@ -1245,7 +1269,7 @@ bool test_backend_output_capture_open_failure_reports_backend_error()
     for (const term::Terminal_session_notification& error : backend_errors) {
         if (error.backend_error.has_value() &&
             error.backend_error->code == term::Terminal_backend_error_code::WRITE_FAILED &&
-            error.message.contains(QStringLiteral("backend output capture open failed")))
+            error.message.contains(QStringLiteral("backend output capture")))
         {
             capture_failure_reported = true;
         }
@@ -1270,7 +1294,10 @@ bool test_backend_output_capture_failure_does_not_hide_start_failure()
     ok &= check(temp_dir.isValid(), "capture start-failure temp dir is valid");
 
     term::Terminal_session_config config;
-    config.backend_output_capture_path = temp_dir.path();
+    config.backend_output_capture_config = vnm_terminal::Backend_output_capture_config{
+        temp_dir.path(),
+        1024U,
+    };
 
     std::unique_ptr<term::Terminal_session> session;
     Scripted_backend* backend = make_session(session, config);
@@ -1296,7 +1323,7 @@ bool test_backend_output_capture_failure_does_not_hide_start_failure()
         }
 
         if (error.backend_error->code == term::Terminal_backend_error_code::WRITE_FAILED &&
-            error.message.contains(QStringLiteral("backend output capture open failed")))
+            error.message.contains(QStringLiteral("backend output capture")))
         {
             capture_failure_reported = true;
         }
@@ -1416,10 +1443,13 @@ bool test_backend_output_capture_records_callback_overflow_bytes()
 
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "overflow capture temp dir is valid");
-    const QString capture_path = temp_dir.filePath(QStringLiteral("overflow-output.raw"));
+    const vnm_terminal::Backend_output_capture_config capture_config{
+        temp_dir.filePath(QStringLiteral("overflow-output")),
+        1024U,
+    };
 
     term::Terminal_session_config config;
-    config.backend_output_capture_path             = capture_path;
+    config.backend_output_capture_config           = capture_config;
     config.backend_event_notifier                  = [] {};
     config.output_queue_limits.high_water_bytes    = 100U;
     config.output_queue_limits.hard_limit_bytes    = 8U;
@@ -1438,10 +1468,8 @@ bool test_backend_output_capture_records_callback_overflow_bytes()
     ok &= check(backend->emit_output(QByteArrayLiteral("ijkl")),
         "overflow capture accepts dropped output callback");
 
-    QFile capture_file(capture_path);
-    ok &= check(capture_file.open(QIODevice::ReadOnly),
-        "overflow capture file opens for verification");
-    ok &= check(capture_file.readAll() == QByteArrayLiteral("abcdefghijkl"),
+    ok &= check(recovered_backend_output_capture_bytes(capture_config) ==
+        QByteArrayLiteral("abcdefghijkl"),
         "overflow capture records bytes before callback queue drop");
 
     return ok;

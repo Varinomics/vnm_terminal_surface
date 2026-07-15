@@ -9,6 +9,7 @@
 #include <QByteArray>
 #include <QSizeF>
 #include <QString>
+#include <atomic>
 #include <chrono>
 #include <deque>
 #include <memory>
@@ -19,11 +20,11 @@
 #include <cstdint>
 #include <vector>
 
-class QFile;
 class QKeyEvent;
 
 namespace vnm_terminal::internal {
 
+class Backend_output_capture_writer;
 class Terminal_session_callback_lifetime;
 
 struct Terminal_input_event_result
@@ -676,8 +677,8 @@ private:
     std::vector<QByteArray>                                m_output_chunks;
     QByteArray                                             m_backend_output_prescan_pending;
     Terminal_utf8_scan_state                               m_backend_output_prescan_utf8_state;
-    std::mutex                                             m_backend_output_capture_mutex;
-    std::unique_ptr<QFile>                                 m_backend_output_capture_file;
+    std::unique_ptr<Backend_output_capture_writer>          m_backend_output_capture_writer;
+    std::atomic<bool>                                      m_backend_output_capture_failure_recorded{false};
     std::optional<Terminal_screen_model>                   m_screen_model;
     // Last color state requested via set_color_state, remembered so it can be
     // reapplied when the screen model is (re)created on the first resize.

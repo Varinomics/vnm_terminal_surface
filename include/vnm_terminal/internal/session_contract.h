@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vnm_terminal/backend_output_capture.h"
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/parser_action.h"
 #include "vnm_terminal/internal/render_snapshot.h"
@@ -182,7 +183,8 @@ struct Terminal_session_config
     std::size_t                     trace_result_limit                       = 0U;
     std::size_t                     trace_resize_limit                       = 0U;
     std::size_t                     trace_output_chunk_limit                 = 0U;
-    QString                         backend_output_capture_path;
+    std::optional<Backend_output_capture_config>
+                                    backend_output_capture_config;
     int                             scrollback_limit                         = 1000;
     std::size_t                     retained_history_capacity_bytes =
         k_terminal_default_retained_history_capacity_bytes;
