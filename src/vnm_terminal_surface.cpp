@@ -3236,14 +3236,16 @@ void VNM_TerminalSurface::set_primary_repaint_recovery_enabled(bool enabled)
     }
 }
 
-QString VNM_TerminalSurface::backend_output_capture_path() const
+std::optional<vnm_terminal::Backend_output_capture_config>
+VNM_TerminalSurface::backend_output_capture_config() const
 {
-    return m_backend_output_capture_path;
+    return m_backend_output_capture_config;
 }
 
-void VNM_TerminalSurface::set_backend_output_capture_path(const QString& path)
+void VNM_TerminalSurface::set_backend_output_capture_config(
+    std::optional<vnm_terminal::Backend_output_capture_config> config)
 {
-    m_backend_output_capture_path = path;
+    m_backend_output_capture_config = std::move(config);
 }
 
 QString VNM_TerminalSurface::transcript_capture_path() const
@@ -6660,7 +6662,7 @@ bool VNM_TerminalSurface::start_process_with_backend(
     session_config.trace_notification_limit              = k_surface_notification_trace_limit;
     session_config.scrollback_limit                      = m_scrollback_limit;
     session_config.retained_history_capacity_bytes       = m_retained_history_capacity_bytes;
-    session_config.backend_output_capture_path           = m_backend_output_capture_path;
+    session_config.backend_output_capture_config         = m_backend_output_capture_config;
     session_config.capture_dirty_row_stats               = m_private->dirty_row_stats_enabled;
     session_config.selection_trace_enabled               = m_selection_trace_enabled;
     session_config.transcript_recorder                   = m_private->transcript_recorder;

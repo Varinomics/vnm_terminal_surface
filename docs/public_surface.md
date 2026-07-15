@@ -90,14 +90,16 @@ Writable Qt properties:
 - `audibleBellPolicy` and `visualBellPolicy` enable or disable the corresponding
   bell effects.
 
-`backend_output_capture_path()` and `set_backend_output_capture_path()` are C++
-diagnostic accessors rather than Qt properties. When set before process start,
-the session appends raw backend output bytes to that path. The capture file is
-opened once and held for the session lifetime, and each output chunk is flushed
-to disk as it is written. The per-chunk flush is a deliberate tradeoff that
-favors crash-safety and external-reader visibility over write throughput, so a
-concurrent reader and a post-crash inspection both observe every chunk the
-session has delivered.
+`backend_output_capture_config()` and `set_backend_output_capture_config()` are
+C++ diagnostic accessors rather than Qt properties. When configured before
+process start, the session retains a bounded suffix of raw backend output in
+capture-owned segments below the configured local path prefix. Each accepted
+chunk is flushed before the backend callback returns, favoring crash recovery
+and external-reader visibility over write throughput. The public recovery API
+validates capture artifacts, distinguishes finalized and interrupted sessions,
+and returns the retained segments in sequence order. Capture paths must reside
+in an existing trusted local directory; remote drives, UNC paths, and reparse
+traversal are rejected.
 
 `retained_history_capacity_bytes()` and
 `set_retained_history_capacity_bytes()` are C++ pre-session configuration
