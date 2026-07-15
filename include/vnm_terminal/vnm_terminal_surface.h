@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vnm_terminal/backend_output_capture.h"
+
 #include <QQuickItem>
 #include <QByteArray>
 #include <QDateTime>
@@ -318,8 +320,10 @@ public:
     bool primary_repaint_recovery_enabled() const;
     void set_primary_repaint_recovery_enabled(bool enabled);
 
-    QString backend_output_capture_path() const;
-    void set_backend_output_capture_path(const QString& path);
+    std::optional<vnm_terminal::Backend_output_capture_config>
+        backend_output_capture_config() const;
+    void set_backend_output_capture_config(
+        std::optional<vnm_terminal::Backend_output_capture_config> config);
 
     QString transcript_capture_path() const;
     void set_transcript_capture_path(const QString& path);
@@ -649,7 +653,8 @@ private:
 #else
     bool                     m_primary_repaint_recovery_enabled     = false;
 #endif
-    QString                  m_backend_output_capture_path;
+    std::optional<vnm_terminal::Backend_output_capture_config>
+                             m_backend_output_capture_config;
     QString                  m_transcript_capture_path;
     bool                     m_transcript_snapshot_diagnostics      = false;
     bool                     m_transcript_timing_diagnostics        = false;

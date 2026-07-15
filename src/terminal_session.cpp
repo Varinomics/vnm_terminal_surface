@@ -1,9 +1,9 @@
 #include "vnm_terminal/internal/terminal_session.h"
+#include "vnm_terminal/internal/backend_output_capture_writer.h"
 
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
-#include <QFile>
 #include <QKeyEvent>
 #include <QString>
 #include <QtGlobal>
@@ -1683,35 +1683,16 @@ public:
     void enqueue_backend_output_capture_failure(Terminal_backend_error error)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_backend_callbacks_stopped ||
-            m_backend_output_capture_failure_report_pending)
+        if (m_backend_output_capture_failure_reported ||
+            m_pending_backend_output_capture_failure.has_value())
         {
-            return;
-        }
-
-        const Terminal_queue_result result = m_pending_callback_queue.reserve(0U, 1U);
-        if (result.code == Terminal_queue_result_code::HARD_LIMIT_REACHED) {
-            drop_pending_output_locked();
-            if (!m_backend_callback_overflow_report_pending) {
-                Terminal_session_command error_command = make_backend_error_command(
-                    0U,
-                    make_backend_error(
-                        Terminal_backend_error_code::OUTPUT_OVERFLOW,
-                        QStringLiteral("pending backend callback hard limit reached")));
-                error_command.backend_callback_epoch = next_backend_callback_epoch_locked();
-                m_pending_commands.push_back(std::move(error_command));
-                m_backend_callback_overflow_report_pending = true;
-            }
-            m_backend_callbacks_stopped = true;
-            m_backend_output_stopped = true;
             return;
         }
 
         Terminal_session_command command = make_backend_error_command(0U, std::move(error));
         command.backend_callback_epoch = next_backend_callback_epoch_locked();
-        m_backend_output_capture_failure_epochs.push_back(command.backend_callback_epoch);
-        m_pending_commands.push_back(std::move(command));
-        m_backend_output_capture_failure_report_pending = true;
+        m_pending_backend_output_capture_failure = std::move(command);
+        m_backend_output_capture_failure_reported = true;
     }
 
     std::deque<Terminal_session_command> take_pending_commands(
@@ -1720,10 +1701,24 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         std::deque<Terminal_session_command> commands;
         commands.swap(m_pending_commands);
-        backend_output_capture_failure_epochs.swap(m_backend_output_capture_failure_epochs);
+        backend_output_capture_failure_epochs.clear();
+        if (m_pending_backend_output_capture_failure.has_value()) {
+            backend_output_capture_failure_epochs.push_back(
+                m_pending_backend_output_capture_failure->backend_callback_epoch);
+            const auto position = std::lower_bound(
+                commands.begin(),
+                commands.end(),
+                m_pending_backend_output_capture_failure->backend_callback_epoch,
+                [](const Terminal_session_command& command, std::uint64_t epoch) {
+                    return command.backend_callback_epoch < epoch;
+                });
+            commands.insert(
+                position,
+                std::move(*m_pending_backend_output_capture_failure));
+            m_pending_backend_output_capture_failure.reset();
+        }
         m_pending_callback_queue = Bounded_terminal_command_queue(m_callback_queue_limits);
         m_backend_callback_overflow_report_pending = false;
-        m_backend_output_capture_failure_report_pending = false;
         return commands;
     }
 
@@ -1738,14 +1733,17 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_mutex);
 
-        return !m_pending_commands.empty() || m_active_callbacks != 0U;
+        return !m_pending_commands.empty() ||
+            m_pending_backend_output_capture_failure.has_value() ||
+            m_active_callbacks != 0U;
     }
 
     std::size_t pending_command_count() const
     {
         std::lock_guard<std::mutex> lock(m_mutex);
 
-        return m_pending_commands.size();
+        return m_pending_commands.size() +
+            (m_pending_backend_output_capture_failure.has_value() ? 1U : 0U);
     }
 
     std::uint64_t last_enqueued_backend_callback_epoch() const
@@ -1769,12 +1767,10 @@ public:
         m_accepting_callbacks = false;
         m_session = nullptr;
         m_pending_commands.clear();
-        m_backend_output_capture_failure_epochs.clear();
-        m_backend_output_capture_failure_report_pending = false;
+        m_pending_backend_output_capture_failure.reset();
         m_idle.wait(lock, [this] { return m_active_callbacks == 0U; });
         m_pending_commands.clear();
-        m_backend_output_capture_failure_epochs.clear();
-        m_backend_output_capture_failure_report_pending = false;
+        m_pending_backend_output_capture_failure.reset();
     }
 
 private:
@@ -1813,7 +1809,8 @@ private:
     std::condition_variable              m_idle;
     Terminal_session*                    m_session = nullptr;
     std::deque<Terminal_session_command> m_pending_commands;
-    std::vector<std::uint64_t>           m_backend_output_capture_failure_epochs;
+    std::optional<Terminal_session_command>
+                                         m_pending_backend_output_capture_failure;
     Terminal_queue_limits                m_callback_queue_limits;
     Bounded_terminal_command_queue       m_pending_callback_queue;
     std::size_t                          m_active_callbacks = 0U;
@@ -1822,7 +1819,7 @@ private:
     bool                                 m_backend_exit_after_stop_pending = false;
     bool                                 m_backend_output_stopped = false;
     bool                                 m_backend_callback_overflow_report_pending = false;
-    bool                                 m_backend_output_capture_failure_report_pending = false;
+    bool                                 m_backend_output_capture_failure_reported = false;
     bool                                 m_coalesce_output_callbacks = false;
     std::uint64_t                        m_next_backend_callback_epoch = 1U;
     std::uint64_t                        m_last_enqueued_backend_callback_epoch = 0U;
@@ -1871,6 +1868,11 @@ Terminal_session::Terminal_session(
 {
     m_config.scrollback_limit = std::max(0, m_config.scrollback_limit);
     m_bell_state.policy = m_config.bell_policy;
+    if (m_config.backend_output_capture_config.has_value()) {
+        m_backend_output_capture_writer =
+            std::make_unique<Backend_output_capture_writer>(
+                *m_config.backend_output_capture_config);
+    }
 }
 
 Terminal_session::~Terminal_session()
@@ -4430,6 +4432,21 @@ Terminal_session_result Terminal_session::process_backend_exit_command(
         : Terminal_process_state::EXITED;
     m_backend_ready  = false;
     m_stop_requested = false;
+    if (m_backend_output_capture_writer) {
+        const Backend_output_capture_writer_result capture_result =
+            m_backend_output_capture_writer->finalize();
+        if (!capture_result.accepted &&
+            !m_backend_output_capture_failure_recorded.exchange(
+                true,
+                std::memory_order_acq_rel))
+        {
+            record_backend_error(
+                command.sequence,
+                make_backend_error(
+                    Terminal_backend_error_code::WRITE_FAILED,
+                    capture_result.error));
+        }
+    }
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     if (m_config.transcript_recorder != nullptr) {
         (void)m_config.transcript_recorder->record_session_process_exit(
@@ -4777,55 +4794,21 @@ void Terminal_session::record_resize_transaction(Terminal_resize_transaction res
 
 void Terminal_session::record_backend_output_capture_chunk(QByteArrayView bytes)
 {
-    if (m_config.backend_output_capture_path.isEmpty()) {
+    if (!m_backend_output_capture_writer) {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(m_backend_output_capture_mutex);
-    const auto report_capture_failure = [this](QString message) {
+    const Backend_output_capture_writer_result result =
+        m_backend_output_capture_writer->append(bytes);
+    if (!result.accepted &&
+        !m_backend_output_capture_failure_recorded.exchange(
+            true,
+            std::memory_order_acq_rel))
+    {
         m_callback_lifetime->enqueue_backend_output_capture_failure(
             make_backend_error(
                 Terminal_backend_error_code::WRITE_FAILED,
-                std::move(message)));
-    };
-
-    // Open the capture file once and keep it for the session lifetime instead of
-    // reopening per chunk. Flush after every write so a concurrent reader and the
-    // crash-safety expectation see the same byte stream the per-chunk
-    // open/append/close path produced. A failed open is retried on the next chunk,
-    // matching the prior behaviour.
-    if (!m_backend_output_capture_file) {
-        auto capture_file = std::make_unique<QFile>(m_config.backend_output_capture_path);
-        if (!capture_file->open(QIODevice::WriteOnly | QIODevice::Append)) {
-            report_capture_failure(
-                QStringLiteral("backend output capture open failed for \"%1\": %2")
-                    .arg(m_config.backend_output_capture_path, capture_file->errorString()));
-            return;
-        }
-        m_backend_output_capture_file = std::move(capture_file);
-    }
-
-    const qint64 requested_bytes = static_cast<qint64>(bytes.size());
-    const qint64 written_bytes =
-        m_backend_output_capture_file->write(bytes.data(), requested_bytes);
-    if (written_bytes != requested_bytes) {
-        const QString error_string = m_backend_output_capture_file->errorString();
-        report_capture_failure(
-            QStringLiteral(
-                "backend output capture write failed for \"%1\": "
-                "wrote %2 of %3 bytes: %4")
-                .arg(m_config.backend_output_capture_path)
-                .arg(static_cast<qlonglong>(written_bytes))
-                .arg(static_cast<qlonglong>(requested_bytes))
-                .arg(error_string));
-    }
-
-    if (!m_backend_output_capture_file->flush()) {
-        report_capture_failure(
-            QStringLiteral("backend output capture flush failed for \"%1\": %2")
-                .arg(
-                    m_config.backend_output_capture_path,
-                    m_backend_output_capture_file->errorString()));
+                result.error));
     }
 }
 

@@ -1716,6 +1716,30 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_backend_session>"
 )
 
+add_executable(vnm_terminal_backend_output_capture
+    backend_output_capture/backend_output_capture_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_backend_output_capture PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+target_compile_definitions(vnm_terminal_backend_output_capture PRIVATE
+    VNM_TERMINAL_CAPTURE_TEST_HOOKS=1
+)
+
+set_target_properties(vnm_terminal_backend_output_capture PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_backend_output_capture
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_backend_output_capture>"
+)
+
 if(WIN32)
     add_executable(vnm_terminal_windows_conpty_backend
         windows_conpty_backend/windows_conpty_backend_tests.cpp
@@ -1815,6 +1839,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_terminal_modes
     vnm_terminal_viewport
     vnm_terminal_backend_session
+    vnm_terminal_backend_output_capture
 )
 
 if(TARGET vnm_terminal_transcript)

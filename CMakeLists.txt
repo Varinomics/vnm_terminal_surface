@@ -99,6 +99,8 @@ set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR "${Qt6_VERSION_MAJOR}")
 set(VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR "${Qt6_VERSION_MINOR}")
 
 add_library(vnm_terminal_surface STATIC
+    include/vnm_terminal/backend_output_capture.h
+    include/vnm_terminal/internal/backend_output_capture_writer.h
     include/vnm_terminal/internal/backend_contract.h
     include/vnm_terminal/internal/csi_parameter_parsing.h
     include/vnm_terminal/internal/ime_contract.h
@@ -137,6 +139,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/diagnostics/profile_text.h
     include/vnm_terminal/font_metrics.h
     include/vnm_terminal/vnm_terminal_surface.h
+    src/backend_output_capture.cpp
     src/diagnostics/metric_descriptor.h
     src/diagnostics/atlas_metric_descriptors.h
     src/diagnostics/metrics_json.cpp
@@ -312,6 +315,7 @@ if(VNM_TERMINAL_ENABLE_MSDF_TEXT_RENDERER AND NOT vnm_terminal_msdf_text_package
 endif()
 
 install(FILES
+    include/vnm_terminal/backend_output_capture.h
     include/vnm_terminal/font_metrics.h
     include/vnm_terminal/vnm_terminal_surface.h
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"
@@ -386,6 +390,9 @@ if(VNM_TERMINAL_BUILD_BENCHMARKS)
 endif()
 
 if(vnm_terminal_surface_testing_enabled)
+    target_compile_definitions(vnm_terminal_surface PRIVATE
+        VNM_TERMINAL_CAPTURE_TEST_HOOKS=1
+    )
     add_subdirectory(tests)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/more_tests/CMakeLists.txt")
         add_subdirectory(more_tests)
