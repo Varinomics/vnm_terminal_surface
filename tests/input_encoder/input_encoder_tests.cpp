@@ -46,6 +46,18 @@ QByteArray framed_paste(QByteArray body)
     return bytes;
 }
 
+QByteArray platform_symbol_paste_bytes(ushort code)
+{
+#if defined(Q_OS_WIN)
+    QByteArray bytes = QByteArrayLiteral("\x1b[0;0;");
+    bytes += QByteArray::number(code);
+    bytes += QByteArrayLiteral(";1;0;1_");
+    return bytes;
+#else
+    return QString(QChar(code)).toUtf8();
+#endif
+}
+
 QByteArray encode(
     int                                key,
     Qt::KeyboardModifiers              modifiers,
@@ -402,13 +414,15 @@ bool test_paste_sanitization()
     control_boundaries.append(QChar(0x007f));
     control_boundaries.append(QChar(0x009f));
     control_boundaries.append(QChar(0x00a0));
+    QByteArray expected_boundaries = QByteArrayLiteral("\t\n\n ");
+    expected_boundaries += platform_symbol_paste_bytes(0x00a0U);
     ok &= check_bytes_equal(
         term::encode_terminal_paste_text(
             control_boundaries,
             {},
             term::Terminal_paste_framing_policy::DISABLED),
-        QByteArrayLiteral("\t\n\n \xc2\xa0"),
-        "paste sanitization preserves tab LF space NBSP and strips control boundaries");
+        expected_boundaries,
+        "paste sanitization preserves allowed boundaries and strips controls");
 
     ok &= check_bytes_equal(
         term::encode_terminal_paste_text(
@@ -452,13 +466,43 @@ bool test_paste_sanitization()
         "paste sanitization that removes the whole body produces no frame");
 
     const QString unicode_text = QString::fromUtf8("lambda \xce\xbb euro \xe2\x82\xac");
+    QByteArray expected_unicode = QString::fromUtf8("lambda \xce\xbb euro ").toUtf8();
+    expected_unicode += platform_symbol_paste_bytes(0x20acU);
     ok &= check_bytes_equal(
         term::encode_terminal_paste_text(
             unicode_text,
             {},
             term::Terminal_paste_framing_policy::DISABLED),
-        unicode_text.toUtf8(),
-        "paste sanitization preserves UTF-8 text");
+        expected_unicode,
+        "paste encoding preserves alphabetic Unicode and safely emits symbols");
+
+    const QString cjk_text = QString::fromUtf8("Chinese \xe4\xb8\xad\xe6\x96\x87");
+    ok &= check_bytes_equal(
+        term::encode_terminal_paste_text(
+            cjk_text,
+            {},
+            term::Terminal_paste_framing_policy::DISABLED),
+        cjk_text.toUtf8(),
+        "paste encoding keeps CJK text on the bulk UTF-8 path");
+
+    const QString degree_text = QString::fromUtf8("23\xc2\xb0 C");
+    QByteArray expected_degree = QByteArrayLiteral("23");
+    expected_degree += platform_symbol_paste_bytes(0x00b0U);
+    expected_degree += QByteArrayLiteral(" C");
+    ok &= check_bytes_equal(
+        term::encode_terminal_paste_text(
+            degree_text,
+            {},
+            term::Terminal_paste_framing_policy::DISABLED),
+        expected_degree,
+        "paste encoding preserves degree through the platform input path");
+    ok &= check_bytes_equal(
+        term::encode_terminal_paste_text(
+            degree_text,
+            {},
+            term::Terminal_paste_framing_policy::ENABLED),
+        framed_paste(expected_degree),
+        "bracketed paste frames the platform-safe degree input");
 
     const QString non_bmp_text = QString::fromUtf8("emoji \xf0\x9f\x98\x80");
     ok &= check_bytes_equal(
