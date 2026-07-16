@@ -4,6 +4,15 @@
 #include <QKeyEvent>
 #include <Qt>
 #include <QtGlobal>
+#if defined(Q_OS_WIN)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <utility>
@@ -125,6 +134,76 @@ QByteArray win32_input_key_event_bytes(
     bytes.append(';');
     bytes.append(QByteArray::number(repeat_count));
     bytes.append('_');
+    return bytes;
+}
+
+bool is_windows_inbox_full_width(ushort code)
+{
+    // Match inbox ConPTY's compatibility predicate so CJK and full-width text
+    // stay on its ordinary key-down path instead of expanding during paste.
+    return
+        (code >= 0x1100U && code <= 0x115fU) ||
+        (code >= 0x2e80U && code <= 0x303eU) ||
+        (code >= 0x3041U && code <= 0x3094U) ||
+        (code >= 0x30a1U && code <= 0x30f6U) ||
+        (code >= 0x3105U && code <= 0x312cU) ||
+        (code >= 0x3131U && code <= 0x318eU) ||
+        (code >= 0x3190U && code <= 0x3247U) ||
+        (code >= 0x3251U && code <= 0x4dbfU) ||
+        (code >= 0x4e00U && code <= 0xa4c6U) ||
+        (code >= 0xa960U && code <= 0xa97cU) ||
+        (code >= 0xac00U && code <= 0xd7a3U) ||
+        (code >= 0xf900U && code <= 0xfaffU) ||
+        (code >= 0xfe10U && code <= 0xfe1fU) ||
+        (code >= 0xfe30U && code <= 0xfe6bU) ||
+        (code >= 0xff01U && code <= 0xff5eU) ||
+        (code >= 0xffe0U && code <= 0xffe6U);
+}
+
+bool needs_win32_paste_event(QChar character)
+{
+    const ushort code = character.unicode();
+    if (code <= 0x007fU || character.isSurrogate() || is_windows_inbox_full_width(code)) {
+        return false;
+    }
+
+    const wchar_t wide_character = static_cast<wchar_t>(code);
+    WORD character_type = 0;
+    (void)GetStringTypeW(CT_CTYPE3, &wide_character, 1, &character_type);
+
+    // Inbox ConPTY otherwise places these symbols on an Alt key-up record,
+    // which release-filtering console clients discard.
+    return (character_type & C3_ALPHA) == 0;
+}
+
+QByteArray encode_windows_paste_body(const QString& text)
+{
+    qsizetype first_event = -1;
+    for (qsizetype i = 0; i < text.size(); ++i) {
+        if (needs_win32_paste_event(text.at(i))) {
+            first_event = i;
+            break;
+        }
+    }
+
+    if (first_event < 0) {
+        return text.toUtf8();
+    }
+
+    QByteArray bytes;
+    bytes.reserve(text.size());
+    qsizetype raw_start = 0;
+    for (qsizetype i = first_event; i < text.size(); ++i) {
+        const QChar character = text.at(i);
+        if (!needs_win32_paste_event(character)) {
+            continue;
+        }
+
+        bytes.append(text.mid(raw_start, i - raw_start).toUtf8());
+        bytes.append(win32_input_key_event_bytes(0, 0, character.unicode(), 1, 0, 1));
+        raw_start = i + 1;
+    }
+    bytes.append(text.mid(raw_start).toUtf8());
     return bytes;
 }
 
@@ -579,7 +658,12 @@ QByteArray encode_terminal_paste_text(
 {
     VNM_TERMINAL_PROFILE_SCOPE("encode_terminal_paste_text");
 
-    const QByteArray body = sanitize_paste_text(std::move(text)).toUtf8();
+    const QString sanitized = sanitize_paste_text(std::move(text));
+#if defined(Q_OS_WIN)
+    const QByteArray body = encode_windows_paste_body(sanitized);
+#else
+    const QByteArray body = sanitized.toUtf8();
+#endif
     if (body.isEmpty() || !should_frame_paste(modes, framing_policy)) {
         return body;
     }
