@@ -11,6 +11,7 @@
 #include <QDateTime>
 #include <QEvent>
 #include <QEventLoop>
+#include <QFile>
 #include <QFontMetricsF>
 #include <QGuiApplication>
 #include <QHoverEvent>
@@ -11003,6 +11004,38 @@ bool test_synchronized_output_scroll_policy_property(QGuiApplication& app)
     return ok;
 }
 
+bool test_interaction_diagnostics_has_single_surface_owner(QGuiApplication& app)
+{
+    Q_UNUSED(app)
+
+    bool ok = true;
+    auto first = std::make_unique<VNM_TerminalSurface>();
+    VNM_TerminalSurface second;
+
+    first->set_interaction_diagnostics_enabled(true);
+    ok &= check(first->interaction_diagnostics_enabled(),
+        "first surface enables interaction diagnostics");
+    ok &= check(first->interaction_diagnostics_error().isEmpty(),
+        "first surface reports no interaction diagnostics error");
+
+    second.set_interaction_diagnostics_enabled(true);
+    ok &= check(!second.interaction_diagnostics_enabled(),
+        "second surface cannot take an active interaction diagnostics writer");
+    ok &= check(!second.interaction_diagnostics_error().isEmpty(),
+        "second surface reports the interaction diagnostics ownership conflict");
+
+    const QString trace_path = first->interaction_diagnostics_path();
+    first.reset();
+    second.set_interaction_diagnostics_enabled(true);
+    ok &= check(second.interaction_diagnostics_enabled(),
+        "destroying the owner releases the interaction diagnostics writer");
+    second.set_interaction_diagnostics_enabled(false);
+
+    (void)QFile::remove(trace_path);
+    (void)QFile::remove(trace_path + QStringLiteral(".previous"));
+    return ok;
+}
+
 bool test_scroll_diagnostic_enum_name_table(QGuiApplication& app)
 {
     using Surface = VNM_TerminalSurface;
@@ -16745,6 +16778,7 @@ int main(int argc, char** argv)
     ok &= test_keyboard_printable_controls_and_prompt_path(app);
     ok &= test_copy_shortcut_policy(app);
     ok &= test_synchronized_output_scroll_policy_property(app);
+    ok &= test_interaction_diagnostics_has_single_surface_owner(app);
     ok &= test_scroll_diagnostic_enum_name_table(app);
     ok &= test_no_payload_copy_fallback_states(app);
     ok &= test_control_wheel_font_zoom(app);

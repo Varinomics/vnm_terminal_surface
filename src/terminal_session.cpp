@@ -1,6 +1,7 @@
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/backend_output_capture_writer.h"
 
+#include "vnm_terminal/internal/interaction_trace.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
@@ -533,8 +534,14 @@ bool selection_lease_has_compatible_visual_source(
             viewport_mappings_match(lease.viewport_mapping, source.viewport_mapping));
 }
 
+bool selection_trace_requested(bool stderr_enabled)
+{
+    return stderr_enabled || interaction_trace_enabled();
+}
+
 void write_selection_trace(bool enabled, const QString& message)
 {
+    record_interaction_trace("selection", "state", message);
     if (!enabled) {
         return;
     }
@@ -1940,7 +1947,8 @@ Terminal_session::try_write_user_bytes_without_backend_drain_if_callbacks_empty(
 Terminal_session_result Terminal_session::write_user_bytes_locked(
     QByteArray                         bytes,
     User_write_viewport_policy         viewport_policy,
-    Backend_callback_drain_policy      drain_policy)
+    Backend_callback_drain_policy      drain_policy,
+    std::uint64_t                      interaction_trace_id)
 {
     const std::uint64_t sequence = next_sequence();
     if (!is_session_writable()) {
@@ -1953,7 +1961,7 @@ Terminal_session_result Terminal_session::write_user_bytes_locked(
     }
 
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
-        make_user_write_command(sequence, std::move(bytes)),
+        make_user_write_command(sequence, std::move(bytes), interaction_trace_id),
         drain_policy);
     return finalize_accepted_text_input_result(
         result,
@@ -1961,7 +1969,9 @@ Terminal_session_result Terminal_session::write_user_bytes_locked(
         viewport_policy);
 }
 
-Terminal_key_event_result Terminal_session::write_key_event(const QKeyEvent& event)
+Terminal_key_event_result Terminal_session::write_key_event(
+    const QKeyEvent& event,
+    std::uint64_t    interaction_trace_id)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     drain_backend_callback_commands();
@@ -1969,12 +1979,14 @@ Terminal_key_event_result Terminal_session::write_key_event(const QKeyEvent& eve
 
     return write_key_event_locked(
         event,
-        Backend_callback_drain_policy::DRAIN_CALLBACKS);
+        Backend_callback_drain_policy::DRAIN_CALLBACKS,
+        interaction_trace_id);
 }
 
 Terminal_key_event_result Terminal_session::write_key_event_locked(
     const QKeyEvent&                   event,
-    Backend_callback_drain_policy      drain_policy)
+    Backend_callback_drain_policy      drain_policy,
+    std::uint64_t                      interaction_trace_id)
 {
     const Terminal_input_mode_state modes = m_screen_model.has_value()
         ? m_screen_model->input_mode_state()
@@ -1991,6 +2003,17 @@ Terminal_key_event_result Terminal_session::write_key_event_locked(
     }
 
     const std::uint64_t sequence = next_sequence();
+    if (interaction_trace_enabled() && interaction_trace_id == 0U) {
+        interaction_trace_id = next_interaction_trace_correlation_id();
+    }
+    if (interaction_trace_enabled()) {
+        record_interaction_trace(
+            "session",
+            "key-encoded",
+            interaction_trace_key_summary(event) + QLatin1Char(' ') +
+                interaction_trace_byte_summary(bytes),
+            interaction_trace_id);
+    }
     if (!is_session_writable()) {
         return {
             true,
@@ -2004,7 +2027,7 @@ Terminal_key_event_result Terminal_session::write_key_event_locked(
     }
 
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
-        make_user_write_command(sequence, std::move(bytes)),
+        make_user_write_command(sequence, std::move(bytes), interaction_trace_id),
         drain_policy);
     return {
         true,
@@ -2061,7 +2084,9 @@ Terminal_mouse_event_result Terminal_session::write_mouse_event_locked(
     };
 }
 
-Terminal_ime_commit_result Terminal_session::write_ime_commit(QString text)
+Terminal_ime_commit_result Terminal_session::write_ime_commit(
+    QString       text,
+    std::uint64_t interaction_trace_id)
 {
     if (text.isEmpty()) {
         return {};
@@ -2079,6 +2104,9 @@ Terminal_ime_commit_result Terminal_session::write_ime_commit(QString text)
     }
 
     const std::uint64_t sequence = next_sequence();
+    if (interaction_trace_enabled() && interaction_trace_id == 0U) {
+        interaction_trace_id = next_interaction_trace_correlation_id();
+    }
     if (!is_session_writable()) {
         return {
             true,
@@ -2092,7 +2120,7 @@ Terminal_ime_commit_result Terminal_session::write_ime_commit(QString text)
     }
 
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
-        make_user_write_command(sequence, std::move(bytes)));
+        make_user_write_command(sequence, std::move(bytes), interaction_trace_id));
 
     Terminal_session_result final_result =
         finalize_accepted_text_input_result(
@@ -2112,7 +2140,8 @@ Terminal_ime_commit_result Terminal_session::write_ime_commit(QString text)
 
 Terminal_paste_text_result Terminal_session::write_paste_text(
     QString                        text,
-    Terminal_paste_framing_policy  policy)
+    Terminal_paste_framing_policy  policy,
+    std::uint64_t                  interaction_trace_id)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     drain_backend_callback_commands();
@@ -2133,6 +2162,9 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     }
 
     const std::uint64_t sequence = next_sequence();
+    if (interaction_trace_enabled() && interaction_trace_id == 0U) {
+        interaction_trace_id = next_interaction_trace_correlation_id();
+    }
     if (!is_session_writable()) {
         return {
             true,
@@ -2146,7 +2178,7 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     }
 
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
-        make_user_paste_command(sequence, std::move(bytes)));
+        make_user_paste_command(sequence, std::move(bytes), interaction_trace_id));
     return {
         true,
         finalize_accepted_text_input_result(
@@ -2552,7 +2584,7 @@ void Terminal_session::detach_selection_visual_attachment()
     const bool had_internal_selection = m_selection.has_internal_selection();
     const bool had_visual_lease       = m_selection.visual_lease().has_value();
     if (!had_internal_selection) {
-        if (m_config.selection_trace_enabled) {
+        if (selection_trace_requested(m_config.selection_trace_enabled)) {
             write_selection_trace(m_config.selection_trace_enabled,
                 QStringLiteral("session visual-detach ignored reason=no-selection"));
         }
@@ -2562,7 +2594,7 @@ void Terminal_session::detach_selection_visual_attachment()
         m_screen_model.has_value() && !model_allows_render_snapshot(*m_screen_model);
 
     m_selection.detach_visual_attachment();
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral(
                 "session visual-detach action=detach had_lease=%1 "
@@ -2593,13 +2625,13 @@ void Terminal_session::clear_selection()
     }
 
     if (!m_selection.has_internal_selection()) {
-        if (m_config.selection_trace_enabled) {
+        if (selection_trace_requested(m_config.selection_trace_enabled)) {
             write_selection_trace(m_config.selection_trace_enabled, QStringLiteral("session clear-selection reason=no-selection"));
         }
         return;
     }
 
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral("session clear-selection range=%1 buffer=%2 basis={%3}")
                 .arg(selection_trace_range(m_selection.range()))
@@ -2927,14 +2959,14 @@ Terminal_selection_result Terminal_session::selected_text() const
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     if (!m_selection.has_selection()) {
-        if (m_config.selection_trace_enabled) {
+        if (selection_trace_requested(m_config.selection_trace_enabled)) {
             write_selection_trace(m_config.selection_trace_enabled, QStringLiteral("session selected-text result=no-selection"));
         }
         return {Terminal_selection_result_code::NO_SELECTION, {}};
     }
 
     if (!m_screen_model.has_value()) {
-        if (m_config.selection_trace_enabled) {
+        if (selection_trace_requested(m_config.selection_trace_enabled)) {
             write_selection_trace(m_config.selection_trace_enabled,
                 QStringLiteral("session selected-text result=invalid-range reason=no-screen-model range=%1")
                     .arg(selection_trace_range(m_selection.range())));
@@ -2943,7 +2975,7 @@ Terminal_selection_result Terminal_session::selected_text() const
     }
 
     const Terminal_selection_result result = m_selection.selected_text();
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral("session selected-text result=%1 range=%2 size=%3")
                 .arg(static_cast<int>(result.code))
@@ -3820,6 +3852,11 @@ Terminal_session_result Terminal_session::process_start_command(
 Terminal_session_result Terminal_session::process_write_command(
     const Terminal_session_command& command)
 {
+    std::uint64_t interaction_trace_id = command.interaction_trace_id;
+    if (interaction_trace_id == 0U && interaction_trace_enabled()) {
+        interaction_trace_id = next_interaction_trace_correlation_id();
+    }
+
     if (m_backend       == nullptr                         ||
         m_process_state != Terminal_process_state::RUNNING ||
         m_stop_requested)
@@ -3864,7 +3901,22 @@ Terminal_session_result Terminal_session::process_write_command(
     }
 #endif
 
+    if (interaction_trace_enabled()) {
+        record_interaction_trace(
+            "session",
+            "write-dispatch",
+            interaction_trace_byte_summary(command.bytes),
+            interaction_trace_id);
+    }
+    const Interaction_trace_scope trace_scope(interaction_trace_id);
     const Terminal_backend_result backend_result = m_backend->write(command.bytes);
+    if (interaction_trace_enabled()) {
+        record_interaction_trace(
+            "session",
+            is_backend_rejection(backend_result) ? "write-rejected" : "write-accepted",
+            interaction_trace_byte_summary(command.bytes),
+            interaction_trace_id);
+    }
     if (is_backend_rejection(backend_result)) {
         record_backend_error(command.sequence, *backend_result.error);
         return make_backend_rejected_result(command.sequence, backend_result.error);
@@ -5552,7 +5604,7 @@ void Terminal_session::publish_selection_snapshot(
     bool           allow_blocked_selection_only_snapshot)
 {
     if (!m_screen_model.has_value()) {
-        if (m_config.selection_trace_enabled) {
+        if (selection_trace_requested(m_config.selection_trace_enabled)) {
             write_selection_trace(m_config.selection_trace_enabled,
                 QStringLiteral("session publish-selection-snapshot skipped reason=no-screen-model sequence=%1")
                     .arg(static_cast<qulonglong>(sequence)));
@@ -5562,7 +5614,7 @@ void Terminal_session::publish_selection_snapshot(
 
     if (!model_allows_render_snapshot(*m_screen_model)) {
         if (!allow_blocked_selection_only_snapshot) {
-            if (m_config.selection_trace_enabled) {
+            if (selection_trace_requested(m_config.selection_trace_enabled)) {
                 write_selection_trace(m_config.selection_trace_enabled,
                     QStringLiteral(
                         "session publish-selection-snapshot deferred reason=publication-blocked sequence=%1")
@@ -5630,7 +5682,7 @@ void Terminal_session::publish_selection_snapshot(
                 m_latest_content_render_snapshot);
         }
 #endif
-        if (m_config.selection_trace_enabled) {
+        if (selection_trace_requested(m_config.selection_trace_enabled)) {
             write_selection_trace(m_config.selection_trace_enabled,
                 QStringLiteral(
                     "session publish-selection-snapshot selection-only sequence=%1 generation=%2 basis={%3}")
@@ -5646,7 +5698,7 @@ void Terminal_session::publish_selection_snapshot(
         return;
     }
 
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral(
                 "session publish-selection-snapshot sequence=%1 message=\"%2\" generation=%3 basis={%4}")
@@ -5756,7 +5808,7 @@ void Terminal_session::advance_selection_content_basis_for_model_result(
                 m_row_origin_generation,
                 current_grid_size,
                 current_viewport);
-            if (m_config.selection_trace_enabled) {
+            if (selection_trace_requested(m_config.selection_trace_enabled)) {
                 const QString advance_reason =
                     same_viewport_retained_lines_can_advance_visual_lease
                         ? QStringLiteral("same-viewport-retained-line-provenance")
@@ -5779,7 +5831,7 @@ void Terminal_session::advance_selection_content_basis_for_model_result(
             return;
         }
 
-        if (m_config.selection_trace_enabled) {
+        if (selection_trace_requested(m_config.selection_trace_enabled)) {
             const auto visual_lease = m_selection.visual_lease();
             const bool lease_present = visual_lease.has_value();
             const bool selection_state_allowed =
@@ -5878,7 +5930,7 @@ void Terminal_session::set_selection_range_from_published_source_locked(
                                         expected_source)
 {
     if (!m_screen_model.has_value()) {
-        if (m_config.selection_trace_enabled) {
+        if (selection_trace_requested(m_config.selection_trace_enabled)) {
             write_selection_trace(m_config.selection_trace_enabled,
                 QStringLiteral("session selection-range ignored reason=no-screen-model range=%1 expected=%2")
                     .arg(selection_trace_range(range))
@@ -5950,7 +6002,7 @@ void Terminal_session::set_selection_range_from_published_source_locked(
                     selected_lines.size()));
         }
     }
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral(
                 "session selection-range-proof range=%1 expected=%2 current=%3 "
@@ -5972,7 +6024,7 @@ void Terminal_session::set_selection_range_from_published_source_locked(
 
     if (proven_selected_text.code != Terminal_selection_result_code::OK) {
         if (m_selection.has_internal_selection()) {
-            if (m_config.selection_trace_enabled) {
+            if (selection_trace_requested(m_config.selection_trace_enabled)) {
                 write_selection_trace(m_config.selection_trace_enabled,
                     QStringLiteral(
                         "session selection-range-failed action=clear range=%1 result=%2 current=%3")
@@ -5987,7 +6039,7 @@ void Terminal_session::set_selection_range_from_published_source_locked(
             publish_selection_snapshot(next_sequence(), QStringLiteral("selection cleared"));
         }
         else {
-            if (m_config.selection_trace_enabled) {
+            if (selection_trace_requested(m_config.selection_trace_enabled)) {
                 write_selection_trace(m_config.selection_trace_enabled,
                     QStringLiteral(
                         "session selection-range-failed action=none range=%1 result=%2 current=%3")
@@ -6008,7 +6060,7 @@ void Terminal_session::set_selection_range_from_published_source_locked(
         visual_lease.has_value()                                &&
         selection_lease_matches_source(*visual_lease, *current_source))
     {
-        if (m_config.selection_trace_enabled) {
+        if (selection_trace_requested(m_config.selection_trace_enabled)) {
             write_selection_trace(m_config.selection_trace_enabled,
                 QStringLiteral("session selection-range-noop range=%1 current=%2")
                     .arg(selection_trace_range(range))
@@ -6023,7 +6075,7 @@ void Terminal_session::set_selection_range_from_published_source_locked(
 
     m_selection.set_range(range, proven_selected_text.text, std::move(lease));
     m_selection_buffer_id = current_source->buffer_id;
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral("session selection-changed range=%1 size=%2 current=%3 basis={%4}")
                 .arg(selection_trace_range(range))
@@ -6144,7 +6196,10 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
             selection_requested = true;
         }
     }
-    if (m_config.selection_trace_enabled && !selection_requested && m_selection.has_internal_selection()) {
+    if (selection_trace_requested(m_config.selection_trace_enabled) &&
+        !selection_requested                                      &&
+        m_selection.has_internal_selection())
+    {
         const bool has_internal_selection = m_selection.has_internal_selection();
         const bool state_allows_span =
             has_internal_selection &&
@@ -6791,7 +6846,7 @@ void Terminal_session::publish_render_snapshot(
 #endif
     Terminal_render_snapshot_request request =
         make_render_snapshot_request(sequence, purpose, public_scroll_diagnostics);
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral(
                 "session publish-render-snapshot begin sequence=%1 message=\"%2\" "
@@ -6812,7 +6867,7 @@ void Terminal_session::publish_render_snapshot(
         }
     }
 #endif
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral(
                 "session publish-render-snapshot constructed requested_sequence=%1 actual_sequence=%2 "
@@ -6925,7 +6980,7 @@ void Terminal_session::publish_render_snapshot(
             m_latest_content_render_snapshot);
     }
 #endif
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral(
                 "session publish-render-snapshot end sequence=%1 generation=%2 snapshot_sequence=%3 basis={%4}")
@@ -6952,7 +7007,7 @@ void Terminal_session::publish_synchronized_resize_snapshot(
         ++m_profile_stats.render_snapshot_requests;
     }
 #endif
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral(
                 "session publish-synchronized-resize-snapshot begin sequence=%1 message=\"%2\" "
@@ -7012,7 +7067,7 @@ void Terminal_session::publish_synchronized_resize_snapshot(
             m_latest_content_render_snapshot);
     }
 #endif
-    if (m_config.selection_trace_enabled) {
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral(
                 "session publish-synchronized-resize-snapshot end sequence=%1 generation=%2 snapshot_sequence=%3 basis={%4}")

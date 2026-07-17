@@ -106,6 +106,7 @@ struct Terminal_resize_transaction
 struct Terminal_session_command
 {
     std::uint64_t                              sequence = 0U;
+    std::uint64_t                              interaction_trace_id = 0U;
     std::uint64_t                              backend_callback_epoch = 0U;
     Terminal_session_command_kind              kind     = Terminal_session_command_kind::BACKEND_OUTPUT;
     QByteArray                                 bytes;
@@ -268,11 +269,13 @@ Terminal_session_command make_backend_output_command(
 
 Terminal_session_command make_user_write_command(
     std::uint64_t          sequence,
-    QByteArray             bytes);
+    QByteArray             bytes,
+    std::uint64_t          interaction_trace_id = 0U);
 
 Terminal_session_command make_user_paste_command(
     std::uint64_t          sequence,
-    QByteArray             bytes);
+    QByteArray             bytes,
+    std::uint64_t          interaction_trace_id = 0U);
 
 Terminal_session_command make_resize_command(
     std::uint64_t                  sequence,
