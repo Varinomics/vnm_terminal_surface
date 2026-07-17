@@ -2,6 +2,7 @@
 
 #include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/interaction_trace.h"
 #include "vnm_terminal/internal/posix_pty_backend.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
@@ -95,6 +96,13 @@ constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget_defa
     k_backend_callback_drain_budget;
 constexpr char k_backend_callback_frame_catchup_budget_env[] =
     "VNM_TERMINAL_BACKEND_CALLBACK_FRAME_CATCHUP_BUDGET_MS";
+
+QPointer<VNM_TerminalSurface>& interaction_trace_owner()
+{
+    static QPointer<VNM_TerminalSurface> owner;
+    return owner;
+}
+
 // Extension the epoch-targeted frame drain may spend past the primary budget
 // to reach a cursor-stable stop point. Value 0 disables the extension, keeping
 // baseline frame-drain behavior unchanged unless a policy explicitly opts in.
@@ -790,6 +798,7 @@ bool selection_source_matches_snapshot(
 
 void write_selection_trace(bool enabled, const QString& message)
 {
+    term::record_interaction_trace("selection", "state", message);
     if (!enabled) {
         return;
     }
@@ -2933,6 +2942,10 @@ VNM_TerminalSurface::~VNM_TerminalSurface()
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
+    if (m_interaction_diagnostics_enabled) {
+        set_interaction_diagnostics_enabled(false);
+    }
+
     QObject::disconnect(m_private->window_scene_graph_invalidated_connection);
     QObject::disconnect(m_private->window_screen_changed_connection);
     QObject::disconnect(m_private->screen_dpi_changed_connection);
@@ -3215,6 +3228,123 @@ void VNM_TerminalSurface::set_retained_history_capacity_bytes(
 
     m_retained_history_capacity_bytes =
         term::terminal_history_ring_aligned_capacity(capacity_bytes);
+}
+
+bool VNM_TerminalSurface::interaction_diagnostics_enabled() const
+{
+    return m_interaction_diagnostics_enabled;
+}
+
+void VNM_TerminalSurface::set_interaction_diagnostics_enabled(bool enabled)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+    if (enabled == m_interaction_diagnostics_enabled) {
+        return;
+    }
+
+    QPointer<VNM_TerminalSurface>& owner = interaction_trace_owner();
+    if (enabled && owner != nullptr && owner != this) {
+        m_interaction_diagnostics_error =
+            QStringLiteral("interaction diagnostics are already enabled by another terminal surface");
+        emit interaction_diagnostics_error_changed();
+        qWarning().noquote() << m_interaction_diagnostics_error;
+        return;
+    }
+
+    QString error;
+    if (enabled) {
+        const QPointer<VNM_TerminalSurface> surface(this);
+        term::set_interaction_trace_failure_handler(
+            [surface](QString failure) {
+                QMetaObject::invokeMethod(
+                    QGuiApplication::instance(),
+                    [surface, failure = std::move(failure)] {
+                        if (surface == nullptr                         ||
+                            interaction_trace_owner() != surface      ||
+                            !surface->m_interaction_diagnostics_enabled)
+                        {
+                            return;
+                        }
+                        interaction_trace_owner().clear();
+                        term::set_interaction_trace_failure_handler({});
+                        surface->m_interaction_diagnostics_enabled = false;
+                        surface->m_interaction_diagnostics_error = failure;
+                        emit surface->interaction_diagnostics_error_changed();
+                        emit surface->interaction_diagnostics_enabled_changed();
+                    },
+                    Qt::QueuedConnection);
+            });
+    }
+    if (!term::set_interaction_trace_enabled(enabled, &error)) {
+        if (enabled) {
+            term::set_interaction_trace_failure_handler({});
+        }
+        m_interaction_diagnostics_error = error;
+        emit interaction_diagnostics_error_changed();
+        qWarning().noquote() << error;
+        return;
+    }
+
+    if (enabled) {
+        owner = this;
+    }
+    else
+    if (owner == this) {
+        owner.clear();
+        term::set_interaction_trace_failure_handler({});
+    }
+
+    m_interaction_diagnostics_error.clear();
+    m_interaction_diagnostics_enabled = enabled;
+    emit interaction_diagnostics_error_changed();
+    emit interaction_diagnostics_enabled_changed();
+    if (enabled) {
+        term::record_interaction_trace(
+            "trace",
+            "enabled",
+            QStringLiteral(
+                "path=%1 trace_capacity_bytes=%2 retained_history_capacity_bytes=%3 "
+                "scrollback_row_limit=%4")
+                .arg(interaction_diagnostics_path())
+                .arg(term::k_interaction_trace_total_capacity_bytes)
+                .arg(m_retained_history_capacity_bytes)
+                .arg(m_scrollback_limit));
+    }
+}
+
+QString VNM_TerminalSurface::interaction_diagnostics_path() const
+{
+    return term::interaction_trace_path();
+}
+
+QString VNM_TerminalSurface::interaction_diagnostics_error() const
+{
+    return m_interaction_diagnostics_error;
+}
+
+void VNM_TerminalSurface::record_interaction_diagnostic(
+    const char*    category,
+    const char*    event,
+    const QString& details,
+    std::uint64_t  correlation_id) const
+{
+    term::record_interaction_trace(category, event, details, correlation_id);
+}
+
+void VNM_TerminalSurface::record_key_interaction_diagnostic(
+    const char*      category,
+    const char*      event,
+    const QKeyEvent& key_event,
+    std::uint64_t    correlation_id) const
+{
+    if (!term::interaction_trace_enabled()) {
+        return;
+    }
+    term::record_interaction_trace(
+        category,
+        event,
+        term::interaction_trace_key_summary(key_event),
+        correlation_id);
 }
 
 bool VNM_TerminalSurface::primary_repaint_recovery_enabled() const
@@ -3829,7 +3959,7 @@ QString VNM_TerminalSurface::selected_text()
     Q_ASSERT(thread() == QThread::currentThread());
 
     if (m_private->session == nullptr) {
-        if (m_selection_trace_enabled) {
+        if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled, QStringLiteral("surface selected-text reason=no-session"));
         }
         return {};
@@ -3837,7 +3967,7 @@ QString VNM_TerminalSurface::selected_text()
 
     drain_backend_callback_events();
     const term::Terminal_selection_result result = m_private->session->selected_text();
-    if (m_selection_trace_enabled) {
+    if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
         write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface selected-text result=%1 size=%2")
                 .arg(static_cast<int>(result.code))
@@ -3851,7 +3981,7 @@ QString VNM_TerminalSurface::selected_text()
 bool VNM_TerminalSurface::copy_selected_text_to_clipboard()
 {
     if (m_private->session == nullptr) {
-        if (m_selection_trace_enabled) {
+        if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled, QStringLiteral("surface copy-selected-text reason=no-session"));
         }
         return false;
@@ -3859,7 +3989,7 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard()
 
     const term::Terminal_selection_result result = m_private->session->selected_text();
     if (result.code != term::Terminal_selection_result_code::OK) {
-        if (m_selection_trace_enabled) {
+        if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral("surface copy-selected-text result=%1 size=%2")
                     .arg(static_cast<int>(result.code))
@@ -3869,7 +3999,7 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard()
     }
 
     const bool clipboard_write_persisted = set_terminal_clipboard_text(result.text);
-    if (m_selection_trace_enabled) {
+    if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
         write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface copy-selected-text result=%1 size=%2 clipboard=%3")
                 .arg(static_cast<int>(result.code))
@@ -3910,11 +4040,23 @@ bool VNM_TerminalSurface::paste_text(QString text)
         return false;
     }
 
+    const std::uint64_t trace_id = term::interaction_trace_enabled()
+        ? term::next_interaction_trace_correlation_id()
+        : 0U;
+    if (term::interaction_trace_enabled()) {
+        term::record_interaction_trace(
+            "surface",
+            "paste",
+            QStringLiteral("text_units=%1").arg(text.size()),
+            trace_id);
+    }
+
     term::Terminal_session* const route_session = m_private->session.get();
     const term::Terminal_paste_text_result paste_result =
         route_session->write_paste_text(
             std::move(text),
-            paste_framing_policy(m_bracketed_paste_policy));
+            paste_framing_policy(m_bracketed_paste_policy),
+            trace_id);
     sync_from_session();
     if (!paste_result.handled) {
         return false;
@@ -4323,6 +4465,17 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
 {
     QQuickItem::itemChange(change, value);
 
+    if (change == ItemActiveFocusHasChanged && term::interaction_trace_enabled()) {
+        term::record_interaction_trace(
+            "surface",
+            "active-focus-changed",
+            QStringLiteral("active_focus=%1 focus=%2 visible=%3 enabled=%4")
+                .arg(hasActiveFocus())
+                .arg(hasFocus())
+                .arg(isVisible())
+                .arg(isEnabled()));
+    }
+
     if (change == ItemSceneChange) {
         const bool window_identity_changed = value.window != m_private->bound_window;
         if (auto lifecycle_recorder = m_private->lifecycle_recorder();
@@ -4396,9 +4549,44 @@ void VNM_TerminalSurface::itemChange(ItemChange change, const ItemChangeData& va
     }
 }
 
+bool VNM_TerminalSurface::event(QEvent* event)
+{
+    const bool trace_event =
+        term::interaction_trace_enabled()             &&
+        (event->type() == QEvent::ShortcutOverride    ||
+         event->type() == QEvent::KeyRelease          ||
+         event->type() == QEvent::FocusIn             ||
+         event->type() == QEvent::FocusOut);
+    QString details;
+    if (trace_event) {
+        details = QStringLiteral("type=%1 active_focus=%2 accepted_before=%3")
+            .arg(static_cast<int>(event->type()))
+            .arg(hasActiveFocus())
+            .arg(event->isAccepted());
+        if (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyRelease) {
+            const auto* key_event = static_cast<const QKeyEvent*>(event);
+            details += QLatin1Char(' ') + term::interaction_trace_key_summary(*key_event);
+        }
+    }
+
+    const bool handled = QQuickItem::event(event);
+    if (trace_event) {
+        details += QStringLiteral(" handled=%1 accepted_after=%2")
+            .arg(handled)
+            .arg(event->isAccepted());
+        term::record_interaction_trace("surface", "event", details);
+    }
+    return handled;
+}
+
 void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+
+    const std::uint64_t trace_id = term::interaction_trace_enabled()
+        ? term::next_interaction_trace_correlation_id()
+        : 0U;
+    record_key_interaction_diagnostic("surface", "key-press", *event, trace_id);
 
     if (is_plain_copy_shortcut(*event)) {
         if (m_copy_shortcut_policy ==
@@ -4408,6 +4596,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
                 copy_selected_text_to_clipboard())
             {
                 event->accept();
+                term::record_interaction_trace("surface", "key-route", QStringLiteral("copy"), trace_id);
                 return;
             }
         }
@@ -4417,6 +4606,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
                 (void)copy_selected_text_to_clipboard();
             }
             event->accept();
+            term::record_interaction_trace("surface", "key-route", QStringLiteral("copy-or-ignore"), trace_id);
             return;
         }
     }
@@ -4442,6 +4632,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
                     direction * visible_rows,
                     QStringLiteral("key.page"));
                 event->accept();
+                term::record_interaction_trace("surface", "key-route", QStringLiteral("page-scroll"), trace_id);
                 return;
             }
         }
@@ -4453,13 +4644,23 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
         }
         term::Terminal_session* const route_session = m_private->session.get();
         const term::Terminal_key_event_result key_result =
-            route_session->write_key_event(*event);
+            route_session->write_key_event(*event, trace_id);
         if (!key_result.handled) {
             event->ignore();
+            term::record_interaction_trace("surface", "key-route", QStringLiteral("unhandled"), trace_id);
             return;
         }
 
         event->accept();
+        if (term::interaction_trace_enabled()) {
+            term::record_interaction_trace(
+                "surface",
+                "key-route",
+                QStringLiteral("session sequence=%1 result=%2")
+                    .arg(key_result.result.sequence)
+                    .arg(static_cast<int>(key_result.result.code)),
+                trace_id);
+        }
         sync_from_session();
         if (!is_accepted(key_result.result.code)) {
             report_result_failure(key_result.result);
@@ -4478,15 +4679,34 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
         term::encode_terminal_key_event(*event, term::Terminal_input_mode_state{});
     if (bytes.isEmpty()) {
         event->ignore();
+        term::record_interaction_trace("surface", "key-route", QStringLiteral("no-session-unhandled"), trace_id);
         return;
     }
 
     event->accept();
+    if (term::interaction_trace_enabled()) {
+        term::record_interaction_trace(
+            "surface",
+            "key-route",
+            QStringLiteral("no-session %1").arg(term::interaction_trace_byte_summary(bytes)),
+            trace_id);
+    }
 }
 
 void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    if (term::interaction_trace_enabled()) {
+        term::record_interaction_trace(
+            "mouse",
+            "press",
+            QStringLiteral("button=%1 buttons=%2 modifiers=%3 keep_grab=%4 tracking=%5")
+                .arg(static_cast<int>(event->button()))
+                .arg(static_cast<int>(event->buttons()))
+                .arg(static_cast<int>(event->modifiers()))
+                .arg(keepMouseGrab())
+                .arg(snapshot_has_terminal_mouse_tracking(m_private->render_snapshot)));
+    }
     event->ignore();
     dismiss_row_timestamp_tooltip();
 
@@ -4504,7 +4724,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
     std::optional<term::terminal_grid_position_t> logical_position;
     const auto trace_decision = [&](const QString& reason) {
         trace_surface_mouse_decision(
-            m_selection_trace_enabled,
+            m_selection_trace_enabled || term::interaction_trace_enabled(),
             QStringLiteral("mouse-press"),
             reason,
             event->position(),
@@ -4667,7 +4887,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
     if (!source.has_value() || m_private->render_snapshot == nullptr ||
         !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
     {
-        if (m_selection_trace_enabled) {
+        if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral(
                     "surface mouse-press source-mismatch reason=%1 anchor=source{none} current=%2 %3")
@@ -4699,7 +4919,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
     m_private->clear_selection_with_sync(*this);
     event->accept();
     sync_from_session();
-    if (m_selection_trace_enabled) {
+    if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
         write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface mouse-press source anchor=%1 current=%2 %3")
                 .arg(selection_trace_source_identity(*m_private->selection_anchor_source))
@@ -4712,6 +4932,17 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
 void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    if (term::interaction_trace_enabled()) {
+        term::record_interaction_trace(
+            "mouse",
+            "move",
+            QStringLiteral("buttons=%1 modifiers=%2 keep_grab=%3 tracking=%4 drag=%5")
+                .arg(static_cast<int>(event->buttons()))
+                .arg(static_cast<int>(event->modifiers()))
+                .arg(keepMouseGrab())
+                .arg(snapshot_has_terminal_mouse_tracking(m_private->render_snapshot))
+                .arg(m_private->selection_drag_active));
+    }
     event->ignore();
     // Same positional guard as hover moves: a move event repeated at an
     // unchanged position is not user motion and must not dismiss.
@@ -4731,7 +4962,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         snapshot_has_terminal_mouse_tracking(m_private->render_snapshot);
     const auto trace_decision = [&](const QString& reason) {
         trace_surface_mouse_decision(
-            m_selection_trace_enabled,
+            m_selection_trace_enabled || term::interaction_trace_enabled(),
             QStringLiteral("mouse-move"),
             reason,
             event->position(),
@@ -4867,7 +5098,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         m_private->render_snapshot->viewport.active_buffer !=
             *m_private->selection_anchor_buffer_id)
     {
-        if (m_selection_trace_enabled) {
+        if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral(
                     "surface mouse-move source-mismatch reason=buffer anchor=%1 current=source{none} %2")
@@ -4897,7 +5128,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
 
     const std::optional<term::terminal_selection_source_identity_t> source =
         m_private->session->published_selection_source_identity();
-    if (m_selection_trace_enabled) {
+    if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
         write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface mouse-move source anchor=%1 current=%2 %3")
                 .arg(selection_trace_source_identity(*m_private->selection_anchor_source))
@@ -4910,7 +5141,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
             *m_private->selection_anchor_source,
             *source))
     {
-        if (m_selection_trace_enabled) {
+        if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral(
                     "surface mouse-move source-mismatch snapshot_reason=%1 anchor_reason=%2")
@@ -5019,7 +5250,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                 return;
             }
         }
-        if (m_selection_trace_enabled) {
+        if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral(
                     "surface mouse-move source-mismatch reason=%1 "
@@ -5073,6 +5304,18 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
 void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    if (term::interaction_trace_enabled()) {
+        term::record_interaction_trace(
+            "mouse",
+            "release",
+            QStringLiteral("button=%1 buttons=%2 modifiers=%3 keep_grab=%4 tracking=%5 drag=%6")
+                .arg(static_cast<int>(event->button()))
+                .arg(static_cast<int>(event->buttons()))
+                .arg(static_cast<int>(event->modifiers()))
+                .arg(keepMouseGrab())
+                .arg(snapshot_has_terminal_mouse_tracking(m_private->render_snapshot))
+                .arg(m_private->selection_drag_active));
+    }
     event->ignore();
     dismiss_row_timestamp_tooltip();
     drain_backend_callback_events();
@@ -5081,7 +5324,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
     std::optional<term::terminal_grid_position_t> logical_position;
     const auto trace_decision = [&](const QString& reason) {
         trace_surface_mouse_decision(
-            m_selection_trace_enabled,
+            m_selection_trace_enabled || term::interaction_trace_enabled(),
             QStringLiteral("mouse-release"),
             reason,
             event->position(),
@@ -5138,7 +5381,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
             m_private->render_snapshot->viewport.active_buffer !=
                 *m_private->selection_anchor_buffer_id)
         {
-            if (m_selection_trace_enabled) {
+            if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
                 write_selection_trace(m_selection_trace_enabled,
                     QStringLiteral(
                         "surface mouse-release source-mismatch reason=buffer anchor=%1 current=source{none} %2")
@@ -5162,7 +5405,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
 
         const std::optional<term::terminal_selection_source_identity_t> source =
             m_private->session->published_selection_source_identity();
-        if (m_selection_trace_enabled) {
+        if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral("surface mouse-release source anchor=%1 current=%2 %3")
                     .arg(selection_trace_source_identity(*m_private->selection_anchor_source))
@@ -5175,7 +5418,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 *m_private->selection_anchor_source,
                 *source))
         {
-            if (m_selection_trace_enabled) {
+            if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
                 write_selection_trace(m_selection_trace_enabled,
                     QStringLiteral(
                         "surface mouse-release source-mismatch snapshot_reason=%1 anchor_reason=%2")
@@ -5283,7 +5526,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                         return;
                     }
                 }
-                if (m_selection_trace_enabled) {
+                if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
                     write_selection_trace(m_selection_trace_enabled,
                         QStringLiteral(
                             "surface mouse-release source-mismatch reason=%1 "
@@ -6307,6 +6550,26 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
     const QString commit_text             = terminal_commit_text_from_event(*event);
     const QString preedit_text            = event->preeditString();
     const int     preedit_cursor_position = preedit_cursor_position_from_event(*event);
+    const std::uint64_t trace_id = term::interaction_trace_enabled()
+        ? term::next_interaction_trace_correlation_id()
+        : 0U;
+    if (term::interaction_trace_enabled()) {
+        term::record_interaction_trace(
+            "ime",
+            "input-method-event",
+            QStringLiteral(
+                "commit_units=%1 preedit_units=%2 preedit_active_before=%3 cursor=%4 "
+                "attributes=%5 replacement_start=%6 replacement_length=%7 accepted_before=%8")
+                .arg(commit_text.size())
+                .arg(preedit_text.size())
+                .arg(m_private->ime_preedit.active)
+                .arg(preedit_cursor_position)
+                .arg(event->attributes().size())
+                .arg(event->replacementStart())
+                .arg(event->replacementLength())
+                .arg(event->isAccepted()),
+            trace_id);
+    }
 
     std::optional<term::Terminal_ime_commit_result> commit_result;
     if (m_private->session != nullptr) {
@@ -6314,10 +6577,12 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
             m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
             if (m_private->session == nullptr) {
                 event->ignore();
+                term::record_interaction_trace(
+                    "ime", "input-method-result", QStringLiteral("route=session-lost accepted=false"), trace_id);
                 return;
             }
             commit_result =
-                m_private->session->write_ime_commit(commit_text);
+                m_private->session->write_ime_commit(commit_text, trace_id);
         }
 
         const bool commit_blocks_empty_preedit_cancel =
@@ -6342,6 +6607,18 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
             !is_accepted(commit_result->result.code))
         {
             report_result_failure(commit_result->result);
+            if (term::interaction_trace_enabled()) {
+                term::record_interaction_trace(
+                    "ime",
+                    "input-method-result",
+                    QStringLiteral(
+                        "handled=true sequence=%1 result=%2 preedit_active_after=%3 accepted=%4")
+                        .arg(commit_result->result.sequence)
+                        .arg(static_cast<int>(commit_result->result.code))
+                        .arg(m_private->ime_preedit.active)
+                        .arg(event->isAccepted()),
+                    trace_id);
+            }
             return;
         }
     }
@@ -6356,6 +6633,19 @@ void VNM_TerminalSurface::inputMethodEvent(QInputMethodEvent* event)
     }
 
     event->accept();
+    if (term::interaction_trace_enabled()) {
+        QString result_details = QStringLiteral("handled=%1 preedit_active_after=%2 accepted=%3")
+            .arg(commit_result.has_value() && commit_result->handled)
+            .arg(m_private->ime_preedit.active)
+            .arg(event->isAccepted());
+        if (commit_result.has_value()) {
+            result_details += QStringLiteral(" sequence=%1 result=%2")
+                .arg(commit_result->result.sequence)
+                .arg(static_cast<int>(commit_result->result.code));
+        }
+        term::record_interaction_trace(
+            "ime", "input-method-result", result_details, trace_id);
+    }
 }
 
 void VNM_TerminalSurface::refresh_grid_metrics()
@@ -6984,7 +7274,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
     Q_ASSERT(thread() == QThread::currentThread());
 
     if (m_private->session == nullptr) {
-        if (m_selection_trace_enabled) {
+        if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled, QStringLiteral("surface backend-drain reason=no-session"));
         }
         (void)process_backend_callback_events_recorded(nullptr, budget, true);
@@ -6994,7 +7284,7 @@ void VNM_TerminalSurface::drain_backend_callback_events_with_budget(
     term::Terminal_session* const session = m_private->session.get();
     const std::uint64_t session_generation = m_private->session_generation;
     const bool trace_drain =
-        m_selection_trace_enabled &&
+        (m_selection_trace_enabled || term::interaction_trace_enabled()) &&
         (m_private->selection_drag_active || session->has_selection());
     if (trace_drain) {
         const std::optional<term::terminal_selection_source_identity_t> before_source =

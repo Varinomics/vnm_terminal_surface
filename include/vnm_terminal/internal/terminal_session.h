@@ -123,7 +123,8 @@ public:
             QByteArray             bytes);
 
     Terminal_key_event_result write_key_event(
-        const QKeyEvent&           event);
+        const QKeyEvent&           event,
+        std::uint64_t              interaction_trace_id = 0U);
 
     // Writes a terminal mouse report without draining backend callbacks only
     // when callback ingress is empty under the session lock. Returns std::nullopt
@@ -133,11 +134,13 @@ public:
             Terminal_mouse_event   event);
 
     Terminal_ime_commit_result write_ime_commit(
-        QString                    text);
+        QString                    text,
+        std::uint64_t              interaction_trace_id = 0U);
 
     Terminal_paste_text_result write_paste_text(
         QString                                text,
-        Terminal_paste_framing_policy          policy);
+        Terminal_paste_framing_policy          policy,
+        std::uint64_t                          interaction_trace_id = 0U);
 
     Terminal_focus_event_result write_focus_event(
         bool                       focused);
@@ -392,11 +395,13 @@ private:
         QByteArray                         bytes,
         User_write_viewport_policy         viewport_policy,
         Backend_callback_drain_policy      drain_policy =
-            Backend_callback_drain_policy::DRAIN_CALLBACKS);
+            Backend_callback_drain_policy::DRAIN_CALLBACKS,
+        std::uint64_t                      interaction_trace_id = 0U);
 
     Terminal_key_event_result write_key_event_locked(
         const QKeyEvent&                   event,
-        Backend_callback_drain_policy      drain_policy);
+        Backend_callback_drain_policy      drain_policy,
+        std::uint64_t                      interaction_trace_id);
 
     Terminal_mouse_event_result write_mouse_event_locked(
         Terminal_mouse_event               event,

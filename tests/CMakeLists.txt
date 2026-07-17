@@ -301,6 +301,26 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_history_ring>"
 )
 
+add_executable(vnm_terminal_interaction_trace
+    interaction_trace/interaction_trace_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_interaction_trace PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_interaction_trace PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_interaction_trace
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_interaction_trace>"
+)
+
 add_executable(vnm_terminal_history_row_record_codec
     history_row_record_codec/history_row_record_codec_tests.cpp
 )

@@ -1,5 +1,6 @@
 #include "vnm_terminal/internal/terminal_screen_model.h"
 
+#include "vnm_terminal/internal/interaction_trace.h"
 #include "vnm_terminal/internal/csi_parameter_parsing.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
 #include "vnm_terminal/internal/terminal_color_scheme.h"
@@ -4418,6 +4419,20 @@ void Terminal_screen_model::append_scrollback_row(
         }
         else {
             m_scrollback_evicted_rows += append.evicted_rows;
+            if (append.evicted_rows > 0 && interaction_trace_enabled()) {
+                const terminal_retained_history_diagnostics_t diagnostics =
+                    retained_history_diagnostics();
+                record_interaction_trace(
+                    "history",
+                    "ring-eviction",
+                    QStringLiteral(
+                        "evicted_rows=%1 retained_rows=%2 record_bytes=%3 byte_capacity=%4 row_limit=%5")
+                        .arg(append.evicted_rows)
+                        .arg(diagnostics.retained_rows)
+                        .arg(diagnostics.retained_record_bytes)
+                        .arg(diagnostics.byte_budget)
+                        .arg(m_config.scrollback_limit));
+            }
             record_primary_history_delta(
                 Terminal_backing_delta_kind::PRIMARY_HISTORY_APPENDED,
                 scrollback_rows_before,
@@ -4427,8 +4442,23 @@ void Terminal_screen_model::append_scrollback_row(
                 0);
         }
         while (scrollback_size() > m_config.scrollback_limit) {
+            const int rows_to_evict = scrollback_size() - m_config.scrollback_limit;
+            if (interaction_trace_enabled()) {
+                const terminal_retained_history_diagnostics_t diagnostics =
+                    retained_history_diagnostics();
+                record_interaction_trace(
+                    "history",
+                    "row-limit-eviction",
+                    QStringLiteral(
+                        "evict_rows=%1 retained_rows=%2 record_bytes=%3 byte_capacity=%4 row_limit=%5")
+                        .arg(rows_to_evict)
+                        .arg(diagnostics.retained_rows)
+                        .arg(diagnostics.retained_record_bytes)
+                        .arg(diagnostics.byte_budget)
+                        .arg(m_config.scrollback_limit));
+            }
             evict_oldest_scrollback_rows(
-                scrollback_size() - m_config.scrollback_limit);
+                rows_to_evict);
         }
     }
     else {

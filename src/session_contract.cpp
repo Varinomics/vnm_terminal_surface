@@ -191,18 +191,22 @@ Terminal_session_command make_backend_output_command(
 
 Terminal_session_command make_user_write_command(
     std::uint64_t          sequence,
-    QByteArray             bytes)
+    QByteArray             bytes,
+    std::uint64_t          interaction_trace_id)
 {
     return {.sequence = sequence,
+            .interaction_trace_id = interaction_trace_id,
             .kind  = Terminal_session_command_kind::USER_WRITE,
             .bytes = std::move(bytes)};
 }
 
 Terminal_session_command make_user_paste_command(
     std::uint64_t          sequence,
-    QByteArray             bytes)
+    QByteArray             bytes,
+    std::uint64_t          interaction_trace_id)
 {
     return {.sequence = sequence,
+            .interaction_trace_id = interaction_trace_id,
             .kind  = Terminal_session_command_kind::USER_PASTE,
             .bytes = std::move(bytes)};
 }

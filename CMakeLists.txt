@@ -104,6 +104,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/backend_contract.h
     include/vnm_terminal/internal/csi_parameter_parsing.h
     include/vnm_terminal/internal/ime_contract.h
+    include/vnm_terminal/internal/interaction_trace.h
     include/vnm_terminal/internal/metrics_contract.h
     include/vnm_terminal/internal/parser_action.h
     include/vnm_terminal/internal/qsg_atlas_renderer.h
@@ -145,6 +146,7 @@ add_library(vnm_terminal_surface STATIC
     src/diagnostics/metrics_json.cpp
     src/diagnostics/profile_text.cpp
     src/font_metrics.cpp
+    src/interaction_trace.cpp
     src/terminal_history_ring.cpp
     src/terminal_history_row_record_codec.cpp
     src/terminal_input_encoder.cpp

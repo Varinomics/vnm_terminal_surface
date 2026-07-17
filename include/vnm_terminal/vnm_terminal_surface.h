@@ -22,6 +22,7 @@ class QKeyEvent;
 class QMouseEvent;
 class QWheelEvent;
 class QInputMethodEvent;
+class QEvent;
 
 namespace vnm_terminal::internal {
 class Terminal_backend;
@@ -51,6 +52,13 @@ class VNM_TerminalSurface : public QQuickItem
         NOTIFY cursor_blink_enabled_changed)
     Q_PROPERTY(int scrollbackLimit
         READ scrollback_limit WRITE set_scrollback_limit NOTIFY scrollback_limit_changed)
+    Q_PROPERTY(bool interactionDiagnosticsEnabled
+        READ interaction_diagnostics_enabled WRITE set_interaction_diagnostics_enabled
+        NOTIFY interaction_diagnostics_enabled_changed)
+    Q_PROPERTY(QString interactionDiagnosticsPath
+        READ interaction_diagnostics_path CONSTANT)
+    Q_PROPERTY(QString interactionDiagnosticsError
+        READ interaction_diagnostics_error NOTIFY interaction_diagnostics_error_changed)
     Q_PROPERTY(bool primaryRepaintRecoveryEnabled
         READ primary_repaint_recovery_enabled WRITE set_primary_repaint_recovery_enabled
         NOTIFY primary_repaint_recovery_enabled_changed)
@@ -311,6 +319,24 @@ public:
     int scrollback_limit() const;
     void set_scrollback_limit(int limit);
 
+    // Interaction diagnostics use one bounded process-global trace writer.
+    // Only one surface may own it at a time. Printable text is redacted, but
+    // control-key identity and event timing remain diagnostic data.
+    bool interaction_diagnostics_enabled() const;
+    void set_interaction_diagnostics_enabled(bool enabled);
+    QString interaction_diagnostics_path() const;
+    QString interaction_diagnostics_error() const;
+    void record_interaction_diagnostic(
+        const char*    category,
+        const char*    event,
+        const QString& details = {},
+        std::uint64_t  correlation_id = 0U) const;
+    void record_key_interaction_diagnostic(
+        const char*      category,
+        const char*      event,
+        const QKeyEvent& key_event,
+        std::uint64_t    correlation_id = 0U) const;
+
     static std::size_t default_retained_history_capacity_bytes();
     static std::size_t minimum_retained_history_capacity_bytes();
     static std::size_t maximum_retained_history_capacity_bytes();
@@ -461,6 +487,8 @@ signals:
     void cursor_style_changed();
     void cursor_blink_enabled_changed();
     void scrollback_limit_changed();
+    void interaction_diagnostics_enabled_changed();
+    void interaction_diagnostics_error_changed();
     void primary_repaint_recovery_enabled_changed();
     void synchronized_output_stale_timeout_ms_changed();
     void synchronized_output_scroll_policy_changed();
@@ -520,6 +548,7 @@ private:
     QSGNode* updatePaintNode(QSGNode* old_node, UpdatePaintNodeData*) override;
     void updatePolish() override;
     void releaseResources() override;
+    bool event(QEvent* event) override;
     void keyPressEvent(QKeyEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
@@ -660,6 +689,8 @@ private:
     bool                     m_transcript_timing_diagnostics        = false;
     bool                     m_wheel_trace_enabled                  = false;
     bool                     m_selection_trace_enabled              = false;
+    bool                     m_interaction_diagnostics_enabled      = false;
+    QString                  m_interaction_diagnostics_error;
     int                      m_synchronized_output_stale_timeout_ms = 1000;
     Synchronized_output_scroll_policy m_synchronized_output_scroll_policy =
         Synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION;

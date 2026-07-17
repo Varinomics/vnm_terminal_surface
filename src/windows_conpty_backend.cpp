@@ -1,5 +1,6 @@
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 
+#include "vnm_terminal/internal/interaction_trace.h"
 #if defined(_WIN32)
 
 #ifndef NOMINMAX
@@ -186,6 +187,15 @@ struct Queued_write
     QByteArray bytes;
     bool       marks_interrupted_exit = false;
     bool       clears_interrupted_exit = false;
+    std::uint64_t trace_id = 0U;
+};
+
+struct Write_all_result
+{
+    bool        ok = false;
+    qsizetype   written_bytes = 0;
+    DWORD       error_code = ERROR_SUCCESS;
+    QString     error_message;
 };
 
 struct Conpty_api
@@ -751,7 +761,18 @@ public:
         }
 
         add_native_backend_queued_write_bytes(m_queued_write_bytes, byte_count);
-        m_write_queue.push_back({std::move(bytes), false, true});
+        const std::uint64_t trace_id = current_interaction_trace_correlation_id();
+        m_write_queue.push_back({std::move(bytes), false, true, trace_id});
+        if (interaction_trace_enabled()) {
+            record_interaction_trace(
+                "conpty",
+                "write-enqueued",
+                QStringLiteral("bytes=%1 queued_bytes=%2 queued_writes=%3")
+                    .arg(byte_count)
+                    .arg(m_queued_write_bytes)
+                    .arg(m_write_queue.size()),
+                trace_id);
+        }
         m_write_cv.notify_one();
         return backend_accept();
     }
@@ -1476,16 +1497,43 @@ private:
                 output_sequence_before_write = m_child_output_sequence;
             }
 
+            if (interaction_trace_enabled()) {
+                record_interaction_trace(
+                    "conpty",
+                    "write-started",
+                    interaction_trace_byte_summary(write.bytes),
+                    write.trace_id);
+            }
+
             if (write.marks_interrupted_exit) {
                 mark_interrupt_write_started();
             }
 
-            if (!write_all(write.bytes)) {
+            const Write_all_result write_result = write_all(write.bytes);
+            if (!write_result.ok) {
+                if (interaction_trace_enabled()) {
+                    record_interaction_trace(
+                        "conpty",
+                        "write-failed",
+                        QStringLiteral("%1 written_bytes=%2 win32_error=%3 error=%4")
+                            .arg(interaction_trace_byte_summary(write.bytes))
+                            .arg(write_result.written_bytes)
+                            .arg(write_result.error_code)
+                            .arg(write_result.error_message),
+                        write.trace_id);
+                }
                 mark_write_completed();
                 mark_writer_failed_after_write_failure(write.marks_interrupted_exit);
                 return;
             }
             mark_write_completed();
+            if (interaction_trace_enabled()) {
+                record_interaction_trace(
+                    "conpty",
+                    "write-completed",
+                    interaction_trace_byte_summary(write.bytes),
+                    write.trace_id);
+            }
 
             if (write.marks_interrupted_exit) {
                 mark_interrupt_delivered();
@@ -1623,7 +1671,7 @@ private:
         }
     }
 
-    bool write_all(const QByteArray& bytes)
+    Write_all_result write_all(const QByteArray& bytes)
     {
         qsizetype offset = 0;
         while (offset < bytes.size()) {
@@ -1631,7 +1679,12 @@ private:
             {
                 std::lock_guard<std::mutex> lock(m_mutex);
                 if (m_stopping || !m_input_write) {
-                    return false;
+                    return {
+                        false,
+                        offset,
+                        ERROR_OPERATION_ABORTED,
+                        QStringLiteral("ConPTY backend stopped before write completion"),
+                    };
                 }
 
                 input_write = m_input_write.get();
@@ -1649,28 +1702,35 @@ private:
                 nullptr);
             if (!write_ok) {
                 const DWORD error_code = GetLastError();
+                const QString error_message =
+                    windows_error_message(QStringLiteral("ConPTY input write"), error_code);
                 if (error_code != ERROR_BROKEN_PIPE       &&
                     error_code != ERROR_OPERATION_ABORTED &&
                     !stopping())
                 {
                     report_error(
                         Terminal_backend_error_code::WRITE_FAILED,
-                        windows_error_message(QStringLiteral("ConPTY input write"), error_code));
+                        error_message);
                 }
-                return false;
+                return {false, offset, error_code, error_message};
             }
 
             if (bytes_written == 0U) {
                 report_error(
                     Terminal_backend_error_code::WRITE_FAILED,
                     QStringLiteral("ConPTY input write made no progress"));
-                return false;
+                return {
+                    false,
+                    offset,
+                    ERROR_WRITE_FAULT,
+                    QStringLiteral("ConPTY input write made no progress"),
+                };
             }
 
             offset += static_cast<qsizetype>(bytes_written);
         }
 
-        return true;
+        return {true, offset, ERROR_SUCCESS, {}};
     }
 
     void wait_loop()
