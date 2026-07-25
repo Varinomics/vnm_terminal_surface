@@ -8,6 +8,7 @@
 #include "vnm_terminal/internal/terminal_transcript.h"
 
 #include <QByteArray>
+#include <QDir>
 #include <QFile>
 #include <QIODevice>
 #include <QJsonArray>
@@ -60,6 +61,18 @@ QByteArray recovered_backend_output_capture_bytes(
         bytes += file.readAll();
     }
     return bytes;
+}
+
+QString canonical_temp_path(const QTemporaryDir& temp_dir)
+{
+    return QDir(temp_dir.path()).canonicalPath();
+}
+
+QString canonical_temp_file_path(
+    const QTemporaryDir& temp_dir,
+    const QString&       file_name)
+{
+    return QDir(canonical_temp_path(temp_dir)).filePath(file_name);
 }
 
 term::Terminal_launch_config valid_launch_config()
@@ -1215,7 +1228,7 @@ bool test_backend_output_capture_file()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "backend output capture temp dir is valid");
     const vnm_terminal::Backend_output_capture_config capture_config{
-        temp_dir.filePath(QStringLiteral("backend-output")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("backend-output")),
         1024U,
     };
 
@@ -1251,7 +1264,7 @@ bool test_backend_output_capture_open_failure_reports_backend_error()
 
     term::Terminal_session_config config;
     config.backend_output_capture_config = vnm_terminal::Backend_output_capture_config{
-        temp_dir.path(),
+        canonical_temp_path(temp_dir),
         1024U,
     };
 
@@ -1295,7 +1308,7 @@ bool test_backend_output_capture_failure_does_not_hide_start_failure()
 
     term::Terminal_session_config config;
     config.backend_output_capture_config = vnm_terminal::Backend_output_capture_config{
-        temp_dir.path(),
+        canonical_temp_path(temp_dir),
         1024U,
     };
 
@@ -1444,7 +1457,7 @@ bool test_backend_output_capture_records_callback_overflow_bytes()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "overflow capture temp dir is valid");
     const vnm_terminal::Backend_output_capture_config capture_config{
-        temp_dir.filePath(QStringLiteral("overflow-output")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("overflow-output")),
         1024U,
     };
 

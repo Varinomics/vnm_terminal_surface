@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -46,6 +47,8 @@ int main(int argc, char** argv)
 
     const qint64 per_file_limit = term::k_interaction_trace_total_capacity_bytes / 2;
     bool ok = true;
+    ok &= check(QDir().mkpath(QFileInfo(path).absolutePath()),
+        "interaction trace fixture directory is created");
     ok &= check(!term::interaction_trace_enabled(),
         "interaction trace starts disabled");
     ok &= check(create_sized_file(path, per_file_limit + 1),
