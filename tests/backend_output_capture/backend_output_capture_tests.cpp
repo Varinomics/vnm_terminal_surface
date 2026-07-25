@@ -547,7 +547,7 @@ bool test_public_artifact_inspection_owns_complete_capture_schema()
     std::size_t finalization_marker_count = 0U;
     std::size_t completion_manifest_count = 0U;
     std::size_t writer_lock_count = 0U;
-    const QFileInfoList entries = QDir(temp_dir.path()).entryInfoList(
+    const QFileInfoList entries = QDir(canonical_temp_path(temp_dir)).entryInfoList(
         QDir::Files | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
         QDir::Name);
     for (const QFileInfo& entry : entries) {
