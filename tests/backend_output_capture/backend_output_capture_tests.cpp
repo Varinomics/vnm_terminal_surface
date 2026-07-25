@@ -81,6 +81,18 @@ bool write_bytes(
     return file.write(bytes.data(), requested_bytes) == requested_bytes && file.flush();
 }
 
+QString canonical_temp_path(const QTemporaryDir& temp_dir)
+{
+    return QDir(temp_dir.path()).canonicalPath();
+}
+
+QString canonical_temp_file_path(
+    const QTemporaryDir& temp_dir,
+    const QString&       file_name)
+{
+    return QDir(canonical_temp_path(temp_dir)).filePath(file_name);
+}
+
 class Output_backend final : public term::Terminal_backend
 {
 public:
@@ -241,16 +253,16 @@ bool test_capture_location_validation_rejects_unsafe_inputs()
         QStringLiteral("base path must be non-empty"),
         "capture rejects an empty base path");
     expect_rejected(
-        {temp_dir.filePath(QStringLiteral("zero-bound")), 0U},
+        {canonical_temp_file_path(temp_dir, QStringLiteral("zero-bound")), 0U},
         QStringLiteral("max_bytes must be between 1"),
         "capture rejects a zero byte bound");
     expect_rejected(
-        {temp_dir.filePath(QStringLiteral("missing/capture")), 8U},
+        {canonical_temp_file_path(temp_dir, QStringLiteral("missing/capture")), 8U},
         QStringLiteral("parent component is not an existing directory"),
         "capture rejects a missing parent directory");
 
     const QString existing_path =
-        temp_dir.filePath(QStringLiteral("existing-prefix"));
+        canonical_temp_file_path(temp_dir, QStringLiteral("existing-prefix"));
     QFile existing_file(existing_path);
     ok &= check(
         existing_file.open(QIODevice::WriteOnly),
@@ -278,7 +290,7 @@ bool test_rollover_retains_exact_bounded_suffix()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "rollover capture temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("rollover")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("rollover")),
         7U,
     };
 
@@ -325,7 +337,7 @@ bool test_oversized_chunk_and_one_byte_bound()
     ok &= check(temp_dir.isValid(), "oversized capture temp dir is valid");
 
     const Backend_output_capture_config oversized_config{
-        temp_dir.filePath(QStringLiteral("oversized")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("oversized")),
         7U,
     };
     term::Backend_output_capture_writer oversized_writer(oversized_config);
@@ -340,7 +352,7 @@ bool test_oversized_chunk_and_one_byte_bound()
         "oversized capture discards only the prefix outside the retained suffix");
 
     const Backend_output_capture_config one_byte_config{
-        temp_dir.filePath(QStringLiteral("one-byte")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("one-byte")),
         1U,
     };
     term::Backend_output_capture_writer one_byte_writer(one_byte_config);
@@ -363,7 +375,7 @@ bool test_recovery_prunes_extra_crash_left_segment()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "recovery capture temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("recovery")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("recovery")),
         8U,
     };
 
@@ -404,7 +416,7 @@ bool test_segment_markers_do_not_imply_capture_completion()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "completion manifest temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("completion-manifest")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("completion-manifest")),
         8U,
     };
 
@@ -429,7 +441,7 @@ bool test_partial_finalized_marker_is_recoverable_as_incomplete()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "partial marker temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("partial-marker")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("partial-marker")),
         8U,
     };
 
@@ -460,7 +472,7 @@ bool test_partial_completion_manifest_is_recoverable_as_incomplete()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "partial completion temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("partial-completion")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("partial-completion")),
         8U,
     };
     const QString completion_path = config.base_path + QStringLiteral(".vnm-complete");
@@ -486,7 +498,7 @@ bool test_explicit_finalize_controls_capture_completion()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "explicit completion temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("explicit-completion")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("explicit-completion")),
         8U,
     };
 
@@ -521,7 +533,7 @@ bool test_public_artifact_inspection_owns_complete_capture_schema()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "artifact inspection temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("artifact-inspection")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("artifact-inspection")),
         8U,
     };
 
@@ -570,7 +582,8 @@ bool test_public_artifact_inspection_owns_complete_capture_schema()
     ok &= check(writer_lock_count == 1U,
         "artifact inspection recognizes the live cross-process writer lock");
 
-    const QString foreign_path = temp_dir.filePath(QStringLiteral("foreign.bin"));
+    const QString foreign_path =
+        canonical_temp_file_path(temp_dir, QStringLiteral("foreign.bin"));
     ok &= check(write_bytes(foreign_path, QByteArrayLiteral("foreign")),
         "artifact inspection creates a foreign file");
     const vnm_terminal::Backend_output_capture_artifact_inspection foreign =
@@ -606,7 +619,7 @@ bool test_finalize_does_not_mask_recovered_incomplete_segment()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "recovered incomplete temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("recovered-incomplete")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("recovered-incomplete")),
         8U,
     };
 
@@ -644,7 +657,7 @@ bool test_writer_is_poisoned_after_injected_io_failure(
     ok &= check(temp_dir.isValid(),
         qPrintable(prefix + QStringLiteral(" temp dir is valid")));
     const Backend_output_capture_config config{
-        temp_dir.filePath(prefix),
+        canonical_temp_file_path(temp_dir, prefix),
         8U,
     };
 
@@ -707,7 +720,7 @@ bool test_capture_error_is_reported_without_failing_backend_output()
 
     term::Terminal_session_config config;
     config.backend_output_capture_config = Backend_output_capture_config{
-        temp_dir.path(),
+        canonical_temp_path(temp_dir),
         8U,
     };
     config.trace_notification_limit = 8U;
@@ -755,7 +768,7 @@ bool test_capture_error_does_not_consume_callback_queue_capacity()
 
     term::Terminal_session_config config;
     config.backend_output_capture_config = Backend_output_capture_config{
-        temp_dir.path(),
+        canonical_temp_path(temp_dir),
         8U,
     };
     config.backend_event_notifier                  = [] {};
@@ -794,7 +807,7 @@ bool test_capture_failure_is_not_reported_again_at_process_exit()
 
     term::Terminal_session_config config;
     config.backend_output_capture_config = Backend_output_capture_config{
-        temp_dir.path(),
+        canonical_temp_path(temp_dir),
         8U,
     };
     config.trace_notification_limit = 8U;
@@ -832,7 +845,7 @@ bool test_capture_failure_survives_stopped_callback_queue()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "stopped callback capture temp dir is valid");
     const Backend_output_capture_config capture_config{
-        temp_dir.filePath(QStringLiteral("stopped-callback")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("stopped-callback")),
         8U,
     };
 
@@ -930,7 +943,7 @@ bool test_same_prefix_writer_is_rejected_before_mutation()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "writer lock temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("writer-lock")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("writer-lock")),
         8U,
     };
 
@@ -973,7 +986,7 @@ bool test_termination_at_rollover_boundary_is_incomplete()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "rollover boundary temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("rollover-boundary")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("rollover-boundary")),
         8U,
     };
 
@@ -1010,7 +1023,7 @@ bool test_forced_termination_recovers_flushed_incomplete_suffix()
     QTemporaryDir temp_dir;
     ok &= check(temp_dir.isValid(), "forced termination temp dir is valid");
     const Backend_output_capture_config config{
-        temp_dir.filePath(QStringLiteral("forced-termination")),
+        canonical_temp_file_path(temp_dir, QStringLiteral("forced-termination")),
         8U,
     };
 
