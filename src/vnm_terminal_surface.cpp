@@ -17,6 +17,8 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 
+#include <vnm_qt_dispatch/vnm_qt_dispatch.h>
+
 #include <QColor>
 #include <QClipboard>
 #include <QDateTime>
@@ -2040,7 +2042,7 @@ struct VNM_TerminalSurface::Private
             return;
         }
 
-        const bool queued = QMetaObject::invokeMethod(
+        const bool queued = vnm::qt::post(
             &surface,
             [surface_ptr = QPointer<VNM_TerminalSurface>(&surface)] {
                 if (surface_ptr == nullptr) {
@@ -2054,8 +2056,7 @@ struct VNM_TerminalSurface::Private
                     surface_private.request_backend_callback_frame_update_or_queue_posted_drain(
                         surface);
                 }
-            },
-            Qt::QueuedConnection);
+            }) == vnm::qt::Post_result::QUEUED;
         if (!queued) {
             backend_callback_frame_update_queued.store(false);
         }
@@ -2102,10 +2103,9 @@ struct VNM_TerminalSurface::Private
             return;
         }
 
-        const bool queued = QMetaObject::invokeMethod(
+        const bool queued = vnm::qt::post(
             &surface,
-            update_after_frame,
-            Qt::QueuedConnection);
+            update_after_frame) == vnm::qt::Post_result::QUEUED;
         if (!queued) {
             backend_callback_frame_update_queued.store(false);
         }
@@ -3027,14 +3027,19 @@ void VNM_TerminalSurface::start_msdf_availability_check()
     QPointer<VNM_TerminalSurface> self = this;
     QThreadPool::globalInstance()->start([self, font, generation]() {
         const bool available = term::qsg_atlas_msdf_text_available_for_font(font);
-        QMetaObject::invokeMethod(
+        const auto post_result = vnm::qt::post(
             qApp,
             [self, available, generation]() {
                 if (self) {
                     self->apply_msdf_availability_result(available, generation);
                 }
-            },
-            Qt::QueuedConnection);
+            });
+        if (post_result != vnm::qt::Post_result::QUEUED) {
+            qWarning(
+                "VNM_TerminalSurface: MSDF availability dispatch admission "
+                "failed (result %d).",
+                static_cast<int>(post_result));
+        }
     });
 }
 
@@ -3256,7 +3261,7 @@ void VNM_TerminalSurface::set_interaction_diagnostics_enabled(bool enabled)
         const QPointer<VNM_TerminalSurface> surface(this);
         term::set_interaction_trace_failure_handler(
             [surface](QString failure) {
-                QMetaObject::invokeMethod(
+                const auto post_result = vnm::qt::post(
                     QGuiApplication::instance(),
                     [surface, failure = std::move(failure)] {
                         if (surface == nullptr                         ||
@@ -3271,8 +3276,13 @@ void VNM_TerminalSurface::set_interaction_diagnostics_enabled(bool enabled)
                         surface->m_interaction_diagnostics_error = failure;
                         emit surface->interaction_diagnostics_error_changed();
                         emit surface->interaction_diagnostics_enabled_changed();
-                    },
-                    Qt::QueuedConnection);
+                    });
+                if (post_result != vnm::qt::Post_result::QUEUED) {
+                    qWarning(
+                        "VNM_TerminalSurface: interaction-trace failure "
+                        "dispatch admission failed (result %d).",
+                        static_cast<int>(post_result));
+                }
             });
     }
     if (!term::set_interaction_trace_enabled(enabled, &error)) {
@@ -7014,15 +7024,14 @@ void VNM_TerminalSurface::queue_backend_callback_drain()
         return;
     }
 
-    const bool queued = QMetaObject::invokeMethod(
+    const bool queued = vnm::qt::post(
         this,
         [this] {
             m_private->session_drain_queued.store(false);
             if (!m_private->shutting_down.load()) {
                 drain_backend_callback_events_for_posted_work();
             }
-        },
-        Qt::QueuedConnection);
+        }) == vnm::qt::Post_result::QUEUED;
     if (!queued) {
         // If the wakeup could not be posted, clear the latch so a later
         // backend callback can retry instead of losing the drain request.

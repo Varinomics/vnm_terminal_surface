@@ -8,6 +8,8 @@
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
 
+#include <vnm_qt_dispatch/vnm_qt_dispatch.h>
+
 #include <QByteArray>
 #include <QColor>
 #include <QCoreApplication>
@@ -10139,8 +10141,9 @@ int test_render_smoke(QGuiApplication& app, const char* backend)
         surface,
         std::make_shared<const term::Terminal_render_snapshot>(
             std::move(publication_snapshot)));
-    std::atomic_bool mutation_started = false;
-    std::atomic_bool mutation_done    = false;
+    std::atomic_bool mutation_started         = false;
+    std::atomic_bool mutation_done            = false;
+    std::atomic_bool mutation_dispatch_failed = false;
     const QMetaObject::Connection mutation_connection = QObject::connect(
         &window,
         &QQuickWindow::beforeRendering,
@@ -10160,13 +10163,15 @@ int test_render_smoke(QGuiApplication& app, const char* backend)
                 mutate();
             }
             else {
-                QMetaObject::invokeMethod(
+                const auto post_result = vnm::qt::post(
                     &surface,
                     [&]() {
                         mutate_surface_after_sync(surface);
                         mutation_done.store(true);
-                    },
-                    Qt::QueuedConnection);
+                    });
+                if (post_result != vnm::qt::Post_result::QUEUED) {
+                    mutation_dispatch_failed.store(true);
+                }
             }
         },
         Qt::DirectConnection);
@@ -10228,6 +10233,8 @@ int test_render_smoke(QGuiApplication& app, const char* backend)
         "threaded atlas smoke mutates GUI-thread state after sync through beforeRendering");
     ok &= check(!basic_loop || mutation_done.load(),
         "basic atlas smoke mutates GUI state after sync through beforeRendering");
+    ok &= check(!mutation_dispatch_failed.load(),
+        "atlas render smoke admits the GUI-thread mutation dispatch");
     ok &= check(coverage_ready &&
             atlas_report_has_prepare_glyph_coverage_evidence(report),
         "atlas smoke covers QRawFont glyphs through prepare");
