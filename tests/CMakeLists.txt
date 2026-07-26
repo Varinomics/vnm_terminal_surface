@@ -716,6 +716,7 @@ add_executable(vnm_terminal_qsg_atlas
 
 target_link_libraries(vnm_terminal_qsg_atlas PRIVATE
     vnm_terminal_surface::vnm_terminal_surface
+    vnm_qt_dispatch::vnm_qt_dispatch
     Qt6::QuickPrivate
 )
 
