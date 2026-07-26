@@ -12,7 +12,7 @@ set(VNM_TERMINAL_SURFACE_MSDF_TEXT_RENDERER_ENABLED
 find_dependency(Qt6
     "${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MAJOR}.${VNM_TERMINAL_SURFACE_QT_PRIVATE_API_VERSION_MINOR}"
     COMPONENTS Core Gui Quick QuickPrivate GuiPrivate)
-find_dependency(vnm_qt_dispatch CONFIG REQUIRED)
+find_dependency(vnm_qt_dispatch 2 CONFIG REQUIRED)
 
 if(VNM_TERMINAL_SURFACE_MSDF_TEXT_RENDERER_ENABLED)
     find_dependency(vnm_msdf_text CONFIG)
