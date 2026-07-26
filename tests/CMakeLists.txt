@@ -1163,6 +1163,32 @@ set_tests_properties(vnm_terminal_surface_host PROPERTIES
     TIMEOUT "${vnm_terminal_surface_host_timeout}"
 )
 
+add_executable(vnm_terminal_msdf_availability
+    msdf_availability/msdf_availability_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_msdf_availability PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_msdf_availability PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_msdf_availability
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_msdf_availability>"
+)
+
+set_tests_properties(vnm_terminal_msdf_availability PROPERTIES
+    LABELS "conformance;rendering;threading"
+    TIMEOUT 60
+)
+
 add_executable(vnm_terminal_input_encoder
     input_encoder/input_encoder_tests.cpp
 )
@@ -1847,6 +1873,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_render_frame
     vnm_terminal_qsg_atlas
     vnm_terminal_shaping_contract
+    vnm_terminal_msdf_availability
     vnm_terminal_input_encoder
     vnm_terminal_surface_host
     vnm_terminal_behavior_smoke

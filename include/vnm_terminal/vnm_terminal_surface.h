@@ -713,6 +713,7 @@ private:
     bool                     m_msdf_text_checking        = false;
     unsigned long long       m_msdf_availability_generation = 0;
     void start_msdf_availability_check();
+    void handle_msdf_availability_completion_timeout();
     void apply_msdf_availability_result(bool available, unsigned long long generation);
     QString                  m_terminal_title;
     QString                  m_terminal_icon_name;

@@ -39,6 +39,19 @@ if(NOT install_result EQUAL 0)
         "${install_stdout}${install_stderr}")
 endif()
 
+file(GLOB_RECURSE provider_config_paths
+    LIST_DIRECTORIES FALSE
+    "${install_dir}/vnm_qt_dispatchConfig.cmake")
+list(LENGTH provider_config_paths provider_config_count)
+if(NOT provider_config_count EQUAL 1)
+    message(FATAL_ERROR
+        "Expected one staged vnm_qt_dispatchConfig.cmake, found "
+        "${provider_config_count} under ${install_dir}")
+endif()
+list(GET provider_config_paths 0 provider_config_path)
+get_filename_component(
+    provider_package_dir "${provider_config_path}" DIRECTORY)
+
 set(installed_diagnostics_header
     "${install_dir}/include/vnm_terminal/diagnostics/metrics_json.h")
 if(NOT EXISTS "${installed_diagnostics_header}")
@@ -89,6 +102,13 @@ endif()
 if(DEFINED vnm_msdf_text_dir AND NOT "${vnm_msdf_text_dir}" STREQUAL "")
     list(APPEND configure_args "-Dvnm_msdf_text_DIR=${vnm_msdf_text_dir}")
 endif()
+list(APPEND configure_args
+    "-Dvnm_qt_dispatch_DIR:PATH=${provider_package_dir}"
+    "-DCMAKE_FIND_USE_PACKAGE_ROOT_PATH=FALSE"
+    "-DCMAKE_FIND_USE_PACKAGE_REGISTRY=FALSE"
+    "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=FALSE"
+    "-DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=TRUE"
+    "-DCMAKE_FIND_PACKAGE_NO_SYSTEM_PACKAGE_REGISTRY=TRUE")
 
 execute_process(
     COMMAND
@@ -105,6 +125,28 @@ if(NOT configure_result EQUAL 0)
     message(FATAL_ERROR
         "Package smoke consumer configure failed.\n"
         "${configure_stdout}${configure_stderr}")
+endif()
+
+set(consumer_cache "${consumer_binary_dir}/CMakeCache.txt")
+file(STRINGS "${consumer_cache}" provider_cache_entries
+    REGEX "^vnm_qt_dispatch_DIR:PATH=")
+list(LENGTH provider_cache_entries provider_cache_entry_count)
+if(NOT provider_cache_entry_count EQUAL 1)
+    message(FATAL_ERROR
+        "Package smoke cache does not contain exactly one "
+        "vnm_qt_dispatch_DIR entry:\n"
+        "  ${consumer_cache}")
+endif()
+list(GET provider_cache_entries 0 provider_cache_entry)
+string(REGEX REPLACE "^[^=]*=" "" resolved_provider_dir
+    "${provider_cache_entry}")
+file(REAL_PATH "${resolved_provider_dir}" resolved_provider_dir)
+file(REAL_PATH "${provider_package_dir}" provider_package_dir)
+if(NOT resolved_provider_dir STREQUAL provider_package_dir)
+    message(FATAL_ERROR
+        "Package smoke resolved vnm_qt_dispatch outside the staged prefix:\n"
+        "  expected=${provider_package_dir}\n"
+        "  actual=${resolved_provider_dir}")
 endif()
 
 set(consumer_build_args
