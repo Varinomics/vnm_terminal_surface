@@ -18,6 +18,7 @@ project(vnm_terminal_surface LANGUAGES CXX VERSION 1.3.2)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 include(CTest)
+include(FetchContent)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,6 +45,8 @@ set(VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS OFF CACHE BOOL
     "Prefer find_package dependencies for the MSDF text renderer dependency.")
 set(VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR "" CACHE PATH
     "Optional vnm_msdf_text source checkout used by the MSDF text renderer.")
+set(VNM_QT_DISPATCH_SOURCE_DIR "" CACHE PATH
+    "Optional path to a local vnm_qt_dispatch source checkout.")
 mark_as_advanced(
     VNM_TERMINAL_MSDF_TEXT_RENDERER_SOURCE_DIR
     VNM_TERMINAL_MSDF_TEXT_RENDERER_USE_SYSTEM_LIBS
@@ -84,6 +87,35 @@ set(vnm_terminal_qt_components
 
 find_package(Qt6 6.7 REQUIRED COMPONENTS ${vnm_terminal_qt_components})
 include(cmake/vnm_terminal_qt_posture.cmake)
+
+if(NOT TARGET vnm_qt_dispatch::vnm_qt_dispatch)
+    if(VNM_QT_DISPATCH_SOURCE_DIR)
+        if(NOT EXISTS "${VNM_QT_DISPATCH_SOURCE_DIR}/CMakeLists.txt")
+            message(FATAL_ERROR
+                "VNM_QT_DISPATCH_SOURCE_DIR does not contain a "
+                "vnm_qt_dispatch CMakeLists.txt:\n"
+                "  ${VNM_QT_DISPATCH_SOURCE_DIR}")
+        endif()
+        FetchContent_Declare(vnm_terminal_surface_qt_dispatch
+            SOURCE_DIR "${VNM_QT_DISPATCH_SOURCE_DIR}"
+            BINARY_DIR
+                "${CMAKE_BINARY_DIR}/_deps/vnm_qt_dispatch-build")
+    else()
+        FetchContent_Declare(vnm_terminal_surface_qt_dispatch
+            GIT_REPOSITORY
+                "https://github.com/Varinomics/vnm_qt_dispatch.git"
+            GIT_TAG master
+            GIT_SHALLOW FALSE
+            BINARY_DIR
+                "${CMAKE_BINARY_DIR}/_deps/vnm_qt_dispatch-build")
+    endif()
+    FetchContent_MakeAvailable(vnm_terminal_surface_qt_dispatch)
+endif()
+
+if(NOT TARGET vnm_qt_dispatch::vnm_qt_dispatch)
+    message(FATAL_ERROR
+        "vnm_qt_dispatch target is unavailable after dependency discovery.")
+endif()
 
 set(vnm_terminal_qt_targets
     Qt6::Core
@@ -220,6 +252,7 @@ target_link_libraries(vnm_terminal_surface PUBLIC
 target_link_libraries(vnm_terminal_surface PRIVATE
     Qt6::GuiPrivate
     Qt6::QuickPrivate
+    vnm_qt_dispatch::vnm_qt_dispatch
 )
 
 target_compile_definitions(vnm_terminal_surface PUBLIC

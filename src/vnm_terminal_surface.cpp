@@ -17,6 +17,8 @@
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 
+#include <vnm_qt_dispatch/vnm_qt_dispatch.h>
+
 #include <QColor>
 #include <QClipboard>
 #include <QDateTime>
@@ -84,6 +86,8 @@ constexpr qreal       k_angle_delta_per_wheel_step               = 120.0;
 constexpr int         k_plain_scroll_lines_per_angle_step        = 3;
 constexpr int         k_min_synchronized_output_stale_timeout_ms = 1;
 constexpr int         k_row_timestamp_tooltip_delay_ms           = 1000;
+constexpr int         k_msdf_availability_completion_poll_ms     = 10;
+constexpr int         k_msdf_availability_completion_timeout_ms  = 30000;
 constexpr std::size_t k_surface_output_queue_high_water_bytes    = 1024U * 1024U;
 constexpr std::size_t k_surface_output_queue_hard_limit_bytes    = 2U * 1024U * 1024U;
 constexpr std::chrono::milliseconds k_backend_callback_drain_budget{4};
@@ -105,6 +109,14 @@ QPointer<VNM_TerminalSurface>& interaction_trace_owner()
     static QPointer<VNM_TerminalSurface> owner;
     return owner;
 }
+
+struct Msdf_availability_completion
+{
+    static constexpr int k_dispatch_pending = -1;
+
+    unsigned long long generation = 0;
+    std::atomic<int>   dispatch_result{k_dispatch_pending};
+};
 
 // Extension the epoch-targeted frame drain may spend past the primary budget
 // to reach a cursor-stable stop point. Value 0 disables the extension, keeping
@@ -1986,7 +1998,7 @@ struct VNM_TerminalSurface::Private
             return;
         }
 
-        const bool queued = QMetaObject::invokeMethod(
+        const bool queued = vnm::qt::post(
             &surface,
             [surface_ptr = QPointer<VNM_TerminalSurface>(&surface)] {
                 if (surface_ptr == nullptr) {
@@ -2000,8 +2012,7 @@ struct VNM_TerminalSurface::Private
                     surface_private.request_backend_callback_frame_update_or_queue_posted_drain(
                         surface);
                 }
-            },
-            Qt::QueuedConnection);
+            }) == vnm::qt::Post_result::QUEUED;
         if (!queued) {
             backend_callback_frame_update_queued.store(false);
         }
@@ -2072,10 +2083,9 @@ struct VNM_TerminalSurface::Private
         }
 
         backend_callback_after_frame_wait_active = true;
-        const bool queued = QMetaObject::invokeMethod(
+        const bool queued = vnm::qt::post(
             &surface,
-            update_after_frame,
-            Qt::QueuedConnection);
+            update_after_frame) == vnm::qt::Post_result::QUEUED;
         if (!queued) {
             clear_backend_callback_after_frame_wait();
             backend_callback_frame_update_queued.store(false);
@@ -2892,6 +2902,9 @@ struct VNM_TerminalSurface::Private
     QString                                                warmed_prompt_text_layout_font_key;
     QTimer                                                 synchronized_output_recovery_timer;
     QTimer                                                 row_timestamp_tooltip_timer;
+    QTimer                                                 msdf_availability_completion_timer;
+    std::shared_ptr<Msdf_availability_completion>          msdf_availability_completion;
+    int                                                    msdf_availability_completion_polls_remaining = 0;
     std::optional<QPointF>                                 row_timestamp_tooltip_pointer_position;
     bool                                                   row_timestamp_tooltip_request_active  = false;
     bool                                                   selection_drag_active                 = false;
@@ -2999,6 +3012,15 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
         [this] {
             handle_row_timestamp_tooltip_timeout();
         });
+    m_private->msdf_availability_completion_timer.setInterval(
+        k_msdf_availability_completion_poll_ms);
+    QObject::connect(
+        &m_private->msdf_availability_completion_timer,
+        &QTimer::timeout,
+        this,
+        [this] {
+            handle_msdf_availability_completion_timeout();
+        });
     refresh_grid_metrics();
 }
 
@@ -3088,18 +3110,70 @@ void VNM_TerminalSurface::start_msdf_availability_check()
         emit msdf_text_checking_changed();
     }
 
+    auto completion = std::make_shared<Msdf_availability_completion>();
+    completion->generation = generation;
+    m_private->msdf_availability_completion = completion;
+    m_private->msdf_availability_completion_polls_remaining =
+        k_msdf_availability_completion_timeout_ms /
+        k_msdf_availability_completion_poll_ms;
+    m_private->msdf_availability_completion_timer.start();
+
     QPointer<VNM_TerminalSurface> self = this;
-    QThreadPool::globalInstance()->start([self, font, generation]() {
+    QThreadPool::globalInstance()->start([self, font, generation, completion]() {
         const bool available = term::qsg_atlas_msdf_text_available_for_font(font);
-        QMetaObject::invokeMethod(
+        const auto post_result = vnm::qt::post(
             qApp,
             [self, available, generation]() {
                 if (self) {
                     self->apply_msdf_availability_result(available, generation);
                 }
-            },
-            Qt::QueuedConnection);
+            });
+        completion->dispatch_result.store(
+            static_cast<int>(post_result),
+            std::memory_order_release);
     });
+}
+
+void VNM_TerminalSurface::handle_msdf_availability_completion_timeout()
+{
+    const std::shared_ptr<Msdf_availability_completion> completion =
+        m_private->msdf_availability_completion;
+    if (completion == nullptr ||
+        completion->generation != m_msdf_availability_generation)
+    {
+        m_private->msdf_availability_completion_timer.stop();
+        m_private->msdf_availability_completion.reset();
+        return;
+    }
+
+    const int dispatch_result =
+        completion->dispatch_result.load(std::memory_order_acquire);
+    const bool dispatch_rejected =
+        dispatch_result != Msdf_availability_completion::k_dispatch_pending &&
+        dispatch_result != static_cast<int>(vnm::qt::Post_result::QUEUED);
+    const bool completion_timed_out =
+        --m_private->msdf_availability_completion_polls_remaining <= 0;
+    if (!dispatch_rejected && !completion_timed_out) {
+        return;
+    }
+
+    m_private->msdf_availability_completion_timer.stop();
+    m_private->msdf_availability_completion.reset();
+    if (m_msdf_text_checking) {
+        m_msdf_text_checking = false;
+        emit msdf_text_checking_changed();
+    }
+
+    if (dispatch_rejected) {
+        qWarning(
+            "VNM_TerminalSurface: MSDF availability dispatch admission "
+            "failed (result %d).",
+            dispatch_result);
+    }
+    else {
+        qWarning(
+            "VNM_TerminalSurface: MSDF availability completion timed out.");
+    }
 }
 
 void VNM_TerminalSurface::apply_msdf_availability_result(
@@ -3109,6 +3183,8 @@ void VNM_TerminalSurface::apply_msdf_availability_result(
         return; // superseded by a newer font change
     }
 
+    m_private->msdf_availability_completion_timer.stop();
+    m_private->msdf_availability_completion.reset();
     if (m_msdf_text_checking) {
         m_msdf_text_checking = false;
         emit msdf_text_checking_changed();
@@ -3320,7 +3396,7 @@ void VNM_TerminalSurface::set_interaction_diagnostics_enabled(bool enabled)
         const QPointer<VNM_TerminalSurface> surface(this);
         term::set_interaction_trace_failure_handler(
             [surface](QString failure) {
-                QMetaObject::invokeMethod(
+                const auto post_result = vnm::qt::post(
                     QGuiApplication::instance(),
                     [surface, failure = std::move(failure)] {
                         if (surface == nullptr                         ||
@@ -3335,8 +3411,13 @@ void VNM_TerminalSurface::set_interaction_diagnostics_enabled(bool enabled)
                         surface->m_interaction_diagnostics_error = failure;
                         emit surface->interaction_diagnostics_error_changed();
                         emit surface->interaction_diagnostics_enabled_changed();
-                    },
-                    Qt::QueuedConnection);
+                    });
+                if (post_result != vnm::qt::Post_result::QUEUED) {
+                    qWarning(
+                        "VNM_TerminalSurface: interaction-trace failure "
+                        "dispatch admission failed (result %d).",
+                        static_cast<int>(post_result));
+                }
             });
     }
     if (!term::set_interaction_trace_enabled(enabled, &error)) {
@@ -7093,7 +7174,7 @@ void VNM_TerminalSurface::queue_backend_callback_drain()
         return;
     }
 
-    const bool queued = QMetaObject::invokeMethod(
+    const bool queued = vnm::qt::post(
         this,
         [this] {
             m_private->session_drain_queued.store(false);
@@ -7105,8 +7186,7 @@ void VNM_TerminalSurface::queue_backend_callback_drain()
                 }
                 drain_backend_callback_events_for_posted_work();
             }
-        },
-        Qt::QueuedConnection);
+        }) == vnm::qt::Post_result::QUEUED;
     if (!queued) {
         // If the wakeup could not be posted, clear the latch so a later
         // backend callback can retry instead of losing the drain request.
