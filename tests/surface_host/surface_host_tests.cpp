@@ -16271,12 +16271,7 @@ bool test_invalid_argv_reports_backend_error(QGuiApplication& app)
 int main(int argc, char** argv)
 {
     QGuiApplication app(argc, argv);
-    const QStringList arguments = app.arguments();
 
-    if (arguments.contains(QStringLiteral("--pending-mouse-input-preservation"))) {
-        const bool ok = test_pending_mouse_report_preserves_following_key_input(app);
-        return ok ? 0 : 1;
-    }
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
     ok &= test_surface_polish_refreshes_metrics_after_window_dpr_change(app);
