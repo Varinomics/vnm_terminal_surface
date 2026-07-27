@@ -94,6 +94,9 @@ constexpr std::chrono::milliseconds k_backend_callback_frame_pending_posted_drai
     k_backend_callback_drain_budget;
 constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget_default =
     k_backend_callback_drain_budget;
+// Six nominal 60 Hz frame intervals absorb ordinary compositor jitter while
+// bounding recovery when an accepted frame request produces no callback progress.
+constexpr int k_backend_callback_frame_progress_watchdog_ms = 100;
 constexpr char k_backend_callback_frame_catchup_budget_env[] =
     "VNM_TERMINAL_BACKEND_CALLBACK_FRAME_CATCHUP_BUDGET_MS";
 
@@ -130,79 +133,6 @@ void play_platform_bell()
     std::fflush(stderr);
 #endif
 }
-
-std::optional<std::uint64_t> live_content_publication_generation_from_snapshot(
-    const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot)
-{
-    if (snapshot == nullptr ||
-        !term::render_snapshot_is_live_content_publication(*snapshot))
-    {
-        return std::nullopt;
-    }
-
-    return snapshot->metadata.publication_generation;
-}
-
-class Cursor_withhold_state_owner
-{
-public:
-    void reset_session(std::uint64_t session_generation)
-    {
-        m_session_generation = session_generation;
-        clear_protection();
-    }
-
-    bool sync_active_session(
-        std::uint64_t                 session_generation,
-        std::optional<std::uint64_t>  live_content_publication_generation,
-        std::uint64_t                 settled_live_content_publication_generation)
-    {
-        if (session_generation != m_session_generation) {
-            reset_session(session_generation);
-        }
-
-        const bool before = cursor_withheld();
-        if (m_protected_live_content_publication_generation.has_value() &&
-            *m_protected_live_content_publication_generation <=
-                settled_live_content_publication_generation)
-        {
-            clear_protection();
-        }
-
-        if (live_content_publication_generation.has_value() &&
-            *live_content_publication_generation >
-                settled_live_content_publication_generation)
-        {
-            m_protected_live_content_publication_generation =
-                *live_content_publication_generation;
-        }
-
-        return cursor_withheld() != before;
-    }
-
-    bool cursor_withheld() const
-    {
-        return m_protected_live_content_publication_generation.has_value();
-    }
-
-    term::Cursor_withhold_state_snapshot snapshot() const
-    {
-        return {
-            m_session_generation,
-            m_protected_live_content_publication_generation.value_or(0U),
-            cursor_withheld(),
-        };
-    }
-
-private:
-    void clear_protection()
-    {
-        m_protected_live_content_publication_generation.reset();
-    }
-
-    std::uint64_t                  m_session_generation = 0U;
-    std::optional<std::uint64_t>   m_protected_live_content_publication_generation;
-};
 
 bool flush_clipboard_after_terminal_write()
 {
@@ -2007,11 +1937,26 @@ struct VNM_TerminalSurface::Private
             return;
         }
         if (!session->has_pending_backend_callback_events()) {
-            sync_cursor_withhold_from_session(surface, std::nullopt);
+            stop_backend_callback_frame_progress_watchdog();
             return;
         }
         if (!backend_callback_frame_target_live_visible(surface)) {
+            stop_backend_callback_frame_progress_watchdog();
             surface.queue_backend_callback_drain();
+            return;
+        }
+        if (session->output_backpressure_active()) {
+            // Once callback ingress has paused the backend, frame-paced slices
+            // cannot safely retain ownership: a following accepted burst can
+            // overlap the incomplete callback and reach the hard limit. The
+            // existing coalesced posted pump exclusively owns pressured catch-up
+            // until the queue falls below high water.
+            stop_backend_callback_frame_progress_watchdog();
+            surface.queue_backend_callback_drain();
+            return;
+        }
+        if (backend_callback_frame_progress_deadline_expired()) {
+            handle_backend_callback_frame_progress_watchdog_timeout(surface);
             return;
         }
 
@@ -2023,6 +1968,7 @@ struct VNM_TerminalSurface::Private
         }
 
         request_render_update(surface);
+        arm_backend_callback_frame_progress_watchdog();
     }
 
     void queue_backend_callback_frame_update_on_surface_thread(
@@ -2075,38 +2021,63 @@ struct VNM_TerminalSurface::Private
         {
             return;
         }
-
+        const std::uint64_t after_frame_wait_generation =
+            ++backend_callback_after_frame_wait_generation;
         const auto update_after_frame =
-            [surface_ptr = QPointer<VNM_TerminalSurface>(&surface)] {
+            [
+                surface_ptr = QPointer<VNM_TerminalSurface>(&surface),
+                after_frame_wait_generation
+            ] {
                 if (surface_ptr == nullptr) {
                     return;
                 }
 
                 VNM_TerminalSurface& surface = *surface_ptr;
                 auto& surface_private = *surface.m_private;
+                if (!surface_private.backend_callback_after_frame_wait_active ||
+                    surface_private.backend_callback_after_frame_wait_generation !=
+                        after_frame_wait_generation)
+                {
+                    ++surface_private.
+                        stale_after_frame_callback_ignored_count_for_testing;
+                    return;
+                }
+
+                surface_private.backend_callback_after_frame_wait_active = false;
+                surface_private.backend_callback_after_frame_connection = {};
                 surface_private.backend_callback_frame_update_queued.store(false);
                 if (!surface_private.shutting_down.load()) {
+                    if (surface_private.backend_callback_frame_progress_deadline_expired()) {
+                        surface_private.
+                            handle_backend_callback_frame_progress_watchdog_timeout(
+                                surface);
+                        return;
+                    }
                     surface_private.request_backend_callback_frame_update_or_queue_posted_drain(
                         surface);
                 }
             };
 
         if (QQuickWindow* render_window = surface.window(); render_window != nullptr) {
-            (void)QObject::connect(
+            backend_callback_after_frame_wait_active = true;
+            backend_callback_after_frame_connection = QObject::connect(
                 render_window,
                 &QQuickWindow::afterFrameEnd,
                 &surface,
                 update_after_frame,
                 static_cast<Qt::ConnectionType>(
                     Qt::QueuedConnection | Qt::SingleShotConnection));
+            arm_backend_callback_frame_progress_watchdog();
             return;
         }
 
+        backend_callback_after_frame_wait_active = true;
         const bool queued = QMetaObject::invokeMethod(
             &surface,
             update_after_frame,
             Qt::QueuedConnection);
         if (!queued) {
+            clear_backend_callback_after_frame_wait();
             backend_callback_frame_update_queued.store(false);
         }
     }
@@ -2121,10 +2092,110 @@ struct VNM_TerminalSurface::Private
         queue_backend_callback_frame_update_on_surface_thread(surface);
     }
 
+    void arm_backend_callback_frame_progress_watchdog()
+    {
+        // Qt may decline a requested frame, and afterFrameEnd can run without
+        // this surface reaching updatePolish. Callback-epoch completion, not
+        // partial snapshot publication, is the ownership progress that resets
+        // this deadline.
+        if (!backend_callback_frame_progress_deadline.has_value()) {
+            restart_backend_callback_frame_progress_watchdog();
+        }
+    }
+
+    void restart_backend_callback_frame_progress_watchdog()
+    {
+        backend_callback_frame_progress_deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds{
+                k_backend_callback_frame_progress_watchdog_ms};
+        backend_callback_frame_progress_watchdog.start(
+            k_backend_callback_frame_progress_watchdog_ms);
+    }
+
+    bool backend_callback_frame_progress_deadline_expired() const
+    {
+        return
+            backend_callback_frame_progress_deadline.has_value() &&
+            std::chrono::steady_clock::now() >=
+                *backend_callback_frame_progress_deadline;
+    }
+
+    void clear_backend_callback_after_frame_wait()
+    {
+        if (!backend_callback_after_frame_wait_active) {
+            return;
+        }
+
+        backend_callback_after_frame_wait_active = false;
+        ++backend_callback_after_frame_wait_generation;
+        QObject::disconnect(backend_callback_after_frame_connection);
+        backend_callback_after_frame_connection = {};
+    }
+
+    void stop_backend_callback_frame_progress_watchdog()
+    {
+        backend_callback_frame_progress_watchdog.stop();
+        backend_callback_frame_progress_deadline.reset();
+        if (backend_callback_after_frame_wait_active) {
+            clear_backend_callback_after_frame_wait();
+            backend_callback_frame_update_queued.store(false);
+        }
+    }
+
+    bool cancel_backend_callback_frame_update_wait()
+    {
+        const bool frame_update_queued =
+            backend_callback_frame_update_queued.exchange(false);
+        const bool watchdog_active =
+            backend_callback_frame_progress_deadline.has_value();
+        backend_callback_frame_progress_watchdog.stop();
+        backend_callback_frame_progress_deadline.reset();
+        clear_backend_callback_after_frame_wait();
+        return frame_update_queued || watchdog_active;
+    }
+
+    void handle_backend_callback_frame_progress_watchdog_timeout(
+        VNM_TerminalSurface& surface)
+    {
+        Q_ASSERT(surface.thread() == QThread::currentThread());
+
+        if (!backend_callback_frame_progress_deadline.has_value()) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < *backend_callback_frame_progress_deadline) {
+            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+                *backend_callback_frame_progress_deadline - now);
+            backend_callback_frame_progress_watchdog.start(
+                static_cast<int>(std::max<std::int64_t>(
+                    remaining.count(),
+                    1)));
+            return;
+        }
+
+        backend_callback_frame_progress_watchdog.stop();
+        backend_callback_frame_progress_deadline.reset();
+
+        if (backend_callback_after_frame_wait_active) {
+            clear_backend_callback_after_frame_wait();
+            backend_callback_frame_update_queued.store(false);
+        }
+        if (shutting_down.load() ||
+            session == nullptr   ||
+            !session->has_pending_backend_callback_events())
+        {
+            return;
+        }
+
+        ++backend_drain_stats.frame_progress_watchdog_firings;
+        surface.queue_backend_callback_drain();
+    }
+
     void cancel_backend_callback_frame_update_or_queue_posted_drain(
         VNM_TerminalSurface& surface)
     {
-        if (!backend_callback_frame_update_queued.exchange(false)) {
+        if (!cancel_backend_callback_frame_update_wait()) {
             return;
         }
 
@@ -2709,32 +2780,6 @@ struct VNM_TerminalSurface::Private
         return extension;
     }
 
-    void sync_cursor_withhold_from_session(
-        VNM_TerminalSurface&            surface,
-        std::optional<std::uint64_t>     live_content_publication_generation)
-    {
-        if (session == nullptr) {
-            return;
-        }
-
-        if (cursor_withhold_state.sync_active_session(
-                session_generation,
-                live_content_publication_generation,
-                session->settled_live_content_publication_generation()))
-        {
-            request_render_update(surface);
-        }
-    }
-
-    void reset_cursor_withhold_session(VNM_TerminalSurface& surface)
-    {
-        const bool cursor_withheld_before = cursor_withhold_state.cursor_withheld();
-        cursor_withhold_state.reset_session(session_generation);
-        if (cursor_withhold_state.cursor_withheld() != cursor_withheld_before) {
-            request_render_update(surface);
-        }
-    }
-
     void clear_selection_with_sync(VNM_TerminalSurface& surface)
     {
         if (session == nullptr) {
@@ -2796,14 +2841,20 @@ struct VNM_TerminalSurface::Private
     std::optional<std::chrono::steady_clock::duration>     backend_callback_frame_catchup_budget_override;
     std::optional<std::chrono::steady_clock::duration>
         backend_callback_frame_catchup_cursor_stable_stop_extension_override;
-    Cursor_withhold_state_owner                            cursor_withhold_state;
     int                                                    pending_published_mouse_report_block_count_for_testing = 0;
-    std::function<void()>                                  backend_event_epoch_notifier_hook_for_testing;
-    std::function<void()>                                  before_backend_callback_follow_up_hook_for_testing;
     std::function<void()>                                  audible_bell_handler;
     bool                                                   render_update_pending              = false;
     std::atomic_bool                                       backend_callback_frame_update_queued =
                                                            false;
+    QTimer                                                 backend_callback_frame_progress_watchdog;
+    std::optional<std::chrono::steady_clock::time_point>
+                                                           backend_callback_frame_progress_deadline;
+    bool                                                   backend_callback_after_frame_wait_active = false;
+    std::uint64_t                                          backend_callback_after_frame_wait_generation = 0U;
+    QMetaObject::Connection                                backend_callback_after_frame_connection;
+    std::uint64_t                                          stale_after_frame_callback_ignored_count_for_testing = 0U;
+    std::function<void()>
+        before_backend_callback_frame_owner_release_handler_for_testing;
     bool                                                   render_node_release_pending        = false;
     bool                                                   render_node_release_requeue_update = false;
     bool                                                   atlas_completion_pending           = false;
@@ -2868,6 +2919,8 @@ struct VNM_TerminalSurface::Private
     // These atomics are read by backend callback threads through the notifier.
     // reset_session() must close the session before Private storage is destroyed.
     std::atomic_bool                                       session_drain_queued                  = false;
+    std::atomic_bool                                       backend_callback_pressure_drain_requested =
+                                                           false;
     std::atomic_bool                                       shutting_down                         = false;
 };
 
@@ -2918,6 +2971,17 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
     setAcceptedMouseButtons(Qt::AllButtons);
     setAcceptHoverEvents(true);
     setFocus(true);
+    m_private->backend_callback_frame_progress_watchdog.setSingleShot(true);
+    m_private->backend_callback_frame_progress_watchdog.setInterval(
+        k_backend_callback_frame_progress_watchdog_ms);
+    QObject::connect(
+        &m_private->backend_callback_frame_progress_watchdog,
+        &QTimer::timeout,
+        this,
+        [this] {
+            m_private->handle_backend_callback_frame_progress_watchdog_timeout(
+                *this);
+        });
     m_private->synchronized_output_recovery_timer.setSingleShot(true);
     QObject::connect(
         &m_private->synchronized_output_recovery_timer,
@@ -6963,17 +7027,20 @@ bool VNM_TerminalSurface::start_process_with_backend(
         m_primary_repaint_recovery_enabled;
     session_config.bell_policy =
         terminal_bell_policy_for_surface(m_audible_bell_policy, m_visual_bell_policy);
-    session_config.backend_event_epoch_notifier = [this](std::uint64_t) {
-        if (m_private->backend_event_epoch_notifier_hook_for_testing) {
-            m_private->backend_event_epoch_notifier_hook_for_testing();
+    session_config.backend_event_epoch_notifier = [this](
+        std::uint64_t,
+        bool          callback_output_pressure) {
+        if (callback_output_pressure) {
+            queue_backend_callback_pressure_drain();
         }
-        m_private->schedule_backend_callback_frame_or_posted_drain(*this);
+        else {
+            m_private->schedule_backend_callback_frame_or_posted_drain(*this);
+        }
     };
 
     m_private->session =
         std::make_unique<term::Terminal_session>(std::move(backend), session_config);
     ++m_private->session_generation;
-    m_private->reset_cursor_withhold_session(*this);
     m_private->session->set_color_state(
         term::make_terminal_color_state(resolve_surface_color_scheme(*this)));
     m_private->resize_controller = std::make_unique<term::Terminal_resize_controller>(
@@ -7001,6 +7068,18 @@ bool VNM_TerminalSurface::start_process_with_backend(
     return true;
 }
 
+void VNM_TerminalSurface::queue_backend_callback_pressure_drain()
+{
+    if (m_private->shutting_down.load()) {
+        return;
+    }
+
+    // Callback ingress may run on a backend thread. Record pressure with an
+    // atomic only; the coalesced GUI wake owns all Qt frame-state cancellation.
+    m_private->backend_callback_pressure_drain_requested.store(true);
+    queue_backend_callback_drain();
+}
+
 void VNM_TerminalSurface::queue_backend_callback_drain()
 {
     if (m_private->shutting_down.load()) {
@@ -7018,7 +7097,12 @@ void VNM_TerminalSurface::queue_backend_callback_drain()
         this,
         [this] {
             m_private->session_drain_queued.store(false);
+            const bool pressure_owner =
+                m_private->backend_callback_pressure_drain_requested.exchange(false);
             if (!m_private->shutting_down.load()) {
+                if (pressure_owner) {
+                    (void)m_private->cancel_backend_callback_frame_update_wait();
+                }
                 drain_backend_callback_events_for_posted_work();
             }
         },
@@ -7173,6 +7257,8 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     }
 
     const std::uint64_t session_generation = m_private->session_generation;
+    const std::uint64_t callback_processed_epoch_before =
+        session->backend_callback_processed_epoch();
     const auto session_processing_started = std::chrono::steady_clock::now();
     if (target_backend_callback_epoch.has_value()) {
         result.stop =
@@ -7211,6 +7297,40 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         m_private->active_session_matches(session, session_generation);
     result.callbacks_pending_after_drain =
         session_still_active && session->has_pending_backend_callback_events();
+    if (session_still_active) {
+        if (!result.callbacks_pending_after_drain) {
+            const bool releases_after_frame_owner =
+                m_private->backend_callback_after_frame_wait_active;
+            if (releases_after_frame_owner &&
+                m_private->
+                    before_backend_callback_frame_owner_release_handler_for_testing)
+            {
+                std::function<void()> handler = std::move(
+                    m_private->
+                        before_backend_callback_frame_owner_release_handler_for_testing);
+                handler();
+            }
+            m_private->stop_backend_callback_frame_progress_watchdog();
+            if (releases_after_frame_owner) {
+                // Clear the active after-frame owner, then close its lost-wake
+                // window. An enqueue that coalesced before the clear needs a new
+                // dispatch; an enqueue after the clear schedules itself.
+                result.callbacks_pending_after_drain =
+                    session->has_pending_backend_callback_events();
+                if (result.callbacks_pending_after_drain) {
+                    m_private->schedule_backend_callback_frame_or_posted_drain(
+                        *this);
+                }
+            }
+        }
+        else
+        if (m_private->backend_callback_frame_progress_deadline.has_value() &&
+            session->backend_callback_processed_epoch() >
+                callback_processed_epoch_before)
+        {
+            m_private->restart_backend_callback_frame_progress_watchdog();
+        }
+    }
     if (budget.has_value()) {
         if (result.stop == term::Backend_callback_drain_stop::CURSOR_STABLE) {
             ++drain_stats.cursor_stable_incomplete;
@@ -7242,10 +7362,6 @@ request_backend_callback_follow_up_after_incomplete_recorded_drain(
     term::Backend_callback_drain_stop               stop,
     Backend_callback_incomplete_follow_up           follow_up)
 {
-    if (m_private->before_backend_callback_follow_up_hook_for_testing) {
-        m_private->before_backend_callback_follow_up_hook_for_testing();
-    }
-
     if (stop != term::Backend_callback_drain_stop::COMPLETE &&
         session != nullptr &&
         m_private->active_session_matches(session, session_generation) &&
@@ -7259,12 +7375,6 @@ request_backend_callback_follow_up_after_incomplete_recorded_drain(
             ++m_private->backend_drain_stats.requeue_count;
             queue_backend_callback_drain();
         }
-    }
-
-    if (session != nullptr &&
-        m_private->active_session_matches(session, session_generation))
-    {
-        m_private->sync_cursor_withhold_from_session(*this, std::nullopt);
     }
 }
 
@@ -7390,12 +7500,6 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
             render_snapshot_installed = true;
         }
     }
-
-    m_private->sync_cursor_withhold_from_session(
-        *this,
-        render_snapshot_installed
-            ? live_content_publication_generation_from_snapshot(m_private->render_snapshot)
-            : std::nullopt);
 
     if (!active_session_still_matches()) {
         return;
@@ -7722,13 +7826,15 @@ void VNM_TerminalSurface::reset_session()
     m_private->session.reset();
     m_private->transcript_recorder.reset();
     m_private->session_drain_queued.store(false);
-    m_private->backend_callback_frame_update_queued.store(false);
+    m_private->backend_callback_pressure_drain_requested.store(false);
+    (void)m_private->cancel_backend_callback_frame_update_wait();
+    m_private->
+        before_backend_callback_frame_owner_release_handler_for_testing = {};
     m_private->reset_atlas_completion();
     m_private->clear_mouse_reporting_state();
     m_private->clear_selection_drag_state();
     m_private->pending_clipboard_write.reset();
     m_private->clear_wheel_remainders();
-    m_private->reset_cursor_withhold_session(*this);
     m_private->last_sgr_mouse_reporting_active       = false;
     m_private->last_alternate_scroll_active          = false;
     m_private->last_alternate_scroll_mode_generation = 0U;
@@ -7761,7 +7867,6 @@ void VNM_TerminalSurface::updatePolish()
     term::Terminal_session* const session = m_private->session.get();
     const std::uint64_t session_generation = m_private->session_generation;
     if (!session->has_pending_backend_callback_events()) {
-        m_private->sync_cursor_withhold_from_session(*this, std::nullopt);
         if (session->render_snapshot_generation() !=
             m_private->last_installed_render_publication_generation)
         {
@@ -7852,8 +7957,6 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
         }
 
         term::Terminal_render_options options = render_options_for_surface(*this);
-        options.cursor_withheld =
-            m_private->cursor_withhold_state.cursor_withheld();
         term::Captured_atlas_frame captured_frame =
             term::capture_qsg_atlas_frame(
                 m_private->render_snapshot,
@@ -8068,6 +8171,30 @@ bool term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
     return surface.m_private->session_drain_queued.load();
 }
 
+bool term::VNM_TerminalSurface_render_bridge::
+backend_callback_frame_update_queued_for_testing(
+    const VNM_TerminalSurface& surface)
+{
+    return surface.m_private->backend_callback_frame_update_queued.load();
+}
+
+bool term::VNM_TerminalSurface_render_bridge::
+backend_callback_after_frame_wait_active_for_testing(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->backend_callback_after_frame_wait_active;
+}
+
+std::uint64_t term::VNM_TerminalSurface_render_bridge::
+stale_after_frame_callback_ignored_count_for_testing(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->
+        stale_after_frame_callback_ignored_count_for_testing;
+}
+
 std::size_t term::VNM_TerminalSurface_render_bridge::pending_backend_callback_count(
     const VNM_TerminalSurface& surface)
 {
@@ -8141,6 +8268,34 @@ term::VNM_TerminalSurface_render_bridge::backend_callback_frame_catchup_budget_f
     return surface.m_private->backend_callback_frame_catchup_budget();
 }
 
+std::chrono::milliseconds
+term::VNM_TerminalSurface_render_bridge::
+backend_callback_frame_progress_watchdog_interval_for_testing()
+{
+    return std::chrono::milliseconds{
+        k_backend_callback_frame_progress_watchdog_ms};
+}
+
+std::optional<std::chrono::steady_clock::time_point>
+term::VNM_TerminalSurface_render_bridge::
+backend_callback_frame_progress_deadline_for_testing(
+    const VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    return surface.m_private->backend_callback_frame_progress_deadline;
+}
+
+void term::VNM_TerminalSurface_render_bridge::
+set_before_backend_callback_frame_owner_release_handler_for_testing(
+    VNM_TerminalSurface&       surface,
+    std::function<void()>      handler)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    surface.m_private->
+        before_backend_callback_frame_owner_release_handler_for_testing =
+            std::move(handler);
+}
+
 void term::VNM_TerminalSurface_render_bridge::
 set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
     VNM_TerminalSurface&                    surface,
@@ -8173,26 +8328,6 @@ set_pending_published_mouse_report_block_count_for_testing(
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.m_private->pending_published_mouse_report_block_count_for_testing =
         std::max(0, count);
-}
-
-void term::VNM_TerminalSurface_render_bridge::
-set_backend_event_epoch_notifier_hook_for_testing(
-    VNM_TerminalSurface&   surface,
-    std::function<void()>  hook)
-{
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    surface.m_private->backend_event_epoch_notifier_hook_for_testing =
-        std::move(hook);
-}
-
-void term::VNM_TerminalSurface_render_bridge::
-set_before_backend_callback_follow_up_hook_for_testing(
-    VNM_TerminalSurface&   surface,
-    std::function<void()>  hook)
-{
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    surface.m_private->before_backend_callback_follow_up_hook_for_testing =
-        std::move(hook);
 }
 
 void term::VNM_TerminalSurface_render_bridge::set_audible_bell_handler_for_testing(
@@ -8331,14 +8466,6 @@ term::VNM_TerminalSurface_render_bridge::lifecycle_stats(
     return lifecycle_recorder != nullptr
         ? lifecycle_recorder->snapshot()
         : term::terminal_renderer_lifecycle_stats_t{};
-}
-
-term::Cursor_withhold_state_snapshot
-term::VNM_TerminalSurface_render_bridge::cursor_withhold_state_for_testing(
-    const VNM_TerminalSurface& surface)
-{
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    return surface.m_private->cursor_withhold_state.snapshot();
 }
 
 std::shared_ptr<term::Terminal_renderer_lifecycle_recorder>

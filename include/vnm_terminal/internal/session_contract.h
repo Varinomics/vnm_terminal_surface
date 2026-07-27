@@ -169,15 +169,19 @@ struct Terminal_bell_request
 
 struct Terminal_session_config
 {
-    // With backend_event_notifier set, output bytes are first bounded in the
-    // callback ingress and then transferred into the session output queue, so a
-    // stalled owner can transiently hold up to roughly two output hard limits.
+    // With either backend-event notifier set, output bytes are first bounded in
+    // callback ingress and then transferred into the session output queue, so
+    // a stalled owner can transiently hold up to roughly two output hard limits.
     Terminal_queue_limits           output_queue_limits;
     Terminal_queue_limits           write_queue_limits;
     Terminal_bell_policy            bell_policy;
     std::function<std::uint64_t()>  bell_clock_ms;
     std::function<void()>           backend_event_notifier;
-    std::function<void(std::uint64_t)>
+    // Runs after durable callback ingress and may run on a backend thread.
+    // The pressure bit is true when this accepted output callback has reached
+    // callback-ingress high water. Owners can select a pressure-safe wake path
+    // without reading or mutating GUI-thread state.
+    std::function<void(std::uint64_t, bool)>
                                     backend_event_epoch_notifier;
     std::size_t                     trace_command_limit                      = 0U;
     std::size_t                     trace_notification_limit                 = 0U;

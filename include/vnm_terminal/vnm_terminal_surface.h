@@ -640,6 +640,7 @@ private:
                                budgets);
     void drain_backend_callback_events_with_budget(std::optional<std::chrono::steady_clock::duration> budget);
     void drain_backend_callback_events_for_posted_work();
+    void queue_backend_callback_pressure_drain();
     void queue_backend_callback_drain();
     void refresh_active_session_geometry();
     void sync_from_session(

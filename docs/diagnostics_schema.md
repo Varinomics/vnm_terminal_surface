@@ -132,6 +132,7 @@ These diagnostics are `UNSTABLE`.
 | `requeue_count` | Counter | Count | Unstable |
 | `pending_callback_after_drain` | Counter | Count | Unstable |
 | `output_backpressure_after_drain` | Counter | Count | Unstable |
+| `frame_progress_watchdog_firings` | Counter | Count | Unstable |
 
 Budgeted drains that stop `UNSETTLED` increment
 `budget_exhausted_incomplete`. Budgeted drains that stop `CURSOR_STABLE`
@@ -139,6 +140,9 @@ increment `cursor_stable_incomplete`. `HELD` drains increment neither. When
 the cursor-stable extension is disabled, frame-drain DECTCM cursor-stable
 boundaries are reported as `UNSETTLED` for default-off behavior;
 synchronized-output release-stable stops remain `CURSOR_STABLE`.
+`frame_progress_watchdog_firings` increments when the bounded frame owner
+expires with callback work still pending and transfers that work to the posted
+drain pump.
 
 ## Descriptor model
 

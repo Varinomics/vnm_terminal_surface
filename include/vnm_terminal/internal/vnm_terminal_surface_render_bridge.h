@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 
 class VNM_TerminalSurface;
 
@@ -56,6 +57,7 @@ struct Terminal_surface_backend_drain_stats_t
     std::uint64_t                           requeue_count                        = 0U;
     std::uint64_t                           pending_callback_after_drain         = 0U;
     std::uint64_t                           output_backpressure_after_drain      = 0U;
+    std::uint64_t                           frame_progress_watchdog_firings      = 0U;
 };
 
 struct Render_profile_snapshot_t
@@ -66,13 +68,6 @@ struct Render_profile_snapshot_t
 #if VNM_TERMINAL_PROFILING_ENABLED
     terminal_text_layout_slow_diagnostics_t slow_text_layouts;
 #endif
-};
-
-struct Cursor_withhold_state_snapshot
-{
-    std::uint64_t                           session_generation = 0U;
-    std::uint64_t                           protected_live_content_publication_generation = 0U;
-    bool                                    cursor_withheld = false;
 };
 
 class VNM_TerminalSurface_render_bridge
@@ -138,6 +133,16 @@ public:
     static bool backend_callback_drain_queued(
         const VNM_TerminalSurface& surface);
 
+    static bool backend_callback_frame_update_queued_for_testing(
+        const VNM_TerminalSurface& surface);
+
+    static bool backend_callback_after_frame_wait_active_for_testing(
+        const VNM_TerminalSurface& surface);
+
+    static std::uint64_t
+        stale_after_frame_callback_ignored_count_for_testing(
+            const VNM_TerminalSurface& surface);
+
     static std::size_t pending_backend_callback_count(
         const VNM_TerminalSurface& surface);
 
@@ -163,6 +168,18 @@ public:
     static std::chrono::steady_clock::duration backend_callback_frame_catchup_budget_for_testing(
         const VNM_TerminalSurface& surface);
 
+    static std::chrono::milliseconds
+        backend_callback_frame_progress_watchdog_interval_for_testing();
+
+    static std::optional<std::chrono::steady_clock::time_point>
+        backend_callback_frame_progress_deadline_for_testing(
+            const VNM_TerminalSurface& surface);
+
+    static void
+        set_before_backend_callback_frame_owner_release_handler_for_testing(
+            VNM_TerminalSurface&       surface,
+            std::function<void()>      handler);
+
     static void set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
         VNM_TerminalSurface&                    surface,
         std::chrono::steady_clock::duration     extension);
@@ -174,14 +191,6 @@ public:
     static void set_pending_published_mouse_report_block_count_for_testing(
         VNM_TerminalSurface&       surface,
         int                        count);
-
-    static void set_backend_event_epoch_notifier_hook_for_testing(
-        VNM_TerminalSurface&       surface,
-        std::function<void()>      hook);
-
-    static void set_before_backend_callback_follow_up_hook_for_testing(
-        VNM_TerminalSurface&       surface,
-        std::function<void()>      hook);
 
     static void set_audible_bell_handler_for_testing(
         VNM_TerminalSurface&       surface,
@@ -231,9 +240,6 @@ public:
         VNM_TerminalSurface& surface);
 
     static terminal_renderer_lifecycle_stats_t lifecycle_stats(
-        const VNM_TerminalSurface& surface);
-
-    static Cursor_withhold_state_snapshot cursor_withhold_state_for_testing(
         const VNM_TerminalSurface& surface);
 
     static std::shared_ptr<Terminal_renderer_lifecycle_recorder> lifecycle_recorder(

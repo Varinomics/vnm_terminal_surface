@@ -866,6 +866,7 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
             "requeue_count",
             "pending_callback_after_drain",
             "output_backpressure_after_drain",
+            "frame_progress_watchdog_firings",
         },
         {});
 

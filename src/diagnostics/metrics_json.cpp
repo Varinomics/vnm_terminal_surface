@@ -565,6 +565,10 @@ void append_backend_drain_metrics_json(
         out,
         "output_backpressure_after_drain",
         stats.output_backpressure_after_drain);
+    insert_json_counter(
+        out,
+        "frame_progress_watchdog_firings",
+        stats.frame_progress_watchdog_firings);
 }
 
 void append_retained_history_metrics_json(
