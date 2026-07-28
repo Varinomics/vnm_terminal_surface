@@ -1787,6 +1787,10 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_backend_output_capture>"
 )
 
+set_tests_properties(vnm_terminal_backend_output_capture PROPERTIES
+    TIMEOUT 60
+)
+
 if(WIN32)
     add_executable(vnm_terminal_windows_conpty_backend
         windows_conpty_backend/windows_conpty_backend_tests.cpp

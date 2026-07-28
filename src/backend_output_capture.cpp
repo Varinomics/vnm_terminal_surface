@@ -985,6 +985,12 @@ public:
         std::lock_guard<std::mutex> lock(m_mutex);
         m_test_fault = fault;
     }
+
+    bool current_file_is_thread_neutral_for_testing()
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_current_file && m_current_file->thread() == nullptr;
+    }
 #endif
 
 private:
@@ -1143,6 +1149,14 @@ private:
 
         const QString path = segment_path(m_layout, m_next_sequence);
         auto file = std::make_unique<QFile>(path);
+        file->moveToThread(nullptr);
+        if (file->thread() != nullptr) {
+            m_error = QStringLiteral(
+                "backend output capture could not detach segment file \"%1\" "
+                "from its creating thread")
+                .arg(path);
+            return false;
+        }
         if (!file->open(QIODevice::WriteOnly | QIODevice::NewOnly)) {
             m_error = QStringLiteral(
                 "backend output capture open failed for \"%1\": %2")
@@ -1283,6 +1297,11 @@ void Backend_output_capture_writer::set_test_fault(
     Backend_output_capture_test_fault fault)
 {
     m_state->set_test_fault(fault);
+}
+
+bool Backend_output_capture_writer::current_file_is_thread_neutral_for_testing()
+{
+    return m_state->current_file_is_thread_neutral_for_testing();
 }
 #endif
 
