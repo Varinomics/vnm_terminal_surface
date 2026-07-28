@@ -42,6 +42,7 @@ public:
 
 #if defined(VNM_TERMINAL_CAPTURE_TEST_HOOKS)
     void set_test_fault(Backend_output_capture_test_fault fault);
+    bool current_file_is_thread_neutral_for_testing();
 #endif
 
 private:

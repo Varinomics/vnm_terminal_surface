@@ -8,16 +8,20 @@
 #include <QDir>
 #include <QFile>
 #include <QIODevice>
+#include <QPointer>
 #include <QProcess>
 #include <QString>
 #include <QStringList>
 #include <QTemporaryDir>
 #include <QThread>
+#include <QtLogging>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -31,6 +35,49 @@ using vnm_terminal::Backend_output_capture_recovery;
 using vnm_terminal::Backend_output_capture_status;
 using vnm_terminal::test_helpers::check;
 using term::Backend_output_capture_test_fault;
+
+std::mutex           qt_warning_mutex;
+std::vector<QString> qt_warning_messages;
+
+void capture_qt_warnings(
+    QtMsgType                 type,
+    const QMessageLogContext&,
+    const QString&            message)
+{
+    if (type != QtWarningMsg) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(qt_warning_mutex);
+    qt_warning_messages.push_back(message);
+}
+
+class Scoped_qt_warning_capture final
+{
+public:
+    Scoped_qt_warning_capture()
+    {
+        {
+            std::lock_guard<std::mutex> lock(qt_warning_mutex);
+            qt_warning_messages.clear();
+        }
+        m_previous_handler = qInstallMessageHandler(capture_qt_warnings);
+    }
+
+    ~Scoped_qt_warning_capture()
+    {
+        qInstallMessageHandler(m_previous_handler);
+    }
+
+    std::vector<QString> messages() const
+    {
+        std::lock_guard<std::mutex> lock(qt_warning_mutex);
+        return qt_warning_messages;
+    }
+
+private:
+    QtMessageHandler m_previous_handler = nullptr;
+};
 
 QString segment_path(
     const Backend_output_capture_config& config,
@@ -522,6 +569,61 @@ bool test_explicit_finalize_controls_capture_completion()
         "append invalidates the prior completion manifest before mutation");
     ok &= check(recovered_bytes(recovery) == QByteArrayLiteral("resume"),
         "resumed capture preserves appended raw bytes");
+
+    return ok;
+}
+
+bool test_raw_producer_file_lifecycle_is_thread_neutral()
+{
+    bool ok = true;
+
+    QTemporaryDir temp_dir;
+    ok &= check(temp_dir.isValid(),
+        "raw producer affinity temp dir is valid");
+    const Backend_output_capture_config config{
+        canonical_temp_file_path(temp_dir, QStringLiteral("raw-producer-affinity")),
+        8U,
+    };
+
+    std::vector<QString> qt_warnings;
+    {
+        auto writer = std::make_unique<term::Backend_output_capture_writer>(config);
+        term::Backend_output_capture_writer_result append_result;
+        term::Backend_output_capture_writer_result finalize_result;
+        QPointer<QThread> producer_qthread;
+
+        Scoped_qt_warning_capture warning_capture;
+        std::thread producer([&] {
+            producer_qthread = QThread::currentThread();
+            append_result = writer->append(QByteArrayLiteral("abcd"));
+        });
+        producer.join();
+
+        ok &= check(append_result.accepted,
+            "raw producer thread appends to backend capture");
+        ok &= check(writer->current_file_is_thread_neutral_for_testing(),
+            "stored backend capture file has no Qt thread affinity");
+        ok &= check(producer_qthread.isNull(),
+            "stored backend capture file does not retain the adopted producer thread");
+
+        std::thread finalizer([&] {
+            finalize_result = writer->finalize();
+        });
+        finalizer.join();
+        ok &= check(finalize_result.accepted,
+            "different raw thread finalizes backend capture");
+
+        writer.reset();
+        qt_warnings = warning_capture.messages();
+    }
+    ok &= check(qt_warnings.empty(),
+        "cross-thread backend capture lifecycle emits no Qt warning");
+
+    const Backend_output_capture_recovery recovery =
+        vnm_terminal::recover_backend_output_capture(config);
+    ok &= check(recovery.status == Backend_output_capture_status::FINALIZED &&
+        recovered_bytes(recovery) == QByteArrayLiteral("abcd"),
+        "cross-thread backend capture lifecycle preserves serialized output");
 
     return ok;
 }
@@ -1089,6 +1191,7 @@ int main(int argc, char** argv)
     ok &= test_partial_finalized_marker_is_recoverable_as_incomplete();
     ok &= test_partial_completion_manifest_is_recoverable_as_incomplete();
     ok &= test_explicit_finalize_controls_capture_completion();
+    ok &= test_raw_producer_file_lifecycle_is_thread_neutral();
     ok &= test_public_artifact_inspection_owns_complete_capture_schema();
     ok &= test_finalize_does_not_mask_recovered_incomplete_segment();
     ok &= test_writer_is_poisoned_after_write_or_flush_failure();
