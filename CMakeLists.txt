@@ -362,6 +362,13 @@ install(FILES
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal/diagnostics"
 )
 
+install(FILES
+    LICENSE
+    LICENSES/Ubuntu-Font-Licence-1.0.txt
+    THIRD_PARTY_NOTICES.md
+    DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/vnm_terminal_surface"
+)
+
 install(EXPORT vnm_terminal_surfaceTargets
     NAMESPACE vnm_terminal_surface::
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/vnm_terminal_surface"
