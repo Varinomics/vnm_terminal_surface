@@ -39,6 +39,30 @@ if(NOT install_result EQUAL 0)
         "${install_stdout}${install_stderr}")
 endif()
 
+set(installed_license
+    "${install_dir}/share/licenses/vnm_terminal_surface/LICENSE")
+if(NOT EXISTS "${installed_license}")
+    message(FATAL_ERROR
+        "Package smoke expected installed project license at "
+        "${installed_license}")
+endif()
+
+set(installed_third_party_notices
+    "${install_dir}/share/licenses/vnm_terminal_surface/THIRD_PARTY_NOTICES.md")
+if(NOT EXISTS "${installed_third_party_notices}")
+    message(FATAL_ERROR
+        "Package smoke expected installed third-party notices at "
+        "${installed_third_party_notices}")
+endif()
+
+set(installed_ubuntu_font_licence
+    "${install_dir}/share/licenses/vnm_terminal_surface/Ubuntu-Font-Licence-1.0.txt")
+if(NOT EXISTS "${installed_ubuntu_font_licence}")
+    message(FATAL_ERROR
+        "Package smoke expected installed Ubuntu Font Licence at "
+        "${installed_ubuntu_font_licence}")
+endif()
+
 file(GLOB_RECURSE provider_config_paths
     LIST_DIRECTORIES FALSE
     "${install_dir}/vnm_qt_dispatchConfig.cmake")
