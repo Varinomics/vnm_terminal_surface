@@ -1961,6 +1961,29 @@ set_tests_properties(vnm_terminal_surface_rejects_distribution_transcript_build 
     TIMEOUT 30
 )
 
+if(PROJECT_VERSION_PATCH GREATER 0)
+    math(EXPR vnm_terminal_surface_previous_patch
+        "${PROJECT_VERSION_PATCH} - 1")
+    set(vnm_terminal_surface_previous_version
+        "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${vnm_terminal_surface_previous_patch}")
+elseif(PROJECT_VERSION_MINOR GREATER 0)
+    math(EXPR vnm_terminal_surface_previous_minor
+        "${PROJECT_VERSION_MINOR} - 1")
+    set(vnm_terminal_surface_previous_version
+        "${PROJECT_VERSION_MAJOR}.${vnm_terminal_surface_previous_minor}.0")
+elseif(PROJECT_VERSION_MAJOR GREATER 0)
+    math(EXPR vnm_terminal_surface_previous_major
+        "${PROJECT_VERSION_MAJOR} - 1")
+    set(vnm_terminal_surface_previous_version
+        "${vnm_terminal_surface_previous_major}.0.0")
+else()
+    message(FATAL_ERROR
+        "Cannot derive an older adjacent package version from ${PROJECT_VERSION}")
+endif()
+math(EXPR vnm_terminal_surface_next_patch "${PROJECT_VERSION_PATCH} + 1")
+set(vnm_terminal_surface_next_version
+    "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${vnm_terminal_surface_next_patch}")
+
 add_test(
     NAME vnm_terminal_surface_package_consumer_builds
     COMMAND
@@ -1970,6 +1993,10 @@ add_test(
         "-Dgenerator_toolset=${CMAKE_GENERATOR_TOOLSET}"
         "-Dmake_program=${CMAKE_MAKE_PROGRAM}"
         "-Dpackage_binary_dir=${CMAKE_BINARY_DIR}"
+        "-Dpackage_version=${PROJECT_VERSION}"
+        "-Dabbreviated_package_version=${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}"
+        "-Dprevious_package_version=${vnm_terminal_surface_previous_version}"
+        "-Dnext_package_version=${vnm_terminal_surface_next_version}"
         "-Dinstall_config=$<CONFIG>"
         "-Dinstall_dir=${CMAKE_CURRENT_BINARY_DIR}/package_smoke_consumer/install"
         "-Dconsumer_source_dir=${PROJECT_SOURCE_DIR}/tests/package_smoke"
