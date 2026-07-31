@@ -1,5 +1,9 @@
 foreach(required_var IN ITEMS
     package_binary_dir
+    package_version
+    abbreviated_package_version
+    previous_package_version
+    next_package_version
     install_dir
     consumer_source_dir
     consumer_binary_dir)
@@ -23,7 +27,8 @@ endif()
 
 file(REMOVE_RECURSE
     "${install_dir}"
-    "${consumer_binary_dir}")
+    "${consumer_binary_dir}"
+    "${consumer_binary_dir}_version_policy")
 
 execute_process(
     COMMAND
@@ -37,6 +42,30 @@ if(NOT install_result EQUAL 0)
     message(FATAL_ERROR
         "Failed to install vnm_terminal_surface for package smoke.\n"
         "${install_stdout}${install_stderr}")
+endif()
+
+set(installed_license
+    "${install_dir}/share/licenses/vnm_terminal_surface/LICENSE")
+if(NOT EXISTS "${installed_license}")
+    message(FATAL_ERROR
+        "Package smoke expected installed project license at "
+        "${installed_license}")
+endif()
+
+set(installed_third_party_notices
+    "${install_dir}/share/licenses/vnm_terminal_surface/THIRD_PARTY_NOTICES.md")
+if(NOT EXISTS "${installed_third_party_notices}")
+    message(FATAL_ERROR
+        "Package smoke expected installed third-party notices at "
+        "${installed_third_party_notices}")
+endif()
+
+set(installed_ubuntu_font_licence
+    "${install_dir}/share/licenses/vnm_terminal_surface/Ubuntu-Font-Licence-1.0.txt")
+if(NOT EXISTS "${installed_ubuntu_font_licence}")
+    message(FATAL_ERROR
+        "Package smoke expected installed Ubuntu Font Licence at "
+        "${installed_ubuntu_font_licence}")
 endif()
 
 file(GLOB_RECURSE provider_config_paths
@@ -109,6 +138,55 @@ list(APPEND configure_args
     "-DCMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY=FALSE"
     "-DCMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY=TRUE"
     "-DCMAKE_FIND_PACKAGE_NO_SYSTEM_PACKAGE_REGISTRY=TRUE")
+
+function(expect_package_version_request request expected_success)
+    string(REPLACE "." "_" request_label "${request}")
+    set(version_source_dir
+        "${consumer_binary_dir}_version_policy/${request_label}/source")
+    set(version_binary_dir
+        "${consumer_binary_dir}_version_policy/${request_label}/build")
+
+    file(MAKE_DIRECTORY "${version_source_dir}")
+    file(WRITE "${version_source_dir}/CMakeLists.txt"
+        "cmake_minimum_required(VERSION 3.21)\n"
+        "project(vnm_terminal_surface_version_consumer LANGUAGES CXX)\n"
+        "find_package(vnm_terminal_surface ${request} CONFIG REQUIRED)\n")
+
+    execute_process(
+        COMMAND
+            "${CMAKE_COMMAND}"
+            ${configure_args}
+            -S "${version_source_dir}"
+            -B "${version_binary_dir}"
+            "-DCMAKE_PREFIX_PATH=${install_dir}"
+        RESULT_VARIABLE version_configure_result
+        OUTPUT_VARIABLE version_configure_stdout
+        ERROR_VARIABLE version_configure_stderr)
+
+    set(version_configure_output
+        "${version_configure_stdout}${version_configure_stderr}")
+    if(expected_success)
+        if(NOT version_configure_result EQUAL 0)
+            message(FATAL_ERROR
+                "Installed package rejected current version ${request}.\n"
+                "${version_configure_output}")
+        endif()
+    elseif(version_configure_result EQUAL 0)
+        message(FATAL_ERROR
+            "Installed package accepted non-current version ${request}; "
+            "expected exact current version ${package_version}.")
+    elseif(NOT version_configure_output MATCHES
+        "compatible with requested version|considered but not accepted")
+        message(FATAL_ERROR
+            "Installed package rejected ${request} for an unexpected reason.\n"
+            "${version_configure_output}")
+    endif()
+endfunction()
+
+expect_package_version_request("${package_version}" TRUE)
+expect_package_version_request("${abbreviated_package_version}" FALSE)
+expect_package_version_request("${previous_package_version}" FALSE)
+expect_package_version_request("${next_package_version}" FALSE)
 
 execute_process(
     COMMAND
