@@ -1303,6 +1303,7 @@ if(WIN32 OR CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin)$")
             "${CMAKE_COMMAND}" -E env
             ${vnm_terminal_qt_offscreen_environment}
             ${vnm_terminal_qt_unscaled_environment}
+            "VNM_INHERITED_PROBE=host-value"
             "${vnm_terminal_qt_runtime_path}"
             "$<TARGET_FILE:vnm_terminal_compat_smoke>"
             "$<TARGET_FILE:vnm_terminal_canvas_fixture>"

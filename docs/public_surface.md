@@ -154,6 +154,36 @@ startup failure, or a second start while a process is live returns `false` and
 reports a typed backend error. Starting again after a process has exited resets
 the old session before launching the new one.
 
+The invokable two-argument `start_process()` inherits the host process
+environment at backend start and remains the QML launch entry point.
+`start_process_with_exact_environment(QStringList argv, const
+QProcessEnvironment& environment_snapshot, QString working_directory = {})` is
+the C++ entry point for a per-launch snapshot. It copies every key and value,
+including present empty values, during the call and does not inherit variables
+from the host environment afterward. Passing
+`QProcessEnvironment::InheritFromParent` therefore supplies no keys; the method
+does not enable Qt's inheritance sentinel.
+
+Terminal identity is still part of the backend contract: the backend supplies
+its default `TERM` and `COLORTERM` values before applying the copied snapshot,
+so snapshot entries with those names replace the defaults. A missing `TERM`
+uses the backend default, while an explicitly empty `TERM` is rejected by the
+launch validation. On Windows this invariant covers every casing variant of
+`TERM`; on POSIX it covers the exact uppercase name. Environment `SET` values
+containing an embedded NUL are also rejected before native process launch.
+These rejected launches create no child process, report
+`INVALID_LAUNCH_CONFIG`, and leave the surface available for a corrected retry.
+
+Environment-name identity follows `QProcessEnvironment`. Names are
+case-sensitive on POSIX. On Windows they are case-insensitive and
+case-preserving, so casing variants occupy one key and the most recently
+inserted value replaces the previous value before the surface copies the
+snapshot. This prevents a launch snapshot from carrying ambiguous Windows
+case-colliding entries. Windows snapshots may also contain the magic
+environment entries whose names begin with `=` (for example, per-drive current
+directories); exact launch preserves them. Environment names containing `=` in
+any other position are rejected.
+
 Initial rows and columns come from the item size, font metrics, and device pixel
 ratio. Hosts should size the item before launch. Later geometry, font, screen,
 or device-pixel-ratio changes refresh the grid and send ordered resize requests

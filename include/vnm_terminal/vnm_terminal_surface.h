@@ -5,6 +5,7 @@
 #include <QQuickItem>
 #include <QByteArray>
 #include <QDateTime>
+#include <QProcessEnvironment>
 #include <QString>
 #include <QStringList>
 #include <QVariant>
@@ -30,6 +31,7 @@ class Terminal_session;
 enum class Backend_callback_drain_stop : std::uint8_t;
 struct backend_callback_drain_budgets_t;
 struct Terminal_backend_error;
+struct Terminal_launch_config;
 struct Terminal_viewport_state;
 struct Terminal_session_notification;
 struct Terminal_session_result;
@@ -474,6 +476,18 @@ public:
         int                    offset_from_tail,
         QString                source);
     Q_INVOKABLE bool start_process(QStringList argv, QString working_directory = {});
+    /**
+     * Starts a child without inheriting the process environment.
+     *
+     * The environment snapshot is copied during this call. On Windows,
+     * QProcessEnvironment has one case-insensitive, case-preserving key space,
+     * so case-colliding inserts are resolved before the snapshot reaches this
+     * boundary.
+     */
+    bool start_process_with_exact_environment(
+        QStringList                argv,
+        const QProcessEnvironment& environment_snapshot,
+        QString                    working_directory = {});
     Q_INVOKABLE bool interrupt_process();
     Q_INVOKABLE bool terminate_process();
 
@@ -589,11 +603,15 @@ private:
     void handle_scene_graph_invalidated(
         std::uint64_t          window_binding_generation);
 
+    bool start_process_with_native_backend(
+        vnm_terminal::internal::Terminal_launch_config
+                               launch_config);
+
     bool start_process_with_backend(
         std::unique_ptr<vnm_terminal::internal::Terminal_backend>
                                backend,
-        QStringList            argv,
-        QString                working_directory);
+        vnm_terminal::internal::Terminal_launch_config
+                               launch_config);
 
     struct backend_callback_drain_result_t
     {

@@ -190,7 +190,29 @@ inline bool is_backend_rejection(const Terminal_backend_result& result)
 
 inline bool is_valid_environment_name(const QString& name)
 {
-    return !name.isEmpty() && !name.contains(QChar(u'=')) && !name.contains(QChar(u'\0'));
+    if (name.isEmpty() || name.contains(QChar(u'\0'))) {
+        return false;
+    }
+
+#if defined(_WIN32)
+    const qsizetype first_equals = name.indexOf(QChar(u'='));
+    return
+        first_equals < 0 ||
+        (first_equals == 0 &&
+         name.size() > 1 &&
+         name.indexOf(QChar(u'='), 1) < 0);
+#else
+    return !name.contains(QChar(u'='));
+#endif
+}
+
+inline bool environment_names_equal(const QString& lhs, const QString& rhs)
+{
+#if defined(_WIN32)
+    return lhs.compare(rhs, Qt::CaseInsensitive) == 0;
+#else
+    return lhs == rhs;
+#endif
 }
 
 inline bool is_valid_grid_size(terminal_grid_size_t grid_size)
@@ -224,15 +246,33 @@ inline Terminal_backend_result validate_launch_config(
                 QStringLiteral("TERM identity must be non-empty"));
     }
 
+    if (config.identity.term.contains(QChar(u'\0')) ||
+        config.identity.colorterm.contains(QChar(u'\0')))
+    {
+        return
+            backend_reject(
+                Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
+                QStringLiteral("terminal identity values must not contain NUL"));
+    }
+
     for (const Terminal_environment_edit& edit : config.environment_edits) {
         if (!is_valid_environment_name(edit.name)) {
             return
                 backend_reject(
                     Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
-                    QStringLiteral("environment edit names must be non-empty variables"));
+                    QStringLiteral("environment edit names are not valid on this platform"));
         }
 
-        if (edit.name == QStringLiteral("TERM") &&
+        if (edit.operation == Terminal_environment_operation::SET &&
+            edit.value.contains(QChar(u'\0')))
+        {
+            return
+                backend_reject(
+                    Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
+                    QStringLiteral("environment SET values must not contain NUL"));
+        }
+
+        if (environment_names_equal(edit.name, QStringLiteral("TERM")) &&
             (edit.operation == Terminal_environment_operation::UNSET ||
              edit.value.trimmed().isEmpty()))
         {
@@ -269,10 +309,6 @@ inline QProcessEnvironment build_launch_environment(
         else {
             environment.remove(edit.name);
         }
-    }
-
-    if (environment.value(QStringLiteral("TERM")).trimmed().isEmpty()) {
-        environment.insert(QStringLiteral("TERM"), config.identity.term);
     }
 
     return environment;

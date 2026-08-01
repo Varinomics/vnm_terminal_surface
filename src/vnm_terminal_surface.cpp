@@ -31,6 +31,7 @@
 #include <QMetaObject>
 #include <QMouseEvent>
 #include <QPointer>
+#include <QProcessEnvironment>
 #include <QThreadPool>
 #include <QQuickWindow>
 #include <QScreen>
@@ -4503,6 +4504,41 @@ bool VNM_TerminalSurface::start_process(QStringList argv, QString working_direct
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
+    term::Terminal_launch_config launch_config;
+    launch_config.argv              = std::move(argv);
+    launch_config.working_directory = std::move(working_directory);
+    return start_process_with_native_backend(std::move(launch_config));
+}
+
+bool VNM_TerminalSurface::start_process_with_exact_environment(
+    QStringList                argv,
+    const QProcessEnvironment& environment_snapshot,
+    QString                    working_directory)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    term::Terminal_launch_config launch_config;
+    launch_config.argv                = std::move(argv);
+    launch_config.working_directory   = std::move(working_directory);
+    launch_config.inherit_environment = false;
+
+    const QStringList environment_names = environment_snapshot.keys();
+    launch_config.environment_edits.reserve(
+        static_cast<std::size_t>(environment_names.size()));
+    for (const QString& name : environment_names) {
+        launch_config.environment_edits.push_back({
+            term::Terminal_environment_operation::SET,
+            name,
+            environment_snapshot.value(name),
+        });
+    }
+
+    return start_process_with_native_backend(std::move(launch_config));
+}
+
+bool VNM_TerminalSurface::start_process_with_native_backend(
+    term::Terminal_launch_config launch_config)
+{
     if (m_private->session != nullptr) {
         drain_backend_callback_events();
         if (is_live_process_state(m_private->session->process_state())) {
@@ -4514,7 +4550,9 @@ bool VNM_TerminalSurface::start_process(QStringList argv, QString working_direct
         }
     }
 
-    if (argv.isEmpty() || argv.front().trimmed().isEmpty()) {
+    if (launch_config.argv.isEmpty() ||
+        launch_config.argv.front().trimmed().isEmpty())
+    {
         report_backend_error({
             term::Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
             QStringLiteral("argv must name an executable"),
@@ -4535,8 +4573,7 @@ bool VNM_TerminalSurface::start_process(QStringList argv, QString working_direct
 
     return start_process_with_backend(
         std::move(backend),
-        std::move(argv),
-        std::move(working_directory));
+        std::move(launch_config));
 }
 
 bool VNM_TerminalSurface::interrupt_process()
@@ -7015,8 +7052,7 @@ void VNM_TerminalSurface::bind_screen_signals(QScreen* screen)
 
 bool VNM_TerminalSurface::start_process_with_backend(
     std::unique_ptr<term::Terminal_backend>    backend,
-    QStringList                                argv,
-    QString                                    working_directory)
+    term::Terminal_launch_config               launch_config)
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
@@ -7127,10 +7163,6 @@ bool VNM_TerminalSurface::start_process_with_backend(
     m_private->resize_controller = std::make_unique<term::Terminal_resize_controller>(
         *m_private->session,
         m_private->grid_metrics_provider);
-
-    term::Terminal_launch_config launch_config;
-    launch_config.argv              = std::move(argv);
-    launch_config.working_directory = std::move(working_directory);
 
     const term::Terminal_session_result result =
         m_private->resize_controller->start_from_geometry(
@@ -8238,10 +8270,13 @@ bool term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
     QString                            working_directory)
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
+
+    Terminal_launch_config launch_config;
+    launch_config.argv              = std::move(argv);
+    launch_config.working_directory = std::move(working_directory);
     return surface.start_process_with_backend(
         std::move(backend),
-        std::move(argv),
-        std::move(working_directory));
+        std::move(launch_config));
 }
 
 bool term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
