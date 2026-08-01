@@ -368,10 +368,6 @@ std::wstring environment_block_from_process_environment(
 
     std::wstring block;
     for (const QString& entry : entries) {
-        if (entry.contains(QChar(u'\0'))) {
-            continue;
-        }
-
         block += wide_from_qstring(entry);
         block.push_back(L'\0');
     }

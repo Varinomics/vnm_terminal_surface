@@ -1,16 +1,20 @@
+#include "vnm_terminal/internal/backend_contract.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/vnm_terminal_surface.h"
 #include "helpers/test_check.h"
 
+#include <QByteArray>
 #include <QEventLoop>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QProcessEnvironment>
 #include <QQuickWindow>
 #include <QSizeF>
 #include <QString>
 #include <QStringList>
 #include <QThread>
+#include <QTemporaryDir>
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -346,6 +350,524 @@ void print_backend_errors(std::string_view label, const QStringList& backend_err
         std::cerr << label << " backend error: "
             << backend_error.toLocal8Bit().constData() << '\n';
     }
+}
+
+QString present_environment_probe_line(const QString& name, const QString& value)
+{
+    return QStringLiteral("%1=present:%2")
+        .arg(name, QString::fromLatin1(value.toUtf8().toHex()));
+}
+
+QString missing_environment_probe_line(const QString& name)
+{
+    return QStringLiteral("%1=missing").arg(name);
+}
+
+term::Terminal_launch_config environment_validation_config()
+{
+    term::Terminal_launch_config config;
+    config.argv = {QStringLiteral("environment-validation-fixture")};
+    config.initial_grid_size = term::terminal_grid_size_t{24, 80};
+    return config;
+}
+
+bool is_invalid_launch_config_result(const term::Terminal_backend_result& result)
+{
+    return
+        result.code == term::Terminal_backend_result_code::REJECTED &&
+        result.error.has_value() &&
+        result.error->code == term::Terminal_backend_error_code::INVALID_LAUNCH_CONFIG;
+}
+
+bool test_launch_environment_validation_contract()
+{
+    bool ok = true;
+    term::Terminal_launch_config config = environment_validation_config();
+
+    ok &= check(
+        !term::is_backend_rejection(term::validate_launch_config(config)),
+        "launch validation accepts a missing explicit TERM override");
+    ok &= check(
+        term::build_launch_environment(config, {}).value(QStringLiteral("TERM")) ==
+            config.identity.term,
+        "launch environment supplies the default TERM when no override is present");
+
+    config.environment_edits = {{
+        term::Terminal_environment_operation::SET,
+        QStringLiteral("TERM"),
+        QStringLiteral("screen-256color"),
+    }};
+    ok &= check(
+        !term::is_backend_rejection(term::validate_launch_config(config)) &&
+            term::build_launch_environment(config, {}).value(QStringLiteral("TERM")) ==
+                QStringLiteral("screen-256color"),
+        "launch environment accepts and applies a non-empty TERM override");
+
+#if defined(_WIN32)
+    config.environment_edits = {{
+        term::Terminal_environment_operation::SET,
+        QStringLiteral("tErM"),
+        QStringLiteral("mixed-case-term"),
+    }};
+    ok &= check(
+        !term::is_backend_rejection(term::validate_launch_config(config)) &&
+            term::build_launch_environment(config, {}).value(QStringLiteral("TERM")) ==
+                QStringLiteral("mixed-case-term"),
+        "Windows launch identity applies a non-empty mixed-case TERM override");
+
+    config.environment_edits = {{
+        term::Terminal_environment_operation::SET,
+        QStringLiteral("tErM"),
+        QString(),
+    }};
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "Windows launch identity rejects an empty mixed-case TERM override");
+
+    config.environment_edits = {{
+        term::Terminal_environment_operation::UNSET,
+        QStringLiteral("term"),
+        {},
+    }};
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "Windows launch identity rejects a lowercase TERM unset");
+#else
+    config.environment_edits = {{
+        term::Terminal_environment_operation::SET,
+        QStringLiteral("tErM"),
+        QString(),
+    }};
+    ok &= check(
+        !term::is_backend_rejection(term::validate_launch_config(config)) &&
+            term::build_launch_environment(config, {}).contains(QStringLiteral("tErM")) &&
+            term::build_launch_environment(config, {}).value(QStringLiteral("TERM")) ==
+                config.identity.term,
+        "POSIX launch identity keeps mixed-case term separate from TERM");
+
+    config.environment_edits = {{
+        term::Terminal_environment_operation::SET,
+        QStringLiteral("TERM"),
+        QString(),
+    }};
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "POSIX launch identity rejects an empty exact-case TERM override");
+
+    config.environment_edits = {{
+        term::Terminal_environment_operation::UNSET,
+        QStringLiteral("TERM"),
+        {},
+    }};
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "POSIX launch identity rejects an exact-case TERM unset");
+#endif
+
+    QString nul_value = QStringLiteral("before");
+    nul_value += QChar(u'\0');
+    nul_value += QStringLiteral("after");
+    config.environment_edits = {{
+        term::Terminal_environment_operation::SET,
+        QStringLiteral("VNM_NUL_VALUE_PROBE"),
+        nul_value,
+    }};
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "launch validation rejects an embedded NUL in every SET value");
+
+    config.environment_edits.clear();
+    config.identity.term = nul_value;
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "launch validation rejects an embedded NUL in the TERM identity");
+
+    config.identity.term      = QStringLiteral("xterm-256color");
+    config.identity.colorterm = nul_value;
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "launch validation rejects an embedded NUL in the COLORTERM identity");
+
+    return ok;
+}
+
+bool test_exact_environment_rejection_allows_retry(
+    QGuiApplication&            app,
+    const QString&              fixture_path,
+    const QProcessEnvironment&  invalid_environment,
+    std::string_view            label)
+{
+    QTemporaryDir marker_dir;
+    if (!check(marker_dir.isValid(), "exact-environment rejection marker directory is valid")) {
+        return false;
+    }
+
+    const QString marker_path = marker_dir.filePath(QStringLiteral("child-started.marker"));
+    const QStringList argv = {
+        fixture_path,
+        QStringLiteral("--write-start-marker"),
+        marker_path,
+    };
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    std::vector<VNM_TerminalSurface::Backend_error_code> backend_error_codes;
+    QStringList backend_errors;
+    bool process_exited = false;
+    VNM_TerminalSurface::Exit_reason exit_reason =
+        VNM_TerminalSurface::Exit_reason::FAILED_TO_START;
+    int process_exit_code = -1;
+
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::backend_error,
+        &fixture.surface,
+        [&](VNM_TerminalSurface::Backend_error_code code, const QString& message) {
+            backend_error_codes.push_back(code);
+            backend_errors.push_back(message);
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::process_exited,
+        &fixture.surface,
+        [&](VNM_TerminalSurface::Exit_reason reason, int exit_code) {
+            process_exited    = true;
+            exit_reason       = reason;
+            process_exit_code = exit_code;
+        });
+
+    const auto case_check = [label](bool condition, std::string_view suffix) {
+        std::string message(label);
+        message += suffix;
+        return check(condition, message);
+    };
+
+    bool ok = true;
+    const bool invalid_started = fixture.surface.start_process_with_exact_environment(
+        argv,
+        invalid_environment,
+        QFileInfo(fixture_path).absolutePath());
+    pump_events(app);
+    ok &= case_check(!invalid_started, " rejects the invalid exact environment");
+    ok &= case_check(
+        backend_error_codes.size() == 1U &&
+            backend_error_codes.front() ==
+                VNM_TerminalSurface::Backend_error_code::INVALID_LAUNCH_CONFIG,
+        " publishes typed INVALID_LAUNCH_CONFIG");
+    ok &= case_check(!QFileInfo::exists(marker_path), " does not launch the child");
+    ok &= case_check(!process_exited, " publishes no child-exit signal");
+    ok &= case_check(
+        fixture.surface.process_state() == VNM_TerminalSurface::Process_state::FAILED,
+        " publishes failed process state");
+    if (invalid_started) {
+        (void)wait_for_process_exit(app, process_exited);
+        print_backend_errors(label, backend_errors);
+        return false;
+    }
+
+    QProcessEnvironment retry_environment;
+    retry_environment.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
+    retry_environment.insert(QStringLiteral("COLORTERM"), QStringLiteral("truecolor"));
+    const bool retry_started = fixture.surface.start_process_with_exact_environment(
+        argv,
+        retry_environment,
+        QFileInfo(fixture_path).absolutePath());
+    ok &= case_check(retry_started, " allows a same-surface valid retry");
+    if (!retry_started) {
+        print_backend_errors(label, backend_errors);
+        return false;
+    }
+
+    ok &= case_check(
+        wait_for_process_exit(app, process_exited),
+        " retry child exits before timeout");
+    pump_events(app);
+    ok &= case_check(QFileInfo::exists(marker_path), " retry launches the real child");
+    ok &= case_check(
+        backend_error_codes.size() == 1U,
+        " retry adds no backend error");
+    ok &= case_check(
+        exit_reason == VNM_TerminalSurface::Exit_reason::EXITED &&
+            process_exit_code == 0,
+        " retry child exits cleanly");
+
+    if (!ok) {
+        print_backend_errors(label, backend_errors);
+    }
+    return ok;
+}
+
+bool test_exact_environment_rejections(QGuiApplication& app, const QString& fixture_path)
+{
+    QProcessEnvironment empty_term_environment;
+#if defined(_WIN32)
+    empty_term_environment.insert(QStringLiteral("tErM"), QString());
+#else
+    empty_term_environment.insert(QStringLiteral("TERM"), QString());
+#endif
+
+    QString nul_value = QStringLiteral("before");
+    nul_value += QChar(u'\0');
+    nul_value += QStringLiteral("after");
+    QProcessEnvironment nul_value_environment;
+    nul_value_environment.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
+    nul_value_environment.insert(QStringLiteral("VNM_NUL_VALUE_PROBE"), nul_value);
+
+    bool ok = true;
+    ok &= test_exact_environment_rejection_allows_retry(
+        app,
+        fixture_path,
+        empty_term_environment,
+        "empty TERM exact environment");
+    ok &= test_exact_environment_rejection_allows_retry(
+        app,
+        fixture_path,
+        nul_value_environment,
+        "NUL-value exact environment");
+    return ok;
+}
+
+bool test_exact_process_environment(QGuiApplication& app, const QString& fixture_path)
+{
+    const QString inherited_name = QStringLiteral("VNM_INHERITED_PROBE");
+    const QString exact_name     = QStringLiteral("VNM_EXACT_PROBE");
+    const QString empty_name     = QStringLiteral("VNM_EMPTY_PROBE");
+    const QString unicode_name   = QStringLiteral("VNM_UNICODE_PROBE");
+    const QString unicode_value  = QString::fromUtf8(
+        QByteArray::fromHex("4772c3bcc39f6520e69db1e4baac"));
+
+    QProcessEnvironment environment;
+    environment.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
+    environment.insert(QStringLiteral("COLORTERM"), QStringLiteral("truecolor"));
+    environment.insert(exact_name, QStringLiteral("snapshot-value"));
+    environment.insert(empty_name, QString());
+    environment.insert(unicode_name, unicode_value);
+
+    QStringList probe_names = {
+        inherited_name,
+        exact_name,
+        empty_name,
+        unicode_name,
+    };
+    bool ok = true;
+
+#if defined(_WIN32)
+    const QString uppercase_case_name = QStringLiteral("VNM_CASE_PROBE");
+    const QString lowercase_case_name = QStringLiteral("vnm_case_probe");
+    const QString magic_name          = QStringLiteral("=VNM_MAGIC_PROBE");
+    environment.insert(uppercase_case_name, QStringLiteral("first-value"));
+    environment.insert(lowercase_case_name, QStringLiteral("replacement-value"));
+    environment.insert(magic_name, QStringLiteral("magic-value"));
+
+    int case_variant_count = 0;
+    for (const QString& name : environment.keys()) {
+        if (name.compare(uppercase_case_name, Qt::CaseInsensitive) == 0) {
+            ++case_variant_count;
+        }
+    }
+
+    ok &= check(case_variant_count == 1,
+        "QProcessEnvironment collapses Windows case-colliding names");
+    ok &= check(
+        environment.value(uppercase_case_name) == QStringLiteral("replacement-value"),
+        "QProcessEnvironment keeps the last value for a Windows case collision");
+    if (!ok) {
+        return false;
+    }
+
+    probe_names.push_back(uppercase_case_name);
+    probe_names.push_back(lowercase_case_name);
+    probe_names.push_back(magic_name);
+#endif
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    int backend_error_count = 0;
+    QStringList backend_errors;
+    bool process_exited = false;
+    VNM_TerminalSurface::Exit_reason exit_reason =
+        VNM_TerminalSurface::Exit_reason::FAILED_TO_START;
+    int process_exit_code = -1;
+
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::backend_error,
+        &fixture.surface,
+        [&](VNM_TerminalSurface::Backend_error_code code, const QString& message) {
+            ++backend_error_count;
+            backend_errors.push_back(
+                QStringLiteral("%1: %2")
+                    .arg(static_cast<int>(code))
+                    .arg(message));
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::process_exited,
+        &fixture.surface,
+        [&](VNM_TerminalSurface::Exit_reason reason, int exit_code) {
+            process_exited    = true;
+            exit_reason       = reason;
+            process_exit_code = exit_code;
+        });
+
+    QStringList argv = {
+        fixture_path,
+        QStringLiteral("--echo-environment"),
+    };
+    argv.append(probe_names);
+    const bool started = fixture.surface.start_process_with_exact_environment(
+        argv,
+        environment,
+        QFileInfo(fixture_path).absolutePath());
+    ok &= check(started, "exact-environment public surface launch starts fixture");
+    if (!started) {
+        print_backend_errors("exact-environment public surface", backend_errors);
+        return false;
+    }
+
+    ok &= check(
+        wait_for_process_exit(app, process_exited),
+        "exact-environment fixture exits before timeout");
+    pump_events(app);
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        current_snapshot(fixture.surface);
+    ok &= check(snapshot != nullptr,
+        "exact-environment fixture publishes a render snapshot");
+    if (snapshot != nullptr) {
+        ok &= check(
+            snapshot_contains_text(*snapshot, missing_environment_probe_line(inherited_name)),
+            "exact environment excludes a variable inherited by the host");
+        ok &= check(
+            snapshot_contains_text(
+                *snapshot,
+                present_environment_probe_line(exact_name, QStringLiteral("snapshot-value"))),
+            "exact environment delivers an explicit snapshot value");
+        ok &= check(
+            snapshot_contains_text(
+                *snapshot,
+                present_environment_probe_line(empty_name, QString())),
+            "exact environment preserves a present empty value");
+        ok &= check(
+            snapshot_contains_text(
+                *snapshot,
+                present_environment_probe_line(unicode_name, unicode_value)),
+            "exact environment preserves a Unicode value");
+
+#if defined(_WIN32)
+        ok &= check(
+            snapshot_contains_text(
+                *snapshot,
+                present_environment_probe_line(
+                    uppercase_case_name,
+                    QStringLiteral("replacement-value"))),
+            "exact environment delivers the resolved Windows case-collision value");
+        ok &= check(
+            snapshot_contains_text(
+                *snapshot,
+                present_environment_probe_line(
+                    lowercase_case_name,
+                    QStringLiteral("replacement-value"))),
+            "Windows child lookup remains case-insensitive after exact launch");
+        ok &= check(
+            snapshot_contains_text(
+                *snapshot,
+                present_environment_probe_line(
+                    magic_name,
+                    QStringLiteral("magic-value"))),
+            "exact environment preserves a Windows magic environment entry");
+#endif
+    }
+
+    print_backend_errors("exact-environment public surface", backend_errors);
+    ok &= check(
+        exit_reason == VNM_TerminalSurface::Exit_reason::EXITED &&
+        process_exit_code == 0,
+        "exact-environment fixture exits cleanly");
+    ok &= check(backend_error_count == 0,
+        "exact-environment public surface launch has no backend errors");
+    return ok;
+}
+
+bool test_default_process_environment_inheritance(
+    QGuiApplication& app,
+    const QString&   fixture_path)
+{
+    const QString inherited_name  = QStringLiteral("VNM_INHERITED_PROBE");
+    const QString inherited_value = QStringLiteral("host-value");
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    int backend_error_count = 0;
+    QStringList backend_errors;
+    bool process_exited = false;
+    VNM_TerminalSurface::Exit_reason exit_reason =
+        VNM_TerminalSurface::Exit_reason::FAILED_TO_START;
+    int process_exit_code = -1;
+
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::backend_error,
+        &fixture.surface,
+        [&](VNM_TerminalSurface::Backend_error_code code, const QString& message) {
+            ++backend_error_count;
+            backend_errors.push_back(
+                QStringLiteral("%1: %2")
+                    .arg(static_cast<int>(code))
+                    .arg(message));
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::process_exited,
+        &fixture.surface,
+        [&](VNM_TerminalSurface::Exit_reason reason, int exit_code) {
+            process_exited    = true;
+            exit_reason       = reason;
+            process_exit_code = exit_code;
+        });
+
+    const bool started = fixture.surface.start_process(
+        {
+            fixture_path,
+            QStringLiteral("--echo-environment"),
+            inherited_name,
+        },
+        QFileInfo(fixture_path).absolutePath());
+    bool ok = true;
+    ok &= check(started, "default public surface launch starts environment fixture");
+    if (!started) {
+        print_backend_errors("default public surface environment", backend_errors);
+        return false;
+    }
+
+    ok &= check(
+        wait_for_process_exit(app, process_exited),
+        "default-environment fixture exits before timeout");
+    pump_events(app);
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        current_snapshot(fixture.surface);
+    ok &= check(snapshot != nullptr,
+        "default-environment fixture publishes a render snapshot");
+    if (snapshot != nullptr) {
+        ok &= check(
+            snapshot_contains_text(
+                *snapshot,
+                present_environment_probe_line(inherited_name, inherited_value)),
+            "default two-argument start_process inherits the host environment");
+    }
+
+    print_backend_errors("default public surface environment", backend_errors);
+    ok &= check(
+        exit_reason == VNM_TerminalSurface::Exit_reason::EXITED &&
+        process_exit_code == 0,
+        "default-environment fixture exits cleanly");
+    ok &= check(backend_error_count == 0,
+        "default public surface environment launch has no backend errors");
+    return ok;
 }
 
 bool test_shell_like_surface_native_smoke(QGuiApplication& app, const QString& fixture_path)
@@ -708,6 +1230,10 @@ int main(int argc, char** argv)
 
     const QString fixture_path = QString::fromLocal8Bit(argv[1]);
     bool ok = true;
+    ok &= test_launch_environment_validation_contract();
+    ok &= test_exact_environment_rejections(app, fixture_path);
+    ok &= test_exact_process_environment(app, fixture_path);
+    ok &= test_default_process_environment_inheritance(app, fixture_path);
     ok &= test_shell_like_surface_native_smoke(app, fixture_path);
     ok &= test_shell_like_surface_interrupt_smoke(app, fixture_path);
     return ok ? 0 : 1;

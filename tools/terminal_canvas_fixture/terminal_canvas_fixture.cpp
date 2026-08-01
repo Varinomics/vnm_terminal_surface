@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -75,6 +76,12 @@ struct gated_stream_arguments_t
     int                        resize_pad_rows = 0;
 };
 
+struct Environment_probe_value
+{
+    bool                       present = false;
+    std::vector<unsigned char> utf8;
+};
+
 void print_usage()
 {
     std::cout
@@ -101,6 +108,8 @@ void print_usage()
         << "       vnm_terminal_canvas_fixture --utf8-payload\n"
         << "       vnm_terminal_canvas_fixture --sync-raw-resize-gate <checkpoint-path>\n"
         << "       vnm_terminal_canvas_fixture --quick-exit\n"
+        << "       vnm_terminal_canvas_fixture --write-start-marker <path>\n"
+        << "       vnm_terminal_canvas_fixture --echo-environment <name> [name...]\n"
         << "       vnm_terminal_canvas_fixture --echo-argv [args...]\n";
 }
 
@@ -172,6 +181,133 @@ int echo_argv(int argc, char** argv)
 {
     for (int index = 1; index < argc; ++index) {
         std::cout << "argv[" << index << "]=" << argv[index] << '\n';
+    }
+
+    return 0;
+}
+
+std::string encode_hex(const std::vector<unsigned char>& bytes);
+bool configure_binary_stdout();
+bool write_all_stdout(std::string_view text);
+
+std::optional<Environment_probe_value> environment_probe_value(std::string_view name)
+{
+#if defined(_WIN32)
+    std::wstring wide_name;
+    wide_name.reserve(name.size());
+    for (unsigned char byte : name) {
+        if (byte > 0x7fU) {
+            return std::nullopt;
+        }
+        wide_name.push_back(static_cast<wchar_t>(byte));
+    }
+
+    LPWCH environment = GetEnvironmentStringsW();
+    if (environment == nullptr) {
+        return std::nullopt;
+    }
+
+    std::optional<std::wstring> wide_value;
+    for (const wchar_t* entry = environment; *entry != L'\0';) {
+        const std::wstring_view entry_view(entry);
+        const std::size_t separator = entry_view.find(L'=', 1U);
+        if (separator != std::wstring_view::npos) {
+            const std::wstring_view entry_name = entry_view.substr(0U, separator);
+            if (CompareStringOrdinal(
+                    entry_name.data(),
+                    static_cast<int>(entry_name.size()),
+                    wide_name.data(),
+                    static_cast<int>(wide_name.size()),
+                    TRUE) == CSTR_EQUAL)
+            {
+                wide_value = std::wstring(entry_view.substr(separator + 1U));
+                break;
+            }
+        }
+
+        entry += entry_view.size() + 1U;
+    }
+
+    FreeEnvironmentStringsW(environment);
+    if (!wide_value.has_value()) {
+        return Environment_probe_value{};
+    }
+    if (wide_value->empty()) {
+        return Environment_probe_value{true, {}};
+    }
+
+    const int utf8_size = WideCharToMultiByte(
+        CP_UTF8,
+        WC_ERR_INVALID_CHARS,
+        wide_value->data(),
+        static_cast<int>(wide_value->size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (utf8_size <= 0) {
+        return std::nullopt;
+    }
+
+    std::vector<unsigned char> utf8(static_cast<std::size_t>(utf8_size));
+    if (WideCharToMultiByte(
+            CP_UTF8,
+            WC_ERR_INVALID_CHARS,
+            wide_value->data(),
+            static_cast<int>(wide_value->size()),
+            reinterpret_cast<char*>(utf8.data()),
+            utf8_size,
+            nullptr,
+            nullptr) != utf8_size)
+    {
+        return std::nullopt;
+    }
+
+    return Environment_probe_value{true, std::move(utf8)};
+#else
+    const std::string variable_name(name);
+    const char* value = std::getenv(variable_name.c_str());
+    if (value == nullptr) {
+        return Environment_probe_value{};
+    }
+
+    const std::string_view value_bytes(value);
+    std::vector<unsigned char> utf8;
+    utf8.reserve(value_bytes.size());
+    for (unsigned char byte : value_bytes) {
+        utf8.push_back(byte);
+    }
+    return Environment_probe_value{true, std::move(utf8)};
+#endif
+}
+
+int echo_environment(int argc, char** argv)
+{
+    if (!configure_binary_stdout()) {
+        return 69;
+    }
+
+    for (int index = 2; index < argc; ++index) {
+        const std::optional<Environment_probe_value> value =
+            environment_probe_value(argv[index]);
+        if (!value.has_value()) {
+            std::cerr << "failed to read environment variable: " << argv[index] << '\n';
+            return 70;
+        }
+
+        std::string line = argv[index];
+        if (!value->present) {
+            line += "=missing\r\n";
+        }
+        else {
+            line += "=present:";
+            line += encode_hex(value->utf8);
+            line += "\r\n";
+        }
+
+        if (!write_all_stdout(line)) {
+            return 71;
+        }
     }
 
     return 0;
@@ -1449,6 +1585,18 @@ int run_quick_exit()
     return write_all_stdout("quick-exit\r\n") ? 0 : 68;
 }
 
+int run_write_start_marker(const std::string& marker_path)
+{
+    if (!write_checkpoint_file(marker_path)) {
+        return 72;
+    }
+    if (!configure_binary_stdout()) {
+        return 73;
+    }
+
+    return write_all_stdout("start-marker\r\n") ? 0 : 74;
+}
+
 }
 
 int main(int argc, char** argv)
@@ -1494,6 +1642,10 @@ int main(int argc, char** argv)
 
     if (argc >= 2 && argument_equals(argv[1], "--echo-argv")) {
         return echo_argv(argc, argv);
+    }
+
+    if (argc >= 3 && argument_equals(argv[1], "--echo-environment")) {
+        return echo_environment(argc, argv);
     }
 
     if (argc == 2 && argument_equals(argv[1], "--shell-like-smoke")) {
@@ -1610,6 +1762,10 @@ int main(int argc, char** argv)
 
     if (argc == 2 && argument_equals(argv[1], "--quick-exit")) {
         return run_quick_exit();
+    }
+
+    if (argc == 3 && argument_equals(argv[1], "--write-start-marker")) {
+        return run_write_start_marker(argv[2]);
     }
 
     print_usage();
