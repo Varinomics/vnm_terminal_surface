@@ -1288,29 +1288,25 @@ private:
     void deliver_or_buffer_output(QByteArray bytes)
     {
         const qsizetype bytes_size = bytes.size();
-        bool should_deliver = false;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            const bool should_buffer =
-                m_paused_output_delivery_in_progress ||
-                m_output_paused ||
-                !m_paused_output.isEmpty();
-            if (should_buffer &&
-                m_output_delivery_limits.delivery_chunk_bytes > 0 &&
-                bytes_size <=
-                    m_output_delivery_limits.high_watermark_bytes -
-                        m_paused_output.size())
-            {
-                append_native_backend_paused_output(m_paused_output, std::move(bytes));
-            }
-            else {
-                should_deliver = true;
-            }
-        }
-
-        if (should_deliver) {
-            deliver_output(std::move(bytes));
-        }
+        deliver_or_buffer_native_backend_output(
+            m_mutex,
+            m_callbacks,
+            m_paused_output,
+            m_output_paused,
+            m_paused_output_delivery_in_progress,
+            std::move(bytes),
+            [this, bytes_size] {
+                // This backend admits a chunk only while the buffer stays at or under the
+                // high watermark, so the pause buffer never exceeds it. The POSIX backend
+                // admits while the buffer is below the watermark instead, and refuses to
+                // buffer at all once stopping. The two policies are not interchangeable
+                // and neither is the shared default.
+                return
+                    m_output_delivery_limits.delivery_chunk_bytes > 0  &&
+                    bytes_size <=
+                        m_output_delivery_limits.high_watermark_bytes -
+                            m_paused_output.size();
+            });
     }
 
     void mark_reader_finished()
