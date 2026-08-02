@@ -76,6 +76,13 @@ bool admit_native_backend_worker(
     native_backend_call_state_t        call_state,
     std::latch&                        startup_gate);
 
+// Releases a startup gate that start() could not finish arming. Marks the startup as
+// aborted under the mutex first, then opens the gate, so every worker released by it sees
+// the abort and returns instead of running against half-committed state.
+void abort_native_backend_startup_gate(
+    native_backend_call_state_t        call_state,
+    std::latch&                        startup_gate);
+
 // Leaves a public call and, when it was the outermost one, runs `on_last_public_call`
 // under the mutex before waking the waiters. The POSIX backend uses that hook to claim
 // the master descriptor it could not close while a call was in flight; claiming it

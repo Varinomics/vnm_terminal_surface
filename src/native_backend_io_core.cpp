@@ -296,6 +296,18 @@ bool admit_native_backend_worker(
     return !call_state.startup_aborted;
 }
 
+void abort_native_backend_startup_gate(
+    native_backend_call_state_t  call_state,
+    std::latch&                  startup_gate)
+{
+    {
+        std::lock_guard<std::mutex> lock(call_state.mutex);
+        call_state.startup_aborted = true;
+    }
+
+    startup_gate.count_down();
+}
+
 void join_or_detach_native_backend_thread(std::thread& thread)
 {
     if (!thread.joinable()) {

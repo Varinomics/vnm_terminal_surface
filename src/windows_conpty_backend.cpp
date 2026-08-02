@@ -715,11 +715,7 @@ public:
         }
         catch (const std::exception& error) {
             if (startup_gate) {
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    m_startup_aborted = true;
-                }
-                startup_gate->count_down();
+                abort_native_backend_startup_gate(call_state(), *startup_gate);
             }
             const QString message = QStringLiteral("ConPTY worker thread startup failed: %1")
                 .arg(QString::fromLocal8Bit(error.what()));
