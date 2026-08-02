@@ -1720,6 +1720,26 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_terminal_modes>"
 )
 
+add_executable(vnm_terminal_wheel_gesture
+    wheel_gesture/wheel_gesture_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_wheel_gesture PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_wheel_gesture PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_wheel_gesture
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_wheel_gesture>"
+)
+
 add_executable(vnm_terminal_viewport
     viewport/viewport_controller_tests.cpp
 )
@@ -1891,6 +1911,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_screen_alternate
     vnm_terminal_terminal_modes
     vnm_terminal_viewport
+    vnm_terminal_wheel_gesture
     vnm_terminal_backend_session
     vnm_terminal_backend_output_capture
 )

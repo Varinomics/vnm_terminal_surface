@@ -167,6 +167,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/unicode_width_tables.h
     include/vnm_terminal/internal/vnm_terminal_font.h
     include/vnm_terminal/internal/viewport_contract.h
+    include/vnm_terminal/internal/wheel_gesture.h
     include/vnm_terminal/internal/vnm_terminal_surface_render_bridge.h
     include/vnm_terminal/internal/posix_pty_backend.h
     include/vnm_terminal/internal/windows_conpty_backend.h
@@ -204,6 +205,7 @@ add_library(vnm_terminal_surface STATIC
     src/viewport_contract.cpp
     src/vnm_terminal_font.cpp
     src/vnm_terminal_surface.cpp
+    src/wheel_gesture.cpp
 )
 
 qt_add_resources(vnm_terminal_surface_resource_sources
