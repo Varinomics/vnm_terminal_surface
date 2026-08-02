@@ -82,6 +82,21 @@ for local runs.
 - The application CI checks out this surface at `ref: master`. For a cross-repo
   change, push the surface before the application so the application build sees
   the surface change.
+- The `Downstream Windows` workflow closes the other direction: it builds the
+  application's `master` against the surface commit under test and runs the
+  application `ctest` suite on Windows. It is advisory and is not a required
+  status check, because a surface commit that changes the surface API
+  legitimately breaks the application's `master` until the matching application
+  commit is pushed. A red result means the canonical pair does not configure,
+  build, or test clean. That can be because the application has not adopted this
+  surface change yet, because this surface change genuinely broke the pair, or
+  because this surface's project version moved ahead of the version the
+  application expects. Read the job log to tell them apart; a red is never
+  benign by default. The version case is recognizable without reading far: it
+  fails at the configure step with the version-mismatch `FATAL_ERROR` from the
+  application's surface dependency logic. That same version equality check does
+  not cover the other two cases, since it passes same-version API drift straight
+  through.
 - All tests run offscreen with `QT_QPA_PLATFORM=offscreen`.
 - `ctest` works without the Visual Studio developer shell; the developer shell is
   needed only to configure and build native MSVC targets.
