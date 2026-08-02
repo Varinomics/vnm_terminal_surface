@@ -5,6 +5,7 @@
 #include "atlas_metric_descriptors.h"
 #include "metric_descriptor.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/profile_text_writers.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
@@ -84,66 +85,6 @@ QString profile_string_literal(const QString& value)
     }
     out += QLatin1Char('"');
     return out;
-}
-
-void append_profile_node_text(
-    QTextStream&                           stream,
-    const term::Profile_node_snapshot&     node,
-    int                                    depth)
-{
-    const QString indent(depth * 2, QLatin1Char(' '));
-    stream
-        << indent
-        << QString::fromStdString(node.name)
-        << " calls="    << static_cast<qulonglong>(node.call_count)
-        << " total_ns=" << profile_nanoseconds(node.total_time)
-        << " mean_ns="  << profile_mean_nanoseconds(node.total_time, node.call_count)
-        << " self_ns="  << profile_nanoseconds(node.self_time)
-        << " child_ns=" << profile_nanoseconds(node.child_time)
-        << " min_ns="   << profile_nanoseconds(node.min_time)
-        << " max_ns="   << profile_nanoseconds(node.max_time)
-        << '\n';
-
-    for (const term::Profile_node_snapshot& child : node.children) {
-        append_profile_node_text(stream, child, depth + 1);
-    }
-}
-
-void append_profile_timeline_text(
-    QTextStream&                           stream,
-    const QString&                         label,
-    const term::Profile_timeline_snapshot& timeline)
-{
-    stream
-        << label
-        << "_timeline bucket_width_ms="
-        << static_cast<qulonglong>(timeline.bucket_width.count())
-        << " buckets=" << static_cast<qulonglong>(timeline.buckets.size())
-        << '\n';
-
-    for (const term::Profile_timeline_bucket_snapshot& bucket : timeline.buckets) {
-        if (bucket.scopes.empty()) {
-            continue;
-        }
-
-        stream
-            << "  bucket start_ms="
-            << static_cast<qulonglong>(bucket.start_time.count())
-            << " end_ms=" << static_cast<qulonglong>(bucket.end_time.count())
-            << " scopes=" << static_cast<qulonglong>(bucket.scopes.size())
-            << '\n';
-        for (const term::Profile_timeline_scope_snapshot& scope : bucket.scopes) {
-            stream
-                << "    " << QString::fromStdString(scope.name)
-                << " calls="    << static_cast<qulonglong>(scope.call_count)
-                << " total_ns=" << profile_nanoseconds(scope.total_time)
-                << " mean_ns="
-                << profile_mean_nanoseconds(scope.total_time, scope.call_count)
-                << " min_ns="   << profile_nanoseconds(scope.min_time)
-                << " max_ns="   << profile_nanoseconds(scope.max_time)
-                << '\n';
-        }
-    }
 }
 
 void append_dirty_row_stats_section(
@@ -761,6 +702,66 @@ void append_qsg_atlas_profile_section(
     detail::emit_metrics_text(stream, report.render, detail::atlas_capabilities_metrics());
 }
 
+}
+
+void append_profile_node_text(
+    QTextStream&                            stream,
+    const internal::Profile_node_snapshot&  node,
+    int                                     depth)
+{
+    const QString indent(depth * 2, QLatin1Char(' '));
+    stream
+        << indent
+        << QString::fromStdString(node.name)
+        << " calls="    << static_cast<qulonglong>(node.call_count)
+        << " total_ns=" << profile_nanoseconds(node.total_time)
+        << " mean_ns="  << profile_mean_nanoseconds(node.total_time, node.call_count)
+        << " self_ns="  << profile_nanoseconds(node.self_time)
+        << " child_ns=" << profile_nanoseconds(node.child_time)
+        << " min_ns="   << profile_nanoseconds(node.min_time)
+        << " max_ns="   << profile_nanoseconds(node.max_time)
+        << '\n';
+
+    for (const term::Profile_node_snapshot& child : node.children) {
+        append_profile_node_text(stream, child, depth + 1);
+    }
+}
+
+void append_profile_timeline_text(
+    QTextStream&                                stream,
+    const QString&                              label,
+    const internal::Profile_timeline_snapshot&  timeline)
+{
+    stream
+        << label
+        << "_timeline bucket_width_ms="
+        << static_cast<qulonglong>(timeline.bucket_width.count())
+        << " buckets=" << static_cast<qulonglong>(timeline.buckets.size())
+        << '\n';
+
+    for (const term::Profile_timeline_bucket_snapshot& bucket : timeline.buckets) {
+        if (bucket.scopes.empty()) {
+            continue;
+        }
+
+        stream
+            << "  bucket start_ms="
+            << static_cast<qulonglong>(bucket.start_time.count())
+            << " end_ms=" << static_cast<qulonglong>(bucket.end_time.count())
+            << " scopes=" << static_cast<qulonglong>(bucket.scopes.size())
+            << '\n';
+        for (const term::Profile_timeline_scope_snapshot& scope : bucket.scopes) {
+            stream
+                << "    " << QString::fromStdString(scope.name)
+                << " calls="    << static_cast<qulonglong>(scope.call_count)
+                << " total_ns=" << profile_nanoseconds(scope.total_time)
+                << " mean_ns="
+                << profile_mean_nanoseconds(scope.total_time, scope.call_count)
+                << " min_ns="   << profile_nanoseconds(scope.min_time)
+                << " max_ns="   << profile_nanoseconds(scope.max_time)
+                << '\n';
+        }
+    }
 }
 
 void append_dirty_row_stats_text(const VNM_TerminalSurface& surface, QTextStream& out)

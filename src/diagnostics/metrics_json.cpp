@@ -2,6 +2,7 @@
 
 #include "atlas_metric_descriptors.h"
 #include "metric_descriptor.h"
+#include "vnm_terminal/internal/metrics_json_writers.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
 #include "vnm_terminal/internal/qsg_atlas_renderer.h"
 #include "vnm_terminal/internal/qsg_terminal_renderer.h"
@@ -16,17 +17,6 @@ namespace vnm_terminal::diagnostics {
 namespace internal = vnm_terminal::internal;
 
 namespace {
-
-template<typename Value>
-void insert_json_counter(
-    QJsonObject&  object,
-    const char*   name,
-    Value         value)
-{
-    object.insert(
-        QString::fromLatin1(name),
-        QString::number(static_cast<qulonglong>(value)));
-}
 
 QJsonObject atlas_buffer_summary_json(
     const internal::Qsg_atlas_buffer_update_summary& summary)

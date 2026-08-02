@@ -138,7 +138,9 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/ime_contract.h
     include/vnm_terminal/internal/interaction_trace.h
     include/vnm_terminal/internal/metrics_contract.h
+    include/vnm_terminal/internal/metrics_json_writers.h
     include/vnm_terminal/internal/parser_action.h
+    include/vnm_terminal/internal/profile_text_writers.h
     include/vnm_terminal/internal/qsg_atlas_renderer.h
     include/vnm_terminal/internal/qsg_terminal_render_frame.h
     include/vnm_terminal/internal/qsg_terminal_renderer.h
