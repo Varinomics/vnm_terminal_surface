@@ -158,6 +158,28 @@ void deliver_native_backend_output(
     const Terminal_backend_callbacks&  callbacks,
     QByteArray                         bytes);
 
+// Appends `bytes` to the paused-output FIFO, or delivers them when nothing is pending.
+//
+// The FIFO is never bypassed. `can_buffer_paused_output` is an admission bound the
+// caller's reader must keep satisfiable, not an overflow relief valve: the else branch
+// emits `bytes` immediately, so taking it while the FIFO is non-empty would put newer
+// bytes ahead of older ones and corrupt the VT stream the session parses. Both backends
+// uphold that by parking their read loop on the output condition variable once the paused
+// buffer reaches the high watermark, which is why the else branch is normally reached only
+// with an empty FIFO. Windows also clamps every read to the room left under the watermark,
+// because only its predicate weighs the incoming chunk size; the POSIX predicate weighs
+// the buffered size alone, so there the clamp only bounds the overshoot. Both backends fix
+// these limits in `start()` before the reader thread exists, so a read is always clamped
+// against the same numbers the predicate later tests.
+//
+// The one clause that can refuse with bytes still buffered is the POSIX `m_stopping`
+// clause, and both of its shapes are safe. The two shutdown paths clear the callbacks
+// under the same lock that sets the flag, so the else branch snapshots an empty
+// `output_received` and emits nothing. The exit-report path leaves the callbacks live, but
+// it runs only after the reader thread has finished and the pending buffer has been
+// drained, so no reader is left to take the else branch against a non-empty FIFO.
+//
+// A reader that reads more than its own predicate admits reintroduces the reordering.
 template <typename Can_buffer_paused_output_fn>
 void deliver_or_buffer_native_backend_output(
     std::mutex&                        mutex,
