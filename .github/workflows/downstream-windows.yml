@@ -1,0 +1,99 @@
+name: Downstream Windows
+
+# The canonical estate builds vnm_terminal against this repository's master,
+# because vnm_terminal/cmake/vnm_terminal_surface_dependency.cmake prefers a
+# local sibling checkout and its network fallback tracks master. vnm_terminal's
+# own CI already builds the pair in the consumer-to-provider direction (it
+# checks this repository out at ref master). Nothing built the pair in the
+# provider-to-consumer direction, so a surface master push could break the
+# canonical pair and stay green here until someone next pushed to vnm_terminal.
+#
+# Advisory, not blocking. The estate convention is "push surface before app",
+# so a surface commit that changes the surface API legitimately breaks
+# vnm_terminal master until the matching app commit is pushed. This workflow is
+# therefore kept out of the required status checks. That does not make a red
+# result benign. Red means the canonical pair does not configure, build or test
+# clean, and there are three distinct causes: vnm_terminal has not adopted this
+# surface change yet, this surface commit genuinely broke the pair, or this
+# surface's project version moved ahead of the one vnm_terminal expects (that
+# last one fails at the configure step with the version-mismatch FATAL_ERROR in
+# vnm_terminal_surface_dependency.cmake). Read the log to tell them apart. This
+# workflow deliberately does not use continue-on-error: an unadopted or a
+# genuinely broken pair must both fail loudly and visibly, and the advisory
+# status is expressed by branch protection not requiring this workflow, not by
+# swallowing the exit code.
+#
+# The version equality guard in vnm_terminal_surface_dependency.cmake does not
+# cover this: the failure it has to catch is same-version API drift, which that
+# guard passes straight through.
+
+on:
+  push:
+    branches: [ master, main, dev ]
+  pull_request:
+    branches: [ master, main, dev ]
+
+# This is the first workflow here that reaches repositories other than its own,
+# so it declares least privilege explicitly, matching vnm_terminal's CI Windows.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CMAKE_BUILD_TYPE: Release
+
+jobs:
+  app-build-and-test:
+    name: Qt Quick Terminal Against This Surface (Windows, advisory)
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout surface
+        uses: actions/checkout@v4
+        with:
+          path: vnm_terminal_surface
+
+      - name: Checkout app
+        uses: actions/checkout@v4
+        with:
+          repository: Varinomics/vnm_terminal
+          path: vnm_terminal
+          ref: master
+          token: ${{ secrets.VARINOMICS_REPO_READ_TOKEN || github.token }}
+
+      - name: Checkout chrome
+        uses: actions/checkout@v4
+        with:
+          repository: imakris/vnm_qml_chrome
+          path: vnm_qml_chrome
+          ref: master
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4.3.1
+        with:
+          version: '6.10.1'
+          arch: 'win64_msvc2022_64'
+          archives: 'qtbase qtdeclarative'
+          cache: 'true'
+
+      - name: Configure CMake
+        run: |
+          cmake -B vnm_terminal/build -S vnm_terminal \
+            -G "Visual Studio 17 2022" \
+            -A x64 \
+            -DVNM_TERMINAL_SURFACE_SOURCE_DIR="${GITHUB_WORKSPACE}/vnm_terminal_surface" \
+            -DVNM_QML_CHROME_SOURCE_DIR="${GITHUB_WORKSPACE}/vnm_qml_chrome" \
+            -DVNM_TERMINAL_ENABLE_PROFILING=OFF \
+            -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build vnm_terminal/build --config ${CMAKE_BUILD_TYPE} --parallel
+
+      - name: Run tests
+        working-directory: vnm_terminal/build
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --output-on-failure -C ${CMAKE_BUILD_TYPE}
