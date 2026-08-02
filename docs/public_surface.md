@@ -412,6 +412,14 @@ privileged state instead, so that the shared encodings have exactly one owner:
   emits its own sections of the runtime-metrics document next to the
   surface-owned ones and has to encode counters identically.
 
-Neither belongs in the installed API: the first takes internal snapshot types,
-and the second is an encoding detail of the metrics document rather than a
-capability an embedder should call.
+A third internal header exists for behaviour the app must not reimplement rather
+than for an encoding: `vnm_terminal/internal/wheel_gesture.h` normalizes a
+vertical wheel gesture into whole notches and owns the ctrl+wheel zoom range. The
+app's scrollbar sits beside the surface and answers the same gesture, so two
+implementations of it are visible to the user as a discontinuity when the pointer
+crosses between them.
+
+None of the three belongs in the installed API: the profile writers take internal
+snapshot types, the counter writer is an encoding detail of the metrics document
+rather than a capability an embedder should call, and the wheel normalization is
+this application's input policy rather than the surface's contract.
