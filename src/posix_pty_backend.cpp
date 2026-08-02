@@ -1144,42 +1144,24 @@ public:
         m_running             = false;
     }
 
-    // Each worker records its id (register_worker_thread, under m_mutex) before it
-    // runs any callback-capable work. The startup gate keeps those callbacks
-    // blocked until start() has committed the std::thread members, and the id set
-    // keeps destruction independent of unsynchronized std::thread member reads.
     bool is_worker_thread()
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return
-            m_worker_thread_ids.find(std::this_thread::get_id()) !=
-            m_worker_thread_ids.end();
+        return is_native_backend_worker_thread(call_state());
     }
 
     bool has_active_public_call()
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_public_call_depth != 0U;
-    }
-
-    void register_worker_thread()
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_worker_thread_ids.insert(std::this_thread::get_id());
+        return native_backend_has_active_public_call(call_state());
     }
 
     void run_worker_after_startup_gate(
         std::shared_ptr<std::latch> startup_gate,
         void (Impl::*loop)())
     {
-        register_worker_thread();
-        startup_gate->wait();
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_startup_aborted) {
-                return;
-            }
+        if (!admit_native_backend_worker(call_state(), *startup_gate)) {
+            return;
         }
+
         (this->*loop)();
     }
 
@@ -1189,14 +1171,10 @@ public:
         Signal_targets                  targets,
         Terminal_termination_policy     policy)
     {
-        register_worker_thread();
-        startup_gate->wait();
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_startup_aborted) {
-                return;
-            }
+        if (!admit_native_backend_worker(call_state(), *startup_gate)) {
+            return;
         }
+
         termination_escalation_loop(child_pid, targets, policy);
     }
 
@@ -1218,23 +1196,28 @@ public:
     }
 
 private:
+    native_backend_call_state_t call_state()
+    {
+        return native_backend_call_state_t{
+            m_mutex,
+            m_public_call_cv,
+            m_public_call_depth,
+            m_worker_thread_ids,
+            m_startup_aborted,
+        };
+    }
+
     void enter_public_call()
     {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        ++m_public_call_depth;
+        enter_native_backend_public_call(call_state());
     }
 
     void leave_public_call()
     {
         int master_to_close = -1;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            --m_public_call_depth;
-            if (m_public_call_depth == 0U) {
-                master_to_close = take_pending_master_close_if_ready_locked();
-                m_public_call_cv.notify_all();
-            }
-        }
+        leave_native_backend_public_call(call_state(), [&] {
+            master_to_close = take_pending_master_close_if_ready_locked();
+        });
 
         if (master_to_close >= 0) {
             ::close(master_to_close);
@@ -1243,10 +1226,7 @@ private:
 
     void wait_for_public_calls_to_finish()
     {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        m_public_call_cv.wait(lock, [this] {
-            return m_public_call_depth == 0U;
-        });
+        wait_for_native_backend_public_calls(call_state());
     }
 
     void request_shutdown_without_cleanup()
