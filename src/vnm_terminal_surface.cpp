@@ -15,6 +15,7 @@
 #include "vnm_terminal/internal/unicode_width.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
+#include "vnm_terminal/internal/wheel_gesture.h"
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 
 #include <vnm_qt_dispatch/vnm_qt_dispatch.h>
@@ -80,11 +81,6 @@ namespace {
 // The trace remains diagnostic; public signal delivery drains the session's
 // durable notification channel during GUI-thread sync.
 constexpr std::size_t k_surface_notification_trace_limit         = 0U;
-constexpr qreal       k_font_zoom_min_pixel_size                 = 6.0;
-constexpr qreal       k_font_zoom_max_pixel_size                 = 72.0;
-constexpr qreal       k_font_zoom_wheel_step                     = 1.0;
-constexpr qreal       k_angle_delta_per_wheel_step               = 120.0;
-constexpr int         k_plain_scroll_lines_per_angle_step        = 3;
 constexpr int         k_min_synchronized_output_stale_timeout_ms = 1;
 constexpr int         k_row_timestamp_tooltip_delay_ms           = 1000;
 constexpr int         k_msdf_availability_completion_poll_ms     = 10;
@@ -246,56 +242,6 @@ qreal normalized_font_pixel_size(qreal font_size)
     }
 
     return static_cast<qreal>(std::max(1, static_cast<int>(std::round(font_size))));
-}
-
-qreal finite_positive_font_size_or_default(qreal font_size)
-{
-    if (!std::isfinite(font_size) || font_size <= 0.0) {
-        return term::k_vnm_terminal_default_font_pixel_size;
-    }
-
-    return font_size;
-}
-
-int wheel_steps_from_delta(int delta, qreal step_size, qreal& remainder)
-{
-    if (delta == 0 || !std::isfinite(step_size) || step_size <= 0.0) {
-        return 0;
-    }
-
-    remainder += static_cast<qreal>(delta);
-    const int steps = static_cast<int>(std::trunc(remainder / step_size));
-    remainder -= static_cast<qreal>(steps) * step_size;
-    return steps;
-}
-
-int vertical_wheel_steps(
-    const QWheelEvent& event,
-    qreal              pixel_step_size,
-    qreal&             angle_remainder,
-    qreal&             pixel_remainder)
-{
-    const int angle_delta = event.angleDelta().y();
-    if (angle_delta != 0) {
-        pixel_remainder = 0.0;
-        return wheel_steps_from_delta(
-            angle_delta,
-            k_angle_delta_per_wheel_step,
-            angle_remainder);
-    }
-
-    const int pixel_delta = event.pixelDelta().y();
-    if (pixel_delta == 0) {
-        return 0;
-    }
-
-    angle_remainder = 0.0;
-    return wheel_steps_from_delta(pixel_delta, pixel_step_size, pixel_remainder);
-}
-
-bool has_vertical_wheel_delta(const QWheelEvent& event)
-{
-    return event.angleDelta().y() != 0 || event.pixelDelta().y() != 0;
 }
 
 int vertical_wheel_direction(const QWheelEvent& event)
@@ -6200,16 +6146,16 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
         };
 
     if ((event->modifiers() & Qt::ControlModifier) != 0) {
-        const int steps = vertical_wheel_steps(
+        const int steps = term::vertical_wheel_steps(
             *event,
-            k_angle_delta_per_wheel_step,
+            term::k_angle_delta_per_wheel_step,
             m_private->wheel_zoom_angle_remainder,
             m_private->wheel_zoom_pixel_remainder);
         wheel_steps           = steps;
         trace_angle_remainder = m_private->wheel_zoom_angle_remainder;
         trace_pixel_remainder = m_private->wheel_zoom_pixel_remainder;
         if (steps == 0) {
-            if (has_vertical_wheel_delta(*event)) {
+            if (term::has_vertical_wheel_delta(*event)) {
                 event->accept();
                 finish_trace(
                     QStringLiteral("control_zoom"),
@@ -6226,14 +6172,10 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
             return;
         }
 
-        const qreal base_font_size = finite_positive_font_size_or_default(m_font_size);
-        const qreal requested_font_size = std::clamp(
-            base_font_size + static_cast<qreal>(steps) * k_font_zoom_wheel_step,
-            k_font_zoom_min_pixel_size,
-            k_font_zoom_max_pixel_size);
-        const qreal previous_font_size = m_font_size;
+        const qreal requested_font_size = term::font_size_after_wheel_zoom(m_font_size, steps);
+        const qreal previous_font_size  = m_font_size;
         set_font_size(requested_font_size);
-        if (has_vertical_wheel_delta(*event) ||
+        if (term::has_vertical_wheel_delta(*event) ||
             !same_property_value(previous_font_size, m_font_size))
         {
             event->accept();
@@ -6281,7 +6223,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 
     const auto route_wheel_to_application = [&]() -> bool {
         application_route_attempted = true;
-        if (!has_vertical_wheel_delta(*event)) {
+        if (!term::has_vertical_wheel_delta(*event)) {
             return false;
         }
 
@@ -6315,7 +6257,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
                 return true;
             }
 
-            const int steps = vertical_wheel_steps(
+            const int steps = term::vertical_wheel_steps(
                 *event,
                 m_private->cell_metrics.height,
                 m_private->wheel_mouse_angle_remainder,
@@ -6338,7 +6280,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
             const int key_count = page_keys
                 ? std::abs(steps)
                 : std::abs(event->angleDelta().y() != 0
-                    ? steps * k_plain_scroll_lines_per_angle_step
+                    ? steps * term::k_plain_scroll_lines_per_angle_step
                     : steps);
             const int key = steps > 0
                 ? (page_keys ? Qt::Key_PageUp : Qt::Key_Up)
@@ -6415,7 +6357,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
                 return true;
             }
 
-            const int steps = vertical_wheel_steps(
+            const int steps = term::vertical_wheel_steps(
                 *event,
                 m_private->cell_metrics.height,
                 m_private->wheel_mouse_angle_remainder,
@@ -6505,7 +6447,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
 
     const auto scroll_viewport_locally = [&](bool trace_on_failure) -> bool {
         local_scroll_attempted = true;
-        if (!has_vertical_wheel_delta(*event)) {
+        if (!term::has_vertical_wheel_delta(*event)) {
             event->ignore();
             local_scroll_block_reason = QStringLiteral("zero_vertical_delta");
             if (trace_on_failure) {
@@ -6563,7 +6505,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
             return false;
         }
 
-        const int line_delta = vertical_wheel_steps(
+        const int line_delta = term::vertical_wheel_steps(
             *event,
             m_private->cell_metrics.height,
             m_private->wheel_scroll_angle_remainder,
@@ -6573,7 +6515,7 @@ void VNM_TerminalSurface::wheelEvent(QWheelEvent* event)
         trace_pixel_remainder = m_private->wheel_scroll_pixel_remainder;
         effective_line_delta =
             event->angleDelta().y() != 0
-                ? line_delta * k_plain_scroll_lines_per_angle_step
+                ? line_delta * term::k_plain_scroll_lines_per_angle_step
                 : line_delta;
         if (effective_line_delta == 0) {
             event->accept();
