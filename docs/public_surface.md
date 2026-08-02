@@ -395,5 +395,23 @@ only under `VNM_TERMINAL_PROFILING_ENABLED`, plus the test/render handoff used b
 the app's integration tests. This privilege is intentional and is not extended to
 installed embedders; the app accepts that these internal types may change and
 migrates in lockstep with the surface (build breaks are an accepted migration
-tool). Profiling read-back and metrics/profile serialization do NOT use this
-privilege; they go through the public `vnm_terminal/diagnostics/` serializers.
+tool).
+
+Everything the app serializes *from the surface* goes through the public
+`vnm_terminal/diagnostics/` serializers, which take only `VNM_TerminalSurface`.
+Two internal writer headers exist for what the app serializes from its own
+privileged state instead, so that the shared encodings have exactly one owner:
+
+- `vnm_terminal/internal/profile_text_writers.h` writes a
+  `Profile_node_snapshot` / `Profile_timeline_snapshot` tree in the profile TEXT
+  format. The app holds those snapshot types already, through its own
+  `Hierarchical_profiler`, and its GUI-thread section must match the format the
+  surface uses for the render thread.
+- `vnm_terminal/internal/metrics_json_writers.h` writes a 64-bit counter into a
+  `QJsonObject` as a decimal string, because a JSON number is a double. The app
+  emits its own sections of the runtime-metrics document next to the
+  surface-owned ones and has to encode counters identically.
+
+Neither belongs in the installed API: the first takes internal snapshot types,
+and the second is an encoding detail of the metrics document rather than a
+capability an embedder should call.
