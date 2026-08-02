@@ -4,9 +4,12 @@
 #include <QByteArray>
 #include <QString>
 #include <QStringView>
+#include <condition_variable>
 #include <cstddef>
+#include <latch>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <thread>
 #include <utility>
 
@@ -28,6 +31,67 @@ struct Native_backend_start_precheck
     Terminal_backend_result                         result;
     std::optional<Terminal_effective_launch_config> effective_config;
 };
+
+// Non-owning view of the caller-admission and worker-identity state a native backend
+// keeps. The fields stay members of the backend and stay under the backend's own mutex,
+// because backend decisions read them together with backend state under a single lock:
+// the POSIX backend claims its deferred master descriptor while holding that lock, and
+// both destructors decide between inline and deferred teardown from it. A registry with
+// a lock of its own would change what those decisions observe.
+struct native_backend_call_state_t
+{
+    std::mutex&                mutex;
+    std::condition_variable&   public_call_cv;
+    std::size_t&               public_call_depth;
+    std::set<std::thread::id>& worker_thread_ids;
+    bool&                      startup_aborted;
+};
+
+void enter_native_backend_public_call(
+    native_backend_call_state_t        call_state);
+
+void wait_for_native_backend_public_calls(
+    native_backend_call_state_t        call_state);
+
+bool native_backend_has_active_public_call(
+    native_backend_call_state_t        call_state);
+
+// True when the calling thread is one of this backend's own worker threads. Destruction
+// reached from a worker callback must not tear down inline, because shutdown() joins the
+// worker threads and would detach the calling thread and free the backend while that
+// worker is still on the stack.
+bool is_native_backend_worker_thread(
+    native_backend_call_state_t        call_state);
+
+// Records the calling worker's id, holds it at `startup_gate` until start() has committed
+// its thread members, and reports whether the worker may run. False means start() aborted
+// and the worker must return without running any callback-capable work.
+//
+// The id is recorded BEFORE the gate opens, so a worker is always in the id set by the
+// time it can deliver a callback. is_native_backend_worker_thread depends on exactly that
+// ordering, and it is the reason workers are admitted through one function rather than
+// registering themselves. Recording ids rather than comparing std::thread members also
+// keeps destruction independent of unsynchronized reads of those members.
+bool admit_native_backend_worker(
+    native_backend_call_state_t        call_state,
+    std::latch&                        startup_gate);
+
+// Leaves a public call and, when it was the outermost one, runs `on_last_public_call`
+// under the mutex before waking the waiters. The POSIX backend uses that hook to claim
+// the master descriptor it could not close while a call was in flight; claiming it
+// without the lock would race a call that entered in between.
+template <typename On_last_public_call_fn>
+void leave_native_backend_public_call(
+    native_backend_call_state_t        call_state,
+    On_last_public_call_fn&&           on_last_public_call)
+{
+    std::lock_guard<std::mutex> lock(call_state.mutex);
+    --call_state.public_call_depth;
+    if (call_state.public_call_depth == 0U) {
+        on_last_public_call();
+        call_state.public_call_cv.notify_all();
+    }
+}
 
 struct native_backend_output_delivery_limits_t
 {

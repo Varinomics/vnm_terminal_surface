@@ -253,6 +253,49 @@ void report_native_backend_exit(
     }
 }
 
+void enter_native_backend_public_call(native_backend_call_state_t call_state)
+{
+    std::lock_guard<std::mutex> lock(call_state.mutex);
+    ++call_state.public_call_depth;
+}
+
+void wait_for_native_backend_public_calls(native_backend_call_state_t call_state)
+{
+    std::unique_lock<std::mutex> lock(call_state.mutex);
+    call_state.public_call_cv.wait(lock, [&call_state] {
+        return call_state.public_call_depth == 0U;
+    });
+}
+
+bool native_backend_has_active_public_call(native_backend_call_state_t call_state)
+{
+    std::lock_guard<std::mutex> lock(call_state.mutex);
+    return call_state.public_call_depth != 0U;
+}
+
+bool is_native_backend_worker_thread(native_backend_call_state_t call_state)
+{
+    std::lock_guard<std::mutex> lock(call_state.mutex);
+    return
+        call_state.worker_thread_ids.find(std::this_thread::get_id()) !=
+        call_state.worker_thread_ids.end();
+}
+
+bool admit_native_backend_worker(
+    native_backend_call_state_t  call_state,
+    std::latch&                  startup_gate)
+{
+    {
+        std::lock_guard<std::mutex> lock(call_state.mutex);
+        call_state.worker_thread_ids.insert(std::this_thread::get_id());
+    }
+
+    startup_gate.wait();
+
+    std::lock_guard<std::mutex> lock(call_state.mutex);
+    return !call_state.startup_aborted;
+}
+
 void join_or_detach_native_backend_thread(std::thread& thread)
 {
     if (!thread.joinable()) {
