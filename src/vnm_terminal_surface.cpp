@@ -3821,7 +3821,9 @@ void VNM_TerminalSurface::dismiss_row_timestamp_tooltip()
     }
 
     m_private->row_timestamp_tooltip_request_active = false;
-    emit row_timestamp_tooltip_dismissed();
+    if (!m_private->shutting_down.load()) {
+        emit row_timestamp_tooltip_dismissed();
+    }
 }
 
 bool VNM_TerminalSurface::row_timestamp_tooltip_pointer_moved(const QPointF& position)
@@ -6874,7 +6876,9 @@ void VNM_TerminalSurface::set_viewport_state(
     if (scroll_position_changed) {
         dismiss_row_timestamp_tooltip();
     }
-    emit viewport_changed();
+    if (!m_private->shutting_down.load()) {
+        emit viewport_changed();
+    }
 }
 
 void VNM_TerminalSurface::set_process_state(Process_state state)
@@ -6914,7 +6918,9 @@ void VNM_TerminalSurface::set_selection_state(Selection_state state)
     }
 
     m_selection_state = state;
-    emit selection_changed();
+    if (!m_private->shutting_down.load()) {
+        emit selection_changed();
+    }
 }
 
 void VNM_TerminalSurface::bind_window_signals(QQuickWindow* window)
@@ -8408,6 +8414,15 @@ void term::VNM_TerminalSurface_render_bridge::handle_synchronized_output_recover
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.handle_synchronized_output_recovery_timeout(budget);
+}
+
+void term::VNM_TerminalSurface_render_bridge::
+    handle_row_timestamp_tooltip_timeout_for_testing(
+        VNM_TerminalSurface& surface)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    surface.m_private->row_timestamp_tooltip_timer.stop();
+    surface.handle_row_timestamp_tooltip_timeout();
 }
 
 std::shared_ptr<const term::Terminal_render_snapshot>

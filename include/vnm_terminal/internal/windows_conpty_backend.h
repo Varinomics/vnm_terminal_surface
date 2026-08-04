@@ -10,12 +10,14 @@ namespace vnm_terminal::internal {
 
 struct Windows_conpty_backend_write_state_for_testing
 {
-    std::size_t queued_write_bytes    = 0U;
-    std::size_t queued_write_count    = 0U;
-    std::size_t in_flight_write_bytes = 0U;
-    bool        running               = false;
-    bool        stopping              = false;
-    bool        writer_failed         = false;
+    std::size_t queued_write_bytes       = 0U;
+    std::size_t queued_write_count       = 0U;
+    std::size_t in_flight_write_bytes    = 0U;
+    std::size_t successful_write_count   = 0U;
+    std::size_t failed_write_count       = 0U;
+    bool        running                  = false;
+    bool        stopping                 = false;
+    bool        writer_failed            = false;
 };
 
 class Windows_conpty_backend final : public Terminal_backend

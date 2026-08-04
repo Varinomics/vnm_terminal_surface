@@ -429,6 +429,8 @@ public:
             m_queued_write_bytes,
             m_write_queue.size(),
             m_in_flight_write_bytes,
+            m_successful_write_count,
+            m_failed_write_count,
             m_running,
             m_stopping,
             m_writer_failed,
@@ -655,6 +657,8 @@ public:
             m_conpty_active_calls                  = 0U;
             m_pending_interrupt_writes             = 0U;
             m_in_flight_write_bytes                = 0U;
+            m_successful_write_count               = 0U;
+            m_failed_write_count                   = 0U;
             m_child_output_sequence                = 0U;
             m_interrupt_delivery_exit_code_pending = false;
             m_interrupt_clear_waits_for_output     = false;
@@ -1321,11 +1325,11 @@ private:
                             .arg(write_result.error_message),
                         write.trace_id);
                 }
-                mark_write_completed();
                 mark_writer_failed_after_write_failure(write.marks_interrupted_exit);
+                record_write_outcome(false);
                 return;
             }
-            mark_write_completed();
+            record_write_outcome(true);
             if (interaction_trace_enabled()) {
                 record_interaction_trace(
                     "conpty",
@@ -1344,10 +1348,16 @@ private:
         }
     }
 
-    void mark_write_completed()
+    void record_write_outcome(bool succeeded)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_in_flight_write_bytes = 0U;
+        if (succeeded) {
+            ++m_successful_write_count;
+        }
+        else {
+            ++m_failed_write_count;
+        }
     }
 
     void mark_interrupt_write_started()
@@ -1734,6 +1744,8 @@ private:
     std::size_t                        m_pending_interrupt_writes = 0U;
     std::size_t                        m_public_call_depth        = 0U;
     std::size_t                        m_in_flight_write_bytes    = 0U;
+    std::size_t                        m_successful_write_count   = 0U;
+    std::size_t                        m_failed_write_count       = 0U;
     std::uint64_t                      m_child_output_sequence    = 0U;
     bool                               m_running = false;
     bool                               m_start_attempted = false;

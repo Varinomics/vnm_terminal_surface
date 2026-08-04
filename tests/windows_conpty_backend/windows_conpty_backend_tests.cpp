@@ -561,6 +561,33 @@ public:
         });
     }
 
+    bool wait_for_exit_while_output_progresses()
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        std::size_t observed_output_events = m_output_events.size();
+        while (!m_exit.has_value()) {
+            const auto inactivity_deadline =
+                std::chrono::steady_clock::now() + k_wait_timeout;
+            const bool state_changed = m_cv.wait_until(lock, inactivity_deadline, [&] {
+                return
+                    m_exit.has_value() ||
+                    m_output_events.size() != observed_output_events;
+            });
+            if (!state_changed) {
+                std::cerr << "exit wait made no output progress: output_bytes="
+                    << m_output.size()
+                    << " output_events=" << m_output_events.size()
+                    << " backend_errors=" << m_errors.size()
+                    << '\n';
+                return false;
+            }
+
+            observed_output_events = m_output_events.size();
+        }
+
+        return true;
+    }
+
     bool wait_for_exit_within(std::chrono::milliseconds interval)
     {
         std::unique_lock<std::mutex> lock(m_mutex);
@@ -718,6 +745,39 @@ bool wait_for_in_flight_write(
         << " queued_count=" << last_state.queued_write_count
         << " in_flight_bytes=" << last_state.in_flight_write_bytes
         << " running=" << last_state.running
+        << " stopping=" << last_state.stopping
+        << " writer_failed=" << last_state.writer_failed
+        << '\n';
+    return check(false, message);
+}
+
+bool wait_for_write_failure(
+    term::Windows_conpty_backend&                               backend,
+    const term::Windows_conpty_backend_write_state_for_testing& before,
+    const char*                                                 message)
+{
+    term::Windows_conpty_backend_write_state_for_testing last_state;
+    const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+    do {
+        last_state = backend.write_state_for_testing();
+        if (last_state.failed_write_count != before.failed_write_count) {
+            return check(true, message);
+        }
+
+        if (last_state.successful_write_count != before.successful_write_count) {
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    while (std::chrono::steady_clock::now() < deadline);
+
+    std::cerr << message
+        << ": successful_before=" << before.successful_write_count
+        << " successful_after=" << last_state.successful_write_count
+        << " failed_before=" << before.failed_write_count
+        << " failed_after=" << last_state.failed_write_count
+        << " in_flight_bytes=" << last_state.in_flight_write_bytes
         << " stopping=" << last_state.stopping
         << " writer_failed=" << last_state.writer_failed
         << '\n';
@@ -1305,7 +1365,8 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
     }
 
     ok &= check(output_pause_released, "interactive scenario exercised output pause");
-    ok &= check(capture.wait_for_exit(), "interactive fixture exits");
+    ok &= check(capture.wait_for_exit_while_output_progresses(),
+        "interactive fixture exits without stalling its output stream");
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
     ok &= check(exit.has_value() &&
         exit->reason == term::Terminal_exit_reason::EXITED &&
@@ -2534,6 +2595,9 @@ bool test_failed_write_after_interrupt_does_not_clear_on_final_output(
             "exit-130-blocked-interrupt-read")),
         "blocked-post-interrupt fixture consumes interrupt byte and stops reading");
 
+    const term::Windows_conpty_backend_write_state_for_testing write_state_before =
+        backend->write_state_for_testing();
+
     constexpr std::size_t blocking_write_size =
         term::k_native_backend_max_queued_write_bytes;
     const term::Terminal_backend_result blocking_write =
@@ -2549,6 +2613,10 @@ bool test_failed_write_after_interrupt_does_not_clear_on_final_output(
     ok &= check(capture.wait_for_output(QByteArrayLiteral(
             "exit-130-blocked-final-output")),
         "blocked-post-interrupt fixture emits final output");
+    ok &= wait_for_write_failure(
+        *backend,
+        write_state_before,
+        "blocked post-interrupt ordinary write reports failure");
     ok &= check(capture.wait_for_exit(), "blocked-post-interrupt fixture exits");
 
     const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
