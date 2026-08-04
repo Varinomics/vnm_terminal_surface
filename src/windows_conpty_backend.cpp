@@ -1055,37 +1055,45 @@ private:
         report_native_backend_error(callbacks, code, std::move(message));
     }
 
+    native_backend_exit_publication_state_t exit_publication_state()
+    {
+        return native_backend_exit_publication_state_t{
+            m_mutex,
+            m_output_cv,
+            m_write_cv,
+            m_callbacks,
+            m_exit_reported,
+            m_running,
+            m_stopping,
+            m_output_paused,
+        };
+    }
+
     void report_exit_once(Terminal_exit_reason default_reason, int exit_code)
     {
-        Terminal_backend_callbacks callbacks;
-        Terminal_exit_reason reason = default_reason;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_exit_reported) {
-                return;
-            }
-
-            if (m_exit_reason_override.has_value()) {
-                reason = *m_exit_reason_override;
-            }
-            else
-            if (m_interrupt_delivery_exit_code_pending &&
-                exit_code == k_interrupt_exit_code)
-            {
-                reason = Terminal_exit_reason::INTERRUPTED;
-            }
-
-            m_exit_reported = true;
-            m_running       = false;
-            m_stopping      = true;
-            m_output_paused = false;
-        }
-
-        m_output_cv.notify_all();
-        m_write_cv.notify_all();
-
-        callbacks = callbacks_for_delivery();
-        report_native_backend_exit(callbacks, reason, exit_code);
+        report_native_backend_exit_once(
+            exit_publication_state(),
+            default_reason,
+            exit_code,
+            [this, exit_code](Terminal_exit_reason reason) {
+                // This backend resolves the reported reason inside the once-section:
+                // an explicit override wins, then a pending interrupt delivery whose
+                // exit code matches the interrupt code. The POSIX backend pre-resolves
+                // its reason from the wait status before the once-section instead. The
+                // two placements are not interchangeable and neither is shared.
+                if (m_exit_reason_override.has_value()) {
+                    return *m_exit_reason_override;
+                }
+                else
+                if (m_interrupt_delivery_exit_code_pending &&
+                    exit_code == k_interrupt_exit_code)
+                {
+                    return Terminal_exit_reason::INTERRUPTED;
+                }
+                return reason;
+            },
+            // Nothing extra to set under the lock and no I/O threads to wake.
+            Native_backend_empty_claim{});
     }
 
     void deliver_output(QByteArray bytes)
