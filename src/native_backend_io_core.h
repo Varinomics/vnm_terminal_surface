@@ -110,16 +110,21 @@ void leave_native_backend_public_call(
     }
 }
 
-// Default on-last-call hook for Native_backend_public_call_guard: claims nothing
-// and defers nothing. Windows uses it because nothing is deferred to the outermost
-// public call on that backend; the ConPTY handle is closed through its own
-// active-call counter instead.
+// Default no-op action for the injected wake hooks: does nothing. Windows passes
+// it where POSIX wakes its I/O threads, because the ConPTY backend has no I/O
+// threads to wake.
 struct Native_backend_empty_action
 {
     void operator()() const noexcept {}
 };
 
-struct Native_backend_empty_last_call_claim
+// Default no-op claim for hooks that run under a lock and return the action to
+// run after it is released: claims nothing and defers nothing. Windows passes it
+// for both the public-call guard and exit publication: nothing is deferred to the
+// outermost public call on that backend (the ConPTY handle is closed through its
+// own active-call counter), and exit publication sets no extra stop flags and
+// wakes no I/O threads there.
+struct Native_backend_empty_claim
 {
     Native_backend_empty_action operator()() const noexcept { return {}; }
 };
@@ -134,7 +139,7 @@ struct Native_backend_empty_last_call_claim
 // second; claiming without the lock would race a call that entered in between, and
 // the close keeps the claim-under-the-lock, close-after-unlock shape every deferred
 // close in that backend already follows.
-template <typename On_last_call_claim_fn = Native_backend_empty_last_call_claim>
+template <typename On_last_call_claim_fn = Native_backend_empty_claim>
 class Native_backend_public_call_guard
 {
 public:
@@ -449,6 +454,83 @@ void report_native_backend_exit(
     const Terminal_backend_callbacks&  callbacks,
     Terminal_exit_reason               reason,
     int                                exit_code);
+
+// Non-owning view of the exit-publication state a native backend keeps. The fields
+// stay members of the backend and stay under the backend's own mutex: the once-flag
+// check, the stop-flag sets, and - on Windows - the exit-reason resolution all run
+// under that single lock, and the callback snapshot is a fresh locked read of the
+// same state the shutdown paths clear. A registry with a lock of its own would
+// change what those decisions observe.
+struct native_backend_exit_publication_state_t
+{
+    std::mutex&                 mutex;
+    std::condition_variable&    output_cv;
+    std::condition_variable&    write_cv;
+    Terminal_backend_callbacks& callbacks;
+    bool&                       exit_reported;
+    bool&                       running;
+    bool&                       stopping;
+    bool&                       output_paused;
+};
+
+// Publishes the child exit exactly once. Under the backend mutex: returns without
+// reporting when the exit was already published; otherwise resolves the reported
+// reason through `resolve_reason_locked`, sets the once-flag and the stop flags,
+// and runs `on_exit_flags_claim`. After the mutex is released: wakes the output
+// and write waiters, runs the action the claim returned, snapshots the callbacks
+// under a fresh lock, and reports the exit through them.
+//
+// `resolve_reason_locked` runs under the same lock as the once-flag check and is
+// deliberately backend-specific. Windows resolves the reason there: an explicit
+// override wins, then a pending interrupt delivery whose exit code matches. POSIX
+// pre-resolves its reason from the wait status BEFORE entering the once-section
+// and passes the resolved reason through, so its hook is the identity. The two
+// placements are load-bearing and not interchangeable, and the shared flow does
+// not pick one.
+//
+// `on_exit_flags_claim` runs under the same lock after the shared stop flags are
+// set and returns the action to run after the waiters are woken - the claim-under-
+// the-lock, act-after-unlock shape the public-call guard uses. POSIX claims its
+// extra stop flag there and wakes its I/O threads from the returned action;
+// Windows passes Native_backend_empty_claim because it has neither.
+template <typename Resolve_reason_fn, typename On_exit_flags_claim_fn>
+void report_native_backend_exit_once(
+    native_backend_exit_publication_state_t exit_publication,
+    Terminal_exit_reason                    default_reason,
+    int                                     exit_code,
+    Resolve_reason_fn&&                     resolve_reason_locked,
+    On_exit_flags_claim_fn&&                on_exit_flags_claim)
+{
+    Terminal_exit_reason reason = default_reason;
+    std::optional<decltype(on_exit_flags_claim())> wake_after_publication;
+    {
+        std::lock_guard<std::mutex> lock(exit_publication.mutex);
+        if (exit_publication.exit_reported) {
+            return;
+        }
+
+        reason = resolve_reason_locked(reason);
+
+        exit_publication.exit_reported = true;
+        exit_publication.running       = false;
+        exit_publication.stopping      = true;
+        exit_publication.output_paused = false;
+        wake_after_publication.emplace(on_exit_flags_claim());
+    }
+
+    exit_publication.output_cv.notify_all();
+    exit_publication.write_cv.notify_all();
+    if (wake_after_publication.has_value()) {
+        (*wake_after_publication)();
+    }
+
+    Terminal_backend_callbacks callbacks;
+    {
+        std::lock_guard<std::mutex> lock(exit_publication.mutex);
+        callbacks = exit_publication.callbacks;
+    }
+    report_native_backend_exit(callbacks, reason, exit_code);
+}
 
 void join_or_detach_native_backend_thread(
     std::thread&                       thread);

@@ -1239,6 +1239,20 @@ private:
         report_native_backend_error(callbacks, code, std::move(message));
     }
 
+    native_backend_exit_publication_state_t exit_publication_state()
+    {
+        return native_backend_exit_publication_state_t{
+            m_mutex,
+            m_output_cv,
+            m_write_cv,
+            m_callbacks,
+            m_exit_reported,
+            m_running,
+            m_stopping,
+            m_output_paused,
+        };
+    }
+
     void report_exit_once(int wait_status)
     {
         std::optional<Terminal_exit_reason> override_reason;
@@ -1254,26 +1268,28 @@ private:
 
     void report_exit_once(Terminal_exit_reason reason, int exit_code)
     {
-        Terminal_backend_callbacks callbacks;
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            if (m_exit_reported) {
-                return;
-            }
-
-            m_exit_reported    = true;
-            m_running          = false;
-            m_process_stopping = true;
-            m_stopping         = true;
-            m_output_paused    = false;
-        }
-
-        m_output_cv.notify_all();
-        m_write_cv.notify_all();
-        wake_io_threads();
-
-        callbacks = callbacks_for_delivery();
-        report_native_backend_exit(callbacks, reason, exit_code);
+        report_native_backend_exit_once(
+            exit_publication_state(),
+            reason,
+            exit_code,
+            [](Terminal_exit_reason resolved_reason) {
+                // This backend pre-resolves the reported reason from the wait status
+                // before the once-section (see the wait-status overload above), so the
+                // shared skeleton takes it as given. The Windows backend resolves its
+                // reason inside the once-section instead. The two placements are not
+                // interchangeable and neither is shared.
+                return resolved_reason;
+            },
+            [this] {
+                // Claims this backend's extra stop flag under the once-lock, after the
+                // shared stop flags are set; the returned action wakes the I/O threads
+                // after the output and write waiters are woken. Windows has neither
+                // and passes the empty claim.
+                m_process_stopping = true;
+                return [this] {
+                    wake_io_threads();
+                };
+            });
     }
 
     void deliver_output(QByteArray bytes)
