@@ -224,6 +224,32 @@ void append_native_backend_paused_output(
     }
 }
 
+bool take_native_backend_paused_output_for_delivery_locked(
+    QByteArray&    paused_output,
+    QByteArray&    delivery_bytes,
+    bool&          paused_output_delivery_in_progress,
+    qsizetype      delivery_chunk_bytes)
+{
+    if (delivery_chunk_bytes <= 0          ||
+        paused_output_delivery_in_progress ||
+        paused_output.isEmpty())
+    {
+        return false;
+    }
+
+    const qsizetype byte_count = std::min(paused_output.size(), delivery_chunk_bytes);
+    if (byte_count == paused_output.size()) {
+        delivery_bytes = std::move(paused_output);
+        paused_output.clear();
+    }
+    else {
+        delivery_bytes = paused_output.sliced(0, byte_count);
+        paused_output.remove(0, byte_count);
+    }
+    paused_output_delivery_in_progress = true;
+    return true;
+}
+
 void report_native_backend_error(
     const Terminal_backend_callbacks&  callbacks,
     Terminal_backend_error_code        code,

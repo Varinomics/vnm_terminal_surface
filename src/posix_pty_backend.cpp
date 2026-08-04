@@ -1284,94 +1284,58 @@ private:
 
     bool take_paused_output_for_delivery_locked(QByteArray& paused_output)
     {
-        if (m_paused_output_limits.delivery_chunk_bytes <= 0 ||
-            m_paused_output_delivery_in_progress             ||
-            m_paused_output.isEmpty())
-        {
-            return false;
-        }
-
-        const qsizetype byte_count = std::min(
-            m_paused_output.size(),
-            m_paused_output_limits.delivery_chunk_bytes);
-        if (byte_count == m_paused_output.size()) {
-            paused_output = std::move(m_paused_output);
-            m_paused_output.clear();
-        }
-        else {
-            paused_output = m_paused_output.sliced(0, byte_count);
-            m_paused_output.remove(0, byte_count);
-        }
-        m_paused_output_delivery_in_progress = true;
-        return true;
+        return
+            take_native_backend_paused_output_for_delivery_locked(
+                m_paused_output,
+                paused_output,
+                m_paused_output_delivery_in_progress,
+                m_paused_output_limits.delivery_chunk_bytes);
     }
 
     void finish_paused_output_delivery(bool delivery_started)
     {
-        if (!delivery_started) {
-            return;
-        }
-
-        for (;;) {
-            QByteArray next_paused_output;
-            {
-                std::lock_guard<std::mutex> lock(m_mutex);
-                if ((!m_output_paused || m_process_stopping || m_stopping) &&
-                    !m_paused_output.isEmpty())
-                {
-                    const qsizetype byte_count = std::min(
-                        m_paused_output.size(),
-                        m_paused_output_limits.delivery_chunk_bytes);
-                    if (byte_count == m_paused_output.size()) {
-                        next_paused_output = std::move(m_paused_output);
-                        m_paused_output.clear();
-                    }
-                    else {
-                        next_paused_output = m_paused_output.sliced(0, byte_count);
-                        m_paused_output.remove(0, byte_count);
-                    }
-                }
-                else {
-                    m_paused_output_delivery_in_progress = false;
-                    break;
-                }
-            }
-
-            deliver_output(std::move(next_paused_output));
-        }
-
-        m_output_cv.notify_all();
-        wake_io_threads();
+        finish_native_backend_paused_output_delivery(
+            m_mutex,
+            m_output_cv,
+            m_paused_output,
+            m_output_paused,
+            m_paused_output_delivery_in_progress,
+            m_paused_output_limits.delivery_chunk_bytes,
+            delivery_started,
+            [this] {
+                // This backend drains through m_process_stopping || m_stopping and
+                // wakes its I/O threads when the drain finishes. The Windows backend
+                // drains through m_stopping || m_shutdown_started instead and has no
+                // I/O threads to wake. The two stop predicates are not
+                // interchangeable and neither is the shared default.
+                return m_process_stopping || m_stopping;
+            },
+            [this](QByteArray bytes) {
+                deliver_output(std::move(bytes));
+            },
+            [this] {
+                wake_io_threads();
+            });
     }
 
     void drain_paused_output_before_exit_report()
     {
-        for (;;) {
-            QByteArray paused_output;
-            bool paused_output_delivery_started = false;
-            {
-                std::unique_lock<std::mutex> lock(m_mutex);
-                m_output_cv.wait(lock, [&] {
-                    return
-                        !m_paused_output_delivery_in_progress &&
-                        (m_paused_output.isEmpty() ||
-                         !m_output_paused          ||
-                         m_process_stopping        ||
-                         m_stopping);
-                });
-                if (m_paused_output.isEmpty()) {
-                    return;
-                }
-
-                paused_output_delivery_started =
-                    take_paused_output_for_delivery_locked(paused_output);
-            }
-
-            if (!paused_output.isEmpty()) {
-                deliver_output(std::move(paused_output));
-            }
-            finish_paused_output_delivery(paused_output_delivery_started);
-        }
+        drain_native_backend_paused_output_before_exit_report(
+            m_mutex,
+            m_output_cv,
+            m_paused_output,
+            m_output_paused,
+            m_paused_output_delivery_in_progress,
+            m_paused_output_limits.delivery_chunk_bytes,
+            [this] {
+                return m_process_stopping || m_stopping;
+            },
+            [this](QByteArray bytes) {
+                deliver_output(std::move(bytes));
+            },
+            [this] {
+                wake_io_threads();
+            });
     }
 
     void deliver_or_buffer_output(QByteArray bytes)

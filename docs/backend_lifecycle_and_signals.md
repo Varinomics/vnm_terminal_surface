@@ -76,13 +76,18 @@ pending and the backend can still buffer) or delivers the bytes to the
 `output_received` callback. Both native backends derive their read chunk,
 paused-buffer high-water, and paused-replay chunk sizes from
 `derive_native_backend_output_delivery_limits` in
-`src/native_backend_io_core.*`. POSIX uses the shared
-`deliver_or_buffer_native_backend_output` helper in
-`src/native_backend_io_core.h`; ConPTY implements the same FIFO/backpressure
-contract in its local pipe-drain path. The session activates backpressure
-through `Terminal_backend::set_output_paused`; the two backends behave
-differently while paused, and that difference is the central cross-platform
-contract here.
+`src/native_backend_io_core.*`. Both backends route the paused-output decision
+through the shared `deliver_or_buffer_native_backend_output` in
+`src/native_backend_io_core.h`, each injecting its own admission predicate, and
+both replay the paused buffer through the shared
+`take_native_backend_paused_output_for_delivery_locked`,
+`finish_native_backend_paused_output_delivery`, and
+`drain_native_backend_paused_output_before_exit_report`, each injecting its own
+stop predicate and post-drain wake hook; the two backends' predicates are
+deliberately different and are spelled out at each injection site. The session
+activates backpressure through `Terminal_backend::set_output_paused`; the two
+backends behave differently while paused, and that difference is the central
+cross-platform contract here.
 
 ### Windows: bounded drain while paused
 
