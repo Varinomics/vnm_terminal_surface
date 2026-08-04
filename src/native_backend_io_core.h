@@ -63,6 +63,15 @@ bool native_backend_has_active_public_call(
 bool is_native_backend_worker_thread(
     native_backend_call_state_t        call_state);
 
+// True when backend destruction must hand its teardown to a fresh thread instead of
+// running it inline: either the calling thread is one of the backend's own workers,
+// so inline teardown would join the thread it runs on, or a public backend call is
+// still unwinding, so the impl must not be freed under live stack frames. The
+// worker-id set and the public-call depth are read as two separate locked snapshots,
+// the same observation shape both destructors have always used.
+bool must_defer_native_backend_destruction(
+    native_backend_call_state_t        call_state);
+
 // Records the calling worker's id, holds it at `startup_gate` until start() has committed
 // its thread members, and reports whether the worker may run. False means start() aborted
 // and the worker must return without running any callback-capable work.
@@ -97,6 +106,87 @@ void leave_native_backend_public_call(
     if (call_state.public_call_depth == 0U) {
         on_last_public_call();
         call_state.public_call_cv.notify_all();
+    }
+}
+
+// Default on-last-call hook for Native_backend_public_call_guard: claims nothing
+// and defers nothing. Windows uses it because nothing is deferred to the outermost
+// public call on that backend; the ConPTY handle is closed through its own
+// active-call counter instead.
+struct Native_backend_empty_action
+{
+    void operator()() const noexcept {}
+};
+
+struct Native_backend_empty_last_call_claim
+{
+    Native_backend_empty_action operator()() const noexcept { return {}; }
+};
+
+// RAII scope for one public backend call: enters the call on construction and leaves
+// it on destruction through the shared enter/leave primitives, so both backends
+// bracket their public surface with the same nesting, locking and wakeup shape. When
+// the leaving call was the outermost one, the leave first runs the on-last-call
+// claim under the backend mutex (before waking the destruction waiters), then runs
+// the action the claim returned after the mutex is released. The POSIX backend
+// claims its deferred master descriptor in the first step and closes it in the
+// second; claiming without the lock would race a call that entered in between, and
+// the close keeps the claim-under-the-lock, close-after-unlock shape every deferred
+// close in that backend already follows.
+template <typename On_last_call_claim_fn = Native_backend_empty_last_call_claim>
+class Native_backend_public_call_guard
+{
+public:
+    explicit Native_backend_public_call_guard(
+        native_backend_call_state_t call_state,
+        On_last_call_claim_fn       on_last_call_claim = {})
+    :
+        m_call_state(call_state),
+        m_on_last_call_claim(std::move(on_last_call_claim))
+    {
+        enter_native_backend_public_call(m_call_state);
+    }
+
+    Native_backend_public_call_guard(const Native_backend_public_call_guard&) = delete;
+    Native_backend_public_call_guard& operator=(const Native_backend_public_call_guard&) = delete;
+
+    ~Native_backend_public_call_guard()
+    {
+        std::optional<decltype(m_on_last_call_claim())> deferred_action;
+        leave_native_backend_public_call(m_call_state, [&] {
+            deferred_action.emplace(m_on_last_call_claim());
+        });
+        if (deferred_action.has_value()) {
+            (*deferred_action)();
+        }
+    }
+
+private:
+    native_backend_call_state_t m_call_state;
+    On_last_call_claim_fn       m_on_last_call_claim;
+};
+
+// Runs impl->shutdown() and deletes impl on a fresh, non-worker thread, after
+// waiting for in-flight public calls to drain, so join_threads() can join the worker
+// threads and any public backend call already on the stack can return before the
+// impl is freed. Takes ownership of impl. When the thread cannot be spawned, runs
+// on_spawn_failure instead: the impl is deliberately leaked (safe: no
+// use-after-free) while the backend force-terminates its child process tree.
+template <typename Impl, typename On_spawn_failure_fn>
+void defer_native_backend_shutdown_and_delete(
+    Impl*                        impl,
+    native_backend_call_state_t  call_state,
+    On_spawn_failure_fn&&        on_spawn_failure) noexcept
+{
+    try {
+        std::thread([impl, call_state] {
+            wait_for_native_backend_public_calls(call_state);
+            impl->shutdown();
+            delete impl;
+        }).detach();
+    }
+    catch (...) {
+        on_spawn_failure();
     }
 }
 

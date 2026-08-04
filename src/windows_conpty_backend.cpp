@@ -417,38 +417,9 @@ std::vector<std::byte> initialized_attribute_list_storage(
 class Windows_conpty_backend::Impl
 {
 public:
-    class Public_call_guard
-    {
-    public:
-        explicit Public_call_guard(Impl& impl)
-        :
-            m_impl(&impl)
-        {
-            m_impl->enter_public_call();
-        }
-
-        Public_call_guard(const Public_call_guard&) = delete;
-        Public_call_guard& operator=(const Public_call_guard&) = delete;
-
-        ~Public_call_guard()
-        {
-            if (m_impl != nullptr) {
-                m_impl->leave_public_call();
-            }
-        }
-
-    private:
-        Impl* m_impl = nullptr;
-    };
-
     ~Impl()
     {
         shutdown();
-    }
-
-    Public_call_guard public_call_guard()
-    {
-        return Public_call_guard(*this);
     }
 
     Windows_conpty_backend_write_state_for_testing write_state_for_testing()
@@ -989,16 +960,6 @@ public:
         m_running = false;
     }
 
-    bool is_worker_thread()
-    {
-        return is_native_backend_worker_thread(call_state());
-    }
-
-    bool has_active_public_call()
-    {
-        return native_backend_has_active_public_call(call_state());
-    }
-
     void run_worker_after_startup_gate(
         std::shared_ptr<std::latch> startup_gate,
         void (Impl::*loop)())
@@ -1023,24 +984,6 @@ public:
         termination_escalation_loop(process, process_job, policy);
     }
 
-    // Run shutdown() and delete on a fresh, non-worker thread so join_threads()
-    // can join worker threads and any public backend call already on the stack
-    // can return before the Impl is freed. Takes ownership of this Impl.
-    void defer_shutdown_and_delete() noexcept
-    {
-        try {
-            std::thread([this] {
-                wait_for_public_calls_to_finish();
-                shutdown();
-                delete this;
-            }).detach();
-        }
-        catch (...) {
-            request_shutdown_without_cleanup();
-        }
-    }
-
-private:
     // Best-effort teardown for the unreachable-in-practice case where the
     // deferred-shutdown thread cannot be spawned. It must not join or delete: the
     // worker threads are still running against this Impl, so the Impl is
@@ -1088,12 +1031,6 @@ private:
         }
     }
 
-    Terminal_backend_callbacks callbacks_for_delivery()
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_callbacks;
-    }
-
     native_backend_call_state_t call_state()
     {
         return native_backend_call_state_t{
@@ -1105,21 +1042,11 @@ private:
         };
     }
 
-    void enter_public_call()
+private:
+    Terminal_backend_callbacks callbacks_for_delivery()
     {
-        enter_native_backend_public_call(call_state());
-    }
-
-    void leave_public_call()
-    {
-        // Nothing is deferred to the outermost public call on this backend; the ConPTY
-        // handle is closed through its own active-call counter instead.
-        leave_native_backend_public_call(call_state(), [] {});
-    }
-
-    void wait_for_public_calls_to_finish()
-    {
-        wait_for_native_backend_public_calls(call_state());
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_callbacks;
     }
 
     void report_error(Terminal_backend_error_code code, QString message)
@@ -1916,11 +1843,12 @@ Windows_conpty_backend::~Windows_conpty_backend()
 {
     // Defer when teardown is reached from a callback or while a public backend
     // call is still unwinding, so the Impl is not freed under live stack frames.
-    if (m_impl &&
-        (m_impl->is_worker_thread() || m_impl->has_active_public_call()))
-    {
+    if (m_impl && must_defer_native_backend_destruction(m_impl->call_state())) {
         Impl* impl = m_impl.release();
-        impl->defer_shutdown_and_delete();
+        defer_native_backend_shutdown_and_delete(
+            impl,
+            impl->call_state(),
+            [impl] { impl->request_shutdown_without_cleanup(); });
     }
 }
 
@@ -1929,14 +1857,14 @@ Terminal_backend_result Windows_conpty_backend::start(
     Terminal_backend_callbacks     callbacks)
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->start(config, std::move(callbacks));
 }
 
 Terminal_backend_result Windows_conpty_backend::write(QByteArray bytes)
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->write(std::move(bytes));
 }
 
@@ -1944,28 +1872,28 @@ Terminal_backend_result Windows_conpty_backend::resize(
     Terminal_backend_resize_request request)
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->resize(request);
 }
 
 Terminal_backend_result Windows_conpty_backend::set_output_paused(bool paused)
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->set_output_paused(paused);
 }
 
 Terminal_backend_result Windows_conpty_backend::interrupt()
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->interrupt();
 }
 
 Terminal_backend_result Windows_conpty_backend::terminate()
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->terminate();
 }
 
@@ -1973,7 +1901,7 @@ Windows_conpty_backend_write_state_for_testing
 Windows_conpty_backend::write_state_for_testing()
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(impl->call_state());
     return impl->write_state_for_testing();
 }
 

@@ -2834,7 +2834,8 @@ bool test_destroy_from_process_exited_callback_on_worker_thread(const QString& f
     // Regression: destroying the backend from inside its own process_exited
     // callback runs ~Windows_conpty_backend on the wait thread, because that
     // callback is delivered from wait_loop(). The backend must defer its
-    // shutdown+delete onto a fresh thread (is_worker_thread/defer_shutdown_and_delete);
+    // shutdown+delete onto a fresh thread (must_defer_native_backend_destruction/
+    // defer_native_backend_shutdown_and_delete);
     // running shutdown() inline there self-detaches the wait thread and frees the
     // Impl while wait_loop() is still on the stack, so the following
     // terminate_process_tree_after_root_exit() would touch freed memory.
