@@ -664,38 +664,32 @@ public:
             m_write_queue.clear();
         }
 
-        std::shared_ptr<std::latch> startup_gate;
-        try {
-            startup_gate = std::make_shared<std::latch>(1);
-            m_reader_thread = std::thread(
-                &Impl::run_worker_after_startup_gate,
-                this,
-                startup_gate,
-                &Impl::read_loop);
-            m_writer_thread = std::thread(
-                &Impl::run_worker_after_startup_gate,
-                this,
-                startup_gate,
-                &Impl::write_loop);
-            m_wait_thread = std::thread(
-                &Impl::run_worker_after_startup_gate,
-                this,
-                startup_gate,
-                &Impl::wait_loop);
-            startup_gate->count_down();
-        }
-        catch (const std::exception& error) {
-            if (startup_gate) {
-                abort_native_backend_startup_gate(call_state(), *startup_gate);
-            }
-            const QString message = QStringLiteral("ConPTY worker thread startup failed: %1")
-                .arg(QString::fromLocal8Bit(error.what()));
-            report_error(Terminal_backend_error_code::START_FAILED, message);
-            shutdown();
-            return backend_reject(Terminal_backend_error_code::START_FAILED, message);
-        }
-
-        return backend_accept();
+        return start_native_backend_workers(
+            call_state(),
+            m_reader_thread,
+            m_writer_thread,
+            m_wait_thread,
+            [this] {
+                read_loop();
+            },
+            [this] {
+                write_loop();
+            },
+            [this] {
+                wait_loop();
+            },
+            [this](const std::exception& error) {
+                const QString message =
+                    QStringLiteral("ConPTY worker thread startup failed: %1")
+                        .arg(QString::fromLocal8Bit(error.what()));
+                report_native_backend_error_with_snapshot(
+                    m_mutex,
+                    m_callbacks,
+                    Terminal_backend_error_code::START_FAILED,
+                    message);
+                shutdown();
+                return backend_reject(Terminal_backend_error_code::START_FAILED, message);
+            });
     }
 
     Terminal_backend_result write(QByteArray bytes)
@@ -801,7 +795,10 @@ public:
         }
 
         if (!paused_output.isEmpty()) {
-            deliver_output(std::move(paused_output));
+            deliver_native_backend_output_with_snapshot(
+                m_mutex,
+                m_callbacks,
+                std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
         if (should_wake_reader && !paused_output_delivery_started) {
@@ -870,40 +867,29 @@ public:
         HANDLE                         process_job,
         Terminal_termination_policy    policy)
     {
-        std::shared_ptr<std::latch> startup_gate;
-        try {
-            startup_gate = std::make_shared<std::latch>(1);
-            m_termination_thread = std::thread(
-                &Impl::run_termination_after_startup_gate,
-                this,
-                startup_gate,
-                process,
-                process_job,
-                policy);
-            startup_gate->count_down();
-        }
-        catch (const std::exception& error) {
-            if (startup_gate) {
-                startup_gate->count_down();
-            }
-            const QString message =
-                QStringLiteral("ConPTY termination escalation worker failed: %1")
-                    .arg(QString::fromLocal8Bit(error.what()));
-            if (!TerminateJobObject(process_job, 1U)) {
-                const DWORD terminate_job_error = GetLastError();
-                TerminateProcess(process, 1U);
-                return
-                    backend_reject(
-                        Terminal_backend_error_code::TERMINATE_FAILED,
-                        windows_error_message(
-                            QStringLiteral("TerminateJobObject"),
-                            terminate_job_error));
-            }
+        return start_native_backend_termination_escalation(
+            call_state(),
+            m_termination_thread,
+            [this, process, process_job, policy] {
+                termination_escalation_loop(process, process_job, policy);
+            },
+            [process, process_job](const std::exception& error) {
+                const QString message =
+                    QStringLiteral("ConPTY termination escalation worker failed: %1")
+                        .arg(QString::fromLocal8Bit(error.what()));
+                if (!TerminateJobObject(process_job, 1U)) {
+                    const DWORD terminate_job_error = GetLastError();
+                    TerminateProcess(process, 1U);
+                    return
+                        backend_reject(
+                            Terminal_backend_error_code::TERMINATE_FAILED,
+                            windows_error_message(
+                                QStringLiteral("TerminateJobObject"),
+                                terminate_job_error));
+                }
 
-            return backend_reject(Terminal_backend_error_code::TERMINATE_FAILED, message);
-        }
-
-        return backend_accept();
+                return backend_reject(Terminal_backend_error_code::TERMINATE_FAILED, message);
+            });
     }
 
     void shutdown()
@@ -944,10 +930,19 @@ public:
             }
         }
 
-        if (!reader_finished_within(k_conpty_reader_close_grace)) {
+        if (!native_backend_reader_finished_within(
+                m_mutex,
+                m_reader_cv,
+                m_reader_finished,
+                k_conpty_reader_close_grace))
+        {
             cancel_blocking_io();
         }
-        join_threads();
+        join_native_backend_threads(
+            m_reader_thread,
+            m_writer_thread,
+            m_wait_thread,
+            m_termination_thread);
 
         std::lock_guard<std::mutex> lock(m_mutex);
         m_input_write.reset();
@@ -958,30 +953,6 @@ public:
         m_writer_thread_handle.reset();
         clear_queued_writes_locked();
         m_running = false;
-    }
-
-    void run_worker_after_startup_gate(
-        std::shared_ptr<std::latch> startup_gate,
-        void (Impl::*loop)())
-    {
-        if (!admit_native_backend_worker(call_state(), *startup_gate)) {
-            return;
-        }
-
-        (this->*loop)();
-    }
-
-    void run_termination_after_startup_gate(
-        std::shared_ptr<std::latch>     startup_gate,
-        HANDLE                          process,
-        HANDLE                          process_job,
-        Terminal_termination_policy     policy)
-    {
-        if (!admit_native_backend_worker(call_state(), *startup_gate)) {
-            return;
-        }
-
-        termination_escalation_loop(process, process_job, policy);
     }
 
     // Best-effort teardown for the unreachable-in-practice case where the
@@ -1043,18 +1014,6 @@ public:
     }
 
 private:
-    Terminal_backend_callbacks callbacks_for_delivery()
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_callbacks;
-    }
-
-    void report_error(Terminal_backend_error_code code, QString message)
-    {
-        Terminal_backend_callbacks callbacks = callbacks_for_delivery();
-        report_native_backend_error(callbacks, code, std::move(message));
-    }
-
     native_backend_exit_publication_state_t exit_publication_state()
     {
         return native_backend_exit_publication_state_t{
@@ -1096,12 +1055,6 @@ private:
             Native_backend_empty_claim{});
     }
 
-    void deliver_output(QByteArray bytes)
-    {
-        Terminal_backend_callbacks callbacks = callbacks_for_delivery();
-        deliver_native_backend_output(callbacks, std::move(bytes));
-    }
-
     bool take_paused_output_for_delivery_locked(QByteArray& paused_output)
     {
         return
@@ -1131,7 +1084,10 @@ private:
                 return m_stopping || m_shutdown_started;
             },
             [this](QByteArray bytes) {
-                deliver_output(std::move(bytes));
+                deliver_native_backend_output_with_snapshot(
+                    m_mutex,
+                    m_callbacks,
+                    std::move(bytes));
             },
             Native_backend_empty_action{});
     }
@@ -1149,7 +1105,10 @@ private:
                 return m_stopping || m_shutdown_started;
             },
             [this](QByteArray bytes) {
-                deliver_output(std::move(bytes));
+                deliver_native_backend_output_with_snapshot(
+                    m_mutex,
+                    m_callbacks,
+                    std::move(bytes));
             },
             Native_backend_empty_action{});
     }
@@ -1178,16 +1137,6 @@ private:
             });
     }
 
-    void mark_reader_finished()
-    {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_reader_finished = true;
-        }
-
-        m_reader_cv.notify_all();
-    }
-
     void finish_conpty_call()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1195,22 +1144,6 @@ private:
         if (m_conpty_active_calls == 0U) {
             m_conpty_cv.notify_all();
         }
-    }
-
-    void wait_for_reader_finished()
-    {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        m_reader_cv.wait(lock, [&] {
-            return m_reader_finished;
-        });
-    }
-
-    bool reader_finished_within(std::chrono::milliseconds timeout)
-    {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        return m_reader_cv.wait_for(lock, timeout, [&] {
-            return m_reader_finished;
-        });
     }
 
     void request_conpty_close()
@@ -1309,9 +1242,11 @@ private:
                 const DWORD error_code = GetLastError();
                 if (error_code != ERROR_BROKEN_PIPE       &&
                     error_code != ERROR_OPERATION_ABORTED &&
-                    !stopping())
+                    !is_native_backend_stopping(m_mutex, m_stopping))
                 {
-                    report_error(
+                    report_native_backend_error_with_snapshot(
+                        m_mutex,
+                        m_callbacks,
                         Terminal_backend_error_code::READ_FAILED,
                         windows_error_message(QStringLiteral("ConPTY output read"), error_code));
                 }
@@ -1328,7 +1263,10 @@ private:
                 static_cast<qsizetype>(bytes_read)));
         }
 
-        mark_reader_finished();
+        mark_native_backend_reader_finished(
+            m_mutex,
+            m_reader_cv,
+            m_reader_finished);
     }
 
     void write_loop()
@@ -1466,7 +1404,9 @@ private:
         }
 
         if (should_report_interrupt_failed) {
-            report_error(
+            report_native_backend_error_with_snapshot(
+                m_mutex,
+                m_callbacks,
                 Terminal_backend_error_code::INTERRUPT_FAILED,
                 QStringLiteral("ConPTY interrupt byte could not be delivered to the child"));
         }
@@ -1567,9 +1507,11 @@ private:
                     windows_error_message(QStringLiteral("ConPTY input write"), error_code);
                 if (error_code != ERROR_BROKEN_PIPE       &&
                     error_code != ERROR_OPERATION_ABORTED &&
-                    !stopping())
+                    !is_native_backend_stopping(m_mutex, m_stopping))
                 {
-                    report_error(
+                    report_native_backend_error_with_snapshot(
+                        m_mutex,
+                        m_callbacks,
                         Terminal_backend_error_code::WRITE_FAILED,
                         error_message);
                 }
@@ -1577,7 +1519,9 @@ private:
             }
 
             if (bytes_written == 0U) {
-                report_error(
+                report_native_backend_error_with_snapshot(
+                    m_mutex,
+                    m_callbacks,
                     Terminal_backend_error_code::WRITE_FAILED,
                     QStringLiteral("ConPTY input write made no progress"));
                 return {
@@ -1626,15 +1570,26 @@ private:
             }
         }
         if (!paused_output.isEmpty()) {
-            deliver_output(std::move(paused_output));
+            deliver_native_backend_output_with_snapshot(
+                m_mutex,
+                m_callbacks,
+                std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
         m_output_cv.notify_all();
         drain_paused_output_before_exit_report();
         request_conpty_close();
-        if (!reader_finished_within(k_conpty_reader_close_grace)) {
+        if (!native_backend_reader_finished_within(
+                m_mutex,
+                m_reader_cv,
+                m_reader_finished,
+                k_conpty_reader_close_grace))
+        {
             cancel_blocking_io();
-            wait_for_reader_finished();
+            wait_for_native_backend_reader_finished(
+                m_mutex,
+                m_reader_cv,
+                m_reader_finished);
         }
         drain_paused_output_before_exit_report();
         report_exit_once(Terminal_exit_reason::EXITED, static_cast<int>(exit_code));
@@ -1654,7 +1609,9 @@ private:
         if (!TerminateJobObject(process_job, 1U)) {
             const DWORD terminate_job_error = GetLastError();
             TerminateProcess(process, 1U);
-            report_error(
+            report_native_backend_error_with_snapshot(
+                m_mutex,
+                m_callbacks,
                 Terminal_backend_error_code::TERMINATE_FAILED,
                 windows_error_message(
                     QStringLiteral("TerminateJobObject"),
@@ -1666,7 +1623,9 @@ private:
             return;
         }
 
-        report_error(
+        report_native_backend_error_with_snapshot(
+            m_mutex,
+            m_callbacks,
             Terminal_backend_error_code::TERMINATE_FAILED,
             QStringLiteral("ConPTY process remained active after forced termination"));
     }
@@ -1681,17 +1640,13 @@ private:
 
         if (process_job != nullptr && process_job != INVALID_HANDLE_VALUE) {
             if (!TerminateJobObject(process_job, 1U)) {
-                report_error(
+                report_native_backend_error_with_snapshot(
+                    m_mutex,
+                    m_callbacks,
                     Terminal_backend_error_code::TERMINATE_FAILED,
                     windows_error_message(QStringLiteral("TerminateJobObject"), GetLastError()));
             }
         }
-    }
-
-    bool stopping()
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_stopping;
     }
 
     void cancel_blocking_io()
@@ -1742,14 +1697,6 @@ private:
         if (writer_thread) {
             CancelSynchronousIo(writer_thread.get());
         }
-    }
-
-    void join_threads()
-    {
-        join_or_detach_native_backend_thread(m_reader_thread);
-        join_or_detach_native_backend_thread(m_writer_thread);
-        join_or_detach_native_backend_thread(m_wait_thread);
-        join_or_detach_native_backend_thread(m_termination_thread);
     }
 
     std::mutex                         m_mutex;

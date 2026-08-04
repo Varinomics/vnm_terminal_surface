@@ -745,38 +745,32 @@ public:
             m_write_queue.clear();
         }
 
-        std::shared_ptr<std::latch> startup_gate;
-        try {
-            startup_gate = std::make_shared<std::latch>(1);
-            m_reader_thread = std::thread(
-                &Impl::run_worker_after_startup_gate,
-                this,
-                startup_gate,
-                &Impl::read_loop);
-            m_writer_thread = std::thread(
-                &Impl::run_worker_after_startup_gate,
-                this,
-                startup_gate,
-                &Impl::write_loop);
-            m_wait_thread = std::thread(
-                &Impl::run_worker_after_startup_gate,
-                this,
-                startup_gate,
-                &Impl::wait_loop);
-            startup_gate->count_down();
-        }
-        catch (const std::exception& error) {
-            if (startup_gate) {
-                abort_native_backend_startup_gate(call_state(), *startup_gate);
-            }
-            const QString message = QStringLiteral("POSIX PTY worker thread startup failed: %1")
-                .arg(QString::fromLocal8Bit(error.what()));
-            report_error(Terminal_backend_error_code::START_FAILED, message);
-            shutdown();
-            return backend_reject(Terminal_backend_error_code::START_FAILED, message);
-        }
-
-        return backend_accept();
+        return start_native_backend_workers(
+            call_state(),
+            m_reader_thread,
+            m_writer_thread,
+            m_wait_thread,
+            [this] {
+                read_loop();
+            },
+            [this] {
+                write_loop();
+            },
+            [this] {
+                wait_loop();
+            },
+            [this](const std::exception& error) {
+                const QString message =
+                    QStringLiteral("POSIX PTY worker thread startup failed: %1")
+                        .arg(QString::fromLocal8Bit(error.what()));
+                report_native_backend_error_with_snapshot(
+                    m_mutex,
+                    m_callbacks,
+                    Terminal_backend_error_code::START_FAILED,
+                    message);
+                shutdown();
+                return backend_reject(Terminal_backend_error_code::START_FAILED, message);
+            });
     }
 
     Terminal_backend_result write(QByteArray bytes)
@@ -869,7 +863,10 @@ public:
         }
 
         if (!paused_output.isEmpty()) {
-            deliver_output(std::move(paused_output));
+            deliver_native_backend_output_with_snapshot(
+                m_mutex,
+                m_callbacks,
+                std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
 
@@ -969,7 +966,10 @@ public:
         }
 
         if (!paused_output.isEmpty()) {
-            deliver_output(std::move(paused_output));
+            deliver_native_backend_output_with_snapshot(
+                m_mutex,
+                m_callbacks,
+                std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
         m_output_cv.notify_all();
@@ -986,37 +986,26 @@ public:
         Signal_targets                 targets,
         Terminal_termination_policy    policy)
     {
-        std::shared_ptr<std::latch> startup_gate;
-        try {
-            startup_gate = std::make_shared<std::latch>(1);
-            m_termination_thread = std::thread(
-                &Impl::run_termination_after_startup_gate,
-                this,
-                startup_gate,
-                child_pid,
-                targets,
-                policy);
-            startup_gate->count_down();
-        }
-        catch (const std::exception& error) {
-            if (startup_gate) {
-                startup_gate->count_down();
-            }
-            const QString message =
-                QStringLiteral("POSIX PTY termination escalation worker failed: %1")
-                    .arg(QString::fromLocal8Bit(error.what()));
-            const std::optional<int> kill_error = send_signal_to_targets(targets, SIGKILL);
-            if (kill_error.has_value()) {
-                return
-                    backend_reject(
-                        Terminal_backend_error_code::TERMINATE_FAILED,
-                        posix_error_message(QStringLiteral("SIGKILL"), *kill_error));
-            }
+        return start_native_backend_termination_escalation(
+            call_state(),
+            m_termination_thread,
+            [this, child_pid, targets, policy] {
+                termination_escalation_loop(child_pid, targets, policy);
+            },
+            [targets](const std::exception& error) {
+                const QString message =
+                    QStringLiteral("POSIX PTY termination escalation worker failed: %1")
+                        .arg(QString::fromLocal8Bit(error.what()));
+                const std::optional<int> kill_error = send_signal_to_targets(targets, SIGKILL);
+                if (kill_error.has_value()) {
+                    return
+                        backend_reject(
+                            Terminal_backend_error_code::TERMINATE_FAILED,
+                            posix_error_message(QStringLiteral("SIGKILL"), *kill_error));
+                }
 
-            return backend_reject(Terminal_backend_error_code::TERMINATE_FAILED, message);
-        }
-
-        return backend_accept();
+                return backend_reject(Terminal_backend_error_code::TERMINATE_FAILED, message);
+            });
     }
 
     void shutdown()
@@ -1080,23 +1069,27 @@ public:
         // own session/process group, kill(-pgid) fails with ESRCH -- which
         // send_signal_to_targets() ignores -- so the still-running child is not
         // killed. The wait thread is then stuck forever in its blocking
-        // waitpid(child_pid) and join_threads() below deadlocks, hanging
-        // teardown. (The race is timing-dependent and was observed on macOS.)
-        // Signal the child PID directly, which always reaches it, so waitpid()
-        // returns and the wait thread can be joined.
+        // waitpid(child_pid) and join_native_backend_threads() below deadlocks,
+        // hanging teardown. (The race is timing-dependent and was observed on
+        // macOS.) Signal the child PID directly, which always reaches it, so
+        // waitpid() returns and the wait thread can be joined.
         if (!child_reaped && child_pid > 0) {
             ::kill(child_pid, SIGKILL);
         }
 
-        // In ordinary shutdown, close the master before join_threads() so a child
-        // blocked writing to the slave is released. If the wait thread still
-        // needs the master for post-exit cleanup, that path owns the pending
-        // close instead.
+        // In ordinary shutdown, close the master before
+        // join_native_backend_threads() so a child blocked writing to the slave
+        // is released. If the wait thread still needs the master for post-exit
+        // cleanup, that path owns the pending close instead.
         if (close_master) {
             ::close(master);
         }
 
-        join_threads();
+        join_native_backend_threads(
+            m_reader_thread,
+            m_writer_thread,
+            m_wait_thread,
+            m_termination_thread);
         reap_child_if_unreaped(child_pid);
 
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1109,30 +1102,6 @@ public:
         m_queued_write_bytes  = 0U;
         m_child_process_group = -1;
         m_running             = false;
-    }
-
-    void run_worker_after_startup_gate(
-        std::shared_ptr<std::latch> startup_gate,
-        void (Impl::*loop)())
-    {
-        if (!admit_native_backend_worker(call_state(), *startup_gate)) {
-            return;
-        }
-
-        (this->*loop)();
-    }
-
-    void run_termination_after_startup_gate(
-        std::shared_ptr<std::latch>     startup_gate,
-        pid_t                           child_pid,
-        Signal_targets                  targets,
-        Terminal_termination_policy     policy)
-    {
-        if (!admit_native_backend_worker(call_state(), *startup_gate)) {
-            return;
-        }
-
-        termination_escalation_loop(child_pid, targets, policy);
     }
 
     native_backend_call_state_t call_state()
@@ -1227,18 +1196,6 @@ private:
         return m_master.release();
     }
 
-    Terminal_backend_callbacks callbacks_for_delivery()
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_callbacks;
-    }
-
-    void report_error(Terminal_backend_error_code code, QString message)
-    {
-        Terminal_backend_callbacks callbacks = callbacks_for_delivery();
-        report_native_backend_error(callbacks, code, std::move(message));
-    }
-
     native_backend_exit_publication_state_t exit_publication_state()
     {
         return native_backend_exit_publication_state_t{
@@ -1292,12 +1249,6 @@ private:
             });
     }
 
-    void deliver_output(QByteArray bytes)
-    {
-        Terminal_backend_callbacks callbacks = callbacks_for_delivery();
-        deliver_native_backend_output(callbacks, std::move(bytes));
-    }
-
     bool take_paused_output_for_delivery_locked(QByteArray& paused_output)
     {
         return
@@ -1327,7 +1278,10 @@ private:
                 return m_process_stopping || m_stopping;
             },
             [this](QByteArray bytes) {
-                deliver_output(std::move(bytes));
+                deliver_native_backend_output_with_snapshot(
+                    m_mutex,
+                    m_callbacks,
+                    std::move(bytes));
             },
             [this] {
                 wake_io_threads();
@@ -1347,7 +1301,10 @@ private:
                 return m_process_stopping || m_stopping;
             },
             [this](QByteArray bytes) {
-                deliver_output(std::move(bytes));
+                deliver_native_backend_output_with_snapshot(
+                    m_mutex,
+                    m_callbacks,
+                    std::move(bytes));
             },
             [this] {
                 wake_io_threads();
@@ -1375,24 +1332,6 @@ private:
                     m_paused_output.size() <
                         m_paused_output_limits.high_watermark_bytes;
             });
-    }
-
-    void mark_reader_finished()
-    {
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            m_reader_finished = true;
-        }
-
-        m_reader_cv.notify_all();
-    }
-
-    void wait_for_reader_finished()
-    {
-        std::unique_lock<std::mutex> lock(m_mutex);
-        m_reader_cv.wait(lock, [&] {
-            return m_reader_finished;
-        });
     }
 
     // Block until the exit-drain window (reap_time + k_exit_output_drain_timeout)
@@ -1512,12 +1451,6 @@ private:
         }
     }
 
-    bool stopping()
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_stopping;
-    }
-
     bool write_stopping()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1612,8 +1545,10 @@ private:
                     continue;
                 }
 
-                if (!stopping()) {
-                    report_error(
+                if (!is_native_backend_stopping(m_mutex, m_stopping)) {
+                    report_native_backend_error_with_snapshot(
+                        m_mutex,
+                        m_callbacks,
                         Terminal_backend_error_code::READ_FAILED,
                         posix_error_message(QStringLiteral("poll PTY output"), errno));
                 }
@@ -1622,7 +1557,7 @@ private:
 
             if ((fds[1].revents & POLLIN) != 0) {
                 drain_wake_pipe(wake_read);
-                if (stopping()) {
+                if (is_native_backend_stopping(m_mutex, m_stopping)) {
                     break;
                 }
             }
@@ -1637,8 +1572,10 @@ private:
                     continue;
                 }
 
-                if (errno != EIO && !stopping()) {
-                    report_error(
+                if (errno != EIO && !is_native_backend_stopping(m_mutex, m_stopping)) {
+                    report_native_backend_error_with_snapshot(
+                        m_mutex,
+                        m_callbacks,
                         Terminal_backend_error_code::READ_FAILED,
                         posix_error_message(QStringLiteral("PTY output read"), errno));
                 }
@@ -1654,7 +1591,10 @@ private:
                 static_cast<qsizetype>(bytes_read)));
         }
 
-        mark_reader_finished();
+        mark_native_backend_reader_finished(
+            m_mutex,
+            m_reader_cv,
+            m_reader_finished);
     }
 
     void write_loop()
@@ -1718,7 +1658,9 @@ private:
             }
 
             if (!write_stopping()) {
-                report_error(
+                report_native_backend_error_with_snapshot(
+                    m_mutex,
+                    m_callbacks,
                     Terminal_backend_error_code::WRITE_FAILED,
                     posix_error_message(QStringLiteral("poll PTY write wake"), errno));
             }
@@ -1776,7 +1718,9 @@ private:
 
             if (count < 0) {
                 if (errno != EIO && !write_stopping()) {
-                    report_error(
+                    report_native_backend_error_with_snapshot(
+                        m_mutex,
+                        m_callbacks,
                         Terminal_backend_error_code::WRITE_FAILED,
                         posix_error_message(QStringLiteral("PTY input write"), errno));
                 }
@@ -1784,7 +1728,9 @@ private:
             }
 
             // count == 0: the write made no progress.
-            report_error(
+            report_native_backend_error_with_snapshot(
+                m_mutex,
+                m_callbacks,
                 Terminal_backend_error_code::WRITE_FAILED,
                 QStringLiteral("PTY input write made no progress"));
             return false;
@@ -1829,15 +1775,23 @@ private:
                 }
             }
             if (!paused_output.isEmpty()) {
-                deliver_output(std::move(paused_output));
+                deliver_native_backend_output_with_snapshot(
+                    m_mutex,
+                    m_callbacks,
+                    std::move(paused_output));
             }
             finish_paused_output_delivery(paused_output_delivery_started);
             m_output_cv.notify_all();
             m_write_cv.notify_all();
             wake_io_threads();
-            wait_for_reader_finished();
+            wait_for_native_backend_reader_finished(
+                m_mutex,
+                m_reader_cv,
+                m_reader_finished);
             drain_paused_output_before_exit_report();
-            report_error(
+            report_native_backend_error_with_snapshot(
+                m_mutex,
+                m_callbacks,
                 Terminal_backend_error_code::TERMINATE_FAILED,
                 posix_error_message(QStringLiteral("waitpid"), wait_error));
             report_exit_once(
@@ -1863,13 +1817,19 @@ private:
             }
         }
         if (!paused_output.isEmpty()) {
-            deliver_output(std::move(paused_output));
+            deliver_native_backend_output_with_snapshot(
+                m_mutex,
+                m_callbacks,
+                std::move(paused_output));
         }
         finish_paused_output_delivery(paused_output_delivery_started);
         m_output_cv.notify_all();
         m_write_cv.notify_all();
         wake_io_threads();
-        wait_for_reader_finished();
+        wait_for_native_backend_reader_finished(
+            m_mutex,
+            m_reader_cv,
+            m_reader_finished);
         // Honor a consistent exit-drain window before finalizing the exit, even
         // when the reader finished early. On Linux the master stays open while a
         // descendant holds the slave, so the reader drains for the full
@@ -1942,7 +1902,9 @@ private:
 
         const std::optional<int> term_error = send_signal_to_targets(targets, SIGTERM);
         if (term_error.has_value()) {
-            report_error(
+            report_native_backend_error_with_snapshot(
+                m_mutex,
+                m_callbacks,
                 Terminal_backend_error_code::TERMINATE_FAILED,
                 posix_error_message(QStringLiteral("SIGTERM"), *term_error));
             return;
@@ -1954,7 +1916,9 @@ private:
 
         const std::optional<int> kill_error = send_signal_to_targets(targets, SIGKILL);
         if (kill_error.has_value()) {
-            report_error(
+            report_native_backend_error_with_snapshot(
+                m_mutex,
+                m_callbacks,
                 Terminal_backend_error_code::TERMINATE_FAILED,
                 posix_error_message(QStringLiteral("SIGKILL"), *kill_error));
             return;
@@ -1964,17 +1928,11 @@ private:
             return;
         }
 
-        report_error(
+        report_native_backend_error_with_snapshot(
+            m_mutex,
+            m_callbacks,
             Terminal_backend_error_code::TERMINATE_FAILED,
             QStringLiteral("POSIX PTY process remained active after forced termination"));
-    }
-
-    void join_threads()
-    {
-        join_or_detach_native_backend_thread(m_reader_thread);
-        join_or_detach_native_backend_thread(m_writer_thread);
-        join_or_detach_native_backend_thread(m_wait_thread);
-        join_or_detach_native_backend_thread(m_termination_thread);
     }
 
     std::mutex                          m_mutex;
