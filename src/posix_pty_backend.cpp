@@ -567,38 +567,9 @@ std::optional<int> send_signal_to_targets(const Signal_targets& targets, int sig
 class Posix_pty_backend::Impl
 {
 public:
-    class Public_call_guard
-    {
-    public:
-        explicit Public_call_guard(Impl& impl)
-        :
-            m_impl(&impl)
-        {
-            m_impl->enter_public_call();
-        }
-
-        Public_call_guard(const Public_call_guard&) = delete;
-        Public_call_guard& operator=(const Public_call_guard&) = delete;
-
-        ~Public_call_guard()
-        {
-            if (m_impl != nullptr) {
-                m_impl->leave_public_call();
-            }
-        }
-
-    private:
-        Impl* m_impl = nullptr;
-    };
-
     ~Impl()
     {
         shutdown();
-    }
-
-    Public_call_guard public_call_guard()
-    {
-        return Public_call_guard(*this);
     }
 
     Terminal_backend_result start(
@@ -1140,16 +1111,6 @@ public:
         m_running             = false;
     }
 
-    bool is_worker_thread()
-    {
-        return is_native_backend_worker_thread(call_state());
-    }
-
-    bool has_active_public_call()
-    {
-        return native_backend_has_active_public_call(call_state());
-    }
-
     void run_worker_after_startup_gate(
         std::shared_ptr<std::latch> startup_gate,
         void (Impl::*loop)())
@@ -1174,24 +1135,6 @@ public:
         termination_escalation_loop(child_pid, targets, policy);
     }
 
-    // Run shutdown() and delete on a fresh, non-worker thread so join_threads()
-    // can join worker threads and any public backend call already on the stack
-    // can return before the Impl is freed. Takes ownership of this Impl.
-    void defer_shutdown_and_delete() noexcept
-    {
-        try {
-            std::thread([this] {
-                wait_for_public_calls_to_finish();
-                shutdown();
-                delete this;
-            }).detach();
-        }
-        catch (...) {
-            request_shutdown_without_cleanup();
-        }
-    }
-
-private:
     native_backend_call_state_t call_state()
     {
         return native_backend_call_state_t{
@@ -1203,26 +1146,19 @@ private:
         };
     }
 
-    void enter_public_call()
+    // The on-last-call claim for the shared public-call guard: claims the master
+    // descriptor whose close shutdown() deferred while a public call was in flight,
+    // and returns the close to run after the backend mutex is released.
+    auto deferred_master_close_claim()
     {
-        enter_native_backend_public_call(call_state());
-    }
-
-    void leave_public_call()
-    {
-        int master_to_close = -1;
-        leave_native_backend_public_call(call_state(), [&] {
-            master_to_close = take_pending_master_close_if_ready_locked();
-        });
-
-        if (master_to_close >= 0) {
-            ::close(master_to_close);
-        }
-    }
-
-    void wait_for_public_calls_to_finish()
-    {
-        wait_for_native_backend_public_calls(call_state());
+        return [this] {
+            const int master_to_close = take_pending_master_close_if_ready_locked();
+            return [master_to_close] {
+                if (master_to_close >= 0) {
+                    ::close(master_to_close);
+                }
+            };
+        };
     }
 
     void request_shutdown_without_cleanup()
@@ -1277,6 +1213,7 @@ private:
         }
     }
 
+private:
     int take_pending_master_close_if_ready_locked()
     {
         if (!m_close_master_pending ||
@@ -2114,11 +2051,12 @@ Posix_pty_backend::~Posix_pty_backend()
 {
     // Defer when teardown is reached from a callback or while a public backend
     // call is still unwinding, so the Impl is not freed under live stack frames.
-    if (m_impl &&
-        (m_impl->is_worker_thread() || m_impl->has_active_public_call()))
-    {
+    if (m_impl && must_defer_native_backend_destruction(m_impl->call_state())) {
         Impl* impl = m_impl.release();
-        impl->defer_shutdown_and_delete();
+        defer_native_backend_shutdown_and_delete(
+            impl,
+            impl->call_state(),
+            [impl] { impl->request_shutdown_without_cleanup(); });
     }
 }
 
@@ -2127,14 +2065,18 @@ Terminal_backend_result Posix_pty_backend::start(
     Terminal_backend_callbacks     callbacks)
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(
+        impl->call_state(),
+        impl->deferred_master_close_claim());
     return impl->start(config, std::move(callbacks));
 }
 
 Terminal_backend_result Posix_pty_backend::write(QByteArray bytes)
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(
+        impl->call_state(),
+        impl->deferred_master_close_claim());
     return impl->write(std::move(bytes));
 }
 
@@ -2142,28 +2084,36 @@ Terminal_backend_result Posix_pty_backend::resize(
     Terminal_backend_resize_request request)
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(
+        impl->call_state(),
+        impl->deferred_master_close_claim());
     return impl->resize(request);
 }
 
 Terminal_backend_result Posix_pty_backend::set_output_paused(bool paused)
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(
+        impl->call_state(),
+        impl->deferred_master_close_claim());
     return impl->set_output_paused(paused);
 }
 
 Terminal_backend_result Posix_pty_backend::interrupt()
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(
+        impl->call_state(),
+        impl->deferred_master_close_claim());
     return impl->interrupt();
 }
 
 Terminal_backend_result Posix_pty_backend::terminate()
 {
     Impl* impl = m_impl.get();
-    auto guard = impl->public_call_guard();
+    auto guard = Native_backend_public_call_guard(
+        impl->call_state(),
+        impl->deferred_master_close_claim());
     return impl->terminate();
 }
 

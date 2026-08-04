@@ -281,6 +281,13 @@ bool is_native_backend_worker_thread(native_backend_call_state_t call_state)
         call_state.worker_thread_ids.end();
 }
 
+bool must_defer_native_backend_destruction(native_backend_call_state_t call_state)
+{
+    return
+        is_native_backend_worker_thread(call_state) ||
+        native_backend_has_active_public_call(call_state);
+}
+
 bool admit_native_backend_worker(
     native_backend_call_state_t  call_state,
     std::latch&                  startup_gate)
