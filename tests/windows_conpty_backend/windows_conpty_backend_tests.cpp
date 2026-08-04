@@ -43,6 +43,10 @@ namespace {
 
 constexpr std::chrono::milliseconds k_wait_timeout(10000);
 constexpr std::chrono::milliseconds k_conhost_exit_timeout(1000);
+// The slowest recorded cold ASan completion of this entire test executable was
+// 57.73 seconds. Bound the first scenario's progressing-output phase at 60
+// seconds, leaving half of the 120-second CTest budget for the remaining cases.
+constexpr std::chrono::milliseconds k_progressing_output_absolute_timeout(60000);
 
 using vnm_terminal::test_helpers::check;
 using vnm_terminal::test_helpers::decode_hex;
@@ -561,24 +565,52 @@ public:
         });
     }
 
-    bool wait_for_exit_while_output_progresses()
+    bool wait_for_exit_while_output_progresses(
+        std::chrono::milliseconds absolute_timeout =
+            k_progressing_output_absolute_timeout)
     {
         std::unique_lock<std::mutex> lock(m_mutex);
         std::size_t observed_output_events = m_output_events.size();
+        const auto wait_started      = std::chrono::steady_clock::now();
+        const auto absolute_deadline = wait_started + absolute_timeout;
+        const auto report_timeout = [&](
+            bool                                  absolute_limit_reached,
+            std::chrono::steady_clock::time_point wait_ended)
+        {
+            if (absolute_limit_reached) {
+                std::cerr << "exit wait exceeded absolute limit: absolute_limit_ms="
+                    << absolute_timeout.count();
+            }
+            else {
+                std::cerr << "exit wait made no output progress: inactivity_limit_ms="
+                    << k_wait_timeout.count();
+            }
+            std::cerr
+                << " elapsed_ms="
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    wait_ended - wait_started).count()
+                << " output_bytes=" << m_output.size()
+                << " output_events=" << m_output_events.size()
+                << " backend_errors=" << m_errors.size()
+                << '\n';
+        };
         while (!m_exit.has_value()) {
-            const auto inactivity_deadline =
-                std::chrono::steady_clock::now() + k_wait_timeout;
-            const bool state_changed = m_cv.wait_until(lock, inactivity_deadline, [&] {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= absolute_deadline) {
+                report_timeout(true, now);
+                return false;
+            }
+
+            const auto inactivity_deadline = now + k_wait_timeout;
+            const auto next_deadline = std::min(inactivity_deadline, absolute_deadline);
+            const bool state_changed = m_cv.wait_until(lock, next_deadline, [&] {
                 return
                     m_exit.has_value() ||
                     m_output_events.size() != observed_output_events;
             });
             if (!state_changed) {
-                std::cerr << "exit wait made no output progress: output_bytes="
-                    << m_output.size()
-                    << " output_events=" << m_output_events.size()
-                    << " backend_errors=" << m_errors.size()
-                    << '\n';
+                const auto wait_ended = std::chrono::steady_clock::now();
+                report_timeout(wait_ended >= absolute_deadline, wait_ended);
                 return false;
             }
 
@@ -1073,6 +1105,36 @@ bool write_tight_paused_output_powershell_script(
     }
 
     return true;
+}
+
+bool test_progressing_output_exit_wait_has_absolute_bound()
+{
+    Backend_capture capture;
+    term::Terminal_backend_callbacks callbacks = capture.callbacks();
+    std::atomic_bool keep_producing = true;
+    std::thread producer([&] {
+        while (keep_producing.load()) {
+            callbacks.output_received(QByteArrayLiteral("progress"));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    });
+
+    const auto wait_started = std::chrono::steady_clock::now();
+    const bool exited = capture.wait_for_exit_while_output_progresses(
+        std::chrono::milliseconds(75));
+    const auto wait_elapsed = std::chrono::steady_clock::now() - wait_started;
+    keep_producing.store(false);
+    producer.join();
+
+    bool ok  = check(!exited,
+        "progressing output without exit reaches its absolute wait bound");
+    ok      &= check(capture.output_event_count_snapshot() > 1U,
+        "absolute exit wait bound is exercised while output keeps progressing");
+    ok      &= check(
+        wait_elapsed >= std::chrono::milliseconds(50) &&
+        wait_elapsed <  std::chrono::seconds(2),
+        "absolute exit wait bound returns near its configured deadline");
+    return ok;
 }
 
 bool write_ignored_interrupt_powershell_script(const QString& script_path)
@@ -3011,6 +3073,8 @@ int main(int argc, char** argv)
     };
 
     run_test("pid parser", test_pid_parser_requires_line_delimiter());
+    run_test("progressing output exit wait has absolute bound",
+        test_progressing_output_exit_wait_has_absolute_bound());
     run_test("interactive canvas fixture", test_interactive_canvas_fixture(fixture_path));
     run_test("resize storm reports final shell size",
         test_resize_storm_reports_final_shell_size(fixture_path));
