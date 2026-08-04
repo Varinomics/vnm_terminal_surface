@@ -269,6 +269,35 @@ void deliver_native_backend_output(
     }
 }
 
+void report_native_backend_error_with_snapshot(
+    std::mutex&                 mutex,
+    Terminal_backend_callbacks& callbacks,
+    Terminal_backend_error_code code,
+    QString                     message)
+{
+    Terminal_backend_callbacks callback_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        callback_snapshot = callbacks;
+    }
+
+    report_native_backend_error(callback_snapshot, code, std::move(message));
+}
+
+void deliver_native_backend_output_with_snapshot(
+    std::mutex&                 mutex,
+    Terminal_backend_callbacks& callbacks,
+    QByteArray                  bytes)
+{
+    Terminal_backend_callbacks callback_snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        callback_snapshot = callbacks;
+    }
+
+    deliver_native_backend_output(callback_snapshot, std::move(bytes));
+}
+
 void report_native_backend_exit(
     const Terminal_backend_callbacks&  callbacks,
     Terminal_exit_reason               reason,
@@ -339,6 +368,62 @@ void abort_native_backend_startup_gate(
     }
 
     startup_gate.count_down();
+}
+
+void mark_native_backend_reader_finished(
+    std::mutex&              mutex,
+    std::condition_variable& reader_cv,
+    bool&                    reader_finished)
+{
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        reader_finished = true;
+    }
+
+    reader_cv.notify_all();
+}
+
+void wait_for_native_backend_reader_finished(
+    std::mutex&              mutex,
+    std::condition_variable& reader_cv,
+    bool&                    reader_finished)
+{
+    std::unique_lock<std::mutex> lock(mutex);
+    reader_cv.wait(lock, [&reader_finished] {
+        return reader_finished;
+    });
+}
+
+bool native_backend_reader_finished_within(
+    std::mutex&               mutex,
+    std::condition_variable&  reader_cv,
+    bool&                     reader_finished,
+    std::chrono::milliseconds timeout)
+{
+    std::unique_lock<std::mutex> lock(mutex);
+    return reader_cv.wait_for(lock, timeout, [&reader_finished] {
+        return reader_finished;
+    });
+}
+
+bool is_native_backend_stopping(
+    std::mutex& mutex,
+    bool&       stopping)
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    return stopping;
+}
+
+void join_native_backend_threads(
+    std::thread& reader_thread,
+    std::thread& writer_thread,
+    std::thread& wait_thread,
+    std::thread& termination_thread)
+{
+    join_or_detach_native_backend_thread(reader_thread);
+    join_or_detach_native_backend_thread(writer_thread);
+    join_or_detach_native_backend_thread(wait_thread);
+    join_or_detach_native_backend_thread(termination_thread);
 }
 
 void join_or_detach_native_backend_thread(std::thread& thread)

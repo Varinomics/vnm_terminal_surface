@@ -5,9 +5,12 @@
 #include <QString>
 #include <QStringView>
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <exception>
 #include <latch>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -173,11 +176,12 @@ private:
 };
 
 // Runs impl->shutdown() and deletes impl on a fresh, non-worker thread, after
-// waiting for in-flight public calls to drain, so join_threads() can join the worker
-// threads and any public backend call already on the stack can return before the
-// impl is freed. Takes ownership of impl. When the thread cannot be spawned, runs
-// on_spawn_failure instead: the impl is deliberately leaked (safe: no
-// use-after-free) while the backend force-terminates its child process tree.
+// waiting for in-flight public calls to drain, so join_native_backend_threads()
+// can join the worker threads and any public backend call already on the stack
+// can return before the impl is freed. Takes ownership of impl. When the thread
+// cannot be spawned, runs on_spawn_failure instead: the impl is deliberately
+// leaked (safe: no use-after-free) while the backend force-terminates its child
+// process tree.
 template <typename Impl, typename On_spawn_failure_fn>
 void defer_native_backend_shutdown_and_delete(
     Impl*                        impl,
@@ -194,6 +198,106 @@ void defer_native_backend_shutdown_and_delete(
     catch (...) {
         on_spawn_failure();
     }
+}
+
+// Spawns one worker thread that is admitted through the shared startup gate
+// before it runs `loop`: the worker records its id, waits at the gate until the
+// spawner has committed its thread members, and returns without running `loop`
+// when the startup was aborted. Both backends ran this trampoline as a member
+// function; it lives here so the admit-before-run ordering exists once.
+template <typename Loop_fn>
+std::thread spawn_native_backend_gated_worker(
+    native_backend_call_state_t        call_state,
+    std::shared_ptr<std::latch>        startup_gate,
+    Loop_fn&&                          loop)
+{
+    return std::thread(
+        [call_state, startup_gate, loop = std::forward<Loop_fn>(loop)]() mutable {
+            if (!admit_native_backend_worker(call_state, *startup_gate)) {
+                return;
+            }
+            loop();
+        });
+}
+
+// Spawns the reader, writer and wait workers through one startup gate and opens
+// the gate once all three thread members are committed, so no worker can run
+// callback-capable work against half-committed state. When a spawn throws, the
+// gate is aborted BEFORE `on_spawn_failure` runs, so an already-spawned worker
+// sees the abort and returns instead of running. `on_spawn_failure` is
+// deliberately backend-specific: each backend reports the failure with its own
+// label, shuts down, and rejects the start attempt; the shared flow does not
+// pick a label.
+template <typename Read_loop_fn, typename Write_loop_fn, typename Wait_loop_fn, typename On_spawn_failure_fn>
+Terminal_backend_result start_native_backend_workers(
+    native_backend_call_state_t        call_state,
+    std::thread&                       reader_thread,
+    std::thread&                       writer_thread,
+    std::thread&                       wait_thread,
+    Read_loop_fn&&                     read_loop,
+    Write_loop_fn&&                    write_loop,
+    Wait_loop_fn&&                     wait_loop,
+    On_spawn_failure_fn&&              on_spawn_failure)
+{
+    std::shared_ptr<std::latch> startup_gate;
+    try {
+        startup_gate = std::make_shared<std::latch>(1);
+        reader_thread = spawn_native_backend_gated_worker(
+            call_state,
+            startup_gate,
+            std::forward<Read_loop_fn>(read_loop));
+        writer_thread = spawn_native_backend_gated_worker(
+            call_state,
+            startup_gate,
+            std::forward<Write_loop_fn>(write_loop));
+        wait_thread = spawn_native_backend_gated_worker(
+            call_state,
+            startup_gate,
+            std::forward<Wait_loop_fn>(wait_loop));
+        startup_gate->count_down();
+    }
+    catch (const std::exception& error) {
+        if (startup_gate) {
+            abort_native_backend_startup_gate(call_state, *startup_gate);
+        }
+        return on_spawn_failure(error);
+    }
+
+    return backend_accept();
+}
+
+// Spawns the termination-escalation worker through one startup gate. Unlike
+// start_native_backend_workers, a failed spawn only counts the gate down
+// instead of aborting it: the failed attempt produced no worker, so no waiter
+// exists that must observe an abort. Both backends had this shape; it is
+// preserved verbatim. `run_termination` carries the escalation arguments and
+// `on_spawn_failure` the backend-specific fallback - Windows force-terminates
+// through the job object, POSIX signals its targets - each with its own
+// labelled message and rejection, verbatim.
+template <typename Run_termination_fn, typename On_spawn_failure_fn>
+Terminal_backend_result start_native_backend_termination_escalation(
+    native_backend_call_state_t        call_state,
+    std::thread&                       termination_thread,
+    Run_termination_fn&&               run_termination,
+    On_spawn_failure_fn&&              on_spawn_failure)
+{
+    std::shared_ptr<std::latch> startup_gate;
+    try {
+        startup_gate = std::make_shared<std::latch>(1);
+        termination_thread = spawn_native_backend_gated_worker(
+            call_state,
+            startup_gate,
+            std::forward<Run_termination_fn>(run_termination));
+        startup_gate->count_down();
+    }
+    catch (const std::exception& error) {
+        if (startup_gate) {
+            startup_gate->count_down();
+        }
+        return on_spawn_failure(error);
+    }
+
+    return backend_accept();
 }
 
 struct native_backend_output_delivery_limits_t
@@ -263,6 +367,23 @@ void report_native_backend_error(
 
 void deliver_native_backend_output(
     const Terminal_backend_callbacks&  callbacks,
+    QByteArray                         bytes);
+
+// Snapshots the callbacks under the backend mutex and reports the error through
+// the snapshot, so the report never runs while the lock is held. This was both
+// backends' report_error member, verbatim.
+void report_native_backend_error_with_snapshot(
+    std::mutex&                        mutex,
+    Terminal_backend_callbacks&        callbacks,
+    Terminal_backend_error_code        code,
+    QString                            message);
+
+// Snapshots the callbacks under the backend mutex and delivers the bytes
+// through the snapshot, so the delivery never runs while the lock is held.
+// This was both backends' deliver_output member, verbatim.
+void deliver_native_backend_output_with_snapshot(
+    std::mutex&                        mutex,
+    Terminal_backend_callbacks&        callbacks,
     QByteArray                         bytes);
 
 // Appends `bytes` to the paused-output FIFO, or delivers them when nothing is pending.
@@ -531,6 +652,44 @@ void report_native_backend_exit_once(
     }
     report_native_backend_exit(callbacks, reason, exit_code);
 }
+
+// Sets the reader-finished flag under the backend mutex and wakes the reader
+// waiters after the lock is released, so a waiter cannot wake into a not-yet-
+// flagged state. This was both backends' mark_reader_finished member, verbatim.
+void mark_native_backend_reader_finished(
+    std::mutex&                        mutex,
+    std::condition_variable&           reader_cv,
+    bool&                              reader_finished);
+
+// Blocks until the reader thread has flagged itself finished. This was both
+// backends' wait_for_reader_finished member, verbatim.
+void wait_for_native_backend_reader_finished(
+    std::mutex&                        mutex,
+    std::condition_variable&           reader_cv,
+    bool&                              reader_finished);
+
+// Bounded form of the reader-finished wait; only the ConPTY backend bounds its
+// wait (its reader close grace), so POSIX has no caller for this one.
+bool native_backend_reader_finished_within(
+    std::mutex&                        mutex,
+    std::condition_variable&           reader_cv,
+    bool&                              reader_finished,
+    std::chrono::milliseconds          timeout);
+
+// Locked read of the backend's stopping flag. This was both backends'
+// stopping() accessor, verbatim.
+bool is_native_backend_stopping(
+    std::mutex&                        mutex,
+    bool&                              stopping);
+
+// Joins (or detaches, when called from the thread itself) the four worker
+// threads every native backend spawns. This was both backends' join_threads
+// member, verbatim.
+void join_native_backend_threads(
+    std::thread&                       reader_thread,
+    std::thread&                       writer_thread,
+    std::thread&                       wait_thread,
+    std::thread&                       termination_thread);
 
 void join_or_detach_native_backend_thread(
     std::thread&                       thread);
