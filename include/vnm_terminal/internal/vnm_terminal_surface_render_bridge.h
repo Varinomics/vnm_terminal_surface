@@ -203,6 +203,9 @@ public:
         VNM_TerminalSurface&                    surface,
         std::chrono::steady_clock::duration     budget);
 
+    static void handle_row_timestamp_tooltip_timeout_for_testing(
+        VNM_TerminalSurface&       surface);
+
     static std::shared_ptr<const Terminal_render_snapshot> render_snapshot(
         const VNM_TerminalSurface& surface);
 

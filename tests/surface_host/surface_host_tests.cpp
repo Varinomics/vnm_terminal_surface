@@ -6345,6 +6345,132 @@ bool test_public_scroll_api_records_deferred_after_projection_invalidation(
     return ok;
 }
 
+bool test_surface_destruction_emits_no_state_change_signals(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    int viewport_change_count                      = 0;
+    int selection_change_count                     = 0;
+    int tooltip_request_count                      = 0;
+    int tooltip_dismissal_count                    = 0;
+    int viewport_change_count_before_destruction   = 0;
+    int selection_change_count_before_destruction  = 0;
+    int tooltip_dismissal_count_before_destruction = 0;
+    {
+        Surface_fixture fixture;
+        fixture.surface.set_scrollback_limit(200);
+        pump_events(app);
+
+        QObject::connect(
+            &fixture.surface,
+            &VNM_TerminalSurface::viewport_changed,
+            &app,
+            [&viewport_change_count] {
+                ++viewport_change_count;
+            });
+        QObject::connect(
+            &fixture.surface,
+            &VNM_TerminalSurface::selection_changed,
+            &app,
+            [&selection_change_count] {
+                ++selection_change_count;
+            });
+        QObject::connect(
+            &fixture.surface,
+            &VNM_TerminalSurface::row_timestamp_tooltip_requested,
+            &app,
+            [&tooltip_request_count] {
+                ++tooltip_request_count;
+            });
+        QObject::connect(
+            &fixture.surface,
+            &VNM_TerminalSurface::row_timestamp_tooltip_dismissed,
+            &app,
+            [&tooltip_dismissal_count] {
+                ++tooltip_dismissal_count;
+            });
+
+        auto backend = std::make_unique<Scripted_backend>();
+        backend->outputs_during_start = {numbered_scroll_lines(80)};
+
+        bool started = false;
+        (void)start_surface_with_backend(
+            fixture.surface,
+            std::move(backend),
+            { QStringLiteral("scripted-terminal") },
+            &started);
+        ok &= check(started, "destruction notification surface starts");
+        if (!started) {
+            return false;
+        }
+
+        term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(fixture.surface);
+        ok &= check(fixture.surface.scrollback_rows() > 0,
+            "destruction notification surface has non-empty viewport state");
+
+        const QPointF selection_start = point_in_grid_cell(fixture.surface, 0, 1);
+        const QPointF selection_end   = point_in_grid_cell(fixture.surface, 0, 4);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            selection_start,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "destruction notification selection press is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            selection_end,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "destruction notification selection drag is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            selection_end,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "destruction notification selection release is accepted");
+        ok &= check(
+            fixture.surface.selection_state() ==
+                VNM_TerminalSurface::Selection_state::ACTIVE,
+            "destruction notification surface has active selection state");
+
+        const QPointF tooltip_position = point_in_grid_cell(fixture.surface, 0, 2);
+        ok &= send_hover_move(
+            fixture.surface,
+            tooltip_position,
+            Qt::NoModifier,
+            false,
+            "destruction notification tooltip hover is not consumed");
+        term::VNM_TerminalSurface_render_bridge::
+            handle_row_timestamp_tooltip_timeout_for_testing(fixture.surface);
+        ok &= check(tooltip_request_count == 1,
+            "destruction notification surface has active timestamp tooltip request");
+
+        viewport_change_count_before_destruction   = viewport_change_count;
+        selection_change_count_before_destruction  = selection_change_count;
+        tooltip_dismissal_count_before_destruction = tooltip_dismissal_count;
+    }
+
+    ok &= check(
+        viewport_change_count == viewport_change_count_before_destruction,
+        "surface destruction emits no ordinary viewport change notification");
+    ok &= check(
+        selection_change_count == selection_change_count_before_destruction,
+        "surface destruction emits no ordinary selection change notification");
+    ok &= check(
+        tooltip_dismissal_count == tooltip_dismissal_count_before_destruction,
+        "surface destruction emits no ordinary tooltip dismissal notification");
+    return ok;
+}
+
 bool test_app_route_boundaries_record_deferred_after_projection_invalidation(
     QGuiApplication& app)
 {
@@ -16321,6 +16447,7 @@ int main(int argc, char** argv)
     ok &= test_public_viewport_scroll_source_labels(app);
     ok &= test_immediate_public_projection_page_keys(app);
     ok &= test_public_scroll_api_records_deferred_after_projection_invalidation(app);
+    ok &= test_surface_destruction_emits_no_state_change_signals(app);
     ok &= test_app_route_boundaries_record_deferred_after_projection_invalidation(app);
     ok &= test_plain_wheel_scrolls_scroll_region_primary_scrollback(app);
     ok &= test_plain_wheel_scrolls_csi_scroll_up_primary_scrollback(app);

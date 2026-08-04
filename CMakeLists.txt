@@ -408,6 +408,37 @@ target_include_directories(vnm_terminal_canvas_fixture PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
 )
 
+if(vnm_terminal_surface_testing_enabled AND VNM_TERMINAL_SANITIZE_ADDRESS AND MSVC)
+    get_filename_component(vnm_terminal_msvc_runtime_dir
+        "${CMAKE_CXX_COMPILER}"
+        DIRECTORY)
+    set(vnm_terminal_asan_runtime
+        "${vnm_terminal_msvc_runtime_dir}/clang_rt.asan_dynamic-x86_64.dll")
+    if(NOT EXISTS "${vnm_terminal_asan_runtime}")
+        message(FATAL_ERROR
+            "MSVC AddressSanitizer runtime was not found beside ${CMAKE_CXX_COMPILER}")
+    endif()
+
+    # Exact-environment tests intentionally omit host PATH. Deploy the runtime
+    # beside the instrumented child fixture so Windows resolves its dependency
+    # without weakening the environment snapshot contract.
+    add_custom_command(TARGET vnm_terminal_canvas_fixture POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${vnm_terminal_asan_runtime}"
+            "$<TARGET_FILE_DIR:vnm_terminal_canvas_fixture>"
+        VERBATIM)
+
+    set(vnm_terminal_asan_debug_runtime
+        "${vnm_terminal_msvc_runtime_dir}/clang_rt.asan_dbg_dynamic-x86_64.dll")
+    if(EXISTS "${vnm_terminal_asan_debug_runtime}")
+        add_custom_command(TARGET vnm_terminal_canvas_fixture POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${vnm_terminal_asan_debug_runtime}"
+                "$<TARGET_FILE_DIR:vnm_terminal_canvas_fixture>"
+            VERBATIM)
+    endif()
+endif()
+
 if(VNM_TERMINAL_ENABLE_TRANSCRIPT_CAPTURE_REPLAY)
     add_executable(vnm_terminal_transcript_replay
         tools/transcript_replay/terminal_transcript_replay.cpp
