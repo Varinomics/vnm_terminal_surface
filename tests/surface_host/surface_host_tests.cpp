@@ -6441,6 +6441,10 @@ bool test_surface_destruction_emits_no_state_change_signals(
             fixture.surface.selection_state() ==
                 VNM_TerminalSurface::Selection_state::ACTIVE,
             "destruction notification surface has active selection state");
+        ok &= check(fixture.surface.scroll_viewport_lines(3),
+            "destruction notification surface scrolls away from the tail");
+        ok &= check(fixture.surface.viewport_offset_from_tail() > 0,
+            "destruction notification surface has a non-tail viewport");
 
         const QPointF tooltip_position = point_in_grid_cell(fixture.surface, 0, 2);
         ok &= send_hover_move(
@@ -6468,6 +6472,32 @@ bool test_surface_destruction_emits_no_state_change_signals(
     ok &= check(
         tooltip_dismissal_count == tooltip_dismissal_count_before_destruction,
         "surface destruction emits no ordinary tooltip dismissal notification");
+    return ok;
+}
+
+bool test_late_lifecycle_recorder_does_not_inherit_released_render_node()
+{
+    bool ok = true;
+    VNM_TerminalSurface surface;
+    // updatePaintNode owns this state independently of lifecycle recording. Set
+    // the exact post-paint state directly so this bookkeeping oracle does not
+    // add another scene-graph render cycle to the monolithic surface test.
+    term::VNM_TerminalSurface_render_bridge::
+        set_qsg_atlas_render_node_live_for_testing(surface, true);
+    term::VNM_TerminalSurface_render_bridge::release_resources(surface);
+    const std::shared_ptr<term::Terminal_renderer_lifecycle_recorder> lifecycle_recorder =
+        term::VNM_TerminalSurface_render_bridge::lifecycle_recorder(surface);
+    term::VNM_TerminalSurface_render_bridge::release_resources(surface);
+
+    const term::terminal_renderer_lifecycle_stats_t stats = lifecycle_recorder->snapshot();
+    ok &= check(stats.release_resources_calls == 1U,
+        "late lifecycle recorder observes only the release after attachment");
+    ok &= check(stats.render_root_nodes_created == 0U &&
+            stats.render_root_nodes_destroyed == 0U &&
+            stats.render_node_deletions_in_paint == 0U,
+        "late lifecycle recorder does not inherit a released render node");
+    ok &= check(has_valid_lifecycle_resource_counts(stats),
+        "late lifecycle recorder starts with balanced resource counts");
     return ok;
 }
 
@@ -16448,6 +16478,7 @@ int main(int argc, char** argv)
     ok &= test_immediate_public_projection_page_keys(app);
     ok &= test_public_scroll_api_records_deferred_after_projection_invalidation(app);
     ok &= test_surface_destruction_emits_no_state_change_signals(app);
+    ok &= test_late_lifecycle_recorder_does_not_inherit_released_render_node();
     ok &= test_app_route_boundaries_record_deferred_after_projection_invalidation(app);
     ok &= test_plain_wheel_scrolls_scroll_region_primary_scrollback(app);
     ok &= test_plain_wheel_scrolls_csi_scroll_up_primary_scrollback(app);

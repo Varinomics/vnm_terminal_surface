@@ -3002,15 +3002,16 @@ void VNM_TerminalSurface::releaseResources()
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
-    if (auto lifecycle_recorder = m_private->lifecycle_recorder();
-        lifecycle_recorder != nullptr)
-    {
+    const auto lifecycle_recorder = m_private->lifecycle_recorder();
+    if (lifecycle_recorder != nullptr) {
         lifecycle_recorder->record_release_resources();
-        if (m_private->qsg_atlas_render_node_live) {
+    }
+    if (m_private->qsg_atlas_render_node_live) {
+        if (lifecycle_recorder != nullptr) {
             lifecycle_recorder->record_root_node_destroyed();
             lifecycle_recorder->record_render_node_deleted();
-            m_private->qsg_atlas_render_node_live = false;
         }
+        m_private->qsg_atlas_render_node_live = false;
     }
     m_private->request_render_node_release(*this);
     QQuickItem::releaseResources();
@@ -8538,6 +8539,14 @@ term::VNM_TerminalSurface_render_bridge::lifecycle_stats(
     return lifecycle_recorder != nullptr
         ? lifecycle_recorder->snapshot()
         : term::terminal_renderer_lifecycle_stats_t{};
+}
+
+void term::VNM_TerminalSurface_render_bridge::set_qsg_atlas_render_node_live_for_testing(
+    VNM_TerminalSurface&   surface,
+    bool                   live)
+{
+    Q_ASSERT(surface.thread() == QThread::currentThread());
+    surface.m_private->qsg_atlas_render_node_live = live;
 }
 
 std::shared_ptr<term::Terminal_renderer_lifecycle_recorder>

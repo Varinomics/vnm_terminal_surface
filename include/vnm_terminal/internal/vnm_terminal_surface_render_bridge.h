@@ -245,6 +245,10 @@ public:
     static terminal_renderer_lifecycle_stats_t lifecycle_stats(
         const VNM_TerminalSurface& surface);
 
+    static void set_qsg_atlas_render_node_live_for_testing(
+        VNM_TerminalSurface&       surface,
+        bool                       live);
+
     static std::shared_ptr<Terminal_renderer_lifecycle_recorder> lifecycle_recorder(
         VNM_TerminalSurface&       surface);
 
