@@ -4,6 +4,7 @@
 #include <QByteArray>
 #include <QString>
 #include <QStringView>
+#include <algorithm>
 #include <condition_variable>
 #include <cstddef>
 #include <latch>
@@ -239,6 +240,17 @@ void append_native_backend_paused_output(
     QByteArray&                        paused_output,
     QByteArray                         bytes);
 
+// Moves up to `delivery_chunk_bytes` from the head of the paused-output FIFO into
+// `delivery_bytes` and marks the delivery in progress, so a second take cannot
+// overtake the first. Returns false without touching the FIFO when replay is
+// disabled (chunk bytes at or below zero), a delivery is already in progress, or
+// the FIFO is empty. The caller must hold the backend mutex guarding all three.
+bool take_native_backend_paused_output_for_delivery_locked(
+    QByteArray&                        paused_output,
+    QByteArray&                        delivery_bytes,
+    bool&                              paused_output_delivery_in_progress,
+    qsizetype                          delivery_chunk_bytes);
+
 void report_native_backend_error(
     const Terminal_backend_callbacks&  callbacks,
     Terminal_backend_error_code        code,
@@ -306,6 +318,131 @@ void deliver_or_buffer_native_backend_output(
     }
 
     deliver_native_backend_output(callback_snapshot, std::move(bytes));
+}
+
+// Drains the paused-output FIFO after a delivery started by
+// take_native_backend_paused_output_for_delivery_locked: keeps delivering chunks
+// while output is unpaused (or the caller's stop condition holds) and bytes remain,
+// then clears the in-progress flag and wakes the reader. Does nothing when
+// `delivery_started` is false.
+//
+// `stop_requested` is evaluated under the mutex and is deliberately
+// backend-specific: Windows stops ignoring the pause once
+// `m_stopping || m_shutdown_started`, POSIX once `m_process_stopping || m_stopping`.
+// The two stop flag sets are not interchangeable and the shared flow does not pick
+// one. `on_drain_finished` runs after the output condition variable is woken;
+// POSIX uses it to wake its I/O threads, Windows passes Native_backend_empty_action
+// because it has no I/O threads to wake.
+template <typename Stop_requested_fn, typename Deliver_output_fn, typename On_drain_finished_fn>
+void finish_native_backend_paused_output_delivery(
+    std::mutex&                        mutex,
+    std::condition_variable&           output_cv,
+    QByteArray&                        paused_output,
+    bool&                              output_paused,
+    bool&                              paused_output_delivery_in_progress,
+    qsizetype                          delivery_chunk_bytes,
+    bool                               delivery_started,
+    Stop_requested_fn&&                stop_requested,
+    Deliver_output_fn&&                deliver_output,
+    On_drain_finished_fn&&             on_drain_finished)
+{
+    if (!delivery_started) {
+        return;
+    }
+
+    for (;;) {
+        QByteArray next_paused_output;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if ((!output_paused || stop_requested()) &&
+                !paused_output.isEmpty())
+            {
+                const qsizetype byte_count = std::min(
+                    paused_output.size(),
+                    delivery_chunk_bytes);
+                if (byte_count == paused_output.size()) {
+                    next_paused_output = std::move(paused_output);
+                    paused_output.clear();
+                }
+                else {
+                    next_paused_output = paused_output.sliced(0, byte_count);
+                    paused_output.remove(0, byte_count);
+                }
+            }
+            else {
+                paused_output_delivery_in_progress = false;
+                break;
+            }
+        }
+
+        deliver_output(std::move(next_paused_output));
+    }
+
+    output_cv.notify_all();
+    on_drain_finished();
+}
+
+// Delivers every remaining paused-output byte before the exit report. Waits on the
+// output condition variable until no delivery is in progress and the FIFO can be
+// drained - it is empty, output is unpaused, or the caller's stop condition
+// holds - then replays it in order through the same take/finish pair every other
+// drain uses, so callback re-pause requests cannot suppress the exit report
+// indefinitely.
+//
+// `stop_requested` is the same deliberately backend-specific stop predicate
+// finish_native_backend_paused_output_delivery takes, and `on_drain_finished` is
+// the same per-backend wake hook; neither is interchangeable between backends.
+template <typename Stop_requested_fn, typename Deliver_output_fn, typename On_drain_finished_fn>
+void drain_native_backend_paused_output_before_exit_report(
+    std::mutex&                        mutex,
+    std::condition_variable&           output_cv,
+    QByteArray&                        paused_output,
+    bool&                              output_paused,
+    bool&                              paused_output_delivery_in_progress,
+    qsizetype                          delivery_chunk_bytes,
+    Stop_requested_fn&&                stop_requested,
+    Deliver_output_fn&&                deliver_output,
+    On_drain_finished_fn&&             on_drain_finished)
+{
+    for (;;) {
+        QByteArray delivery_bytes;
+        bool paused_output_delivery_started = false;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            output_cv.wait(lock, [&] {
+                return
+                    !paused_output_delivery_in_progress &&
+                    (paused_output.isEmpty() ||
+                     !output_paused          ||
+                     stop_requested());
+            });
+            if (paused_output.isEmpty()) {
+                return;
+            }
+
+            paused_output_delivery_started =
+                take_native_backend_paused_output_for_delivery_locked(
+                    paused_output,
+                    delivery_bytes,
+                    paused_output_delivery_in_progress,
+                    delivery_chunk_bytes);
+        }
+
+        if (!delivery_bytes.isEmpty()) {
+            deliver_output(std::move(delivery_bytes));
+        }
+        finish_native_backend_paused_output_delivery(
+            mutex,
+            output_cv,
+            paused_output,
+            output_paused,
+            paused_output_delivery_in_progress,
+            delivery_chunk_bytes,
+            paused_output_delivery_started,
+            stop_requested,
+            deliver_output,
+            on_drain_finished);
+    }
 }
 
 void report_native_backend_exit(
