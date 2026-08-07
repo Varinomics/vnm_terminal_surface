@@ -78,6 +78,9 @@ class VNM_TerminalSurface : public QQuickItem
     Q_PROPERTY(Copy_shortcut_policy copyShortcutPolicy
         READ copy_shortcut_policy WRITE set_copy_shortcut_policy
         NOTIFY copy_shortcut_policy_changed)
+    Q_PROPERTY(bool copyOnSelect
+        READ copy_on_select WRITE set_copy_on_select
+        NOTIFY copy_on_select_changed)
     Q_PROPERTY(Wheel_event_policy wheelEventPolicy
         READ wheel_event_policy WRITE set_wheel_event_policy
         NOTIFY wheel_event_policy_changed)
@@ -395,6 +398,9 @@ public:
     Copy_shortcut_policy copy_shortcut_policy() const;
     void set_copy_shortcut_policy(Copy_shortcut_policy policy);
 
+    bool copy_on_select() const;
+    void set_copy_on_select(bool enabled);
+
     Wheel_event_policy wheel_event_policy() const;
     void set_wheel_event_policy(Wheel_event_policy policy);
 
@@ -508,6 +514,7 @@ signals:
     void synchronized_output_scroll_policy_changed();
     void mouse_reporting_policy_changed();
     void copy_shortcut_policy_changed();
+    void copy_on_select_changed();
     void wheel_event_policy_changed();
     void alternate_screen_wheel_policy_changed();
     void bracketed_paste_policy_changed();
@@ -682,7 +689,12 @@ private:
                                result);
 
     void reset_session();
-    bool copy_selected_text_to_clipboard();
+    enum class Empty_selection_copy_policy
+    {
+        COPY,
+        IGNORE,
+    };
+    bool copy_selected_text_to_clipboard(Empty_selection_copy_policy policy);
     std::optional<QString> read_clipboard_text_for_paste();
     void set_selection_state(Selection_state state);
     void dismiss_row_timestamp_tooltip();
@@ -717,6 +729,7 @@ private:
         Mouse_reporting_policy::APPLICATION_CONTROLLED;
     Copy_shortcut_policy     m_copy_shortcut_policy =
         Copy_shortcut_policy::COPY_SELECTION_OR_TERMINAL_INPUT;
+    bool                     m_copy_on_select = false;
     Wheel_event_policy       m_wheel_event_policy =
         Wheel_event_policy::APPLICATION_CONTROLLED;
     Alternate_screen_wheel_policy m_alternate_screen_wheel_policy =

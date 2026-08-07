@@ -75,6 +75,9 @@ Writable Qt properties:
   never sends Ctrl+C to the child process. Retained `PAYLOAD_ONLY` text remains
   readable through `selected_text()`, but it is not treated as copyable by the
   built-in plain Ctrl+C shortcut.
+- `copyOnSelect` controls whether completing a non-empty local mouse selection
+  immediately copies its plain text to the system clipboard. It defaults to
+  `false`.
 - `wheelEventPolicy` controls primary-screen wheel routing:
   `APPLICATION_CONTROLLED` tries terminal mouse or alternate-screen behavior
   before local scrollback, `LOCAL_SCROLLBACK_FIRST` prefers local scrollback
@@ -286,7 +289,7 @@ string spellings are diagnostic schema, not a stability contract.
 There are three clipboard paths:
 
 - Local copy uses the host clipboard directly when `copyShortcutPolicy` chooses
-  to copy a local selection.
+  to copy a local selection or `copyOnSelect` is enabled.
 - Host paste can call `paste_text()` when the host already has text to paste, or
   `paste_clipboard_text()` to ask the surface to read paste text and route it
   through the normal paste path. `paste_clipboard_text()` uses the reader
