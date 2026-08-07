@@ -4100,7 +4100,7 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard(
 
     const term::Terminal_selection_result result = m_private->session->selected_text();
     if (result.code != term::Terminal_selection_result_code::OK ||
-        (policy == Empty_selection_copy_policy::IGNORE && result.text.isEmpty()))
+        (policy == Empty_selection_copy_policy::SKIP_EMPTY_SELECTION && result.text.isEmpty()))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
@@ -5671,7 +5671,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                             *source);
                         if (m_copy_on_select) {
                             (void)copy_selected_text_to_clipboard(
-                                Empty_selection_copy_policy::IGNORE);
+                                Empty_selection_copy_policy::SKIP_EMPTY_SELECTION);
                         }
                         m_private->clear_selection_drag_state();
                         event->accept();
@@ -5737,7 +5737,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                     *source);
                 if (m_copy_on_select) {
                     (void)copy_selected_text_to_clipboard(
-                        Empty_selection_copy_policy::IGNORE);
+                        Empty_selection_copy_policy::SKIP_EMPTY_SELECTION);
                 }
             }
             else {

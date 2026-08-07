@@ -692,7 +692,7 @@ private:
     enum class Empty_selection_copy_policy
     {
         COPY,
-        IGNORE,
+        SKIP_EMPTY_SELECTION,
     };
     bool copy_selected_text_to_clipboard(Empty_selection_copy_policy policy);
     std::optional<QString> read_clipboard_text_for_paste();
