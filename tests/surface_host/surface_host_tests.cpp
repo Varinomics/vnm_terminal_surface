@@ -4807,6 +4807,11 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
 
         const QPointF start_point = point_in_grid_cell(fixture.surface, 0, 1);
         const QPointF end_point   = point_in_grid_cell(fixture.surface, 0, 4);
+        ok &= check(!fixture.surface.copy_on_select(),
+            "copy on select defaults off");
+        QGuiApplication::clipboard()->setText(
+            QStringLiteral("copy-on-select-disabled-sentinel"),
+            QClipboard::Clipboard);
         ok &= send_mouse_event(
             fixture.surface,
             QEvent::MouseButtonPress,
@@ -4836,6 +4841,45 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
             "copy shortcut selection release is accepted");
         ok &= check(fixture.surface.selected_text() == QStringLiteral("lpha"),
             "copy shortcut fixture has selected text");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral("copy-on-select-disabled-sentinel"),
+            "disabled copy on select leaves clipboard unchanged");
+
+        fixture.surface.clear_selection();
+        fixture.surface.set_copy_on_select(true);
+        QGuiApplication::clipboard()->setText(
+            QStringLiteral("copy-on-select-enabled-sentinel"),
+            QClipboard::Clipboard);
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonPress,
+            start_point,
+            Qt::LeftButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "copy on select selection press is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseMove,
+            end_point,
+            Qt::NoButton,
+            Qt::LeftButton,
+            Qt::NoModifier,
+            true,
+            "copy on select selection drag is accepted");
+        ok &= send_mouse_event(
+            fixture.surface,
+            QEvent::MouseButtonRelease,
+            end_point,
+            Qt::LeftButton,
+            Qt::NoButton,
+            Qt::NoModifier,
+            true,
+            "copy on select selection release is accepted");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral("lpha"),
+            "enabled copy on select copies selected text on release");
 
         QGuiApplication::clipboard()->setText(QStringLiteral("copy-sentinel"),
             QClipboard::Clipboard);
@@ -4868,6 +4912,9 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
             "copy shortcut empty-selection fixture has enough columns");
         const QPointF empty_start = point_in_grid_cell(fixture.surface, 0, 5);
         const QPointF empty_end   = point_in_grid_cell(fixture.surface, 0, last_column);
+        QGuiApplication::clipboard()->setText(
+            QStringLiteral("copy-on-select-empty-sentinel"),
+            QClipboard::Clipboard);
         ok &= send_mouse_event(
             fixture.surface,
             QEvent::MouseButtonPress,
@@ -4900,6 +4947,9 @@ bool test_copy_shortcut_policy(QGuiApplication& app)
             "copy shortcut empty selection remains active");
         ok &= check(fixture.surface.selected_text().isEmpty(),
             "copy shortcut empty selection has empty selected text");
+        ok &= check(QGuiApplication::clipboard()->text(QClipboard::Clipboard) ==
+            QStringLiteral("copy-on-select-empty-sentinel"),
+            "copy on select ignores an active empty selection");
 
         QGuiApplication::clipboard()->setText(QStringLiteral("empty-selection-sentinel"),
             QClipboard::Clipboard);

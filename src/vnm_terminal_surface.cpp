@@ -3708,6 +3708,21 @@ void VNM_TerminalSurface::set_copy_shortcut_policy(Copy_shortcut_policy policy)
     emit copy_shortcut_policy_changed();
 }
 
+bool VNM_TerminalSurface::copy_on_select() const
+{
+    return m_copy_on_select;
+}
+
+void VNM_TerminalSurface::set_copy_on_select(bool enabled)
+{
+    if (m_copy_on_select == enabled) {
+        return;
+    }
+
+    m_copy_on_select = enabled;
+    emit copy_on_select_changed();
+}
+
 VNM_TerminalSurface::Wheel_event_policy VNM_TerminalSurface::wheel_event_policy() const
 {
     return m_wheel_event_policy;
@@ -4073,7 +4088,8 @@ QString VNM_TerminalSurface::selected_text()
         : QString();
 }
 
-bool VNM_TerminalSurface::copy_selected_text_to_clipboard()
+bool VNM_TerminalSurface::copy_selected_text_to_clipboard(
+    Empty_selection_copy_policy policy)
 {
     if (m_private->session == nullptr) {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
@@ -4083,7 +4099,9 @@ bool VNM_TerminalSurface::copy_selected_text_to_clipboard()
     }
 
     const term::Terminal_selection_result result = m_private->session->selected_text();
-    if (result.code != term::Terminal_selection_result_code::OK) {
+    if (result.code != term::Terminal_selection_result_code::OK ||
+        (policy == Empty_selection_copy_policy::IGNORE && result.text.isEmpty()))
+    {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral("surface copy-selected-text result=%1 size=%2")
@@ -4724,7 +4742,7 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
             Copy_shortcut_policy::COPY_SELECTION_OR_TERMINAL_INPUT)
         {
             if (m_private->has_copyable_selection_attachment() &&
-                copy_selected_text_to_clipboard())
+                copy_selected_text_to_clipboard(Empty_selection_copy_policy::COPY))
             {
                 event->accept();
                 term::record_interaction_trace("surface", "key-route", QStringLiteral("copy"), trace_id);
@@ -4734,7 +4752,8 @@ void VNM_TerminalSurface::keyPressEvent(QKeyEvent* event)
         else
         if (m_copy_shortcut_policy == Copy_shortcut_policy::COPY_SELECTION_OR_IGNORE) {
             if (m_private->has_copyable_selection_attachment()) {
-                (void)copy_selected_text_to_clipboard();
+                (void)copy_selected_text_to_clipboard(
+                    Empty_selection_copy_policy::COPY);
             }
             event->accept();
             term::record_interaction_trace("surface", "key-route", QStringLiteral("copy-or-ignore"), trace_id);
@@ -5650,6 +5669,10 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                         m_private->session->set_selection_range_from_drained_published_source(
                             current_range,
                             *source);
+                        if (m_copy_on_select) {
+                            (void)copy_selected_text_to_clipboard(
+                                Empty_selection_copy_policy::IGNORE);
+                        }
                         m_private->clear_selection_drag_state();
                         event->accept();
                         sync_from_session();
@@ -5712,6 +5735,10 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 m_private->session->set_selection_range_from_drained_published_source(
                     *mutation.range,
                     *source);
+                if (m_copy_on_select) {
+                    (void)copy_selected_text_to_clipboard(
+                        Empty_selection_copy_policy::IGNORE);
+                }
             }
             else {
                 m_private->clear_selection_with_sync(*this);
