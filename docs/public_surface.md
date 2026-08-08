@@ -36,7 +36,7 @@ Writable Qt properties:
   rounded to an integer pixel size. Font, device-pixel-ratio, and item geometry
   changes recompute terminal grid metrics.
 - `colorScheme` selects a bundled color scheme by name (the Windows Terminal
-  built-in set; `Campbell` is the default). The scheme drives the 16 ANSI colors
+  built-in set; `Classic` is the default). The scheme drives the 16 ANSI colors
   plus the default foreground, background, cursor, and selection colors, and is
   switchable at runtime. The light-vs-dark rendering decision derives from the
   scheme background luminance. `available_color_schemes()` lists the scheme names

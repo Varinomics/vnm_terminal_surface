@@ -703,7 +703,7 @@ private:
 
     QString                  m_font_family;
     qreal                    m_font_size                            = 13.0;
-    QString                  m_color_scheme                         = QStringLiteral("Campbell");
+    QString                  m_color_scheme                         = QStringLiteral("Classic");
     Cursor_style             m_cursor_style                         = Cursor_style::BLOCK;
     bool                     m_cursor_blink_enabled                 = true;
     int                      m_scrollback_limit                     = 10000;

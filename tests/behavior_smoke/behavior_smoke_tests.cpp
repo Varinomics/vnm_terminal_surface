@@ -29,12 +29,12 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
-// The screen model seeds its color state from the default (Campbell) scheme, so
+// The screen model seeds its color state from the default Classic scheme, so
 // the basic-16 SGR colors and the default foreground/background resolve to the
-// Campbell palette values rather than the Terminal_color_state struct fallbacks.
-constexpr quint32 k_red_rgba                = 0xffc50f1fU; // Campbell palette slot 1 (SGR 31m)
-constexpr quint32 k_default_foreground_rgba = 0xffccccccU; // Campbell foreground
-constexpr quint32 k_default_background_rgba = 0xff0c0c0cU; // Campbell background
+// Classic palette values rather than the Terminal_color_state struct fallbacks.
+constexpr quint32 k_red_rgba                = 0xffcd0000U; // Classic palette slot 1 (SGR 31m)
+constexpr quint32 k_default_foreground_rgba = 0xffffffffU; // Classic foreground
+constexpr quint32 k_default_background_rgba = 0xff000000U; // Classic background
 
 struct command_result_t
 {

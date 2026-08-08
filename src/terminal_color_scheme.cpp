@@ -218,7 +218,9 @@ const std::vector<Terminal_color_scheme>& builtin_color_schemes()
 
 const Terminal_color_scheme& default_color_scheme()
 {
-    return builtin_color_schemes().front();
+    const Terminal_color_scheme* scheme = find_color_scheme(QStringLiteral("Classic"));
+    Q_ASSERT(scheme != nullptr);
+    return *scheme;
 }
 
 const Terminal_color_scheme* find_color_scheme(QStringView name)

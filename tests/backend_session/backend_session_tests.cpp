@@ -4699,7 +4699,7 @@ bool test_public_projection_copy_is_immutable_after_hidden_mutation()
     const term::Terminal_render_cursor pre_hidden_cursor = captured->cursor();
     const term::Terminal_mode_state    pre_hidden_modes  = captured->modes();
     const term::Terminal_color_state   pre_hidden_colors = captured->color_state();
-    // The projection seeds its color state from the default (Campbell) scheme,
+    // The projection seeds its color state from the default Classic scheme,
     // so the captured defaults match that scheme, not the struct fallbacks.
     const term::Terminal_color_state   default_scheme_colors =
         term::make_terminal_color_state(term::default_color_scheme());

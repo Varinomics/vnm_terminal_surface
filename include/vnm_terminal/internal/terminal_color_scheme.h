@@ -26,10 +26,10 @@ struct Terminal_color_scheme
 };
 
 // The bundled color schemes (the Windows Terminal built-in set) in presentation
-// order. The first entry is the default scheme.
+// order.
 const std::vector<Terminal_color_scheme>& builtin_color_schemes();
 
-// The bundled scheme applied when none is selected (Windows Terminal Campbell).
+// The bundled Classic scheme applied when none is selected.
 const Terminal_color_scheme& default_color_scheme();
 
 // Looks up a bundled scheme by name (case-insensitive). Returns nullptr when no
