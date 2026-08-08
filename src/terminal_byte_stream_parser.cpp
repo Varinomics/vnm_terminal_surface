@@ -280,6 +280,15 @@ bool is_csi_intermediate_byte(unsigned char byte)
     return byte >= 0x20U && byte <= 0x2fU;
 }
 
+// An escape sequence ends on 0x30-0x7e, which reaches lower than the 0x40-0x7e
+// a CSI sequence ends on: the digits and punctuation a CSI spends on parameters
+// are final bytes once no CSI introducer is in play. ESC # 8 and ESC ( 0 both
+// terminate in that lower band.
+bool is_escape_final_byte(unsigned char byte)
+{
+    return byte >= 0x30U && byte <= 0x7eU;
+}
+
 bool string_terminator_is_valid_for_family(
     Parser_sequence_family     family,
     Parser_string_terminator   terminator)
@@ -1085,11 +1094,57 @@ Terminal_byte_stream_parser::try_consume_escape_or_csi(
             return String_state_result::CONSUMED;
         }
 
-        const unsigned char final_byte = byte_at(bytes, offset + 1);
-        if (final_byte == 'D' || final_byte == 'E' ||
-            final_byte == 'M' || final_byte == '7' ||
-            final_byte == '8' || final_byte == '=' ||
-            final_byte == '>')
+        // ECMA-48 spells an escape sequence ESC I... F: any number of
+        // intermediates, then one final byte. Taking a fixed two bytes leaves
+        // the final byte of every longer form to be printed as text, which is
+        // how ESC ( B - the US-ASCII designation that xterm-256color's sgr0 and
+        // rmacs carry, so almost every attribute reset emits it - painted a
+        // stray "B" into the grid.
+        qsizetype final_offset = offset + 1;
+        while (final_offset < bytes.size() &&
+            is_csi_intermediate_byte(byte_at(bytes, final_offset)))
+        {
+            ++final_offset;
+        }
+
+        // Real sequences carry one or two intermediates, so this bounds a
+        // stream that would otherwise grow the pending prefix without end.
+        const qsizetype sequence_size = final_offset - offset + 1;
+        if (sequence_size > static_cast<qsizetype>(k_control_sequence_pending_limit_bytes)) {
+            actions.push_back(make_unsupported_sequence_diagnostic(
+                QStringLiteral("ESC"),
+                Parser_sequence_family::ESC,
+                static_cast<std::size_t>(sequence_size),
+                k_control_sequence_pending_limit_bytes,
+                Parser_recovery_strategy::DISCARD_SEQUENCE));
+            offset = final_offset;
+            return String_state_result::CONSUMED;
+        }
+
+        if (final_offset >= bytes.size()) {
+            m_pending_prefix = QByteArray(bytes.data() + offset, bytes.size() - offset);
+            offset = bytes.size();
+            return String_state_result::CONSUMED;
+        }
+
+        const unsigned char final_byte = byte_at(bytes, final_offset);
+        if (!is_escape_final_byte(final_byte)) {
+            // The run ran into a byte that cannot end a sequence, so the
+            // sequence is abandoned rather than swallowing that byte with it:
+            // a control arriving mid-sequence still has to be executed.
+            emit_unsupported_control(QStringLiteral("ESC"), Parser_sequence_family::ESC, actions);
+            offset = final_offset;
+            return String_state_result::CONSUMED;
+        }
+
+        // The two-byte forms below are two-byte forms; an intermediate run
+        // ahead of the same final byte is a different sequence.
+        const bool has_no_intermediates = final_offset == offset + 1;
+        if (has_no_intermediates &&
+            (final_byte == 'D' || final_byte == 'E' ||
+             final_byte == 'M' || final_byte == '7' ||
+             final_byte == '8' || final_byte == '=' ||
+             final_byte == '>'))
         {
             actions.push_back(make_escape_dispatch_action(
                 QByteArray(1, static_cast<char>(final_byte)),
@@ -1099,7 +1154,7 @@ Terminal_byte_stream_parser::try_consume_escape_or_csi(
         }
 
         emit_unsupported_control(QStringLiteral("ESC"), Parser_sequence_family::ESC, actions);
-        offset += 2;
+        offset = final_offset + 1;
         return String_state_result::CONSUMED;
     }
 

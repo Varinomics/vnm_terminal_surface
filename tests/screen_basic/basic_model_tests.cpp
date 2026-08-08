@@ -2009,6 +2009,81 @@ bool test_unsupported_escape_does_not_leak()
     return ok;
 }
 
+// ESC ( B designates US-ASCII into G0. It is what xterm-256color's sgr0 and
+// rmacs carry, so a host emits it on nearly every attribute reset, and reading
+// it as a two-byte sequence left its "B" to be printed into the grid.
+bool test_escape_intermediates_do_not_leak()
+{
+    bool ok = true;
+
+    struct
+    {
+        const char* name;
+        QByteArray  bytes;
+    }
+    cases[] = {
+        {"ESC ( B",   QByteArray("ab\x1b(B",     5) + QByteArrayLiteral("cd")},
+        {"ESC ( 0",   QByteArray("ab\x1b(0",     5) + QByteArrayLiteral("cd")},
+        {"ESC ) 0",   QByteArray("ab\x1b)0",     5) + QByteArrayLiteral("cd")},
+        {"ESC # 8",   QByteArray("ab\x1b#8",     5) + QByteArrayLiteral("cd")},
+        {"ESC SP F",  QByteArray("ab\x1b F",     5) + QByteArrayLiteral("cd")},
+        {"ESC % G",   QByteArray("ab\x1b%G",     5) + QByteArrayLiteral("cd")},
+        {"sgr0",      QByteArray("ab\x1b(B\x1b[m", 8) + QByteArrayLiteral("cd")},
+    };
+
+    for (const auto& sequence_case : cases) {
+        term::Terminal_screen_model              model  = make_model();
+        const term::Terminal_screen_model_result result = model.ingest(sequence_case.bytes);
+        ok &= check(model.row_text(0) == QStringLiteral("abcd"), sequence_case.name);
+        ok &= check(diagnostic_count(result) == 1, "escape with intermediates emits diagnostic");
+        ok &= check(first_diagnostic(result).family == term::Parser_sequence_family::ESC,
+            "escape with intermediates diagnostic family");
+    }
+
+    // The sequence has to survive arriving across two reads, which is how a
+    // repaint burst large enough to be split delivers it.
+    const QByteArray split_case("ab\x1b(B""cd", 7);
+    for (qsizetype cut = 1; cut < split_case.size(); ++cut) {
+        term::Terminal_screen_model model = make_model();
+        (void)model.ingest(QByteArrayView(split_case).sliced(0, cut));
+        (void)model.ingest(QByteArrayView(split_case).sliced(cut));
+        ok &= check(model.row_text(0) == QStringLiteral("abcd"),
+            "ESC ( B split across reads does not leak text");
+    }
+
+    // A byte that cannot end a sequence abandons it instead of being swallowed
+    // as its final byte.
+    term::Terminal_screen_model model = make_model();
+    (void)model.ingest(QByteArray("ab\x1b(\ncd", 7));
+    ok &= check(model.row_text(0) == QStringLiteral("ab"),
+        "control byte inside an escape sequence still executes");
+    ok &= check(model.row_text(1) == QStringLiteral("  cd"),
+        "parser resumes at the column the line feed kept");
+
+    return ok;
+}
+
+bool test_bounded_escape_intermediate_recovery()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model();
+    QByteArray overlong_escape("\x1b", 1);
+    overlong_escape.append(
+        QByteArray(static_cast<int>(term::k_control_sequence_pending_limit_bytes), '('));
+
+    const term::Terminal_screen_model_result result = model.ingest(overlong_escape);
+    ok &= check(diagnostic_count(result) == 1, "overlong escape run emits diagnostic");
+    ok &= check(first_diagnostic(result).family == term::Parser_sequence_family::ESC,
+        "overlong escape run diagnostic family");
+    ok &= check(first_diagnostic(result).recovery ==
+        term::Parser_recovery_strategy::DISCARD_SEQUENCE,
+        "overlong escape run recovery strategy");
+    ok &= check_no_screen_mutation(result, model, "overlong escape run does not mutate screen");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -2029,5 +2104,7 @@ int main()
     ok &= test_string_payload_limits_and_recovery();
     ok &= test_bounded_csi_recovery();
     ok &= test_unsupported_escape_does_not_leak();
+    ok &= test_escape_intermediates_do_not_leak();
+    ok &= test_bounded_escape_intermediate_recovery();
     return ok ? 0 : 1;
 }
