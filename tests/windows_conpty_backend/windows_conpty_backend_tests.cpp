@@ -6,6 +6,7 @@
 #include "vnm_terminal/internal/windows_conpty_backend.h"
 
 #include <QByteArray>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QIODevice>
@@ -2241,6 +2242,131 @@ bool test_missing_working_directory(const QString& fixture_path)
     return ok;
 }
 
+bool test_absolute_forward_slash_cmd_stays_running()
+{
+    bool ok = true;
+
+    QString cmd_path = qEnvironmentVariable("ComSpec");
+    ok &= check(!cmd_path.isEmpty(), "ComSpec names the Windows command processor");
+    ok &= check(QFileInfo::exists(cmd_path), "Windows command processor exists");
+    if (cmd_path.isEmpty() || !QFileInfo::exists(cmd_path)) {
+        return false;
+    }
+
+    cmd_path = QDir::fromNativeSeparators(QFileInfo(cmd_path).absoluteFilePath());
+    ok &= check(cmd_path.contains(QLatin1Char('/')),
+        "Windows command processor path uses forward slashes");
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
+    term::Terminal_launch_config config = launch_config(cmd_path, {});
+    config.working_directory = QDir::tempPath();
+
+    const term::Terminal_backend_result start_result =
+        backend->start(config, capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "absolute forward-slash cmd path starts");
+    if (start_result.code != term::Terminal_backend_result_code::ACCEPTED) {
+        return false;
+    }
+
+    const bool exited_early =
+        capture.wait_for_exit_within(std::chrono::milliseconds(1000));
+    ok &= check(!exited_early,
+        "absolute forward-slash cmd path remains interactive");
+    if (exited_early) {
+        const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+        if (exit.has_value()) {
+            std::cerr << "absolute forward-slash cmd exited early: exit_code="
+                << exit->exit_code << '\n';
+        }
+        return false;
+    }
+
+    const term::Terminal_backend_result terminate_result = backend->terminate();
+    ok &= check(terminate_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "absolute forward-slash cmd accepts terminate");
+    ok &= check(capture.wait_for_exit(),
+        "absolute forward-slash cmd exits after terminate");
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::TERMINATED,
+        "absolute forward-slash cmd reports terminated exit");
+    ok &= check_no_backend_errors(capture,
+        "absolute forward-slash cmd produces no backend errors");
+
+    return ok;
+}
+
+bool test_windows_command_line_quoting(const QString& fixture_path)
+{
+    bool ok = true;
+
+    QTemporaryDir temporary_directory;
+    ok &= check(temporary_directory.isValid(),
+        "command-line quoting temporary directory is available");
+    if (!temporary_directory.isValid()) {
+        return false;
+    }
+
+    const QString fixture_directory =
+        temporary_directory.filePath(QStringLiteral("fixture path with spaces"));
+    ok &= check(QDir().mkpath(fixture_directory),
+        "command-line quoting fixture directory is available");
+    const QString copied_fixture_path = QDir::fromNativeSeparators(
+        QDir(fixture_directory).filePath(QFileInfo(fixture_path).fileName()));
+    ok &= check(QFile::copy(fixture_path, copied_fixture_path),
+        "command-line quoting fixture copy is available");
+    if (!QFileInfo::exists(copied_fixture_path)) {
+        return false;
+    }
+
+    const QStringList forwarded_arguments = {
+        QStringLiteral("plain"),
+        QStringLiteral("/D"),
+        QStringLiteral("C:/payload/path"),
+        QStringLiteral("contains spaces"),
+        QStringLiteral("embedded\"quote"),
+        QStringLiteral("space and trailing slash\\"),
+        QStringLiteral(""),
+    };
+    QStringList command_arguments = {QStringLiteral("--echo-argv")};
+    command_arguments.append(forwarded_arguments);
+
+    Backend_capture capture;
+    std::unique_ptr<term::Terminal_backend> backend = term::make_windows_conpty_backend();
+    const term::Terminal_backend_result start_result = backend->start(
+        launch_config(copied_fixture_path, command_arguments),
+        capture.callbacks());
+    ok &= check(start_result.code == term::Terminal_backend_result_code::ACCEPTED,
+        "forward-slash executable path with spaces starts");
+    if (start_result.code != term::Terminal_backend_result_code::ACCEPTED) {
+        return false;
+    }
+
+    ok &= check(capture.wait_for_exit(),
+        "command-line quoting fixture exits");
+    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+    ok &= check(exit.has_value() &&
+        exit->reason == term::Terminal_exit_reason::EXITED &&
+        exit->exit_code == 0,
+        "command-line quoting fixture reports clean exit");
+
+    const QByteArray output = capture.output_snapshot();
+    for (qsizetype index = 0; index < forwarded_arguments.size(); ++index) {
+        const QByteArray expected = QStringLiteral("argv[%1]=%2")
+            .arg(index + 2)
+            .arg(forwarded_arguments.at(index))
+            .toUtf8();
+        ok &= check(output.contains(expected),
+            "Windows command-line argument survives quoting");
+    }
+    ok &= check_no_backend_errors(capture,
+        "command-line quoting fixture produces no backend errors");
+
+    return ok;
+}
+
 bool test_failed_executable(const QString& fixture_path)
 {
     bool ok = true;
@@ -3099,6 +3225,10 @@ int main(int argc, char** argv)
         test_terminate_after_resize_storm_stops_child_process(fixture_path));
     run_test("close path stops descendant process",
         test_close_path_stops_descendant_process(fixture_path));
+    run_test("absolute forward-slash cmd stays running",
+        test_absolute_forward_slash_cmd_stays_running());
+    run_test("Windows command-line quoting",
+        test_windows_command_line_quoting(fixture_path));
     run_test("missing working directory", test_missing_working_directory(fixture_path));
     run_test("failed executable", test_failed_executable(fixture_path));
     run_test("rejection paths", test_rejection_paths(fixture_path));

@@ -21,6 +21,7 @@
 DECLARE_HANDLE(HPCON);
 #endif
 
+#include <QDir>
 #include <QProcessEnvironment>
 #include <QStringList>
 #include <algorithm>
@@ -349,11 +350,14 @@ std::wstring quote_windows_argument(const std::wstring& argument)
 std::wstring command_line_from_argv(const QStringList& argv)
 {
     std::wstring command_line;
-    for (const QString& argument : argv) {
+    for (qsizetype index = 0; index < argv.size(); ++index) {
         if (!command_line.empty()) {
             command_line.push_back(L' ');
         }
 
+        const QString argument = index == 0
+            ? QDir::toNativeSeparators(argv.at(index))
+            : argv.at(index);
         command_line += quote_windows_argument(wide_from_qstring(argument));
     }
 
