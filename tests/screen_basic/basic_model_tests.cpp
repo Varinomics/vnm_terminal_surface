@@ -2072,14 +2072,52 @@ bool test_bounded_escape_intermediate_recovery()
     overlong_escape.append(
         QByteArray(static_cast<int>(term::k_control_sequence_pending_limit_bytes), '('));
 
-    const term::Terminal_screen_model_result result = model.ingest(overlong_escape);
+    term::Terminal_screen_model_result result =
+        model.ingest(overlong_escape + QByteArrayLiteral("0A"));
     ok &= check(diagnostic_count(result) == 1, "overlong escape run emits diagnostic");
     ok &= check(first_diagnostic(result).family == term::Parser_sequence_family::ESC,
         "overlong escape run diagnostic family");
     ok &= check(first_diagnostic(result).recovery ==
         term::Parser_recovery_strategy::DISCARD_SEQUENCE,
         "overlong escape run recovery strategy");
-    ok &= check_no_screen_mutation(result, model, "overlong escape run does not mutate screen");
+    ok &= check(model.row_text(0) == QStringLiteral("A"),
+        "overlong escape run discards its same-chunk final byte");
+
+    model   = make_model();
+    result  = model.ingest(overlong_escape);
+    ok     &= check(diagnostic_count(result) == 1, "split overlong escape run emits diagnostic");
+    ok     &= check_no_screen_mutation(result, model, "split overlong escape run does not mutate screen");
+
+    result  = model.ingest(QByteArray(31, '('));
+    ok     &= check(diagnostic_count(result) == 0,
+        "first discarded escape intermediate-only chunk emits no new diagnostic");
+    ok     &= check_no_screen_mutation(result, model,
+        "first discarded escape intermediate-only chunk does not mutate screen");
+
+    result  = model.ingest(QByteArray(47, '/'));
+    ok     &= check(diagnostic_count(result) == 0,
+        "second discarded escape intermediate-only chunk emits no new diagnostic");
+    ok     &= check_no_screen_mutation(result, model,
+        "second discarded escape intermediate-only chunk does not mutate screen");
+
+    result  = model.ingest(QByteArrayLiteral("0B"));
+    ok     &= check(diagnostic_count(result) == 0, "split overlong escape final emits no new diagnostic");
+    ok     &= check(model.row_text(0) == QStringLiteral("B"),
+        "overlong escape run discards its split final byte");
+
+    model   = make_model();
+    (void)model.ingest(QByteArrayLiteral("ab"));
+    result  = model.ingest(overlong_escape);
+    ok     &= check(diagnostic_count(result) == 1,
+        "overlong escape before invalid terminator emits diagnostic");
+
+    result  = model.ingest(QByteArrayLiteral("\nC"));
+    ok     &= check(diagnostic_count(result) == 0,
+        "invalid escape terminator after over-limit discard emits no new diagnostic");
+    ok     &= check(model.row_text(0) == QStringLiteral("ab"),
+        "invalid escape terminator preserves the preceding row");
+    ok     &= check(model.row_text(1) == QStringLiteral("  C"),
+        "invalid escape terminator is reprocessed as its existing control");
 
     return ok;
 }

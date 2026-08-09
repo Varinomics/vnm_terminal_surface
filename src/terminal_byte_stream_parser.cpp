@@ -929,6 +929,12 @@ std::vector<Parser_action> Terminal_byte_stream_parser::ingest_buffer(QByteArray
             continue;
         }
 
+        if (m_discarding_escape) {
+            flush_print_text();
+            continue_discarded_escape(bytes, offset);
+            continue;
+        }
+
         if (is_string_family(m_string_family)) {
             flush_print_text();
             continue_string(bytes, offset, actions);
@@ -1117,6 +1123,7 @@ Terminal_byte_stream_parser::try_consume_escape_or_csi(
                 static_cast<std::size_t>(sequence_size),
                 k_control_sequence_pending_limit_bytes,
                 Parser_recovery_strategy::DISCARD_SEQUENCE));
+            m_discarding_escape = true;
             offset = final_offset;
             return String_state_result::CONSUMED;
         }
@@ -1631,6 +1638,24 @@ void Terminal_byte_stream_parser::continue_discarded_csi(
             m_discarding_csi = false;
             return;
         }
+    }
+}
+
+void Terminal_byte_stream_parser::continue_discarded_escape(
+    QByteArrayView bytes,
+    qsizetype&     offset)
+{
+    for (; offset < bytes.size(); ++offset) {
+        const unsigned char byte = byte_at(bytes, offset);
+        if (is_csi_intermediate_byte(byte)) {
+            continue;
+        }
+
+        m_discarding_escape = false;
+        if (is_escape_final_byte(byte)) {
+            ++offset;
+        }
+        return;
     }
 }
 

@@ -86,12 +86,17 @@ private:
         QByteArrayView                 bytes,
         qsizetype&                     offset);
 
+    void continue_discarded_escape(
+        QByteArrayView                 bytes,
+        qsizetype&                     offset);
+
     QByteArray                 m_pending_prefix;
     QByteArray                 m_string_payload;
     Parser_sequence_family     m_string_family                 = Parser_sequence_family::NONE;
     bool                       m_string_over_limit             = false;
     Terminal_utf8_scan_state   m_string_utf8_scan_state;
     bool                       m_discarding_csi                = false;
+    bool                       m_discarding_escape             = false;
     std::uint64_t              m_next_host_request_id          = 1U;
 };
 
