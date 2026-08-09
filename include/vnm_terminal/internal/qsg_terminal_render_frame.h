@@ -59,7 +59,8 @@ struct Terminal_render_options
 {
     QColor                     default_background   = QColor(9,   12,  16);
     QColor                     default_foreground   = QColor(196, 230, 201);
-    QColor                     selection_background = QColor(48, 96, 160, 190);
+    QColor                     selection_background = QColor(48,  96, 160);
+    QColor                     selection_foreground = QColor(255, 255, 255);
     QColor                     cursor_color         = QColor(230, 240, 220);
     QColor                     preedit_background   = QColor(96,  96,  96,  120);
     QColor                     visual_bell_color    = QColor(255, 255, 255, 70);
@@ -75,6 +76,9 @@ struct Terminal_render_options
                                msdf_lcd_subpixel_order =
                                    Terminal_lcd_subpixel_order::NONE;
 };
+
+// Matches Windows Terminal's selected-text contrast policy.
+QColor terminal_selection_foreground_for_background(const QColor& background);
 
 inline bool terminal_render_cursor_visible(
     const Terminal_render_snapshot&    snapshot,

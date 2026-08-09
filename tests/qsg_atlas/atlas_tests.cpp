@@ -12667,7 +12667,8 @@ bool run_atlas_report_case(
     bool ok = true;
     ok &= check(reported, std::string("atlas report invalidation case ") + name);
     ok &= check(report.render.rect_buffer.full_upload ||
-            report.render.glyph_buffer.full_upload,
+            report.render.glyph_buffer.full_upload ||
+            report.render.msdf_text_buffer.full_upload,
         std::string("atlas report full-uploads at least one instance buffer for ") +
             name);
     return ok;
@@ -19452,7 +19453,12 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
             });
         },
         [](const term::Qsg_atlas_render_summary& render_summary) {
-            return render_summary.non_dirty_selection_invalidation;
+            return
+                render_summary.non_dirty_selection_invalidation &&
+                (render_summary.glyph_buffer.full_upload ||
+                    render_summary.glyph_buffer.partial_upload ||
+                    render_summary.msdf_text_buffer.full_upload ||
+                    render_summary.msdf_text_buffer.partial_upload);
         });
     ok &= run_atlas_report_case(
         app,

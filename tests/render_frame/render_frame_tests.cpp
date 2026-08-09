@@ -950,8 +950,9 @@ bool test_selection_cursor_blink_and_shapes()
     ok    &= check(frame.cursor_text_runs.size() == 1U &&
         frame.cursor_text_runs.front().text == QStringLiteral("C") &&
         frame.cursor_text_runs.front().foreground ==
-            frame.cursor_text_runs.front().background,
-        "block cursor duplicates covered glyph in contrasting color");
+            QColor::fromRgba(snapshot.color_state.default_background_rgba) &&
+        frame.cursor_text_runs.front().background == options().cursor_color,
+        "block cursor text uses the cursor fill as its effective background");
     ok    &= check(frame.cursor_text_runs.front().clip_rect == frame.cursors.front().rect,
         "block cursor text overlay is clipped to cursor cell");
 
@@ -985,6 +986,148 @@ bool test_selection_cursor_blink_and_shapes()
     ok              &= check(frame.cursors.front().kind == term::Terminal_cursor_shape::UNDERLINE &&
         frame.cursors.front().rect.height() < metrics().height,
         "underline cursor is short");
+    return ok;
+}
+
+bool test_selection_applies_contrasting_cell_style()
+{
+    bool ok = true;
+    ok &= check(
+        term::terminal_selection_foreground_for_background(QColor(255, 255, 255)) ==
+                QColor(0, 0, 0) &&
+            term::terminal_selection_foreground_for_background(QColor(12, 12, 12)) ==
+                QColor(255, 255, 255),
+        "selection foreground follows the black-or-white perceptual-lightness rule");
+
+    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 4});
+    snapshot.cursor.visible = false;
+
+    term::Terminal_text_style decorated = term::make_default_terminal_text_style();
+    term::set_terminal_style_attribute(
+        decorated,
+        term::Terminal_style_attribute::UNDERLINE);
+    snapshot.styles.push_back(decorated);
+
+    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
+    snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("B")});
+    snapshot.cells.push_back({.position = {0, 2}, .text = QStringLiteral("C")});
+    snapshot.cells.push_back({
+        .position = {1, 0},
+        .text     = QStringLiteral("D"),
+        .style_id = 1U,
+    });
+    snapshot.cells.push_back({
+        .position = {1, 1},
+        .text     = QStringLiteral("\u2500"),
+    });
+    snapshot.cells.push_back({
+        .position      = {2, 1},
+        .text          = QStringLiteral("\u754c"),
+        .display_width = 2,
+    });
+    snapshot.cells.push_back({
+        .position          = {2, 2},
+        .display_width     = 0,
+        .wide_continuation = true,
+    });
+    snapshot.selection_spans.push_back({
+        {{0, 1}, {0, 2}, term::Terminal_selection_mode::NORMAL},
+        0,
+        1,
+        1,
+    });
+    snapshot.selection_spans.push_back({
+        {{1, 0}, {1, 2}, term::Terminal_selection_mode::NORMAL},
+        1,
+        0,
+        2,
+    });
+    snapshot.selection_spans.push_back({
+        {{2, 2}, {2, 3}, term::Terminal_selection_mode::NORMAL},
+        2,
+        2,
+        1,
+    });
+
+    term::Terminal_render_options render_options = options();
+    render_options.selection_background = QColor(255, 255, 255);
+    render_options.selection_foreground =
+        term::terminal_selection_foreground_for_background(
+            render_options.selection_background);
+    const term::Terminal_render_frame frame = build(snapshot, render_options);
+
+    const std::vector<const term::Terminal_render_text_run*> row_zero_runs =
+        text_runs_for_row(frame, 0);
+    ok &= check(
+        row_zero_runs.size() == 3U &&
+            row_zero_runs[0]->text == QStringLiteral("A") &&
+            row_zero_runs[0]->foreground == render_options.default_foreground &&
+            row_zero_runs[0]->background == render_options.default_background &&
+            row_zero_runs[1]->text == QStringLiteral("B") &&
+            row_zero_runs[1]->foreground == QColor(0, 0, 0) &&
+            row_zero_runs[1]->background == QColor(255, 255, 255) &&
+            row_zero_runs[2]->text == QStringLiteral("C") &&
+            row_zero_runs[2]->foreground == render_options.default_foreground &&
+            row_zero_runs[2]->background == render_options.default_background,
+        "selection splits text runs and replaces both effective paint colors");
+    ok &= check(
+        frame.selection_rects.size() == 3U &&
+            std::all_of(
+                frame.selection_rects.begin(),
+                frame.selection_rects.end(),
+                [](const term::Terminal_render_rect& rect) {
+                    return rect.color == QColor(255, 255, 255) &&
+                        rect.color.alpha() == 255;
+                }),
+        "selection backgrounds preserve the scheme's opaque color");
+    ok &= check(
+        frame.selection_rects.size() == 3U &&
+            frame.selection_rects[2].rect == QRectF(10.0, 40.0, 20.0, 20.0),
+        "selection background expands to the complete wide glyph");
+    ok &= check(
+        frame.decorations.size() == 1U &&
+            frame.decorations.front().color == QColor(0, 0, 0),
+        "selected text decorations use the selection foreground");
+    ok &= check(
+        !frame.graphic_rects.empty() &&
+            std::all_of(
+                frame.graphic_rects.begin(),
+                frame.graphic_rects.end(),
+                [](const term::Terminal_render_rect& rect) {
+                    return rect.color == QColor(0, 0, 0);
+                }),
+        "selected terminal graphics use the selection foreground");
+    const term::Terminal_render_text_run* const wide_run = run_at(frame, 2, 1);
+    ok &= check(
+        wide_run != nullptr &&
+            wide_run->foreground == QColor(0, 0, 0) &&
+            wide_run->background == QColor(255, 255, 255),
+        "selection of a wide continuation applies to the complete glyph");
+
+    snapshot.cursor = {{0, 1}, term::Terminal_cursor_shape::BLOCK, true, false};
+    const term::Terminal_render_frame cursor_frame = build(snapshot, render_options);
+    ok &= check(
+        cursor_frame.cursor_text_runs.size() == 1U &&
+            cursor_frame.cursor_text_runs.front().foreground == QColor(0, 0, 0) &&
+            cursor_frame.cursor_text_runs.front().background == QColor(255, 255, 255),
+        "a block cursor remains readable when its fill matches the selection background");
+
+    term::Terminal_render_options dark_selection_options = render_options;
+    dark_selection_options.selection_background = QColor(12, 12, 12);
+    dark_selection_options.selection_foreground =
+        term::terminal_selection_foreground_for_background(
+            dark_selection_options.selection_background);
+    const term::Terminal_render_frame dark_selection_frame =
+        build(snapshot, dark_selection_options);
+    ok &= check(
+        run_at(dark_selection_frame, 0, 1) != nullptr &&
+            run_at(dark_selection_frame, 0, 1)->foreground == QColor(255, 255, 255) &&
+            run_at(dark_selection_frame, 0, 1)->background == QColor(12, 12, 12),
+        "dark selection backgrounds receive white selected text");
+    ok &= check(
+        dark_selection_frame.layer_descriptors.render_options_key !=
+            cursor_frame.layer_descriptors.render_options_key,
+        "selection colors participate in render-option invalidation");
     return ok;
 }
 
@@ -2653,6 +2796,7 @@ int main()
     ok &= test_default_and_reverse_full_grid_background();
     ok &= test_styled_blank_cells_emit_background_rects();
     ok &= test_selection_cursor_blink_and_shapes();
+    ok &= test_selection_applies_contrasting_cell_style();
     ok &= test_terminal_render_cursor_visible_truth_table();
     ok &= test_decorations_preedit_hyperlink_and_bell();
     ok &= test_zero_grid_and_preedit_width();

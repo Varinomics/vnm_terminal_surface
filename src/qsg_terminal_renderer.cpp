@@ -48,6 +48,28 @@ constexpr std::size_t k_eager_render_style_attribute_limit  = 256U;
 constexpr int         k_terminal_render_frame_full_layer_descriptor_count  = 13;
 constexpr int         k_terminal_render_frame_state_layer_descriptor_count = 5;
 
+qreal srgb_component_to_linear(int component)
+{
+    const qreal srgb = static_cast<qreal>(component) / 255.0;
+    return srgb <= 0.04045
+        ? srgb / 12.92
+        : std::pow((srgb + 0.055) / 1.055, 2.4);
+}
+
+qreal oklab_lightness(const QColor& color)
+{
+    const qreal red   = srgb_component_to_linear(color.red());
+    const qreal green = srgb_component_to_linear(color.green());
+    const qreal blue  = srgb_component_to_linear(color.blue());
+    const qreal l = 0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue;
+    const qreal m = 0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue;
+    const qreal s = 0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue;
+    return
+        0.2104542553 * std::cbrt(l) +
+        0.7936177850 * std::cbrt(m) -
+        0.0040720468 * std::cbrt(s);
+}
+
 std::size_t bounded_frame_reserve(
     std::size_t cell_count,
     int         visible_rows,
@@ -1337,6 +1359,7 @@ void append_frame_key_render_options(
     append_frame_key_color(key, options.default_background);
     append_frame_key_color(key, options.default_foreground);
     append_frame_key_color(key, options.selection_background);
+    append_frame_key_color(key, options.selection_foreground);
     append_frame_key_color(key, options.cursor_color);
     append_frame_key_color(key, options.preedit_background);
     append_frame_key_color(key, options.visual_bell_color);
@@ -1805,6 +1828,13 @@ void build_terminal_render_frame_descriptors(
 
 } // namespace
 
+QColor terminal_selection_foreground_for_background(const QColor& background)
+{
+    return oklab_lightness(background) < 0.5
+        ? QColor(255, 255, 255)
+        : QColor(0, 0, 0);
+}
+
 Terminal_render_frame build_terminal_render_frame(
     const Terminal_render_snapshot*    snapshot,
     QSizeF                             logical_size,
@@ -1906,6 +1936,54 @@ Terminal_render_frame build_terminal_render_frame(
         : 0;
     Render_style_attribute_cache style_attributes(*snapshot);
     frame.stats.cell_pass_input_cells = static_cast<int>(rows.cell_count());
+
+    std::vector<unsigned char> selected_cell_flags;
+    if (valid_grid && !snapshot->selection_spans.empty()) {
+        const std::size_t column_count =
+            static_cast<std::size_t>(snapshot->grid_size.columns);
+        selected_cell_flags.resize(
+            static_cast<std::size_t>(snapshot->grid_size.rows) * column_count,
+            0U);
+        for (const Terminal_render_selection_span& span : snapshot->selection_spans) {
+            const std::size_t first =
+                static_cast<std::size_t>(span.row) * column_count +
+                static_cast<std::size_t>(span.first_column);
+            std::fill_n(
+                selected_cell_flags.begin() + static_cast<std::ptrdiff_t>(first),
+                span.column_count,
+                1U);
+        }
+        // A glyph and its backdrop must cover the same cells because MSDF LCD
+        // reconstruction precomposes against the run's effective background.
+        for (const Terminal_render_snapshot_row_content row : rows) {
+            for (const Terminal_render_cell& cell : row) {
+                if (cell.wide_continuation ||
+                    cell.display_width <= 1 ||
+                    cell.position.row < 0 ||
+                    cell.position.row >= snapshot->grid_size.rows ||
+                    cell.position.column < 0 ||
+                    cell.display_width >
+                        snapshot->grid_size.columns - cell.position.column)
+                {
+                    continue;
+                }
+
+                const std::size_t first =
+                    static_cast<std::size_t>(cell.position.row) * column_count +
+                    static_cast<std::size_t>(cell.position.column);
+                const auto begin =
+                    selected_cell_flags.begin() + static_cast<std::ptrdiff_t>(first);
+                const auto end = begin + cell.display_width;
+                if (std::any_of(
+                        begin,
+                        end,
+                        [](unsigned char flag) { return flag != 0U; }))
+                {
+                    std::fill(begin, end, 1U);
+                }
+            }
+        }
+    }
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::reserve_outputs");
@@ -2079,16 +2157,34 @@ Terminal_render_frame build_terminal_render_frame(
                 }
 
                 const render_style_attributes_t& style = *style_or_null;
-                const QColor foreground = style.foreground;
-                const QColor background = style.background;
+                bool selected = false;
+                if (!selected_cell_flags.empty()) {
+                    const std::size_t first =
+                        static_cast<std::size_t>(cell.position.row) *
+                            static_cast<std::size_t>(snapshot->grid_size.columns) +
+                        static_cast<std::size_t>(cell.position.column);
+                    selected = std::any_of(
+                        selected_cell_flags.begin() + static_cast<std::ptrdiff_t>(first),
+                        selected_cell_flags.begin() + static_cast<std::ptrdiff_t>(
+                            first + static_cast<std::size_t>(cell.display_width)),
+                        [](unsigned char flag) { return flag != 0U; });
+                }
+                const QColor foreground = selected
+                    ? options.selection_foreground
+                    : style.foreground;
+                // This is paint metadata as well as a color: the MSDF LCD path
+                // requires it to equal the framebuffer underneath the glyph.
+                const QColor background = selected
+                    ? options.selection_background
+                    : style.background;
 
                 const QRectF rect = cell_rect(
                     cell.position.row,
                     cell.position.column,
                     cell.display_width,
                     cell_metrics);
-                if (background != grid_background) {
-                    frame.background_rects.push_back({rect, background});
+                if (style.background != grid_background) {
+                    frame.background_rects.push_back({rect, style.background});
                 }
 
                 const Terminal_render_line_provenance& line_provenance = cached_line_provenance;
@@ -2343,11 +2439,41 @@ Terminal_render_frame build_terminal_render_frame(
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::selection");
 
-        for (const Terminal_render_selection_span& span : snapshot->selection_spans) {
-            frame.selection_rects.push_back({
-                cell_rect(span.row, span.first_column, span.column_count, cell_metrics),
-                options.selection_background,
-            });
+        if (!selected_cell_flags.empty()) {
+            const int column_count = snapshot->grid_size.columns;
+            for (int row = 0; row < snapshot->grid_size.rows; ++row) {
+                int column = 0;
+                while (column < column_count) {
+                    const std::size_t index =
+                        static_cast<std::size_t>(row) *
+                            static_cast<std::size_t>(column_count) +
+                        static_cast<std::size_t>(column);
+                    if (selected_cell_flags[index] == 0U) {
+                        ++column;
+                        continue;
+                    }
+
+                    const int first_column = column;
+                    while (column < column_count) {
+                        const std::size_t selected_index =
+                            static_cast<std::size_t>(row) *
+                                static_cast<std::size_t>(column_count) +
+                            static_cast<std::size_t>(column);
+                        if (selected_cell_flags[selected_index] == 0U) {
+                            break;
+                        }
+                        ++column;
+                    }
+                    frame.selection_rects.push_back({
+                        cell_rect(
+                            row,
+                            first_column,
+                            column - first_column,
+                            cell_metrics),
+                        options.selection_background,
+                    });
+                }
+            }
         }
     }
 
@@ -2374,8 +2500,11 @@ Terminal_render_frame build_terminal_render_frame(
                     });
                 if (text_run != frame.text_runs.end()) {
                     Terminal_render_text_run cursor_run = *text_run;
-                    cursor_run.foreground = cursor_run.background;
-                    cursor_run.clip_rect  = rendered_cursor_rect;
+                    cursor_run.foreground = cursor_run.background == options.cursor_color
+                        ? cursor_run.foreground
+                        : cursor_run.background;
+                    cursor_run.background = options.cursor_color;
+                    cursor_run.clip_rect   = rendered_cursor_rect;
                     frame.cursor_text_runs.push_back(std::move(cursor_run));
                 }
             }

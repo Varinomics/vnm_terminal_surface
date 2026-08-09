@@ -388,15 +388,6 @@ bool color_is_light(quint32 rgba)
     return luma > 127.5;
 }
 
-QColor scheme_selection_color(quint32 selection_rgba)
-{
-    // The scheme selection color is opaque; render it as a translucent overlay
-    // so selected text stays legible regardless of the scheme.
-    QColor color = QColor::fromRgba(selection_rgba);
-    color.setAlpha(150);
-    return color;
-}
-
 const term::Terminal_color_scheme& resolve_surface_color_scheme(
     const VNM_TerminalSurface& surface)
 {
@@ -1255,7 +1246,10 @@ term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurfa
     options.default_background   = QColor::fromRgba(scheme.background_rgba);
     options.default_foreground   = QColor::fromRgba(scheme.foreground_rgba);
     options.cursor_color         = QColor::fromRgba(scheme.cursor_rgba);
-    options.selection_background = scheme_selection_color(scheme.selection_rgba);
+    options.selection_background = QColor::fromRgba(scheme.selection_rgba);
+    options.selection_foreground =
+        term::terminal_selection_foreground_for_background(
+            options.selection_background);
 
     const bool light_scheme = color_is_light(scheme.background_rgba);
     options.preedit_background = light_scheme
