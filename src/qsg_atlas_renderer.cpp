@@ -4316,6 +4316,7 @@ private:
             key,
             options.cursor_blink_enabled_override.has_value() &&
                 *options.cursor_blink_enabled_override);
+        append_key_bool(key, options.cursor_withheld);
         append_key_bool(key, options.visual_bell_enabled);
         append_key_bool(key, options.underline_hyperlinks);
         append_key_int(key, static_cast<int>(options.text_renderer_policy));

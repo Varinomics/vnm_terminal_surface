@@ -567,6 +567,14 @@ bool test_block_cursor_over_text_like_symbol_uses_cursor_text()
         frame.cursor_text_runs.front().clip_rect == frame.cursors.front().rect,
         "block cursor inverse text comes from the shaped text run");
 
+    term::Terminal_render_options withheld_options = options();
+    withheld_options.cursor_withheld = true;
+    const term::Terminal_render_frame withheld_frame = build(snapshot, withheld_options);
+    ok &= check(withheld_frame.cursors.empty(),
+        "withheld block cursor emits no cursor rect");
+    ok &= check(withheld_frame.cursor_text_runs.empty(),
+        "withheld block cursor emits no inverse text run");
+
     return ok;
 }
 
@@ -1141,6 +1149,12 @@ bool test_terminal_render_cursor_visible_truth_table()
     ok &= check(
         term::terminal_render_cursor_visible(snapshot, render_options, true),
         "cursor visibility predicate accepts visible in-grid cursor");
+
+    render_options.cursor_withheld = true;
+    ok &= check(
+        !term::terminal_render_cursor_visible(snapshot, render_options, true),
+        "cursor visibility predicate rejects withheld cursor");
+    render_options.cursor_withheld = false;
 
     snapshot.cursor.visible = false;
     ok &= check(
@@ -2610,6 +2624,15 @@ bool test_descriptor_keys_are_mutation_sensitive()
         options_frame.layer_descriptors.render_options_key !=
             base_frame.layer_descriptors.render_options_key,
         "render option mutations change the layer descriptor key");
+
+    term::Terminal_render_options cursor_withheld_options = options();
+    cursor_withheld_options.cursor_withheld = true;
+    const term::Terminal_render_frame cursor_withheld_options_frame =
+        build(base, cursor_withheld_options);
+    ok &= check(
+        cursor_withheld_options_frame.layer_descriptors.render_options_key !=
+            base_frame.layer_descriptors.render_options_key,
+        "cursor-withheld render option changes the layer descriptor key");
 
     term::terminal_cell_metrics_t changed_metrics = metrics();
     changed_metrics.width = 11.0;
