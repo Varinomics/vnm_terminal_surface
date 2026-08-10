@@ -171,10 +171,6 @@ public:
     static std::chrono::milliseconds
         backend_callback_frame_progress_watchdog_interval_for_testing();
 
-    static void set_cursor_output_quiet_interval_for_testing(
-        VNM_TerminalSurface&       surface,
-        int                        interval_ms);
-
     static std::optional<std::chrono::steady_clock::time_point>
         backend_callback_frame_progress_deadline_for_testing(
             const VNM_TerminalSurface& surface);

@@ -2142,18 +2142,6 @@ bool test_surface_no_echo_input_keeps_cursor_visible(QGuiApplication& app)
     term::VNM_TerminalSurface_render_bridge::reconcile_atlas_completion_for_testing(
         fixture.surface);
 
-    term::VNM_TerminalSurface_render_bridge::
-        set_cursor_output_quiet_interval_for_testing(fixture.surface, 0);
-    ok &= check(window_render_matches(
-        app,
-        fixture.window,
-        fixture.surface,
-        [&] {
-            return term::VNM_TerminalSurface_render_bridge::
-                qsg_atlas_frame(fixture.surface).captured_render_cursor.visible;
-        }),
-        "no-echo cursor visibility waits for startup output to quiet");
-
     ok &= check(!term::VNM_TerminalSurface_render_bridge::backend_callback_drain_queued(
             fixture.surface),
         "no-echo cursor visibility starts without queued backend callbacks");
@@ -2188,7 +2176,7 @@ bool test_surface_no_echo_input_keeps_cursor_visible(QGuiApplication& app)
     return ok;
 }
 
-bool test_surface_unrendered_publication_input_preserves_output_quiet_cursor(
+bool test_surface_unrendered_publication_input_keeps_cursor_visible(
     QGuiApplication& app)
 {
     bool ok = true;
@@ -2278,16 +2266,19 @@ bool test_surface_unrendered_publication_input_preserves_output_quiet_cursor(
         return ok;
     }
 
-    const bool withheld_stale_frame =
+    const bool visible_stale_frame =
         frame_attempt.report.captured_snapshot_sequence ==
             unrendered_snapshot->metadata.sequence &&
         frame_attempt.report.captured_snapshot_cursor.visible &&
-        frame_attempt.report.captured_render_cursor.valid &&
-        !frame_attempt.report.captured_render_cursor.visible &&
+        frame_attempt.report.captured_render_cursor.visible &&
         frame_attempt.report.captured_render_cursor.column ==
             unrendered_snapshot->cursor.position.column;
-    ok &= check(withheld_stale_frame,
-        "unrendered publication input does not expose the active output cursor");
+    const bool rendered_caught_up_frame =
+        frame_attempt.report.captured_snapshot_sequence >
+            unrendered_snapshot->metadata.sequence &&
+        frame_attempt.report.captured_render_cursor.visible;
+    ok &= check(visible_stale_frame || rendered_caught_up_frame,
+        "unrendered publication input keeps stale cursor visible or renders caught-up cursor");
 
     return ok;
 }
@@ -2615,9 +2606,6 @@ bool test_surface_undrawn_publication_restores_cursor_after_render(
         !term::VNM_TerminalSurface_render_bridge::atlas_completion_pending_for_testing(
             fixture.surface),
         "undrawn publication cursor clears atlas completion after draw");
-
-    term::VNM_TerminalSurface_render_bridge::
-        set_cursor_output_quiet_interval_for_testing(fixture.surface, 0);
 
     const term::Qsg_atlas_frame_report report_before_restored_cursor_frame =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(fixture.surface);
@@ -3403,131 +3391,7 @@ bool test_surface_synchronized_release_stable_with_extension_disabled_counts_cur
     return ok;
 }
 
-bool test_surface_sequential_tui_frames_withhold_intermediate_cursors(
-    QGuiApplication& app)
-{
-    bool ok = true;
-    Surface_fixture fixture;
-    pump_events(app);
-    fixture.surface.set_cursor_blink_enabled(false);
-    term::VNM_TerminalSurface_render_bridge::
-        set_cursor_output_quiet_interval_for_testing(fixture.surface, 10000);
-
-    auto backend = std::make_unique<Scripted_backend>();
-    backend->outputs_during_start = {
-        QByteArrayLiteral("\x1b[1;1Hcursor-quiet-baseline\x1b[2;2H")};
-
-    bool started = false;
-    Scripted_backend* backend_ptr = start_surface_with_backend(
-        fixture.surface,
-        std::move(backend),
-        { QStringLiteral("scripted-terminal") },
-        &started);
-    ok &= check(started && backend_ptr != nullptr,
-        "sequential TUI cursor test starts");
-    if (!started || backend_ptr == nullptr) {
-        return ok;
-    }
-
-    // Release startup output, then keep the real timer from expiring while the
-    // test renders each later callback separately. The callbacks are deliberately
-    // below the native 16 KiB read ceiling and are never prequeued together.
-    term::VNM_TerminalSurface_render_bridge::
-        set_cursor_output_quiet_interval_for_testing(fixture.surface, 0);
-    ok &= check(window_render_matches(
-        app,
-        fixture.window,
-        fixture.surface,
-        [&] {
-            return term::VNM_TerminalSurface_render_bridge::
-                qsg_atlas_frame(fixture.surface).captured_render_cursor.visible;
-        }),
-        "sequential TUI cursor test exposes the quiet baseline cursor");
-    term::VNM_TerminalSurface_render_bridge::
-        set_cursor_output_quiet_interval_for_testing(fixture.surface, 10000);
-
-    const QByteArray first_frame = QByteArrayLiteral(
-        "\x1b[3;3Hfirst-frame\x1b[?25h\x1b[4;6H");
-    ok &= check(first_frame.size() < 16 * 1024,
-        "sequential TUI cursor first callback fits one native read");
-    const std::uint64_t baseline_capture_count =
-        term::VNM_TerminalSurface_render_bridge::
-            qsg_atlas_frame(fixture.surface).capture_count;
-    backend_ptr->emit_output_from_worker(first_frame);
-    backend_ptr->join_worker();
-    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
-        fixture.surface);
-
-    const std::shared_ptr<const term::Terminal_render_snapshot> first_snapshot =
-        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(first_snapshot != nullptr &&
-        snapshot_contains_text(*first_snapshot, QStringLiteral("first-frame")) &&
-        first_snapshot->cursor.visible &&
-        first_snapshot->cursor.position.row == 3 &&
-        first_snapshot->cursor.position.column == 5,
-        "sequential TUI cursor first callback publishes content and cursor state");
-    const std::optional<term::Qsg_atlas_frame_report> first_frame_report =
-        capture_next_surface_frame(
-            app,
-            fixture.window,
-            fixture.surface,
-            baseline_capture_count);
-    ok &= check(first_frame_report.has_value() &&
-        first_frame_report->captured_snapshot_cursor.visible &&
-        first_frame_report->captured_render_cursor.valid &&
-        !first_frame_report->captured_render_cursor.visible,
-        "sequential TUI cursor first completed frame withholds its cursor");
-
-    const QByteArray second_frame = QByteArrayLiteral(
-        "\x1b[5;4Hsecond-frame\x1b[?25h\x1b[7;9H");
-    ok &= check(second_frame.size() < 16 * 1024,
-        "sequential TUI cursor second callback fits one native read");
-    const std::uint64_t first_capture_count =
-        term::VNM_TerminalSurface_render_bridge::
-            qsg_atlas_frame(fixture.surface).capture_count;
-    backend_ptr->emit_output_from_worker(second_frame);
-    backend_ptr->join_worker();
-    term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
-        fixture.surface);
-
-    const std::shared_ptr<const term::Terminal_render_snapshot> second_snapshot =
-        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
-    ok &= check(second_snapshot != nullptr &&
-        snapshot_contains_text(*second_snapshot, QStringLiteral("second-frame")) &&
-        second_snapshot->cursor.visible &&
-        second_snapshot->cursor.position.row == 6 &&
-        second_snapshot->cursor.position.column == 8,
-        "sequential TUI cursor second callback publishes the latest state");
-    const std::optional<term::Qsg_atlas_frame_report> second_frame_report =
-        capture_next_surface_frame(
-            app,
-            fixture.window,
-            fixture.surface,
-            first_capture_count);
-    ok &= check(second_frame_report.has_value() &&
-        second_frame_report->captured_snapshot_cursor.visible &&
-        second_frame_report->captured_render_cursor.valid &&
-        !second_frame_report->captured_render_cursor.visible,
-        "sequential TUI cursor second completed frame still withholds its cursor");
-
-    term::VNM_TerminalSurface_render_bridge::
-        set_cursor_output_quiet_interval_for_testing(fixture.surface, 0);
-    ok &= check(window_render_matches(
-        app,
-        fixture.window,
-        fixture.surface,
-        [&] {
-            const term::Qsg_atlas_cursor_report cursor =
-                term::VNM_TerminalSurface_render_bridge::
-                    qsg_atlas_frame(fixture.surface).captured_render_cursor;
-            return cursor.visible && cursor.row == 6 && cursor.column == 8;
-        }),
-        "sequential TUI cursor test exposes only the final cursor after output quiets");
-
-    return ok;
-}
-
-bool test_surface_bulk_output_withholds_render_cursor(QGuiApplication& app)
+bool test_surface_bulk_output_keeps_snapshot_cursor_visible(QGuiApplication& app)
 {
     bool ok = true;
     Surface_fixture fixture;
@@ -3645,8 +3509,8 @@ bool test_surface_bulk_output_withholds_render_cursor(QGuiApplication& app)
         ok &= check(
             mid_drain_frame_report->captured_snapshot_cursor.visible &&
             mid_drain_frame_report->captured_render_cursor.valid     &&
-            !mid_drain_frame_report->captured_render_cursor.visible,
-            "surface bulk-output cursor test withholds the unsettled render cursor");
+            mid_drain_frame_report->captured_render_cursor.visible,
+            "surface bulk-output cursor test renders the snapshot-visible cursor");
     }
 
     term::VNM_TerminalSurface_render_bridge::drain_backend_callback_events(
@@ -16625,7 +16489,7 @@ int main(int argc, char** argv)
     ok &= test_surface_output_backpressure_uses_posted_callback_owner(app);
     ok &= test_surface_pressure_bypasses_active_after_frame_owner(app);
     ok &= test_surface_no_echo_input_keeps_cursor_visible(app);
-    ok &= test_surface_unrendered_publication_input_preserves_output_quiet_cursor(app);
+    ok &= test_surface_unrendered_publication_input_keeps_cursor_visible(app);
     ok &= test_surface_undrawn_publication_keeps_atlas_completion_pending(app);
     ok &= test_surface_undrawn_publication_restores_cursor_after_render(app);
     ok &= test_surface_frame_boundary_output_publishes_followup_dirty_rows(app);
@@ -16636,8 +16500,7 @@ int main(int argc, char** argv)
     ok &= test_surface_epoch_catchup_uses_frame_budget_override(app);
     ok &= test_surface_cursor_stable_extension_disabled_preserves_incomplete_boundary(app);
     ok &= test_surface_synchronized_release_stable_with_extension_disabled_counts_cursor_stable(app);
-    ok &= test_surface_sequential_tui_frames_withhold_intermediate_cursors(app);
-    ok &= test_surface_bulk_output_withholds_render_cursor(app);
+    ok &= test_surface_bulk_output_keeps_snapshot_cursor_visible(app);
     ok &= test_surface_synchronized_hold_stop_preserves_drain_stats(app);
     ok &= test_surface_epoch_catchup_pending_mouse_retry_stays_on_frame_path(app);
     ok &= test_surface_posted_backend_drain_uses_full_budget_without_frame_work(app);

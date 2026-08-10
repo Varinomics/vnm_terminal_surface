@@ -209,10 +209,6 @@ public:
     std::size_t pending_backend_callback_event_count() const;
     std::uint64_t backend_callback_enqueue_epoch() const;
     std::uint64_t backend_callback_processed_epoch() const;
-    // Latest non-empty backend-output command. Unlike public OUTPUT_ACTIVITY
-    // notifications, this is observable even while notification delivery is
-    // coalesced across a budgeted drain.
-    std::uint64_t last_output_activity_sequence() const;
     bool mouse_reporting_active() const;
     bool alternate_scroll_active() const;
     std::uint64_t alternate_scroll_mode_generation() const;
@@ -705,7 +701,6 @@ private:
     std::uint64_t                                          m_next_sequence = 1U;
     std::uint64_t                                          m_next_resize_id = 1U;
     std::uint64_t                                          m_last_processed_sequence = 0U;
-    std::uint64_t                                          m_last_output_activity_sequence = 0U;
     std::uint64_t                                          m_last_processed_backend_callback_epoch = 0U;
     std::uint64_t                                          m_ready_processed_backend_callback_epoch = 0U;
     std::uint64_t                                          m_processing_backend_callback_epoch = 0U;

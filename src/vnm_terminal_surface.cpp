@@ -95,11 +95,6 @@ constexpr std::chrono::milliseconds k_backend_callback_frame_pending_posted_drai
     k_backend_callback_drain_budget;
 constexpr std::chrono::milliseconds k_backend_callback_frame_catchup_budget_default =
     k_backend_callback_drain_budget;
-// ConPTY does not carry application flush or repaint boundaries. Hold the cursor
-// across a few nominal display intervals so separately delivered chunks from one
-// TUI redraw cannot expose its cursor-addressed drawing path. This presentation
-// debounce is intentionally independent of the callback-progress watchdog below.
-constexpr int k_cursor_output_quiet_interval_ms = 50;
 // Six nominal 60 Hz frame intervals absorb ordinary compositor jitter while
 // bounding recovery when an accepted frame request produces no callback progress.
 constexpr int k_backend_callback_frame_progress_watchdog_ms = 100;
@@ -2171,74 +2166,6 @@ struct VNM_TerminalSurface::Private
         render_update_window = nullptr;
     }
 
-    void sync_cursor_output_activity(VNM_TerminalSurface& surface)
-    {
-        if (session == nullptr) {
-            return;
-        }
-
-        // Do not key this policy from delivered OUTPUT_ACTIVITY notifications:
-        // notification delivery is intentionally deferred at some partial-drain
-        // boundaries, but those intermediate snapshots can still be rendered.
-        const std::uint64_t output_activity_sequence =
-            session->last_output_activity_sequence();
-        if (output_activity_sequence == 0U ||
-            output_activity_sequence == cursor_output_activity_sequence)
-        {
-            return;
-        }
-
-        cursor_output_activity_sequence = output_activity_sequence;
-        cursor_output_quiet_session_generation = session_generation;
-        const bool cursor_was_withheld = cursor_output_withheld;
-        cursor_output_withheld = true;
-        cursor_output_quiet_timer.start();
-        if (!cursor_was_withheld) {
-            request_render_update(surface);
-        }
-    }
-
-    void handle_cursor_output_quiet_timeout(VNM_TerminalSurface& surface)
-    {
-        if (!cursor_output_withheld) {
-            return;
-        }
-
-        if (session == nullptr ||
-            session_generation != cursor_output_quiet_session_generation)
-        {
-            reset_cursor_output_quiet_state(surface);
-            return;
-        }
-
-        const std::uint64_t output_activity_sequence =
-            session->last_output_activity_sequence();
-        if (output_activity_sequence != cursor_output_activity_sequence) {
-            cursor_output_activity_sequence = output_activity_sequence;
-            cursor_output_quiet_timer.start();
-            return;
-        }
-        if (session->has_pending_backend_callback_events()) {
-            cursor_output_quiet_timer.start();
-            return;
-        }
-
-        cursor_output_withheld = false;
-        request_render_update(surface);
-    }
-
-    void reset_cursor_output_quiet_state(VNM_TerminalSurface& surface)
-    {
-        cursor_output_quiet_timer.stop();
-        cursor_output_activity_sequence = 0U;
-        cursor_output_quiet_session_generation = 0U;
-        const bool cursor_was_withheld = cursor_output_withheld;
-        cursor_output_withheld = false;
-        if (cursor_was_withheld && !shutting_down.load()) {
-            request_render_update(surface);
-        }
-    }
-
     void reset_atlas_completion()
     {
         atlas_completion_pending                       = false;
@@ -2841,10 +2768,6 @@ struct VNM_TerminalSurface::Private
     std::shared_ptr<const term::Terminal_render_snapshot>  render_snapshot;
     term::Ime_preedit_state                                ime_preedit;
     bool                                                   cursor_blink_visible                  = true;
-    QTimer                                                 cursor_output_quiet_timer;
-    bool                                                   cursor_output_withheld                = false;
-    std::uint64_t                                          cursor_output_activity_sequence       = 0U;
-    std::uint64_t                                          cursor_output_quiet_session_generation = 0U;
     std::shared_ptr<term::Qsg_atlas_recorder>              qsg_atlas_recorder;
     mutable std::mutex                                     paint_completion_mutex;
     std::uint64_t                                          paint_completed_frame_count = 0U;
@@ -3002,16 +2925,6 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
     setAcceptedMouseButtons(Qt::AllButtons);
     setAcceptHoverEvents(true);
     setFocus(true);
-    m_private->cursor_output_quiet_timer.setSingleShot(true);
-    m_private->cursor_output_quiet_timer.setInterval(
-        k_cursor_output_quiet_interval_ms);
-    QObject::connect(
-        &m_private->cursor_output_quiet_timer,
-        &QTimer::timeout,
-        this,
-        [this] {
-            m_private->handle_cursor_output_quiet_timeout(*this);
-        });
     m_private->backend_callback_frame_progress_watchdog.setSingleShot(true);
     m_private->backend_callback_frame_progress_watchdog.setInterval(
         k_backend_callback_frame_progress_watchdog_ms);
@@ -7642,8 +7555,6 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         return m_private->active_session_matches(session, session_generation);
     };
 
-    m_private->sync_cursor_output_activity(*this);
-
     bool render_snapshot_installed = false;
     std::shared_ptr<const term::Terminal_render_snapshot> installed_render_snapshot;
     const auto installed_render_snapshot_still_current = [&] {
@@ -7991,7 +7902,6 @@ void VNM_TerminalSurface::report_result_failure(
 void VNM_TerminalSurface::reset_session()
 {
     m_private->synchronized_output_recovery_timer.stop();
-    m_private->reset_cursor_output_quiet_state(*this);
     ++m_private->session_generation;
     m_private->clear_pending_published_mouse_reports();
     m_private->resize_controller.reset();
@@ -8129,7 +8039,6 @@ QSGNode* VNM_TerminalSurface::updatePaintNode(QSGNode* old_node, UpdatePaintNode
         }
 
         term::Terminal_render_options options = render_options_for_surface(*this);
-        options.cursor_withheld = m_private->cursor_output_withheld;
         term::Captured_atlas_frame captured_frame =
             term::capture_qsg_atlas_frame(
                 m_private->render_snapshot,
@@ -8450,20 +8359,6 @@ backend_callback_frame_progress_watchdog_interval_for_testing()
 {
     return std::chrono::milliseconds{
         k_backend_callback_frame_progress_watchdog_ms};
-}
-
-void term::VNM_TerminalSurface_render_bridge::
-set_cursor_output_quiet_interval_for_testing(
-    VNM_TerminalSurface& surface,
-    int                  interval_ms)
-{
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    QTimer& timer = surface.m_private->cursor_output_quiet_timer;
-    const bool restart_timer = timer.isActive();
-    timer.setInterval(std::max(0, interval_ms));
-    if (restart_timer) {
-        timer.start();
-    }
 }
 
 std::optional<std::chrono::steady_clock::time_point>

@@ -2841,13 +2841,6 @@ std::uint64_t Terminal_session::backend_callback_processed_epoch() const
     return m_last_processed_backend_callback_epoch;
 }
 
-std::uint64_t Terminal_session::last_output_activity_sequence() const
-{
-    std::lock_guard<std::recursive_mutex> lock(m_mutex);
-
-    return m_last_output_activity_sequence;
-}
-
 bool Terminal_session::mouse_reporting_active() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -4833,7 +4826,6 @@ void Terminal_session::record_output_chunk(QByteArray bytes)
 
 void Terminal_session::record_output_activity(std::uint64_t sequence)
 {
-    m_last_output_activity_sequence = sequence;
     record_notification({
         Terminal_session_notification_kind::OUTPUT_ACTIVITY,
         sequence,
