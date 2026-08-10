@@ -122,7 +122,7 @@ std::vector<std::string> backend_drain_keys()
         "posted_full_budget_calls",
         "posted_frame_pending_small_budget_calls",
         "budget_exhausted_incomplete",
-        "cursor_stable_incomplete",
+        "synchronized_output_release_incomplete",
         "total_elapsed_ns",
         "max_elapsed_ns",
         "session_processing_calls",

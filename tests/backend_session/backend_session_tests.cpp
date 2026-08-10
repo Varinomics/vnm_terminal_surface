@@ -10938,7 +10938,7 @@ QByteArray exact_budgeted_control_slice(QByteArray payload)
     return payload;
 }
 
-QByteArray budgeted_dectcm_slice(
+QByteArray budgeted_output_slice(
     int target_row, int neutral_row, QByteArray marker, QByteArray control)
 {
     const QByteArray prefix = cursor_position_sequence(neutral_row, 0);
@@ -10958,7 +10958,7 @@ QByteArray budgeted_dectcm_slice(
 
 QByteArray budgeted_dirty_row_slice(int target_row, int neutral_row, QByteArray marker)
 {
-    return budgeted_dectcm_slice(target_row, neutral_row, std::move(marker), {});
+    return budgeted_output_slice(target_row, neutral_row, std::move(marker), {});
 }
 
 bool dirty_row_ranges_include_row(
@@ -11366,7 +11366,7 @@ bool test_rejected_output_callback_enqueue_advances_processed_epoch()
     const bool target_reached =
         session->process_backend_callback_events_until_epoch(
             rejected_epoch,
-            term::backend_callback_drain_budgets_t{std::chrono::seconds(10)}) ==
+            std::chrono::seconds(10)) ==
         term::Backend_callback_drain_stop::COMPLETE;
 
     ok &= check(target_reached,
@@ -11415,8 +11415,7 @@ bool test_rejected_callback_epoch_waits_for_lower_sliced_output()
     const bool early_target_reached =
         session->process_backend_callback_events_until_epoch(
             rejected_epoch,
-            term::backend_callback_drain_budgets_t{
-                std::chrono::steady_clock::duration::zero()}) ==
+            std::chrono::steady_clock::duration::zero()) ==
         term::Backend_callback_drain_stop::COMPLETE;
     const std::optional<term::Terminal_render_snapshot> early_snapshot =
         session->latest_render_snapshot();
@@ -11434,7 +11433,7 @@ bool test_rejected_callback_epoch_waits_for_lower_sliced_output()
     const bool target_reached =
         session->process_backend_callback_events_until_epoch(
             rejected_epoch,
-            term::backend_callback_drain_budgets_t{std::chrono::seconds(10)}) ==
+            std::chrono::seconds(10)) ==
         term::Backend_callback_drain_stop::COMPLETE;
 
     ok &= check(target_reached,
@@ -11498,8 +11497,7 @@ bool test_rejected_callback_epoch_waits_for_lower_non_output_callback()
         target_reached =
             session->process_backend_callback_events_until_epoch(
                 rejected_epoch,
-                term::backend_callback_drain_budgets_t{
-                    std::chrono::steady_clock::duration::zero()}) ==
+                std::chrono::steady_clock::duration::zero()) ==
             term::Backend_callback_drain_stop::COMPLETE;
     }
     const std::optional<term::Terminal_render_snapshot> before_error_snapshot =
@@ -11528,7 +11526,7 @@ bool test_rejected_callback_epoch_waits_for_lower_non_output_callback()
     target_reached =
         session->process_backend_callback_events_until_epoch(
             rejected_epoch,
-            term::backend_callback_drain_budgets_t{std::chrono::seconds(10)}) ==
+            std::chrono::seconds(10)) ==
         term::Backend_callback_drain_stop::COMPLETE;
 
     ok &= check(target_reached,
@@ -11696,165 +11694,7 @@ bool test_budgeted_backend_callback_drain_holds_output_command_backpressure()
     return ok;
 }
 
-bool test_budgeted_drain_stop_point_extends_to_cursor_show()
-{
-    bool ok = true;
-
-    term::Terminal_session_config config;
-    config.backend_event_notifier = [] {};
-
-    std::unique_ptr<term::Terminal_session> session;
-    Scripted_backend* backend = make_session(session, config);
-    const term::Terminal_launch_config launch_config = valid_launch_config();
-    ok &= check(session->start(launch_config).code ==
-        term::Terminal_session_result_code::ACCEPTED,
-        "cursor-stable stop session starts");
-    const int neutral_row = launch_config.initial_grid_size->rows - 1;
-
-    // Slice 1 opens a repaint (hides the cursor), slice 3 closes it (shows the
-    // cursor) after intermediate hidden-cursor content, and slices 4-5 are a
-    // later repaint that must stay behind the settled stop point.
-    QByteArray output;
-    output += budgeted_dectcm_slice(
-        0, neutral_row, QByteArrayLiteral("frame-a"), QByteArrayLiteral("\x1b[?25l"));
-    output += budgeted_dirty_row_slice(1, neutral_row, QByteArrayLiteral("frame-b"));
-    output += budgeted_dectcm_slice(
-        2, neutral_row, QByteArrayLiteral("frame-c"), QByteArrayLiteral("\x1b[?25h"));
-    output += budgeted_dirty_row_slice(3, neutral_row, QByteArrayLiteral("frame-d"));
-    output += budgeted_dirty_row_slice(4, neutral_row, QByteArrayLiteral("frame-e"));
-    ok &= check(output.size() == k_budgeted_output_slice_contract_bytes * 5,
-        "cursor-stable stop fixture spans five exact budgeted slices");
-    ok &= check(backend->emit_output(output),
-        "cursor-stable stop queues the multi-slice repaint");
-
-    const std::uint64_t target_epoch = session->backend_callback_enqueue_epoch();
-    const term::Backend_callback_drain_stop stop =
-        session->process_backend_callback_events_until_epoch(
-            target_epoch,
-            term::backend_callback_drain_budgets_t{
-                std::chrono::steady_clock::duration::zero(),
-                std::chrono::seconds(10)});
-    const std::optional<term::Terminal_render_snapshot> snapshot =
-        session->latest_render_snapshot();
-
-    ok &= check(stop == term::Backend_callback_drain_stop::CURSOR_STABLE,
-        "budgeted drain extends past the budget to the cursor-show boundary");
-    ok &= check(session->has_pending_backend_callback_events(),
-        "cursor-stable stop leaves the later repaint queued");
-    ok &= check(snapshot.has_value() && snapshot->modes.cursor_visible,
-        "cursor-stable stop publishes a cursor-visible settled frame");
-    ok &= check(snapshot.has_value() &&
-        snapshot_contains_text(*snapshot, QStringLiteral("frame-c")),
-        "cursor-stable stop publishes content through the repaint close");
-    ok &= check(snapshot.has_value() &&
-        !snapshot_contains_text(*snapshot, QStringLiteral("frame-d")),
-        "cursor-stable stop does not publish later-frame content");
-
-    return ok;
-}
-
-bool test_budgeted_drain_stop_point_cursor_show_at_primary_expiry()
-{
-    bool ok = true;
-
-    term::Terminal_session_config config;
-    config.backend_event_notifier = [] {};
-
-    std::unique_ptr<term::Terminal_session> session;
-    Scripted_backend* backend = make_session(session, config);
-    const term::Terminal_launch_config launch_config = valid_launch_config();
-    ok &= check(session->start(launch_config).code ==
-        term::Terminal_session_result_code::ACCEPTED,
-        "primary-expiry cursor-show stop session starts");
-    const int neutral_row = launch_config.initial_grid_size->rows - 1;
-
-    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?25l")),
-        "primary-expiry cursor-show stop hides the cursor before the budgeted drain");
-    session->process_backend_callback_events();
-
-    QByteArray output;
-    output += budgeted_dectcm_slice(
-        0, neutral_row, QByteArrayLiteral("primary-expiry-close"), QByteArrayLiteral("\x1b[?25h"));
-    output += budgeted_dirty_row_slice(1, neutral_row, QByteArrayLiteral("primary-expiry-tail"));
-    ok &= check(output.size() == k_budgeted_output_slice_contract_bytes * 2,
-        "primary-expiry cursor-show fixture spans two exact budgeted slices");
-    ok &= check(backend->emit_output(output),
-        "primary-expiry cursor-show stop queues the close-boundary repaint");
-
-    const std::uint64_t target_epoch = session->backend_callback_enqueue_epoch();
-    const term::Backend_callback_drain_stop stop =
-        session->process_backend_callback_events_until_epoch(
-            target_epoch,
-            term::backend_callback_drain_budgets_t{
-                std::chrono::steady_clock::duration::zero(),
-                std::chrono::seconds(10)});
-    const std::optional<term::Terminal_render_snapshot> snapshot =
-        session->latest_render_snapshot();
-
-    ok &= check(stop == term::Backend_callback_drain_stop::CURSOR_STABLE,
-        "budgeted drain reports CURSOR_STABLE at the primary-expiry cursor-show boundary");
-    ok &= check(session->output_chunks().size() == 2U,
-        "primary-expiry cursor-show stop processes only the setup output and one budgeted slice");
-    ok &= check(session->has_pending_backend_callback_events(),
-        "primary-expiry cursor-show stop leaves later work queued");
-    ok &= check(snapshot.has_value() && snapshot->modes.cursor_visible,
-        "primary-expiry cursor-show stop publishes a cursor-visible snapshot");
-    ok &= check(snapshot.has_value() &&
-        snapshot_contains_text(*snapshot, QStringLiteral("primary-expiry-close")),
-        "primary-expiry cursor-show stop publishes the close-boundary content");
-    ok &= check(snapshot.has_value() &&
-        !snapshot_contains_text(*snapshot, QStringLiteral("primary-expiry-tail")),
-        "primary-expiry cursor-show stop leaves later content unpublished");
-
-    return ok;
-}
-
-bool test_budgeted_drain_stop_point_never_bracketing_stops_unsettled()
-{
-    bool ok = true;
-
-    term::Terminal_session_config config;
-    config.backend_event_notifier = [] {};
-
-    std::unique_ptr<term::Terminal_session> session;
-    Scripted_backend* backend = make_session(session, config);
-    const term::Terminal_launch_config launch_config = valid_launch_config();
-    ok &= check(session->start(launch_config).code ==
-        term::Terminal_session_result_code::ACCEPTED,
-        "never-bracketing stop session starts");
-    const int neutral_row = launch_config.initial_grid_size->rows - 1;
-
-    // A plain-content stream never toggles the cursor, so no cursor-stable
-    // boundary can appear: the extension must not run and the drain must yield
-    // unsettled after the single budget-bounded slice.
-    QByteArray output;
-    output += budgeted_dirty_row_slice(0, neutral_row, QByteArrayLiteral("plain-a"));
-    output += budgeted_dirty_row_slice(1, neutral_row, QByteArrayLiteral("plain-b"));
-    output += budgeted_dirty_row_slice(2, neutral_row, QByteArrayLiteral("plain-c"));
-    ok &= check(output.size() == k_budgeted_output_slice_contract_bytes * 3,
-        "never-bracketing stop fixture spans three exact budgeted slices");
-    ok &= check(backend->emit_output(output),
-        "never-bracketing stop queues the multi-slice plain output");
-
-    const std::uint64_t target_epoch = session->backend_callback_enqueue_epoch();
-    const term::Backend_callback_drain_stop stop =
-        session->process_backend_callback_events_until_epoch(
-            target_epoch,
-            term::backend_callback_drain_budgets_t{
-                std::chrono::steady_clock::duration::zero(),
-                std::chrono::seconds(10)});
-
-    ok &= check(stop == term::Backend_callback_drain_stop::UNSETTLED,
-        "never-bracketing budgeted drain stops unsettled");
-    ok &= check(session->output_chunks().size() == 1U,
-        "never-bracketing budgeted drain pays no extension and yields after one slice");
-    ok &= check(session->has_pending_backend_callback_events(),
-        "never-bracketing budgeted drain leaves the remaining slices queued");
-
-    return ok;
-}
-
-bool test_budgeted_drain_stop_point_release_rehold_reports_cursor_stable()
+bool test_budgeted_drain_stop_point_release_rehold_reports_release()
 {
     bool ok = true;
 
@@ -11878,7 +11718,7 @@ bool test_budgeted_drain_stop_point_release_rehold_reports_cursor_stable()
         session->render_snapshot_generation();
 
     QByteArray output;
-    output += budgeted_dectcm_slice(
+    output += budgeted_output_slice(
         0, neutral_row, QByteArrayLiteral("release-rehold-a"),
         QByteArrayLiteral("\x1b[?2026l\x1b[?2026h"));
     output += budgeted_dirty_row_slice(1, neutral_row, QByteArrayLiteral("release-rehold-b"));
@@ -11891,14 +11731,13 @@ bool test_budgeted_drain_stop_point_release_rehold_reports_cursor_stable()
     const term::Backend_callback_drain_stop stop =
         session->process_backend_callback_events_until_epoch(
             target_epoch,
-            term::backend_callback_drain_budgets_t{
-                std::chrono::steady_clock::duration::zero(),
-                std::chrono::seconds(10)});
+            std::chrono::steady_clock::duration::zero());
     const std::optional<term::Terminal_render_snapshot> snapshot =
         session->latest_render_snapshot();
 
-    ok &= check(stop == term::Backend_callback_drain_stop::CURSOR_STABLE,
-        "budgeted drain reports CURSOR_STABLE for a published release followed by a re-hold");
+    ok &= check(
+        stop == term::Backend_callback_drain_stop::SYNCHRONIZED_OUTPUT_RELEASED,
+        "budgeted drain reports the published synchronized-output release");
     ok &= check(session->render_snapshot_generation() == generation_before_release + 1U,
         "release-rehold stop publishes exactly the synchronized-output release frame");
     ok &= check(session->has_pending_backend_callback_events(),
@@ -11958,9 +11797,7 @@ bool test_budgeted_drain_stop_point_release_then_live_publication_is_unsettled()
     const term::Backend_callback_drain_stop stop =
         session->process_backend_callback_events_until_epoch(
             target_epoch,
-            term::backend_callback_drain_budgets_t{
-                std::chrono::steady_clock::duration::zero(),
-                std::chrono::seconds(10)});
+            std::chrono::steady_clock::duration::zero());
     const std::optional<term::Terminal_render_snapshot> snapshot =
         session->latest_render_snapshot();
 
@@ -12017,9 +11854,7 @@ bool test_budgeted_drain_stop_point_held_during_synchronized_output()
     const term::Backend_callback_drain_stop stop =
         session->process_backend_callback_events_until_epoch(
             target_epoch,
-            term::backend_callback_drain_budgets_t{
-                std::chrono::steady_clock::duration::zero(),
-                std::chrono::seconds(10)});
+            std::chrono::steady_clock::duration::zero());
 
     ok &= check(stop == term::Backend_callback_drain_stop::HELD,
         "budgeted drain reports HELD while a synchronized-output hold is active");
@@ -12044,22 +11879,15 @@ bool test_budgeted_drain_stop_point_deferred_content_before_hold_is_unsettled()
         "deferred-content hold stop session starts");
     const int neutral_row = launch_config.initial_grid_size->rows - 1;
 
-    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?25l")),
-        "deferred-content hold stop hides the cursor before the budgeted drain");
-    session->process_backend_callback_events();
-
-    QByteArray hold_entry_slice = QByteArrayLiteral("\x1b[?2026h");
-    hold_entry_slice += cursor_horizontal_position_padding(
-        k_budgeted_output_slice_contract_bytes - hold_entry_slice.size());
-    ok &= check(hold_entry_slice.size() == k_budgeted_output_slice_contract_bytes,
-        "deferred-content hold entry fixture spans one exact budgeted slice");
-
     QByteArray output;
-    output += budgeted_dirty_row_slice(0, neutral_row, QByteArrayLiteral("deferred-before-hold-a"));
-    output += hold_entry_slice;
+    output += budgeted_output_slice(
+        0,
+        neutral_row,
+        QByteArrayLiteral("deferred-before-hold-a"),
+        QByteArrayLiteral("\x1b[?2026h"));
     output += budgeted_dirty_row_slice(2, neutral_row, QByteArrayLiteral("deferred-before-hold-c"));
-    ok &= check(output.size() == k_budgeted_output_slice_contract_bytes * 3,
-        "deferred-content hold fixture spans three exact budgeted slices");
+    ok &= check(output.size() == k_budgeted_output_slice_contract_bytes * 2,
+        "deferred-content hold fixture spans two exact budgeted slices");
     const std::uint64_t generation_before_output =
         session->render_snapshot_generation();
     ok &= check(backend->emit_output(output),
@@ -12069,9 +11897,7 @@ bool test_budgeted_drain_stop_point_deferred_content_before_hold_is_unsettled()
     const term::Backend_callback_drain_stop stop =
         session->process_backend_callback_events_until_epoch(
             target_epoch,
-            term::backend_callback_drain_budgets_t{
-                std::chrono::steady_clock::duration::zero(),
-                std::chrono::seconds(10)});
+            std::chrono::steady_clock::duration::zero());
     const std::optional<term::Terminal_render_snapshot> snapshot =
         session->latest_render_snapshot();
 
@@ -12087,81 +11913,6 @@ bool test_budgeted_drain_stop_point_deferred_content_before_hold_is_unsettled()
     ok &= check(snapshot.has_value() &&
         !snapshot_contains_text(*snapshot, QStringLiteral("deferred-before-hold-c")),
         "deferred-content hold stop leaves later held content unpublished");
-
-    return ok;
-}
-
-bool test_budgeted_drain_stop_point_extension_reaches_epoch()
-{
-    bool ok = true;
-
-    const auto make_hidden_burst = [](int neutral_row) {
-        QByteArray output;
-        output += budgeted_dectcm_slice(
-            0, neutral_row, QByteArrayLiteral("burst-a"), QByteArrayLiteral("\x1b[?25l"));
-        output += budgeted_dirty_row_slice(1, neutral_row, QByteArrayLiteral("burst-b"));
-        output += budgeted_dirty_row_slice(2, neutral_row, QByteArrayLiteral("burst-c"));
-        return output;
-    };
-
-    // Without the extension, the zero budget stops unsettled after one slice.
-    {
-        term::Terminal_session_config config;
-        config.backend_event_notifier = [] {};
-        std::unique_ptr<term::Terminal_session> session;
-        Scripted_backend* backend = make_session(session, config);
-        const term::Terminal_launch_config launch_config = valid_launch_config();
-        ok &= check(session->start(launch_config).code ==
-            term::Terminal_session_result_code::ACCEPTED,
-            "extension-off burst session starts");
-        const int neutral_row = launch_config.initial_grid_size->rows - 1;
-
-        ok &= check(backend->emit_output(make_hidden_burst(neutral_row)),
-            "extension-off burst queues the hidden-cursor slices");
-        const std::uint64_t target_epoch = session->backend_callback_enqueue_epoch();
-        const term::Backend_callback_drain_stop stop =
-            session->process_backend_callback_events_until_epoch(
-                target_epoch,
-                term::backend_callback_drain_budgets_t{
-                    std::chrono::steady_clock::duration::zero(),
-                    std::nullopt});
-
-        ok &= check(stop == term::Backend_callback_drain_stop::UNSETTLED,
-            "hidden-cursor burst stops unsettled with the extension disabled");
-        ok &= check(session->has_pending_backend_callback_events(),
-            "extension-off burst leaves the later slices queued");
-    }
-
-    // With the extension, the same hidden-cursor burst drains all the way to the
-    // target epoch (no cursor-show boundary ever appears) and stops complete.
-    {
-        term::Terminal_session_config config;
-        config.backend_event_notifier = [] {};
-        std::unique_ptr<term::Terminal_session> session;
-        Scripted_backend* backend = make_session(session, config);
-        const term::Terminal_launch_config launch_config = valid_launch_config();
-        ok &= check(session->start(launch_config).code ==
-            term::Terminal_session_result_code::ACCEPTED,
-            "extension-on burst session starts");
-        const int neutral_row = launch_config.initial_grid_size->rows - 1;
-
-        ok &= check(backend->emit_output(make_hidden_burst(neutral_row)),
-            "extension-on burst queues the hidden-cursor slices");
-        const std::uint64_t target_epoch = session->backend_callback_enqueue_epoch();
-        const term::Backend_callback_drain_stop stop =
-            session->process_backend_callback_events_until_epoch(
-                target_epoch,
-                term::backend_callback_drain_budgets_t{
-                    std::chrono::steady_clock::duration::zero(),
-                    std::chrono::seconds(10)});
-
-        ok &= check(stop == term::Backend_callback_drain_stop::COMPLETE,
-            "extension drains the hidden-cursor burst to the target epoch");
-        ok &= check(session->backend_callback_processed_epoch() >= target_epoch,
-            "extension-on burst reaches the target epoch");
-        ok &= check(!session->has_pending_backend_callback_events(),
-            "extension-on burst leaves no pending work at the epoch");
-    }
 
     return ok;
 }
@@ -14758,14 +14509,10 @@ int main()
     ok &= test_combined_synchronized_release_suffix_does_not_publish_epoch_early();
     ok &= test_budgeted_backend_callback_drain_coalesces_incomplete_content_snapshot();
     ok &= test_budgeted_backend_callback_drain_holds_output_command_backpressure();
-    ok &= test_budgeted_drain_stop_point_extends_to_cursor_show();
-    ok &= test_budgeted_drain_stop_point_cursor_show_at_primary_expiry();
-    ok &= test_budgeted_drain_stop_point_never_bracketing_stops_unsettled();
-    ok &= test_budgeted_drain_stop_point_release_rehold_reports_cursor_stable();
+    ok &= test_budgeted_drain_stop_point_release_rehold_reports_release();
     ok &= test_budgeted_drain_stop_point_release_then_live_publication_is_unsettled();
     ok &= test_budgeted_drain_stop_point_held_during_synchronized_output();
     ok &= test_budgeted_drain_stop_point_deferred_content_before_hold_is_unsettled();
-    ok &= test_budgeted_drain_stop_point_extension_reaches_epoch();
     ok &= test_deferred_callback_ingress_pauses_backend_at_high_water();
     ok &= test_backend_epoch_notifier_reports_callback_ingress_pressure();
     ok &= test_deferred_callback_ingress_overflow_is_bounded();

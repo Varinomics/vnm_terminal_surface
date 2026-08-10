@@ -3444,9 +3444,7 @@ Terminal_session_result Terminal_session::enqueue_command(Terminal_session_comma
 Backend_callback_drain_stop Terminal_session::process_pending_commands(
     Backend_callback_drain_policy          drain_policy,
     Backend_callback_drain_deadline        deadline,
-    std::optional<std::uint64_t>           target_backend_callback_epoch,
-    std::optional<std::chrono::steady_clock::duration>
-                                           cursor_stable_stop_extension)
+    std::optional<std::uint64_t>           target_backend_callback_epoch)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::process_pending_commands");
 
@@ -3460,21 +3458,6 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
     const bool previous_backend_content_snapshot_deferral =
         m_backend_content_snapshot_deferral_active;
     m_backend_content_snapshot_deferral_active = deadline.has_value();
-
-    // Cursor-stable stop-point state, sampled at every command/slice boundary
-    // from drain start. Sampling is per boundary, so a DECTCM transition is
-    // detected at one-slice granularity: the stop can overshoot the exact
-    // ?25h by the tail of the slice that contained it, and a full hide/show
-    // bracket inside one slice is invisible.
-    bool prev_cursor_visible      = true;
-    bool prev_synchronized_output = false;
-    if (m_screen_model.has_value()) {
-        const Terminal_mode_state& modes = m_screen_model->mode_state();
-        prev_cursor_visible      = modes.cursor_visible;
-        prev_synchronized_output = modes.synchronized_output;
-    }
-    bool hide_observed_this_drain = !prev_cursor_visible;
-    Backend_callback_drain_deadline extension_deadline = std::nullopt;
 
     Backend_callback_drain_stop stop = Backend_callback_drain_stop::COMPLETE;
     for (;;) {
@@ -3553,18 +3536,11 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
             advance_processed_backend_callback_epoch(command_backend_callback_epoch);
         }
 
-        bool cursor_visible             = prev_cursor_visible;
-        bool synchronized_output_active = prev_synchronized_output;
+        bool synchronized_output_active = false;
         if (m_screen_model.has_value()) {
-            const Terminal_mode_state& modes = m_screen_model->mode_state();
-            cursor_visible             = modes.cursor_visible;
-            synchronized_output_active = modes.synchronized_output;
+            synchronized_output_active =
+                m_screen_model->mode_state().synchronized_output;
         }
-        const bool cursor_shown_at_boundary =
-            !prev_cursor_visible && cursor_visible;
-        hide_observed_this_drain = hide_observed_this_drain || !cursor_visible;
-        prev_cursor_visible      = cursor_visible;
-        prev_synchronized_output = synchronized_output_active;
 
         if (target_backend_callback_epoch.has_value() &&
             m_last_processed_backend_callback_epoch >= *target_backend_callback_epoch)
@@ -3584,14 +3560,9 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
         }
 
         // The primary budget expired at a command/slice boundary with work
-        // remaining: classify the stop. A synchronized-output release that is
-        // still the latest live-content publication leaves a whole released
-        // frame installed (settled); an active hold is HELD only when the
-        // installed publication stays unchanged; a DECTCM hidden -> visible
-        // flip across this boundary is ConPTY's repaint-complete marker
-        // (settled); otherwise the extension may run, but only when this drain
-        // has seen bracket evidence, streams that never hide the cursor stop
-        // unsettled immediately and pay no extension.
+        // remaining. A synchronized-output release that remains the latest
+        // live-content publication is an explicit whole-frame boundary. An
+        // active hold is HELD only while the installed publication is unchanged.
         const bool deferred_content_publication_pending =
             m_deferred_backend_content_snapshot.has_value();
         const bool release_is_latest_publication =
@@ -3601,7 +3572,7 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
                     *m_drain_synchronized_release_publication_generation) &&
             !deferred_content_publication_pending;
         if (release_is_latest_publication) {
-            stop = Backend_callback_drain_stop::CURSOR_STABLE;
+            stop = Backend_callback_drain_stop::SYNCHRONIZED_OUTPUT_RELEASED;
             break;
         }
         if (synchronized_output_active) {
@@ -3614,37 +3585,8 @@ Backend_callback_drain_stop Terminal_session::process_pending_commands(
                 : Backend_callback_drain_stop::UNSETTLED;
             break;
         }
-        if (cursor_shown_at_boundary) {
-            // Default-off frame drains keep DECTCM cursor-stable boundaries
-            // inert; synchronized-output release-stable stops are handled
-            // above and remain settled without the extension.
-            const bool frame_dectcm_stop_extension_disabled =
-                target_backend_callback_epoch.has_value() &&
-                !cursor_stable_stop_extension.has_value();
-            stop = frame_dectcm_stop_extension_disabled
-                ? Backend_callback_drain_stop::UNSETTLED
-                : Backend_callback_drain_stop::CURSOR_STABLE;
-            break;
-        }
-        if (!extension_deadline.has_value()) {
-            if (!cursor_stable_stop_extension.has_value() ||
-                !m_screen_model.has_value()               ||
-                !hide_observed_this_drain)
-            {
-                stop = Backend_callback_drain_stop::UNSETTLED;
-                break;
-            }
-            // The hard cap is anchored on the primary deadline. Deadline
-            // checks run only after a processed command or slice, and
-            // non-output commands process whole, so primary-budget overshoot
-            // eats into the extension window and can consume it entirely on
-            // this drain.
-            extension_deadline = *deadline + *cursor_stable_stop_extension;
-        }
-        if (backend_callback_drain_deadline_reached(extension_deadline)) {
-            stop = Backend_callback_drain_stop::UNSETTLED;
-            break;
-        }
+        stop = Backend_callback_drain_stop::UNSETTLED;
+        break;
     }
     flush_deferred_backend_content_snapshot();
     m_backend_content_snapshot_deferral_active =
@@ -4571,8 +4513,8 @@ Backend_callback_drain_stop Terminal_session::process_backend_callback_events_fo
 }
 
 Backend_callback_drain_stop Terminal_session::process_backend_callback_events_until_epoch(
-    std::uint64_t                     target_epoch,
-    backend_callback_drain_budgets_t  budgets)
+    std::uint64_t target_epoch,
+    std::optional<std::chrono::steady_clock::duration> budget)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
@@ -4583,17 +4525,16 @@ Backend_callback_drain_stop Terminal_session::process_backend_callback_events_un
     }
 
     Backend_callback_drain_deadline deadline = std::nullopt;
-    if (budgets.budget.has_value()) {
+    if (budget.has_value()) {
         const std::chrono::steady_clock::duration zero =
             std::chrono::steady_clock::duration::zero();
-        deadline = std::chrono::steady_clock::now() + std::max(*budgets.budget, zero);
+        deadline = std::chrono::steady_clock::now() + std::max(*budget, zero);
     }
 
     return process_pending_commands(
         Backend_callback_drain_policy::DRAIN_CALLBACKS,
         deadline,
-        target_epoch,
-        budgets.cursor_stable_stop_extension);
+        target_epoch);
 }
 
 void Terminal_session::pause_backend_output_from_callback_ingress()

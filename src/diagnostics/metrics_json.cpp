@@ -502,8 +502,8 @@ void append_backend_drain_metrics_json(
         stats.budget_exhausted_incomplete);
     insert_json_counter(
         out,
-        "cursor_stable_incomplete",
-        stats.cursor_stable_incomplete);
+        "synchronized_output_release_incomplete",
+        stats.synchronized_output_release_incomplete);
     insert_json_counter(out, "total_elapsed_ns", stats.total_elapsed_ns);
     insert_json_counter(out, "max_elapsed_ns", stats.max_elapsed_ns);
     insert_json_counter(

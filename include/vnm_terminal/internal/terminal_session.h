@@ -73,23 +73,15 @@ enum class Backend_callback_drain_stop : std::uint8_t
     // zero-initialized and must read as a complete drain (the surface's
     // null-session early path relies on it).
     COMPLETE = 0,
-    // Stopped early at a settled whole-frame client state: the model's DECTCM
-    // state flipped hidden -> visible across a command/slice boundary
-    // (ConPTY's repaint-complete marker), or a synchronized-output release is
-    // still the drain's latest live-content publication.
-    CURSOR_STABLE,
-    // Stopped early anywhere else: primary budget or extension cap exhausted,
-    // or the drain re-entered while one was already in progress.
+    // Stopped early after a synchronized-output release that remains the
+    // drain's latest live-content publication.
+    SYNCHRONIZED_OUTPUT_RELEASED,
+    // Stopped early anywhere else: the primary budget expired or the drain
+    // re-entered while one was already in progress.
     UNSETTLED,
     // Stopped while a synchronized-output hold was active with no release
     // published during this drain; the installed publication is unchanged.
     HELD,
-};
-
-struct backend_callback_drain_budgets_t
-{
-    std::optional<std::chrono::steady_clock::duration> budget;
-    std::optional<std::chrono::steady_clock::duration> cursor_stable_stop_extension;
 };
 
 class Terminal_session
@@ -287,7 +279,8 @@ public:
         std::chrono::steady_clock::duration     budget);
     Backend_callback_drain_stop process_backend_callback_events_until_epoch(
         std::uint64_t                           target_epoch,
-        backend_callback_drain_budgets_t        budgets = {});
+        std::optional<std::chrono::steady_clock::duration>
+                                                budget = std::nullopt);
 
 private:
     enum class Queue_category
@@ -337,9 +330,6 @@ private:
         std::optional<std::chrono::steady_clock::time_point>
                                             deadline = std::nullopt,
         std::optional<std::uint64_t>       target_backend_callback_epoch =
-            std::nullopt,
-        std::optional<std::chrono::steady_clock::duration>
-                                            cursor_stable_stop_extension =
             std::nullopt);
 
     Terminal_session_result process_command(

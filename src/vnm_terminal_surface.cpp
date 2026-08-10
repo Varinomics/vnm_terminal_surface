@@ -115,14 +115,6 @@ struct Msdf_availability_completion
     std::atomic<int>   dispatch_result{k_dispatch_pending};
 };
 
-// Extension the epoch-targeted frame drain may spend past the primary budget
-// to reach a cursor-stable stop point. Value 0 disables the extension, keeping
-// baseline frame-drain behavior unchanged unless a policy explicitly opts in.
-constexpr std::chrono::milliseconds
-    k_backend_callback_frame_catchup_cursor_stable_stop_extension_default{0};
-constexpr char k_backend_callback_frame_catchup_cursor_stable_stop_extension_env[] =
-    "VNM_TERMINAL_BACKEND_CALLBACK_FRAME_CATCHUP_CURSOR_STABLE_STOP_EXTENSION_MS";
-
 #if defined(_WIN32)
 constexpr unsigned int k_win_spi_get_font_smoothing             = 0x004AU;
 constexpr unsigned int k_win_spi_get_font_smoothing_type        = 0x200AU;
@@ -187,34 +179,6 @@ std::chrono::steady_clock::duration configured_backend_callback_frame_catchup_bu
     }
 
     return std::chrono::milliseconds{budget_ms};
-}
-
-std::chrono::steady_clock::duration
-configured_backend_callback_frame_catchup_cursor_stable_stop_extension()
-{
-    if (!qEnvironmentVariableIsSet(
-            k_backend_callback_frame_catchup_cursor_stable_stop_extension_env))
-    {
-        return k_backend_callback_frame_catchup_cursor_stable_stop_extension_default;
-    }
-
-    bool ok = false;
-    const QString extension_text = qEnvironmentVariable(
-        k_backend_callback_frame_catchup_cursor_stable_stop_extension_env);
-    const int extension_ms = extension_text.toInt(&ok);
-    if (!ok || extension_ms < 0) {
-        const QByteArray extension_bytes = extension_text.toLocal8Bit();
-        qWarning(
-            "VNM_TerminalSurface: ignoring invalid %s=%s; using %lldms",
-            k_backend_callback_frame_catchup_cursor_stable_stop_extension_env,
-            extension_bytes.constData(),
-            static_cast<long long>(
-                k_backend_callback_frame_catchup_cursor_stable_stop_extension_default
-                    .count()));
-        return k_backend_callback_frame_catchup_cursor_stable_stop_extension_default;
-    }
-
-    return std::chrono::milliseconds{extension_ms};
 }
 
 bool set_terminal_clipboard_text(const QString& text)
@@ -494,13 +458,11 @@ bool backend_drain_reached_notification_boundary(
     term::Backend_callback_drain_stop  stop,
     const term::Terminal_session&      session)
 {
-    // Settled stops (COMPLETE, CURSOR_STABLE) publish coherent painted
-    // states, so they deliver coalesced notifications: sustained
-    // cursor-stable regimes must not starve bell/title against the
-    // pending-notification cap.
+    // Complete drains and explicit synchronized-output release boundaries
+    // publish coherent states, so they deliver coalesced notifications.
     return
-        stop == term::Backend_callback_drain_stop::COMPLETE      ||
-        stop == term::Backend_callback_drain_stop::CURSOR_STABLE ||
+        stop == term::Backend_callback_drain_stop::COMPLETE ||
+        stop == term::Backend_callback_drain_stop::SYNCHRONIZED_OUTPUT_RELEASED ||
         !session.has_pending_backend_callback_events();
 }
 
@@ -2716,21 +2678,6 @@ struct VNM_TerminalSurface::Private
             configured_backend_callback_frame_catchup_budget());
     }
 
-    // A zero configured extension means disabled and maps to nullopt at the
-    // session parameter.
-    std::optional<std::chrono::steady_clock::duration>
-    backend_callback_frame_catchup_cursor_stable_stop_extension() const
-    {
-        const std::chrono::steady_clock::duration extension =
-            backend_callback_frame_catchup_cursor_stable_stop_extension_override
-                .value_or(
-                    configured_backend_callback_frame_catchup_cursor_stable_stop_extension());
-        if (extension <= std::chrono::steady_clock::duration::zero()) {
-            return std::nullopt;
-        }
-        return extension;
-    }
-
     void clear_selection_with_sync(VNM_TerminalSurface& surface)
     {
         if (session == nullptr) {
@@ -2790,8 +2737,6 @@ struct VNM_TerminalSurface::Private
     term::Terminal_surface_render_invalidation_stats_t     render_invalidation_stats;
     term::Terminal_surface_backend_drain_stats_t           backend_drain_stats;
     std::optional<std::chrono::steady_clock::duration>     backend_callback_frame_catchup_budget_override;
-    std::optional<std::chrono::steady_clock::duration>
-        backend_callback_frame_catchup_cursor_stable_stop_extension_override;
     int                                                    pending_published_mouse_report_block_count_for_testing = 0;
     std::function<void()>                                  audible_bell_handler;
     bool                                                   render_update_pending              = false;
@@ -7234,23 +7179,22 @@ void VNM_TerminalSurface::drain_backend_callback_events_for(
 
 VNM_TerminalSurface::backend_callback_drain_result_t
 VNM_TerminalSurface::drain_backend_callback_events_until_epoch(
-    std::uint64_t                          target_epoch,
-    term::backend_callback_drain_budgets_t budgets)
+    std::uint64_t                                     target_epoch,
+    std::optional<std::chrono::steady_clock::duration> budget)
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
     const Backend_callback_incomplete_follow_up incomplete_follow_up =
-        budgets.budget.has_value()
+        budget.has_value()
             ? Backend_callback_incomplete_follow_up::FRAME_UPDATE
             : Backend_callback_incomplete_follow_up::POSTED_DRAIN;
 
     if (m_private->session == nullptr) {
         return process_backend_callback_events_recorded(
             nullptr,
-            budgets.budget,
+            budget,
             true,
             target_epoch,
-            budgets.cursor_stable_stop_extension,
             incomplete_follow_up);
     }
 
@@ -7259,12 +7203,11 @@ VNM_TerminalSurface::drain_backend_callback_events_until_epoch(
     const backend_callback_drain_result_t drain_result =
         process_backend_callback_events_recorded(
             session,
-            budgets.budget,
+            budget,
             true,
             target_epoch,
-            budgets.cursor_stable_stop_extension,
             incomplete_follow_up);
-    if (budgets.budget.has_value()) {
+    if (budget.has_value()) {
         request_backend_callback_follow_up_after_incomplete_recorded_drain(
             session,
             session_generation,
@@ -7280,7 +7223,6 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
     std::optional<std::chrono::steady_clock::duration>       budget,
     bool                                                     use_budget_notification_boundary,
     std::optional<std::uint64_t>                             target_backend_callback_epoch,
-    std::optional<std::chrono::steady_clock::duration>       cursor_stable_stop_extension,
     Backend_callback_incomplete_follow_up                    pending_mouse_report_follow_up)
 {
     Q_ASSERT(thread() == QThread::currentThread());
@@ -7346,9 +7288,7 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         result.stop =
             session->process_backend_callback_events_until_epoch(
                 *target_backend_callback_epoch,
-                term::backend_callback_drain_budgets_t{
-                    budget,
-                    cursor_stable_stop_extension});
+                budget);
     }
     else
     if (budget.has_value()) {
@@ -7414,8 +7354,10 @@ VNM_TerminalSurface::process_backend_callback_events_recorded(
         }
     }
     if (budget.has_value()) {
-        if (result.stop == term::Backend_callback_drain_stop::CURSOR_STABLE) {
-            ++drain_stats.cursor_stable_incomplete;
+        if (result.stop ==
+            term::Backend_callback_drain_stop::SYNCHRONIZED_OUTPUT_RELEASED)
+        {
+            ++drain_stats.synchronized_output_release_incomplete;
         }
         else if (result.stop == term::Backend_callback_drain_stop::UNSETTLED) {
             ++drain_stats.budget_exhausted_incomplete;
@@ -7964,9 +7906,7 @@ void VNM_TerminalSurface::updatePolish()
     if (target_epoch > session->backend_callback_processed_epoch()) {
         (void)drain_backend_callback_events_until_epoch(
             target_epoch,
-            term::backend_callback_drain_budgets_t{
-                m_private->backend_callback_frame_catchup_budget(),
-                m_private->backend_callback_frame_catchup_cursor_stable_stop_extension()});
+            m_private->backend_callback_frame_catchup_budget());
     }
 }
 
@@ -8379,30 +8319,6 @@ set_before_backend_callback_frame_owner_release_handler_for_testing(
     surface.m_private->
         before_backend_callback_frame_owner_release_handler_for_testing =
             std::move(handler);
-}
-
-void term::VNM_TerminalSurface_render_bridge::
-set_backend_callback_frame_catchup_cursor_stable_stop_extension_for_benchmark(
-    VNM_TerminalSurface&                    surface,
-    std::chrono::steady_clock::duration     extension)
-{
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    const std::chrono::steady_clock::duration zero =
-        std::chrono::steady_clock::duration::zero();
-    surface.m_private
-        ->backend_callback_frame_catchup_cursor_stable_stop_extension_override =
-        std::max(extension, zero);
-}
-
-std::chrono::steady_clock::duration
-term::VNM_TerminalSurface_render_bridge::
-backend_callback_frame_catchup_cursor_stable_stop_extension_for_testing(
-    const VNM_TerminalSurface& surface)
-{
-    Q_ASSERT(surface.thread() == QThread::currentThread());
-    return surface.m_private
-        ->backend_callback_frame_catchup_cursor_stable_stop_extension()
-        .value_or(std::chrono::steady_clock::duration::zero());
 }
 
 void term::VNM_TerminalSurface_render_bridge::

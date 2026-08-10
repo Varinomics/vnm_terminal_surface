@@ -116,7 +116,7 @@ These diagnostics are `UNSTABLE`.
 | `posted_full_budget_calls` | Counter | Count | Unstable |
 | `posted_frame_pending_small_budget_calls` | Counter | Count | Unstable |
 | `budget_exhausted_incomplete` | Counter | Count | Unstable |
-| `cursor_stable_incomplete` | Counter | Count | Unstable |
+| `synchronized_output_release_incomplete` | Counter | Count | Unstable |
 | `total_elapsed_ns` | Counter | Nanoseconds | Unstable |
 | `max_elapsed_ns` | Counter | Nanoseconds | Unstable |
 | `session_processing_calls` | Counter | Count | Unstable |
@@ -135,11 +135,9 @@ These diagnostics are `UNSTABLE`.
 | `frame_progress_watchdog_firings` | Counter | Count | Unstable |
 
 Budgeted drains that stop `UNSETTLED` increment
-`budget_exhausted_incomplete`. Budgeted drains that stop `CURSOR_STABLE`
-increment `cursor_stable_incomplete`. `HELD` drains increment neither. When
-the cursor-stable extension is disabled, frame-drain DECTCM cursor-stable
-boundaries are reported as `UNSETTLED` for default-off behavior;
-synchronized-output release-stable stops remain `CURSOR_STABLE`.
+`budget_exhausted_incomplete`. Budgeted drains that stop after an explicit
+synchronized-output release increment
+`synchronized_output_release_incomplete`. `HELD` drains increment neither.
 `frame_progress_watchdog_firings` increments when the bounded frame owner
 expires with callback work still pending and transfers that work to the posted
 drain pump.
