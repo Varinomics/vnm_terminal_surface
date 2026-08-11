@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #if defined(__APPLE__)
+#include <sys/sysctl.h>
 #include <util.h>
 #else
 #include <pty.h>
@@ -561,6 +562,48 @@ std::optional<int> send_signal_to_targets(const Signal_targets& targets, int sig
 
     return std::nullopt;
 }
+
+#if defined(__APPLE__)
+std::optional<bool> macos_process_group_has_unterminated_members(pid_t process_group)
+{
+    int mib[4] = {
+        CTL_KERN,
+        KERN_PROC,
+        KERN_PROC_PGRP,
+        static_cast<int>(process_group),
+    };
+
+    constexpr int k_process_snapshot_attempts = 3;
+    for (int attempt = 0; attempt < k_process_snapshot_attempts; ++attempt) {
+        std::size_t byte_count = 0U;
+        if (::sysctl(mib, 4U, nullptr, &byte_count, nullptr, 0U) < 0) {
+            return std::nullopt;
+        }
+        if (byte_count == 0U) {
+            return false;
+        }
+
+        const std::size_t process_capacity =
+            (byte_count + sizeof(kinfo_proc) - 1U) / sizeof(kinfo_proc);
+        std::vector<kinfo_proc> processes(process_capacity);
+        byte_count = processes.size() * sizeof(kinfo_proc);
+        if (::sysctl(mib, 4U, processes.data(), &byte_count, nullptr, 0U) == 0) {
+            const std::size_t process_count = byte_count / sizeof(kinfo_proc);
+            for (std::size_t i = 0U; i < process_count; ++i) {
+                if (processes[i].kp_proc.p_stat != SZOMB) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (errno != ENOMEM) {
+            return std::nullopt;
+        }
+    }
+
+    return std::nullopt;
+}
+#endif
 
 }
 
@@ -1372,6 +1415,14 @@ private:
         if (process_group <= 0) {
             return false;
         }
+
+#if defined(__APPLE__)
+        const std::optional<bool> active_members =
+            macos_process_group_has_unterminated_members(process_group);
+        if (active_members.has_value()) {
+            return *active_members;
+        }
+#endif
 
         if (::kill(-process_group, 0) == 0) {
             return true;
