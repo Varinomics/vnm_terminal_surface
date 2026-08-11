@@ -9,16 +9,25 @@ child process, in a Qt Quick application as a single C++ `QQuickItem`:
 `VNM_TerminalSurface`. It was built for and ships in Varinomics products, and
 the same component is usable by any Qt Quick host.
 
+For the packaged terminal application and screenshots, see
+[`vnm_terminal`](https://github.com/Varinomics/vnm_terminal).
+
 ## Highlights
 
 - Real terminal behavior, not a log viewer: alternate screen, cursor
   addressing, scrollback, keyboard and mouse reporting modes, bracketed paste,
-  selection, clipboard policy, and terminal replies.
+  selection, clipboard policy, and terminal replies. The maintained
+  [terminal sequence matrix](docs/terminal_sequence_matrix.md) records the
+  supported protocol surface and recovery behavior.
 - Native process hosting per platform: ConPTY on Windows and PTY on Linux and
   macOS, with resize propagation and process lifecycle signals.
+- Explicit text semantics: Qt IME commit/preedit handling and an owned
+  [Unicode 16.0 cell-width policy](docs/unicode_width_policy.md) that is
+  independent of rendering-library glyph metrics.
 - GPU text rendering through the Qt Scene Graph: a glyph-atlas render node
   with MSDF and glyph raster paths and LCD subpixel modes.
-- A documented public API (`docs/public_surface.md`), typed scroll
+- A documented [public API](docs/public_surface.md), host-owned interaction and
+  clipboard policies, provenance-aware scrollback selection, typed scroll
   diagnostics, and a public diagnostics serialization API.
 - Continuously tested on Windows, Linux, and macOS: contract, model, backend,
   renderer, conformance, randomized-parser, and lifecycle test families.
