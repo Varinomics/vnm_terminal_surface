@@ -61,6 +61,10 @@ struct Terminal_render_options
     QColor                     default_foreground   = QColor(196, 230, 201);
     QColor                     selection_background = QColor(48,  96, 160);
     QColor                     selection_foreground = QColor(255, 255, 255);
+    QColor                     search_match_background = QColor(92,  76,  24);
+    QColor                     search_match_foreground = QColor(255, 248, 220);
+    QColor                     current_search_match_background = QColor(224, 160, 32);
+    QColor                     current_search_match_foreground = QColor(24, 18, 4);
     QColor                     cursor_color         = QColor(230, 240, 220);
     QColor                     preedit_background   = QColor(96,  96,  96,  120);
     QColor                     visual_bell_color    = QColor(255, 255, 255, 70);

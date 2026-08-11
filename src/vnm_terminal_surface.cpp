@@ -400,6 +400,24 @@ VNM_TerminalSurface::Process_state surface_process_state(
     return VNM_TerminalSurface::Process_state::FAILED;
 }
 
+VNM_TerminalSurface::Search_result_state surface_search_result_state(
+    term::Terminal_search_result_status status)
+{
+    using Public = VNM_TerminalSurface::Search_result_state;
+    switch (status) {
+        case term::Terminal_search_result_status::INACTIVE:
+            return Public::INACTIVE;
+        case term::Terminal_search_result_status::SOURCE_UNAVAILABLE:
+            return Public::SOURCE_UNAVAILABLE;
+        case term::Terminal_search_result_status::NO_MATCH:
+            return Public::NO_MATCH;
+        case term::Terminal_search_result_status::MATCH:
+            return Public::MATCH;
+    }
+
+    return Public::SOURCE_UNAVAILABLE;
+}
+
 VNM_TerminalSurface::Exit_reason surface_exit_reason(term::Terminal_exit_reason reason)
 {
     switch (reason) {
@@ -4036,6 +4054,27 @@ VNM_TerminalSurface::Selection_state VNM_TerminalSurface::selection_state() cons
     return m_selection_state;
 }
 
+QString VNM_TerminalSurface::search_query() const
+{
+    return m_search_query;
+}
+
+VNM_TerminalSurface::Search_result_state
+VNM_TerminalSurface::search_result_state() const
+{
+    return m_search_result_state;
+}
+
+int VNM_TerminalSurface::search_match_count() const
+{
+    return m_search_match_count;
+}
+
+int VNM_TerminalSurface::current_search_match() const
+{
+    return m_current_search_match;
+}
+
 bool VNM_TerminalSurface::respond_clipboard_write(
     quint64                        request_id,
     Clipboard_response_decision    decision)
@@ -4187,6 +4226,64 @@ void VNM_TerminalSurface::clear_selection()
         std::nullopt,
         false);
     m_private->clear_selection_with_sync(*this);
+}
+
+void VNM_TerminalSurface::set_search_query(QString query)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    drain_backend_callback_events();
+    if (m_private->session == nullptr) {
+        const Search_result_state state = query.isEmpty()
+            ? Search_result_state::INACTIVE
+            : Search_result_state::SOURCE_UNAVAILABLE;
+        set_search_state(std::move(query), state, 0, 0);
+        return;
+    }
+
+    m_private->session->set_search_query(std::move(query));
+    sync_from_session();
+}
+
+void VNM_TerminalSurface::clear_search()
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    if (m_private->session == nullptr) {
+        set_search_state({}, Search_result_state::INACTIVE, 0, 0);
+        return;
+    }
+
+    m_private->session->clear_search();
+    sync_from_session();
+}
+
+bool VNM_TerminalSurface::search_next()
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    drain_backend_callback_events();
+    if (m_private->session == nullptr) {
+        return false;
+    }
+
+    const bool selected = m_private->session->search_next();
+    sync_from_session();
+    return selected;
+}
+
+bool VNM_TerminalSurface::search_previous()
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    drain_backend_callback_events();
+    if (m_private->session == nullptr) {
+        return false;
+    }
+
+    const bool selected = m_private->session->search_previous();
+    sync_from_session();
+    return selected;
 }
 
 bool VNM_TerminalSurface::paste_text(QString text)
@@ -7090,6 +7187,29 @@ void VNM_TerminalSurface::set_selection_state(Selection_state state)
     }
 }
 
+void VNM_TerminalSurface::set_search_state(
+    QString             query,
+    Search_result_state state,
+    int                 match_count,
+    int                 current_match)
+{
+    if (m_search_query         == query         &&
+        m_search_result_state  == state         &&
+        m_search_match_count   == match_count   &&
+        m_current_search_match == current_match)
+    {
+        return;
+    }
+
+    m_search_query         = std::move(query);
+    m_search_result_state  = state;
+    m_search_match_count   = match_count;
+    m_current_search_match = current_match;
+    if (!m_private->shutting_down.load()) {
+        emit search_changed();
+    }
+}
+
 void VNM_TerminalSurface::bind_window_signals(QQuickWindow* window)
 {
     QObject::disconnect(m_private->window_screen_changed_connection);
@@ -7285,6 +7405,9 @@ bool VNM_TerminalSurface::start_process_with_backend(
         m_private->resize_controller->start_from_geometry(
             std::move(launch_config),
             boundingRect().size());
+    if (is_accepted(result.code) && !m_search_query.isEmpty()) {
+        m_private->session->set_search_query(m_search_query);
+    }
     sync_from_session();
     if (!is_accepted(result.code)) {
         if (m_process_state == Process_state::NOT_STARTED) {
@@ -7757,6 +7880,16 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         if (!active_session_still_matches()) {
             return;
         }
+        const term::terminal_search_result_state_t search_state =
+            session->search_result_state();
+        set_search_state(
+            session->search_query(),
+            surface_search_result_state(search_state.status),
+            search_state.match_count,
+            search_state.current_match);
+        if (!active_session_still_matches()) {
+            return;
+        }
     }
 
     {
@@ -8066,6 +8199,13 @@ void VNM_TerminalSurface::reset_session()
     m_private->last_alternate_scroll_active          = false;
     m_private->last_alternate_scroll_mode_generation = 0U;
     set_selection_state(Selection_state::NONE);
+    set_search_state(
+        m_search_query,
+        m_search_query.isEmpty()
+            ? Search_result_state::INACTIVE
+            : Search_result_state::SOURCE_UNAVAILABLE,
+        0,
+        0);
     term::Terminal_viewport_state empty_viewport;
     empty_viewport.visible_rows = std::max(0, m_rows);
     set_viewport_state(empty_viewport);

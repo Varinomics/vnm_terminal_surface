@@ -2225,6 +2225,25 @@ bool test_visible_line_provenance_validation()
     ok &= check(term::validate_render_snapshot(empty_with_span).status ==
         term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE,
         "snapshot without line provenance cannot publish selection spans");
+
+    term::Terminal_render_snapshot valid_search_span = valid;
+    valid_search_span.search_match_spans.push_back({0, 0, 1, true});
+    ok &= check(term::validate_render_snapshot(valid_search_span).status ==
+        term::Terminal_render_snapshot_status::OK,
+        "search match spans validate against visible line provenance");
+
+    term::Terminal_render_snapshot invalid_search_span = valid_search_span;
+    invalid_search_span.search_match_spans.front().first_column =
+        invalid_search_span.grid_size.columns;
+    ok &= check(term::validate_render_snapshot(invalid_search_span).status ==
+        term::Terminal_render_snapshot_status::INVALID_SEARCH_MATCH_SPAN,
+        "search match spans reject columns outside the visible grid");
+
+    term::Terminal_render_snapshot empty_with_search = empty_without_spans;
+    empty_with_search.search_match_spans.push_back({0, 0, 1, false});
+    ok &= check(term::validate_render_snapshot(empty_with_search).status ==
+        term::Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE,
+        "snapshot without provenance cannot publish search match spans");
     return ok;
 }
 

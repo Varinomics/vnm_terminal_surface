@@ -56,6 +56,14 @@ public scroll diagnostics. The first-party app exposes the policy as
 `--synchronized-output-scroll-policy defer|immediate-public`
 (`vnm_terminal/src/app_cli.cpp`).
 
+Search follows the same publication boundary independently of the configured
+scroll policy. It searches only an immutable full-row projection captured at a
+safe publication boundary. An active query may continue to navigate that safe
+projection during a hold. A query first activated during a default hold reports
+`SOURCE_UNAVAILABLE` when no such source exists, rather than inspecting hidden
+model rows or reporting a misleading `NO_MATCH`. The query refreshes only after
+release publishes the accumulated content.
+
 ## Release And Reconciliation
 
 When a hold releases (mode reset, or forced release), the accumulated

@@ -27,6 +27,7 @@ against an app build that consumes this surface.
 | Native backend shared I/O helpers or output delivery limit coupling | `vnm_terminal_backend_session`, `vnm_terminal_posix_pty_backend`, `vnm_terminal_windows_conpty_backend` | surface |
 | Render snapshot and frame building | `vnm_terminal_render_snapshot`, `vnm_terminal_render_frame`, `vnm_terminal_qsg_atlas`, `vnm_terminal_render_cell_text` | surface |
 | Surface / host API (scroll, selection, paste, focus, clipboard) | `vnm_terminal_surface_host` | surface |
+| Search, scrollback match identity, and search overlays | `vnm_terminal_backend_session`, `vnm_terminal_render_snapshot`, `vnm_terminal_render_frame`, `vnm_terminal_surface_host`, `vnm_terminal_custom_titlebar_integration` | surface + application |
 | Screen model, parser, and escape-sequence behavior | `vnm_terminal_screen_basic`, `vnm_terminal_screen_operations`, `vnm_terminal_screen_alternate`, `vnm_terminal_screen_sgr`, `vnm_terminal_terminal_modes`, `vnm_terminal_viewport`, `vnm_terminal_sequence_matrix`, `vnm_terminal_parser_ir`, `vnm_terminal_parser_randomized` | surface |
 | CLI / application behavior | `vnm_terminal_smoke`, `vnm_terminal_help_*`, `vnm_terminal_rejects_*` | application |
 | Metrics and diagnostics output | `vnm_terminal_qt_metrics`, `vnm_terminal_qt_metrics_scaled`, `vnm_terminal_diagnostics_text_layout`, `vnm_terminal_diagnostics_schema_sync` | surface |

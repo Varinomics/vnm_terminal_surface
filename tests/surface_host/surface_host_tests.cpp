@@ -16519,6 +16519,76 @@ bool test_surface_overflow_reports_error_and_exit(QGuiApplication& app)
     return ok;
 }
 
+bool test_public_search_api_persists_query_and_navigates(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    pump_events(app);
+
+    int search_change_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::search_changed,
+        &fixture.surface,
+        [&search_change_count] { ++search_change_count; });
+
+    fixture.surface.set_search_query(QStringLiteral("host-needle"));
+    bool ok = true;
+    ok &= check(
+        fixture.surface.search_query() == QStringLiteral("host-needle") &&
+        fixture.surface.search_result_state() ==
+            VNM_TerminalSurface::Search_result_state::SOURCE_UNAVAILABLE &&
+        fixture.surface.search_match_count() == 0 &&
+        fixture.surface.current_search_match() == 0,
+        "public search API retains a pre-session query without inventing results");
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral(
+            "host-needle first\r\nplain\r\nhost-needle second"),
+    };
+    bool started = false;
+    (void)start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        {QStringLiteral("scripted-terminal")},
+        &started);
+    pump_events(app);
+
+    ok &= check(started, "public search API fixture starts");
+    ok &= check(
+        fixture.surface.search_result_state() ==
+            VNM_TerminalSurface::Search_result_state::MATCH &&
+        fixture.surface.search_match_count() == 2 &&
+        fixture.surface.current_search_match() >= 1,
+        "starting a session applies the retained query to published terminal content");
+
+    const int first_match = fixture.surface.current_search_match();
+    ok &= check(fixture.surface.search_next(),
+        "public search next reports successful navigation");
+    ok &= check(
+        fixture.surface.current_search_match() != first_match,
+        "public search next changes the current result exposed to hosts");
+    ok &= check(fixture.surface.search_previous(),
+        "public search previous reports successful navigation");
+    ok &= check(
+        fixture.surface.current_search_match() == first_match,
+        "public search previous restores the prior result");
+
+    fixture.surface.clear_search();
+    ok &= check(
+        fixture.surface.search_query().isEmpty() &&
+        fixture.surface.search_result_state() ==
+            VNM_TerminalSurface::Search_result_state::INACTIVE &&
+        fixture.surface.search_match_count() == 0 &&
+        fixture.surface.current_search_match() == 0 &&
+        !fixture.surface.search_next() &&
+        !fixture.surface.search_previous(),
+        "public clear search removes result state and disables navigation");
+    ok &= check(search_change_count >= 4,
+        "public search state changes notify host property observers");
+    return ok;
+}
+
 bool test_invalid_argv_reports_backend_error(QGuiApplication& app)
 {
     bool ok = true;
@@ -16720,6 +16790,7 @@ int main(int argc, char** argv)
     ok &= test_audible_bell_policy_requests_platform_bell(app);
     ok &= test_notification_burst_uses_durable_channel(app);
     ok &= test_surface_overflow_reports_error_and_exit(app);
+    ok &= test_public_search_api_persists_query_and_navigates(app);
     ok &= test_invalid_argv_reports_backend_error(app);
     return ok ? 0 : 1;
 }

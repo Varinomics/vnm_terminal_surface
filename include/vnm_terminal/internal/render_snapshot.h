@@ -69,6 +69,7 @@ enum class Terminal_render_snapshot_status
     INVALID_VIEWPORT,
     INVALID_DIRTY_ROW_RANGE,
     INVALID_SELECTION_SPAN,
+    INVALID_SEARCH_MATCH_SPAN,
     INVALID_LINE_PROVENANCE,
     INVALID_HYPERLINK_METADATA,
     INVALID_SNAPSHOT_BASIS_PURPOSE,
@@ -85,6 +86,7 @@ enum class Terminal_render_snapshot_purpose
 {
     CONTENT,
     SELECTION_DERIVED,
+    SEARCH_DERIVED,
     GEOMETRY_DERIVED,
     SCROLL,
 };
@@ -219,6 +221,8 @@ inline QString render_snapshot_purpose_name(Terminal_render_snapshot_purpose pur
             return QStringLiteral("CONTENT");
         case Terminal_render_snapshot_purpose::SELECTION_DERIVED:
             return QStringLiteral("SELECTION_DERIVED");
+        case Terminal_render_snapshot_purpose::SEARCH_DERIVED:
+            return QStringLiteral("SEARCH_DERIVED");
         case Terminal_render_snapshot_purpose::GEOMETRY_DERIVED:
             return QStringLiteral("GEOMETRY_DERIVED");
         case Terminal_render_snapshot_purpose::SCROLL:
@@ -402,6 +406,14 @@ struct Terminal_render_selection_span
     int                        column_count = 0;
 };
 
+struct Terminal_render_search_match_span
+{
+    int                        row          = 0;
+    int                        first_column = 0;
+    int                        column_count = 0;
+    bool                       current      = false;
+};
+
 struct Terminal_render_line_provenance
 {
     std::int64_t               logical_row        = 0;
@@ -516,6 +528,7 @@ struct Terminal_render_snapshot
     Terminal_render_cursor                             cursor;
     Ime_preedit_state                                  ime_preedit;
     std::vector<Terminal_render_selection_span>        selection_spans;
+    std::vector<Terminal_render_search_match_span>     search_match_spans;
     Terminal_render_metadata                           metadata;
     Terminal_mode_state                                modes;
 };
@@ -719,6 +732,16 @@ inline void suppress_selection_spans_without_valid_line_provenance(
         !render_snapshot_visible_line_provenance_is_valid(snapshot))
     {
         snapshot.selection_spans.clear();
+    }
+}
+
+inline void suppress_search_match_spans_without_valid_line_provenance(
+    Terminal_render_snapshot& snapshot)
+{
+    if (!snapshot.search_match_spans.empty() &&
+        !render_snapshot_visible_line_provenance_is_valid(snapshot))
+    {
+        snapshot.search_match_spans.clear();
     }
 }
 
@@ -1259,7 +1282,9 @@ inline Terminal_render_snapshot_validation validate_render_snapshot_metadata(
         return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};
     }
 
-    if (snapshot.visible_line_provenance.empty() && !snapshot.selection_spans.empty()) {
+    if (snapshot.visible_line_provenance.empty() &&
+        (!snapshot.selection_spans.empty() || !snapshot.search_match_spans.empty()))
+    {
         return {Terminal_render_snapshot_status::INVALID_LINE_PROVENANCE};
     }
 
@@ -1427,6 +1452,15 @@ inline Terminal_render_snapshot_validation validate_render_snapshot_overlay_meta
             span.first_column + span.column_count > snapshot.grid_size.columns)
         {
             return {Terminal_render_snapshot_status::INVALID_SELECTION_SPAN};
+        }
+    }
+
+    for (const Terminal_render_search_match_span& span : snapshot.search_match_spans) {
+        if (span.row < 0          || span.row >= snapshot.grid_size.rows ||
+            span.first_column < 0 || span.column_count <= 0              ||
+            span.first_column + span.column_count > snapshot.grid_size.columns)
+        {
+            return {Terminal_render_snapshot_status::INVALID_SEARCH_MATCH_SPAN};
         }
     }
 

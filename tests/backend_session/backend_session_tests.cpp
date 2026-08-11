@@ -14226,6 +14226,274 @@ bool test_flat_ring_public_projection_handle_resolution_policy()
     return ok;
 }
 
+bool test_terminal_search_scrollback_navigation_and_eviction()
+{
+    std::unique_ptr<term::Terminal_session> session;
+    term::Terminal_session_config config;
+    config.scrollback_limit = 3;
+    Scripted_backend* backend = make_session(session, config);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {3, 20};
+
+    bool ok = true;
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "search navigation session starts");
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral(
+                "needle-a\r\nplain-a\r\nneedle-b\r\nplain-b\r\nneedle-c")),
+        "search navigation fixture publishes retained and visible matches");
+
+    session->set_search_query(QStringLiteral("needle"));
+    term::terminal_search_result_state_t state = session->search_result_state();
+    ok &= check(
+        state.status == term::Terminal_search_result_status::MATCH &&
+        state.match_count == 3 &&
+        state.current_match == 2,
+        "literal search includes retained primary history and starts at the viewport");
+
+    std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        !snapshot->search_match_spans.empty() &&
+        snapshot->selection_spans.empty(),
+        "search matches publish a dedicated overlay independent of selection");
+
+    ok &= check(session->search_next(), "search next selects the following match");
+    state = session->search_result_state();
+    ok &= check(state.current_match == 3,
+        "search next advances the one-based host result index");
+    ok &= check(session->search_next(), "search next wraps to retained history");
+    state = session->search_result_state();
+    snapshot = session->latest_render_snapshot();
+    ok &= check(state.current_match == 1 &&
+        snapshot.has_value() &&
+        snapshot_contains_text(*snapshot, QStringLiteral("needle-a")) &&
+        std::any_of(
+            snapshot->search_match_spans.begin(),
+            snapshot->search_match_spans.end(),
+            [](const term::Terminal_render_search_match_span& span) {
+                return span.current;
+            }),
+        "wrapped navigation reveals and marks the retained current match");
+    ok &= check(session->search_previous(),
+        "search previous wraps back from retained history");
+    ok &= check(session->search_result_state().current_match == 3,
+        "search previous wraps in the opposite direction");
+
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("\x1b[?1049hneedle-alternate")),
+        "search buffer fixture enters an alternate screen with a matching row");
+    state = session->search_result_state();
+    snapshot = session->latest_render_snapshot();
+    ok &= check(
+        state.status == term::Terminal_search_result_status::MATCH &&
+        state.match_count == 1 &&
+        state.current_match == 1 &&
+        snapshot.has_value() &&
+        snapshot->viewport.active_buffer == term::Terminal_buffer_id::ALTERNATE &&
+        snapshot_contains_text(*snapshot, QStringLiteral("needle-alternate")) &&
+        !snapshot->search_match_spans.empty(),
+        "alternate-screen search publishes only matches from its active-buffer epoch");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?1049l")),
+        "search buffer fixture restores the primary screen");
+    state = session->search_result_state();
+    snapshot = session->latest_render_snapshot();
+    ok &= check(
+        state.status == term::Terminal_search_result_status::MATCH &&
+        state.match_count == 3 &&
+        snapshot.has_value() &&
+        snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY &&
+        !snapshot_contains_text(*snapshot, QStringLiteral("needle-alternate")),
+        "returning to primary rebuilds search without reusing alternate match identity");
+
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral(
+                "\r\nplain-c\r\nplain-d\r\nplain-e\r\nplain-f\r\nplain-g\r\nplain-h")),
+        "search eviction fixture replaces all matching retained rows");
+    state = session->search_result_state();
+    ok &= check(
+        state.status == term::Terminal_search_result_status::NO_MATCH &&
+        state.match_count == 0 &&
+        state.current_match == 0,
+        "content publication removes evicted matches and clears current identity");
+
+    session->clear_search();
+    state = session->search_result_state();
+    ok &= check(
+        state.status == term::Terminal_search_result_status::INACTIVE &&
+        session->search_query().isEmpty(),
+        "clearing search removes its reusable session state");
+    return ok;
+}
+
+bool test_terminal_search_literal_physical_row_semantics()
+{
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {4, 8};
+
+    bool ok = true;
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "literal search semantics session starts");
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("Case\r\naaaa\r\nfragmentmatch")),
+        "literal search semantics fixture publishes wrapped content");
+
+    session->set_search_query(QStringLiteral("case"));
+    ok &= check(
+        session->search_result_state().status ==
+            term::Terminal_search_result_status::NO_MATCH,
+        "literal search is case-sensitive");
+
+    session->set_search_query(QStringLiteral("Case"));
+    ok &= check(session->search_result_state().match_count == 1,
+        "literal search matches exact case");
+
+    session->set_search_query(QStringLiteral("aa"));
+    ok &= check(session->search_result_state().match_count == 2,
+        "literal search reports non-overlapping matches within one physical row");
+
+    session->set_search_query(QStringLiteral("tmatch"));
+    ok &= check(
+        session->search_result_state().status ==
+            term::Terminal_search_result_status::NO_MATCH,
+        "literal search does not join adjacent reflow fragments");
+    session->set_search_query(QStringLiteral("fragment"));
+    ok &= check(session->search_result_state().match_count == 1,
+        "literal search matches the first physical reflow fragment");
+    session->set_search_query(QStringLiteral("match"));
+    ok &= check(session->search_result_state().match_count == 1,
+        "literal search independently matches the following reflow fragment");
+
+    std::unique_ptr<term::Terminal_session> reflow_session;
+    Scripted_backend* reflow_backend = make_session(reflow_session);
+    term::Terminal_launch_config reflow_launch_config = valid_launch_config();
+    reflow_launch_config.initial_grid_size = {3, 8};
+    ok &= check(reflow_session->start(reflow_launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "reflow identity session starts");
+    ok &= check(reflow_backend->emit_output(
+            QByteArrayLiteral(
+                "fragmentmatch\r\nzzzz\r\nxxxx\r\nyyyy\r\nwwww")),
+        "reflow identity fixture retains an autowrapped logical line");
+    reflow_session->set_search_query(QStringLiteral("a"));
+    ok &= check(reflow_session->search_previous(),
+        "reflow identity fixture selects the final match in the retained line");
+    const term::terminal_search_result_state_t before_reflow =
+        reflow_session->search_result_state();
+    ok &= check(reflow_session->resize(QSizeF(160.0, 60.0), {3, 16}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "reflow identity fixture widens and recombines retained fragments");
+    const term::terminal_search_result_state_t after_reflow =
+        reflow_session->search_result_state();
+    const std::optional<term::Terminal_render_snapshot> reflowed_snapshot =
+        reflow_session->latest_render_snapshot();
+    ok &= check(
+        before_reflow.match_count == 2 &&
+        before_reflow.current_match == 2 &&
+        after_reflow == before_reflow &&
+        reflowed_snapshot.has_value() &&
+        reflowed_snapshot->grid_size.columns == 16 &&
+        snapshot_row_text(*reflowed_snapshot, 0) == QStringLiteral("fragment") &&
+        snapshot_row_text(*reflowed_snapshot, 1) == QStringLiteral("match") &&
+        std::any_of(
+            reflowed_snapshot->search_match_spans.begin(),
+            reflowed_snapshot->search_match_spans.end(),
+            [](const term::Terminal_render_search_match_span& span) {
+                return span.current && span.row == 1 && span.first_column == 1;
+            }),
+        "current match identity survives grid reflow and retained physical fragments");
+    return ok;
+}
+
+bool test_terminal_search_synchronized_output_source_safety()
+{
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {3, 24};
+
+    bool ok = true;
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "synchronized search session starts");
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("public-needle\r\nsafe-row")),
+        "synchronized search publishes its safe prefix");
+    session->set_search_query(QStringLiteral("public-needle"));
+    ok &= check(session->search_result_state().match_count == 1,
+        "search captures a full safe source before synchronized output");
+
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("\x1b[?2026h\r\nhidden-needle")),
+        "synchronized search fixture enters a hold with hidden output");
+    session->set_search_query(QStringLiteral("hidden-needle"));
+    const term::terminal_search_result_state_t held_state =
+        session->search_result_state();
+    const std::optional<term::Terminal_render_snapshot> held_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(
+        held_state.status == term::Terminal_search_result_status::NO_MATCH &&
+        held_state.match_count == 0 &&
+        held_snapshot.has_value() &&
+        !snapshot_contains_text(*held_snapshot, QStringLiteral("hidden-needle")) &&
+        held_snapshot->search_match_spans.empty(),
+        "search reuses only its published safe projection during a hold");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "synchronized search fixture releases hidden output");
+    const term::terminal_search_result_state_t released_state =
+        session->search_result_state();
+    const std::optional<term::Terminal_render_snapshot> released_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(
+        released_state.status == term::Terminal_search_result_status::MATCH &&
+        released_state.match_count == 1 &&
+        released_snapshot.has_value() &&
+        snapshot_contains_text(*released_snapshot, QStringLiteral("hidden-needle")),
+        "released content becomes searchable only after public content publication");
+
+    std::unique_ptr<term::Terminal_session> unavailable_session;
+    Scripted_backend* unavailable_backend = make_session(unavailable_session);
+    ok &= check(unavailable_session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "fresh synchronized search session starts");
+    ok &= check(unavailable_backend->emit_output(
+            QByteArrayLiteral("safe-only")),
+        "fresh synchronized search publishes a safe visible row");
+    const std::optional<term::Terminal_public_projection> viewport_only_source =
+        unavailable_session->capture_public_projection_for_testing();
+    ok &= check(viewport_only_source.has_value() &&
+        viewport_only_source->rows_are_safe_basis_viewport_only(),
+        "fresh synchronized search fixture captures a viewport-only safe source");
+    ok &= check(unavailable_backend->emit_output(
+            QByteArrayLiteral("\x1b[?2026hsecret-query")),
+        "fresh synchronized search enters a default hold without a search source");
+    if (viewport_only_source.has_value()) {
+        unavailable_session->install_public_projection_for_testing(
+            *viewport_only_source);
+    }
+    unavailable_session->set_search_query(QStringLiteral("safe-only"));
+    ok &= check(
+        unavailable_session->search_result_state().status ==
+            term::Terminal_search_result_status::SOURCE_UNAVAILABLE,
+        "viewport-only projections are rejected as incomplete primary search sources");
+    unavailable_session->set_search_query(QStringLiteral("secret-query"));
+    const std::optional<term::Terminal_render_snapshot> unavailable_snapshot =
+        unavailable_session->latest_render_snapshot();
+    ok &= check(
+        unavailable_session->search_result_state().status ==
+            term::Terminal_search_result_status::SOURCE_UNAVAILABLE &&
+        unavailable_snapshot.has_value() &&
+        !snapshot_contains_text(*unavailable_snapshot, QStringLiteral("secret-query")),
+        "first activation during a default hold fails closed without reading live state");
+    return ok;
+}
+
 bool test_exit_failed_start_and_double_stop()
 {
     bool ok = true;
@@ -14529,6 +14797,9 @@ int main()
     ok &= test_resize_transactions();
     ok &= test_metrics_driven_resize_controller();
     ok &= test_metrics_driven_resize_interleaves_with_output();
+    ok &= test_terminal_search_scrollback_navigation_and_eviction();
+    ok &= test_terminal_search_literal_physical_row_semantics();
+    ok &= test_terminal_search_synchronized_output_source_safety();
     ok &= test_exit_failed_start_and_double_stop();
     return ok ? 0 : 1;
 }

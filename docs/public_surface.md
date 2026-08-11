@@ -138,6 +138,10 @@ Read-only Qt properties expose the host-visible state:
   values freeze at the last visible public state until live content is
   published. Hidden live scrollback growth does not change these properties.
 - `selectionState` is `NONE` or `ACTIVE`.
+- `searchQuery` is the current literal query. `searchResultState` distinguishes
+  inactive search, an unavailable safe source, no matches, and matches.
+  `searchMatchCount` is the total retained-public match count and
+  `currentSearchMatch` is its one-based current index (zero when absent).
 
 Every property has a matching notify signal. Grid size changes emit
 `grid_geometry_changed()`. Viewport changes emit `viewport_changed()`. Backend
@@ -214,6 +218,11 @@ Invokable methods:
   hiding unpublished model changes, it reads from the visible render snapshot
   so host copy behavior matches what the user can see.
 - `clear_selection()` clears local selection and drag state.
+- `set_search_query(QString query)` sets the literal terminal query;
+  `clear_search()` clears it. `search_next()` and `search_previous()` navigate
+  with wraparound and reveal the current match, returning `false` when no match
+  can be selected. See [Search and scrollback](search_and_scrollback.md) for
+  exact row, reflow, refresh, and synchronized-output semantics.
 - `paste_text(QString text)` writes paste text through the terminal input path.
   Paste text is UTF-8 encoded, CR and CRLF are normalized to LF, C0/C1 controls
   other than LF and TAB are removed, and bracketed-paste framing follows

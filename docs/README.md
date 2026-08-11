@@ -34,6 +34,8 @@ the repository without reading every implementation detail.
   handling: read [Render snapshot contract](render_snapshot_contract.md).
 - Before changing backend process hosting or lifecycle signals: read
   [Backend lifecycle and signals](backend_lifecycle_and_signals.md).
+- Before changing terminal search, retained-history matching, or match
+  highlighting: read [Search and scrollback](search_and_scrollback.md).
 
 ## Reference Material
 
@@ -67,6 +69,8 @@ the repository without reading every implementation detail.
 - [Selection and provenance](selection_and_provenance.md) records the
   selection state machine, row-identity leases, snapshot projection, and
   text extraction.
+- [Search and scrollback](search_and_scrollback.md) records literal match
+  semantics, public result state, safe-source rules, and match identity.
 
 ## Maintenance Rule
 

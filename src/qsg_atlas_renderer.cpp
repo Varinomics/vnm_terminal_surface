@@ -4302,6 +4302,10 @@ private:
         append_key_color(key, options.default_foreground);
         append_key_color(key, options.selection_background);
         append_key_color(key, options.selection_foreground);
+        append_key_color(key, options.search_match_background);
+        append_key_color(key, options.search_match_foreground);
+        append_key_color(key, options.current_search_match_background);
+        append_key_color(key, options.current_search_match_foreground);
         append_key_color(key, options.cursor_color);
         append_key_color(key, options.preedit_background);
         append_key_color(key, options.visual_bell_color);

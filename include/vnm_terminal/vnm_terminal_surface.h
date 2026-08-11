@@ -122,6 +122,12 @@ class VNM_TerminalSurface : public QQuickItem
         READ viewport_offset_from_tail NOTIFY viewport_changed)
     Q_PROPERTY(bool viewportAtTail READ viewport_at_tail NOTIFY viewport_changed)
     Q_PROPERTY(Selection_state selectionState READ selection_state NOTIFY selection_changed)
+    Q_PROPERTY(QString searchQuery
+        READ search_query WRITE set_search_query NOTIFY search_changed)
+    Q_PROPERTY(Search_result_state searchResultState
+        READ search_result_state NOTIFY search_changed)
+    Q_PROPERTY(int searchMatchCount READ search_match_count NOTIFY search_changed)
+    Q_PROPERTY(int currentSearchMatch READ current_search_match NOTIFY search_changed)
 
 public:
     enum class Cursor_style
@@ -299,6 +305,15 @@ public:
     };
     Q_ENUM(Selection_state)
 
+    enum class Search_result_state
+    {
+        INACTIVE,
+        SOURCE_UNAVAILABLE,
+        NO_MATCH,
+        MATCH,
+    };
+    Q_ENUM(Search_result_state)
+
     explicit VNM_TerminalSurface(QQuickItem* parent = nullptr);
     ~VNM_TerminalSurface() override;
 
@@ -439,6 +454,10 @@ public:
     int viewport_offset_from_tail() const;
     bool viewport_at_tail() const;
     Selection_state selection_state() const;
+    QString search_query() const;
+    Search_result_state search_result_state() const;
+    int search_match_count() const;
+    int current_search_match() const;
 
     // Cumulative frame counts for host-side timing and frame evidence. The
     // atlas counter is the canonical renderer frame count; the paint-completed
@@ -465,6 +484,10 @@ public:
     Q_INVOKABLE QByteArray explicit_hyperlink_at(qreal x, qreal y) const;
     Q_INVOKABLE QString selected_text();
     Q_INVOKABLE void    clear_selection();
+    Q_INVOKABLE void    set_search_query(QString query);
+    Q_INVOKABLE void    clear_search();
+    Q_INVOKABLE bool    search_next();
+    Q_INVOKABLE bool    search_previous();
     Q_INVOKABLE bool    paste_text(QString text);
     Q_INVOKABLE bool    paste_clipboard_text();
     // Scrolls only when the published public viewport is primary-screen
@@ -540,6 +563,7 @@ signals:
     void geometry_sync_changed();
     void viewport_changed();
     void selection_changed();
+    void search_changed();
 
     void process_started();
     void process_exited(Exit_reason reason, int exit_code);
@@ -708,6 +732,11 @@ private:
     bool copy_selected_text_to_clipboard(Empty_selection_copy_policy policy);
     std::optional<QString> read_clipboard_text_for_paste();
     void set_selection_state(Selection_state state);
+    void set_search_state(
+        QString             query,
+        Search_result_state state,
+        int                 match_count,
+        int                 current_match);
     void set_hyperlink_hover_position(std::optional<QPointF> position);
     void refresh_hyperlink_hover_feedback();
     void dismiss_row_timestamp_tooltip();
@@ -772,6 +801,10 @@ private:
     int                      m_viewport_offset_from_tail = 0;
     bool                     m_viewport_at_tail          = true;
     Selection_state          m_selection_state           = Selection_state::NONE;
+    QString                  m_search_query;
+    Search_result_state      m_search_result_state       = Search_result_state::INACTIVE;
+    int                      m_search_match_count        = 0;
+    int                      m_current_search_match      = 0;
 
     struct Private;
     std::unique_ptr<Private> m_private;

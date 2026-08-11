@@ -159,6 +159,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/internal/terminal_resize_controller.h
     include/vnm_terminal/internal/terminal_render_cell_text.h
     include/vnm_terminal/internal/terminal_screen_model.h
+    include/vnm_terminal/internal/terminal_search.h
     include/vnm_terminal/internal/terminal_session.h
     include/vnm_terminal/internal/terminal_transcript.h
     include/vnm_terminal/internal/terminal_style.h
@@ -193,6 +194,7 @@ add_library(vnm_terminal_surface STATIC
     src/terminal_color_scheme.cpp
     src/terminal_screen_model.cpp
     src/terminal_screen_model_snapshot.cpp
+    src/terminal_search.cpp
     src/metrics_contract.cpp
     src/native_backend_io_core.cpp
     src/qsg_atlas_font_bytes.cpp

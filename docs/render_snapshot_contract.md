@@ -106,7 +106,7 @@ The viewport must describe the grid (`INVALID_VIEWPORT`):
 
 `basis` records what the snapshot was built from (`LIVE_CONTENT` or
 `PUBLIC_PROJECTION`); `purpose` records why it was built (`CONTENT`,
-`SELECTION_DERIVED`, `GEOMETRY_DERIVED`, `SCROLL`). The pairing is a
+`SELECTION_DERIVED`, `SEARCH_DERIVED`, `GEOMETRY_DERIVED`, `SCROLL`). The pairing is a
 biconditional: `basis == PUBLIC_PROJECTION` exactly when
 `purpose == SCROLL` (`INVALID_SNAPSHOT_BASIS_PURPOSE`). The transcript
 reader enforces the same pairing on recorded snapshot events
@@ -116,7 +116,7 @@ Public-projection snapshots additionally must use the primary buffer and must
 carry exactly one full-viewport dirty range, because a projection snapshot
 republishes the whole projected viewport.
 
-## Line Provenance And Selections
+## Line Provenance, Selections, And Search
 
 `visible_line_provenance`, when present, identifies each visible row: it must
 hold exactly one entry per grid row, each entry's `logical_row` must equal
@@ -130,6 +130,14 @@ provenance is invalid, and producers use
 `suppress_selection_spans_without_valid_line_provenance` to drop spans rather
 than publish an inconsistent snapshot. Each span must lie inside the grid
 (`INVALID_SELECTION_SPAN`).
+
+Search match spans have the same provenance requirement but remain a separate
+overlay contract. Each `Terminal_render_search_match_span` lies within one
+visible row, identifies its column extent, and marks whether it is the current
+match (`INVALID_SEARCH_MATCH_SPAN`). Producers use
+`suppress_search_match_spans_without_valid_line_provenance` when provenance is
+not available. Selection paint takes precedence over search paint where spans
+overlap.
 
 ## Styles, Hyperlinks, Cursor
 

@@ -1501,6 +1501,7 @@ bool validate_optional_snapshot_public_scroll_fields(
             {
                 QStringLiteral("CONTENT"),
                 QStringLiteral("SELECTION_DERIVED"),
+                QStringLiteral("SEARCH_DERIVED"),
                 QStringLiteral("GEOMETRY_DERIVED"),
                 QStringLiteral("SCROLL"),
             },

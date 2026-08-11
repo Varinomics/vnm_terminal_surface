@@ -1131,6 +1131,74 @@ bool test_selection_applies_contrasting_cell_style()
     return ok;
 }
 
+bool test_search_matches_use_distinct_styles_and_selection_precedence()
+{
+    term::Terminal_render_snapshot snapshot = empty_snapshot({1, 4});
+    snapshot.cursor.visible = false;
+    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
+    snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("B")});
+    snapshot.cells.push_back({.position = {0, 2}, .text = QStringLiteral("C")});
+    snapshot.cells.push_back({.position = {0, 3}, .text = QStringLiteral("D")});
+    snapshot.search_match_spans.push_back({0, 1, 2, false});
+    snapshot.search_match_spans.push_back({0, 3, 1, true});
+    snapshot.selection_spans.push_back({
+        {{0, 2}, {0, 3}, term::Terminal_selection_mode::NORMAL},
+        0,
+        2,
+        1,
+    });
+
+    term::Terminal_render_options render_options = options();
+    render_options.search_match_background = QColor(80, 60, 20);
+    render_options.search_match_foreground = QColor(250, 240, 210);
+    render_options.current_search_match_background = QColor(230, 160, 30);
+    render_options.current_search_match_foreground = QColor(20, 15, 5);
+    render_options.selection_background = QColor(40, 100, 170);
+    render_options.selection_foreground = QColor(255, 255, 255);
+
+    const term::Terminal_render_frame frame = build(snapshot, render_options);
+    const term::Terminal_render_text_run* const normal_match = run_at(frame, 0, 1);
+    const term::Terminal_render_text_run* const selected_match = run_at(frame, 0, 2);
+    const term::Terminal_render_text_run* const current_match = run_at(frame, 0, 3);
+
+    bool ok = true;
+    ok &= check(
+        normal_match != nullptr &&
+        normal_match->foreground == render_options.search_match_foreground &&
+        normal_match->background == render_options.search_match_background,
+        "ordinary search matches use their own non-selection colors");
+    ok &= check(
+        current_match != nullptr &&
+        current_match->foreground == render_options.current_search_match_foreground &&
+        current_match->background == render_options.current_search_match_background,
+        "the current search match is visually distinct from other matches");
+    ok &= check(
+        selected_match != nullptr &&
+        selected_match->foreground == render_options.selection_foreground &&
+        selected_match->background == render_options.selection_background,
+        "selection styling takes precedence where selection overlaps a search match");
+    const auto has_overlay_rect = [&](const QRectF& rect, const QColor& color) {
+        return std::any_of(
+            frame.selection_rects.begin(),
+            frame.selection_rects.end(),
+            [&](const term::Terminal_render_rect& candidate) {
+                return candidate.rect == rect && candidate.color == color;
+            });
+    };
+    ok &= check(
+        has_overlay_rect(
+            QRectF(10.0, 0.0, 20.0, 20.0),
+            render_options.search_match_background) &&
+        has_overlay_rect(
+            QRectF(30.0, 0.0, 10.0, 20.0),
+            render_options.current_search_match_background) &&
+        has_overlay_rect(
+            QRectF(20.0, 0.0, 10.0, 20.0),
+            render_options.selection_background),
+        "search and selection overlays retain distinct background geometry");
+    return ok;
+}
+
 bool test_terminal_render_cursor_visible_truth_table()
 {
     bool ok = true;
@@ -2797,6 +2865,7 @@ int main()
     ok &= test_styled_blank_cells_emit_background_rects();
     ok &= test_selection_cursor_blink_and_shapes();
     ok &= test_selection_applies_contrasting_cell_style();
+    ok &= test_search_matches_use_distinct_styles_and_selection_precedence();
     ok &= test_terminal_render_cursor_visible_truth_table();
     ok &= test_decorations_preedit_hyperlink_and_bell();
     ok &= test_zero_grid_and_preedit_width();

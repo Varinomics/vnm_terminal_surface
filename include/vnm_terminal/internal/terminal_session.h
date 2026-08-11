@@ -4,6 +4,7 @@
 #include "vnm_terminal/internal/selection_contract.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_public_projection.h"
+#include "vnm_terminal/internal/terminal_search.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/utf8_scan.h"
 #include <QByteArray>
@@ -212,6 +213,12 @@ public:
     Terminal_selection_anchor_domain selection_anchor_domain() const;
     std::optional<terminal_selection_visual_lease_t> selection_visual_lease() const;
     std::optional<terminal_selection_source_identity_t> published_selection_source_identity() const;
+    void set_search_query(QString query);
+    void clear_search();
+    bool search_next();
+    bool search_previous();
+    QString search_query() const;
+    terminal_search_result_state_t search_result_state() const;
 
     std::vector<Terminal_session_command> processed_commands() const;
     std::vector<Terminal_session_notification> notifications() const;
@@ -554,7 +561,8 @@ private:
         std::uint64_t                  sequence,
         QString                        message,
         const Terminal_viewport_state& public_viewport_before,
-        const Terminal_viewport_state& public_viewport_after);
+        const Terminal_viewport_state& public_viewport_after,
+        bool                           visible_scroll_applied = true);
     Terminal_viewport_scroll_result finish_public_projection_scroll(
         Terminal_public_viewport_scroll_result scroll_result,
         Terminal_public_viewport_controller    public_viewport_controller_before,
@@ -575,6 +583,17 @@ private:
     void latch_synchronized_output_scroll_policy_for_new_hold();
     void reset_synchronized_output_policy_lifecycle();
     bool capture_public_projection_from_latest_content_basis();
+    bool capture_search_projection_from_safe_basis(
+        const Terminal_render_snapshot&            safe_basis,
+        terminal_selection_content_basis_t         content_basis);
+    bool refresh_search_from_current_public_source();
+    void apply_search_matches_to_snapshot(
+        Terminal_render_snapshot&                  snapshot,
+        std::uint64_t                              active_buffer_epoch) const;
+    bool reveal_current_search_match(QString message);
+    bool publish_search_overlay_from_latest_public_snapshot(QString message);
+    bool publish_search_derived_snapshot(QString message);
+    void invalidate_search_projection();
     std::optional<Terminal_public_scroll_diagnostics> reconcile_public_projection_release(
         const Terminal_public_release_intent& release_intent,
         Terminal_viewport_state               live_viewport_before_on_release);
@@ -679,6 +698,7 @@ private:
     std::shared_ptr<const Terminal_render_snapshot>        m_latest_content_render_snapshot;
     terminal_selection_content_basis_t                     m_latest_content_render_snapshot_content_basis;
     std::optional<Terminal_public_projection>              m_public_projection;
+    std::optional<Terminal_public_projection>              m_search_projection;
     Terminal_public_viewport_controller                    m_public_viewport_controller;
     std::optional<Terminal_screen_model_result>            m_last_model_ingest_result;
     std::optional<Terminal_screen_model_result>            m_render_snapshot_model_result;
@@ -702,6 +722,7 @@ private:
     std::optional<std::uint64_t>                           m_drain_synchronized_release_publication_generation;
     std::optional<std::uint64_t>                           m_drain_latest_live_content_publication_generation;
     std::uint64_t                                          m_next_public_projection_generation = 1U;
+    std::uint64_t                                          m_next_search_projection_generation = 1U;
     std::shared_ptr<const Terminal_render_snapshot>        m_unrendered_render_snapshot_dirty_basis;
     std::optional<Terminal_synchronized_output_scroll_policy>
                                                            m_synchronized_output_hold_policy;
@@ -726,6 +747,7 @@ private:
     Terminal_viewport_controller                           m_viewport_controller;
     Terminal_bell_state                                    m_bell_state;
     Selection_contract_controller                          m_selection;
+    Terminal_search_controller                             m_search;
     terminal_selection_content_basis_t                     m_selection_content_basis;
     Terminal_session_profile_stats                         m_profile_stats;
     Terminal_buffer_id                         m_selection_buffer_id =
