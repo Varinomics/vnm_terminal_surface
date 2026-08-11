@@ -19,6 +19,8 @@ The surface owns the Qt-facing boundary for one terminal session:
 - creates the native terminal backend used by the session;
 - publishes terminal metadata, process state, backend state, grid geometry,
   viewport state, and selection state as read-only Qt properties;
+- exposes explicit OSC 8 hyperlink lookup and activation requests against the
+  immutable published render snapshot;
 - routes host operations such as paste, selection access, viewport scrolling,
   interrupt, terminate, and OSC 52 clipboard decisions into the same ordered
   session pipeline as backend output;
@@ -222,6 +224,10 @@ Invokable methods:
   primary-screen scrollback viewport to an offset from the tail.
 - `respond_clipboard_write(quint64 request_id, Clipboard_response_decision
   decision)` answers a pending OSC 52 write request.
+- `explicit_hyperlink_at(qreal x, qreal y)` returns the untrusted OSC 8 target
+  bytes at an item-coordinate point in the current published render snapshot,
+  or an empty byte array when the point is outside an explicit hyperlink.
+  This method never scans plain text for URL-like content.
 
 Viewport operations return `true` when the visible viewport moves, or when an
 invalidated immediate public projection accepts a deferred release intent. They
@@ -284,6 +290,29 @@ and `scroll_action_name()` exist ONLY to format those enums for transcript/debug
 output (`NONE` maps to an empty string); they are not control-flow API, and their
 string spellings are diagnostic schema, not a stability contract.
 
+## Hyperlink Interaction
+
+OSC 8 hyperlink interaction is snapshot-owned and host-mediated. Explicit
+hyperlinks are underlined, and hovering a cell whose current published snapshot
+contains hyperlink metadata uses the pointing-hand cursor. Ctrl+left-click is
+the activation gesture. A press becomes a request only when release still lands
+on the same OSC 8 identity and target in the then-current published snapshot.
+Moving to another target, changing the modifier chord, or replacing the target
+before release cancels the gesture.
+
+The activation gesture takes precedence over a new terminal mouse-reporting
+press when the pointer is on an explicit hyperlink. An existing terminal mouse
+grab is not interrupted. Plain left-click and Shift-drag retain their existing
+mouse-reporting and local-selection routes, and URL-like plain text is never
+made interactive.
+
+On a completed gesture, the surface emits
+`explicit_hyperlink_activation_requested(QByteArray target)`. The target is
+untrusted terminal data. The surface does not parse it as an application URL,
+validate a scheme, or open an external resource. Hosts must apply their own
+supported-scheme and URL policy before dispatch, and must not dispatch merely
+because lookup or hover identified a target.
+
 ## Clipboard Policy
 
 There are three clipboard paths:
@@ -320,7 +349,8 @@ Process and runtime signals:
 - `bell_requested()`;
 - `text_area_resize_requested(int rows, int columns)`;
 - `clipboard_write_requested(quint64 request_id, QString target_selection,
-  QByteArray payload)`.
+  QByteArray payload)`;
+- `explicit_hyperlink_activation_requested(QByteArray target)`.
 
 `bell_requested()` reports a policy-enabled bell event. The surface has already
 handled audible playback; hosts must not treat the signal as a request to play
@@ -349,8 +379,9 @@ At a high level:
 - `keyPressEvent()` handles copy policy, page-scroll keys for primary
   scrollback, then terminal key encoding.
 - `mousePressEvent()`, `mouseMoveEvent()`, `mouseReleaseEvent()`, and
-  `hoverMoveEvent()` route terminal mouse reporting when active and otherwise
-  maintain local selection. Shift-drag forces local selection.
+  `hoverMoveEvent()` maintain explicit-hyperlink activation and feedback, route
+  terminal mouse reporting when active, and otherwise maintain local selection.
+  Shift-drag forces local selection.
 - `wheelEvent()` handles Ctrl+wheel font zoom, terminal mouse wheel routing,
   alternate-screen wheel policy, and local scrollback policy.
 - `inputMethodEvent()` sends commit text through the terminal input path and
@@ -369,7 +400,8 @@ At a high level:
 A host constructs a `QQuickWindow`, creates `VNM_TerminalSurface`, sizes it from
 window geometry, and starts a process after the item is attached to a window.
 The host owns surrounding application behavior such as command-line parsing,
-window chrome, titlebar policy, clipboard policy decisions, and packaging.
+window chrome, titlebar policy, clipboard policy decisions, hyperlink target
+validation and external dispatch, and packaging.
 
 The standalone Varinomics terminal application lives in the `vnm_terminal`
 repository and uses this surface as its terminal engine.

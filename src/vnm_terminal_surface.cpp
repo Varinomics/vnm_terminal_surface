@@ -22,6 +22,7 @@
 
 #include <QColor>
 #include <QClipboard>
+#include <QCursor>
 #include <QDateTime>
 #include <QFont>
 #include <QGuiApplication>
@@ -548,6 +549,62 @@ std::optional<term::terminal_grid_position_t> grid_position_for_local_point(
     }
 
     return term::terminal_grid_position_t{row, column};
+}
+
+struct Surface_hyperlink_target
+{
+    QByteArray identity_key;
+    QByteArray uri;
+};
+
+std::optional<Surface_hyperlink_target> explicit_hyperlink_for_local_point(
+    const std::shared_ptr<const term::Terminal_render_snapshot>& snapshot,
+    term::terminal_cell_metrics_t                                metrics,
+    QPointF                                                      point)
+{
+    const std::optional<term::terminal_grid_position_t> position =
+        grid_position_for_local_point(snapshot, metrics, point);
+    if (!position.has_value()) {
+        return std::nullopt;
+    }
+
+    const term::Terminal_render_snapshot_row_content_view rows(*snapshot);
+    const term::Terminal_render_cell* cell = rows.cell_at(
+        position->row,
+        position->column);
+    if (cell == nullptr || cell->hyperlink_id == term::k_no_terminal_hyperlink_id) {
+        return std::nullopt;
+    }
+
+    const auto metadata = std::find_if(
+        snapshot->hyperlinks.begin(),
+        snapshot->hyperlinks.end(),
+        [hyperlink_id = cell->hyperlink_id](
+            const term::Terminal_render_hyperlink_metadata& candidate) {
+            return candidate.hyperlink_id == hyperlink_id;
+        });
+    if (metadata == snapshot->hyperlinks.end()) {
+        return std::nullopt;
+    }
+
+    return Surface_hyperlink_target{metadata->identity_key, metadata->uri};
+}
+
+bool same_surface_hyperlink_target(
+    const Surface_hyperlink_target& left,
+    const Surface_hyperlink_target& right)
+{
+    return left.identity_key == right.identity_key && left.uri == right.uri;
+}
+
+bool explicit_hyperlink_activation_modifiers(Qt::KeyboardModifiers modifiers)
+{
+    constexpr Qt::KeyboardModifiers k_relevant_modifiers =
+        Qt::ControlModifier |
+        Qt::ShiftModifier   |
+        Qt::AltModifier     |
+        Qt::MetaModifier;
+    return (modifiers & k_relevant_modifiers) == Qt::ControlModifier;
 }
 
 std::optional<term::terminal_grid_position_t> clamped_grid_position_for_local_point(
@@ -1223,6 +1280,7 @@ term::Terminal_render_options render_options_for_surface(const VNM_TerminalSurfa
 
     options.cursor_shape_override         = terminal_cursor_shape(surface.cursor_style());
     options.cursor_blink_enabled_override = surface.cursor_blink_enabled();
+    options.underline_hyperlinks           = true;
     options.visual_bell_enabled =
         surface.visual_bell_policy() == VNM_TerminalSurface::Bell_policy::ENABLED;
     options.text_renderer_policy =
@@ -2628,6 +2686,12 @@ struct VNM_TerminalSurface::Private
         selection_drag_cancelled = false;
     }
 
+    void clear_hyperlink_activation_state()
+    {
+        hyperlink_activation_target.reset();
+        hyperlink_activation_gesture_active = false;
+    }
+
     bool has_copyable_selection_attachment() const
     {
         if (session == nullptr) {
@@ -2777,6 +2841,10 @@ struct VNM_TerminalSurface::Private
     std::optional<term::terminal_grid_position_t>          mouse_reporting_last_position;
     std::deque<Pending_published_mouse_report>             pending_published_mouse_reports;
     bool                                                   retrying_pending_published_mouse_reports = false;
+    std::optional<Surface_hyperlink_target>                 hyperlink_activation_target;
+    std::optional<QPointF>                                 hyperlink_hover_position;
+    bool                                                   hyperlink_activation_gesture_active = false;
+    bool                                                   hyperlink_cursor_active             = false;
     std::optional<term::terminal_grid_position_t>          selection_anchor;
     std::optional<term::terminal_grid_position_t>          selection_anchor_viewport;
     std::optional<term::Terminal_buffer_id>                selection_anchor_buffer_id;
@@ -4003,6 +4071,47 @@ bool VNM_TerminalSurface::respond_clipboard_write(
     return set_terminal_clipboard_text(QString::fromUtf8(request.decoded_payload));
 }
 
+QByteArray VNM_TerminalSurface::explicit_hyperlink_at(qreal x, qreal y) const
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    const std::optional<Surface_hyperlink_target> hyperlink =
+        explicit_hyperlink_for_local_point(
+            m_private->render_snapshot,
+            m_private->cell_metrics,
+            QPointF(x, y));
+    return hyperlink.has_value() ? hyperlink->uri : QByteArray{};
+}
+
+void VNM_TerminalSurface::set_hyperlink_hover_position(std::optional<QPointF> position)
+{
+    m_private->hyperlink_hover_position = std::move(position);
+    refresh_hyperlink_hover_feedback();
+}
+
+void VNM_TerminalSurface::refresh_hyperlink_hover_feedback()
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    const bool cursor_active =
+        m_private->hyperlink_hover_position.has_value() &&
+        explicit_hyperlink_for_local_point(
+            m_private->render_snapshot,
+            m_private->cell_metrics,
+            *m_private->hyperlink_hover_position).has_value();
+    if (cursor_active == m_private->hyperlink_cursor_active) {
+        return;
+    }
+
+    m_private->hyperlink_cursor_active = cursor_active;
+    if (cursor_active) {
+        setCursor(QCursor(Qt::PointingHandCursor));
+    }
+    else {
+        unsetCursor();
+    }
+}
+
 QString VNM_TerminalSurface::selected_text()
 {
     Q_ASSERT(thread() == QThread::currentThread());
@@ -4797,6 +4906,7 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
                 .arg(snapshot_has_terminal_mouse_tracking(m_private->render_snapshot)));
     }
     event->ignore();
+    set_hyperlink_hover_position(event->position());
     dismiss_row_timestamp_tooltip();
 
     forceActiveFocus(Qt::MouseFocusReason);
@@ -4828,6 +4938,31 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
             event->isAccepted());
     };
     trace_decision(QStringLiteral("entry"));
+
+    if (event->button() == Qt::LeftButton &&
+        m_private->hyperlink_activation_gesture_active)
+    {
+        m_private->clear_hyperlink_activation_state();
+    }
+
+    if (event->button() == Qt::LeftButton &&
+        explicit_hyperlink_activation_modifiers(event->modifiers()) &&
+        m_private->mouse_reporting_pressed_buttons == Qt::NoButton)
+    {
+        const std::optional<Surface_hyperlink_target> hyperlink =
+            explicit_hyperlink_for_local_point(
+                published_snapshot,
+                m_private->cell_metrics,
+                event->position());
+        if (hyperlink.has_value()) {
+            m_private->clear_selection_drag_state();
+            m_private->hyperlink_activation_target         = *hyperlink;
+            m_private->hyperlink_activation_gesture_active = true;
+            event->accept();
+            trace_decision(QStringLiteral("explicit-hyperlink"));
+            return;
+        }
+    }
 
     if (!force_local_selection &&
         m_mouse_reporting_policy != Mouse_reporting_policy::DISABLED &&
@@ -5033,6 +5168,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                 .arg(m_private->selection_drag_active));
     }
     event->ignore();
+    set_hyperlink_hover_position(event->position());
     // Same positional guard as hover moves: a move event repeated at an
     // unchanged position is not user motion and must not dismiss.
     if (row_timestamp_tooltip_pointer_moved(event->position())) {
@@ -5066,6 +5202,31 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
             event->isAccepted());
     };
     trace_decision(QStringLiteral("entry"));
+
+    if (m_private->hyperlink_activation_gesture_active &&
+        (event->buttons() & Qt::LeftButton) != Qt::NoButton)
+    {
+        const std::optional<Surface_hyperlink_target> current_hyperlink =
+            explicit_hyperlink_for_local_point(
+                m_private->render_snapshot,
+                m_private->cell_metrics,
+                event->position());
+        if (!m_private->hyperlink_activation_target.has_value()          ||
+            !current_hyperlink.has_value()                               ||
+            !explicit_hyperlink_activation_modifiers(event->modifiers()) ||
+            !same_surface_hyperlink_target(
+                *m_private->hyperlink_activation_target,
+                *current_hyperlink))
+        {
+            m_private->hyperlink_activation_target.reset();
+        }
+        event->accept();
+        trace_decision(QStringLiteral("explicit-hyperlink"));
+        return;
+    }
+    if (m_private->hyperlink_activation_gesture_active) {
+        m_private->clear_hyperlink_activation_state();
+    }
 
     if (!m_private->selection_drag_active &&
         (!force_local_selection || terminal_mouse_grab_active)       &&
@@ -5406,6 +5567,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 .arg(m_private->selection_drag_active));
     }
     event->ignore();
+    set_hyperlink_hover_position(event->position());
     dismiss_row_timestamp_tooltip();
     drain_backend_callback_events();
 
@@ -5428,6 +5590,40 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
             event->isAccepted());
     };
     trace_decision(QStringLiteral("entry"));
+
+    if (m_private->hyperlink_activation_gesture_active &&
+        event->button() == Qt::LeftButton)
+    {
+        viewport_position = grid_position_for_local_point(
+            m_private->render_snapshot,
+            m_private->cell_metrics,
+            event->position());
+        const std::optional<Surface_hyperlink_target> current_hyperlink =
+            explicit_hyperlink_for_local_point(
+                m_private->render_snapshot,
+                m_private->cell_metrics,
+                event->position());
+        const bool request_activation =
+            m_private->hyperlink_activation_target.has_value()          &&
+            current_hyperlink.has_value()                               &&
+            explicit_hyperlink_activation_modifiers(event->modifiers()) &&
+            same_surface_hyperlink_target(
+                *m_private->hyperlink_activation_target,
+                *current_hyperlink);
+        const QByteArray target = request_activation
+            ? current_hyperlink->uri
+            : QByteArray{};
+        m_private->clear_hyperlink_activation_state();
+        event->accept();
+        trace_decision(
+            request_activation
+                ? QStringLiteral("explicit-hyperlink")
+                : QStringLiteral("explicit-hyperlink-cancelled"));
+        if (request_activation) {
+            emit explicit_hyperlink_activation_requested(target);
+        }
+        return;
+    }
 
     if (m_private->selection_drag_active &&
         event->button()    == Qt::LeftButton              &&
@@ -5884,6 +6080,7 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
     event->ignore();
+    set_hyperlink_hover_position(event->position());
     // Actual pointer motion hides a shown tooltip; a fresh idle period over
     // the new position re-requests it. Same-position hover events are scene
     // redeliveries, not motion, and pass through without touching the tooltip
@@ -5954,6 +6151,7 @@ void VNM_TerminalSurface::hoverMoveEvent(QHoverEvent* event)
 void VNM_TerminalSurface::hoverLeaveEvent(QHoverEvent* event)
 {
     Q_ASSERT(thread() == QThread::currentThread());
+    set_hyperlink_hover_position(std::nullopt);
     dismiss_row_timestamp_tooltip();
     QQuickItem::hoverLeaveEvent(event);
 }
@@ -6761,6 +6959,7 @@ void VNM_TerminalSurface::refresh_grid_metrics()
 
     if (!std::isfinite(m_font_size) || m_font_size <= 0.0) {
         m_private->cell_metrics = {};
+        refresh_hyperlink_hover_feedback();
         if (m_private->session != nullptr) {
             refresh_active_session_geometry();
         }
@@ -6773,6 +6972,7 @@ void VNM_TerminalSurface::refresh_grid_metrics()
 
     m_private->warm_prompt_text_layouts_for_render_font();
     m_private->cell_metrics = m_private->grid_metrics_provider.cell_metrics();
+    refresh_hyperlink_hover_feedback();
     const term::Terminal_metrics_result grid_result =
         m_private->grid_metrics_provider.grid_size_for_item_geometry(boundingRect().size());
     if (m_private->session != nullptr) {
@@ -7004,7 +7204,9 @@ bool VNM_TerminalSurface::start_process_with_backend(
     set_process_state(Process_state::NOT_STARTED);
     set_backend_ready(false);
     set_backend_geometry_in_sync(false);
+    m_private->clear_hyperlink_activation_state();
     m_private->render_snapshot.reset();
+    refresh_hyperlink_hover_feedback();
     m_private->set_ime_preedit_state(*this, {});
     m_private->last_installed_render_publication_generation = 0U;
     m_private->last_ime_preedit_generation        = 0U;
@@ -7856,6 +8058,7 @@ void VNM_TerminalSurface::reset_session()
         before_backend_callback_frame_owner_release_handler_for_testing = {};
     m_private->reset_atlas_completion();
     m_private->clear_mouse_reporting_state();
+    m_private->clear_hyperlink_activation_state();
     m_private->clear_selection_drag_state();
     m_private->pending_clipboard_write.reset();
     m_private->clear_wheel_remainders();
@@ -8052,6 +8255,7 @@ void term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
 {
     Q_ASSERT(surface.thread() == QThread::currentThread());
     surface.m_private->render_snapshot = std::move(snapshot);
+    surface.refresh_hyperlink_hover_feedback();
     surface.updateInputMethod(Qt::ImCursorRectangle);
     surface.m_private->request_render_update(surface);
 }

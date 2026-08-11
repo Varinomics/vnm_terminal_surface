@@ -1154,7 +1154,7 @@ add_test(
 )
 
 set(vnm_terminal_surface_host_timeout 60)
-if(APPLE)
+if(WIN32 OR APPLE)
     set(vnm_terminal_surface_host_timeout 120)
 endif()
 

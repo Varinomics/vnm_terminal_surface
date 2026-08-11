@@ -306,6 +306,21 @@ QByteArray osc52_write_sequence(const char* target_selection, const QByteArray& 
     return bytes;
 }
 
+QByteArray osc8_hyperlink_sequence(
+    const QByteArray& parameters,
+    const QByteArray& target,
+    const QByteArray& text)
+{
+    QByteArray bytes = QByteArrayLiteral("\x1b]8;");
+    bytes += parameters;
+    bytes += ';';
+    bytes += target;
+    bytes += '\a';
+    bytes += text;
+    bytes += QByteArrayLiteral("\x1b]8;;\a");
+    return bytes;
+}
+
 struct Clipboard_write_observation
 {
     quint64    request_id = 0U;
@@ -369,6 +384,19 @@ void observe_clipboard_write_requests(
             const QString& target_selection,
             const QByteArray& payload) {
             requests.push_back({request_id, target_selection, payload});
+        });
+}
+
+void observe_hyperlink_activation_requests(
+    VNM_TerminalSurface&      surface,
+    std::vector<QByteArray>&  targets)
+{
+    QObject::connect(
+        &surface,
+        &VNM_TerminalSurface::explicit_hyperlink_activation_requested,
+        &surface,
+        [&targets](const QByteArray& target) {
+            targets.push_back(target);
         });
 }
 
@@ -4138,6 +4166,313 @@ bool test_surface_session_single_drain_coalesces_dirty_rows(QGuiApplication& app
         fixture.surface,
         snapshot->metadata.sequence),
         "surface single-drain dirty coalescing captures latest snapshot");
+    return ok;
+}
+
+bool test_explicit_hyperlink_lookup_feedback_and_activation(QGuiApplication& app)
+{
+    constexpr int k_plain_url_column = 8;
+    const QByteArray target = QByteArrayLiteral("https://docs.example.test/guide");
+
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    std::vector<QByteArray> activation_targets;
+    observe_hyperlink_activation_requests(fixture.surface, activation_targets);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        osc8_hyperlink_sequence(
+            QByteArrayLiteral("id=guide"),
+            target,
+            QByteArrayLiteral("linked")) +
+        QByteArrayLiteral(" https://plain.example.test"),
+    };
+
+    bool started = false;
+    (void)start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "explicit hyperlink interaction surface starts");
+
+    const term::terminal_cell_metrics_t metrics = current_cell_metrics(fixture.surface);
+    const QPointF link_point(metrics.width * 0.5, metrics.height * 0.5);
+    const QPointF plain_url_point(
+        metrics.width * (static_cast<qreal>(k_plain_url_column) + 0.5),
+        metrics.height * 0.5);
+    ok &= check(
+        fixture.surface.explicit_hyperlink_at(link_point.x(), link_point.y()) == target,
+        "explicit hyperlink lookup returns OSC 8 target bytes");
+    ok &= check(
+        fixture.surface.explicit_hyperlink_at(
+            plain_url_point.x(),
+            plain_url_point.y()).isEmpty(),
+        "explicit hyperlink lookup does not detect a plain-text URL");
+    ok &= check(
+        fixture.surface.explicit_hyperlink_at(-1.0, link_point.y()).isEmpty(),
+        "explicit hyperlink lookup rejects points outside the published grid");
+
+    ok &= send_hover_move(
+        fixture.surface,
+        link_point,
+        Qt::NoModifier,
+        false,
+        "explicit hyperlink hover leaves unreported motion unaccepted");
+    ok &= check(
+        fixture.surface.cursor().shape() == Qt::PointingHandCursor,
+        "explicit hyperlink hover uses pointing-hand feedback");
+    ok &= send_hover_move(
+        fixture.surface,
+        plain_url_point,
+        Qt::NoModifier,
+        false,
+        "plain-text URL hover leaves unreported motion unaccepted");
+    ok &= check(
+        fixture.surface.cursor().shape() != Qt::PointingHandCursor,
+        "plain-text URL hover does not retain hyperlink cursor feedback");
+
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        link_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "plain hyperlink press keeps the local-selection route");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        link_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "plain hyperlink release keeps the local-selection route");
+    ok &= check(
+        activation_targets.empty(),
+        "plain left-click does not request hyperlink activation");
+
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        link_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::ControlModifier,
+        true,
+        "Ctrl+left hyperlink press starts explicit activation");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        link_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::ControlModifier,
+        true,
+        "Ctrl+left hyperlink release completes explicit activation");
+    ok &= check(
+        activation_targets == std::vector<QByteArray>{target},
+        "completed explicit hyperlink gesture requests the terminal-provided target once");
+
+    ok &= send_hover_move(
+        fixture.surface,
+        link_point,
+        Qt::NoModifier,
+        false,
+        "explicit hyperlink hover is restored before snapshot replacement");
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    if (snapshot != nullptr) {
+        auto without_hyperlink = std::make_shared<term::Terminal_render_snapshot>(*snapshot);
+        for (term::Terminal_render_cell& cell : without_hyperlink->cells) {
+            if (cell.position.row == 0 && cell.position.column == 0) {
+                cell.hyperlink_id = term::k_no_terminal_hyperlink_id;
+                break;
+            }
+        }
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            fixture.surface,
+            std::move(without_hyperlink));
+        ok &= check(
+            fixture.surface.cursor().shape() != Qt::PointingHandCursor,
+            "snapshot replacement refreshes stationary-pointer hyperlink feedback");
+    }
+    else {
+        ok &= check(false, "explicit hyperlink interaction publishes a render snapshot");
+    }
+
+    return ok;
+}
+
+bool test_explicit_hyperlink_stale_and_mouse_reporting_boundaries(QGuiApplication& app)
+{
+    const QByteArray initial_target = QByteArrayLiteral("https://first.example.test/");
+    const QByteArray replacement_target = QByteArrayLiteral("https://second.example.test/");
+
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    std::vector<QByteArray> activation_targets;
+    observe_hyperlink_activation_requests(fixture.surface, activation_targets);
+
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->outputs_during_start = {
+        QByteArrayLiteral("\x1b[?1000;1006h") +
+        osc8_hyperlink_sequence(
+            QByteArrayLiteral("id=first"),
+            initial_target,
+            QByteArrayLiteral("link")) +
+        QByteArrayLiteral(" plain"),
+    };
+
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    ok &= check(started, "hyperlink stale-boundary surface starts");
+
+    const term::terminal_cell_metrics_t metrics = current_cell_metrics(fixture.surface);
+    const QPointF link_point(metrics.width * 0.5, metrics.height * 0.5);
+    const QPointF plain_point(metrics.width * 5.5, metrics.height * 0.5);
+    const std::size_t activation_write_count = backend_ptr->writes.size();
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        link_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::ControlModifier,
+        true,
+        "Ctrl+left hyperlink press takes the explicit activation route");
+
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    if (snapshot != nullptr && !snapshot->hyperlinks.empty()) {
+        auto replacement = std::make_shared<term::Terminal_render_snapshot>(*snapshot);
+        replacement->hyperlinks.front().identity_key = QByteArrayLiteral("id=second;target");
+        replacement->hyperlinks.front().uri          = replacement_target;
+        term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
+            fixture.surface,
+            std::move(replacement));
+    }
+    else {
+        ok &= check(false, "hyperlink stale-boundary publishes hyperlink metadata");
+    }
+
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        link_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::ControlModifier,
+        true,
+        "changed hyperlink release is consumed without stale activation");
+    ok &= check(
+        activation_targets.empty(),
+        "changed published hyperlink identity cancels the activation request");
+    ok &= check(
+        backend_ptr->writes.size() == activation_write_count,
+        "cancelled explicit activation writes no terminal mouse bytes");
+    ok &= check(
+        fixture.surface.explicit_hyperlink_at(link_point.x(), link_point.y()) ==
+            replacement_target,
+        "post-replacement lookup reads the current published hyperlink target");
+
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        link_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::ControlModifier,
+        true,
+        "replacement hyperlink press starts a fresh activation gesture");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseMove,
+        plain_point,
+        Qt::NoButton,
+        Qt::LeftButton,
+        Qt::ControlModifier,
+        true,
+        "dragging an activation gesture off the hyperlink is consumed");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        link_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::ControlModifier,
+        true,
+        "dragged hyperlink release is consumed without activation");
+    ok &= check(
+        activation_targets.empty(),
+        "leaving the pressed hyperlink permanently cancels that gesture");
+
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        link_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::ControlModifier,
+        true,
+        "current hyperlink press starts activation while mouse reporting is enabled");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        link_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::ControlModifier,
+        true,
+        "current hyperlink release completes activation while mouse reporting is enabled");
+    ok &= check(
+        activation_targets == std::vector<QByteArray>{replacement_target},
+        "explicit hyperlink activation wins only for its Ctrl+left gesture");
+    ok &= check(
+        backend_ptr->writes.size() == activation_write_count,
+        "completed explicit activation sends no terminal mouse report");
+
+    const std::size_t reported_write_index = backend_ptr->writes.size();
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonPress,
+        link_point,
+        Qt::LeftButton,
+        Qt::LeftButton,
+        Qt::NoModifier,
+        true,
+        "plain hyperlink press retains terminal mouse-reporting precedence");
+    ok &= send_mouse_event(
+        fixture.surface,
+        QEvent::MouseButtonRelease,
+        link_point,
+        Qt::LeftButton,
+        Qt::NoButton,
+        Qt::NoModifier,
+        true,
+        "plain hyperlink release retains terminal mouse-reporting precedence");
+    ok &= check_write_chunks_equal(
+        backend_ptr->writes,
+        reported_write_index,
+        {
+            sgr_mouse_report(0, 0, 0, 'M'),
+            sgr_mouse_report(0, 0, 0, 'm'),
+        },
+        "plain hyperlink click remains terminal mouse input when tracking is enabled");
+    ok &= check(
+        activation_targets == std::vector<QByteArray>{replacement_target},
+        "plain reported click emits no additional hyperlink activation request");
+
     return ok;
 }
 
@@ -16298,6 +16633,8 @@ int main(int argc, char** argv)
     ok &= test_surface_reset_session_clears_pending_atlas_completion(app);
     ok &= test_surface_qsg_capture_without_draw_preserves_dirty_rows(app);
     ok &= test_surface_session_single_drain_coalesces_dirty_rows(app);
+    ok &= test_explicit_hyperlink_lookup_feedback_and_activation(app);
+    ok &= test_explicit_hyperlink_stale_and_mouse_reporting_boundaries(app);
     ok &= test_osc52_clipboard_write_signal_and_deny(app);
     ok &= test_osc52_clipboard_wrong_duplicate_and_replacement(app);
     ok &= test_osc52_clipboard_late_exit_restart_and_targets(app);

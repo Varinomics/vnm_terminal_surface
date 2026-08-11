@@ -455,6 +455,14 @@ public:
         quint64                        request_id,
         Clipboard_response_decision    decision);
 
+    /**
+     * Returns the OSC 8 target published at the item-coordinate point.
+     *
+     * An empty result means the current render snapshot has no explicit
+     * hyperlink at the point. The bytes are terminal-provided, untrusted data;
+     * hosts must validate them before dispatching outside the terminal.
+     */
+    Q_INVOKABLE QByteArray explicit_hyperlink_at(qreal x, qreal y) const;
     Q_INVOKABLE QString selected_text();
     Q_INVOKABLE void    clear_selection();
     Q_INVOKABLE bool    paste_text(QString text);
@@ -548,6 +556,12 @@ signals:
         quint64                request_id,
         QString                target_selection,
         QByteArray             payload);
+
+    // Emitted only for a completed Ctrl+left-click on one explicit OSC 8
+    // identity in the current published snapshot. The surface never opens the
+    // target; the host owns validation and external dispatch.
+    void explicit_hyperlink_activation_requested(
+        QByteArray             target);
 
     // Hover-idle row timestamp tooltip contract: requested fires after the
     // pointer rests over a stamped row, dismissed fires once per shown tooltip
@@ -694,6 +708,8 @@ private:
     bool copy_selected_text_to_clipboard(Empty_selection_copy_policy policy);
     std::optional<QString> read_clipboard_text_for_paste();
     void set_selection_state(Selection_state state);
+    void set_hyperlink_hover_position(std::optional<QPointF> position);
+    void refresh_hyperlink_hover_feedback();
     void dismiss_row_timestamp_tooltip();
     bool row_timestamp_tooltip_pointer_moved(const QPointF& position);
     void handle_row_timestamp_tooltip_timeout();
