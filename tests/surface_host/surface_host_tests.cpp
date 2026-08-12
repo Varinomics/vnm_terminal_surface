@@ -13734,6 +13734,10 @@ bool test_paste_text_public_method_and_policy(QGuiApplication& app)
                 vnm_terminal::Terminal_message_submission_outcome::INVALID_UTF8,
             "message submission rejects invalid UTF-8 before session lookup");
         ok &= check(
+            fixture.surface.submit_utf8_message(QByteArray("\xc3", 1)).outcome ==
+                vnm_terminal::Terminal_message_submission_outcome::INVALID_UTF8,
+            "message submission rejects incomplete UTF-8 before session lookup");
+        ok &= check(
             fixture.surface.submit_utf8_message({}).outcome ==
                 vnm_terminal::Terminal_message_submission_outcome::EMPTY_MESSAGE,
             "message submission rejects an empty payload explicitly");
