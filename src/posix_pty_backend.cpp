@@ -532,6 +532,10 @@ Signal_targets shutdown_signal_targets(
     return process_signal_targets(child_process_group, master);
 }
 
+#if defined(__APPLE__)
+std::optional<bool> macos_process_group_has_unterminated_members(pid_t process_group);
+#endif
+
 std::optional<int> send_signal_to_targets(const Signal_targets& targets, int signal_number)
 {
     const pid_t own_process_group = ::getpgrp();
@@ -551,8 +555,28 @@ std::optional<int> send_signal_to_targets(const Signal_targets& targets, int sig
             continue;
         }
 
-        if (errno != ESRCH && first_error == 0) {
-            first_error = errno;
+        const int signal_error = errno;
+        if (signal_error == ESRCH) {
+            continue;
+        }
+
+#if defined(__APPLE__)
+        // A process can commit to exit between the pre-signal activity check
+        // and kill(). macOS may then reject the group signal with EPERM even
+        // though the group has no member that can still execute. Preserve a
+        // genuine permission failure, but treat that completed lifecycle race
+        // like ESRCH.
+        if (signal_error == EPERM) {
+            const std::optional<bool> active_members =
+                macos_process_group_has_unterminated_members(process_group);
+            if (active_members.has_value() && !*active_members) {
+                continue;
+            }
+        }
+#endif
+
+        if (first_error == 0) {
+            first_error = signal_error;
         }
     }
 
@@ -590,7 +614,8 @@ std::optional<bool> macos_process_group_has_unterminated_members(pid_t process_g
         if (::sysctl(mib, 4U, processes.data(), &byte_count, nullptr, 0U) == 0) {
             const std::size_t process_count = byte_count / sizeof(kinfo_proc);
             for (std::size_t i = 0U; i < process_count; ++i) {
-                if (processes[i].kp_proc.p_stat != SZOMB) {
+                const extern_proc& process = processes[i].kp_proc;
+                if (process.p_stat != SZOMB && (process.p_flag & P_WEXIT) == 0) {
                     return true;
                 }
             }
