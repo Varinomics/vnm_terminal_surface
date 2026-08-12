@@ -290,6 +290,46 @@ private:
     std::size_t                m_callback_sequence = 0U;
 };
 
+const char* backend_error_code_name(term::Terminal_backend_error_code code)
+{
+    switch (code) {
+        case term::Terminal_backend_error_code::INVALID_LAUNCH_CONFIG:         return "INVALID_LAUNCH_CONFIG";
+        case term::Terminal_backend_error_code::INVALID_INITIAL_GRID_SIZE:     return "INVALID_INITIAL_GRID_SIZE";
+        case term::Terminal_backend_error_code::WORKING_DIRECTORY_UNAVAILABLE: return "WORKING_DIRECTORY_UNAVAILABLE";
+        case term::Terminal_backend_error_code::START_FAILED:                  return "START_FAILED";
+        case term::Terminal_backend_error_code::WRITE_FAILED:                  return "WRITE_FAILED";
+        case term::Terminal_backend_error_code::RESIZE_FAILED:                 return "RESIZE_FAILED";
+        case term::Terminal_backend_error_code::INTERRUPT_FAILED:              return "INTERRUPT_FAILED";
+        case term::Terminal_backend_error_code::TERMINATE_FAILED:              return "TERMINATE_FAILED";
+        case term::Terminal_backend_error_code::OUTPUT_OVERFLOW:               return "OUTPUT_OVERFLOW";
+        case term::Terminal_backend_error_code::CALLBACK_MISSING:              return "CALLBACK_MISSING";
+        case term::Terminal_backend_error_code::READ_FAILED:                   return "READ_FAILED";
+        default:                                                               return "UNKNOWN";
+    }
+}
+
+bool check_no_backend_errors(Backend_capture& capture, const char* message)
+{
+    const std::vector<term::Terminal_backend_error> errors =
+        capture.errors_snapshot();
+    if (errors.empty()) {
+        return check(true, message);
+    }
+
+    std::cerr << message << ": " << errors.size()
+        << " backend error(s)\n";
+    for (const term::Terminal_backend_error& error : errors) {
+        const QByteArray error_message = error.message.toLocal8Bit();
+        std::cerr << "  "
+            << backend_error_code_name(error.code)
+            << ": "
+            << error_message.constData()
+            << '\n';
+    }
+
+    return check(false, message);
+}
+
 term::Terminal_launch_config launch_config(
     const QString& fixture_path,
     QStringList    arguments)
@@ -380,7 +420,7 @@ bool test_launch_output(const QString& fixture_path)
         exit->reason == term::Terminal_exit_reason::EXITED &&
         exit->exit_code == 0,
         "list fixture reports clean exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "list fixture produces no backend errors");
     ok &= check(backend->write(QByteArrayLiteral("after")).code ==
         term::Terminal_backend_result_code::REJECTED,
@@ -495,7 +535,7 @@ bool test_interactive_canvas_fixture(const QString& fixture_path)
         "POSIX PTY output preserves high-volume stream rows");
     ok &= check(scripted_output_is_ordered(output),
         "POSIX PTY output contains the scripted fixture output in order");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "interactive fixture produces no backend errors");
 
     return ok;
@@ -689,7 +729,7 @@ bool test_interrupt(const QString& fixture_path)
         exit->reason == term::Terminal_exit_reason::INTERRUPTED &&
         exit->exit_code == 130,
         "interrupt reports typed interrupted exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "interrupt fixture produces no backend errors");
     ok &= check(backend->write(QByteArrayLiteral("after")).code ==
         term::Terminal_backend_result_code::REJECTED,
@@ -723,7 +763,7 @@ bool test_interrupt_without_stdin_reader(const QString& fixture_path)
         exit->reason == term::Terminal_exit_reason::INTERRUPTED &&
         exit->exit_code == 130,
         "no-read interrupt reports typed interrupted exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "no-read interrupt fixture produces no backend errors");
 
     return ok;
@@ -759,7 +799,7 @@ bool test_interrupt_ignored_child_exits_normally()
         exit->reason == term::Terminal_exit_reason::EXITED &&
         exit->exit_code == 0,
         "ignored interrupt preserves normal child exit status");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "interrupt-ignored shell produces no backend errors");
 
     return ok;
@@ -817,7 +857,7 @@ bool test_process_exit_reports_with_descendant_slave_open()
             exit->reason == term::Terminal_exit_reason::EXITED &&
             exit->exit_code == 0,
             "descendant-open shell reports direct child clean exit");
-        ok &= check(capture.errors_snapshot().empty(),
+        ok &= check_no_backend_errors(capture,
             "descendant-open shell produces no backend errors");
     }
 
@@ -891,7 +931,7 @@ bool test_exit_drain_ignores_repause_and_delivers_buffered_output()
         exit->reason == term::Terminal_exit_reason::EXITED &&
         exit->exit_code == 0,
         "paused exit-drain shell reports direct child clean exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "paused exit-drain shell produces no backend errors");
 
     return ok;
@@ -976,7 +1016,7 @@ bool test_paused_release_preserves_marker_order_and_caps_callback_bursts()
         exit->reason == term::Terminal_exit_reason::EXITED &&
         exit->exit_code == 0,
         "paused-release burst shell reports clean exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "paused-release burst shell produces no backend errors");
 
     return ok;
@@ -1058,7 +1098,7 @@ bool test_paused_release_with_tight_delivery_limits_does_not_trap_output()
     const qsizetype tail_index   = output.indexOf(tail);
     ok &= check(marker_index >= 0 && tail_index > marker_index,
         "tight paused-output shell preserves marker order");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "tight paused-output shell produces no backend errors");
 
     return ok;
@@ -1325,7 +1365,7 @@ bool test_terminate_kills_descendant_in_target_group()
             ::kill(*descendant_pid, SIGKILL);
         }
     }
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "terminate-descendant shell produces no backend errors");
 
     return ok;
@@ -1355,7 +1395,7 @@ bool test_terminate(const QString& fixture_path)
     ok &= check(exit.has_value() &&
         exit->reason == term::Terminal_exit_reason::TERMINATED,
         "terminate reports typed terminated exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "terminate fixture produces no backend errors");
     ok &= check(backend->resize({1U, {24, 80}}).code ==
         term::Terminal_backend_result_code::REJECTED,
@@ -1391,7 +1431,7 @@ bool test_terminate_accepts_zero_grace_policy(const QString& fixture_path)
     ok &= check(exit.has_value() &&
         exit->reason == term::Terminal_exit_reason::TERMINATED,
         "zero-grace terminate reports typed terminated exit");
-    ok &= check(capture.errors_snapshot().empty(),
+    ok &= check_no_backend_errors(capture,
         "zero-grace terminate fixture produces no backend errors");
 
     return ok;
