@@ -4347,11 +4347,10 @@ VNM_TerminalSurface::submit_utf8_message(QByteArray message_utf8)
         };
     }
 
-    QStringDecoder decoder(
-        QStringDecoder::Utf8,
-        QStringDecoder::Flag::Stateless);
+    QStringDecoder decoder(QStringDecoder::Utf8);
     QString text = decoder.decode(message_utf8);
-    if (decoder.hasError()) {
+    const QStringDecoder::FinalizeResult finalization = decoder.finalize();
+    if (finalization.error != QStringDecoder::FinalizeResult::Error::NoError) {
         return {
             Outcome::INVALID_UTF8,
             QStringLiteral("The message is not valid UTF-8."),

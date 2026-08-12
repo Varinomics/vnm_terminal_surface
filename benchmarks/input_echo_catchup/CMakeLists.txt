@@ -6,7 +6,7 @@ add_executable(vnm_terminal_input_echo_ordering_benchmark
     input_echo_ordering_benchmark.cpp
 )
 
-find_package(Qt6Gui 6.7 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
+find_package(Qt6Gui 6.11 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
 
 target_link_libraries(vnm_terminal_input_echo_catchup_benchmark PRIVATE
     vnm_terminal_surface::vnm_terminal_surface

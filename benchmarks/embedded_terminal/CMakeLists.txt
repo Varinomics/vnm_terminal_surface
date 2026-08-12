@@ -2,7 +2,7 @@ add_executable(vnm_terminal_embedded_benchmark
     embedded_terminal_benchmark.cpp
 )
 
-find_package(Qt6Gui 6.7 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
+find_package(Qt6Gui 6.11 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
 
 target_link_libraries(vnm_terminal_embedded_benchmark PRIVATE
     vnm_terminal_surface::vnm_terminal_surface

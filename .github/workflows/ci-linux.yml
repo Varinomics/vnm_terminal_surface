@@ -34,7 +34,7 @@ jobs:
       - name: Install Qt
         uses: jurplel/install-qt-action@v4.3.1
         with:
-          version: '6.10.1'
+          version: '6.11.1'
           arch: 'linux_gcc_64'
           archives: 'icu qtbase qtdeclarative'
           cache: 'true'
@@ -99,7 +99,7 @@ jobs:
       - name: Install Qt
         uses: jurplel/install-qt-action@v4.3.1
         with:
-          version: '6.10.1'
+          version: '6.11.1'
           arch: 'linux_gcc_64'
           archives: 'icu qtbase qtdeclarative'
           cache: 'true'
@@ -138,7 +138,7 @@ jobs:
       - name: Install Qt
         uses: jurplel/install-qt-action@v4.3.1
         with:
-          version: '6.10.1'
+          version: '6.11.1'
           arch: 'linux_gcc_64'
           archives: 'icu qtbase qtdeclarative'
           cache: 'true'

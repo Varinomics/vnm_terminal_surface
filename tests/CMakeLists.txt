@@ -11,7 +11,7 @@ else()
         "LD_LIBRARY_PATH=$<TARGET_FILE_DIR:Qt6::Core>:$ENV{LD_LIBRARY_PATH}")
 endif()
 
-find_package(Qt6Gui 6.7 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
+find_package(Qt6Gui 6.11 REQUIRED COMPONENTS QOffscreenIntegrationPlugin)
 find_package(Threads REQUIRED)
 include("${PROJECT_SOURCE_DIR}/cmake/vnm_terminal_msdf_text_dependency.cmake")
 
