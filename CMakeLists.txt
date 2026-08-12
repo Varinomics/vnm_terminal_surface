@@ -85,7 +85,7 @@ set(vnm_terminal_qt_components
     GuiPrivate
 )
 
-find_package(Qt6 6.7 REQUIRED COMPONENTS ${vnm_terminal_qt_components})
+find_package(Qt6 6.11 REQUIRED COMPONENTS ${vnm_terminal_qt_components})
 include(cmake/vnm_terminal_qt_posture.cmake)
 
 if(NOT TARGET vnm_qt_dispatch::vnm_qt_dispatch)

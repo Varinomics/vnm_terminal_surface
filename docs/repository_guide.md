@@ -36,7 +36,7 @@ benchmarks.
 
 ## Build Options
 
-The project requires CMake 3.21 or newer, C++20, and Qt 6.7 Core, Gui, and
+The project requires CMake 3.21 or newer, C++20, and Qt 6.11 Core, Gui, and
 Quick.
 
 The atlas renderer uses Qt private modules for QRhi integration
