@@ -192,11 +192,13 @@ the paused state, wakes the workers, and starts an escalation worker governed by
 
 - POSIX escalation sends `SIGTERM` to the process-group signal targets, waits up
   to the graceful interval for them to disappear, then sends `SIGKILL` and waits
-  up to the kill interval. On macOS, the post-signal check excludes zombies:
-  they have terminated and only await reaping, although `kill(-pgid, 0)` still
-  reports their process group as present. A group with an unterminated member
-  after forced termination, or a signal failure, is reported as
-  `TERMINATE_FAILED`.
+  up to the kill interval. On macOS, the post-signal check excludes zombies and
+  processes marked `P_WEXIT`: both have committed to termination even though
+  `kill(-pgid, 0)` can still report their process group as present. If a group
+  signal races that transition and returns `EPERM`, the backend rechecks the
+  group and ignores the error only when no unterminated member remains. A group
+  with an unterminated member after forced termination, or a genuine signal
+  failure, is reported as `TERMINATE_FAILED`.
 - ConPTY escalation waits up to the graceful interval for the process to exit,
   then calls `TerminateJobObject` on the child process job, then waits up to the
   kill interval for the root process to exit. A process still active after
