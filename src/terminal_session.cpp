@@ -2179,6 +2179,71 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     };
 }
 
+Terminal_paste_text_result Terminal_session::write_submitted_text(
+    QString                        text,
+    Terminal_paste_framing_policy  policy,
+    std::uint64_t                  interaction_trace_id)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    drain_backend_callback_commands();
+    process_pending_commands();
+
+    const Terminal_input_mode_state modes = m_screen_model.has_value()
+        ? m_screen_model->input_mode_state()
+        : Terminal_input_mode_state{};
+    QByteArray bytes = encode_terminal_paste_text(std::move(text), modes, policy);
+    if (bytes.isEmpty()) {
+        return {};
+    }
+    bytes.append('\r');
+    if (bytes.size() > vnm_terminal::k_terminal_message_utf8_hard_limit_bytes) {
+        const std::uint64_t sequence = next_sequence();
+        return {
+            true,
+            make_rejected_result(
+                sequence,
+                Terminal_session_result_code::INVALID_ARGUMENT,
+                make_backend_error(
+                    Terminal_backend_error_code::WRITE_FAILED,
+                    QStringLiteral(
+                        "encoded message exceeds terminal message hard limit"))),
+        };
+    }
+
+    if (m_process_state == Terminal_process_state::NOT_STARTED ||
+        m_process_state == Terminal_process_state::STARTING)
+    {
+        return {};
+    }
+
+    const std::uint64_t sequence = next_sequence();
+    if (interaction_trace_enabled() && interaction_trace_id == 0U) {
+        interaction_trace_id = next_interaction_trace_correlation_id();
+    }
+    if (!is_session_writable()) {
+        return {
+            true,
+            make_rejected_result(
+                sequence,
+                Terminal_session_result_code::INVALID_STATE,
+                make_backend_error(
+                    Terminal_backend_error_code::WRITE_FAILED,
+                    QStringLiteral(
+                        "message submission requires a running backend"))),
+        };
+    }
+
+    const Terminal_session_result result = enqueue_and_process_synchronous_command(
+        make_user_message_command(sequence, std::move(bytes), interaction_trace_id));
+    return {
+        true,
+        finalize_accepted_text_input_result(
+            result,
+            sequence,
+            User_write_viewport_policy::RETURN_TO_TAIL),
+    };
+}
+
 Terminal_focus_event_result Terminal_session::write_focus_event(bool focused)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -3495,6 +3560,12 @@ Terminal_session_result Terminal_session::enqueue_command(Terminal_session_comma
                 Terminal_backend_error_code::WRITE_FAILED,
                 QStringLiteral("paste text exceeds session write queue hard limit"));
         }
+        else
+        if (command.kind == Terminal_session_command_kind::USER_MESSAGE) {
+            error = make_backend_error(
+                Terminal_backend_error_code::WRITE_FAILED,
+                QStringLiteral("message exceeds session write queue hard limit"));
+        }
         else {
             error = make_backend_error(
                 Terminal_backend_error_code::WRITE_FAILED,
@@ -3698,6 +3769,7 @@ Terminal_session_result Terminal_session::process_command(Terminal_session_comma
             return process_start_command(command);
         case Terminal_session_command_kind::USER_WRITE:
         case Terminal_session_command_kind::USER_PASTE:
+        case Terminal_session_command_kind::USER_MESSAGE:
         case Terminal_session_command_kind::TERMINAL_REPLY:
             return process_write_command(command);
         case Terminal_session_command_kind::RESIZE:
@@ -3859,7 +3931,9 @@ Terminal_session_result Terminal_session::process_write_command(
                 ? QStringLiteral("terminal_reply")
                 : command.kind == Terminal_session_command_kind::USER_PASTE
                     ? QStringLiteral("paste")
-                    : QStringLiteral("user");
+                    : command.kind == Terminal_session_command_kind::USER_MESSAGE
+                        ? QStringLiteral("message")
+                        : QStringLiteral("user");
         (void)m_config.transcript_recorder->record_host_write(
             command.sequence,
             source,
@@ -7509,6 +7583,7 @@ Terminal_session::Queue_category Terminal_session::queue_category_for(
             return Queue_category::OUTPUT;
         case Terminal_session_command_kind::USER_WRITE:
         case Terminal_session_command_kind::USER_PASTE:
+        case Terminal_session_command_kind::USER_MESSAGE:
         case Terminal_session_command_kind::TERMINAL_REPLY:
             return Queue_category::WRITE;
         case Terminal_session_command_kind::START:

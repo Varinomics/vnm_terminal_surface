@@ -7,6 +7,7 @@
 #include "vnm_terminal/internal/terminal_search.h"
 #include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/utf8_scan.h"
+#include "vnm_terminal/terminal_message_submission.h"
 #include <QByteArray>
 #include <QSizeF>
 #include <QString>
@@ -131,6 +132,11 @@ public:
         std::uint64_t              interaction_trace_id = 0U);
 
     Terminal_paste_text_result write_paste_text(
+        QString                                text,
+        Terminal_paste_framing_policy          policy,
+        std::uint64_t                          interaction_trace_id = 0U);
+
+    Terminal_paste_text_result write_submitted_text(
         QString                                text,
         Terminal_paste_framing_policy          policy,
         std::uint64_t                          interaction_trace_id = 0U);

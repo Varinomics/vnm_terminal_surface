@@ -211,6 +211,17 @@ Terminal_session_command make_user_paste_command(
             .bytes = std::move(bytes)};
 }
 
+Terminal_session_command make_user_message_command(
+    std::uint64_t          sequence,
+    QByteArray             bytes,
+    std::uint64_t          interaction_trace_id)
+{
+    return {.sequence = sequence,
+            .interaction_trace_id = interaction_trace_id,
+            .kind  = Terminal_session_command_kind::USER_MESSAGE,
+            .bytes = std::move(bytes)};
+}
+
 Terminal_session_command make_resize_command(
     std::uint64_t                  sequence,
     Terminal_resize_transaction    resize)

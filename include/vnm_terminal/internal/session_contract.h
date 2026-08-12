@@ -31,6 +31,7 @@ enum class Terminal_session_command_kind
     RESIZE,
     USER_WRITE,
     USER_PASTE,
+    USER_MESSAGE,
     TERMINAL_REPLY,
     BACKEND_OUTPUT,
 };
@@ -277,6 +278,11 @@ Terminal_session_command make_user_write_command(
     std::uint64_t          interaction_trace_id = 0U);
 
 Terminal_session_command make_user_paste_command(
+    std::uint64_t          sequence,
+    QByteArray             bytes,
+    std::uint64_t          interaction_trace_id = 0U);
+
+Terminal_session_command make_user_message_command(
     std::uint64_t          sequence,
     QByteArray             bytes,
     std::uint64_t          interaction_trace_id = 0U);

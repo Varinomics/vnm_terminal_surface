@@ -175,6 +175,7 @@ add_library(vnm_terminal_surface STATIC
     include/vnm_terminal/diagnostics/metrics_json.h
     include/vnm_terminal/diagnostics/profile_text.h
     include/vnm_terminal/font_metrics.h
+    include/vnm_terminal/terminal_message_submission.h
     include/vnm_terminal/vnm_terminal_surface.h
     src/backend_output_capture.cpp
     src/diagnostics/metric_descriptor.h
@@ -358,6 +359,7 @@ endif()
 install(FILES
     include/vnm_terminal/backend_output_capture.h
     include/vnm_terminal/font_metrics.h
+    include/vnm_terminal/terminal_message_submission.h
     include/vnm_terminal/vnm_terminal_surface.h
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/vnm_terminal"
 )

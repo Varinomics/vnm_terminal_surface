@@ -13725,8 +13725,31 @@ bool test_paste_text_public_method_and_policy(QGuiApplication& app)
 
         ok &= check(!fixture.surface.paste_text(QStringLiteral("no-session")),
             "no-session paste_text returns false");
+        ok &= check(
+            fixture.surface.submit_utf8_message(QByteArrayLiteral("no-session")).outcome ==
+                vnm_terminal::Terminal_message_submission_outcome::NOT_RUNNING,
+            "no-session message submission has an explicit not-running outcome");
+        ok &= check(
+            fixture.surface.submit_utf8_message(QByteArray("\xff", 1)).outcome ==
+                vnm_terminal::Terminal_message_submission_outcome::INVALID_UTF8,
+            "message submission rejects invalid UTF-8 before session lookup");
+        ok &= check(
+            fixture.surface.submit_utf8_message({}).outcome ==
+                vnm_terminal::Terminal_message_submission_outcome::EMPTY_MESSAGE,
+            "message submission rejects an empty payload explicitly");
+        ok &= check(
+            fixture.surface.submit_utf8_message(QByteArrayLiteral("carriage\rreturn")).outcome ==
+                vnm_terminal::Terminal_message_submission_outcome::INVALID_MESSAGE,
+            "message submission rejects controls that paste policy would mutate");
+        ok &= check(
+            fixture.surface.submit_utf8_message(QByteArray(
+                vnm_terminal::k_terminal_message_utf8_hard_limit_bytes + 1,
+                'x')).outcome ==
+                    vnm_terminal::Terminal_message_submission_outcome::
+                        MESSAGE_TOO_LARGE,
+            "message submission rejects raw UTF-8 above its hard limit");
         ok &= check(error_codes.empty(),
-            "no-session paste_text emits no backend_error");
+            "local message validation emits no backend_error");
     }
 
     {
@@ -13758,6 +13781,17 @@ bool test_paste_text_public_method_and_policy(QGuiApplication& app)
             QByteArrayLiteral("plain\ntext"),
             "application-controlled paste without DECSET writes unframed sanitized text");
 
+        const std::size_t message_write_index = backend_ptr->writes.size();
+        const vnm_terminal::Terminal_message_submission_result plain_message =
+            fixture.surface.submit_utf8_message(
+                QStringLiteral("Gr\u00fc\u00dfe").toUtf8());
+        ok &= check(plain_message.accepted(),
+            "surface admits a valid Unicode message");
+        ok &= check(backend_ptr->writes.size() == message_write_index + 1U &&
+            backend_ptr->writes.back() ==
+                QStringLiteral("Gr\u00fc\u00dfe").toUtf8() + '\r',
+            "surface submits Unicode text and Enter in one unframed write");
+
         backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2004h"));
         const std::size_t framed_write_index = backend_ptr->writes.size();
         ok &= check(fixture.surface.paste_text(QStringLiteral("mode")),
@@ -13765,6 +13799,17 @@ bool test_paste_text_public_method_and_policy(QGuiApplication& app)
         ok &= check(joined_writes_since(backend_ptr->writes, framed_write_index) ==
             framed_paste(QByteArrayLiteral("mode")),
             "surface paste_text drains pending DECSET before policy mapping");
+
+        const std::size_t framed_message_write_index = backend_ptr->writes.size();
+        const vnm_terminal::Terminal_message_submission_result framed_message =
+            fixture.surface.submit_utf8_message(QByteArrayLiteral("message"));
+        ok &= check(framed_message.accepted(),
+            "surface admits a bracketed message");
+        ok &= check(
+            backend_ptr->writes.size() == framed_message_write_index + 1U &&
+            backend_ptr->writes.back() ==
+                framed_paste(QByteArrayLiteral("message")) + '\r',
+            "surface places Enter outside the bracketed frame in one write");
 
         fixture.surface.set_bracketed_paste_policy(
             VNM_TerminalSurface::Bracketed_paste_policy::DISABLED);

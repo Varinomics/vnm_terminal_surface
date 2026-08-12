@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vnm_terminal/backend_output_capture.h"
+#include "vnm_terminal/terminal_message_submission.h"
 
 #include <QQuickItem>
 #include <QByteArray>
@@ -489,6 +490,8 @@ public:
     Q_INVOKABLE bool    search_next();
     Q_INVOKABLE bool    search_previous();
     Q_INVOKABLE bool    paste_text(QString text);
+    vnm_terminal::Terminal_message_submission_result submit_utf8_message(
+        QByteArray message_utf8);
     Q_INVOKABLE bool    paste_clipboard_text();
     // Scrolls only when the published public viewport is primary-screen
     // scrollback and can be updated immediately. Under the default synchronized

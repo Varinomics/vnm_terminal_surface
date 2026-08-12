@@ -12978,6 +12978,108 @@ bool test_paste_queue_atomicity_and_failures()
     return ok;
 }
 
+bool test_message_submission_is_one_atomic_write()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> not_started_session;
+    Scripted_backend* not_started_backend = make_session(not_started_session);
+    const term::Terminal_paste_text_result not_started =
+        not_started_session->write_submitted_text(
+            QStringLiteral("ignored"),
+            term::Terminal_paste_framing_policy::DISABLED);
+    ok &= check(!not_started.handled,
+        "not-started message submission is not admitted");
+    ok &= check(not_started_backend->writes.empty(),
+        "not-started message submission writes no bytes");
+
+    term::Terminal_session_config config;
+    config.backend_event_notifier = [] {};
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "message submission session starts");
+
+    const term::Terminal_paste_text_result plain =
+        session->write_submitted_text(
+            QStringLiteral("Gr\u00fc\u00dfe"),
+            term::Terminal_paste_framing_policy::APPLICATION_CONTROLLED);
+    ok &= check(plain.handled &&
+        plain.result.code == term::Terminal_session_result_code::ACCEPTED,
+        "unframed Unicode message is admitted");
+    ok &= check(backend->writes.size() == 1U &&
+        backend->writes.back() == QStringLiteral("Gr\u00fc\u00dfe").toUtf8() + '\r',
+        "unframed Unicode message and submit action use one exact write");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2004h")),
+        "message submission fixture enables bracketed paste");
+    const std::size_t framed_write_count = backend->writes.size();
+    const term::Terminal_paste_text_result framed =
+        session->write_submitted_text(
+            QStringLiteral("multi\r\nline"),
+            term::Terminal_paste_framing_policy::APPLICATION_CONTROLLED);
+    ok &= check(framed.handled &&
+        framed.result.code == term::Terminal_session_result_code::ACCEPTED,
+        "bracketed multiline message is admitted");
+    ok &= check(backend->writes.size() == framed_write_count + 1U &&
+        backend->writes.back() ==
+            framed_paste(QByteArrayLiteral("multi\nline")) + '\r',
+        "submit action follows the closing bracket in one backend write");
+
+    const auto commands = session->processed_commands();
+    const auto message_command_count = std::count_if(
+        commands.begin(),
+        commands.end(),
+        [](const term::Terminal_session_command& command) {
+            return command.kind ==
+                term::Terminal_session_command_kind::USER_MESSAGE;
+        });
+    ok &= check(message_command_count == 2,
+        "each admitted message is one distinct message command");
+
+    const std::size_t empty_write_count = backend->writes.size();
+    const term::Terminal_paste_text_result empty =
+        session->write_submitted_text(
+            QString(QChar(0x001b)),
+            term::Terminal_paste_framing_policy::ENABLED);
+    ok &= check(!empty.handled,
+        "message removed entirely by terminal sanitization is rejected");
+    ok &= check(backend->writes.size() == empty_write_count,
+        "sanitized-empty message writes no frame or submit byte");
+
+    const QString exact_limit_text(
+        vnm_terminal::k_terminal_message_utf8_hard_limit_bytes - 1,
+        QChar(u'a'));
+    const term::Terminal_paste_text_result exact_limit =
+        session->write_submitted_text(
+            exact_limit_text,
+            term::Terminal_paste_framing_policy::DISABLED);
+    ok &= check(exact_limit.handled &&
+        exact_limit.result.code == term::Terminal_session_result_code::ACCEPTED,
+        "message whose encoded body plus submit equals the hard limit is admitted");
+    ok &= check(backend->writes.back().size() ==
+        vnm_terminal::k_terminal_message_utf8_hard_limit_bytes &&
+        backend->writes.back().endsWith('\r'),
+        "exact-limit message remains one complete write");
+
+    const std::size_t over_limit_write_count = backend->writes.size();
+    const QString over_limit_text(
+        vnm_terminal::k_terminal_message_utf8_hard_limit_bytes,
+        QChar(u'a'));
+    const term::Terminal_paste_text_result over_limit =
+        session->write_submitted_text(
+            over_limit_text,
+            term::Terminal_paste_framing_policy::DISABLED);
+    ok &= check(over_limit.handled &&
+        over_limit.result.code == term::Terminal_session_result_code::INVALID_ARGUMENT,
+        "encoded message above the hard limit is rejected explicitly");
+    ok &= check(backend->writes.size() == over_limit_write_count,
+        "over-limit message writes no prefix or submit byte");
+
+    return ok;
+}
+
 bool test_resize_transactions()
 {
     bool ok = true;
@@ -14794,6 +14896,7 @@ int main()
     ok &= test_paste_policy_modes_and_drain();
     ok &= test_focus_reporting_mode_writes_and_drain();
     ok &= test_paste_queue_atomicity_and_failures();
+    ok &= test_message_submission_is_one_atomic_write();
     ok &= test_resize_transactions();
     ok &= test_metrics_driven_resize_controller();
     ok &= test_metrics_driven_resize_interleaves_with_output();

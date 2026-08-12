@@ -37,6 +37,7 @@
 #include <QThreadPool>
 #include <QQuickWindow>
 #include <QScreen>
+#include <QStringDecoder>
 #include <QStringList>
 #include <QThread>
 #include <QTextLayout>
@@ -4326,6 +4327,97 @@ bool VNM_TerminalSurface::paste_text(QString text)
     }
 
     return true;
+}
+
+vnm_terminal::Terminal_message_submission_result
+VNM_TerminalSurface::submit_utf8_message(QByteArray message_utf8)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    using Outcome = vnm_terminal::Terminal_message_submission_outcome;
+    if (message_utf8.isEmpty()) {
+        return {Outcome::EMPTY_MESSAGE, QStringLiteral("The message is empty.")};
+    }
+    if (message_utf8.size() >
+        vnm_terminal::k_terminal_message_utf8_hard_limit_bytes)
+    {
+        return {
+            Outcome::MESSAGE_TOO_LARGE,
+            QStringLiteral("The message exceeds the terminal message hard limit."),
+        };
+    }
+
+    QStringDecoder decoder(QStringDecoder::Utf8);
+    QString text = decoder.decode(message_utf8);
+    if (decoder.hasError()) {
+        return {
+            Outcome::INVALID_UTF8,
+            QStringLiteral("The message is not valid UTF-8."),
+        };
+    }
+    for (const QChar character : text) {
+        const ushort code = character.unicode();
+        if ((code <= 0x001fU && code != u'\n' && code != u'\t') ||
+            code == 0x007fU ||
+            (code >= 0x0080U && code <= 0x009fU))
+        {
+            return {
+                Outcome::INVALID_MESSAGE,
+                QStringLiteral(
+                    "The message contains unsupported terminal control characters."),
+            };
+        }
+    }
+    if (m_private->session == nullptr) {
+        return {
+            Outcome::NOT_RUNNING,
+            QStringLiteral("The terminal session is not running."),
+        };
+    }
+
+    m_private->resolve_pending_published_mouse_reports_before_terminal_input(*this);
+    if (m_private->session == nullptr) {
+        return {
+            Outcome::NOT_RUNNING,
+            QStringLiteral("The terminal session is not running."),
+        };
+    }
+
+    const std::uint64_t trace_id = term::interaction_trace_enabled()
+        ? term::next_interaction_trace_correlation_id()
+        : 0U;
+    term::Terminal_session* const route_session = m_private->session.get();
+    const term::Terminal_paste_text_result submission =
+        route_session->write_submitted_text(
+            std::move(text),
+            paste_framing_policy(m_bracketed_paste_policy),
+            trace_id);
+    sync_from_session();
+    if (!submission.handled) {
+        return {
+            Outcome::EMPTY_MESSAGE,
+            QStringLiteral("The message has no terminal-safe text."),
+        };
+    }
+
+    const QString error = submission.result.error
+        ? submission.result.error->message
+        : QString{};
+    switch (submission.result.code) {
+        case term::Terminal_session_result_code::ACCEPTED:
+            return {Outcome::ACCEPTED, {}};
+        case term::Terminal_session_result_code::INVALID_STATE:
+            return {Outcome::NOT_RUNNING, error};
+        case term::Terminal_session_result_code::INVALID_ARGUMENT:
+            return {Outcome::MESSAGE_TOO_LARGE, error};
+        case term::Terminal_session_result_code::QUEUE_HARD_LIMIT_REACHED:
+            return {Outcome::QUEUE_LIMIT, error};
+        case term::Terminal_session_result_code::BACKEND_REJECTED:
+            return {Outcome::BACKEND_REJECTED, error};
+    }
+
+    Q_UNREACHABLE();
+    return {Outcome::BACKEND_REJECTED, error};
 }
 
 std::optional<QString> VNM_TerminalSurface::read_clipboard_text_for_paste()
