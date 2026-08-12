@@ -29,6 +29,7 @@ jobs:
           arch: 'win64_msvc2022_64'
           archives: 'qtbase qtdeclarative'
           cache: 'true'
+          aqtsource: 'git+https://github.com/miurahr/aqtinstall.git@8c3695d4a4e1ceabf6a74dc6c79681656dc6b74b'
 
       - name: Configure CMake
         run: |
@@ -92,6 +93,7 @@ jobs:
           arch: 'win64_msvc2022_64'
           archives: 'qtbase qtdeclarative'
           cache: 'true'
+          aqtsource: 'git+https://github.com/miurahr/aqtinstall.git@8c3695d4a4e1ceabf6a74dc6c79681656dc6b74b'
 
       - name: Add MSVC AddressSanitizer runtime to PATH
         shell: pwsh
