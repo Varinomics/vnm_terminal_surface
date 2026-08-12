@@ -12988,8 +12988,9 @@ bool test_message_submission_is_one_atomic_write()
         not_started_session->write_submitted_text(
             QStringLiteral("ignored"),
             term::Terminal_paste_framing_policy::DISABLED);
-    ok &= check(!not_started.handled,
-        "not-started message submission is not admitted");
+    ok &= check(not_started.handled &&
+        not_started.result.code == term::Terminal_session_result_code::INVALID_STATE,
+        "not-started message submission reports the lifecycle rejection");
     ok &= check(not_started_backend->writes.empty(),
         "not-started message submission writes no bytes");
 

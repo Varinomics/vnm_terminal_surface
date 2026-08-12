@@ -2213,7 +2213,17 @@ Terminal_paste_text_result Terminal_session::write_submitted_text(
     if (m_process_state == Terminal_process_state::NOT_STARTED ||
         m_process_state == Terminal_process_state::STARTING)
     {
-        return {};
+        const std::uint64_t sequence = next_sequence();
+        return {
+            true,
+            make_rejected_result(
+                sequence,
+                Terminal_session_result_code::INVALID_STATE,
+                make_backend_error(
+                    Terminal_backend_error_code::WRITE_FAILED,
+                    QStringLiteral(
+                        "message submission requires a running backend"))),
+        };
     }
 
     const std::uint64_t sequence = next_sequence();

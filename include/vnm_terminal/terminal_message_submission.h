@@ -5,6 +5,9 @@
 
 namespace vnm_terminal {
 
+// Bounds both the raw UTF-8 input and the fully encoded terminal message,
+// including framing and the final submit byte. Terminal encoding may expand
+// some characters, so a raw payload below this ceiling can still be too large.
 inline constexpr qsizetype k_terminal_message_utf8_hard_limit_bytes =
     256 * 1024;
 

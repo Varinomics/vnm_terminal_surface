@@ -211,6 +211,16 @@ live process requests termination during teardown.
 
 ## Host Operations
 
+The C++-only `submit_utf8_message(QByteArray message_utf8)` operation validates
+one complete UTF-8 message, rejects unsupported terminal controls, and admits
+the encoded body plus its submit action as one terminal command and backend
+write. It reports a typed outcome for invalid or empty input, raw or encoded
+size overflow, a non-running session, queue pressure, and backend rejection.
+The public message ceiling bounds both the raw UTF-8 input and the fully encoded
+terminal command; platform input encoding may expand some characters before
+the second check. Bracketed-paste framing, when active, closes before the final
+submit byte.
+
 Invokable methods:
 
 - `selected_text()` returns the local terminal selection, including retained
