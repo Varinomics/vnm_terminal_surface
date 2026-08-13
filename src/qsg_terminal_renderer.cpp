@@ -48,6 +48,10 @@ constexpr std::size_t k_eager_render_style_attribute_limit  = 256U;
 constexpr int         k_terminal_render_frame_full_layer_descriptor_count  = 13;
 constexpr int         k_terminal_render_frame_state_layer_descriptor_count = 5;
 
+constexpr unsigned char k_selection_cell_state            = 1U;
+constexpr unsigned char k_search_match_cell_state         = 1U;
+constexpr unsigned char k_current_search_match_cell_state = 2U;
+
 qreal srgb_component_to_linear(int component)
 {
     const qreal srgb = static_cast<qreal>(component) / 255.0;
@@ -312,6 +316,115 @@ QRectF cell_rect(
             static_cast<qreal>(row) * metrics.height,
             static_cast<qreal>(column_count) * metrics.width,
             metrics.height);
+}
+
+using Cell_state_mask = std::vector<unsigned char>;
+
+template <typename Span, typename State_for_span, typename Merge_state>
+Cell_state_mask build_cell_state_mask(
+    terminal_grid_size_t                             grid_size,
+    const Terminal_render_snapshot_row_content_view& rows,
+    const std::vector<Span>&                         spans,
+    State_for_span                                   state_for_span,
+    Merge_state                                      merge_state)
+{
+    if (grid_size.rows <= 0 || grid_size.columns <= 0 || spans.empty()) {
+        return {};
+    }
+
+    const std::size_t column_count = static_cast<std::size_t>(grid_size.columns);
+    Cell_state_mask states(
+        static_cast<std::size_t>(grid_size.rows) * column_count,
+        0U);
+    for (const Span& span : spans) {
+        const std::size_t first =
+            static_cast<std::size_t>(span.row) * column_count +
+            static_cast<std::size_t>(span.first_column);
+        const unsigned char span_state = state_for_span(span);
+        auto begin = states.begin() + static_cast<std::ptrdiff_t>(first);
+        const auto end = begin + span.column_count;
+        for (auto state = begin; state != end; ++state) {
+            *state = merge_state(*state, span_state);
+        }
+    }
+
+    // A wide glyph and its backdrop are one paint unit. A single maximum
+    // state also keeps MSDF LCD precomposition aligned with that backdrop.
+    for (const Terminal_render_snapshot_row_content row : rows) {
+        for (const Terminal_render_cell& cell : row) {
+            if (cell.wide_continuation ||
+                cell.display_width <= 1 ||
+                cell.position.row < 0 ||
+                cell.position.row >= grid_size.rows ||
+                cell.position.column < 0 ||
+                cell.display_width > grid_size.columns - cell.position.column)
+            {
+                continue;
+            }
+
+            const std::size_t first =
+                static_cast<std::size_t>(cell.position.row) * column_count +
+                static_cast<std::size_t>(cell.position.column);
+            auto begin = states.begin() + static_cast<std::ptrdiff_t>(first);
+            const auto end = begin + cell.display_width;
+            const unsigned char glyph_state = *std::max_element(begin, end);
+            if (glyph_state != 0U) {
+                std::fill(begin, end, glyph_state);
+            }
+        }
+    }
+
+    return states;
+}
+
+template <typename Color_for_state>
+void append_cell_state_rects(
+    std::vector<Terminal_render_rect>& rects,
+    const Cell_state_mask&             states,
+    terminal_grid_size_t               grid_size,
+    terminal_cell_metrics_t            cell_metrics,
+    Color_for_state                    color_for_state)
+{
+    if (states.empty()) {
+        return;
+    }
+
+    const int column_count = grid_size.columns;
+    for (int row = 0; row < grid_size.rows; ++row) {
+        int column = 0;
+        while (column < column_count) {
+            const std::size_t index =
+                static_cast<std::size_t>(row) *
+                    static_cast<std::size_t>(column_count) +
+                static_cast<std::size_t>(column);
+            const unsigned char state = states[index];
+            if (state == 0U) {
+                ++column;
+                continue;
+            }
+
+            const int first_column = column;
+            while (column < column_count) {
+                const std::size_t state_index =
+                    static_cast<std::size_t>(row) *
+                        static_cast<std::size_t>(column_count) +
+                    static_cast<std::size_t>(column);
+                if (states[state_index] != state) {
+                    break;
+                }
+                ++column;
+            }
+
+            rects.push_back({
+                cell_rect(
+                    row,
+                    first_column,
+                    column - first_column,
+                    cell_metrics),
+                color_for_state(state),
+            });
+        }
+    }
 }
 
 QColor effective_foreground(
@@ -1941,105 +2054,28 @@ Terminal_render_frame build_terminal_render_frame(
     Render_style_attribute_cache style_attributes(*snapshot);
     frame.stats.cell_pass_input_cells = static_cast<int>(rows.cell_count());
 
-    std::vector<unsigned char> selected_cell_flags;
-    if (valid_grid && !snapshot->selection_spans.empty()) {
-        const std::size_t column_count =
-            static_cast<std::size_t>(snapshot->grid_size.columns);
-        selected_cell_flags.resize(
-            static_cast<std::size_t>(snapshot->grid_size.rows) * column_count,
-            0U);
-        for (const Terminal_render_selection_span& span : snapshot->selection_spans) {
-            const std::size_t first =
-                static_cast<std::size_t>(span.row) * column_count +
-                static_cast<std::size_t>(span.first_column);
-            std::fill_n(
-                selected_cell_flags.begin() + static_cast<std::ptrdiff_t>(first),
-                span.column_count,
-                1U);
-        }
-        // A glyph and its backdrop must cover the same cells because MSDF LCD
-        // reconstruction precomposes against the run's effective background.
-        for (const Terminal_render_snapshot_row_content row : rows) {
-            for (const Terminal_render_cell& cell : row) {
-                if (cell.wide_continuation ||
-                    cell.display_width <= 1 ||
-                    cell.position.row < 0 ||
-                    cell.position.row >= snapshot->grid_size.rows ||
-                    cell.position.column < 0 ||
-                    cell.display_width >
-                        snapshot->grid_size.columns - cell.position.column)
-                {
-                    continue;
-                }
-
-                const std::size_t first =
-                    static_cast<std::size_t>(cell.position.row) * column_count +
-                    static_cast<std::size_t>(cell.position.column);
-                const auto begin =
-                    selected_cell_flags.begin() + static_cast<std::ptrdiff_t>(first);
-                const auto end = begin + cell.display_width;
-                if (std::any_of(
-                        begin,
-                        end,
-                        [](unsigned char flag) { return flag != 0U; }))
-                {
-                    std::fill(begin, end, 1U);
-                }
-            }
-        }
-    }
-
-    std::vector<unsigned char> search_match_cell_flags;
-    if (valid_grid && !snapshot->search_match_spans.empty()) {
-        const std::size_t column_count =
-            static_cast<std::size_t>(snapshot->grid_size.columns);
-        search_match_cell_flags.resize(
-            static_cast<std::size_t>(snapshot->grid_size.rows) * column_count,
-            0U);
-        for (const Terminal_render_search_match_span& span : snapshot->search_match_spans) {
-            const std::size_t first =
-                static_cast<std::size_t>(span.row) * column_count +
-                static_cast<std::size_t>(span.first_column);
-            const unsigned char match_kind = span.current ? 2U : 1U;
-            auto begin =
-                search_match_cell_flags.begin() + static_cast<std::ptrdiff_t>(first);
-            const auto end = begin + span.column_count;
-            std::transform(
-                begin,
-                end,
-                begin,
-                [match_kind](unsigned char existing) {
-                    return std::max(existing, match_kind);
-                });
-        }
-        // A wide glyph is one paint unit even when the literal match touches
-        // only one code unit stored in its base cell.
-        for (const Terminal_render_snapshot_row_content row : rows) {
-            for (const Terminal_render_cell& cell : row) {
-                if (cell.wide_continuation ||
-                    cell.display_width <= 1 ||
-                    cell.position.row < 0 ||
-                    cell.position.row >= snapshot->grid_size.rows ||
-                    cell.position.column < 0 ||
-                    cell.display_width >
-                        snapshot->grid_size.columns - cell.position.column)
-                {
-                    continue;
-                }
-
-                const std::size_t first =
-                    static_cast<std::size_t>(cell.position.row) * column_count +
-                    static_cast<std::size_t>(cell.position.column);
-                auto begin =
-                    search_match_cell_flags.begin() + static_cast<std::ptrdiff_t>(first);
-                const auto end = begin + cell.display_width;
-                const unsigned char match_kind = *std::max_element(begin, end);
-                if (match_kind != 0U) {
-                    std::fill(begin, end, match_kind);
-                }
-            }
-        }
-    }
+    const Cell_state_mask selected_cell_flags = build_cell_state_mask(
+        snapshot->grid_size,
+        rows,
+        snapshot->selection_spans,
+        [](const Terminal_render_selection_span&) {
+            return k_selection_cell_state;
+        },
+        [](unsigned char existing, unsigned char incoming) {
+            return static_cast<unsigned char>(existing != 0U || incoming != 0U);
+        });
+    const Cell_state_mask search_match_cell_flags = build_cell_state_mask(
+        snapshot->grid_size,
+        rows,
+        snapshot->search_match_spans,
+        [](const Terminal_render_search_match_span& span) {
+            return span.current
+                ? k_current_search_match_cell_state
+                : k_search_match_cell_state;
+        },
+        [](unsigned char existing, unsigned char incoming) {
+            return std::max(existing, incoming);
+        });
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::reserve_outputs");
@@ -2239,18 +2275,18 @@ Terminal_render_frame build_terminal_render_frame(
                 }
                 const QColor foreground = selected
                     ? options.selection_foreground
-                    : search_match_kind == 2U
+                    : search_match_kind == k_current_search_match_cell_state
                         ? options.current_search_match_foreground
-                        : search_match_kind == 1U
+                        : search_match_kind == k_search_match_cell_state
                             ? options.search_match_foreground
                             : style.foreground;
                 // This is paint metadata as well as a color: the MSDF LCD path
                 // requires it to equal the framebuffer underneath the glyph.
                 const QColor background = selected
                     ? options.selection_background
-                    : search_match_kind == 2U
+                    : search_match_kind == k_current_search_match_cell_state
                         ? options.current_search_match_background
-                        : search_match_kind == 1U
+                        : search_match_kind == k_search_match_cell_state
                             ? options.search_match_background
                             : style.background;
 
@@ -2515,86 +2551,29 @@ Terminal_render_frame build_terminal_render_frame(
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::search_matches");
 
-        if (!search_match_cell_flags.empty()) {
-            const int column_count = snapshot->grid_size.columns;
-            for (int row = 0; row < snapshot->grid_size.rows; ++row) {
-                int column = 0;
-                while (column < column_count) {
-                    const std::size_t index =
-                        static_cast<std::size_t>(row) *
-                            static_cast<std::size_t>(column_count) +
-                        static_cast<std::size_t>(column);
-                    const unsigned char match_kind = search_match_cell_flags[index];
-                    if (match_kind == 0U) {
-                        ++column;
-                        continue;
-                    }
-
-                    const int first_column = column;
-                    while (column < column_count) {
-                        const std::size_t match_index =
-                            static_cast<std::size_t>(row) *
-                                static_cast<std::size_t>(column_count) +
-                            static_cast<std::size_t>(column);
-                        if (search_match_cell_flags[match_index] != match_kind) {
-                            break;
-                        }
-                        ++column;
-                    }
-                    frame.selection_rects.push_back({
-                        cell_rect(
-                            row,
-                            first_column,
-                            column - first_column,
-                            cell_metrics),
-                        match_kind == 2U
-                            ? options.current_search_match_background
-                            : options.search_match_background,
-                    });
-                }
-            }
-        }
+        append_cell_state_rects(
+            frame.selection_rects,
+            search_match_cell_flags,
+            snapshot->grid_size,
+            cell_metrics,
+            [&options](unsigned char match_kind) {
+                return match_kind == k_current_search_match_cell_state
+                    ? options.current_search_match_background
+                    : options.search_match_background;
+            });
     }
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("build_terminal_render_frame::selection");
 
-        if (!selected_cell_flags.empty()) {
-            const int column_count = snapshot->grid_size.columns;
-            for (int row = 0; row < snapshot->grid_size.rows; ++row) {
-                int column = 0;
-                while (column < column_count) {
-                    const std::size_t index =
-                        static_cast<std::size_t>(row) *
-                            static_cast<std::size_t>(column_count) +
-                        static_cast<std::size_t>(column);
-                    if (selected_cell_flags[index] == 0U) {
-                        ++column;
-                        continue;
-                    }
-
-                    const int first_column = column;
-                    while (column < column_count) {
-                        const std::size_t selected_index =
-                            static_cast<std::size_t>(row) *
-                                static_cast<std::size_t>(column_count) +
-                            static_cast<std::size_t>(column);
-                        if (selected_cell_flags[selected_index] == 0U) {
-                            break;
-                        }
-                        ++column;
-                    }
-                    frame.selection_rects.push_back({
-                        cell_rect(
-                            row,
-                            first_column,
-                            column - first_column,
-                            cell_metrics),
-                        options.selection_background,
-                    });
-                }
-            }
-        }
+        append_cell_state_rects(
+            frame.selection_rects,
+            selected_cell_flags,
+            snapshot->grid_size,
+            cell_metrics,
+            [&options](unsigned char) {
+                return options.selection_background;
+            });
     }
 
     {
