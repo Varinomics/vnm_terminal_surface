@@ -1,4 +1,5 @@
 #include "vnm_terminal/internal/selection_contract.h"
+#include "vnm_terminal/internal/terminal_screen_model.h"
 #include "vnm_terminal/internal/viewport_contract.h"
 #include "helpers/test_check.h"
 
@@ -208,6 +209,32 @@ bool test_coordinate_mapping_and_selection_rows()
     return ok;
 }
 
+bool test_model_continuity_fields_do_not_change_viewport_policy()
+{
+    term::Terminal_viewport_controller viewport;
+    viewport.set_visible_rows(4);
+    viewport.set_scrollback_rows(9);
+    viewport.scroll_lines(3);
+    const term::Terminal_viewport_state before = viewport.state();
+
+    term::Terminal_screen_model_result model_result;
+    model_result.selection_continuity.emplace();
+    const term::terminal_history_handle_t old_handle =
+        term::terminal_history_handle_from_retained_identity(41U, 2U);
+    const term::terminal_history_handle_t final_handle =
+        term::terminal_history_handle_from_retained_identity(73U, 2U);
+    model_result.selection_continuity->
+        successors_by_old_retained_line_id[old_handle.row_sequence].push_back(
+            {old_handle, final_handle, 5, 6, 1});
+
+    return check(viewport.state().active_buffer == before.active_buffer &&
+            viewport.state().scrollback_rows == before.scrollback_rows &&
+            viewport.state().visible_rows == before.visible_rows &&
+            viewport.state().offset_from_tail == before.offset_from_tail &&
+            viewport.state().follow_tail == before.follow_tail,
+        "model continuity result fields alone do not change viewport policy");
+}
+
 }
 
 int main()
@@ -217,5 +244,6 @@ int main()
     ok &= test_page_scroll_and_bounds();
     ok &= test_alternate_screen_policy_and_restore();
     ok &= test_coordinate_mapping_and_selection_rows();
+    ok &= test_model_continuity_fields_do_not_change_viewport_policy();
     return ok ? 0 : 1;
 }

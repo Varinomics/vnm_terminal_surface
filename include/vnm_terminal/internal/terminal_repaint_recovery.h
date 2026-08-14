@@ -17,6 +17,33 @@ struct terminal_repaint_recovery_shift_input_t
     bool                 explicit_non_home_repaint_address = false;
 };
 
+enum class Terminal_repaint_recovery_match_kind
+{
+    NONE,
+    FULL,
+    PARTIAL,
+};
+
+enum class Terminal_repaint_recovery_rejection_kind
+{
+    NONMATCHING,
+    REPEATED_ROW_AMBIGUOUS,
+};
+
+struct terminal_repaint_recovery_shift_result_t
+{
+    int                                         shifted_rows = 0;
+    int                                         matched_prefix_rows = 0;
+    int                                         unmatched_tail_rows = 0;
+    Terminal_repaint_recovery_match_kind        match_kind =
+        Terminal_repaint_recovery_match_kind::NONE;
+    Terminal_repaint_recovery_rejection_kind    rejection_kind =
+        Terminal_repaint_recovery_rejection_kind::NONMATCHING;
+};
+
+terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
+    const terminal_repaint_recovery_shift_input_t& input);
+
 int primary_repaint_recovery_shift_rows(
     const terminal_repaint_recovery_shift_input_t& input);
 

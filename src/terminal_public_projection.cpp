@@ -788,9 +788,13 @@ void Terminal_public_viewport_controller::invalidate(
     Terminal_public_projection_disable_reason reason,
     Terminal_public_scroll_diagnostic_reason  diagnostic_reason)
 {
-    if (!m_release_intent.has_public_viewport ||
-        !m_release_intent.public_projection_valid)
-    {
+    if (!m_release_intent.has_public_viewport) {
+        return;
+    }
+    if (reason == Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED) {
+        m_release_intent.geometry_invalidated = true;
+    }
+    if (!m_release_intent.public_projection_valid) {
         return;
     }
 

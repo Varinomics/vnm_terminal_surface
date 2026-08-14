@@ -1230,6 +1230,7 @@ bool test_hyperlink_compaction_remaps_primary_repaint_recovery_candidate()
     const term::Terminal_screen_model_result recovery_result =
         model.ingest(QByteArrayLiteral("\x1b[?25h"));
     ok &= check(recovery_result.recovery_proposals.size() == 1U &&
+            recovery_result.selection_continuity.has_value() &&
             model.scrollback_size() == 1,
         "primary-repaint candidate compaction still accepts recovered row");
 
@@ -1238,6 +1239,8 @@ bool test_hyperlink_compaction_remaps_primary_repaint_recovery_candidate()
     ok &= check(term::validate_render_snapshot(recovered_snapshot).status ==
         term::Terminal_render_snapshot_status::OK,
         "primary-repaint candidate compaction recovered snapshot validates");
+    ok &= check(recovered_snapshot.selection_spans.empty(),
+        "model continuity evidence alone emits no render selection spans");
 
     const term::Terminal_render_cell* recovered_cell =
         cell_with_text(recovered_snapshot, QStringLiteral("a"));

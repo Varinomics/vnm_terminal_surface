@@ -67,8 +67,9 @@ the repository without reading every implementation detail.
   hold/release machine, the scroll policies during a hold, and the
   stale-hold recovery path.
 - [Selection and provenance](selection_and_provenance.md) records the
-  selection state machine, row-identity leases, snapshot projection, and
-  text extraction.
+  selection state machine, exact row-identity attachment and reconciliation,
+  synchronized-output and resize boundaries, snapshot projection, and text
+  extraction.
 - [Search and scrollback](search_and_scrollback.md) records literal match
   semantics, public result state, safe-source rules, and match identity.
 
