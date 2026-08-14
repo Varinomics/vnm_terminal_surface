@@ -121,6 +121,26 @@ std::vector<const term::Terminal_render_text_run*> text_runs_for_row(
     return runs;
 }
 
+bool render_rect_sequences_match(
+    const std::vector<term::Terminal_render_rect>& actual,
+    const std::vector<term::Terminal_render_rect>& expected)
+{
+    if (actual.size() != expected.size()) {
+        return false;
+    }
+
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        if (actual[index].rect      != expected[index].rect  ||
+            actual[index].color     != expected[index].color ||
+            actual[index].antialias != expected[index].antialias)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool has_graphic_rect(
     const term::Terminal_render_frame& frame,
     const QRectF&                      rect)
@@ -1199,6 +1219,156 @@ bool test_search_matches_use_distinct_styles_and_selection_precedence()
     return ok;
 }
 
+bool test_overlay_cell_masks_preserve_geometry_and_order()
+{
+    term::Terminal_render_snapshot snapshot = empty_snapshot({3, 6});
+    snapshot.cursor.visible = false;
+    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
+    snapshot.cells.push_back({.position = {0, 1}, .text = QStringLiteral("B")});
+    snapshot.cells.push_back({.position = {0, 2}, .text = QStringLiteral("C")});
+    snapshot.cells.push_back({.position = {0, 3}, .text = QStringLiteral("D")});
+    snapshot.cells.push_back({.position = {0, 4}, .text = QStringLiteral("E")});
+    snapshot.cells.push_back({
+        .position      = {1, 1},
+        .text          = QStringLiteral("\u754c"),
+        .display_width = 2,
+    });
+    snapshot.cells.push_back({
+        .position          = {1, 2},
+        .display_width     = 0,
+        .wide_continuation = true,
+    });
+
+    snapshot.search_match_spans.push_back({0, 0, 4, false});
+    snapshot.search_match_spans.push_back({0, 1, 2, true});
+    snapshot.search_match_spans.push_back({1, 0, 1, false});
+    snapshot.search_match_spans.push_back({1, 2, 1, false});
+    snapshot.search_match_spans.push_back({2, 0, 1, false});
+    snapshot.search_match_spans.push_back({2, 1, 1, false});
+    snapshot.selection_spans.push_back({
+        {{0, 2}, {0, 3}, term::Terminal_selection_mode::NORMAL},
+        0,
+        2,
+        1,
+    });
+    snapshot.selection_spans.push_back({
+        {{1, 1}, {1, 2}, term::Terminal_selection_mode::NORMAL},
+        1,
+        1,
+        1,
+    });
+    snapshot.selection_spans.push_back({
+        {{2, 3}, {2, 4}, term::Terminal_selection_mode::NORMAL},
+        2,
+        3,
+        1,
+    });
+    snapshot.selection_spans.push_back({
+        {{2, 4}, {2, 5}, term::Terminal_selection_mode::NORMAL},
+        2,
+        4,
+        1,
+    });
+
+    term::Terminal_render_options render_options = options();
+    render_options.search_match_background         = QColor(80, 60, 20);
+    render_options.search_match_foreground         = QColor(250, 240, 210);
+    render_options.current_search_match_background = QColor(230, 160, 30);
+    render_options.current_search_match_foreground = QColor(20, 15, 5);
+    render_options.selection_background            = QColor(40, 100, 170);
+    render_options.selection_foreground            = QColor(255, 255, 255);
+
+    const term::Terminal_render_frame frame = build(snapshot, render_options);
+    const std::vector<term::Terminal_render_rect> expected_overlay_rects = {
+        {QRectF( 0.0,  0.0, 10.0, 20.0), render_options.search_match_background},
+        {QRectF(10.0,  0.0, 20.0, 20.0), render_options.current_search_match_background},
+        {QRectF(30.0,  0.0, 10.0, 20.0), render_options.search_match_background},
+        {QRectF( 0.0, 20.0, 30.0, 20.0), render_options.search_match_background},
+        {QRectF( 0.0, 40.0, 20.0, 20.0), render_options.search_match_background},
+        {QRectF(20.0,  0.0, 10.0, 20.0), render_options.selection_background},
+        {QRectF(10.0, 20.0, 20.0, 20.0), render_options.selection_background},
+        {QRectF(30.0, 40.0, 20.0, 20.0), render_options.selection_background},
+    };
+
+    bool ok = true;
+    ok &= check(
+        render_rect_sequences_match(frame.selection_rects, expected_overlay_rects),
+        "search and selection emit complete row-local geometry, colors, and order");
+
+    const term::Terminal_render_text_run* const ordinary_match = run_at(frame, 0, 0);
+    const term::Terminal_render_text_run* const current_match  = run_at(frame, 0, 1);
+    const term::Terminal_render_text_run* const selected_match = run_at(frame, 0, 2);
+    const term::Terminal_render_text_run* const unmatched      = run_at(frame, 0, 4);
+    const term::Terminal_render_text_run* const wide_match     = run_at(frame, 1, 1);
+    ok &= check(
+        ordinary_match != nullptr &&
+            ordinary_match->foreground == render_options.search_match_foreground &&
+            ordinary_match->background == render_options.search_match_background &&
+            current_match != nullptr &&
+            current_match->foreground == render_options.current_search_match_foreground &&
+            current_match->background == render_options.current_search_match_background &&
+            selected_match != nullptr &&
+            selected_match->foreground == render_options.selection_foreground &&
+            selected_match->background == render_options.selection_background &&
+            wide_match != nullptr &&
+            wide_match->foreground == render_options.selection_foreground &&
+            wide_match->background == render_options.selection_background &&
+            unmatched != nullptr &&
+            unmatched->foreground == render_options.default_foreground &&
+            unmatched->background == render_options.default_background,
+        "mask states preserve search rank, selection precedence, wide glyph style, and defaults");
+    return ok;
+}
+
+bool test_wide_search_match_uses_highest_cell_state()
+{
+    term::Terminal_render_snapshot snapshot = empty_snapshot({1, 5});
+    snapshot.cursor.visible = false;
+    snapshot.cells.push_back({.position = {0, 0}, .text = QStringLiteral("A")});
+    snapshot.cells.push_back({
+        .position      = {0, 1},
+        .text          = QStringLiteral("\u754c"),
+        .display_width = 2,
+    });
+    snapshot.cells.push_back({
+        .position          = {0, 2},
+        .display_width     = 0,
+        .wide_continuation = true,
+    });
+    snapshot.search_match_spans.push_back({0, 0, 3, false});
+    snapshot.search_match_spans.push_back({0, 2, 1, true});
+
+    term::Terminal_render_options render_options = options();
+    render_options.search_match_background         = QColor(80, 60, 20);
+    render_options.search_match_foreground         = QColor(250, 240, 210);
+    render_options.current_search_match_background = QColor(230, 160, 30);
+    render_options.current_search_match_foreground = QColor(20, 15, 5);
+
+    const term::Terminal_render_frame frame = build(snapshot, render_options);
+    const std::vector<term::Terminal_render_rect> expected_overlay_rects = {
+        {QRectF( 0.0, 0.0, 10.0, 20.0), render_options.search_match_background},
+        {QRectF(10.0, 0.0, 20.0, 20.0), render_options.current_search_match_background},
+    };
+
+    bool ok = true;
+    ok &= check(
+        render_rect_sequences_match(frame.selection_rects, expected_overlay_rects),
+        "a current match on a wide continuation governs complete wide overlay geometry and order");
+
+    const term::Terminal_render_text_run* const ordinary_match = run_at(frame, 0, 0);
+    const term::Terminal_render_text_run* const wide_match     = run_at(frame, 0, 1);
+    ok &= check(
+        ordinary_match != nullptr &&
+            ordinary_match->foreground == render_options.search_match_foreground &&
+            ordinary_match->background == render_options.search_match_background &&
+            wide_match != nullptr &&
+            wide_match->rect == QRectF(10.0, 0.0, 20.0, 20.0) &&
+            wide_match->foreground == render_options.current_search_match_foreground &&
+            wide_match->background == render_options.current_search_match_background,
+        "the highest search state styles the complete wide glyph across base and continuation cells");
+    return ok;
+}
+
 bool test_terminal_render_cursor_visible_truth_table()
 {
     bool ok = true;
@@ -1309,13 +1479,20 @@ bool test_zero_grid_and_preedit_width()
     zero_grid.cursor.visible                 = true;
     zero_grid.ime_preedit.active             = true;
     zero_grid.ime_preedit.text               = QStringLiteral("\u754c");
+    zero_grid.search_match_spans.push_back({0, 0, 1, false});
+    zero_grid.selection_spans.push_back({
+        {{0, 0}, {0, 1}, term::Terminal_selection_mode::NORMAL},
+        0,
+        0,
+        1,
+    });
     term::Terminal_render_frame frame = build(zero_grid);
     ok &= check(frame.text_runs.empty() &&
         frame.selection_rects.empty() &&
         frame.decorations.empty() &&
         frame.cursors.empty() &&
         frame.row_descriptors.empty(),
-        "zero-grid active preedit creates no primitives");
+        "zero-grid preedit and overlays create no primitives");
 
     term::Terminal_render_snapshot snapshot = empty_snapshot({2, 8});
     snapshot.cursor.position              = {0, 1};
@@ -2866,6 +3043,8 @@ int main()
     ok &= test_selection_cursor_blink_and_shapes();
     ok &= test_selection_applies_contrasting_cell_style();
     ok &= test_search_matches_use_distinct_styles_and_selection_precedence();
+    ok &= test_overlay_cell_masks_preserve_geometry_and_order();
+    ok &= test_wide_search_match_uses_highest_cell_state();
     ok &= test_terminal_render_cursor_visible_truth_table();
     ok &= test_decorations_preedit_hyperlink_and_bell();
     ok &= test_zero_grid_and_preedit_width();

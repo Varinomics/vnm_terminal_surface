@@ -13,21 +13,22 @@ bool row_has_visible_text(const QString& row)
 
 }
 
-int primary_repaint_recovery_shift_rows(
+terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift_result(
     const terminal_repaint_recovery_shift_input_t& input)
 {
+    terminal_repaint_recovery_shift_result_t result;
     if (!input.candidate_active              ||
         !input.primary_buffer_active         ||
         !input.scrollback_rows_unchanged     ||
         input.candidate_rows.size() != input.current_rows.size())
     {
-        return 0;
+        return result;
     }
 
     if (input.line_start_clear_before_text &&
         input.explicit_non_home_repaint_address)
     {
-        return 0;
+        return result;
     }
 
     constexpr int k_min_meaningful_matches                 = 2;
@@ -38,6 +39,8 @@ int primary_repaint_recovery_shift_rows(
     int best_shift              = 0;
     int best_meaningful_matches = 0;
     int best_matched_prefix     = 0;
+    bool best_full_match         = false;
+    bool repeated_row_ambiguity  = false;
 
     for (int shift = 1; shift < row_count; ++shift) {
         bool displaced_has_text = false;
@@ -86,6 +89,11 @@ int primary_repaint_recovery_shift_rows(
             ++matched_prefix;
         }
 
+        if (meaningful_matches >= k_min_meaningful_matches &&
+            static_cast<int>(distinct_matched_texts.size()) < k_min_meaningful_matches)
+        {
+            repeated_row_ambiguity = true;
+        }
         if (meaningful_matches < required_meaningful_matches ||
             static_cast<int>(distinct_matched_texts.size()) < k_min_meaningful_matches)
         {
@@ -125,10 +133,29 @@ int primary_repaint_recovery_shift_rows(
             best_meaningful_matches = meaningful_matches;
             best_matched_prefix     = matched_prefix;
             best_shift              = shift;
+            best_full_match         = full_surviving_suffix_matched;
         }
     }
 
-    return best_shift;
+    result.shifted_rows = best_shift;
+    if (best_shift > 0) {
+        result.matched_prefix_rows = best_matched_prefix;
+        result.unmatched_tail_rows = row_count - best_shift - best_matched_prefix;
+        result.match_kind = best_full_match
+            ? Terminal_repaint_recovery_match_kind::FULL
+            : Terminal_repaint_recovery_match_kind::PARTIAL;
+    }
+    else if (repeated_row_ambiguity) {
+        result.rejection_kind =
+            Terminal_repaint_recovery_rejection_kind::REPEATED_ROW_AMBIGUOUS;
+    }
+    return result;
+}
+
+int primary_repaint_recovery_shift_rows(
+    const terminal_repaint_recovery_shift_input_t& input)
+{
+    return primary_repaint_recovery_shift_result(input).shifted_rows;
 }
 
 } // namespace vnm_terminal::internal

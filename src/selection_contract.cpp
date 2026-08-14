@@ -93,7 +93,7 @@ void Selection_contract_controller::set_range(Terminal_selection_range range)
     clear_payload_identity();
     clear_visual_lease();
     m_anchor_domain  = Terminal_selection_anchor_domain::UNRESOLVED_ACTIVE_GRID;
-    m_internal_state = Terminal_selection_internal_state::ATTACHED_VISIBLE;
+    m_internal_state = Terminal_selection_internal_state::ATTACHED;
     m_has_selection  = true;
 }
 
@@ -122,18 +122,6 @@ void Selection_contract_controller::set_range(
     }
 }
 
-void Selection_contract_controller::hide_visual_attachment()
-{
-    if (!m_has_selection || !m_selected_text.has_value()) {
-        return;
-    }
-
-    m_internal_state =
-        m_visual_lease.has_value()
-            ? Terminal_selection_internal_state::ATTACHED_HIDDEN
-            : Terminal_selection_internal_state::PAYLOAD_ONLY;
-}
-
 void Selection_contract_controller::detach_visual_attachment()
 {
     clear_visual_lease();
@@ -156,22 +144,16 @@ void Selection_contract_controller::detach_visual_attachment()
     }
 }
 
-void Selection_contract_controller::update_visual_lease_source(
-    terminal_selection_content_basis_t source_content_basis,
-    std::uint64_t                      grid_reflow_basis,
-    std::uint64_t                      row_origin_generation,
-    terminal_grid_size_t               grid_size,
-    const Terminal_viewport_state&     viewport_mapping)
+void Selection_contract_controller::install_translated_attachment(
+    Terminal_selection_range          range,
+    terminal_selection_visual_lease_t visual_lease)
 {
-    if (!m_visual_lease.has_value()) {
+    if (!m_has_selection || !m_selected_text.has_value()) {
         return;
     }
 
-    m_visual_lease->source_content_basis  = source_content_basis;
-    m_visual_lease->grid_reflow_basis     = grid_reflow_basis;
-    m_visual_lease->row_origin_generation = row_origin_generation;
-    m_visual_lease->grid_size             = grid_size;
-    m_visual_lease->viewport_mapping      = viewport_mapping;
+    m_range = range;
+    record_visual_lease(std::move(visual_lease));
 }
 
 Terminal_selection_result Selection_contract_controller::selected_text() const
@@ -275,7 +257,7 @@ void Selection_contract_controller::record_visual_lease(
     visual_lease.extent                        = m_range.end;
     visual_lease.durable_payload_identity      = m_durable_payload_identity;
     visual_lease.provisional_payload_identity  = m_provisional_payload_identity;
-    m_internal_state                           = Terminal_selection_internal_state::ATTACHED_VISIBLE;
+    m_internal_state                           = Terminal_selection_internal_state::ATTACHED;
     m_anchor_domain                            = visual_lease.anchor_domain;
     m_visual_lease                             = visual_lease;
 }

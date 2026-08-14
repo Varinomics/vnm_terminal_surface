@@ -131,6 +131,14 @@ provenance is invalid, and producers use
 than publish an inconsistent snapshot. Each span must lie inside the grid
 (`INVALID_SELECTION_SPAN`).
 
+The session emits spans only from an attached lease that passed the model's
+complete retained-row proof. An unchanged-column height resize may therefore
+publish translated spans when the selected handles and endpoints remain exact;
+width reflow, an incompatible buffer, or any missing or mutated selected row
+suppresses spans and leaves only the retained selection payload. Replacement
+session initialization is stronger than an attachment-proof failure: it clears
+both the attachment and payload while advancing the selection epoch.
+
 Search match spans have the same provenance requirement but remain a separate
 overlay contract. Each `Terminal_render_search_match_span` lies within one
 visible row, identifies its column extent, and marks whether it is the current

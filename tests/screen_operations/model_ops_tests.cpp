@@ -209,6 +209,84 @@ bool grid_size_equal(
     return left.rows == right.rows && left.columns == right.columns;
 }
 
+term::terminal_selection_source_identity_t selection_source_for_model(
+    const term::Terminal_screen_model& model,
+    std::uint64_t                     session_epoch = 7U)
+{
+    term::terminal_selection_source_identity_t source;
+    source.source_content_basis  = {11U, 13U};
+    source.anchor_domain         = model.active_buffer_id() ==
+            term::Terminal_buffer_id::PRIMARY
+        ? term::Terminal_selection_anchor_domain::PRIMARY_BACKING
+        : term::Terminal_selection_anchor_domain::ALTERNATE_ACTIVE_GRID;
+    source.session_epoch         = session_epoch;
+    source.buffer_id             = model.active_buffer_id();
+    source.grid_reflow_basis     = 13U;
+    source.row_origin_generation = 17U;
+    source.grid_size             = model.grid_size();
+    source.viewport_mapping.active_buffer   = model.active_buffer_id();
+    source.viewport_mapping.visible_rows    = model.grid_size().rows;
+    source.viewport_mapping.scrollback_rows = model.scrollback_size();
+    return source;
+}
+
+term::terminal_selection_visual_lease_t selection_lease_for_range(
+    const term::Terminal_screen_model&             model,
+    term::Terminal_selection_range                 range,
+    term::terminal_selection_source_identity_t     source)
+{
+    term::terminal_selection_visual_lease_t lease;
+    lease.source_content_basis  = source.source_content_basis;
+    lease.anchor_domain         = source.anchor_domain;
+    lease.session_epoch         = source.session_epoch;
+    lease.buffer_id             = source.buffer_id;
+    lease.grid_reflow_basis     = source.grid_reflow_basis;
+    lease.row_origin_generation = source.row_origin_generation;
+    lease.grid_size             = source.grid_size;
+    lease.viewport_mapping      = source.viewport_mapping;
+    lease.selected_range        = range;
+    lease.anchor                = range.start;
+    lease.extent                = range.end;
+    lease.selected_lines = model.selection_line_leases(source.buffer_id, range);
+    return lease;
+}
+
+std::vector<term::terminal_selection_line_successor_t> continuity_successors(
+    const term::Terminal_screen_model_result& result)
+{
+    std::vector<term::terminal_selection_line_successor_t> successors;
+    if (!result.selection_continuity.has_value()) {
+        return successors;
+    }
+    for (const auto& [old_retained_line_id, entries] :
+        result.selection_continuity->successors_by_old_retained_line_id)
+    {
+        static_cast<void>(old_retained_line_id);
+        successors.insert(successors.end(), entries.begin(), entries.end());
+    }
+    return successors;
+}
+
+const term::terminal_selection_line_successor_t* successor_for_old_handle(
+    const term::Terminal_screen_model_result& result,
+    term::terminal_history_handle_t           old_handle)
+{
+    if (!result.selection_continuity.has_value()) {
+        return nullptr;
+    }
+    const auto found =
+        result.selection_continuity->successors_by_old_retained_line_id.find(
+            old_handle.row_sequence);
+    if (found ==
+            result.selection_continuity->successors_by_old_retained_line_id.end() ||
+        found->second.size() != 1U ||
+        found->second.front().old_handle != old_handle)
+    {
+        return nullptr;
+    }
+    return &found->second.front();
+}
+
 bool single_active_grid_backing_delta_equal(
     const std::vector<term::terminal_backing_delta_t>& deltas,
     term::Terminal_backing_delta_kind                  kind,
@@ -986,8 +1064,23 @@ bool test_primary_repaint_recovery_accepts_distinct_shift()
                 term::Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT &&
             result.recovery_proposals[0].candidate_visible_rows == 4 &&
             result.recovery_proposals[0].recovered_row_count == 1 &&
+            result.recovery_proposals[0].matched_prefix_rows == 3 &&
+            result.recovery_proposals[0].unmatched_tail_rows == 0 &&
             result.recovery_proposals[0].visible_row_identity_ambiguous,
         "recovery records accepted proposal metadata");
+    const std::vector<term::terminal_selection_line_successor_t> successors =
+        continuity_successors(result);
+    ok &= check(result.selection_continuity.has_value() &&
+            successors.size() == 4U &&
+            result.selection_continuity->survivor_proofs.size() == 4U &&
+            std::all_of(
+                result.selection_continuity->survivor_proofs.begin(),
+                result.selection_continuity->survivor_proofs.end(),
+                [](const term::terminal_selection_survivor_proof_t& proof) {
+                    return proof.result ==
+                        term::Terminal_selection_survivor_proof_result::EXACT;
+                }),
+        "full recovery publishes exact recovered-copy and matched-survivor proofs");
     ok &= check(model.row_text(0) == QStringLiteral("bb") &&
             model.row_text(1) == QStringLiteral("cc") &&
             model.row_text(2) == QStringLiteral("dd") &&
@@ -1075,17 +1168,20 @@ bool test_primary_repaint_recovery_preserves_row_content_stamps()
             written_stamps[0],
         "recovered scrollback row preserves its original content stamp");
 
-    // The repainted active rows were rebased onto fresh retained ids after
-    // the accepted recovery. Each still shows real output written during the
-    // repaint, so each must keep a stamp from the repaint ingest window;
-    // zero would suppress the row-timestamp tooltip for the whole viewport.
-    for (int row = 0; row < 4; ++row) {
+    // Exact matched survivors retain the predecessor's non-identity provenance
+    // on their fresh final ids. Only the newly exposed tail is replacement
+    // content and therefore keeps its repaint-window stamp.
+    for (int row = 0; row < 3; ++row) {
         const qint64 stamp_ms =
             primary_retained_line_provenance(model, 1 + row).content_stamp_ms;
         ok &= check(
-            stamp_ms >= repaint_start_ms && stamp_ms <= repaint_end_ms,
-            "rebased active row keeps its repaint-window content stamp");
+            stamp_ms == written_stamps[static_cast<std::size_t>(row + 1)],
+            "exact survivor transfers predecessor content stamp to fresh id");
     }
+    const qint64 tail_stamp_ms =
+        primary_retained_line_provenance(model, 4).content_stamp_ms;
+    ok &= check(tail_stamp_ms >= repaint_start_ms && tail_stamp_ms <= repaint_end_ms,
+        "new recovery tail keeps its repaint-window content stamp");
 
     return ok;
 }
@@ -1250,8 +1346,23 @@ bool test_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_t
                 term::Terminal_recovery_proposal_reason::PRIMARY_REPAINT_SHIFTED_VISIBLE_ROWS &&
             result.recovery_proposals[0].status ==
                 term::Terminal_recovery_proposal_status::ACCEPTED &&
-            result.recovery_proposals[0].recovered_row_count == 1,
+            result.recovery_proposals[0].recovered_row_count == 1 &&
+            result.recovery_proposals[0].matched_prefix_rows == 3 &&
+            result.recovery_proposals[0].unmatched_tail_rows == 2,
         "recovery accepts the strong partial blank-shift proposal");
+    const std::vector<term::terminal_selection_line_successor_t> successors =
+        continuity_successors(result);
+    const auto unmatched_tail_proofs = std::count_if(
+        result.selection_continuity->survivor_proofs.begin(),
+        result.selection_continuity->survivor_proofs.end(),
+        [](const term::terminal_selection_survivor_proof_t& proof) {
+            return proof.result ==
+                term::Terminal_selection_survivor_proof_result::UNMATCHED_TAIL;
+        });
+    ok &= check(result.selection_continuity.has_value() &&
+            successors.size() == 4U &&
+            unmatched_tail_proofs == 2,
+        "partial recovery publishes only recovered and matched-prefix successors");
     ok &= check(model.row_text(0) == QStringLiteral("bb") &&
             model.row_text(1) == QStringLiteral("cc") &&
             model.row_text(2) == QStringLiteral("dd") &&
@@ -1268,6 +1379,403 @@ bool test_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_t
             snapshot_row_text(scrollback_snapshot, 3) == QStringLiteral("dd"),
         "recovery exposes the partial-match recovered blank through primary backing");
 
+    return ok;
+}
+
+bool test_primary_repaint_recovery_selection_proof_matrix()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model no_advance =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    no_advance.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"), QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"), QByteArrayLiteral("dd"),
+    }, false));
+    const term::terminal_selection_source_identity_t no_advance_source =
+        selection_source_for_model(no_advance);
+    const term::Terminal_selection_range row_one{{1, 0}, {1, 2},
+        term::Terminal_selection_mode::NORMAL};
+    const term::terminal_selection_visual_lease_t no_advance_lease =
+        selection_lease_for_range(no_advance, row_one, no_advance_source);
+    const std::uint64_t no_advance_generation =
+        no_advance_lease.selected_lines.front().history_handle.content_generation;
+    no_advance.ingest(QByteArrayLiteral("\x1b[2;1Hbb"));
+    const std::vector<term::terminal_selection_line_lease_t> unchanged_line =
+        no_advance.selection_line_leases(
+            term::Terminal_buffer_id::PRIMARY,
+            row_one);
+    ok &= check(unchanged_line.size() == 1U &&
+            unchanged_line.front().history_handle.content_generation ==
+                no_advance_generation,
+        "content-identical write does not advance the predecessor generation");
+    const term::Terminal_screen_model_result no_advance_result = no_advance.ingest(
+        visible_row_write_stream({
+            QByteArrayLiteral("bb"), QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"), QByteArrayLiteral("ee"),
+        }, true));
+    const term::Terminal_selection_attachment_resolution no_advance_resolution =
+        no_advance.resolve_selection_attachment(
+            no_advance_lease,
+            no_advance_source,
+            no_advance_result);
+    ok &= check(successor_for_old_handle(
+            no_advance_result,
+            no_advance_lease.selected_lines.front().history_handle) != nullptr &&
+            no_advance_resolution.status ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED,
+        "content-identical predecessor receives an exact successor");
+
+    term::Terminal_screen_model changed =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    changed.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"), QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"), QByteArrayLiteral("dd"),
+    }, false));
+    const term::terminal_selection_source_identity_t changed_source =
+        selection_source_for_model(changed);
+    const term::terminal_selection_visual_lease_t changed_lease =
+        selection_lease_for_range(changed, row_one, changed_source);
+    changed.ingest(QByteArrayLiteral(
+        "\x1b[2;1H\x1b[Kxx\x1b[2;1H\x1b[Kbb"));
+    const std::vector<term::terminal_selection_line_lease_t> rewritten_line =
+        changed.selection_line_leases(term::Terminal_buffer_id::PRIMARY, row_one);
+    ok &= check(rewritten_line.size() == 1U &&
+            rewritten_line.front().history_handle.row_sequence ==
+                changed_lease.selected_lines.front().history_handle.row_sequence &&
+            rewritten_line.front().history_handle.content_generation >
+                changed_lease.selected_lines.front().history_handle.content_generation,
+        "actual erase-and-rewrite advances predecessor generation while restoring text");
+    const term::Terminal_screen_model_result changed_result = changed.ingest(
+        visible_row_write_stream({
+            QByteArrayLiteral("bb"), QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"), QByteArrayLiteral("ee"),
+        }, true));
+    const term::Terminal_selection_attachment_resolution changed_resolution =
+        changed.resolve_selection_attachment(
+            changed_lease,
+            changed_source,
+            changed_result);
+    ok &= check(successor_for_old_handle(
+            changed_result,
+            changed_lease.selected_lines.front().history_handle) == nullptr &&
+            changed_resolution.status ==
+                term::Terminal_selection_attachment_resolution_status::
+                    CONTENT_GENERATION_MISMATCH,
+        "same text with changed predecessor generation fails closed without an edge");
+
+    term::Terminal_screen_model representation =
+        make_recovery_enabled_primary_repaint_model(6, 12, 12);
+    representation.ingest(visible_row_write_stream({
+        QByteArray(), QByteArrayLiteral("bb"), QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"), QByteArray(), QByteArrayLiteral("tail"),
+    }, false));
+    const term::Terminal_screen_model_result representation_result =
+        representation.ingest(visible_row_write_stream({
+            QByteArrayLiteral("bb"), QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"), QByteArrayLiteral(" "),
+            QByteArrayLiteral("tail"), QByteArrayLiteral("new"),
+        }, true));
+    const bool has_representation_mismatch =
+        representation_result.selection_continuity.has_value() &&
+        std::any_of(
+            representation_result.selection_continuity->survivor_proofs.begin(),
+            representation_result.selection_continuity->survivor_proofs.end(),
+            [](const term::terminal_selection_survivor_proof_t& proof) {
+                return proof.result ==
+                    term::Terminal_selection_survivor_proof_result::
+                        REPRESENTATION_MISMATCH;
+            });
+    ok &= check(has_representation_mismatch,
+        "equal trimmed QString with different occupied-cell representation has no successor");
+
+    term::Terminal_screen_model unavailable =
+        make_recovery_enabled_primary_repaint_model(4, 8, 0);
+    unavailable.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"), QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"), QByteArrayLiteral("dd"),
+    }, false));
+    const term::terminal_selection_source_identity_t unavailable_source =
+        selection_source_for_model(unavailable);
+    const term::Terminal_selection_range row_zero{{0, 0}, {0, 2},
+        term::Terminal_selection_mode::NORMAL};
+    const term::terminal_selection_visual_lease_t unavailable_lease =
+        selection_lease_for_range(unavailable, row_zero, unavailable_source);
+    const term::Terminal_screen_model_result unavailable_result = unavailable.ingest(
+        visible_row_write_stream({
+            QByteArrayLiteral("bb"), QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"), QByteArrayLiteral("ee"),
+        }, true));
+    const term::Terminal_selection_attachment_resolution unavailable_resolution =
+        unavailable.resolve_selection_attachment(
+            unavailable_lease,
+            unavailable_source,
+            unavailable_result);
+    ok &= check(unavailable_result.selection_continuity.has_value() &&
+            std::any_of(
+                unavailable_result.selection_continuity->survivor_proofs.begin(),
+                unavailable_result.selection_continuity->survivor_proofs.end(),
+                [](const term::terminal_selection_survivor_proof_t& proof) {
+                    return proof.result ==
+                        term::Terminal_selection_survivor_proof_result::PROOF_UNAVAILABLE;
+                }) &&
+            unavailable_resolution.status ==
+                term::Terminal_selection_attachment_resolution_status::MISSING_LINE,
+        "unavailable recovered-copy proof emits no edge and resolves fail closed");
+
+    return ok;
+}
+
+bool test_model_selection_attachment_resolver_matrix()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model(5, 8, 8);
+    model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"), QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"), QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+    }, false));
+    const term::terminal_selection_source_identity_t source =
+        selection_source_for_model(model);
+    const term::Terminal_selection_range range{{1, 1}, {2, 2},
+        term::Terminal_selection_mode::NORMAL};
+    const term::terminal_selection_visual_lease_t lease =
+        selection_lease_for_range(model, range, source);
+    const term::Terminal_screen_model_result empty_publication;
+
+    const auto resolve = [&](const term::terminal_selection_visual_lease_t& input,
+                             const term::terminal_selection_source_identity_t& target,
+                             const term::Terminal_screen_model_result& publication) {
+        return model.resolve_selection_attachment(input, target, publication);
+    };
+    const term::Terminal_selection_attachment_resolution stable =
+        resolve(lease, source, empty_publication);
+    ok &= check(stable.status ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            stable.translated_lease.has_value() &&
+            stable.row_deltas == std::vector<int>({0, 0}) &&
+            stable.translated_lease->selected_lines == lease.selected_lines,
+        "ordinary stable IDs resolve with zero uniform delta without a capability");
+
+    term::terminal_selection_visual_lease_t positive = lease;
+    --positive.selected_range.start.row;
+    --positive.selected_range.end.row;
+    --positive.anchor.row;
+    --positive.extent.row;
+    const term::Terminal_selection_attachment_resolution positive_result =
+        resolve(positive, source, empty_publication);
+    ok &= check(positive_result.status ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            positive_result.row_deltas == std::vector<int>({1, 1}),
+        "resolver accepts a positive uniform delta");
+
+    term::terminal_selection_visual_lease_t negative = lease;
+    ++negative.selected_range.start.row;
+    ++negative.selected_range.end.row;
+    ++negative.anchor.row;
+    ++negative.extent.row;
+    const term::Terminal_selection_attachment_resolution negative_result =
+        resolve(negative, source, empty_publication);
+    ok &= check(negative_result.status ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            negative_result.row_deltas == std::vector<int>({-1, -1}),
+        "resolver accepts a negative uniform delta");
+
+    term::terminal_selection_source_identity_t wrong_source = source;
+    wrong_source.anchor_domain = term::Terminal_selection_anchor_domain::PAYLOAD_ONLY;
+    ok &= check(resolve(lease, wrong_source, empty_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::SOURCE_MISMATCH,
+        "resolver names source mismatch");
+    wrong_source = source;
+    wrong_source.buffer_id = term::Terminal_buffer_id::ALTERNATE;
+    ok &= check(resolve(lease, wrong_source, empty_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::BUFFER_MISMATCH,
+        "resolver names buffer mismatch");
+    wrong_source = source;
+    ++wrong_source.session_epoch;
+    ok &= check(resolve(lease, wrong_source, empty_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::EPOCH_MISMATCH,
+        "resolver names epoch mismatch");
+    wrong_source = source;
+    ++wrong_source.grid_reflow_basis;
+    ok &= check(resolve(lease, wrong_source, empty_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH,
+        "resolver names grid-reflow mismatch");
+    wrong_source = source;
+    ++wrong_source.grid_size.columns;
+    ok &= check(resolve(lease, wrong_source, empty_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::GRID_SIZE_MISMATCH,
+        "resolver names grid-size mismatch");
+
+    term::Terminal_screen_model height_resized_model = make_model(5, 8, 8);
+    height_resized_model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"), QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"), QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+    }, false));
+    const term::terminal_selection_source_identity_t height_source =
+        selection_source_for_model(height_resized_model);
+    const term::terminal_selection_visual_lease_t height_lease =
+        selection_lease_for_range(height_resized_model, range, height_source);
+    const term::Terminal_screen_model_result height_resize =
+        height_resized_model.resize({6, 8});
+    const term::terminal_selection_source_identity_t resized_height_source =
+        selection_source_for_model(height_resized_model);
+    const term::Terminal_selection_attachment_resolution resized_height =
+        height_resized_model.resolve_selection_attachment(
+            height_lease,
+            resized_height_source,
+            height_resize);
+    ok &= check(resized_height.status ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            resized_height.translated_lease.has_value() &&
+            resized_height.translated_lease->grid_size.rows == 6 &&
+            resized_height.translated_lease->selected_lines ==
+                height_lease.selected_lines,
+        "resolver accepts a height-only resize with exact retained handles");
+
+    const auto synthetic_lease = [&](std::vector<term::terminal_history_handle_t> handles) {
+        term::terminal_selection_visual_lease_t synthetic = lease;
+        synthetic.selected_lines.clear();
+        synthetic.selected_range = {{0, 0},
+            {static_cast<int>(handles.size()) - 1, 1},
+            term::Terminal_selection_mode::NORMAL};
+        synthetic.anchor = synthetic.selected_range.start;
+        synthetic.extent = synthetic.selected_range.end;
+        for (std::size_t index = 0U; index < handles.size(); ++index) {
+            synthetic.selected_lines.push_back({static_cast<int>(index), handles[index]});
+        }
+        return synthetic;
+    };
+    const std::vector<term::terminal_selection_line_lease_t> final_lines =
+        model.selection_line_leases(
+            term::Terminal_buffer_id::PRIMARY,
+            {{0, 0}, {3, 1}, term::Terminal_selection_mode::NORMAL});
+    const auto old_for_final = [](term::terminal_history_handle_t final_handle,
+                                  std::uint64_t old_id) {
+        return term::terminal_history_handle_from_retained_identity(
+            old_id,
+            final_handle.content_generation);
+    };
+    const term::terminal_history_handle_t old0 = old_for_final(
+        final_lines[0].history_handle, 10001U);
+    const term::terminal_history_handle_t old1 = old_for_final(
+        final_lines[1].history_handle, 10002U);
+    const term::terminal_history_handle_t old2 = old_for_final(
+        final_lines[2].history_handle, 10003U);
+
+    term::Terminal_screen_model_result missing_publication;
+    missing_publication.selection_continuity.emplace();
+    missing_publication.selection_continuity->successors_by_old_retained_line_id[old0.row_sequence]
+        .push_back({old0, final_lines[0].history_handle, 0, 0, 0});
+    missing_publication.selection_continuity->successors_by_old_retained_line_id[old2.row_sequence]
+        .push_back({old2, final_lines[2].history_handle, 2, 2, 0});
+    ok &= check(resolve(
+            synthetic_lease({old0, old1, old2}), source, missing_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::MISSING_LINE,
+        "resolver fails closed on a missing middle successor");
+
+    term::Terminal_screen_model_result duplicate_publication = missing_publication;
+    duplicate_publication.selection_continuity->
+        successors_by_old_retained_line_id[old0.row_sequence].push_back(
+            {old0, final_lines[0].history_handle, 0, 0, 0});
+    ok &= check(resolve(
+            synthetic_lease({old0}), source, duplicate_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::DUPLICATE_RESOLUTION,
+        "resolver rejects duplicate old-key evidence");
+
+    term::Terminal_screen_model_result duplicate_final_publication;
+    duplicate_final_publication.selection_continuity.emplace();
+    duplicate_final_publication.selection_continuity->
+        successors_by_old_retained_line_id[old0.row_sequence].push_back(
+            {old0, final_lines[0].history_handle, 0, 0, 0});
+    duplicate_final_publication.selection_continuity->
+        successors_by_old_retained_line_id[old1.row_sequence].push_back(
+            {old1, final_lines[0].history_handle, 1, 0, -1});
+    ok &= check(resolve(
+            synthetic_lease({old0, old1}), source, duplicate_final_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::DUPLICATE_RESOLUTION,
+        "resolver rejects duplicate final-handle evidence");
+
+    term::Terminal_screen_model_result reordered_publication;
+    reordered_publication.selection_continuity.emplace();
+    reordered_publication.selection_continuity->successors_by_old_retained_line_id[old0.row_sequence]
+        .push_back({old0, final_lines[1].history_handle, 0, 1, 1});
+    reordered_publication.selection_continuity->successors_by_old_retained_line_id[old1.row_sequence]
+        .push_back({old1, final_lines[0].history_handle, 1, 0, -1});
+    ok &= check(resolve(
+            synthetic_lease({old0, old1}), source, reordered_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::REORDERED_RESOLUTION,
+        "resolver rejects reordered final handles");
+
+    term::Terminal_screen_model_result noncontiguous_publication;
+    noncontiguous_publication.selection_continuity.emplace();
+    noncontiguous_publication.selection_continuity->
+        successors_by_old_retained_line_id[old0.row_sequence].push_back(
+            {old0, final_lines[0].history_handle, 0, 0, 0});
+    noncontiguous_publication.selection_continuity->
+        successors_by_old_retained_line_id[old1.row_sequence].push_back(
+            {old1, final_lines[2].history_handle, 1, 2, 1});
+    ok &= check(resolve(
+            synthetic_lease({old0, old1}), source, noncontiguous_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::NONCONTIGUOUS_RESOLUTION,
+        "resolver rejects noncontiguous final handles");
+
+    term::Terminal_screen_model_result inconsistent_publication;
+    inconsistent_publication.selection_continuity.emplace();
+    inconsistent_publication.selection_continuity->
+        successors_by_old_retained_line_id[old0.row_sequence].push_back(
+            {old0, final_lines[0].history_handle, 0, 0, 1});
+    ok &= check(resolve(
+            synthetic_lease({old0}), source, inconsistent_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::
+                INCONSISTENT_ROW_DELTA,
+        "resolver rejects an inconsistent successor row delta");
+
+    term::terminal_selection_visual_lease_t endpoint_lease = lease;
+    endpoint_lease.selected_range.start.column = -1;
+    endpoint_lease.anchor = endpoint_lease.selected_range.start;
+    endpoint_lease.extent = endpoint_lease.selected_range.end;
+    ok &= check(resolve(endpoint_lease, source, empty_publication).status ==
+            term::Terminal_selection_attachment_resolution_status::
+                ENDPOINT_UNREPRESENTABLE,
+        "resolver names an unrepresentable translated endpoint");
+
+    return ok;
+}
+
+bool test_model_selection_attachment_resolver_row_eviction()
+{
+    bool ok = true;
+    term::Terminal_screen_model model = make_model(3, 12, 3);
+    model.ingest(QByteArrayLiteral("00\r\n01\r\n02\r\n03\r\n04"));
+    const term::terminal_selection_source_identity_t source =
+        selection_source_for_model(model);
+    const term::Terminal_selection_range range{{1, 0}, {1, 2},
+        term::Terminal_selection_mode::NORMAL};
+    const term::terminal_selection_visual_lease_t lease =
+        selection_lease_for_range(model, range, source);
+    ok &= check(lease.selected_lines.size() == 1U && model.scrollback_size() == 2,
+        "row-cap resolver fixture captures a retained line below the prefix");
+
+    const term::Terminal_screen_model_result prefix_eviction =
+        model.ingest(QByteArrayLiteral("\r\n05\r\n06"));
+    const term::Terminal_selection_attachment_resolution shifted =
+        model.resolve_selection_attachment(lease, source, prefix_eviction);
+    ok &= check(prefix_eviction.evicted_scrollback_rows == 1 &&
+            shifted.status ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            shifted.row_deltas == std::vector<int>({-1}),
+        "unselected row-cap prefix eviction resolves the stable handle directly");
+
+    const term::Terminal_screen_model_result selected_eviction =
+        model.ingest(QByteArrayLiteral("\r\n07"));
+    const term::Terminal_selection_attachment_resolution missing =
+        model.resolve_selection_attachment(lease, source, selected_eviction);
+    ok &= check(selected_eviction.evicted_scrollback_rows == 1 &&
+            missing.status ==
+                term::Terminal_selection_attachment_resolution_status::MISSING_LINE,
+        "row-cap eviction of the selected handle fails closed by name");
     return ok;
 }
 
@@ -1784,7 +2292,11 @@ bool test_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("dd"),
         QStringLiteral("ee"),
     };
-    ok &= check(term::primary_repaint_recovery_shift_rows(input) == 1,
+    const term::terminal_repaint_recovery_shift_result_t full_shift =
+        term::primary_repaint_recovery_shift_result(input);
+    ok &= check(full_shift.shifted_rows == 1 &&
+            full_shift.matched_prefix_rows == 3 &&
+            full_shift.unmatched_tail_rows == 0,
         "recovery helper accepts distinct shifted repaint");
 
     input.candidate_rows = {
@@ -1880,7 +2392,11 @@ bool test_repaint_recovery_shift_helper_matches_policy()
         QStringLiteral("tail2"),
         QStringLiteral("tail3"),
     };
-    ok &= check(term::primary_repaint_recovery_shift_rows(input) == 1,
+    const term::terminal_repaint_recovery_shift_result_t partial_shift =
+        term::primary_repaint_recovery_shift_result(input);
+    ok &= check(partial_shift.shifted_rows == 1 &&
+            partial_shift.matched_prefix_rows == 3 &&
+            partial_shift.unmatched_tail_rows == 2,
         "recovery helper accepts a blank displaced row on a strong partial-suffix match");
 
     input.candidate_rows = {
@@ -1963,7 +2479,17 @@ bool test_primary_repaint_recovery_suppresses_false_positives()
         }, true));
     ok &= check(repeated_model.scrollback_size() == 0 &&
             repeated_result.backing_deltas.empty() &&
-            repeated_result.recovery_proposals.empty(),
+            repeated_result.recovery_proposals.empty() &&
+            repeated_result.selection_continuity.has_value() &&
+            continuity_successors(repeated_result).empty() &&
+            !repeated_result.selection_continuity->survivor_proofs.empty() &&
+            std::all_of(
+                repeated_result.selection_continuity->survivor_proofs.begin(),
+                repeated_result.selection_continuity->survivor_proofs.end(),
+                [](const term::terminal_selection_survivor_proof_t& proof) {
+                    return proof.result ==
+                        term::Terminal_selection_survivor_proof_result::PROOF_UNAVAILABLE;
+                }),
         "recovery suppresses repeated-row ambiguous repaint shifts");
 
     term::Terminal_screen_model blank_ambiguous_model =
@@ -1985,6 +2511,49 @@ bool test_primary_repaint_recovery_suppresses_false_positives()
             blank_ambiguous_result.backing_deltas.empty() &&
             blank_ambiguous_result.recovery_proposals.empty(),
         "recovery suppresses a blank displaced row above ambiguous survivors");
+
+    term::Terminal_screen_model nonmatching_model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    nonmatching_model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+    const term::terminal_selection_source_identity_t nonmatching_source =
+        selection_source_for_model(nonmatching_model);
+    const term::Terminal_selection_range nonmatching_range{{0, 0}, {0, 2},
+        term::Terminal_selection_mode::NORMAL};
+    const term::terminal_selection_visual_lease_t nonmatching_lease =
+        selection_lease_for_range(
+            nonmatching_model,
+            nonmatching_range,
+            nonmatching_source);
+    const term::Terminal_screen_model_result nonmatching_result =
+        nonmatching_model.ingest(visible_row_write_stream({
+            QByteArrayLiteral("ww"),
+            QByteArrayLiteral("xx"),
+            QByteArrayLiteral("yy"),
+            QByteArrayLiteral("zz"),
+        }, true));
+    const term::Terminal_selection_attachment_resolution nonmatching_resolution =
+        nonmatching_model.resolve_selection_attachment(
+            nonmatching_lease,
+            nonmatching_source,
+            nonmatching_result);
+    ok &= check(nonmatching_result.selection_continuity.has_value() &&
+            continuity_successors(nonmatching_result).empty() &&
+            !nonmatching_result.selection_continuity->survivor_proofs.empty() &&
+            std::all_of(
+                nonmatching_result.selection_continuity->survivor_proofs.begin(),
+                nonmatching_result.selection_continuity->survivor_proofs.end(),
+                [](const term::terminal_selection_survivor_proof_t& proof) {
+                    return proof.result ==
+                        term::Terminal_selection_survivor_proof_result::PROOF_UNAVAILABLE;
+                }) &&
+            nonmatching_resolution.status ==
+                term::Terminal_selection_attachment_resolution_status::MISSING_LINE,
+        "rejected nonmatching recovery publishes no successor and resolves missing-line");
 
     term::Terminal_screen_model resize_model =
         make_recovery_enabled_primary_repaint_model(4, 8, 8);
@@ -2040,6 +2609,17 @@ bool test_primary_repaint_recovery_toggle_cancels_candidate()
         "recovery toggle off leaves no accepted proposal");
     ok &= check(result.backing_deltas.empty(),
         "recovery toggle off emits no recovered history delta");
+    ok &= check(result.selection_continuity.has_value() &&
+            continuity_successors(result).empty() &&
+            !result.selection_continuity->survivor_proofs.empty() &&
+            std::all_of(
+                result.selection_continuity->survivor_proofs.begin(),
+                result.selection_continuity->survivor_proofs.end(),
+                [](const term::terminal_selection_survivor_proof_t& proof) {
+                    return proof.result ==
+                        term::Terminal_selection_survivor_proof_result::PROOF_UNAVAILABLE;
+                }),
+        "cancelled ambiguous recovery publishes no successors");
     ok &= check(model.row_text(0) == QStringLiteral("bb") &&
             model.row_text(1) == QStringLiteral("cc") &&
             model.row_text(2) == QStringLiteral("dd") &&
@@ -2320,6 +2900,133 @@ bool test_retained_history_storage_is_lazy()
         retained_model.scrollback_size() == 0 &&
             retained_model.retained_history_storage_allocated_for_testing(),
         "retained-history clear reuses allocated storage");
+
+    return ok;
+}
+
+bool test_retained_history_minimum_byte_capacity_exact_evictions()
+{
+    constexpr std::size_t k_byte_budget = 1U * 1024U * 1024U;
+    constexpr int k_rows                = 24;
+    constexpr int k_columns             = 80;
+    constexpr int k_row_limit           = 100000;
+    constexpr int k_payload_columns     = 8;
+    constexpr int k_record_bytes        = 148;
+    constexpr int k_full_retained_rows  = 7084;
+    constexpr int k_grid_fill_lines     = k_rows - 1;
+    constexpr int k_pre_full_line_count = k_grid_fill_lines + k_full_retained_rows - 1;
+    constexpr int k_full_line_count     = k_grid_fill_lines + k_full_retained_rows;
+    const QByteArray row = QByteArrayLiteral("CAPACITY\r\n");
+
+    const auto make_capacity_model = []() {
+        term::Terminal_screen_model_config config;
+        config.grid_size                       = {k_rows, k_columns};
+        config.scrollback_limit                = k_row_limit;
+        config.tab_width                       = 4;
+        config.retained_history_capacity_bytes = k_byte_budget;
+        return term::Terminal_screen_model(config);
+    };
+    const auto diagnostics_match = [](const term::Terminal_screen_model& model,
+                                      std::uint64_t expected_rows) {
+        const term::terminal_retained_history_diagnostics_t diagnostics =
+            model.retained_history_diagnostics();
+        return diagnostics.byte_budget == k_byte_budget &&
+            diagnostics.retained_rows == expected_rows &&
+            diagnostics.retained_record_bytes ==
+                expected_rows * static_cast<std::uint64_t>(k_record_bytes) &&
+            diagnostics.payload_kind_prefix_plain_ascii_rows == expected_rows &&
+            diagnostics.payload_kind_generic_compact_rows == 0U;
+    };
+
+    bool ok = true;
+    ok &= check(row.size() == k_payload_columns + 2,
+        "minimum byte-cap fixture pins its ASCII payload and CRLF encoding");
+    ok &= check(k_full_retained_rows >= 4096 &&
+            k_full_retained_rows < k_row_limit &&
+            k_row_limit - k_full_retained_rows == 92916,
+        "minimum byte-cap fixture has at least 4096 rows and a non-binding row limit");
+    ok &= check(k_full_retained_rows * k_record_bytes <=
+            static_cast<int>(k_byte_budget) &&
+            (k_full_retained_rows + 1) * k_record_bytes >
+                static_cast<int>(k_byte_budget),
+        "minimum byte-cap fixture constants prove the exact 148-byte capacity boundary");
+
+    term::Terminal_screen_model zero_eviction_model = make_capacity_model();
+    const term::Terminal_screen_model_result pre_full = zero_eviction_model.ingest(
+        row.repeated(k_pre_full_line_count));
+    ok &= check(pre_full.evicted_scrollback_rows == 0 &&
+            diagnostics_match(zero_eviction_model, k_full_retained_rows - 1U),
+        "minimum byte-cap zero-eviction precondition pins retained rows and bytes");
+    const term::Terminal_screen_model_result zero_evictions =
+        zero_eviction_model.ingest(row);
+    ok &= check(zero_evictions.evicted_scrollback_rows == 0 &&
+            diagnostics_match(zero_eviction_model, k_full_retained_rows),
+        "minimum byte-cap trigger consumes remaining bytes without eviction");
+
+    term::Terminal_screen_model one_eviction_model = make_capacity_model();
+    const term::Terminal_screen_model_result one_full = one_eviction_model.ingest(
+        row.repeated(k_full_line_count));
+    const std::optional<term::terminal_history_handle_t> selected_endpoint =
+        one_eviction_model.retained_history_handle_at_logical_row(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    const term::Terminal_selection_range endpoint_range{
+        {0, 0},
+        {0, k_payload_columns},
+        term::Terminal_selection_mode::NORMAL,
+    };
+    const std::vector<term::terminal_selection_line_lease_t> endpoint_lease =
+        selected_endpoint.has_value()
+            ? std::vector<term::terminal_selection_line_lease_t>{{0, *selected_endpoint}}
+            : std::vector<term::terminal_selection_line_lease_t>{};
+    const term::terminal_selection_source_identity_t endpoint_source =
+        selection_source_for_model(one_eviction_model);
+    const term::terminal_selection_visual_lease_t endpoint_visual_lease =
+        selection_lease_for_range(
+            one_eviction_model,
+            endpoint_range,
+            endpoint_source);
+    ok &= check(one_full.evicted_scrollback_rows == 0 &&
+            diagnostics_match(one_eviction_model, k_full_retained_rows) &&
+            selected_endpoint.has_value() &&
+            selected_endpoint->record_bytes == k_record_bytes &&
+            one_eviction_model.retained_line_descriptors_match(
+                term::Terminal_buffer_id::PRIMARY,
+                endpoint_range,
+                endpoint_lease),
+        "minimum byte-cap endpoint begins as an exact selected retained handle");
+    const term::Terminal_screen_model_result one_eviction = one_eviction_model.ingest(row);
+    const term::Terminal_selection_attachment_resolution one_eviction_resolution =
+        one_eviction_model.resolve_selection_attachment(
+            endpoint_visual_lease,
+            endpoint_source,
+            one_eviction);
+    ok &= check(one_eviction.evicted_scrollback_rows == 1 &&
+            diagnostics_match(one_eviction_model, k_full_retained_rows) &&
+            !one_eviction_model.retained_line_descriptors_match(
+                term::Terminal_buffer_id::PRIMARY,
+                endpoint_range,
+                endpoint_lease) &&
+            one_eviction_resolution.status ==
+                term::Terminal_selection_attachment_resolution_status::MISSING_LINE,
+        "minimum byte-cap one-row trigger evicts the selected endpoint exactly");
+
+    term::Terminal_screen_model three_eviction_model = make_capacity_model();
+    const term::Terminal_screen_model_result three_full = three_eviction_model.ingest(
+        row.repeated(k_full_line_count));
+    const term::terminal_retained_history_diagnostics_t before_three =
+        three_eviction_model.retained_history_diagnostics();
+    const term::Terminal_screen_model_result three_evictions =
+        three_eviction_model.ingest(row.repeated(3));
+    const term::terminal_retained_history_diagnostics_t after_three =
+        three_eviction_model.retained_history_diagnostics();
+    ok &= check(three_full.evicted_scrollback_rows == 0 &&
+            before_three.retained_record_bytes ==
+                static_cast<std::uint64_t>(k_full_retained_rows * k_record_bytes) &&
+            three_evictions.evicted_scrollback_rows == 3 &&
+            after_three.retained_rows == k_full_retained_rows &&
+            after_three.retained_record_bytes == before_three.retained_record_bytes,
+        "minimum byte-cap three-row trigger causes exactly three byte-budget evictions");
 
     return ok;
 }
@@ -4006,6 +4713,102 @@ bool test_replies_and_cursor_save_restore()
                 term::terminal_grid_size_t{5, 9}),
         "text-area resize request records active-grid resize and column-reflow deltas");
 
+    term::Terminal_screen_model checkpoint_model = make_model(4, 20);
+    struct resize_stream_capture_t
+    {
+        std::vector<term::terminal_screen_model_resize_transition_t> transitions;
+        std::vector<term::terminal_screen_model_text_area_resize_request_t> requests;
+        std::vector<char> events;
+    } resize_stream;
+    const term::terminal_screen_model_resize_transition_sink_t resize_transition_sink{
+        &resize_stream,
+        [](void* context, const term::terminal_screen_model_resize_transition_t& transition) {
+            auto& capture = *static_cast<resize_stream_capture_t*>(context);
+            capture.transitions.push_back(transition);
+            capture.events.push_back('C');
+        },
+        73U,
+        nullptr,
+        [](void* context,
+            const term::terminal_screen_model_text_area_resize_request_t& request)
+        {
+            auto& capture = *static_cast<resize_stream_capture_t*>(context);
+            capture.requests.push_back(request);
+            capture.events.push_back('R');
+        },
+    };
+    checkpoint_model.ingest(
+        QByteArrayLiteral("\x1b[8;2;20t\x1b[8;4;20t"),
+        &resize_transition_sink);
+    const std::vector<term::terminal_screen_model_resize_transition_t>& resize_transitions =
+        resize_stream.transitions;
+    ok &= check(resize_transitions.size() == 2U &&
+            resize_transitions[0].sequence == 73U &&
+            resize_transitions[0].ordinal == 1U &&
+            term::grid_sizes_match(
+                resize_transitions[0].grid_size_before,
+                term::terminal_grid_size_t{4, 20}) &&
+            term::grid_sizes_match(
+                resize_transitions[0].grid_size_after,
+                term::terminal_grid_size_t{2, 20}) &&
+            resize_transitions[1].sequence == 73U &&
+            resize_transitions[1].ordinal == 2U &&
+            term::grid_sizes_match(
+                resize_transitions[1].grid_size_before,
+                term::terminal_grid_size_t{2, 20}) &&
+            term::grid_sizes_match(
+                resize_transitions[1].grid_size_after,
+                term::terminal_grid_size_t{4, 20}),
+        "one ingest checkpoints both accepted resize transitions in order");
+    ok &= check(resize_transitions.size() == 2U &&
+            resize_transitions[0].result.grid_reflow_changed &&
+            resize_transitions[0].result.backing_deltas.size() == 1U &&
+            resize_transitions[1].result.grid_reflow_changed &&
+            resize_transitions[1].result.backing_deltas.size() == 1U,
+        "each checkpoint carries its transition-local model result");
+    ok &= check(resize_stream.requests.size() == 2U &&
+            resize_stream.requests[0].ordinal == 1U &&
+            resize_stream.requests[0].model_grid_changed &&
+            term::grid_sizes_match(
+                resize_stream.requests[0].grid_size,
+                term::terminal_grid_size_t{2, 20}) &&
+            resize_stream.requests[1].ordinal == 2U &&
+            resize_stream.requests[1].model_grid_changed &&
+            term::grid_sizes_match(
+                resize_stream.requests[1].grid_size,
+                term::terminal_grid_size_t{4, 20}) &&
+            resize_stream.events == std::vector<char>{'C', 'R', 'C', 'R'},
+        "changed text-area requests follow their ordered model checkpoints");
+
+    const std::size_t accepted_transition_count = resize_transitions.size();
+    checkpoint_model.ingest(
+        QByteArrayLiteral("\x1b[8;4;20t\x1b[8;4097;20t\x1b[14t"),
+        &resize_transition_sink);
+    ok &= check(resize_transitions.size() == accepted_transition_count,
+        "same-grid, invalid, and unsupported requests emit no changed-grid checkpoint");
+    ok &= check(resize_stream.requests.size() == 3U &&
+            resize_stream.requests.back().ordinal == 1U &&
+            !resize_stream.requests.back().model_grid_changed &&
+            term::grid_sizes_match(
+                resize_stream.requests.back().grid_size,
+                term::terminal_grid_size_t{4, 20}),
+        "same-grid request emits one request-boundary event while invalid forms emit none");
+
+    resize_stream.transitions.clear();
+    resize_stream.requests.clear();
+    resize_stream.events.clear();
+    checkpoint_model.ingest(
+        QByteArrayLiteral("\x1b[8;4;20t\x1b[8;3;20t"),
+        &resize_transition_sink);
+    ok &= check(resize_stream.transitions.size() == 1U &&
+            resize_stream.requests.size() == 2U &&
+            resize_stream.requests[0].ordinal == 1U &&
+            !resize_stream.requests[0].model_grid_changed &&
+            resize_stream.requests[1].ordinal == 2U &&
+            resize_stream.requests[1].model_grid_changed &&
+            resize_stream.events == std::vector<char>{'R', 'C', 'R'},
+        "same-grid request is consumed before a later changed-grid checkpoint in one ingest");
+
     result  = model.ingest(QByteArrayLiteral("\x1b[8;4097;9t"));
     ok     &= check(diagnostic_count(result) == 1,
         "oversized text-area resize request emits a diagnostic");
@@ -4135,6 +4938,9 @@ int main()
     ok &= test_primary_repaint_recovery_recovers_blank_separator_row();
     ok &= test_primary_repaint_recovery_preserves_styled_blank_separator_row();
     ok &= test_primary_repaint_recovery_recovers_blank_separator_row_with_rewritten_tail();
+    ok &= test_primary_repaint_recovery_selection_proof_matrix();
+    ok &= test_model_selection_attachment_resolver_matrix();
+    ok &= test_model_selection_attachment_resolver_row_eviction();
     ok &= test_primary_repaint_recovery_suppresses_broad_blank_layout_repaint();
     ok &= test_flat_ring_retained_record_producer_contract();
     ok &= test_flat_ring_recovery_shared_producer_boundary();
@@ -4147,6 +4953,7 @@ int main()
     ok &= test_erase_operations_and_wide_damage();
     ok &= test_scroll_region_and_origin_mode();
     ok &= test_retained_history_storage_is_lazy();
+    ok &= test_retained_history_minimum_byte_capacity_exact_evictions();
     ok &= test_top_anchored_scroll_region_appends_scrollback();
     ok &= test_alternate_top_anchored_scroll_region_does_not_append_scrollback();
     ok &= test_escape_index_controls();
