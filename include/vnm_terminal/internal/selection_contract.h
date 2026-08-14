@@ -39,8 +39,7 @@ enum class Terminal_selection_internal_state
     NONE,
     DRAG_ARMED,
     DRAG_PREVIEW,
-    ATTACHED_VISIBLE,
-    ATTACHED_HIDDEN,
+    ATTACHED,
     PAYLOAD_ONLY,
 };
 
@@ -229,15 +228,10 @@ public:
         Terminal_selection_range             range,
         QString                              selected_text,
         terminal_selection_visual_lease_t    visual_lease);
-    void hide_visual_attachment();
     void detach_visual_attachment();
-    void update_visual_lease_source(
-        terminal_selection_content_basis_t source_content_basis,
-        std::uint64_t                      grid_reflow_basis,
-        std::uint64_t                      row_origin_generation,
-        terminal_grid_size_t               grid_size,
-        const Terminal_viewport_state&     viewport_mapping);
-
+    void install_translated_attachment(
+        Terminal_selection_range          range,
+        terminal_selection_visual_lease_t visual_lease);
     Terminal_selection_result selected_text() const;
     Terminal_selection_result selected_text(std::span<const QString> logical_rows) const;
 

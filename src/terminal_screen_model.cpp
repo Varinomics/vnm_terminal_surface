@@ -28,6 +28,45 @@
 
 namespace vnm_terminal::internal {
 
+const char* terminal_selection_attachment_resolution_status_token(
+    Terminal_selection_attachment_resolution_status status) noexcept
+{
+    switch (status) {
+        case Terminal_selection_attachment_resolution_status::TRANSLATED:
+            return "translated";
+        case Terminal_selection_attachment_resolution_status::INVALID_LEASE:
+            return "invalid-lease";
+        case Terminal_selection_attachment_resolution_status::SOURCE_MISMATCH:
+            return "source-mismatch";
+        case Terminal_selection_attachment_resolution_status::BUFFER_MISMATCH:
+            return "buffer-mismatch";
+        case Terminal_selection_attachment_resolution_status::EPOCH_MISMATCH:
+            return "epoch-mismatch";
+        case Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH:
+            return "grid-reflow-mismatch";
+        case Terminal_selection_attachment_resolution_status::GRID_SIZE_MISMATCH:
+            return "grid-size-mismatch";
+        case Terminal_selection_attachment_resolution_status::CAPABILITY_UNAVAILABLE:
+            return "capability-unavailable";
+        case Terminal_selection_attachment_resolution_status::MISSING_LINE:
+            return "missing-line";
+        case Terminal_selection_attachment_resolution_status::CONTENT_GENERATION_MISMATCH:
+            return "content-generation-mismatch";
+        case Terminal_selection_attachment_resolution_status::DUPLICATE_RESOLUTION:
+            return "duplicate-resolution";
+        case Terminal_selection_attachment_resolution_status::REORDERED_RESOLUTION:
+            return "reordered-resolution";
+        case Terminal_selection_attachment_resolution_status::NONCONTIGUOUS_RESOLUTION:
+            return "noncontiguous-resolution";
+        case Terminal_selection_attachment_resolution_status::INCONSISTENT_ROW_DELTA:
+            return "inconsistent-row-delta";
+        case Terminal_selection_attachment_resolution_status::ENDPOINT_UNREPRESENTABLE:
+            return "endpoint-unrepresentable";
+    }
+
+    return "unknown";
+}
+
 namespace {
 
 constexpr std::size_t k_printable_ascii_count =
@@ -402,6 +441,37 @@ QByteArray color_reply_payload(quint32 rgba)
 
 }
 
+const char* terminal_recovery_attempt_status_token(
+    Terminal_recovery_attempt_status status) noexcept
+{
+    switch (status) {
+        case Terminal_recovery_attempt_status::ACCEPTED:  return "accepted";
+        case Terminal_recovery_attempt_status::REJECTED:  return "rejected";
+        case Terminal_recovery_attempt_status::CANCELLED: return "cancelled";
+    }
+    return "unknown";
+}
+
+const char* terminal_recovery_attempt_reason_token(
+    Terminal_recovery_attempt_reason reason) noexcept
+{
+    switch (reason) {
+        case Terminal_recovery_attempt_reason::FULL_SHIFT_MATCH:
+            return "full-shift-match";
+        case Terminal_recovery_attempt_reason::PARTIAL_SHIFT_MATCH:
+            return "partial-shift-match";
+        case Terminal_recovery_attempt_reason::NONMATCHING:
+            return "nonmatching";
+        case Terminal_recovery_attempt_reason::REPEATED_ROW_AMBIGUOUS:
+            return "repeated-row-ambiguous";
+        case Terminal_recovery_attempt_reason::RECOVERY_DISABLED:
+            return "recovery-disabled";
+        case Terminal_recovery_attempt_reason::CANDIDATE_INVALIDATED:
+            return "candidate-invalidated";
+    }
+    return "unknown";
+}
+
 Terminal_screen_model_config_status validate_terminal_screen_model_config(
     const Terminal_screen_model_config& config)
 {
@@ -449,9 +519,43 @@ Terminal_screen_model::Terminal_screen_model(Terminal_screen_model_config config
             m_config.retained_history_capacity_bytes);
 
     reset_grid();
+    refresh_active_grid_retained_lookup_indexes();
 }
 
-Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
+Terminal_screen_model::Resize_transition_scope::Resize_transition_scope(
+    Terminal_screen_model& model,
+    const terminal_screen_model_resize_transition_sink_t* sink,
+    ingest_publication_t& publication)
+:
+    m_model(model)
+{
+    Q_ASSERT(m_model.m_resize_transition_sink == nullptr);
+    Q_ASSERT(m_model.m_resize_transition_publication == nullptr);
+    Q_ASSERT(!m_model.m_pending_resize_transition.has_value());
+    Q_ASSERT(!m_model.m_skip_next_resize_transition_accumulation);
+    if (sink != nullptr) {
+        Q_ASSERT(sink->consume != nullptr);
+    }
+    m_model.m_resize_transition_sink        = sink;
+    m_model.m_resize_transition_publication = &publication;
+    m_model.m_resize_transition_ordinal     = 0U;
+    m_model.m_text_area_resize_request_ordinal = 0U;
+    m_model.m_skip_next_resize_transition_accumulation = false;
+}
+
+Terminal_screen_model::Resize_transition_scope::~Resize_transition_scope()
+{
+    m_model.m_pending_resize_transition.reset();
+    m_model.m_resize_transition_publication = nullptr;
+    m_model.m_resize_transition_sink        = nullptr;
+    m_model.m_resize_transition_ordinal     = 0U;
+    m_model.m_text_area_resize_request_ordinal = 0U;
+    m_model.m_skip_next_resize_transition_accumulation = false;
+}
+
+Terminal_screen_model_result Terminal_screen_model::ingest(
+    QByteArrayView bytes,
+    const terminal_screen_model_resize_transition_sink_t* resize_transition_sink)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::ingest");
 
@@ -459,6 +563,7 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
     m_scrollback_evicted_rows = 0;
     clear_backing_deltas();
     clear_recovery_proposals();
+    clear_selection_continuity();
     clear_dirty();
     std::vector<Parser_action> parser_actions;
     {
@@ -467,6 +572,11 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
     }
 
     ingest_publication_t publication;
+    ingest_publication_t resize_transition_publication;
+    Resize_transition_scope resize_transition_scope(
+        *this,
+        resize_transition_sink,
+        resize_transition_publication);
 
     {
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::apply_parser_actions");
@@ -475,12 +585,51 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
         }
 
         for (const Parser_action& action : parser_actions) {
+            const std::size_t result_action_begin = result.actions.size();
             if (m_config.retain_structural_actions || action_is_session_visible(action)) {
                 result.actions.push_back(action);
             }
             clear_dirty();
             apply_action(action, result.actions, &publication);
             advance_primary_repaint_recovery_resize_guard();
+            std::optional<terminal_grid_size_t> text_area_resize_request;
+            for (std::size_t index = result_action_begin;
+                 index < result.actions.size();
+                 ++index)
+            {
+                const Parser_action& result_action = result.actions[index];
+                if (parser_action_kind(result_action) != Parser_action_kind::NOTIFICATION) {
+                    continue;
+                }
+                const Parser_notification& notification =
+                    std::get<Parser_notification>(result_action.payload);
+                if (notification.kind ==
+                    Parser_notification_kind::TEXT_AREA_RESIZE_REQUESTED)
+                {
+                    Q_ASSERT(!text_area_resize_request.has_value());
+                    text_area_resize_request = terminal_grid_size_t{
+                        notification.rows,
+                        notification.columns,
+                    };
+                }
+            }
+            const bool text_area_resize_changed_model_grid =
+                text_area_resize_request.has_value() &&
+                m_pending_resize_transition.has_value() &&
+                grid_sizes_match(
+                    m_pending_resize_transition->second,
+                    *text_area_resize_request);
+            if (m_pending_resize_transition.has_value()) {
+                emit_pending_resize_transition();
+            }
+            else {
+                accumulate_pending_changes(resize_transition_publication);
+            }
+            if (text_area_resize_request.has_value()) {
+                emit_text_area_resize_request(
+                    *text_area_resize_request,
+                    text_area_resize_changed_model_grid);
+            }
 
             if (m_modes.synchronized_output) {
                 collect_synchronized_changes();
@@ -494,6 +643,7 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
     if (m_primary_repaint_recovery_candidate.active && m_modes.cursor_visible) {
         clear_dirty();
         finish_primary_repaint_recovery_candidate(false);
+        accumulate_pending_changes(resize_transition_publication);
         if (m_modes.synchronized_output) {
             collect_synchronized_changes();
         }
@@ -505,6 +655,11 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
     result_change_overrides_t overrides;
     overrides.dirty_rows_have_stable_mutation_identity =
         publication.dirty_rows_have_stable_mutation_identity;
+    assign_trailing_changes(
+        resize_transition_publication,
+        resize_transition_sink != nullptr
+            ? resize_transition_sink->trailing_changes
+            : nullptr);
     adopt_publication_changes(std::move(publication));
 
     {
@@ -514,16 +669,24 @@ Terminal_screen_model_result Terminal_screen_model::ingest(QByteArrayView bytes)
     return result;
 }
 
-Terminal_screen_model_result Terminal_screen_model::force_release_synchronized_output()
+Terminal_screen_model_result Terminal_screen_model::force_release_synchronized_output(
+    terminal_screen_model_trailing_changes_t* trailing_changes)
 {
     Terminal_screen_model_result result;
     m_scrollback_evicted_rows = 0;
     clear_backing_deltas();
     clear_recovery_proposals();
+    clear_selection_continuity();
     clear_dirty();
 
     ingest_publication_t publication;
+    ingest_publication_t resize_transition_publication;
+    Resize_transition_scope resize_transition_scope(
+        *this,
+        nullptr,
+        resize_transition_publication);
     set_synchronized_output_mode(false, &publication);
+    assign_trailing_changes(resize_transition_publication, trailing_changes);
 
     result_change_overrides_t overrides;
     overrides.dirty_rows_have_stable_mutation_identity =
@@ -538,6 +701,7 @@ void Terminal_screen_model::apply_action(const Parser_action& action)
     std::vector<Parser_action> generated_actions;
     apply_action(action, generated_actions, nullptr);
     advance_primary_repaint_recovery_resize_guard();
+    refresh_active_grid_retained_lookup_indexes();
 }
 
 void Terminal_screen_model::apply_action(
@@ -1706,6 +1870,10 @@ Terminal_retained_line_lookup_result Terminal_screen_model::retained_line_lookup
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::retained_line_lookup");
 
+    if (m_selection_reconciliation_counters.enabled) {
+        ++m_selection_reconciliation_counters.retained_line_lookup_requests;
+    }
+
     if (!terminal_history_handle_has_identity(history_handle)) {
         return {};
     }
@@ -1716,81 +1884,343 @@ Terminal_retained_line_lookup_result Terminal_screen_model::retained_line_lookup
         return result;
     }
 
-    for (int attempt = 0; attempt < 2; ++attempt) {
-        result = {};
-        result.resolution_status = Terminal_history_resolution_status::STALE_ROW_SEQUENCE;
+    result.resolution_status = Terminal_history_resolution_status::STALE_ROW_SEQUENCE;
+    const retained_lookup_index_t& index = retained_lookup_index(buffer_id);
 
-        const retained_lookup_cache_t& cache = retained_lookup_cache(buffer_id);
-        bool invalid_cache_hit = false;
+    const auto remember_neighbor =
+        [&](const retained_lookup_index_entry_t& entry, bool successor) {
+            const std::optional<int> logical_row =
+                retained_lookup_index_entry_logical_row(buffer_id, entry);
+            if (!logical_row.has_value() ||
+                retained_lookup_index_entry_status(buffer_id, entry, *logical_row) !=
+                    Terminal_history_resolution_status::OK)
+            {
+                return;
+            }
 
-        const auto remember_neighbor =
-            [&](const retained_lookup_cache_entry_t& entry, bool successor) {
-                const Terminal_history_resolution_status entry_status =
-                    retained_lookup_cache_entry_status(buffer_id, entry);
-                if (entry_status != Terminal_history_resolution_status::OK) {
-                    invalid_cache_hit = true;
-                    return;
-                }
-
-                if (successor) {
-                    result.nearest_successor = true;
-                    result.nearest_successor_logical_row = entry.logical_row;
-                }
-                else {
-                    result.nearest_predecessor = true;
-                    result.nearest_predecessor_logical_row = entry.logical_row;
-                }
-            };
-
-        auto equal_or_successor =
-            cache.by_row_sequence.lower_bound(history_handle.row_sequence);
-        if (equal_or_successor != cache.by_row_sequence.end() &&
-            equal_or_successor->first == history_handle.row_sequence)
-        {
-            const retained_lookup_cache_entry_t& entry = equal_or_successor->second;
-            const Terminal_history_resolution_status entry_status =
-                retained_lookup_cache_entry_status(buffer_id, entry);
-            if (entry_status != Terminal_history_resolution_status::OK) {
-                invalid_cache_hit = true;
+            if (successor) {
+                result.nearest_successor             = true;
+                result.nearest_successor_logical_row = *logical_row;
             }
             else {
-                result.retained_line_id_found = true;
-                result.retained_line_id_match_count = entry.row_sequence_match_count;
-                result.resolution_status =
-                    retained_history_handle_match_status(entry.history_handle, history_handle);
-                if (result.resolution_status == Terminal_history_resolution_status::OK) {
-                    result.exact_match       = true;
-                    result.exact_logical_row = entry.logical_row;
-                }
-                else
-                if (result.resolution_status ==
-                    Terminal_history_resolution_status::CONTENT_GENERATION_MISMATCH)
-                {
-                    result.retained_line_content_generation_mismatch = true;
-                }
+                result.nearest_predecessor             = true;
+                result.nearest_predecessor_logical_row = *logical_row;
             }
+        };
 
-            ++equal_or_successor;
+    const auto history_match =
+        index.history_by_row_sequence.find(history_handle.row_sequence);
+    const auto active_match =
+        index.active_grid_by_row_sequence.find(history_handle.row_sequence);
+    const int history_match_count = history_match == index.history_by_row_sequence.end()
+        ? 0
+        : history_match->second.history_match_count;
+    const int active_match_count = active_match == index.active_grid_by_row_sequence.end()
+        ? 0
+        : active_match->second.active_grid_match_count;
+    const retained_lookup_index_entry_t* exact_entry =
+        history_match != index.history_by_row_sequence.end()
+            ? &history_match->second
+            : active_match != index.active_grid_by_row_sequence.end()
+                ? &active_match->second
+                : nullptr;
+    if (exact_entry != nullptr) {
+        const retained_lookup_index_entry_t& entry = *exact_entry;
+        const std::optional<int> logical_row =
+            retained_lookup_index_entry_logical_row(buffer_id, entry);
+        if (logical_row.has_value() &&
+            retained_lookup_index_entry_status(buffer_id, entry, *logical_row) ==
+                Terminal_history_resolution_status::OK)
+        {
+            result.retained_line_id_found = true;
+            result.retained_line_id_match_count =
+                history_match_count + active_match_count;
+            result.resolution_status =
+                retained_history_handle_match_status(entry.history_handle, history_handle);
+            if (result.resolution_status == Terminal_history_resolution_status::OK) {
+                result.exact_match       = true;
+                result.exact_logical_row = *logical_row;
+            }
+            else
+            if (result.resolution_status ==
+                Terminal_history_resolution_status::CONTENT_GENERATION_MISMATCH)
+            {
+                result.retained_line_content_generation_mismatch = true;
+            }
         }
-
-        if (equal_or_successor != cache.by_row_sequence.end()) {
-            remember_neighbor(equal_or_successor->second, true);
-        }
-
-        auto predecessor = cache.by_row_sequence.lower_bound(history_handle.row_sequence);
-        if (predecessor != cache.by_row_sequence.begin()) {
-            --predecessor;
-            remember_neighbor(predecessor->second, false);
-        }
-
-        if (!invalid_cache_hit) {
-            return result;
-        }
-
-        invalidate_retained_lookup_caches();
     }
 
+    const retained_lookup_index_entry_t* successor_entry = nullptr;
+    std::uint64_t successor_id = std::numeric_limits<std::uint64_t>::max();
+    const auto remember_successor_candidate =
+        [&](const auto& entries) {
+            const auto found = entries.upper_bound(history_handle.row_sequence);
+            if (found != entries.end() && found->first < successor_id) {
+                successor_id = found->first;
+                successor_entry = &found->second;
+            }
+        };
+    remember_successor_candidate(index.history_by_row_sequence);
+    remember_successor_candidate(index.active_grid_by_row_sequence);
+    if (successor_entry != nullptr) {
+        remember_neighbor(*successor_entry, true);
+    }
+
+    const retained_lookup_index_entry_t* predecessor_entry = nullptr;
+    std::uint64_t predecessor_id = 0U;
+    bool has_predecessor = false;
+    const auto remember_predecessor_candidate =
+        [&](const auto& entries) {
+            auto found = entries.lower_bound(history_handle.row_sequence);
+            if (found == entries.begin()) {
+                return;
+            }
+            --found;
+            if (!has_predecessor || found->first > predecessor_id) {
+                predecessor_id = found->first;
+                predecessor_entry = &found->second;
+                has_predecessor = true;
+            }
+        };
+    remember_predecessor_candidate(index.history_by_row_sequence);
+    remember_predecessor_candidate(index.active_grid_by_row_sequence);
+    if (predecessor_entry != nullptr) {
+        remember_neighbor(*predecessor_entry, false);
+    }
     return result;
+}
+
+Terminal_selection_attachment_resolution
+Terminal_screen_model::resolve_selection_attachment(
+    const terminal_selection_visual_lease_t&  prior_lease,
+    const terminal_selection_source_identity_t& target_source,
+    const Terminal_screen_model_result&       publication) const
+{
+    Terminal_selection_attachment_resolution resolution;
+    if (m_selection_reconciliation_counters.enabled) {
+        ++m_selection_reconciliation_counters.attachment_resolver_requests;
+    }
+
+    const terminal_grid_position_t old_start =
+        normalized_selection_start(prior_lease.selected_range);
+    const std::size_t selected_row_count =
+        normalized_selection_row_count(prior_lease.selected_range);
+    if (prior_lease.selected_range.mode == Terminal_selection_mode::NONE ||
+        selected_row_count == 0U ||
+        prior_lease.selected_lines.size() != selected_row_count ||
+        prior_lease.anchor != prior_lease.selected_range.start ||
+        prior_lease.extent != prior_lease.selected_range.end)
+    {
+        return resolution;
+    }
+
+    if (prior_lease.buffer_id != target_source.buffer_id ||
+        target_source.buffer_id != m_active_buffer_id)
+    {
+        resolution.status = Terminal_selection_attachment_resolution_status::BUFFER_MISMATCH;
+        return resolution;
+    }
+    if (prior_lease.session_epoch != target_source.session_epoch) {
+        resolution.status = Terminal_selection_attachment_resolution_status::EPOCH_MISMATCH;
+        return resolution;
+    }
+    if (prior_lease.anchor_domain != target_source.anchor_domain) {
+        resolution.status = Terminal_selection_attachment_resolution_status::SOURCE_MISMATCH;
+        return resolution;
+    }
+    if (prior_lease.grid_reflow_basis != target_source.grid_reflow_basis) {
+        resolution.status =
+            Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH;
+        return resolution;
+    }
+    if (!is_terminal_screen_model_grid_size_supported(prior_lease.grid_size) ||
+        prior_lease.grid_size.columns != target_source.grid_size.columns ||
+        !grid_sizes_match(target_source.grid_size, m_config.grid_size))
+    {
+        resolution.status = Terminal_selection_attachment_resolution_status::GRID_SIZE_MISMATCH;
+        return resolution;
+    }
+
+    const terminal_selection_continuity_capability_t* continuity = nullptr;
+    if (publication.selection_continuity.has_value()) {
+        if (publication.selection_continuity->version !=
+            k_terminal_selection_continuity_capability_version)
+        {
+            resolution.status =
+                Terminal_selection_attachment_resolution_status::CAPABILITY_UNAVAILABLE;
+            return resolution;
+        }
+        continuity = &*publication.selection_continuity;
+    }
+
+    resolution.old_logical_rows.reserve(selected_row_count);
+    resolution.final_logical_rows.reserve(selected_row_count);
+    resolution.row_deltas.reserve(selected_row_count);
+    std::vector<terminal_selection_line_lease_t> final_lines;
+    final_lines.reserve(selected_row_count);
+    std::set<std::uint64_t> final_retained_line_ids;
+
+    for (std::size_t index = 0U; index < selected_row_count; ++index) {
+        if (m_selection_reconciliation_counters.enabled) {
+            ++m_selection_reconciliation_counters.attachment_resolver_line_resolutions;
+        }
+        const terminal_selection_line_lease_t& old_line =
+            prior_lease.selected_lines[index];
+        if (old_line.row_offset != static_cast<int>(index) ||
+            !terminal_history_handle_has_identity(old_line.history_handle))
+        {
+            resolution.status = Terminal_selection_attachment_resolution_status::INVALID_LEASE;
+            return resolution;
+        }
+
+        const int old_logical_row = old_start.row + old_line.row_offset;
+        terminal_history_handle_t final_handle = old_line.history_handle;
+        const terminal_selection_line_successor_t* used_successor = nullptr;
+        Terminal_retained_line_lookup_result lookup = retained_line_lookup(
+            prior_lease.buffer_id,
+            final_handle);
+        if (!lookup.exact_match || lookup.retained_line_id_match_count != 1) {
+            if (lookup.retained_line_id_match_count > 1) {
+                resolution.status = Terminal_selection_attachment_resolution_status::
+                    DUPLICATE_RESOLUTION;
+                return resolution;
+            }
+            if (lookup.retained_line_content_generation_mismatch) {
+                resolution.status = Terminal_selection_attachment_resolution_status::
+                    CONTENT_GENERATION_MISMATCH;
+                return resolution;
+            }
+
+            const terminal_selection_line_successor_t* successor = nullptr;
+            if (continuity != nullptr) {
+                if (m_selection_reconciliation_counters.enabled) {
+                    ++m_selection_reconciliation_counters.successor_relation_lookups;
+                }
+                const auto found =
+                    continuity->successors_by_old_retained_line_id.find(
+                        old_line.history_handle.row_sequence);
+                if (found !=
+                    continuity->successors_by_old_retained_line_id.end())
+                {
+                    if (found->second.size() != 1U) {
+                        resolution.status =
+                            Terminal_selection_attachment_resolution_status::
+                                DUPLICATE_RESOLUTION;
+                        return resolution;
+                    }
+                    successor = &found->second.front();
+                    used_successor = successor;
+                }
+            }
+            if (successor == nullptr) {
+                resolution.status = Terminal_selection_attachment_resolution_status::MISSING_LINE;
+                return resolution;
+            }
+            if (successor->old_handle != old_line.history_handle) {
+                resolution.status = Terminal_selection_attachment_resolution_status::
+                    CONTENT_GENERATION_MISMATCH;
+                return resolution;
+            }
+            if (successor->final_handle.content_generation !=
+                old_line.history_handle.content_generation)
+            {
+                resolution.status = Terminal_selection_attachment_resolution_status::
+                    CONTENT_GENERATION_MISMATCH;
+                return resolution;
+            }
+
+            final_handle = successor->final_handle;
+            lookup = retained_line_lookup(prior_lease.buffer_id, final_handle);
+            if (!lookup.exact_match || lookup.retained_line_id_match_count != 1) {
+                resolution.status = lookup.retained_line_id_match_count > 1
+                    ? Terminal_selection_attachment_resolution_status::
+                        DUPLICATE_RESOLUTION
+                    : lookup.retained_line_content_generation_mismatch
+                    ? Terminal_selection_attachment_resolution_status::
+                        CONTENT_GENERATION_MISMATCH
+                    : Terminal_selection_attachment_resolution_status::MISSING_LINE;
+                return resolution;
+            }
+        }
+
+        if (used_successor != nullptr &&
+            (used_successor->old_logical_row != old_logical_row ||
+             used_successor->final_logical_row != lookup.exact_logical_row ||
+             used_successor->row_delta != lookup.exact_logical_row - old_logical_row))
+        {
+            resolution.status = Terminal_selection_attachment_resolution_status::
+                INCONSISTENT_ROW_DELTA;
+            return resolution;
+        }
+
+        if (!final_retained_line_ids.insert(final_handle.row_sequence).second) {
+            resolution.status = Terminal_selection_attachment_resolution_status::
+                DUPLICATE_RESOLUTION;
+            return resolution;
+        }
+
+        resolution.old_logical_rows.push_back(old_logical_row);
+        resolution.final_logical_rows.push_back(lookup.exact_logical_row);
+        resolution.row_deltas.push_back(lookup.exact_logical_row - old_logical_row);
+        final_lines.push_back({old_line.row_offset, final_handle});
+    }
+
+    const int uniform_delta = resolution.row_deltas.front();
+    for (std::size_t index = 1U; index < selected_row_count; ++index) {
+        if (resolution.final_logical_rows[index] <=
+            resolution.final_logical_rows[index - 1U])
+        {
+            resolution.status = Terminal_selection_attachment_resolution_status::
+                REORDERED_RESOLUTION;
+            return resolution;
+        }
+        if (resolution.final_logical_rows[index] !=
+            resolution.final_logical_rows[index - 1U] + 1)
+        {
+            resolution.status = Terminal_selection_attachment_resolution_status::
+                NONCONTIGUOUS_RESOLUTION;
+            return resolution;
+        }
+        if (resolution.row_deltas[index] != uniform_delta) {
+            resolution.status = Terminal_selection_attachment_resolution_status::
+                INCONSISTENT_ROW_DELTA;
+            return resolution;
+        }
+    }
+
+    const auto endpoint_is_representable = [&](terminal_grid_position_t endpoint) {
+        const int translated_row = endpoint.row + uniform_delta;
+        return translated_row >= 0 &&
+            endpoint.column >= 0 && endpoint.column <= target_source.grid_size.columns;
+    };
+    if (!endpoint_is_representable(prior_lease.selected_range.start) ||
+        !endpoint_is_representable(prior_lease.selected_range.end)   ||
+        !endpoint_is_representable(prior_lease.anchor)               ||
+        !endpoint_is_representable(prior_lease.extent))
+    {
+        resolution.status = Terminal_selection_attachment_resolution_status::
+            ENDPOINT_UNREPRESENTABLE;
+        return resolution;
+    }
+
+    terminal_selection_visual_lease_t translated = prior_lease;
+    translated.source_content_basis  = target_source.source_content_basis;
+    translated.anchor_domain         = target_source.anchor_domain;
+    translated.session_epoch         = target_source.session_epoch;
+    translated.buffer_id             = target_source.buffer_id;
+    translated.grid_reflow_basis     = target_source.grid_reflow_basis;
+    translated.row_origin_generation = target_source.row_origin_generation;
+    translated.grid_size             = target_source.grid_size;
+    translated.viewport_mapping      = target_source.viewport_mapping;
+    translated.selected_range.start.row += uniform_delta;
+    translated.selected_range.end.row   += uniform_delta;
+    translated.anchor.row                += uniform_delta;
+    translated.extent.row                += uniform_delta;
+    translated.selected_lines = std::move(final_lines);
+
+    resolution.status = Terminal_selection_attachment_resolution_status::TRANSLATED;
+    resolution.translated_lease = std::move(translated);
+    return resolution;
 }
 
 std::optional<terminal_history_handle_t>
@@ -1803,7 +2233,7 @@ Terminal_screen_model::retained_history_handle_at_logical_row(
 
 void Terminal_screen_model::discard_retained_lookup_cache_for_testing() const
 {
-    invalidate_retained_lookup_caches();
+    // The retained index is owner-maintained and has no lazy cache to discard.
 }
 
 bool Terminal_screen_model::retained_history_storage_allocated_for_testing() const
@@ -1894,72 +2324,134 @@ Terminal_screen_model::retained_history_diagnostics() const
     return diagnostics;
 }
 
-void Terminal_screen_model::invalidate_retained_lookup_caches() const
+void Terminal_screen_model::set_selection_reconciliation_counters_enabled(
+    bool enabled) const
 {
-    if (m_primary_retained_lookup_cache.invalidated() &&
-        m_alternate_retained_lookup_cache.invalidated()) {
-        return;
-    }
-
-    m_primary_retained_lookup_cache.valid = false;
-    m_primary_retained_lookup_cache.by_row_sequence.clear();
-    m_alternate_retained_lookup_cache.valid = false;
-    m_alternate_retained_lookup_cache.by_row_sequence.clear();
+    m_selection_reconciliation_counters.enabled = enabled;
 }
 
-void Terminal_screen_model::rebuild_retained_lookup_cache(
-    Terminal_buffer_id buffer_id) const
+void Terminal_screen_model::reset_selection_reconciliation_counters() const
 {
-    VNM_TERMINAL_PROFILE_SCOPE(
-        "Terminal_screen_model::rebuild_retained_lookup_cache");
+    const bool enabled = m_selection_reconciliation_counters.enabled;
+    m_selection_reconciliation_counters = {};
+    m_selection_reconciliation_counters.enabled = enabled;
+}
 
-    retained_lookup_cache_t& cache = mutable_retained_lookup_cache(buffer_id);
-    cache.by_row_sequence.clear();
+terminal_selection_reconciliation_counters_t
+Terminal_screen_model::selection_reconciliation_counters() const
+{
+    return m_selection_reconciliation_counters;
+}
 
-    const int row_count = buffer_id == Terminal_buffer_id::PRIMARY
-        ? primary_backing_row_count()
-        : active_grid_row_count();
+void Terminal_screen_model::refresh_active_grid_retained_lookup_index(
+    Terminal_buffer_id buffer_id)
+{
+    retained_lookup_index_t& index = mutable_retained_lookup_index(buffer_id);
+    if (m_selection_reconciliation_counters.enabled) {
+        m_selection_reconciliation_counters.retained_lookup_active_grid_entries_visited +=
+            index.active_grid_by_row_sequence.size();
+    }
+    index.active_grid_by_row_sequence.clear();
 
-    for (int logical_row = 0; logical_row < row_count; ++logical_row) {
-        const std::optional<terminal_history_handle_t> handle =
-            retained_lookup_cache_live_handle(buffer_id, logical_row);
-        if (!handle.has_value() || !terminal_history_handle_has_identity(*handle)) {
+    const std::vector<Terminal_screen_row>& rows = buffer_id == Terminal_buffer_id::PRIMARY
+        ? primary_active_grid_rows()
+        : alternate_active_grid_rows();
+    if (m_selection_reconciliation_counters.enabled) {
+        m_selection_reconciliation_counters.retained_lookup_active_grid_entries_visited +=
+            rows.size();
+    }
+    for (int active_row = 0; active_row < static_cast<int>(rows.size()); ++active_row) {
+        const terminal_history_handle_t handle = retained_history_handle_from_provenance(
+            rows[static_cast<std::size_t>(active_row)].retained_line_provenance);
+        if (!terminal_history_handle_has_identity(handle)) {
             continue;
         }
 
-        auto insertion = cache.by_row_sequence.emplace(
-            handle->row_sequence,
-            retained_lookup_cache_entry_t{
-                logical_row,
-                *handle,
+        auto insertion = index.active_grid_by_row_sequence.emplace(
+            handle.row_sequence,
+            retained_lookup_index_entry_t{
+                Retained_lookup_location_kind::ACTIVE_GRID,
+                0U,
+                active_row,
+                handle,
+                handle,
+                0,
+                1,
                 1,
             });
         if (!insertion.second) {
-            ++insertion.first->second.row_sequence_match_count;
+            retained_lookup_index_entry_t& entry = insertion.first->second;
+            ++entry.active_grid_match_count;
+            ++entry.row_sequence_match_count;
         }
     }
-
-    cache.valid = true;
 }
 
-const Terminal_screen_model::retained_lookup_cache_t&
-Terminal_screen_model::retained_lookup_cache(Terminal_buffer_id buffer_id) const
+void Terminal_screen_model::refresh_active_grid_retained_lookup_indexes()
 {
-    VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::retained_lookup_cache");
-
-    retained_lookup_cache_t& cache = mutable_retained_lookup_cache(buffer_id);
-    if (!cache.valid) {
-        rebuild_retained_lookup_cache(buffer_id);
-    }
-    return cache;
+    refresh_active_grid_retained_lookup_index(Terminal_buffer_id::PRIMARY);
+    refresh_active_grid_retained_lookup_index(Terminal_buffer_id::ALTERNATE);
 }
 
-Terminal_screen_model::retained_lookup_cache_t&
-Terminal_screen_model::mutable_retained_lookup_cache(Terminal_buffer_id buffer_id) const
+void Terminal_screen_model::insert_primary_history_retained_lookup(
+    terminal_history_handle_t handle,
+    std::uint64_t             history_ordinal)
+{
+    auto insertion = m_primary_retained_lookup_index.history_by_row_sequence.emplace(
+        handle.row_sequence,
+        retained_lookup_index_entry_t{
+            Retained_lookup_location_kind::PRIMARY_HISTORY,
+            history_ordinal,
+            0,
+            handle,
+            {},
+            1,
+            0,
+            1,
+        });
+    if (!insertion.second) {
+        retained_lookup_index_entry_t& entry = insertion.first->second;
+        entry.location_kind = Retained_lookup_location_kind::PRIMARY_HISTORY;
+        entry.history_ordinal = history_ordinal;
+        entry.history_handle = handle;
+        ++entry.history_match_count;
+        ++entry.row_sequence_match_count;
+    }
+}
+
+void Terminal_screen_model::erase_retained_lookup_entry(
+    Terminal_buffer_id buffer_id,
+    std::uint64_t      retained_line_id)
+{
+    retained_lookup_index_t& index = mutable_retained_lookup_index(buffer_id);
+    const auto found = index.history_by_row_sequence.find(retained_line_id);
+    if (found == index.history_by_row_sequence.end()) {
+        return;
+    }
+    retained_lookup_index_entry_t& entry = found->second;
+    if (entry.history_match_count > 0) {
+        --entry.history_match_count;
+        --entry.row_sequence_match_count;
+    }
+    if (entry.row_sequence_match_count == 0) {
+        index.history_by_row_sequence.erase(found);
+    }
+}
+
+const Terminal_screen_model::retained_lookup_index_t&
+Terminal_screen_model::retained_lookup_index(Terminal_buffer_id buffer_id) const
 {
     return buffer_id == Terminal_buffer_id::PRIMARY
-        ? m_primary_retained_lookup_cache
-        : m_alternate_retained_lookup_cache;
+        ? m_primary_retained_lookup_index
+        : m_alternate_retained_lookup_index;
+}
+
+Terminal_screen_model::retained_lookup_index_t&
+Terminal_screen_model::mutable_retained_lookup_index(Terminal_buffer_id buffer_id)
+{
+    return buffer_id == Terminal_buffer_id::PRIMARY
+        ? m_primary_retained_lookup_index
+        : m_alternate_retained_lookup_index;
 }
 
 std::optional<terminal_history_handle_t>
@@ -2002,13 +2494,53 @@ Terminal_screen_model::retained_lookup_cache_live_handle(
     return retained_history_handle_from_provenance(row->retained_line_provenance);
 }
 
-Terminal_history_resolution_status
-Terminal_screen_model::retained_lookup_cache_entry_status(
-    Terminal_buffer_id                     buffer_id,
-    const retained_lookup_cache_entry_t&   entry) const
+std::optional<int> Terminal_screen_model::retained_lookup_index_entry_logical_row(
+    Terminal_buffer_id                   buffer_id,
+    const retained_lookup_index_entry_t& entry) const
 {
+    if (entry.location_kind == Retained_lookup_location_kind::ACTIVE_GRID) {
+        const int row_count = buffer_id == Terminal_buffer_id::PRIMARY
+            ? static_cast<int>(primary_active_grid_rows().size())
+            : static_cast<int>(alternate_active_grid_rows().size());
+        if (entry.active_grid_row < 0 || entry.active_grid_row >= row_count) {
+            return std::nullopt;
+        }
+        return buffer_id == Terminal_buffer_id::PRIMARY
+            ? scrollback_size() + entry.active_grid_row
+            : entry.active_grid_row;
+    }
+
+    if (buffer_id != Terminal_buffer_id::PRIMARY ||
+        m_primary_backing.retained_history.index.empty())
+    {
+        return std::nullopt;
+    }
+
+    const std::uint64_t first_ordinal =
+        m_primary_backing.retained_history.index.front().ordinal;
+    if (entry.history_ordinal < first_ordinal) {
+        return std::nullopt;
+    }
+    const std::uint64_t offset = entry.history_ordinal - first_ordinal;
+    if (offset >= m_primary_backing.retained_history.index.size() ||
+        offset > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+    {
+        return std::nullopt;
+    }
+    return static_cast<int>(offset);
+}
+
+Terminal_history_resolution_status
+Terminal_screen_model::retained_lookup_index_entry_status(
+    Terminal_buffer_id                   buffer_id,
+    const retained_lookup_index_entry_t& entry,
+    int                                  logical_row) const
+{
+    if (m_selection_reconciliation_counters.enabled) {
+        ++m_selection_reconciliation_counters.retained_lookup_entry_revalidations;
+    }
     const std::optional<terminal_history_handle_t> live_handle =
-        retained_lookup_cache_live_handle(buffer_id, entry.logical_row);
+        retained_lookup_cache_live_handle(buffer_id, logical_row);
     if (!live_handle.has_value()) {
         return Terminal_history_resolution_status::STALE_ROW_SEQUENCE;
     }
@@ -2042,6 +2574,21 @@ Terminal_retained_line_provenance Terminal_screen_model::retained_line_provenanc
         return row->retained_line_provenance;
     }
     return {};
+}
+
+void Terminal_screen_model::set_active_grid_retained_line_provenance_for_testing(
+    Terminal_buffer_id                buffer_id,
+    int                               active_grid_row,
+    Terminal_retained_line_provenance provenance)
+{
+    std::vector<Terminal_screen_row>& rows = buffer_id == Terminal_buffer_id::PRIMARY
+        ? m_primary_backing.active_grid_state().rows
+        : m_alternate_grid.active_grid_state().rows;
+    if (active_grid_row < 0 || active_grid_row >= static_cast<int>(rows.size())) {
+        return;
+    }
+    rows[static_cast<std::size_t>(active_grid_row)].retained_line_provenance = provenance;
+    refresh_active_grid_retained_lookup_index(buffer_id);
 }
 
 std::optional<terminal_retained_row_record_metadata_t>
@@ -2201,6 +2748,7 @@ void Terminal_screen_model::Retained_history_storage::reset()
     }
     index.clear();
     prefix_plain_ascii_rows = 0U;
+    next_ordinal = 0U;
 }
 
 void Terminal_screen_model::Retained_history_storage::
@@ -2212,6 +2760,7 @@ void Terminal_screen_model::Retained_history_storage::
 
     index.back().history_handle = history_handle;
     index.back().payload_kind   = payload_kind;
+    index.back().ordinal        = next_ordinal++;
 
     switch (payload_kind) {
         case Terminal_history_row_record_payload_kind::GENERIC_COMPACT:
@@ -2362,20 +2911,23 @@ Terminal_screen_model::Primary_backing_buffer::append_retained_history_record(
         append.history_handle,
         append.payload_kind);
     retained_history_append_result_t result;
+    result.appended_handle  = append.history_handle;
+    result.appended_ordinal = retained_history.index.back().ordinal;
     if (append.commit.tail_advanced) {
-        result.evicted_rows = prune_retained_history_rows_outside_live_window();
+        result.evicted_handles = prune_retained_history_rows_outside_live_window();
     }
     return result;
 }
 
-int Terminal_screen_model::Primary_backing_buffer::discard_oldest_retained_history_records(
+std::vector<terminal_history_handle_t>
+Terminal_screen_model::Primary_backing_buffer::discard_oldest_retained_history_records(
     int row_count)
 {
     VNM_TERMINAL_PROFILE_SCOPE(
         "Terminal_screen_model::Primary_backing_buffer::discard_oldest_retained_history_records");
 
     if (row_count <= 0 || retained_history.index.empty()) {
-        return 0;
+        return {};
     }
 
     const std::size_t rows_to_discard = std::min(
@@ -2387,6 +2939,11 @@ int Terminal_screen_model::Primary_backing_buffer::discard_oldest_retained_histo
         throw_retained_history_storage_failure();
     }
 
+    std::vector<terminal_history_handle_t> discarded_handles;
+    discarded_handles.reserve(discard.discarded_records);
+    for (std::size_t index = 0U; index < discard.discarded_records; ++index) {
+        discarded_handles.push_back(retained_history.index[index].history_handle);
+    }
     retained_history.discard_index_prefix(discard.discarded_records);
 
     if (discard.discarded_records >
@@ -2395,7 +2952,7 @@ int Terminal_screen_model::Primary_backing_buffer::discard_oldest_retained_histo
         throw std::overflow_error("terminal retained history discard exceeds int range");
     }
 
-    return static_cast<int>(discard.discarded_records);
+    return discarded_handles;
 }
 
 void Terminal_screen_model::Primary_backing_buffer::clear_retained_history()
@@ -2406,7 +2963,8 @@ void Terminal_screen_model::Primary_backing_buffer::clear_retained_history()
     retained_history.reset();
 }
 
-int Terminal_screen_model::Primary_backing_buffer::
+std::vector<terminal_history_handle_t>
+Terminal_screen_model::Primary_backing_buffer::
     prune_retained_history_rows_outside_live_window() const
 {
     VNM_TERMINAL_PROFILE_SCOPE(
@@ -2424,13 +2982,18 @@ int Terminal_screen_model::Primary_backing_buffer::
 
     const std::size_t pruned_rows = static_cast<std::size_t>(
         first_live - retained_history.index.begin());
+    std::vector<terminal_history_handle_t> pruned_handles;
+    pruned_handles.reserve(pruned_rows);
+    for (std::size_t index = 0U; index < pruned_rows; ++index) {
+        pruned_handles.push_back(retained_history.index[index].history_handle);
+    }
     retained_history.discard_index_prefix(pruned_rows);
 
     if (pruned_rows > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
         throw std::overflow_error("terminal retained history prune exceeds int range");
     }
 
-    return static_cast<int>(pruned_rows);
+    return pruned_handles;
 }
 
 Terminal_screen_model::screen_buffer_state_t&
@@ -2570,7 +3133,6 @@ void Terminal_screen_model::replace_retained_line_id(
     Terminal_screen_row&                    row,
     Terminal_retained_line_provenance_source source)
 {
-    invalidate_retained_lookup_caches();
     row.retained_line_provenance = {
         .retained_line_id   = next_retained_line_id(),
         .content_generation = 0U,
@@ -2586,7 +3148,6 @@ void Terminal_screen_model::rebase_retained_line_id_preserving_content(
     Terminal_screen_row&                    row,
     Terminal_retained_line_provenance_source source)
 {
-    invalidate_retained_lookup_caches();
     row.retained_line_provenance = {
         .retained_line_id   = next_retained_line_id(),
         .content_generation = row.retained_line_provenance.content_generation,
@@ -2837,7 +3398,6 @@ void Terminal_screen_model::advance_row_content_generation_with_change_flag(
     }
 #endif
 
-    invalidate_retained_lookup_caches();
     if (row.retained_line_provenance.content_generation ==
         std::numeric_limits<std::uint64_t>::max())
     {
@@ -2917,25 +3477,54 @@ bool Terminal_screen_model::apply_grid_resize(
             grid_size);
     }
 
+    if (m_resize_transition_sink != nullptr) {
+        Q_ASSERT(!m_pending_resize_transition.has_value());
+        m_pending_resize_transition = std::pair{grid_size_before, grid_size};
+    }
+
     return true;
 }
 
-Terminal_screen_model_result Terminal_screen_model::resize(terminal_grid_size_t grid_size)
+Terminal_screen_model_result Terminal_screen_model::resize(
+    terminal_grid_size_t grid_size,
+    const terminal_screen_model_resize_transition_sink_t* resize_transition_sink)
 {
     Terminal_screen_model_result result;
     m_scrollback_evicted_rows = 0;
     clear_backing_deltas();
     clear_recovery_proposals();
+    clear_selection_continuity();
     clear_dirty();
 
+    ingest_publication_t resize_transition_publication;
+    Resize_transition_scope resize_transition_scope(
+        *this,
+        resize_transition_sink,
+        resize_transition_publication);
+
     const bool grid_resized = apply_grid_resize(grid_size, true);
-    const bool resize_terminal_content_changed = m_terminal_content_changed;
-    const bool resize_active_buffer_changed    = m_active_buffer_changed;
-    const bool resize_grid_reflow_changed      = m_grid_reflow_changed;
+    if (m_pending_resize_transition.has_value()) {
+        emit_pending_resize_transition();
+    }
+    else {
+        accumulate_pending_changes(resize_transition_publication);
+    }
+    const bool resize_grid_reflow_changed = m_grid_reflow_changed;
     result_change_overrides_t resize_overrides;
-    resize_overrides.terminal_content_changed = resize_terminal_content_changed;
-    resize_overrides.active_buffer_changed    = resize_active_buffer_changed;
-    resize_overrides.grid_reflow_changed      = resize_grid_reflow_changed;
+    resize_overrides.terminal_content_changed =
+        resize_transition_publication.terminal_content_changed;
+    resize_overrides.active_buffer_changed =
+        resize_transition_publication.active_buffer_changed;
+    resize_overrides.grid_reflow_changed =
+        resize_transition_publication.grid_reflow_changed;
+    resize_overrides.viewport_changed =
+        resize_transition_publication.viewport_changed;
+    resize_overrides.mode_state_changed =
+        resize_transition_publication.mode_state_changed;
+    resize_overrides.mouse_reporting_mode_changed =
+        resize_transition_publication.mouse_reporting_mode_changed;
+    resize_overrides.alternate_scroll_mode_changed =
+        resize_transition_publication.alternate_scroll_mode_changed;
     if (!grid_resized) {
         return finalize_result(std::move(result), resize_overrides);
     }
@@ -2957,6 +3546,7 @@ Terminal_screen_model_result Terminal_screen_model::set_scrollback_limit(int lim
     m_scrollback_evicted_rows = 0;
     clear_backing_deltas();
     clear_recovery_proposals();
+    clear_selection_continuity();
     clear_dirty();
 
     const int bounded_limit = std::max(0, limit);
@@ -3007,6 +3597,7 @@ Terminal_screen_model_result Terminal_screen_model::set_color_state(Terminal_col
     Terminal_screen_model_result result;
     clear_backing_deltas();
     clear_recovery_proposals();
+    clear_selection_continuity();
     clear_dirty();
 
     m_color_state = std::move(state);
@@ -3028,7 +3619,8 @@ void Terminal_screen_model::set_primary_repaint_recovery_enabled(bool enabled)
     m_config.recover_scrollback_from_primary_repaints = enabled;
     if (!enabled) {
         cancel_primary_repaint_recovery_resize_guard();
-        cancel_primary_repaint_recovery_candidate();
+        cancel_primary_repaint_recovery_candidate(
+            Terminal_recovery_attempt_reason::RECOVERY_DISABLED);
     }
 }
 
@@ -3774,7 +4366,7 @@ void Terminal_screen_model::erase_in_display(int mode)
             const int scrollback_rows_before = scrollback_size();
             m_scrollback_evicted_rows       += scrollback_rows_before;
             m_primary_backing.clear_retained_history();
-            invalidate_retained_lookup_caches();
+            m_primary_retained_lookup_index.history_by_row_sequence.clear();
             record_primary_history_delta(
                 Terminal_backing_delta_kind::PRIMARY_HISTORY_CLEARED,
                 scrollback_rows_before,
@@ -4382,12 +4974,13 @@ void Terminal_screen_model::clear_all_tab_stops()
     std::fill(m_tab_stops.begin(), m_tab_stops.end(), false);
 }
 
-void Terminal_screen_model::append_scrollback_row(
+std::optional<terminal_history_handle_t> Terminal_screen_model::append_scrollback_row(
     const Terminal_screen_row&               row,
     Terminal_retained_line_provenance_source source,
     const std::map<Terminal_hyperlink_id, QByteArray>* hyperlink_identity_keys,
     const terminal_hyperlink_identity_by_id_t* active_hyperlink_identity_keys_by_id)
 {
+    std::optional<terminal_history_handle_t> appended_handle;
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_profile_stats.enabled && m_text_span_profile_depth > 0) {
         ++m_profile_stats.scrollback_appends_from_text_writes;
@@ -4418,8 +5011,20 @@ void Terminal_screen_model::append_scrollback_row(
                 1);
         }
         else {
-            m_scrollback_evicted_rows += append.evicted_rows;
-            if (append.evicted_rows > 0 && interaction_trace_enabled()) {
+            appended_handle = append.appended_handle;
+            if (append.appended_handle.has_value()) {
+                insert_primary_history_retained_lookup(
+                    *append.appended_handle,
+                    append.appended_ordinal);
+            }
+            for (const terminal_history_handle_t evicted_handle : append.evicted_handles) {
+                erase_retained_lookup_entry(
+                    Terminal_buffer_id::PRIMARY,
+                    evicted_handle.row_sequence);
+            }
+            const int evicted_rows = static_cast<int>(append.evicted_handles.size());
+            m_scrollback_evicted_rows += evicted_rows;
+            if (evicted_rows > 0 && interaction_trace_enabled()) {
                 const terminal_retained_history_diagnostics_t diagnostics =
                     retained_history_diagnostics();
                 record_interaction_trace(
@@ -4427,7 +5032,7 @@ void Terminal_screen_model::append_scrollback_row(
                     "ring-eviction",
                     QStringLiteral(
                         "evicted_rows=%1 retained_rows=%2 record_bytes=%3 byte_capacity=%4 row_limit=%5")
-                        .arg(append.evicted_rows)
+                        .arg(evicted_rows)
                         .arg(diagnostics.retained_rows)
                         .arg(diagnostics.retained_record_bytes)
                         .arg(diagnostics.byte_budget)
@@ -4438,7 +5043,7 @@ void Terminal_screen_model::append_scrollback_row(
                 scrollback_rows_before,
                 scrollback_size(),
                 1,
-                append.evicted_rows,
+                evicted_rows,
                 0);
         }
         while (scrollback_size() > m_config.scrollback_limit) {
@@ -4472,6 +5077,7 @@ void Terminal_screen_model::append_scrollback_row(
             1);
     }
     mark_viewport_changed();
+    return appended_handle;
 }
 
 void Terminal_screen_model::scroll_up_region(
@@ -4653,17 +5259,43 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
         std::move(m_primary_repaint_recovery_candidate);
     m_primary_repaint_recovery_candidate = {};
 
-    if (candidate.visible_row_identity_ambiguous) {
-        for (Terminal_screen_row& row : candidate.rows) {
-            rebase_retained_line_id_preserving_content(row);
-        }
-    }
-
+    const terminal_repaint_recovery_shift_result_t shift =
+        primary_repaint_recovery_shift(candidate);
     std::optional<primary_repaint_recovery_proposal_t> proposal =
-        primary_repaint_recovery_proposal(candidate);
+        primary_repaint_recovery_proposal(candidate, shift);
     if (!proposal.has_value()) {
+        record_recovery_attempt({
+            Terminal_recovery_attempt_status::REJECTED,
+            shift.rejection_kind ==
+                    Terminal_repaint_recovery_rejection_kind::REPEATED_ROW_AMBIGUOUS
+                ? Terminal_recovery_attempt_reason::REPEATED_ROW_AMBIGUOUS
+                : Terminal_recovery_attempt_reason::NONMATCHING,
+            static_cast<int>(candidate.rows.size()),
+            0,
+        });
         if (candidate.visible_row_identity_ambiguous) {
-            rebase_visible_retained_line_ids_preserving_content();
+            terminal_selection_continuity_capability_t& continuity =
+                selection_continuity();
+            std::vector<Terminal_screen_row>& active_rows = active_grid_rows();
+            const int proof_rows = std::min(
+                static_cast<int>(candidate.rows.size()),
+                static_cast<int>(active_rows.size()));
+            for (int row = 0; row < proof_rows; ++row) {
+                const terminal_history_handle_t old_handle =
+                    retained_history_handle_from_provenance(
+                        candidate.rows[static_cast<std::size_t>(row)].retained_line_provenance);
+                Terminal_screen_row& target = active_rows[static_cast<std::size_t>(row)];
+                rebase_retained_line_id_preserving_content(target);
+                continuity.survivor_proofs.push_back({
+                    old_handle,
+                    {},
+                    retained_history_handle_from_provenance(
+                        target.retained_line_provenance),
+                    Terminal_selection_survivor_proof_result::PROOF_UNAVAILABLE,
+                    candidate.scrollback_rows + row,
+                    candidate.scrollback_rows + row,
+                });
+            }
             mark_all_dirty();
             candidate.visible_row_identity_ambiguous = false;
         }
@@ -4674,22 +5306,120 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
         return;
     }
 
+    record_recovery_attempt({
+        Terminal_recovery_attempt_status::ACCEPTED,
+        shift.match_kind == Terminal_repaint_recovery_match_kind::FULL
+            ? Terminal_recovery_attempt_reason::FULL_SHIFT_MATCH
+            : Terminal_recovery_attempt_reason::PARTIAL_SHIFT_MATCH,
+        static_cast<int>(candidate.rows.size()),
+        shift.shifted_rows,
+    });
     accept_primary_repaint_recovery_proposal(*proposal);
-    for (Terminal_screen_row& row : active_grid_rows()) {
-        rebase_retained_line_id_preserving_content(row);
+    std::vector<Terminal_screen_row>& active_rows = active_grid_rows();
+    terminal_selection_continuity_capability_t& continuity = selection_continuity();
+    for (int row = 0; row < static_cast<int>(active_rows.size()); ++row) {
+        Terminal_screen_row& target = active_rows[static_cast<std::size_t>(row)];
+        const int predecessor_row = shift.shifted_rows + row;
+        const bool matched_candidate = row < shift.matched_prefix_rows &&
+            predecessor_row < static_cast<int>(candidate.rows.size());
+
+        terminal_history_handle_t old_handle;
+        Terminal_selection_survivor_proof_result proof_result =
+            Terminal_selection_survivor_proof_result::UNMATCHED_TAIL;
+        if (predecessor_row < static_cast<int>(candidate.rows.size())) {
+            const Terminal_screen_row& predecessor =
+                candidate.rows[static_cast<std::size_t>(predecessor_row)];
+            old_handle = retained_history_handle_from_provenance(
+                predecessor.retained_line_provenance);
+            if (matched_candidate) {
+                if (!rows_have_same_selection_content(predecessor.cells, target.cells)) {
+                    proof_result =
+                        Terminal_selection_survivor_proof_result::REPRESENTATION_MISMATCH;
+                }
+                else {
+                    proof_result = Terminal_selection_survivor_proof_result::EXACT;
+                }
+            }
+        }
+
+        rebase_retained_line_id_preserving_content(target);
+        const std::uint64_t final_retained_line_id =
+            target.retained_line_provenance.retained_line_id;
+        if (proof_result == Terminal_selection_survivor_proof_result::EXACT) {
+            const Terminal_retained_line_provenance& predecessor_provenance =
+                candidate.rows[static_cast<std::size_t>(predecessor_row)].retained_line_provenance;
+            target.retained_line_provenance = predecessor_provenance;
+            target.retained_line_provenance.retained_line_id = final_retained_line_id;
+        }
+        const terminal_history_handle_t final_handle =
+            retained_history_handle_from_provenance(target.retained_line_provenance);
+
+        if (terminal_history_handle_has_identity(old_handle)) {
+            continuity.survivor_proofs.push_back({
+                old_handle,
+                old_handle,
+                final_handle,
+                proof_result,
+                candidate.scrollback_rows + predecessor_row,
+                scrollback_size() + row,
+            });
+        }
+        if (proof_result == Terminal_selection_survivor_proof_result::EXACT) {
+            record_selection_successor({
+                old_handle,
+                final_handle,
+                candidate.scrollback_rows + predecessor_row,
+                scrollback_size() + row,
+                row - predecessor_row,
+            });
+        }
     }
     mark_all_dirty();
 }
 
-void Terminal_screen_model::cancel_primary_repaint_recovery_candidate()
+void Terminal_screen_model::cancel_primary_repaint_recovery_candidate(
+    Terminal_recovery_attempt_reason reason)
 {
+    const bool had_active_candidate = m_primary_repaint_recovery_candidate.active;
+    const int candidate_visible_rows = static_cast<int>(
+        m_primary_repaint_recovery_candidate.rows.size());
     if (m_primary_repaint_recovery_candidate.active &&
         m_primary_repaint_recovery_candidate.visible_row_identity_ambiguous)
     {
-        rebase_visible_retained_line_ids_preserving_content();
+        terminal_selection_continuity_capability_t& continuity =
+            selection_continuity();
+        std::vector<Terminal_screen_row>& active_rows = active_grid_rows();
+        const int proof_rows = std::min(
+            candidate_visible_rows,
+            static_cast<int>(active_rows.size()));
+        for (int row = 0; row < proof_rows; ++row) {
+            const terminal_history_handle_t old_handle =
+                retained_history_handle_from_provenance(
+                    m_primary_repaint_recovery_candidate.rows[
+                        static_cast<std::size_t>(row)].retained_line_provenance);
+            Terminal_screen_row& target = active_rows[static_cast<std::size_t>(row)];
+            rebase_retained_line_id_preserving_content(target);
+            continuity.survivor_proofs.push_back({
+                old_handle,
+                {},
+                retained_history_handle_from_provenance(
+                    target.retained_line_provenance),
+                Terminal_selection_survivor_proof_result::PROOF_UNAVAILABLE,
+                m_primary_repaint_recovery_candidate.scrollback_rows + row,
+                scrollback_size() + row,
+            });
+        }
         mark_all_dirty();
     }
     m_primary_repaint_recovery_candidate = {};
+    if (had_active_candidate) {
+        record_recovery_attempt({
+            Terminal_recovery_attempt_status::CANCELLED,
+            reason,
+            candidate_visible_rows,
+            0,
+        });
+    }
 }
 
 void Terminal_screen_model::accept_primary_repaint_recovery_proposal(
@@ -4719,28 +5449,76 @@ void Terminal_screen_model::accept_primary_repaint_recovery_proposal(
         active_identity_keys_by_id.has_value()
             ? &*active_identity_keys_by_id
             : nullptr;
-    for (Terminal_screen_row recovered_row : proposal.rows) {
-        append_scrollback_row(
+    for (int row = 0; row < static_cast<int>(proposal.rows.size()); ++row) {
+        const Terminal_screen_row& recovered_row =
+            proposal.rows[static_cast<std::size_t>(row)];
+        const terminal_history_handle_t old_handle =
+            retained_history_handle_from_provenance(
+                recovered_row.retained_line_provenance);
+        const std::optional<terminal_history_handle_t> final_handle = append_scrollback_row(
             recovered_row,
             proposal.metadata.provenance_source,
             &proposal.hyperlink_identity_keys,
             active_identity_keys);
+        terminal_selection_survivor_proof_t proof;
+        proof.old_handle                   = old_handle;
+        proof.candidate_predecessor_handle = old_handle;
+        proof.old_logical_row = proposal.source_scrollback_rows + row;
+        proof.final_logical_row = scrollback_size() - 1;
+        if (final_handle.has_value()) {
+            proof.final_handle = *final_handle;
+            const Terminal_retained_line_lookup_result lookup = retained_line_lookup(
+                Terminal_buffer_id::PRIMARY,
+                *final_handle);
+            const std::optional<std::vector<Cell>> final_cells = lookup.exact_match &&
+                    lookup.retained_line_id_match_count == 1
+                ? logical_row_cells(Terminal_buffer_id::PRIMARY, lookup.exact_logical_row)
+                : std::nullopt;
+            if (!final_cells.has_value()) {
+                proof.result = Terminal_selection_survivor_proof_result::PROOF_UNAVAILABLE;
+            }
+            else
+            if (final_handle->content_generation != old_handle.content_generation) {
+                proof.result = Terminal_selection_survivor_proof_result::
+                    CONTENT_GENERATION_MISMATCH;
+            }
+            else
+            if (!rows_have_same_selection_content(recovered_row.cells, *final_cells)) {
+                proof.result = Terminal_selection_survivor_proof_result::
+                    REPRESENTATION_MISMATCH;
+            }
+            else {
+                proof.result = Terminal_selection_survivor_proof_result::EXACT;
+                proof.final_logical_row = lookup.exact_logical_row;
+                record_selection_successor({
+                    old_handle,
+                    *final_handle,
+                    proof.old_logical_row,
+                    proof.final_logical_row,
+                    proof.final_logical_row - proof.old_logical_row,
+                });
+            }
+        }
+        else {
+            proof.result = Terminal_selection_survivor_proof_result::PROOF_UNAVAILABLE;
+        }
+        selection_continuity().survivor_proofs.push_back(std::move(proof));
     }
     m_recovery_proposals.push_back(proposal.metadata);
 }
 
 std::optional<Terminal_screen_model::primary_repaint_recovery_proposal_t>
 Terminal_screen_model::primary_repaint_recovery_proposal(
-    const primary_repaint_recovery_candidate_t& candidate) const
+    const primary_repaint_recovery_candidate_t& candidate,
+    const terminal_repaint_recovery_shift_result_t& shift) const
 {
-    const int scrolled_rows = primary_repaint_recovery_shift_rows(candidate);
-    if (scrolled_rows <= 0) {
+    if (shift.shifted_rows <= 0) {
         return std::nullopt;
     }
 
     primary_repaint_recovery_proposal_t proposal;
-    proposal.rows.reserve(static_cast<std::size_t>(scrolled_rows));
-    for (int row = 0; row < scrolled_rows; ++row) {
+    proposal.rows.reserve(static_cast<std::size_t>(shift.shifted_rows));
+    for (int row = 0; row < shift.shifted_rows; ++row) {
         proposal.rows.push_back(candidate.rows[static_cast<std::size_t>(row)]);
     }
     proposal.hyperlink_identity_keys = candidate.hyperlink_identity_keys;
@@ -4752,13 +5530,17 @@ Terminal_screen_model::primary_repaint_recovery_proposal(
         Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT;
     proposal.metadata.candidate_visible_rows =
         static_cast<int>(candidate.rows.size());
-    proposal.metadata.recovered_row_count = scrolled_rows;
+    proposal.metadata.recovered_row_count = shift.shifted_rows;
+    proposal.metadata.matched_prefix_rows = shift.matched_prefix_rows;
+    proposal.metadata.unmatched_tail_rows = shift.unmatched_tail_rows;
     proposal.metadata.visible_row_identity_ambiguous =
         candidate.visible_row_identity_ambiguous;
+    proposal.source_scrollback_rows = candidate.scrollback_rows;
     return proposal;
 }
 
-int Terminal_screen_model::primary_repaint_recovery_shift_rows(
+terminal_repaint_recovery_shift_result_t
+Terminal_screen_model::primary_repaint_recovery_shift(
     const primary_repaint_recovery_candidate_t& candidate) const
 {
     terminal_repaint_recovery_shift_input_t input;
@@ -4781,7 +5563,18 @@ int Terminal_screen_model::primary_repaint_recovery_shift_rows(
             row_text_from_cells(row.cells, 0, m_config.grid_size.columns));
     }
 
-    return internal::primary_repaint_recovery_shift_rows(input);
+    return internal::primary_repaint_recovery_shift_result(input);
+}
+
+void Terminal_screen_model::record_recovery_attempt(
+    terminal_recovery_attempt_t attempt)
+{
+    if (m_recovery_attempts.size() < k_terminal_recovery_attempt_result_limit) {
+        m_recovery_attempts.push_back(std::move(attempt));
+    }
+    else {
+        ++m_dropped_recovery_attempts;
+    }
 }
 
 bool Terminal_screen_model::row_has_visible_text(const Terminal_screen_row& row) const
@@ -4917,13 +5710,11 @@ void Terminal_screen_model::mark_terminal_content_changed()
         m_primary_repaint_recovery_candidate.visible_row_identity_ambiguous = true;
     }
 
-    invalidate_retained_lookup_caches();
     m_terminal_content_changed = true;
 }
 
 void Terminal_screen_model::mark_active_buffer_changed()
 {
-    invalidate_retained_lookup_caches();
     m_active_buffer_changed = true;
 }
 
@@ -5033,6 +5824,72 @@ void Terminal_screen_model::clear_recovery_proposals()
     m_recovery_proposals.clear();
 }
 
+void Terminal_screen_model::clear_selection_continuity()
+{
+    if (m_selection_continuity_published) {
+        m_selection_continuity.reset();
+        m_selection_continuity_published = false;
+    }
+}
+
+terminal_selection_continuity_capability_t&
+Terminal_screen_model::selection_continuity()
+{
+    if (m_selection_continuity_published) {
+        m_selection_continuity.reset();
+        m_selection_continuity_published = false;
+    }
+    if (!m_selection_continuity.has_value()) {
+        m_selection_continuity.emplace();
+    }
+    return *m_selection_continuity;
+}
+
+void Terminal_screen_model::record_selection_successor(
+    terminal_selection_line_successor_t successor)
+{
+    terminal_selection_continuity_capability_t& continuity = selection_continuity();
+    continuity.successors_by_old_retained_line_id[successor.old_handle.row_sequence]
+        .push_back(successor);
+}
+
+void Terminal_screen_model::finalize_selection_continuity_rows()
+{
+    if (!m_selection_continuity.has_value()) {
+        return;
+    }
+
+    for (auto& [old_retained_line_id, successors] :
+        m_selection_continuity->successors_by_old_retained_line_id)
+    {
+        Q_UNUSED(old_retained_line_id);
+        for (terminal_selection_line_successor_t& successor : successors) {
+            const Terminal_retained_line_lookup_result lookup = retained_line_lookup(
+                Terminal_buffer_id::PRIMARY,
+                successor.final_handle);
+            if (!lookup.exact_match || lookup.retained_line_id_match_count != 1) {
+                continue;
+            }
+            successor.final_logical_row = lookup.exact_logical_row;
+            successor.row_delta = successor.final_logical_row - successor.old_logical_row;
+        }
+    }
+
+    for (terminal_selection_survivor_proof_t& proof :
+        m_selection_continuity->survivor_proofs)
+    {
+        if (!terminal_history_handle_has_identity(proof.final_handle)) {
+            continue;
+        }
+        const Terminal_retained_line_lookup_result lookup = retained_line_lookup(
+            Terminal_buffer_id::PRIMARY,
+            proof.final_handle);
+        if (lookup.exact_match && lookup.retained_line_id_match_count == 1) {
+            proof.final_logical_row = lookup.exact_logical_row;
+        }
+    }
+}
+
 void Terminal_screen_model::adopt_publication_changes(ingest_publication_t&& publication)
 {
     m_dirty_rows                    = std::move(publication.dirty_rows);
@@ -5045,10 +5902,157 @@ void Terminal_screen_model::adopt_publication_changes(ingest_publication_t&& pub
     m_alternate_scroll_mode_changed = publication.alternate_scroll_mode_changed;
 }
 
+void Terminal_screen_model::accumulate_pending_changes(
+    ingest_publication_t& publication) const
+{
+    publication.dirty_rows.insert(m_dirty_rows.begin(), m_dirty_rows.end());
+    publication.viewport_changed =
+        publication.viewport_changed || m_viewport_changed;
+    publication.terminal_content_changed =
+        publication.terminal_content_changed || m_terminal_content_changed;
+    publication.active_buffer_changed =
+        publication.active_buffer_changed || m_active_buffer_changed;
+    publication.grid_reflow_changed =
+        publication.grid_reflow_changed || m_grid_reflow_changed;
+    publication.mode_state_changed =
+        publication.mode_state_changed || m_mode_state_changed;
+    publication.mouse_reporting_mode_changed =
+        publication.mouse_reporting_mode_changed ||
+        m_mouse_reporting_mode_changed;
+    publication.alternate_scroll_mode_changed =
+        publication.alternate_scroll_mode_changed ||
+        m_alternate_scroll_mode_changed;
+}
+
+void Terminal_screen_model::accumulate_publication_changes(
+    ingest_publication_t&       target,
+    const ingest_publication_t& source) const
+{
+    target.dirty_rows.insert(source.dirty_rows.begin(), source.dirty_rows.end());
+    target.dirty_rows_have_stable_mutation_identity =
+        target.dirty_rows_have_stable_mutation_identity &&
+        source.dirty_rows_have_stable_mutation_identity;
+    target.viewport_changed = target.viewport_changed || source.viewport_changed;
+    target.terminal_content_changed =
+        target.terminal_content_changed || source.terminal_content_changed;
+    target.active_buffer_changed =
+        target.active_buffer_changed || source.active_buffer_changed;
+    target.grid_reflow_changed =
+        target.grid_reflow_changed || source.grid_reflow_changed;
+    target.mode_state_changed =
+        target.mode_state_changed || source.mode_state_changed;
+    target.mouse_reporting_mode_changed =
+        target.mouse_reporting_mode_changed || source.mouse_reporting_mode_changed;
+    target.alternate_scroll_mode_changed =
+        target.alternate_scroll_mode_changed || source.alternate_scroll_mode_changed;
+}
+
+void Terminal_screen_model::assign_trailing_changes(
+    const ingest_publication_t&                    publication,
+    terminal_screen_model_trailing_changes_t* trailing_changes) const
+{
+    if (trailing_changes == nullptr) {
+        return;
+    }
+
+    trailing_changes->terminal_content_changed = publication.terminal_content_changed;
+    trailing_changes->active_buffer_changed = publication.active_buffer_changed;
+    trailing_changes->grid_reflow_changed = publication.grid_reflow_changed;
+    trailing_changes->viewport_changed = publication.viewport_changed;
+    trailing_changes->mode_state_changed = publication.mode_state_changed;
+    trailing_changes->mouse_reporting_mode_changed =
+        publication.mouse_reporting_mode_changed;
+    trailing_changes->alternate_scroll_mode_changed =
+        publication.alternate_scroll_mode_changed;
+}
+
+void Terminal_screen_model::emit_pending_resize_transition()
+{
+    Q_ASSERT(m_resize_transition_sink != nullptr);
+    Q_ASSERT(m_resize_transition_publication != nullptr);
+    Q_ASSERT(m_pending_resize_transition.has_value());
+
+    accumulate_publication_changes(
+        *m_resize_transition_publication,
+        m_synchronized_selection_changes);
+    m_synchronized_selection_changes = {};
+    accumulate_pending_changes(*m_resize_transition_publication);
+    terminal_screen_model_resize_transition_t transition;
+    transition.result = finalize_resize_transition_result(
+        *m_resize_transition_publication);
+    transition.grid_size_before = m_pending_resize_transition->first;
+    transition.grid_size_after  = m_pending_resize_transition->second;
+    transition.sequence         = m_resize_transition_sink->sequence;
+    transition.ordinal          = ++m_resize_transition_ordinal;
+    m_pending_resize_transition.reset();
+    m_skip_next_resize_transition_accumulation = true;
+
+    m_resize_transition_sink->consume(
+        m_resize_transition_sink->context,
+        transition);
+
+    clear_backing_deltas();
+    clear_recovery_proposals();
+    clear_selection_continuity();
+    *m_resize_transition_publication = {};
+}
+
+void Terminal_screen_model::emit_text_area_resize_request(
+    terminal_grid_size_t grid_size,
+    bool                 model_grid_changed)
+{
+    if (m_resize_transition_sink == nullptr ||
+        m_resize_transition_sink->consume_text_area_resize_request == nullptr)
+    {
+        return;
+    }
+
+    terminal_screen_model_text_area_resize_request_t request;
+    request.grid_size          = grid_size;
+    request.sequence           = m_resize_transition_sink->sequence;
+    request.ordinal            = ++m_text_area_resize_request_ordinal;
+    request.model_grid_changed = model_grid_changed;
+    m_resize_transition_sink->consume_text_area_resize_request(
+        m_resize_transition_sink->context,
+        request);
+}
+
+Terminal_screen_model_result Terminal_screen_model::finalize_resize_transition_result(
+    const ingest_publication_t& publication)
+{
+    refresh_active_grid_retained_lookup_indexes();
+    finalize_selection_continuity_rows();
+
+    Terminal_screen_model_result result;
+    result.dirty_rows.assign(publication.dirty_rows.begin(), publication.dirty_rows.end());
+    result.dirty_rows_have_stable_mutation_identity =
+        publication.dirty_rows_have_stable_mutation_identity;
+    result.terminal_content_changed     = publication.terminal_content_changed;
+    result.active_buffer_changed        = publication.active_buffer_changed;
+    result.grid_reflow_changed          = publication.grid_reflow_changed;
+    result.viewport_changed              = publication.viewport_changed;
+    result.mode_state_changed            = publication.mode_state_changed;
+    result.mouse_reporting_mode_changed  = publication.mouse_reporting_mode_changed;
+    result.alternate_scroll_mode_changed = publication.alternate_scroll_mode_changed;
+    result.scrollback_rows               = scrollback_size();
+    result.backing_deltas                = m_backing_deltas;
+    result.recovery_proposals            = m_recovery_proposals;
+    result.recovery_attempts             = std::move(m_recovery_attempts);
+    result.selection_continuity          = m_selection_continuity;
+    m_selection_continuity_published     = true;
+    result.dropped_recovery_attempts     = m_dropped_recovery_attempts;
+    m_recovery_attempts.clear();
+    m_dropped_recovery_attempts = 0U;
+    result.evicted_scrollback_rows = compatibility_evicted_scrollback_rows();
+    return result;
+}
+
 Terminal_screen_model_result Terminal_screen_model::finalize_result(
     Terminal_screen_model_result result,
-    result_change_overrides_t overrides) const
+    result_change_overrides_t overrides)
 {
+    refresh_active_grid_retained_lookup_indexes();
+    finalize_selection_continuity_rows();
     result.dirty_rows = dirty_rows();
     result.dirty_rows_have_stable_mutation_identity =
         overrides.dirty_rows_have_stable_mutation_identity.value_or(true);
@@ -5070,6 +6074,12 @@ Terminal_screen_model_result Terminal_screen_model::finalize_result(
     result.scrollback_rows               = scrollback_size();
     result.backing_deltas                = m_backing_deltas;
     result.recovery_proposals            = m_recovery_proposals;
+    result.recovery_attempts             = std::move(m_recovery_attempts);
+    result.selection_continuity          = m_selection_continuity;
+    m_selection_continuity_published     = true;
+    result.dropped_recovery_attempts     = m_dropped_recovery_attempts;
+    m_recovery_attempts.clear();
+    m_dropped_recovery_attempts = 0U;
     result.evicted_scrollback_rows       = compatibility_evicted_scrollback_rows();
     return result;
 }
@@ -5153,13 +6163,16 @@ void Terminal_screen_model::evict_oldest_scrollback_rows(int row_count)
         return;
     }
 
-    const int evicted_rows =
+    const std::vector<terminal_history_handle_t> evicted_handles =
         m_primary_backing.discard_oldest_retained_history_records(rows_to_evict);
-    if (evicted_rows <= 0) {
+    if (evicted_handles.empty()) {
         return;
     }
 
-    invalidate_retained_lookup_caches();
+    for (const terminal_history_handle_t handle : evicted_handles) {
+        erase_retained_lookup_entry(Terminal_buffer_id::PRIMARY, handle.row_sequence);
+    }
+    const int evicted_rows = static_cast<int>(evicted_handles.size());
     m_scrollback_evicted_rows += evicted_rows;
     record_primary_history_delta(
         Terminal_backing_delta_kind::PRIMARY_HISTORY_EVICTED,
@@ -5248,6 +6261,25 @@ void Terminal_screen_model::collect_synchronized_changes()
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::collect_synchronized_changes");
 
+    const bool skip_resize_transition_accumulation =
+        m_skip_next_resize_transition_accumulation;
+    m_skip_next_resize_transition_accumulation = false;
+    if (!skip_resize_transition_accumulation) {
+        const bool synchronized_dirty_rows_present = !m_dirty_rows.empty();
+        accumulate_pending_changes(m_synchronized_selection_changes);
+        if (synchronized_dirty_rows_present) {
+            m_synchronized_selection_changes
+                .dirty_rows_have_stable_mutation_identity = false;
+        }
+        if (m_resize_transition_publication != nullptr) {
+            accumulate_pending_changes(*m_resize_transition_publication);
+            if (synchronized_dirty_rows_present) {
+                m_resize_transition_publication
+                    ->dirty_rows_have_stable_mutation_identity = false;
+            }
+        }
+    }
+
 #if VNM_TERMINAL_PROFILING_ENABLED
     if (m_dirty_row_stats.enabled) {
         ++m_dirty_row_stats.collect_synchronized_calls;
@@ -5288,6 +6320,15 @@ void Terminal_screen_model::collect_synchronized_changes()
 void Terminal_screen_model::publish_pending_changes(ingest_publication_t& publication)
 {
     VNM_TERMINAL_PROFILE_SCOPE("Terminal_screen_model::publish_pending_changes");
+
+    if (m_resize_transition_publication != nullptr) {
+        if (m_skip_next_resize_transition_accumulation) {
+            m_skip_next_resize_transition_accumulation = false;
+        }
+        else {
+            accumulate_pending_changes(*m_resize_transition_publication);
+        }
+    }
 
 #if VNM_TERMINAL_PROFILING_ENABLED
     const std::size_t previous_dirty_row_count = publication.dirty_rows.size();
@@ -5365,6 +6406,12 @@ void Terminal_screen_model::release_synchronized_changes(ingest_publication_t& p
     publication.alternate_scroll_mode_changed =
         publication.alternate_scroll_mode_changed ||
         m_synchronized_alternate_scroll_mode_changed;
+    if (m_resize_transition_publication != nullptr) {
+        accumulate_publication_changes(
+            *m_resize_transition_publication,
+            m_synchronized_selection_changes);
+    }
+    m_synchronized_selection_changes = {};
     m_synchronized_dirty_rows.clear();
     m_synchronized_viewport_changed              = false;
     m_synchronized_terminal_content_changed      = false;

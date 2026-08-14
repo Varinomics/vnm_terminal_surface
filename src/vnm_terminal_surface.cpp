@@ -682,27 +682,6 @@ bool position_is_before(
     return lhs.row < rhs.row || (lhs.row == rhs.row && lhs.column < rhs.column);
 }
 
-bool selection_drag_sources_have_compatible_coordinates(
-    const term::terminal_selection_source_identity_t& left,
-    const term::terminal_selection_source_identity_t& right)
-{
-    return
-        left.source_content_basis.grid_reflow_generation ==
-            right.source_content_basis.grid_reflow_generation    &&
-        left.session_epoch     == right.session_epoch            &&
-        left.buffer_id         == right.buffer_id                &&
-        left.grid_reflow_basis == right.grid_reflow_basis        &&
-        term::grid_sizes_match(left.grid_size, right.grid_size);
-}
-
-bool selection_drag_sources_have_same_content_generation(
-    const term::terminal_selection_source_identity_t& left,
-    const term::terminal_selection_source_identity_t& right)
-{
-    return left.source_content_basis.content_generation ==
-        right.source_content_basis.content_generation;
-}
-
 bool selection_source_matches_snapshot(
     const term::terminal_selection_source_identity_t& source,
     const term::Terminal_render_snapshot&             snapshot)
@@ -948,147 +927,6 @@ term::Terminal_selection_range selection_range_for_drag(
     return {anchor, current, term::Terminal_selection_mode::NORMAL};
 }
 
-enum class Selection_drag_content_validation_status
-{
-    ACCEPTED,
-    MISSING_SNAPSHOT,
-    ROW_ORIGIN_CHANGED,
-    ROW_ORIGIN_AMBIGUOUS,
-    RANGE_NOT_VISIBLE,
-    SELECTED_ROW_CONTENT_CHANGED,
-};
-
-QString selection_trace_drag_content_validation_status(
-    Selection_drag_content_validation_status status)
-{
-    switch (status) {
-        case Selection_drag_content_validation_status::ACCEPTED:
-            return QStringLiteral("accepted");
-        case Selection_drag_content_validation_status::MISSING_SNAPSHOT:
-            return QStringLiteral("missing-snapshot");
-        case Selection_drag_content_validation_status::ROW_ORIGIN_CHANGED:
-            return QStringLiteral("row-origin-changed");
-        case Selection_drag_content_validation_status::ROW_ORIGIN_AMBIGUOUS:
-            return QStringLiteral("row-origin-ambiguous");
-        case Selection_drag_content_validation_status::RANGE_NOT_VISIBLE:
-            return QStringLiteral("range-not-visible");
-        case Selection_drag_content_validation_status::SELECTED_ROW_CONTENT_CHANGED:
-            return QStringLiteral("selected-row-content");
-    }
-
-    return QStringLiteral("unknown");
-}
-
-Selection_drag_content_validation_status validate_selection_drag_content_drift(
-    const term::terminal_selection_source_identity_t&             anchor_source,
-    const term::terminal_selection_source_identity_t&             current_source,
-    const std::shared_ptr<const term::Terminal_render_snapshot>&  anchor_snapshot,
-    const std::shared_ptr<const term::Terminal_render_snapshot>&  current_snapshot,
-    const term::Terminal_selection_range&                         range,
-    int                                                           scrollback_limit)
-{
-    if (anchor_snapshot == nullptr || current_snapshot == nullptr) {
-        return Selection_drag_content_validation_status::MISSING_SNAPSHOT;
-    }
-
-    if (anchor_source.row_origin_generation != current_source.row_origin_generation) {
-        return Selection_drag_content_validation_status::ROW_ORIGIN_AMBIGUOUS;
-    }
-
-    if (selection_drag_sources_have_same_content_generation(anchor_source, current_source)) {
-        return Selection_drag_content_validation_status::ACCEPTED;
-    }
-
-    if (!term::grid_sizes_match(anchor_snapshot->grid_size, current_snapshot->grid_size)) {
-        return Selection_drag_content_validation_status::ROW_ORIGIN_CHANGED;
-    }
-
-    const term::terminal_grid_position_t start = term::normalized_selection_start(range);
-    const term::terminal_grid_position_t end   = term::normalized_selection_end(range);
-    const int anchor_first_visible_logical_row =
-        term::render_snapshot_first_visible_logical_row(*anchor_snapshot);
-    const int current_first_visible_logical_row =
-        term::render_snapshot_first_visible_logical_row(*current_snapshot);
-    if (anchor_snapshot->viewport.active_buffer == term::Terminal_buffer_id::PRIMARY) {
-        const int anchor_scrollback_rows  = anchor_snapshot->viewport.scrollback_rows;
-        const int current_scrollback_rows = current_snapshot->viewport.scrollback_rows;
-        if (scrollback_limit <= 0 &&
-            (start.row < anchor_first_visible_logical_row ||
-                start.row < current_first_visible_logical_row))
-        {
-            return Selection_drag_content_validation_status::ROW_ORIGIN_AMBIGUOUS;
-        }
-        if (current_scrollback_rows < anchor_scrollback_rows) {
-            return Selection_drag_content_validation_status::ROW_ORIGIN_AMBIGUOUS;
-        }
-        if (scrollback_limit > 0 &&
-            current_scrollback_rows >= scrollback_limit &&
-            (current_scrollback_rows != anchor_scrollback_rows ||
-                anchor_scrollback_rows >= scrollback_limit))
-        {
-            return Selection_drag_content_validation_status::ROW_ORIGIN_AMBIGUOUS;
-        }
-    }
-
-    if (start.row < anchor_first_visible_logical_row ||
-        end.row   >= anchor_first_visible_logical_row + anchor_snapshot->grid_size.rows ||
-        start.row < current_first_visible_logical_row ||
-        end.row   >= current_first_visible_logical_row + current_snapshot->grid_size.rows)
-    {
-        return Selection_drag_content_validation_status::RANGE_NOT_VISIBLE;
-    }
-
-    const term::Terminal_render_snapshot_row_content_view anchor_rows(*anchor_snapshot);
-    const term::Terminal_render_snapshot_row_content_view current_rows(*current_snapshot);
-    for (int logical_row = start.row; logical_row <= end.row; ++logical_row) {
-        const int anchor_viewport_row  = logical_row - anchor_first_visible_logical_row;
-        const int current_viewport_row = logical_row - current_first_visible_logical_row;
-        const QString anchor_row =
-            term::selected_text_from_render_snapshot_row(
-                anchor_rows.row_at(anchor_viewport_row),
-                0,
-                anchor_snapshot->grid_size.columns,
-                false);
-        const QString current_row =
-            term::selected_text_from_render_snapshot_row(
-                current_rows.row_at(current_viewport_row),
-                0,
-                current_snapshot->grid_size.columns,
-                false);
-        if (anchor_row != current_row) {
-            return Selection_drag_content_validation_status::SELECTED_ROW_CONTENT_CHANGED;
-        }
-    }
-
-    return Selection_drag_content_validation_status::ACCEPTED;
-}
-
-bool selection_drag_content_validation_accepted(
-    Selection_drag_content_validation_status status)
-{
-    return status == Selection_drag_content_validation_status::ACCEPTED;
-}
-
-bool selection_drag_content_validation_allows_payload_detach(
-    Selection_drag_content_validation_status status)
-{
-    return
-        status == Selection_drag_content_validation_status::ROW_ORIGIN_AMBIGUOUS ||
-        status == Selection_drag_content_validation_status::RANGE_NOT_VISIBLE ||
-        status == Selection_drag_content_validation_status::SELECTED_ROW_CONTENT_CHANGED;
-}
-
-bool selection_drag_can_rebase_after_content_validation_failure(
-    Selection_drag_content_validation_status status,
-    bool                                     drag_moved)
-{
-    // First-move capped-history drift selects the current visible text. Use
-    // retained-line remapping if press-time row identity must survive eviction.
-    return
-        status == Selection_drag_content_validation_status::ROW_ORIGIN_AMBIGUOUS &&
-        !drag_moved;
-}
-
 enum class Selection_session_mutation
 {
     CLEAR_SELECTION,
@@ -1103,17 +941,6 @@ struct Selection_drag_session_mutation
     std::optional<term::Terminal_selection_range>
                                              range;
 };
-
-Selection_session_mutation selection_drag_cancellation_mutation(
-    Selection_drag_content_validation_status status,
-    bool                                    drag_moved)
-{
-    if (drag_moved && selection_drag_content_validation_allows_payload_detach(status)) {
-        return Selection_session_mutation::DETACH_SELECTION_VISUAL_ATTACHMENT;
-    }
-
-    return Selection_session_mutation::CLEAR_SELECTION;
-}
 
 Selection_drag_session_mutation selection_drag_session_mutation_for_drag(
     term::terminal_grid_position_t anchor,
@@ -2695,11 +2522,11 @@ struct VNM_TerminalSurface::Private
 
     void clear_selection_drag_state()
     {
+        if (session != nullptr) {
+            session->clear_selection_drag_provenance();
+        }
         selection_anchor.reset();
-        selection_anchor_viewport.reset();
-        selection_anchor_buffer_id.reset();
-        selection_anchor_source.reset();
-        selection_anchor_snapshot.reset();
+        selection_drag_press_provenance.reset();
         selection_drag_active    = false;
         selection_drag_moved     = false;
         selection_drag_cancelled = false;
@@ -2865,11 +2692,8 @@ struct VNM_TerminalSurface::Private
     bool                                                   hyperlink_activation_gesture_active = false;
     bool                                                   hyperlink_cursor_active             = false;
     std::optional<term::terminal_grid_position_t>          selection_anchor;
-    std::optional<term::terminal_grid_position_t>          selection_anchor_viewport;
-    std::optional<term::Terminal_buffer_id>                selection_anchor_buffer_id;
-    std::optional<term::terminal_selection_source_identity_t>
-                                                           selection_anchor_source;
-    std::shared_ptr<const term::Terminal_render_snapshot>  selection_anchor_snapshot;
+    std::optional<term::terminal_selection_drag_press_provenance_t>
+                                                           selection_drag_press_provenance;
     std::optional<term::Terminal_osc52_write_request>      pending_clipboard_write;
     std::function<std::optional<QString>()>                clipboard_text_reader;
     QString                                                warmed_prompt_text_layout_font_key;
@@ -5315,14 +5139,20 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
         return;
     }
 
-    m_private->selection_anchor           = *logical_position;
-    m_private->selection_anchor_viewport  = *position;
-    m_private->selection_anchor_buffer_id = m_private->render_snapshot->viewport.active_buffer;
-    m_private->selection_anchor_source    = *source;
-    m_private->selection_anchor_snapshot  = m_private->render_snapshot;
-    m_private->selection_drag_active      = true;
-    m_private->selection_drag_moved       = false;
-    m_private->selection_drag_cancelled   = false;
+    const std::optional<term::terminal_selection_drag_press_provenance_t> provenance =
+        m_private->session->begin_selection_drag_provenance(
+            *logical_position,
+            *source);
+    if (!provenance.has_value()) {
+        trace_decision(QStringLiteral("press-provenance-unavailable"));
+        return;
+    }
+
+    m_private->selection_anchor                = *logical_position;
+    m_private->selection_drag_press_provenance = *provenance;
+    m_private->selection_drag_active           = true;
+    m_private->selection_drag_moved            = false;
+    m_private->selection_drag_cancelled        = false;
     record_surface_selection_drag_transcript(
         m_private->transcript_recorder,
         QStringLiteral("start"),
@@ -5336,7 +5166,8 @@ void VNM_TerminalSurface::mousePressEvent(QMouseEvent* event)
     if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
         write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface mouse-press source anchor=%1 current=%2 %3")
-                .arg(selection_trace_source_identity(*m_private->selection_anchor_source))
+                .arg(selection_trace_source_identity(
+                    m_private->selection_drag_press_provenance->source))
                 .arg(selection_trace_source_identity(source))
                 .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
     }
@@ -5505,11 +5336,10 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         }
     }
 
-    if (!m_private->selection_drag_active                  ||
-        !m_private->selection_anchor.has_value()           ||
-        !m_private->selection_anchor_buffer_id.has_value() ||
-        !m_private->selection_anchor_source.has_value()    ||
-        m_private->session                  == nullptr     ||
+    if (!m_private->selection_drag_active                       ||
+        !m_private->selection_anchor.has_value()                ||
+        !m_private->selection_drag_press_provenance.has_value() ||
+        m_private->session                  == nullptr          ||
         (event->buttons() & Qt::LeftButton) == Qt::NoButton)
     {
         trace_decision(QStringLiteral("drag-inactive"));
@@ -5534,32 +5364,6 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         return;
     }
 
-    if (m_private->render_snapshot == nullptr ||
-        m_private->render_snapshot->viewport.active_buffer !=
-            *m_private->selection_anchor_buffer_id)
-    {
-        if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-            write_selection_trace(m_selection_trace_enabled,
-                QStringLiteral(
-                    "surface mouse-move source-mismatch reason=buffer anchor=%1 current=source{none} %2")
-                    .arg(selection_trace_source_identity(*m_private->selection_anchor_source))
-                    .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
-        }
-        record_surface_selection_drag_transcript(
-            m_private->transcript_recorder,
-            QStringLiteral("cancel"),
-            m_private->selection_anchor,
-            logical_position,
-            std::nullopt,
-            m_private->selection_drag_moved);
-        m_private->clear_selection_drag_state();
-        m_private->clear_selection_with_sync(*this);
-        event->accept();
-        sync_from_session();
-        trace_decision(QStringLiteral("source-mismatch"));
-        return;
-    }
-
     if (m_private->session->render_publication_blocked()) {
         event->accept();
         trace_decision(QStringLiteral("publication-blocked"));
@@ -5571,15 +5375,14 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
     if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
         write_selection_trace(m_selection_trace_enabled,
             QStringLiteral("surface mouse-move source anchor=%1 current=%2 %3")
-                .arg(selection_trace_source_identity(*m_private->selection_anchor_source))
+                .arg(selection_trace_source_identity(
+                    m_private->selection_drag_press_provenance->source))
                 .arg(selection_trace_source_identity(source))
                 .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
     }
     if (!source.has_value() ||
-        !selection_source_matches_snapshot(*source, *m_private->render_snapshot) ||
-        !selection_drag_sources_have_compatible_coordinates(
-            *m_private->selection_anchor_source,
-            *source))
+        m_private->render_snapshot == nullptr ||
+        !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
     {
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
@@ -5588,11 +5391,7 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
                     .arg(selection_trace_source_snapshot_mismatch_reason(
                         source,
                         m_private->render_snapshot))
-                    .arg(source.has_value()
-                        ? selection_trace_drag_coordinate_mismatch_reason(
-                            *m_private->selection_anchor_source,
-                            *source)
-                        : QStringLiteral("source-missing")));
+                    .arg(QStringLiteral("resolver-owned")));
         }
         m_private->selection_drag_cancelled = true;
         record_surface_selection_drag_transcript(
@@ -5628,79 +5427,27 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         return;
     }
 
-    const term::Terminal_selection_range range =
-        selection_range_for_drag(*m_private->selection_anchor, *logical_position);
-    const Selection_drag_content_validation_status content_validation =
-        validate_selection_drag_content_drift(
-            *m_private->selection_anchor_source,
-            *source,
-            m_private->selection_anchor_snapshot,
-            m_private->render_snapshot,
-            range,
-            m_scrollback_limit);
-    if (!selection_drag_content_validation_accepted(content_validation))
+    const term::Terminal_selection_drag_resolution proof =
+        m_private->session->resolve_selection_drag_provenance(
+            *m_private->selection_drag_press_provenance,
+            m_private->selection_drag_moved);
+    if (proof.status !=
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED ||
+        !proof.resolved_position.has_value() ||
+        !proof.source.has_value() ||
+        (m_private->selection_drag_moved &&
+            !proof.reconciled_proven_range.has_value()))
     {
-        if (selection_drag_can_rebase_after_content_validation_failure(
-                content_validation,
-                m_private->selection_drag_moved) &&
-            m_private->selection_anchor_viewport.has_value())
-        {
-            const std::optional<term::terminal_grid_position_t> current_anchor =
-                logical_grid_position_for_viewport_cell(
-                    m_private->render_snapshot,
-                    *m_private->selection_anchor_viewport);
-            if (current_anchor.has_value()) {
-                if (*current_anchor == *logical_position) {
-                    m_private->selection_anchor          = *current_anchor;
-                    m_private->selection_anchor_source   = *source;
-                    m_private->selection_anchor_snapshot = m_private->render_snapshot;
-                    record_surface_selection_drag_transcript(
-                        m_private->transcript_recorder,
-                        QStringLiteral("clear"),
-                        m_private->selection_anchor,
-                        logical_position,
-                        std::nullopt,
-                        false);
-                    m_private->clear_selection_with_sync(*this);
-                    event->accept();
-                    sync_from_session();
-                    trace_decision(QStringLiteral("clear-on-rebased-click"));
-                    return;
-                }
-
-                const term::Terminal_selection_range current_range =
-                    selection_range_for_drag(*current_anchor, *logical_position);
-                m_private->selection_anchor          = *current_anchor;
-                m_private->selection_anchor_source   = *source;
-                m_private->selection_anchor_snapshot = m_private->render_snapshot;
-                m_private->selection_drag_moved      = true;
-                record_surface_selection_drag_transcript(
-                    m_private->transcript_recorder,
-                    QStringLiteral("update"),
-                    m_private->selection_anchor,
-                    logical_position,
-                    current_range,
-                    true);
-                m_private->session->set_selection_range_from_drained_published_source(
-                    current_range,
-                    *source);
-                event->accept();
-                sync_from_session();
-                trace_decision(QStringLiteral("selection-range-rebased"));
-                return;
-            }
-        }
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral(
-                    "surface mouse-move source-mismatch reason=%1 "
-                    "range=%2 anchor=%3 current=%4 anchor_snapshot=%5 current_snapshot=%6")
-                    .arg(selection_trace_drag_content_validation_status(content_validation))
-                    .arg(selection_trace_range(range))
-                    .arg(selection_trace_source_identity(*m_private->selection_anchor_source))
-                    .arg(selection_trace_source_identity(*source))
-                    .arg(selection_trace_snapshot_identity(m_private->selection_anchor_snapshot))
-                    .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
+                    "surface mouse-move gesture-proof status=%1 original=%2 current=%3")
+                    .arg(QString::fromLatin1(
+                        term::terminal_selection_attachment_resolution_status_token(
+                            proof.status)))
+                    .arg(selection_trace_grid_position(
+                        m_private->selection_drag_press_provenance->original_position))
+                    .arg(selection_trace_grid_position(logical_position)));
         }
         m_private->selection_drag_cancelled = true;
         record_surface_selection_drag_transcript(
@@ -5708,13 +5455,9 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
             QStringLiteral("cancel"),
             m_private->selection_anchor,
             logical_position,
-            range,
+            std::nullopt,
             m_private->selection_drag_moved);
-        if (selection_drag_cancellation_mutation(
-                content_validation,
-                m_private->selection_drag_moved) ==
-            Selection_session_mutation::DETACH_SELECTION_VISUAL_ATTACHMENT)
-        {
+        if (m_private->selection_drag_moved) {
             m_private->detach_selection_visual_attachment_with_sync(
                 *this);
         }
@@ -5727,6 +5470,9 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         return;
     }
 
+    m_private->selection_anchor = *proof.resolved_position;
+    const term::Terminal_selection_range range =
+        selection_range_for_drag(*proof.resolved_position, *logical_position);
     m_private->selection_drag_moved = true;
     record_surface_selection_drag_transcript(
         m_private->transcript_recorder,
@@ -5735,7 +5481,10 @@ void VNM_TerminalSurface::mouseMoveEvent(QMouseEvent* event)
         logical_position,
         range,
         true);
-    m_private->session->set_selection_range_from_drained_published_source(range, *source);
+    m_private->session->set_selection_range_from_drained_published_source(
+        range,
+        *proof.source);
+    m_private->session->record_selection_drag_proven_range();
     event->accept();
     sync_from_session();
     trace_decision(QStringLiteral("selection-range-set"));
@@ -5816,10 +5565,9 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
     }
 
     if (m_private->selection_drag_active &&
-        event->button()    == Qt::LeftButton              &&
-        m_private->selection_anchor.has_value()           &&
-        m_private->selection_anchor_buffer_id.has_value() &&
-        m_private->selection_anchor_source.has_value()    &&
+        event->button()    == Qt::LeftButton                   &&
+        m_private->selection_anchor.has_value()                &&
+        m_private->selection_drag_press_provenance.has_value() &&
         m_private->session != nullptr)
     {
         if (m_private->selection_drag_cancelled) {
@@ -5852,46 +5600,19 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
             return;
         }
 
-        if (m_private->render_snapshot == nullptr ||
-            m_private->render_snapshot->viewport.active_buffer !=
-                *m_private->selection_anchor_buffer_id)
-        {
-            if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
-                write_selection_trace(m_selection_trace_enabled,
-                    QStringLiteral(
-                        "surface mouse-release source-mismatch reason=buffer anchor=%1 current=source{none} %2")
-                    .arg(selection_trace_source_identity(*m_private->selection_anchor_source))
-                    .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
-            }
-            record_surface_selection_drag_transcript(
-                m_private->transcript_recorder,
-                QStringLiteral("cancel"),
-                m_private->selection_anchor,
-                logical_position,
-                std::nullopt,
-                m_private->selection_drag_moved);
-            m_private->clear_selection_drag_state();
-            m_private->clear_selection_with_sync(*this);
-            event->accept();
-            sync_from_session();
-            trace_decision(QStringLiteral("source-mismatch"));
-            return;
-        }
-
         const std::optional<term::terminal_selection_source_identity_t> source =
             m_private->session->published_selection_source_identity();
         if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
             write_selection_trace(m_selection_trace_enabled,
                 QStringLiteral("surface mouse-release source anchor=%1 current=%2 %3")
-                    .arg(selection_trace_source_identity(*m_private->selection_anchor_source))
+                    .arg(selection_trace_source_identity(
+                        m_private->selection_drag_press_provenance->source))
                     .arg(selection_trace_source_identity(source))
                     .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
         }
         if (!source.has_value() ||
-            !selection_source_matches_snapshot(*source, *m_private->render_snapshot) ||
-            !selection_drag_sources_have_compatible_coordinates(
-                *m_private->selection_anchor_source,
-                *source))
+            m_private->render_snapshot == nullptr ||
+            !selection_source_matches_snapshot(*source, *m_private->render_snapshot))
         {
             if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
                 write_selection_trace(m_selection_trace_enabled,
@@ -5900,11 +5621,7 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                         .arg(selection_trace_source_snapshot_mismatch_reason(
                             source,
                             m_private->render_snapshot))
-                        .arg(source.has_value()
-                        ? selection_trace_drag_coordinate_mismatch_reason(
-                            *m_private->selection_anchor_source,
-                            *source)
-                        : QStringLiteral("source-missing")));
+                        .arg(QStringLiteral("resolver-owned")));
             }
             record_surface_selection_drag_transcript(
                 m_private->transcript_recorder,
@@ -5938,99 +5655,36 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
         }
         QString decision_reason = QStringLiteral("out-of-grid");
         if (logical_position.has_value()) {
-            const term::Terminal_selection_range range =
-                selection_range_for_drag(*m_private->selection_anchor, *logical_position);
-            const bool selection_range_needed =
-                m_private->selection_drag_moved ||
-                *logical_position != *m_private->selection_anchor;
-            const Selection_drag_content_validation_status content_validation =
-                selection_range_needed
-                    ? validate_selection_drag_content_drift(
-                        *m_private->selection_anchor_source,
-                        *source,
-                        m_private->selection_anchor_snapshot,
-                        m_private->render_snapshot,
-                        range,
-                        m_scrollback_limit)
-                    : Selection_drag_content_validation_status::ACCEPTED;
-            if (!selection_drag_content_validation_accepted(content_validation))
+            const term::Terminal_selection_drag_resolution proof =
+                m_private->session->resolve_selection_drag_provenance(
+                    *m_private->selection_drag_press_provenance,
+                    m_private->selection_drag_moved);
+            if (proof.status !=
+                    term::Terminal_selection_attachment_resolution_status::TRANSLATED ||
+                !proof.resolved_position.has_value() ||
+                !proof.source.has_value() ||
+                (m_private->selection_drag_moved &&
+                    !proof.reconciled_proven_range.has_value()))
             {
-                if (selection_drag_can_rebase_after_content_validation_failure(
-                        content_validation,
-                        m_private->selection_drag_moved) &&
-                    m_private->selection_anchor_viewport.has_value())
-                {
-                    const std::optional<term::terminal_grid_position_t> current_anchor =
-                        logical_grid_position_for_viewport_cell(
-                            m_private->render_snapshot,
-                            *m_private->selection_anchor_viewport);
-                    if (current_anchor.has_value()) {
-                        if (*current_anchor == *logical_position) {
-                            record_surface_selection_drag_transcript(
-                                m_private->transcript_recorder,
-                                QStringLiteral("clear"),
-                                current_anchor,
-                                logical_position,
-                                std::nullopt,
-                                false);
-                            m_private->clear_selection_with_sync(
-                                *this);
-                            m_private->clear_selection_drag_state();
-                            event->accept();
-                            sync_from_session();
-                            trace_decision(QStringLiteral("clear-on-rebased-click"));
-                            return;
-                        }
-
-                        const term::Terminal_selection_range current_range =
-                            selection_range_for_drag(*current_anchor, *logical_position);
-                        record_surface_selection_drag_transcript(
-                            m_private->transcript_recorder,
-                            QStringLiteral("finish"),
-                            current_anchor,
-                            logical_position,
-                            current_range,
-                            true);
-                        m_private->session->set_selection_range_from_drained_published_source(
-                            current_range,
-                            *source);
-                        if (m_copy_on_select) {
-                            (void)copy_selected_text_to_clipboard(
-                                Empty_selection_copy_policy::SKIP_EMPTY_SELECTION);
-                        }
-                        m_private->clear_selection_drag_state();
-                        event->accept();
-                        sync_from_session();
-                        trace_decision(QStringLiteral("selection-range-rebased"));
-                        return;
-                    }
-                }
                 if (m_selection_trace_enabled || term::interaction_trace_enabled()) {
                     write_selection_trace(m_selection_trace_enabled,
                         QStringLiteral(
-                            "surface mouse-release source-mismatch reason=%1 "
-                            "range=%2 anchor=%3 current=%4 anchor_snapshot=%5 current_snapshot=%6")
-                            .arg(selection_trace_drag_content_validation_status(content_validation))
-                            .arg(selection_trace_range(range))
-                            .arg(selection_trace_source_identity(
-                                *m_private->selection_anchor_source))
-                            .arg(selection_trace_source_identity(*source))
-                            .arg(selection_trace_snapshot_identity(
-                                m_private->selection_anchor_snapshot))
-                            .arg(selection_trace_snapshot_identity(m_private->render_snapshot)));
+                            "surface mouse-release gesture-proof status=%1 original=%2 current=%3")
+                            .arg(QString::fromLatin1(
+                                term::terminal_selection_attachment_resolution_status_token(
+                                    proof.status)))
+                            .arg(selection_trace_grid_position(
+                                m_private->selection_drag_press_provenance->original_position))
+                            .arg(selection_trace_grid_position(logical_position)));
                 }
                 record_surface_selection_drag_transcript(
                     m_private->transcript_recorder,
                     QStringLiteral("cancel"),
                     m_private->selection_anchor,
                     logical_position,
-                    range,
+                    std::nullopt,
                     m_private->selection_drag_moved);
-                if (selection_drag_cancellation_mutation(
-                        content_validation,
-                        m_private->selection_drag_moved) ==
-                    Selection_session_mutation::DETACH_SELECTION_VISUAL_ATTACHMENT)
-                {
+                if (m_private->selection_drag_moved) {
                     m_private->detach_selection_visual_attachment_with_sync(
                         *this);
                 }
@@ -6043,6 +5697,13 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 trace_decision(QStringLiteral("source-mismatch"));
                 return;
             }
+
+            m_private->selection_anchor = *proof.resolved_position;
+            const term::Terminal_selection_range range =
+                selection_range_for_drag(*proof.resolved_position, *logical_position);
+            const bool selection_range_needed =
+                m_private->selection_drag_moved ||
+                *logical_position != *proof.resolved_position;
             record_surface_selection_drag_transcript(
                 m_private->transcript_recorder,
                 QStringLiteral("finish"),
@@ -6059,7 +5720,8 @@ void VNM_TerminalSurface::mouseReleaseEvent(QMouseEvent* event)
                 Q_ASSERT(mutation.range.has_value());
                 m_private->session->set_selection_range_from_drained_published_source(
                     *mutation.range,
-                    *source);
+                    *proof.source);
+                m_private->session->record_selection_drag_proven_range();
                 if (m_copy_on_select) {
                     (void)copy_selected_text_to_clipboard(
                         Empty_selection_copy_policy::SKIP_EMPTY_SELECTION);

@@ -54,6 +54,7 @@ struct Terminal_public_release_intent
 {
     bool                                            has_public_viewport = false;
     bool                                            public_projection_valid = false;
+    bool                                            geometry_invalidated = false;
     bool                                            deferred_intent_recorded = false;
     std::uint64_t                                   public_projection_generation = 0U;
     Terminal_viewport_state                         public_viewport;

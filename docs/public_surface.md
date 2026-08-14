@@ -204,6 +204,16 @@ moves. The lower-level backend/session contract keeps that projection disabled
 by default, so direct session owners must enable it explicitly when they want
 the same visual behavior.
 
+Attachment survival across content publications is based on exact retained-row
+provenance. When every selected row remains exactly provable, the attachment can
+survive primary or alternate scrolling, clearing scrollback for active rows, and
+a same-column height resize. Width reflow, buffer transitions, or loss or
+mutation of any selected row detach the visual selection while preserving its
+immutable payload. Starting a replacement session clears both the attachment
+and payload. See
+[Selection and row provenance](selection_and_provenance.md) for the complete
+boundary contract.
+
 `interrupt_process()` and `terminate_process()` forward lifecycle requests to
 the active session. They return `false` and emit a backend error if there is no
 active session or if the backend rejects the request. Destroying a surface with a

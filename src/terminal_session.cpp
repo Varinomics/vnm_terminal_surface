@@ -52,6 +52,21 @@ bool model_result_warrants_render_snapshot(const Terminal_screen_model_result& r
         result.mouse_reporting_mode_changed;
 }
 
+void apply_trailing_changes(
+    Terminal_screen_model_result&                         result,
+    const terminal_screen_model_trailing_changes_t& trailing_changes)
+{
+    result.terminal_content_changed = trailing_changes.terminal_content_changed;
+    result.active_buffer_changed = trailing_changes.active_buffer_changed;
+    result.grid_reflow_changed = trailing_changes.grid_reflow_changed;
+    result.viewport_changed = trailing_changes.viewport_changed;
+    result.mode_state_changed = trailing_changes.mode_state_changed;
+    result.mouse_reporting_mode_changed =
+        trailing_changes.mouse_reporting_mode_changed;
+    result.alternate_scroll_mode_changed =
+        trailing_changes.alternate_scroll_mode_changed;
+}
+
 void coalesce_dirty_rows(std::vector<int>& dirty_rows, const std::vector<int>& added_rows)
 {
     dirty_rows.insert(dirty_rows.end(), added_rows.begin(), added_rows.end());
@@ -543,6 +558,27 @@ bool selection_lease_has_compatible_visual_source(
             viewport_mappings_match(lease.viewport_mapping, source.viewport_mapping));
 }
 
+bool selection_visual_leases_match(
+    const terminal_selection_visual_lease_t& left,
+    const terminal_selection_visual_lease_t& right)
+{
+    return
+        left.source_content_basis         == right.source_content_basis         &&
+        left.anchor_domain                == right.anchor_domain                &&
+        left.session_epoch                == right.session_epoch                &&
+        left.buffer_id                    == right.buffer_id                    &&
+        left.grid_reflow_basis            == right.grid_reflow_basis            &&
+        left.row_origin_generation        == right.row_origin_generation        &&
+        grid_sizes_match(left.grid_size, right.grid_size)                       &&
+        viewport_mappings_match(left.viewport_mapping, right.viewport_mapping)  &&
+        left.selected_range                == right.selected_range                &&
+        left.anchor                        == right.anchor                        &&
+        left.extent                        == right.extent                        &&
+        left.durable_payload_identity      == right.durable_payload_identity      &&
+        left.provisional_payload_identity  == right.provisional_payload_identity  &&
+        left.selected_lines                == right.selected_lines;
+}
+
 bool selection_trace_requested(bool stderr_enabled)
 {
     return stderr_enabled || interaction_trace_enabled();
@@ -690,10 +726,32 @@ QString selection_trace_source_identity(
 QString selection_trace_visual_lease(
     const terminal_selection_visual_lease_t& lease)
 {
+    QString line_leases = QStringLiteral("none");
+    if (!lease.selected_lines.empty()) {
+        line_leases.clear();
+        const std::size_t line_count = std::min(
+            lease.selected_lines.size(),
+            k_selection_trace_span_limit);
+        for (std::size_t index = 0U; index < line_count; ++index) {
+            const terminal_selection_line_lease_t& line = lease.selected_lines[index];
+            if (!line_leases.isEmpty()) {
+                line_leases += QLatin1Char(';');
+            }
+            line_leases += QStringLiteral("offset=%1,epoch=%2,row=%3,generation=%4")
+                .arg(line.row_offset)
+                .arg(static_cast<qulonglong>(line.history_handle.epoch))
+                .arg(static_cast<qulonglong>(line.history_handle.row_sequence))
+                .arg(static_cast<qulonglong>(line.history_handle.content_generation));
+        }
+        if (lease.selected_lines.size() > line_count) {
+            line_leases += QStringLiteral(";...");
+        }
+    }
+
     return QStringLiteral(
         "lease{basis={%1},domain=%2,epoch=%3,buffer=%4,grid_reflow=%5,"
         "row_origin=%6,grid=%7,viewport={%8},range=%9,anchor=%10,extent=%11,"
-        "durable=%12,provisional=%13,line_leases=%14}")
+        "durable=%12,provisional=%13,line_lease_count=%14,line_leases={%15}}")
         .arg(selection_trace_content_basis(lease.source_content_basis))
         .arg(selection_trace_anchor_domain(lease.anchor_domain))
         .arg(static_cast<qulonglong>(lease.session_epoch))
@@ -707,7 +765,8 @@ QString selection_trace_visual_lease(
         .arg(selection_trace_grid_position(lease.extent))
         .arg(static_cast<qulonglong>(lease.durable_payload_identity))
         .arg(static_cast<qulonglong>(lease.provisional_payload_identity))
-        .arg(static_cast<qulonglong>(lease.selected_lines.size()));
+        .arg(static_cast<qulonglong>(lease.selected_lines.size()))
+        .arg(line_leases);
 }
 
 QString selection_trace_visual_lease(
@@ -716,6 +775,180 @@ QString selection_trace_visual_lease(
     return lease.has_value()
         ? selection_trace_visual_lease(*lease)
         : QStringLiteral("lease{none}");
+}
+
+QString selection_trace_history_handle(const terminal_history_handle_t& handle)
+{
+    return QStringLiteral("epoch=%1,byte=%2,row=%3,bytes=%4,generation=%5")
+        .arg(static_cast<qulonglong>(handle.epoch))
+        .arg(static_cast<qulonglong>(handle.byte_sequence))
+        .arg(static_cast<qulonglong>(handle.row_sequence))
+        .arg(handle.record_bytes)
+        .arg(static_cast<qulonglong>(handle.content_generation));
+}
+
+QString selection_trace_history_handles(
+    const std::vector<terminal_history_handle_t>& handles)
+{
+    if (handles.empty()) {
+        return QStringLiteral("none");
+    }
+    QString text;
+    const std::size_t count = std::min(handles.size(), k_selection_trace_span_limit);
+    for (std::size_t index = 0U; index < count; ++index) {
+        if (!text.isEmpty()) {
+            text += QLatin1Char(';');
+        }
+        text += QStringLiteral("{%1}").arg(selection_trace_history_handle(handles[index]));
+    }
+    if (handles.size() > count) {
+        text += QStringLiteral(";...");
+    }
+    return text;
+}
+
+QString selection_trace_int_values(const std::vector<int>& values)
+{
+    if (values.empty()) {
+        return QStringLiteral("none");
+    }
+
+    QString text;
+    const std::size_t count = std::min(values.size(), k_selection_trace_span_limit);
+    for (std::size_t index = 0U; index < count; ++index) {
+        if (!text.isEmpty()) {
+            text += QLatin1Char(',');
+        }
+        text += QString::number(values[index]);
+    }
+    if (values.size() > count) {
+        text += QStringLiteral(",...");
+    }
+    return text;
+}
+
+QString selection_trace_continuity(
+    const std::optional<terminal_selection_continuity_capability_t>& continuity)
+{
+    if (!continuity.has_value()) {
+        return QStringLiteral("continuity{absent}");
+    }
+
+    QString successors;
+    std::size_t successor_count = 0U;
+    for (const auto& [retained_line_id, candidates] :
+        continuity->successors_by_old_retained_line_id)
+    {
+        for (const terminal_selection_line_successor_t& successor : candidates) {
+            if (successor_count >= k_selection_trace_span_limit) {
+                successors += QStringLiteral(";...");
+                break;
+            }
+            if (!successors.isEmpty()) {
+                successors += QLatin1Char(';');
+            }
+            successors += QStringLiteral(
+                "key=%1,old={%2},final={%3},old_row=%4,final_row=%5,delta=%6")
+                .arg(static_cast<qulonglong>(retained_line_id))
+                .arg(selection_trace_history_handle(successor.old_handle))
+                .arg(selection_trace_history_handle(successor.final_handle))
+                .arg(successor.old_logical_row)
+                .arg(successor.final_logical_row)
+                .arg(successor.row_delta);
+            ++successor_count;
+        }
+        if (successor_count >= k_selection_trace_span_limit) {
+            break;
+        }
+    }
+    if (successors.isEmpty()) {
+        successors = QStringLiteral("none");
+    }
+
+    QString proofs;
+    const std::size_t proof_count = std::min(
+        continuity->survivor_proofs.size(),
+        k_selection_trace_span_limit);
+    for (std::size_t index = 0U; index < proof_count; ++index) {
+        const terminal_selection_survivor_proof_t& proof =
+            continuity->survivor_proofs[index];
+        if (!proofs.isEmpty()) {
+            proofs += QLatin1Char(';');
+        }
+        proofs += QStringLiteral(
+            "old={%1},predecessor={%2},final={%3},result=%4,old_row=%5,final_row=%6")
+            .arg(selection_trace_history_handle(proof.old_handle))
+            .arg(selection_trace_history_handle(proof.candidate_predecessor_handle))
+            .arg(selection_trace_history_handle(proof.final_handle))
+            .arg(static_cast<int>(proof.result))
+            .arg(proof.old_logical_row)
+            .arg(proof.final_logical_row);
+    }
+    if (continuity->survivor_proofs.size() > proof_count) {
+        proofs += QStringLiteral(";...");
+    }
+    if (proofs.isEmpty()) {
+        proofs = QStringLiteral("none");
+    }
+
+    return QStringLiteral("continuity{version=%1,successors={%2},proofs={%3}}")
+        .arg(continuity->version)
+        .arg(successors)
+        .arg(proofs);
+}
+
+QString selection_trace_recovery_proposals(
+    const std::vector<terminal_recovery_proposal_t>& proposals)
+{
+    if (proposals.empty()) {
+        return QStringLiteral("none");
+    }
+
+    QString text;
+    for (const terminal_recovery_proposal_t& proposal : proposals) {
+        if (!text.isEmpty()) {
+            text += QLatin1Char(';');
+        }
+        text += QStringLiteral(
+            "reason=%1,status=%2,source=%3,candidate_rows=%4,recovered_rows=%5,"
+            "matched_prefix=%6,unmatched_tail=%7,ambiguous=%8")
+            .arg(static_cast<int>(proposal.reason))
+            .arg(static_cast<int>(proposal.status))
+            .arg(static_cast<int>(proposal.provenance_source))
+            .arg(proposal.candidate_visible_rows)
+            .arg(proposal.recovered_row_count)
+            .arg(proposal.matched_prefix_rows)
+            .arg(proposal.unmatched_tail_rows)
+            .arg(selection_trace_bool(proposal.visible_row_identity_ambiguous));
+    }
+    return text;
+}
+
+QString selection_trace_recovery_attempts(
+    const std::vector<terminal_recovery_attempt_t>& attempts,
+    std::uint64_t                                   dropped_attempts)
+{
+    QString text = attempts.empty() ? QStringLiteral("none") : QString();
+    for (const terminal_recovery_attempt_t& attempt : attempts) {
+        if (!text.isEmpty()) {
+            text += QLatin1Char(';');
+        }
+        text += QStringLiteral("status=%1,reason=%2,candidate_rows=%3,recovered_rows=%4")
+            .arg(QString::fromLatin1(
+                terminal_recovery_attempt_status_token(attempt.status)))
+            .arg(QString::fromLatin1(
+                terminal_recovery_attempt_reason_token(attempt.reason)))
+            .arg(attempt.candidate_visible_rows)
+            .arg(attempt.recovered_row_count);
+    }
+    if (dropped_attempts > 0U) {
+        if (!text.isEmpty()) {
+            text += QLatin1Char(';');
+        }
+        text += QStringLiteral("dropped=%1")
+            .arg(static_cast<qulonglong>(dropped_attempts));
+    }
+    return text;
 }
 
 void append_selection_trace_reason(QString& reasons, const QString& reason)
@@ -762,7 +995,7 @@ bool selection_state_allows_span_emission(Terminal_selection_internal_state stat
 {
     return
         state == Terminal_selection_internal_state::DRAG_PREVIEW ||
-        state == Terminal_selection_internal_state::ATTACHED_VISIBLE;
+        state == Terminal_selection_internal_state::ATTACHED;
 }
 
 std::vector<terminal_selection_line_lease_t> selection_line_leases_from_snapshot(
@@ -793,185 +1026,6 @@ std::vector<terminal_selection_line_lease_t> selection_line_leases_from_snapshot
             provenance.content_generation));
     }
     return lines;
-}
-
-bool selection_line_leases_match_model(
-    const Terminal_screen_model&                         model,
-    Terminal_buffer_id                                   buffer_id,
-    const std::vector<terminal_selection_line_lease_t>&  lines,
-    const Terminal_selection_range&                      range)
-{
-    return model.retained_line_descriptors_match(
-        buffer_id,
-        range,
-        std::span<const terminal_selection_line_lease_t>(lines.data(), lines.size()));
-}
-
-bool retained_lines_have_scrollback_growth_source(
-    const Terminal_screen_model_result& result,
-    Terminal_buffer_id                  active_buffer,
-    const Terminal_viewport_state&      previous_viewport,
-    const Terminal_viewport_state&      current_viewport,
-    terminal_grid_size_t                previous_grid_size,
-    terminal_grid_size_t                current_grid_size)
-{
-    if (active_buffer != Terminal_buffer_id::PRIMARY ||
-        previous_viewport.active_buffer != Terminal_buffer_id::PRIMARY ||
-        current_viewport.active_buffer  != Terminal_buffer_id::PRIMARY ||
-        !result.dirty_rows_have_stable_mutation_identity ||
-        !grid_sizes_match(previous_grid_size, current_grid_size))
-    {
-        return false;
-    }
-
-    const int scrollback_growth =
-        current_viewport.scrollback_rows - previous_viewport.scrollback_rows;
-    if (scrollback_growth <= 0 ||
-        result.scrollback_rows         != current_viewport.scrollback_rows ||
-        current_viewport.visible_rows  != previous_viewport.visible_rows   ||
-        current_viewport.offset_from_tail - previous_viewport.offset_from_tail !=
-            scrollback_growth)
-    {
-        return false;
-    }
-
-    return
-        current_viewport.scrollback_rows  - current_viewport.offset_from_tail ==
-        previous_viewport.scrollback_rows - previous_viewport.offset_from_tail;
-}
-
-bool retained_lines_have_synchronized_output_release_source(
-    const Terminal_screen_model_result& result,
-    Terminal_buffer_id                  active_buffer,
-    const Terminal_viewport_state&      previous_viewport,
-    const Terminal_viewport_state&      current_viewport,
-    terminal_grid_size_t                previous_grid_size,
-    terminal_grid_size_t                current_grid_size)
-{
-    return
-        !result.dirty_rows_have_stable_mutation_identity            &&
-        active_buffer                   == previous_viewport.active_buffer &&
-        active_buffer                   == current_viewport.active_buffer  &&
-        current_viewport.visible_rows   == previous_viewport.visible_rows  &&
-        grid_sizes_match(previous_grid_size, current_grid_size);
-}
-
-bool retained_lines_have_same_viewport_mutation_source(
-    const Terminal_screen_model_result& result,
-    Terminal_buffer_id                  active_buffer,
-    const Terminal_viewport_state&      previous_viewport,
-    const Terminal_viewport_state&      current_viewport,
-    terminal_grid_size_t                previous_grid_size,
-    terminal_grid_size_t                current_grid_size)
-{
-    return
-        result.dirty_rows_have_stable_mutation_identity              &&
-        active_buffer                   == previous_viewport.active_buffer &&
-        active_buffer                   == current_viewport.active_buffer  &&
-        grid_sizes_match(previous_grid_size, current_grid_size)      &&
-        viewport_mappings_match(previous_viewport, current_viewport);
-}
-
-enum class Dirty_rows_selection_range_proof
-{
-    EMPTY_DIRTY_ROWS,
-    UNSTABLE_MUTATION_IDENTITY,
-    GRID_SIZE_MISMATCH,
-    VIEWPORT_MAPPING_MISMATCH,
-    OVERLAPS_SELECTION,
-    UNTOUCHED,
-};
-
-Dirty_rows_selection_range_proof dirty_rows_selection_range_proof(
-    const Terminal_screen_model_result& result,
-    const Terminal_selection_range&     range,
-    Terminal_buffer_id                  active_buffer,
-    const Terminal_viewport_state&      mutation_viewport,
-    const Terminal_viewport_state&      published_viewport,
-    terminal_grid_size_t                mutation_grid_size,
-    terminal_grid_size_t                published_grid_size)
-{
-    if (result.dirty_rows.empty()) {
-        return Dirty_rows_selection_range_proof::EMPTY_DIRTY_ROWS;
-    }
-
-    // Synchronized output release may publish a union of dirty row indexes
-    // accumulated across hidden viewport identities. Those indexes cannot prove
-    // the selected logical rows were untouched.
-    if (!result.dirty_rows_have_stable_mutation_identity) {
-        return Dirty_rows_selection_range_proof::UNSTABLE_MUTATION_IDENTITY;
-    }
-
-    // Dirty rows are screen rows from the mutation. If publication moved the
-    // viewport identity space, those rows no longer prove anything about the
-    // selection's logical rows.
-    if (!grid_sizes_match(mutation_grid_size, published_grid_size)) {
-        return Dirty_rows_selection_range_proof::GRID_SIZE_MISMATCH;
-    }
-    if (!viewport_mappings_match(mutation_viewport, published_viewport)) {
-        return Dirty_rows_selection_range_proof::VIEWPORT_MAPPING_MISMATCH;
-    }
-
-    const terminal_grid_position_t start = normalized_selection_start(range);
-    const terminal_grid_position_t end   = normalized_selection_end(range);
-    for (int dirty_row : result.dirty_rows) {
-        const int dirty_logical_row =
-            active_buffer == Terminal_buffer_id::ALTERNATE
-                ? dirty_row
-                : mutation_viewport.scrollback_rows + dirty_row;
-        if (dirty_logical_row >= start.row && dirty_logical_row <= end.row) {
-            return Dirty_rows_selection_range_proof::OVERLAPS_SELECTION;
-        }
-    }
-
-    return Dirty_rows_selection_range_proof::UNTOUCHED;
-}
-
-bool dirty_rows_selection_range_proof_is_ambiguous(Dirty_rows_selection_range_proof proof)
-{
-    return
-        proof == Dirty_rows_selection_range_proof::EMPTY_DIRTY_ROWS ||
-        proof == Dirty_rows_selection_range_proof::UNSTABLE_MUTATION_IDENTITY ||
-        proof == Dirty_rows_selection_range_proof::GRID_SIZE_MISMATCH ||
-        proof == Dirty_rows_selection_range_proof::VIEWPORT_MAPPING_MISMATCH;
-}
-
-QString selection_trace_dirty_rows_selection_range_proof(Dirty_rows_selection_range_proof proof)
-{
-    switch (proof) {
-    case Dirty_rows_selection_range_proof::EMPTY_DIRTY_ROWS:
-        return QStringLiteral("empty-dirty-rows");
-    case Dirty_rows_selection_range_proof::UNSTABLE_MUTATION_IDENTITY:
-        return QStringLiteral("unstable-mutation-identity");
-    case Dirty_rows_selection_range_proof::GRID_SIZE_MISMATCH:
-        return QStringLiteral("grid-size-mismatch");
-    case Dirty_rows_selection_range_proof::VIEWPORT_MAPPING_MISMATCH:
-        return QStringLiteral("viewport-mapping-mismatch");
-    case Dirty_rows_selection_range_proof::OVERLAPS_SELECTION:
-        return QStringLiteral("overlaps-selection");
-    case Dirty_rows_selection_range_proof::UNTOUCHED:
-        return QStringLiteral("untouched");
-    }
-    return QStringLiteral("unknown");
-}
-
-bool dirty_rows_prove_selection_range_untouched(
-    const Terminal_screen_model_result& result,
-    const Terminal_selection_range&     range,
-    Terminal_buffer_id                  active_buffer,
-    const Terminal_viewport_state&      mutation_viewport,
-    const Terminal_viewport_state&      published_viewport,
-    terminal_grid_size_t                mutation_grid_size,
-    terminal_grid_size_t                published_grid_size)
-{
-    return dirty_rows_selection_range_proof(
-        result,
-        range,
-        active_buffer,
-        mutation_viewport,
-        published_viewport,
-        mutation_grid_size,
-        published_grid_size) == Dirty_rows_selection_range_proof::UNTOUCHED;
 }
 
 bool active_model_matches_published_selection_source(
@@ -2660,6 +2714,7 @@ void Terminal_session::detach_selection_visual_attachment()
         m_screen_model.has_value() && !model_allows_render_snapshot(*m_screen_model);
 
     m_selection.detach_visual_attachment();
+    reset_synchronized_selection_continuity_hold();
     if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral(
@@ -2705,6 +2760,7 @@ void Terminal_session::clear_selection()
                 .arg(selection_trace_content_basis(m_selection_content_basis)));
     }
     m_selection.clear();
+    reset_synchronized_selection_continuity_hold();
     if (m_screen_model.has_value()) {
         m_selection_buffer_id = m_screen_model->active_buffer_id();
         publish_selection_snapshot(next_sequence(), QStringLiteral("selection cleared"));
@@ -2733,6 +2789,7 @@ void Terminal_session::set_scrollback_limit(int limit)
 
     const bool render_snapshot_available = model_allows_render_snapshot(*m_screen_model);
     if (!render_snapshot_available) {
+        accumulate_synchronized_selection_continuity(model_result);
         record_blocked_synchronized_row_origin_change(model_result);
     }
     if ((model_result_warrants_render_snapshot(model_result) || m_visual_bell_active) &&
@@ -2775,6 +2832,7 @@ void Terminal_session::set_color_state(Terminal_color_state state)
 
     const bool render_snapshot_available = model_allows_render_snapshot(*m_screen_model);
     if (!render_snapshot_available) {
+        accumulate_synchronized_selection_continuity(model_result);
         record_blocked_synchronized_row_origin_change(model_result);
     }
     if ((model_result_warrants_render_snapshot(model_result) || m_visual_bell_active) &&
@@ -3015,6 +3073,13 @@ std::optional<terminal_selection_visual_lease_t> Terminal_session::selection_vis
     return m_selection.visual_lease();
 }
 
+std::optional<Terminal_selection_attachment_resolution_status>
+Terminal_session::last_selection_attachment_resolution_status() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return m_last_selection_attachment_resolution_status;
+}
+
 Terminal_selection_anchor_domain Terminal_session::selection_anchor_domain() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -3028,6 +3093,217 @@ Terminal_session::published_selection_source_identity() const
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     return published_selection_source_identity_unlocked();
+}
+
+std::optional<terminal_selection_drag_press_provenance_t>
+Terminal_session::begin_selection_drag_provenance(
+    terminal_grid_position_t             original_position,
+    terminal_selection_source_identity_t source)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_selection_drag_continuity.reset();
+    if (!m_screen_model.has_value()) {
+        return std::nullopt;
+    }
+
+    const std::optional<terminal_selection_source_identity_t> current_source =
+        published_selection_source_identity_unlocked();
+    if (!current_source.has_value() ||
+        !selection_source_identities_match(*current_source, source))
+    {
+        return std::nullopt;
+    }
+
+    const std::optional<terminal_history_handle_t> handle =
+        m_screen_model->retained_history_handle_at_logical_row(
+            source.buffer_id,
+            original_position.row);
+    if (!handle.has_value()) {
+        return std::nullopt;
+    }
+
+    terminal_selection_visual_lease_t anchor_lease =
+        make_selection_visual_lease(
+            {original_position, original_position, Terminal_selection_mode::NORMAL},
+            source);
+    anchor_lease.selected_lines.push_back({0, *handle});
+    const Terminal_selection_attachment_resolution proof =
+        m_screen_model->resolve_selection_attachment(
+            anchor_lease,
+            source,
+            Terminal_screen_model_result{});
+    if (proof.status != Terminal_selection_attachment_resolution_status::TRANSLATED ||
+        !proof.translated_lease.has_value())
+    {
+        return std::nullopt;
+    }
+
+    terminal_selection_drag_press_provenance_t provenance;
+    provenance.original_position    = original_position;
+    provenance.retained_line_handle = *handle;
+    provenance.source               = source;
+
+    Selection_drag_continuity continuity;
+    continuity.provenance   = provenance;
+    continuity.anchor_lease = *proof.translated_lease;
+    m_selection_drag_continuity = std::move(continuity);
+    return provenance;
+}
+
+Terminal_selection_drag_resolution
+Terminal_session::resolve_selection_drag_provenance(
+    const terminal_selection_drag_press_provenance_t& provenance,
+    bool                                               require_established_selection)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    Terminal_selection_drag_resolution result;
+    if (!m_screen_model.has_value() ||
+        !m_selection_drag_continuity.has_value() ||
+        m_selection_drag_continuity->provenance.original_position !=
+            provenance.original_position ||
+        m_selection_drag_continuity->provenance.retained_line_handle !=
+            provenance.retained_line_handle ||
+        !selection_source_identities_match(
+            m_selection_drag_continuity->provenance.source,
+            provenance.source))
+    {
+        return result;
+    }
+
+    Selection_drag_continuity& continuity = *m_selection_drag_continuity;
+    if (continuity.failure.has_value()) {
+        result.status = *continuity.failure;
+        return result;
+    }
+
+    const std::optional<terminal_selection_source_identity_t> target_source =
+        published_selection_source_identity_unlocked();
+    if (!target_source.has_value()) {
+        result.status = Terminal_selection_attachment_resolution_status::SOURCE_MISMATCH;
+        return result;
+    }
+
+    if (continuity.cached_success.has_value()) {
+        const Selection_drag_continuity::Cached_success& success =
+            *continuity.cached_success;
+        const std::optional<terminal_selection_visual_lease_t>& selection_lease =
+            m_selection.visual_lease();
+        const bool cache_has_compatible_selection = continuity.established
+            ? success.proven_selection_lease.has_value() &&
+                m_selection.internal_state() == Terminal_selection_internal_state::ATTACHED &&
+                selection_lease.has_value() &&
+                continuity.durable_payload_identity ==
+                    success.proven_selection_lease->durable_payload_identity &&
+                continuity.provisional_payload_identity ==
+                    success.proven_selection_lease->provisional_payload_identity &&
+                m_selection.range() == success.proven_selection_lease->selected_range &&
+                selection_visual_leases_match(
+                    *selection_lease,
+                    *success.proven_selection_lease) &&
+                selection_lease_has_compatible_visual_source(
+                    *selection_lease,
+                    *target_source,
+                    true)
+            : !success.proven_selection_lease.has_value();
+        const bool cached_success_matches =
+            selection_source_identities_match(success.source, *target_source) &&
+            selection_visual_leases_match(success.anchor_lease, continuity.anchor_lease) &&
+            cache_has_compatible_selection;
+        if (cached_success_matches &&
+            (!require_established_selection || continuity.established))
+        {
+            result.status            = Terminal_selection_attachment_resolution_status::TRANSLATED;
+            result.resolved_position = success.anchor_lease.anchor;
+            result.source            = success.source;
+            if (require_established_selection) {
+                result.reconciled_proven_range =
+                    success.proven_selection_lease->selected_range;
+            }
+            return result;
+        }
+        continuity.cached_success.reset();
+    }
+
+    const Terminal_selection_attachment_resolution anchor_resolution =
+        m_screen_model->resolve_selection_attachment(
+            continuity.anchor_lease,
+            *target_source,
+            Terminal_screen_model_result{});
+    result.status = anchor_resolution.status;
+    if (anchor_resolution.status !=
+            Terminal_selection_attachment_resolution_status::TRANSLATED ||
+        !anchor_resolution.translated_lease.has_value())
+    {
+        continuity.failure = anchor_resolution.status;
+        continuity.cached_success.reset();
+        return result;
+    }
+    continuity.anchor_lease = *anchor_resolution.translated_lease;
+
+    if (require_established_selection) {
+        const std::optional<terminal_selection_visual_lease_t>& lease =
+            m_selection.visual_lease();
+        if (!continuity.established ||
+            m_selection.internal_state() != Terminal_selection_internal_state::ATTACHED ||
+            !lease.has_value() ||
+            lease->durable_payload_identity != continuity.durable_payload_identity ||
+            lease->provisional_payload_identity != continuity.provisional_payload_identity ||
+            !selection_lease_has_compatible_visual_source(
+                *lease,
+                *target_source,
+                true))
+        {
+            result.status = m_last_selection_attachment_resolution_status.value_or(
+                Terminal_selection_attachment_resolution_status::INVALID_LEASE);
+            continuity.failure = result.status;
+            continuity.cached_success.reset();
+            return result;
+        }
+        result.reconciled_proven_range = lease->selected_range;
+    }
+
+    result.resolved_position = continuity.anchor_lease.anchor;
+    result.source            = *target_source;
+    return result;
+}
+
+void Terminal_session::record_selection_drag_proven_range()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_selection_drag_continuity.has_value()) {
+        return;
+    }
+
+    const std::optional<terminal_selection_visual_lease_t>& lease =
+        m_selection.visual_lease();
+    if (m_selection.internal_state() != Terminal_selection_internal_state::ATTACHED ||
+        !lease.has_value())
+    {
+        m_selection_drag_continuity->failure =
+            Terminal_selection_attachment_resolution_status::INVALID_LEASE;
+        m_selection_drag_continuity->cached_success.reset();
+        return;
+    }
+
+    m_selection_drag_continuity->durable_payload_identity =
+        lease->durable_payload_identity;
+    m_selection_drag_continuity->provisional_payload_identity =
+        lease->provisional_payload_identity;
+    m_selection_drag_continuity->established = true;
+    const std::optional<terminal_selection_source_identity_t> target_source =
+        published_selection_source_identity_unlocked();
+    if (target_source.has_value()) {
+        refresh_selection_drag_cached_success_range(*target_source);
+    }
+    else {
+        m_selection_drag_continuity->cached_success.reset();
+    }
+}
+
+void Terminal_session::clear_selection_drag_provenance()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_selection_drag_continuity.reset();
 }
 
 std::optional<terminal_selection_source_identity_t>
@@ -3505,6 +3781,31 @@ terminal_retained_history_diagnostics_t Terminal_session::retained_history_diagn
     return m_screen_model.has_value()
         ? m_screen_model->retained_history_diagnostics()
         : terminal_retained_history_diagnostics_t{};
+}
+
+void Terminal_session::set_selection_reconciliation_counters_enabled(bool enabled)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (m_screen_model.has_value()) {
+        m_screen_model->set_selection_reconciliation_counters_enabled(enabled);
+    }
+}
+
+void Terminal_session::reset_selection_reconciliation_counters()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (m_screen_model.has_value()) {
+        m_screen_model->reset_selection_reconciliation_counters();
+    }
+}
+
+terminal_selection_reconciliation_counters_t
+Terminal_session::selection_reconciliation_counters() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    return m_screen_model.has_value()
+        ? m_screen_model->selection_reconciliation_counters()
+        : terminal_selection_reconciliation_counters_t{};
 }
 
 Terminal_session_profile_stats Terminal_session::profile_stats() const
@@ -4042,80 +4343,87 @@ Terminal_session_result Terminal_session::process_resize_command(
                 QStringLiteral("resize requires an initialized screen model")));
     }
 
-    const terminal_grid_size_t    previous_grid_size = m_grid_size;
-    const Terminal_viewport_state previous_viewport   = m_viewport_controller.state();
-    m_grid_size               = resize.target_grid_size;
-    resize.snapshot_grid_size = m_grid_size;
-    resize.model_result       = Terminal_model_resize_result::APPLIED;
-    const Terminal_screen_model_result model_result = m_screen_model->resize(m_grid_size);
-    sync_viewport_from_model_result(model_result, std::nullopt);
-    m_render_snapshot_model_result = model_result;
-    const bool backend_geometry_was_in_sync = m_backend_geometry_in_sync;
-    const bool render_snapshot_available =
-        model_allows_render_snapshot(*m_screen_model);
-    const bool grid_size_changed = !grid_sizes_match(previous_grid_size, m_grid_size);
-    if (grid_size_changed && !render_snapshot_available) {
-        invalidate_public_projection(
-            Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED);
-    }
+    const terminal_grid_size_t previous_grid_size = m_grid_size;
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     if (m_config.transcript_recorder != nullptr) {
         (void)m_config.transcript_recorder->record_session_resize_request(command.sequence, resize);
     }
 #endif
 
-    const Terminal_backend_result backend_result =
-        m_backend->resize({resize.id, resize.target_grid_size});
-    if (is_backend_rejection(backend_result)) {
-        resize.backend_result           = Terminal_backend_resize_result::FAILED;
-        resize.backend_geometry_in_sync = false;
-        m_backend_geometry_in_sync      = false;
-        // The failed resize path keeps the backend error before the resize-failed notification.
-        record_resize_transaction(resize);
+    Resize_transition_context resize_context;
+    resize_context.session     = this;
+    resize_context.host_resize = &resize;
+    resize_context.sequence    = command.sequence;
+    const terminal_screen_model_resize_transition_sink_t resize_transition_sink{
+        &resize_context,
+        &Terminal_session::consume_screen_model_resize_transition_callback,
+        command.sequence,
+    };
+    const Terminal_screen_model_result model_result = m_screen_model->resize(
+        resize.target_grid_size,
+        &resize_transition_sink);
+    if (!resize_context.transition_consumed) {
+        resize.snapshot_grid_size = m_grid_size;
+        resize.model_result       = Terminal_model_resize_result::APPLIED;
+        const bool backend_geometry_was_in_sync = m_backend_geometry_in_sync;
+        const Terminal_backend_result backend_result =
+            m_backend->resize({resize.id, resize.target_grid_size});
+        if (is_backend_rejection(backend_result)) {
+            resize.backend_result           = Terminal_backend_resize_result::FAILED;
+            resize.backend_geometry_in_sync = false;
+            m_backend_geometry_in_sync      = false;
+            resize_context.backend_error    = backend_result.error;
+            resize_context.render_snapshot_metadata_changed =
+                backend_geometry_was_in_sync;
+            // The failed resize path keeps the backend error before the resize-failed notification.
+            record_resize_transaction(resize);
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
-        if (m_config.transcript_recorder != nullptr) {
-            (void)m_config.transcript_recorder->record_session_resize(command.sequence, resize);
-        }
+            if (m_config.transcript_recorder != nullptr) {
+                (void)m_config.transcript_recorder->record_session_resize(command.sequence, resize);
+            }
 #endif
-        record_backend_error(command.sequence, *backend_result.error);
-        record_notification({
-            Terminal_session_notification_kind::RESIZE_TRANSACTION,
-            command.sequence,
-            QStringLiteral("resize failed"),
-            std::nullopt,
-            std::nullopt,
-            resize,
-            false,
-        });
-
-        publish_resize_outcome(
-            command.sequence,
-            render_snapshot_available,
-            grid_size_changed,
-            backend_geometry_was_in_sync,
-            model_result,
-            previous_viewport,
-            previous_grid_size);
-
-        return make_backend_rejected_result(command.sequence, backend_result.error);
+            record_backend_error(command.sequence, *backend_result.error);
+            record_notification({
+                Terminal_session_notification_kind::RESIZE_TRANSACTION,
+                command.sequence,
+                QStringLiteral("resize failed"),
+                std::nullopt,
+                std::nullopt,
+                resize,
+                false,
+            });
+        }
+        else {
+            resize.backend_result           = Terminal_backend_resize_result::APPLIED;
+            resize.backend_geometry_in_sync = true;
+            m_backend_geometry_in_sync      = true;
+            resize_context.render_snapshot_metadata_changed =
+                !backend_geometry_was_in_sync;
+            finalize_resize_transaction(
+                resize,
+                command.sequence,
+                QStringLiteral("resize applied"));
+        }
     }
 
-    resize.backend_result           = Terminal_backend_resize_result::APPLIED;
-    resize.backend_geometry_in_sync = true;
-    m_backend_geometry_in_sync      = true;
-    finalize_resize_transaction(
-        resize,
-        command.sequence,
-        QStringLiteral("resize applied"));
+    sync_viewport_from_model_result(model_result, std::nullopt);
+    m_render_snapshot_model_result = model_result;
+    const bool render_snapshot_available =
+        model_allows_render_snapshot(*m_screen_model);
+    const bool grid_size_changed = !grid_sizes_match(previous_grid_size, m_grid_size);
 
     publish_resize_outcome(
         command.sequence,
         render_snapshot_available,
         grid_size_changed,
-        !backend_geometry_was_in_sync,
-        model_result,
-        previous_viewport,
-        previous_grid_size);
+        resize_context.render_snapshot_metadata_changed,
+        model_result);
+
+    if (resize_context.backend_error.has_value()) {
+        return make_backend_rejected_result(
+            command.sequence,
+            resize_context.backend_error);
+    }
 
     return make_accepted_result(command.sequence);
 }
@@ -4142,30 +4450,223 @@ void Terminal_session::finalize_resize_transaction(
     });
 }
 
+void Terminal_session::consume_screen_model_resize_transition_callback(
+    void* context,
+    const terminal_screen_model_resize_transition_t& transition)
+{
+    auto& resize_context = *static_cast<Resize_transition_context*>(context);
+    Q_ASSERT(resize_context.session != nullptr);
+    resize_context.session->consume_screen_model_resize_transition(
+        resize_context,
+        transition);
+}
+
+void Terminal_session::consume_screen_model_resize_transition(
+    Resize_transition_context&                        context,
+    const terminal_screen_model_resize_transition_t& transition)
+{
+    Q_ASSERT(m_screen_model.has_value());
+    Q_ASSERT(transition.sequence == context.sequence);
+    Q_ASSERT(grid_sizes_match(m_grid_size, transition.grid_size_before));
+
+    const Terminal_viewport_state previous_viewport = m_viewport_controller.state();
+    m_grid_size = transition.grid_size_after;
+    sync_viewport_from_model_result(
+        transition.result,
+        context.detached_viewport_anchor,
+        false);
+
+    const bool render_snapshot_available = model_allows_render_snapshot(*m_screen_model);
+    if (!render_snapshot_available) {
+        invalidate_public_projection(
+            Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED);
+        accumulate_synchronized_selection_continuity(transition.result);
+    }
+
+    const Terminal_screen_model_result selection_basis_result =
+        model_result_with_deferred_synchronized_row_origins(transition.result);
+    const std::optional<Terminal_selection_attachment_resolution_status>
+        synchronized_failure = !render_snapshot_available &&
+            m_synchronized_selection_continuity_hold.has_value() &&
+            m_synchronized_selection_continuity_hold->selection.has_value()
+                ? m_synchronized_selection_continuity_hold->selection->failure
+                : std::nullopt;
+    const std::optional<Terminal_selection_attachment_resolution_status>
+        synchronized_drag_failure = !render_snapshot_available &&
+            m_synchronized_selection_continuity_hold.has_value() &&
+            m_synchronized_selection_continuity_hold->drag.has_value()
+                ? m_synchronized_selection_continuity_hold->drag->failure
+                : std::nullopt;
+    advance_selection_content_basis_for_model_result(
+        selection_basis_result,
+        previous_viewport,
+        transition.grid_size_before,
+        synchronized_failure,
+        synchronized_drag_failure,
+        true);
+    if (!render_snapshot_available) {
+        rebase_synchronized_selection_continuity_hold();
+    }
+
+    Terminal_resize_transaction resize = context.host_resize != nullptr
+        ? *context.host_resize
+        : Terminal_resize_transaction{};
+    if (context.host_resize == nullptr) {
+        resize.id = next_resize_id();
+    }
+    resize.target_grid_size   = transition.grid_size_after;
+    resize.active_buffer      = m_screen_model->active_buffer_id();
+    resize.model_result       = Terminal_model_resize_result::APPLIED;
+    resize.snapshot_grid_size = transition.grid_size_after;
+
+    const bool backend_geometry_was_in_sync = m_backend_geometry_in_sync;
+    const QString outcome_prefix = context.host_resize != nullptr
+        ? QStringLiteral("resize")
+        : QStringLiteral("text-area resize");
+    if (m_backend       == nullptr                         ||
+        m_process_state != Terminal_process_state::RUNNING ||
+        m_stop_requested)
+    {
+        resize.backend_result           = Terminal_backend_resize_result::FAILED;
+        resize.backend_geometry_in_sync = false;
+        m_backend_geometry_in_sync      = false;
+        context.render_snapshot_metadata_changed =
+            context.render_snapshot_metadata_changed || backend_geometry_was_in_sync;
+        record_resize_transaction(resize);
+        record_notification({
+            Terminal_session_notification_kind::RESIZE_TRANSACTION,
+            context.sequence,
+            outcome_prefix + QStringLiteral(" requires a running backend"),
+            std::nullopt,
+            std::nullopt,
+            resize,
+            false,
+        });
+    }
+    else {
+        const Terminal_backend_result backend_result =
+            m_backend->resize({resize.id, resize.target_grid_size});
+        if (is_backend_rejection(backend_result)) {
+            resize.backend_result           = Terminal_backend_resize_result::FAILED;
+            resize.backend_geometry_in_sync = false;
+            m_backend_geometry_in_sync      = false;
+            context.backend_error           = backend_result.error;
+            context.render_snapshot_metadata_changed =
+                context.render_snapshot_metadata_changed || backend_geometry_was_in_sync;
+            record_resize_transaction(resize);
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+            if (context.host_resize != nullptr && m_config.transcript_recorder != nullptr) {
+                (void)m_config.transcript_recorder->record_session_resize(
+                    context.sequence,
+                    resize);
+            }
+#endif
+            record_backend_error(context.sequence, *backend_result.error);
+            record_notification({
+                Terminal_session_notification_kind::RESIZE_TRANSACTION,
+                context.sequence,
+                outcome_prefix + QStringLiteral(" failed"),
+                std::nullopt,
+                std::nullopt,
+                resize,
+                false,
+            });
+        }
+        else {
+            resize.backend_result           = Terminal_backend_resize_result::APPLIED;
+            resize.backend_geometry_in_sync = true;
+            m_backend_geometry_in_sync      = true;
+            context.render_snapshot_metadata_changed =
+                context.render_snapshot_metadata_changed || !backend_geometry_was_in_sync;
+            if (context.host_resize != nullptr) {
+                finalize_resize_transaction(
+                    resize,
+                    context.sequence,
+                    outcome_prefix + QStringLiteral(" applied"));
+            }
+            else {
+                record_resize_transaction(resize);
+                record_notification({
+                    Terminal_session_notification_kind::RESIZE_TRANSACTION,
+                    context.sequence,
+                    outcome_prefix + QStringLiteral(" applied"),
+                    std::nullopt,
+                    std::nullopt,
+                    resize,
+                    false,
+                });
+            }
+        }
+    }
+
+    if (context.host_resize != nullptr) {
+        *context.host_resize = resize;
+    }
+    context.transition_consumed = true;
+}
+
+void Terminal_session::consume_screen_model_text_area_resize_request_callback(
+    void* context,
+    const terminal_screen_model_text_area_resize_request_t& request)
+{
+    auto& resize_context = *static_cast<Resize_transition_context*>(context);
+    Q_ASSERT(resize_context.session != nullptr);
+    resize_context.session->consume_screen_model_text_area_resize_request(
+        resize_context,
+        request);
+}
+
+void Terminal_session::consume_screen_model_text_area_resize_request(
+    Resize_transition_context&                              context,
+    const terminal_screen_model_text_area_resize_request_t& request)
+{
+    Q_ASSERT(m_screen_model.has_value());
+    Q_ASSERT(context.host_resize == nullptr);
+    Q_ASSERT(request.sequence == context.sequence);
+    Q_ASSERT(request.ordinal == context.parser_resize_requests.size() + 1U);
+    Q_ASSERT(grid_sizes_match(m_screen_model->grid_size(), request.grid_size));
+    Q_ASSERT(grid_sizes_match(m_grid_size, request.grid_size));
+
+#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
+    if (m_config.transcript_recorder != nullptr) {
+        (void)m_config.transcript_recorder->record_text_area_resize_request(
+            context.sequence,
+            request.grid_size);
+    }
+#endif
+    if (!request.model_grid_changed) {
+        context.render_snapshot_metadata_changed =
+            retry_text_area_resize_request(
+                context.sequence,
+                request.grid_size) ||
+            context.render_snapshot_metadata_changed;
+    }
+    record_notification({
+        Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED,
+        context.sequence,
+        QStringLiteral("text-area resize requested"),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+        false,
+        std::nullopt,
+        request.grid_size,
+    });
+    context.parser_resize_requests.push_back(request.grid_size);
+}
+
 void Terminal_session::publish_resize_outcome(
     std::uint64_t                       sequence,
     bool                                render_snapshot_available,
     bool                                grid_size_changed,
     bool                                geometry_transition_warrants_publication,
-    const Terminal_screen_model_result& model_result,
-    const Terminal_viewport_state&      previous_viewport,
-    terminal_grid_size_t                previous_grid_size)
+    const Terminal_screen_model_result& model_result)
 {
-    const auto advance_selection_content_basis_for_resize_publication = [&] {
-        const Terminal_screen_model_result selection_basis_result =
-            model_result_with_deferred_synchronized_row_origins(model_result);
-        advance_selection_content_basis_for_model_result(
-            selection_basis_result,
-            previous_viewport,
-            previous_grid_size);
-    };
-
     if (!render_snapshot_available &&
         (grid_size_changed ||
             geometry_transition_warrants_publication ||
             m_latest_render_snapshot == nullptr))
     {
-        advance_selection_content_basis_for_resize_publication();
         publish_synchronized_resize_snapshot(
             sequence,
             QStringLiteral("resize geometry snapshot ready"));
@@ -4175,7 +4676,6 @@ void Terminal_session::publish_resize_outcome(
         (model_result_warrants_render_snapshot(model_result) ||
             geometry_transition_warrants_publication))
     {
-        advance_selection_content_basis_for_resize_publication();
         publish_render_snapshot(sequence, QStringLiteral("resize snapshot ready"));
     }
 }
@@ -4265,8 +4765,11 @@ Terminal_session_result Terminal_session::force_release_synchronized_output_lock
             : std::nullopt;
     const std::optional<Live_primary_viewport_anchor> detached_viewport_anchor =
         capture_live_primary_detached_viewport_anchor();
-    const Terminal_screen_model_result model_result =
-        m_screen_model->force_release_synchronized_output();
+    terminal_screen_model_trailing_changes_t trailing_changes;
+    Terminal_screen_model_result model_result =
+        m_screen_model->force_release_synchronized_output(&trailing_changes);
+    const bool render_result_warrants_snapshot =
+        model_result_warrants_render_snapshot(model_result);
     if (m_config.capture_last_model_ingest_result) {
         m_last_model_ingest_result = model_result;
     }
@@ -4274,14 +4777,28 @@ Terminal_session_result Terminal_session::force_release_synchronized_output_lock
     const terminal_grid_size_t    previous_grid_size = m_grid_size;
     m_render_snapshot_model_result = model_result;
     sync_viewport_from_model_result(model_result, detached_viewport_anchor);
+    apply_trailing_changes(model_result, trailing_changes);
+    accumulate_synchronized_selection_continuity(model_result);
 
-    if (model_result_warrants_render_snapshot(model_result) || m_visual_bell_active) {
-        const Terminal_screen_model_result selection_basis_result =
+    if (render_result_warrants_snapshot || m_visual_bell_active) {
+        Terminal_screen_model_result selection_basis_result =
             model_result_with_deferred_synchronized_row_origins(model_result);
+        selection_basis_result = compose_synchronized_selection_release(
+            std::move(selection_basis_result));
+        const std::optional<Terminal_selection_attachment_resolution_status>
+            synchronized_failure = synchronized_selection_release_failure();
+        const std::optional<Terminal_selection_attachment_resolution_status>
+            synchronized_drag_failure = m_synchronized_selection_continuity_hold.has_value()
+                && m_synchronized_selection_continuity_hold->drag.has_value()
+                ? m_synchronized_selection_continuity_hold->drag->failure
+                : std::nullopt;
         advance_selection_content_basis_for_model_result(
             selection_basis_result,
             previous_viewport,
-            previous_grid_size);
+            previous_grid_size,
+            synchronized_failure,
+            synchronized_drag_failure,
+            true);
         const std::optional<Terminal_public_scroll_diagnostics> release_diagnostics =
             release_intent.has_value()
                 ? reconcile_public_projection_release(
@@ -4295,6 +4812,7 @@ Terminal_session_result Terminal_session::force_release_synchronized_output_lock
             release_diagnostics.value_or(Terminal_public_scroll_diagnostics{}));
     }
     if (model_allows_render_snapshot(*m_screen_model)) {
+        reset_synchronized_selection_continuity_hold();
         reset_synchronized_output_policy_lifecycle();
     }
     if (had_public_projection_hold && model_allows_render_snapshot(*m_screen_model)) {
@@ -5077,6 +5595,7 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     m_selection.clear();
     m_selection_buffer_id                    = Terminal_buffer_id::PRIMARY;
     m_selection_content_basis                = {};
+    m_last_selection_attachment_resolution_status.reset();
     m_ime_preedit                            = {};
     m_render_snapshot_generation             = 0U;
     m_render_snapshot_installed_generation  = 0U;
@@ -5087,6 +5606,7 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     m_synchronized_output_hold_policy.reset();
     m_synchronized_output_policy_change_event =
         Terminal_synchronized_output_policy_change_event::NONE;
+    m_synchronized_selection_continuity_hold.reset();
     m_ime_preedit_generation            = 0U;
     m_alternate_scroll_mode_generation  = 0U;
     m_active_buffer_epoch               = 0U;
@@ -5119,10 +5639,22 @@ void Terminal_session::ingest_backend_output_segment(
             : std::nullopt;
     const std::optional<Live_primary_viewport_anchor> detached_viewport_anchor =
         capture_live_primary_detached_viewport_anchor();
+    Resize_transition_context resize_context;
+    resize_context.session                  = this;
+    resize_context.detached_viewport_anchor = detached_viewport_anchor;
+    resize_context.sequence                 = sequence;
+    terminal_screen_model_trailing_changes_t trailing_changes;
+    const terminal_screen_model_resize_transition_sink_t resize_transition_sink{
+        &resize_context,
+        &Terminal_session::consume_screen_model_resize_transition_callback,
+        sequence,
+        &trailing_changes,
+        &Terminal_session::consume_screen_model_text_area_resize_request_callback,
+    };
     Terminal_screen_model_result ingest_result;
     {
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::model_ingest");
-        ingest_result = m_screen_model->ingest(bytes);
+        ingest_result = m_screen_model->ingest(bytes, &resize_transition_sink);
     }
 
     {
@@ -5138,35 +5670,69 @@ void Terminal_session::ingest_backend_output_segment(
     const terminal_grid_size_t    previous_grid_size = m_grid_size;
     {
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::handle_parser_actions");
-        render_snapshot_metadata_changed = handle_parser_actions(sequence, ingest_result);
+        handle_parser_actions(
+            sequence,
+            ingest_result,
+            resize_context.parser_resize_requests);
+        render_snapshot_metadata_changed =
+            resize_context.render_snapshot_metadata_changed;
     }
     {
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::sync_viewport_from_model_result");
         sync_viewport_from_model_result(ingest_result, detached_viewport_anchor);
     }
+    const bool render_result_warrants_snapshot =
+        model_result_warrants_render_snapshot(ingest_result);
+    const bool render_terminal_content_changed = ingest_result.terminal_content_changed;
+    apply_trailing_changes(ingest_result, trailing_changes);
     if (completes_backend_output_callback) {
         complete_processing_backend_output_side_effects();
     }
 
     const bool render_snapshot_available = model_allows_render_snapshot(*m_screen_model);
+    if (!render_snapshot_was_blocked && !render_snapshot_available) {
+        begin_synchronized_selection_continuity_hold();
+    }
+    if (!render_snapshot_available ||
+        (render_snapshot_was_blocked && render_snapshot_available))
+    {
+        accumulate_synchronized_selection_continuity(ingest_result);
+    }
     if (!render_snapshot_available) {
         record_blocked_synchronized_row_origin_change(ingest_result);
     }
     const bool synchronized_output_released =
         render_snapshot_was_blocked && render_snapshot_available;
-    if ((model_result_warrants_render_snapshot(ingest_result) ||
+    if ((render_result_warrants_snapshot                         ||
         render_snapshot_metadata_changed                      ||
         m_visual_bell_active)
         &&
         render_snapshot_available)
     {
         VNM_TERMINAL_PROFILE_SCOPE("Terminal_session::publish_backend_render_snapshot");
-        const Terminal_screen_model_result selection_basis_result =
+        Terminal_screen_model_result selection_basis_result =
             model_result_with_deferred_synchronized_row_origins(ingest_result);
+        if (synchronized_output_released) {
+            selection_basis_result = compose_synchronized_selection_release(
+                std::move(selection_basis_result));
+        }
+        const std::optional<Terminal_selection_attachment_resolution_status>
+            synchronized_failure = synchronized_output_released
+                ? synchronized_selection_release_failure()
+                : std::nullopt;
+        const std::optional<Terminal_selection_attachment_resolution_status>
+            synchronized_drag_failure = synchronized_output_released &&
+                m_synchronized_selection_continuity_hold.has_value() &&
+                m_synchronized_selection_continuity_hold->drag.has_value()
+                    ? m_synchronized_selection_continuity_hold->drag->failure
+                    : std::nullopt;
         advance_selection_content_basis_for_model_result(
             selection_basis_result,
             previous_viewport,
-            previous_grid_size);
+            previous_grid_size,
+            synchronized_failure,
+            synchronized_drag_failure,
+            synchronized_output_released);
         const std::optional<Terminal_public_scroll_diagnostics> release_diagnostics =
             release_intent.has_value()
                 ? reconcile_public_projection_release(
@@ -5182,7 +5748,7 @@ void Terminal_session::ingest_backend_output_segment(
             defer_backend_content_snapshot(
                 sequence,
                 QStringLiteral("backend output received"),
-                ingest_result,
+                *m_render_snapshot_model_result,
                 Terminal_public_scroll_diagnostics{});
         }
         else {
@@ -5198,11 +5764,12 @@ void Terminal_session::ingest_backend_output_segment(
                 record_backend_callback_drain_content_publication(
                     m_render_snapshot_generation,
                     synchronized_output_released,
-                    ingest_result.terminal_content_changed);
+                    render_terminal_content_changed);
             }
         }
     }
     if (render_snapshot_available) {
+        reset_synchronized_selection_continuity_hold();
         reset_synchronized_output_policy_lifecycle();
     }
     if (had_public_projection_hold && render_snapshot_available) {
@@ -5277,21 +5844,19 @@ void Terminal_session::record_backend_callback_drain_content_publication(
     }
 }
 
-bool Terminal_session::apply_text_area_resize_request(
+bool Terminal_session::retry_text_area_resize_request(
     std::uint64_t          sequence,
     terminal_grid_size_t   grid_size)
 {
     if (!m_screen_model.has_value() ||
         !is_terminal_screen_model_grid_size_supported(grid_size) ||
-        !grid_sizes_match(m_screen_model->grid_size(), grid_size))
+        !grid_sizes_match(m_screen_model->grid_size(), grid_size) ||
+        !grid_sizes_match(m_grid_size, grid_size)                  ||
+        m_backend_geometry_in_sync)
     {
         return false;
     }
 
-    const bool grid_size_changed = !grid_sizes_match(m_grid_size, grid_size);
-    if (!grid_size_changed && m_backend_geometry_in_sync) {
-        return false;
-    }
     const bool backend_geometry_was_in_sync = m_backend_geometry_in_sync;
 
     Terminal_resize_transaction resize;
@@ -5300,12 +5865,6 @@ bool Terminal_session::apply_text_area_resize_request(
     resize.active_buffer      = m_screen_model->active_buffer_id();
     resize.model_result       = Terminal_model_resize_result::APPLIED;
     resize.snapshot_grid_size = grid_size;
-
-    m_grid_size = grid_size;
-    if (grid_size_changed && !model_allows_render_snapshot(*m_screen_model)) {
-        invalidate_public_projection(
-            Terminal_public_projection_disable_reason::GEOMETRY_INVALIDATED);
-    }
 
     if (m_backend       == nullptr                         ||
         m_process_state != Terminal_process_state::RUNNING ||
@@ -5363,11 +5922,12 @@ bool Terminal_session::apply_text_area_resize_request(
     return backend_geometry_was_in_sync != m_backend_geometry_in_sync;
 }
 
-bool Terminal_session::handle_parser_actions(
+void Terminal_session::handle_parser_actions(
     std::uint64_t                          sequence,
-    const Terminal_screen_model_result&    result)
+    const Terminal_screen_model_result&    result,
+    std::span<const terminal_grid_size_t>  consumed_resize_requests)
 {
-    bool render_snapshot_metadata_changed = false;
+    std::size_t consumed_resize_index = 0U;
 
     for (const Parser_action& action : result.actions) {
         switch (parser_action_kind(action)) {
@@ -5399,29 +5959,14 @@ bool Terminal_session::handle_parser_actions(
                                     notification.rows,
                                     notification.columns,
                                 };
-#if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
-                                if (m_config.transcript_recorder != nullptr) {
-                                    (void)m_config.transcript_recorder->record_text_area_resize_request(
-                                        sequence,
-                                        requested_grid_size);
+                                Q_ASSERT(
+                                    consumed_resize_index < consumed_resize_requests.size());
+                                if (consumed_resize_index < consumed_resize_requests.size()) {
+                                    Q_ASSERT(grid_sizes_match(
+                                        consumed_resize_requests[consumed_resize_index],
+                                        requested_grid_size));
+                                    ++consumed_resize_index;
                                 }
-#endif
-                                render_snapshot_metadata_changed =
-                                    apply_text_area_resize_request(
-                                        sequence,
-                                        requested_grid_size) ||
-                                    render_snapshot_metadata_changed;
-                                record_notification({
-                                    Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED,
-                                    sequence,
-                                    QStringLiteral("text-area resize requested"),
-                                    std::nullopt,
-                                    std::nullopt,
-                                    std::nullopt,
-                                    false,
-                                    std::nullopt,
-                                    requested_grid_size,
-                                });
                             }
                             break;
                         case Parser_notification_kind::OUTPUT_ACTIVITY:
@@ -5468,7 +6013,7 @@ bool Terminal_session::handle_parser_actions(
         }
     }
 
-    return render_snapshot_metadata_changed;
+    Q_ASSERT(consumed_resize_index == consumed_resize_requests.size());
 }
 
 void Terminal_session::handle_bell_request(std::uint64_t sequence)
@@ -5493,16 +6038,17 @@ void Terminal_session::handle_bell_request(std::uint64_t sequence)
 
 void Terminal_session::sync_viewport_from_model_result(
     const Terminal_screen_model_result& result,
-    std::optional<Live_primary_viewport_anchor> detached_viewport_anchor)
+    std::optional<Live_primary_viewport_anchor> detached_viewport_anchor,
+    bool                                        advance_publication_generations)
 {
     if (!m_screen_model.has_value()) {
         return;
     }
 
-    if (result.alternate_scroll_mode_changed) {
+    if (advance_publication_generations && result.alternate_scroll_mode_changed) {
         ++m_alternate_scroll_mode_generation;
     }
-    if (result.active_buffer_changed) {
+    if (advance_publication_generations && result.active_buffer_changed) {
         ++m_active_buffer_epoch;
         if (m_active_buffer_epoch == 0U) {
             m_active_buffer_epoch = 1U;
@@ -5775,15 +6321,21 @@ void Terminal_session::publish_selection_snapshot(
 void Terminal_session::advance_selection_content_basis_for_model_result(
     const Terminal_screen_model_result& result,
     const Terminal_viewport_state&      previous_viewport,
-    terminal_grid_size_t                previous_grid_size)
+    terminal_grid_size_t                previous_grid_size,
+    std::optional<Terminal_selection_attachment_resolution_status>
+                                        forced_failure,
+    std::optional<Terminal_selection_attachment_resolution_status>
+                                        forced_drag_failure,
+    bool                                cache_drag_success)
 {
+    Q_UNUSED(previous_viewport);
     const bool content_basis_changed =
         result.terminal_content_changed || result.active_buffer_changed;
-    const bool grid_reflow_basis_changed = result.grid_reflow_changed;
+    const bool grid_reflow_basis_changed =
+        previous_grid_size.columns != m_screen_model->grid_size().columns;
+    const bool grid_height_changed =
+        previous_grid_size.rows != m_screen_model->grid_size().rows;
     const bool row_origin_changed        = result.evicted_scrollback_rows > 0;
-    const terminal_selection_content_basis_t previous_content_basis =
-        m_selection_content_basis;
-
     if (content_basis_changed) {
         ++m_selection_content_basis.content_generation;
     }
@@ -5796,171 +6348,588 @@ void Terminal_session::advance_selection_content_basis_for_model_result(
         ++m_row_origin_generation;
     }
 
-    if ((content_basis_changed || grid_reflow_basis_changed || row_origin_changed) &&
-        m_selection.has_internal_selection())
+    if (!content_basis_changed      &&
+        !grid_reflow_basis_changed  &&
+        !grid_height_changed        &&
+        !row_origin_changed         &&
+        !forced_failure.has_value() &&
+        !forced_drag_failure.has_value())
     {
-        const Terminal_buffer_id active_buffer       = m_screen_model->active_buffer_id();
-        const Terminal_viewport_state current_viewport = m_viewport_controller.state();
-        const terminal_grid_size_t current_grid_size = m_screen_model->grid_size();
-        const std::optional<terminal_selection_visual_lease_t>& visual_lease =
+        return;
+    }
+
+    terminal_selection_source_identity_t target_source;
+    target_source.source_content_basis  = m_selection_content_basis;
+    target_source.anchor_domain = selection_anchor_domain_for_buffer(
+        m_screen_model->active_buffer_id());
+    target_source.session_epoch         = m_selection_session_epoch;
+    target_source.buffer_id             = m_screen_model->active_buffer_id();
+    target_source.grid_reflow_basis     =
+        m_selection_content_basis.grid_reflow_generation;
+    target_source.row_origin_generation = m_row_origin_generation;
+    target_source.grid_size             = m_screen_model->grid_size();
+    target_source.viewport_mapping      = m_viewport_controller.state();
+
+    advance_selection_drag_continuity(
+        result,
+        target_source,
+        forced_drag_failure,
+        cache_drag_success);
+
+    const std::optional<terminal_selection_visual_lease_t> prior_lease =
+        m_selection.visual_lease();
+    if (!prior_lease.has_value() ||
+        m_selection.internal_state() != Terminal_selection_internal_state::ATTACHED)
+    {
+        refresh_selection_drag_cached_success_range(target_source);
+        return;
+    }
+
+    Terminal_selection_attachment_resolution resolution =
+        m_screen_model->resolve_selection_attachment(
+            *prior_lease,
+            target_source,
+            result);
+    const Terminal_selection_attachment_resolution_status model_resolution_status =
+        resolution.status;
+    if (forced_failure.has_value()) {
+        resolution.status = *forced_failure;
+        resolution.translated_lease.reset();
+    }
+    m_last_selection_attachment_resolution_status = resolution.status;
+    if (resolution.status == Terminal_selection_attachment_resolution_status::TRANSLATED &&
+        resolution.translated_lease.has_value())
+    {
+        const Terminal_selection_range translated_range =
+            resolution.translated_lease->selected_range;
+        m_selection.install_translated_attachment(
+            translated_range,
+            *resolution.translated_lease);
+        m_selection_buffer_id = target_source.buffer_id;
+    }
+    else {
+        m_selection.detach_visual_attachment();
+    }
+    refresh_selection_drag_cached_success_range(target_source);
+
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
+        write_selection_trace(m_config.selection_trace_enabled,
+            QStringLiteral(
+                "session attachment-resolution status=%1 model_status=%2 hold_poison=%3 "
+                "action=%4 old_rows={%5} final_rows={%6} deltas={%7} capability=%8 "
+                "recovery_proposals={%9} recovery_attempts={%10} "
+                "lease_before=%11 lease_after=%12")
+                .arg(static_cast<int>(resolution.status))
+                .arg(static_cast<int>(model_resolution_status))
+                .arg(forced_failure.has_value()
+                    ? QString::number(static_cast<int>(*forced_failure))
+                    : QStringLiteral("none"))
+                .arg(resolution.translated_lease.has_value()
+                    ? QStringLiteral("atomic-install")
+                    : QStringLiteral("detach-payload-only"))
+                .arg(selection_trace_int_values(resolution.old_logical_rows))
+                .arg(selection_trace_int_values(resolution.final_logical_rows))
+                .arg(selection_trace_int_values(resolution.row_deltas))
+                .arg(selection_trace_continuity(result.selection_continuity))
+                .arg(selection_trace_recovery_proposals(result.recovery_proposals))
+                .arg(selection_trace_recovery_attempts(
+                    result.recovery_attempts,
+                    result.dropped_recovery_attempts))
+                .arg(selection_trace_visual_lease(prior_lease))
+                .arg(selection_trace_visual_lease(m_selection.visual_lease())));
+    }
+}
+
+void Terminal_session::advance_selection_drag_continuity(
+    const Terminal_screen_model_result&         result,
+    const terminal_selection_source_identity_t& target_source,
+    std::optional<Terminal_selection_attachment_resolution_status>
+                                              forced_failure,
+    bool                                      cache_success)
+{
+    if (!m_selection_drag_continuity.has_value() || !m_screen_model.has_value()) {
+        return;
+    }
+
+    Selection_drag_continuity& continuity = *m_selection_drag_continuity;
+    if (continuity.failure.has_value()) {
+        return;
+    }
+    continuity.cached_success.reset();
+
+    Terminal_selection_attachment_resolution resolution =
+        m_screen_model->resolve_selection_attachment(
+            continuity.anchor_lease,
+            target_source,
+            result);
+    if (forced_failure.has_value()) {
+        resolution.status = *forced_failure;
+        resolution.translated_lease.reset();
+    }
+    if (resolution.status != Terminal_selection_attachment_resolution_status::TRANSLATED ||
+        !resolution.translated_lease.has_value())
+    {
+        continuity.failure = resolution.status;
+        return;
+    }
+    continuity.anchor_lease = *resolution.translated_lease;
+    if (cache_success) {
+        Selection_drag_continuity::Cached_success success;
+        success.anchor_lease = continuity.anchor_lease;
+        success.source       = target_source;
+        continuity.cached_success = std::move(success);
+    }
+}
+
+void Terminal_session::refresh_selection_drag_cached_success_range(
+    const terminal_selection_source_identity_t& target_source)
+{
+    if (!m_selection_drag_continuity.has_value()) {
+        return;
+    }
+
+    Selection_drag_continuity& continuity = *m_selection_drag_continuity;
+    if (!continuity.cached_success.has_value()) {
+        return;
+    }
+    Selection_drag_continuity::Cached_success& success =
+        *continuity.cached_success;
+    if (continuity.failure.has_value() ||
+        !selection_source_identities_match(success.source, target_source) ||
+        !selection_visual_leases_match(success.anchor_lease, continuity.anchor_lease))
+    {
+        continuity.cached_success.reset();
+        return;
+    }
+
+    success.proven_selection_lease.reset();
+    if (!continuity.established) {
+        return;
+    }
+
+    const std::optional<terminal_selection_visual_lease_t>& lease =
+        m_selection.visual_lease();
+    if (m_selection.internal_state() != Terminal_selection_internal_state::ATTACHED ||
+        !lease.has_value() ||
+        lease->durable_payload_identity != continuity.durable_payload_identity ||
+        lease->provisional_payload_identity != continuity.provisional_payload_identity ||
+        lease->selected_range != m_selection.range() ||
+        !selection_lease_has_compatible_visual_source(*lease, target_source, true))
+    {
+        continuity.cached_success.reset();
+        return;
+    }
+    success.proven_selection_lease = *lease;
+}
+
+void Terminal_session::begin_synchronized_selection_continuity_hold()
+{
+    m_synchronized_selection_continuity_hold.reset();
+    if (!m_screen_model.has_value()) {
+        return;
+    }
+
+    Synchronized_selection_continuity_hold hold;
+    if (m_selection.internal_state() == Terminal_selection_internal_state::ATTACHED) {
+        const std::optional<terminal_selection_visual_lease_t> lease =
             m_selection.visual_lease();
-        const bool visual_lease_payload_matches =
-            visual_lease.has_value() &&
-            visual_lease->durable_payload_identity ==
-                m_selection.durable_payload_identity() &&
-            visual_lease->provisional_payload_identity ==
-                m_selection.provisional_payload_identity();
-        const bool can_evaluate_visual_lease =
-            result.terminal_content_changed                       &&
-            !result.active_buffer_changed                         &&
-            !grid_reflow_basis_changed                            &&
-            !row_origin_changed                                   &&
-            visual_lease_payload_matches                           &&
-            selection_state_allows_span_emission(m_selection.internal_state()) &&
-            m_selection_buffer_id == active_buffer                &&
-            selection_range_is_valid_for_active_model(m_selection.range());
-        const bool retained_line_model_proof =
-            can_evaluate_visual_lease &&
-            selection_line_leases_match_model(
-                *m_screen_model,
-                active_buffer,
-                visual_lease->selected_lines,
-                m_selection.range());
-        const bool same_viewport_retained_lines_can_advance_visual_lease =
-            retained_line_model_proof &&
-            retained_lines_have_same_viewport_mutation_source(
-                result,
-                active_buffer,
-                previous_viewport,
-                current_viewport,
-                previous_grid_size,
-                current_grid_size);
-        const bool scrollback_growth_retained_lines_can_advance_visual_lease =
-            retained_line_model_proof &&
-            retained_lines_have_scrollback_growth_source(
-                result,
-                active_buffer,
-                previous_viewport,
-                current_viewport,
-                previous_grid_size,
-                current_grid_size);
-        const bool synchronized_release_retained_lines_can_advance_visual_lease =
-            retained_line_model_proof &&
-            retained_lines_have_synchronized_output_release_source(
-                result,
-                active_buffer,
-                previous_viewport,
-                current_viewport,
-                previous_grid_size,
-                current_grid_size);
-        const bool retained_lines_can_advance_visual_lease =
-            same_viewport_retained_lines_can_advance_visual_lease ||
-            scrollback_growth_retained_lines_can_advance_visual_lease ||
-            synchronized_release_retained_lines_can_advance_visual_lease;
-        const bool can_advance_visual_lease = retained_lines_can_advance_visual_lease;
-        if (can_advance_visual_lease) {
-            m_selection.update_visual_lease_source(
-                m_selection_content_basis,
-                m_selection_content_basis.grid_reflow_generation,
-                m_row_origin_generation,
-                current_grid_size,
-                current_viewport);
-            if (selection_trace_requested(m_config.selection_trace_enabled)) {
-                const QString advance_reason =
-                    same_viewport_retained_lines_can_advance_visual_lease
-                        ? QStringLiteral("same-viewport-retained-line-provenance")
-                    : synchronized_release_retained_lines_can_advance_visual_lease
-                        ? QStringLiteral("synchronized-release-retained-line-provenance")
-                    : scrollback_growth_retained_lines_can_advance_visual_lease
-                        ? QStringLiteral("retained-line-provenance")
-                        : QStringLiteral("retained-line-provenance");
-                write_selection_trace(m_config.selection_trace_enabled,
-                    QStringLiteral(
-                        "session visual-lease-advance reason=%1 "
-                        "previous_basis={%2} next_basis={%3} range=%4 dirty_rows=%5 lease=%6")
-                        .arg(advance_reason)
-                        .arg(selection_trace_content_basis(previous_content_basis))
-                        .arg(selection_trace_content_basis(m_selection_content_basis))
-                        .arg(selection_trace_range(m_selection.range()))
-                        .arg(static_cast<qulonglong>(result.dirty_rows.size()))
-                        .arg(selection_trace_visual_lease(m_selection.visual_lease())));
+        if (lease.has_value() && !lease->selected_lines.empty()) {
+            Synchronized_continuity_track selection_track;
+            selection_track.original_lease = *lease;
+            selection_track.latest_handles.reserve(lease->selected_lines.size());
+            for (const terminal_selection_line_lease_t& line : lease->selected_lines) {
+                selection_track.latest_handles.push_back(line.history_handle);
             }
+            hold.selection = std::move(selection_track);
+        }
+    }
+
+    if (m_selection_drag_continuity.has_value() &&
+        !m_selection_drag_continuity->failure.has_value())
+    {
+        Synchronized_continuity_track drag_track;
+        drag_track.original_lease = m_selection_drag_continuity->anchor_lease;
+        if (!drag_track.original_lease.selected_lines.empty()) {
+            drag_track.latest_handles.push_back(
+                drag_track.original_lease.selected_lines.front().history_handle);
+            hold.drag = std::move(drag_track);
+        }
+    }
+
+    if (!hold.selection.has_value() && !hold.drag.has_value()) {
+        return;
+    }
+
+    m_synchronized_selection_continuity_hold = std::move(hold);
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
+        write_selection_trace(m_config.selection_trace_enabled,
+            QStringLiteral(
+                "session hold-continuity begin selection_lines=%1 drag_lines=%2 "
+                "selection_originals={%3} drag_originals={%4}")
+                .arg(m_synchronized_selection_continuity_hold->selection.has_value()
+                    ? static_cast<qulonglong>(
+                        m_synchronized_selection_continuity_hold->selection->
+                            latest_handles.size())
+                    : 0U)
+                .arg(m_synchronized_selection_continuity_hold->drag.has_value()
+                    ? static_cast<qulonglong>(
+                        m_synchronized_selection_continuity_hold->drag->latest_handles.size())
+                    : 0U)
+                .arg(selection_trace_history_handles(
+                    m_synchronized_selection_continuity_hold->selection.has_value()
+                        ? m_synchronized_selection_continuity_hold->selection->latest_handles
+                        : std::vector<terminal_history_handle_t>{}))
+                .arg(selection_trace_history_handles(
+                    m_synchronized_selection_continuity_hold->drag.has_value()
+                        ? m_synchronized_selection_continuity_hold->drag->latest_handles
+                        : std::vector<terminal_history_handle_t>{})));
+    }
+}
+
+void Terminal_session::accumulate_synchronized_selection_continuity(
+    const Terminal_screen_model_result& result)
+{
+    if (!m_synchronized_selection_continuity_hold.has_value() ||
+        !m_screen_model.has_value())
+    {
+        return;
+    }
+
+    Synchronized_selection_continuity_hold& hold =
+        *m_synchronized_selection_continuity_hold;
+    if (hold.selection.has_value()) {
+        accumulate_synchronized_continuity_track(
+            *hold.selection,
+            result,
+            "selection");
+    }
+    if (hold.drag.has_value()) {
+        accumulate_synchronized_continuity_track(
+            *hold.drag,
+            result,
+            "drag");
+    }
+}
+
+void Terminal_session::accumulate_synchronized_continuity_track(
+    Synchronized_continuity_track&       track,
+    const Terminal_screen_model_result& result,
+    const char*                         domain)
+{
+    const auto trace_hold = [&](QString action) {
+        if (!selection_trace_requested(m_config.selection_trace_enabled)) {
+            return;
+        }
+        write_selection_trace(m_config.selection_trace_enabled,
+            QStringLiteral(
+                "session hold-continuity accumulate action=%1 domain=%2 "
+                "failure=%3 latest={%4} input=%5")
+                .arg(std::move(action))
+                .arg(QString::fromLatin1(domain))
+                .arg(track.failure.has_value()
+                    ? QString::number(static_cast<int>(*track.failure))
+                    : QStringLiteral("none"))
+                .arg(selection_trace_history_handles(track.latest_handles))
+                .arg(selection_trace_continuity(result.selection_continuity)));
+    };
+    if (track.failure.has_value()) {
+        trace_hold(QStringLiteral("already-poisoned"));
+        return;
+    }
+    if (track.original_lease.session_epoch != m_selection_session_epoch) {
+        track.failure = Terminal_selection_attachment_resolution_status::EPOCH_MISMATCH;
+        trace_hold(QStringLiteral("poison-epoch"));
+        return;
+    }
+    if (result.active_buffer_changed ||
+        m_screen_model->active_buffer_id() != track.original_lease.buffer_id)
+    {
+        track.failure = Terminal_selection_attachment_resolution_status::BUFFER_MISMATCH;
+        trace_hold(QStringLiteral("poison-buffer"));
+        return;
+    }
+    if (m_screen_model->grid_size().columns != track.original_lease.grid_size.columns) {
+        track.failure = Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH;
+        trace_hold(QStringLiteral("poison-reflow"));
+        return;
+    }
+    if (!result.terminal_content_changed &&
+        result.evicted_scrollback_rows <= 0 &&
+        !result.selection_continuity.has_value())
+    {
+        trace_hold(QStringLiteral("unaffected"));
+        return;
+    }
+
+    for (terminal_history_handle_t& handle : track.latest_handles) {
+        const Terminal_retained_line_lookup_result current_lookup =
+            m_screen_model->retained_line_lookup(track.original_lease.buffer_id, handle);
+        if (current_lookup.exact_match &&
+            current_lookup.retained_line_id_match_count == 1)
+        {
+            continue;
+        }
+        if (current_lookup.retained_line_id_match_count > 1) {
+            track.failure = Terminal_selection_attachment_resolution_status::
+                DUPLICATE_RESOLUTION;
+            trace_hold(QStringLiteral("poison-duplicate-current"));
+            return;
+        }
+        if (current_lookup.retained_line_content_generation_mismatch) {
+            track.failure = Terminal_selection_attachment_resolution_status::
+                CONTENT_GENERATION_MISMATCH;
+            trace_hold(QStringLiteral("poison-generation"));
             return;
         }
 
-        if (selection_trace_requested(m_config.selection_trace_enabled)) {
-            const auto visual_lease = m_selection.visual_lease();
-            const bool lease_present = visual_lease.has_value();
-            const bool selection_state_allowed =
-                selection_state_allows_span_emission(m_selection.internal_state());
-            const bool buffer_match = m_selection_buffer_id == active_buffer;
-            const bool range_valid = selection_range_is_valid_for_active_model(m_selection.range());
-            const bool mutation_grid_matches_published_grid =
-                grid_sizes_match(previous_grid_size, current_grid_size);
-            const bool mutation_viewport_matches_published_viewport =
-                viewport_mappings_match(previous_viewport, current_viewport);
-            const Dirty_rows_selection_range_proof dirty_rows_proof =
-                dirty_rows_selection_range_proof(
-                    result,
-                    m_selection.range(),
-                    active_buffer,
-                    previous_viewport,
-                    current_viewport,
-                    previous_grid_size,
-                    current_grid_size);
-            const bool dirty_rows_overlap_selection =
-                dirty_rows_proof == Dirty_rows_selection_range_proof::OVERLAPS_SELECTION;
-            const bool dirty_rows_proof_ambiguous =
-                dirty_rows_selection_range_proof_is_ambiguous(dirty_rows_proof);
-            const bool dirty_rows_would_have_advanced_visual_lease =
-                can_evaluate_visual_lease &&
-                dirty_rows_prove_selection_range_untouched(
-                    result,
-                    m_selection.range(),
-                    active_buffer,
-                    previous_viewport,
-                    current_viewport,
-                    previous_grid_size,
-                    current_grid_size);
-
-            write_selection_trace(m_config.selection_trace_enabled,
-                QStringLiteral(
-                    "session visual-lease-detach reason=source-basis-change "
-                    "content_changed=%1 terminal_content_changed=%2 active_buffer_changed=%3 "
-                    "reflow_changed=%4 row_origin_changed=%5 "
-                    "lease_present=%6 selection_state_allowed=%7 buffer_match=%8 range_valid=%9 "
-                    "dirty_rows=%10 dirty_rows_have_stable_mutation_identity=%11 "
-                    "dirty_rows_overlap_selection=%12 dirty_rows_proof_ambiguous=%13 "
-                    "dirty_rows_would_advance=%14 dirty_rows_proof=%15 "
-                    "mutation_grid_match=%16 viewport_mapping_match=%17 "
-                    "previous_basis={%18} next_basis={%19} range=%20 selection_buffer=%21 "
-                    "active_buffer=%22 lease=%23")
-                    .arg(selection_trace_bool(content_basis_changed))
-                    .arg(selection_trace_bool(result.terminal_content_changed))
-                    .arg(selection_trace_bool(result.active_buffer_changed))
-                    .arg(selection_trace_bool(grid_reflow_basis_changed))
-                    .arg(selection_trace_bool(row_origin_changed))
-                    .arg(selection_trace_bool(lease_present))
-                    .arg(selection_trace_bool(selection_state_allowed))
-                    .arg(selection_trace_bool(buffer_match))
-                    .arg(selection_trace_bool(range_valid))
-                    .arg(static_cast<qulonglong>(result.dirty_rows.size()))
-                    .arg(selection_trace_bool(result.dirty_rows_have_stable_mutation_identity))
-                    .arg(selection_trace_bool(dirty_rows_overlap_selection))
-                    .arg(selection_trace_bool(dirty_rows_proof_ambiguous))
-                    .arg(selection_trace_bool(dirty_rows_would_have_advanced_visual_lease))
-                    .arg(selection_trace_dirty_rows_selection_range_proof(dirty_rows_proof))
-                    .arg(selection_trace_bool(mutation_grid_matches_published_grid))
-                    .arg(selection_trace_bool(mutation_viewport_matches_published_viewport))
-                    .arg(selection_trace_content_basis(previous_content_basis))
-                    .arg(selection_trace_content_basis(m_selection_content_basis))
-                    .arg(selection_trace_range(m_selection.range()))
-                    .arg(static_cast<int>(m_selection_buffer_id))
-                    .arg(static_cast<int>(active_buffer))
-                    .arg(selection_trace_visual_lease(visual_lease)));
+        const terminal_selection_continuity_capability_t* continuity =
+            result.selection_continuity.has_value()
+                ? &*result.selection_continuity
+                : nullptr;
+        if (continuity == nullptr ||
+            continuity->version != k_terminal_selection_continuity_capability_version)
+        {
+            track.failure = Terminal_selection_attachment_resolution_status::MISSING_LINE;
+            trace_hold(QStringLiteral("poison-capability-missing"));
+            return;
         }
-        m_selection.detach_visual_attachment();
+
+        const auto successor_it =
+            continuity->successors_by_old_retained_line_id.find(handle.row_sequence);
+        if (successor_it == continuity->successors_by_old_retained_line_id.end()) {
+            track.failure = Terminal_selection_attachment_resolution_status::MISSING_LINE;
+            trace_hold(QStringLiteral("poison-successor-key-missing"));
+            return;
+        }
+
+        const terminal_selection_line_successor_t* successor = nullptr;
+        std::size_t                                 match_count = 0U;
+        for (const terminal_selection_line_successor_t& candidate : successor_it->second) {
+            if (candidate.old_handle == handle) {
+                successor = &candidate;
+                ++match_count;
+            }
+        }
+        if (match_count != 1U || successor == nullptr) {
+            track.failure = match_count > 1U
+                ? Terminal_selection_attachment_resolution_status::DUPLICATE_RESOLUTION
+                : Terminal_selection_attachment_resolution_status::MISSING_LINE;
+            trace_hold(match_count > 1U
+                ? QStringLiteral("poison-successor-ambiguous")
+                : QStringLiteral("poison-successor-missing"));
+            return;
+        }
+
+        const Terminal_retained_line_lookup_result final_lookup =
+            m_screen_model->retained_line_lookup(
+                track.original_lease.buffer_id,
+                successor->final_handle);
+        if (final_lookup.retained_line_id_match_count > 1) {
+            track.failure = Terminal_selection_attachment_resolution_status::
+                DUPLICATE_RESOLUTION;
+            trace_hold(QStringLiteral("poison-final-duplicate"));
+            return;
+        }
+        if (!final_lookup.exact_match ||
+            final_lookup.retained_line_id_match_count != 1)
+        {
+            track.failure = final_lookup.retained_line_content_generation_mismatch
+                ? Terminal_selection_attachment_resolution_status::CONTENT_GENERATION_MISMATCH
+                : Terminal_selection_attachment_resolution_status::MISSING_LINE;
+            trace_hold(QStringLiteral("poison-final-missing"));
+            return;
+        }
+        handle = successor->final_handle;
     }
+    trace_hold(QStringLiteral("updated"));
+}
+
+Terminal_screen_model_result Terminal_session::compose_synchronized_selection_release(
+    Terminal_screen_model_result result)
+{
+    if (!m_synchronized_selection_continuity_hold.has_value() ||
+        !m_screen_model.has_value())
+    {
+        return result;
+    }
+
+    Synchronized_selection_continuity_hold& hold =
+        *m_synchronized_selection_continuity_hold;
+    terminal_selection_continuity_capability_t composed;
+    bool has_successor = false;
+    const auto compose_track = [&](std::optional<Synchronized_continuity_track>& track) {
+        if (!track.has_value() || track->failure.has_value()) {
+            return;
+        }
+
+        const terminal_grid_position_t old_start =
+            normalized_selection_start(track->original_lease.selected_range);
+        for (std::size_t index = 0U; index < track->latest_handles.size(); ++index) {
+            const terminal_history_handle_t& old_handle =
+                track->original_lease.selected_lines[index].history_handle;
+            const terminal_history_handle_t& final_handle = track->latest_handles[index];
+            if (old_handle == final_handle) {
+                continue;
+            }
+
+            const Terminal_retained_line_lookup_result final_lookup =
+                m_screen_model->retained_line_lookup(
+                    track->original_lease.buffer_id,
+                    final_handle);
+            if (!final_lookup.exact_match ||
+                final_lookup.retained_line_id_match_count != 1)
+            {
+                track->failure = final_lookup.retained_line_content_generation_mismatch
+                    ? Terminal_selection_attachment_resolution_status::
+                        CONTENT_GENERATION_MISMATCH
+                    : Terminal_selection_attachment_resolution_status::MISSING_LINE;
+                return;
+            }
+
+            const int old_logical_row = old_start.row +
+                track->original_lease.selected_lines[index].row_offset;
+            terminal_selection_line_successor_t successor;
+            successor.old_handle        = old_handle;
+            successor.final_handle      = final_handle;
+            successor.old_logical_row   = old_logical_row;
+            successor.final_logical_row = final_lookup.exact_logical_row;
+            successor.row_delta         = final_lookup.exact_logical_row - old_logical_row;
+
+            std::vector<terminal_selection_line_successor_t>& candidates =
+                composed.successors_by_old_retained_line_id[old_handle.row_sequence];
+            const auto same_old = std::find_if(
+                candidates.begin(),
+                candidates.end(),
+                [&](const terminal_selection_line_successor_t& candidate) {
+                    return candidate.old_handle == old_handle;
+                });
+            if (same_old != candidates.end()) {
+                if (same_old->final_handle != final_handle) {
+                    track->failure = Terminal_selection_attachment_resolution_status::
+                        DUPLICATE_RESOLUTION;
+                }
+                continue;
+            }
+            candidates.push_back(std::move(successor));
+            has_successor = true;
+        }
+    };
+
+    compose_track(hold.selection);
+    compose_track(hold.drag);
+
+    if (has_successor) {
+        result.selection_continuity = std::move(composed);
+    }
+    else
+    if ((hold.selection.has_value() && hold.selection->failure.has_value()) ||
+        (hold.drag.has_value() && hold.drag->failure.has_value()))
+    {
+        result.selection_continuity.reset();
+    }
+    if (selection_trace_requested(m_config.selection_trace_enabled)) {
+        write_selection_trace(m_config.selection_trace_enabled,
+            QStringLiteral(
+                "session hold-continuity release action=%1 selection_failure=%2 "
+                "drag_failure=%3 selection_latest={%4} drag_latest={%5} output=%6")
+                .arg(has_successor
+                    ? QStringLiteral("composed")
+                    : QStringLiteral("identity-stable"))
+                .arg(hold.selection.has_value() && hold.selection->failure.has_value()
+                    ? QString::number(static_cast<int>(*hold.selection->failure))
+                    : QStringLiteral("none"))
+                .arg(hold.drag.has_value() && hold.drag->failure.has_value()
+                    ? QString::number(static_cast<int>(*hold.drag->failure))
+                    : QStringLiteral("none"))
+                .arg(selection_trace_history_handles(
+                    hold.selection.has_value()
+                        ? hold.selection->latest_handles
+                        : std::vector<terminal_history_handle_t>{}))
+                .arg(selection_trace_history_handles(
+                    hold.drag.has_value()
+                        ? hold.drag->latest_handles
+                        : std::vector<terminal_history_handle_t>{}))
+                .arg(selection_trace_continuity(result.selection_continuity)));
+    }
+    return result;
+}
+
+std::optional<Terminal_selection_attachment_resolution_status>
+Terminal_session::synchronized_selection_release_failure() const
+{
+    if (m_synchronized_selection_continuity_hold.has_value() &&
+        m_synchronized_selection_continuity_hold->selection.has_value() &&
+        m_synchronized_selection_continuity_hold->selection->failure.has_value())
+    {
+        return m_synchronized_selection_continuity_hold->selection->failure;
+    }
+
+    const std::optional<terminal_selection_visual_lease_t> lease =
+        m_selection.visual_lease();
+    if (m_selection.internal_state() == Terminal_selection_internal_state::ATTACHED &&
+        lease.has_value()                                                          &&
+        lease->selected_lines.empty())
+    {
+        return Terminal_selection_attachment_resolution_status::MISSING_LINE;
+    }
+    return std::nullopt;
+}
+
+void Terminal_session::rebase_synchronized_selection_continuity_hold()
+{
+    if (!m_synchronized_selection_continuity_hold.has_value()) {
+        return;
+    }
+
+    const auto rebase_track = [](
+        Synchronized_continuity_track&             track,
+        const terminal_selection_visual_lease_t& lease)
+    {
+        track.original_lease = lease;
+        track.latest_handles.clear();
+        track.latest_handles.reserve(lease.selected_lines.size());
+        for (const terminal_selection_line_lease_t& line : lease.selected_lines) {
+            track.latest_handles.push_back(line.history_handle);
+        }
+    };
+
+    Synchronized_selection_continuity_hold& hold =
+        *m_synchronized_selection_continuity_hold;
+    if (hold.selection.has_value() && !hold.selection->failure.has_value()) {
+        const std::optional<terminal_selection_visual_lease_t> lease =
+            m_selection.visual_lease();
+        if (m_selection.internal_state() == Terminal_selection_internal_state::ATTACHED &&
+            lease.has_value())
+        {
+            rebase_track(*hold.selection, *lease);
+        }
+        else {
+            hold.selection->failure =
+                m_last_selection_attachment_resolution_status.value_or(
+                    Terminal_selection_attachment_resolution_status::INVALID_LEASE);
+        }
+    }
+
+    if (hold.drag.has_value() && !hold.drag->failure.has_value()) {
+        if (!m_selection_drag_continuity.has_value()) {
+            hold.drag->failure =
+                Terminal_selection_attachment_resolution_status::INVALID_LEASE;
+        }
+        else
+        if (m_selection_drag_continuity->failure.has_value()) {
+            hold.drag->failure = m_selection_drag_continuity->failure;
+        }
+        else {
+            rebase_track(
+                *hold.drag,
+                m_selection_drag_continuity->anchor_lease);
+        }
+    }
+}
+
+void Terminal_session::reset_synchronized_selection_continuity_hold()
+{
+    m_synchronized_selection_continuity_hold.reset();
 }
 
 void Terminal_session::record_blocked_synchronized_row_origin_change(
@@ -6090,6 +7059,7 @@ void Terminal_session::set_selection_range_from_published_source_locked(
                         .arg(selection_trace_source_identity(current_source)));
             }
             m_selection.clear();
+            reset_synchronized_selection_continuity_hold();
             m_selection_buffer_id = current_source.has_value()
                 ? current_source->buffer_id
                 : m_screen_model->active_buffer_id();
@@ -6132,6 +7102,9 @@ void Terminal_session::set_selection_range_from_published_source_locked(
 
     m_selection.set_range(range, proven_selected_text.text, std::move(lease));
     m_selection_buffer_id = current_source->buffer_id;
+    if (!model_allows_render_snapshot(*m_screen_model)) {
+        begin_synchronized_selection_continuity_hold();
+    }
     if (selection_trace_requested(m_config.selection_trace_enabled)) {
         write_selection_trace(m_config.selection_trace_enabled,
             QStringLiteral("session selection-changed range=%1 size=%2 current=%3 basis={%4}")
@@ -6239,12 +7212,7 @@ Terminal_render_snapshot_request Terminal_session::make_render_snapshot_request(
             visual_lease->durable_payload_identity ==
                 m_selection.durable_payload_identity()                          &&
             visual_lease->provisional_payload_identity ==
-                m_selection.provisional_payload_identity()                      &&
-            selection_line_leases_match_model(
-                *m_screen_model,
-                source.buffer_id,
-                visual_lease->selected_lines,
-                m_selection.range()))
+                m_selection.provisional_payload_identity())
         {
             request.selections.push_back({
                 m_selection.range(),
@@ -6922,8 +7890,13 @@ Terminal_session::reconcile_public_projection_release(
         const bool epoch_compatible =
             anchor.active_buffer_epoch == m_active_buffer_epoch;
         const bool geometry_compatible =
+            m_latest_content_render_snapshot != nullptr &&
+            !release_intent.geometry_invalidated &&
             anchor.geometry_generation ==
-                m_selection_content_basis.grid_reflow_generation;
+                m_selection_content_basis.grid_reflow_generation &&
+            grid_sizes_match(
+                m_latest_content_render_snapshot->grid_size,
+                m_screen_model->grid_size());
 
         if (!buffer_compatible) {
             record_incompatible_buffer(

@@ -3,6 +3,7 @@
 #include "helpers/test_check.h"
 #include "vnm_terminal/internal/terminal_canvas_fixture_contract.h"
 #include "vnm_terminal/internal/terminal_color_scheme.h"
+#include "vnm_terminal/internal/interaction_trace.h"
 #include "vnm_terminal/internal/terminal_resize_controller.h"
 #include "vnm_terminal/internal/terminal_session.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
@@ -10,6 +11,7 @@
 #include <QByteArray>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QIODevice>
 #include <QJsonArray>
 #include <QJsonValue>
@@ -823,6 +825,28 @@ QByteArray numbered_scroll_lines(int count)
     return bytes;
 }
 
+QByteArray selection_recovery_addressed_rows(
+    std::initializer_list<QByteArray> rows,
+    bool                              cursor_hidden)
+{
+    QByteArray bytes;
+    if (cursor_hidden) {
+        bytes += QByteArrayLiteral("\x1b[?25l");
+    }
+    int row_number = 1;
+    for (const QByteArray& row : rows) {
+        bytes += QByteArrayLiteral("\x1b[");
+        bytes += QByteArray::number(row_number++);
+        bytes += QByteArrayLiteral(";1H");
+        bytes += row;
+        bytes += QByteArrayLiteral("\x1b[K");
+    }
+    if (cursor_hidden) {
+        bytes += QByteArrayLiteral("\x1b[?25h");
+    }
+    return bytes;
+}
+
 QByteArray public_prefix_lines(int count)
 {
     QByteArray bytes;
@@ -1446,6 +1470,92 @@ bool test_text_area_resize_retry_publishes_geometry_metadata()
         "same-grid text-area retry snapshot records restored geometry sync");
     ok &= check(retry_snapshot.has_value() && retry_snapshot->dirty_row_ranges.empty(),
         "same-grid text-area retry snapshot has no text dirty rows");
+
+    return ok;
+}
+
+bool test_text_area_resize_retry_precedes_later_changed_request_in_same_callback()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "ordered text-area resize retry session starts");
+
+    backend->fail_resize  = true;
+    ok                   &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;3;5t")),
+        "initial changed-grid text-area resize output is accepted");
+    ok                   &= check(!session->backend_geometry_in_sync(),
+        "initial changed-grid failure leaves backend geometry out of sync");
+
+    backend->fail_resize = false;
+    ok &= check(backend->emit_output(
+        QByteArrayLiteral("\x1b[8;3;5t\x1b[8;4;6t")),
+        "same-grid retry and later changed-grid request are accepted in one callback");
+
+    ok &= check(backend->resize_requests.size() == 3U,
+        "mixed text-area resize callback dispatches the same-grid retry before the later change");
+    if (backend->resize_requests.size() == 3U) {
+        ok &= check(
+            backend->resize_requests[0].grid_size.rows == 3 &&
+                backend->resize_requests[0].grid_size.columns == 5 &&
+            backend->resize_requests[1].grid_size.rows == 3 &&
+                backend->resize_requests[1].grid_size.columns == 5 &&
+            backend->resize_requests[2].grid_size.rows == 4 &&
+                backend->resize_requests[2].grid_size.columns == 6,
+            "mixed text-area resize callback preserves failed-B, retry-B, changed-C order");
+        ok &= check(
+            backend->resize_requests[0].transaction_id <
+                backend->resize_requests[1].transaction_id &&
+            backend->resize_requests[1].transaction_id <
+                backend->resize_requests[2].transaction_id,
+            "mixed text-area resize callback preserves resize transaction identity order");
+    }
+
+    const std::vector<term::Terminal_resize_transaction>& transactions =
+        session->resize_transactions();
+    ok &= check(transactions.size() == 3U,
+        "mixed text-area resize callback records each backend outcome");
+    if (transactions.size() == 3U) {
+        ok &= check(
+            transactions[0].backend_result == term::Terminal_backend_resize_result::FAILED &&
+            transactions[1].backend_result == term::Terminal_backend_resize_result::APPLIED &&
+            transactions[2].backend_result == term::Terminal_backend_resize_result::APPLIED,
+            "mixed text-area resize callback records failed-B, applied-B, applied-C outcomes");
+    }
+
+    const std::vector<term::Terminal_session_notification> resize_requests =
+        notifications_of_kind(
+            *session,
+            term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED);
+    ok &= check(resize_requests.size() == 3U,
+        "mixed text-area resize callback preserves every public request notification");
+    if (resize_requests.size() == 3U) {
+        ok &= check(
+            resize_requests[0].text_area_resize_request.has_value() &&
+                resize_requests[0].text_area_resize_request->rows == 3 &&
+                resize_requests[0].text_area_resize_request->columns == 5 &&
+            resize_requests[1].text_area_resize_request.has_value() &&
+                resize_requests[1].text_area_resize_request->rows == 3 &&
+                resize_requests[1].text_area_resize_request->columns == 5 &&
+            resize_requests[2].text_area_resize_request.has_value() &&
+                resize_requests[2].text_area_resize_request->rows == 4 &&
+                resize_requests[2].text_area_resize_request->columns == 6,
+            "mixed text-area resize callback preserves B, B, C public request order");
+    }
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(
+        session->grid_size().rows == 4 && session->grid_size().columns == 6 &&
+        session->backend_geometry_in_sync() &&
+        snapshot.has_value() &&
+        snapshot->grid_size.rows == 4 && snapshot->grid_size.columns == 6 &&
+        snapshot->metadata.backend_geometry_in_sync,
+        "mixed text-area resize callback publishes final changed-grid in-sync state");
 
     return ok;
 }
@@ -2348,7 +2458,7 @@ bool test_selection_internal_state_and_lease()
     const std::uint64_t durable_identity = selection.durable_payload_identity();
     const term::Terminal_selection_result durable_text = selection.selected_text();
     ok &= check(selection.internal_state() ==
-            term::Terminal_selection_internal_state::ATTACHED_VISIBLE &&
+            term::Terminal_selection_internal_state::ATTACHED &&
         selection.anchor_domain() ==
             term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         durable_identity != 0U &&
@@ -2374,15 +2484,6 @@ bool test_selection_internal_state_and_lease()
         lease->selected_lines == make_selection_lease(range).selected_lines &&
         lease->durable_payload_identity == durable_identity,
         "visual lease records content basis, grid, viewport, endpoints, and payload identity");
-
-    selection.hide_visual_attachment();
-    ok &= check(selection.internal_state() ==
-            term::Terminal_selection_internal_state::ATTACHED_HIDDEN &&
-        selection.anchor_domain() ==
-            term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
-        selection.visual_lease().has_value() &&
-        selection.selected_text().text == QStringLiteral("cdef"),
-        "hidden attachment keeps the lease and durable payload");
 
     selection.detach_visual_attachment();
     ok &= check(selection.internal_state() ==
@@ -2450,7 +2551,7 @@ bool test_selection_replacement_empty_cancel_and_payload_detach()
     const std::uint64_t empty_identity = selection.durable_payload_identity();
     const term::Terminal_selection_result empty_text = selection.selected_text();
     ok &= check(selection.internal_state() ==
-            term::Terminal_selection_internal_state::ATTACHED_VISIBLE &&
+            term::Terminal_selection_internal_state::ATTACHED &&
         selection.anchor_domain() ==
             term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
         selection.has_selection() &&
@@ -3255,6 +3356,18 @@ bool test_selection_visual_lease_span_compatibility()
     ok &= check(scroll_session->selection_visual_lease().has_value() &&
         scroll_session->selected_text().text == scroll_payload.text,
         "compatible viewport scroll keeps lease and payload while hidden");
+    ok &= check(scroll_backend->emit_output(QByteArrayLiteral("tail-update")),
+        "offscreen attached selection accepts a content publication while hidden");
+    const std::optional<term::Terminal_render_snapshot> hidden_content_snapshot =
+        scroll_session->latest_render_snapshot();
+    const term::Terminal_selection_result hidden_content_payload =
+        scroll_session->selected_text();
+    ok &= check(hidden_content_snapshot.has_value() &&
+            hidden_content_snapshot->selection_spans.empty() &&
+            scroll_session->selection_visual_lease().has_value() &&
+            hidden_content_payload.code == term::Terminal_selection_result_code::OK &&
+            hidden_content_payload.text == scroll_payload.text,
+        "offscreen content publication keeps the attached lease copyable without spans");
 
     ok &= check(scroll_session->scroll_viewport_lines(6).action ==
         term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
@@ -3479,7 +3592,7 @@ bool test_selection_spans_detach_when_selected_row_mutates()
     return ok;
 }
 
-bool test_selection_spans_detach_when_retained_row_moves()
+bool test_selection_spans_preserve_when_retained_row_moves()
 {
     bool ok = true;
 
@@ -3519,11 +3632,17 @@ bool test_selection_spans_detach_when_retained_row_moves()
     ok &= check(moved_snapshot.has_value() &&
         snapshot_row_text(*moved_snapshot, 2) == QStringLiteral("beta"),
         "retained-row movement snapshot keeps the retained text at its moved row");
-    ok &= check(!session->selection_visual_lease().has_value(),
-        "retained-row movement detaches the stale visual lease");
+    const std::optional<term::terminal_selection_visual_lease_t> moved_lease =
+        session->selection_visual_lease();
+    ok &= check(moved_lease.has_value() &&
+            moved_lease->selected_range.start.row == 2 &&
+            moved_lease->selected_range.end.row == 2 &&
+            session->last_selection_attachment_resolution_status() ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED,
+        "retained-row movement atomically translates the exact visual lease");
     ok &= check(moved_snapshot.has_value() &&
-        moved_snapshot->selection_spans.empty(),
-        "retained-row movement suppresses spans after row-layout mismatch");
+            snapshot_has_selection_span(*moved_snapshot, 2, 0, 4),
+        "retained-row movement projects spans at the translated row");
 
     std::unique_ptr<term::Terminal_session> delete_session;
     Scripted_backend* delete_backend = make_session(delete_session);
@@ -3561,11 +3680,820 @@ bool test_selection_spans_detach_when_retained_row_moves()
     ok &= check(delete_moved_snapshot.has_value() &&
         snapshot_row_text(*delete_moved_snapshot, 1) == QStringLiteral("gamma"),
         "retained-row delete movement snapshot keeps the retained text at its moved row");
-    ok &= check(!delete_session->selection_visual_lease().has_value(),
-        "retained-row delete movement detaches the stale visual lease");
+    const std::optional<term::terminal_selection_visual_lease_t> delete_moved_lease =
+        delete_session->selection_visual_lease();
+    ok &= check(delete_moved_lease.has_value() &&
+            delete_moved_lease->selected_range.start.row == 1 &&
+            delete_moved_lease->selected_range.end.row == 1 &&
+            delete_session->last_selection_attachment_resolution_status() ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED,
+        "retained-row delete movement atomically translates the exact visual lease");
     ok &= check(delete_moved_snapshot.has_value() &&
-        delete_moved_snapshot->selection_spans.empty(),
-        "retained-row delete movement suppresses spans after row-layout mismatch");
+            snapshot_has_selection_span(*delete_moved_snapshot, 1, 0, 5),
+        "retained-row delete movement projects spans at the translated row");
+
+    return ok;
+}
+
+bool test_selection_drag_press_provenance_composes_exact_publications()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {6, 20};
+    ok &= check(session->start(launch_config).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "drag provenance session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta\r\ngamma")),
+        "drag provenance backend emits anchor rows");
+
+    const std::optional<term::terminal_selection_source_identity_t> source =
+        session->published_selection_source_identity();
+    const std::optional<term::terminal_selection_drag_press_provenance_t> provenance =
+        source.has_value()
+            ? session->begin_selection_drag_provenance({1, 2}, *source)
+            : std::nullopt;
+    ok &= check(provenance.has_value(),
+        "drag provenance captures the exact retained press handle");
+    if (!provenance.has_value()) {
+        return ok;
+    }
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[1;1H\x1b[L")),
+        "drag provenance first publication moves the anchor row");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[1;1H\x1b[L")),
+        "drag provenance second publication moves the anchor row again");
+    const term::Terminal_selection_drag_resolution first_move =
+        session->resolve_selection_drag_provenance(*provenance, false);
+    ok &= check(first_move.status ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+        first_move.resolved_position == term::terminal_grid_position_t{3, 2} &&
+        first_move.source.has_value(),
+        "drag provenance composes multiple publication-local successors before first move");
+
+    if (first_move.source.has_value()) {
+        session->set_selection_range_from_published_source(
+            {{3, 0}, {3, 4}, term::Terminal_selection_mode::NORMAL},
+            *first_move.source);
+        session->record_selection_drag_proven_range();
+    }
+    ok &= check(session->selected_text().text == QStringLiteral("beta"),
+        "drag provenance establishes the selected payload on the resolved row");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[1;1H\x1b[L")),
+        "drag provenance established publication moves the proven range");
+    const term::Terminal_selection_drag_resolution established =
+        session->resolve_selection_drag_provenance(*provenance, true);
+    ok &= check(established.status ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+        established.resolved_position == term::terminal_grid_position_t{4, 2} &&
+        established.reconciled_proven_range == term::Terminal_selection_range{
+            {4, 0}, {4, 4}, term::Terminal_selection_mode::NORMAL},
+        "drag provenance atomically reconciles the established proven range");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[5;1Hchanged")),
+        "drag provenance mutates the established selected row");
+    const term::Terminal_selection_drag_resolution failed =
+        session->resolve_selection_drag_provenance(*provenance, true);
+    ok &= check(failed.status ==
+            term::Terminal_selection_attachment_resolution_status::
+                CONTENT_GENERATION_MISMATCH &&
+        !failed.resolved_position.has_value(),
+        "drag provenance names the selected-row mutation and fails closed");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\r\nnext")),
+        "drag provenance accepts a publication after proof failure");
+    const term::Terminal_selection_drag_resolution repeated =
+        session->resolve_selection_drag_provenance(*provenance, true);
+    ok &= check(repeated.status == failed.status &&
+        !repeated.resolved_position.has_value(),
+        "drag provenance cannot resurrect after the first proof failure");
+    session->clear_selection_drag_provenance();
+
+    return ok;
+}
+
+bool test_selection_drag_press_provenance_composes_synchronized_publications()
+{
+    const auto make_drag_session = [](
+        std::unique_ptr<term::Terminal_session>& session) {
+        auto backend = std::make_unique<Scripted_backend>();
+        Scripted_backend* backend_ptr = backend.get();
+        term::Terminal_session_config config;
+        config.recover_scrollback_from_primary_repaints = true;
+        config.capture_last_model_ingest_result = true;
+        session = std::make_unique<term::Terminal_session>(
+            std::move(backend),
+            enable_test_traces(config));
+        term::Terminal_launch_config launch = valid_launch_config();
+        launch.initial_grid_size = {4, 8};
+        if (session->start(launch).code != term::Terminal_session_result_code::ACCEPTED) {
+            return static_cast<Scripted_backend*>(nullptr);
+        }
+        return backend_ptr;
+    };
+    const auto begin_drag = [](term::Terminal_session& session,
+                               term::terminal_grid_position_t position) {
+        const std::optional<term::terminal_selection_source_identity_t> source =
+            session.published_selection_source_identity();
+        return source.has_value()
+            ? session.begin_selection_drag_provenance(position, *source)
+            : std::optional<term::terminal_selection_drag_press_provenance_t>{};
+    };
+
+    bool ok = true;
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_drag_session(session);
+        ok &= check(backend != nullptr && backend->emit_output(
+                selection_recovery_addressed_rows({
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("bb"),
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                }, false)),
+            "synchronized drag continuity natural-release fixture starts");
+        const auto provenance = begin_drag(*session, {2, 1});
+        ok &= check(provenance.has_value() && !session->has_selection(),
+            "synchronized drag continuity captures press without attached selection");
+        session->set_selection_reconciliation_counters_enabled(true);
+        session->reset_selection_reconciliation_counters();
+
+        QByteArray first = QByteArrayLiteral("\x1b[?2026h");
+        first += selection_recovery_addressed_rows({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("ee"),
+        }, true);
+        ok &= check(backend->emit_output(first) && backend->emit_output(
+                selection_recovery_addressed_rows({
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                    QByteArrayLiteral("ee"),
+                    QByteArrayLiteral("ff"),
+                }, true)) &&
+            backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "synchronized drag continuity accepts two held successors and natural release");
+        ok &= check(!session->render_publication_blocked() &&
+                session->selection_reconciliation_counters().attachment_resolver_requests == 1U,
+            "natural release performs exactly one drag resolver proof without selection attach");
+        const term::Terminal_selection_drag_resolution proof = provenance.has_value()
+            ? session->resolve_selection_drag_provenance(*provenance, false)
+            : term::Terminal_selection_drag_resolution{};
+        ok &= check(proof.status ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+                proof.resolved_position == term::terminal_grid_position_t{2, 1} &&
+                proof.source.has_value() &&
+                proof.source->source_content_basis.content_generation >
+                    provenance->source.source_content_basis.content_generation &&
+                !session->has_selection(),
+            "natural release composes the original drag handle while retaining logical row identity");
+        ok &= check(session->selection_reconciliation_counters()
+                .attachment_resolver_requests == 1U,
+            "natural release reuses its drag proof for the later provenance query");
+        if (proof.source.has_value()) {
+            session->set_selection_range_from_published_source(
+                {{2, 0}, {2, 2}, term::Terminal_selection_mode::NORMAL},
+                *proof.source);
+            session->record_selection_drag_proven_range();
+        }
+        const term::Terminal_selection_drag_resolution established = provenance.has_value()
+            ? session->resolve_selection_drag_provenance(*provenance, true)
+            : term::Terminal_selection_drag_resolution{};
+        ok &= check(established.status ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+                established.reconciled_proven_range == term::Terminal_selection_range{
+                    {2, 0}, {2, 2}, term::Terminal_selection_mode::NORMAL} &&
+                session->selection_reconciliation_counters()
+                    .attachment_resolver_requests == 1U,
+            "recording the proven range refreshes the release proof without another resolution");
+        if (proof.source.has_value()) {
+            session->set_selection_range_from_published_source(
+                {{3, 0}, {3, 2}, term::Terminal_selection_mode::NORMAL},
+                *proof.source);
+        }
+        const term::Terminal_selection_drag_resolution incompatible = provenance.has_value()
+            ? session->resolve_selection_drag_provenance(*provenance, true)
+            : term::Terminal_selection_drag_resolution{};
+        ok &= check(incompatible.status ==
+                term::Terminal_selection_attachment_resolution_status::INVALID_LEASE &&
+                !incompatible.resolved_position.has_value() &&
+                session->selection_reconciliation_counters()
+                    .attachment_resolver_requests == 2U,
+            "an incompatible attached payload bypasses the cached proof and fails closed");
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_drag_session(session);
+        ok &= check(backend != nullptr && backend->emit_output(
+                selection_recovery_addressed_rows({
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("bb"),
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                }, false)),
+            "synchronized drag continuity forced-release fixture starts");
+        const auto provenance = begin_drag(*session, {2, 1});
+        session->set_selection_reconciliation_counters_enabled(true);
+        session->reset_selection_reconciliation_counters();
+
+        QByteArray first = QByteArrayLiteral("\x1b[?2026h");
+        first += selection_recovery_addressed_rows({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("ee"),
+        }, true);
+        ok &= check(provenance.has_value() && backend->emit_output(first) &&
+                backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                    QByteArrayLiteral("ee"),
+                    QByteArrayLiteral("ff"),
+                }, true)) &&
+                session->force_release_synchronized_output().code ==
+                    term::Terminal_session_result_code::ACCEPTED,
+            "synchronized drag continuity accepts two held successors and forced release");
+        ok &= check(!session->render_publication_blocked() &&
+                session->selection_reconciliation_counters().attachment_resolver_requests == 1U,
+            "forced release performs exactly one drag resolver proof without selection attach");
+        const term::Terminal_selection_drag_resolution proof = provenance.has_value()
+            ? session->resolve_selection_drag_provenance(*provenance, false)
+            : term::Terminal_selection_drag_resolution{};
+        ok &= check(proof.status ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+                proof.resolved_position == term::terminal_grid_position_t{2, 1} &&
+                proof.source.has_value() &&
+                !session->has_selection(),
+            "forced release composes the original drag handle while retaining logical row identity");
+        ok &= check(session->selection_reconciliation_counters()
+                .attachment_resolver_requests == 1U,
+            "forced release reuses its drag proof for the later provenance query");
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_drag_session(session);
+        ok &= check(backend != nullptr && backend->emit_output(
+                selection_recovery_addressed_rows({
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("bb"),
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                }, false)),
+            "synchronized drag mutation fixture starts");
+        const auto provenance = begin_drag(*session, {1, 0});
+        session->set_selection_reconciliation_counters_enabled(true);
+        session->reset_selection_reconciliation_counters();
+        ok &= check(provenance.has_value() && backend->emit_output(
+                QByteArrayLiteral("\x1b[?2026h\x1b[2;1Hchanged")) &&
+            session->force_release_synchronized_output().code ==
+                term::Terminal_session_result_code::ACCEPTED,
+            "forced synchronized release publishes selected press-row mutation");
+        const term::Terminal_selection_drag_resolution failed = provenance.has_value()
+            ? session->resolve_selection_drag_provenance(*provenance, false)
+            : term::Terminal_selection_drag_resolution{};
+        ok &= check(failed.status ==
+                term::Terminal_selection_attachment_resolution_status::
+                    CONTENT_GENERATION_MISMATCH &&
+                !failed.resolved_position.has_value() &&
+                !session->has_selection(),
+            "forced release permanently poisons mutated drag press handle without attaching");
+        ok &= check(session->selection_reconciliation_counters()
+                .attachment_resolver_requests == 1U,
+            "forced release performs one drag proof and cached poison rejects later query");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\r\nnext")),
+            "synchronized drag mutation accepts output after forced release");
+        const term::Terminal_selection_drag_resolution repeated = provenance.has_value()
+            ? session->resolve_selection_drag_provenance(*provenance, false)
+            : term::Terminal_selection_drag_resolution{};
+        ok &= check(repeated.status == failed.status &&
+                !repeated.resolved_position.has_value(),
+            "forced-release drag poison cannot resurrect on later publication");
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_drag_session(session);
+        session->set_scrollback_limit(0);
+        ok &= check(backend != nullptr &&
+                backend->emit_output(QByteArrayLiteral("alpha")),
+            "synchronized drag missing-handle fixture starts");
+        const auto provenance = begin_drag(*session, {0, 0});
+        ok &= check(provenance.has_value() && backend->emit_output(
+                QByteArrayLiteral("\x1b[?2026h\x1b[4;1H\r\n")) &&
+            backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "synchronized drag missing-handle fixture evicts press row while held");
+        const term::Terminal_selection_drag_resolution failed = provenance.has_value()
+            ? session->resolve_selection_drag_provenance(*provenance, false)
+            : term::Terminal_selection_drag_resolution{};
+        ok &= check(failed.status ==
+                term::Terminal_selection_attachment_resolution_status::MISSING_LINE &&
+                !failed.resolved_position.has_value(),
+            "synchronized drag hold permanently poisons missing press handle");
+    }
+
+    return ok;
+}
+
+bool test_selection_current_detach_after_accepted_primary_repaint_recovery()
+{
+    bool ok = true;
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+    term::Terminal_session_config config;
+    config.recover_scrollback_from_primary_repaints = true;
+    config.capture_last_model_ingest_result = true;
+    config.selection_trace_enabled = true;
+    std::unique_ptr<term::Terminal_session> session =
+        std::make_unique<term::Terminal_session>(
+            std::move(backend),
+            enable_test_traces(config));
+    term::Terminal_launch_config launch = valid_launch_config();
+    launch.initial_grid_size = {4, 8};
+    ok &= check(session->start(launch).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "selection recovery causal fixture starts");
+    ok &= check(backend_ptr->emit_output(selection_recovery_addressed_rows({
+            QByteArrayLiteral("aa"),
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+        }, false)),
+        "selection recovery causal fixture publishes distinct source rows");
+
+    session->set_selection_range({
+        {1, 0},
+        {1, 2},
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result original_payload = session->selected_text();
+    const std::optional<term::terminal_selection_visual_lease_t> original_lease =
+        session->selection_visual_lease();
+    ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+            original_payload.text == QStringLiteral("bb") &&
+            original_lease.has_value() &&
+            original_lease->selected_lines.size() == 1U &&
+            session->selection_anchor_domain() ==
+                term::Terminal_selection_anchor_domain::PRIMARY_BACKING,
+        "selection recovery causal fixture begins with one exact attached line");
+
+    QString trace_error;
+    ok &= check(term::set_interaction_trace_enabled(true, &trace_error),
+        "selection recovery causal fixture enables the existing interaction trace channel");
+    const QString trace_path = term::interaction_trace_path();
+    const qint64 trace_start = QFileInfo(trace_path).size();
+
+    ok &= check(backend_ptr->emit_output(selection_recovery_addressed_rows({
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+            QByteArrayLiteral("ee"),
+        }, true)),
+        "selection recovery causal fixture publishes a shifted repaint");
+    const std::optional<term::Terminal_screen_model_result> result =
+        session->last_model_ingest_result();
+    const term::Terminal_selection_result detached_payload = session->selected_text();
+    const std::optional<term::Terminal_render_snapshot> detached_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(result.has_value() && result->recovery_proposals.size() == 1U &&
+            result->recovery_proposals.front().status ==
+                term::Terminal_recovery_proposal_status::ACCEPTED &&
+            result->recovery_proposals.front().candidate_visible_rows == 4 &&
+            result->recovery_proposals.front().recovered_row_count == 1 &&
+            result->recovery_proposals.front().visible_row_identity_ambiguous &&
+            result->recovery_attempts.size() == 1U &&
+            result->recovery_attempts.front().status ==
+                term::Terminal_recovery_attempt_status::ACCEPTED &&
+            result->recovery_attempts.front().reason ==
+                term::Terminal_recovery_attempt_reason::FULL_SHIFT_MATCH &&
+            QString::fromLatin1(term::terminal_recovery_attempt_status_token(
+                result->recovery_attempts.front().status)) == QStringLiteral("accepted") &&
+            QString::fromLatin1(term::terminal_recovery_attempt_reason_token(
+                result->recovery_attempts.front().reason)) ==
+                    QStringLiteral("full-shift-match") &&
+            result->dropped_recovery_attempts == 0U,
+        "selection recovery causal fixture records exact accepted full-match tokens");
+    const std::optional<term::terminal_selection_visual_lease_t> translated_lease =
+        session->selection_visual_lease();
+    ok &= check(session->has_selection() &&
+            detached_payload.code == term::Terminal_selection_result_code::OK &&
+            detached_payload.text == original_payload.text &&
+            translated_lease.has_value() &&
+            translated_lease->selected_lines.front().history_handle !=
+                original_lease->selected_lines.front().history_handle &&
+            translated_lease->selected_lines.front().history_handle.content_generation ==
+                original_lease->selected_lines.front().history_handle.content_generation &&
+            session->last_selection_attachment_resolution_status() ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            session->selection_anchor_domain() ==
+                term::Terminal_selection_anchor_domain::PRIMARY_BACKING,
+        "accepted repaint atomically installs the exact successor attachment");
+    ok &= check(detached_snapshot.has_value() &&
+            snapshot_has_selection_span(*detached_snapshot, 0, 0, 2),
+        "accepted repaint projects the exact successor span");
+    (void)term::set_interaction_trace_enabled(false);
+    QFile trace_file(trace_path);
+    QByteArray trace_tail;
+    if (trace_file.open(QIODevice::ReadOnly) && trace_file.seek(trace_start)) {
+        trace_tail = trace_file.readAll();
+    }
+    ok &= check(trace_tail.contains("attachment-resolution status=0 model_status=0") &&
+            trace_tail.contains("old_rows={1}") &&
+            trace_tail.contains("final_rows={1}") &&
+            trace_tail.contains("deltas={0}") &&
+            trace_tail.contains("matched_prefix=3") &&
+            trace_tail.contains("unmatched_tail=0") &&
+            trace_tail.contains("successors={key=") &&
+            trace_tail.contains("proofs={old={") &&
+            trace_tail.contains("predecessor={") &&
+            trace_tail.contains("result=0"),
+        "selection recovery serializes bounded continuity, proof, boundary, row, delta, and resolver evidence through the session trace channel");
+
+    return ok;
+}
+
+bool test_selection_current_repaint_recovery_detach_classification()
+{
+    const auto make_recovery_session = [](
+        std::unique_ptr<term::Terminal_session>& session,
+        term::terminal_grid_size_t               grid_size) {
+        auto backend = std::make_unique<Scripted_backend>();
+        Scripted_backend* backend_ptr = backend.get();
+        term::Terminal_session_config config;
+        config.recover_scrollback_from_primary_repaints = true;
+        config.capture_last_model_ingest_result = true;
+        config.selection_trace_enabled = true;
+        session = std::make_unique<term::Terminal_session>(
+            std::move(backend),
+            enable_test_traces(config));
+        term::Terminal_launch_config launch = valid_launch_config();
+        launch.initial_grid_size = grid_size;
+        if (session->start(launch).code !=
+            term::Terminal_session_result_code::ACCEPTED)
+        {
+            return static_cast<Scripted_backend*>(nullptr);
+        }
+        return backend_ptr;
+    };
+
+    bool ok = true;
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_recovery_session(session, {6, 12});
+        ok &= check(backend != nullptr,
+            "partial-recovery selection causal fixture starts");
+        if (backend != nullptr) {
+            ok &= check(backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArray(),
+                    QByteArrayLiteral("bb"),
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                    QByteArrayLiteral("old"),
+                    QByteArrayLiteral("tail"),
+                }, false)),
+                "partial-recovery selection fixture publishes source rows");
+            session->set_selection_range({
+                {1, 0},
+                {2, 2},
+                term::Terminal_selection_mode::NORMAL,
+            });
+            const term::Terminal_selection_result selected = session->selected_text();
+            ok &= check(selected.code == term::Terminal_selection_result_code::OK &&
+                    selected.text == QStringLiteral("bb\ncc") &&
+                    session->selection_visual_lease().has_value() &&
+                    session->selection_visual_lease()->selected_lines.size() == 2U,
+                "partial-recovery selection begins attached across two exact lines");
+            ok &= check(backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArrayLiteral("bb"),
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                    QByteArrayLiteral("new"),
+                    QByteArrayLiteral("tail2"),
+                    QByteArrayLiteral("tail3"),
+                }, true)),
+                "partial-recovery selection fixture publishes a rewritten tail");
+            const std::optional<term::Terminal_screen_model_result> result =
+                session->last_model_ingest_result();
+            ok &= check(result.has_value() && result->recovery_proposals.size() == 1U &&
+                    result->recovery_proposals.front().status ==
+                        term::Terminal_recovery_proposal_status::ACCEPTED &&
+                    result->recovery_proposals.front().recovered_row_count == 1 &&
+                    result->recovery_proposals.front().candidate_visible_rows == 6 &&
+                    result->recovery_attempts.size() == 1U &&
+                    result->recovery_attempts.front().status ==
+                        term::Terminal_recovery_attempt_status::ACCEPTED &&
+                    result->recovery_attempts.front().reason ==
+                        term::Terminal_recovery_attempt_reason::PARTIAL_SHIFT_MATCH &&
+                    QString::fromLatin1(term::terminal_recovery_attempt_reason_token(
+                        result->recovery_attempts.front().reason)) ==
+                            QStringLiteral("partial-shift-match"),
+                "partial-recovery selection records exact accepted partial-match tokens");
+            ok &= check(session->has_selection() &&
+                    session->selected_text().text == selected.text &&
+                    session->selection_visual_lease().has_value() &&
+                    session->last_selection_attachment_resolution_status() ==
+                        term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+                    session->selection_anchor_domain() ==
+                        term::Terminal_selection_anchor_domain::PRIMARY_BACKING,
+                "partial accepted repaint preserves exact matched-prefix successors");
+        }
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_recovery_session(session, {4, 8});
+        ok &= check(backend != nullptr,
+            "rejected-recovery selection causal fixture starts");
+        if (backend != nullptr) {
+            ok &= check(backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("bb"),
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                }, false)),
+                "rejected-recovery selection fixture publishes source rows");
+            session->set_selection_range({
+                {1, 0},
+                {1, 2},
+                term::Terminal_selection_mode::NORMAL,
+            });
+            const term::Terminal_selection_result selected = session->selected_text();
+            ok &= check(selected.text == QStringLiteral("bb") &&
+                    session->selection_visual_lease().has_value(),
+                "rejected-recovery selection begins attached");
+            ok &= check(backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArrayLiteral("ww"),
+                    QByteArrayLiteral("xx"),
+                    QByteArrayLiteral("yy"),
+                    QByteArrayLiteral("zz"),
+                }, true)),
+                "rejected-recovery selection fixture publishes a non-matching repaint");
+            const std::optional<term::Terminal_screen_model_result> result =
+                session->last_model_ingest_result();
+            ok &= check(result.has_value() && result->recovery_proposals.empty() &&
+                    !result->recovery_attempts.empty() &&
+                    result->recovery_attempts.back().status ==
+                        term::Terminal_recovery_attempt_status::REJECTED &&
+                    result->recovery_attempts.back().reason ==
+                        term::Terminal_recovery_attempt_reason::NONMATCHING &&
+                    QString::fromLatin1(term::terminal_recovery_attempt_status_token(
+                        result->recovery_attempts.back().status)) == QStringLiteral("rejected") &&
+                    QString::fromLatin1(term::terminal_recovery_attempt_reason_token(
+                        result->recovery_attempts.back().reason)) == QStringLiteral("nonmatching"),
+                "non-matching repaint records exact rejected/nonmatching tokens");
+            ok &= check(session->has_selection() &&
+                    session->selected_text().text == selected.text &&
+                    !session->selection_visual_lease().has_value(),
+                "rejected repaint currently detaches visual selection and keeps payload");
+        }
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_recovery_session(session, {4, 8});
+        ok &= check(backend != nullptr,
+            "synchronized ambiguous-recovery fixture starts");
+        if (backend != nullptr) {
+            ok &= check(backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("aa"),
+                }, false)),
+                "synchronized ambiguous-recovery fixture publishes repeated rows");
+            session->set_selection_range({
+                {1, 0},
+                {1, 2},
+                term::Terminal_selection_mode::NORMAL,
+            });
+            const QString selected = session->selected_text().text;
+            session->set_selection_reconciliation_counters_enabled(true);
+            session->reset_selection_reconciliation_counters();
+            QByteArray held = QByteArrayLiteral("\x1b[?2026h");
+            held += selection_recovery_addressed_rows({
+                QByteArrayLiteral("aa"),
+                QByteArrayLiteral("aa"),
+                QByteArrayLiteral("aa"),
+                QByteArrayLiteral("zz"),
+            }, true);
+            ok &= check(backend->emit_output(held) &&
+                    backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+                "synchronized ambiguous recovery is held and released");
+            ok &= check(session->has_selection() &&
+                    session->selected_text().text == selected &&
+                    !session->selection_visual_lease().has_value() &&
+                    session->last_selection_attachment_resolution_status() ==
+                        term::Terminal_selection_attachment_resolution_status::MISSING_LINE &&
+                    session->selection_reconciliation_counters()
+                        .attachment_resolver_requests == 1U,
+                "synchronized ambiguous recovery poisons the hold and fails closed after one proof");
+        }
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_recovery_session(session, {4, 8});
+        ok &= check(backend != nullptr,
+            "ambiguous-recovery selection causal fixture starts");
+        if (backend != nullptr) {
+            ok &= check(backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("aa"),
+                }, false)),
+                "ambiguous-recovery selection fixture publishes repeated source rows");
+            session->set_selection_range({
+                {1, 0},
+                {1, 2},
+                term::Terminal_selection_mode::NORMAL,
+            });
+            const term::Terminal_selection_result selected = session->selected_text();
+            ok &= check(selected.text == QStringLiteral("aa") &&
+                    session->selection_visual_lease().has_value(),
+                "ambiguous-recovery selection begins attached");
+            ok &= check(backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("zz"),
+                }, true)),
+                "ambiguous-recovery selection fixture publishes repeated survivors");
+            const std::optional<term::Terminal_screen_model_result> result =
+                session->last_model_ingest_result();
+            ok &= check(result.has_value() && result->recovery_proposals.empty() &&
+                    !result->recovery_attempts.empty() &&
+                    result->recovery_attempts.back().status ==
+                        term::Terminal_recovery_attempt_status::REJECTED &&
+                    result->recovery_attempts.back().reason ==
+                        term::Terminal_recovery_attempt_reason::REPEATED_ROW_AMBIGUOUS &&
+                    QString::fromLatin1(term::terminal_recovery_attempt_reason_token(
+                        result->recovery_attempts.back().reason)) ==
+                            QStringLiteral("repeated-row-ambiguous"),
+                "ambiguous repaint records exact repeated-row rejection token");
+            ok &= check(session->has_selection() &&
+                    session->selected_text().text == selected.text &&
+                    !session->selection_visual_lease().has_value(),
+                "ambiguous repaint currently fails closed to payload-only selection");
+        }
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_recovery_session(session, {4, 8});
+        ok &= check(backend != nullptr,
+            "cancelled-recovery selection causal fixture starts");
+        if (backend != nullptr) {
+            ok &= check(backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("bb"),
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                }, false)),
+                "cancelled-recovery selection fixture publishes source rows");
+            session->set_selection_range({
+                {2, 0},
+                {2, 2},
+                term::Terminal_selection_mode::NORMAL,
+            });
+            const term::Terminal_selection_result selected = session->selected_text();
+            ok &= check(selected.text == QStringLiteral("cc") &&
+                    session->selection_visual_lease().has_value(),
+                "cancelled-recovery selection begins attached");
+            ok &= check(backend->emit_output(
+                    QByteArrayLiteral("\x1b[?25l\x1b[1;1Hbb\x1b[K")),
+                "cancelled-recovery selection fixture begins candidate");
+            session->set_primary_repaint_recovery_enabled(false);
+            ok &= check(backend->emit_output(QByteArrayLiteral(
+                    "\x1b[2;1Hcc\x1b[K"
+                    "\x1b[3;1Hdd\x1b[K"
+                    "\x1b[4;1Hee\x1b[K"
+                    "\x1b[?25h")),
+                "cancelled-recovery selection fixture completes after cancellation");
+            const std::optional<term::Terminal_screen_model_result> result =
+                session->last_model_ingest_result();
+            ok &= check(result.has_value() && result->recovery_proposals.empty() &&
+                    result->recovery_attempts.size() == 1U &&
+                    result->recovery_attempts.front().status ==
+                        term::Terminal_recovery_attempt_status::CANCELLED &&
+                    result->recovery_attempts.front().reason ==
+                        term::Terminal_recovery_attempt_reason::RECOVERY_DISABLED &&
+                    QString::fromLatin1(term::terminal_recovery_attempt_status_token(
+                        result->recovery_attempts.front().status)) == QStringLiteral("cancelled") &&
+                    QString::fromLatin1(term::terminal_recovery_attempt_reason_token(
+                        result->recovery_attempts.front().reason)) ==
+                            QStringLiteral("recovery-disabled"),
+                "cancelled repaint records exact cancellation reason tokens");
+            ok &= check(session->has_selection() &&
+                    session->selected_text().text == selected.text &&
+                    !session->selection_visual_lease().has_value(),
+                "cancelled repaint currently detaches visual selection and keeps payload");
+        }
+    }
+
+    {
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_recovery_session(session, {4, 8});
+        ok &= check(backend != nullptr,
+            "synchronized recovery selection causal fixture starts");
+        if (backend != nullptr) {
+            ok &= check(backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArrayLiteral("aa"),
+                    QByteArrayLiteral("bb"),
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                }, false)),
+                "synchronized recovery selection fixture publishes source rows");
+            session->set_selection_range({
+                {2, 0},
+                {2, 2},
+                term::Terminal_selection_mode::NORMAL,
+            });
+            const term::Terminal_selection_result selected = session->selected_text();
+            const std::optional<term::terminal_selection_visual_lease_t> selected_lease =
+                session->selection_visual_lease();
+            session->set_selection_reconciliation_counters_enabled(true);
+            session->reset_selection_reconciliation_counters();
+            QString hold_trace_error;
+            ok &= check(term::set_interaction_trace_enabled(true, &hold_trace_error),
+                "synchronized recovery enables hold composition tracing");
+            const QString hold_trace_path = term::interaction_trace_path();
+            const qint64 hold_trace_start = QFileInfo(hold_trace_path).size();
+            QByteArray held = QByteArrayLiteral("\x1b[?2026h");
+            held += selection_recovery_addressed_rows({
+                QByteArrayLiteral("bb"),
+                QByteArrayLiteral("cc"),
+                QByteArrayLiteral("dd"),
+                QByteArrayLiteral("ee"),
+            }, true);
+            ok &= check(backend->emit_output(held),
+                "synchronized recovery selection fixture holds repaint output");
+            const std::optional<term::terminal_selection_visual_lease_t> held_lease =
+                session->selection_visual_lease();
+            ok &= check(session->render_publication_blocked() &&
+                    held_lease.has_value() && selected_lease.has_value() &&
+                    held_lease->source_content_basis == selected_lease->source_content_basis &&
+                    held_lease->selected_lines == selected_lease->selected_lines &&
+                    session->selected_text().text == selected.text,
+                "synchronized hold preserves the published pre-release selection");
+            ok &= check(backend->emit_output(selection_recovery_addressed_rows({
+                    QByteArrayLiteral("cc"),
+                    QByteArrayLiteral("dd"),
+                    QByteArrayLiteral("ee"),
+                    QByteArrayLiteral("ff"),
+                }, true)),
+                "synchronized recovery selection composes a second exact successor");
+            ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+                "synchronized recovery selection fixture releases held output");
+            const std::optional<term::terminal_selection_visual_lease_t> released_lease =
+                session->selection_visual_lease();
+            const std::optional<term::Terminal_render_snapshot> released_snapshot =
+                session->latest_render_snapshot();
+            ok &= check(!session->render_publication_blocked() &&
+                    session->has_selection() &&
+                    session->selected_text().text == selected.text &&
+                    selected_lease.has_value() && released_lease.has_value() &&
+                    released_lease->selected_lines.front().history_handle !=
+                        selected_lease->selected_lines.front().history_handle &&
+                    released_lease->selected_lines.front().history_handle.content_generation ==
+                        selected_lease->selected_lines.front().history_handle.content_generation &&
+                    released_lease->durable_payload_identity ==
+                        selected_lease->durable_payload_identity &&
+                    released_lease->provisional_payload_identity ==
+                        selected_lease->provisional_payload_identity &&
+                    session->last_selection_attachment_resolution_status() ==
+                        term::Terminal_selection_attachment_resolution_status::TRANSLATED,
+                "synchronized recovery release atomically installs the composed exact successor");
+            ok &= check(released_snapshot.has_value() &&
+                    snapshot_has_selection_span(*released_snapshot, 0, 0, 2),
+                "synchronized recovery release projects only the final successor row");
+            ok &= check(session->selection_reconciliation_counters()
+                    .attachment_resolver_requests == 1U,
+                "synchronized recovery release performs exactly one final resolver proof");
+            (void)term::set_interaction_trace_enabled(false);
+            QFile hold_trace_file(hold_trace_path);
+            QByteArray hold_trace_tail;
+            if (hold_trace_file.open(QIODevice::ReadOnly) &&
+                hold_trace_file.seek(hold_trace_start))
+            {
+                hold_trace_tail = hold_trace_file.readAll();
+            }
+            ok &= check(hold_trace_tail.contains("hold-continuity begin") &&
+                    hold_trace_tail.contains("hold-continuity accumulate action=updated") &&
+                    hold_trace_tail.contains("hold-continuity release action=composed") &&
+                    hold_trace_tail.contains("attachment-resolution status=0 model_status=0") &&
+                    hold_trace_tail.contains("successors={key=") &&
+                    hold_trace_tail.contains("old_rows={2}") &&
+                    hold_trace_tail.contains("final_rows={2}") &&
+                    hold_trace_tail.contains("deltas={0}"),
+                "synchronized recovery serializes composed hold and final proof evidence on the session trace channel");
+        }
+    }
 
     return ok;
 }
@@ -3597,6 +4525,8 @@ bool test_selection_spans_preserve_after_unchanged_synchronized_output_release()
     ok &= check(selected_snapshot.has_value() &&
         snapshot_has_selection_span(*selected_snapshot, 0, 0, 8),
         "unchanged sync-release selection initially publishes a visible span");
+    session->set_selection_reconciliation_counters_enabled(true);
+    session->reset_selection_reconciliation_counters();
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h\x1b[2;1Hchanged")),
         "unchanged sync-release backend mutates an unselected row while unpublished");
@@ -3606,8 +4536,9 @@ bool test_selection_spans_preserve_after_unchanged_synchronized_output_release()
         held_payload.text == QStringLiteral("original"),
         "unchanged sync-release selection retains payload while output is hidden");
 
-    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
-        "unchanged sync-release backend publishes held mutation");
+    ok &= check(session->force_release_synchronized_output().code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "unchanged sync-release force publishes the held mutation");
     const term::Terminal_selection_result retained_payload =
         session->selected_text();
     const std::optional<term::Terminal_render_snapshot> released_snapshot =
@@ -3619,6 +4550,11 @@ bool test_selection_spans_preserve_after_unchanged_synchronized_output_release()
         "unchanged sync-release selection keeps public copyability active");
     ok &= check(session->selection_visual_lease().has_value(),
         "unchanged sync-release selection preserves the visual lease");
+    ok &= check(session->last_selection_attachment_resolution_status() ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            session->selection_reconciliation_counters()
+                .attachment_resolver_requests == 1U,
+        "forced synchronized release performs exactly one successful resolver proof");
     ok &= check(released_snapshot.has_value() &&
         snapshot_row_text(*released_snapshot, 0) == QStringLiteral("original") &&
         snapshot_row_text(*released_snapshot, 1) == QStringLiteral("changed"),
@@ -3673,6 +4609,8 @@ bool test_selection_spans_detach_when_synchronized_release_mutates_selected_row(
     ok &= check(selected_snapshot.has_value() &&
         snapshot_has_selection_span(*selected_snapshot, 0, 0, 8),
         "mutating sync-release selection initially publishes a visible span");
+    session->set_selection_reconciliation_counters_enabled(true);
+    session->reset_selection_reconciliation_counters();
 
     ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h\x1b[1;1Hmutated!")),
         "mutating sync-release backend rewrites the selected row while unpublished");
@@ -3693,6 +4631,12 @@ bool test_selection_spans_detach_when_synchronized_release_mutates_selected_row(
         "mutating sync-release keeps the finalized copy payload");
     ok &= check(!session->selection_visual_lease().has_value(),
         "mutating sync-release detaches the stale visual lease");
+    ok &= check(session->last_selection_attachment_resolution_status() ==
+            term::Terminal_selection_attachment_resolution_status::
+                CONTENT_GENERATION_MISMATCH &&
+            session->selection_reconciliation_counters()
+                .attachment_resolver_requests == 1U,
+        "mutating sync-release poison preserves its causal failure after one final proof");
     ok &= check(released_snapshot.has_value() &&
         snapshot_row_text(*released_snapshot, 0) == QStringLiteral("mutated!"),
         "mutating sync-release snapshot contains replacement selected-row text");
@@ -3703,7 +4647,7 @@ bool test_selection_spans_detach_when_synchronized_release_mutates_selected_row(
     return ok;
 }
 
-bool test_selection_spans_detach_when_synchronized_release_moves_retained_row()
+bool test_selection_spans_preserve_when_synchronized_release_moves_retained_row()
 {
     bool ok = true;
 
@@ -3724,6 +4668,10 @@ bool test_selection_spans_detach_when_synchronized_release_moves_retained_row()
         insert_session->selected_text();
     const std::optional<term::Terminal_render_snapshot> insert_selected_snapshot =
         insert_session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_visual_lease_t> insert_original_lease =
+        insert_session->selection_visual_lease();
+    insert_session->set_selection_reconciliation_counters_enabled(true);
+    insert_session->reset_selection_reconciliation_counters();
     ok &= check(insert_original_payload.code == term::Terminal_selection_result_code::OK &&
         insert_original_payload.text == QStringLiteral("beta"),
         "insert sync-release movement selection captures the original payload");
@@ -3745,11 +4693,25 @@ bool test_selection_spans_detach_when_synchronized_release_moves_retained_row()
     ok &= check(insert_moved_snapshot.has_value() &&
         snapshot_row_text(*insert_moved_snapshot, 2) == QStringLiteral("beta"),
         "insert sync-release movement snapshot keeps the retained text at its moved row");
-    ok &= check(!insert_session->selection_visual_lease().has_value(),
-        "insert sync-release movement detaches the stale visual lease");
+    const std::optional<term::terminal_selection_visual_lease_t> insert_moved_lease =
+        insert_session->selection_visual_lease();
+    ok &= check(insert_original_lease.has_value() && insert_moved_lease.has_value() &&
+        insert_moved_lease->selected_range.start.row == 2 &&
+        insert_moved_lease->selected_range.end.row == 2 &&
+        insert_moved_lease->selected_lines == insert_original_lease->selected_lines &&
+        insert_moved_lease->durable_payload_identity ==
+            insert_original_lease->durable_payload_identity &&
+        insert_moved_lease->provisional_payload_identity ==
+            insert_original_lease->provisional_payload_identity &&
+        insert_session->last_selection_attachment_resolution_status() ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED,
+        "insert sync-release movement atomically translates the retained visual lease");
+    ok &= check(insert_session->selection_reconciliation_counters()
+            .attachment_resolver_requests == 1U,
+        "insert sync-release movement performs exactly one final resolver proof");
     ok &= check(insert_moved_snapshot.has_value() &&
-        insert_moved_snapshot->selection_spans.empty(),
-        "insert sync-release movement suppresses stale spans");
+        snapshot_has_selection_span(*insert_moved_snapshot, 2, 0, 4),
+        "insert sync-release movement projects the translated span");
 
     std::unique_ptr<term::Terminal_session> delete_session;
     Scripted_backend* delete_backend = make_session(delete_session);
@@ -3768,6 +4730,10 @@ bool test_selection_spans_detach_when_synchronized_release_moves_retained_row()
         delete_session->selected_text();
     const std::optional<term::Terminal_render_snapshot> delete_selected_snapshot =
         delete_session->latest_render_snapshot();
+    const std::optional<term::terminal_selection_visual_lease_t> delete_original_lease =
+        delete_session->selection_visual_lease();
+    delete_session->set_selection_reconciliation_counters_enabled(true);
+    delete_session->reset_selection_reconciliation_counters();
     ok &= check(delete_original_payload.code == term::Terminal_selection_result_code::OK &&
         delete_original_payload.text == QStringLiteral("gamma"),
         "delete sync-release movement selection captures the original payload");
@@ -3789,11 +4755,25 @@ bool test_selection_spans_detach_when_synchronized_release_moves_retained_row()
     ok &= check(delete_moved_snapshot.has_value() &&
         snapshot_row_text(*delete_moved_snapshot, 1) == QStringLiteral("gamma"),
         "delete sync-release movement snapshot keeps the retained text at its moved row");
-    ok &= check(!delete_session->selection_visual_lease().has_value(),
-        "delete sync-release movement detaches the stale visual lease");
+    const std::optional<term::terminal_selection_visual_lease_t> delete_moved_lease =
+        delete_session->selection_visual_lease();
+    ok &= check(delete_original_lease.has_value() && delete_moved_lease.has_value() &&
+        delete_moved_lease->selected_range.start.row == 1 &&
+        delete_moved_lease->selected_range.end.row == 1 &&
+        delete_moved_lease->selected_lines == delete_original_lease->selected_lines &&
+        delete_moved_lease->durable_payload_identity ==
+            delete_original_lease->durable_payload_identity &&
+        delete_moved_lease->provisional_payload_identity ==
+            delete_original_lease->provisional_payload_identity &&
+        delete_session->last_selection_attachment_resolution_status() ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED,
+        "delete sync-release movement atomically translates the retained visual lease");
+    ok &= check(delete_session->selection_reconciliation_counters()
+            .attachment_resolver_requests == 1U,
+        "delete sync-release movement performs exactly one final resolver proof");
     ok &= check(delete_moved_snapshot.has_value() &&
-        delete_moved_snapshot->selection_spans.empty(),
-        "delete sync-release movement suppresses stale spans");
+        snapshot_has_selection_span(*delete_moved_snapshot, 1, 0, 5),
+        "delete sync-release movement projects the translated span");
 
     return ok;
 }
@@ -4051,6 +5031,591 @@ bool test_selection_spans_fail_closed_at_boundaries()
     return ok;
 }
 
+bool test_selection_spans_preserve_when_height_resize_keeps_selected_columns()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "height-resize selection session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("alpha\r\nbeta")),
+        "height-resize backend emits selectable rows");
+
+    session->set_selection_range({
+        { 0, 1 },
+        { 0, 4 },
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result original_payload = session->selected_text();
+    const std::optional<term::terminal_selection_visual_lease_t> original_lease =
+        session->selection_visual_lease();
+    ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+            original_payload.text == QStringLiteral("lph") &&
+            original_lease.has_value(),
+        "height-resize selection captures an attached partial-row payload");
+
+    session->set_selection_reconciliation_counters_enabled(true);
+    session->reset_selection_reconciliation_counters();
+    const term::Terminal_session_result resize_result =
+        session->resize(QSizeF(800.0, 200.0), {20, 80});
+    const term::Terminal_selection_result retained_payload = session->selected_text();
+    const std::optional<term::terminal_selection_visual_lease_t> resized_lease =
+        session->selection_visual_lease();
+    const std::optional<term::Terminal_render_snapshot> resized_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(resize_result.code == term::Terminal_session_result_code::ACCEPTED,
+        "height-resize compatible row-count resize is accepted");
+    ok &= check(retained_payload.code == term::Terminal_selection_result_code::OK &&
+            retained_payload.text == original_payload.text,
+        "height-resize preserves the immutable selection payload");
+    ok &= check(original_lease.has_value() &&
+            resized_lease.has_value() &&
+            resized_lease->selected_lines == original_lease->selected_lines &&
+            resized_lease->selected_range == original_lease->selected_range &&
+            term::grid_sizes_match(
+                resized_lease->grid_size,
+                term::terminal_grid_size_t{20, 80}) &&
+            session->last_selection_attachment_resolution_status() ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED,
+        "height-resize preserves the exact selected handles and translates the lease basis");
+    ok &= check(session->selection_reconciliation_counters()
+                .attachment_resolver_requests == 1U,
+        "height-resize performs one authoritative attachment proof");
+    ok &= check(resized_snapshot.has_value() &&
+            term::grid_sizes_match(
+                resized_snapshot->grid_size,
+                term::terminal_grid_size_t{20, 80}) &&
+            snapshot_has_selection_span(*resized_snapshot, 0, 1, 3),
+        "height-resize projects the preserved partial-row span");
+
+    return ok;
+}
+
+bool test_selection_spans_reconcile_alternate_scrolling()
+{
+    bool ok = true;
+
+    const auto make_alternate_session = [](std::unique_ptr<term::Terminal_session>& session) {
+        Scripted_backend* backend = make_session(session);
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = {3, 20};
+        return std::pair{backend, launch_config};
+    };
+
+    std::unique_ptr<term::Terminal_session> preserved_session;
+    auto [preserved_backend, preserved_launch] = make_alternate_session(preserved_session);
+    ok &= check(preserved_session->start(preserved_launch).code ==
+            term::Terminal_session_result_code::ACCEPTED &&
+            preserved_backend->emit_output(
+                QByteArrayLiteral("\x1b[?1049halpha\r\nbeta\r\ngamma")),
+        "alternate-scroll preservation fixture fills the alternate grid");
+    preserved_session->set_selection_range({
+        {1, 0},
+        {1, 4},
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result preserved_payload =
+        preserved_session->selected_text();
+    const std::optional<term::terminal_selection_visual_lease_t> preserved_lease =
+        preserved_session->selection_visual_lease();
+    preserved_session->set_selection_reconciliation_counters_enabled(true);
+    preserved_session->reset_selection_reconciliation_counters();
+    ok &= check(preserved_backend->emit_output(QByteArrayLiteral("\r\ndelta")),
+        "alternate-scroll preservation fixture scrolls one row");
+    const std::optional<term::terminal_selection_visual_lease_t> translated_lease =
+        preserved_session->selection_visual_lease();
+    const std::optional<term::Terminal_render_snapshot> preserved_snapshot =
+        preserved_session->latest_render_snapshot();
+    ok &= check(preserved_payload.code == term::Terminal_selection_result_code::OK &&
+            preserved_payload.text == QStringLiteral("beta") &&
+            preserved_lease.has_value() &&
+            translated_lease.has_value() &&
+            translated_lease->selected_lines == preserved_lease->selected_lines &&
+            translated_lease->selected_range.start.row == 0 &&
+            translated_lease->selected_range.end.row == 0 &&
+            preserved_session->last_selection_attachment_resolution_status() ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            preserved_session->selection_reconciliation_counters()
+                .attachment_resolver_requests == 1U,
+        "alternate scrolling translates an exactly retained selected row once");
+    ok &= check(preserved_snapshot.has_value() &&
+            snapshot_has_selection_span(*preserved_snapshot, 0, 0, 4),
+        "alternate scrolling projects the translated selected row");
+
+    std::unique_ptr<term::Terminal_session> discarded_session;
+    auto [discarded_backend, discarded_launch] = make_alternate_session(discarded_session);
+    ok &= check(discarded_session->start(discarded_launch).code ==
+            term::Terminal_session_result_code::ACCEPTED &&
+            discarded_backend->emit_output(
+                QByteArrayLiteral("\x1b[?1049halpha\r\nbeta\r\ngamma")),
+        "alternate-scroll discard fixture fills the alternate grid");
+    discarded_session->set_selection_range({
+        {0, 0},
+        {0, 5},
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result discarded_payload =
+        discarded_session->selected_text();
+    ok &= check(discarded_backend->emit_output(QByteArrayLiteral("\r\ndelta")),
+        "alternate-scroll discard fixture scrolls away the selected row");
+    const std::optional<term::Terminal_render_snapshot> discarded_snapshot =
+        discarded_session->latest_render_snapshot();
+    ok &= check(discarded_payload.code == term::Terminal_selection_result_code::OK &&
+            discarded_payload.text == QStringLiteral("alpha") &&
+            discarded_session->selected_text().text == discarded_payload.text &&
+            !discarded_session->selection_visual_lease().has_value() &&
+            discarded_session->selection_anchor_domain() ==
+                term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
+            discarded_session->last_selection_attachment_resolution_status() ==
+                term::Terminal_selection_attachment_resolution_status::MISSING_LINE &&
+            discarded_snapshot.has_value() &&
+            discarded_snapshot->selection_spans.empty(),
+        "alternate scrolling detaches when the selected row is discarded");
+
+    return ok;
+}
+
+bool test_selection_spans_preserve_when_clear_scrollback_keeps_active_rows()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session);
+    term::Terminal_launch_config launch_config = valid_launch_config();
+    launch_config.initial_grid_size = {4, 20};
+    ok &= check(session->start(launch_config).code ==
+            term::Terminal_session_result_code::ACCEPTED &&
+            backend->emit_output(numbered_scroll_lines(10)),
+        "clear-scrollback preservation fixture creates retained and active rows");
+    const std::optional<term::Terminal_render_snapshot> source_snapshot =
+        session->latest_render_snapshot();
+    if (!source_snapshot.has_value()) {
+        return check(false, "clear-scrollback preservation source snapshot is available");
+    }
+
+    const int original_logical_row = source_snapshot->viewport.scrollback_rows + 2;
+    const QString original_text = snapshot_row_text(*source_snapshot, 2);
+    session->set_selection_range({
+        {original_logical_row, 0},
+        {original_logical_row, 15},
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const std::optional<term::terminal_selection_visual_lease_t> original_lease =
+        session->selection_visual_lease();
+    session->set_selection_reconciliation_counters_enabled(true);
+    session->reset_selection_reconciliation_counters();
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[3J")),
+        "clear-scrollback preservation clears only retained history");
+    const std::optional<term::terminal_selection_visual_lease_t> cleared_lease =
+        session->selection_visual_lease();
+    const std::optional<term::Terminal_render_snapshot> cleared_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(!original_text.isEmpty() &&
+            session->selected_text().text == original_text &&
+            original_lease.has_value() &&
+            cleared_lease.has_value() &&
+            cleared_lease->selected_lines == original_lease->selected_lines &&
+            cleared_lease->selected_range.start.row == 2 &&
+            cleared_lease->selected_range.end.row == 2 &&
+            session->last_selection_attachment_resolution_status() ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            session->selection_reconciliation_counters()
+                .attachment_resolver_requests == 1U,
+        "clear scrollback preserves an exact active-row attachment with one proof");
+    ok &= check(cleared_snapshot.has_value() &&
+            cleared_snapshot->viewport.scrollback_rows == 0 &&
+            snapshot_has_selection_span(*cleared_snapshot, 2, 0, 15),
+        "clear scrollback projects the preserved active-row span");
+
+    return ok;
+}
+
+bool test_selection_spans_reconcile_synchronized_release_policy_matrix()
+{
+    bool ok = true;
+
+    struct Resize_case
+    {
+        term::terminal_grid_size_t first_grid;
+        bool                       return_to_original_grid = false;
+        int                        selected_row = 0;
+        int                        selected_end_column = 0;
+        term::Terminal_selection_attachment_resolution_status expected_status =
+            term::Terminal_selection_attachment_resolution_status::INVALID_LEASE;
+    };
+    const std::array policies = {
+        term::Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION,
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION,
+    };
+    const std::array resize_cases = {
+        Resize_case{{5, 20}, false, 1, 4,
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED},
+        Resize_case{{2, 20}, false, 3, 5,
+            term::Terminal_selection_attachment_resolution_status::MISSING_LINE},
+        Resize_case{{4, 19}, false, 1, 4,
+            term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH},
+        Resize_case{{2, 20}, true, 3, 5,
+            term::Terminal_selection_attachment_resolution_status::MISSING_LINE},
+        Resize_case{{4, 19}, true, 1, 4,
+            term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH},
+    };
+    for (const term::Terminal_synchronized_output_scroll_policy policy : policies) {
+        for (const bool force_release : {false, true}) {
+            for (const Resize_case& resize_case : resize_cases) {
+                term::Terminal_session_config config;
+                config.synchronized_output_scroll_policy = policy;
+                std::unique_ptr<term::Terminal_session> session;
+                Scripted_backend* backend = make_session(session, config);
+                term::Terminal_launch_config launch_config = valid_launch_config();
+                launch_config.initial_grid_size = {4, 20};
+                ok &= check(session->start(launch_config).code ==
+                        term::Terminal_session_result_code::ACCEPTED &&
+                        backend->emit_output(
+                            QByteArrayLiteral("\x1b[?1049halpha\r\nbeta\r\ngamma\r\ndelta")),
+                    "pure synchronized resize fixture fills the alternate grid");
+                session->set_selection_range({
+                    {resize_case.selected_row, 0},
+                    {resize_case.selected_row, resize_case.selected_end_column},
+                    term::Terminal_selection_mode::NORMAL,
+                });
+                const term::Terminal_selection_result original_payload =
+                    session->selected_text();
+                const std::optional<term::terminal_selection_visual_lease_t> original_lease =
+                    session->selection_visual_lease();
+                session->set_selection_reconciliation_counters_enabled(true);
+                session->reset_selection_reconciliation_counters();
+                ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+                    "pure synchronized resize fixture enters the hold");
+                ok &= check(session->resize(
+                        QSizeF(800.0, 250.0),
+                        resize_case.first_grid).code ==
+                            term::Terminal_session_result_code::ACCEPTED,
+                    "pure synchronized resize fixture applies the held resize");
+                if (resize_case.return_to_original_grid) {
+                    ok &= check(session->resize(QSizeF(800.0, 250.0), {4, 20}).code ==
+                            term::Terminal_session_result_code::ACCEPTED,
+                        "pure synchronized resize fixture returns to the original grid");
+                }
+                if (force_release) {
+                    ok &= check(session->force_release_synchronized_output().code ==
+                            term::Terminal_session_result_code::ACCEPTED,
+                        "forced pure synchronized resize fixture publishes the hold");
+                }
+                else {
+                    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+                        "natural pure synchronized resize fixture publishes the hold");
+                }
+
+                const std::optional<term::terminal_selection_visual_lease_t> released_lease =
+                    session->selection_visual_lease();
+                const std::optional<term::Terminal_render_snapshot> released_snapshot =
+                    session->latest_render_snapshot();
+                const bool preserves_attachment = resize_case.expected_status ==
+                    term::Terminal_selection_attachment_resolution_status::TRANSLATED;
+                if (preserves_attachment) {
+                    ok &= check(original_payload.code ==
+                                term::Terminal_selection_result_code::OK &&
+                            original_payload.text == QStringLiteral("beta") &&
+                            session->selected_text().text == original_payload.text &&
+                            original_lease.has_value() &&
+                            released_lease.has_value() &&
+                            released_lease->selected_lines == original_lease->selected_lines &&
+                            released_lease->selected_range == original_lease->selected_range &&
+                            term::grid_sizes_match(
+                                released_lease->grid_size,
+                                resize_case.first_grid) &&
+                            session->last_selection_attachment_resolution_status() ==
+                                resize_case.expected_status &&
+                            session->selection_reconciliation_counters()
+                                .attachment_resolver_requests == 1U,
+                        "pure synchronized height grow preserves and translates the exact selection once");
+                    ok &= check(released_snapshot.has_value() &&
+                            term::grid_sizes_match(
+                                released_snapshot->grid_size,
+                                resize_case.first_grid) &&
+                            snapshot_has_selection_span(*released_snapshot, 1, 0, 4),
+                        "pure synchronized height grow projects the translated span");
+                }
+                else {
+                    ok &= check(original_payload.code ==
+                                term::Terminal_selection_result_code::OK &&
+                            session->selected_text().text == original_payload.text &&
+                            original_lease.has_value() &&
+                            !released_lease.has_value() &&
+                            session->selection_anchor_domain() ==
+                                term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
+                            session->last_selection_attachment_resolution_status() ==
+                                resize_case.expected_status &&
+                            session->selection_reconciliation_counters()
+                                .attachment_resolver_requests == 1U &&
+                            released_snapshot.has_value() &&
+                            released_snapshot->selection_spans.empty(),
+                        "pure synchronized incompatible resize detaches once and cannot resurrect");
+                }
+                ok &= check(session->effective_synchronized_output_scroll_policy() == policy,
+                    "pure synchronized resize fixture retains the configured release policy");
+            }
+        }
+    }
+
+    return ok;
+}
+
+bool test_selection_spans_reconcile_synchronized_text_area_resize_policy_matrix()
+{
+    bool ok = true;
+
+    struct Resize_case
+    {
+        term::terminal_grid_size_t first_grid;
+        bool                       return_to_original_grid = false;
+        int                        selected_row = 0;
+        int                        selected_end_column = 0;
+        term::Terminal_selection_attachment_resolution_status expected_status =
+            term::Terminal_selection_attachment_resolution_status::INVALID_LEASE;
+    };
+    const std::array policies = {
+        term::Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION,
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION,
+    };
+    const std::array resize_cases = {
+        Resize_case{{5, 20}, false, 1, 4,
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED},
+        Resize_case{{2, 20}, false, 3, 5,
+            term::Terminal_selection_attachment_resolution_status::MISSING_LINE},
+        Resize_case{{4, 19}, false, 1, 4,
+            term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH},
+        Resize_case{{2, 20}, true, 3, 5,
+            term::Terminal_selection_attachment_resolution_status::MISSING_LINE},
+        Resize_case{{4, 19}, true, 1, 4,
+            term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH},
+    };
+    const auto text_area_resize_sequence = [](term::terminal_grid_size_t grid_size) {
+        return QByteArrayLiteral("\x1b[8;") + QByteArray::number(grid_size.rows) +
+            ';' + QByteArray::number(grid_size.columns) + 't';
+    };
+    for (const term::Terminal_synchronized_output_scroll_policy policy : policies) {
+        for (const bool force_release : {false, true}) {
+            for (const Resize_case& resize_case : resize_cases) {
+                term::Terminal_session_config config;
+                config.synchronized_output_scroll_policy = policy;
+                std::unique_ptr<term::Terminal_session> session;
+                Scripted_backend* backend = make_session(session, config);
+                term::Terminal_launch_config launch_config = valid_launch_config();
+                launch_config.initial_grid_size = {4, 20};
+                ok &= check(session->start(launch_config).code ==
+                        term::Terminal_session_result_code::ACCEPTED &&
+                        backend->emit_output(
+                            QByteArrayLiteral("\x1b[?1049halpha\r\nbeta\r\ngamma\r\ndelta")),
+                    "parser synchronized resize fixture fills the alternate grid");
+                session->set_selection_range({
+                    {resize_case.selected_row, 0},
+                    {resize_case.selected_row, resize_case.selected_end_column},
+                    term::Terminal_selection_mode::NORMAL,
+                });
+                const term::Terminal_selection_result original_payload =
+                    session->selected_text();
+                const std::optional<term::terminal_selection_visual_lease_t> original_lease =
+                    session->selection_visual_lease();
+                session->set_selection_reconciliation_counters_enabled(true);
+                session->reset_selection_reconciliation_counters();
+                ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+                    "parser synchronized resize fixture enters the hold");
+                ok &= check(backend->emit_output(
+                        text_area_resize_sequence(resize_case.first_grid)),
+                    "parser synchronized resize fixture applies the held request");
+                if (resize_case.return_to_original_grid) {
+                    ok &= check(backend->emit_output(
+                            text_area_resize_sequence({4, 20})),
+                        "parser synchronized resize fixture returns to the original grid");
+                }
+                if (force_release) {
+                    ok &= check(session->force_release_synchronized_output().code ==
+                            term::Terminal_session_result_code::ACCEPTED,
+                        "forced parser synchronized resize fixture publishes the hold");
+                }
+                else {
+                    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+                        "natural parser synchronized resize fixture publishes the hold");
+                }
+
+                const std::optional<term::terminal_selection_visual_lease_t> released_lease =
+                    session->selection_visual_lease();
+                const std::optional<term::Terminal_render_snapshot> released_snapshot =
+                    session->latest_render_snapshot();
+                const bool preserves_attachment = resize_case.expected_status ==
+                    term::Terminal_selection_attachment_resolution_status::TRANSLATED;
+                if (preserves_attachment) {
+                    ok &= check(original_payload.code ==
+                                term::Terminal_selection_result_code::OK &&
+                            original_payload.text == QStringLiteral("beta") &&
+                            session->selected_text().text == original_payload.text &&
+                            original_lease.has_value() &&
+                            released_lease.has_value() &&
+                            released_lease->selected_lines == original_lease->selected_lines &&
+                            released_lease->selected_range == original_lease->selected_range &&
+                            term::grid_sizes_match(
+                                released_lease->grid_size,
+                                resize_case.first_grid) &&
+                            session->last_selection_attachment_resolution_status() ==
+                                resize_case.expected_status &&
+                            session->selection_reconciliation_counters()
+                                .attachment_resolver_requests == 1U,
+                        "parser synchronized height grow translates the exact selection once");
+                    ok &= check(released_snapshot.has_value() &&
+                            term::grid_sizes_match(
+                                released_snapshot->grid_size,
+                                resize_case.first_grid) &&
+                            snapshot_has_selection_span(*released_snapshot, 1, 0, 4),
+                        "parser synchronized height grow projects the translated span");
+                }
+                else {
+                    ok &= check(original_payload.code ==
+                                term::Terminal_selection_result_code::OK &&
+                            session->selected_text().text == original_payload.text &&
+                            original_lease.has_value() &&
+                            !released_lease.has_value() &&
+                            session->selection_anchor_domain() ==
+                                term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
+                            session->last_selection_attachment_resolution_status() ==
+                                resize_case.expected_status &&
+                            session->selection_reconciliation_counters()
+                                .attachment_resolver_requests == 1U &&
+                            released_snapshot.has_value() &&
+                            released_snapshot->selection_spans.empty(),
+                        "parser synchronized incompatible resize detaches once without resurrection");
+                }
+                ok &= check(session->effective_synchronized_output_scroll_policy() == policy,
+                    "parser synchronized resize fixture retains the configured release policy");
+            }
+        }
+    }
+
+    return ok;
+}
+
+bool test_selection_and_drag_checkpoint_each_synchronized_text_area_resize()
+{
+    bool ok = true;
+
+    struct Resize_case
+    {
+        term::terminal_grid_size_t away_grid;
+        int                        selected_row = 0;
+        int                        selected_end_column = 0;
+        term::Terminal_selection_attachment_resolution_status expected_status =
+            term::Terminal_selection_attachment_resolution_status::INVALID_LEASE;
+    };
+    const std::array policies = {
+        term::Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION,
+        term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION,
+    };
+    const std::array resize_cases = {
+        Resize_case{{2, 20}, 3, 5,
+            term::Terminal_selection_attachment_resolution_status::MISSING_LINE},
+        Resize_case{{4, 19}, 1, 4,
+            term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH},
+    };
+    const auto text_area_resize_sequence = [](term::terminal_grid_size_t grid_size) {
+        return QByteArrayLiteral("\x1b[8;") + QByteArray::number(grid_size.rows) +
+            ';' + QByteArray::number(grid_size.columns) + 't';
+    };
+
+    for (const term::Terminal_synchronized_output_scroll_policy policy : policies) {
+        for (const bool force_release : {false, true}) {
+            for (const Resize_case& resize_case : resize_cases) {
+                term::Terminal_session_config config;
+                config.synchronized_output_scroll_policy = policy;
+                std::unique_ptr<term::Terminal_session> session;
+                Scripted_backend* backend = make_session(session, config);
+                term::Terminal_launch_config launch_config = valid_launch_config();
+                launch_config.initial_grid_size = {4, 20};
+                ok &= check(session->start(launch_config).code ==
+                        term::Terminal_session_result_code::ACCEPTED &&
+                        backend->emit_output(
+                            QByteArrayLiteral("\x1b[?1049halpha\r\nbeta\r\ngamma\r\ndelta")),
+                    "checkpoint resize fixture fills the alternate grid");
+                session->set_selection_range({
+                    {resize_case.selected_row, 0},
+                    {resize_case.selected_row, resize_case.selected_end_column},
+                    term::Terminal_selection_mode::NORMAL,
+                });
+                const term::Terminal_selection_result original_payload =
+                    session->selected_text();
+                const std::optional<term::terminal_selection_source_identity_t> source =
+                    session->published_selection_source_identity();
+                const std::optional<term::terminal_selection_drag_press_provenance_t>
+                    provenance = source.has_value()
+                        ? session->begin_selection_drag_provenance(
+                            {resize_case.selected_row, 1},
+                            *source)
+                        : std::nullopt;
+                ok &= check(original_payload.code == term::Terminal_selection_result_code::OK &&
+                        session->selection_visual_lease().has_value() &&
+                        provenance.has_value(),
+                    "checkpoint resize fixture owns attached selection and drag proofs");
+                session->set_selection_reconciliation_counters_enabled(true);
+                session->reset_selection_reconciliation_counters();
+                ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+                    "checkpoint resize fixture enters the synchronized hold");
+
+                const std::size_t resize_request_count = backend->resize_requests.size();
+                QByteArray round_trip = text_area_resize_sequence(resize_case.away_grid);
+                round_trip += text_area_resize_sequence({4, 20});
+                ok &= check(backend->emit_output(round_trip),
+                    "one callback applies both accepted resize transitions");
+                ok &= check(backend->resize_requests.size() == resize_request_count + 2U &&
+                        term::grid_sizes_match(
+                            backend->resize_requests[resize_request_count].grid_size,
+                            resize_case.away_grid) &&
+                        term::grid_sizes_match(
+                            backend->resize_requests[resize_request_count + 1U].grid_size,
+                            term::terminal_grid_size_t{4, 20}),
+                    "each accepted transition dispatches one ordered backend resize");
+                ok &= check(session->selection_reconciliation_counters()
+                        .attachment_resolver_requests == 2U,
+                    "first incompatible checkpoint proves selection and drag exactly once");
+
+                if (force_release) {
+                    ok &= check(session->force_release_synchronized_output().code ==
+                            term::Terminal_session_result_code::ACCEPTED,
+                        "forced checkpoint resize fixture publishes the hold");
+                }
+                else {
+                    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+                        "natural checkpoint resize fixture publishes the hold");
+                }
+
+                const term::Terminal_selection_drag_resolution drag_resolution =
+                    provenance.has_value()
+                        ? session->resolve_selection_drag_provenance(*provenance, false)
+                        : term::Terminal_selection_drag_resolution{};
+                const std::optional<term::Terminal_render_snapshot> released_snapshot =
+                    session->latest_render_snapshot();
+                ok &= check(session->selected_text().text == original_payload.text &&
+                        !session->selection_visual_lease().has_value() &&
+                        session->selection_anchor_domain() ==
+                            term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
+                        session->last_selection_attachment_resolution_status() ==
+                            resize_case.expected_status &&
+                        drag_resolution.status == resize_case.expected_status &&
+                        !drag_resolution.resolved_position.has_value() &&
+                        session->selection_reconciliation_counters()
+                            .attachment_resolver_requests == 2U &&
+                        released_snapshot.has_value() &&
+                        released_snapshot->selection_spans.empty(),
+                    "away-and-back checkpoint permanently detaches selection and poisons drag");
+                ok &= check(session->effective_synchronized_output_scroll_policy() == policy,
+                    "checkpoint resize fixture retains the configured release policy");
+            }
+        }
+    }
+
+    return ok;
+}
+
 bool test_selection_spans_detach_when_resize_invalidates_selected_columns()
 {
     bool ok = true;
@@ -4095,6 +5660,9 @@ bool test_selection_spans_detach_when_resize_invalidates_selected_columns()
         "resize-invalidated columns emit no stale spans");
     ok &= check(!session->selection_visual_lease().has_value(),
         "resize-invalidated columns clear retained-line visual proof");
+    ok &= check(session->last_selection_attachment_resolution_status() ==
+            term::Terminal_selection_attachment_resolution_status::GRID_REFLOW_MISMATCH,
+        "resize-invalidated columns report the grid-reflow causal resolver failure");
     ok &= check(session->selection_anchor_domain() ==
             term::Terminal_selection_anchor_domain::PAYLOAD_ONLY,
         "resize-invalidated columns mark the preserved payload as payload-only");
@@ -4154,12 +5722,15 @@ bool test_selection_anchor_domains_and_invalidation_events()
         "domain session leaves alternate content");
     const term::Terminal_selection_result alternate_payload =
         domain_session->selected_text();
-    ok &= check(alternate_payload.code == term::Terminal_selection_result_code::OK &&
+        ok &= check(alternate_payload.code == term::Terminal_selection_result_code::OK &&
         alternate_payload.text == QStringLiteral("alte") &&
         domain_session->selection_anchor_domain() ==
             term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
         !domain_session->selection_visual_lease().has_value(),
         "alternate transition detaches to explicit payload-only domain");
+    ok &= check(domain_session->last_selection_attachment_resolution_status() ==
+            term::Terminal_selection_attachment_resolution_status::BUFFER_MISMATCH,
+        "alternate transition reports the buffer causal resolver failure");
 
     domain_session->clear_selection();
     ok &= check(domain_session->selection_anchor_domain() ==
@@ -4205,10 +5776,44 @@ bool test_selection_anchor_domains_and_invalidation_events()
         ok &= check(retained_payload.code == term::Terminal_selection_result_code::OK &&
             retained_payload.text == original_payload.text &&
             eviction_session->selection_anchor_domain() ==
-                term::Terminal_selection_anchor_domain::PAYLOAD_ONLY &&
-            !eviction_session->selection_visual_lease().has_value(),
-            "oldest-row eviction preserves payload and detaches domain");
+                term::Terminal_selection_anchor_domain::PRIMARY_BACKING &&
+            eviction_session->selection_visual_lease().has_value() &&
+            eviction_session->selection_visual_lease()->selected_range.start.row == 0 &&
+            eviction_session->last_selection_attachment_resolution_status() ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED,
+            "oldest-row eviction preserves the surviving-prefix attachment");
     }
+
+    std::unique_ptr<term::Terminal_session> held_eviction_session;
+    Scripted_backend* held_eviction_backend = make_session(held_eviction_session);
+    term::Terminal_launch_config held_eviction_launch = valid_launch_config();
+    held_eviction_launch.initial_grid_size = {4, 20};
+    ok &= check(held_eviction_session->start(held_eviction_launch).code ==
+            term::Terminal_session_result_code::ACCEPTED &&
+            held_eviction_backend->emit_output(numbered_scroll_lines(10)),
+        "held selected-row eviction fixture creates scrollback");
+    held_eviction_session->set_selection_range({
+        {0, 0},
+        {0, 15},
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const QString held_eviction_payload = held_eviction_session->selected_text().text;
+    held_eviction_session->set_selection_reconciliation_counters_enabled(true);
+    held_eviction_session->reset_selection_reconciliation_counters();
+    ok &= check(held_eviction_backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+        "held selected-row eviction enters synchronized output");
+    held_eviction_session->set_scrollback_limit(0);
+    ok &= check(held_eviction_session->force_release_synchronized_output().code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "held selected-row eviction force releases final publication");
+    ok &= check(held_eviction_session->has_selection() &&
+            held_eviction_session->selected_text().text == held_eviction_payload &&
+            !held_eviction_session->selection_visual_lease().has_value() &&
+            held_eviction_session->last_selection_attachment_resolution_status() ==
+                term::Terminal_selection_attachment_resolution_status::MISSING_LINE &&
+            held_eviction_session->selection_reconciliation_counters()
+                .attachment_resolver_requests == 1U,
+        "held selected-row eviction poisons missing continuity and detaches after one forced proof");
 
     std::unique_ptr<term::Terminal_session> clear_session;
     Scripted_backend* clear_backend = make_session(clear_session);
@@ -4642,6 +6247,25 @@ bool test_public_projection_tracks_active_buffer_epoch()
         released_hidden_projection->active_buffer_epoch() ==
             pre_hidden_transition_epoch + 1U,
         "projection advances buffer epoch once for released hidden transition");
+
+    const std::uint64_t pre_checkpoint_transition_epoch =
+        released_hidden_projection.has_value()
+            ? released_hidden_projection->active_buffer_epoch()
+            : 0U;
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+        "projection checkpoint fixture enters synchronized output");
+    ok &= check(backend->emit_output(
+            QByteArrayLiteral("\x1b[?1049h\x1b[8;4;16t\x1b[?1049l")),
+        "projection checkpoint fixture crosses a buffer around accepted resize");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "projection checkpoint fixture releases synchronized output");
+    const std::optional<term::Terminal_public_projection> checkpoint_projection =
+        session->capture_public_projection_for_testing();
+    ok &= check(checkpoint_projection.has_value() &&
+            checkpoint_projection->active_buffer() == term::Terminal_buffer_id::PRIMARY &&
+            checkpoint_projection->active_buffer_epoch() ==
+                pre_checkpoint_transition_epoch + 1U,
+        "resize checkpoint does not replay the released public buffer epoch");
 
     return ok;
 }
@@ -6138,6 +7762,65 @@ bool test_public_projection_release_reconciliation()
         sticky_alternate_release->public_scroll_diagnostics.release_reconciliation_result ==
             term::Terminal_release_reconciliation_result::INCOMPATIBLE_BUFFER,
         "sticky-tail release does not apply primary tail action to alternate buffer");
+
+    return ok;
+}
+
+bool test_public_projection_geometry_invalidation_composes_with_prior_invalidation()
+{
+    bool ok = true;
+
+    const std::array prior_reasons = {
+        term::Terminal_public_projection_disable_reason::PROJECTION_INVALIDATED,
+        term::Terminal_public_projection_disable_reason::MEMORY_PRESSURE,
+    };
+    for (const term::Terminal_public_projection_disable_reason prior_reason : prior_reasons) {
+        term::Terminal_session_config config;
+        config.scrollback_limit = 20;
+        config.synchronized_output_scroll_policy =
+            term::Terminal_synchronized_output_scroll_policy::IMMEDIATE_PUBLIC_PROJECTION;
+
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        term::Terminal_launch_config launch_config = valid_launch_config();
+        launch_config.initial_grid_size = {3, 16};
+        ok &= check(session->start(launch_config).code ==
+                term::Terminal_session_result_code::ACCEPTED &&
+                backend->emit_output(numbered_scroll_lines(8)),
+            "composed geometry invalidation fixture publishes retained rows");
+        ok &= check(session->scroll_published_viewport_to_offset_from_tail(1).action ==
+                term::Terminal_viewport_scroll_action::VIEWPORT_MOVED,
+            "composed geometry invalidation fixture detaches before the hold");
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+            "composed geometry invalidation fixture enters the hold");
+
+        session->invalidate_public_projection_for_testing(prior_reason);
+        ok &= check(session->resize(QSizeF(200.0, 80.0), {4, 16}).code ==
+                term::Terminal_session_result_code::ACCEPTED &&
+                session->resize(QSizeF(200.0, 80.0), {3, 16}).code ==
+                    term::Terminal_session_result_code::ACCEPTED,
+            "composed geometry invalidation fixture resizes away and back");
+        const std::optional<term::Terminal_public_release_intent> held_intent =
+            session->public_release_intent_for_testing();
+        ok &= check(held_intent.has_value() &&
+                held_intent->public_projection_disable_reason == prior_reason &&
+                held_intent->geometry_invalidated,
+            "composed geometry invalidation retains the first reason and sticky geometry fact");
+
+        ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+            "composed geometry invalidation fixture releases the hold");
+        const std::optional<term::Terminal_render_snapshot> release =
+            session->latest_render_snapshot();
+        ok &= check(release.has_value() &&
+                release->public_scroll_diagnostics.public_projection_disable_reason ==
+                    prior_reason &&
+                release->public_scroll_diagnostics.diagnostic_reason ==
+                    term::Terminal_public_scroll_diagnostic_reason::
+                        DETACHED_ANCHOR_GEOMETRY_CHANGED &&
+                release->public_scroll_diagnostics.release_reconciliation_result ==
+                    term::Terminal_release_reconciliation_result::RETAINED_ID_BEST_EFFORT,
+            "composed geometry invalidation cannot release an exact anchor after resize away and back");
+    }
 
     return ok;
 }
@@ -13914,7 +15597,7 @@ bool test_flat_ring_history_handle_resolution_statuses()
     return ok;
 }
 
-bool test_flat_ring_retained_lookup_cache_rebuild_and_validation()
+bool test_flat_ring_direct_retained_lookup_index_and_validation()
 {
     bool ok = true;
 
@@ -13943,14 +15626,24 @@ bool test_flat_ring_retained_lookup_cache_rebuild_and_validation()
             middle_provenance.retained_line_id,
             middle_provenance.content_generation);
 
+    model.set_selection_reconciliation_counters_enabled(true);
+    model.reset_selection_reconciliation_counters();
     const term::Terminal_retained_line_lookup_result exact_lookup =
         model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, middle_handle);
+    const term::terminal_selection_reconciliation_counters_t first_lookup_counters =
+        model.selection_reconciliation_counters();
     ok &= check(exact_lookup.resolution_status ==
             term::Terminal_history_resolution_status::OK &&
         exact_lookup.exact_match &&
         exact_lookup.exact_logical_row == 1 &&
         exact_lookup.retained_line_id_match_count == 1,
-        "flat-ring exact retained-line lookup resolves from cache");
+        "flat-ring exact retained-line lookup resolves from the direct index");
+    ok &= check(first_lookup_counters.enabled &&
+            first_lookup_counters.retained_line_lookup_requests == 1U &&
+            first_lookup_counters.retained_lookup_cache_rebuilds == 0U &&
+            first_lookup_counters.retained_lookup_history_rows_visited == 0U &&
+            first_lookup_counters.retained_lookup_entry_revalidations == 3U,
+        "flat-ring direct lookup performs no retained-index rebuild or history visit");
 
     const std::optional<term::terminal_history_handle_t> ordinal_handle =
         model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, 1);
@@ -13972,11 +15665,14 @@ bool test_flat_ring_retained_lookup_cache_rebuild_and_validation()
         generation_lookup.retained_line_id_found &&
         generation_lookup.retained_line_content_generation_mismatch &&
         !generation_lookup.exact_match,
-        "flat-ring cache hit validates retained-line generation mismatch");
+        "flat-ring direct-index hit validates retained-line generation mismatch");
 
     model.discard_retained_lookup_cache_for_testing();
+    model.reset_selection_reconciliation_counters();
     const term::Terminal_retained_line_lookup_result rebuilt_lookup =
         model.retained_line_lookup(term::Terminal_buffer_id::PRIMARY, middle_handle);
+    const term::terminal_selection_reconciliation_counters_t rebuilt_counters =
+        model.selection_reconciliation_counters();
     const std::optional<term::terminal_history_handle_t> rebuilt_ordinal_handle =
         model.retained_history_handle_at_logical_row(term::Terminal_buffer_id::PRIMARY, 1);
     ok &= check(rebuilt_lookup.exact_match &&
@@ -13986,7 +15682,11 @@ bool test_flat_ring_retained_lookup_cache_rebuild_and_validation()
         rebuilt_ordinal_handle->content_generation == middle_handle.content_generation &&
         rebuilt_ordinal_handle->record_bytes >
             term::k_terminal_history_retained_identity_record_bytes,
-        "flat-ring dropped lookup caches rebuild without losing retained rows");
+        "flat-ring test-only cache discard is neutral for the direct retained index");
+    ok &= check(rebuilt_counters.retained_line_lookup_requests == 1U &&
+            rebuilt_counters.retained_lookup_cache_rebuilds == 0U &&
+            rebuilt_counters.retained_lookup_history_rows_visited == 0U,
+        "flat-ring repeated lookup remains independent of retained-history size");
     const int scrollback_before_evict = model.scrollback_size();
     model.set_scrollback_limit(scrollback_before_evict - 1);
     const term::Terminal_retained_line_lookup_result stale_first_lookup =
@@ -14022,6 +15722,55 @@ bool test_flat_ring_retained_lookup_cache_rebuild_and_validation()
             future_lookup.nearest_predecessor_logical_row == latest_logical_row,
             "flat-ring missing retained handle reconciles to nearest predecessor");
     }
+
+    model.reset_selection_reconciliation_counters();
+    model.ingest(QByteArrayView{});
+    const term::terminal_selection_reconciliation_counters_t small_history_refresh =
+        model.selection_reconciliation_counters();
+
+    term::Terminal_screen_model_config large_config = config;
+    large_config.scrollback_limit = 4096;
+    term::Terminal_screen_model large_history_model(large_config);
+    large_history_model.ingest(numbered_scroll_lines(2050));
+    ok &= check(large_history_model.scrollback_size() > 1024,
+        "flat-ring bounded-refresh fixture creates a materially larger history");
+    large_history_model.set_selection_reconciliation_counters_enabled(true);
+    large_history_model.reset_selection_reconciliation_counters();
+    large_history_model.ingest(QByteArrayView{});
+    const term::terminal_selection_reconciliation_counters_t large_history_refresh =
+        large_history_model.selection_reconciliation_counters();
+    ok &= check(small_history_refresh.retained_lookup_cache_rebuilds == 0U &&
+            small_history_refresh.retained_lookup_history_rows_visited == 0U &&
+            large_history_refresh.retained_lookup_cache_rebuilds == 0U &&
+            large_history_refresh.retained_lookup_history_rows_visited == 0U &&
+            small_history_refresh.retained_lookup_active_grid_entries_visited ==
+                large_history_refresh.retained_lookup_active_grid_entries_visited &&
+            large_history_refresh.retained_lookup_active_grid_entries_visited ==
+                static_cast<std::uint64_t>(config.grid_size.rows * 4),
+        "active-grid refresh visits only grid-bounded entries independent of history size");
+
+    term::Terminal_screen_model duplicate_model(config);
+    duplicate_model.ingest(numbered_scroll_lines(8));
+    const term::Terminal_retained_line_provenance duplicate_provenance =
+        duplicate_model.retained_line_provenance_for_testing(
+            term::Terminal_buffer_id::PRIMARY,
+            0);
+    const term::terminal_history_handle_t duplicate_handle =
+        term::terminal_history_handle_from_retained_identity(
+            duplicate_provenance.retained_line_id,
+            duplicate_provenance.content_generation);
+    duplicate_model.set_active_grid_retained_line_provenance_for_testing(
+        term::Terminal_buffer_id::PRIMARY,
+        0,
+        duplicate_provenance);
+    const term::Terminal_retained_line_lookup_result duplicate_lookup =
+        duplicate_model.retained_line_lookup(
+            term::Terminal_buffer_id::PRIMARY,
+            duplicate_handle);
+    ok &= check(duplicate_lookup.exact_match &&
+            duplicate_lookup.retained_line_id_found &&
+            duplicate_lookup.retained_line_id_match_count == 2,
+        "direct lookup sums duplicate retained IDs across history and active indexes");
 
     return ok;
 }
@@ -14770,6 +16519,7 @@ int main()
     ok &= test_backend_output_capture_failure_does_not_hide_start_failure();
     ok &= test_text_area_resize_request_updates_session_grid_in_sequence();
     ok &= test_text_area_resize_retry_publishes_geometry_metadata();
+    ok &= test_text_area_resize_retry_precedes_later_changed_request_in_same_callback();
     ok &= test_backend_output_capture_records_callback_overflow_bytes();
     ok &= test_backend_output_updates_latest_render_snapshot();
     ok &= test_selection_snapshot_and_visible_text();
@@ -14785,11 +16535,21 @@ int main()
     ok &= test_selection_spans_preserve_after_same_viewport_idempotent_selected_row_rewrite();
     ok &= test_selection_spans_preserve_during_scrollback_growth_with_retained_lines();
     ok &= test_selection_spans_detach_when_selected_row_mutates();
-    ok &= test_selection_spans_detach_when_retained_row_moves();
+    ok &= test_selection_spans_preserve_when_retained_row_moves();
+    ok &= test_selection_drag_press_provenance_composes_exact_publications();
+    ok &= test_selection_drag_press_provenance_composes_synchronized_publications();
+    ok &= test_selection_current_detach_after_accepted_primary_repaint_recovery();
+    ok &= test_selection_current_repaint_recovery_detach_classification();
     ok &= test_selection_spans_preserve_after_unchanged_synchronized_output_release();
     ok &= test_selection_spans_detach_when_synchronized_release_mutates_selected_row();
-    ok &= test_selection_spans_detach_when_synchronized_release_moves_retained_row();
+    ok &= test_selection_spans_preserve_when_synchronized_release_moves_retained_row();
     ok &= test_selection_spans_fail_closed_at_boundaries();
+    ok &= test_selection_spans_preserve_when_height_resize_keeps_selected_columns();
+    ok &= test_selection_spans_reconcile_alternate_scrolling();
+    ok &= test_selection_spans_preserve_when_clear_scrollback_keeps_active_rows();
+    ok &= test_selection_spans_reconcile_synchronized_release_policy_matrix();
+    ok &= test_selection_spans_reconcile_synchronized_text_area_resize_policy_matrix();
+    ok &= test_selection_and_drag_checkpoint_each_synchronized_text_area_resize();
     ok &= test_selection_spans_detach_when_resize_invalidates_selected_columns();
     ok &= test_selection_anchor_domains_and_invalidation_events();
     ok &= test_selection_unicode_cluster_payloads();
@@ -14808,6 +16568,7 @@ int main()
     ok &= test_public_projection_selection_mutation_is_ignored_during_hold();
     ok &= test_public_projection_entry_and_release_boundaries();
     ok &= test_public_projection_release_reconciliation();
+    ok &= test_public_projection_geometry_invalidation_composes_with_prior_invalidation();
     ok &= test_public_projection_publishes_natural_full_row_scroll();
     ok &= test_public_projection_natural_wrapped_capture_fragment_ordinals();
     ok &= test_public_projection_wrapped_fragment_release_reconciles_fragment_index();
@@ -14849,7 +16610,7 @@ int main()
     ok &= test_flat_ring_retained_history_contract_baseline();
     ok &= test_flat_ring_recovered_provenance_baseline();
     ok &= test_flat_ring_history_handle_resolution_statuses();
-    ok &= test_flat_ring_retained_lookup_cache_rebuild_and_validation();
+    ok &= test_flat_ring_direct_retained_lookup_index_and_validation();
     ok &= test_flat_ring_selection_handle_resolution_policy();
     ok &= test_flat_ring_viewport_handle_resolution_policy();
     ok &= test_flat_ring_public_projection_handle_resolution_policy();

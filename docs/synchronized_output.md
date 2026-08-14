@@ -78,6 +78,16 @@ projection disable reason when a projection had to be dropped
 (geometry invalidated, memory pressure, projection invalidated, unsupported
 buffer).
 
+Attached selections reconcile from exact retained-row provenance at the same
+release boundary under both scroll policies. Natural mode reset and forced
+release share this path. Exact selected-handle successors accumulated during
+the hold may preserve and translate the attachment. Missing, ambiguous,
+mutated, buffer-incompatible, or width-reflow evidence fails closed for that
+hold, so release retains only the immutable payload even if later state appears
+compatible again. See
+[Selection and row provenance](selection_and_provenance.md) for the complete
+attachment contract.
+
 ## Stale-Hold Recovery
 
 A hold is application-controlled, so a misbehaving program could hold

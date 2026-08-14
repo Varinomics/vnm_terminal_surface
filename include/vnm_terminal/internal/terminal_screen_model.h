@@ -5,6 +5,7 @@
 #include "vnm_terminal/internal/terminal_byte_stream_parser.h"
 #include "vnm_terminal/internal/terminal_hyperlink.h"
 #include "vnm_terminal/internal/terminal_history_ring.h"
+#include "vnm_terminal/internal/terminal_repaint_recovery.h"
 #include "vnm_terminal/internal/utf8_scan.h"
 #include "vnm_terminal/internal/terminal_input_mode.h"
 #include "vnm_terminal/internal/terminal_style.h"
@@ -23,6 +24,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace vnm_terminal::internal {
@@ -129,6 +131,77 @@ struct Terminal_retained_line_lookup_result
     bool retained_line_content_generation_mismatch = false;
 };
 
+enum class Terminal_selection_survivor_proof_result
+{
+    EXACT,
+    REPRESENTATION_MISMATCH,
+    CONTENT_GENERATION_MISMATCH,
+    PROOF_UNAVAILABLE,
+    UNMATCHED_TAIL,
+};
+
+struct terminal_selection_line_successor_t
+{
+    terminal_history_handle_t old_handle;
+    terminal_history_handle_t final_handle;
+    int                       old_logical_row = 0;
+    int                       final_logical_row = 0;
+    int                       row_delta = 0;
+};
+
+struct terminal_selection_survivor_proof_t
+{
+    terminal_history_handle_t              old_handle;
+    terminal_history_handle_t              candidate_predecessor_handle;
+    terminal_history_handle_t              final_handle;
+    Terminal_selection_survivor_proof_result result =
+        Terminal_selection_survivor_proof_result::PROOF_UNAVAILABLE;
+    int                                    old_logical_row = 0;
+    int                                    final_logical_row = 0;
+};
+
+constexpr std::uint32_t k_terminal_selection_continuity_capability_version = 1U;
+
+struct terminal_selection_continuity_capability_t
+{
+    std::uint32_t version = k_terminal_selection_continuity_capability_version;
+    std::map<std::uint64_t, std::vector<terminal_selection_line_successor_t>>
+        successors_by_old_retained_line_id;
+    std::vector<terminal_selection_survivor_proof_t> survivor_proofs;
+};
+
+enum class Terminal_selection_attachment_resolution_status
+{
+    TRANSLATED,
+    INVALID_LEASE,
+    SOURCE_MISMATCH,
+    BUFFER_MISMATCH,
+    EPOCH_MISMATCH,
+    GRID_REFLOW_MISMATCH,
+    GRID_SIZE_MISMATCH,
+    CAPABILITY_UNAVAILABLE,
+    MISSING_LINE,
+    CONTENT_GENERATION_MISMATCH,
+    DUPLICATE_RESOLUTION,
+    REORDERED_RESOLUTION,
+    NONCONTIGUOUS_RESOLUTION,
+    INCONSISTENT_ROW_DELTA,
+    ENDPOINT_UNREPRESENTABLE,
+};
+
+const char* terminal_selection_attachment_resolution_status_token(
+    Terminal_selection_attachment_resolution_status status) noexcept;
+
+struct Terminal_selection_attachment_resolution
+{
+    Terminal_selection_attachment_resolution_status status =
+        Terminal_selection_attachment_resolution_status::INVALID_LEASE;
+    std::optional<terminal_selection_visual_lease_t> translated_lease;
+    std::vector<int>                                 old_logical_rows;
+    std::vector<int>                                 final_logical_rows;
+    std::vector<int>                                 row_deltas;
+};
+
 enum class Terminal_backing_delta_kind
 {
     BACKING_UNCHANGED,
@@ -177,8 +250,44 @@ struct terminal_recovery_proposal_t
         Terminal_retained_line_provenance_source::RECOVERED_PRIMARY_REPAINT;
     int                                         candidate_visible_rows = 0;
     int                                         recovered_row_count = 0;
+    int                                         matched_prefix_rows = 0;
+    int                                         unmatched_tail_rows = 0;
     bool                                        visible_row_identity_ambiguous = false;
 };
+
+enum class Terminal_recovery_attempt_status
+{
+    ACCEPTED,
+    REJECTED,
+    CANCELLED,
+};
+
+enum class Terminal_recovery_attempt_reason
+{
+    FULL_SHIFT_MATCH,
+    PARTIAL_SHIFT_MATCH,
+    NONMATCHING,
+    REPEATED_ROW_AMBIGUOUS,
+    RECOVERY_DISABLED,
+    CANDIDATE_INVALIDATED,
+};
+
+struct terminal_recovery_attempt_t
+{
+    Terminal_recovery_attempt_status status =
+        Terminal_recovery_attempt_status::REJECTED;
+    Terminal_recovery_attempt_reason reason =
+        Terminal_recovery_attempt_reason::NONMATCHING;
+    int candidate_visible_rows = 0;
+    int recovered_row_count    = 0;
+};
+
+const char* terminal_recovery_attempt_status_token(
+    Terminal_recovery_attempt_status status) noexcept;
+const char* terminal_recovery_attempt_reason_token(
+    Terminal_recovery_attempt_reason reason) noexcept;
+
+constexpr std::size_t k_terminal_recovery_attempt_result_limit = 8U;
 
 struct Terminal_screen_model_result
 {
@@ -188,6 +297,11 @@ struct Terminal_screen_model_result
                                backing_deltas;
     std::vector<terminal_recovery_proposal_t>
                                recovery_proposals;
+    std::vector<terminal_recovery_attempt_t>
+                               recovery_attempts;
+    std::optional<terminal_selection_continuity_capability_t>
+                               selection_continuity;
+    std::uint64_t              dropped_recovery_attempts = 0U;
     bool                       dirty_rows_have_stable_mutation_identity = true;
     bool                       terminal_content_changed     = false;
     bool                       active_buffer_changed        = false;
@@ -198,6 +312,47 @@ struct Terminal_screen_model_result
     bool                       alternate_scroll_mode_changed = false;
     int                        scrollback_rows               = 0;
     int                        evicted_scrollback_rows       = 0;
+};
+
+struct terminal_screen_model_resize_transition_t
+{
+    Terminal_screen_model_result result;
+    terminal_grid_size_t         grid_size_before;
+    terminal_grid_size_t         grid_size_after;
+    std::uint64_t                sequence = 0U;
+    std::size_t                  ordinal = 0U;
+};
+
+struct terminal_screen_model_text_area_resize_request_t
+{
+    terminal_grid_size_t grid_size;
+    std::uint64_t        sequence = 0U;
+    std::size_t          ordinal = 0U;
+    bool                 model_grid_changed = false;
+};
+
+struct terminal_screen_model_trailing_changes_t
+{
+    bool terminal_content_changed     = false;
+    bool active_buffer_changed        = false;
+    bool grid_reflow_changed          = false;
+    bool viewport_changed              = false;
+    bool mode_state_changed            = false;
+    bool mouse_reporting_mode_changed  = false;
+    bool alternate_scroll_mode_changed = false;
+};
+
+struct terminal_screen_model_resize_transition_sink_t
+{
+    void* context = nullptr;
+    void (*consume)(
+        void*,
+        const terminal_screen_model_resize_transition_t&) = nullptr;
+    std::uint64_t sequence = 0U;
+    terminal_screen_model_trailing_changes_t* trailing_changes = nullptr;
+    void (*consume_text_area_resize_request)(
+        void*,
+        const terminal_screen_model_text_area_resize_request_t&) = nullptr;
 };
 
 struct Terminal_screen_model_dirty_row_stats
@@ -346,6 +501,19 @@ struct terminal_retained_history_diagnostics_t
                                prefix_plain_ascii_estimate;
 };
 
+struct terminal_selection_reconciliation_counters_t
+{
+    bool          enabled                              = false;
+    std::uint64_t retained_line_lookup_requests        = 0U;
+    std::uint64_t retained_lookup_cache_rebuilds       = 0U;
+    std::uint64_t retained_lookup_history_rows_visited = 0U;
+    std::uint64_t retained_lookup_active_grid_entries_visited = 0U;
+    std::uint64_t retained_lookup_entry_revalidations  = 0U;
+    std::uint64_t attachment_resolver_requests         = 0U;
+    std::uint64_t attachment_resolver_line_resolutions = 0U;
+    std::uint64_t successor_relation_lookups           = 0U;
+};
+
 enum class Terminal_hyperlink_compaction_allocation_phase
 {
     IDENTITY_TO_NEW_ID,
@@ -364,12 +532,19 @@ public:
     Terminal_screen_model(Terminal_screen_model&&)            = default;
     Terminal_screen_model& operator=(Terminal_screen_model&&) = default;
 
-    Terminal_screen_model_result ingest(QByteArrayView bytes);
-    Terminal_screen_model_result resize(terminal_grid_size_t grid_size);
+    Terminal_screen_model_result ingest(
+        QByteArrayView bytes,
+        const terminal_screen_model_resize_transition_sink_t*
+            resize_transition_sink = nullptr);
+    Terminal_screen_model_result resize(
+        terminal_grid_size_t grid_size,
+        const terminal_screen_model_resize_transition_sink_t*
+            resize_transition_sink = nullptr);
     Terminal_screen_model_result set_scrollback_limit(int limit);
     Terminal_screen_model_result set_color_state(Terminal_color_state state);
     void set_primary_repaint_recovery_enabled(bool enabled);
-    Terminal_screen_model_result force_release_synchronized_output();
+    Terminal_screen_model_result force_release_synchronized_output(
+        terminal_screen_model_trailing_changes_t* trailing_changes = nullptr);
 
     Terminal_render_snapshot render_snapshot(
         std::uint64_t                  sequence) const;
@@ -410,6 +585,10 @@ public:
     Terminal_retained_line_lookup_result retained_line_lookup(
         Terminal_buffer_id             buffer_id,
         terminal_history_handle_t      history_handle) const;
+    Terminal_selection_attachment_resolution resolve_selection_attachment(
+        const terminal_selection_visual_lease_t& prior_lease,
+        const terminal_selection_source_identity_t& target_source,
+        const Terminal_screen_model_result& publication) const;
     std::optional<terminal_history_handle_t> retained_history_handle_at_logical_row(
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
@@ -418,6 +597,10 @@ public:
     Terminal_retained_line_provenance retained_line_provenance_for_testing(
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
+    void set_active_grid_retained_line_provenance_for_testing(
+        Terminal_buffer_id                    buffer_id,
+        int                                   active_grid_row,
+        Terminal_retained_line_provenance     provenance);
     std::optional<terminal_retained_row_record_metadata_t>
         retained_row_record_metadata_for_testing(
             Terminal_buffer_id         buffer_id,
@@ -433,6 +616,10 @@ public:
         std::size_t                  count_cap);
     terminal_screen_model_style_table_stats_t style_table_stats() const;
     terminal_retained_history_diagnostics_t retained_history_diagnostics() const;
+    void set_selection_reconciliation_counters_enabled(bool enabled) const;
+    void reset_selection_reconciliation_counters() const;
+    terminal_selection_reconciliation_counters_t
+        selection_reconciliation_counters() const;
     void set_dirty_row_stats_enabled(bool enabled);
     Terminal_screen_model_dirty_row_stats dirty_row_stats() const;
     Terminal_screen_model_dirty_row_timeline dirty_row_timeline() const;
@@ -468,8 +655,10 @@ private:
 
     struct retained_history_append_result_t
     {
-        int  evicted_rows    = 0;
-        bool record_discarded = false;
+        std::optional<terminal_history_handle_t> appended_handle;
+        std::uint64_t                            appended_ordinal = 0U;
+        std::vector<terminal_history_handle_t>   evicted_handles;
+        bool                                     record_discarded = false;
     };
 
     struct active_grid_row_t
@@ -518,23 +707,31 @@ private:
         bool materialized() const { return borrowed_cells == nullptr; }
     };
 
-    struct retained_lookup_cache_entry_t
+    enum class Retained_lookup_location_kind
     {
-        int                       logical_row = 0;
+        PRIMARY_HISTORY,
+        ACTIVE_GRID,
+    };
+
+    struct retained_lookup_index_entry_t
+    {
+        Retained_lookup_location_kind location_kind =
+            Retained_lookup_location_kind::ACTIVE_GRID;
+        std::uint64_t             history_ordinal = 0U;
+        int                       active_grid_row = 0;
         terminal_history_handle_t history_handle;
+        terminal_history_handle_t active_grid_handle;
+        int                       history_match_count = 0;
+        int                       active_grid_match_count = 0;
         int                       row_sequence_match_count = 0;
     };
 
-    struct retained_lookup_cache_t
+    struct retained_lookup_index_t
     {
-        bool                      valid = false;
-        std::map<std::uint64_t, retained_lookup_cache_entry_t>
-                                  by_row_sequence;
-
-        bool invalidated() const
-        {
-            return !valid && by_row_sequence.empty();
-        }
+        std::map<std::uint64_t, retained_lookup_index_entry_t>
+                                  history_by_row_sequence;
+        std::map<std::uint64_t, retained_lookup_index_entry_t>
+                                  active_grid_by_row_sequence;
     };
 
     struct Retained_history_storage
@@ -543,6 +740,7 @@ private:
         {
             terminal_history_handle_t history_handle;
             Terminal_history_row_record_payload_kind payload_kind{};
+            std::uint64_t             ordinal = 0U;
         };
 
         Retained_history_storage();
@@ -565,6 +763,7 @@ private:
         mutable std::deque<retained_history_index_entry_t>
                                   index;
         mutable std::uint64_t     prefix_plain_ascii_rows = 0U;
+        std::uint64_t             next_ordinal = 0U;
         std::size_t               capacity_bytes =
                                       k_terminal_default_retained_history_capacity_bytes;
     };
@@ -616,9 +815,11 @@ private:
 
         retained_history_append_result_t append_retained_history_record(
             retained_row_record_t row);
-        int discard_oldest_retained_history_records(int row_count);
+        std::vector<terminal_history_handle_t>
+            discard_oldest_retained_history_records(int row_count);
         void clear_retained_history();
-        int prune_retained_history_rows_outside_live_window() const;
+        std::vector<terminal_history_handle_t>
+            prune_retained_history_rows_outside_live_window() const;
 
         screen_buffer_state_t          active_grid;
         Retained_history_storage
@@ -658,6 +859,20 @@ private:
         std::optional<bool>            alternate_scroll_mode_changed;
     };
 
+    struct Resize_transition_scope
+    {
+        Resize_transition_scope(
+            Terminal_screen_model& model,
+            const terminal_screen_model_resize_transition_sink_t* sink,
+            ingest_publication_t& publication);
+        ~Resize_transition_scope();
+
+        Resize_transition_scope(const Resize_transition_scope&) = delete;
+        Resize_transition_scope& operator=(const Resize_transition_scope&) = delete;
+
+        Terminal_screen_model& m_model;
+    };
+
     struct primary_repaint_recovery_candidate_t
     {
         std::vector<Terminal_screen_row> rows;
@@ -678,6 +893,7 @@ private:
         std::map<Terminal_hyperlink_id, QByteArray>
                                      hyperlink_identity_keys;
         terminal_recovery_proposal_t     metadata;
+        int                              source_scrollback_rows = 0;
     };
 
     screen_buffer_state_t make_empty_buffer_state();
@@ -974,7 +1190,7 @@ private:
     void restore_cursor();
     void clear_current_tab_stop();
     void clear_all_tab_stops();
-    void append_scrollback_row(
+    std::optional<terminal_history_handle_t> append_scrollback_row(
         const Terminal_screen_row&     row,
         Terminal_retained_line_provenance_source source =
             Terminal_retained_line_provenance_source::TERMINAL_STORAGE,
@@ -990,16 +1206,20 @@ private:
     void advance_primary_repaint_recovery_resize_guard();
     void begin_primary_repaint_recovery_candidate();
     void finish_primary_repaint_recovery_candidate(bool discard_if_no_match);
-    void cancel_primary_repaint_recovery_candidate();
+    void cancel_primary_repaint_recovery_candidate(
+        Terminal_recovery_attempt_reason reason =
+            Terminal_recovery_attempt_reason::CANDIDATE_INVALIDATED);
     void accept_primary_repaint_recovery_proposal(
         const primary_repaint_recovery_proposal_t&     proposal);
 
     std::optional<primary_repaint_recovery_proposal_t>
         primary_repaint_recovery_proposal(
-            const primary_repaint_recovery_candidate_t&    candidate) const;
+            const primary_repaint_recovery_candidate_t&    candidate,
+            const terminal_repaint_recovery_shift_result_t& shift) const;
 
-    int primary_repaint_recovery_shift_rows(
+    terminal_repaint_recovery_shift_result_t primary_repaint_recovery_shift(
         const primary_repaint_recovery_candidate_t&    candidate) const;
+    void record_recovery_attempt(terminal_recovery_attempt_t attempt);
 
     bool row_has_visible_text(
         const Terminal_screen_row&     row) const;
@@ -1023,10 +1243,28 @@ private:
     void clear_dirty();
     void clear_backing_deltas();
     void clear_recovery_proposals();
+    void clear_selection_continuity();
+    terminal_selection_continuity_capability_t& selection_continuity();
+    void record_selection_successor(
+        terminal_selection_line_successor_t successor);
+    void finalize_selection_continuity_rows();
     void adopt_publication_changes(ingest_publication_t&& publication);
+    void accumulate_publication_changes(
+        ingest_publication_t&       target,
+        const ingest_publication_t& source) const;
+    void accumulate_pending_changes(ingest_publication_t& publication) const;
+    void assign_trailing_changes(
+        const ingest_publication_t&                    publication,
+        terminal_screen_model_trailing_changes_t* trailing_changes) const;
+    void emit_pending_resize_transition();
+    void emit_text_area_resize_request(
+        terminal_grid_size_t grid_size,
+        bool                 model_grid_changed);
+    Terminal_screen_model_result finalize_resize_transition_result(
+        const ingest_publication_t& publication);
     Terminal_screen_model_result finalize_result(
         Terminal_screen_model_result   result,
-        result_change_overrides_t      overrides = {}) const;
+        result_change_overrides_t      overrides = {});
     int compatibility_evicted_scrollback_rows() const;
     void record_backing_delta(terminal_backing_delta_t delta);
     void record_active_grid_delta(
@@ -1167,19 +1405,29 @@ private:
         terminal_selection_line_lease_t descriptor,
         int&                           logical_row) const;
 
-    void invalidate_retained_lookup_caches() const;
-    void rebuild_retained_lookup_cache(
+    void refresh_active_grid_retained_lookup_index(
+        Terminal_buffer_id             buffer_id);
+    void refresh_active_grid_retained_lookup_indexes();
+    void insert_primary_history_retained_lookup(
+        terminal_history_handle_t      handle,
+        std::uint64_t                  history_ordinal);
+    void erase_retained_lookup_entry(
+        Terminal_buffer_id             buffer_id,
+        std::uint64_t                  retained_line_id);
+    const retained_lookup_index_t& retained_lookup_index(
         Terminal_buffer_id             buffer_id) const;
-    const retained_lookup_cache_t& retained_lookup_cache(
-        Terminal_buffer_id             buffer_id) const;
-    retained_lookup_cache_t& mutable_retained_lookup_cache(
-        Terminal_buffer_id             buffer_id) const;
+    retained_lookup_index_t& mutable_retained_lookup_index(
+        Terminal_buffer_id             buffer_id);
     std::optional<terminal_history_handle_t> retained_lookup_cache_live_handle(
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
-    Terminal_history_resolution_status retained_lookup_cache_entry_status(
+    std::optional<int> retained_lookup_index_entry_logical_row(
         Terminal_buffer_id             buffer_id,
-        const retained_lookup_cache_entry_t& entry) const;
+        const retained_lookup_index_entry_t& entry) const;
+    Terminal_history_resolution_status retained_lookup_index_entry_status(
+        Terminal_buffer_id             buffer_id,
+        const retained_lookup_index_entry_t& entry,
+        int                            logical_row) const;
 
     bool selection_line_lease_logical_rows(
         Terminal_buffer_id             buffer_id,
@@ -1223,6 +1471,9 @@ private:
                                     m_backing_deltas;
     std::vector<terminal_recovery_proposal_t>
                                     m_recovery_proposals;
+    std::vector<terminal_recovery_attempt_t>
+                                    m_recovery_attempts;
+    std::uint64_t                   m_dropped_recovery_attempts = 0U;
     int                             m_last_dirty_row = -1;
     std::vector<bool>               m_tab_stops;
     saved_cursor_state_t            m_saved_cursor;
@@ -1240,8 +1491,21 @@ private:
     std::optional<Terminal_hyperlink_compaction_allocation_phase>
                                      m_fail_next_hyperlink_compaction_allocation_phase_for_testing;
     std::uint64_t                   m_next_retained_line_id = 1U;
-    mutable retained_lookup_cache_t m_primary_retained_lookup_cache;
-    mutable retained_lookup_cache_t m_alternate_retained_lookup_cache;
+    retained_lookup_index_t         m_primary_retained_lookup_index;
+    retained_lookup_index_t         m_alternate_retained_lookup_index;
+    std::optional<terminal_selection_continuity_capability_t>
+                                    m_selection_continuity;
+    bool                            m_selection_continuity_published = false;
+    const terminal_screen_model_resize_transition_sink_t*
+                                    m_resize_transition_sink = nullptr;
+    ingest_publication_t*           m_resize_transition_publication = nullptr;
+    std::optional<std::pair<terminal_grid_size_t, terminal_grid_size_t>>
+                                    m_pending_resize_transition;
+    std::size_t                     m_resize_transition_ordinal = 0U;
+    std::size_t                     m_text_area_resize_request_ordinal = 0U;
+    bool                            m_skip_next_resize_transition_accumulation = false;
+    mutable terminal_selection_reconciliation_counters_t
+                                     m_selection_reconciliation_counters;
     std::map<QByteArray, Terminal_hyperlink_id>
                                      m_active_hyperlink_ids;
     int                             m_scroll_top = 0;
@@ -1273,6 +1537,7 @@ private:
     bool                            m_synchronized_mode_state_changed = false;
     bool                            m_synchronized_mouse_reporting_mode_changed = false;
     bool                            m_synchronized_alternate_scroll_mode_changed = false;
+    ingest_publication_t            m_synchronized_selection_changes;
     int                             m_scrollback_evicted_rows = 0;
     int                             m_primary_repaint_recovery_resize_guard_remaining = 0;
     primary_repaint_recovery_candidate_t

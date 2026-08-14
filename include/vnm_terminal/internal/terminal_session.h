@@ -41,6 +41,23 @@ using Terminal_ime_commit_result  = Terminal_input_event_result;
 using Terminal_paste_text_result  = Terminal_input_event_result;
 using Terminal_focus_event_result = Terminal_input_event_result;
 
+struct terminal_selection_drag_press_provenance_t
+{
+    terminal_grid_position_t               original_position;
+    terminal_history_handle_t              retained_line_handle;
+    terminal_selection_source_identity_t   source;
+};
+
+struct Terminal_selection_drag_resolution
+{
+    Terminal_selection_attachment_resolution_status status =
+        Terminal_selection_attachment_resolution_status::INVALID_LEASE;
+    std::optional<terminal_grid_position_t>           resolved_position;
+    std::optional<Terminal_selection_range>           reconciled_proven_range;
+    std::optional<terminal_selection_source_identity_t>
+                                                       source;
+};
+
 struct Terminal_session_profile_stats
 {
     bool                       enabled                               = false;
@@ -218,7 +235,18 @@ public:
     Terminal_selection_result selected_text() const;
     Terminal_selection_anchor_domain selection_anchor_domain() const;
     std::optional<terminal_selection_visual_lease_t> selection_visual_lease() const;
+    std::optional<Terminal_selection_attachment_resolution_status>
+        last_selection_attachment_resolution_status() const;
     std::optional<terminal_selection_source_identity_t> published_selection_source_identity() const;
+    std::optional<terminal_selection_drag_press_provenance_t>
+        begin_selection_drag_provenance(
+            terminal_grid_position_t               original_position,
+            terminal_selection_source_identity_t   source);
+    Terminal_selection_drag_resolution resolve_selection_drag_provenance(
+        const terminal_selection_drag_press_provenance_t& provenance,
+        bool require_established_selection);
+    void record_selection_drag_proven_range();
+    void clear_selection_drag_provenance();
     void set_search_query(QString query);
     void clear_search();
     bool search_next();
@@ -275,6 +303,10 @@ public:
     void set_profile_stats_enabled(bool enabled);
     Terminal_screen_model_profile_stats model_profile_stats() const;
     terminal_retained_history_diagnostics_t retained_history_diagnostics() const;
+    void set_selection_reconciliation_counters_enabled(bool enabled);
+    void reset_selection_reconciliation_counters();
+    terminal_selection_reconciliation_counters_t
+        selection_reconciliation_counters() const;
     Terminal_session_profile_stats profile_stats() const;
     std::optional<Terminal_backend_exit> exit_status() const;
 
@@ -329,6 +361,18 @@ private:
         std::uint64_t                      sequence = 0U;
     };
 
+    struct Resize_transition_context
+    {
+        Terminal_session*                            session = nullptr;
+        Terminal_resize_transaction*                 host_resize = nullptr;
+        std::optional<Live_primary_viewport_anchor>  detached_viewport_anchor;
+        std::vector<terminal_grid_size_t>             parser_resize_requests;
+        std::optional<Terminal_backend_error>         backend_error;
+        std::uint64_t                                 sequence = 0U;
+        bool                                          transition_consumed = false;
+        bool                                          render_snapshot_metadata_changed = false;
+    };
+
     Terminal_session_result enqueue_command(
         Terminal_session_command   command);
 
@@ -367,9 +411,20 @@ private:
         bool                                   render_snapshot_available,
         bool                                   grid_size_changed,
         bool                                   geometry_transition_warrants_publication,
-        const Terminal_screen_model_result&    model_result,
-        const Terminal_viewport_state&         previous_viewport,
-        terminal_grid_size_t                   previous_grid_size);
+        const Terminal_screen_model_result&    model_result);
+
+    static void consume_screen_model_resize_transition_callback(
+        void* context,
+        const terminal_screen_model_resize_transition_t& transition);
+    void consume_screen_model_resize_transition(
+        Resize_transition_context&                         context,
+        const terminal_screen_model_resize_transition_t&  transition);
+    static void consume_screen_model_text_area_resize_request_callback(
+        void* context,
+        const terminal_screen_model_text_area_resize_request_t& request);
+    void consume_screen_model_text_area_resize_request(
+        Resize_transition_context&                              context,
+        const terminal_screen_model_text_area_resize_request_t& request);
 
     Terminal_session_result process_interrupt_command(
         const Terminal_session_command&        command);
@@ -483,11 +538,12 @@ private:
         bool                                   synchronized_output_release,
         bool                                   terminal_content_changed);
 
-    bool handle_parser_actions(
+    void handle_parser_actions(
         std::uint64_t                          sequence,
-        const Terminal_screen_model_result&    result);
+        const Terminal_screen_model_result&    result,
+        std::span<const terminal_grid_size_t>  consumed_resize_requests);
 
-    bool apply_text_area_resize_request(
+    bool retry_text_area_resize_request(
         std::uint64_t              sequence,
         terminal_grid_size_t       grid_size);
 
@@ -497,7 +553,8 @@ private:
     void sync_viewport_from_model_result(
         const Terminal_screen_model_result&    result,
         std::optional<Live_primary_viewport_anchor>
-                                             detached_viewport_anchor);
+                                             detached_viewport_anchor,
+        bool                                 advance_publication_generations = true);
     std::optional<Live_primary_viewport_anchor>
         capture_live_primary_detached_viewport_anchor() const;
     void resolve_live_primary_detached_viewport_anchor(
@@ -520,7 +577,68 @@ private:
     void advance_selection_content_basis_for_model_result(
         const Terminal_screen_model_result&    result,
         const Terminal_viewport_state&         previous_viewport,
-        terminal_grid_size_t                   previous_grid_size);
+        terminal_grid_size_t                   previous_grid_size,
+        std::optional<Terminal_selection_attachment_resolution_status>
+                                               forced_failure = std::nullopt,
+        std::optional<Terminal_selection_attachment_resolution_status>
+                                               forced_drag_failure = std::nullopt,
+        bool                                   cache_drag_success = false);
+    struct Synchronized_continuity_track
+    {
+        terminal_selection_visual_lease_t      original_lease;
+        std::vector<terminal_history_handle_t> latest_handles;
+        std::optional<Terminal_selection_attachment_resolution_status>
+                                               failure;
+    };
+
+    struct Synchronized_selection_continuity_hold
+    {
+        std::optional<Synchronized_continuity_track> selection;
+        std::optional<Synchronized_continuity_track> drag;
+    };
+
+    struct Selection_drag_continuity
+    {
+        struct Cached_success
+        {
+            terminal_selection_visual_lease_t    anchor_lease;
+            terminal_selection_source_identity_t source;
+            std::optional<terminal_selection_visual_lease_t>
+                                                 proven_selection_lease;
+        };
+
+        terminal_selection_drag_press_provenance_t provenance;
+        terminal_selection_visual_lease_t          anchor_lease;
+        std::optional<Terminal_selection_attachment_resolution_status>
+                                                   failure;
+        std::optional<Cached_success>               cached_success;
+        std::uint64_t                              durable_payload_identity     = 0U;
+        std::uint64_t                              provisional_payload_identity = 0U;
+        bool                                       established = false;
+    };
+
+    void begin_synchronized_selection_continuity_hold();
+    void accumulate_synchronized_selection_continuity(
+        const Terminal_screen_model_result& result);
+    void accumulate_synchronized_continuity_track(
+        Synchronized_continuity_track&       track,
+        const Terminal_screen_model_result& result,
+        const char*                         domain);
+    Terminal_screen_model_result compose_synchronized_selection_release(
+        Terminal_screen_model_result result);
+    std::optional<Terminal_selection_attachment_resolution_status>
+        synchronized_selection_release_failure() const;
+    void rebase_synchronized_selection_continuity_hold();
+    void reset_synchronized_selection_continuity_hold();
+
+    void advance_selection_drag_continuity(
+        const Terminal_screen_model_result&       result,
+        const terminal_selection_source_identity_t& target_source,
+        std::optional<Terminal_selection_attachment_resolution_status>
+                                               forced_failure = std::nullopt,
+        bool                                   cache_success = false);
+    void refresh_selection_drag_cached_success_range(
+        const terminal_selection_source_identity_t& target_source);
 
     void record_blocked_synchronized_row_origin_change(
         const Terminal_screen_model_result&    result);
@@ -755,7 +873,12 @@ private:
     Selection_contract_controller                          m_selection;
     Terminal_search_controller                             m_search;
     terminal_selection_content_basis_t                     m_selection_content_basis;
+    std::optional<Synchronized_selection_continuity_hold>
+                                                           m_synchronized_selection_continuity_hold;
+    std::optional<Selection_drag_continuity>                m_selection_drag_continuity;
     Terminal_session_profile_stats                         m_profile_stats;
+    std::optional<Terminal_selection_attachment_resolution_status>
+                                                           m_last_selection_attachment_resolution_status;
     Terminal_buffer_id                         m_selection_buffer_id =
         Terminal_buffer_id::PRIMARY;
     bool                                                   m_deferred_viewport_changed = false;
