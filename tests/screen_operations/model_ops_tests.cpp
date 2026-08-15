@@ -4925,6 +4925,46 @@ bool test_replies_and_cursor_save_restore()
     return ok;
 }
 
+// The veto lives in the parser branch, so it is pinned at the model layer where
+// the decision is made, not only through the host suites above it.
+bool test_text_area_resize_policy_gates_the_request()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model_config config;
+    config.grid_size               = term::terminal_grid_size_t{7, 13};
+    config.scrollback_limit        = 16;
+    config.tab_width               = 4;
+    config.text_area_resize_policy = term::Terminal_text_area_resize_policy::DISABLED;
+    term::Terminal_screen_model model(config);
+
+    term::Terminal_screen_model_result result = model.ingest(QByteArrayLiteral("\x1b[8;5;9t"));
+    ok &= check(model.grid_size().rows == 7 && model.grid_size().columns == 13,
+        "disabled text-area resize policy keeps the configured grid");
+    ok &= check(notifications_in(result).empty(),
+        "disabled text-area resize policy emits no resize notification");
+    ok &= check(replies_in(result).empty(),
+        "disabled text-area resize policy emits no terminal reply");
+    ok &= check(diagnostic_count(result) == 1,
+        "disabled text-area resize policy records one diagnostic");
+
+    // The sequence is ignored, not fatal: parsing continues from the next byte.
+    result = model.ingest(QByteArrayLiteral("ok"));
+    ok &= check(model.row_text(0) == QStringLiteral("ok"),
+        "disabled text-area resize policy keeps interpreting following output");
+
+    // Handing geometry back re-enables the request on the same model.
+    model.set_text_area_resize_policy(
+        term::Terminal_text_area_resize_policy::APPLICATION_CONTROLLED);
+    result = model.ingest(QByteArrayLiteral("\x1b[8;5;9t"));
+    ok &= check(model.grid_size().rows == 5 && model.grid_size().columns == 9,
+        "application-controlled text-area resize policy applies the requested grid");
+    ok &= check(notifications_in(result).size() == 1U,
+        "application-controlled text-area resize policy emits one resize notification");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -4968,5 +5008,6 @@ int main()
     ok &= test_recovery_disabled_scrollback_limit_changes_do_not_grow_retained_history();
     ok &= test_retained_line_content_generation_mutations();
     ok &= test_replies_and_cursor_save_restore();
+    ok &= test_text_area_resize_policy_gates_the_request();
     return ok ? 0 : 1;
 }

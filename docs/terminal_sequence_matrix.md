@@ -344,6 +344,38 @@ reply: DECRQM private mode reply
 diagnostic: ignored DEC private mode diagnostic
 oracle: product-decision-vnm-terminal
 
+## csi-window-op-8
+
+id: csi-window-op-8
+family: CSI
+sequence: CSI 8 ; rows ; columns t
+feature: xterm text-area resize request
+status: supported
+action_category: host-policy-request
+behavior: applies the requested grid at the sequence point and notifies the host under the application-controlled policy; ignored with no grid change under the disabled policy
+host_policy: textAreaResizePolicy selects application-controlled or disabled; hosts disable it while the window manager owns their geometry
+payload_limit: grid must be within the supported screen model bounds
+recovery: malformed parameters discard the sequence; unsupported grid or disabled policy leaves the grid unchanged and the parser continues
+reply: no-reply
+diagnostic: malformed sequence diagnostic; unsupported sequence diagnostic for a rejected grid or a disabled policy
+oracle: product-decision-vnm-terminal
+
+## csi-window-op-18
+
+id: csi-window-op-18
+family: CSI
+sequence: CSI 18 t
+feature: xterm text-area size report
+status: supported
+action_category: terminal-reply
+behavior: reports the current grid without changing terminal state
+host_policy: none
+payload_limit: none
+recovery: malformed parameters discard the sequence and the parser continues
+reply: text-area size reply through same backend write path
+diagnostic: malformed sequence diagnostic; unsupported sequence diagnostic for other window operations
+oracle: xterm-409-reference
+
 ## dec-private-5
 
 id: dec-private-5

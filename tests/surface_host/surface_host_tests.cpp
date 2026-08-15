@@ -1344,6 +1344,148 @@ bool test_start_maps_output_to_snapshot(QGuiApplication& app)
     return ok;
 }
 
+// CSI 8 ; rows ; columns t moves the grid at the parser sequence point, so a
+// host that cannot honor it is left rendering into a text area that no longer
+// matches the item. refresh_grid_from_item_geometry() puts the grid back on the
+// geometry the host can actually display.
+bool test_honored_text_area_resize_can_be_returned_to_item_geometry(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    int  signal_count   = 0;
+    int  signal_rows    = 0;
+    int  signal_columns = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_requested,
+        &fixture.surface,
+        [&signal_count, &signal_rows, &signal_columns](int rows, int columns) {
+            ++signal_count;
+            signal_rows    = rows;
+            signal_columns = columns;
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    pump_events(app);
+    ok &= check(started, "declined text-area resize fixture starts");
+
+    const int geometry_rows    = fixture.surface.rows();
+    const int geometry_columns = fixture.surface.columns();
+    ok &= check(geometry_rows > 0 && geometry_columns > 0,
+        "declined text-area resize fixture derives a grid from item geometry");
+    ok &= check(geometry_rows != 24 || geometry_columns != 80,
+        "declined text-area resize fixture does not already sit on the requested grid");
+
+    const std::size_t resize_count_before = backend_ptr->resize_requests.size();
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[8;24;80t"));
+    pump_events(app);
+
+    // Under the default policy the grid follows the request even though the
+    // item never changed size, and the host is told so it can respond.
+    ok &= check(fixture.surface.rows() == 24 && fixture.surface.columns() == 80,
+        "text-area resize request moves the grid off the item geometry");
+    ok &= check(backend_ptr->resize_requests.size() > resize_count_before &&
+        backend_ptr->resize_requests.back().grid_size.rows == 24 &&
+        backend_ptr->resize_requests.back().grid_size.columns == 80,
+        "text-area resize request reaches the backend before the host responds");
+    ok &= check(signal_count == 1 && signal_rows == 24 && signal_columns == 80,
+        "text-area resize request notifies the host once with rows then columns");
+
+    const std::size_t resize_count_after_request = backend_ptr->resize_requests.size();
+    fixture.surface.refresh_grid_from_item_geometry();
+    pump_events(app);
+
+    ok &= check(fixture.surface.rows() == geometry_rows &&
+        fixture.surface.columns() == geometry_columns,
+        "refresh_grid_from_item_geometry returns the grid to the item geometry");
+    ok &= check(backend_ptr->resize_requests.size() > resize_count_after_request &&
+        backend_ptr->resize_requests.back().grid_size.rows == geometry_rows &&
+        backend_ptr->resize_requests.back().grid_size.columns == geometry_columns,
+        "refresh_grid_from_item_geometry resizes the backend back to the item geometry");
+
+    return ok;
+}
+
+// A host whose geometry belongs to the window manager declares the policy up
+// front, so the request is never applied. Reverting it afterwards would resize
+// the pty twice per request and would never converge against a client that
+// re-asserts its size on every SIGWINCH.
+bool test_disabled_text_area_resize_policy_ignores_the_request(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_text_area_resize_policy(
+        VNM_TerminalSurface::Text_area_resize_policy::DISABLED);
+    pump_events(app);
+
+    int signal_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_requested,
+        &fixture.surface,
+        [&signal_count](int, int) {
+            ++signal_count;
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    pump_events(app);
+    ok &= check(started, "disabled text-area resize fixture starts");
+
+    const int geometry_rows    = fixture.surface.rows();
+    const int geometry_columns = fixture.surface.columns();
+    ok &= check(geometry_rows != 24 || geometry_columns != 80,
+        "disabled text-area resize fixture does not already sit on the requested grid");
+
+    const std::size_t resize_count_before = backend_ptr->resize_requests.size();
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[8;24;80t"));
+    pump_events(app);
+
+    ok &= check(fixture.surface.rows() == geometry_rows &&
+        fixture.surface.columns() == geometry_columns,
+        "disabled policy keeps the grid on the item geometry");
+    ok &= check(backend_ptr->resize_requests.size() == resize_count_before,
+        "disabled policy issues no backend resize for the request");
+    ok &= check(signal_count == 0,
+        "disabled policy does not ask the host to resize");
+
+    // Following output in the same stream still lands, so the sequence is
+    // ignored rather than breaking the parse.
+    backend_ptr->emit_output(QByteArrayLiteral("after-ignored-resize"));
+    pump_events(app);
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(
+        snapshot != nullptr &&
+        snapshot_contains_text(*snapshot, QStringLiteral("after-ignored-resize")),
+        "disabled policy keeps interpreting output after the ignored request");
+
+    // Handing geometry back re-enables the request.
+    fixture.surface.set_text_area_resize_policy(
+        VNM_TerminalSurface::Text_area_resize_policy::APPLICATION_CONTROLLED);
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[8;24;80t"));
+    pump_events(app);
+    ok &= check(fixture.surface.rows() == 24 && fixture.surface.columns() == 80,
+        "restoring the application-controlled policy honors the request again");
+    ok &= check(signal_count == 1,
+        "restoring the application-controlled policy notifies the host again");
+
+    return ok;
+}
+
 bool test_surface_polish_refreshes_metrics_after_window_dpr_change(QGuiApplication& app)
 {
     (void)app;
@@ -10939,6 +11081,119 @@ bool test_synchronized_output_scroll_policy_property(QGuiApplication& app)
     return ok;
 }
 
+bool test_text_area_resize_policy_property(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    const QMetaObject* meta_object = fixture.surface.metaObject();
+    const int property_index = meta_object->indexOfProperty("textAreaResizePolicy");
+    ok &= check(property_index >= 0, "textAreaResizePolicy property is registered");
+    if (property_index < 0) {
+        return ok;
+    }
+
+    const QMetaProperty property = meta_object->property(property_index);
+    int changed_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_policy_changed,
+        &fixture.surface,
+        [&changed_count] {
+            ++changed_count;
+        });
+
+    ok &= check(property.read(&fixture.surface).toInt() ==
+        static_cast<int>(
+            VNM_TerminalSurface::Text_area_resize_policy::APPLICATION_CONTROLLED),
+        "textAreaResizePolicy property reads the application-controlled default");
+    ok &= check(property.write(
+            &fixture.surface,
+            QVariant::fromValue(static_cast<int>(
+                VNM_TerminalSurface::Text_area_resize_policy::DISABLED))),
+        "textAreaResizePolicy property writes the disabled policy");
+    ok &= check(fixture.surface.text_area_resize_policy() ==
+        VNM_TerminalSurface::Text_area_resize_policy::DISABLED,
+        "textAreaResizePolicy property updates the public getter");
+    ok &= check(property.read(&fixture.surface).toInt() ==
+        static_cast<int>(VNM_TerminalSurface::Text_area_resize_policy::DISABLED),
+        "textAreaResizePolicy property rereads the disabled policy");
+    ok &= check(changed_count == 1,
+        "textAreaResizePolicy property write emits notify once");
+
+    ok &= check(property.write(
+            &fixture.surface,
+            QVariant::fromValue(static_cast<int>(
+                VNM_TerminalSurface::Text_area_resize_policy::DISABLED))),
+        "textAreaResizePolicy property accepts idempotent write");
+    ok &= check(changed_count == 1,
+        "textAreaResizePolicy idempotent write emits no notify");
+
+    return ok;
+}
+
+// The direction a host actually takes at runtime: the session is already live
+// and serving requests when the window manager takes the geometry, so the veto
+// has to reach the running screen model, not just a session built with it.
+bool test_text_area_resize_policy_disables_on_a_live_session(QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    pump_events(app);
+
+    int signal_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_requested,
+        &fixture.surface,
+        [&signal_count](int, int) {
+            ++signal_count;
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    pump_events(app);
+    ok &= check(started, "live-session policy fixture starts");
+
+    // Honored while the host still owns its geometry.
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[8;24;80t"));
+    pump_events(app);
+    ok &= check(fixture.surface.rows() == 24 && fixture.surface.columns() == 80,
+        "live session honors the request under the application-controlled policy");
+    ok &= check(signal_count == 1,
+        "live session notifies the host under the application-controlled policy");
+
+    fixture.surface.refresh_grid_from_item_geometry();
+    pump_events(app);
+    const int geometry_rows    = fixture.surface.rows();
+    const int geometry_columns = fixture.surface.columns();
+    ok &= check(geometry_rows != 24 || geometry_columns != 80,
+        "live-session policy fixture returns to a grid unlike the requested one");
+
+    // Now the window manager takes the geometry mid-session.
+    fixture.surface.set_text_area_resize_policy(
+        VNM_TerminalSurface::Text_area_resize_policy::DISABLED);
+    const std::size_t resize_count_before = backend_ptr->resize_requests.size();
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[8;24;80t"));
+    pump_events(app);
+
+    ok &= check(fixture.surface.rows() == geometry_rows &&
+        fixture.surface.columns() == geometry_columns,
+        "disabling on a live session keeps the grid on the item geometry");
+    ok &= check(backend_ptr->resize_requests.size() == resize_count_before,
+        "disabling on a live session issues no backend resize");
+    ok &= check(signal_count == 1,
+        "disabling on a live session stops asking the host to resize");
+
+    return ok;
+}
+
 bool test_interaction_diagnostics_has_single_surface_owner(QGuiApplication& app)
 {
     Q_UNUSED(app)
@@ -16719,6 +16974,8 @@ int main(int argc, char** argv)
 
     bool ok = true;
     ok &= test_start_maps_output_to_snapshot(app);
+    ok &= test_honored_text_area_resize_can_be_returned_to_item_geometry(app);
+    ok &= test_disabled_text_area_resize_policy_ignores_the_request(app);
     ok &= test_surface_polish_refreshes_metrics_after_window_dpr_change(app);
     ok &= test_surface_session_snapshot_burst_coalesces_to_latest_render(app);
     ok &= test_surface_polish_drains_queued_backend_output_before_render_capture(app);
@@ -16756,6 +17013,8 @@ int main(int argc, char** argv)
     ok &= test_keyboard_printable_controls_and_prompt_path(app);
     ok &= test_copy_shortcut_policy(app);
     ok &= test_synchronized_output_scroll_policy_property(app);
+    ok &= test_text_area_resize_policy_property(app);
+    ok &= test_text_area_resize_policy_disables_on_a_live_session(app);
     ok &= test_interaction_diagnostics_has_single_surface_owner(app);
     ok &= test_scroll_diagnostic_enum_name_table(app);
     ok &= test_no_payload_copy_fallback_states(app);

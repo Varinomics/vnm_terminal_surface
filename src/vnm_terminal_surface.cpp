@@ -1323,6 +1323,19 @@ term::Terminal_synchronized_output_scroll_policy terminal_synchronized_output_sc
         DEFER_UNTIL_CONTENT_PUBLICATION;
 }
 
+term::Terminal_text_area_resize_policy terminal_text_area_resize_policy(
+    VNM_TerminalSurface::Text_area_resize_policy policy)
+{
+    switch (policy) {
+        case VNM_TerminalSurface::Text_area_resize_policy::APPLICATION_CONTROLLED:
+            return term::Terminal_text_area_resize_policy::APPLICATION_CONTROLLED;
+        case VNM_TerminalSurface::Text_area_resize_policy::DISABLED:
+            return term::Terminal_text_area_resize_policy::DISABLED;
+    }
+
+    return term::Terminal_text_area_resize_policy::APPLICATION_CONTROLLED;
+}
+
 QString surface_synchronized_output_scroll_policy_name(
     VNM_TerminalSurface::Synchronized_output_scroll_policy policy)
 {
@@ -3523,6 +3536,29 @@ void VNM_TerminalSurface::set_synchronized_output_scroll_policy(
             terminal_synchronized_output_scroll_policy(policy));
     }
     emit synchronized_output_scroll_policy_changed();
+}
+
+VNM_TerminalSurface::Text_area_resize_policy
+VNM_TerminalSurface::text_area_resize_policy() const
+{
+    return m_text_area_resize_policy;
+}
+
+void VNM_TerminalSurface::set_text_area_resize_policy(Text_area_resize_policy policy)
+{
+    if (m_text_area_resize_policy == policy) {
+        return;
+    }
+
+    m_text_area_resize_policy = policy;
+    if (m_private->session != nullptr) {
+        m_private->session->set_text_area_resize_policy(
+            terminal_text_area_resize_policy(policy));
+        // The session drains pending work across that call, which can advance
+        // the model and publish a snapshot, so republish before the notify.
+        sync_from_session();
+    }
+    emit text_area_resize_policy_changed();
 }
 
 VNM_TerminalSurface::Mouse_reporting_policy VNM_TerminalSurface::mouse_reporting_policy() const
@@ -6852,6 +6888,13 @@ void VNM_TerminalSurface::refresh_grid_metrics_if_device_pixel_ratio_changed()
     refresh_grid_metrics();
 }
 
+void VNM_TerminalSurface::refresh_grid_from_item_geometry()
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    refresh_grid_metrics();
+}
+
 void VNM_TerminalSurface::set_grid_size(int rows, int columns)
 {
     if (m_rows == rows && m_columns == columns) {
@@ -7132,6 +7175,8 @@ bool VNM_TerminalSurface::start_process_with_backend(
     session_config.selection_viewport_projection_enabled = true;
     session_config.synchronized_output_scroll_policy =
         terminal_synchronized_output_scroll_policy(m_synchronized_output_scroll_policy);
+    session_config.text_area_resize_policy =
+        terminal_text_area_resize_policy(m_text_area_resize_policy);
     session_config.recover_scrollback_from_primary_repaints =
         m_primary_repaint_recovery_enabled;
     session_config.bell_policy =

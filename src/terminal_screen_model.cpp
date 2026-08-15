@@ -1239,6 +1239,18 @@ void Terminal_screen_model::apply_control_sequence(
                                     unsupported();
                                     return;
                                 }
+                                // The host owns its geometry right now, so the
+                                // text area cannot move. Ignoring it here keeps
+                                // the grid on the item; applying it and letting
+                                // the host revert would resize the pty twice per
+                                // request and never converge against a client
+                                // that re-asserts its size.
+                                if (m_config.text_area_resize_policy ==
+                                    Terminal_text_area_resize_policy::DISABLED)
+                                {
+                                    unsupported();
+                                    return;
+                                }
                                 const terminal_grid_size_t grid_size{rows, columns};
                                 if (!is_terminal_screen_model_grid_size_supported(grid_size)) {
                                     unsupported();
@@ -3608,6 +3620,12 @@ Terminal_screen_model_result Terminal_screen_model::set_color_state(Terminal_col
     }
 
     return finalize_result(std::move(result));
+}
+
+void Terminal_screen_model::set_text_area_resize_policy(
+    Terminal_text_area_resize_policy policy)
+{
+    m_config.text_area_resize_policy = policy;
 }
 
 void Terminal_screen_model::set_primary_repaint_recovery_enabled(bool enabled)

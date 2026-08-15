@@ -66,6 +66,13 @@ Writable Qt properties:
   rows. Policy changes during an active hold are latched: the current hold keeps
   its entry policy, a diagnostic is recorded, and the next hold uses the new
   policy.
+- `textAreaResizePolicy` is `APPLICATION_CONTROLLED` (the default) or
+  `DISABLED`, and controls whether XTWINOPS `CSI 8 ; rows ; columns t` may move
+  the text area. Hosts set `DISABLED` whenever the window manager owns their
+  window geometry rather than they do, typically maximized, fullscreen, or
+  minimized. Requests are then ignored: no grid change, no backend resize, and
+  no `text_area_resize_requested()` signal. The policy applies to a live
+  session, so hosts update it as their window state changes.
 - `mouseReportingPolicy` is `APPLICATION_CONTROLLED` or `DISABLED`. With the
   application-controlled policy, mouse-reporting terminal modes receive mouse
   input. Holding Shift forces local selection when no terminal mouse grab is
@@ -238,6 +245,12 @@ Invokable methods:
   hiding unpublished model changes, it reads from the visible render snapshot
   so host copy behavior matches what the user can see.
 - `clear_selection()` clears local selection and drag state.
+- `refresh_grid_from_item_geometry()` re-derives the terminal grid from the
+  current item geometry, resizing the model and the backend when the two have
+  diverged. It issues no resize when they already agree, though it still
+  re-resolves render state, so it is not free. See the
+  `text_area_resize_requested()` notes under [Runtime Signals](#runtime-signals)
+  for when a host needs it.
 - `set_search_query(QString query)` sets the literal terminal query;
   `clear_search()` clears it. `search_next()` and `search_previous()` navigate
   with wraparound and reveal the current match, returning `false` when no match
@@ -396,6 +409,22 @@ xterm text-area resize requests. The terminal model applies the requested grid
 at the parser sequence point so following output is interpreted against the new
 text area. Hosts that choose to honor this signal should resize the surrounding
 item/window so the visual shell mirrors the terminal grid.
+
+Because the grid moves at the sequence point, the decision cannot be answered
+from the signal handler; by then it has already been applied and the backend
+resized. A host that cannot move its text area therefore declares
+`textAreaResizePolicy` DISABLED in advance, and the request is ignored outright:
+no grid change, no backend resize, and no signal. Applying it and having the
+host revert would resize the pty twice per request and would never converge
+against a client that re-asserts its size on every resize it is told about.
+
+A host that honors the signal but cannot land on the requested geometry, for
+example when the window manager clamps the resize or the target equals the
+current size, calls `refresh_grid_from_item_geometry()` to put the grid back on
+the item. No geometry change arrives to reconcile it otherwise. That call
+resizes synchronously, so invoking it from the signal handler nests inside
+session notification delivery and can reorder later host-visible signals from
+that same delivery; deferring it to the next event loop turn avoids that.
 
 ## Event And Render Overrides
 

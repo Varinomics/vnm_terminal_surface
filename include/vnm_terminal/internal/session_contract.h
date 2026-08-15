@@ -201,6 +201,8 @@ struct Terminal_session_config
     bool                            selection_viewport_projection_enabled    = false;
     Terminal_synchronized_output_scroll_policy synchronized_output_scroll_policy =
         Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION;
+    Terminal_text_area_resize_policy text_area_resize_policy =
+        Terminal_text_area_resize_policy::APPLICATION_CONTROLLED;
     std::shared_ptr<Terminal_transcript_recorder> transcript_recorder;
 };
 

@@ -2848,6 +2848,29 @@ void Terminal_session::set_color_state(Terminal_color_state state)
     }
 }
 
+void Terminal_session::set_text_area_resize_policy(
+    Terminal_text_area_resize_policy policy)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    if (m_config.text_area_resize_policy == policy) {
+        return;
+    }
+
+    // Assigned before the drain, unlike the settings either side of this one.
+    // The policy answers "can the host move its window right now", so bytes
+    // that arrived before the host lost its geometry but have not been parsed
+    // yet must still be parsed under the new policy. Draining first would honor
+    // a queued request against a window that can no longer move.
+    m_config.text_area_resize_policy = policy;
+    if (m_screen_model.has_value()) {
+        m_screen_model->set_text_area_resize_policy(policy);
+    }
+
+    drain_backend_callback_commands();
+    process_pending_commands();
+}
+
 void Terminal_session::set_primary_repaint_recovery_enabled(bool enabled)
 {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
@@ -5569,6 +5592,7 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     screen_config.retain_structural_actions = m_config.capture_last_model_ingest_result;
     screen_config.recover_scrollback_from_primary_repaints =
         m_config.recover_scrollback_from_primary_repaints;
+    screen_config.text_area_resize_policy = m_config.text_area_resize_policy;
     m_screen_model.emplace(screen_config);
     if (m_color_state.has_value()) {
         m_screen_model->set_color_state(*m_color_state);

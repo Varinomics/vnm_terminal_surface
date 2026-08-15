@@ -144,6 +144,19 @@ enum class Terminal_synchronized_output_scroll_policy
     IMMEDIATE_PUBLIC_PROJECTION,
 };
 
+// Whether XTWINOPS `CSI 8 ; rows ; columns t` may move the text area.
+//
+// The grid is applied at the parser sequence point, so following output in the
+// same chunk is interpreted against the new text area and the decision cannot
+// be deferred to the host. A host whose window geometry is owned by the window
+// manager (maximized, fullscreen, minimized) therefore declares DISABLED up
+// front, and the request is ignored rather than applied and then reverted.
+enum class Terminal_text_area_resize_policy
+{
+    APPLICATION_CONTROLLED,
+    DISABLED,
+};
+
 enum class Terminal_synchronized_output_policy_change_event
 {
     NONE,

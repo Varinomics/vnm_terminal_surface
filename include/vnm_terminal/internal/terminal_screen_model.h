@@ -67,6 +67,8 @@ struct Terminal_screen_model_config
     bool                   retain_structural_actions                = true;
     std::size_t            retained_history_capacity_bytes =
                                k_terminal_default_retained_history_capacity_bytes;
+    Terminal_text_area_resize_policy text_area_resize_policy =
+        Terminal_text_area_resize_policy::APPLICATION_CONTROLLED;
 };
 
 enum class Terminal_screen_model_config_status
@@ -543,6 +545,7 @@ public:
     Terminal_screen_model_result set_scrollback_limit(int limit);
     Terminal_screen_model_result set_color_state(Terminal_color_state state);
     void set_primary_repaint_recovery_enabled(bool enabled);
+    void set_text_area_resize_policy(Terminal_text_area_resize_policy policy);
     Terminal_screen_model_result force_release_synchronized_output(
         terminal_screen_model_trailing_changes_t* trailing_changes = nullptr);
 

@@ -72,6 +72,9 @@ class VNM_TerminalSurface : public QQuickItem
         READ synchronized_output_scroll_policy
         WRITE set_synchronized_output_scroll_policy
         NOTIFY synchronized_output_scroll_policy_changed)
+    Q_PROPERTY(Text_area_resize_policy textAreaResizePolicy
+        READ text_area_resize_policy WRITE set_text_area_resize_policy
+        NOTIFY text_area_resize_policy_changed)
     Q_PROPERTY(Mouse_reporting_policy mouseReportingPolicy
         READ mouse_reporting_policy WRITE set_mouse_reporting_policy
         NOTIFY mouse_reporting_policy_changed)
@@ -168,6 +171,13 @@ public:
         IMMEDIATE_PUBLIC_PROJECTION,
     };
     Q_ENUM(Synchronized_output_scroll_policy)
+
+    enum class Text_area_resize_policy
+    {
+        APPLICATION_CONTROLLED,
+        DISABLED,
+    };
+    Q_ENUM(Text_area_resize_policy)
 
     enum class Alternate_screen_wheel_policy
     {
@@ -407,6 +417,22 @@ public:
     void set_synchronized_output_scroll_policy(
         Synchronized_output_scroll_policy policy);
 
+    /**
+     * Whether XTWINOPS `CSI 8 ; rows ; columns t` may move the text area.
+     *
+     * The grid is applied at the parser sequence point, so following output in
+     * the same chunk is interpreted against the new text area. The decision
+     * cannot be deferred to a `text_area_resize_requested()` handler, which is
+     * why this is declared up front rather than answered per request.
+     *
+     * A host sets DISABLED whenever its window geometry belongs to the window
+     * manager rather than to it (maximized, fullscreen, minimized). Requests
+     * are then ignored: no grid change, no pty resize, and no
+     * `text_area_resize_requested()` signal. The default,
+     * APPLICATION_CONTROLLED, honors the request and signals the host.
+     */
+    Text_area_resize_policy text_area_resize_policy() const;
+    void set_text_area_resize_policy(Text_area_resize_policy policy);
     Mouse_reporting_policy mouse_reporting_policy() const;
     void set_mouse_reporting_policy(Mouse_reporting_policy policy);
 
@@ -493,6 +519,26 @@ public:
     vnm_terminal::Terminal_message_submission_result submit_utf8_message(
         QByteArray message_utf8);
     Q_INVOKABLE bool    paste_clipboard_text();
+    /**
+     * Re-derives the terminal grid from the current item geometry, resizing the
+     * model and the backend when the two have diverged. It issues no resize when
+     * the grid already matches the item, though it still re-resolves render
+     * state, so it is not free.
+     *
+     * Hosts that honor `text_area_resize_requested()` need this when resizing
+     * the shell did not land on the requested geometry, for example when the
+     * window manager clamps the request: the model is on the requested grid,
+     * the item is not, and no geometry change arrives to reconcile them. Hosts
+     * that never want the text area moved should set
+     * `textAreaResizePolicy` to DISABLED instead, which stops the request being
+     * applied at all.
+     *
+     * This resizes synchronously, so calling it from a
+     * `text_area_resize_requested()` handler nests inside session notification
+     * delivery and can reorder later host-visible signals from that same
+     * delivery. Deferring it to the next event loop turn avoids that.
+     */
+    Q_INVOKABLE void    refresh_grid_from_item_geometry();
     // Scrolls only when the published public viewport is primary-screen
     // scrollback and can be updated immediately. Under the default synchronized
     // output policy, hidden synchronized output remains deferred and returns
@@ -545,6 +591,7 @@ signals:
     void primary_repaint_recovery_enabled_changed();
     void synchronized_output_stale_timeout_ms_changed();
     void synchronized_output_scroll_policy_changed();
+    void text_area_resize_policy_changed();
     void mouse_reporting_policy_changed();
     void copy_shortcut_policy_changed();
     void copy_on_select_changed();
@@ -768,6 +815,8 @@ private:
     bool                     m_interaction_diagnostics_enabled      = false;
     QString                  m_interaction_diagnostics_error;
     int                      m_synchronized_output_stale_timeout_ms = 1000;
+    Text_area_resize_policy m_text_area_resize_policy =
+        Text_area_resize_policy::APPLICATION_CONTROLLED;
     Synchronized_output_scroll_policy m_synchronized_output_scroll_policy =
         Synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION;
     Mouse_reporting_policy   m_mouse_reporting_policy =
