@@ -1446,6 +1446,20 @@ private:
         std::uint64_t output_sequence_before_write)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
+        // A write that only completed once the child was gone cannot have
+        // caused the exit, so it must not reclassify one. On Windows a
+        // successful WriteFile means the bytes reached the input pipe, not that
+        // the child read them: a child that stops reading leaves the write
+        // blocked, and closing the pseudoconsole during teardown can let that
+        // write complete successfully with the bytes never consumed. The exit
+        // waiter sets m_stopping as soon as the child exits and before it
+        // closes the pseudoconsole, so it is already set by the time such a
+        // write unblocks. Without this the reported exit reason would depend on
+        // whether the operating system happened to drain the pipe.
+        if (m_stopping) {
+            return;
+        }
+
         if (!m_exit_reported &&
             m_interrupt_delivery_exit_code_pending)
         {
