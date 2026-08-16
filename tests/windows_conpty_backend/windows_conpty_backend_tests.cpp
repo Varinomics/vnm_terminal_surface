@@ -42,11 +42,24 @@ namespace term = vnm_terminal::internal;
 
 namespace {
 
-constexpr std::chrono::milliseconds k_wait_timeout(10000);
+// Bounds how long a scenario waits for the backend to deliver expected output.
+// It is a liveness bound, not a latency assertion: a healthy round trip takes
+// milliseconds, and a genuine product hang never completes, so the value only
+// has to exceed the worst scheduling delay a loaded host can impose. Ten
+// seconds was not enough under CPU saturation with ASan.
+constexpr std::chrono::milliseconds k_wait_timeout(20000);
+// Filesystem markers are written by a freshly started PowerShell fixture, so
+// this covers process cold start rather than backend responsiveness. Ten
+// seconds proved too tight on loaded ASan CI runners. Only five call sites use
+// it, and each returns as soon as its marker appears, so the extra tolerance
+// costs nothing on a healthy run and stays inside the 120 second CTest budget
+// even if several fixtures genuinely fail.
+constexpr std::chrono::milliseconds k_file_marker_wait_timeout(20000);
 constexpr std::chrono::milliseconds k_conhost_exit_timeout(1000);
 // The slowest recorded cold ASan completion of this entire test executable was
-// 57.73 seconds. Bound the first scenario's progressing-output phase at 60
-// seconds, leaving half of the 120-second CTest budget for the remaining cases.
+// 57.73 seconds, and it reached 80 seconds under full CPU saturation. Bound the
+// first scenario's progressing-output phase at 60 seconds, comfortably inside
+// the 300-second CTest budget even when the rest of the suite runs slowly.
 constexpr std::chrono::milliseconds k_progressing_output_absolute_timeout(60000);
 
 using vnm_terminal::test_helpers::check;
@@ -101,7 +114,8 @@ int diagnostic_count(const term::Terminal_screen_model_result& result)
 
 bool wait_for_file(const QString& path)
 {
-    const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
+    const auto deadline =
+        std::chrono::steady_clock::now() + k_file_marker_wait_timeout;
     do {
         if (QFileInfo::exists(path)) {
             return true;
@@ -671,6 +685,19 @@ public:
         return m_output_events.size();
     }
 
+    // Blocks until at least `minimum` output events have been observed. Lets a
+    // test take producer start-up latency out of a bounded measurement window
+    // instead of assuming a background thread gets scheduled in time.
+    bool wait_for_output_event_count(
+        std::size_t                minimum,
+        std::chrono::milliseconds  timeout)
+    {
+        std::unique_lock<std::mutex> lock(m_mutex);
+        return m_cv.wait_for(lock, timeout, [&] {
+            return m_output_events.size() >= minimum;
+        });
+    }
+
     bool output_precedes_exit(const QByteArray& needle)
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1110,30 +1137,45 @@ bool write_tight_paused_output_powershell_script(
 
 bool test_progressing_output_exit_wait_has_absolute_bound()
 {
+    // The bound under test is the absolute one, so the window has to be wide
+    // enough that a 5 ms producer cannot be starved out of it. An earlier 75 ms
+    // window failed intermittently on loaded ASan CI runners, once with zero
+    // output events, because the producer thread had not been scheduled at all
+    // before the window closed.
+    constexpr auto k_producer_interval = std::chrono::milliseconds(5);
+    constexpr auto k_absolute_bound    = std::chrono::milliseconds(500);
+
     Backend_capture capture;
     term::Terminal_backend_callbacks callbacks = capture.callbacks();
     std::atomic_bool keep_producing = true;
     std::thread producer([&] {
         while (keep_producing.load()) {
             callbacks.output_received(QByteArrayLiteral("progress"));
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            std::this_thread::sleep_for(k_producer_interval);
         }
     });
 
+    // Take thread start-up out of the measured window: only once output is
+    // genuinely flowing does the bounded wait mean what the test claims.
+    const bool producing = capture.wait_for_output_event_count(1U, k_wait_timeout);
+    const std::size_t events_before_wait = capture.output_event_count_snapshot();
+
     const auto wait_started = std::chrono::steady_clock::now();
-    const bool exited = capture.wait_for_exit_while_output_progresses(
-        std::chrono::milliseconds(75));
+    const bool exited = capture.wait_for_exit_while_output_progresses(k_absolute_bound);
     const auto wait_elapsed = std::chrono::steady_clock::now() - wait_started;
+    const std::size_t events_after_wait = capture.output_event_count_snapshot();
     keep_producing.store(false);
     producer.join();
 
-    bool ok  = check(!exited,
+    bool ok  = check(producing,
+        "progressing output fixture produces output before the bounded wait");
+    ok      &= check(!exited,
         "progressing output without exit reaches its absolute wait bound");
-    ok      &= check(capture.output_event_count_snapshot() > 1U,
+    ok      &= check(events_after_wait > events_before_wait,
         "absolute exit wait bound is exercised while output keeps progressing");
     ok      &= check(
-        wait_elapsed >= std::chrono::milliseconds(50) &&
-        wait_elapsed <  std::chrono::seconds(2),
+        wait_elapsed >= k_absolute_bound / 2 &&
+        wait_elapsed <  k_absolute_bound + std::chrono::seconds(2),
         "absolute exit wait bound returns near its configured deadline");
     return ok;
 }

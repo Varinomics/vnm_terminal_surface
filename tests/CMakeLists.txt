@@ -1840,7 +1840,13 @@ if(WIN32)
 
     set_tests_properties(vnm_terminal_windows_conpty_backend PROPERTIES
         LABELS "conformance;windows;conpty"
-        TIMEOUT 120
+        # This suite drives real ConPTY sessions and PowerShell fixtures, so its
+        # runtime tracks host load rather than its own work: ~10s idle, ~58s on a
+        # cold ASan run, and ~80s measured under full CPU saturation. At 120s a
+        # busy CI runner was hitting the ceiling and reporting a timeout rather
+        # than a result, which cost reruns. A real hang is still caught, just
+        # with headroom over the slowest legitimate run.
+        TIMEOUT 300
     )
 endif()
 
