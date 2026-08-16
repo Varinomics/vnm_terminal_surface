@@ -2649,6 +2649,22 @@ bool test_queued_interrupt_after_exit_130_write_stays_natural(const QString& fix
     const term::Terminal_backend_result interrupt_result = backend->interrupt();
     ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
         "ConPTY backend accepts interrupt queued behind ordinary input");
+
+    // The scenario only means anything while the ordinary write is still
+    // blocking, because that is what keeps the interrupt queued and
+    // undelivered. The child has stopped reading, but the pseudoconsole host
+    // keeps draining the pipe into its own input buffer, so a long enough stall
+    // here would let the write finish and the interrupt reach the child, at
+    // which point classifying the exit as INTERRUPTED is correct and the
+    // assertion below would be measuring the wrong thing. Say so explicitly
+    // rather than leaving it looking like a backend misclassification.
+    if (backend->write_state_for_testing().in_flight_write_bytes == 0U) {
+        std::cerr
+            << "note: ordinary write drained before the exit gate was released, "
+               "so the queued interrupt was deliverable and this scenario no "
+               "longer isolates an undelivered interrupt\n";
+    }
+
     ok &= check(write_gate_file(gate_path),
         "exit-130 blocked-input fixture exit gate is released");
     ok &= check(capture.wait_for_exit(), "exit-130 blocked-input fixture exits");

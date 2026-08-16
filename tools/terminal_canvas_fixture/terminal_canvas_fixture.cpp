@@ -724,7 +724,17 @@ bool write_checkpoint_file(const std::string& path)
 
 bool wait_for_gate_file(const std::string& path)
 {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    // A hang guard, not a latency bound, so it has to outlast everything the
+    // test does between this process reaching the gate and the test writing it.
+    // Ten seconds was not enough: this deadline starts when the fixture reaches
+    // the gate, while the test's own waits only start once it observes the
+    // preceding output, and on a loaded host the delivery latency between those
+    // two points is added to whatever the test then does. Giving up early makes
+    // the fixture return an error code instead of its scripted exit code, which
+    // fails the test somewhere unrelated to the cause. Kept well inside the
+    // suite's CTest budget so a genuine hang still reports this clean failure
+    // rather than being killed.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
     do {
         std::ifstream file(path, std::ios::binary);
         if (file.good()) {
