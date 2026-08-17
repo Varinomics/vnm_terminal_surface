@@ -70,7 +70,10 @@ QFont vnm_terminal_font(QString family, qreal pixel_size)
     font.setStyleHint(QFont::Monospace);
     font.setFixedPitch(true);
     if (std::isfinite(pixel_size) && pixel_size > 0.0) {
-        font.setPixelSize(std::max(1, static_cast<int>(std::round(pixel_size))));
+        const qreal bounded_pixel_size = std::min(
+            pixel_size,
+            static_cast<qreal>(k_vnm_terminal_max_font_pixel_size));
+        font.setPixelSize(std::max(1, static_cast<int>(std::round(bounded_pixel_size))));
     }
     return font;
 }

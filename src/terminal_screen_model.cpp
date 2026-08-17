@@ -6465,6 +6465,19 @@ Terminal_hyperlink_id Terminal_screen_model::active_hyperlink_id_for_identity(
         return found->second;
     }
 
+    // Interning is driven by terminal output, and an OSC 8 start does not have
+    // to print anything: a producer can replace the current link indefinitely
+    // and leave every superseded identity behind, because the only routine
+    // pruning happens on a grid resize or a scrollback-limit change. Prune on
+    // the way in too, the way the style table compacts before it grows, so what
+    // the registry holds tracks the links the screen still shows rather than
+    // every link that has ever been announced. Rows that scrolled away carry
+    // their own identity copies, so an entry dropped here costs the reuse of
+    // its id and not the link.
+    if (m_active_hyperlink_ids.size() >= m_next_hyperlink_prune_count) {
+        retain_referenced_active_hyperlink_ids();
+    }
+
     const Terminal_hyperlink_id hyperlink_id = next_hyperlink_id();
     m_active_hyperlink_ids.emplace(identity_key, hyperlink_id);
     return hyperlink_id;
@@ -6488,6 +6501,7 @@ void Terminal_screen_model::retain_referenced_active_hyperlink_ids()
         return;
     }
 
+    const std::size_t identities_before_pruning = m_active_hyperlink_ids.size();
     std::set<Terminal_hyperlink_id> live_ids;
 
     const auto collect_cells = [&](const std::vector<Terminal_screen_row>& rows) {
@@ -6518,6 +6532,14 @@ void Terminal_screen_model::retain_referenced_active_hyperlink_ids()
             ++it;
         }
     }
+
+    // The next prune is measured from what survived this one, so a screen that
+    // legitimately holds many links does not re-scan on every new identity, and
+    // a screen that holds none goes back to the starting allowance.
+    m_next_hyperlink_prune_count =
+        m_active_hyperlink_ids.size() + k_terminal_hyperlink_prune_threshold;
+    m_hyperlink_table_stats.reclaimed_hyperlink_ids += static_cast<std::uint64_t>(
+        identities_before_pruning - m_active_hyperlink_ids.size());
 }
 
 void Terminal_screen_model::fail_hyperlink_compaction_allocation_if_requested(
@@ -6708,6 +6730,8 @@ void Terminal_screen_model::compact_hyperlink_ids()
     ++m_hyperlink_table_stats.compaction_count;
     m_hyperlink_table_stats.reclaimed_hyperlink_ids += reclaimed_hyperlink_ids;
     m_next_hyperlink_id = next_hyperlink_id;
+    m_next_hyperlink_prune_count =
+        m_active_hyperlink_ids.size() + k_terminal_hyperlink_prune_threshold;
 }
 
 Terminal_screen_model::retained_row_record_t Terminal_screen_model::seal_retained_row_record(

@@ -35,12 +35,17 @@ constexpr int k_win32_scan_return        = 28;
 constexpr int k_win32_shift_pressed      = 0x0010;
 #endif
 
-QString sanitize_paste_text(QString text)
+// Stops once the sanitized text is longer than `stop_beyond_units`, so a caller
+// that is only going to refuse an over-budget paste does not pay for copying all
+// of it first. One unit past the budget is enough to keep the answer the same:
+// the encoded form is never shorter than the code-unit count it comes from, so
+// the caller's byte check still refuses the truncated result.
+QString sanitize_paste_text(QString text, qsizetype stop_beyond_units)
 {
     QString sanitized;
-    sanitized.reserve(text.size());
+    sanitized.reserve(std::min(text.size(), stop_beyond_units));
 
-    for (qsizetype i = 0; i < text.size(); ++i) {
+    for (qsizetype i = 0; i < text.size() && sanitized.size() <= stop_beyond_units; ++i) {
         const QChar  ch   = text.at(i);
         const ushort code = ch.unicode();
         if (code == u'\r') {
@@ -654,11 +659,12 @@ QByteArray encode_terminal_mouse_event(
 QByteArray encode_terminal_paste_text(
     QString                        text,
     Terminal_input_mode_state      modes,
-    Terminal_paste_framing_policy  framing_policy)
+    Terminal_paste_framing_policy  framing_policy,
+    qsizetype                      reject_beyond_bytes)
 {
     VNM_TERMINAL_PROFILE_SCOPE("encode_terminal_paste_text");
 
-    const QString sanitized = sanitize_paste_text(std::move(text));
+    const QString sanitized = sanitize_paste_text(std::move(text), reject_beyond_bytes);
 #if defined(Q_OS_WIN)
     const QByteArray body = encode_windows_paste_body(sanitized);
 #else

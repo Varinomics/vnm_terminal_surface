@@ -22,6 +22,12 @@ constexpr std::size_t k_csi_parameter_group_limit            = 128U;
 constexpr std::size_t k_csi_parameter_atom_limit             = 256U;
 constexpr std::size_t k_csi_parameter_digit_limit            = 9U;
 constexpr std::size_t k_title_scalar_limit                   = 4096U;
+// An OSC 8 body is not a string the terminal prints and forgets: the screen
+// model interns every distinct hyperlink identity it produces, so the body
+// length multiplies whatever that registry retains. The generic megabyte OSC
+// payload bound is the wrong scale for that, and no real target needs more
+// than a few kilobytes.
+constexpr std::size_t k_hyperlink_identity_limit_bytes       = 8192U;
 
 enum class Parser_action_kind
 {

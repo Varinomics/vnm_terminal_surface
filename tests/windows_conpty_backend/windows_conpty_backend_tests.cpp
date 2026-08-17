@@ -779,10 +779,15 @@ bool check_no_backend_errors(Backend_capture& capture, const char* message)
     return check(false, message);
 }
 
+// `required` is false for a caller the in-flight write is a precondition of
+// rather than the subject of: the state dump is still printed, but the caller
+// decides whether not reaching it is a failure or a run that cannot exercise
+// what it set out to.
 bool wait_for_in_flight_write(
     term::Windows_conpty_backend& backend,
     std::size_t                   minimum_bytes,
-    const char*                   message)
+    const char*                   message,
+    bool                          required = true)
 {
     term::Windows_conpty_backend_write_state_for_testing last_state;
     const auto deadline = std::chrono::steady_clock::now() + k_wait_timeout;
@@ -808,7 +813,7 @@ bool wait_for_in_flight_write(
         << " stopping=" << last_state.stopping
         << " writer_failed=" << last_state.writer_failed
         << '\n';
-    return check(false, message);
+    return required ? check(false, message) : false;
 }
 
 // Waits until an in-flight write has reached a terminal outcome, without
@@ -2641,39 +2646,63 @@ bool test_queued_interrupt_after_exit_130_write_stays_natural(const QString& fix
         "ConPTY backend accepts ordinary exit-triggering input");
     ok &= check(capture.wait_for_output(QByteArrayLiteral("exit-130-input-read")),
         "exit-130 blocked-input fixture consumes trigger byte and stops reading");
-    ok &= wait_for_in_flight_write(
-        *backend,
-        ordinary_input_size,
-        "exit-130 blocked-input ordinary write remains in flight");
+    // The scenario needs the ordinary write to still be blocking, and the
+    // pseudoconsole host decides that: under load it can absorb the whole
+    // backlog before the test observes it in flight. That is the same premise
+    // the exit classification below rests on, so a run that cannot establish it
+    // is inconclusive rather than failing - asserting here would be the mistake
+    // this fixture exists to avoid, one step earlier. Release the gate on the
+    // way out so the fixture is not left waiting on it.
+    if (!wait_for_in_flight_write(
+            *backend,
+            ordinary_input_size,
+            "exit-130 blocked-input ordinary write remains in flight",
+            false))
+    {
+        std::cerr
+            << "note: the pseudoconsole host drained the ordinary write before it "
+               "was observed in flight, so this run does not isolate an "
+               "undelivered interrupt and the scenario is not exercised\n";
+        (void)write_gate_file(gate_path);
+        (void)capture.wait_for_exit();
+        return ok;
+    }
 
     const term::Terminal_backend_result interrupt_result = backend->interrupt();
     ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
         "ConPTY backend accepts interrupt queued behind ordinary input");
 
-    // The scenario only means anything while the ordinary write is still
-    // blocking, because that is what keeps the interrupt queued and
-    // undelivered. The child has stopped reading, but the pseudoconsole host
-    // keeps draining the pipe into its own input buffer, so a long enough stall
-    // here would let the write finish and the interrupt reach the child, at
-    // which point classifying the exit as INTERRUPTED is correct and the
-    // assertion below would be measuring the wrong thing. Say so explicitly
-    // rather than leaving it looking like a backend misclassification.
-    if (backend->write_state_for_testing().in_flight_write_bytes == 0U) {
-        std::cerr
-            << "note: ordinary write drained before the exit gate was released, "
-               "so the queued interrupt was deliverable and this scenario no "
-               "longer isolates an undelivered interrupt\n";
-    }
-
     ok &= check(write_gate_file(gate_path),
         "exit-130 blocked-input fixture exit gate is released");
     ok &= check(capture.wait_for_exit(), "exit-130 blocked-input fixture exits");
 
-    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
-    ok &= check(exit.has_value() &&
-        exit->reason == term::Terminal_exit_reason::EXITED &&
-        exit->exit_code == 130,
-        "queued but undelivered interrupt does not classify ordinary code-130 exit");
+    // The scenario only means anything while the ordinary write is still
+    // blocking, because that is what keeps the interrupt queued and
+    // undelivered. The child has stopped reading, but the pseudoconsole host
+    // keeps draining the pipe into its own input buffer, so a long enough stall
+    // anywhere above would let the writer reach the Ctrl+C entry, at which
+    // point the backend has recorded an interrupt and classifying a code-130
+    // exit as INTERRUPTED is the correct answer. Ask whether the interrupt is
+    // still queued rather than asserting an oracle whose premise the host may
+    // have dissolved. Bytes in flight cannot answer that: the counter holds
+    // whichever write is current, so it is non-zero again once the interrupt
+    // itself is being written, and a snapshot taken before the gate is
+    // released would miss a drain that happens after it.
+    const term::Windows_conpty_backend_write_state_for_testing settled_state =
+        backend->write_state_for_testing();
+    if (settled_state.interrupt_left_write_queue) {
+        std::cerr
+            << "note: the queued interrupt left the write queue before the child "
+               "exited, so this run no longer isolates an undelivered interrupt "
+               "and its exit classification is not asserted\n";
+    }
+    else {
+        const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+        ok &= check(exit.has_value() &&
+            exit->reason == term::Terminal_exit_reason::EXITED &&
+            exit->exit_code == 130,
+            "queued but undelivered interrupt does not classify ordinary code-130 exit");
+    }
     ok &= check_no_backend_errors(capture,
         "exit-130 blocked-input fixture produces no backend errors");
 

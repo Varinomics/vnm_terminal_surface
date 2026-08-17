@@ -35,8 +35,9 @@ threads report output, exit, and errors back through queued session callbacks.
 Writable Qt properties:
 
 - `fontFamily` and `fontSize` select the terminal font. Positive font sizes are
-  rounded to an integer pixel size. Font, device-pixel-ratio, and item geometry
-  changes recompute terminal grid metrics.
+  rounded to an integer pixel size, up to a supported maximum of 1024 pixels;
+  a larger size is accepted and bounded to that maximum. Font,
+  device-pixel-ratio, and item geometry changes recompute terminal grid metrics.
 - `colorScheme` selects a bundled color scheme by name (the Windows Terminal
   built-in set; `Classic` is the default). The scheme drives the 16 ANSI colors
   plus the default foreground, background, cursor, and selection colors, and is

@@ -51,10 +51,18 @@ jobs:
     runs-on: windows-2022
 
     steps:
+      # actions/checkout leaves its credential in the checkout's git config so
+      # later git commands can authenticate, and removes it in a post-job step.
+      # This job configures and compiles pull-request-controlled surface source
+      # in between, and CMake is itself executable repository code, so the app
+      # checkout's token would be readable by the very code under test. Nothing
+      # in this job runs git, so none of the three checkouts needs the
+      # credential to survive the step that created it.
       - name: Checkout surface
         uses: actions/checkout@v4
         with:
           path: vnm_terminal_surface
+          persist-credentials: false
 
       - name: Checkout app
         uses: actions/checkout@v4
@@ -63,6 +71,7 @@ jobs:
           path: vnm_terminal
           ref: master
           token: ${{ secrets.VARINOMICS_REPO_READ_TOKEN || github.token }}
+          persist-credentials: false
 
       - name: Checkout chrome
         uses: actions/checkout@v4
@@ -70,6 +79,7 @@ jobs:
           repository: imakris/vnm_qml_chrome
           path: vnm_qml_chrome
           ref: master
+          persist-credentials: false
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4.3.1

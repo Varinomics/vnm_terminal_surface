@@ -1115,7 +1115,14 @@ Terminal_byte_stream_parser::try_consume_escape_or_csi(
 
         // Real sequences carry one or two intermediates, so this bounds a
         // stream that would otherwise grow the pending prefix without end.
-        const qsizetype sequence_size = final_offset - offset + 1;
+        // The trailing byte only counts once it has actually arrived: when the
+        // chunk ends on an intermediate there is no final byte yet, and
+        // charging for one discards a prefix that is exactly at the limit. The
+        // CSI branch above measures its incomplete case the same way.
+        const qsizetype sequence_size =
+            final_offset < bytes.size()
+                ? final_offset - offset + 1
+                : bytes.size() - offset;
         if (sequence_size > static_cast<qsizetype>(k_control_sequence_pending_limit_bytes)) {
             actions.push_back(make_unsupported_sequence_diagnostic(
                 QStringLiteral("ESC"),
@@ -1432,6 +1439,20 @@ void Terminal_byte_stream_parser::handle_osc_payload(
         osc_command_body(payload, QByteArrayLiteral("8"));
         hyperlink.has_value())
     {
+        // A body past the hyperlink bound is refused rather than truncated, and
+        // the current link is cleared with it: leaving the previous link in
+        // place would attribute the text that follows to a target the producer
+        // did not name.
+        if (static_cast<std::size_t>(hyperlink->size()) > k_hyperlink_identity_limit_bytes) {
+            actions.push_back(make_payload_limit_diagnostic(
+                QStringLiteral("OSC 8"),
+                static_cast<std::size_t>(hyperlink->size()),
+                k_hyperlink_identity_limit_bytes,
+                Parser_sequence_family::OSC));
+            actions.push_back(make_hyperlink_action({}));
+            return;
+        }
+
         const qsizetype separator = hyperlink->indexOf(';');
         if (separator < 0) {
             actions.push_back(make_malformed_recovery_diagnostic(
@@ -1451,10 +1472,25 @@ void Terminal_byte_stream_parser::handle_osc_payload(
             return;
         }
 
+        const std::optional<QByteArray> id = parse_osc8_id_parameter(parameters);
+
+        // The identity key joins the id to the URI with 0x1f, and everything
+        // that reads a target back out of it takes the first one. An id
+        // carrying that byte therefore moves the split: the host is handed the
+        // tail of the id where the target belongs, and two different
+        // declarations can share one identity. The producer chooses the id, so
+        // refuse the sequence rather than quietly renaming its link.
+        if (id.has_value() && id->contains('\x1f')) {
+            actions.push_back(make_malformed_recovery_diagnostic(
+                QStringLiteral("OSC 8"),
+                Parser_sequence_family::OSC,
+                Parser_recovery_strategy::DISCARD_STRING));
+            actions.push_back(make_hyperlink_action({}));
+            return;
+        }
+
         QByteArray identity_key = QByteArrayLiteral("uri:");
-        if (const std::optional<QByteArray> id = parse_osc8_id_parameter(parameters);
-            id.has_value())
-        {
+        if (id.has_value()) {
             identity_key = QByteArrayLiteral("id:");
             identity_key.append(*id);
             identity_key.append('\x1f');

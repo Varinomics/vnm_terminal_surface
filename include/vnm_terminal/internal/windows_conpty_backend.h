@@ -18,6 +18,14 @@ struct Windows_conpty_backend_write_state_for_testing
     bool        running                  = false;
     bool        stopping                 = false;
     bool        writer_failed            = false;
+    // Whether a queued interrupt has left the write queue. The writer sets an
+    // INTERRUPTED exit override the moment it dequeues the Ctrl+C entry and
+    // trades that for the delivery flag once the write completes, so either
+    // state means a code-130 exit is now classified as an interrupt. A test
+    // whose scenario depends on the interrupt staying queued can ask whether
+    // that premise held instead of inferring it from bytes in flight, which
+    // are counted per write and so cannot distinguish the two writes.
+    bool        interrupt_left_write_queue = false;
 };
 
 class Windows_conpty_backend final : public Terminal_backend

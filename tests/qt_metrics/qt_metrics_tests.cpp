@@ -463,6 +463,21 @@ bool test_surface_publication(QGuiApplication& app, qreal device_pixel_ratio)
     ok &= check(font_size_signal_count == font_size_signals_before_nan_noop,
         "font-size setter treats repeated NaN as a no-op");
 
+    // A finite size can still be far outside the range of the integer pixel
+    // size it is rounded into, and that conversion is undefined rather than
+    // merely large, so the property stops at the supported ceiling first.
+    surface.set_font_size(1e300);
+    pump_events(app);
+    ok &= check(
+        surface.font_size() == static_cast<qreal>(term::k_vnm_terminal_max_font_pixel_size),
+        "font-size setter bounds an out-of-range size to the supported maximum");
+
+    surface.set_font_size(static_cast<qreal>(std::numeric_limits<int>::max()) * 4.0);
+    pump_events(app);
+    ok &= check(
+        surface.font_size() == static_cast<qreal>(term::k_vnm_terminal_max_font_pixel_size),
+        "font-size setter bounds a size past int range to the supported maximum");
+
     return ok;
 }
 

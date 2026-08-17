@@ -2195,7 +2195,18 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     const Terminal_input_mode_state modes = m_screen_model.has_value()
         ? m_screen_model->input_mode_state()
         : Terminal_input_mode_state{};
-    QByteArray bytes = encode_terminal_paste_text(std::move(text), modes, policy);
+    // The write queue refuses anything past its hard limit, so encoding a
+    // clipboard far beyond it copies and converts megabytes to reach a
+    // conclusion the byte count already settles. Hand the encoder that budget:
+    // it stops one unit past it, and enqueue_command below still produces the
+    // rejection, so the outcome is the same one the complete encoding reached.
+    QByteArray bytes = encode_terminal_paste_text(
+        std::move(text),
+        modes,
+        policy,
+        static_cast<qsizetype>(std::min<std::size_t>(
+            m_config.write_queue_limits.hard_limit_bytes,
+            static_cast<std::size_t>(std::numeric_limits<qsizetype>::max()))));
     if (bytes.isEmpty()) {
         return {};
     }

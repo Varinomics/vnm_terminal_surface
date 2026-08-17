@@ -40,6 +40,7 @@
 #include <functional>
 #include <initializer_list>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <thread>
@@ -4410,6 +4411,15 @@ bool test_explicit_hyperlink_lookup_feedback_and_activation(QGuiApplication& app
     ok &= check(
         fixture.surface.explicit_hyperlink_at(-1.0, link_point.y()).isEmpty(),
         "explicit hyperlink lookup rejects points outside the published grid");
+    // The caller supplies these coordinates directly, and the cell index they
+    // divide out to used to be converted to int before anything compared it
+    // against the grid, which is undefined once the quotient does not fit.
+    ok &= check(
+        fixture.surface.explicit_hyperlink_at(1e300, 1e300).isEmpty(),
+        "explicit hyperlink lookup rejects points beyond the integer cell range");
+    ok &= check(
+        fixture.surface.explicit_hyperlink_at(link_point.x(), 1e300).isEmpty(),
+        "explicit hyperlink lookup rejects an out-of-range row on a valid column");
 
     ok &= send_hover_move(
         fixture.surface,
@@ -6276,6 +6286,20 @@ bool test_public_viewport_scroll_api(QGuiApplication& app)
             "public viewport offset clamps to maximum scrollback");
     }
 
+    // The requested delta is the caller's offset minus the published one, so a
+    // bottom-of-range offset against a scrolled-back viewport used to underflow
+    // an int before anything clamped it. From the top of the scrollback this
+    // still has to read as a plain return to the tail.
+    ok &= check(
+        fixture.surface.scroll_to_offset_from_tail(std::numeric_limits<int>::min()),
+        "public viewport offset scroll clamps a bottom-of-range offset to the tail");
+    ok &= check_int_equal(
+        fixture.surface.viewport_offset_from_tail(),
+        0,
+        "public viewport offset clamps a bottom-of-range offset to zero");
+
+    ok &= check(fixture.surface.scroll_to_offset_from_tail(100000),
+        "public viewport offset scroll clamps to top again");
     ok &= check(fixture.surface.scroll_to_offset_from_tail(0),
         "public viewport offset scroll returns to tail");
     ok &= check_int_equal(

@@ -438,6 +438,8 @@ public:
             m_running,
             m_stopping,
             m_writer_failed,
+            m_exit_reason_override == Terminal_exit_reason::INTERRUPTED ||
+                m_interrupt_delivery_exit_code_pending,
         };
     }
 

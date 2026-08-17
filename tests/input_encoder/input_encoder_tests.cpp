@@ -516,6 +516,54 @@ bool test_paste_sanitization()
     return ok;
 }
 
+bool test_paste_budget_stops_encoding_past_the_budget()
+{
+    bool ok = true;
+
+    // A paste that fits the caller's budget must come back whole, budget or no
+    // budget, because the budget only bounds work that would be thrown away.
+    const QString within_budget(64, QChar(u'a'));
+    ok &= check_bytes_equal(
+        term::encode_terminal_paste_text(
+            within_budget,
+            {},
+            term::Terminal_paste_framing_policy::DISABLED,
+            64),
+        within_budget.toUtf8(),
+        "a paste at the budget is encoded whole");
+
+    // Past the budget the result only has to stay past it, so the caller's own
+    // byte check reaches the same refusal it would have reached anyway.
+    const QString past_budget(4096, QChar(u'a'));
+    const QByteArray bounded = term::encode_terminal_paste_text(
+        past_budget,
+        {},
+        term::Terminal_paste_framing_policy::DISABLED,
+        64);
+    ok &= check(bounded.size() > 64,
+        "a paste past the budget still encodes past the budget");
+    ok &= check(bounded.size() < past_budget.size(),
+        "a paste past the budget stops short of encoding all of it");
+
+    // Sanitizing removes control characters, so the budget is spent on what
+    // survives sanitization rather than on what arrived.
+    QString controls_then_text;
+    for (int index = 0; index < 4096; ++index) {
+        controls_then_text += QChar(u'\x01');
+    }
+    controls_then_text += QStringLiteral("tail");
+    ok &= check_bytes_equal(
+        term::encode_terminal_paste_text(
+            controls_then_text,
+            {},
+            term::Terminal_paste_framing_policy::DISABLED,
+            64),
+        QByteArrayLiteral("tail"),
+        "the budget counts sanitized units, not the units that arrived");
+
+    return ok;
+}
+
 bool test_sgr_mouse_reporting()
 {
     bool ok = true;
@@ -863,6 +911,7 @@ int main(int argc, char** argv)
     ok &= test_keypad_policy();
     ok &= test_paste_framing_policy();
     ok &= test_paste_sanitization();
+    ok &= test_paste_budget_stops_encoding_past_the_budget();
     ok &= test_sgr_mouse_reporting();
     ok &= test_sgr_mouse_modifier_button_matrix();
     ok &= test_mouse_tracking_mode_matrix();
