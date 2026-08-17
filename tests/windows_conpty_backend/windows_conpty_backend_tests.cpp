@@ -2650,30 +2650,37 @@ bool test_queued_interrupt_after_exit_130_write_stays_natural(const QString& fix
     ok &= check(interrupt_result.code == term::Terminal_backend_result_code::ACCEPTED,
         "ConPTY backend accepts interrupt queued behind ordinary input");
 
-    // The scenario only means anything while the ordinary write is still
-    // blocking, because that is what keeps the interrupt queued and
-    // undelivered. The child has stopped reading, but the pseudoconsole host
-    // keeps draining the pipe into its own input buffer, so a long enough stall
-    // here would let the write finish and the interrupt reach the child, at
-    // which point classifying the exit as INTERRUPTED is correct and the
-    // assertion below would be measuring the wrong thing. Say so explicitly
-    // rather than leaving it looking like a backend misclassification.
-    if (backend->write_state_for_testing().in_flight_write_bytes == 0U) {
-        std::cerr
-            << "note: ordinary write drained before the exit gate was released, "
-               "so the queued interrupt was deliverable and this scenario no "
-               "longer isolates an undelivered interrupt\n";
-    }
-
     ok &= check(write_gate_file(gate_path),
         "exit-130 blocked-input fixture exit gate is released");
     ok &= check(capture.wait_for_exit(), "exit-130 blocked-input fixture exits");
 
-    const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
-    ok &= check(exit.has_value() &&
-        exit->reason == term::Terminal_exit_reason::EXITED &&
-        exit->exit_code == 130,
-        "queued but undelivered interrupt does not classify ordinary code-130 exit");
+    // The scenario only means anything while the ordinary write is still
+    // blocking, because that is what keeps the interrupt queued and
+    // undelivered. The child has stopped reading, but the pseudoconsole host
+    // keeps draining the pipe into its own input buffer, so a long enough stall
+    // anywhere above would let the writer reach the Ctrl+C entry, at which
+    // point the backend has recorded an interrupt and classifying a code-130
+    // exit as INTERRUPTED is the correct answer. Ask whether the interrupt is
+    // still queued rather than asserting an oracle whose premise the host may
+    // have dissolved. Bytes in flight cannot answer that: the counter holds
+    // whichever write is current, so it is non-zero again once the interrupt
+    // itself is being written, and a snapshot taken before the gate is
+    // released would miss a drain that happens after it.
+    const term::Windows_conpty_backend_write_state_for_testing settled_state =
+        backend->write_state_for_testing();
+    if (settled_state.interrupt_left_write_queue) {
+        std::cerr
+            << "note: the queued interrupt left the write queue before the child "
+               "exited, so this run no longer isolates an undelivered interrupt "
+               "and its exit classification is not asserted\n";
+    }
+    else {
+        const std::optional<term::Terminal_backend_exit> exit = capture.exit_snapshot();
+        ok &= check(exit.has_value() &&
+            exit->reason == term::Terminal_exit_reason::EXITED &&
+            exit->exit_code == 130,
+            "queued but undelivered interrupt does not classify ordinary code-130 exit");
+    }
     ok &= check_no_backend_errors(capture,
         "exit-130 blocked-input fixture produces no backend errors");
 
