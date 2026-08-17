@@ -230,6 +230,30 @@ inline Terminal_backend_result validate_launch_config(
                 QStringLiteral("argv must name an executable"));
     }
 
+    // Both backends hand these strings to interfaces that stop at the first NUL:
+    // CreateProcessW reads a null-terminated command line and directory, and
+    // chdir() a null-terminated path. An embedded NUL therefore launches
+    // something other than the configuration the caller validated, and because
+    // CreateProcessW receives a null lpApplicationName the image name comes out
+    // of that truncated command line. Rejecting here keeps both backends honest;
+    // the POSIX one already refuses NUL in argv on its own, and neither one
+    // checks the working directory.
+    for (const QString& argument : config.argv) {
+        if (argument.contains(QChar(u'\0'))) {
+            return
+                backend_reject(
+                    Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
+                    QStringLiteral("argv values must not contain NUL"));
+        }
+    }
+
+    if (config.working_directory.contains(QChar(u'\0'))) {
+        return
+            backend_reject(
+                Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
+                QStringLiteral("working directory must not contain NUL"));
+    }
+
     if (!config.initial_grid_size.has_value() ||
         !is_valid_grid_size(*config.initial_grid_size))
     {

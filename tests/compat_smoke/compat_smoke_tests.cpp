@@ -488,6 +488,34 @@ bool test_launch_environment_validation_contract()
         is_invalid_launch_config_result(term::validate_launch_config(config)),
         "launch validation rejects an embedded NUL in the COLORTERM identity");
 
+    config = environment_validation_config();
+    config.argv = {nul_value};
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "launch validation rejects an embedded NUL in argv[0]");
+
+    config = environment_validation_config();
+    config.argv.push_back(nul_value);
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "launch validation rejects an embedded NUL in a later argument");
+
+    config = environment_validation_config();
+    config.working_directory = nul_value;
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "launch validation rejects an embedded NUL inside the working directory");
+
+    // A trailing NUL is the quiet case: the truncated path is still a path the
+    // platform will happily change to, so nothing downstream reports that the
+    // directory the caller asked for was not the directory that was used.
+    config = environment_validation_config();
+    config.working_directory = QStringLiteral("valid-directory");
+    config.working_directory += QChar(u'\0');
+    ok &= check(
+        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        "launch validation rejects a trailing NUL in the working directory");
+
     return ok;
 }
 
