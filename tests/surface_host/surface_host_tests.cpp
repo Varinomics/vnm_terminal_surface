@@ -4410,6 +4410,15 @@ bool test_explicit_hyperlink_lookup_feedback_and_activation(QGuiApplication& app
     ok &= check(
         fixture.surface.explicit_hyperlink_at(-1.0, link_point.y()).isEmpty(),
         "explicit hyperlink lookup rejects points outside the published grid");
+    // The caller supplies these coordinates directly, and the cell index they
+    // divide out to used to be converted to int before anything compared it
+    // against the grid, which is undefined once the quotient does not fit.
+    ok &= check(
+        fixture.surface.explicit_hyperlink_at(1e300, 1e300).isEmpty(),
+        "explicit hyperlink lookup rejects points beyond the integer cell range");
+    ok &= check(
+        fixture.surface.explicit_hyperlink_at(link_point.x(), 1e300).isEmpty(),
+        "explicit hyperlink lookup rejects an out-of-range row on a valid column");
 
     ok &= send_hover_move(
         fixture.surface,

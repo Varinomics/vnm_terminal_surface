@@ -207,7 +207,13 @@ qreal normalized_font_pixel_size(qreal font_size)
         return font_size;
     }
 
-    return static_cast<qreal>(std::max(1, static_cast<int>(std::round(font_size))));
+    // The ceiling is applied while the value is still a qreal: fontSize accepts
+    // any finite number a host cares to set, and rounding one that does not fit
+    // an int and then converting it is undefined rather than merely large.
+    const qreal bounded_font_size = std::min(
+        font_size,
+        static_cast<qreal>(term::k_vnm_terminal_max_font_pixel_size));
+    return static_cast<qreal>(std::max(1, static_cast<int>(std::round(bounded_font_size))));
 }
 
 int vertical_wheel_direction(const QWheelEvent& event)
@@ -559,15 +565,23 @@ std::optional<term::terminal_grid_position_t> grid_position_for_local_point(
         return std::nullopt;
     }
 
-    const int column = static_cast<int>(std::floor(point.x() / metrics.width));
-    const int row    = static_cast<int>(std::floor(point.y() / metrics.height));
-    if (row <  0 || column < 0 || row >= snapshot->grid_size.rows ||
-        column >= snapshot->grid_size.columns)
+    // The grid bounds are tested before the conversion, not after it:
+    // explicit_hyperlink_at() takes its coordinates straight from the caller,
+    // and converting a finite but enormous quotient to int is undefined, so a
+    // range check on the converted value would already be too late.
+    const qreal column_index = std::floor(point.x() / metrics.width);
+    const qreal row_index    = std::floor(point.y() / metrics.height);
+    const qreal column_limit = static_cast<qreal>(snapshot->grid_size.columns);
+    const qreal row_limit    = static_cast<qreal>(snapshot->grid_size.rows);
+    if (row_index <  0.0       || column_index <  0.0          ||
+        row_index >= row_limit || column_index >= column_limit)
     {
         return std::nullopt;
     }
 
-    return term::terminal_grid_position_t{row, column};
+    return term::terminal_grid_position_t{
+        static_cast<int>(row_index),
+        static_cast<int>(column_index)};
 }
 
 struct Surface_hyperlink_target
@@ -640,15 +654,20 @@ std::optional<term::terminal_grid_position_t> clamped_grid_position_for_local_po
         return std::nullopt;
     }
 
-    const int column = std::clamp(
-        static_cast<int>(std::floor(point.x() / metrics.width)),
-        0,
-        snapshot->grid_size.columns - 1);
-    const int row = std::clamp(
-        static_cast<int>(std::floor(point.y() / metrics.height)),
-        0,
-        snapshot->grid_size.rows - 1);
-    return term::terminal_grid_position_t{row, column};
+    // Clamped in qreal for the same reason the unclamped lookup range-checks in
+    // qreal: the conversion is what is undefined for an out-of-range value, so
+    // it has to come after the clamp rather than inside it.
+    const qreal column_index = std::clamp(
+        std::floor(point.x() / metrics.width),
+        0.0,
+        static_cast<qreal>(snapshot->grid_size.columns - 1));
+    const qreal row_index = std::clamp(
+        std::floor(point.y() / metrics.height),
+        0.0,
+        static_cast<qreal>(snapshot->grid_size.rows - 1));
+    return term::terminal_grid_position_t{
+        static_cast<int>(row_index),
+        static_cast<int>(column_index)};
 }
 
 std::optional<term::terminal_grid_position_t> logical_grid_position_for_viewport_cell(
