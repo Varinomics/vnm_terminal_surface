@@ -56,6 +56,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -4495,8 +4496,16 @@ VNM_TerminalSurface::scroll_to_offset_from_tail_with_diagnostics(
     if (source.isEmpty()) {
         source = QStringLiteral("api.offset");
     }
-    const int requested_line_delta =
-        offset_from_tail - viewport_before.offset_from_tail;
+    // The session clamps the offset itself, but this difference is taken here
+    // from the caller's raw value, and it is the one place on this path where
+    // that value still reaches int arithmetic: an offset near the bottom of the
+    // range against any scrolled-back viewport underflows, which is undefined
+    // rather than merely a wrong number in the transcript.
+    const int requested_line_delta = static_cast<int>(std::clamp<long long>(
+        static_cast<long long>(offset_from_tail) -
+            static_cast<long long>(viewport_before.offset_from_tail),
+        std::numeric_limits<int>::min(),
+        std::numeric_limits<int>::max()));
     record_surface_scroll_intent_transcript(
         m_private->transcript_recorder,
         source,
