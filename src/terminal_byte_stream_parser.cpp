@@ -1472,10 +1472,25 @@ void Terminal_byte_stream_parser::handle_osc_payload(
             return;
         }
 
+        const std::optional<QByteArray> id = parse_osc8_id_parameter(parameters);
+
+        // The identity key joins the id to the URI with 0x1f, and everything
+        // that reads a target back out of it takes the first one. An id
+        // carrying that byte therefore moves the split: the host is handed the
+        // tail of the id where the target belongs, and two different
+        // declarations can share one identity. The producer chooses the id, so
+        // refuse the sequence rather than quietly renaming its link.
+        if (id.has_value() && id->contains('\x1f')) {
+            actions.push_back(make_malformed_recovery_diagnostic(
+                QStringLiteral("OSC 8"),
+                Parser_sequence_family::OSC,
+                Parser_recovery_strategy::DISCARD_STRING));
+            actions.push_back(make_hyperlink_action({}));
+            return;
+        }
+
         QByteArray identity_key = QByteArrayLiteral("uri:");
-        if (const std::optional<QByteArray> id = parse_osc8_id_parameter(parameters);
-            id.has_value())
-        {
+        if (id.has_value()) {
             identity_key = QByteArrayLiteral("id:");
             identity_key.append(*id);
             identity_key.append('\x1f');

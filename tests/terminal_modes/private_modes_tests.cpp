@@ -761,6 +761,30 @@ bool test_osc8_hyperlink_registry_stays_bounded_without_linked_cells()
     return ok;
 }
 
+bool test_osc8_hyperlink_id_carrying_the_identity_separator_is_refused()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(1, 8);
+    // 0x1f is what the identity key puts between the id and the URI, and it is
+    // an ordinary payload byte on the wire: no string terminator matches it and
+    // nothing upstream strips it.
+    QByteArray separator_in_id = QByteArrayLiteral("\x1b]8;id=a\x1f");
+    separator_in_id += QByteArrayLiteral("b;https://example.test\x1b\\A\x1b]8;;\x1b\\");
+
+    const term::Terminal_screen_model_result result = model.ingest(separator_in_id);
+    ok &= check(diagnostic_count(result) == 1,
+        "an OSC 8 id carrying the identity separator emits one diagnostic");
+
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(35U);
+    ok &= check(cell_at(snapshot, 0, 0).hyperlink_id == term::k_no_terminal_hyperlink_id,
+        "a refused OSC 8 id leaves the text it wrapped unlinked");
+    ok &= check(model.active_hyperlink_identity_keys_by_id_for_testing().empty(),
+        "a refused OSC 8 id interns no identity");
+
+    return ok;
+}
+
 bool test_osc8_hyperlink_body_beyond_its_limit_is_refused()
 {
     bool ok = true;
@@ -908,6 +932,7 @@ int main()
     ok &= test_osc8_hyperlink_allocator_compacts_near_overflow();
     ok &= test_osc8_hyperlink_compaction_prunes_overwritten_ids();
     ok &= test_osc8_hyperlink_registry_stays_bounded_without_linked_cells();
+    ok &= test_osc8_hyperlink_id_carrying_the_identity_separator_is_refused();
     ok &= test_osc8_hyperlink_body_beyond_its_limit_is_refused();
     ok &= test_bell_and_synchronized_output_mutation();
     return ok ? 0 : 1;
