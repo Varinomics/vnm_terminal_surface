@@ -1115,7 +1115,14 @@ Terminal_byte_stream_parser::try_consume_escape_or_csi(
 
         // Real sequences carry one or two intermediates, so this bounds a
         // stream that would otherwise grow the pending prefix without end.
-        const qsizetype sequence_size = final_offset - offset + 1;
+        // The trailing byte only counts once it has actually arrived: when the
+        // chunk ends on an intermediate there is no final byte yet, and
+        // charging for one discards a prefix that is exactly at the limit. The
+        // CSI branch above measures its incomplete case the same way.
+        const qsizetype sequence_size =
+            final_offset < bytes.size()
+                ? final_offset - offset + 1
+                : bytes.size() - offset;
         if (sequence_size > static_cast<qsizetype>(k_control_sequence_pending_limit_bytes)) {
             actions.push_back(make_unsupported_sequence_diagnostic(
                 QStringLiteral("ESC"),

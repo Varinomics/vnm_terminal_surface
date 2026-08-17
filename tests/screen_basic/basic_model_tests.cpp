@@ -2122,6 +2122,39 @@ bool test_bounded_escape_intermediate_recovery()
     return ok;
 }
 
+bool test_exact_limit_escape_prefix_stays_pending()
+{
+    bool ok = true;
+
+    // The pending limit counts the bytes that have arrived. An escape run that
+    // ends the chunk on its last permitted intermediate has no final byte to
+    // count yet, so it is still a sequence the parser is allowed to hold.
+    term::Terminal_screen_model model = make_model();
+    QByteArray exact_limit_escape("\x1b", 1);
+    exact_limit_escape.append(
+        QByteArray(static_cast<int>(term::k_control_sequence_pending_limit_bytes) - 1, '('));
+
+    term::Terminal_screen_model_result result = model.ingest(exact_limit_escape);
+    ok &= check(diagnostic_count(result) == 0,
+        "an escape prefix of exactly the pending limit stays pending");
+    ok &= check_no_screen_mutation(result, model,
+        "an escape prefix of exactly the pending limit does not mutate screen");
+
+    // One more byte is what crosses the bound, and it crosses it once.
+    result  = model.ingest(QByteArrayLiteral("0A"));
+    ok     &= check(diagnostic_count(result) == 1,
+        "the byte past the pending limit emits one diagnostic");
+    ok     &= check(first_diagnostic(result).family == term::Parser_sequence_family::ESC,
+        "the byte past the pending limit keeps the escape family");
+    ok     &= check(first_diagnostic(result).recovery ==
+        term::Parser_recovery_strategy::DISCARD_SEQUENCE,
+        "the byte past the pending limit discards the escape sequence");
+    ok     &= check(model.row_text(0) == QStringLiteral("A"),
+        "the parser resumes after discarding the over-limit escape final");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -2144,5 +2177,6 @@ int main()
     ok &= test_unsupported_escape_does_not_leak();
     ok &= test_escape_intermediates_do_not_leak();
     ok &= test_bounded_escape_intermediate_recovery();
+    ok &= test_exact_limit_escape_prefix_stays_pending();
     return ok ? 0 : 1;
 }
