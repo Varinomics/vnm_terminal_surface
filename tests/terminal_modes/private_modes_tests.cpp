@@ -715,6 +715,80 @@ bool test_osc8_hyperlink_compaction_prunes_overwritten_ids()
     return ok;
 }
 
+bool test_osc8_hyperlink_registry_stays_bounded_without_linked_cells()
+{
+    bool ok = true;
+
+    // Announcing a link costs the producer one sequence and draws nothing, so
+    // this is what a stream that never prints a linked cell can do to the
+    // registry. Resizing the grid and changing the scrollback limit are the
+    // only other things that prune it, and output triggers neither.
+    term::Terminal_screen_model model = make_model(3, 8);
+    const int announcement_count =
+        static_cast<int>(term::k_terminal_hyperlink_prune_threshold) + 512;
+    QByteArray announcements;
+    for (int index = 0; index < announcement_count; ++index) {
+        announcements +=
+            QByteArrayLiteral("\x1b]8;;https://example.test/") +
+            QByteArray::number(index) +
+            QByteArrayLiteral("\x1b\\");
+    }
+
+    term::Terminal_screen_model_result result = model.ingest(announcements);
+    ok &= check(diagnostic_count(result) == 0,
+        "unlinked OSC 8 announcements have no diagnostics");
+    ok &= check(
+        model.active_hyperlink_identity_keys_by_id_for_testing().size() <=
+            term::k_terminal_hyperlink_prune_threshold,
+        "unreferenced OSC 8 identities do not accumulate past the prune threshold");
+
+    // Pruning must not take the link that is still open with it.
+    result = model.ingest(QByteArrayLiteral("A"));
+    ok    &= check(diagnostic_count(result) == 0,
+        "text after bounded OSC 8 announcements has no diagnostics");
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(33U);
+    const term::Terminal_hyperlink_id open_hyperlink_id =
+        cell_at(snapshot, 0, 0).hyperlink_id;
+    ok &= check(open_hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "the OSC 8 link still open when pruning ran keeps linking new cells");
+    ok &= check(active_hyperlink_identity_contains_uri(
+            model,
+            open_hyperlink_id,
+            QByteArrayLiteral("https://example.test/") +
+                QByteArray::number(announcement_count - 1)),
+        "the surviving identity is the announcement that was still open");
+
+    return ok;
+}
+
+bool test_osc8_hyperlink_body_beyond_its_limit_is_refused()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model = make_model(3, 8);
+    term::Terminal_screen_model_result result = model.ingest(
+        QByteArrayLiteral("\x1b]8;;https://example.test\x1b\\A"));
+    ok &= check(diagnostic_count(result) == 0,
+        "over-limit OSC 8 setup has no diagnostics");
+
+    QByteArray oversized_uri = QByteArrayLiteral("https://example.test/");
+    oversized_uri += QByteArray(
+        static_cast<int>(term::k_hyperlink_identity_limit_bytes),
+        'x');
+    result = model.ingest(
+        QByteArrayLiteral("\x1b]8;;") + oversized_uri + QByteArrayLiteral("\x1b\\B"));
+    ok &= check(diagnostic_count(result) == 1,
+        "an OSC 8 body past the hyperlink limit emits one diagnostic");
+
+    const term::Terminal_render_snapshot snapshot = model.render_snapshot(34U);
+    ok &= check(cell_at(snapshot, 0, 0).hyperlink_id != term::k_no_terminal_hyperlink_id,
+        "the refused OSC 8 body leaves already-linked cells alone");
+    ok &= check(cell_at(snapshot, 0, 1).hyperlink_id == term::k_no_terminal_hyperlink_id,
+        "text after a refused OSC 8 body is not attributed to the previous link");
+
+    return ok;
+}
+
 bool test_bell_and_synchronized_output_mutation()
 {
     bool ok = true;
@@ -833,6 +907,8 @@ int main()
     ok &= test_osc8_hyperlinks();
     ok &= test_osc8_hyperlink_allocator_compacts_near_overflow();
     ok &= test_osc8_hyperlink_compaction_prunes_overwritten_ids();
+    ok &= test_osc8_hyperlink_registry_stays_bounded_without_linked_cells();
+    ok &= test_osc8_hyperlink_body_beyond_its_limit_is_refused();
     ok &= test_bell_and_synchronized_output_mutation();
     return ok ? 0 : 1;
 }

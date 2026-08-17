@@ -1511,6 +1511,8 @@ private:
                                      m_selection_reconciliation_counters;
     std::map<QByteArray, Terminal_hyperlink_id>
                                      m_active_hyperlink_ids;
+    std::size_t                     m_next_hyperlink_prune_count =
+                                        k_terminal_hyperlink_prune_threshold;
     int                             m_scroll_top = 0;
     int                             m_scroll_bottom = 0;
     bool                            m_origin_mode = false;

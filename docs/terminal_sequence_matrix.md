@@ -242,8 +242,8 @@ status: supported
 action_category: screen-mutation
 behavior: begins hyperlink metadata for subsequent cells
 host_policy: activation remains host UI policy
-payload_limit: 1048576 raw bytes
-recovery: malformed parameters ignored with diagnostic
+payload_limit: 1048576 raw bytes, of which 8192 raw bytes may be hyperlink body
+recovery: malformed parameters ignored with diagnostic, oversized body refused with diagnostic and clears the active hyperlink
 reply: no-reply
 diagnostic: malformed OSC 8 diagnostic
 oracle: xterm-409-reference
@@ -258,7 +258,7 @@ status: supported
 action_category: screen-mutation
 behavior: ends active hyperlink metadata
 host_policy: activation remains host UI policy
-payload_limit: 1048576 raw bytes
+payload_limit: 1048576 raw bytes, of which 8192 raw bytes may be hyperlink body
 recovery: malformed close ignored with diagnostic
 reply: no-reply
 diagnostic: malformed OSC 8 diagnostic

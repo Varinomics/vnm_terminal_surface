@@ -1439,6 +1439,20 @@ void Terminal_byte_stream_parser::handle_osc_payload(
         osc_command_body(payload, QByteArrayLiteral("8"));
         hyperlink.has_value())
     {
+        // A body past the hyperlink bound is refused rather than truncated, and
+        // the current link is cleared with it: leaving the previous link in
+        // place would attribute the text that follows to a target the producer
+        // did not name.
+        if (static_cast<std::size_t>(hyperlink->size()) > k_hyperlink_identity_limit_bytes) {
+            actions.push_back(make_payload_limit_diagnostic(
+                QStringLiteral("OSC 8"),
+                static_cast<std::size_t>(hyperlink->size()),
+                k_hyperlink_identity_limit_bytes,
+                Parser_sequence_family::OSC));
+            actions.push_back(make_hyperlink_action({}));
+            return;
+        }
+
         const qsizetype separator = hyperlink->indexOf(';');
         if (separator < 0) {
             actions.push_back(make_malformed_recovery_diagnostic(
