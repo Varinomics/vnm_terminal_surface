@@ -4,6 +4,8 @@
 #include <QByteArray>
 #include <QString>
 #include <Qt>
+#include <cstddef>
+#include <limits>
 
 class QKeyEvent;
 
@@ -52,9 +54,21 @@ QByteArray encode_terminal_mouse_event(
     Terminal_mouse_event           event,
     Terminal_input_mode_state      modes);
 
+// `reject_beyond_bytes` is the caller's byte budget for the encoded result, and
+// it bounds the work rather than the outcome. Sanitizing, encoding and framing
+// each copy the whole paste, and a caller that is going to refuse the result
+// anyway gains nothing from completing those copies for a clipboard far past
+// its budget. Encoding therefore stops once the sanitized text alone is longer
+// than the budget, and what comes back is then deliberately over it: UTF-8 is
+// never shorter than the UTF-16 code-unit count it encodes, and framing only
+// adds, so the caller's own limit check still refuses it for the same reason
+// and with the same message it would have used for the complete encoding.
+// Pass the default to encode everything.
 QByteArray encode_terminal_paste_text(
     QString                        text,
     Terminal_input_mode_state      modes,
-    Terminal_paste_framing_policy  framing_policy);
+    Terminal_paste_framing_policy  framing_policy,
+    qsizetype                      reject_beyond_bytes =
+                                       std::numeric_limits<qsizetype>::max());
 
 }
