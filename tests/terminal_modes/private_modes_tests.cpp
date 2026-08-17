@@ -121,6 +121,22 @@ bool snapshot_valid(const term::Terminal_screen_model& model, std::uint64_t sequ
         term::Terminal_render_snapshot_status::OK;
 }
 
+// The render snapshot interns its own hyperlink ids, so a cell's id addresses
+// the snapshot's metadata and not the model's registry. Keep the two lookups
+// separate rather than letting one id be used against both.
+QByteArray snapshot_hyperlink_uri(
+    const term::Terminal_render_snapshot&  snapshot,
+    term::Terminal_hyperlink_id            hyperlink_id)
+{
+    for (const term::Terminal_render_hyperlink_metadata& metadata : snapshot.hyperlinks) {
+        if (metadata.hyperlink_id == hyperlink_id) {
+            return metadata.uri;
+        }
+    }
+
+    return {};
+}
+
 bool active_hyperlink_identity_contains_uri(
     const term::Terminal_screen_model& model,
     term::Terminal_hyperlink_id        hyperlink_id,
@@ -751,12 +767,11 @@ bool test_osc8_hyperlink_registry_stays_bounded_without_linked_cells()
         cell_at(snapshot, 0, 0).hyperlink_id;
     ok &= check(open_hyperlink_id != term::k_no_terminal_hyperlink_id,
         "the OSC 8 link still open when pruning ran keeps linking new cells");
-    ok &= check(active_hyperlink_identity_contains_uri(
-            model,
-            open_hyperlink_id,
+    ok &= check(
+        snapshot_hyperlink_uri(snapshot, open_hyperlink_id) ==
             QByteArrayLiteral("https://example.test/") +
-                QByteArray::number(announcement_count - 1)),
-        "the surviving identity is the announcement that was still open");
+                QByteArray::number(announcement_count - 1),
+        "the link still open when pruning ran keeps its own target");
 
     return ok;
 }

@@ -412,8 +412,14 @@ bool test_retained_history_capacity_override()
 
 bool test_oversize_retained_history_row_is_discarded()
 {
+    // The ring refuses a record larger than an eighth of its capacity, so with
+    // the minimum capacity the row has to clear 128 KiB. Hyperlink identities
+    // are the densest way to fill one, because each distinct identity is stored
+    // with the row - but a single one is bounded at
+    // k_hyperlink_identity_limit_bytes, so the row carries a column of them.
+    constexpr int oversized_row_columns = 32;
     term::Terminal_screen_model_config config;
-    config.grid_size                       = {1, 8};
+    config.grid_size                       = {1, oversized_row_columns};
     config.scrollback_limit                = 10;
     config.retained_history_capacity_bytes =
         term::k_terminal_min_retained_history_capacity_bytes;
@@ -425,9 +431,18 @@ bool test_oversize_retained_history_row_is_discarded()
             term::Terminal_buffer_id::PRIMARY,
             0);
 
-    QByteArray oversized_row = QByteArrayLiteral("\x1b]8;;");
-    oversized_row.append(QByteArray(192 * 1024, 'u'));
-    oversized_row.append(QByteArrayLiteral("\x07x\x1b]8;;\x07\r\n"));
+    QByteArray oversized_row;
+    for (int column = 0; column < oversized_row_columns; ++column) {
+        QByteArray uri = QByteArrayLiteral("https://example.test/");
+        uri += QByteArray::number(column);
+        uri += '/';
+        uri += QByteArray(
+            static_cast<int>(term::k_hyperlink_identity_limit_bytes) - 128,
+            'u');
+        oversized_row += QByteArrayLiteral("\x1b]8;;") + uri +
+            QByteArrayLiteral("\x07u");
+    }
+    oversized_row += QByteArrayLiteral("\x1b]8;;\x07\r\n");
 
     term::Terminal_screen_model_result result;
     bool threw = false;
