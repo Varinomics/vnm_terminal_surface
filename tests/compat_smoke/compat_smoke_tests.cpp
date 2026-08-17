@@ -379,6 +379,18 @@ bool is_invalid_launch_config_result(const term::Terminal_backend_result& result
         result.error->code == term::Terminal_backend_error_code::INVALID_LAUNCH_CONFIG;
 }
 
+// Several launch-config checks share one error code, so a configuration that
+// would also fail an earlier check cannot be pinned by the code alone: the
+// assertion would pass on the wrong rule. Name the rule where that matters.
+bool is_launch_config_rejection_for(
+    const term::Terminal_backend_result&  result,
+    const QString&                        reason)
+{
+    return
+        is_invalid_launch_config_result(result) &&
+        result.error->message.contains(reason);
+}
+
 bool test_launch_environment_validation_contract()
 {
     bool ok = true;
@@ -491,19 +503,25 @@ bool test_launch_environment_validation_contract()
     config = environment_validation_config();
     config.argv = {nul_value};
     ok &= check(
-        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        is_launch_config_rejection_for(
+            term::validate_launch_config(config),
+            QStringLiteral("argv values must not contain NUL")),
         "launch validation rejects an embedded NUL in argv[0]");
 
     config = environment_validation_config();
     config.argv.push_back(nul_value);
     ok &= check(
-        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        is_launch_config_rejection_for(
+            term::validate_launch_config(config),
+            QStringLiteral("argv values must not contain NUL")),
         "launch validation rejects an embedded NUL in a later argument");
 
     config = environment_validation_config();
     config.working_directory = nul_value;
     ok &= check(
-        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        is_launch_config_rejection_for(
+            term::validate_launch_config(config),
+            QStringLiteral("working directory must not contain NUL")),
         "launch validation rejects an embedded NUL inside the working directory");
 
     // A trailing NUL is the quiet case: the truncated path is still a path the
@@ -513,7 +531,9 @@ bool test_launch_environment_validation_contract()
     config.working_directory = QStringLiteral("valid-directory");
     config.working_directory += QChar(u'\0');
     ok &= check(
-        is_invalid_launch_config_result(term::validate_launch_config(config)),
+        is_launch_config_rejection_for(
+            term::validate_launch_config(config),
+            QStringLiteral("working directory must not contain NUL")),
         "launch validation rejects a trailing NUL in the working directory");
 
     return ok;
