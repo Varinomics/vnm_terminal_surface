@@ -75,6 +75,14 @@ class VNM_TerminalSurface : public QQuickItem
     Q_PROPERTY(Text_area_resize_policy textAreaResizePolicy
         READ text_area_resize_policy WRITE set_text_area_resize_policy
         NOTIFY text_area_resize_policy_changed)
+    Q_PROPERTY(bool textAreaResizeArbitrationEnabled
+        READ text_area_resize_arbitration_enabled
+        WRITE set_text_area_resize_arbitration_enabled
+        NOTIFY text_area_resize_arbitration_enabled_changed)
+    Q_PROPERTY(int textAreaResizeArbitrationTimeoutMs
+        READ text_area_resize_arbitration_timeout_ms
+        WRITE set_text_area_resize_arbitration_timeout_ms
+        NOTIFY text_area_resize_arbitration_timeout_ms_changed)
     Q_PROPERTY(Mouse_reporting_policy mouseReportingPolicy
         READ mouse_reporting_policy WRITE set_mouse_reporting_policy
         NOTIFY mouse_reporting_policy_changed)
@@ -178,6 +186,26 @@ public:
         DISABLED,
     };
     Q_ENUM(Text_area_resize_policy)
+
+    enum class Text_area_resize_arbitration_decision
+    {
+        REJECT,
+        ACCEPT,
+    };
+    Q_ENUM(Text_area_resize_arbitration_decision)
+
+    enum class Text_area_resize_arbitration_outcome
+    {
+        ACCEPTED,
+        REJECTED,
+        HOLD_LIMIT_REACHED,
+        HOST_GEOMETRY_CHANGED,
+        TEXT_AREA_RESIZE_DISABLED,
+        ARBITRATION_DISABLED,
+        PROCESS_EXITED,
+        TIMED_OUT,
+    };
+    Q_ENUM(Text_area_resize_arbitration_outcome)
 
     enum class Alternate_screen_wheel_policy
     {
@@ -433,6 +461,31 @@ public:
      */
     Text_area_resize_policy text_area_resize_policy() const;
     void set_text_area_resize_policy(Text_area_resize_policy policy);
+
+    /**
+     * Whether XTWINOPS `CSI 8 ; rows ; columns t` is a two-phase transaction.
+     *
+     * Enabled, the sequence no longer commits anything on its own. Backend
+     * output stops at the sequence point, the host receives
+     * `text_area_resize_arbitration_requested(request_id, rows, columns)`,
+     * resizes its window, and answers with `respond_text_area_resize` carrying
+     * the grid it actually got. Only then is the grid committed, the pty
+     * resized, and the held output interpreted against the answer. A refusal
+     * costs no reflow and no pty resize at all.
+     *
+     * `text_area_resize_requested()` is not emitted while this is enabled: an
+     * arbitrating host has already moved its window by the time the request
+     * settles. Output after the sequence is held until the host answers,
+     * bounded by the session's hold limit and by
+     * `textAreaResizeArbitrationTimeoutMs`. Disabled, the default, the sequence
+     * keeps its sequence-point behavior and `textAreaResizePolicy` remains the
+     * only host control over it.
+     */
+    bool text_area_resize_arbitration_enabled() const;
+    void set_text_area_resize_arbitration_enabled(bool enabled);
+
+    int  text_area_resize_arbitration_timeout_ms() const;
+    void set_text_area_resize_arbitration_timeout_ms(int timeout_ms);
     Mouse_reporting_policy mouse_reporting_policy() const;
     void set_mouse_reporting_policy(Mouse_reporting_policy policy);
 
@@ -500,6 +553,21 @@ public:
     Q_INVOKABLE bool respond_clipboard_write(
         quint64                        request_id,
         Clipboard_response_decision    decision);
+
+    /**
+     * Answers the in-flight text-area resize arbitration.
+     *
+     * ACCEPT commits the grid the host actually got, which may differ from the
+     * requested one when the window system clamped it. REJECT leaves the grid
+     * untouched and ignores the grid arguments. Either way the held output
+     * resumes. Returns false, with a CALLBACK_MISSING `backend_error`, when the
+     * request id does not match the one in flight.
+     */
+    Q_INVOKABLE bool respond_text_area_resize(
+        quint64                                 request_id,
+        Text_area_resize_arbitration_decision   decision,
+        int                                     effective_rows,
+        int                                     effective_columns);
 
     /**
      * Returns the OSC 8 target published at the item-coordinate point.
@@ -592,6 +660,14 @@ signals:
     void synchronized_output_stale_timeout_ms_changed();
     void synchronized_output_scroll_policy_changed();
     void text_area_resize_policy_changed();
+    void text_area_resize_arbitration_requested(quint64 request_id, int rows, int columns);
+    void text_area_resize_arbitration_settled(
+        quint64                                 request_id,
+        Text_area_resize_arbitration_outcome    outcome,
+        int                                     rows,
+        int                                     columns);
+    void text_area_resize_arbitration_enabled_changed();
+    void text_area_resize_arbitration_timeout_ms_changed();
     void mouse_reporting_policy_changed();
     void copy_shortcut_policy_changed();
     void copy_on_select_changed();
@@ -792,6 +868,7 @@ private:
     void dismiss_row_timestamp_tooltip();
     bool row_timestamp_tooltip_pointer_moved(const QPointF& position);
     void handle_row_timestamp_tooltip_timeout();
+    void handle_text_area_resize_arbitration_timeout();
 
     QString                  m_font_family;
     qreal                    m_font_size                            = 13.0;
@@ -817,6 +894,11 @@ private:
     int                      m_synchronized_output_stale_timeout_ms = 1000;
     Text_area_resize_policy m_text_area_resize_policy =
         Text_area_resize_policy::APPLICATION_CONTROLLED;
+    bool                     m_text_area_resize_arbitration_enabled = false;
+    // Long enough for a host to complete a window resize round trip on a loaded
+    // compositor, short enough that a host that never answers does not read as a
+    // frozen terminal. 0 removes the bound.
+    int                      m_text_area_resize_arbitration_timeout_ms = 250;
     Synchronized_output_scroll_policy m_synchronized_output_scroll_policy =
         Synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION;
     Mouse_reporting_policy   m_mouse_reporting_policy =
