@@ -1187,6 +1187,28 @@ bool test_selection_attachment_follows_multiple_successors_in_one_ingest()
     ok &= check(model.row_text(0) == QStringLiteral("cc"),
         "the twice-recovered viewport starts at the second recovery's first row");
 
+    // The intermediate relation is not retained, but its redundant row_delta is
+    // still part of the capability contract. Reject a chain whose row fields do
+    // not agree rather than silently trusting whichever representation the
+    // consumer happened to use.
+    term::Terminal_screen_model_result inconsistent = result;
+    auto inconsistent_first = inconsistent.selection_continuity->
+        successors_by_old_retained_line_id.find(original_handle.row_sequence);
+    ok &= check(inconsistent_first != inconsistent.selection_continuity->
+            successors_by_old_retained_line_id.end() &&
+            inconsistent_first->second.size() == 1U,
+        "the malformed-chain fixture finds the intermediate successor");
+    if (inconsistent_first != inconsistent.selection_continuity->
+            successors_by_old_retained_line_id.end() &&
+        inconsistent_first->second.size() == 1U)
+    {
+        ++inconsistent_first->second.front().row_delta;
+        ok &= check(model.resolve_selection_attachment(lease, source, inconsistent).status ==
+                term::Terminal_selection_attachment_resolution_status::
+                    INCONSISTENT_ROW_DELTA,
+            "selection attachment rejects an inconsistent intermediate row delta");
+    }
+
     return ok;
 }
 
