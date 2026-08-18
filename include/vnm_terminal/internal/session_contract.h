@@ -106,6 +106,9 @@ constexpr std::size_t k_terminal_default_text_area_resize_hold_limit_bytes = 102
 // the sequence-point grid commit and never asks a host anything.
 struct terminal_text_area_resize_arbitration_config_t
 {
+    // Checked when the next output command arrives, so a hold can exceed this by
+    // the bytes of the command that armed it before the next one settles the
+    // request. That overshoot is bounded by the output queue's own hard limit.
     std::size_t hold_limit_bytes = k_terminal_default_text_area_resize_hold_limit_bytes;
 };
 
