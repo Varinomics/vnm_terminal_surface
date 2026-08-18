@@ -1577,21 +1577,70 @@ backend_output_prescan_t prescan_backend_output(
             continue;
         }
 
-        qsizetype cursor = parameter_begin;
-        while (cursor < bytes.size() &&
-            is_csi_parameter_byte(static_cast<unsigned char>(bytes[cursor])))
-        {
+        // The parser does not stop a CSI scan at an embedded C0 byte: it emits
+        // the control and keeps looking for the final byte
+        // (Terminal_byte_stream_parser::try_consume_escape_or_csi), and drops the
+        // same bytes again when it builds the parameter payload
+        // (parse_csi_dispatch_parts). A walk that stopped there would classify a
+        // byte run the model still dispatches, which is how the NUL padding
+        // terminfo emits through tputs lands in the middle of a sequence. Only
+        // 0x1b and 0x9b abandon the scan, in both scanners.
+        qsizetype  cursor                = parameter_begin;
+        bool       parameters_skipped_c0 = false;
+        bool       sequence_skipped_c0   = false;
+        QByteArray joined_parameter_bytes;
+        while (cursor < bytes.size()) {
+            const unsigned char parameter_byte = static_cast<unsigned char>(bytes[cursor]);
+            if (is_csi_parameter_byte(parameter_byte)) {
+                if (parameters_skipped_c0) {
+                    joined_parameter_bytes.append(static_cast<char>(parameter_byte));
+                }
+                ++cursor;
+                continue;
+            }
+
+            if (parameter_byte >= 0x20U || parameter_byte == 0x1bU) {
+                break;
+            }
+
+            if (!parameters_skipped_c0) {
+                parameters_skipped_c0  = true;
+                sequence_skipped_c0    = true;
+                joined_parameter_bytes = QByteArray(
+                    bytes.data() + parameter_begin,
+                    cursor - parameter_begin);
+            }
             ++cursor;
         }
 
         const qsizetype parameter_end = cursor;
-        while (cursor < bytes.size() &&
-            is_csi_intermediate_byte(static_cast<unsigned char>(bytes[cursor])))
-        {
+        while (cursor < bytes.size()) {
+            const unsigned char intermediate_byte = static_cast<unsigned char>(bytes[cursor]);
+            if (is_csi_intermediate_byte(intermediate_byte)) {
+                ++cursor;
+                continue;
+            }
+
+            if (intermediate_byte >= 0x20U || intermediate_byte == 0x1bU) {
+                break;
+            }
+
+            sequence_skipped_c0 = true;
             ++cursor;
         }
 
         if (cursor >= bytes.size()) {
+            if (sequence_skipped_c0) {
+                // The parser applies an embedded C0 as it scans and keeps only
+                // the stripped prefix pending (csi_pending_prefix_without_c0), so
+                // holding this run back would defer a control the sequence-point
+                // path applies now. Leaving it to the model costs the arbitration
+                // this one request; it does not cost the host the notification,
+                // because the standing signal is suppressed only for the request
+                // the transaction actually captured.
+                continue;
+            }
+
             result.trailing_incomplete_csi_start = offset;
             return result;
         }
@@ -1608,9 +1657,11 @@ backend_output_prescan_t prescan_backend_output(
                 static_cast<unsigned char>(bytes[cursor]) == 't' &&
                 cursor == parameter_end                          &&
                 text_area_resize_request_grid_size(
-                    QByteArrayView(
-                        bytes.data() + parameter_begin,
-                        parameter_end - parameter_begin),
+                    parameters_skipped_c0
+                        ? QByteArrayView(joined_parameter_bytes)
+                        : QByteArrayView(
+                            bytes.data() + parameter_begin,
+                            parameter_end - parameter_begin),
                     result.text_area_resize_grid_size))
             {
                 result.text_area_resize_start = offset;
@@ -1632,6 +1683,33 @@ QByteArray text_area_resize_sequence(terminal_grid_size_t grid_size)
     sequence.append('t');
     return sequence;
 }
+
+// Marks the model dispatch that replays an arbitrated CSI 8 t. Restoring the
+// latch on the way out keeps a throwing replay from leaving the session silent
+// about every later request.
+class Arbitrated_text_area_resize_replay_scope
+{
+public:
+    explicit Arbitrated_text_area_resize_replay_scope(bool& replaying)
+    :
+        m_replaying(replaying)
+    {
+        m_replaying = true;
+    }
+
+    Arbitrated_text_area_resize_replay_scope(
+        const Arbitrated_text_area_resize_replay_scope&) = delete;
+    Arbitrated_text_area_resize_replay_scope& operator=(
+        const Arbitrated_text_area_resize_replay_scope&) = delete;
+
+    ~Arbitrated_text_area_resize_replay_scope()
+    {
+        m_replaying = false;
+    }
+
+private:
+    bool& m_replaying;
+};
 
 // Declining a request the host refused is observationally the standing DISABLED
 // policy applied to one sequence, so it reuses that path rather than inventing a
@@ -4886,8 +4964,12 @@ void Terminal_session::consume_screen_model_text_area_resize_request(
             context.render_snapshot_metadata_changed;
     }
     // An arbitrating host already resized its window for this request when it
-    // answered. Firing the standing request signal as well would move it twice.
-    if (!m_config.text_area_resize_arbitration.has_value()) {
+    // answered, so firing the standing request signal as well would move it
+    // twice. The test is the replay of that answer and not the capability being
+    // installed: a request the prescan never captured reaches this point exactly
+    // as it does without the capability, and it has to reach the host the same
+    // way, or the grid and the pty move with no signal at all.
+    if (!m_replaying_arbitrated_text_area_resize) {
         record_notification({
             Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED,
             context.sequence,
@@ -5254,21 +5336,28 @@ void Terminal_session::release_text_area_resize_arbitration(
         };
     record_notification(std::move(notification));
 
-    if (accepted) {
-        const QByteArray sequence_bytes =
-            grid_sizes_match(effective_grid_size, hold.requested_grid_size)
-                ? hold.sequence_bytes
-                : text_area_resize_sequence(effective_grid_size);
-        ingest_backend_output_segment(hold.sequence, QByteArrayView(sequence_bytes), false);
-    }
-    else {
-        Text_area_resize_policy_scope declined(
-            *m_screen_model,
-            m_config.text_area_resize_policy);
-        ingest_backend_output_segment(
-            hold.sequence,
-            QByteArrayView(hold.sequence_bytes),
-            false);
+    {
+        // Scoped to the sequence this transaction captured, and deliberately not
+        // to the tail: a CSI 8 t the released tail carries is a request the host
+        // has not been asked about yet.
+        Arbitrated_text_area_resize_replay_scope arbitrated(
+            m_replaying_arbitrated_text_area_resize);
+        if (accepted) {
+            const QByteArray sequence_bytes =
+                grid_sizes_match(effective_grid_size, hold.requested_grid_size)
+                    ? hold.sequence_bytes
+                    : text_area_resize_sequence(effective_grid_size);
+            ingest_backend_output_segment(hold.sequence, QByteArrayView(sequence_bytes), false);
+        }
+        else {
+            Text_area_resize_policy_scope declined(
+                *m_screen_model,
+                m_config.text_area_resize_policy);
+            ingest_backend_output_segment(
+                hold.sequence,
+                QByteArrayView(hold.sequence_bytes),
+                false);
+        }
     }
 
     ingest_backend_output_bytes(hold.sequence, QByteArrayView(hold.bytes));

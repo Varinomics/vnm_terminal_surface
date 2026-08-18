@@ -880,6 +880,10 @@ private:
     QByteArray                                             m_backend_output_prescan_pending;
     Terminal_utf8_scan_state                               m_backend_output_prescan_utf8_state;
     std::optional<Text_area_resize_arbitration_hold>       m_text_area_resize_arbitration;
+    // Latched only while a settled arbitration replays its own CSI 8 t, which is
+    // the one request whose standing text-area resize notification has to stay
+    // silent because the host has already moved its window for it.
+    bool                                                   m_replaying_arbitrated_text_area_resize = false;
     std::unique_ptr<Backend_output_capture_writer>          m_backend_output_capture_writer;
     std::atomic<bool>                                      m_backend_output_capture_failure_recorded{false};
     std::optional<Terminal_screen_model>                   m_screen_model;

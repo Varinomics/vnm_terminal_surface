@@ -2537,6 +2537,110 @@ bool test_text_area_resize_arbitration_suppresses_the_standing_request_notificat
     return ok;
 }
 
+// The parser keeps scanning a CSI across an embedded C0 byte and still
+// dispatches the sequence, so a prescan that stopped at one would let a request
+// the host never saw commit the grid and resize the pty. NUL padding from
+// terminfo lands in exactly this shape.
+bool test_text_area_resize_arbitration_arms_across_an_embedded_c0()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "embedded-C0 arbitration session starts");
+
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("aa\x1b[8;3;5\rt\x1b[3;5HZ"));
+    ok &= check(request_id != 0U,
+        "a CSI 8 t carrying an embedded C0 arms one arbitration request");
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 4,
+        "a CSI 8 t carrying an embedded C0 leaves the grid until the host answers");
+    ok &= check(backend->resize_requests.empty(),
+        "a CSI 8 t carrying an embedded C0 resizes no backend before the answer");
+    ok &= check(notification_count(
+        *session,
+        term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED) == 0U,
+        "the captured embedded-C0 request does not also fire the standing notification");
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the embedded-C0 request is answered");
+    ok &= check(session->grid_size().rows == 3 && session->grid_size().columns == 5,
+        "the answered embedded-C0 request commits the accepted grid");
+    ok &= check(backend->resize_requests.size() == 1U,
+        "the answered embedded-C0 request resizes the backend exactly once");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_row_text(*snapshot, 2) == QStringLiteral("    Z"),
+        "held output replays against the accepted grid after an embedded C0");
+
+    // A C0 ahead of the first parameter digit is the same divergence: the parser
+    // drops it when it builds the parameter payload.
+    ok &= check(arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[\r8;6;9t")) != 0U,
+        "a CSI 8 t carrying a leading C0 arms one arbitration request");
+
+    const std::vector<term::Terminal_session_notification> requests =
+        arbitration_requests(*session);
+    ok &= check(requests.size() == 2U &&
+        requests.back().text_area_resize_arbitration_request.has_value() &&
+        requests.back().text_area_resize_arbitration_request->requested_grid_size.rows == 6 &&
+        requests.back().text_area_resize_arbitration_request->requested_grid_size.columns == 9,
+        "the leading-C0 request carries the grid the parser would have dispatched");
+
+    return ok;
+}
+
+// A CSI 8 t whose embedded C0 falls on a chunk boundary is left to the model,
+// which commits the grid at the sequence point exactly as it does without the
+// capability. The standing notification is then the host's only signal, so it
+// has to fire: suppressing it on the capability being installed would move the
+// grid and the pty behind the host's back with nothing to reconcile from.
+bool test_uncaptured_text_area_resize_request_still_notifies_the_host()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "uncaptured-request session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("aa\x1b[8;3;5\r")),
+        "the leading half of the split embedded-C0 sequence is accepted");
+    ok &= check(arbitration_requests(*session).empty(),
+        "an incomplete embedded-C0 sequence arms nothing");
+    ok &= check(backend->emit_output(QByteArrayLiteral("t")),
+        "the trailing half of the split embedded-C0 sequence is accepted");
+
+    ok &= check(arbitration_requests(*session).empty(),
+        "the transaction does not capture a sequence split across its embedded C0");
+    ok &= check(session->grid_size().rows == 3 && session->grid_size().columns == 5,
+        "the uncaptured request commits the grid at the sequence point");
+    ok &= check(backend->resize_requests.size() == 1U &&
+        backend->resize_requests.back().grid_size.rows == 3 &&
+        backend->resize_requests.back().grid_size.columns == 5,
+        "the uncaptured request resizes the backend");
+    ok &= check(notification_count(
+        *session,
+        term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED) == 1U,
+        "an uncaptured text-area resize request still reaches the host");
+
+    return ok;
+}
+
 bool test_backend_output_capture_records_callback_overflow_bytes()
 {
     bool ok = true;
@@ -17633,6 +17737,8 @@ int main()
     ok &= test_text_area_resize_arbitration_inside_synchronized_output();
     ok &= test_text_area_resize_arbitration_rejects_an_unsupported_effective_grid();
     ok &= test_text_area_resize_arbitration_suppresses_the_standing_request_notification();
+    ok &= test_text_area_resize_arbitration_arms_across_an_embedded_c0();
+    ok &= test_uncaptured_text_area_resize_request_still_notifies_the_host();
     ok &= test_backend_output_capture_records_callback_overflow_bytes();
     ok &= test_backend_output_updates_latest_render_snapshot();
     ok &= test_selection_snapshot_and_visible_text();
