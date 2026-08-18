@@ -90,7 +90,6 @@ enum class Terminal_text_area_resize_arbitration_outcome
     ACCEPTED,
     REJECTED,
     HOLD_LIMIT_REACHED,
-    HOST_GEOMETRY_CHANGED,
     TEXT_AREA_RESIZE_DISABLED,
     ARBITRATION_DISABLED,
     PROCESS_EXITED,

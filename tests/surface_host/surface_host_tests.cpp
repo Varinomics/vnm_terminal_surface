@@ -11439,6 +11439,91 @@ bool test_accepted_text_area_resize_arbitration_resizes_the_backend_once(
     return ok;
 }
 
+// The documented protocol, in the documented order and from the handler the
+// signal was delivered to: resize the window, read back the grid it actually
+// got, answer with it. The item resize reaches the session as an ordinary
+// geometry change, so this is the shape that broke when a geometry change
+// settled the request the host was in the middle of answering.
+bool test_text_area_resize_arbitration_accepts_after_the_host_resizes_its_item(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_text_area_resize_arbitration_enabled(true);
+    fixture.surface.set_text_area_resize_arbitration_timeout_ms(0);
+    pump_events(app);
+
+    Text_area_resize_arbitration_observer observer(fixture.surface);
+
+    int error_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::backend_error,
+        &fixture.surface,
+        [&error_count](VNM_TerminalSurface::Backend_error_code, const QString&) {
+            ++error_count;
+        });
+
+    bool answered       = false;
+    bool answer_ok      = false;
+    int  answer_rows    = 0;
+    int  answer_columns = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_arbitration_requested,
+        &fixture.surface,
+        [&](quint64 request_id, int, int) {
+            answered = true;
+            fixture.surface.setSize(QSizeF(660.0, 300.0));
+            answer_rows    = fixture.surface.rows();
+            answer_columns = fixture.surface.columns();
+            answer_ok      = fixture.surface.respond_text_area_resize(
+                request_id,
+                VNM_TerminalSurface::Text_area_resize_arbitration_decision::ACCEPT,
+                answer_rows,
+                answer_columns);
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    pump_events(app);
+    ok &= check(started, "host-resize answer fixture starts");
+
+    const int geometry_rows    = fixture.surface.rows();
+    const int geometry_columns = fixture.surface.columns();
+
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[8;24;80t"));
+    ok &= check(pump_until(app, [&observer] {
+        return !observer.settlements.empty();
+    }),
+        "the request the host answered after resizing settles");
+
+    ok &= check(answered, "the arbitrated request reaches the host");
+    ok &= check(answer_rows != geometry_rows || answer_columns != geometry_columns,
+        "the host resize really moved the grid before the answer");
+    ok &= check(answer_ok, "an answer that follows the host's own resize is accepted");
+    ok &= check(error_count == 0,
+        "answering after resizing the item reports no error");
+    ok &= check(observer.settlements.size() == 1U &&
+        observer.settlements.front().outcome ==
+            VNM_TerminalSurface::Text_area_resize_arbitration_outcome::ACCEPTED &&
+        observer.settlements.front().rows == answer_rows &&
+        observer.settlements.front().columns == answer_columns,
+        "the exchange settles once, as accepted, on the grid the host reported");
+    ok &= check(fixture.surface.rows() == answer_rows &&
+        fixture.surface.columns() == answer_columns,
+        "the accepted answer leaves the grid the host reported");
+    ok &= check(observer.standing_request_signals == 0,
+        "the arbitrated exchange never fires the standing request signal");
+
+    return ok;
+}
+
 bool test_rejected_text_area_resize_arbitration_leaves_the_item_grid(QGuiApplication& app)
 {
     bool ok = true;
@@ -17606,6 +17691,7 @@ int main(int argc, char** argv)
     ok &= test_text_area_resize_arbitration_enabled_property(app);
     ok &= test_text_area_resize_arbitration_timeout_ms_property(app);
     ok &= test_accepted_text_area_resize_arbitration_resizes_the_backend_once(app);
+    ok &= test_text_area_resize_arbitration_accepts_after_the_host_resizes_its_item(app);
     ok &= test_rejected_text_area_resize_arbitration_leaves_the_item_grid(app);
     ok &= test_text_area_resize_arbitration_times_out(app);
     ok &= test_text_area_resize_arbitration_does_not_spin_the_backend_drain(app);

@@ -1368,8 +1368,6 @@ surface_text_area_resize_arbitration_outcome(
             return Surface_outcome::REJECTED;
         case term::Terminal_text_area_resize_arbitration_outcome::HOLD_LIMIT_REACHED:
             return Surface_outcome::HOLD_LIMIT_REACHED;
-        case term::Terminal_text_area_resize_arbitration_outcome::HOST_GEOMETRY_CHANGED:
-            return Surface_outcome::HOST_GEOMETRY_CHANGED;
         case term::Terminal_text_area_resize_arbitration_outcome::TEXT_AREA_RESIZE_DISABLED:
             return Surface_outcome::TEXT_AREA_RESIZE_DISABLED;
         case term::Terminal_text_area_resize_arbitration_outcome::ARBITRATION_DISABLED:

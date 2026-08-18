@@ -446,16 +446,22 @@ host reports, and a refused one costs none at all. `text_area_resize_requested()
 is not emitted while arbitration is enabled, because an arbitrating host has
 already moved its window by the time the request settles.
 
+Resizing the window before answering is the expected order and does not settle
+the request. The item geometry reaches the grid the way it always does, so
+`rows()` and `columns()` report the grid the host actually got and the answer
+can be truthful, while the held output stays held until the answer arrives. A
+window resize is never itself an answer: only `respond_text_area_resize`, the
+timeout, or the session ends the request.
+
 Output that arrives after the sequence is held until the host answers. The hold
 is bounded twice: by `textAreaResizeArbitrationTimeoutMs`, and by the session's
 own byte limit for a host that answers eventually while the process floods.
 `text_area_resize_arbitration_settled(request_id, outcome, rows, columns)`
 reports every ending, whether it was the host's `ACCEPTED` or `REJECTED` answer
 or a settlement the terminal had to make: `HOLD_LIMIT_REACHED`,
-`HOST_GEOMETRY_CHANGED` when the host resized its own geometry meanwhile,
 `TEXT_AREA_RESIZE_DISABLED`, `ARBITRATION_DISABLED`, `PROCESS_EXITED`, or
 `TIMED_OUT`. Held output always replays, against the answered grid when the
-request was accepted and against the unchanged grid otherwise. A host that armed
+request was accepted and against the grid then current otherwise. A host that armed
 UI on the request tears it down on this signal rather than on its own answer.
 
 Arbitration is an optional capability and adds no transcript event kind. A

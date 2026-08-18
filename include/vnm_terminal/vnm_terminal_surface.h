@@ -199,7 +199,6 @@ public:
         ACCEPTED,
         REJECTED,
         HOLD_LIMIT_REACHED,
-        HOST_GEOMETRY_CHANGED,
         TEXT_AREA_RESIZE_DISABLED,
         ARBITRATION_DISABLED,
         PROCESS_EXITED,
@@ -562,6 +561,12 @@ public:
      * untouched and ignores the grid arguments. Either way the held output
      * resumes. Returns false, with a CALLBACK_MISSING `backend_error`, when the
      * request id does not match the one in flight.
+     *
+     * Resizing the window first is expected and does not settle the request:
+     * the item geometry reaches the grid the way it always does, so `rows()`
+     * and `columns()` report the grid the host actually got and the answer can
+     * be truthful. The request stays in flight until this call, its timeout, or
+     * the session ending it.
      */
     Q_INVOKABLE bool respond_text_area_resize(
         quint64                                 request_id,

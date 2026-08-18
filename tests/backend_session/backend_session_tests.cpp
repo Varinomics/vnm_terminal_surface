@@ -2204,7 +2204,11 @@ bool test_text_area_resize_arbitration_settles_on_process_exit()
     return ok;
 }
 
-bool test_text_area_resize_arbitration_settles_on_a_host_resize()
+// Moving the window is how the documented protocol answers a request: the host
+// resizes, reads the grid it actually got back off the session, and only then
+// answers. A resize that settled the request would cancel it before its own
+// answer arrived, so this pins that it does not.
+bool test_text_area_resize_arbitration_survives_a_host_resize()
 {
     bool ok = true;
 
@@ -2216,15 +2220,35 @@ bool test_text_area_resize_arbitration_settles_on_a_host_resize()
         "host-resize arbitration session starts");
     // Row 9 column 9 exists in neither grid, so where it clamps says which grid
     // the held tail was applied against.
-    ok &= check(arm_text_area_resize_arbitration(
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
         *session,
         *backend,
-        QByteArrayLiteral("\x1b[8;3;5t\x1b[9;9HZ")) != 0U,
-        "host-resize arbitration request arms once");
+        QByteArrayLiteral("\x1b[8;3;5t\x1b[9;9HZ"));
+    ok &= check(request_id != 0U, "host-resize arbitration request arms once");
 
     ok &= check(session->resize(QSizeF(900.0, 200.0), term::terminal_grid_size_t{2, 9}).code ==
         term::Terminal_session_result_code::ACCEPTED,
         "the host resize is accepted");
+
+    ok &= check(arbitration_settlements(*session).empty(),
+        "a host resize does not settle the request the host is answering");
+    ok &= check(session->pending_text_area_resize_arbitration().has_value() &&
+        session->pending_text_area_resize_arbitration()->request_id == request_id,
+        "the request is still in flight after the host moved its geometry");
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 9,
+        "a host resize commits its own grid while the request waits");
+    ok &= check(backend->resize_requests.size() == 1U &&
+        backend->resize_requests.back().grid_size.rows == 2 &&
+        backend->resize_requests.back().grid_size.columns == 9,
+        "a host resize is one backend resize");
+
+    // The grid the host actually got, which is the answer the protocol asks for.
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{2, 9},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the answer that follows the host resize is accepted");
 
     const std::vector<term::Terminal_session_notification> settlements =
         arbitration_settlements(*session);
@@ -2232,20 +2256,18 @@ bool test_text_area_resize_arbitration_settles_on_a_host_resize()
         settlement_has_outcome(
             settlements,
             0U,
-            term::Terminal_text_area_resize_arbitration_outcome::HOST_GEOMETRY_CHANGED),
-        "a host resize settles the in-flight request once");
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED),
+        "the answer settles the request once, as accepted");
     ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 9,
-        "a host resize commits its own grid");
-    ok &= check(backend->resize_requests.size() == 1U &&
-        backend->resize_requests.back().grid_size.rows == 2 &&
-        backend->resize_requests.back().grid_size.columns == 9,
-        "a host resize is the only backend resize of the exchange");
+        "the accepted answer leaves the grid the host reported");
+    ok &= check(backend->resize_requests.size() == 1U,
+        "the whole exchange costs one backend resize");
 
     const std::optional<term::Terminal_render_snapshot> snapshot =
         session->latest_render_snapshot();
     ok &= check(snapshot.has_value() &&
-        snapshot_row_text(*snapshot, 1) == QStringLiteral("   Z"),
-        "held output replays against the grid it was emitted for");
+        snapshot_row_text(*snapshot, 1) == QStringLiteral("        Z"),
+        "held output replays against the grid the host answered with");
 
     return ok;
 }
@@ -17729,7 +17751,7 @@ int main()
     ok &= test_text_area_resize_arbitration_rejects_a_stale_request_id();
     ok &= test_text_area_resize_arbitration_hold_limit_settles_the_request();
     ok &= test_text_area_resize_arbitration_settles_on_process_exit();
-    ok &= test_text_area_resize_arbitration_settles_on_a_host_resize();
+    ok &= test_text_area_resize_arbitration_survives_a_host_resize();
     ok &= test_text_area_resize_arbitration_settles_on_a_policy_change();
     ok &= test_text_area_resize_arbitration_settles_when_the_capability_is_removed();
     ok &= test_text_area_resize_arbitration_advances_the_backend_callback_epoch();

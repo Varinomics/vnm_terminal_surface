@@ -4656,15 +4656,14 @@ Terminal_session_result Terminal_session::process_resize_command(
                 QStringLiteral("resize requires an initialized screen model")));
     }
 
-    if (m_text_area_resize_arbitration.has_value()) {
-        // The host is moving its own geometry, so the question this request
-        // asked has been answered by other means. The held tail replays against
-        // the grid its bytes were emitted for, before the new grid lands.
-        release_text_area_resize_arbitration(
-            Terminal_text_area_resize_arbitration_outcome::HOST_GEOMETRY_CHANGED,
-            {});
-    }
-
+    // A host resize does not settle an in-flight request. Moving the window is
+    // how the documented protocol answers one: the host resizes, reads the grid
+    // it actually got back off this session, and only then answers. Settling
+    // here would cancel the request before its own answer arrived, replay the
+    // held tail against the grid the host has already left, and refuse the
+    // answer the protocol asked for. The answer stays the one authority over
+    // whether the request was granted; this resize is only the host's geometry
+    // reaching the grid, exactly as it does with no request in flight.
     const terminal_grid_size_t previous_grid_size = m_grid_size;
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     if (m_config.transcript_recorder != nullptr) {
