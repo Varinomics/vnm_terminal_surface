@@ -3201,7 +3201,8 @@ Terminal_session::begin_selection_drag_provenance(
         make_selection_visual_lease(
             {original_position, original_position, Terminal_selection_mode::NORMAL},
             source);
-    anchor_lease.selected_lines.push_back({0, *handle});
+    anchor_lease.selected_lines =
+        std::vector<terminal_selection_line_lease_t>{{0, *handle}};
     const Terminal_selection_attachment_resolution proof =
         m_screen_model->resolve_selection_attachment(
             anchor_lease,

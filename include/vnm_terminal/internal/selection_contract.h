@@ -6,8 +6,11 @@
 #include <QByteArray>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <memory>
 #include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace vnm_terminal::internal {
@@ -154,6 +157,113 @@ struct terminal_selection_line_lease_t
         const terminal_selection_line_lease_t&) = default;
 };
 
+// The rows a selection holds, shared rather than copied. A lease is copied on
+// every content-changed publication, on every synchronized hold and rebase, and
+// on every drag step, and it carries one record per selected row - so at a
+// large selection those copies moved megabytes to change a handful of scalar
+// fields. The rows themselves never change once a lease exists: translation
+// builds a new list. Making that explicit lets every copy share one immutable
+// block and reduces to a reference-count increment.
+//
+// Deliberately read-only. A caller that needs different rows builds a vector
+// and assigns it, which is what keeps sharing safe without copy-on-write.
+class Terminal_selection_line_lease_list
+{
+public:
+    using Storage = std::vector<terminal_selection_line_lease_t>;
+
+    Terminal_selection_line_lease_list()
+    :
+        m_rows(shared_empty_rows())
+    {
+    }
+
+    Terminal_selection_line_lease_list(Storage rows)
+    :
+        m_rows(rows.empty()
+            ? shared_empty_rows()
+            : std::make_shared<const Storage>(std::move(rows)))
+    {
+    }
+
+    Terminal_selection_line_lease_list(
+        std::initializer_list<terminal_selection_line_lease_t> rows)
+    :
+        Terminal_selection_line_lease_list(Storage(rows))
+    {
+    }
+
+    Terminal_selection_line_lease_list(
+        const Terminal_selection_line_lease_list&) = default;
+    Terminal_selection_line_lease_list& operator=(
+        const Terminal_selection_line_lease_list&) = default;
+
+    // A moved-from list reads as an empty one, which is what a moved-from
+    // std::vector did here before. Leaving the block pointer null instead would
+    // turn every accessor into a null dereference exactly where the member used
+    // to be safe to query - and this is the change that introduces whole-lease
+    // moves in the first place.
+    Terminal_selection_line_lease_list(
+        Terminal_selection_line_lease_list&& other) noexcept
+    :
+        m_rows(std::exchange(other.m_rows, shared_empty_rows()))
+    {
+    }
+
+    Terminal_selection_line_lease_list& operator=(
+        Terminal_selection_line_lease_list&& other) noexcept
+    {
+        m_rows = std::exchange(other.m_rows, shared_empty_rows());
+        return *this;
+    }
+
+    bool        empty() const noexcept { return m_rows->empty(); }
+    std::size_t size()  const noexcept { return m_rows->size();  }
+
+    const terminal_selection_line_lease_t& operator[](std::size_t index) const
+    {
+        return (*m_rows)[index];
+    }
+    const terminal_selection_line_lease_t& front() const { return m_rows->front(); }
+    const terminal_selection_line_lease_t* data()  const noexcept { return m_rows->data();  }
+    const terminal_selection_line_lease_t* begin() const noexcept { return m_rows->data(); }
+    const terminal_selection_line_lease_t* end()   const noexcept
+    {
+        return m_rows->data() + m_rows->size();
+    }
+
+    std::span<const terminal_selection_line_lease_t> rows() const noexcept
+    {
+        return *m_rows;
+    }
+
+    // Compares rows, not blocks. Two leases built separately from the same rows
+    // are the same selection, and callers - tests especially - depend on that.
+    // Sharing only makes the common case cheap enough to skip the walk.
+    friend bool operator==(
+        const Terminal_selection_line_lease_list& left,
+        const Terminal_selection_line_lease_list& right)
+    {
+        return left.m_rows == right.m_rows || *left.m_rows == *right.m_rows;
+    }
+    friend bool operator==(
+        const Terminal_selection_line_lease_list& left,
+        const Storage&                            right)
+    {
+        return *left.m_rows == right;
+    }
+
+private:
+    static const std::shared_ptr<const Storage>& shared_empty_rows()
+    {
+        static const std::shared_ptr<const Storage> empty =
+            std::make_shared<const Storage>();
+        return empty;
+    }
+
+    std::shared_ptr<const Storage> m_rows;
+};
+
 struct terminal_selection_visual_lease_t
 {
     terminal_selection_content_basis_t source_content_basis;
@@ -169,8 +279,7 @@ struct terminal_selection_visual_lease_t
     terminal_grid_position_t           extent;
     std::uint64_t                      durable_payload_identity     = 0U;
     std::uint64_t                      provisional_payload_identity = 0U;
-    std::vector<terminal_selection_line_lease_t>
-                                       selected_lines;
+    Terminal_selection_line_lease_list selected_lines;
 };
 
 inline terminal_selection_line_lease_t terminal_selection_line_lease_from_retained_identity(

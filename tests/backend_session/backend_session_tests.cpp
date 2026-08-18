@@ -3196,7 +3196,7 @@ bool test_selection_visual_lease_span_compatibility()
         "attached visible lease initially emits selection spans");
     ok &= check(selected_lease.has_value(),
         "attached visible selection records a visual lease");
-    const std::vector<term::terminal_selection_line_lease_t> selected_lines =
+    const term::Terminal_selection_line_lease_list selected_lines =
         selected_lease.has_value()
             ? selected_lease->selected_lines
             : std::vector<term::terminal_selection_line_lease_t>{};
@@ -3408,7 +3408,7 @@ bool test_selection_spans_preserve_after_same_viewport_idempotent_selected_row_r
         selected_lease.has_value()
             ? selected_lease->source_content_basis
             : term::terminal_selection_content_basis_t{};
-    const std::vector<term::terminal_selection_line_lease_t> selected_lines =
+    const term::Terminal_selection_line_lease_list selected_lines =
         selected_lease.has_value()
             ? selected_lease->selected_lines
             : std::vector<term::terminal_selection_line_lease_t>{};

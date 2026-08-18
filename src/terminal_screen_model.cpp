@@ -2712,9 +2712,7 @@ bool Terminal_screen_model::render_selection_request_logical_rows(
     return selection_line_lease_logical_rows(
         buffer_id,
         request.range,
-        std::span<const terminal_selection_line_lease_t>(
-            request.expected_lines.data(),
-            request.expected_lines.size()),
+        request.expected_lines.rows(),
         logical_rows);
 }
 

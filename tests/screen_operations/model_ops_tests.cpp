@@ -1119,6 +1119,69 @@ void wait_for_wall_clock_after_ms(qint64 reference_ms)
     }
 }
 
+bool test_selection_line_lease_list_semantics()
+{
+    bool ok = true;
+
+    using List    = term::Terminal_selection_line_lease_list;
+    using Storage = List::Storage;
+
+    const term::terminal_history_handle_t first =
+        term::terminal_history_handle_from_retained_identity(11U, 3U);
+    const term::terminal_history_handle_t second =
+        term::terminal_history_handle_from_retained_identity(12U, 3U);
+
+    const List empty;
+    ok &= check(empty.empty() && empty.size() == 0U,
+        "a default-constructed lease row list is empty");
+
+    const List rows = Storage{{0, first}, {1, second}};
+    ok &= check(!rows.empty() && rows.size() == 2U &&
+            rows.front().history_handle == first &&
+            rows[1].history_handle == second &&
+            rows.data() == rows.begin() &&
+            rows.end() - rows.begin() == 2 &&
+            rows.rows().size() == 2U,
+        "a lease row list reads back the rows it was built from");
+
+    // Sharing is the whole point, so two lists built separately from equal rows
+    // still have to compare equal: the block-pointer test is a shortcut, not the
+    // definition.
+    const List same_rows_built_separately = Storage{{0, first}, {1, second}};
+    const List shared_copy = rows;
+    ok &= check(rows == same_rows_built_separately && rows == shared_copy,
+        "lease row lists compare by rows, not by block");
+    ok &= check(!(rows == List(Storage{{0, first}})),
+        "lease row lists with different rows are not equal");
+    ok &= check(rows == Storage{{0, first}, {1, second}},
+        "a lease row list compares equal to the rows themselves");
+
+    const List braced = {{0, first}, {1, second}};
+    ok &= check(braced == rows,
+        "a lease row list can be built from a braced row list");
+
+    // A moved-from list has to stay queryable. The member it replaced was a
+    // std::vector, whose moved-from state is safe to read, and the same
+    // publication path now moves whole leases.
+    List moved_from = rows;
+    const List moved_to = std::move(moved_from);
+    ok &= check(moved_to == rows,
+        "moving a lease row list carries the rows across");
+    ok &= check(moved_from.empty() && moved_from.size() == 0U &&
+            moved_from.begin() == moved_from.end() && moved_from == List(),
+        "a moved-from lease row list reads as an empty one");
+
+    List move_assigned = rows;
+    List move_source   = Storage{{0, second}};
+    move_assigned = std::move(move_source);
+    ok &= check(move_assigned.size() == 1U &&
+            move_assigned.front().history_handle == second &&
+            move_source.empty(),
+        "move-assigning a lease row list leaves the source empty");
+
+    return ok;
+}
+
 bool test_selection_attachment_follows_multiple_successors_in_one_ingest()
 {
     bool ok = true;
@@ -1707,15 +1770,17 @@ bool test_model_selection_attachment_resolver_matrix()
 
     const auto synthetic_lease = [&](std::vector<term::terminal_history_handle_t> handles) {
         term::terminal_selection_visual_lease_t synthetic = lease;
-        synthetic.selected_lines.clear();
         synthetic.selected_range = {{0, 0},
             {static_cast<int>(handles.size()) - 1, 1},
             term::Terminal_selection_mode::NORMAL};
         synthetic.anchor = synthetic.selected_range.start;
         synthetic.extent = synthetic.selected_range.end;
+        std::vector<term::terminal_selection_line_lease_t> rows;
+        rows.reserve(handles.size());
         for (std::size_t index = 0U; index < handles.size(); ++index) {
-            synthetic.selected_lines.push_back({static_cast<int>(index), handles[index]});
+            rows.push_back({static_cast<int>(index), handles[index]});
         }
+        synthetic.selected_lines = std::move(rows);
         return synthetic;
     };
     const std::vector<term::terminal_selection_line_lease_t> final_lines =
@@ -5045,6 +5110,7 @@ int main()
     ok &= test_scrollback_growth_observer_seam();
     ok &= test_repaint_recovery_shift_helper_matches_policy();
     ok &= test_primary_repaint_recovery_accepts_distinct_shift();
+    ok &= test_selection_line_lease_list_semantics();
     ok &= test_selection_attachment_follows_multiple_successors_in_one_ingest();
     ok &= test_primary_repaint_recovery_preserves_row_content_stamps();
     ok &= test_primary_repaint_recovery_recovers_blank_separator_row();

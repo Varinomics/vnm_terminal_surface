@@ -445,7 +445,9 @@ struct Terminal_render_line_provenance
 struct Terminal_render_selection_request
 {
     Terminal_selection_range                         range;
-    std::vector<terminal_selection_line_lease_t>     expected_lines;
+    // Shares the lease's rows rather than copying them into the request; the
+    // model only reads them back out through data()/size().
+    Terminal_selection_line_lease_list               expected_lines;
 };
 
 inline bool operator==(
