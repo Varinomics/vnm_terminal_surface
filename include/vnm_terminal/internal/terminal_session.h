@@ -286,6 +286,23 @@ public:
         Terminal_public_projection_disable_reason reason);
     void set_bell_policy(Terminal_bell_policy policy);
     void set_text_area_resize_policy(Terminal_text_area_resize_policy policy);
+
+    // Installs or removes the two-phase text-area resize transaction. While it
+    // is installed, CSI 8 ; rows ; columns t stops the backend output stream at
+    // the sequence point and asks the host instead of committing the grid;
+    // removing it settles any request already in flight.
+    void set_text_area_resize_arbitration(
+        std::optional<terminal_text_area_resize_arbitration_config_t> arbitration);
+
+    std::optional<terminal_text_area_resize_arbitration_request_t>
+        pending_text_area_resize_arbitration() const;
+
+    // Ends the in-flight arbitration. The settlement is queued, not applied
+    // inline, so a host answering from inside a notification handler cannot
+    // reenter a drain, and so output queued behind the answer is folded into the
+    // held stream before it replays.
+    Terminal_session_result settle_text_area_resize_arbitration(
+        terminal_text_area_resize_arbitration_settlement_t settlement);
     void set_synchronized_output_scroll_policy(
         Terminal_synchronized_output_scroll_policy policy);
     void set_synchronized_output_scroll_policy_for_testing(
@@ -520,6 +537,41 @@ private:
 
     void initialize_screen_model(
         terminal_grid_size_t       grid_size);
+
+    // Output withheld from the screen model while a text-area resize request is
+    // in flight with the host. sequence_bytes is the request itself, replayed
+    // once the answer decides what it means; bytes is everything that arrived
+    // after it, in stream order.
+    struct Text_area_resize_arbitration_hold
+    {
+        QByteArray           sequence_bytes;
+        QByteArray           bytes;
+        terminal_grid_size_t requested_grid_size;
+        // Latched at arm time so the hold stays bounded even after the capability
+        // record is removed from the config.
+        std::size_t          hold_limit_bytes = 0U;
+        std::uint64_t        request_id       = 0U;
+        std::uint64_t        sequence         = 0U;
+    };
+
+    bool          text_area_resize_arbitration_armable() const;
+    std::uint64_t next_text_area_resize_request_id();
+
+    void arm_text_area_resize_arbitration(
+        std::uint64_t              sequence,
+        QByteArrayView             sequence_bytes,
+        QByteArrayView             tail_bytes,
+        terminal_grid_size_t       requested_grid_size);
+
+    bool hold_text_area_resize_arbitration_output(
+        const Terminal_session_command&                command);
+
+    void release_text_area_resize_arbitration(
+        Terminal_text_area_resize_arbitration_outcome  outcome,
+        terminal_grid_size_t                           effective_grid_size);
+
+    Terminal_session_result process_text_area_resize_arbitration_command(
+        const Terminal_session_command&                command);
 
     void ingest_backend_output_bytes(
         std::uint64_t              sequence,
@@ -827,6 +879,7 @@ private:
     std::vector<QByteArray>                                m_output_chunks;
     QByteArray                                             m_backend_output_prescan_pending;
     Terminal_utf8_scan_state                               m_backend_output_prescan_utf8_state;
+    std::optional<Text_area_resize_arbitration_hold>       m_text_area_resize_arbitration;
     std::unique_ptr<Backend_output_capture_writer>          m_backend_output_capture_writer;
     std::atomic<bool>                                      m_backend_output_capture_failure_recorded{false};
     std::optional<Terminal_screen_model>                   m_screen_model;
@@ -849,6 +902,7 @@ private:
     terminal_grid_size_t                                   m_grid_size;
     std::uint64_t                                          m_next_sequence = 1U;
     std::uint64_t                                          m_next_resize_id = 1U;
+    std::uint64_t                                          m_next_text_area_resize_request_id = 1U;
     std::uint64_t                                          m_last_processed_sequence = 0U;
     std::uint64_t                                          m_last_processed_backend_callback_epoch = 0U;
     std::uint64_t                                          m_ready_processed_backend_callback_epoch = 0U;

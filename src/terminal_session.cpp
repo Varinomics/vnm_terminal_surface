@@ -1522,10 +1522,33 @@ QByteArray sync_sequence_from_sync_parameter_and_tail(
     return rewritten;
 }
 
-qsizetype trailing_incomplete_csi_start(
-    QByteArrayView             bytes,
-    Terminal_utf8_scan_state   initial_utf8_scan_state)
+struct backend_output_prescan_t
 {
+    qsizetype            trailing_incomplete_csi_start = -1;
+    qsizetype            text_area_resize_start        = -1;
+    qsizetype            text_area_resize_end          = -1;
+    terminal_grid_size_t text_area_resize_grid_size;
+};
+
+bool text_area_resize_request_grid_size(
+    QByteArrayView          parameter_bytes,
+    terminal_grid_size_t&   grid_size)
+{
+    std::vector<Sgr_parameter_group> groups;
+    if (!parse_simple_csi_parameter_groups(parameter_bytes, groups)) {
+        return false;
+    }
+
+    return terminal_text_area_resize_request_status(groups, grid_size) ==
+        Terminal_text_area_resize_request_status::SUPPORTED;
+}
+
+backend_output_prescan_t prescan_backend_output(
+    QByteArrayView             bytes,
+    Terminal_utf8_scan_state   initial_utf8_scan_state,
+    bool                       find_text_area_resize)
+{
+    backend_output_prescan_t result;
     Terminal_utf8_scan_state utf8_scan_state = initial_utf8_scan_state;
     for (qsizetype offset = 0; offset < bytes.size(); ++offset) {
         if (utf8_scan_consumes_byte(static_cast<unsigned char>(bytes[offset]), utf8_scan_state)) {
@@ -1539,7 +1562,8 @@ qsizetype trailing_incomplete_csi_start(
         else
         if (static_cast<unsigned char>(bytes[offset]) == 0x1bU) {
             if (offset + 1 >= bytes.size()) {
-                return offset;
+                result.trailing_incomplete_csi_start = offset;
+                return result;
             }
 
             if (bytes[offset + 1] == '[') {
@@ -1560,6 +1584,7 @@ qsizetype trailing_incomplete_csi_start(
             ++cursor;
         }
 
+        const qsizetype parameter_end = cursor;
         while (cursor < bytes.size() &&
             is_csi_intermediate_byte(static_cast<unsigned char>(bytes[cursor])))
         {
@@ -1567,16 +1592,75 @@ qsizetype trailing_incomplete_csi_start(
         }
 
         if (cursor >= bytes.size()) {
-            return offset;
+            result.trailing_incomplete_csi_start = offset;
+            return result;
         }
 
         if (is_csi_final_byte(static_cast<unsigned char>(bytes[cursor]))) {
+            // A CSI 8 t inside a DCS/OSC/APC/PM/SOS payload is not a false
+            // positive: the parser terminates any string payload the moment it
+            // sees ESC [ or 0x9b (Parser_string_terminator::RECOVERY,
+            // terminal_byte_stream_parser.cpp find_string_terminator), so it
+            // dispatches the same byte run this walk sees. If that recovery rule
+            // ever relaxes, this walk needs string-state awareness.
+            if (find_text_area_resize                            &&
+                result.text_area_resize_start < 0                &&
+                static_cast<unsigned char>(bytes[cursor]) == 't' &&
+                cursor == parameter_end                          &&
+                text_area_resize_request_grid_size(
+                    QByteArrayView(
+                        bytes.data() + parameter_begin,
+                        parameter_end - parameter_begin),
+                    result.text_area_resize_grid_size))
+            {
+                result.text_area_resize_start = offset;
+                result.text_area_resize_end   = cursor + 1;
+            }
             offset = cursor;
         }
     }
 
-    return -1;
+    return result;
 }
+
+QByteArray text_area_resize_sequence(terminal_grid_size_t grid_size)
+{
+    QByteArray sequence = QByteArrayLiteral("[8;");
+    sequence.append(QByteArray::number(grid_size.rows));
+    sequence.append(';');
+    sequence.append(QByteArray::number(grid_size.columns));
+    sequence.append('t');
+    return sequence;
+}
+
+// Declining a request the host refused is observationally the standing DISABLED
+// policy applied to one sequence, so it reuses that path rather than inventing a
+// second way to refuse the same bytes.
+class Text_area_resize_policy_scope
+{
+public:
+    Text_area_resize_policy_scope(
+        Terminal_screen_model&             model,
+        Terminal_text_area_resize_policy   restore)
+    :
+        m_model(model),
+        m_restore(restore)
+    {
+        m_model.set_text_area_resize_policy(Terminal_text_area_resize_policy::DISABLED);
+    }
+
+    Text_area_resize_policy_scope(const Text_area_resize_policy_scope&)            = delete;
+    Text_area_resize_policy_scope& operator=(const Text_area_resize_policy_scope&) = delete;
+
+    ~Text_area_resize_policy_scope()
+    {
+        m_model.set_text_area_resize_policy(m_restore);
+    }
+
+private:
+    Terminal_screen_model&           m_model;
+    Terminal_text_area_resize_policy m_restore;
+};
 
 bool utf8_scan_state_is_reset(const Terminal_utf8_scan_state& state)
 {
@@ -2919,8 +3003,82 @@ void Terminal_session::set_text_area_resize_policy(
         m_screen_model->set_text_area_resize_policy(policy);
     }
 
+    if (policy == Terminal_text_area_resize_policy::DISABLED &&
+        m_text_area_resize_arbitration.has_value())
+    {
+        // The host just declared it cannot move its window, which is the answer
+        // the in-flight request was waiting for.
+        (void)settle_text_area_resize_arbitration({
+            m_text_area_resize_arbitration->request_id,
+            Terminal_text_area_resize_arbitration_outcome::TEXT_AREA_RESIZE_DISABLED,
+            {},
+        });
+    }
+
     drain_backend_callback_commands();
     process_pending_commands();
+}
+
+void Terminal_session::set_text_area_resize_arbitration(
+    std::optional<terminal_text_area_resize_arbitration_config_t> arbitration)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    // Assigned before the release, for the same reason set_text_area_resize_policy
+    // assigns before its drain: the release must run under the new capability
+    // state so the replayed tail cannot arm a request the host can no longer
+    // answer.
+    m_config.text_area_resize_arbitration = arbitration;
+    if (!arbitration.has_value() && m_text_area_resize_arbitration.has_value()) {
+        (void)settle_text_area_resize_arbitration({
+            m_text_area_resize_arbitration->request_id,
+            Terminal_text_area_resize_arbitration_outcome::ARBITRATION_DISABLED,
+            {},
+        });
+    }
+    drain_backend_callback_commands();
+    process_pending_commands();
+}
+
+std::optional<terminal_text_area_resize_arbitration_request_t>
+    Terminal_session::pending_text_area_resize_arbitration() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    if (!m_text_area_resize_arbitration.has_value()) {
+        return std::nullopt;
+    }
+
+    return terminal_text_area_resize_arbitration_request_t{
+        m_text_area_resize_arbitration->request_id,
+        m_text_area_resize_arbitration->requested_grid_size,
+    };
+}
+
+Terminal_session_result Terminal_session::settle_text_area_resize_arbitration(
+    terminal_text_area_resize_arbitration_settlement_t settlement)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    if (!m_text_area_resize_arbitration.has_value() ||
+        m_text_area_resize_arbitration->request_id != settlement.request_id)
+    {
+        return make_rejected_result(
+            m_last_processed_sequence,
+            Terminal_session_result_code::INVALID_STATE,
+            make_backend_error(
+                Terminal_backend_error_code::CALLBACK_MISSING,
+                QStringLiteral("no in-flight text-area resize arbitration for this request")));
+    }
+
+    Terminal_session_command command;
+    command.sequence                     = next_sequence();
+    command.kind                         =
+        Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION;
+    command.text_area_resize_arbitration = settlement;
+
+    drain_backend_callback_commands();
+    return enqueue_and_process_synchronous_command(std::move(command));
 }
 
 void Terminal_session::set_primary_repaint_recovery_enabled(bool enabled)
@@ -4172,6 +4330,8 @@ Terminal_session_result Terminal_session::process_command(Terminal_session_comma
             return process_backend_exit_command(command);
         case Terminal_session_command_kind::BACKEND_ERROR:
             return process_backend_error_command(command);
+        case Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION:
+            return process_text_area_resize_arbitration_command(command);
     }
 
     return make_accepted_result(command.sequence);
@@ -4416,6 +4576,15 @@ Terminal_session_result Terminal_session::process_resize_command(
             make_backend_error(
                 Terminal_backend_error_code::RESIZE_FAILED,
                 QStringLiteral("resize requires an initialized screen model")));
+    }
+
+    if (m_text_area_resize_arbitration.has_value()) {
+        // The host is moving its own geometry, so the question this request
+        // asked has been answered by other means. The held tail replays against
+        // the grid its bytes were emitted for, before the new grid lands.
+        release_text_area_resize_arbitration(
+            Terminal_text_area_resize_arbitration_outcome::HOST_GEOMETRY_CHANGED,
+            {});
     }
 
     const terminal_grid_size_t previous_grid_size = m_grid_size;
@@ -4716,17 +4885,21 @@ void Terminal_session::consume_screen_model_text_area_resize_request(
                 request.grid_size) ||
             context.render_snapshot_metadata_changed;
     }
-    record_notification({
-        Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED,
-        context.sequence,
-        QStringLiteral("text-area resize requested"),
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        false,
-        std::nullopt,
-        request.grid_size,
-    });
+    // An arbitrating host already resized its window for this request when it
+    // answered. Firing the standing request signal as well would move it twice.
+    if (!m_config.text_area_resize_arbitration.has_value()) {
+        record_notification({
+            Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED,
+            context.sequence,
+            QStringLiteral("text-area resize requested"),
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            false,
+            std::nullopt,
+            request.grid_size,
+        });
+    }
     context.parser_resize_requests.push_back(request.grid_size);
 }
 
@@ -4936,6 +5109,12 @@ Terminal_session_result Terminal_session::process_backend_output_command(
         record_output_activity(command.sequence);
     }
 
+    if (m_text_area_resize_arbitration.has_value() &&
+        hold_text_area_resize_arbitration_output(command))
+    {
+        return make_accepted_result(command.sequence);
+    }
+
     const Terminal_utf8_scan_state backend_output_prescan_utf8_state =
         m_backend_output_prescan_utf8_state;
     const bool use_plain_ascii_prescan_fast_path =
@@ -4955,6 +5134,198 @@ Terminal_session_result Terminal_session::process_backend_output_command(
     return make_accepted_result(command.sequence);
 }
 
+bool Terminal_session::text_area_resize_arbitration_armable() const
+{
+    // A standing DISABLED policy already refuses every request, so asking the
+    // host would cost a round trip to reach the answer it has already given.
+    return
+        m_config.text_area_resize_arbitration.has_value()            &&
+        m_config.text_area_resize_policy ==
+            Terminal_text_area_resize_policy::APPLICATION_CONTROLLED &&
+        !m_text_area_resize_arbitration.has_value();
+}
+
+std::uint64_t Terminal_session::next_text_area_resize_request_id()
+{
+    const std::uint64_t id = m_next_text_area_resize_request_id++;
+    if (m_next_text_area_resize_request_id == 0U) {
+        m_next_text_area_resize_request_id = 1U;
+    }
+    return id;
+}
+
+void Terminal_session::arm_text_area_resize_arbitration(
+    std::uint64_t          sequence,
+    QByteArrayView         sequence_bytes,
+    QByteArrayView         tail_bytes,
+    terminal_grid_size_t   requested_grid_size)
+{
+    Q_ASSERT(!m_text_area_resize_arbitration.has_value());
+
+    Text_area_resize_arbitration_hold hold;
+    hold.sequence_bytes = sequence_bytes.toByteArray();
+    hold.bytes          = tail_bytes.toByteArray();
+    // The prescan hold-back is chronologically after this tail, so folding it in
+    // here is what keeps the released stream in byte order.
+    hold.bytes.append(m_backend_output_prescan_pending);
+    m_backend_output_prescan_pending.clear();
+    hold.requested_grid_size = requested_grid_size;
+    hold.hold_limit_bytes    = m_config.text_area_resize_arbitration->hold_limit_bytes;
+    hold.request_id          = next_text_area_resize_request_id();
+    hold.sequence            = sequence;
+    // The hold begins immediately after a complete control sequence, the same
+    // reset every segmentation boundary in ingest_backend_output_run performs.
+    reset_utf8_scan_state(m_backend_output_prescan_utf8_state);
+    m_text_area_resize_arbitration = std::move(hold);
+
+    Terminal_session_notification notification;
+    notification.kind     =
+        Terminal_session_notification_kind::TEXT_AREA_RESIZE_ARBITRATION_REQUESTED;
+    notification.sequence = sequence;
+    notification.message  = QStringLiteral("text-area resize arbitration requested");
+    notification.text_area_resize_arbitration_request =
+        terminal_text_area_resize_arbitration_request_t{
+            m_text_area_resize_arbitration->request_id,
+            requested_grid_size,
+        };
+    record_notification(std::move(notification));
+}
+
+bool Terminal_session::hold_text_area_resize_arbitration_output(
+    const Terminal_session_command& command)
+{
+    while (m_text_area_resize_arbitration.has_value()) {
+        Text_area_resize_arbitration_hold& hold = *m_text_area_resize_arbitration;
+        const std::size_t held =
+            static_cast<std::size_t>(hold.bytes.size()) +
+            static_cast<std::size_t>(command.bytes.size());
+        if (held <= hold.hold_limit_bytes) {
+            hold.bytes.append(command.bytes);
+            // Held bytes are attributed to the command that will release them,
+            // the same convention carried-over prescan bytes already use.
+            hold.sequence = command.sequence;
+            // A hold owns every byte it captured, so this callback is fully
+            // accounted even though the bytes are not on screen yet. Withholding
+            // the epoch would stall frame capture for the whole host round trip
+            // and would suppress the output that arrived before the request.
+            complete_processing_backend_output_side_effects();
+            return true;
+        }
+
+        // The process is outrunning the host's answer. Decline rather than
+        // retain unbounded output. The release can re-arm from a request inside
+        // the released tail, so this loops rather than recursing.
+        release_text_area_resize_arbitration(
+            Terminal_text_area_resize_arbitration_outcome::HOLD_LIMIT_REACHED,
+            {});
+    }
+
+    return false;
+}
+
+void Terminal_session::release_text_area_resize_arbitration(
+    Terminal_text_area_resize_arbitration_outcome  outcome,
+    terminal_grid_size_t                           effective_grid_size)
+{
+    Q_ASSERT(m_text_area_resize_arbitration.has_value());
+
+    const Text_area_resize_arbitration_hold hold =
+        std::move(*m_text_area_resize_arbitration);
+    // Reset before ingesting anything, so a request inside the released tail can
+    // arm cleanly.
+    m_text_area_resize_arbitration.reset();
+
+    const bool accepted =
+        outcome == Terminal_text_area_resize_arbitration_outcome::ACCEPTED;
+
+    // Recorded before the replay, so the host sees the answer acknowledged
+    // before the answer's consequences, and so a request armed by the replayed
+    // tail is announced after this settlement rather than before it.
+    Terminal_session_notification notification;
+    notification.kind     =
+        Terminal_session_notification_kind::TEXT_AREA_RESIZE_ARBITRATION_SETTLED;
+    notification.sequence = hold.sequence;
+    notification.message  = QStringLiteral("text-area resize arbitration settled");
+    notification.text_area_resize_arbitration_settlement =
+        terminal_text_area_resize_arbitration_settlement_t{
+            hold.request_id,
+            outcome,
+            accepted ? effective_grid_size : m_grid_size,
+        };
+    record_notification(std::move(notification));
+
+    if (accepted) {
+        const QByteArray sequence_bytes =
+            grid_sizes_match(effective_grid_size, hold.requested_grid_size)
+                ? hold.sequence_bytes
+                : text_area_resize_sequence(effective_grid_size);
+        ingest_backend_output_segment(hold.sequence, QByteArrayView(sequence_bytes), false);
+    }
+    else {
+        Text_area_resize_policy_scope declined(
+            *m_screen_model,
+            m_config.text_area_resize_policy);
+        ingest_backend_output_segment(
+            hold.sequence,
+            QByteArrayView(hold.sequence_bytes),
+            false);
+    }
+
+    ingest_backend_output_bytes(hold.sequence, QByteArrayView(hold.bytes));
+}
+
+Terminal_session_result Terminal_session::process_text_area_resize_arbitration_command(
+    const Terminal_session_command& command)
+{
+    if (!command.text_area_resize_arbitration.has_value()) {
+        return make_rejected_result(
+            command.sequence,
+            Terminal_session_result_code::INVALID_ARGUMENT,
+            make_backend_error(
+                Terminal_backend_error_code::CALLBACK_MISSING,
+                QStringLiteral("text-area resize arbitration command requires a settlement")));
+    }
+
+    const terminal_text_area_resize_arbitration_settlement_t& settlement =
+        *command.text_area_resize_arbitration;
+    // A cancellation queued ahead of this settlement (a backend exit, a host
+    // resize) legitimately ends the request first, so the id is checked again
+    // here and not only at the public entry point.
+    if (!m_text_area_resize_arbitration.has_value() ||
+        m_text_area_resize_arbitration->request_id != settlement.request_id)
+    {
+        return make_rejected_result(
+            command.sequence,
+            Terminal_session_result_code::INVALID_STATE,
+            make_backend_error(
+                Terminal_backend_error_code::CALLBACK_MISSING,
+                QStringLiteral("text-area resize arbitration is no longer in flight")));
+    }
+
+    if (settlement.outcome ==
+            Terminal_text_area_resize_arbitration_outcome::ACCEPTED &&
+        !is_terminal_screen_model_grid_size_supported(settlement.effective_grid_size))
+    {
+        // An unusable answer is truthfully a refusal, and settling here rather
+        // than leaving the request in flight keeps a bad host answer from
+        // stalling output until the deadline.
+        release_text_area_resize_arbitration(
+            Terminal_text_area_resize_arbitration_outcome::REJECTED,
+            {});
+        return make_rejected_result(
+            command.sequence,
+            Terminal_session_result_code::INVALID_ARGUMENT,
+            make_backend_error(
+                Terminal_backend_error_code::RESIZE_FAILED,
+                QStringLiteral("text-area resize arbitration effective grid is unsupported")));
+    }
+
+    release_text_area_resize_arbitration(
+        settlement.outcome,
+        settlement.effective_grid_size);
+    return make_accepted_result(command.sequence);
+}
+
 void Terminal_session::ingest_backend_output_bytes(
     std::uint64_t   sequence,
     QByteArrayView  arriving_bytes)
@@ -4969,15 +5340,44 @@ void Terminal_session::ingest_backend_output_bytes(
         remaining = QByteArrayView(combined_output);
     }
 
-    const qsizetype incomplete_csi_start = trailing_incomplete_csi_start(remaining, utf8_seed);
-    if (incomplete_csi_start >= 0) {
-        const qsizetype pending_size = remaining.size() - incomplete_csi_start;
+    const backend_output_prescan_t prescan = prescan_backend_output(
+        remaining,
+        utf8_seed,
+        text_area_resize_arbitration_armable());
+    if (prescan.trailing_incomplete_csi_start >= 0) {
+        const qsizetype pending_size =
+            remaining.size() - prescan.trailing_incomplete_csi_start;
+        // A run longer than the parser's own pending limit is one it will never
+        // complete, so it is handed on rather than retained. No resize request
+        // can be lost that way: the parser caps parameter groups and digits far
+        // below this limit, so a valid CSI 8 t never reaches it.
         if (static_cast<std::size_t>(pending_size) <= k_control_sequence_pending_limit_bytes) {
             m_backend_output_prescan_pending = QByteArray(
-                remaining.data() + incomplete_csi_start,
+                remaining.data() + prescan.trailing_incomplete_csi_start,
                 pending_size);
-            remaining = remaining.sliced(0, incomplete_csi_start);
+            remaining = remaining.sliced(0, prescan.trailing_incomplete_csi_start);
         }
+    }
+
+    if (prescan.text_area_resize_start >= 0) {
+        if (prescan.text_area_resize_start > 0) {
+            ingest_backend_output_run(
+                sequence,
+                remaining.sliced(0, prescan.text_area_resize_start),
+                utf8_seed,
+                false);
+        }
+        arm_text_area_resize_arbitration(
+            sequence,
+            remaining.sliced(
+                prescan.text_area_resize_start,
+                prescan.text_area_resize_end - prescan.text_area_resize_start),
+            remaining.sliced(prescan.text_area_resize_end),
+            prescan.text_area_resize_grid_size);
+        // The hold owns every remaining byte of this command, so the callback is
+        // fully accounted. See hold_text_area_resize_arbitration_output.
+        complete_processing_backend_output_side_effects();
+        return;
     }
 
     ingest_backend_output_run(sequence, remaining, utf8_seed, true);
@@ -5142,6 +5542,15 @@ Terminal_session_result Terminal_session::process_backend_exit_command(
             make_backend_error(
                 Terminal_backend_error_code::START_FAILED,
                 QStringLiteral("backend exit was already reported")));
+    }
+
+    // Nothing can answer a request once the process is gone, and a request
+    // armed by the replayed tail is in the same position, so this drains to
+    // idle rather than settling once.
+    while (m_text_area_resize_arbitration.has_value()) {
+        release_text_area_resize_arbitration(
+            Terminal_text_area_resize_arbitration_outcome::PROCESS_EXITED,
+            {});
     }
 
     m_exit_status    = *command.exit;
@@ -5475,6 +5884,10 @@ void Terminal_session::record_pending_notification(
         case Terminal_session_notification_kind::PROCESS_EXITED:
         case Terminal_session_notification_kind::BACKEND_ERROR:
         case Terminal_session_notification_kind::HOST_REQUEST:
+        // A request, its settlement and the next request can all be pending in
+        // one drain, and the state machine needs all three in order.
+        case Terminal_session_notification_kind::TEXT_AREA_RESIZE_ARBITRATION_REQUESTED:
+        case Terminal_session_notification_kind::TEXT_AREA_RESIZE_ARBITRATION_SETTLED:
             break;
     }
 
@@ -8714,6 +9127,7 @@ Terminal_session::Queue_category Terminal_session::queue_category_for(
         case Terminal_session_command_kind::BACKEND_EXIT:
         case Terminal_session_command_kind::BACKEND_ERROR:
         case Terminal_session_command_kind::RESIZE:
+        case Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION:
             return Queue_category::NONE;
     }
 
