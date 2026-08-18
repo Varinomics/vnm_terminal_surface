@@ -4951,17 +4951,25 @@ Terminal_session_result Terminal_session::process_backend_output_command(
         return make_accepted_result(command.sequence);
     }
 
-    QByteArray combined_output;
-    QByteArrayView remaining(command.bytes);
+    ingest_backend_output_bytes(command.sequence, QByteArrayView(command.bytes));
+    return make_accepted_result(command.sequence);
+}
+
+void Terminal_session::ingest_backend_output_bytes(
+    std::uint64_t   sequence,
+    QByteArrayView  arriving_bytes)
+{
+    const Terminal_utf8_scan_state utf8_seed = m_backend_output_prescan_utf8_state;
+
+    QByteArray     combined_output;
+    QByteArrayView remaining(arriving_bytes);
     if (!m_backend_output_prescan_pending.isEmpty()) {
-        combined_output = m_backend_output_prescan_pending + command.bytes;
+        combined_output = m_backend_output_prescan_pending + arriving_bytes.toByteArray();
         m_backend_output_prescan_pending.clear();
         remaining = QByteArrayView(combined_output);
     }
 
-    const qsizetype incomplete_csi_start = trailing_incomplete_csi_start(
-        remaining,
-        backend_output_prescan_utf8_state);
+    const qsizetype incomplete_csi_start = trailing_incomplete_csi_start(remaining, utf8_seed);
     if (incomplete_csi_start >= 0) {
         const qsizetype pending_size = remaining.size() - incomplete_csi_start;
         if (static_cast<std::size_t>(pending_size) <= k_control_sequence_pending_limit_bytes) {
@@ -4972,7 +4980,30 @@ Terminal_session_result Terminal_session::process_backend_output_command(
         }
     }
 
-    Terminal_utf8_scan_state remaining_utf8_scan_state = backend_output_prescan_utf8_state;
+    ingest_backend_output_run(sequence, remaining, utf8_seed, true);
+
+    if (arriving_bytes.empty() && m_backend_output_prescan_pending.isEmpty()) {
+        complete_processing_backend_output_side_effects();
+    }
+
+    if (!m_backend_output_prescan_pending.isEmpty()) {
+        record_incomplete_processing_backend_output_side_effects();
+    }
+
+    m_backend_output_prescan_utf8_state = utf8_scan_state_after(
+        arriving_bytes,
+        m_backend_output_prescan_utf8_state);
+}
+
+void Terminal_session::ingest_backend_output_run(
+    std::uint64_t              sequence,
+    QByteArrayView             bytes,
+    Terminal_utf8_scan_state   utf8_seed,
+    bool                       may_complete_backend_output_callback)
+{
+    QByteArray               combined_output;
+    QByteArrayView           remaining(bytes);
+    Terminal_utf8_scan_state remaining_utf8_scan_state = utf8_seed;
     while (!remaining.empty()) {
         if (immediate_public_projection_policy_enabled() &&
             m_screen_model->mode_state().synchronized_output)
@@ -4983,7 +5014,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             if (sync_reset.start >= 0) {
                 if (sync_reset.start > 0) {
                     ingest_backend_output_segment(
-                        command.sequence,
+                        sequence,
                         remaining.sliced(0, sync_reset.start));
                     remaining = remaining.sliced(sync_reset.start);
                     reset_utf8_scan_state(remaining_utf8_scan_state);
@@ -4993,7 +5024,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
                 flush_deferred_backend_content_snapshot();
                 const QByteArray prefix = sync_sequence_prefix(remaining, sync_reset, 'l');
                 if (!prefix.isEmpty()) {
-                    ingest_backend_output_segment(command.sequence, QByteArrayView(prefix));
+                    ingest_backend_output_segment(sequence, QByteArrayView(prefix));
                     combined_output =
                         sync_sequence_from_sync_parameter_and_tail(remaining, sync_reset, 'l');
                     remaining = QByteArrayView(combined_output);
@@ -5005,9 +5036,11 @@ Terminal_session_result Terminal_session::process_backend_output_command(
                 combined_output =
                     sync_sequence_post_parameter_suffix_and_tail(remaining, sync_reset, 'l');
                 ingest_backend_output_segment(
-                    command.sequence,
+                    sequence,
                     QByteArrayView(release),
-                    m_backend_output_prescan_pending.isEmpty() && combined_output.isEmpty());
+                    may_complete_backend_output_callback           &&
+                        m_backend_output_prescan_pending.isEmpty() &&
+                        combined_output.isEmpty());
                 remaining = QByteArrayView(combined_output);
                 reset_utf8_scan_state(remaining_utf8_scan_state);
                 continue;
@@ -5019,15 +5052,16 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             remaining_utf8_scan_state);
         if (sync_set.start < 0) {
             ingest_backend_output_segment(
-                command.sequence,
+                sequence,
                 remaining,
-                m_backend_output_prescan_pending.isEmpty());
+                may_complete_backend_output_callback &&
+                    m_backend_output_prescan_pending.isEmpty());
             break;
         }
 
         if (sync_set.start > 0) {
             ingest_backend_output_segment(
-                command.sequence,
+                sequence,
                 remaining.sliced(0, sync_set.start));
             remaining = remaining.sliced(sync_set.start);
             reset_utf8_scan_state(remaining_utf8_scan_state);
@@ -5045,7 +5079,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             immediate_public_projection_policy_enabled();
         const QByteArray prefix = sync_sequence_prefix(remaining, sync_set, 'h');
         if (!prefix.isEmpty()) {
-            ingest_backend_output_segment(command.sequence, QByteArrayView(prefix));
+            ingest_backend_output_segment(sequence, QByteArrayView(prefix));
             combined_output =
                 immediate_entry_boundary
                     ? sync_sequence_from_sync_parameter_and_tail(remaining, sync_set, 'h')
@@ -5060,9 +5094,11 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             combined_output =
                 sync_sequence_post_parameter_suffix_and_tail(remaining, sync_set, 'h');
             ingest_backend_output_segment(
-                command.sequence,
+                sequence,
                 QByteArrayView(entry),
-                m_backend_output_prescan_pending.isEmpty() && combined_output.isEmpty());
+                may_complete_backend_output_callback           &&
+                    m_backend_output_prescan_pending.isEmpty() &&
+                    combined_output.isEmpty());
             (void)capture_public_projection_from_latest_content_basis();
             remaining = QByteArrayView(combined_output);
             reset_utf8_scan_state(remaining_utf8_scan_state);
@@ -5071,7 +5107,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
 
         if (sync_set.end < remaining.size()) {
             ingest_backend_output_segment(
-                command.sequence,
+                sequence,
                 remaining.sliced(0, sync_set.end));
             remaining = remaining.sliced(sync_set.end);
             reset_utf8_scan_state(remaining_utf8_scan_state);
@@ -5079,25 +5115,12 @@ Terminal_session_result Terminal_session::process_backend_output_command(
         }
 
         ingest_backend_output_segment(
-            command.sequence,
+            sequence,
             remaining,
-            m_backend_output_prescan_pending.isEmpty());
+            may_complete_backend_output_callback &&
+                m_backend_output_prescan_pending.isEmpty());
         break;
     }
-
-    if (command.bytes.isEmpty() && m_backend_output_prescan_pending.isEmpty()) {
-        complete_processing_backend_output_side_effects();
-    }
-
-    if (!m_backend_output_prescan_pending.isEmpty()) {
-        record_incomplete_processing_backend_output_side_effects();
-    }
-
-    m_backend_output_prescan_utf8_state = utf8_scan_state_after(
-        command.bytes,
-        m_backend_output_prescan_utf8_state);
-
-    return make_accepted_result(command.sequence);
 }
 
 Terminal_session_result Terminal_session::process_backend_exit_command(

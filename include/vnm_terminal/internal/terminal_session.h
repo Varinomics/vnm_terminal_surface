@@ -521,6 +521,20 @@ private:
     void initialize_screen_model(
         terminal_grid_size_t       grid_size);
 
+    void ingest_backend_output_bytes(
+        std::uint64_t              sequence,
+        QByteArrayView             arriving_bytes);
+
+    // Walks one contiguous run of already-prescanned bytes, splitting it at the
+    // synchronized-output boundaries it contains. The caller states whether this
+    // run may complete the in-flight backend output callback; a run that is only
+    // a prefix of the command's bytes may not.
+    void ingest_backend_output_run(
+        std::uint64_t              sequence,
+        QByteArrayView             bytes,
+        Terminal_utf8_scan_state   utf8_seed,
+        bool                       may_complete_backend_output_callback);
+
     void ingest_backend_output_segment(
         std::uint64_t              sequence,
         QByteArrayView             bytes,
