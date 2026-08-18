@@ -259,7 +259,7 @@ void Selection_contract_controller::record_visual_lease(
     visual_lease.provisional_payload_identity  = m_provisional_payload_identity;
     m_internal_state                           = Terminal_selection_internal_state::ATTACHED;
     m_anchor_domain                            = visual_lease.anchor_domain;
-    m_visual_lease                             = visual_lease;
+    m_visual_lease                             = std::move(visual_lease);
 }
 
 }

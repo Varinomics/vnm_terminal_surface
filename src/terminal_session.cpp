@@ -6480,7 +6480,7 @@ void Terminal_session::advance_selection_content_basis_for_model_result(
             resolution.translated_lease->selected_range;
         m_selection.install_translated_attachment(
             translated_range,
-            *resolution.translated_lease);
+            std::move(*resolution.translated_lease));
         m_selection_buffer_id = target_source.buffer_id;
     }
     else {
