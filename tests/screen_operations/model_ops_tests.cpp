@@ -5058,6 +5058,69 @@ bool test_text_area_resize_policy_gates_the_request()
     return ok;
 }
 
+// The session's backend-output prescan and this model's control-sequence
+// dispatch both classify CSI 8 t through this one function. Pinning it directly
+// is what keeps the two from drifting apart about which byte run is a request.
+bool test_text_area_resize_request_status_classifier()
+{
+    bool ok = true;
+
+    const auto classify = [](
+        QByteArrayView                parameter_bytes,
+        term::terminal_grid_size_t&   grid_size) {
+        std::vector<term::Sgr_parameter_group> groups;
+        if (!term::parse_sgr_parameter_groups(parameter_bytes, groups)) {
+            return term::Terminal_text_area_resize_request_status::MALFORMED;
+        }
+        return term::terminal_text_area_resize_request_status(groups, grid_size);
+    };
+
+    using Status = term::Terminal_text_area_resize_request_status;
+    term::terminal_grid_size_t grid_size;
+
+    ok &= check(classify(QByteArrayLiteral(""), grid_size)      == Status::NOT_REQUESTED,
+        "empty parameters are not a text-area resize request");
+    ok &= check(classify(QByteArrayLiteral("8"), grid_size)     == Status::NOT_REQUESTED,
+        "bare mode 8 is not a text-area resize request");
+    ok &= check(classify(QByteArrayLiteral("8;3"), grid_size)   == Status::NOT_REQUESTED,
+        "mode 8 without a column parameter is not a text-area resize request");
+    ok &= check(classify(QByteArrayLiteral("18"), grid_size)    == Status::NOT_REQUESTED,
+        "the text-area size query is not a text-area resize request");
+    ok &= check(classify(QByteArrayLiteral("2;3;5"), grid_size) == Status::NOT_REQUESTED,
+        "a three-parameter window operation other than 8 is not a resize request");
+
+    // An unreadable mode parameter cannot name the resize form, so the caller
+    // keeps ownership of the diagnostic: the model re-reads parameter 0 and
+    // reports it malformed, the session prescan simply declines to arm.
+    ok &= check(classify(QByteArrayLiteral("8:1;3;5"), grid_size) == Status::NOT_REQUESTED,
+        "a colon-subdivided mode parameter is not a text-area resize request");
+
+    ok &= check(classify(QByteArrayLiteral("8;0;5"), grid_size)    == Status::UNSUPPORTED,
+        "a zero row count is unsupported");
+    ok &= check(classify(QByteArrayLiteral("8;3;0"), grid_size)    == Status::UNSUPPORTED,
+        "a zero column count is unsupported");
+    ok &= check(classify(QByteArrayLiteral("8;4097;9"), grid_size) == Status::UNSUPPORTED,
+        "a row count past the model bound is unsupported");
+
+    grid_size = term::terminal_grid_size_t{};
+    ok &= check(classify(QByteArrayLiteral("8;3;5"), grid_size) == Status::SUPPORTED,
+        "a well-formed in-bounds request is supported");
+    ok &= check(grid_size.rows == 3 && grid_size.columns == 5,
+        "a supported request carries the requested grid out");
+
+    // A multi-atom rows group cannot reach the model dispatch, which pre-filters
+    // through parse_simple_csi_parameter_groups, but it can reach this shared
+    // classifier from any caller that parses groups directly.
+    std::vector<term::Sgr_parameter_group> groups;
+    ok &= check(term::parse_sgr_parameter_groups(QByteArrayLiteral("8;3:1;5"), groups),
+        "a colon-subdivided row parameter parses into groups");
+    ok &= check(
+        term::terminal_text_area_resize_request_status(groups, grid_size) == Status::MALFORMED,
+        "a colon-subdivided row parameter is malformed");
+
+    return ok;
+}
+
 }
 
 int main()
@@ -5103,5 +5166,6 @@ int main()
     ok &= test_retained_line_content_generation_mutations();
     ok &= test_replies_and_cursor_save_restore();
     ok &= test_text_area_resize_policy_gates_the_request();
+    ok &= test_text_area_resize_request_status_classifier();
     return ok ? 0 : 1;
 }
