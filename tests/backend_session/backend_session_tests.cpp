@@ -4498,6 +4498,84 @@ bool test_selection_current_repaint_recovery_detach_classification()
     return ok;
 }
 
+bool test_synchronized_hold_follows_multiple_successors_in_one_publication()
+{
+    bool ok = true;
+
+    auto backend = std::make_unique<Scripted_backend>();
+    Scripted_backend* backend_ptr = backend.get();
+    term::Terminal_session_config config;
+    config.recover_scrollback_from_primary_repaints = true;
+    config.capture_last_model_ingest_result         = true;
+    std::unique_ptr<term::Terminal_session> session =
+        std::make_unique<term::Terminal_session>(
+            std::move(backend),
+            enable_test_traces(config));
+    term::Terminal_launch_config launch = valid_launch_config();
+    launch.initial_grid_size = {4, 8};
+    ok &= check(session->start(launch).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+        "chained hold successor fixture starts");
+    ok &= check(backend_ptr->emit_output(selection_recovery_addressed_rows({
+            QByteArrayLiteral("aa"),
+            QByteArrayLiteral("bb"),
+            QByteArrayLiteral("cc"),
+            QByteArrayLiteral("dd"),
+        }, false)),
+        "chained hold successor fixture publishes distinct source rows");
+
+    session->set_selection_range({
+        {1, 0},
+        {1, 2},
+        term::Terminal_selection_mode::NORMAL,
+    });
+    const term::Terminal_selection_result selected = session->selected_text();
+    const std::optional<term::terminal_selection_visual_lease_t> selected_lease =
+        session->selection_visual_lease();
+    ok &= check(selected.text == QStringLiteral("bb") && selected_lease.has_value(),
+        "chained hold successor fixture selects the row that survives both repaints");
+
+    ok &= check(backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026h")),
+        "chained hold successor fixture opens a synchronized-output hold");
+
+    // Both repaints arrive in one backend chunk, so one publication carries the
+    // whole H0 -> H1 -> H2 chain. Following a single link lands on H1, which
+    // this same publication has already replaced.
+    QByteArray two_repaints = selection_recovery_addressed_rows({
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+    }, true);
+    two_repaints += selection_recovery_addressed_rows({
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+        QByteArrayLiteral("ff"),
+    }, true);
+    ok &= check(backend_ptr->emit_output(two_repaints),
+        "chained hold successor fixture holds two repaints in one publication");
+    ok &= check(backend_ptr->emit_output(QByteArrayLiteral("\x1b[?2026l")),
+        "chained hold successor fixture releases the held output");
+
+    const std::optional<term::terminal_selection_visual_lease_t> released_lease =
+        session->selection_visual_lease();
+    ok &= check(session->has_selection() &&
+            session->selected_text().text == selected.text &&
+            session->last_selection_attachment_resolution_status() ==
+                term::Terminal_selection_attachment_resolution_status::TRANSLATED,
+        "a held selection survives two repaint recoveries in one publication");
+    ok &= check(released_lease.has_value() && selected_lease.has_value() &&
+            released_lease->selected_lines.size() == 1U &&
+            released_lease->selected_lines.front().history_handle !=
+                selected_lease->selected_lines.front().history_handle &&
+            released_lease->selected_lines.front().history_handle.content_generation ==
+                selected_lease->selected_lines.front().history_handle.content_generation,
+        "the released hold carries the last handle of the chain, not the first");
+
+    return ok;
+}
+
 bool test_selection_spans_preserve_after_unchanged_synchronized_output_release()
 {
     bool ok = true;
@@ -16540,6 +16618,7 @@ int main()
     ok &= test_selection_drag_press_provenance_composes_synchronized_publications();
     ok &= test_selection_current_detach_after_accepted_primary_repaint_recovery();
     ok &= test_selection_current_repaint_recovery_detach_classification();
+    ok &= test_synchronized_hold_follows_multiple_successors_in_one_publication();
     ok &= test_selection_spans_preserve_after_unchanged_synchronized_output_release();
     ok &= test_selection_spans_detach_when_synchronized_release_mutates_selected_row();
     ok &= test_selection_spans_preserve_when_synchronized_release_moves_retained_row();

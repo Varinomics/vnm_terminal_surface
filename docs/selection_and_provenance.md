@@ -58,7 +58,8 @@ At mouse-down, the session records the retained handle for the press row, its
 original logical row and column, and the published source basis. Movement and
 release resolve that provenance through the same model-owned attachment
 resolver used by committed selections. Exact successor edges compose across
-publications between pointer events. A missing, ambiguous, mutated, or evicted
+publications between pointer events, and within one publication when a
+recovery supersedes a replacement the same publication already recorded. A missing, ambiguous, mutated, or evicted
 handle permanently cancels the gesture; an established drag may retain its
 trusted payload as `PAYLOAD_ONLY`, but it cannot reattach to the row currently
 occupying the press-time viewport cell.
@@ -68,9 +69,17 @@ occupying the press-time viewport cell.
 `Terminal_screen_model::resolve_selection_attachment` is the authoritative
 attachment proof. It resolves every selected retained-line handle by exact
 identity and content generation, using a model-issued successor only when the
-old handle no longer exists. The resolved rows must be unique, ordered,
-contiguous, and shifted by one uniform logical-row delta, and every translated
-endpoint must remain representable. The session installs the translated lease
+old handle no longer exists. One publication can carry more than one accepted
+repaint recovery, in which case a replacement is itself replaced before the
+publication is observed; the resolver therefore follows the exact successor
+chain to the retained handle rather than stopping after one edge. Every edge of
+that walk is taken on the same evidence a single edge is: an exact old handle,
+an unambiguous relation, an unchanged content generation, and a logical row
+that continues where the previous edge landed. A walk longer than the number of
+published relations has reused one, which is reported as a duplicate
+resolution. The resolved rows must be unique, ordered, contiguous, and shifted
+by one uniform logical-row delta, and every translated endpoint must remain
+representable. The session installs the translated lease
 atomically only after the complete proof succeeds; otherwise it drops the
 visual lease and retains only the immutable payload.
 
