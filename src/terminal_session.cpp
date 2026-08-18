@@ -6786,28 +6786,40 @@ void Terminal_session::accumulate_synchronized_continuity_track(
                 return;
             }
 
-            const terminal_selection_line_successor_t* successor = nullptr;
-            std::size_t                                 match_count = 0U;
-            for (const terminal_selection_line_successor_t& candidate : successor_it->second) {
-                if (candidate.old_handle == handle) {
-                    successor = &candidate;
-                    ++match_count;
-                }
+            // Taken on the same terms as resolve_selection_attachment takes a
+            // relation: a usable key carries exactly one, and that one has to
+            // name this handle. Picking the matching candidate out of a key
+            // that carries several would accept evidence the model itself
+            // rejects, and the two paths have to agree on which publications
+            // are followable.
+            if (successor_it->second.size() != 1U) {
+                track.failure = Terminal_selection_attachment_resolution_status::
+                    DUPLICATE_RESOLUTION;
+                trace_hold(QStringLiteral("poison-successor-ambiguous"));
+                return;
             }
-            if (match_count != 1U || successor == nullptr) {
-                track.failure = match_count > 1U
-                    ? Terminal_selection_attachment_resolution_status::DUPLICATE_RESOLUTION
-                    : Terminal_selection_attachment_resolution_status::MISSING_LINE;
-                trace_hold(match_count > 1U
-                    ? QStringLiteral("poison-successor-ambiguous")
-                    : QStringLiteral("poison-successor-missing"));
+
+            const terminal_selection_line_successor_t& successor =
+                successor_it->second.front();
+            if (successor.old_handle != handle) {
+                track.failure = Terminal_selection_attachment_resolution_status::
+                    CONTENT_GENERATION_MISMATCH;
+                trace_hold(QStringLiteral("poison-successor-mismatch"));
+                return;
+            }
+            if (successor.final_handle.content_generation !=
+                handle.content_generation)
+            {
+                track.failure = Terminal_selection_attachment_resolution_status::
+                    CONTENT_GENERATION_MISMATCH;
+                trace_hold(QStringLiteral("poison-successor-generation"));
                 return;
             }
 
             const Terminal_retained_line_lookup_result final_lookup =
                 m_screen_model->retained_line_lookup(
                     track.original_lease.buffer_id,
-                    successor->final_handle);
+                    successor.final_handle);
             if (final_lookup.retained_line_id_match_count > 1) {
                 track.failure = Terminal_selection_attachment_resolution_status::
                     DUPLICATE_RESOLUTION;
@@ -6828,9 +6840,9 @@ void Terminal_session::accumulate_synchronized_continuity_track(
                     successor_hops <=
                         continuity->successors_by_old_retained_line_id.size() &&
                     continuity->successors_by_old_retained_line_id.contains(
-                        successor->final_handle.row_sequence);
+                        successor.final_handle.row_sequence);
                 if (chain_continues) {
-                    handle = successor->final_handle;
+                    handle = successor.final_handle;
                     continue;
                 }
 
@@ -6840,7 +6852,7 @@ void Terminal_session::accumulate_synchronized_continuity_track(
                 trace_hold(QStringLiteral("poison-final-missing"));
                 return;
             }
-            handle = successor->final_handle;
+            handle = successor.final_handle;
             break;
         }
     }

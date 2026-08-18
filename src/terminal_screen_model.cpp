@@ -2170,7 +2170,16 @@ Terminal_screen_model::resolve_selection_attachment(
             // link's final handle by definition is not. So an intermediate link
             // proves only that it continues from where the previous one landed;
             // the retained row itself is checked once, after the walk.
-            if (successor->old_logical_row != expected_successor_old_logical_row) {
+            //
+            // The delta is redundant evidence: every producer writes it as
+            // final_logical_row - old_logical_row, and the finalizer rewrites it
+            // the same way. A link whose three row fields disagree is malformed
+            // whichever one is right, so reject it here rather than pick the
+            // field this consumer happens to read.
+            if (successor->old_logical_row != expected_successor_old_logical_row ||
+                successor->row_delta !=
+                    successor->final_logical_row - successor->old_logical_row)
+            {
                 resolution.status = Terminal_selection_attachment_resolution_status::
                     INCONSISTENT_ROW_DELTA;
                 return resolution;
