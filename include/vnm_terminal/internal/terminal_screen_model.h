@@ -513,6 +513,9 @@ struct terminal_selection_reconciliation_counters_t
     std::uint64_t retained_lookup_entry_revalidations  = 0U;
     std::uint64_t attachment_resolver_requests         = 0U;
     std::uint64_t attachment_resolver_line_resolutions = 0U;
+    // One per successor-relation probe, not one per selected line: resolving a
+    // line whose handle was replaced more than once in the same publication
+    // probes once per link of that chain.
     std::uint64_t successor_relation_lookups           = 0U;
 };
 

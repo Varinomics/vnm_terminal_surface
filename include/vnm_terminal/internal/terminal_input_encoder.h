@@ -58,11 +58,12 @@ QByteArray encode_terminal_mouse_event(
 // it bounds the work rather than the outcome. Sanitizing, encoding and framing
 // each copy the whole paste, and a caller that is going to refuse the result
 // anyway gains nothing from completing those copies for a clipboard far past
-// its budget. Encoding therefore stops once the sanitized text alone is longer
-// than the budget, and what comes back is then deliberately over it: UTF-8 is
-// never shorter than the UTF-16 code-unit count it encodes, and framing only
-// adds, so the caller's own limit check still refuses it for the same reason
-// and with the same message it would have used for the complete encoding.
+// its budget. Encoding therefore stops once the sanitized body is longer than
+// the body budget, and what comes back is then deliberately over the caller's
+// total budget: UTF-8 is never shorter than the UTF-16 code-unit count it
+// encodes, and bracketed-paste delimiters are charged before sanitization. The
+// caller's own limit check therefore still refuses the result for the same
+// reason and with the same message it would have used for complete encoding.
 // Pass the default to encode everything.
 QByteArray encode_terminal_paste_text(
     QString                        text,

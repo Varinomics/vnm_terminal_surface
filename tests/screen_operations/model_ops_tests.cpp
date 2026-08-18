@@ -1119,6 +1119,77 @@ void wait_for_wall_clock_after_ms(qint64 reference_ms)
     }
 }
 
+bool test_selection_attachment_follows_multiple_successors_in_one_ingest()
+{
+    bool ok = true;
+
+    term::Terminal_screen_model model =
+        make_recovery_enabled_primary_repaint_model(4, 8, 8);
+    model.ingest(visible_row_write_stream({
+        QByteArrayLiteral("aa"),
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+    }, false));
+
+    const term::terminal_selection_source_identity_t source =
+        selection_source_for_model(model);
+    const term::Terminal_selection_range range{{1, 0}, {1, 2},
+        term::Terminal_selection_mode::NORMAL};
+    const term::terminal_selection_visual_lease_t lease =
+        selection_lease_for_range(model, range, source);
+    const term::terminal_history_handle_t original_handle =
+        lease.selected_lines.front().history_handle;
+
+    QByteArray two_repaints = visible_row_write_stream({
+        QByteArrayLiteral("bb"),
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+    }, true);
+    two_repaints += visible_row_write_stream({
+        QByteArrayLiteral("cc"),
+        QByteArrayLiteral("dd"),
+        QByteArrayLiteral("ee"),
+        QByteArrayLiteral("ff"),
+    }, true);
+    const term::Terminal_screen_model_result result = model.ingest(two_repaints);
+
+    const term::terminal_selection_line_successor_t* first =
+        successor_for_old_handle(result, original_handle);
+    const term::terminal_selection_line_successor_t* second = first == nullptr
+        ? nullptr
+        : successor_for_old_handle(result, first->final_handle);
+    ok &= check(first != nullptr && second != nullptr,
+        "one publication exposes both links of a repaint successor chain");
+
+    const term::Terminal_selection_attachment_resolution resolution =
+        model.resolve_selection_attachment(lease, source, result);
+    ok &= check(resolution.status ==
+            term::Terminal_selection_attachment_resolution_status::TRANSLATED &&
+            resolution.translated_lease.has_value() &&
+            resolution.translated_lease->selected_lines.size() == 1U &&
+            second != nullptr &&
+            resolution.translated_lease->selected_lines.front().history_handle ==
+                second->final_handle,
+        "selection attachment follows H0 to H1 to the retained H2 handle");
+    // Landing on the right handle is not enough: the walk must also account for
+    // the rows the chain moved through, or a wrong accumulated delta would
+    // translate the range onto a different line than the handle names.
+    ok &= check(resolution.old_logical_rows == std::vector<int>({1}) &&
+            resolution.final_logical_rows == std::vector<int>({1}) &&
+            resolution.row_deltas == std::vector<int>({0}) &&
+            resolution.translated_lease->selected_range == range,
+        "the chained translation reports the rows the chain actually moved through");
+    ok &= check(result.recovery_proposals.size() == 2U &&
+            model.scrollback_size() == 2,
+        "both repaint recoveries are committed in the same ingest");
+    ok &= check(model.row_text(0) == QStringLiteral("cc"),
+        "the twice-recovered viewport starts at the second recovery's first row");
+
+    return ok;
+}
+
 bool test_primary_repaint_recovery_preserves_row_content_stamps()
 {
     bool ok = true;
@@ -4974,6 +5045,7 @@ int main()
     ok &= test_scrollback_growth_observer_seam();
     ok &= test_repaint_recovery_shift_helper_matches_policy();
     ok &= test_primary_repaint_recovery_accepts_distinct_shift();
+    ok &= test_selection_attachment_follows_multiple_successors_in_one_ingest();
     ok &= test_primary_repaint_recovery_preserves_row_content_stamps();
     ok &= test_primary_repaint_recovery_recovers_blank_separator_row();
     ok &= test_primary_repaint_recovery_preserves_styled_blank_separator_row();

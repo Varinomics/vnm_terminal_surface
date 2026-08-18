@@ -2192,28 +2192,81 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     drain_backend_callback_commands();
     process_pending_commands();
 
+    if (m_process_state == Terminal_process_state::NOT_STARTED ||
+        m_process_state == Terminal_process_state::STARTING)
+    {
+        return {};
+    }
+
     const Terminal_input_mode_state modes = m_screen_model.has_value()
         ? m_screen_model->input_mode_state()
         : Terminal_input_mode_state{};
-    // The write queue refuses anything past its hard limit, so encoding a
-    // clipboard far beyond it copies and converts megabytes to reach a
-    // conclusion the byte count already settles. Hand the encoder that budget:
-    // it stops one unit past it, and enqueue_command below still produces the
-    // rejection, so the outcome is the same one the complete encoding reached.
+
+    // An unwritable backend and a queue with no command slot left both settle
+    // the outcome without reading the payload, so neither should pay for
+    // sanitizing and encoding a clipboard first. The one thing the payload still
+    // decides is which of two outcomes this is: text that is entirely filtered
+    // control characters has always been a no-op rather than a rejection. A
+    // zero-budget encode answers exactly that question for the cost of the first
+    // surviving character, so it stands in for the whole conversion. Called at
+    // most once - each caller returns whatever it produces.
+    const auto refuse_before_encoding =
+        [&](Terminal_session_result_code code, QString message)
+    {
+        const QByteArray payload_probe = encode_terminal_paste_text(
+            std::move(text),
+            modes,
+            policy,
+            0);
+        if (payload_probe.isEmpty()) {
+            return Terminal_paste_text_result{};
+        }
+
+        const std::uint64_t sequence = next_sequence();
+        return Terminal_paste_text_result{
+            true,
+            make_rejected_result(
+                sequence,
+                code,
+                make_backend_error(
+                    Terminal_backend_error_code::WRITE_FAILED,
+                    std::move(message))),
+        };
+    };
+
+    if (!is_session_writable()) {
+        return refuse_before_encoding(
+            Terminal_session_result_code::INVALID_STATE,
+            QStringLiteral("session write requires a running backend"));
+    }
+
+    if (would_accept_command(Queue_category::WRITE, 0U, 1U).code ==
+        Terminal_queue_result_code::HARD_LIMIT_REACHED)
+    {
+        return refuse_before_encoding(
+            Terminal_session_result_code::QUEUE_HARD_LIMIT_REACHED,
+            QStringLiteral("paste text exceeds session write queue hard limit"));
+    }
+
+    // Charge what is already queued, and the framing, against the encoder
+    // budget. The enqueue below stays authoritative; this only stops the
+    // encoder at the byte count that will actually be refused. It matters when
+    // the queue could not be drained above - the backend is applying
+    // backpressure - because the encoder would otherwise work to the queue's
+    // total capacity while far less of it is free.
+    const std::size_t queued_bytes = queue_for(Queue_category::WRITE).byte_count();
+    const std::size_t remaining_bytes =
+        queued_bytes < m_config.write_queue_limits.hard_limit_bytes
+            ? m_config.write_queue_limits.hard_limit_bytes - queued_bytes
+            : 0U;
     QByteArray bytes = encode_terminal_paste_text(
         std::move(text),
         modes,
         policy,
         static_cast<qsizetype>(std::min<std::size_t>(
-            m_config.write_queue_limits.hard_limit_bytes,
+            remaining_bytes,
             static_cast<std::size_t>(std::numeric_limits<qsizetype>::max()))));
     if (bytes.isEmpty()) {
-        return {};
-    }
-
-    if (m_process_state == Terminal_process_state::NOT_STARTED ||
-        m_process_state == Terminal_process_state::STARTING)
-    {
         return {};
     }
 
@@ -2221,18 +2274,6 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     if (interaction_trace_enabled() && interaction_trace_id == 0U) {
         interaction_trace_id = next_interaction_trace_correlation_id();
     }
-    if (!is_session_writable()) {
-        return {
-            true,
-            make_rejected_result(
-                sequence,
-                Terminal_session_result_code::INVALID_STATE,
-                make_backend_error(
-                    Terminal_backend_error_code::WRITE_FAILED,
-                    QStringLiteral("session write requires a running backend"))),
-        };
-    }
-
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
         make_user_paste_command(sequence, std::move(bytes), interaction_trace_id));
     return {
@@ -6697,84 +6738,111 @@ void Terminal_session::accumulate_synchronized_continuity_track(
     }
 
     for (terminal_history_handle_t& handle : track.latest_handles) {
-        const Terminal_retained_line_lookup_result current_lookup =
-            m_screen_model->retained_line_lookup(track.original_lease.buffer_id, handle);
-        if (current_lookup.exact_match &&
-            current_lookup.retained_line_id_match_count == 1)
-        {
-            continue;
-        }
-        if (current_lookup.retained_line_id_match_count > 1) {
-            track.failure = Terminal_selection_attachment_resolution_status::
-                DUPLICATE_RESOLUTION;
-            trace_hold(QStringLiteral("poison-duplicate-current"));
-            return;
-        }
-        if (current_lookup.retained_line_content_generation_mismatch) {
-            track.failure = Terminal_selection_attachment_resolution_status::
-                CONTENT_GENERATION_MISMATCH;
-            trace_hold(QStringLiteral("poison-generation"));
-            return;
-        }
-
-        const terminal_selection_continuity_capability_t* continuity =
-            result.selection_continuity.has_value()
-                ? &*result.selection_continuity
-                : nullptr;
-        if (continuity == nullptr ||
-            continuity->version != k_terminal_selection_continuity_capability_version)
-        {
-            track.failure = Terminal_selection_attachment_resolution_status::MISSING_LINE;
-            trace_hold(QStringLiteral("poison-capability-missing"));
-            return;
-        }
-
-        const auto successor_it =
-            continuity->successors_by_old_retained_line_id.find(handle.row_sequence);
-        if (successor_it == continuity->successors_by_old_retained_line_id.end()) {
-            track.failure = Terminal_selection_attachment_resolution_status::MISSING_LINE;
-            trace_hold(QStringLiteral("poison-successor-key-missing"));
-            return;
-        }
-
-        const terminal_selection_line_successor_t* successor = nullptr;
-        std::size_t                                 match_count = 0U;
-        for (const terminal_selection_line_successor_t& candidate : successor_it->second) {
-            if (candidate.old_handle == handle) {
-                successor = &candidate;
-                ++match_count;
+        // One publication can carry more than one accepted repaint recovery, so
+        // the replacement a held handle resolves to may itself have been
+        // replaced before the publication was observed. Walking that chain keeps
+        // a hold the publication can still prove intact; poisoning at the first
+        // dead intermediate handle would drop it. Every link is taken on the
+        // same exact, unambiguous evidence a single link was already taken on.
+        std::size_t successor_hops = 0U;
+        for (;;) {
+            const Terminal_retained_line_lookup_result current_lookup =
+                m_screen_model->retained_line_lookup(track.original_lease.buffer_id, handle);
+            if (current_lookup.exact_match &&
+                current_lookup.retained_line_id_match_count == 1)
+            {
+                break;
             }
-        }
-        if (match_count != 1U || successor == nullptr) {
-            track.failure = match_count > 1U
-                ? Terminal_selection_attachment_resolution_status::DUPLICATE_RESOLUTION
-                : Terminal_selection_attachment_resolution_status::MISSING_LINE;
-            trace_hold(match_count > 1U
-                ? QStringLiteral("poison-successor-ambiguous")
-                : QStringLiteral("poison-successor-missing"));
-            return;
-        }
+            if (current_lookup.retained_line_id_match_count > 1) {
+                track.failure = Terminal_selection_attachment_resolution_status::
+                    DUPLICATE_RESOLUTION;
+                trace_hold(QStringLiteral("poison-duplicate-current"));
+                return;
+            }
+            if (current_lookup.retained_line_content_generation_mismatch) {
+                track.failure = Terminal_selection_attachment_resolution_status::
+                    CONTENT_GENERATION_MISMATCH;
+                trace_hold(QStringLiteral("poison-generation"));
+                return;
+            }
 
-        const Terminal_retained_line_lookup_result final_lookup =
-            m_screen_model->retained_line_lookup(
-                track.original_lease.buffer_id,
-                successor->final_handle);
-        if (final_lookup.retained_line_id_match_count > 1) {
-            track.failure = Terminal_selection_attachment_resolution_status::
-                DUPLICATE_RESOLUTION;
-            trace_hold(QStringLiteral("poison-final-duplicate"));
-            return;
+            const terminal_selection_continuity_capability_t* continuity =
+                result.selection_continuity.has_value()
+                    ? &*result.selection_continuity
+                    : nullptr;
+            if (continuity == nullptr ||
+                continuity->version != k_terminal_selection_continuity_capability_version)
+            {
+                track.failure = Terminal_selection_attachment_resolution_status::MISSING_LINE;
+                trace_hold(QStringLiteral("poison-capability-missing"));
+                return;
+            }
+
+            const auto successor_it =
+                continuity->successors_by_old_retained_line_id.find(handle.row_sequence);
+            if (successor_it == continuity->successors_by_old_retained_line_id.end()) {
+                track.failure = Terminal_selection_attachment_resolution_status::MISSING_LINE;
+                trace_hold(QStringLiteral("poison-successor-key-missing"));
+                return;
+            }
+
+            const terminal_selection_line_successor_t* successor = nullptr;
+            std::size_t                                 match_count = 0U;
+            for (const terminal_selection_line_successor_t& candidate : successor_it->second) {
+                if (candidate.old_handle == handle) {
+                    successor = &candidate;
+                    ++match_count;
+                }
+            }
+            if (match_count != 1U || successor == nullptr) {
+                track.failure = match_count > 1U
+                    ? Terminal_selection_attachment_resolution_status::DUPLICATE_RESOLUTION
+                    : Terminal_selection_attachment_resolution_status::MISSING_LINE;
+                trace_hold(match_count > 1U
+                    ? QStringLiteral("poison-successor-ambiguous")
+                    : QStringLiteral("poison-successor-missing"));
+                return;
+            }
+
+            const Terminal_retained_line_lookup_result final_lookup =
+                m_screen_model->retained_line_lookup(
+                    track.original_lease.buffer_id,
+                    successor->final_handle);
+            if (final_lookup.retained_line_id_match_count > 1) {
+                track.failure = Terminal_selection_attachment_resolution_status::
+                    DUPLICATE_RESOLUTION;
+                trace_hold(QStringLiteral("poison-final-duplicate"));
+                return;
+            }
+            if (!final_lookup.exact_match ||
+                final_lookup.retained_line_id_match_count != 1)
+            {
+                // A replacement this publication itself replaces again is the
+                // one case worth another pass. Each relation is keyed by the
+                // retained line id it replaces, so a walk longer than the number
+                // of keys has reused one, which is a cycle rather than a longer
+                // history.
+                ++successor_hops;
+                const bool chain_continues =
+                    !final_lookup.retained_line_content_generation_mismatch &&
+                    successor_hops <=
+                        continuity->successors_by_old_retained_line_id.size() &&
+                    continuity->successors_by_old_retained_line_id.contains(
+                        successor->final_handle.row_sequence);
+                if (chain_continues) {
+                    handle = successor->final_handle;
+                    continue;
+                }
+
+                track.failure = final_lookup.retained_line_content_generation_mismatch
+                    ? Terminal_selection_attachment_resolution_status::CONTENT_GENERATION_MISMATCH
+                    : Terminal_selection_attachment_resolution_status::MISSING_LINE;
+                trace_hold(QStringLiteral("poison-final-missing"));
+                return;
+            }
+            handle = successor->final_handle;
+            break;
         }
-        if (!final_lookup.exact_match ||
-            final_lookup.retained_line_id_match_count != 1)
-        {
-            track.failure = final_lookup.retained_line_content_generation_mismatch
-                ? Terminal_selection_attachment_resolution_status::CONTENT_GENERATION_MISMATCH
-                : Terminal_selection_attachment_resolution_status::MISSING_LINE;
-            trace_hold(QStringLiteral("poison-final-missing"));
-            return;
-        }
-        handle = successor->final_handle;
     }
     trace_hold(QStringLiteral("updated"));
 }

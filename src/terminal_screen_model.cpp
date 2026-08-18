@@ -2088,10 +2088,21 @@ Terminal_screen_model::resolve_selection_attachment(
         const int old_logical_row = old_start.row + old_line.row_offset;
         terminal_history_handle_t final_handle = old_line.history_handle;
         const terminal_selection_line_successor_t* used_successor = nullptr;
+        int         expected_successor_old_logical_row = old_logical_row;
+        std::size_t successor_hops                     = 0U;
         Terminal_retained_line_lookup_result lookup = retained_line_lookup(
             prior_lease.buffer_id,
             final_handle);
-        if (!lookup.exact_match || lookup.retained_line_id_match_count != 1) {
+        // One ingest can accept more than one repaint recovery, and each one
+        // replaces the handles the one before it published. A selected line can
+        // therefore stand two or more exact replacements away from the handle
+        // the lease holds while every link of that chain sits in this same
+        // publication. Stopping after one link detaches a selection the
+        // publication can still prove intact, so follow the chain instead. Each
+        // link is taken on the terms a single link was already taken on, so an
+        // ambiguous relation, a changed generation, a missing handle and a cycle
+        // all still fail closed.
+        while (!lookup.exact_match || lookup.retained_line_id_match_count != 1) {
             if (lookup.retained_line_id_match_count > 1) {
                 resolution.status = Terminal_selection_attachment_resolution_status::
                     DUPLICATE_RESOLUTION;
@@ -2110,7 +2121,7 @@ Terminal_screen_model::resolve_selection_attachment(
                 }
                 const auto found =
                     continuity->successors_by_old_retained_line_id.find(
-                        old_line.history_handle.row_sequence);
+                        final_handle.row_sequence);
                 if (found !=
                     continuity->successors_by_old_retained_line_id.end())
                 {
@@ -2121,44 +2132,60 @@ Terminal_screen_model::resolve_selection_attachment(
                         return resolution;
                     }
                     successor = &found->second.front();
-                    used_successor = successor;
                 }
             }
             if (successor == nullptr) {
                 resolution.status = Terminal_selection_attachment_resolution_status::MISSING_LINE;
                 return resolution;
             }
-            if (successor->old_handle != old_line.history_handle) {
+            if (successor->old_handle != final_handle) {
                 resolution.status = Terminal_selection_attachment_resolution_status::
                     CONTENT_GENERATION_MISMATCH;
                 return resolution;
             }
             if (successor->final_handle.content_generation !=
-                old_line.history_handle.content_generation)
+                final_handle.content_generation)
             {
                 resolution.status = Terminal_selection_attachment_resolution_status::
                     CONTENT_GENERATION_MISMATCH;
                 return resolution;
             }
 
-            final_handle = successor->final_handle;
-            lookup = retained_line_lookup(prior_lease.buffer_id, final_handle);
-            if (!lookup.exact_match || lookup.retained_line_id_match_count != 1) {
-                resolution.status = lookup.retained_line_id_match_count > 1
-                    ? Terminal_selection_attachment_resolution_status::
-                        DUPLICATE_RESOLUTION
-                    : lookup.retained_line_content_generation_mismatch
-                    ? Terminal_selection_attachment_resolution_status::
-                        CONTENT_GENERATION_MISMATCH
-                    : Terminal_selection_attachment_resolution_status::MISSING_LINE;
+            // Each relation is keyed by the retained line id it replaces and a
+            // usable key carries exactly one relation, so a walk longer than the
+            // number of keys has already reused one. That is a cycle rather than
+            // a longer history, and it needs no visited set to detect.
+            ++successor_hops;
+            if (successor_hops >
+                continuity->successors_by_old_retained_line_id.size())
+            {
+                resolution.status = Terminal_selection_attachment_resolution_status::
+                    DUPLICATE_RESOLUTION;
                 return resolution;
             }
+
+            // Only the last link carries rows normalized against the published
+            // history, because finalize_selection_continuity_rows() can only
+            // resolve a final handle that is still retained and an intermediate
+            // link's final handle by definition is not. So an intermediate link
+            // proves only that it continues from where the previous one landed;
+            // the retained row itself is checked once, after the walk.
+            if (successor->old_logical_row != expected_successor_old_logical_row) {
+                resolution.status = Terminal_selection_attachment_resolution_status::
+                    INCONSISTENT_ROW_DELTA;
+                return resolution;
+            }
+
+            expected_successor_old_logical_row = successor->final_logical_row;
+            used_successor                     = successor;
+            final_handle                       = successor->final_handle;
+            lookup = retained_line_lookup(prior_lease.buffer_id, final_handle);
         }
 
         if (used_successor != nullptr &&
-            (used_successor->old_logical_row != old_logical_row ||
-             used_successor->final_logical_row != lookup.exact_logical_row ||
-             used_successor->row_delta != lookup.exact_logical_row - old_logical_row))
+            (used_successor->final_logical_row != lookup.exact_logical_row ||
+             used_successor->row_delta !=
+                 lookup.exact_logical_row - used_successor->old_logical_row))
         {
             resolution.status = Terminal_selection_attachment_resolution_status::
                 INCONSISTENT_ROW_DELTA;
@@ -5383,12 +5410,20 @@ void Terminal_screen_model::finish_primary_repaint_recovery_candidate(
             });
         }
         if (proof_result == Terminal_selection_survivor_proof_result::EXACT) {
+            const int old_logical_row   = candidate.scrollback_rows + predecessor_row;
+            const int final_logical_row = scrollback_size() + row;
+            // The delta the relation publishes is a logical-row delta, the same
+            // one finalize_selection_continuity_rows() writes back and the same
+            // one the session composes across publications. Recording the
+            // visible-row shift here instead left the two disagreeing on every
+            // relation the finalizer could not reach, which is exactly the
+            // relation a later recovery in the same ingest supersedes.
             record_selection_successor({
                 old_handle,
                 final_handle,
-                candidate.scrollback_rows + predecessor_row,
-                scrollback_size() + row,
-                row - predecessor_row,
+                old_logical_row,
+                final_logical_row,
+                final_logical_row - old_logical_row,
             });
         }
     }
