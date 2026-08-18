@@ -1625,7 +1625,7 @@ backend_output_prescan_t prescan_backend_output(
 
 QByteArray text_area_resize_sequence(terminal_grid_size_t grid_size)
 {
-    QByteArray sequence = QByteArrayLiteral("[8;");
+    QByteArray sequence = QByteArrayLiteral("\x1b[8;");
     sequence.append(QByteArray::number(grid_size.rows));
     sequence.append(';');
     sequence.append(QByteArray::number(grid_size.columns));
@@ -5335,7 +5335,8 @@ void Terminal_session::ingest_backend_output_bytes(
     QByteArray     combined_output;
     QByteArrayView remaining(arriving_bytes);
     if (!m_backend_output_prescan_pending.isEmpty()) {
-        combined_output = m_backend_output_prescan_pending + arriving_bytes.toByteArray();
+        combined_output = m_backend_output_prescan_pending;
+        combined_output.append(arriving_bytes);
         m_backend_output_prescan_pending.clear();
         remaining = QByteArrayView(combined_output);
     }
