@@ -2192,28 +2192,81 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     drain_backend_callback_commands();
     process_pending_commands();
 
+    if (m_process_state == Terminal_process_state::NOT_STARTED ||
+        m_process_state == Terminal_process_state::STARTING)
+    {
+        return {};
+    }
+
     const Terminal_input_mode_state modes = m_screen_model.has_value()
         ? m_screen_model->input_mode_state()
         : Terminal_input_mode_state{};
-    // The write queue refuses anything past its hard limit, so encoding a
-    // clipboard far beyond it copies and converts megabytes to reach a
-    // conclusion the byte count already settles. Hand the encoder that budget:
-    // it stops one unit past it, and enqueue_command below still produces the
-    // rejection, so the outcome is the same one the complete encoding reached.
+
+    // An unwritable backend and a queue with no command slot left both settle
+    // the outcome without reading the payload, so neither should pay for
+    // sanitizing and encoding a clipboard first. The one thing the payload still
+    // decides is which of two outcomes this is: text that is entirely filtered
+    // control characters has always been a no-op rather than a rejection. A
+    // zero-budget encode answers exactly that question for the cost of the first
+    // surviving character, so it stands in for the whole conversion. Called at
+    // most once - each caller returns whatever it produces.
+    const auto refuse_before_encoding =
+        [&](Terminal_session_result_code code, QString message)
+    {
+        const QByteArray payload_probe = encode_terminal_paste_text(
+            std::move(text),
+            modes,
+            policy,
+            0);
+        if (payload_probe.isEmpty()) {
+            return Terminal_paste_text_result{};
+        }
+
+        const std::uint64_t sequence = next_sequence();
+        return Terminal_paste_text_result{
+            true,
+            make_rejected_result(
+                sequence,
+                code,
+                make_backend_error(
+                    Terminal_backend_error_code::WRITE_FAILED,
+                    std::move(message))),
+        };
+    };
+
+    if (!is_session_writable()) {
+        return refuse_before_encoding(
+            Terminal_session_result_code::INVALID_STATE,
+            QStringLiteral("session write requires a running backend"));
+    }
+
+    if (would_accept_command(Queue_category::WRITE, 0U, 1U).code ==
+        Terminal_queue_result_code::HARD_LIMIT_REACHED)
+    {
+        return refuse_before_encoding(
+            Terminal_session_result_code::QUEUE_HARD_LIMIT_REACHED,
+            QStringLiteral("paste text exceeds session write queue hard limit"));
+    }
+
+    // Charge what is already queued, and the framing, against the encoder
+    // budget. The enqueue below stays authoritative; this only stops the
+    // encoder at the byte count that will actually be refused. It matters when
+    // the queue could not be drained above - the backend is applying
+    // backpressure - because the encoder would otherwise work to the queue's
+    // total capacity while far less of it is free.
+    const std::size_t queued_bytes = queue_for(Queue_category::WRITE).byte_count();
+    const std::size_t remaining_bytes =
+        queued_bytes < m_config.write_queue_limits.hard_limit_bytes
+            ? m_config.write_queue_limits.hard_limit_bytes - queued_bytes
+            : 0U;
     QByteArray bytes = encode_terminal_paste_text(
         std::move(text),
         modes,
         policy,
         static_cast<qsizetype>(std::min<std::size_t>(
-            m_config.write_queue_limits.hard_limit_bytes,
+            remaining_bytes,
             static_cast<std::size_t>(std::numeric_limits<qsizetype>::max()))));
     if (bytes.isEmpty()) {
-        return {};
-    }
-
-    if (m_process_state == Terminal_process_state::NOT_STARTED ||
-        m_process_state == Terminal_process_state::STARTING)
-    {
         return {};
     }
 
@@ -2221,18 +2274,6 @@ Terminal_paste_text_result Terminal_session::write_paste_text(
     if (interaction_trace_enabled() && interaction_trace_id == 0U) {
         interaction_trace_id = next_interaction_trace_correlation_id();
     }
-    if (!is_session_writable()) {
-        return {
-            true,
-            make_rejected_result(
-                sequence,
-                Terminal_session_result_code::INVALID_STATE,
-                make_backend_error(
-                    Terminal_backend_error_code::WRITE_FAILED,
-                    QStringLiteral("session write requires a running backend"))),
-        };
-    }
-
     const Terminal_session_result result = enqueue_and_process_synchronous_command(
         make_user_paste_command(sequence, std::move(bytes), interaction_trace_id));
     return {

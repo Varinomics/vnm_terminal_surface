@@ -15,6 +15,7 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <utility>
 
 namespace vnm_terminal::internal {
@@ -29,6 +30,18 @@ constexpr ushort k_del_control    = 0x007fU;
 constexpr ushort k_c1_control_min = 0x0080U;
 constexpr ushort k_c1_control_max = 0x009fU;
 
+// Bracketed-paste delimiters, and what they cost. The budget the encoder is
+// given covers the framed result, so the delimiters have to be charged before
+// the body is sanitized rather than added on afterwards.
+constexpr char      k_bracketed_paste_begin[]      = "\x1b[200~";
+constexpr char      k_bracketed_paste_end[]        = "\x1b[201~";
+constexpr qsizetype k_bracketed_paste_begin_bytes  =
+    static_cast<qsizetype>(sizeof(k_bracketed_paste_begin) - 1U);
+constexpr qsizetype k_bracketed_paste_end_bytes    =
+    static_cast<qsizetype>(sizeof(k_bracketed_paste_end) - 1U);
+constexpr qsizetype k_bracketed_paste_framing_bytes =
+    k_bracketed_paste_begin_bytes + k_bracketed_paste_end_bytes;
+
 #if defined(Q_OS_WIN)
 constexpr int k_win32_vk_return          = 13;
 constexpr int k_win32_scan_return        = 28;
@@ -39,7 +52,11 @@ constexpr int k_win32_shift_pressed      = 0x0010;
 // that is only going to refuse an over-budget paste does not pay for copying all
 // of it first. One unit past the budget is enough to keep the answer the same:
 // the encoded form is never shorter than the code-unit count it comes from, so
-// the caller's byte check still refuses the truncated result.
+// a byte check against that same budget still refuses the truncated result.
+// This is a budget for the paste body alone; encode_terminal_paste_text() has
+// already deducted whatever framing it is going to add, which is what makes the
+// truncated result over the caller's own budget rather than merely over this
+// one.
 QString sanitize_paste_text(QString text, qsizetype stop_beyond_units)
 {
     QString sanitized;
@@ -664,24 +681,33 @@ QByteArray encode_terminal_paste_text(
 {
     VNM_TERMINAL_PROFILE_SCOPE("encode_terminal_paste_text");
 
-    const QString sanitized = sanitize_paste_text(std::move(text), reject_beyond_bytes);
+    const bool frame = should_frame_paste(modes, framing_policy);
+    // Clamped once before the subtraction so a negative budget cannot underflow
+    // it, and once after so the deduction cannot take it below zero. The
+    // unlimited budget is passed through untouched: deducting from it would
+    // turn "encode everything" into a very large but finite limit.
+    const qsizetype bounded_budget = std::max<qsizetype>(0, reject_beyond_bytes);
+    const qsizetype framing_budget = frame ? k_bracketed_paste_framing_bytes : 0;
+    const qsizetype body_budget =
+        reject_beyond_bytes == std::numeric_limits<qsizetype>::max()
+            ? reject_beyond_bytes
+            : std::max<qsizetype>(0, bounded_budget - framing_budget);
+
+    const QString sanitized = sanitize_paste_text(std::move(text), body_budget);
 #if defined(Q_OS_WIN)
     const QByteArray body = encode_windows_paste_body(sanitized);
 #else
     const QByteArray body = sanitized.toUtf8();
 #endif
-    if (body.isEmpty() || !should_frame_paste(modes, framing_policy)) {
+    if (body.isEmpty() || !frame) {
         return body;
     }
 
     QByteArray bytes;
-    bytes.reserve(
-        QByteArrayLiteral("\x1b[200~").size() +
-        body.size() +
-        QByteArrayLiteral("\x1b[201~").size());
-    bytes.append(QByteArrayLiteral("\x1b[200~"));
+    bytes.reserve(k_bracketed_paste_framing_bytes + body.size());
+    bytes.append(k_bracketed_paste_begin, k_bracketed_paste_begin_bytes);
     bytes.append(body);
-    bytes.append(QByteArrayLiteral("\x1b[201~"));
+    bytes.append(k_bracketed_paste_end, k_bracketed_paste_end_bytes);
     return bytes;
 }
 

@@ -14607,6 +14607,39 @@ bool test_paste_queue_atomicity_and_failures()
     bool ok = true;
 
     {
+        term::Terminal_session_config config;
+        config.write_queue_limits.hard_limit_commands = 0U;
+
+        std::unique_ptr<term::Terminal_session> session;
+        Scripted_backend* backend = make_session(session, config);
+        ok &= check(session->start(valid_launch_config()).code ==
+            term::Terminal_session_result_code::ACCEPTED,
+            "command-saturated paste session starts");
+
+        const term::Terminal_paste_text_result rejected =
+            session->write_paste_text(
+                QString(1024 * 1024, QChar(u'x')),
+                term::Terminal_paste_framing_policy::ENABLED);
+        ok &= check(rejected.handled &&
+            rejected.result.code ==
+                term::Terminal_session_result_code::QUEUE_HARD_LIMIT_REACHED,
+            "command-saturated paste rejects a large clipboard before enqueue");
+        ok &= check(rejected.result.error.has_value() &&
+            rejected.result.error->message.contains(QStringLiteral("paste")),
+            "command-saturated paste keeps the paste-specific rejection");
+        ok &= check(backend->writes.empty(),
+            "command-saturated paste sends no backend bytes");
+
+        QString filtered_only(1024, QChar(u'\x01'));
+        const term::Terminal_paste_text_result filtered =
+            session->write_paste_text(
+                std::move(filtered_only),
+                term::Terminal_paste_framing_policy::ENABLED);
+        ok &= check(!filtered.handled,
+            "command saturation preserves the no-op result for filtered-only paste text");
+    }
+
+    {
         const QByteArray expected = framed_paste(QByteArrayLiteral("abc"));
         term::Terminal_session_config config;
         config.write_queue_limits.high_water_bytes =
@@ -14702,14 +14735,21 @@ bool test_paste_queue_atomicity_and_failures()
 
         const term::Terminal_paste_text_result after_exit =
             session->write_paste_text(
-                QStringLiteral("after"),
+                QString(1024 * 1024, QChar(u'x')),
                 term::Terminal_paste_framing_policy::DISABLED);
         ok &= check(after_exit.handled &&
             after_exit.result.code == term::Terminal_session_result_code::INVALID_STATE,
-            "paste after backend exit fails explicitly");
+            "large paste after backend exit fails explicitly");
         ok &= check(after_exit.result.error.has_value() &&
             after_exit.result.error->code == term::Terminal_backend_error_code::WRITE_FAILED,
             "paste after backend exit carries WRITE_FAILED error");
+
+        const term::Terminal_paste_text_result filtered_after_exit =
+            session->write_paste_text(
+                QString(1024, QChar(u'\x01')),
+                term::Terminal_paste_framing_policy::ENABLED);
+        ok &= check(!filtered_after_exit.handled,
+            "filtered-only paste after backend exit remains a no-op");
         ok &= check(backend->writes.empty(),
             "paste after backend exit does not reach backend write");
     }

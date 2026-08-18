@@ -545,6 +545,29 @@ bool test_paste_budget_stops_encoding_past_the_budget()
     ok &= check(bounded.size() < past_budget.size(),
         "a paste past the budget stops short of encoding all of it");
 
+    // Framing consumes twelve bytes of the same queue budget. The encoder must
+    // therefore stop just past the remaining body capacity, not copy a full
+    // budget of body and add the delimiters afterwards.
+    const QByteArray framed_at_budget = term::encode_terminal_paste_text(
+        QStringLiteral("a"),
+        {},
+        term::Terminal_paste_framing_policy::ENABLED,
+        13);
+    ok &= check_bytes_equal(
+        framed_at_budget,
+        framed_paste(QByteArrayLiteral("a")),
+        "a framed paste exactly at the total budget is encoded whole");
+
+    const QByteArray bounded_framed = term::encode_terminal_paste_text(
+        past_budget,
+        {},
+        term::Terminal_paste_framing_policy::ENABLED,
+        64);
+    ok &= check(bounded_framed.size() > 64,
+        "a framed paste past the total budget still reaches rejection");
+    ok &= check(bounded_framed.size() < bounded.size() + 12,
+        "framing bytes reduce the body work budget before encoding");
+
     // Sanitizing removes control characters, so the budget is spent on what
     // survives sanitization rather than on what arrived.
     QString controls_then_text;
