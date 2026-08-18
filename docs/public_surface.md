@@ -431,8 +431,9 @@ example when the window manager clamps the resize or the target equals the
 current size, calls `refresh_grid_from_item_geometry()` to put the grid back on
 the item. No geometry change arrives to reconcile it otherwise. That call
 resizes synchronously, so invoking it from the signal handler nests inside
-session notification delivery and can reorder later host-visible signals from
-that same delivery; deferring it to the next event loop turn avoids that.
+session notification delivery. Notifications still queued behind it keep their
+order, but the nested call republishes surface state, so property change signals
+can arrive ahead of them; deferring it to the next event loop turn avoids that.
 
 `text_area_resize_arbitration_requested(request_id, rows, columns)` replaces
 that whole shape for a host that sets `textAreaResizeArbitrationEnabled`. The

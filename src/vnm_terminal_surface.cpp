@@ -1381,6 +1381,33 @@ surface_text_area_resize_arbitration_outcome(
     return Surface_outcome::REJECTED;
 }
 
+// Marks the notification delivery loop that owns the current batch. Lowering the
+// latch from the destructor matters: the loop returns early whenever the active
+// session changes under it, and a latch left raised would silence every later
+// notification.
+class Session_notification_delivery_scope
+{
+public:
+    explicit Session_notification_delivery_scope(bool& delivering)
+    :
+        m_delivering(delivering)
+    {
+        m_delivering = true;
+    }
+
+    Session_notification_delivery_scope(const Session_notification_delivery_scope&) = delete;
+    Session_notification_delivery_scope& operator=(
+        const Session_notification_delivery_scope&) = delete;
+
+    ~Session_notification_delivery_scope()
+    {
+        m_delivering = false;
+    }
+
+private:
+    bool& m_delivering;
+};
+
 QString surface_synchronized_output_scroll_policy_name(
     VNM_TerminalSurface::Synchronized_output_scroll_policy policy)
 {
@@ -2754,6 +2781,11 @@ struct VNM_TerminalSurface::Private
                                                            selection_drag_press_provenance;
     std::optional<term::Terminal_osc52_write_request>      pending_clipboard_write;
     std::optional<quint64>                                 pending_text_area_resize_arbitration;
+    // Raised for the length of one notification delivery loop. A host is
+    // allowed to answer a notification from inside the handler it was delivered
+    // to, and every answer re-enters sync_from_session through the session call
+    // it makes, so without this the delivery would nest once per answer.
+    bool                                                   delivering_session_notifications    = false;
     std::function<std::optional<QString>()>                clipboard_text_reader;
     QString                                                warmed_prompt_text_layout_font_key;
     QTimer                                                 synchronized_output_recovery_timer;
@@ -7955,15 +7987,32 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         }
     }
 
-    if (deliver_notifications) {
+    if (deliver_notifications && !m_private->delivering_session_notifications) {
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::notifications");
 
-        const std::vector<term::Terminal_session_notification> notifications =
-            session->take_pending_notifications();
-        for (const term::Terminal_session_notification& notification : notifications) {
-            replay_session_notification(notification);
-            if (!active_session_still_matches()) {
-                return;
+        // Answering from inside a handler re-enters here, and the answer can
+        // have queued the next notification before it returns: settling one
+        // arbitrated text-area resize releases its held tail, which arms the
+        // request the tail carries. Delivering that newer batch from the nested
+        // call would put it ahead of the notifications this loop still holds and
+        // would cost one stack frame per queued request, which a burst of held
+        // CSI 8 t sequences answered inline turned into a stack overflow after a
+        // few hundred of them. The latch makes the nested delivery a no-op and
+        // this loop drains what it queued, in order and without recursing.
+        Session_notification_delivery_scope delivering(
+            m_private->delivering_session_notifications);
+        for (;;) {
+            const std::vector<term::Terminal_session_notification> notifications =
+                session->take_pending_notifications();
+            if (notifications.empty()) {
+                break;
+            }
+
+            for (const term::Terminal_session_notification& notification : notifications) {
+                replay_session_notification(notification);
+                if (!active_session_still_matches()) {
+                    return;
+                }
             }
         }
     }
