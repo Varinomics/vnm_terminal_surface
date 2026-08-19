@@ -1,5 +1,6 @@
 add_subdirectory(embedded_terminal)
 add_subdirectory(input_echo_catchup)
 add_subdirectory(public_scroll)
+add_subdirectory(search_incremental)
 add_subdirectory(surface_stress)
 add_subdirectory(evidence)
