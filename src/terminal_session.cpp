@@ -1674,12 +1674,32 @@ backend_output_prescan_t prescan_backend_output(
     return result;
 }
 
-QByteArray text_area_resize_sequence(terminal_grid_size_t grid_size)
+// Rewrites a captured CSI 8 t onto the grid the host answered with. The run is
+// the one prescan_backend_output matched, so after the introducer it holds
+// parameter bytes, any C0 control the child embedded, and the final byte. Those
+// controls are carried over rather than dropped: the parser applies each one
+// where it scans it, ahead of the dispatch that resizes
+// (Terminal_byte_stream_parser::try_consume_escape_or_csi). Where they sat among
+// the parameter bytes is not observable, those having no effect of their own, so
+// carrying them in order leaves the grid the sequence commits as the only thing
+// the host's answer decides.
+QByteArray text_area_resize_sequence_on_grid(
+    QByteArrayView         captured_sequence_bytes,
+    terminal_grid_size_t   grid_size)
 {
     QByteArray sequence = QByteArrayLiteral("\x1b[8;");
     sequence.append(QByteArray::number(grid_size.rows));
     sequence.append(';');
     sequence.append(QByteArray::number(grid_size.columns));
+    // Byte 0 is the introducer the prescan matched, ESC or 0x9b; every C0 after
+    // it is one the child put inside the sequence.
+    for (qsizetype offset = 1; offset < captured_sequence_bytes.size(); ++offset) {
+        const unsigned char byte =
+            static_cast<unsigned char>(captured_sequence_bytes[offset]);
+        if (byte < 0x20U) {
+            sequence.append(static_cast<char>(byte));
+        }
+    }
     sequence.append('t');
     return sequence;
 }
@@ -5345,7 +5365,9 @@ void Terminal_session::release_text_area_resize_arbitration(
             const QByteArray sequence_bytes =
                 grid_sizes_match(effective_grid_size, hold.requested_grid_size)
                     ? hold.sequence_bytes
-                    : text_area_resize_sequence(effective_grid_size);
+                    : text_area_resize_sequence_on_grid(
+                        QByteArrayView(hold.sequence_bytes),
+                        effective_grid_size);
             ingest_backend_output_segment(hold.sequence, QByteArrayView(sequence_bytes), false);
         }
         else {

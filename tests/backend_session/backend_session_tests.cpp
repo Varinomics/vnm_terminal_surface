@@ -1863,6 +1863,122 @@ bool test_clamped_text_area_resize_arbitration_commits_the_effective_grid()
     return ok;
 }
 
+// One arbitrated CSI 8 t carried through to an accepted answer, in everything
+// the captured byte run is observable through: the row the replay leaves behind,
+// the notifications it produced in order, and the grid the answer committed.
+struct Arbitrated_replay_observation
+{
+    bool                                                  completed = false;
+    QString                                               row_text;
+    std::vector<term::Terminal_session_notification_kind> notification_kinds;
+    int                                                   rows      = 0;
+    int                                                   columns   = 0;
+};
+
+Arbitrated_replay_observation observe_arbitrated_text_area_resize_replay(
+    QByteArray                   output,
+    term::terminal_grid_size_t   effective_grid_size)
+{
+    Arbitrated_replay_observation observation;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+    if (session->start(launch_config_with_grid(2, 4)).code !=
+        term::Terminal_session_result_code::ACCEPTED)
+    {
+        return observation;
+    }
+
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        std::move(output));
+    if (request_id == 0U) {
+        return observation;
+    }
+
+    if (session->settle_text_area_resize_arbitration({
+            request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+            effective_grid_size,
+        }).code != term::Terminal_session_result_code::ACCEPTED)
+    {
+        return observation;
+    }
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    if (!snapshot.has_value()) {
+        return observation;
+    }
+
+    for (const term::Terminal_session_notification& notification : session->notifications()) {
+        observation.notification_kinds.push_back(notification.kind);
+    }
+
+    observation.completed = true;
+    observation.row_text  = snapshot_row_text(*snapshot, 0);
+    observation.rows      = session->grid_size().rows;
+    observation.columns   = session->grid_size().columns;
+    return observation;
+}
+
+// A captured CSI 8 t can carry an embedded C0 control, which the parser applies
+// where it finds it and before it dispatches the sequence. Only the grid the
+// sequence commits is the host's answer to decide, so the same captured bytes
+// have to produce the same side effects whether or not the host clamped.
+bool test_clamped_text_area_resize_arbitration_replays_the_captured_controls()
+{
+    bool ok = true;
+
+    // "ab" leaves the cursor at column 2, the embedded carriage return takes it
+    // back to column 0, and the held "Z" then overwrites the "a". Row 0 reads
+    // "Zb" only if the replay applied the control the child sent.
+    const QByteArray carriage_return_output = QByteArrayLiteral("ab\x1b[8;3;5\rtZ");
+    const Arbitrated_replay_observation exact_carriage_return =
+        observe_arbitrated_text_area_resize_replay(carriage_return_output, {3, 5});
+    const Arbitrated_replay_observation clamped_carriage_return =
+        observe_arbitrated_text_area_resize_replay(carriage_return_output, {4, 6});
+
+    ok &= check(exact_carriage_return.completed && clamped_carriage_return.completed,
+        "both carriage-return replays reach an accepted answer");
+    ok &= check(
+        exact_carriage_return.rows      == 3 && exact_carriage_return.columns   == 5 &&
+        clamped_carriage_return.rows    == 4 && clamped_carriage_return.columns == 6,
+        "the two carriage-return replays differ in the grid the host answered with");
+    ok &= check(exact_carriage_return.row_text == QStringLiteral("Zb"),
+        "an exactly answered replay applies the carriage return the sequence carried");
+    ok &= check(clamped_carriage_return.row_text == exact_carriage_return.row_text,
+        "a clamped answer leaves the same row as an exact one");
+    ok &= check(
+        clamped_carriage_return.notification_kinds ==
+            exact_carriage_return.notification_kinds,
+        "a clamped answer produces the same notifications as an exact one");
+
+    // The bell is a control with no screen state of its own, so it pins the
+    // notification half of the same equivalence.
+    const QByteArray bell_output = QByteArrayLiteral("ab\x1b[8;3;5\atZ");
+    const Arbitrated_replay_observation exact_bell =
+        observe_arbitrated_text_area_resize_replay(bell_output, {3, 5});
+    const Arbitrated_replay_observation clamped_bell =
+        observe_arbitrated_text_area_resize_replay(bell_output, {4, 6});
+
+    ok &= check(exact_bell.completed && clamped_bell.completed,
+        "both bell replays reach an accepted answer");
+    ok &= check(
+        std::count(
+            exact_bell.notification_kinds.begin(),
+            exact_bell.notification_kinds.end(),
+            term::Terminal_session_notification_kind::BELL_REQUESTED) == 1,
+        "an exactly answered replay rings the bell the sequence carried");
+    ok &= check(clamped_bell.notification_kinds == exact_bell.notification_kinds,
+        "a clamped answer rings the same bell as an exact one");
+    ok &= check(clamped_bell.row_text == exact_bell.row_text,
+        "a clamped bell replay leaves the same row as an exact one");
+
+    return ok;
+}
+
 bool test_text_area_resize_arbitration_holds_output_that_arrives_while_in_flight()
 {
     bool ok = true;
@@ -17744,6 +17860,7 @@ int main()
     ok &= test_text_area_resize_arbitration_defers_the_grid_until_the_host_answers();
     ok &= test_rejected_text_area_resize_arbitration_costs_no_reflow_or_backend_resize();
     ok &= test_clamped_text_area_resize_arbitration_commits_the_effective_grid();
+    ok &= test_clamped_text_area_resize_arbitration_replays_the_captured_controls();
     ok &= test_text_area_resize_arbitration_holds_output_that_arrives_while_in_flight();
     ok &= test_text_area_resize_arbitration_serializes_two_requests_in_one_chunk();
     ok &= test_text_area_resize_arbitration_spans_a_chunk_boundary();

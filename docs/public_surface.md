@@ -444,7 +444,10 @@ sequence point, the host resizes its window, and it answers with
 carrying the grid it actually got, or
 `respond_text_area_resize(request_id, REJECT, 0, 0)`. Only the answer commits:
 an accepted request costs one reflow and one backend resize, on the grid the
-host reports, and a refused one costs none at all. A captured request emits no
+host reports, and a refused one costs none at all. That grid is all the answer
+decides: a C0 control byte the child embedded in the captured sequence, which
+the parser applies ahead of the resize, takes effect whether the host answered
+with the requested grid or with a clamped one. A captured request emits no
 `text_area_resize_requested()`, because an arbitrating host has already moved
 its window by the time the request settles.
 

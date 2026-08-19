@@ -567,7 +567,10 @@ public:
      * Answers the in-flight text-area resize arbitration.
      *
      * ACCEPT commits the grid the host actually got, which may differ from the
-     * requested one when the window system clamped it. REJECT leaves the grid
+     * requested one when the window system clamped it. That grid is all the
+     * answer decides: a C0 control byte the child embedded in the captured
+     * sequence, which the parser applies ahead of the resize, takes effect
+     * whether or not the answer matched the request. REJECT leaves the grid
      * untouched and ignores the grid arguments. Either way the held output
      * resumes. Returns false, with a CALLBACK_MISSING `backend_error`, when the
      * request id does not match the one in flight.
