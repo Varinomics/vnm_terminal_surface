@@ -7170,6 +7170,88 @@ QString Terminal_screen_model::row_text_from_cells(
     return text;
 }
 
+terminal_retained_history_ordinal_range_t
+Terminal_screen_model::retained_history_ordinal_range() const
+{
+    const Retained_history_storage& storage = m_primary_backing.retained_history;
+    return {
+        storage.index.empty()
+            ? storage.next_ordinal
+            : storage.index.front().ordinal,
+        storage.next_ordinal,
+    };
+}
+
+bool Terminal_screen_model::search_row_text(
+    Terminal_buffer_id        buffer_id,
+    int                       logical_row,
+    Terminal_search_row_text& out_text) const
+{
+    out_text.clear();
+    if (logical_row < 0) {
+        return false;
+    }
+
+    // The active-grid row is borrowed rather than taken through
+    // primary_backing_row, which returns a whole row by value.
+    const std::vector<Cell>*           source_cells = nullptr;
+    std::optional<Terminal_screen_row> materialized;
+    if (buffer_id == Terminal_buffer_id::ALTERNATE) {
+        const Terminal_screen_row* row =
+            alternate_active_row(active_grid_row_t{logical_row});
+        if (row == nullptr) {
+            return false;
+        }
+        source_cells = &row->cells;
+    }
+    else
+    if (logical_row < scrollback_size()) {
+        std::optional<retained_row_record_t> record =
+            m_primary_backing.materialize_retained_history_record(
+                static_cast<std::size_t>(logical_row));
+        if (!record.has_value()) {
+            return false;
+        }
+        materialized = std::move(record->row);
+        source_cells = &materialized->cells;
+    }
+    else {
+        const std::optional<active_grid_row_t> active_row =
+            active_grid_row_from_primary_backing(primary_backing_row_t{logical_row});
+        if (!active_row.has_value()) {
+            return false;
+        }
+        source_cells = &primary_active_grid_rows()[
+            static_cast<std::size_t>(active_row->value)].cells;
+    }
+
+    // The geometry rule is the snapshot builder's own, so the emitted columns
+    // cannot drift from the published row.
+    out_text.source_width = static_cast<std::int32_t>(source_cells->size());
+    std::vector<Cell>        visual_projection;
+    const std::vector<Cell>& visual_row =
+        row_cells_for_current_geometry(*source_cells, visual_projection);
+    const int column_count = m_config.grid_size.columns;
+    int       next_column  = 0;
+    for (int column = 0; column < column_count; ++column) {
+        const Cell& cell = visual_row[static_cast<std::size_t>(column)];
+        if (!cell.occupied || cell.wide_continuation || cell.text.isEmpty()) {
+            continue;
+        }
+
+        while (next_column < column) {
+            out_text.append_padding_column(next_column);
+            ++next_column;
+        }
+
+        const int end_column = column + std::max(1, cell.display_width);
+        out_text.append_cell_text(cell.text, column, end_column);
+        next_column = std::max(next_column, end_column);
+    }
+
+    return true;
+}
+
 std::optional<std::vector<Terminal_screen_model::Cell>>
 Terminal_screen_model::logical_row_cells(
     Terminal_buffer_id         buffer_id,

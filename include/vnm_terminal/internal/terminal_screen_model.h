@@ -6,6 +6,7 @@
 #include "vnm_terminal/internal/terminal_hyperlink.h"
 #include "vnm_terminal/internal/terminal_history_ring.h"
 #include "vnm_terminal/internal/terminal_repaint_recovery.h"
+#include "vnm_terminal/internal/terminal_search_row_text.h"
 #include "vnm_terminal/internal/utf8_scan.h"
 #include "vnm_terminal/internal/terminal_input_mode.h"
 #include "vnm_terminal/internal/terminal_style.h"
@@ -503,6 +504,15 @@ struct terminal_retained_history_diagnostics_t
                                prefix_plain_ascii_estimate;
 };
 
+// Live retained-history ordinal window. Ordinals are assigned in append order
+// and are contiguous over the live range, so first_ordinal identifies logical
+// row 0 and end_ordinal is one past the newest retained row.
+struct terminal_retained_history_ordinal_range_t
+{
+    std::uint64_t              first_ordinal = 0U;
+    std::uint64_t              end_ordinal   = 0U;
+};
+
 struct terminal_selection_reconciliation_counters_t
 {
     bool          enabled                              = false;
@@ -598,6 +608,18 @@ public:
     std::optional<terminal_history_handle_t> retained_history_handle_at_logical_row(
         Terminal_buffer_id             buffer_id,
         int                            logical_row) const;
+    terminal_retained_history_ordinal_range_t
+        retained_history_ordinal_range() const;
+    // Emits the searchable text of one logical row exactly as a published render
+    // snapshot emits that row: a cell contributes iff it is occupied, is not a
+    // wide continuation and has non-empty text; each skipped column before a
+    // contributing cell contributes one space; there is no trailing pad. Columns
+    // are those of the row projected to the live grid geometry. Returns false
+    // when the row does not exist.
+    bool search_row_text(
+        Terminal_buffer_id             buffer_id,
+        int                            logical_row,
+        Terminal_search_row_text&      out_text) const;
     void discard_retained_lookup_cache_for_testing() const;
     bool retained_history_storage_allocated_for_testing() const;
     Terminal_retained_line_provenance retained_line_provenance_for_testing(
