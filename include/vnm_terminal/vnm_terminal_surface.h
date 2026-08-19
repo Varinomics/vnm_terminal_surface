@@ -464,21 +464,31 @@ public:
     /**
      * Whether XTWINOPS `CSI 8 ; rows ; columns t` is a two-phase transaction.
      *
-     * Enabled, the sequence no longer commits anything on its own. Backend
-     * output stops at the sequence point, the host receives
+     * Enabled, a captured sequence no longer commits anything on its own.
+     * Backend output stops at the sequence point, the host receives
      * `text_area_resize_arbitration_requested(request_id, rows, columns)`,
      * resizes its window, and answers with `respond_text_area_resize` carrying
      * the grid it actually got. Only then is the grid committed, the pty
      * resized, and the held output interpreted against the answer. A refusal
-     * costs no reflow and no pty resize at all.
+     * costs no reflow and no pty resize at all. Output after the sequence is
+     * held until the host answers, bounded by the session's hold limit and by
+     * `textAreaResizeArbitrationTimeoutMs`.
      *
-     * `text_area_resize_requested()` is not emitted while this is enabled: an
+     * A captured request emits no `text_area_resize_requested()`, because an
      * arbitrating host has already moved its window by the time the request
-     * settles. Output after the sequence is held until the host answers,
-     * bounded by the session's hold limit and by
-     * `textAreaResizeArbitrationTimeoutMs`. Disabled, the default, the sequence
-     * keeps its sequence-point behavior and `textAreaResizePolicy` remains the
-     * only host control over it.
+     * settles. One shape is not captured: a `CSI 8 t` carrying an embedded C0
+     * control byte and split across a backend read boundary that falls after
+     * the control. The parser applies such a control as it scans and carries
+     * only the stripped prefix across the boundary, so the two halves are no
+     * longer joinable in the byte stream the transaction watches. That request
+     * commits at the sequence point and emits `text_area_resize_requested()`,
+     * exactly as it does with arbitration disabled. An arbitrating host
+     * therefore connects both signals; leaving `text_area_resize_requested()`
+     * unconnected moves the grid and the pty with nothing telling the host to
+     * follow.
+     *
+     * Disabled, the default, the sequence keeps its sequence-point behavior and
+     * `textAreaResizePolicy` remains the only host control over it.
      */
     bool text_area_resize_arbitration_enabled() const;
     void set_text_area_resize_arbitration_enabled(bool enabled);

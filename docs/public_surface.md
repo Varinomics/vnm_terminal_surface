@@ -74,10 +74,11 @@ Writable Qt properties:
   minimized. Requests are then ignored: no grid change, no backend resize, and
   no `text_area_resize_requested()` signal. The policy applies to a live
   session, so hosts update it as their window state changes.
-- `textAreaResizeArbitrationEnabled` turns each XTWINOPS
-  `CSI 8 ; rows ; columns t` into a two-phase transaction instead of a
-  sequence-point commit. It is off by default. See
-  `text_area_resize_arbitration_requested()` below for the protocol.
+- `textAreaResizeArbitrationEnabled` turns an XTWINOPS
+  `CSI 8 ; rows ; columns t` the terminal captures into a two-phase transaction
+  instead of a sequence-point commit. It is off by default. See
+  `text_area_resize_arbitration_requested()` below for the protocol, and for the
+  one request shape the transaction cannot capture.
 - `textAreaResizeArbitrationTimeoutMs` bounds how long backend output is held
   waiting for that answer. The default is 250 ms; 0 removes the bound and leaves
   only the session byte limit. Negative values clamp to 0.
@@ -436,16 +437,33 @@ order, but the nested call republishes surface state, so property change signals
 can arrive ahead of them; deferring it to the next event loop turn avoids that.
 
 `text_area_resize_arbitration_requested(request_id, rows, columns)` replaces
-that whole shape for a host that sets `textAreaResizeArbitrationEnabled`. The
-sequence then commits nothing on its own. Backend output stops at the sequence
-point, the host resizes its window, and it answers with
+that whole shape for a host that sets `textAreaResizeArbitrationEnabled`. A
+captured sequence then commits nothing on its own. Backend output stops at the
+sequence point, the host resizes its window, and it answers with
 `respond_text_area_resize(request_id, ACCEPT, actual_rows, actual_columns)`
 carrying the grid it actually got, or
 `respond_text_area_resize(request_id, REJECT, 0, 0)`. Only the answer commits:
 an accepted request costs one reflow and one backend resize, on the grid the
-host reports, and a refused one costs none at all. `text_area_resize_requested()`
-is not emitted while arbitration is enabled, because an arbitrating host has
-already moved its window by the time the request settles.
+host reports, and a refused one costs none at all. A captured request emits no
+`text_area_resize_requested()`, because an arbitrating host has already moved
+its window by the time the request settles.
+
+The transaction captures a request out of the backend byte stream, ahead of the
+parser that would dispatch it. One shape escapes that: a
+`CSI 8 ; rows ; columns t` carrying an embedded C0 control byte and split across
+a backend read boundary that falls after the control. The parser applies such a
+control as it scans and carries only the stripped prefix across the boundary, so
+the two halves are no longer joinable in the byte stream the terminal watches.
+That request is not arbitrated. It commits the grid and resizes the backend at
+the sequence point, and it emits `text_area_resize_requested()`, exactly as it
+does with arbitration disabled.
+
+A host that enables arbitration therefore connects both signals.
+`text_area_resize_arbitration_requested()` is where it resizes its window and
+answers; `text_area_resize_requested()` is where it handles an already-committed
+request, the same handler it would write without arbitration. Leaving that
+second signal unconnected moves the grid and the backend with nothing telling
+the host to follow, which is the divergence the transaction exists to remove.
 
 Resizing the window before answering is the expected order and does not settle
 the request. The item geometry reaches the grid the way it always does, so
