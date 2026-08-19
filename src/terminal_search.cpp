@@ -136,7 +136,6 @@ void Terminal_search_controller::rebuild(
                         match_ordinal,
                     },
                     row.public_row,
-                    row.visual_fragment_index,
                     first_column,
                     std::max(1, end_column - first_column),
                 });
