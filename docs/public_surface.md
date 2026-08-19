@@ -442,9 +442,12 @@ captured sequence then commits nothing on its own. Backend output stops at the
 sequence point, the host resizes its window, and it answers with
 `respond_text_area_resize(request_id, ACCEPT, actual_rows, actual_columns)`
 carrying the grid it actually got, or
-`respond_text_area_resize(request_id, REJECT, 0, 0)`. Only the answer commits:
-an accepted request costs one reflow and one backend resize, on the grid the
-host reports, and a refused one costs none at all. That grid is all the answer
+`respond_text_area_resize(request_id, REJECT, 0, 0)`. That window resize is not
+the answer, but it does reach the grid and the backend, exactly as it would
+with no request in flight, and the answer then commits the grid the host
+reports. Honoring a request therefore costs one reflow and one backend resize
+in total, whether the host's own resize or the answer applied it, and refusing
+adds nothing to what that resize already cost. That grid is all the answer
 decides: a C0 control byte the child embedded in the captured sequence, which
 the parser applies ahead of the resize, takes effect whether the host answered
 with the requested grid or with a clamped one. A captured request emits no
@@ -482,9 +485,12 @@ own byte limit for a host that answers eventually while the process floods.
 reports every ending, whether it was the host's `ACCEPTED` or `REJECTED` answer
 or a settlement the terminal had to make: `HOLD_LIMIT_REACHED`,
 `TEXT_AREA_RESIZE_DISABLED`, `ARBITRATION_DISABLED`, `PROCESS_EXITED`, or
-`TIMED_OUT`. Held output always replays, against the answered grid when the
-request was accepted and against the grid then current otherwise. A host that armed
-UI on the request tears it down on this signal rather than on its own answer.
+`TIMED_OUT`. An `ACCEPT` carrying a grid the terminal cannot support is settled
+as `REJECTED` instead, and `respond_text_area_resize` returns false with a
+`RESIZE_FAILED` backend error. Held output always replays, against the answered
+grid when the request was accepted and against the grid then current otherwise;
+`rows` and `columns` are that grid. A host that armed UI on the request tears it
+down on this signal rather than on its own answer.
 
 Arbitration is an optional capability and adds no transcript event kind. A
 transcript captured with it enabled replays under a session without it as the

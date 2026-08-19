@@ -122,6 +122,9 @@ struct terminal_text_area_resize_arbitration_settlement_t
     std::uint64_t                                 request_id = 0U;
     Terminal_text_area_resize_arbitration_outcome outcome    =
         Terminal_text_area_resize_arbitration_outcome::REJECTED;
+    // Carries the host's answered grid into a settlement command, and the grid
+    // the held output replays against out of a settlement notification: that
+    // answer on ACCEPTED, the grid current at settlement on every other outcome.
     terminal_grid_size_t                          effective_grid_size;
 };
 

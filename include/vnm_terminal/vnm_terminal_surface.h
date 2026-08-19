@@ -468,11 +468,15 @@ public:
      * Backend output stops at the sequence point, the host receives
      * `text_area_resize_arbitration_requested(request_id, rows, columns)`,
      * resizes its window, and answers with `respond_text_area_resize` carrying
-     * the grid it actually got. Only then is the grid committed, the pty
-     * resized, and the held output interpreted against the answer. A refusal
-     * costs no reflow and no pty resize at all. Output after the sequence is
-     * held until the host answers, bounded by the session's hold limit and by
-     * `textAreaResizeArbitrationTimeoutMs`.
+     * the grid it actually got. The host's own window resize is not the answer,
+     * but it is an ordinary geometry change: it reaches the grid and the pty
+     * exactly as it would with no request in flight. The answer decides only
+     * whether the request was granted, committing the answered grid and
+     * interpreting the held output against it, so an acceptance adds a reflow
+     * and a pty resize only where its grid differs from the one the host's own
+     * resize already reached, and a refusal adds neither. Output after the
+     * sequence is held until the host answers, bounded by the session's hold
+     * limit and by `textAreaResizeArbitrationTimeoutMs`.
      *
      * A captured request emits no `text_area_resize_requested()`, because an
      * arbitrating host has already moved its window by the time the request
@@ -573,7 +577,10 @@ public:
      * whether or not the answer matched the request. REJECT leaves the grid
      * untouched and ignores the grid arguments. Either way the held output
      * resumes. Returns false, with a CALLBACK_MISSING `backend_error`, when the
-     * request id does not match the one in flight.
+     * request id does not match the one in flight. An ACCEPT carrying a grid
+     * the terminal cannot support ends the request as a refusal instead and
+     * returns false with a RESIZE_FAILED `backend_error`; the held output
+     * resumes against the unchanged grid rather than waiting out the timeout.
      *
      * Resizing the window first is expected and does not settle the request:
      * the item geometry reaches the grid the way it always does, so `rows()`
@@ -679,6 +686,10 @@ signals:
     void synchronized_output_scroll_policy_changed();
     void text_area_resize_policy_changed();
     void text_area_resize_arbitration_requested(quint64 request_id, int rows, int columns);
+    // Reports every ending of an in-flight arbitration, the host's own answer
+    // and the settlements the terminal makes alike. rows and columns carry the
+    // grid the held output replays against: the grid the answer committed on
+    // ACCEPTED, and the grid current at settlement on every other outcome.
     void text_area_resize_arbitration_settled(
         quint64                                 request_id,
         Text_area_resize_arbitration_outcome    outcome,
