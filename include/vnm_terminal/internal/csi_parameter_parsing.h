@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArrayView>
+#include <cstddef>
 #include <vector>
 
 namespace vnm_terminal::internal {
@@ -28,6 +29,47 @@ struct Sgr_parameter_group
 bool parse_sgr_parameter_groups(
     QByteArrayView                     bytes,
     std::vector<Sgr_parameter_group>&  groups);
+
+// Every group holds exactly one atom. The screen model's control-sequence
+// dispatch and the session's backend-output prescan both need this shape before
+// they can read a parameter as a plain integer.
+inline bool parse_simple_csi_parameter_groups(
+    QByteArrayView                       parameter_bytes,
+    std::vector<Sgr_parameter_group>&    groups)
+{
+    if (!parse_sgr_parameter_groups(parameter_bytes, groups)) {
+        return false;
+    }
+
+    for (const Sgr_parameter_group& group : groups) {
+        if (group.atoms.size() != 1U) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+inline bool csi_parameter_value(
+    const std::vector<Sgr_parameter_group>&    groups,
+    std::size_t                                index,
+    int                                        default_value,
+    int&                                       value)
+{
+    if (index >= groups.size()) {
+        value = default_value;
+        return true;
+    }
+
+    const Sgr_parameter_group& group = groups[index];
+    if (group.atoms.size() != 1U) {
+        return false;
+    }
+
+    const Sgr_parameter_atom& atom = group.atoms.front();
+    value = atom.has_value ? atom.value : default_value;
+    return true;
+}
 
 inline bool palette_index_is_valid(int value)
 {

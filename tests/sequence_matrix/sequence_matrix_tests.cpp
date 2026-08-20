@@ -635,6 +635,32 @@ void validate_matrix_records(
         require(contains_text(value_of(grapheme->second, "behavior"), "no runtime grapheme-cluster mode"),
             errors, "DECSET 2027 must not store runtime grapheme mode");
     }
+
+    const auto text_area_resize = matrix.find("csi-window-op-8");
+    if (text_area_resize != matrix.end()) {
+        // The arbitration captures a request out of the backend byte stream, so
+        // it cannot capture one the parser completes from a pending prefix it
+        // has already stripped the embedded control out of. That request keeps
+        // the sequence-point commit and the standing notification, and a host
+        // that read only the two-phase half of this row would leave the one
+        // signal it fires unconnected.
+        require(contains_text(value_of(text_area_resize->second, "behavior"),
+                "does not capture"),
+            errors, "CSI 8 t must document the request arbitration cannot capture");
+        require(contains_text(value_of(text_area_resize->second, "behavior"),
+                "keeps the sequence-point commit and the standing"),
+            errors, "CSI 8 t must document that an uncaptured request still commits and notifies");
+        require(contains_text(value_of(text_area_resize->second, "host_policy"),
+                "text_area_resize_requested"),
+            errors, "CSI 8 t host policy must tell an arbitrating host to connect both signals");
+        // The host resizes its window before it answers, and that resize reaches
+        // the grid and the backend on its own. A contract that reads as though
+        // the answer were the only thing that commits has already been written
+        // three times on this surface, so the row that says otherwise is pinned.
+        require(contains_text(value_of(text_area_resize->second, "host_policy"),
+                "never settles the request"),
+            errors, "CSI 8 t host policy must document that a host window resize is not the answer");
+    }
 }
 
 std::string replace_once(std::string text, const std::string& before, const std::string& after)
@@ -726,6 +752,21 @@ bool run_negative_cases(const std::string& matrix_text, const std::string& oracl
         replace_in_record(matrix_text, "osc-payload-limit",
             "oracle: product-decision-vnm-terminal",
             "oracle: missing-oracle"),
+        oracle_text);
+    ok &= expect_failure("CSI 8 t uncaptured-request fallback drift",
+        replace_in_record(matrix_text, "csi-window-op-8",
+            "a sequence the arbitration does not capture",
+            "a sequence the arbitration always captures"),
+        oracle_text);
+    ok &= expect_failure("CSI 8 t both-signals host policy drift",
+        replace_in_record(matrix_text, "csi-window-op-8",
+            "connects text_area_resize_requested as well",
+            "connects the arbitration signal alone"),
+        oracle_text);
+    ok &= expect_failure("CSI 8 t host-resize settlement drift",
+        replace_in_record(matrix_text, "csi-window-op-8",
+            "never settles the request",
+            "settles the request"),
         oracle_text);
     ok &= expect_failure("reference output allowed",
         matrix_text,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "vnm_terminal/internal/csi_parameter_parsing.h"
 #include "vnm_terminal/internal/parser_action.h"
 #include "vnm_terminal/internal/render_snapshot.h"
 #include "vnm_terminal/internal/terminal_byte_stream_parser.h"
@@ -57,6 +58,25 @@ inline bool is_terminal_screen_model_grid_size_supported(terminal_grid_size_t gr
     const std::size_t columns = static_cast<std::size_t>(grid_size.columns);
     return rows <= k_terminal_screen_model_max_cells / columns;
 }
+
+enum class Terminal_text_area_resize_request_status
+{
+    NOT_REQUESTED,
+    MALFORMED,
+    UNSUPPORTED,
+    SUPPORTED,
+};
+
+// Classifies already-parsed CSI parameter groups as the
+// CSI 8 ; rows ; columns t text-area resize form. Declared here so the session's
+// backend-output prescan and the model's control-sequence dispatch cannot drift
+// apart about which byte run is a resize request. Accepts groups straight from
+// parse_sgr_parameter_groups, so a multi-atom rows or columns group is reported
+// as MALFORMED rather than assumed away. Defined in terminal_screen_model.cpp;
+// linked into both translation units of this library.
+Terminal_text_area_resize_request_status terminal_text_area_resize_request_status(
+    const std::vector<Sgr_parameter_group>&    groups,
+    terminal_grid_size_t&                      grid_size);
 
 struct Terminal_screen_model_config
 {

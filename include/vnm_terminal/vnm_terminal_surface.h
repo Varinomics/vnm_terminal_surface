@@ -34,6 +34,7 @@ struct Terminal_backend_error;
 struct Terminal_launch_config;
 struct Terminal_viewport_state;
 struct Terminal_session_notification;
+struct Terminal_text_area_resize_arbitration_event;
 struct Terminal_session_result;
 class VNM_TerminalSurface_render_bridge;
 }
@@ -75,6 +76,14 @@ class VNM_TerminalSurface : public QQuickItem
     Q_PROPERTY(Text_area_resize_policy textAreaResizePolicy
         READ text_area_resize_policy WRITE set_text_area_resize_policy
         NOTIFY text_area_resize_policy_changed)
+    Q_PROPERTY(bool textAreaResizeArbitrationEnabled
+        READ text_area_resize_arbitration_enabled
+        WRITE set_text_area_resize_arbitration_enabled
+        NOTIFY text_area_resize_arbitration_enabled_changed)
+    Q_PROPERTY(int textAreaResizeArbitrationTimeoutMs
+        READ text_area_resize_arbitration_timeout_ms
+        WRITE set_text_area_resize_arbitration_timeout_ms
+        NOTIFY text_area_resize_arbitration_timeout_ms_changed)
     Q_PROPERTY(Mouse_reporting_policy mouseReportingPolicy
         READ mouse_reporting_policy WRITE set_mouse_reporting_policy
         NOTIFY mouse_reporting_policy_changed)
@@ -178,6 +187,25 @@ public:
         DISABLED,
     };
     Q_ENUM(Text_area_resize_policy)
+
+    enum class Text_area_resize_arbitration_decision
+    {
+        REJECT,
+        ACCEPT,
+    };
+    Q_ENUM(Text_area_resize_arbitration_decision)
+
+    enum class Text_area_resize_arbitration_outcome
+    {
+        ACCEPTED,
+        REJECTED,
+        HOLD_LIMIT_REACHED,
+        TEXT_AREA_RESIZE_DISABLED,
+        ARBITRATION_DISABLED,
+        PROCESS_EXITED,
+        TIMED_OUT,
+    };
+    Q_ENUM(Text_area_resize_arbitration_outcome)
 
     enum class Alternate_screen_wheel_policy
     {
@@ -433,6 +461,54 @@ public:
      */
     Text_area_resize_policy text_area_resize_policy() const;
     void set_text_area_resize_policy(Text_area_resize_policy policy);
+
+    /**
+     * Whether XTWINOPS `CSI 8 ; rows ; columns t` is a two-phase transaction.
+     *
+     * Enabled, a captured sequence no longer commits anything on its own.
+     * Backend output stops at the sequence point, the host receives
+     * `text_area_resize_arbitration_requested(request_id, rows, columns)`,
+     * resizes its window, and answers with `respond_text_area_resize` carrying
+     * the grid it actually got. The host's own window resize is not the answer,
+     * but it is an ordinary geometry change: it reaches the grid and the pty
+     * exactly as it would with no request in flight. The answer decides only
+     * whether the request was granted, committing the answered grid and
+     * interpreting the held output against it, so an acceptance adds a reflow
+     * and a pty resize only where its grid differs from the one the host's own
+     * resize already reached, and a refusal adds neither. Output after the
+     * sequence is held until the host answers, bounded by the session's hold
+     * limit and by `textAreaResizeArbitrationTimeoutMs`.
+     *
+     * If the request itself exceeds the bounded control-sequence allowance, or
+     * its own callback already has more trailing bytes than the hold limit, the
+     * request is declined without being presented and processing continues
+     * normally.
+     *
+     * At most one request is actionable at a time. If the process exits before
+     * a queued request reaches the host, neither that stale request nor a
+     * matching historical settlement is emitted.
+     *
+     * A captured request emits no `text_area_resize_requested()`, because an
+     * arbitrating host has already moved its window by the time the request
+     * settles. One shape is not captured: a `CSI 8 t` carrying an embedded C0
+     * control byte and split across a backend read boundary that falls after
+     * the control. The parser applies such a control as it scans and carries
+     * only the stripped prefix across the boundary, so the two halves are no
+     * longer joinable in the byte stream the transaction watches. That request
+     * commits at the sequence point and emits `text_area_resize_requested()`,
+     * exactly as it does with arbitration disabled. An arbitrating host
+     * therefore connects both signals; leaving `text_area_resize_requested()`
+     * unconnected moves the grid and the pty with nothing telling the host to
+     * follow.
+     *
+     * Disabled, the default, the sequence keeps its sequence-point behavior and
+     * `textAreaResizePolicy` remains the only host control over it.
+     */
+    bool text_area_resize_arbitration_enabled() const;
+    void set_text_area_resize_arbitration_enabled(bool enabled);
+
+    int  text_area_resize_arbitration_timeout_ms() const;
+    void set_text_area_resize_arbitration_timeout_ms(int timeout_ms);
     Mouse_reporting_policy mouse_reporting_policy() const;
     void set_mouse_reporting_policy(Mouse_reporting_policy policy);
 
@@ -500,6 +576,33 @@ public:
     Q_INVOKABLE bool respond_clipboard_write(
         quint64                        request_id,
         Clipboard_response_decision    decision);
+
+    /**
+     * Answers the in-flight text-area resize arbitration.
+     *
+     * ACCEPT commits the grid the host actually got, which may differ from the
+     * requested one when the window system clamped it. That grid is all the
+     * answer decides: a C0 control byte the child embedded in the captured
+     * sequence, which the parser applies ahead of the resize, takes effect
+     * whether or not the answer matched the request. REJECT leaves the grid
+     * untouched and ignores the grid arguments. Either way the held output
+     * resumes. Returns false, with a CALLBACK_MISSING `backend_error`, when the
+     * request id does not match the one in flight. An ACCEPT carrying a grid
+     * the terminal cannot support ends the request as a refusal instead and
+     * returns false with a RESIZE_FAILED `backend_error`; the held output
+     * resumes against the unchanged grid rather than waiting out the timeout.
+     *
+     * Resizing the window first is expected and does not settle the request:
+     * the item geometry reaches the grid the way it always does, so `rows()`
+     * and `columns()` report the grid the host actually got and the answer can
+     * be truthful. The request stays in flight until this call, its timeout, or
+     * the session ending it.
+     */
+    Q_INVOKABLE bool respond_text_area_resize(
+        quint64                                 request_id,
+        Text_area_resize_arbitration_decision   decision,
+        int                                     effective_rows,
+        int                                     effective_columns);
 
     /**
      * Returns the OSC 8 target published at the item-coordinate point.
@@ -592,6 +695,20 @@ signals:
     void synchronized_output_stale_timeout_ms_changed();
     void synchronized_output_scroll_policy_changed();
     void text_area_resize_policy_changed();
+    void text_area_resize_arbitration_requested(quint64 request_id, int rows, int columns);
+    // Reports every ending of an arbitration that was presented to the host,
+    // the host's own answer and the settlements the terminal makes alike. A
+    // request withdrawn before presentation emits neither signal. rows and
+    // columns carry the grid the held output replays against: the grid the
+    // answer committed on ACCEPTED, and the grid current at settlement on every
+    // other outcome.
+    void text_area_resize_arbitration_settled(
+        quint64                                 request_id,
+        Text_area_resize_arbitration_outcome    outcome,
+        int                                     rows,
+        int                                     columns);
+    void text_area_resize_arbitration_enabled_changed();
+    void text_area_resize_arbitration_timeout_ms_changed();
     void mouse_reporting_policy_changed();
     void copy_shortcut_policy_changed();
     void copy_on_select_changed();
@@ -763,6 +880,9 @@ private:
     void replay_session_notification(
         const vnm_terminal::internal::Terminal_session_notification&
                                notification);
+    void replay_text_area_resize_arbitration_event(
+        const vnm_terminal::internal::Terminal_text_area_resize_arbitration_event&
+                               event);
 
     void report_backend_error(
         vnm_terminal::internal::Terminal_backend_error
@@ -792,6 +912,7 @@ private:
     void dismiss_row_timestamp_tooltip();
     bool row_timestamp_tooltip_pointer_moved(const QPointF& position);
     void handle_row_timestamp_tooltip_timeout();
+    void handle_text_area_resize_arbitration_timeout();
 
     QString                  m_font_family;
     qreal                    m_font_size                            = 13.0;
@@ -817,6 +938,11 @@ private:
     int                      m_synchronized_output_stale_timeout_ms = 1000;
     Text_area_resize_policy m_text_area_resize_policy =
         Text_area_resize_policy::APPLICATION_CONTROLLED;
+    bool                     m_text_area_resize_arbitration_enabled = false;
+    // Long enough for a host to complete a window resize round trip on a loaded
+    // compositor, short enough that a host that never answers does not read as a
+    // frozen terminal. 0 removes the bound.
+    int                      m_text_area_resize_arbitration_timeout_ms = 250;
     Synchronized_output_scroll_policy m_synchronized_output_scroll_policy =
         Synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION;
     Mouse_reporting_policy   m_mouse_reporting_policy =

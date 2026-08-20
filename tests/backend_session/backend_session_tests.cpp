@@ -108,6 +108,9 @@ term::Terminal_session_config enable_test_traces(term::Terminal_session_config c
     config.trace_resize_limit               = 1024U;
     config.trace_output_chunk_limit         = 4096U;
     config.capture_last_model_ingest_result = true;
+    if (config.text_area_resize_arbitration.has_value()) {
+        config.text_area_resize_arbitration->trace_event_limit = 4096U;
+    }
     return config;
 }
 
@@ -417,6 +420,24 @@ bool has_backend_error_code(
         if (notification.kind                == term::Terminal_session_notification_kind::BACKEND_ERROR &&
             notification.backend_error.has_value()                                                      &&
             notification.backend_error->code == code)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool has_backend_error(
+    const std::vector<term::Terminal_session_notification>& notifications,
+    term::Terminal_backend_error_code                       code,
+    const QString&                                          message)
+{
+    for (const term::Terminal_session_notification& notification : notifications) {
+        if (notification.kind == term::Terminal_session_notification_kind::BACKEND_ERROR &&
+            notification.backend_error.has_value()                                          &&
+            notification.backend_error->code    == code                                     &&
+            notification.backend_error->message == message)
         {
             return true;
         }
@@ -1556,6 +1577,1854 @@ bool test_text_area_resize_retry_precedes_later_changed_request_in_same_callback
         snapshot->grid_size.rows == 4 && snapshot->grid_size.columns == 6 &&
         snapshot->metadata.backend_geometry_in_sync,
         "mixed text-area resize callback publishes final changed-grid in-sync state");
+
+    return ok;
+}
+
+int model_result_diagnostic_count(const term::Terminal_screen_model_result& result)
+{
+    int count = 0;
+    for (const term::Parser_action& action : result.actions) {
+        if (term::parser_action_kind(action) == term::Parser_action_kind::DIAGNOSTIC) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// The two-phase text-area resize transaction is an optional capability: absent,
+// the sequence keeps committing the grid at the parser sequence point. The tests
+// below all install it, and the last one pins that a session without it is
+// unaffected.
+term::Terminal_session_config text_area_resize_arbitration_config(
+    std::size_t hold_limit_bytes =
+        term::k_terminal_default_text_area_resize_hold_limit_bytes)
+{
+    term::Terminal_session_config config;
+    config.text_area_resize_arbitration.emplace();
+    config.text_area_resize_arbitration->hold_limit_bytes = hold_limit_bytes;
+    return config;
+}
+
+term::Terminal_launch_config launch_config_with_grid(int rows, int columns)
+{
+    term::Terminal_launch_config config = valid_launch_config();
+    config.initial_grid_size            = term::terminal_grid_size_t{rows, columns};
+    return config;
+}
+
+std::vector<term::Terminal_text_area_resize_arbitration_event> arbitration_requests(
+    term::Terminal_session& session)
+{
+    std::vector<term::Terminal_text_area_resize_arbitration_event> pending;
+    for (term::Terminal_session_delivery& delivery : session.take_pending_deliveries()) {
+        if (delivery.text_area_resize_arbitration_event.has_value()) {
+            pending.push_back(std::move(*delivery.text_area_resize_arbitration_event));
+        }
+    }
+    for (const term::Terminal_text_area_resize_arbitration_event& event : pending) {
+        if (event.kind ==
+                term::Terminal_text_area_resize_arbitration_event_kind::REQUESTED &&
+            event.request.has_value())
+        {
+            (void)session.mark_text_area_resize_arbitration_presented(
+                event.request->request_id);
+        }
+    }
+
+    std::vector<term::Terminal_text_area_resize_arbitration_event> requests;
+    for (const term::Terminal_text_area_resize_arbitration_event& event :
+        session.text_area_resize_arbitration_events())
+    {
+        if (event.kind ==
+            term::Terminal_text_area_resize_arbitration_event_kind::REQUESTED)
+        {
+            requests.push_back(event);
+        }
+    }
+    return requests;
+}
+
+std::vector<term::Terminal_text_area_resize_arbitration_event>
+    take_pending_arbitration_events(
+        term::Terminal_session&                            session,
+        std::vector<term::Terminal_session_notification>* common_notifications = nullptr)
+{
+    std::vector<term::Terminal_text_area_resize_arbitration_event> events;
+    for (term::Terminal_session_delivery& delivery : session.take_pending_deliveries()) {
+        if (delivery.common_notification.has_value() && common_notifications != nullptr) {
+            common_notifications->push_back(std::move(*delivery.common_notification));
+        }
+        if (delivery.text_area_resize_arbitration_event.has_value()) {
+            events.push_back(std::move(*delivery.text_area_resize_arbitration_event));
+        }
+    }
+    return events;
+}
+
+std::vector<term::Terminal_text_area_resize_arbitration_event> arbitration_settlements(
+    const term::Terminal_session& session)
+{
+    std::vector<term::Terminal_text_area_resize_arbitration_event> settlements;
+    for (const term::Terminal_text_area_resize_arbitration_event& event :
+        session.text_area_resize_arbitration_events())
+    {
+        if (event.kind ==
+            term::Terminal_text_area_resize_arbitration_event_kind::SETTLED)
+        {
+            settlements.push_back(event);
+        }
+    }
+    return settlements;
+}
+
+bool settlement_has_outcome(
+    const std::vector<term::Terminal_text_area_resize_arbitration_event>& settlements,
+    std::size_t                                                           index,
+    term::Terminal_text_area_resize_arbitration_outcome                    outcome)
+{
+    return
+        index < settlements.size()                    &&
+        settlements[index].settlement.has_value()     &&
+        settlements[index].settlement->outcome == outcome;
+}
+
+// Arms one request from a single chunk and returns its id, or 0 when the chunk
+// did not produce exactly one new request.
+std::uint64_t arm_text_area_resize_arbitration(
+    term::Terminal_session&    session,
+    Scripted_backend&          backend,
+    QByteArray                 bytes)
+{
+    const std::size_t before = arbitration_requests(session).size();
+    if (!backend.emit_output(std::move(bytes))) {
+        return 0U;
+    }
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(session);
+    if (requests.size() != before + 1U ||
+        !requests.back().request.has_value())
+    {
+        return 0U;
+    }
+
+    return requests.back().request->request_id;
+}
+
+bool test_text_area_resize_arbitration_defers_the_grid_until_the_host_answers()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "arbitrated text-area resize session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("aa\x1b[8;3;5t\x1b[3;5HZ")),
+        "arbitrated text-area resize output is accepted");
+
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 4,
+        "an unanswered text-area resize request leaves the session grid alone");
+    ok &= check(backend->resize_requests.empty(),
+        "an unanswered text-area resize request does not resize the backend");
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    ok &= check(requests.size() == 1U &&
+        requests.front().request.has_value() &&
+        requests.front().request->requested_grid_size.rows == 3 &&
+        requests.front().request->requested_grid_size.columns == 5,
+        "the arbitrated request reaches the host once with the requested grid");
+    ok &= check(notification_count(
+        *session,
+        term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED) == 0U,
+        "the arbitrated request does not also fire the standing request notification");
+
+    const std::optional<term::Terminal_render_snapshot> held_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(held_snapshot.has_value() &&
+        held_snapshot->grid_size.rows == 2 && held_snapshot->grid_size.columns == 4,
+        "output before the request publishes on the pre-request grid");
+    if (held_snapshot.has_value()) {
+        ok &= check(snapshot_row_text(*held_snapshot, 0) == QStringLiteral("aa"),
+            "output before the request is published while the answer is pending");
+        ok &= check(snapshot_row_text(*held_snapshot, 1).isEmpty(),
+            "output after the request is withheld while the answer is pending");
+    }
+
+    const std::uint64_t request_id =
+        requests.front().request->request_id;
+    ok &= check(session->pending_text_area_resize_arbitration().has_value(),
+        "the session reports the request as in flight");
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the host answer is accepted");
+
+    ok &= check(session->grid_size().rows == 3 && session->grid_size().columns == 5,
+        "an accepted text-area resize request commits the requested grid");
+    ok &= check(backend->resize_requests.size() == 1U &&
+        backend->resize_requests.back().grid_size.rows == 3 &&
+        backend->resize_requests.back().grid_size.columns == 5,
+        "an accepted text-area resize request resizes the backend exactly once");
+    ok &= check(!session->pending_text_area_resize_arbitration().has_value(),
+        "the answered request is no longer in flight");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot->grid_size.rows == 3 && snapshot->grid_size.columns == 5,
+        "the accepted answer publishes a snapshot on the new grid");
+    if (snapshot.has_value()) {
+        ok &= check(snapshot_row_text(*snapshot, 2) == QStringLiteral("    Z"),
+            "held output replays against the accepted grid");
+        ok &= check(term::validate_render_snapshot(*snapshot).status ==
+            term::Terminal_render_snapshot_status::OK,
+            "the accepted answer snapshot validates");
+    }
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> settlements =
+        arbitration_settlements(*session);
+    ok &= check(settlements.size() == 1U &&
+        settlement_has_outcome(
+            settlements,
+            0U,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED),
+        "the accepted answer settles the request once");
+
+    return ok;
+}
+
+bool test_rejected_text_area_resize_arbitration_costs_no_reflow_or_backend_resize()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "rejected text-area resize session starts");
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("aa\x1b[8;3;5t\x1b[3;5HZ"));
+    ok &= check(request_id != 0U, "rejected text-area resize request arms once");
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+        {},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the refusal is accepted");
+
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 4,
+        "a refused text-area resize request leaves the grid alone");
+    ok &= check(backend->resize_requests.empty(),
+        "a refused text-area resize request never resizes the backend");
+    ok &= check(session->resize_transactions().empty(),
+        "a refused text-area resize request records no resize transaction");
+    ok &= check(notification_count(
+        *session,
+        term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED) == 0U,
+        "a refused text-area resize request fires no standing request notification");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot->grid_size.rows == 2 && snapshot->grid_size.columns == 4,
+        "a refused text-area resize request keeps publishing on the original grid");
+    if (snapshot.has_value()) {
+        // Row 3 column 5 does not exist in a 2x4 grid, so the address clamps.
+        ok &= check(snapshot_row_text(*snapshot, 1) == QStringLiteral("   Z"),
+            "held output replays clamped inside the original grid");
+    }
+
+    // With nothing held behind the sequence, the declined sequence is the last
+    // thing the model saw, so its diagnostic is directly observable.
+    std::unique_ptr<term::Terminal_session> bare_session;
+    Scripted_backend* bare_backend =
+        make_session(bare_session, text_area_resize_arbitration_config());
+    ok &= check(bare_session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "refusal diagnostic session starts");
+    const std::uint64_t bare_request_id = arm_text_area_resize_arbitration(
+        *bare_session,
+        *bare_backend,
+        QByteArrayLiteral("\x1b[8;3;5t"));
+    ok &= check(bare_request_id != 0U, "refusal diagnostic request arms once");
+    ok &= check(bare_session->settle_text_area_resize_arbitration({
+        bare_request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+        {},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the refusal without a held tail is accepted");
+
+    const std::optional<term::Terminal_screen_model_result> refused_result =
+        bare_session->last_model_ingest_result();
+    ok &= check(refused_result.has_value() &&
+        model_result_diagnostic_count(*refused_result) == 1,
+        "a refused request records exactly one unsupported-sequence diagnostic");
+
+    return ok;
+}
+
+bool test_clamped_text_area_resize_arbitration_commits_the_effective_grid()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "clamped text-area resize session starts");
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5t"));
+    ok &= check(request_id != 0U, "clamped text-area resize request arms once");
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{4, 6},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the clamped answer is accepted");
+
+    ok &= check(session->grid_size().rows == 4 && session->grid_size().columns == 6,
+        "a clamped answer commits the grid the host actually got");
+    ok &= check(backend->resize_requests.size() == 1U &&
+        backend->resize_requests.back().grid_size.rows == 4 &&
+        backend->resize_requests.back().grid_size.columns == 6,
+        "a clamped answer resizes the backend once, to the effective grid");
+
+    const std::vector<term::Terminal_resize_transaction> transactions =
+        session->resize_transactions();
+    ok &= check(transactions.size() == 1U &&
+        transactions.front().target_grid_size.rows == 4 &&
+        transactions.front().target_grid_size.columns == 6 &&
+        transactions.front().backend_result == term::Terminal_backend_resize_result::APPLIED,
+        "a clamped answer records one applied resize transaction on the effective grid");
+
+    const std::vector<term::Terminal_session_notification> resize_notifications =
+        notifications_of_kind(
+            *session,
+            term::Terminal_session_notification_kind::RESIZE_TRANSACTION);
+    ok &= check(resize_notifications.size() == 1U &&
+        resize_notifications.front().message ==
+            QStringLiteral("text-area resize applied"),
+        "a clamped answer reports the text-area resize outcome once");
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> settlements =
+        arbitration_settlements(*session);
+    ok &= check(settlements.size() == 1U &&
+        settlements.front().settlement.has_value() &&
+        settlements.front().settlement->effective_grid_size.rows == 4 &&
+        settlements.front().settlement->effective_grid_size.columns == 6,
+        "the settlement carries the effective grid, not the requested one");
+
+    return ok;
+}
+
+// One arbitrated CSI 8 t carried through to an accepted answer, in everything
+// the captured byte run is observable through: the row the replay leaves behind,
+// the notifications it produced in order, and the grid the answer committed.
+struct Arbitrated_replay_observation
+{
+    bool                                                  completed = false;
+    QString                                               row_text;
+    std::vector<term::Terminal_session_notification_kind> notification_kinds;
+    int                                                   rows      = 0;
+    int                                                   columns   = 0;
+};
+
+Arbitrated_replay_observation observe_arbitrated_text_area_resize_replay(
+    QByteArray                   output,
+    term::terminal_grid_size_t   effective_grid_size)
+{
+    Arbitrated_replay_observation observation;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+    if (session->start(launch_config_with_grid(2, 4)).code !=
+        term::Terminal_session_result_code::ACCEPTED)
+    {
+        return observation;
+    }
+
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        std::move(output));
+    if (request_id == 0U) {
+        return observation;
+    }
+
+    if (session->settle_text_area_resize_arbitration({
+            request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+            effective_grid_size,
+        }).code != term::Terminal_session_result_code::ACCEPTED)
+    {
+        return observation;
+    }
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    if (!snapshot.has_value()) {
+        return observation;
+    }
+
+    for (const term::Terminal_session_notification& notification : session->notifications()) {
+        observation.notification_kinds.push_back(notification.kind);
+    }
+
+    observation.completed = true;
+    observation.row_text  = snapshot_row_text(*snapshot, 0);
+    observation.rows      = session->grid_size().rows;
+    observation.columns   = session->grid_size().columns;
+    return observation;
+}
+
+// A captured CSI 8 t can carry an embedded C0 control, which the parser applies
+// where it finds it and before it dispatches the sequence. Only the grid the
+// sequence commits is the host's answer to decide, so the same captured bytes
+// have to produce the same side effects whether or not the host clamped.
+bool test_clamped_text_area_resize_arbitration_replays_the_captured_controls()
+{
+    bool ok = true;
+
+    // "ab" leaves the cursor at column 2, the embedded carriage return takes it
+    // back to column 0, and the held "Z" then overwrites the "a". Row 0 reads
+    // "Zb" only if the replay applied the control the child sent.
+    const QByteArray carriage_return_output = QByteArrayLiteral("ab\x1b[8;3;5\rtZ");
+    const Arbitrated_replay_observation exact_carriage_return =
+        observe_arbitrated_text_area_resize_replay(carriage_return_output, {3, 5});
+    const Arbitrated_replay_observation clamped_carriage_return =
+        observe_arbitrated_text_area_resize_replay(carriage_return_output, {4, 6});
+
+    ok &= check(exact_carriage_return.completed && clamped_carriage_return.completed,
+        "both carriage-return replays reach an accepted answer");
+    ok &= check(
+        exact_carriage_return.rows      == 3 && exact_carriage_return.columns   == 5 &&
+        clamped_carriage_return.rows    == 4 && clamped_carriage_return.columns == 6,
+        "the two carriage-return replays differ in the grid the host answered with");
+    ok &= check(exact_carriage_return.row_text == QStringLiteral("Zb"),
+        "an exactly answered replay applies the carriage return the sequence carried");
+    ok &= check(clamped_carriage_return.row_text == exact_carriage_return.row_text,
+        "a clamped answer leaves the same row as an exact one");
+    ok &= check(
+        clamped_carriage_return.notification_kinds ==
+            exact_carriage_return.notification_kinds,
+        "a clamped answer produces the same notifications as an exact one");
+
+    // The bell is a control with no screen state of its own, so it pins the
+    // notification half of the same equivalence.
+    const QByteArray bell_output = QByteArrayLiteral("ab\x1b[8;3;5\atZ");
+    const Arbitrated_replay_observation exact_bell =
+        observe_arbitrated_text_area_resize_replay(bell_output, {3, 5});
+    const Arbitrated_replay_observation clamped_bell =
+        observe_arbitrated_text_area_resize_replay(bell_output, {4, 6});
+
+    ok &= check(exact_bell.completed && clamped_bell.completed,
+        "both bell replays reach an accepted answer");
+    ok &= check(
+        std::count(
+            exact_bell.notification_kinds.begin(),
+            exact_bell.notification_kinds.end(),
+            term::Terminal_session_notification_kind::BELL_REQUESTED) == 1,
+        "an exactly answered replay rings the bell the sequence carried");
+    ok &= check(clamped_bell.notification_kinds == exact_bell.notification_kinds,
+        "a clamped answer rings the same bell as an exact one");
+    ok &= check(clamped_bell.row_text == exact_bell.row_text,
+        "a clamped bell replay leaves the same row as an exact one");
+
+    return ok;
+}
+
+struct Malformed_del_replay_observation
+{
+    bool          completed    = false;
+    std::size_t   request_count = 0U;
+    std::size_t   resize_count  = 0U;
+    int           rows          = 0;
+    int           columns       = 0;
+    QString       row_text;
+};
+
+Malformed_del_replay_observation observe_malformed_del_after_accepted_answer(
+    term::terminal_grid_size_t first_effective_grid,
+    term::terminal_grid_size_t unexpected_second_effective_grid)
+{
+    Malformed_del_replay_observation observation;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config(64U));
+    if (session->start(launch_config_with_grid(2, 4)).code !=
+        term::Terminal_session_result_code::ACCEPTED)
+    {
+        return observation;
+    }
+
+    QByteArray output = QByteArrayLiteral("\x1b[8;3;5tA\x1b[8;6;9");
+    output.append(static_cast<char>(0x7f));
+    output.append(QByteArrayLiteral("tB"));
+    const std::uint64_t first_request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        std::move(output));
+    if (first_request_id == 0U ||
+        session->settle_text_area_resize_arbitration({
+            first_request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+            first_effective_grid,
+        }).code != term::Terminal_session_result_code::ACCEPTED)
+    {
+        return observation;
+    }
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    observation.request_count = requests.size();
+    if (requests.size() > 1U && requests.back().request.has_value()) {
+        (void)session->settle_text_area_resize_arbitration({
+            requests.back().request->request_id,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+            unexpected_second_effective_grid,
+        });
+    }
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    observation.completed    = snapshot.has_value();
+    observation.resize_count = backend->resize_requests.size();
+    observation.rows         = session->grid_size().rows;
+    observation.columns      = session->grid_size().columns;
+    if (snapshot.has_value()) {
+        observation.row_text = snapshot_row_text(*snapshot, 0);
+    }
+    return observation;
+}
+
+bool test_malformed_del_resize_sequence_is_not_arbitrated_after_an_exact_answer()
+{
+    const Malformed_del_replay_observation observation =
+        observe_malformed_del_after_accepted_answer({3, 5}, {6, 9});
+    bool ok = true;
+    ok &= check(observation.completed,
+        "the exact-answer malformed-DEL fixture completes");
+    ok &= check(observation.request_count == 1U,
+        "DEL inside CSI parameters never presents a second arbitration request");
+    ok &= check(observation.resize_count == 1U &&
+            observation.rows == 3 && observation.columns == 5,
+        "an exact answer never resizes or rewrites the malformed DEL sequence");
+    ok &= check(observation.row_text == QStringLiteral("AB"),
+        "output around the malformed DEL sequence replays once in stream order");
+    return ok;
+}
+
+bool test_malformed_del_resize_sequence_is_not_arbitrated_after_a_clamped_answer()
+{
+    const Malformed_del_replay_observation observation =
+        observe_malformed_del_after_accepted_answer({4, 6}, {7, 10});
+    bool ok = true;
+    ok &= check(observation.completed,
+        "the clamped-answer malformed-DEL fixture completes");
+    ok &= check(observation.request_count == 1U,
+        "a clamped answer does not make malformed DEL bytes host-visible");
+    ok &= check(observation.resize_count == 1U &&
+            observation.rows == 4 && observation.columns == 6,
+        "a clamped answer never resizes or rewrites the malformed DEL sequence");
+    ok &= check(observation.row_text == QStringLiteral("AB"),
+        "clamped replay preserves output around the malformed DEL sequence once");
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_holds_output_that_arrives_while_in_flight()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(3, 8)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "in-flight hold session starts");
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5tab"));
+    ok &= check(request_id != 0U, "in-flight hold request arms once");
+
+    const std::uint64_t armed_generation = session->render_snapshot_generation();
+    ok &= check(backend->emit_output(QByteArrayLiteral("cd")),
+        "output arriving during arbitration is accepted");
+    ok &= check(backend->emit_output(QByteArrayLiteral("ef")),
+        "further output arriving during arbitration is accepted");
+    ok &= check(session->render_snapshot_generation() == armed_generation,
+        "held output publishes no render snapshot while the answer is pending");
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the answer after held output is accepted");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot->grid_size.rows == 3 && snapshot->grid_size.columns == 5,
+        "held output publishes on the accepted grid");
+    if (snapshot.has_value()) {
+        ok &= check(snapshot_row_text(*snapshot, 0) == QStringLiteral("abcde") &&
+            snapshot_row_text(*snapshot, 1) == QStringLiteral("f"),
+            "held output replays in the order the backend produced it");
+    }
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_serializes_two_requests_in_one_chunk()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "serialized arbitration session starts");
+    const std::uint64_t first_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5tX\x1b[8;6;9tY"));
+    ok &= check(first_id != 0U, "the first of two chained requests arms alone");
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+        first_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the first chained answer is accepted");
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    ok &= check(requests.size() == 2U &&
+        requests[1].request.has_value() &&
+        requests[1].request->request_id > first_id,
+        "releasing the first request arms the second with a fresh id");
+
+    const std::uint64_t second_id =
+        requests.size() == 2U && requests[1].request.has_value()
+            ? requests[1].request->request_id
+            : 0U;
+    ok &= check(session->settle_text_area_resize_arbitration({
+        second_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{6, 9},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the second chained answer is accepted");
+
+    ok &= check(session->grid_size().rows == 6 && session->grid_size().columns == 9,
+        "two chained requests end on the second grid");
+    ok &= check(backend->resize_requests.size() == 2U &&
+        backend->resize_requests[0].grid_size.rows == 3 &&
+        backend->resize_requests[1].grid_size.rows == 6,
+        "two chained requests resize the backend once each, in order");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_row_text(*snapshot, 0) == QStringLiteral("XY"),
+        "text between two chained requests keeps its stream order");
+
+    std::vector<term::Terminal_text_area_resize_arbitration_event_kind> arbitration_order;
+    for (const term::Terminal_text_area_resize_arbitration_event& event :
+        session->text_area_resize_arbitration_events())
+    {
+        arbitration_order.push_back(event.kind);
+    }
+    ok &= check(arbitration_order ==
+        std::vector<term::Terminal_text_area_resize_arbitration_event_kind>{
+        term::Terminal_text_area_resize_arbitration_event_kind::REQUESTED,
+        term::Terminal_text_area_resize_arbitration_event_kind::SETTLED,
+        term::Terminal_text_area_resize_arbitration_event_kind::REQUESTED,
+        term::Terminal_text_area_resize_arbitration_event_kind::SETTLED,
+    },
+        "chained arbitration announces request, settlement, request, settlement");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_decreased_limit_starts_a_safe_tail_epoch()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(
+        session,
+        text_area_resize_arbitration_config(64U));
+    ok &= check(session->start(launch_config_with_grid(2, 12)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "active hold-limit decrease session starts");
+
+    const std::uint64_t first_request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5tX\x1b[8;6;9tY"));
+    ok &= check(first_request_id != 0U,
+        "the old-limit transaction presents before its capability changes");
+
+    term::Terminal_session_config decreased_config =
+        enable_test_traces(text_area_resize_arbitration_config(1U));
+    session->set_text_area_resize_arbitration(
+        decreased_config.text_area_resize_arbitration);
+    const term::terminal_text_area_resize_arbitration_work_counters_t old_epoch =
+        session->text_area_resize_arbitration_work_counters();
+    ok &= check(old_epoch.current_tail_size_bytes == 10U &&
+            old_epoch.current_tail_capacity_bytes <= 64U,
+        "an active transaction keeps its latched 64-byte tail epoch");
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+        first_request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+        {},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the old-limit transaction settles after the configuration decrease");
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    ok &= check(requests.size() == 2U && requests.back().request.has_value() &&
+            requests.back().request->requested_grid_size.rows == 6 &&
+            requests.back().request->requested_grid_size.columns == 9,
+        "req2 is admitted at the exact new H only after its X prefix is consumed");
+    const term::terminal_text_area_resize_arbitration_work_counters_t new_epoch =
+        session->text_area_resize_arbitration_work_counters();
+    ok &= check(new_epoch.current_tail_size_bytes == 1U &&
+            new_epoch.current_tail_capacity_bytes <= 1U,
+        "req2 owns exactly Y in a physical tail capped by the new H");
+
+    const std::uint64_t second_request_id =
+        requests.size() == 2U && requests.back().request.has_value()
+            ? requests.back().request->request_id
+            : 0U;
+    ok &= check(session->settle_text_area_resize_arbitration({
+        second_request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+        {},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the new-limit transaction settles once");
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> settlements =
+        arbitration_settlements(*session);
+    ok &= check(settlements.size() == 2U &&
+            settlement_has_outcome(
+                settlements,
+                0U,
+                term::Terminal_text_area_resize_arbitration_outcome::REJECTED) &&
+            settlement_has_outcome(
+                settlements,
+                1U,
+                term::Terminal_text_area_resize_arbitration_outcome::REJECTED),
+        "the limit transition settles each transaction exactly once");
+    const std::optional<term::Terminal_render_snapshot> admitted_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(admitted_snapshot.has_value() &&
+            snapshot_row_text(*admitted_snapshot, 0) == QStringLiteral("XY"),
+        "the admitted transition replays X and Y exactly once in order");
+
+    std::unique_ptr<term::Terminal_session> decline_session;
+    Scripted_backend* decline_backend = make_session(
+        decline_session,
+        text_area_resize_arbitration_config(64U));
+    ok &= check(decline_session->start(launch_config_with_grid(2, 12)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "decreased-limit decline session starts");
+    const std::uint64_t decline_first_id = arm_text_area_resize_arbitration(
+        *decline_session,
+        *decline_backend,
+        QByteArrayLiteral("\x1b[8;3;5tX\x1b[8;6;9tYZ"));
+    term::Terminal_session_config decreased_decline_config =
+        enable_test_traces(text_area_resize_arbitration_config(1U));
+    decline_session->set_text_area_resize_arbitration(
+        decreased_decline_config.text_area_resize_arbitration);
+    ok &= check(decline_session->settle_text_area_resize_arbitration({
+        decline_first_id,
+        term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+        {},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the decline fixture settles its old-limit transaction");
+    ok &= check(arbitration_requests(*decline_session).size() == 1U &&
+            !decline_session->pending_text_area_resize_arbitration().has_value(),
+        "req2 is declined when its already-available tail exceeds the new H");
+    const std::optional<term::Terminal_render_snapshot> declined_snapshot =
+        decline_session->latest_render_snapshot();
+    ok &= check(declined_snapshot.has_value() &&
+            snapshot_row_text(*declined_snapshot, 0) == QStringLiteral("XYZ"),
+        "the declined transition replays its prefix and tail exactly once in order");
+    const term::terminal_text_area_resize_arbitration_work_counters_t declined_epoch =
+        decline_session->text_area_resize_arbitration_work_counters();
+    ok &= check(declined_epoch.current_tail_size_bytes == 0U &&
+            declined_epoch.current_tail_capacity_bytes <= 1U,
+        "a drained declined transition retains no physical tail above the new H");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_spans_a_chunk_boundary()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "split-request session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("aa\x1b[8;3")),
+        "the leading half of a split request is accepted");
+    ok &= check(arbitration_requests(*session).empty(),
+        "an incomplete request does not arm an arbitration");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral(";5tZ")),
+        "the trailing half of a split request is accepted");
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    ok &= check(requests.size() == 1U &&
+        requests.front().request.has_value() &&
+        requests.front().request->requested_grid_size.rows == 3 &&
+        requests.front().request->requested_grid_size.columns == 5,
+        "a request split across chunks arms once when it completes");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_folds_scanner_pending_into_the_hold()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "hold-back folding session starts");
+    // The chunk ends with an incomplete sequence, which the scanner holds back.
+    // Those bytes are chronologically after the request's tail and must replay
+    // after it.
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5tZ\x1b[3"));
+    ok &= check(request_id != 0U, "hold-back folding request arms once");
+    ok &= check(backend->emit_output(QByteArrayLiteral(";1HQ")),
+        "the completion of the held-back sequence is accepted");
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the answer after a folded hold-back is accepted");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot->grid_size.rows == 3 && snapshot->grid_size.columns == 5,
+        "the folded hold-back publishes on the accepted grid");
+    if (snapshot.has_value()) {
+        ok &= check(snapshot_row_text(*snapshot, 0) == QStringLiteral("Z") &&
+            snapshot_row_text(*snapshot, 2) == QStringLiteral("Q"),
+            "the held-back sequence replays after the tail it followed");
+    }
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_rejects_a_stale_request_id()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "stale-id session starts");
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5tZ"));
+    ok &= check(request_id != 0U, "stale-id request arms once");
+
+    const term::Terminal_session_result stale = session->settle_text_area_resize_arbitration({
+        request_id + 1U,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    });
+    ok &= check(stale.code == term::Terminal_session_result_code::INVALID_STATE &&
+        stale.error.has_value() &&
+        stale.error->code == term::Terminal_backend_error_code::CALLBACK_MISSING,
+        "an answer for an unknown request id is refused");
+    ok &= check(session->pending_text_area_resize_arbitration().has_value(),
+        "an answer for an unknown request id leaves the real request in flight");
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 4,
+        "an answer for an unknown request id changes no grid");
+    ok &= check(backend->resize_requests.empty(),
+        "an answer for an unknown request id resizes no backend");
+    ok &= check(arbitration_settlements(*session).empty(),
+        "an answer for an unknown request id settles nothing");
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the real request id still answers after a stale one was refused");
+    ok &= check(session->grid_size().rows == 3 && session->grid_size().columns == 5,
+        "the real answer commits after a stale one was refused");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_hold_limit_settles_the_request()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config(64U));
+
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "hold-limit session starts");
+    QByteArray initial = QByteArrayLiteral("\x1b[8;3;5t");
+    initial.append(QByteArray(63, 'a'));
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        std::move(initial));
+    ok &= check(request_id != 0U, "hold-limit request arms once");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("a")) &&
+            session->pending_text_area_resize_arbitration().has_value() &&
+            arbitration_settlements(*session).empty(),
+        "a split callback can fill the latched hold exactly to H");
+    ok &= check(backend->emit_output(QByteArrayLiteral("x")),
+        "the split H+1 byte is accepted after settling the full hold");
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> settlements =
+        arbitration_settlements(*session);
+    ok &= check(settlements.size() == 1U &&
+        settlement_has_outcome(
+            settlements,
+            0U,
+            term::Terminal_text_area_resize_arbitration_outcome::HOLD_LIMIT_REACHED),
+        "output past the hold limit settles the request once");
+    ok &= check(session->grid_size().rows == 24 && session->grid_size().columns == 80,
+        "a request settled by the hold limit changes no grid");
+    ok &= check(backend->resize_requests.empty(),
+        "a request settled by the hold limit resizes no backend");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_row_text(*snapshot, 0) ==
+            QString(64, QLatin1Char('a')) + QLatin1Char('x'),
+        "the exact-H held tail and overflowing H+1 byte replay once in order");
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    }).code == term::Terminal_session_result_code::INVALID_STATE,
+        "a late answer for a hold-limit settled request is refused");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_same_callback_overflow_never_presents()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config(64U));
+
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "same-callback hold-overflow session starts");
+
+    QByteArray output = QByteArrayLiteral("\x1b[8;3;5t");
+    output.append(QByteArray(65, 'x'));
+    ok &= check(backend->emit_output(std::move(output)),
+        "a request with an already-oversized callback tail is accepted");
+
+    ok &= check(session->text_area_resize_arbitration_events().empty() &&
+        take_pending_arbitration_events(*session).empty(),
+        "an already-overflowing request never becomes host-visible");
+    ok &= check(!session->pending_text_area_resize_arbitration().has_value(),
+        "an already-overflowing request leaves no actionable work");
+    ok &= check(session->grid_size().rows == 24 && session->grid_size().columns == 80,
+        "an already-overflowing request is declined at its sequence point");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_row_text(*snapshot, 0) == QString(65, QLatin1Char('x')),
+        "the exact H+1 same-callback tail still renders in full");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_oversized_sequence_never_presents()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "oversized arbitration-sequence session starts");
+
+    QByteArray output = QByteArrayLiteral("\x1b[8;24;80");
+    output.append(QByteArray(
+        static_cast<qsizetype>(
+            term::k_terminal_text_area_resize_arbitration_request_limit_bytes -
+                static_cast<std::size_t>(output.size())),
+        '\0'));
+    output.append(QByteArrayLiteral("tx"));
+    ok &= check(
+        output.size() - 1 == static_cast<qsizetype>(
+            term::k_terminal_text_area_resize_arbitration_request_limit_bytes + 1U),
+        "the oversized boundary fixture encodes an exact 4097-byte request");
+    ok &= check(backend->emit_output(std::move(output)),
+        "an oversized request encoding is accepted as ordinary output");
+
+    ok &= check(session->text_area_resize_arbitration_events().empty() &&
+        take_pending_arbitration_events(*session).empty(),
+        "an oversized request encoding never becomes host-visible");
+    ok &= check(!session->pending_text_area_resize_arbitration().has_value(),
+        "an oversized request encoding leaves no actionable work");
+    ok &= check(session->grid_size().rows == 24 && session->grid_size().columns == 80,
+        "an oversized request encoding is declined at its sequence point");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_row_text(*snapshot, 0) == QStringLiteral("x"),
+        "output after an oversized request encoding still renders");
+    ok &= check(
+        session->text_area_resize_arbitration_work_counters().peak_retained_storage_bytes == 0U,
+        "an oversized request encoding allocates no arbitration hold");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_exit_invalidates_an_extracted_unclaimed_request()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "extracted-request exit session starts");
+    (void)session->take_pending_deliveries();
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;25;81ttail")),
+        "the request to invalidate is extracted from backend output");
+    std::uint64_t extracted_request_id = 0U;
+    for (const term::Terminal_session_delivery& delivery :
+        session->take_pending_deliveries())
+    {
+        if (delivery.text_area_resize_arbitration_event.has_value() &&
+            delivery.text_area_resize_arbitration_event->request.has_value())
+        {
+            extracted_request_id =
+                delivery.text_area_resize_arbitration_event->request->request_id;
+        }
+    }
+    ok &= check(extracted_request_id != 0U,
+        "the request is claimable but not yet presented");
+
+    backend->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+    ok &= check(!session->mark_text_area_resize_arbitration_presented(extracted_request_id),
+        "process exit invalidates an extracted request before the host can claim it");
+    ok &= check(arbitration_settlements(*session).empty(),
+        "an extracted but unpresented request publishes no process-exit settlement");
+
+    std::vector<term::Terminal_session_notification> notifications;
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> events =
+        take_pending_arbitration_events(*session, &notifications);
+    ok &= check(events.empty() &&
+            std::count_if(
+                notifications.begin(),
+                notifications.end(),
+                [](const term::Terminal_session_notification& notification) {
+                    return notification.kind ==
+                        term::Terminal_session_notification_kind::PROCESS_EXITED;
+                }) == 1,
+        "the atomic post-exit drain exposes only the common exit record");
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+            snapshot_row_text(*snapshot, 0) == QStringLiteral("tail"),
+        "exit replays the extracted request tail exactly once without rearming");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_settles_on_process_exit()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "process-exit arbitration session starts");
+    ok &= check(arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5tbye")) != 0U,
+        "process-exit arbitration request arms once");
+
+    backend->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> settlements =
+        arbitration_settlements(*session);
+    ok &= check(settlements.size() == 1U &&
+        settlement_has_outcome(
+            settlements,
+            0U,
+            term::Terminal_text_area_resize_arbitration_outcome::PROCESS_EXITED),
+        "a process exit settles the in-flight request once");
+
+    const std::optional<term::Terminal_session_notification> exited = first_notification(
+        *session,
+        term::Terminal_session_notification_kind::PROCESS_EXITED);
+    ok &= check(settlements.front().sequence != 0U && exited.has_value() &&
+        settlements.front().sequence == exited->sequence,
+        "the settlement is announced before the process exit that caused it");
+
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 4,
+        "a process exit leaves the pre-request grid");
+    ok &= check(backend->resize_requests.empty(),
+        "a process exit resizes no backend");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_row_text(*snapshot, 0) == QStringLiteral("bye"),
+        "output held behind the request still renders after the process exits");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_burst_preserves_common_critical_notifications()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "arbitration notification-capacity session starts");
+    (void)session->take_pending_deliveries();
+
+    backend->emit_error({
+        term::Terminal_backend_error_code::READ_FAILED,
+        QStringLiteral("arbitration-capacity-marker"),
+    });
+
+    constexpr int k_request_count = 2100;
+    QByteArray burst;
+    burst.reserve(k_request_count * 11);
+    for (int index = 0; index < k_request_count; ++index) {
+        burst.append(QByteArrayLiteral("\x1b[8;24;80t"));
+    }
+    ok &= check(backend->emit_output(std::move(burst)),
+        "more than 4096 arbitration transitions enter one held stream");
+
+    std::size_t transition_count = 0U;
+    std::size_t peak_sidecar_depth = 0U;
+    std::vector<term::Terminal_session_notification> notifications;
+    for (int index = 0; index < k_request_count; ++index) {
+        const std::vector<term::Terminal_text_area_resize_arbitration_event> events =
+            take_pending_arbitration_events(*session, &notifications);
+        peak_sidecar_depth = std::max(peak_sidecar_depth, events.size());
+        transition_count += events.size();
+        const std::optional<term::terminal_text_area_resize_arbitration_request_t> request =
+            session->pending_text_area_resize_arbitration();
+        if (!request.has_value() ||
+            !session->mark_text_area_resize_arbitration_presented(request->request_id))
+        {
+            ok &= check(false, "every adjacent request becomes actionable in order");
+            break;
+        }
+        const term::Terminal_session_result settlement =
+            session->settle_text_area_resize_arbitration({
+                request->request_id,
+                term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+                {},
+            });
+        if (settlement.code != term::Terminal_session_result_code::ACCEPTED) {
+            ok &= check(false, "every adjacent request can settle in order");
+            break;
+        }
+    }
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> final_events =
+        take_pending_arbitration_events(*session, &notifications);
+    peak_sidecar_depth = std::max(peak_sidecar_depth, final_events.size());
+    transition_count += final_events.size();
+    ok &= check(has_backend_error(
+        notifications,
+        term::Terminal_backend_error_code::READ_FAILED,
+        QStringLiteral("arbitration-capacity-marker")),
+        "arbitration traffic cannot evict an earlier common critical notification");
+    ok &= check(!session->pending_text_area_resize_arbitration().has_value(),
+        "the adjacent arbitration burst settles completely");
+    ok &= check(transition_count > 4096U,
+        "the capacity fixture delivers more than 4096 arbitration transitions");
+    ok &= check(peak_sidecar_depth <= 2U,
+        "the arbitration sidecar retains at most one settlement and one next request");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_near_limit_replay_is_linear()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.output_queue_limits.high_water_bytes = 1024U * 1024U;
+    config.output_queue_limits.hard_limit_bytes  = 2U * 1024U * 1024U;
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "near-limit arbitration work-counter session starts");
+
+    constexpr int k_request_count = 512;
+    constexpr qsizetype k_stream_size = 900 * 1024;
+    QByteArray stream;
+    stream.reserve(k_stream_size);
+    for (int index = 0; index < k_request_count; ++index) {
+        stream.append(QByteArrayLiteral("\x1b[8;24;80t"));
+    }
+    stream.append(QByteArray(k_stream_size - stream.size(), 'x'));
+    ok &= check(backend->emit_output(std::move(stream)),
+        "the near-limit held stream is accepted");
+
+    for (int index = 0; index < k_request_count; ++index) {
+        const std::vector<term::Terminal_text_area_resize_arbitration_event> events =
+            take_pending_arbitration_events(*session);
+        const std::optional<term::terminal_text_area_resize_arbitration_request_t> request =
+            session->pending_text_area_resize_arbitration();
+        if (events.empty() || !request.has_value() ||
+            !session->mark_text_area_resize_arbitration_presented(request->request_id))
+        {
+            ok &= check(false, "every near-limit request is admitted exactly once");
+            break;
+        }
+        if (session->settle_text_area_resize_arbitration({
+                request->request_id,
+                term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+                {},
+            }).code != term::Terminal_session_result_code::ACCEPTED)
+        {
+            ok &= check(false, "every near-limit request settles exactly once");
+            break;
+        }
+    }
+
+    const term::terminal_text_area_resize_arbitration_work_counters_t counters =
+        session->text_area_resize_arbitration_work_counters();
+    ok &= check(counters.scanned_bytes == static_cast<std::uint64_t>(k_stream_size),
+        "the scanner visits every byte exactly once across the held stream");
+    ok &= check(counters.storage_copy_bytes == 0U,
+        "adjacent requests replay by cursor without suffix storage copies");
+    ok &= check(
+        counters.held_append_bytes ==
+            static_cast<std::uint64_t>(k_stream_size - 10),
+        "one-chunk near-limit replay copies its admitted tail exactly once");
+    ok &= check(!session->pending_text_area_resize_arbitration().has_value(),
+        "the near-limit held stream settles completely");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_sustained_callbacks_bound_retained_storage()
+{
+    bool ok = true;
+
+    constexpr std::size_t k_hold_limit = 64U * 1024U;
+    constexpr int k_transition_count = 4114;
+    constexpr qsizetype k_request_size =
+        static_cast<qsizetype>(
+            term::k_terminal_text_area_resize_arbitration_request_limit_bytes);
+
+    QByteArray request_bytes = QByteArrayLiteral("\x1b[8;24;80");
+    request_bytes.append(QByteArray(k_request_size - request_bytes.size() - 1, '\0'));
+    request_bytes.append('t');
+
+    QByteArray initial_stream = request_bytes;
+    while (initial_stream.size() < k_request_size + static_cast<qsizetype>(k_hold_limit)) {
+        initial_stream.append(request_bytes);
+    }
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(
+        session,
+        text_area_resize_arbitration_config(k_hold_limit));
+    ok &= check(session->start(valid_launch_config()).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "sustained arbitration storage-bound session starts");
+
+    std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        std::move(initial_stream));
+    ok &= check(request_bytes.size() == k_request_size,
+        "the sustained chain uses the maximum admissible request encoding");
+    ok &= check(request_id != 0U,
+        "the maximum request plus a full 64 KiB live tail arms once");
+
+    int completed_transitions = 0;
+    for (; completed_transitions < k_transition_count && request_id != 0U;
+         ++completed_transitions)
+    {
+        if (session->settle_text_area_resize_arbitration({
+                request_id,
+                term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+                {},
+            }).code != term::Terminal_session_result_code::ACCEPTED)
+        {
+            ok &= check(false, "each sustained request settles in order");
+            break;
+        }
+
+        if (!backend->emit_output(request_bytes)) {
+            ok &= check(false, "each sustained callback replenishes the live tail");
+            break;
+        }
+
+        request_id = 0U;
+        const std::vector<term::Terminal_text_area_resize_arbitration_event> events =
+            take_pending_arbitration_events(*session);
+        for (const term::Terminal_text_area_resize_arbitration_event& event : events) {
+            if (event.kind ==
+                    term::Terminal_text_area_resize_arbitration_event_kind::REQUESTED &&
+                event.request.has_value())
+            {
+                request_id = event.request->request_id;
+            }
+        }
+        if (request_id == 0U ||
+            !session->mark_text_area_resize_arbitration_presented(request_id))
+        {
+            ok &= check(false, "each sustained callback yields one actionable request");
+            break;
+        }
+    }
+
+    ok &= check(completed_transitions == k_transition_count,
+        "the sustained workload completes all 4,114 callback/answer transitions");
+    session->set_text_area_resize_arbitration(std::nullopt);
+
+    const std::uint64_t total_stream_bytes =
+        static_cast<std::uint64_t>(k_request_size) +
+        static_cast<std::uint64_t>(k_hold_limit) +
+        static_cast<std::uint64_t>(k_transition_count) *
+            static_cast<std::uint64_t>(k_request_size);
+    const term::terminal_text_area_resize_arbitration_work_counters_t counters =
+        session->text_area_resize_arbitration_work_counters();
+    const std::uint64_t physical_storage_bound =
+        static_cast<std::uint64_t>(k_hold_limit) +
+        static_cast<std::uint64_t>(k_request_size);
+    const std::uint64_t copy_work_bound =
+        total_stream_bytes + 2U * physical_storage_bound;
+    ok &= check(counters.peak_retained_storage_bytes <=
+            physical_storage_bound,
+        "sustained answers retain at most the hold limit plus bounded control storage");
+    ok &= check(counters.scanned_bytes == total_stream_bytes,
+        "sustained replay scans every input byte exactly once");
+    if (counters.storage_copy_bytes > copy_work_bound) {
+        std::cerr
+            << "sustained arbitration copied " << counters.storage_copy_bytes
+            << " bytes for " << total_stream_bytes << " input bytes\n";
+    }
+    ok &= check(counters.storage_copy_bytes <= copy_work_bound,
+        "sustained storage-copy work stays linear in admitted input");
+    ok &= check(!session->pending_text_area_resize_arbitration().has_value(),
+        "the sustained callback chain settles completely");
+
+    return ok;
+}
+
+// Moving the window is how the documented protocol answers a request: the host
+// resizes, reads the grid it actually got back off the session, and only then
+// answers. A resize that settled the request would cancel it before its own
+// answer arrived, so this pins that it does not.
+bool test_text_area_resize_arbitration_survives_a_host_resize()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "host-resize arbitration session starts");
+    // Row 9 column 9 exists in neither grid, so where it clamps says which grid
+    // the held tail was applied against.
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5t\x1b[9;9HZ"));
+    ok &= check(request_id != 0U, "host-resize arbitration request arms once");
+
+    ok &= check(session->resize(QSizeF(900.0, 200.0), term::terminal_grid_size_t{2, 9}).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "the host resize is accepted");
+
+    ok &= check(arbitration_settlements(*session).empty(),
+        "a host resize does not settle the request the host is answering");
+    ok &= check(session->pending_text_area_resize_arbitration().has_value() &&
+        session->pending_text_area_resize_arbitration()->request_id == request_id,
+        "the request is still in flight after the host moved its geometry");
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 9,
+        "a host resize commits its own grid while the request waits");
+    ok &= check(backend->resize_requests.size() == 1U &&
+        backend->resize_requests.back().grid_size.rows == 2 &&
+        backend->resize_requests.back().grid_size.columns == 9,
+        "a host resize is one backend resize");
+
+    // The grid the host actually got, which is the answer the protocol asks for.
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{2, 9},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the answer that follows the host resize is accepted");
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> settlements =
+        arbitration_settlements(*session);
+    ok &= check(settlements.size() == 1U &&
+        settlement_has_outcome(
+            settlements,
+            0U,
+            term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED),
+        "the answer settles the request once, as accepted");
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 9,
+        "the accepted answer leaves the grid the host reported");
+    ok &= check(backend->resize_requests.size() == 1U,
+        "the whole exchange costs one backend resize");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_row_text(*snapshot, 1) == QStringLiteral("        Z"),
+        "held output replays against the grid the host answered with");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_settles_on_a_policy_change()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "policy-change arbitration session starts");
+    ok &= check(arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5tZ")) != 0U,
+        "policy-change arbitration request arms once");
+
+    session->set_text_area_resize_policy(term::Terminal_text_area_resize_policy::DISABLED);
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> settlements =
+        arbitration_settlements(*session);
+    ok &= check(settlements.size() == 1U &&
+        settlement_has_outcome(
+            settlements,
+            0U,
+            term::Terminal_text_area_resize_arbitration_outcome::TEXT_AREA_RESIZE_DISABLED),
+        "losing the text-area resize policy settles the in-flight request once");
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 4,
+        "losing the text-area resize policy leaves the grid alone");
+    ok &= check(backend->resize_requests.empty(),
+        "losing the text-area resize policy resizes no backend");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_row_text(*snapshot, 0) == QStringLiteral("Z"),
+        "output held behind the request still renders after the policy change");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_settles_when_the_capability_is_removed()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "capability-removal session starts");
+    ok &= check(arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5tZ")) != 0U,
+        "capability-removal request arms once");
+
+    session->set_text_area_resize_arbitration(std::nullopt);
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> settlements =
+        arbitration_settlements(*session);
+    ok &= check(settlements.size() == 1U &&
+        settlement_has_outcome(
+            settlements,
+            0U,
+            term::Terminal_text_area_resize_arbitration_outcome::ARBITRATION_DISABLED),
+        "removing the capability settles the in-flight request once");
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 4,
+        "removing the capability leaves the pre-request grid");
+
+    const std::optional<term::Terminal_render_snapshot> held_snapshot =
+        session->latest_render_snapshot();
+    ok &= check(held_snapshot.has_value() &&
+        snapshot_row_text(*held_snapshot, 0) == QStringLiteral("Z"),
+        "output held behind the request still renders after the capability is removed");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;3;5t")),
+        "a request after the capability is removed is accepted");
+    ok &= check(arbitration_requests(*session).size() == 1U,
+        "a request after the capability is removed asks the host nothing");
+    ok &= check(session->grid_size().rows == 3 && session->grid_size().columns == 5,
+        "a request after the capability is removed commits at the sequence point");
+    ok &= check(backend->resize_requests.size() == 1U,
+        "a request after the capability is removed resizes the backend directly");
+    ok &= check(notification_count(
+        *session,
+        term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED) == 1U,
+        "a request after the capability is removed fires the standing notification");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_advances_the_backend_callback_epoch()
+{
+    bool ok = true;
+
+    std::vector<std::uint64_t> epochs;
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.backend_event_epoch_notifier  = [&epochs](std::uint64_t epoch, bool) {
+        epochs.push_back(epoch);
+    };
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "callback-epoch arbitration session starts");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("aa\x1b[8;3;5tZ")),
+        "the arming chunk is queued for deferred processing");
+    session->process_backend_callback_events();
+
+    ok &= check(arbitration_requests(*session).size() == 1U,
+        "the deferred drain arms the request");
+    ok &= check(!epochs.empty() &&
+        session->backend_callback_processed_epoch() == epochs.back(),
+        "the arming command's callback epoch completes while the request is in flight");
+    ok &= check(!session->has_pending_backend_callback_events(),
+        "an armed request leaves no pending backend callback events");
+
+    ok &= check(backend->emit_output(QByteArrayLiteral("held")),
+        "output during arbitration is queued for deferred processing");
+    session->process_backend_callback_events();
+    ok &= check(session->backend_callback_processed_epoch() == epochs.back(),
+        "a held command's callback epoch completes while the request is in flight");
+    ok &= check(!session->has_pending_backend_callback_events(),
+        "held output leaves no pending backend callback events");
+    ok &= check(session->pending_text_area_resize_arbitration().has_value(),
+        "the request is still in flight after both drains");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_respects_the_disabled_policy()
+{
+    bool ok = true;
+
+    term::Terminal_session_config config = text_area_resize_arbitration_config();
+    config.text_area_resize_policy       = term::Terminal_text_area_resize_policy::DISABLED;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, config);
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "disabled-policy arbitration session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("\x1b[8;3;5t")),
+        "a request under a disabled policy is accepted");
+
+    ok &= check(arbitration_requests(*session).empty(),
+        "a standing refusal costs the host no arbitration round trip");
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 4,
+        "a standing refusal leaves the grid alone");
+    ok &= check(backend->resize_requests.empty(),
+        "a standing refusal resizes no backend");
+
+    const std::optional<term::Terminal_screen_model_result> result =
+        session->last_model_ingest_result();
+    ok &= check(result.has_value() && model_result_diagnostic_count(*result) == 1,
+        "a standing refusal records exactly one unsupported-sequence diagnostic");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_inside_synchronized_output()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "synchronized-output arbitration session starts");
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[?2026h\x1b[8;3;5t\x1b[?2026l"));
+    ok &= check(request_id != 0U,
+        "a request inside a synchronized-output hold arms once");
+    ok &= check(session->render_publication_blocked(),
+        "the request arms while render publication is blocked");
+
+    const std::uint64_t armed_generation = session->render_snapshot_generation();
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the synchronized-output answer is accepted");
+
+    ok &= check(!session->render_publication_blocked(),
+        "the held synchronized-output reset replays and releases the hold");
+    ok &= check(session->render_snapshot_generation() == armed_generation + 1U,
+        "the release publishes exactly once");
+    ok &= check(session->grid_size().rows == 3 && session->grid_size().columns == 5,
+        "the synchronized-output answer commits the accepted grid");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_rejects_an_unsupported_effective_grid()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "unsupported-answer session starts");
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5tZ"));
+    ok &= check(request_id != 0U, "unsupported-answer request arms once");
+
+    const term::Terminal_session_result result = session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{4097, 9},
+    });
+    ok &= check(result.code == term::Terminal_session_result_code::INVALID_ARGUMENT &&
+        result.error.has_value() &&
+        result.error->code == term::Terminal_backend_error_code::RESIZE_FAILED,
+        "an unusable effective grid is reported back to the host");
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> settlements =
+        arbitration_settlements(*session);
+    ok &= check(settlements.size() == 1U &&
+        settlement_has_outcome(
+            settlements,
+            0U,
+            term::Terminal_text_area_resize_arbitration_outcome::REJECTED),
+        "an unusable effective grid settles the request as a refusal");
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 4,
+        "an unusable effective grid changes no grid");
+    ok &= check(backend->resize_requests.empty(),
+        "an unusable effective grid resizes no backend");
+    ok &= check(!session->pending_text_area_resize_arbitration().has_value(),
+        "an unusable effective grid does not leave the request in flight");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_suppresses_the_standing_request_notification()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "standing-notification suppression session starts");
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[8;3;5tZ"));
+    ok &= check(request_id != 0U, "standing-notification suppression request arms once");
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the suppression-scenario answer is accepted");
+
+    ok &= check(notification_count(
+        *session,
+        term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED) == 0U,
+        "an arbitrating host is never told to move its window twice");
+
+    std::unique_ptr<term::Terminal_session> plain_session;
+    Scripted_backend* plain_backend = make_session(plain_session);
+    ok &= check(plain_session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "unarbitrated comparison session starts");
+    ok &= check(plain_backend->emit_output(QByteArrayLiteral("\x1b[8;3;5tZ")),
+        "the unarbitrated comparison output is accepted");
+    ok &= check(notification_count(
+        *plain_session,
+        term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED) == 1U,
+        "a session without the capability still fires the standing notification");
+
+    return ok;
+}
+
+// The parser keeps scanning a CSI across an embedded C0 byte and still
+// dispatches the sequence, so a scanner that stopped at one would let a request
+// the host never saw commit the grid and resize the pty. NUL padding from
+// terminfo lands in exactly this shape.
+bool test_text_area_resize_arbitration_arms_across_an_embedded_c0()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "embedded-C0 arbitration session starts");
+
+    const std::uint64_t request_id = arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("aa\x1b[8;3;5\rt\x1b[3;5HZ"));
+    ok &= check(request_id != 0U,
+        "a CSI 8 t carrying an embedded C0 arms one arbitration request");
+    ok &= check(session->grid_size().rows == 2 && session->grid_size().columns == 4,
+        "a CSI 8 t carrying an embedded C0 leaves the grid until the host answers");
+    ok &= check(backend->resize_requests.empty(),
+        "a CSI 8 t carrying an embedded C0 resizes no backend before the answer");
+    ok &= check(notification_count(
+        *session,
+        term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED) == 0U,
+        "the captured embedded-C0 request does not also fire the standing notification");
+
+    ok &= check(session->settle_text_area_resize_arbitration({
+        request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED,
+        term::terminal_grid_size_t{3, 5},
+    }).code == term::Terminal_session_result_code::ACCEPTED,
+        "the embedded-C0 request is answered");
+    ok &= check(session->grid_size().rows == 3 && session->grid_size().columns == 5,
+        "the answered embedded-C0 request commits the accepted grid");
+    ok &= check(backend->resize_requests.size() == 1U,
+        "the answered embedded-C0 request resizes the backend exactly once");
+
+    const std::optional<term::Terminal_render_snapshot> snapshot =
+        session->latest_render_snapshot();
+    ok &= check(snapshot.has_value() &&
+        snapshot_row_text(*snapshot, 2) == QStringLiteral("    Z"),
+        "held output replays against the accepted grid after an embedded C0");
+
+    // A C0 ahead of the first parameter digit is the same divergence: the parser
+    // drops it when it builds the parameter payload.
+    ok &= check(arm_text_area_resize_arbitration(
+        *session,
+        *backend,
+        QByteArrayLiteral("\x1b[\r8;6;9t")) != 0U,
+        "a CSI 8 t carrying a leading C0 arms one arbitration request");
+
+    const std::vector<term::Terminal_text_area_resize_arbitration_event> requests =
+        arbitration_requests(*session);
+    ok &= check(requests.size() == 2U &&
+        requests.back().request.has_value() &&
+        requests.back().request->requested_grid_size.rows == 6 &&
+        requests.back().request->requested_grid_size.columns == 9,
+        "the leading-C0 request carries the grid the parser would have dispatched");
+
+    return ok;
+}
+
+// A CSI 8 t whose embedded C0 falls on a chunk boundary is left to the model,
+// which commits the grid at the sequence point exactly as it does without the
+// capability. The standing notification is then the host's only signal, so it
+// has to fire: suppressing it on the capability being installed would move the
+// grid and the pty behind the host's back with nothing to reconcile from.
+bool test_uncaptured_text_area_resize_request_still_notifies_the_host()
+{
+    bool ok = true;
+
+    std::unique_ptr<term::Terminal_session> session;
+    Scripted_backend* backend = make_session(session, text_area_resize_arbitration_config());
+
+    ok &= check(session->start(launch_config_with_grid(2, 4)).code ==
+        term::Terminal_session_result_code::ACCEPTED,
+        "uncaptured-request session starts");
+    ok &= check(backend->emit_output(QByteArrayLiteral("aa\x1b[8;3;5\r")),
+        "the leading half of the split embedded-C0 sequence is accepted");
+    ok &= check(arbitration_requests(*session).empty(),
+        "an incomplete embedded-C0 sequence arms nothing");
+    ok &= check(backend->emit_output(QByteArrayLiteral("t")),
+        "the trailing half of the split embedded-C0 sequence is accepted");
+
+    ok &= check(arbitration_requests(*session).empty(),
+        "the transaction does not capture a sequence split across its embedded C0");
+    ok &= check(session->grid_size().rows == 3 && session->grid_size().columns == 5,
+        "the uncaptured request commits the grid at the sequence point");
+    ok &= check(backend->resize_requests.size() == 1U &&
+        backend->resize_requests.back().grid_size.rows == 3 &&
+        backend->resize_requests.back().grid_size.columns == 5,
+        "the uncaptured request resizes the backend");
+    ok &= check(notification_count(
+        *session,
+        term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED) == 1U,
+        "an uncaptured text-area resize request still reaches the host");
 
     return ok;
 }
@@ -16638,6 +18507,36 @@ int main()
     ok &= test_text_area_resize_request_updates_session_grid_in_sequence();
     ok &= test_text_area_resize_retry_publishes_geometry_metadata();
     ok &= test_text_area_resize_retry_precedes_later_changed_request_in_same_callback();
+    ok &= test_text_area_resize_arbitration_defers_the_grid_until_the_host_answers();
+    ok &= test_rejected_text_area_resize_arbitration_costs_no_reflow_or_backend_resize();
+    ok &= test_clamped_text_area_resize_arbitration_commits_the_effective_grid();
+    ok &= test_clamped_text_area_resize_arbitration_replays_the_captured_controls();
+    ok &= test_malformed_del_resize_sequence_is_not_arbitrated_after_an_exact_answer();
+    ok &= test_malformed_del_resize_sequence_is_not_arbitrated_after_a_clamped_answer();
+    ok &= test_text_area_resize_arbitration_holds_output_that_arrives_while_in_flight();
+    ok &= test_text_area_resize_arbitration_serializes_two_requests_in_one_chunk();
+    ok &= test_text_area_resize_arbitration_decreased_limit_starts_a_safe_tail_epoch();
+    ok &= test_text_area_resize_arbitration_spans_a_chunk_boundary();
+    ok &= test_text_area_resize_arbitration_folds_scanner_pending_into_the_hold();
+    ok &= test_text_area_resize_arbitration_rejects_a_stale_request_id();
+    ok &= test_text_area_resize_arbitration_hold_limit_settles_the_request();
+    ok &= test_text_area_resize_arbitration_same_callback_overflow_never_presents();
+    ok &= test_text_area_resize_arbitration_oversized_sequence_never_presents();
+    ok &= test_text_area_resize_arbitration_exit_invalidates_an_extracted_unclaimed_request();
+    ok &= test_text_area_resize_arbitration_settles_on_process_exit();
+    ok &= test_text_area_resize_arbitration_burst_preserves_common_critical_notifications();
+    ok &= test_text_area_resize_arbitration_near_limit_replay_is_linear();
+    ok &= test_text_area_resize_arbitration_sustained_callbacks_bound_retained_storage();
+    ok &= test_text_area_resize_arbitration_survives_a_host_resize();
+    ok &= test_text_area_resize_arbitration_settles_on_a_policy_change();
+    ok &= test_text_area_resize_arbitration_settles_when_the_capability_is_removed();
+    ok &= test_text_area_resize_arbitration_advances_the_backend_callback_epoch();
+    ok &= test_text_area_resize_arbitration_respects_the_disabled_policy();
+    ok &= test_text_area_resize_arbitration_inside_synchronized_output();
+    ok &= test_text_area_resize_arbitration_rejects_an_unsupported_effective_grid();
+    ok &= test_text_area_resize_arbitration_suppresses_the_standing_request_notification();
+    ok &= test_text_area_resize_arbitration_arms_across_an_embedded_c0();
+    ok &= test_uncaptured_text_area_resize_request_still_notifies_the_host();
     ok &= test_backend_output_capture_records_callback_overflow_bytes();
     ok &= test_backend_output_updates_latest_render_snapshot();
     ok &= test_selection_snapshot_and_visible_text();

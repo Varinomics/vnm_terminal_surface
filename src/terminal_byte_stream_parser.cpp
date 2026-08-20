@@ -262,12 +262,12 @@ bool is_control_byte(unsigned char byte)
 
 bool is_csi_final_byte(unsigned char byte)
 {
-    return byte >= 0x40U && byte <= 0x7eU;
+    return terminal_csi_byte_kind(byte) == Terminal_csi_byte_kind::FINAL;
 }
 
 bool is_csi_parameter_byte(unsigned char byte)
 {
-    return byte >= 0x30U && byte <= 0x3fU;
+    return terminal_csi_byte_kind(byte) == Terminal_csi_byte_kind::PARAMETER;
 }
 
 bool is_csi_private_marker_byte(unsigned char byte)
@@ -277,7 +277,7 @@ bool is_csi_private_marker_byte(unsigned char byte)
 
 bool is_csi_intermediate_byte(unsigned char byte)
 {
-    return byte >= 0x20U && byte <= 0x2fU;
+    return terminal_csi_byte_kind(byte) == Terminal_csi_byte_kind::INTERMEDIATE;
 }
 
 // An escape sequence ends on 0x30-0x7e, which reaches lower than the 0x40-0x7e
@@ -356,7 +356,9 @@ bool parse_csi_dispatch_parts(
     bool parsing_intermediates = false;
     for (qsizetype i = csi_begin; i < final_offset; ++i) {
         const unsigned char byte = byte_at(bytes, i);
-        if (byte < 0x20U) {
+        if (terminal_csi_byte_kind(byte) ==
+            Terminal_csi_byte_kind::EMBEDDED_CONTROL)
+        {
             continue;
         }
 
@@ -803,7 +805,9 @@ QByteArray csi_pending_prefix_without_c0(QByteArrayView bytes, qsizetype offset)
     pending.reserve(bytes.size() - offset);
     for (qsizetype i = offset; i < bytes.size(); ++i) {
         const unsigned char byte = byte_at(bytes, i);
-        if (i == offset || byte >= 0x20U) {
+        if (i == offset || terminal_csi_byte_kind(byte) !=
+            Terminal_csi_byte_kind::EMBEDDED_CONTROL)
+        {
             pending.append(static_cast<char>(byte));
         }
     }
@@ -811,6 +815,23 @@ QByteArray csi_pending_prefix_without_c0(QByteArrayView bytes, qsizetype offset)
     return pending;
 }
 
+}
+
+Terminal_csi_byte_kind terminal_csi_byte_kind(unsigned char byte)
+{
+    if (byte < 0x20U) {
+        return Terminal_csi_byte_kind::EMBEDDED_CONTROL;
+    }
+    if (byte >= 0x20U && byte <= 0x2fU) {
+        return Terminal_csi_byte_kind::INTERMEDIATE;
+    }
+    if (byte >= 0x30U && byte <= 0x3fU) {
+        return Terminal_csi_byte_kind::PARAMETER;
+    }
+    if (byte >= 0x40U && byte <= 0x7eU) {
+        return Terminal_csi_byte_kind::FINAL;
+    }
+    return Terminal_csi_byte_kind::INVALID;
 }
 
 bool parse_sgr_parameter_groups(
@@ -1063,7 +1084,9 @@ Terminal_byte_stream_parser::try_consume_escape_or_csi(
                 return String_state_result::CONSUMED;
             }
 
-            if (current_byte < 0x20U) {
+            if (terminal_csi_byte_kind(current_byte) ==
+                Terminal_csi_byte_kind::EMBEDDED_CONTROL)
+            {
                 append_c0_control_action(current_byte, actions);
                 continue;
             }

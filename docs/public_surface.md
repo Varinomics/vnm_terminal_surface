@@ -74,6 +74,14 @@ Writable Qt properties:
   minimized. Requests are then ignored: no grid change, no backend resize, and
   no `text_area_resize_requested()` signal. The policy applies to a live
   session, so hosts update it as their window state changes.
+- `textAreaResizeArbitrationEnabled` turns an XTWINOPS
+  `CSI 8 ; rows ; columns t` the terminal captures into a two-phase transaction
+  instead of a sequence-point commit. It is off by default. See
+  `text_area_resize_arbitration_requested()` below for the protocol, and for the
+  one request shape the transaction cannot capture.
+- `textAreaResizeArbitrationTimeoutMs` bounds how long backend output is held
+  waiting for that answer. The default is 250 ms; 0 removes the bound and leaves
+  only the session byte limit. Negative values clamp to 0.
 - `mouseReportingPolicy` is `APPLICATION_CONTROLLED` or `DISABLED`. With the
   application-controlled policy, mouse-reporting terminal modes receive mouse
   input. Holding Shift forces local selection when no terminal mouse grab is
@@ -424,8 +432,82 @@ example when the window manager clamps the resize or the target equals the
 current size, calls `refresh_grid_from_item_geometry()` to put the grid back on
 the item. No geometry change arrives to reconcile it otherwise. That call
 resizes synchronously, so invoking it from the signal handler nests inside
-session notification delivery and can reorder later host-visible signals from
-that same delivery; deferring it to the next event loop turn avoids that.
+session notification delivery. Notifications still queued behind it keep their
+order, but the nested call republishes surface state, so property change signals
+can arrive ahead of them; deferring it to the next event loop turn avoids that.
+
+`text_area_resize_arbitration_requested(request_id, rows, columns)` replaces
+that whole shape for a host that sets `textAreaResizeArbitrationEnabled`. A
+captured sequence then commits nothing on its own. Backend output stops at the
+sequence point, the host resizes its window, and it answers with
+`respond_text_area_resize(request_id, ACCEPT, actual_rows, actual_columns)`
+carrying the grid it actually got, or
+`respond_text_area_resize(request_id, REJECT, 0, 0)`. That window resize is not
+the answer, but it does reach the grid and the backend, exactly as it would
+with no request in flight, and the answer then commits the grid the host
+reports. Honoring a request therefore costs one reflow and one backend resize
+in total, whether the host's own resize or the answer applied it, and refusing
+adds nothing to what that resize already cost. That grid is all the answer
+decides: a C0 control byte the child embedded in the captured sequence, which
+the parser applies ahead of the resize, takes effect whether the host answered
+with the requested grid or with a clamped one. A captured request emits no
+`text_area_resize_requested()`, because an arbitrating host has already moved
+its window by the time the request settles.
+
+The transaction captures a request out of the backend byte stream, ahead of the
+parser that would dispatch it. One shape escapes that: a
+`CSI 8 ; rows ; columns t` carrying an embedded C0 control byte and split across
+a backend read boundary that falls after the control. The parser applies such a
+control as it scans and carries only the stripped prefix across the boundary, so
+the two halves are no longer joinable in the byte stream the terminal watches.
+That request is not arbitrated. It commits the grid and resizes the backend at
+the sequence point, and it emits `text_area_resize_requested()`, exactly as it
+does with arbitration disabled.
+
+A host that enables arbitration therefore connects both signals.
+`text_area_resize_arbitration_requested()` is where it resizes its window and
+answers; `text_area_resize_requested()` is where it handles an already-committed
+request, the same handler it would write without arbitration. Leaving that
+second signal unconnected moves the grid and the backend with nothing telling
+the host to follow, which is the divergence the transaction exists to remove.
+
+Resizing the window before answering is the expected order and does not settle
+the request. The item geometry reaches the grid the way it always does, so
+`rows()` and `columns()` report the grid the host actually got and the answer
+can be truthful, while the held output stays held until the answer arrives. A
+window resize is never itself an answer: only `respond_text_area_resize`, the
+timeout, or the session ends the request.
+
+At most one request is actionable to the host at a time. Delivery is part of
+the optional arbitration capability rather than the common session-notification
+stream. If the process exits after the session captured a request but before
+the surface presents it, the surface emits neither the now-stale request nor a
+matching historical settlement. Held output still replays once, followed by
+the process-exit notification.
+
+Output that arrives after the sequence is held until the host answers. The hold
+is bounded twice: by `textAreaResizeArbitrationTimeoutMs`, and by the session's
+own byte limit for a host that answers eventually while the process floods.
+If the request itself exceeds the bounded control-sequence allowance, or if the
+remainder of its callback already exceeds the byte limit, the session declines
+the request at its sequence point without presenting it to the host and
+continues processing normally.
+`text_area_resize_arbitration_settled(request_id, outcome, rows, columns)`
+reports every ending of a request that reached the host, whether it was the
+host's `ACCEPTED` or `REJECTED` answer or a settlement the terminal had to make:
+`HOLD_LIMIT_REACHED`,
+`TEXT_AREA_RESIZE_DISABLED`, `ARBITRATION_DISABLED`, `PROCESS_EXITED`, or
+`TIMED_OUT`. An `ACCEPT` carrying a grid the terminal cannot support is settled
+as `REJECTED` instead, and `respond_text_area_resize` returns false with a
+`RESIZE_FAILED` backend error. Held output always replays, against the answered
+grid when the request was accepted and against the grid then current otherwise;
+`rows` and `columns` are that grid. A host that armed UI on the request tears it
+down on this signal rather than on its own answer.
+
+Arbitration is an optional capability and adds no transcript event kind. A
+transcript captured with it enabled replays under a session without it as the
+sequence-point behavior, because the recorded backend byte stream is identical
+either way and the decision was never part of it.
 
 ## Event And Render Overrides
 

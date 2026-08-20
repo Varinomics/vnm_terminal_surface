@@ -377,44 +377,6 @@ Parser_action make_text_area_resize_notification_action(int rows, int columns)
     };
 }
 
-bool parse_simple_csi_parameter_groups(
-    QByteArrayView                             parameter_bytes,
-    std::vector<Sgr_parameter_group>&          groups)
-{
-    if (!parse_sgr_parameter_groups(parameter_bytes, groups)) {
-        return false;
-    }
-
-    for (const Sgr_parameter_group& group : groups) {
-        if (group.atoms.size() != 1U) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool csi_parameter_value(
-    const std::vector<Sgr_parameter_group>&    groups,
-    std::size_t                                index,
-    int                                        default_value,
-    int&                                       value)
-{
-    if (index >= groups.size()) {
-        value = default_value;
-        return true;
-    }
-
-    const Sgr_parameter_group& group = groups[index];
-    if (group.atoms.size() != 1U) {
-        return false;
-    }
-
-    const Sgr_parameter_atom& atom = group.atoms.front();
-    value = atom.has_value ? atom.value : default_value;
-    return true;
-}
-
 QByteArray four_digit_hex(int value)
 {
     QByteArray hex = QByteArray::number(value, 16);
@@ -470,6 +432,35 @@ const char* terminal_recovery_attempt_reason_token(
             return "candidate-invalidated";
     }
     return "unknown";
+}
+
+Terminal_text_area_resize_request_status terminal_text_area_resize_request_status(
+    const std::vector<Sgr_parameter_group>&    groups,
+    terminal_grid_size_t&                      grid_size)
+{
+    int mode = 0;
+    if (groups.size() != 3U                       ||
+        !csi_parameter_value(groups, 0U, 0, mode) ||
+        mode != 8)
+    {
+        return Terminal_text_area_resize_request_status::NOT_REQUESTED;
+    }
+
+    int rows    = 0;
+    int columns = 0;
+    if (!csi_parameter_value(groups, 1U, 0, rows) ||
+        !csi_parameter_value(groups, 2U, 0, columns))
+    {
+        return Terminal_text_area_resize_request_status::MALFORMED;
+    }
+    if (rows <= 0 || columns <= 0) {
+        return Terminal_text_area_resize_request_status::UNSUPPORTED;
+    }
+
+    grid_size = terminal_grid_size_t{rows, columns};
+    return is_terminal_screen_model_grid_size_supported(grid_size)
+        ? Terminal_text_area_resize_request_status::SUPPORTED
+        : Terminal_text_area_resize_request_status::UNSUPPORTED;
 }
 
 Terminal_screen_model_config_status validate_terminal_screen_model_config(
@@ -1214,7 +1205,6 @@ void Terminal_screen_model::apply_control_sequence(
         }
         case 't':
     {
-                            int mode = 0;
                             if (!has_no_prefix) {
                                 unsupported();
                                 return;
@@ -1222,43 +1212,44 @@ void Terminal_screen_model::apply_control_sequence(
                             if (!parse_simple_parameters()) {
                                 return;
                             }
-                            if (!csi_parameter_value(groups, 0U, 0, mode)) {
-                                malformed();
-                                return;
-                            }
-                            if (mode == 8 && groups.size() == 3U) {
-                                int rows    = 0;
-                                int columns = 0;
-                                if (!csi_parameter_value(groups, 1U, 0, rows) ||
-                                    !csi_parameter_value(groups, 2U, 0, columns))
-                                {
+
+                            terminal_grid_size_t requested_grid_size;
+                            switch (terminal_text_area_resize_request_status(
+                                groups,
+                                requested_grid_size))
+                            {
+                                case Terminal_text_area_resize_request_status::MALFORMED:
                                     malformed();
                                     return;
-                                }
-                                if (rows <= 0 || columns <= 0) {
+                                case Terminal_text_area_resize_request_status::UNSUPPORTED:
                                     unsupported();
                                     return;
-                                }
-                                // The host owns its geometry right now, so the
-                                // text area cannot move. Ignoring it here keeps
-                                // the grid on the item; applying it and letting
-                                // the host revert would resize the pty twice per
-                                // request and never converge against a client
-                                // that re-asserts its size.
-                                if (m_config.text_area_resize_policy ==
-                                    Terminal_text_area_resize_policy::DISABLED)
-                                {
-                                    unsupported();
+                                case Terminal_text_area_resize_request_status::SUPPORTED:
+                                    // The host owns its geometry right now, so the
+                                    // text area cannot move. Ignoring it here keeps
+                                    // the grid on the item; applying it and letting
+                                    // the host revert would resize the pty twice per
+                                    // request and never converge against a client
+                                    // that re-asserts its size.
+                                    if (m_config.text_area_resize_policy ==
+                                        Terminal_text_area_resize_policy::DISABLED)
+                                    {
+                                        unsupported();
+                                        return;
+                                    }
+                                    apply_grid_resize(requested_grid_size, false);
+                                    generated_actions.push_back(
+                                        make_text_area_resize_notification_action(
+                                            requested_grid_size.rows,
+                                            requested_grid_size.columns));
                                     return;
-                                }
-                                const terminal_grid_size_t grid_size{rows, columns};
-                                if (!is_terminal_screen_model_grid_size_supported(grid_size)) {
-                                    unsupported();
-                                    return;
-                                }
-                                apply_grid_resize(grid_size, false);
-                                generated_actions.push_back(
-                                    make_text_area_resize_notification_action(rows, columns));
+                                case Terminal_text_area_resize_request_status::NOT_REQUESTED:
+                                    break;
+                            }
+
+                            int mode = 0;
+                            if (!csi_parameter_value(groups, 0U, 0, mode)) {
+                                malformed();
                                 return;
                             }
                             // Other multi-parameter lowercase t forms are xterm window-operation

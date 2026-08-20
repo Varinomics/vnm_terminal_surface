@@ -3,6 +3,7 @@
 
 #include "vnm_terminal/internal/interaction_trace.h"
 #include "vnm_terminal/internal/hierarchical_profiler.h"
+#include "vnm_terminal/internal/terminal_byte_stream_parser.h"
 #include "vnm_terminal/internal/terminal_input_encoder.h"
 #include "vnm_terminal/internal/terminal_transcript.h"
 #include <QKeyEvent>
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <limits>
 #include <mutex>
@@ -1278,17 +1280,23 @@ struct Sync_set_sequence
 
 bool is_csi_parameter_byte(unsigned char byte)
 {
-    return byte >= 0x30U && byte <= 0x3fU;
+    return terminal_csi_byte_kind(byte) == Terminal_csi_byte_kind::PARAMETER;
 }
 
 bool is_csi_intermediate_byte(unsigned char byte)
 {
-    return byte >= 0x20U && byte <= 0x2fU;
+    return terminal_csi_byte_kind(byte) == Terminal_csi_byte_kind::INTERMEDIATE;
 }
 
 bool is_csi_final_byte(unsigned char byte)
 {
-    return byte >= 0x40U && byte <= 0x7eU;
+    return terminal_csi_byte_kind(byte) == Terminal_csi_byte_kind::FINAL;
+}
+
+bool is_csi_embedded_control(unsigned char byte)
+{
+    return terminal_csi_byte_kind(byte) ==
+        Terminal_csi_byte_kind::EMBEDDED_CONTROL;
 }
 
 Sync_parameter_location find_sync_parameter_location(QByteArrayView parameter_bytes)
@@ -1522,81 +1530,91 @@ QByteArray sync_sequence_from_sync_parameter_and_tail(
     return rewritten;
 }
 
-qsizetype trailing_incomplete_csi_start(
-    QByteArrayView             bytes,
-    Terminal_utf8_scan_state   initial_utf8_scan_state)
+// Rewrites a captured CSI 8 t onto the grid the host answered with. The run is
+// the one the incremental scanner matched, so after the introducer it holds
+// parameter bytes, any C0 control the child embedded, and the final byte. Those
+// controls are carried over rather than dropped: the parser applies each one
+// where it scans it, ahead of the dispatch that resizes
+// (Terminal_byte_stream_parser::try_consume_escape_or_csi). Where they sat among
+// the parameter bytes is not observable, those having no effect of their own, so
+// carrying them in order leaves the grid the sequence commits as the only thing
+// the host's answer decides.
+QByteArray text_area_resize_sequence_on_grid(
+    QByteArrayView         captured_sequence_bytes,
+    terminal_grid_size_t   grid_size)
 {
-    Terminal_utf8_scan_state utf8_scan_state = initial_utf8_scan_state;
-    for (qsizetype offset = 0; offset < bytes.size(); ++offset) {
-        if (utf8_scan_consumes_byte(static_cast<unsigned char>(bytes[offset]), utf8_scan_state)) {
-            continue;
-        }
-
-        qsizetype parameter_begin = -1;
-        if (static_cast<unsigned char>(bytes[offset]) == 0x9bU) {
-            parameter_begin = offset + 1;
-        }
-        else
-        if (static_cast<unsigned char>(bytes[offset]) == 0x1bU) {
-            if (offset + 1 >= bytes.size()) {
-                return offset;
-            }
-
-            if (bytes[offset + 1] == '[') {
-                parameter_begin = offset + 2;
-            }
-            else {
-                continue;
-            }
-        }
-        else {
-            continue;
-        }
-
-        qsizetype cursor = parameter_begin;
-        while (cursor < bytes.size() &&
-            is_csi_parameter_byte(static_cast<unsigned char>(bytes[cursor])))
-        {
-            ++cursor;
-        }
-
-        while (cursor < bytes.size() &&
-            is_csi_intermediate_byte(static_cast<unsigned char>(bytes[cursor])))
-        {
-            ++cursor;
-        }
-
-        if (cursor >= bytes.size()) {
-            return offset;
-        }
-
-        if (is_csi_final_byte(static_cast<unsigned char>(bytes[cursor]))) {
-            offset = cursor;
+    QByteArray sequence = QByteArrayLiteral("\x1b[8;");
+    sequence.append(QByteArray::number(grid_size.rows));
+    sequence.append(';');
+    sequence.append(QByteArray::number(grid_size.columns));
+    // Byte 0 is the introducer the incremental scanner matched, ESC or 0x9b; every C0 after
+    // it is one the child put inside the sequence.
+    for (qsizetype offset = 1; offset < captured_sequence_bytes.size(); ++offset) {
+        const unsigned char byte =
+            static_cast<unsigned char>(captured_sequence_bytes[offset]);
+        if (is_csi_embedded_control(byte)) {
+            sequence.append(static_cast<char>(byte));
         }
     }
-
-    return -1;
+    sequence.append('t');
+    return sequence;
 }
 
-bool utf8_scan_state_is_reset(const Terminal_utf8_scan_state& state)
+// Marks the model dispatch that replays an arbitrated CSI 8 t. Restoring the
+// latch on the way out keeps a throwing replay from leaving the session silent
+// about every later request.
+class Arbitrated_text_area_resize_replay_scope
 {
-    return
-        state.continuation_remaining == 0     &&
-        state.next_minimum           == 0x80U &&
-        state.next_maximum           == 0xbfU;
-}
-
-bool backend_output_is_plain_ascii_without_prescan_intro(QByteArrayView bytes)
-{
-    for (const char byte : bytes) {
-        const unsigned char value = static_cast<unsigned char>(byte);
-        if (value == 0x1bU || value == 0x9bU || value >= 0x80U) {
-            return false;
-        }
+public:
+    explicit Arbitrated_text_area_resize_replay_scope(bool& replaying)
+    :
+        m_replaying(replaying)
+    {
+        m_replaying = true;
     }
 
-    return true;
-}
+    Arbitrated_text_area_resize_replay_scope(
+        const Arbitrated_text_area_resize_replay_scope&) = delete;
+    Arbitrated_text_area_resize_replay_scope& operator=(
+        const Arbitrated_text_area_resize_replay_scope&) = delete;
+
+    ~Arbitrated_text_area_resize_replay_scope()
+    {
+        m_replaying = false;
+    }
+
+private:
+    bool& m_replaying;
+};
+
+// Declining a request the host refused is observationally the standing DISABLED
+// policy applied to one sequence, so it reuses that path rather than inventing a
+// second way to refuse the same bytes.
+class Text_area_resize_policy_scope
+{
+public:
+    Text_area_resize_policy_scope(
+        Terminal_screen_model&             model,
+        Terminal_text_area_resize_policy   restore)
+    :
+        m_model(model),
+        m_restore(restore)
+    {
+        m_model.set_text_area_resize_policy(Terminal_text_area_resize_policy::DISABLED);
+    }
+
+    Text_area_resize_policy_scope(const Text_area_resize_policy_scope&)            = delete;
+    Text_area_resize_policy_scope& operator=(const Text_area_resize_policy_scope&) = delete;
+
+    ~Text_area_resize_policy_scope()
+    {
+        m_model.set_text_area_resize_policy(m_restore);
+    }
+
+private:
+    Terminal_screen_model&           m_model;
+    Terminal_text_area_resize_policy m_restore;
+};
 
 bool uses_deferred_backend_callbacks(const Terminal_session_config& config)
 {
@@ -1920,6 +1938,13 @@ Terminal_session::Terminal_session(
 {
     m_config.scrollback_limit = std::max(0, m_config.scrollback_limit);
     m_bell_state.policy = m_config.bell_policy;
+    if (m_config.text_area_resize_arbitration.has_value() &&
+        m_config.text_area_resize_arbitration->version ==
+            k_terminal_text_area_resize_arbitration_capability_version)
+    {
+        m_text_area_resize_arbitration_trace_event_limit =
+            m_config.text_area_resize_arbitration->trace_event_limit;
+    }
     if (m_config.backend_output_capture_config.has_value()) {
         m_backend_output_capture_writer =
             std::make_unique<Backend_output_capture_writer>(
@@ -2919,8 +2944,153 @@ void Terminal_session::set_text_area_resize_policy(
         m_screen_model->set_text_area_resize_policy(policy);
     }
 
+    if (policy == Terminal_text_area_resize_policy::DISABLED &&
+        m_text_area_resize_arbitration.has_value())
+    {
+        // The host just declared it cannot move its window, which is the answer
+        // the in-flight request was waiting for.
+        (void)settle_text_area_resize_arbitration({
+            m_text_area_resize_arbitration->request_id,
+            Terminal_text_area_resize_arbitration_outcome::TEXT_AREA_RESIZE_DISABLED,
+            {},
+        });
+    }
+
     drain_backend_callback_commands();
     process_pending_commands();
+}
+
+void Terminal_session::set_text_area_resize_arbitration(
+    std::optional<terminal_text_area_resize_arbitration_config_t> arbitration)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    // Assigned before the release, for the same reason set_text_area_resize_policy
+    // assigns before its drain: the release must run under the new capability
+    // state so the replayed tail cannot arm a request the host can no longer
+    // answer.
+    m_config.text_area_resize_arbitration = arbitration;
+    const bool capability_available = arbitration.has_value() &&
+        arbitration->version ==
+            k_terminal_text_area_resize_arbitration_capability_version;
+    if (!capability_available && m_text_area_resize_arbitration.has_value()) {
+        (void)settle_text_area_resize_arbitration({
+            m_text_area_resize_arbitration->request_id,
+            Terminal_text_area_resize_arbitration_outcome::ARBITRATION_DISABLED,
+            {},
+        });
+    }
+    drain_backend_callback_commands();
+    process_pending_commands();
+    const std::size_t configured_hold_limit = capability_available
+        ? arbitration->hold_limit_bytes
+        : 0U;
+    if (!m_text_area_resize_arbitration.has_value() &&
+        text_area_resize_tail_size() == 0U &&
+        m_text_area_resize_tail.capacity_limit != configured_hold_limit)
+    {
+        clear_text_area_resize_tail_epoch();
+    }
+    m_text_area_resize_arbitration_trace_event_limit = capability_available
+        ? arbitration->trace_event_limit
+        : 0U;
+}
+
+std::optional<terminal_text_area_resize_arbitration_request_t>
+    Terminal_session::pending_text_area_resize_arbitration() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    if (!m_text_area_resize_arbitration.has_value()) {
+        return std::nullopt;
+    }
+
+    return terminal_text_area_resize_arbitration_request_t{
+        m_text_area_resize_arbitration->request_id,
+        m_text_area_resize_arbitration->requested_grid_size,
+    };
+}
+
+std::optional<terminal_text_area_resize_arbitration_request_t>
+    Terminal_session::presented_text_area_resize_arbitration() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    if (!m_text_area_resize_arbitration.has_value() ||
+        m_text_area_resize_arbitration->delivery_state !=
+            Text_area_resize_arbitration_delivery_state::PRESENTED)
+    {
+        return std::nullopt;
+    }
+
+    return terminal_text_area_resize_arbitration_request_t{
+        m_text_area_resize_arbitration->request_id,
+        m_text_area_resize_arbitration->requested_grid_size,
+    };
+}
+
+bool Terminal_session::mark_text_area_resize_arbitration_presented(
+    std::uint64_t request_id)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    if (!m_text_area_resize_arbitration.has_value() ||
+        m_text_area_resize_arbitration->request_id != request_id ||
+        m_text_area_resize_arbitration->delivery_state !=
+            Text_area_resize_arbitration_delivery_state::CLAIMABLE)
+    {
+        return false;
+    }
+
+    m_text_area_resize_arbitration->delivery_state =
+        Text_area_resize_arbitration_delivery_state::PRESENTED;
+    return true;
+}
+
+terminal_text_area_resize_arbitration_work_counters_t
+    Terminal_session::text_area_resize_arbitration_work_counters() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    terminal_text_area_resize_arbitration_work_counters_t counters =
+        m_text_area_resize_arbitration_work_counters;
+    counters.current_tail_size_bytes =
+        static_cast<std::uint64_t>(text_area_resize_tail_size());
+    counters.current_tail_capacity_bytes =
+        static_cast<std::uint64_t>(m_text_area_resize_tail.bytes.size());
+    return counters;
+}
+
+Terminal_session_result Terminal_session::settle_text_area_resize_arbitration(
+    terminal_text_area_resize_arbitration_settlement_t settlement)
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    const bool host_settlement =
+        settlement.outcome == Terminal_text_area_resize_arbitration_outcome::ACCEPTED ||
+        settlement.outcome == Terminal_text_area_resize_arbitration_outcome::REJECTED ||
+        settlement.outcome == Terminal_text_area_resize_arbitration_outcome::TIMED_OUT;
+    if (!m_text_area_resize_arbitration.has_value() ||
+        m_text_area_resize_arbitration->request_id != settlement.request_id ||
+        (host_settlement &&
+            m_text_area_resize_arbitration->delivery_state !=
+                Text_area_resize_arbitration_delivery_state::PRESENTED))
+    {
+        return make_rejected_result(
+            m_last_processed_sequence,
+            Terminal_session_result_code::INVALID_STATE,
+            make_backend_error(
+                Terminal_backend_error_code::CALLBACK_MISSING,
+                QStringLiteral("no presented text-area resize arbitration for this request")));
+    }
+
+    Terminal_session_command command;
+    command.sequence                     = next_sequence();
+    command.kind                         =
+        Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION;
+    command.text_area_resize_arbitration = settlement;
+
+    drain_backend_callback_commands();
+    return enqueue_and_process_synchronous_command(std::move(command));
 }
 
 void Terminal_session::set_primary_repaint_recovery_enabled(bool enabled)
@@ -3497,8 +3667,76 @@ std::vector<Terminal_session_notification> Terminal_session::take_pending_notifi
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
 
     std::vector<Terminal_session_notification> notifications;
-    notifications.swap(m_pending_notifications);
+    std::sort(
+        m_pending_common_deliveries.begin(),
+        m_pending_common_deliveries.end(),
+        [](const Terminal_session_delivery& left, const Terminal_session_delivery& right) {
+            return left.delivery_order < right.delivery_order;
+        });
+    notifications.reserve(m_pending_common_deliveries.size());
+    for (Terminal_session_delivery& delivery : m_pending_common_deliveries) {
+        if (delivery.common_notification.has_value()) {
+            notifications.push_back(std::move(*delivery.common_notification));
+        }
+    }
+    m_pending_common_deliveries.clear();
     return notifications;
+}
+
+std::vector<Terminal_session_delivery> Terminal_session::take_pending_deliveries()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    std::vector<Terminal_session_delivery> deliveries;
+    deliveries.swap(m_pending_common_deliveries);
+    deliveries.reserve(
+        deliveries.size() + m_pending_text_area_resize_arbitration_events.size());
+    for (Terminal_text_area_resize_arbitration_event& event :
+        m_pending_text_area_resize_arbitration_events)
+    {
+        Terminal_session_delivery delivery;
+        delivery.delivery_order = event.delivery_order;
+        delivery.text_area_resize_arbitration_event = std::move(event);
+        deliveries.push_back(std::move(delivery));
+    }
+    m_pending_text_area_resize_arbitration_events.clear();
+
+    if (m_text_area_resize_arbitration.has_value() &&
+        m_text_area_resize_arbitration->delivery_state ==
+            Text_area_resize_arbitration_delivery_state::QUEUED)
+    {
+        const std::uint64_t request_order =
+            m_text_area_resize_arbitration->request_delivery_order;
+        const bool request_is_in_batch = std::any_of(
+            deliveries.begin(),
+            deliveries.end(),
+            [request_order](const Terminal_session_delivery& delivery) {
+                return
+                    delivery.text_area_resize_arbitration_event.has_value() &&
+                    delivery.text_area_resize_arbitration_event->delivery_order ==
+                        request_order;
+            });
+        if (request_is_in_batch) {
+            m_text_area_resize_arbitration->delivery_state =
+                Text_area_resize_arbitration_delivery_state::CLAIMABLE;
+        }
+    }
+
+    std::sort(
+        deliveries.begin(),
+        deliveries.end(),
+        [](const Terminal_session_delivery& left, const Terminal_session_delivery& right) {
+            return left.delivery_order < right.delivery_order;
+        });
+    return deliveries;
+}
+
+std::vector<Terminal_text_area_resize_arbitration_event>
+    Terminal_session::text_area_resize_arbitration_events() const
+{
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    return m_text_area_resize_arbitration_events;
 }
 
 std::vector<Terminal_resize_transaction> Terminal_session::resize_transactions() const
@@ -4172,6 +4410,8 @@ Terminal_session_result Terminal_session::process_command(Terminal_session_comma
             return process_backend_exit_command(command);
         case Terminal_session_command_kind::BACKEND_ERROR:
             return process_backend_error_command(command);
+        case Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION:
+            return process_text_area_resize_arbitration_command(command);
     }
 
     return make_accepted_result(command.sequence);
@@ -4418,6 +4658,14 @@ Terminal_session_result Terminal_session::process_resize_command(
                 QStringLiteral("resize requires an initialized screen model")));
     }
 
+    // A host resize does not settle an in-flight request. Moving the window is
+    // how the documented protocol answers one: the host resizes, reads the grid
+    // it actually got back off this session, and only then answers. Settling
+    // here would cancel the request before its own answer arrived, replay the
+    // held tail against the grid the host has already left, and refuse the
+    // answer the protocol asked for. The answer stays the one authority over
+    // whether the request was granted; this resize is only the host's geometry
+    // reaching the grid, exactly as it does with no request in flight.
     const terminal_grid_size_t previous_grid_size = m_grid_size;
 #if VNM_TERMINAL_TRANSCRIPT_CAPTURE_REPLAY_ENABLED
     if (m_config.transcript_recorder != nullptr) {
@@ -4716,17 +4964,25 @@ void Terminal_session::consume_screen_model_text_area_resize_request(
                 request.grid_size) ||
             context.render_snapshot_metadata_changed;
     }
-    record_notification({
-        Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED,
-        context.sequence,
-        QStringLiteral("text-area resize requested"),
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        false,
-        std::nullopt,
-        request.grid_size,
-    });
+    // An arbitrating host already resized its window for this request when it
+    // answered, so firing the standing request signal as well would move it
+    // twice. The test is the replay of that answer and not the capability being
+    // installed: a request the arbitration scanner never captured reaches this point exactly
+    // as it does without the capability, and it has to reach the host the same
+    // way, or the grid and the pty move with no signal at all.
+    if (!m_replaying_arbitrated_text_area_resize) {
+        record_notification({
+            Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED,
+            context.sequence,
+            QStringLiteral("text-area resize requested"),
+            std::nullopt,
+            std::nullopt,
+            std::nullopt,
+            false,
+            std::nullopt,
+            request.grid_size,
+        });
+    }
     context.parser_resize_requests.push_back(request.grid_size);
 }
 
@@ -4936,43 +5192,1018 @@ Terminal_session_result Terminal_session::process_backend_output_command(
         record_output_activity(command.sequence);
     }
 
-    const Terminal_utf8_scan_state backend_output_prescan_utf8_state =
-        m_backend_output_prescan_utf8_state;
-    const bool use_plain_ascii_prescan_fast_path =
-        !command.bytes.isEmpty()                                      &&
-        m_backend_output_prescan_pending.isEmpty()                    &&
-        utf8_scan_state_is_reset(backend_output_prescan_utf8_state)   &&
-        backend_output_is_plain_ascii_without_prescan_intro(command.bytes);
-    if (use_plain_ascii_prescan_fast_path) {
-        ingest_backend_output_segment(
-            command.sequence,
-            QByteArrayView(command.bytes),
-            true);
+    if (m_text_area_resize_arbitration.has_value() &&
+        hold_text_area_resize_arbitration_output(command))
+    {
         return make_accepted_result(command.sequence);
     }
 
-    QByteArray combined_output;
-    QByteArrayView remaining(command.bytes);
-    if (!m_backend_output_prescan_pending.isEmpty()) {
-        combined_output = m_backend_output_prescan_pending + command.bytes;
-        m_backend_output_prescan_pending.clear();
-        remaining = QByteArrayView(combined_output);
+    ingest_backend_output_bytes(command.sequence, QByteArrayView(command.bytes));
+    return make_accepted_result(command.sequence);
+}
+
+bool Terminal_session::text_area_resize_arbitration_armable() const
+{
+    // A standing DISABLED policy already refuses every request, so asking the
+    // host would cost a round trip to reach the answer it has already given.
+    return
+        m_config.text_area_resize_arbitration.has_value()            &&
+        m_config.text_area_resize_arbitration->version ==
+            k_terminal_text_area_resize_arbitration_capability_version &&
+        m_config.text_area_resize_policy ==
+            Terminal_text_area_resize_policy::APPLICATION_CONTROLLED &&
+        !m_text_area_resize_arbitration.has_value();
+}
+
+std::uint64_t Terminal_session::next_text_area_resize_request_id()
+{
+    const std::uint64_t id = m_next_text_area_resize_request_id++;
+    if (m_next_text_area_resize_request_id == 0U) {
+        m_next_text_area_resize_request_id = 1U;
+    }
+    return id;
+}
+
+void Terminal_session::arm_text_area_resize_arbitration(
+    std::uint64_t          sequence,
+    QByteArrayView         sequence_bytes,
+    QByteArrayView         tail_bytes,
+    terminal_grid_size_t   requested_grid_size,
+    bool                   tail_already_owned)
+{
+    Q_ASSERT(!m_text_area_resize_arbitration.has_value());
+    Q_ASSERT(sequence_bytes.size() >= 0);
+    Q_ASSERT(static_cast<std::size_t>(sequence_bytes.size()) <=
+        k_terminal_text_area_resize_arbitration_request_limit_bytes);
+
+    Text_area_resize_arbitration_hold hold;
+    hold.request_size        = static_cast<std::size_t>(sequence_bytes.size());
+    if (sequence_bytes.data() != m_text_area_resize_arena.data()) {
+        std::memmove(
+            m_text_area_resize_arena.data(),
+            sequence_bytes.data(),
+            hold.request_size);
+    }
+    hold.requested_grid_size = requested_grid_size;
+    hold.hold_limit_bytes    = m_config.text_area_resize_arbitration->hold_limit_bytes;
+    hold.request_id          = next_text_area_resize_request_id();
+    hold.request_sequence    = sequence;
+
+    prepare_text_area_resize_tail(hold.hold_limit_bytes);
+    if (!tail_already_owned) {
+        Q_ASSERT(text_area_resize_tail_size() == 0U);
+        append_text_area_resize_tail(tail_bytes);
+    }
+    else {
+        Q_ASSERT(text_area_resize_tail_size() <= hold.hold_limit_bytes);
     }
 
-    const qsizetype incomplete_csi_start = trailing_incomplete_csi_start(
-        remaining,
-        backend_output_prescan_utf8_state);
-    if (incomplete_csi_start >= 0) {
-        const qsizetype pending_size = remaining.size() - incomplete_csi_start;
-        if (static_cast<std::size_t>(pending_size) <= k_control_sequence_pending_limit_bytes) {
-            m_backend_output_prescan_pending = QByteArray(
-                remaining.data() + incomplete_csi_start,
-                pending_size);
-            remaining = remaining.sliced(0, incomplete_csi_start);
+    m_text_area_resize_arbitration = std::move(hold);
+
+    Terminal_text_area_resize_arbitration_event event;
+    event.kind     = Terminal_text_area_resize_arbitration_event_kind::REQUESTED;
+    event.sequence = m_text_area_resize_arbitration->request_sequence;
+    event.request  = terminal_text_area_resize_arbitration_request_t{
+        m_text_area_resize_arbitration->request_id,
+        m_text_area_resize_arbitration->requested_grid_size,
+    };
+    m_text_area_resize_arbitration->request_delivery_order =
+        record_text_area_resize_arbitration_event(std::move(event));
+    observe_text_area_resize_arbitration_storage();
+}
+
+void Terminal_session::withdraw_unpresented_text_area_resize_arbitration_request(
+    std::uint64_t request_id)
+{
+    std::erase_if(
+        m_pending_text_area_resize_arbitration_events,
+        [request_id](const Terminal_text_area_resize_arbitration_event& event) {
+            return
+                event.kind == Terminal_text_area_resize_arbitration_event_kind::REQUESTED &&
+                event.request.has_value() &&
+                event.request->request_id == request_id;
+        });
+}
+
+std::uint64_t Terminal_session::record_text_area_resize_arbitration_event(
+    Terminal_text_area_resize_arbitration_event event)
+{
+    Q_ASSERT(m_pending_text_area_resize_arbitration_events.size() < 2U);
+    event.delivery_order = next_delivery_order();
+    const std::uint64_t delivery_order = event.delivery_order;
+    m_pending_text_area_resize_arbitration_events.push_back(event);
+
+    if (m_text_area_resize_arbitration_trace_event_limit > 0U) {
+        push_bounded(
+            m_text_area_resize_arbitration_events,
+            std::move(event),
+            m_text_area_resize_arbitration_trace_event_limit);
+    }
+    return delivery_order;
+}
+
+void Terminal_session::observe_text_area_resize_arbitration_storage()
+{
+    if (!m_text_area_resize_arbitration.has_value()) {
+        return;
+    }
+
+    m_text_area_resize_arbitration_work_counters.peak_retained_storage_bytes =
+        std::max(
+            m_text_area_resize_arbitration_work_counters.peak_retained_storage_bytes,
+            static_cast<std::uint64_t>(m_text_area_resize_arbitration->request_size) +
+                static_cast<std::uint64_t>(m_text_area_resize_tail.bytes.size()));
+}
+
+std::size_t Terminal_session::text_area_resize_tail_size() const
+{
+    Q_ASSERT(m_text_area_resize_tail.write_cursor >= m_text_area_resize_tail.read_cursor);
+    return static_cast<std::size_t>(
+        m_text_area_resize_tail.write_cursor - m_text_area_resize_tail.read_cursor);
+}
+
+QByteArrayView Terminal_session::text_area_resize_tail_front() const
+{
+    const std::size_t tail_size = text_area_resize_tail_size();
+    const std::size_t capacity  = m_text_area_resize_tail.bytes.size();
+    if (tail_size == 0U || capacity == 0U) {
+        return {};
+    }
+
+    const std::size_t begin =
+        static_cast<std::size_t>(m_text_area_resize_tail.read_cursor % capacity);
+    const std::size_t contiguous = std::min(tail_size, capacity - begin);
+    return QByteArrayView(
+        m_text_area_resize_tail.bytes.data() + begin,
+        static_cast<qsizetype>(contiguous));
+}
+
+void Terminal_session::consume_text_area_resize_tail(std::size_t byte_count)
+{
+    Q_ASSERT(byte_count <= text_area_resize_tail_size());
+    m_text_area_resize_tail.read_cursor += static_cast<std::uint64_t>(byte_count);
+}
+
+void Terminal_session::prepare_text_area_resize_tail(std::size_t hold_limit_bytes)
+{
+    if (m_text_area_resize_tail.capacity_limit == hold_limit_bytes) {
+        return;
+    }
+
+    const std::size_t tail_size = text_area_resize_tail_size();
+    Q_ASSERT(tail_size <= hold_limit_bytes);
+    if (m_text_area_resize_tail.bytes.size() > hold_limit_bytes) {
+        std::vector<char> resized(tail_size);
+        const std::size_t old_capacity = m_text_area_resize_tail.bytes.size();
+        for (std::size_t offset = 0U; offset < tail_size; ++offset) {
+            const std::size_t old_index = static_cast<std::size_t>(
+                (m_text_area_resize_tail.read_cursor + offset) % old_capacity);
+            const std::size_t new_index = static_cast<std::size_t>(
+                (m_text_area_resize_tail.read_cursor + offset) % tail_size);
+            resized[new_index] = m_text_area_resize_tail.bytes[old_index];
+        }
+        m_text_area_resize_arbitration_work_counters.storage_copy_bytes +=
+            static_cast<std::uint64_t>(tail_size);
+        m_text_area_resize_tail.bytes.swap(resized);
+    }
+    m_text_area_resize_tail.capacity_limit = hold_limit_bytes;
+}
+
+void Terminal_session::append_text_area_resize_tail(QByteArrayView bytes)
+{
+    Q_ASSERT(bytes.size() >= 0);
+    const std::size_t append_size = static_cast<std::size_t>(bytes.size());
+    const std::size_t tail_size   = text_area_resize_tail_size();
+    Q_ASSERT(append_size <= m_text_area_resize_tail.capacity_limit - tail_size);
+    if (append_size == 0U) {
+        return;
+    }
+
+    const std::size_t required = tail_size + append_size;
+    const std::size_t old_capacity = m_text_area_resize_tail.bytes.size();
+    if (required > old_capacity) {
+        std::size_t new_capacity = old_capacity == 0U ? 1U : old_capacity;
+        while (new_capacity < required) {
+            if (new_capacity > m_text_area_resize_tail.capacity_limit / 2U) {
+                new_capacity = m_text_area_resize_tail.capacity_limit;
+                break;
+            }
+            new_capacity *= 2U;
+        }
+        new_capacity = std::max(new_capacity, required);
+        Q_ASSERT(new_capacity <= m_text_area_resize_tail.capacity_limit);
+
+        std::vector<char> grown(new_capacity);
+        for (std::size_t offset = 0U; offset < tail_size; ++offset) {
+            const std::size_t old_index = static_cast<std::size_t>(
+                (m_text_area_resize_tail.read_cursor + offset) % old_capacity);
+            const std::size_t new_index = static_cast<std::size_t>(
+                (m_text_area_resize_tail.read_cursor + offset) % new_capacity);
+            grown[new_index] = m_text_area_resize_tail.bytes[old_index];
+        }
+        m_text_area_resize_arbitration_work_counters.storage_copy_bytes +=
+            static_cast<std::uint64_t>(tail_size);
+        m_text_area_resize_tail.bytes.swap(grown);
+    }
+
+    const std::size_t capacity = m_text_area_resize_tail.bytes.size();
+    const std::size_t begin = static_cast<std::size_t>(
+        m_text_area_resize_tail.write_cursor % capacity);
+    const std::size_t first = std::min(append_size, capacity - begin);
+    std::memcpy(m_text_area_resize_tail.bytes.data() + begin, bytes.data(), first);
+    if (first < append_size) {
+        std::memcpy(
+            m_text_area_resize_tail.bytes.data(),
+            bytes.data() + first,
+            append_size - first);
+    }
+    m_text_area_resize_tail.write_cursor += static_cast<std::uint64_t>(append_size);
+    m_text_area_resize_arbitration_work_counters.held_append_bytes +=
+        static_cast<std::uint64_t>(append_size);
+}
+
+void Terminal_session::clear_text_area_resize_tail_epoch()
+{
+    Q_ASSERT(text_area_resize_tail_size() == 0U);
+    std::vector<char>{}.swap(m_text_area_resize_tail.bytes);
+    m_text_area_resize_tail = {};
+}
+
+void Terminal_session::reset_text_area_resize_scanner()
+{
+    m_text_area_resize_scanner = {};
+    reset_utf8_scan_state(m_text_area_resize_scanner.utf8_state);
+}
+
+void Terminal_session::begin_text_area_resize_candidate(unsigned char introducer)
+{
+    reset_text_area_resize_scanner();
+    m_text_area_resize_scanner.state = introducer == 0x1bU
+        ? Text_area_resize_scan_state::ESCAPE
+        : Text_area_resize_scan_state::PARAMETERS;
+    const bool appended = append_text_area_resize_candidate_byte(introducer);
+    Q_ASSERT(appended);
+}
+
+bool Terminal_session::append_text_area_resize_candidate_byte(unsigned char byte)
+{
+    if (m_text_area_resize_scanner.candidate_size >=
+        k_terminal_text_area_resize_arbitration_request_limit_bytes)
+    {
+        return false;
+    }
+    m_text_area_resize_arena[
+        m_text_area_resize_scanner.candidate_size++] = static_cast<char>(byte);
+    return true;
+}
+
+void Terminal_session::observe_text_area_resize_parameter_byte(unsigned char byte)
+{
+    Text_area_resize_scanner& scanner = m_text_area_resize_scanner;
+    if (!scanner.parameters_valid) {
+        return;
+    }
+
+    if (byte >= '0' && byte <= '9') {
+        if (scanner.parameter_group >= scanner.parameter_values.size()) {
+            scanner.parameters_valid = false;
+            return;
+        }
+        const std::uint64_t digit = static_cast<std::uint64_t>(byte - '0');
+        std::uint64_t& value = scanner.parameter_values[scanner.parameter_group];
+        if (value > (static_cast<std::uint64_t>(std::numeric_limits<int>::max()) - digit) / 10U) {
+            scanner.parameters_valid = false;
+            return;
+        }
+        value = value * 10U + digit;
+        scanner.parameter_has_digit[scanner.parameter_group] = true;
+        return;
+    }
+
+    if (byte == ';' && scanner.parameter_group + 1U < scanner.parameter_values.size()) {
+        ++scanner.parameter_group;
+        return;
+    }
+
+    scanner.parameters_valid = false;
+}
+
+bool Terminal_session::scanned_text_area_resize_request(
+    unsigned char          final_byte,
+    terminal_grid_size_t&  requested_grid_size) const
+{
+    const Text_area_resize_scanner& scanner = m_text_area_resize_scanner;
+    if (final_byte != 't'                     ||
+        scanner.parameter_group != 2U         ||
+        !scanner.parameters_valid             ||
+        !scanner.parameter_has_digit[0]        ||
+        !scanner.parameter_has_digit[1]        ||
+        !scanner.parameter_has_digit[2]        ||
+        scanner.parameter_values[0] != 8U)
+    {
+        return false;
+    }
+
+    requested_grid_size = {
+        static_cast<int>(scanner.parameter_values[1]),
+        static_cast<int>(scanner.parameter_values[2]),
+    };
+    return is_terminal_screen_model_grid_size_supported(requested_grid_size);
+}
+
+void Terminal_session::flush_text_area_resize_candidate(
+    std::uint64_t sequence,
+    bool          decline_request,
+    bool          may_complete_backend_output_callback)
+{
+    if (m_text_area_resize_scanner.candidate_size == 0U) {
+        return;
+    }
+
+    const QByteArrayView candidate(
+        m_text_area_resize_arena.data(),
+        static_cast<qsizetype>(m_text_area_resize_scanner.candidate_size));
+    Terminal_utf8_scan_state utf8_seed;
+    reset_utf8_scan_state(utf8_seed);
+    if (decline_request) {
+        Arbitrated_text_area_resize_replay_scope arbitrated(
+            m_replaying_arbitrated_text_area_resize);
+        Text_area_resize_policy_scope declined(
+            *m_screen_model,
+            m_config.text_area_resize_policy);
+        ingest_backend_output_run(
+            sequence,
+            candidate,
+            utf8_seed,
+            may_complete_backend_output_callback);
+    }
+    else {
+        ingest_backend_output_run(
+            sequence,
+            candidate,
+            utf8_seed,
+            may_complete_backend_output_callback);
+    }
+    m_text_area_resize_scanner.candidate_size = 0U;
+}
+
+bool Terminal_session::scan_backend_output_span(
+    std::uint64_t  sequence,
+    QByteArrayView bytes,
+    bool           allow_arbitration,
+    std::size_t    available_bytes,
+    bool           tail_already_owned,
+    std::size_t&   consumed_bytes)
+{
+    Q_ASSERT(bytes.size() >= 0);
+    Q_ASSERT(available_bytes >= static_cast<std::size_t>(bytes.size()));
+    consumed_bytes = 0U;
+
+    const bool capability_known =
+        m_config.text_area_resize_arbitration.has_value() &&
+        m_config.text_area_resize_arbitration->version ==
+            k_terminal_text_area_resize_arbitration_capability_version;
+
+    qsizetype plain_begin = 0;
+    Terminal_utf8_scan_state plain_seed = m_text_area_resize_scanner.utf8_state;
+    const auto flush_plain = [this, sequence, bytes, &plain_begin, &plain_seed](
+        qsizetype end,
+        bool      may_complete_backend_output_callback = false)
+    {
+        if (end > plain_begin) {
+            ingest_backend_output_run(
+                sequence,
+                bytes.sliced(plain_begin, end - plain_begin),
+                plain_seed,
+                may_complete_backend_output_callback);
+        }
+        plain_begin = end;
+        plain_seed  = m_text_area_resize_scanner.utf8_state;
+    };
+
+    const auto ingest_passthrough_byte = [this, sequence](
+        unsigned char byte,
+        bool          decline_request,
+        bool          may_complete_backend_output_callback)
+    {
+        const char encoded = static_cast<char>(byte);
+        const QByteArrayView one_byte(&encoded, 1);
+        Terminal_utf8_scan_state utf8_seed;
+        reset_utf8_scan_state(utf8_seed);
+        if (decline_request) {
+            Arbitrated_text_area_resize_replay_scope arbitrated(
+                m_replaying_arbitrated_text_area_resize);
+            Text_area_resize_policy_scope declined(
+                *m_screen_model,
+                m_config.text_area_resize_policy);
+            ingest_backend_output_run(
+                sequence,
+                one_byte,
+                utf8_seed,
+                may_complete_backend_output_callback);
+        }
+        else {
+            ingest_backend_output_run(
+                sequence,
+                one_byte,
+                utf8_seed,
+                may_complete_backend_output_callback);
+        }
+    };
+
+    qsizetype offset = 0;
+    qsizetype scanned_through = 0;
+    while (offset < bytes.size()) {
+        if (offset >= scanned_through) {
+            ++m_text_area_resize_arbitration_work_counters.scanned_bytes;
+            scanned_through = offset + 1;
+        }
+        const unsigned char byte = static_cast<unsigned char>(bytes[offset]);
+        Text_area_resize_scanner& scanner = m_text_area_resize_scanner;
+
+        if (scanner.state == Text_area_resize_scan_state::PLAIN) {
+            if (utf8_scan_consumes_byte(byte, scanner.utf8_state)) {
+                ++offset;
+                continue;
+            }
+
+            if (byte == 0x1bU || byte == 0x9bU) {
+                flush_plain(offset);
+                begin_text_area_resize_candidate(byte);
+                ++offset;
+                plain_begin = offset;
+                plain_seed  = scanner.utf8_state;
+                continue;
+            }
+
+            ++offset;
+            continue;
+        }
+
+        if (byte == 0x1bU || byte == 0x9bU) {
+            if (scanner.candidate_size > 0U) {
+                flush_text_area_resize_candidate(sequence, false);
+            }
+            begin_text_area_resize_candidate(byte);
+            ++offset;
+            plain_begin = offset;
+            plain_seed  = m_text_area_resize_scanner.utf8_state;
+            continue;
+        }
+
+        const bool passthrough =
+            scanner.state == Text_area_resize_scan_state::PASSTHROUGH_ESCAPE ||
+            scanner.state == Text_area_resize_scan_state::PASSTHROUGH_PARAMETERS ||
+            scanner.state == Text_area_resize_scan_state::PASSTHROUGH_INTERMEDIATES;
+        if (passthrough) {
+            terminal_grid_size_t requested_grid_size;
+            const bool final_byte = is_csi_final_byte(byte);
+            const bool recognized_request =
+                final_byte &&
+                scanner.state != Text_area_resize_scan_state::PASSTHROUGH_ESCAPE &&
+                scanner.state != Text_area_resize_scan_state::PASSTHROUGH_INTERMEDIATES &&
+                scanned_text_area_resize_request(byte, requested_grid_size);
+            ingest_passthrough_byte(
+                byte,
+                scanner.decline_passthrough_request && recognized_request,
+                !tail_already_owned && offset + 1 == bytes.size());
+
+            if (scanner.state == Text_area_resize_scan_state::PASSTHROUGH_ESCAPE) {
+                if (byte == '[') {
+                    scanner.state = Text_area_resize_scan_state::PASSTHROUGH_PARAMETERS;
+                }
+                else
+                if (is_csi_embedded_control(byte)) {
+                    scanner.embedded_c0 = true;
+                }
+                else {
+                    reset_text_area_resize_scanner();
+                }
+            }
+            else
+            if (is_csi_embedded_control(byte)) {
+                scanner.embedded_c0 = true;
+            }
+            else
+            if (scanner.state == Text_area_resize_scan_state::PASSTHROUGH_PARAMETERS &&
+                is_csi_parameter_byte(byte))
+            {
+                observe_text_area_resize_parameter_byte(byte);
+            }
+            else
+            if (is_csi_intermediate_byte(byte)) {
+                scanner.state = Text_area_resize_scan_state::PASSTHROUGH_INTERMEDIATES;
+            }
+            else {
+                reset_text_area_resize_scanner();
+            }
+
+            ++offset;
+            plain_begin = offset;
+            plain_seed  = m_text_area_resize_scanner.utf8_state;
+            continue;
+        }
+
+        if (!append_text_area_resize_candidate_byte(byte)) {
+            const Text_area_resize_scan_state previous_state = scanner.state;
+            flush_text_area_resize_candidate(sequence, capability_known);
+            scanner.state = previous_state == Text_area_resize_scan_state::ESCAPE
+                ? Text_area_resize_scan_state::PASSTHROUGH_ESCAPE
+                : previous_state == Text_area_resize_scan_state::INTERMEDIATES
+                    ? Text_area_resize_scan_state::PASSTHROUGH_INTERMEDIATES
+                    : Text_area_resize_scan_state::PASSTHROUGH_PARAMETERS;
+            scanner.decline_passthrough_request = capability_known;
+            continue;
+        }
+
+        if (is_csi_embedded_control(byte)) {
+            scanner.embedded_c0 = true;
+            ++offset;
+            continue;
+        }
+
+        if (scanner.state == Text_area_resize_scan_state::ESCAPE) {
+            if (byte == '[') {
+                scanner.state = Text_area_resize_scan_state::PARAMETERS;
+            }
+            else {
+                flush_text_area_resize_candidate(sequence, false);
+                reset_text_area_resize_scanner();
+                plain_begin = offset + 1;
+                plain_seed  = scanner.utf8_state;
+            }
+            ++offset;
+            continue;
+        }
+
+        if (scanner.state == Text_area_resize_scan_state::PARAMETERS &&
+            is_csi_parameter_byte(byte))
+        {
+            observe_text_area_resize_parameter_byte(byte);
+            ++offset;
+            continue;
+        }
+
+        if (is_csi_intermediate_byte(byte)) {
+            scanner.state = Text_area_resize_scan_state::INTERMEDIATES;
+            ++offset;
+            continue;
+        }
+
+        if (is_csi_final_byte(byte)) {
+            terminal_grid_size_t requested_grid_size;
+            const bool recognized_request =
+                scanner.state == Text_area_resize_scan_state::PARAMETERS &&
+                scanned_text_area_resize_request(byte, requested_grid_size);
+            if (recognized_request && capability_known) {
+                const std::size_t bytes_after_sequence =
+                    available_bytes - static_cast<std::size_t>(offset + 1);
+                if (allow_arbitration                     &&
+                    text_area_resize_arbitration_armable() &&
+                    bytes_after_sequence <=
+                        m_config.text_area_resize_arbitration->hold_limit_bytes)
+                {
+                    const QByteArrayView request_bytes(
+                        m_text_area_resize_arena.data(),
+                        static_cast<qsizetype>(scanner.candidate_size));
+                    const QByteArrayView tail_bytes = tail_already_owned
+                        ? QByteArrayView{}
+                        : bytes.sliced(offset + 1);
+                    const std::size_t request_consumed =
+                        static_cast<std::size_t>(offset + 1);
+                    if (tail_already_owned) {
+                        // Advancing the absolute cursor first removes the
+                        // already-rendered prefix and captured request from the
+                        // old ring epoch. Only the post-sequence tail then
+                        // crosses into the newly configured capability epoch.
+                        consume_text_area_resize_tail(request_consumed);
+                    }
+                    arm_text_area_resize_arbitration(
+                        sequence,
+                        request_bytes,
+                        tail_bytes,
+                        requested_grid_size,
+                        tail_already_owned);
+                    reset_text_area_resize_scanner();
+                    consumed_bytes = tail_already_owned
+                        ? request_consumed
+                        : static_cast<std::size_t>(bytes.size());
+                    return true;
+                }
+
+                flush_text_area_resize_candidate(
+                    sequence,
+                    true,
+                    !tail_already_owned && offset + 1 == bytes.size());
+            }
+            else {
+                flush_text_area_resize_candidate(
+                    sequence,
+                    false,
+                    !tail_already_owned && offset + 1 == bytes.size());
+            }
+            reset_text_area_resize_scanner();
+            ++offset;
+            plain_begin = offset;
+            plain_seed  = m_text_area_resize_scanner.utf8_state;
+            continue;
+        }
+
+        flush_text_area_resize_candidate(
+            sequence,
+            false,
+            !tail_already_owned && offset + 1 == bytes.size());
+        reset_text_area_resize_scanner();
+        ++offset;
+        plain_begin = offset;
+        plain_seed  = m_text_area_resize_scanner.utf8_state;
+    }
+
+    if (m_text_area_resize_scanner.state == Text_area_resize_scan_state::PLAIN) {
+        flush_plain(bytes.size(), !tail_already_owned);
+    }
+    else
+    if (m_text_area_resize_scanner.candidate_size > 0U &&
+        m_text_area_resize_scanner.embedded_c0)
+    {
+        const Text_area_resize_scan_state previous_state =
+            m_text_area_resize_scanner.state;
+        flush_text_area_resize_candidate(sequence, false, !tail_already_owned);
+        m_text_area_resize_scanner.state =
+            previous_state == Text_area_resize_scan_state::ESCAPE
+                ? Text_area_resize_scan_state::PASSTHROUGH_ESCAPE
+                : previous_state == Text_area_resize_scan_state::INTERMEDIATES
+                    ? Text_area_resize_scan_state::PASSTHROUGH_INTERMEDIATES
+                    : Text_area_resize_scan_state::PASSTHROUGH_PARAMETERS;
+        m_text_area_resize_scanner.embedded_c0 = false;
+    }
+
+    consumed_bytes = static_cast<std::size_t>(bytes.size());
+    return false;
+}
+
+bool Terminal_session::hold_text_area_resize_arbitration_output(
+    const Terminal_session_command& command)
+{
+    while (m_text_area_resize_arbitration.has_value()) {
+        const std::size_t append_size =
+            static_cast<std::size_t>(command.bytes.size());
+        const std::size_t held = text_area_resize_tail_size();
+        if (append_size <=
+            m_text_area_resize_arbitration->hold_limit_bytes - held)
+        {
+            append_text_area_resize_tail(QByteArrayView(command.bytes));
+            observe_text_area_resize_arbitration_storage();
+            // A hold owns every byte it captured, so this callback is fully
+            // accounted even though the bytes are not on screen yet. Withholding
+            // the epoch would stall frame capture for the whole host round trip
+            // and would suppress the output that arrived before the request.
+            complete_processing_backend_output_side_effects();
+            return true;
+        }
+
+        // Settle before admitting even the first byte of the overflowing
+        // callback. Replayed tail may arm the next request, so keep this
+        // iterative.
+        release_text_area_resize_arbitration(
+            Terminal_text_area_resize_arbitration_outcome::HOLD_LIMIT_REACHED,
+            {},
+            command.sequence);
+    }
+
+    return false;
+}
+
+void Terminal_session::release_text_area_resize_arbitration(
+    Terminal_text_area_resize_arbitration_outcome  outcome,
+    terminal_grid_size_t                           effective_grid_size,
+    std::uint64_t                                  settlement_sequence,
+    bool                                           allow_rearm)
+{
+    Q_ASSERT(m_text_area_resize_arbitration.has_value());
+
+    Text_area_resize_arbitration_hold hold =
+        std::move(*m_text_area_resize_arbitration);
+    // Reset before ingesting anything, so a request inside the released tail can
+    // arm cleanly.
+    m_text_area_resize_arbitration.reset();
+
+    const bool accepted =
+        outcome == Terminal_text_area_resize_arbitration_outcome::ACCEPTED;
+    const bool presented =
+        hold.delivery_state == Text_area_resize_arbitration_delivery_state::PRESENTED;
+
+    if (presented) {
+        Terminal_text_area_resize_arbitration_event event;
+        event.kind       = Terminal_text_area_resize_arbitration_event_kind::SETTLED;
+        event.sequence   = settlement_sequence;
+        event.settlement = terminal_text_area_resize_arbitration_settlement_t{
+            hold.request_id,
+            outcome,
+            accepted ? effective_grid_size : m_grid_size,
+        };
+        record_text_area_resize_arbitration_event(std::move(event));
+    }
+    else {
+        withdraw_unpresented_text_area_resize_arbitration_request(hold.request_id);
+    }
+
+    {
+        // Scoped to the sequence this transaction captured, and deliberately not
+        // to the tail: a CSI 8 t the released tail carries is a request the host
+        // has not been asked about yet.
+        Arbitrated_text_area_resize_replay_scope arbitrated(
+            m_replaying_arbitrated_text_area_resize);
+        const QByteArrayView captured_sequence(
+            m_text_area_resize_arena.data(),
+            static_cast<qsizetype>(hold.request_size));
+        if (accepted) {
+            if (grid_sizes_match(effective_grid_size, hold.requested_grid_size)) {
+                ingest_backend_output_segment(
+                    settlement_sequence,
+                    captured_sequence,
+                    false);
+            }
+            else {
+                const QByteArray sequence_bytes = text_area_resize_sequence_on_grid(
+                    captured_sequence,
+                    effective_grid_size);
+                ingest_backend_output_segment(
+                    settlement_sequence,
+                    QByteArrayView(sequence_bytes),
+                    false);
+            }
+        }
+        else {
+            Text_area_resize_policy_scope declined(
+                *m_screen_model,
+                m_config.text_area_resize_policy);
+            ingest_backend_output_segment(
+                settlement_sequence,
+                captured_sequence,
+                false);
         }
     }
 
-    Terminal_utf8_scan_state remaining_utf8_scan_state = backend_output_prescan_utf8_state;
+    replay_text_area_resize_tail(settlement_sequence, allow_rearm);
+    if (!allow_rearm &&
+        !m_text_area_resize_arbitration.has_value() &&
+        m_text_area_resize_scanner.candidate_size > 0U)
+    {
+        flush_text_area_resize_candidate(settlement_sequence, false, false);
+        reset_text_area_resize_scanner();
+    }
+}
+
+Terminal_session_result Terminal_session::process_text_area_resize_arbitration_command(
+    const Terminal_session_command& command)
+{
+    if (!command.text_area_resize_arbitration.has_value()) {
+        return make_rejected_result(
+            command.sequence,
+            Terminal_session_result_code::INVALID_ARGUMENT,
+            make_backend_error(
+                Terminal_backend_error_code::CALLBACK_MISSING,
+                QStringLiteral("text-area resize arbitration command requires a settlement")));
+    }
+
+    const terminal_text_area_resize_arbitration_settlement_t& settlement =
+        *command.text_area_resize_arbitration;
+    // A cancellation queued ahead of this settlement (a backend exit, a host
+    // resize) legitimately ends the request first, so the id is checked again
+    // here and not only at the public entry point.
+    if (!m_text_area_resize_arbitration.has_value() ||
+        m_text_area_resize_arbitration->request_id != settlement.request_id)
+    {
+        return make_rejected_result(
+            command.sequence,
+            Terminal_session_result_code::INVALID_STATE,
+            make_backend_error(
+                Terminal_backend_error_code::CALLBACK_MISSING,
+                QStringLiteral("text-area resize arbitration is no longer in flight")));
+    }
+
+    if (settlement.outcome ==
+            Terminal_text_area_resize_arbitration_outcome::ACCEPTED &&
+        !is_terminal_screen_model_grid_size_supported(settlement.effective_grid_size))
+    {
+        // An unusable answer is truthfully a refusal, and settling here rather
+        // than leaving the request in flight keeps a bad host answer from
+        // stalling output until the deadline.
+        release_text_area_resize_arbitration(
+            Terminal_text_area_resize_arbitration_outcome::REJECTED,
+            {},
+            command.sequence);
+        return make_rejected_result(
+            command.sequence,
+            Terminal_session_result_code::INVALID_ARGUMENT,
+            make_backend_error(
+                Terminal_backend_error_code::RESIZE_FAILED,
+                QStringLiteral("text-area resize arbitration effective grid is unsupported")));
+    }
+
+    release_text_area_resize_arbitration(
+        settlement.outcome,
+        settlement.effective_grid_size,
+        command.sequence);
+    return make_accepted_result(command.sequence);
+}
+
+void Terminal_session::ingest_backend_output_bytes(
+    std::uint64_t  sequence,
+    QByteArrayView bytes,
+    bool           allow_arbitration)
+{
+    const bool capability_known =
+        m_config.text_area_resize_arbitration.has_value() &&
+        m_config.text_area_resize_arbitration->version ==
+            k_terminal_text_area_resize_arbitration_capability_version;
+    if (!capability_known &&
+        m_text_area_resize_scanner.state == Text_area_resize_scan_state::PLAIN)
+    {
+        const Terminal_utf8_scan_state utf8_seed =
+            m_text_area_resize_scanner.utf8_state;
+        Terminal_utf8_scan_state scan_utf8_state = utf8_seed;
+        Text_area_resize_scan_state scan_state = Text_area_resize_scan_state::PLAIN;
+        qsizetype candidate_start = -1;
+        bool candidate_embedded_c0 = false;
+        bool parameters_empty       = true;
+        bool private_parameters     = false;
+
+        for (qsizetype offset = 0; offset < bytes.size(); ++offset) {
+            const unsigned char byte = static_cast<unsigned char>(bytes[offset]);
+            if (scan_state == Text_area_resize_scan_state::PLAIN) {
+                if (utf8_scan_consumes_byte(byte, scan_utf8_state)) {
+                    continue;
+                }
+                if (byte == 0x1bU || byte == 0x9bU) {
+                    candidate_start      = offset;
+                    candidate_embedded_c0 = false;
+                    parameters_empty      = true;
+                    private_parameters    = false;
+                    scan_state = byte == 0x1bU
+                        ? Text_area_resize_scan_state::ESCAPE
+                        : Text_area_resize_scan_state::PARAMETERS;
+                    reset_utf8_scan_state(scan_utf8_state);
+                }
+                continue;
+            }
+
+            if (byte == 0x1bU || byte == 0x9bU) {
+                candidate_start       = offset;
+                candidate_embedded_c0 = false;
+                parameters_empty      = true;
+                private_parameters    = false;
+                scan_state = byte == 0x1bU
+                    ? Text_area_resize_scan_state::ESCAPE
+                    : Text_area_resize_scan_state::PARAMETERS;
+                continue;
+            }
+            if (is_csi_embedded_control(byte)) {
+                candidate_embedded_c0 = true;
+                continue;
+            }
+            if (scan_state == Text_area_resize_scan_state::ESCAPE) {
+                if (byte == '[') {
+                    scan_state = Text_area_resize_scan_state::PARAMETERS;
+                }
+                else {
+                    scan_state       = Text_area_resize_scan_state::PLAIN;
+                    candidate_start  = -1;
+                }
+                continue;
+            }
+            if (scan_state == Text_area_resize_scan_state::PARAMETERS &&
+                is_csi_parameter_byte(byte))
+            {
+                if (parameters_empty) {
+                    private_parameters = byte == '?';
+                    parameters_empty   = false;
+                }
+                continue;
+            }
+            if (is_csi_intermediate_byte(byte)) {
+                scan_state = Text_area_resize_scan_state::INTERMEDIATES;
+                continue;
+            }
+
+            scan_state      = Text_area_resize_scan_state::PLAIN;
+            candidate_start = -1;
+        }
+
+        const bool could_complete_synchronized_output =
+            candidate_start >= 0                              &&
+            !candidate_embedded_c0                            &&
+            (scan_state == Text_area_resize_scan_state::ESCAPE ||
+                (scan_state == Text_area_resize_scan_state::PARAMETERS &&
+                    (parameters_empty || private_parameters)));
+        const qsizetype candidate_size = candidate_start >= 0
+            ? bytes.size() - candidate_start
+            : 0;
+        if (could_complete_synchronized_output &&
+            static_cast<std::size_t>(candidate_size) <=
+                k_terminal_text_area_resize_arbitration_request_limit_bytes)
+        {
+            if (candidate_start > 0) {
+                ingest_backend_output_run(
+                    sequence,
+                    bytes.sliced(0, candidate_start),
+                    utf8_seed,
+                    false);
+            }
+            reset_text_area_resize_scanner();
+            std::memcpy(
+                m_text_area_resize_arena.data(),
+                bytes.data() + candidate_start,
+                static_cast<std::size_t>(candidate_size));
+            m_text_area_resize_scanner.candidate_size =
+                static_cast<std::size_t>(candidate_size);
+            m_text_area_resize_scanner.state = scan_state;
+            m_text_area_resize_scanner.parameters_valid = false;
+            record_incomplete_processing_backend_output_side_effects();
+            return;
+        }
+
+        ingest_backend_output_run(sequence, bytes, utf8_seed, true);
+        m_text_area_resize_scanner.utf8_state = scan_utf8_state;
+        if (bytes.empty()) {
+            complete_processing_backend_output_side_effects();
+        }
+        return;
+    }
+
+    std::size_t consumed_bytes = 0U;
+    const bool armed = scan_backend_output_span(
+        sequence,
+        bytes,
+        allow_arbitration,
+        static_cast<std::size_t>(bytes.size()),
+        false,
+        consumed_bytes);
+    Q_ASSERT(consumed_bytes == static_cast<std::size_t>(bytes.size()));
+    if (armed || bytes.empty()) {
+        complete_processing_backend_output_side_effects();
+    }
+    else
+    if (m_text_area_resize_scanner.candidate_size > 0U) {
+        record_incomplete_processing_backend_output_side_effects();
+    }
+}
+
+void Terminal_session::replay_text_area_resize_tail(
+    std::uint64_t sequence,
+    bool          allow_arbitration)
+{
+    while (!m_text_area_resize_arbitration.has_value() &&
+        text_area_resize_tail_size() > 0U)
+    {
+        const std::size_t available_bytes = text_area_resize_tail_size();
+        const QByteArrayView front = text_area_resize_tail_front();
+        std::size_t consumed_bytes = 0U;
+        const bool armed = scan_backend_output_span(
+            sequence,
+            front,
+            allow_arbitration,
+            available_bytes,
+            true,
+            consumed_bytes);
+        if (armed) {
+            // An owned-tail arm advances its absolute read cursor before
+            // changing ring epochs, so applying consumed_bytes again would
+            // replay past the newly latched tail.
+            Q_ASSERT(consumed_bytes > 0U);
+            observe_text_area_resize_arbitration_storage();
+            return;
+        }
+        Q_ASSERT(consumed_bytes > 0U);
+        consume_text_area_resize_tail(consumed_bytes);
+    }
+
+    if (!m_text_area_resize_arbitration.has_value() &&
+        text_area_resize_tail_size() == 0U)
+    {
+        const bool capability_known =
+            m_config.text_area_resize_arbitration.has_value() &&
+            m_config.text_area_resize_arbitration->version ==
+                k_terminal_text_area_resize_arbitration_capability_version;
+        const std::size_t configured_hold_limit = capability_known
+            ? m_config.text_area_resize_arbitration->hold_limit_bytes
+            : 0U;
+        if (m_text_area_resize_tail.capacity_limit != configured_hold_limit) {
+            clear_text_area_resize_tail_epoch();
+        }
+    }
+}
+
+void Terminal_session::ingest_backend_output_run(
+    std::uint64_t              sequence,
+    QByteArrayView             bytes,
+    Terminal_utf8_scan_state   utf8_seed,
+    bool                       may_complete_backend_output_callback)
+{
+    QByteArray               combined_output;
+    QByteArrayView           remaining(bytes);
+    Terminal_utf8_scan_state remaining_utf8_scan_state = utf8_seed;
     while (!remaining.empty()) {
         if (immediate_public_projection_policy_enabled() &&
             m_screen_model->mode_state().synchronized_output)
@@ -4983,7 +6214,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             if (sync_reset.start >= 0) {
                 if (sync_reset.start > 0) {
                     ingest_backend_output_segment(
-                        command.sequence,
+                        sequence,
                         remaining.sliced(0, sync_reset.start));
                     remaining = remaining.sliced(sync_reset.start);
                     reset_utf8_scan_state(remaining_utf8_scan_state);
@@ -4993,7 +6224,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
                 flush_deferred_backend_content_snapshot();
                 const QByteArray prefix = sync_sequence_prefix(remaining, sync_reset, 'l');
                 if (!prefix.isEmpty()) {
-                    ingest_backend_output_segment(command.sequence, QByteArrayView(prefix));
+                    ingest_backend_output_segment(sequence, QByteArrayView(prefix));
                     combined_output =
                         sync_sequence_from_sync_parameter_and_tail(remaining, sync_reset, 'l');
                     remaining = QByteArrayView(combined_output);
@@ -5005,9 +6236,10 @@ Terminal_session_result Terminal_session::process_backend_output_command(
                 combined_output =
                     sync_sequence_post_parameter_suffix_and_tail(remaining, sync_reset, 'l');
                 ingest_backend_output_segment(
-                    command.sequence,
+                    sequence,
                     QByteArrayView(release),
-                    m_backend_output_prescan_pending.isEmpty() && combined_output.isEmpty());
+                    may_complete_backend_output_callback &&
+                        combined_output.isEmpty());
                 remaining = QByteArrayView(combined_output);
                 reset_utf8_scan_state(remaining_utf8_scan_state);
                 continue;
@@ -5019,15 +6251,15 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             remaining_utf8_scan_state);
         if (sync_set.start < 0) {
             ingest_backend_output_segment(
-                command.sequence,
+                sequence,
                 remaining,
-                m_backend_output_prescan_pending.isEmpty());
+                may_complete_backend_output_callback);
             break;
         }
 
         if (sync_set.start > 0) {
             ingest_backend_output_segment(
-                command.sequence,
+                sequence,
                 remaining.sliced(0, sync_set.start));
             remaining = remaining.sliced(sync_set.start);
             reset_utf8_scan_state(remaining_utf8_scan_state);
@@ -5045,7 +6277,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             immediate_public_projection_policy_enabled();
         const QByteArray prefix = sync_sequence_prefix(remaining, sync_set, 'h');
         if (!prefix.isEmpty()) {
-            ingest_backend_output_segment(command.sequence, QByteArrayView(prefix));
+            ingest_backend_output_segment(sequence, QByteArrayView(prefix));
             combined_output =
                 immediate_entry_boundary
                     ? sync_sequence_from_sync_parameter_and_tail(remaining, sync_set, 'h')
@@ -5060,9 +6292,10 @@ Terminal_session_result Terminal_session::process_backend_output_command(
             combined_output =
                 sync_sequence_post_parameter_suffix_and_tail(remaining, sync_set, 'h');
             ingest_backend_output_segment(
-                command.sequence,
+                sequence,
                 QByteArrayView(entry),
-                m_backend_output_prescan_pending.isEmpty() && combined_output.isEmpty());
+                may_complete_backend_output_callback &&
+                    combined_output.isEmpty());
             (void)capture_public_projection_from_latest_content_basis();
             remaining = QByteArrayView(combined_output);
             reset_utf8_scan_state(remaining_utf8_scan_state);
@@ -5071,7 +6304,7 @@ Terminal_session_result Terminal_session::process_backend_output_command(
 
         if (sync_set.end < remaining.size()) {
             ingest_backend_output_segment(
-                command.sequence,
+                sequence,
                 remaining.sliced(0, sync_set.end));
             remaining = remaining.sliced(sync_set.end);
             reset_utf8_scan_state(remaining_utf8_scan_state);
@@ -5079,25 +6312,11 @@ Terminal_session_result Terminal_session::process_backend_output_command(
         }
 
         ingest_backend_output_segment(
-            command.sequence,
+            sequence,
             remaining,
-            m_backend_output_prescan_pending.isEmpty());
+            may_complete_backend_output_callback);
         break;
     }
-
-    if (command.bytes.isEmpty() && m_backend_output_prescan_pending.isEmpty()) {
-        complete_processing_backend_output_side_effects();
-    }
-
-    if (!m_backend_output_prescan_pending.isEmpty()) {
-        record_incomplete_processing_backend_output_side_effects();
-    }
-
-    m_backend_output_prescan_utf8_state = utf8_scan_state_after(
-        command.bytes,
-        m_backend_output_prescan_utf8_state);
-
-    return make_accepted_result(command.sequence);
 }
 
 Terminal_session_result Terminal_session::process_backend_exit_command(
@@ -5119,6 +6338,18 @@ Terminal_session_result Terminal_session::process_backend_exit_command(
             make_backend_error(
                 Terminal_backend_error_code::START_FAILED,
                 QStringLiteral("backend exit was already reported")));
+    }
+
+    // Nothing can answer a new request once the process is gone. Release the
+    // one transaction that could already have reached the host, then interpret
+    // its tail with arbitration disabled so exit cannot manufacture historical
+    // request/settlement pairs for requests no host ever saw.
+    if (m_text_area_resize_arbitration.has_value()) {
+        release_text_area_resize_arbitration(
+            Terminal_text_area_resize_arbitration_outcome::PROCESS_EXITED,
+            {},
+            command.sequence,
+            false);
     }
 
     m_exit_status    = *command.exit;
@@ -5411,8 +6642,18 @@ void Terminal_session::record_notification(Terminal_session_notification notific
 void Terminal_session::record_pending_notification(
     Terminal_session_notification notification)
 {
-    const auto same_kind = [&notification](const Terminal_session_notification& pending) {
-        return pending.kind == notification.kind;
+    const auto same_kind = [&notification](const Terminal_session_delivery& pending) {
+        return
+            pending.common_notification.has_value() &&
+            pending.common_notification->kind == notification.kind;
+    };
+
+    const auto replace_notification = [this](
+        Terminal_session_delivery&     delivery,
+        Terminal_session_notification replacement)
+    {
+        delivery.delivery_order     = next_delivery_order();
+        delivery.common_notification = std::move(replacement);
     };
 
     switch (notification.kind) {
@@ -5421,15 +6662,17 @@ void Terminal_session::record_pending_notification(
             return;
         case Terminal_session_notification_kind::BELL_REQUESTED:
             if (auto it = std::find_if(
-                    m_pending_notifications.begin(),
-                    m_pending_notifications.end(),
+                    m_pending_common_deliveries.begin(),
+                    m_pending_common_deliveries.end(),
                     same_kind);
-                it != m_pending_notifications.end())
+                it != m_pending_common_deliveries.end())
             {
-                it->sequence      = notification.sequence;
-                it->message       = std::move(notification.message);
-                it->bell_audible  = it->bell_audible || notification.bell_audible;
-                it->bell_visual   = it->bell_visual  || notification.bell_visual;
+                Terminal_session_notification& pending = *it->common_notification;
+                pending.sequence     = notification.sequence;
+                pending.message      = std::move(notification.message);
+                pending.bell_audible = pending.bell_audible || notification.bell_audible;
+                pending.bell_visual  = pending.bell_visual  || notification.bell_visual;
+                it->delivery_order   = next_delivery_order();
                 return;
             }
             break;
@@ -5439,12 +6682,12 @@ void Terminal_session::record_pending_notification(
         case Terminal_session_notification_kind::ICON_NAME_CHANGED:
         case Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED:
             if (auto it = std::find_if(
-                    m_pending_notifications.begin(),
-                    m_pending_notifications.end(),
+                    m_pending_common_deliveries.begin(),
+                    m_pending_common_deliveries.end(),
                     same_kind);
-                it != m_pending_notifications.end())
+                it != m_pending_common_deliveries.end())
             {
-                *it = std::move(notification);
+                replace_notification(*it, std::move(notification));
                 return;
             }
             break;
@@ -5455,12 +6698,19 @@ void Terminal_session::record_pending_notification(
             break;
     }
 
-    if (m_pending_notifications.size() < k_pending_notification_limit) {
-        m_pending_notifications.push_back(std::move(notification));
+    if (m_pending_common_deliveries.size() < k_pending_notification_limit) {
+        Terminal_session_delivery delivery;
+        delivery.delivery_order      = next_delivery_order();
+        delivery.common_notification = std::move(notification);
+        m_pending_common_deliveries.push_back(std::move(delivery));
         return;
     }
 
-    const auto coalescible = [](const Terminal_session_notification& pending) {
+    const auto coalescible = [](const Terminal_session_delivery& delivery) {
+        if (!delivery.common_notification.has_value()) {
+            return false;
+        }
+        const Terminal_session_notification& pending = *delivery.common_notification;
         return
             pending.kind == Terminal_session_notification_kind::OUTPUT_ACTIVITY             ||
             pending.kind == Terminal_session_notification_kind::OUTPUT_BACKPRESSURE_CHANGED ||
@@ -5470,17 +6720,20 @@ void Terminal_session::record_pending_notification(
             pending.kind == Terminal_session_notification_kind::TEXT_AREA_RESIZE_REQUESTED;
     };
     if (auto it = std::find_if(
-            m_pending_notifications.begin(),
-            m_pending_notifications.end(),
+            m_pending_common_deliveries.begin(),
+            m_pending_common_deliveries.end(),
             coalescible);
-        it != m_pending_notifications.end())
+        it != m_pending_common_deliveries.end())
     {
-        *it = std::move(notification);
+        replace_notification(*it, std::move(notification));
         return;
     }
 
-    m_pending_notifications.erase(m_pending_notifications.begin());
-    m_pending_notifications.push_back(std::move(notification));
+    m_pending_common_deliveries.erase(m_pending_common_deliveries.begin());
+    Terminal_session_delivery delivery;
+    delivery.delivery_order      = next_delivery_order();
+    delivery.common_notification = std::move(notification);
+    m_pending_common_deliveries.push_back(std::move(delivery));
 }
 
 void Terminal_session::record_resize_transaction(Terminal_resize_transaction resize)
@@ -5656,9 +6909,11 @@ void Terminal_session::initialize_screen_model(terminal_grid_size_t grid_size)
     m_screen_model->set_profile_stats_enabled(m_profile_stats.enabled);
     m_viewport_controller = Terminal_viewport_controller{};
     m_viewport_controller.set_visible_rows(grid_size.rows);
-    m_backend_output_prescan_pending.clear();
+    Q_ASSERT(!m_text_area_resize_arbitration.has_value());
+    Q_ASSERT(text_area_resize_tail_size() == 0U);
+    reset_text_area_resize_scanner();
+    clear_text_area_resize_tail_epoch();
     m_incomplete_backend_output_callback_epoch = 0U;
-    reset_utf8_scan_state(m_backend_output_prescan_utf8_state);
     m_latest_render_snapshot.reset();
     m_latest_content_render_snapshot.reset();
     m_latest_content_render_snapshot_content_basis = {};
@@ -8664,6 +9919,15 @@ std::uint64_t Terminal_session::next_sequence()
     return sequence;
 }
 
+std::uint64_t Terminal_session::next_delivery_order()
+{
+    const std::uint64_t order = m_next_delivery_order++;
+    if (m_next_delivery_order == 0U) {
+        m_next_delivery_order = 1U;
+    }
+    return order;
+}
+
 std::uint64_t Terminal_session::next_resize_id()
 {
     const std::uint64_t id = m_next_resize_id++;
@@ -8691,6 +9955,7 @@ Terminal_session::Queue_category Terminal_session::queue_category_for(
         case Terminal_session_command_kind::BACKEND_EXIT:
         case Terminal_session_command_kind::BACKEND_ERROR:
         case Terminal_session_command_kind::RESIZE:
+        case Terminal_session_command_kind::TEXT_AREA_RESIZE_ARBITRATION:
             return Queue_category::NONE;
     }
 

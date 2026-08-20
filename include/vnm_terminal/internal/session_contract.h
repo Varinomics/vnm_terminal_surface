@@ -34,6 +34,7 @@ enum class Terminal_session_command_kind
     USER_MESSAGE,
     TERMINAL_REPLY,
     BACKEND_OUTPUT,
+    TEXT_AREA_RESIZE_ARBITRATION,
 };
 
 enum class Terminal_queue_result_code
@@ -78,6 +79,87 @@ struct Terminal_queue_limits
     std::size_t hard_limit_commands    = 1024U;
 };
 
+// Why an in-flight text-area resize arbitration ended. ACCEPTED and REJECTED
+// are the host's own answer; the rest are settlements the session or the
+// surface had to make because the host's answer became impossible or never
+// arrived.
+enum class Terminal_text_area_resize_arbitration_outcome
+{
+    ACCEPTED,
+    REJECTED,
+    HOLD_LIMIT_REACHED,
+    TEXT_AREA_RESIZE_DISABLED,
+    ARBITRATION_DISABLED,
+    PROCESS_EXITED,
+    TIMED_OUT,
+};
+
+// Sized to absorb one surface output high-water burst so ordinary throughput
+// does not defeat a host that answers inside its deadline, while still bounding
+// what a single unanswered request can retain.
+constexpr std::size_t k_terminal_default_text_area_resize_hold_limit_bytes = 1024U * 1024U;
+constexpr std::uint32_t k_terminal_text_area_resize_arbitration_capability_version = 1U;
+constexpr std::size_t k_terminal_text_area_resize_arbitration_request_limit_bytes = 4096U;
+
+// Presence-tagged optional capability record. A session config without it keeps
+// the sequence-point grid commit and never asks a host anything.
+struct terminal_text_area_resize_arbitration_config_t
+{
+    std::uint32_t version = k_terminal_text_area_resize_arbitration_capability_version;
+    // Bounds bytes after the captured sequence. A sequence whose same-command
+    // tail already exceeds the limit is declined before it becomes host-visible.
+    std::size_t hold_limit_bytes = k_terminal_default_text_area_resize_hold_limit_bytes;
+    std::size_t trace_event_limit = 0U;
+};
+
+struct terminal_text_area_resize_arbitration_request_t
+{
+    std::uint64_t        request_id = 0U;
+    terminal_grid_size_t requested_grid_size;
+};
+
+struct terminal_text_area_resize_arbitration_settlement_t
+{
+    std::uint64_t                                 request_id = 0U;
+    Terminal_text_area_resize_arbitration_outcome outcome    =
+        Terminal_text_area_resize_arbitration_outcome::REJECTED;
+    // Carries the host's answered grid into a settlement command, and the grid
+    // the held output replays against out of a settlement notification: that
+    // answer on ACCEPTED, the grid current at settlement on every other outcome.
+    terminal_grid_size_t                          effective_grid_size;
+};
+
+enum class Terminal_text_area_resize_arbitration_event_kind
+{
+    REQUESTED,
+    SETTLED,
+};
+
+// Capability-owned delivery sidecar. Its version moves independently from the
+// common session notification record, which remains usable when this optional
+// capability is absent or unknown.
+struct Terminal_text_area_resize_arbitration_event
+{
+    std::uint32_t                                    version =
+        k_terminal_text_area_resize_arbitration_capability_version;
+    Terminal_text_area_resize_arbitration_event_kind kind =
+        Terminal_text_area_resize_arbitration_event_kind::REQUESTED;
+    std::uint64_t                                    delivery_order = 0U;
+    std::uint64_t                                    sequence = 0U;
+    std::optional<terminal_text_area_resize_arbitration_request_t> request;
+    std::optional<terminal_text_area_resize_arbitration_settlement_t> settlement;
+};
+
+struct terminal_text_area_resize_arbitration_work_counters_t
+{
+    std::uint64_t scanned_bytes       = 0U;
+    std::uint64_t held_append_bytes   = 0U;
+    std::uint64_t storage_copy_bytes  = 0U;
+    std::uint64_t peak_retained_storage_bytes = 0U;
+    std::uint64_t current_tail_size_bytes      = 0U;
+    std::uint64_t current_tail_capacity_bytes  = 0U;
+};
+
 enum class Terminal_model_resize_result
 {
     APPLIED,
@@ -115,6 +197,8 @@ struct Terminal_session_command
     std::optional<Terminal_resize_transaction> resize;
     std::optional<Terminal_backend_exit>       exit;
     std::optional<Terminal_backend_error>      error;
+    std::optional<terminal_text_area_resize_arbitration_settlement_t>
+                                               text_area_resize_arbitration;
 };
 
 struct Terminal_session_result
@@ -145,6 +229,16 @@ struct Terminal_session_notification
     std::optional<terminal_grid_size_t>            text_area_resize_request;
     bool                                           bell_audible = false;
     bool                                           bell_visual  = false;
+};
+
+// Private delivery wrapper. The common notification schema stays unchanged;
+// ordering belongs to the session queue that arbitrates common and optional
+// capability records together.
+struct Terminal_session_delivery
+{
+    std::uint64_t delivery_order = 0U;
+    std::optional<Terminal_session_notification> common_notification;
+    std::optional<Terminal_text_area_resize_arbitration_event> text_area_resize_arbitration_event;
 };
 
 struct Terminal_bell_policy
@@ -203,6 +297,14 @@ struct Terminal_session_config
         Terminal_synchronized_output_scroll_policy::DEFER_UNTIL_CONTENT_PUBLICATION;
     Terminal_text_area_resize_policy text_area_resize_policy =
         Terminal_text_area_resize_policy::APPLICATION_CONTROLLED;
+    // Absent means the two-phase transaction is not installed: CSI 8 t keeps the
+    // sequence-point commit and the host is never asked. Present means output is
+    // held at the sequence point until the host answers through
+    // Terminal_session::settle_text_area_resize_arbitration. A host embedding
+    // Terminal_session directly owns that answer: the session has no clock and
+    // bounds the wait only by hold_limit_bytes.
+    std::optional<terminal_text_area_resize_arbitration_config_t>
+                                    text_area_resize_arbitration;
     std::shared_ptr<Terminal_transcript_recorder> transcript_recorder;
 };
 

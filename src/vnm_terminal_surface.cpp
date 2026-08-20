@@ -1356,6 +1356,58 @@ term::Terminal_text_area_resize_policy terminal_text_area_resize_policy(
     return term::Terminal_text_area_resize_policy::APPLICATION_CONTROLLED;
 }
 
+VNM_TerminalSurface::Text_area_resize_arbitration_outcome
+surface_text_area_resize_arbitration_outcome(
+    term::Terminal_text_area_resize_arbitration_outcome outcome)
+{
+    using Surface_outcome = VNM_TerminalSurface::Text_area_resize_arbitration_outcome;
+    switch (outcome) {
+        case term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED:
+            return Surface_outcome::ACCEPTED;
+        case term::Terminal_text_area_resize_arbitration_outcome::REJECTED:
+            return Surface_outcome::REJECTED;
+        case term::Terminal_text_area_resize_arbitration_outcome::HOLD_LIMIT_REACHED:
+            return Surface_outcome::HOLD_LIMIT_REACHED;
+        case term::Terminal_text_area_resize_arbitration_outcome::TEXT_AREA_RESIZE_DISABLED:
+            return Surface_outcome::TEXT_AREA_RESIZE_DISABLED;
+        case term::Terminal_text_area_resize_arbitration_outcome::ARBITRATION_DISABLED:
+            return Surface_outcome::ARBITRATION_DISABLED;
+        case term::Terminal_text_area_resize_arbitration_outcome::PROCESS_EXITED:
+            return Surface_outcome::PROCESS_EXITED;
+        case term::Terminal_text_area_resize_arbitration_outcome::TIMED_OUT:
+            return Surface_outcome::TIMED_OUT;
+    }
+
+    return Surface_outcome::REJECTED;
+}
+
+// Marks the notification delivery loop that owns the current batch. Lowering the
+// latch from the destructor matters: the loop returns early whenever the active
+// session changes under it, and a latch left raised would silence every later
+// notification.
+class Session_notification_delivery_scope
+{
+public:
+    explicit Session_notification_delivery_scope(bool& delivering)
+    :
+        m_delivering(delivering)
+    {
+        m_delivering = true;
+    }
+
+    Session_notification_delivery_scope(const Session_notification_delivery_scope&) = delete;
+    Session_notification_delivery_scope& operator=(
+        const Session_notification_delivery_scope&) = delete;
+
+    ~Session_notification_delivery_scope()
+    {
+        m_delivering = false;
+    }
+
+private:
+    bool& m_delivering;
+};
+
 QString surface_synchronized_output_scroll_policy_name(
     VNM_TerminalSurface::Synchronized_output_scroll_policy policy)
 {
@@ -2728,9 +2780,15 @@ struct VNM_TerminalSurface::Private
     std::optional<term::terminal_selection_drag_press_provenance_t>
                                                            selection_drag_press_provenance;
     std::optional<term::Terminal_osc52_write_request>      pending_clipboard_write;
+    // Raised for the length of one notification delivery loop. A host is
+    // allowed to answer a notification from inside the handler it was delivered
+    // to, and every answer re-enters sync_from_session through the session call
+    // it makes, so without this the delivery would nest once per answer.
+    bool                                                   delivering_session_notifications    = false;
     std::function<std::optional<QString>()>                clipboard_text_reader;
     QString                                                warmed_prompt_text_layout_font_key;
     QTimer                                                 synchronized_output_recovery_timer;
+    QTimer                                                 text_area_resize_arbitration_timer;
     QTimer                                                 row_timestamp_tooltip_timer;
     QTimer                                                 msdf_availability_completion_timer;
     std::shared_ptr<Msdf_availability_completion>          msdf_availability_completion;
@@ -2832,6 +2890,14 @@ VNM_TerminalSurface::VNM_TerminalSurface(QQuickItem* parent)
         this,
         [this] {
             handle_synchronized_output_recovery_timeout();
+        });
+    m_private->text_area_resize_arbitration_timer.setSingleShot(true);
+    QObject::connect(
+        &m_private->text_area_resize_arbitration_timer,
+        &QTimer::timeout,
+        this,
+        [this] {
+            handle_text_area_resize_arbitration_timeout();
         });
     m_private->row_timestamp_tooltip_timer.setSingleShot(true);
     m_private->row_timestamp_tooltip_timer.setInterval(k_row_timestamp_tooltip_delay_ms);
@@ -3581,6 +3647,57 @@ void VNM_TerminalSurface::set_text_area_resize_policy(Text_area_resize_policy po
     emit text_area_resize_policy_changed();
 }
 
+bool VNM_TerminalSurface::text_area_resize_arbitration_enabled() const
+{
+    return m_text_area_resize_arbitration_enabled;
+}
+
+void VNM_TerminalSurface::set_text_area_resize_arbitration_enabled(bool enabled)
+{
+    if (m_text_area_resize_arbitration_enabled == enabled) {
+        return;
+    }
+
+    m_text_area_resize_arbitration_enabled = enabled;
+    if (m_private->session != nullptr) {
+        m_private->session->set_text_area_resize_arbitration(
+            enabled
+                ? std::optional<term::terminal_text_area_resize_arbitration_config_t>(
+                    term::terminal_text_area_resize_arbitration_config_t{})
+                : std::nullopt);
+        // Removing the capability settles any request in flight, which drains
+        // pending work and can publish, so republish before the notify.
+        sync_from_session();
+    }
+    emit text_area_resize_arbitration_enabled_changed();
+}
+
+int VNM_TerminalSurface::text_area_resize_arbitration_timeout_ms() const
+{
+    return m_text_area_resize_arbitration_timeout_ms;
+}
+
+void VNM_TerminalSurface::set_text_area_resize_arbitration_timeout_ms(int timeout_ms)
+{
+    const int bounded_timeout_ms = std::max(timeout_ms, 0);
+    if (m_text_area_resize_arbitration_timeout_ms == bounded_timeout_ms) {
+        return;
+    }
+
+    m_text_area_resize_arbitration_timeout_ms = bounded_timeout_ms;
+    // A request already in flight was armed under the previous deadline; the new
+    // one is what the host just asked for, so it takes effect immediately.
+    if (m_private->session != nullptr &&
+        m_private->session->presented_text_area_resize_arbitration().has_value())
+    {
+        m_private->text_area_resize_arbitration_timer.stop();
+        if (bounded_timeout_ms > 0) {
+            m_private->text_area_resize_arbitration_timer.start(bounded_timeout_ms);
+        }
+    }
+    emit text_area_resize_arbitration_timeout_ms_changed();
+}
+
 VNM_TerminalSurface::Mouse_reporting_policy VNM_TerminalSurface::mouse_reporting_policy() const
 {
     return m_mouse_reporting_policy;
@@ -3989,6 +4106,63 @@ bool VNM_TerminalSurface::respond_clipboard_write(
     }
 
     return set_terminal_clipboard_text(QString::fromUtf8(request.decoded_payload));
+}
+
+bool VNM_TerminalSurface::respond_text_area_resize(
+    quint64                                 request_id,
+    Text_area_resize_arbitration_decision   decision,
+    int                                     effective_rows,
+    int                                     effective_columns)
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    if (m_private->session == nullptr)
+    {
+        emit backend_error(
+            Backend_error_code::CALLBACK_MISSING,
+            QStringLiteral("no active text-area resize arbitration"));
+        return false;
+    }
+
+    const term::Terminal_session_result result =
+        m_private->session->settle_text_area_resize_arbitration({
+            request_id,
+            decision == Text_area_resize_arbitration_decision::ACCEPT
+                ? term::Terminal_text_area_resize_arbitration_outcome::ACCEPTED
+                : term::Terminal_text_area_resize_arbitration_outcome::REJECTED,
+            term::terminal_grid_size_t{effective_rows, effective_columns},
+        });
+    // The session drains pending work across that call, which can advance the
+    // model and publish a snapshot, so republish before returning.
+    sync_from_session();
+    if (!is_accepted(result.code)) {
+        report_result_failure(result);
+        return false;
+    }
+
+    return true;
+}
+
+void VNM_TerminalSurface::handle_text_area_resize_arbitration_timeout()
+{
+    Q_ASSERT(thread() == QThread::currentThread());
+
+    if (m_private->session == nullptr)
+    {
+        return;
+    }
+
+    const std::optional<term::terminal_text_area_resize_arbitration_request_t> request =
+        m_private->session->presented_text_area_resize_arbitration();
+    if (!request.has_value()) {
+        return;
+    }
+    (void)m_private->session->settle_text_area_resize_arbitration({
+        request->request_id,
+        term::Terminal_text_area_resize_arbitration_outcome::TIMED_OUT,
+        {},
+    });
+    sync_from_session();
 }
 
 QByteArray VNM_TerminalSurface::explicit_hyperlink_at(qreal x, qreal y) const
@@ -7205,6 +7379,9 @@ bool VNM_TerminalSurface::start_process_with_backend(
         terminal_synchronized_output_scroll_policy(m_synchronized_output_scroll_policy);
     session_config.text_area_resize_policy =
         terminal_text_area_resize_policy(m_text_area_resize_policy);
+    if (m_text_area_resize_arbitration_enabled) {
+        session_config.text_area_resize_arbitration.emplace();
+    }
     session_config.recover_scrollback_from_primary_repaints =
         m_primary_repaint_recovery_enabled;
     session_config.bell_policy =
@@ -7808,15 +7985,39 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         }
     }
 
-    if (deliver_notifications) {
+    if (deliver_notifications && !m_private->delivering_session_notifications) {
         VNM_TERMINAL_PROFILE_SCOPE("VNM_TerminalSurface::sync_from_session::notifications");
 
-        const std::vector<term::Terminal_session_notification> notifications =
-            session->take_pending_notifications();
-        for (const term::Terminal_session_notification& notification : notifications) {
-            replay_session_notification(notification);
-            if (!active_session_still_matches()) {
-                return;
+        // Answering from inside a handler re-enters here, and the answer can
+        // have queued the next notification before it returns: settling one
+        // arbitrated text-area resize releases its held tail, which arms the
+        // request the tail carries. Delivering that newer batch from the nested
+        // call would put it ahead of the notifications this loop still holds and
+        // would cost one stack frame per queued request, which a burst of held
+        // CSI 8 t sequences answered inline turned into a stack overflow after a
+        // few hundred of them. The latch makes the nested delivery a no-op and
+        // this loop drains what it queued, in order and without recursing.
+        Session_notification_delivery_scope delivering(
+            m_private->delivering_session_notifications);
+        for (;;) {
+            const std::vector<term::Terminal_session_delivery> deliveries =
+                session->take_pending_deliveries();
+            if (deliveries.empty()) {
+                break;
+            }
+
+            for (const term::Terminal_session_delivery& delivery : deliveries) {
+                if (delivery.text_area_resize_arbitration_event.has_value()) {
+                    replay_text_area_resize_arbitration_event(
+                        *delivery.text_area_resize_arbitration_event);
+                }
+                else
+                if (delivery.common_notification.has_value()) {
+                    replay_session_notification(*delivery.common_notification);
+                }
+                if (!active_session_still_matches()) {
+                    return;
+                }
             }
         }
     }
@@ -7973,6 +8174,46 @@ void VNM_TerminalSurface::replay_session_notification(
     }
 }
 
+void VNM_TerminalSurface::replay_text_area_resize_arbitration_event(
+    const term::Terminal_text_area_resize_arbitration_event& event)
+{
+    if (event.version !=
+        term::k_terminal_text_area_resize_arbitration_capability_version)
+    {
+        return;
+    }
+
+    switch (event.kind) {
+        case term::Terminal_text_area_resize_arbitration_event_kind::REQUESTED:
+            if (event.request.has_value() &&
+                m_private->session != nullptr &&
+                m_private->session->mark_text_area_resize_arbitration_presented(
+                    event.request->request_id))
+            {
+                if (m_text_area_resize_arbitration_timeout_ms > 0) {
+                    m_private->text_area_resize_arbitration_timer.start(
+                        m_text_area_resize_arbitration_timeout_ms);
+                }
+                emit text_area_resize_arbitration_requested(
+                    event.request->request_id,
+                    event.request->requested_grid_size.rows,
+                    event.request->requested_grid_size.columns);
+            }
+            break;
+        case term::Terminal_text_area_resize_arbitration_event_kind::SETTLED:
+            if (event.settlement.has_value()) {
+                m_private->text_area_resize_arbitration_timer.stop();
+                emit text_area_resize_arbitration_settled(
+                    event.settlement->request_id,
+                    surface_text_area_resize_arbitration_outcome(
+                        event.settlement->outcome),
+                    event.settlement->effective_grid_size.rows,
+                    event.settlement->effective_grid_size.columns);
+            }
+            break;
+    }
+}
+
 void VNM_TerminalSurface::report_backend_error(
     term::Terminal_backend_error   error,
     quint64                        sequence)
@@ -8022,6 +8263,7 @@ void VNM_TerminalSurface::reset_session()
     m_private->clear_hyperlink_activation_state();
     m_private->clear_selection_drag_state();
     m_private->pending_clipboard_write.reset();
+    m_private->text_area_resize_arbitration_timer.stop();
     m_private->clear_wheel_remainders();
     m_private->last_sgr_mouse_reporting_active       = false;
     m_private->last_alternate_scroll_active          = false;
