@@ -15,6 +15,8 @@ layout(std140, binding = 0) uniform msdf_text_block
     float target_width;
     float target_height;
     float lcd_subpixel_order;
+    float framebuffer_y_up;
+    float ndc_y_up;
 };
 
 layout(location = 0) smooth out vec4 fragment_uv_rect;
@@ -27,9 +29,12 @@ vec2 frame_position(vec2 local_position)
 {
     vec4 clip = mvp * vec4(local_position, 0.0, 1.0);
     vec2 ndc = clip.xy / clip.w;
+    float frame_y = ndc_y_up > 0.5
+        ? (0.5 - ndc.y * 0.5) * target_height
+        : (ndc.y * 0.5 + 0.5) * target_height;
     return vec2(
         (ndc.x * 0.5 + 0.5) * target_width,
-        (0.5 - ndc.y * 0.5) * target_height);
+        frame_y);
 }
 
 void main()

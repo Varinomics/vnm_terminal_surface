@@ -147,6 +147,8 @@ struct atlas_msdf_uniform_t
     float target_width  = 1.0f;
     float target_height = 1.0f;
     float lcd_subpixel_order = 0.0f;
+    float framebuffer_y_up   = 0.0f;
+    float ndc_y_up           = 0.0f;
 };
 
 static_assert(offsetof(atlas_msdf_uniform_t, matrix)        == 0);
@@ -154,7 +156,9 @@ static_assert(offsetof(atlas_msdf_uniform_t, px_range)      == 64);
 static_assert(offsetof(atlas_msdf_uniform_t, target_width)  == 68);
 static_assert(offsetof(atlas_msdf_uniform_t, target_height) == 72);
 static_assert(offsetof(atlas_msdf_uniform_t, lcd_subpixel_order) == 76);
-static_assert(sizeof(atlas_msdf_uniform_t)                  == 80);
+static_assert(offsetof(atlas_msdf_uniform_t, framebuffer_y_up) == 80);
+static_assert(offsetof(atlas_msdf_uniform_t, ndc_y_up)      == 84);
+static_assert(sizeof(atlas_msdf_uniform_t)                  == 88);
 
 struct atlas_pass_range_t
 {
@@ -6533,6 +6537,9 @@ private:
             msdf_uniform.lcd_subpixel_order =
                 qsg_atlas_lcd_subpixel_order_shader_value(
                     m_frame.options.msdf_lcd_subpixel_order);
+            msdf_uniform.framebuffer_y_up =
+                rhi->isYUpInFramebuffer() ? 1.0f : 0.0f;
+            msdf_uniform.ndc_y_up = rhi->isYUpInNDC() ? 1.0f : 0.0f;
             updates->updateDynamicBuffer(
                 m_msdf_text_uniform_buffer,
                 0U,
