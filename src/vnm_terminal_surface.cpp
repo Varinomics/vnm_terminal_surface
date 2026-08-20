@@ -2780,7 +2780,6 @@ struct VNM_TerminalSurface::Private
     std::optional<term::terminal_selection_drag_press_provenance_t>
                                                            selection_drag_press_provenance;
     std::optional<term::Terminal_osc52_write_request>      pending_clipboard_write;
-    std::optional<quint64>                                 pending_text_area_resize_arbitration;
     // Raised for the length of one notification delivery loop. A host is
     // allowed to answer a notification from inside the handler it was delivered
     // to, and every answer re-enters sync_from_session through the session call
@@ -3688,7 +3687,9 @@ void VNM_TerminalSurface::set_text_area_resize_arbitration_timeout_ms(int timeou
     m_text_area_resize_arbitration_timeout_ms = bounded_timeout_ms;
     // A request already in flight was armed under the previous deadline; the new
     // one is what the host just asked for, so it takes effect immediately.
-    if (m_private->pending_text_area_resize_arbitration.has_value()) {
+    if (m_private->session != nullptr &&
+        m_private->session->presented_text_area_resize_arbitration().has_value())
+    {
         m_private->text_area_resize_arbitration_timer.stop();
         if (bounded_timeout_ms > 0) {
             m_private->text_area_resize_arbitration_timer.start(bounded_timeout_ms);
@@ -4115,18 +4116,13 @@ bool VNM_TerminalSurface::respond_text_area_resize(
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
-    if (!m_private->pending_text_area_resize_arbitration.has_value() ||
-        *m_private->pending_text_area_resize_arbitration != request_id ||
-        m_private->session == nullptr)
+    if (m_private->session == nullptr)
     {
         emit backend_error(
             Backend_error_code::CALLBACK_MISSING,
             QStringLiteral("no active text-area resize arbitration"));
         return false;
     }
-
-    m_private->text_area_resize_arbitration_timer.stop();
-    m_private->pending_text_area_resize_arbitration.reset();
 
     const term::Terminal_session_result result =
         m_private->session->settle_text_area_resize_arbitration({
@@ -4151,16 +4147,18 @@ void VNM_TerminalSurface::handle_text_area_resize_arbitration_timeout()
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
-    if (!m_private->pending_text_area_resize_arbitration.has_value() ||
-        m_private->session == nullptr)
+    if (m_private->session == nullptr)
     {
         return;
     }
 
-    const quint64 request_id = *m_private->pending_text_area_resize_arbitration;
-    m_private->pending_text_area_resize_arbitration.reset();
+    const std::optional<term::terminal_text_area_resize_arbitration_request_t> request =
+        m_private->session->presented_text_area_resize_arbitration();
+    if (!request.has_value()) {
+        return;
+    }
     (void)m_private->session->settle_text_area_resize_arbitration({
-        request_id,
+        request->request_id,
         term::Terminal_text_area_resize_arbitration_outcome::TIMED_OUT,
         {},
     });
@@ -8002,14 +8000,21 @@ void VNM_TerminalSurface::sync_from_session(bool deliver_notifications)
         Session_notification_delivery_scope delivering(
             m_private->delivering_session_notifications);
         for (;;) {
-            const std::vector<term::Terminal_session_notification> notifications =
-                session->take_pending_notifications();
-            if (notifications.empty()) {
+            const std::vector<term::Terminal_session_delivery> deliveries =
+                session->take_pending_deliveries();
+            if (deliveries.empty()) {
                 break;
             }
 
-            for (const term::Terminal_session_notification& notification : notifications) {
-                replay_session_notification(notification);
+            for (const term::Terminal_session_delivery& delivery : deliveries) {
+                if (delivery.text_area_resize_arbitration_event.has_value()) {
+                    replay_text_area_resize_arbitration_event(
+                        *delivery.text_area_resize_arbitration_event);
+                }
+                else
+                if (delivery.common_notification.has_value()) {
+                    replay_session_notification(*delivery.common_notification);
+                }
                 if (!active_session_still_matches()) {
                     return;
                 }
@@ -8152,36 +8157,6 @@ void VNM_TerminalSurface::replay_session_notification(
                     notification.text_area_resize_request->columns);
             }
             break;
-        case term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_ARBITRATION_REQUESTED:
-            if (notification.text_area_resize_arbitration_request.has_value()) {
-                const term::terminal_text_area_resize_arbitration_request_t& request =
-                    *notification.text_area_resize_arbitration_request;
-                // The session id passes through unchanged: there is exactly one
-                // request in flight and it has to travel back to the session.
-                m_private->pending_text_area_resize_arbitration = request.request_id;
-                if (m_text_area_resize_arbitration_timeout_ms > 0) {
-                    m_private->text_area_resize_arbitration_timer.start(
-                        m_text_area_resize_arbitration_timeout_ms);
-                }
-                emit text_area_resize_arbitration_requested(
-                    request.request_id,
-                    request.requested_grid_size.rows,
-                    request.requested_grid_size.columns);
-            }
-            break;
-        case term::Terminal_session_notification_kind::TEXT_AREA_RESIZE_ARBITRATION_SETTLED:
-            if (notification.text_area_resize_arbitration_settlement.has_value()) {
-                const term::terminal_text_area_resize_arbitration_settlement_t& settlement =
-                    *notification.text_area_resize_arbitration_settlement;
-                m_private->text_area_resize_arbitration_timer.stop();
-                m_private->pending_text_area_resize_arbitration.reset();
-                emit text_area_resize_arbitration_settled(
-                    settlement.request_id,
-                    surface_text_area_resize_arbitration_outcome(settlement.outcome),
-                    settlement.effective_grid_size.rows,
-                    settlement.effective_grid_size.columns);
-            }
-            break;
         case term::Terminal_session_notification_kind::HOST_REQUEST:
             if (notification.clipboard_write_request.has_value()) {
                 m_private->pending_clipboard_write = *notification.clipboard_write_request;
@@ -8194,6 +8169,46 @@ void VNM_TerminalSurface::replay_session_notification(
                     m_private->pending_clipboard_write->request_id,
                     m_private->pending_clipboard_write->target_selection,
                     m_private->pending_clipboard_write->decoded_payload);
+            }
+            break;
+    }
+}
+
+void VNM_TerminalSurface::replay_text_area_resize_arbitration_event(
+    const term::Terminal_text_area_resize_arbitration_event& event)
+{
+    if (event.version !=
+        term::k_terminal_text_area_resize_arbitration_capability_version)
+    {
+        return;
+    }
+
+    switch (event.kind) {
+        case term::Terminal_text_area_resize_arbitration_event_kind::REQUESTED:
+            if (event.request.has_value() &&
+                m_private->session != nullptr &&
+                m_private->session->mark_text_area_resize_arbitration_presented(
+                    event.request->request_id))
+            {
+                if (m_text_area_resize_arbitration_timeout_ms > 0) {
+                    m_private->text_area_resize_arbitration_timer.start(
+                        m_text_area_resize_arbitration_timeout_ms);
+                }
+                emit text_area_resize_arbitration_requested(
+                    event.request->request_id,
+                    event.request->requested_grid_size.rows,
+                    event.request->requested_grid_size.columns);
+            }
+            break;
+        case term::Terminal_text_area_resize_arbitration_event_kind::SETTLED:
+            if (event.settlement.has_value()) {
+                m_private->text_area_resize_arbitration_timer.stop();
+                emit text_area_resize_arbitration_settled(
+                    event.settlement->request_id,
+                    surface_text_area_resize_arbitration_outcome(
+                        event.settlement->outcome),
+                    event.settlement->effective_grid_size.rows,
+                    event.settlement->effective_grid_size.columns);
             }
             break;
     }
@@ -8248,7 +8263,6 @@ void VNM_TerminalSurface::reset_session()
     m_private->clear_hyperlink_activation_state();
     m_private->clear_selection_drag_state();
     m_private->pending_clipboard_write.reset();
-    m_private->pending_text_area_resize_arbitration.reset();
     m_private->text_area_resize_arbitration_timer.stop();
     m_private->clear_wheel_remainders();
     m_private->last_sgr_mouse_reporting_active       = false;

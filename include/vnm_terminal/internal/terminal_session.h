@@ -11,6 +11,7 @@
 #include <QByteArray>
 #include <QSizeF>
 #include <QString>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <deque>
@@ -265,6 +266,9 @@ public:
      * queue so trace truncation does not drive public signal delivery.
      */
     std::vector<Terminal_session_notification> take_pending_notifications();
+    std::vector<Terminal_session_delivery> take_pending_deliveries();
+    std::vector<Terminal_text_area_resize_arbitration_event>
+        text_area_resize_arbitration_events() const;
     std::vector<Terminal_resize_transaction> resize_transactions() const;
     std::vector<QByteArray> output_chunks() const;
     std::optional<Terminal_render_snapshot> latest_render_snapshot() const;
@@ -296,6 +300,11 @@ public:
 
     std::optional<terminal_text_area_resize_arbitration_request_t>
         pending_text_area_resize_arbitration() const;
+    std::optional<terminal_text_area_resize_arbitration_request_t>
+        presented_text_area_resize_arbitration() const;
+    bool mark_text_area_resize_arbitration_presented(std::uint64_t request_id);
+    terminal_text_area_resize_arbitration_work_counters_t
+        text_area_resize_arbitration_work_counters() const;
 
     // Ends the in-flight arbitration. The settlement is queued, not applied
     // inline, so a host answering from inside a notification handler cannot
@@ -538,20 +547,55 @@ private:
     void initialize_screen_model(
         terminal_grid_size_t       grid_size);
 
-    // Output withheld from the screen model while a text-area resize request is
-    // in flight with the host. sequence_bytes is the request itself, replayed
-    // once the answer decides what it means; bytes is everything that arrived
-    // after it, in stream order.
+    enum class Text_area_resize_arbitration_delivery_state
+    {
+        QUEUED,
+        CLAIMABLE,
+        PRESENTED,
+    };
+
     struct Text_area_resize_arbitration_hold
     {
-        QByteArray           sequence_bytes;
-        QByteArray           bytes;
+        std::size_t          request_size = 0U;
         terminal_grid_size_t requested_grid_size;
-        // Latched at arm time so the hold stays bounded even after the capability
-        // record is removed from the config.
         std::size_t          hold_limit_bytes = 0U;
         std::uint64_t        request_id       = 0U;
-        std::uint64_t        sequence         = 0U;
+        std::uint64_t        request_sequence = 0U;
+        std::uint64_t        request_delivery_order = 0U;
+        Text_area_resize_arbitration_delivery_state delivery_state =
+            Text_area_resize_arbitration_delivery_state::QUEUED;
+    };
+
+    enum class Text_area_resize_scan_state
+    {
+        PLAIN,
+        ESCAPE,
+        PARAMETERS,
+        INTERMEDIATES,
+        PASSTHROUGH_ESCAPE,
+        PASSTHROUGH_PARAMETERS,
+        PASSTHROUGH_INTERMEDIATES,
+    };
+
+    struct Text_area_resize_scanner
+    {
+        std::size_t                candidate_size = 0U;
+        Text_area_resize_scan_state state = Text_area_resize_scan_state::PLAIN;
+        Terminal_utf8_scan_state   utf8_state;
+        std::array<std::uint64_t, 3U> parameter_values{};
+        std::array<bool, 3U>       parameter_has_digit{};
+        std::size_t                parameter_group = 0U;
+        bool                       parameters_valid = true;
+        bool                       embedded_c0 = false;
+        bool                       decline_passthrough_request = false;
+    };
+
+    struct Text_area_resize_tail_fifo
+    {
+        std::vector<char> bytes;
+        std::uint64_t     read_cursor    = 0U;
+        std::uint64_t     write_cursor   = 0U;
+        std::size_t       capacity_limit = 0U;
     };
 
     bool          text_area_resize_arbitration_armable() const;
@@ -561,23 +605,62 @@ private:
         std::uint64_t              sequence,
         QByteArrayView             sequence_bytes,
         QByteArrayView             tail_bytes,
-        terminal_grid_size_t       requested_grid_size);
+        terminal_grid_size_t       requested_grid_size,
+        bool                       tail_already_owned);
+
+    void withdraw_unpresented_text_area_resize_arbitration_request(
+        std::uint64_t              request_id);
+    std::uint64_t record_text_area_resize_arbitration_event(
+        Terminal_text_area_resize_arbitration_event event);
+    void observe_text_area_resize_arbitration_storage();
+
+    void reset_text_area_resize_scanner();
+    void begin_text_area_resize_candidate(unsigned char introducer);
+    bool append_text_area_resize_candidate_byte(unsigned char byte);
+    void observe_text_area_resize_parameter_byte(unsigned char byte);
+    bool scanned_text_area_resize_request(
+        unsigned char             final_byte,
+        terminal_grid_size_t&     requested_grid_size) const;
+    void flush_text_area_resize_candidate(
+        std::uint64_t              sequence,
+        bool                       decline_request,
+        bool                       may_complete_backend_output_callback = false);
+    bool scan_backend_output_span(
+        std::uint64_t              sequence,
+        QByteArrayView             bytes,
+        bool                       allow_arbitration,
+        std::size_t                available_bytes,
+        bool                       tail_already_owned,
+        std::size_t&               consumed_bytes);
+
+    std::size_t text_area_resize_tail_size() const;
+    QByteArrayView text_area_resize_tail_front() const;
+    void consume_text_area_resize_tail(std::size_t byte_count);
+    void prepare_text_area_resize_tail(std::size_t hold_limit_bytes);
+    void append_text_area_resize_tail(QByteArrayView bytes);
+    void clear_text_area_resize_tail_epoch();
+    void replay_text_area_resize_tail(
+        std::uint64_t              sequence,
+        bool                       allow_arbitration);
 
     bool hold_text_area_resize_arbitration_output(
         const Terminal_session_command&                command);
 
     void release_text_area_resize_arbitration(
         Terminal_text_area_resize_arbitration_outcome  outcome,
-        terminal_grid_size_t                           effective_grid_size);
+        terminal_grid_size_t                           effective_grid_size,
+        std::uint64_t                                  settlement_sequence,
+        bool                                           allow_rearm = true);
 
     Terminal_session_result process_text_area_resize_arbitration_command(
         const Terminal_session_command&                command);
 
     void ingest_backend_output_bytes(
         std::uint64_t              sequence,
-        QByteArrayView             arriving_bytes);
+        QByteArrayView             bytes,
+        bool                       allow_arbitration = true);
 
-    // Walks one contiguous run of already-prescanned bytes, splitting it at the
+    // Walks one scanner-approved run, splitting it at the
     // synchronized-output boundaries it contains. The caller states whether this
     // run may complete the in-flight backend output callback; a run that is only
     // a prefix of the command's bytes may not.
@@ -827,6 +910,7 @@ private:
 
     std::uint64_t next_sequence();
     std::uint64_t next_resize_id();
+    std::uint64_t next_delivery_order();
     Queue_category queue_category_for(Terminal_session_command_kind kind) const;
     Bounded_terminal_command_queue& queue_for(Queue_category category);
     const Bounded_terminal_command_queue& queue_for(Queue_category category) const;
@@ -873,13 +957,23 @@ private:
     Bounded_terminal_command_queue                         m_write_queue;
     std::vector<Terminal_session_command>                  m_processed_commands;
     std::vector<Terminal_session_notification>             m_notifications;
-    std::vector<Terminal_session_notification>             m_pending_notifications;
+    std::vector<Terminal_session_delivery>                 m_pending_common_deliveries;
+    std::vector<Terminal_text_area_resize_arbitration_event>
+                                                            m_text_area_resize_arbitration_events;
+    std::vector<Terminal_text_area_resize_arbitration_event>
+                                                            m_pending_text_area_resize_arbitration_events;
     std::vector<Terminal_session_result>                   m_results;
     std::vector<Terminal_resize_transaction>               m_resize_transactions;
     std::vector<QByteArray>                                m_output_chunks;
-    QByteArray                                             m_backend_output_prescan_pending;
-    Terminal_utf8_scan_state                               m_backend_output_prescan_utf8_state;
+    std::array<
+        char,
+        k_terminal_text_area_resize_arbitration_request_limit_bytes>
+                                                            m_text_area_resize_arena{};
+    Text_area_resize_scanner                               m_text_area_resize_scanner;
+    Text_area_resize_tail_fifo                             m_text_area_resize_tail;
     std::optional<Text_area_resize_arbitration_hold>       m_text_area_resize_arbitration;
+    terminal_text_area_resize_arbitration_work_counters_t  m_text_area_resize_arbitration_work_counters;
+    std::size_t                                            m_text_area_resize_arbitration_trace_event_limit = 0U;
     // Latched only while a settled arbitration replays its own CSI 8 t, which is
     // the one request whose standing text-area resize notification has to stay
     // silent because the host has already moved its window for it.
@@ -906,6 +1000,7 @@ private:
     terminal_grid_size_t                                   m_grid_size;
     std::uint64_t                                          m_next_sequence = 1U;
     std::uint64_t                                          m_next_resize_id = 1U;
+    std::uint64_t                                          m_next_delivery_order = 1U;
     std::uint64_t                                          m_next_text_area_resize_request_id = 1U;
     std::uint64_t                                          m_last_processed_sequence = 0U;
     std::uint64_t                                          m_last_processed_backend_callback_epoch = 0U;

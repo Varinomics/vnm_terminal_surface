@@ -34,6 +34,7 @@ struct Terminal_backend_error;
 struct Terminal_launch_config;
 struct Terminal_viewport_state;
 struct Terminal_session_notification;
+struct Terminal_text_area_resize_arbitration_event;
 struct Terminal_session_result;
 class VNM_TerminalSurface_render_bridge;
 }
@@ -478,6 +479,15 @@ public:
      * sequence is held until the host answers, bounded by the session's hold
      * limit and by `textAreaResizeArbitrationTimeoutMs`.
      *
+     * If the request itself exceeds the bounded control-sequence allowance, or
+     * its own callback already has more trailing bytes than the hold limit, the
+     * request is declined without being presented and processing continues
+     * normally.
+     *
+     * At most one request is actionable at a time. If the process exits before
+     * a queued request reaches the host, neither that stale request nor a
+     * matching historical settlement is emitted.
+     *
      * A captured request emits no `text_area_resize_requested()`, because an
      * arbitrating host has already moved its window by the time the request
      * settles. One shape is not captured: a `CSI 8 t` carrying an embedded C0
@@ -686,10 +696,12 @@ signals:
     void synchronized_output_scroll_policy_changed();
     void text_area_resize_policy_changed();
     void text_area_resize_arbitration_requested(quint64 request_id, int rows, int columns);
-    // Reports every ending of an in-flight arbitration, the host's own answer
-    // and the settlements the terminal makes alike. rows and columns carry the
-    // grid the held output replays against: the grid the answer committed on
-    // ACCEPTED, and the grid current at settlement on every other outcome.
+    // Reports every ending of an arbitration that was presented to the host,
+    // the host's own answer and the settlements the terminal makes alike. A
+    // request withdrawn before presentation emits neither signal. rows and
+    // columns carry the grid the held output replays against: the grid the
+    // answer committed on ACCEPTED, and the grid current at settlement on every
+    // other outcome.
     void text_area_resize_arbitration_settled(
         quint64                                 request_id,
         Text_area_resize_arbitration_outcome    outcome,
@@ -868,6 +880,9 @@ private:
     void replay_session_notification(
         const vnm_terminal::internal::Terminal_session_notification&
                                notification);
+    void replay_text_area_resize_arbitration_event(
+        const vnm_terminal::internal::Terminal_text_area_resize_arbitration_event&
+                               event);
 
     void report_backend_error(
         vnm_terminal::internal::Terminal_backend_error

@@ -57,8 +57,6 @@ enum class Terminal_session_notification_kind
     RESIZE_TRANSACTION,
     TEXT_AREA_RESIZE_REQUESTED,
     HOST_REQUEST,
-    TEXT_AREA_RESIZE_ARBITRATION_REQUESTED,
-    TEXT_AREA_RESIZE_ARBITRATION_SETTLED,
 };
 
 enum class Terminal_session_result_code
@@ -100,15 +98,18 @@ enum class Terminal_text_area_resize_arbitration_outcome
 // does not defeat a host that answers inside its deadline, while still bounding
 // what a single unanswered request can retain.
 constexpr std::size_t k_terminal_default_text_area_resize_hold_limit_bytes = 1024U * 1024U;
+constexpr std::uint32_t k_terminal_text_area_resize_arbitration_capability_version = 1U;
+constexpr std::size_t k_terminal_text_area_resize_arbitration_request_limit_bytes = 4096U;
 
 // Presence-tagged optional capability record. A session config without it keeps
 // the sequence-point grid commit and never asks a host anything.
 struct terminal_text_area_resize_arbitration_config_t
 {
-    // Checked when the next output command arrives, so a hold can exceed this by
-    // the bytes of the command that armed it before the next one settles the
-    // request. That overshoot is bounded by the output queue's own hard limit.
+    std::uint32_t version = k_terminal_text_area_resize_arbitration_capability_version;
+    // Bounds bytes after the captured sequence. A sequence whose same-command
+    // tail already exceeds the limit is declined before it becomes host-visible.
     std::size_t hold_limit_bytes = k_terminal_default_text_area_resize_hold_limit_bytes;
+    std::size_t trace_event_limit = 0U;
 };
 
 struct terminal_text_area_resize_arbitration_request_t
@@ -126,6 +127,37 @@ struct terminal_text_area_resize_arbitration_settlement_t
     // the held output replays against out of a settlement notification: that
     // answer on ACCEPTED, the grid current at settlement on every other outcome.
     terminal_grid_size_t                          effective_grid_size;
+};
+
+enum class Terminal_text_area_resize_arbitration_event_kind
+{
+    REQUESTED,
+    SETTLED,
+};
+
+// Capability-owned delivery sidecar. Its version moves independently from the
+// common session notification record, which remains usable when this optional
+// capability is absent or unknown.
+struct Terminal_text_area_resize_arbitration_event
+{
+    std::uint32_t                                    version =
+        k_terminal_text_area_resize_arbitration_capability_version;
+    Terminal_text_area_resize_arbitration_event_kind kind =
+        Terminal_text_area_resize_arbitration_event_kind::REQUESTED;
+    std::uint64_t                                    delivery_order = 0U;
+    std::uint64_t                                    sequence = 0U;
+    std::optional<terminal_text_area_resize_arbitration_request_t> request;
+    std::optional<terminal_text_area_resize_arbitration_settlement_t> settlement;
+};
+
+struct terminal_text_area_resize_arbitration_work_counters_t
+{
+    std::uint64_t scanned_bytes       = 0U;
+    std::uint64_t held_append_bytes   = 0U;
+    std::uint64_t storage_copy_bytes  = 0U;
+    std::uint64_t peak_retained_storage_bytes = 0U;
+    std::uint64_t current_tail_size_bytes      = 0U;
+    std::uint64_t current_tail_capacity_bytes  = 0U;
 };
 
 enum class Terminal_model_resize_result
@@ -197,10 +229,16 @@ struct Terminal_session_notification
     std::optional<terminal_grid_size_t>            text_area_resize_request;
     bool                                           bell_audible = false;
     bool                                           bell_visual  = false;
-    std::optional<terminal_text_area_resize_arbitration_request_t>
-                                                   text_area_resize_arbitration_request;
-    std::optional<terminal_text_area_resize_arbitration_settlement_t>
-                                                   text_area_resize_arbitration_settlement;
+};
+
+// Private delivery wrapper. The common notification schema stays unchanged;
+// ordering belongs to the session queue that arbitrates common and optional
+// capability records together.
+struct Terminal_session_delivery
+{
+    std::uint64_t delivery_order = 0U;
+    std::optional<Terminal_session_notification> common_notification;
+    std::optional<Terminal_text_area_resize_arbitration_event> text_area_resize_arbitration_event;
 };
 
 struct Terminal_bell_policy

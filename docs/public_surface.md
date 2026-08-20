@@ -478,12 +478,24 @@ can be truthful, while the held output stays held until the answer arrives. A
 window resize is never itself an answer: only `respond_text_area_resize`, the
 timeout, or the session ends the request.
 
+At most one request is actionable to the host at a time. Delivery is part of
+the optional arbitration capability rather than the common session-notification
+stream. If the process exits after the session captured a request but before
+the surface presents it, the surface emits neither the now-stale request nor a
+matching historical settlement. Held output still replays once, followed by
+the process-exit notification.
+
 Output that arrives after the sequence is held until the host answers. The hold
 is bounded twice: by `textAreaResizeArbitrationTimeoutMs`, and by the session's
 own byte limit for a host that answers eventually while the process floods.
+If the request itself exceeds the bounded control-sequence allowance, or if the
+remainder of its callback already exceeds the byte limit, the session declines
+the request at its sequence point without presenting it to the host and
+continues processing normally.
 `text_area_resize_arbitration_settled(request_id, outcome, rows, columns)`
-reports every ending, whether it was the host's `ACCEPTED` or `REJECTED` answer
-or a settlement the terminal had to make: `HOLD_LIMIT_REACHED`,
+reports every ending of a request that reached the host, whether it was the
+host's `ACCEPTED` or `REJECTED` answer or a settlement the terminal had to make:
+`HOLD_LIMIT_REACHED`,
 `TEXT_AREA_RESIZE_DISABLED`, `ARBITRATION_DISABLED`, `PROCESS_EXITED`, or
 `TIMED_OUT`. An `ACCEPT` carrying a grid the terminal cannot support is settled
 as `REJECTED` instead, and `respond_text_area_resize` returns false with a

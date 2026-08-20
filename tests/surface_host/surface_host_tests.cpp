@@ -11672,6 +11672,160 @@ bool test_text_area_resize_arbitration_answered_inline_keeps_notification_order(
     return ok;
 }
 
+bool test_text_area_resize_arbitration_prefix_title_precedes_same_command_request(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_text_area_resize_arbitration_enabled(true);
+    fixture.surface.set_text_area_resize_arbitration_timeout_ms(0);
+    pump_events(app);
+
+    QStringList order;
+    bool        answer_ok = false;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::terminal_title_changed,
+        &fixture.surface,
+        [&fixture, &order] {
+            if (fixture.surface.terminal_title() == QStringLiteral("before")) {
+                order.append(QStringLiteral("title"));
+            }
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_arbitration_requested,
+        &fixture.surface,
+        [&](quint64 request_id, int rows, int columns) {
+            order.append(QStringLiteral("requested"));
+            answer_ok = fixture.surface.respond_text_area_resize(
+                request_id,
+                VNM_TerminalSurface::Text_area_resize_arbitration_decision::ACCEPT,
+                rows,
+                columns);
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_arbitration_settled,
+        &fixture.surface,
+        [&order](
+            quint64,
+            VNM_TerminalSurface::Text_area_resize_arbitration_outcome,
+            int,
+            int) {
+            order.append(QStringLiteral("settled"));
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    pump_events(app);
+    ok &= check(started, "same-command title-prefix ordering fixture starts");
+
+    backend_ptr->emit_output(QByteArrayLiteral(
+        "\x1b]2;stale\x07\x1b]2;before\x07\x1b[8;24;80t"));
+    ok &= check(pump_until(app, [&order] {
+        return order.contains(QStringLiteral("settled"));
+    }),
+        "the same-command request after a title settles");
+
+    ok &= check(answer_ok, "the same-command request answer is accepted");
+    ok &= check(order == QStringList{
+            QStringLiteral("title"),
+            QStringLiteral("requested"),
+            QStringLiteral("settled"),
+        },
+        "a coalesced title prefix keeps its latest delivery token before the request");
+
+    return ok;
+}
+
+// Replaying one held tail can record common and capability events under the
+// same settlement command sequence. Their observable order still follows the
+// byte stream: settlement one, the title between the requests, then request two.
+bool test_text_area_resize_arbitration_same_command_ties_keep_stream_order(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_text_area_resize_arbitration_enabled(true);
+    fixture.surface.set_text_area_resize_arbitration_timeout_ms(0);
+    pump_events(app);
+
+    QStringList order;
+    int         request_count    = 0;
+    int         settlement_count = 0;
+    bool        every_answer_ok  = true;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_arbitration_requested,
+        &fixture.surface,
+        [&](quint64 request_id, int rows, int columns) {
+            ++request_count;
+            order.append(QStringLiteral("requested%1").arg(request_count));
+            every_answer_ok = fixture.surface.respond_text_area_resize(
+                request_id,
+                VNM_TerminalSurface::Text_area_resize_arbitration_decision::ACCEPT,
+                rows,
+                columns) && every_answer_ok;
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_arbitration_settled,
+        &fixture.surface,
+        [&order, &settlement_count](
+            quint64,
+            VNM_TerminalSurface::Text_area_resize_arbitration_outcome,
+            int,
+            int) {
+            ++settlement_count;
+            order.append(QStringLiteral("settled%1").arg(settlement_count));
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::terminal_title_changed,
+        &fixture.surface,
+        [&fixture, &order] {
+            if (fixture.surface.terminal_title() == QStringLiteral("between-requests")) {
+                order.append(QStringLiteral("title"));
+            }
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    pump_events(app);
+    ok &= check(started, "same-command arbitration ordering fixture starts");
+
+    backend_ptr->emit_output(QByteArrayLiteral(
+        "\x1b[8;24;80t\x1b]0;stale-between\x07"
+        "\x1b]0;between-requests\x07\x1b[8;25;81t"));
+    ok &= check(pump_until(app, [&settlement_count] {
+        return settlement_count == 2;
+    }),
+        "both inline-answered requests settle");
+
+    ok &= check(every_answer_ok, "both same-command inline answers are accepted");
+    ok &= check(order == QStringList{
+            QStringLiteral("requested1"),
+            QStringLiteral("settled1"),
+            QStringLiteral("title"),
+            QStringLiteral("requested2"),
+            QStringLiteral("settled2"),
+        },
+        "coalesced common and arbitration records retain exact stream order");
+
+    return ok;
+}
+
 bool test_rejected_text_area_resize_arbitration_leaves_the_item_grid(QGuiApplication& app)
 {
     bool ok = true;
@@ -11946,6 +12100,82 @@ bool test_text_area_resize_arbitration_clears_when_the_process_is_torn_down(
     pump_events(app);
     ok &= check(fixture.surface.rows() == 24 && fixture.surface.columns() == 80,
         "the restarted session commits its own answer");
+
+    return ok;
+}
+
+bool test_text_area_resize_arbitration_exit_before_delivery_suppresses_stale_request(
+    QGuiApplication& app)
+{
+    bool ok = true;
+    Surface_fixture fixture;
+    fixture.surface.set_text_area_resize_arbitration_enabled(true);
+    fixture.surface.set_text_area_resize_arbitration_timeout_ms(0);
+    pump_events(app);
+
+    QStringList delivery_order;
+    int         answer_count = 0;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_arbitration_requested,
+        &fixture.surface,
+        [&](quint64 request_id, int rows, int columns) {
+            delivery_order.append(QStringLiteral("requested"));
+            ++answer_count;
+            (void)fixture.surface.respond_text_area_resize(
+                request_id,
+                VNM_TerminalSurface::Text_area_resize_arbitration_decision::ACCEPT,
+                rows,
+                columns);
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::text_area_resize_arbitration_settled,
+        &fixture.surface,
+        [&delivery_order](
+            quint64,
+            VNM_TerminalSurface::Text_area_resize_arbitration_outcome,
+            int,
+            int) {
+            delivery_order.append(QStringLiteral("settled"));
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::process_exited,
+        &fixture.surface,
+        [&delivery_order](VNM_TerminalSurface::Exit_reason, int) {
+            delivery_order.append(QStringLiteral("exited"));
+        });
+
+    auto backend = std::make_unique<Scripted_backend>();
+    bool started = false;
+    Scripted_backend* backend_ptr = start_surface_with_backend(
+        fixture.surface,
+        std::move(backend),
+        { QStringLiteral("scripted-terminal") },
+        &started);
+    pump_events(app);
+    ok &= check(started, "pre-delivery process-exit arbitration fixture starts");
+
+    // Both callbacks reach the session before the GUI gets one delivery turn.
+    // The request is therefore no longer actionable by the time a host could
+    // see it and must not be emitted as historical work.
+    backend_ptr->emit_output(QByteArrayLiteral("\x1b[8;24;80tfinal-output"));
+    backend_ptr->emit_exit({term::Terminal_exit_reason::EXITED, 0});
+    ok &= check(pump_until(app, [&delivery_order] {
+        return delivery_order.contains(QStringLiteral("exited"));
+    }),
+        "the process exit reaches the host");
+
+    ok &= check(delivery_order == QStringList{QStringLiteral("exited")},
+        "an exit before delivery emits no stale request or synthetic settlement");
+    ok &= check(answer_count == 0,
+        "the inline responder is never invited to answer an exited request");
+    const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
+        term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
+    ok &= check(snapshot != nullptr &&
+        snapshot_row_text(*snapshot, 0) == QStringLiteral("final-output"),
+        "held output before the same-drain exit replays exactly once");
 
     return ok;
 }
@@ -17842,11 +18072,14 @@ int main(int argc, char** argv)
     ok &= test_text_area_resize_arbitration_accepts_after_the_host_resizes_its_item(app);
     ok &= test_text_area_resize_arbitration_answered_inline_does_not_nest(app);
     ok &= test_text_area_resize_arbitration_answered_inline_keeps_notification_order(app);
+    ok &= test_text_area_resize_arbitration_prefix_title_precedes_same_command_request(app);
+    ok &= test_text_area_resize_arbitration_same_command_ties_keep_stream_order(app);
     ok &= test_rejected_text_area_resize_arbitration_leaves_the_item_grid(app);
     ok &= test_text_area_resize_arbitration_times_out(app);
     ok &= test_text_area_resize_arbitration_does_not_spin_the_backend_drain(app);
     ok &= test_respond_text_area_resize_reports_a_missing_request(app);
     ok &= test_text_area_resize_arbitration_clears_when_the_process_is_torn_down(app);
+    ok &= test_text_area_resize_arbitration_exit_before_delivery_suppresses_stale_request(app);
     ok &= test_text_area_resize_arbitration_can_be_enabled_on_a_live_session(app);
     ok &= test_interaction_diagnostics_has_single_surface_owner(app);
     ok &= test_scroll_diagnostic_enum_name_table(app);

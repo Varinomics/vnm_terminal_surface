@@ -10,6 +10,19 @@
 
 namespace vnm_terminal::internal {
 
+enum class Terminal_csi_byte_kind
+{
+    EMBEDDED_CONTROL,
+    PARAMETER,
+    INTERMEDIATE,
+    FINAL,
+    INVALID,
+};
+
+// The parser owns the byte grammar shared by incremental observers that must
+// agree with its CSI recognition before they defer a sequence.
+Terminal_csi_byte_kind terminal_csi_byte_kind(unsigned char byte);
+
 class Terminal_byte_stream_parser
 {
 public:
