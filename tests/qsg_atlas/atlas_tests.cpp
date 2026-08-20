@@ -11970,7 +11970,9 @@ bool test_atlas_rect_row_stable_dense_graphic_update(QGuiApplication& app)
     return ok;
 }
 
-bool test_atlas_rect_row_stable_graphic_arc_update(QGuiApplication& app)
+bool test_atlas_rect_row_stable_graphic_arc_update(
+    QGuiApplication& app,
+    bool             require_fractional_row_boundary = false)
 {
     QQuickWindow window;
     window.resize(280, 160);
@@ -11995,6 +11997,13 @@ bool test_atlas_rect_row_stable_graphic_arc_update(QGuiApplication& app)
         window,
         surface,
         atlas_report_render_state_ready);
+    const qreal device_pixel_ratio = pixel_window_device_pixel_ratio(window);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(
+        device_pixel_ratio,
+        18.0,
+        QStringLiteral("monospace"));
+    const bool fractional_row_boundary =
+        std::abs(metrics.height - std::round(metrics.height)) > 0.001;
     term::Qsg_atlas_frame_report baseline_report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
     if (!baseline_rendered ||
@@ -12050,6 +12059,8 @@ bool test_atlas_rect_row_stable_graphic_arc_update(QGuiApplication& app)
     }
 
     bool ok = true;
+    ok &= check(!require_fractional_row_boundary || fractional_row_boundary,
+        "atlas arc row provenance exercises a fractional logical row boundary");
     ok &= check(prepared,
         "atlas rect row-stable graphic arc update reaches a prepared frame");
     ok &= check(report.frame_build.frame_graphic_arcs > 0 &&
@@ -12062,7 +12073,8 @@ bool test_atlas_rect_row_stable_graphic_arc_update(QGuiApplication& app)
             !rect_buffer.non_dirty_state_upload &&
             rect_buffer.uploaded_bytes > 0 &&
             rect_buffer.uploaded_bytes < rect_buffer.buffer_bytes,
-        "atlas rect row-stable graphic arc update patches dirty-row arc bytes");
+        "atlas rect row-stable graphic arc update keeps every recolored span in "
+        "the dirty source row");
     return ok;
 }
 
@@ -19426,6 +19438,23 @@ int test_lcd_capability_probe(QGuiApplication& app, const char* backend)
     return ok ? 0 : 1;
 }
 
+int test_atlas_arc_row_provenance(QGuiApplication& app, const char* backend)
+{
+    const int backend_status =
+        verify_requested_backend(app, backend, "atlas arc row provenance");
+    if (backend_status != 0) {
+        return backend_status;
+    }
+
+    const qreal device_pixel_ratio =
+        pixel_probe_render_window_device_pixel_ratio(app);
+    if (!atlas_report_backend_usable(app, device_pixel_ratio)) {
+        return k_unsupported_backend_skip_return_code;
+    }
+
+    return test_atlas_rect_row_stable_graphic_arc_update(app, true) ? 0 : 1;
+}
+
 int test_atlas_report(QGuiApplication& app, const char* backend)
 {
     const int backend_status =
@@ -19787,6 +19816,8 @@ int main(int argc, char** argv)
     const bool pixel_parity = has_argument(argc, argv, "--pixel-parity");
     const bool layout_parity = has_argument(argc, argv, "--layout-parity");
     const bool atlas_report = has_argument(argc, argv, "--atlas-report");
+    const bool arc_row_provenance =
+        has_argument(argc, argv, "--arc-row-provenance");
     const bool warm_lazy_smoke = has_argument(argc, argv, "--warm-lazy-smoke");
     const bool lcd_capability_probe =
         has_argument(argc, argv, "--lcd-capability-probe");
@@ -19796,8 +19827,8 @@ int main(int argc, char** argv)
     const char* backend = argument_value(argc, argv, "--backend", "d3d11");
     const bool graphics_mode =
         render_smoke || dense_grid_smoke || pixel_parity || layout_parity ||
-        atlas_report || warm_lazy_smoke || lcd_capability_probe ||
-        host_state_smoke || cursor_descender_smoke;
+        atlas_report || arc_row_provenance || warm_lazy_smoke ||
+        lcd_capability_probe || host_state_smoke || cursor_descender_smoke;
     if (graphics_mode) {
         configure_graphics_api(backend);
     }
@@ -19815,6 +19846,9 @@ int main(int argc, char** argv)
     }
     if (atlas_report) {
         return test_atlas_report(app, backend);
+    }
+    if (arc_row_provenance) {
+        return test_atlas_arc_row_provenance(app, backend);
     }
     if (warm_lazy_smoke) {
         return test_atlas_warm_lazy_smoke(app, backend);

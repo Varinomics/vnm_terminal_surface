@@ -921,6 +921,32 @@ if(WIN32)
             # render-loop regressions and can run slowly on debug D3D/WARP.
             TIMEOUT ${vnm_terminal_qsg_atlas_report_timeout_seconds}
     )
+
+    set(vnm_terminal_qsg_atlas_arc_row_provenance_environment
+        ${vnm_terminal_qt_windows_qpa_environment}
+        "QSG_RENDER_LOOP=threaded"
+        "QT_SCALE_FACTOR=1.3"
+        ${vnm_terminal_qt_scale_environment}
+    )
+    add_test(
+        NAME vnm_terminal_qsg_atlas_arc_row_provenance_d3d11
+        COMMAND
+            "${CMAKE_COMMAND}" -E env
+            ${vnm_terminal_qsg_atlas_arc_row_provenance_environment}
+            "${vnm_terminal_qt_runtime_path}"
+            "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+            "--arc-row-provenance"
+            "--backend"
+            "d3d11"
+    )
+
+    set_tests_properties(
+        vnm_terminal_qsg_atlas_arc_row_provenance_d3d11
+        PROPERTIES
+            LABELS "qsg;hardware;atlas;row-provenance"
+            SKIP_RETURN_CODE 77
+            TIMEOUT 120
+    )
 endif()
 
 if(VNM_TERMINAL_ENABLE_GPU_ATLAS_SMOKE)

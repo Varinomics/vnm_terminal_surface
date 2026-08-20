@@ -3761,7 +3761,8 @@ private:
     void append_rect_instance(
         const QRectF& rect,
         QColor        color,
-        qreal         opacity)
+        qreal         opacity,
+        int           owner_row)
     {
         if (rect.width() <= 0.0 || rect.height() <= 0.0 || color.alpha() <= 0) {
             return;
@@ -3771,10 +3772,22 @@ private:
         store_rect(instance.rect, rect);
         store_color(instance.color, color, opacity);
         m_rect_instances.push_back(instance);
-        m_rect_instance_rows.push_back(atlas_rect_row(
+        m_rect_instance_rows.push_back(owner_row);
+    }
+
+    void append_rect_instance(
+        const QRectF& rect,
+        QColor        color,
+        qreal         opacity)
+    {
+        append_rect_instance(
             rect,
-            m_frame.cell_metrics,
-            m_render_row_count));
+            color,
+            opacity,
+            atlas_rect_row(
+                rect,
+                m_frame.cell_metrics,
+                m_render_row_count));
     }
 
     void append_graphic_rect_instance(
@@ -3794,6 +3807,7 @@ private:
         const QRectF&   bounds,
         const QColor&   color,
         qreal           opacity,
+        int             owner_row,
         Coverage_fn     coverage_at)
     {
         const qreal pixel  = atlas_logical_pixel_size(m_frame.device_pixel_ratio);
@@ -3827,7 +3841,8 @@ private:
                             static_cast<qreal>(x - span_start) * pixel,
                             pixel),
                         span_color,
-                        opacity);
+                        opacity,
+                        owner_row);
                     ++instance_count;
                 }
                 has_span   = span_pixel_color.alpha() != 0;
@@ -3843,7 +3858,8 @@ private:
                         static_cast<qreal>(right - span_start) * pixel,
                         pixel),
                     span_color,
-                    opacity);
+                    opacity,
+                    owner_row);
                 ++instance_count;
             }
         }
@@ -3854,6 +3870,10 @@ private:
         const Terminal_render_rect& rect,
         qreal                       opacity)
     {
+        const int owner_row = atlas_rect_row(
+            rect.rect,
+            m_frame.cell_metrics,
+            m_render_row_count);
         const QRectF bounds = rect.rect.adjusted(
             -k_terminal_graphic_antialias_feather,
             -k_terminal_graphic_antialias_feather,
@@ -3863,6 +3883,7 @@ private:
             bounds,
             rect.color,
             opacity,
+            owner_row,
             [&](QPointF center) {
                 return atlas_antialiased_rect_pixel_coverage(rect, center);
             });
@@ -3872,12 +3893,17 @@ private:
         const Terminal_render_arc& arc,
         qreal                      opacity)
     {
+        const int owner_row = atlas_rect_row(
+            arc.rect,
+            m_frame.cell_metrics,
+            m_render_row_count);
         const terminal_render_arc_geometry_t arc_spec =
             terminal_render_arc_geometry(arc);
         (void)append_coverage_rasterized_rect_instances(
             arc.rect,
             arc.color,
             opacity,
+            owner_row,
             [&](QPointF center) {
                 return terminal_render_arc_pixel_coverage(arc, arc_spec, center);
             });
