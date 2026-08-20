@@ -764,6 +764,24 @@ set_tests_properties(vnm_terminal_qsg_atlas PROPERTIES
     TIMEOUT 60
 )
 
+add_test(
+    NAME vnm_terminal_qsg_atlas_post_verification_failure_contract
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+        "--post-verification-failure-contract"
+)
+
+set_tests_properties(
+    vnm_terminal_qsg_atlas_post_verification_failure_contract
+    PROPERTIES
+        LABELS "qsg;atlas;failure-contract"
+        TIMEOUT 60
+)
+
 if(WIN32)
     set(vnm_terminal_qsg_atlas_dense_grid_environment
         ${vnm_terminal_qt_windows_qpa_environment}

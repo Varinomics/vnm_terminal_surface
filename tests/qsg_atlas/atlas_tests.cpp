@@ -45,6 +45,7 @@
 #include <QSGTextNode>
 #include <QThread>
 #include <private/qquickitem_p.h>
+#include <private/qquickwindow_p.h>
 #include <rhi/qrhi.h>
 
 #if !defined(VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED)
@@ -475,7 +476,8 @@ QString driver_device_type_name(QRhiDriverInfo::DeviceType type)
 int verify_requested_backend(
     QGuiApplication& app,
     const char*      backend,
-    const char*      test_name)
+    const char*      test_name,
+    bool             requires_msdf_ownership = false)
 {
     const QSGRendererInterface::GraphicsApi expected =
         expected_graphics_api_for_backend(backend);
@@ -485,8 +487,34 @@ int verify_requested_backend(
         return 1;
     }
 
+    std::atomic_bool msdf_rhi_observed{false};
+    std::atomic_bool known_software_adapter{false};
     QQuickWindow probe;
     probe.resize(64, 64);
+    const auto capture_msdf_rhi_capability = [&]() {
+        QRhi* const rhi = QQuickWindowPrivate::get(&probe)->rhi;
+        if (rhi != nullptr) {
+            known_software_adapter.store(
+                term::qsg_atlas_driver_info_is_known_software_renderer(
+                    rhi->driverInfo()),
+                std::memory_order_relaxed);
+            msdf_rhi_observed.store(true, std::memory_order_release);
+        }
+    };
+    if (requires_msdf_ownership) {
+        QObject::connect(
+            &probe,
+            &QQuickWindow::sceneGraphInitialized,
+            &probe,
+            capture_msdf_rhi_capability,
+            Qt::DirectConnection);
+        QObject::connect(
+            &probe,
+            &QQuickWindow::beforeRendering,
+            &probe,
+            capture_msdf_rhi_capability,
+            Qt::DirectConnection);
+    }
     probe.show();
     app.processEvents(QEventLoop::AllEvents, 50);
     QThread::msleep(20);
@@ -496,17 +524,46 @@ int verify_requested_backend(
         probe.rendererInterface() != nullptr
             ? probe.rendererInterface()->graphicsApi()
             : QSGRendererInterface::Unknown;
+    if (requires_msdf_ownership && active == expected &&
+        probe.rendererInterface() != nullptr)
+    {
+        for (int attempt = 0;
+            attempt < 80 &&
+                !msdf_rhi_observed.load(std::memory_order_acquire);
+            ++attempt)
+        {
+            probe.requestUpdate();
+            app.processEvents(QEventLoop::AllEvents, 50);
+            QThread::msleep(10);
+            if (attempt == 0) {
+                (void)probe.grabWindow();
+            }
+        }
+    }
     probe.hide();
     app.processEvents(QEventLoop::AllEvents, 50);
 
-    if (active == expected) {
-        return 0;
+    if (active != expected) {
+        std::cerr << "SKIP: " << test_name << " requested backend " << backend
+            << " but Qt activated "
+            << graphics_api_name(active).toUtf8().constData() << '\n';
+        return k_unsupported_backend_skip_return_code;
     }
 
-    std::cerr << "SKIP: " << test_name << " requested backend " << backend
-        << " but Qt activated " << graphics_api_name(active).toUtf8().constData()
-        << '\n';
-    return k_unsupported_backend_skip_return_code;
+    if (requires_msdf_ownership &&
+        !msdf_rhi_observed.load(std::memory_order_acquire))
+    {
+        std::cerr << "FAIL: " << test_name << " activated backend " << backend
+            << " without exposing its QRhi capability state\n";
+        return 1;
+    }
+    if (known_software_adapter.load(std::memory_order_relaxed)) {
+        std::cerr << "SKIP: " << test_name
+            << " requires MSDF ownership unavailable on this known software adapter\n";
+        return k_unsupported_backend_skip_return_code;
+    }
+
+    return 0;
 }
 
 term::Terminal_render_snapshot make_text_snapshot(std::uint64_t sequence, QString text)
@@ -905,7 +962,6 @@ struct Pixel_decorative_primitive
 struct Pixel_parity_fixture
 {
     std::string                         name;
-    bool                                layout_parity = false;
     term::Terminal_render_snapshot      snapshot;
     term::terminal_cell_metrics_t       cell_metrics;
     QSizeF                              logical_size;
@@ -1870,7 +1926,6 @@ term::Terminal_render_snapshot make_pixel_base_snapshot(
 
 Pixel_parity_fixture make_pixel_parity_base_fixture(
     std::string                   name,
-    bool                          layout_parity,
     term::terminal_grid_size_t    grid_size,
     std::uint64_t                 sequence,
     term::terminal_cell_metrics_t metrics,
@@ -1878,7 +1933,6 @@ Pixel_parity_fixture make_pixel_parity_base_fixture(
 {
     Pixel_parity_fixture fixture;
     fixture.name               = std::move(name);
-    fixture.layout_parity      = layout_parity;
     fixture.snapshot           = make_pixel_base_snapshot(grid_size, sequence);
     fixture.cell_metrics       = metrics;
     fixture.logical_size       = pixel_logical_size(grid_size, metrics);
@@ -1894,7 +1948,6 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
 
     Pixel_parity_fixture fills = make_pixel_parity_base_fixture(
         "fills_decorations_cursor",
-        false,
         {4, 12},
         710U,
         metrics,
@@ -1959,7 +2012,6 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
 
     Pixel_parity_fixture glyphs = make_pixel_parity_base_fixture(
         "ascii_bmp_attributes",
-        false,
         {3, 14},
         711U,
         metrics,
@@ -2000,7 +2052,6 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
 
     Pixel_parity_fixture cursor = make_pixel_parity_base_fixture(
         "block_cursor_text",
-        false,
         {1, 10},
         712U,
         metrics,
@@ -2024,7 +2075,6 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
 
     Pixel_parity_fixture empty_cursor = make_pixel_parity_base_fixture(
         "block_cursor_empty_fill",
-        false,
         {1, 8},
         713U,
         metrics,
@@ -2040,7 +2090,6 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
 
     Pixel_parity_fixture graphic_cursor = make_pixel_parity_base_fixture(
         "block_cursor_block_element_text",
-        false,
         {1, 8},
         714U,
         metrics,
@@ -2081,7 +2130,6 @@ Pixel_parity_fixture make_layout_parity_base_fixture(
 {
     return make_pixel_parity_base_fixture(
         std::move(name),
-        true,
         grid_size,
         sequence,
         metrics,
@@ -5710,13 +5758,10 @@ bool compare_pixel_fixture(
     const Pixel_render_result&     reference,
     const Pixel_render_result&     atlas,
     const char*                    backend,
-    std::optional<Pixel_aa_budget> budget_override = std::nullopt,
-    const char*                    parity_mode_override = nullptr,
+    std::optional<Pixel_aa_budget> budget_override,
+    const char*                    parity_mode,
     bool                           compare_glyph_regions_enabled = true)
 {
-    const char* const parity_mode = parity_mode_override != nullptr
-        ? parity_mode_override
-        : (fixture.layout_parity ? "atlas layout parity" : "atlas pixel parity");
     if (!reference.ready || !atlas.ready) {
         std::cerr << "FAIL: " << parity_mode << " fixture "
             << fixture.name
@@ -6153,6 +6198,48 @@ bool compare_renderer_glyph_placement(
     return ok;
 }
 
+bool atlas_fixture_render_state_ready_after_backend_verification(
+    const Pixel_render_result& result)
+{
+    return
+        result.ready                                  &&
+        !result.image.isNull()                        &&
+        result.atlas_report.prepare_count > 0U        &&
+        result.atlas_report.render_count > 0U         &&
+        result.atlas_report.drew                      &&
+        result.atlas_report.command_buffer_non_null   &&
+        result.atlas_report.render_target_non_null    &&
+        result.atlas_report.rhi_non_null;
+}
+
+int verified_atlas_fixture_render_state_status(
+    const Pixel_render_result& result,
+    const char*                test_name,
+    const std::string&         fixture_name,
+    bool                       report_failure = true)
+{
+    if (atlas_fixture_render_state_ready_after_backend_verification(result)) {
+        return 0;
+    }
+
+    if (report_failure) {
+        std::cerr << "FAIL: " << test_name << " fixture " << fixture_name
+            << " lost usable atlas render state after backend verification"
+            << " ready=" << result.ready
+            << " capture_null=" << result.image.isNull()
+            << " prepare_count=" << result.atlas_report.prepare_count
+            << " render_count=" << result.atlas_report.render_count
+            << " drew=" << result.atlas_report.drew
+            << " command_buffer_non_null="
+            << result.atlas_report.command_buffer_non_null
+            << " render_target_non_null="
+            << result.atlas_report.render_target_non_null
+            << " rhi_non_null=" << result.atlas_report.rhi_non_null
+            << '\n';
+    }
+    return 1;
+}
+
 Pixel_parity_fixture make_msdf_orientation_discriminator_fixture(
     qreal device_pixel_ratio)
 {
@@ -6163,7 +6250,6 @@ Pixel_parity_fixture make_msdf_orientation_discriminator_fixture(
         pixel_metrics(dpr, k_font_size, family);
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "msdf_orientation_top_bottom",
-        false,
         {6, 8},
         730U,
         metrics,
@@ -6192,7 +6278,8 @@ int test_msdf_orientation_discriminator(
     const int backend_status = verify_requested_backend(
         app,
         backend,
-        "forced MSDF orientation discriminator");
+        "forced MSDF orientation discriminator",
+        true);
     if (backend_status != 0) {
         return backend_status;
     }
@@ -6211,14 +6298,12 @@ int test_msdf_orientation_discriminator(
         family,
         VNM_TerminalSurface::Text_renderer_mode::MSDF,
         VNM_TerminalSurface::Lcd_subpixel_order::NONE);
-    if (!candidate.ready &&
-        (candidate.atlas_report.prepare_count == 0U ||
-            candidate.atlas_report.render_count == 0U ||
-            !candidate.atlas_report.rhi_non_null))
-    {
-        std::cerr << "SKIP: forced MSDF orientation discriminator did not reach "
-            << "a usable " << backend << " QRhi backend\n";
-        return k_unsupported_backend_skip_return_code;
+    const int fixture_status = verified_atlas_fixture_render_state_status(
+        candidate,
+        "forced MSDF orientation discriminator",
+        fixture.name);
+    if (fixture_status != 0) {
+        return fixture_status;
     }
 
     const Msdf_single_w_probe_result reference =
@@ -6315,13 +6400,67 @@ int test_msdf_orientation_discriminator(
 #endif
 }
 
-bool atlas_fixture_backend_unavailable(const Pixel_render_result& result)
+int test_post_verification_failure_exit_contract()
 {
-    return
-        !result.ready &&
-        (result.atlas_report.prepare_count == 0U ||
-            result.atlas_report.render_count == 0U ||
-            !result.atlas_report.rhi_non_null);
+    struct Failure_case
+    {
+        const char*         name;
+        Pixel_render_result result;
+    };
+
+    Pixel_render_result ready_state;
+    ready_state.image = QImage(1, 1, QImage::Format_RGBA8888);
+    ready_state.ready = true;
+    ready_state.atlas_report.prepare_count = 1U;
+    ready_state.atlas_report.render_count  = 1U;
+    ready_state.atlas_report.drew = true;
+    ready_state.atlas_report.command_buffer_non_null = true;
+    ready_state.atlas_report.render_target_non_null = true;
+    ready_state.atlas_report.rhi_non_null = true;
+
+    Pixel_render_result no_ready = ready_state;
+    no_ready.ready = false;
+
+    Pixel_render_result no_prepare = no_ready;
+    no_prepare.atlas_report.prepare_count = 0U;
+
+    Pixel_render_result no_render = no_ready;
+    no_render.atlas_report.render_count = 0U;
+
+    Pixel_render_result no_draw = no_ready;
+    no_draw.atlas_report.drew = false;
+
+    Pixel_render_result no_rhi = no_ready;
+    no_rhi.atlas_report.rhi_non_null = false;
+
+    Pixel_render_result no_capture = ready_state;
+    no_capture.image = {};
+
+    const std::array<Failure_case, 7> cases = {{
+        {"no fixture state", {}},
+        {"no ready state", no_ready},
+        {"no prepare", no_prepare},
+        {"no render", no_render},
+        {"no draw", no_draw},
+        {"no RHI", no_rhi},
+        {"no capture", no_capture},
+    }};
+
+    bool ok = true;
+    for (const Failure_case& failure : cases) {
+        const int simulated_exit_code =
+            verified_atlas_fixture_render_state_status(
+                failure.result,
+                "post-verification failure contract",
+                failure.name,
+                false);
+        ok &= check(
+            simulated_exit_code != 0 &&
+                simulated_exit_code != k_unsupported_backend_skip_return_code,
+            std::string("post-verification ") + failure.name +
+                " failure exits nonzero without becoming a skip");
+    }
+    return ok ? 0 : 1;
 }
 
 int test_primitive_parity(QGuiApplication& app, const char* backend)
@@ -6384,9 +6523,12 @@ int test_primitive_parity(QGuiApplication& app, const char* backend)
                 term::vnm_terminal_default_monospace_font_family(),
                 VNM_TerminalSurface::Text_renderer_mode::GLYPH,
                 VNM_TerminalSurface::Lcd_subpixel_order::NONE);
-        if (atlas_fixture_backend_unavailable(atlas)) {
-            std::cerr << "SKIP: atlas primitive parity did not reach usable QRhi render state\n";
-            return k_unsupported_backend_skip_return_code;
+        const int fixture_status = verified_atlas_fixture_render_state_status(
+            atlas,
+            "atlas primitive parity",
+            fixture.name);
+        if (fixture_status != 0) {
+            return fixture_status;
         }
 
         const Pixel_render_result reference =
@@ -6431,9 +6573,12 @@ int test_forced_glyph_parity(QGuiApplication& app, const char* backend)
             term::vnm_terminal_default_monospace_font_family(),
             VNM_TerminalSurface::Text_renderer_mode::GLYPH,
             VNM_TerminalSurface::Lcd_subpixel_order::NONE);
-        if (atlas_fixture_backend_unavailable(atlas)) {
-            std::cerr << "SKIP: forced glyph renderer parity did not reach usable QRhi render state\n";
-            return k_unsupported_backend_skip_return_code;
+        const int fixture_status = verified_atlas_fixture_render_state_status(
+            atlas,
+            "forced glyph renderer parity",
+            fixture.name);
+        if (fixture_status != 0) {
+            return fixture_status;
         }
 
         const term::Qsg_atlas_render_summary& render = atlas.atlas_report.render;
@@ -6481,7 +6626,6 @@ std::vector<Pixel_parity_fixture> make_forced_msdf_parity_fixtures(
 
     Pixel_parity_fixture cursor = make_pixel_parity_base_fixture(
         "msdf_cursor_text",
-        false,
         {3, 8},
         731U,
         metrics,
@@ -6500,7 +6644,6 @@ std::vector<Pixel_parity_fixture> make_forced_msdf_parity_fixtures(
 
     Pixel_parity_fixture preedit = make_pixel_parity_base_fixture(
         "msdf_preedit_text",
-        false,
         {3, 8},
         732U,
         metrics,
@@ -6605,7 +6748,8 @@ int test_forced_msdf_parity(QGuiApplication& app, const char* backend)
     const int backend_status = verify_requested_backend(
         app,
         backend,
-        "forced MSDF renderer parity");
+        "forced MSDF renderer parity",
+        true);
     if (backend_status != 0) {
         return backend_status;
     }
@@ -6624,9 +6768,12 @@ int test_forced_msdf_parity(QGuiApplication& app, const char* backend)
             term::vnm_terminal_default_monospace_font_family(),
             VNM_TerminalSurface::Text_renderer_mode::MSDF,
             VNM_TerminalSurface::Lcd_subpixel_order::NONE);
-        if (atlas_fixture_backend_unavailable(candidate)) {
-            std::cerr << "SKIP: forced MSDF parity did not reach usable QRhi render state\n";
-            return k_unsupported_backend_skip_return_code;
+        const int fixture_status = verified_atlas_fixture_render_state_status(
+            candidate,
+            "forced MSDF renderer parity",
+            fixture.name);
+        if (fixture_status != 0) {
+            return fixture_status;
         }
         const Msdf_single_w_probe_result reference =
             render_msdf_single_w_probe_fixture(fixture, candidate.image.size());
@@ -6645,7 +6792,8 @@ int test_auto_text_renderer_routing(QGuiApplication& app, const char* backend)
     const int backend_status = verify_requested_backend(
         app,
         backend,
-        "automatic text renderer routing");
+        "automatic text renderer routing",
+        true);
     if (backend_status != 0) {
         return backend_status;
     }
@@ -6669,11 +6817,19 @@ int test_auto_text_renderer_routing(QGuiApplication& app, const char* backend)
     };
     const Pixel_render_result supported_result = render_auto(supported);
     const Pixel_render_result unsupported_result = render_auto(unsupported);
-    if (atlas_fixture_backend_unavailable(supported_result) ||
-        atlas_fixture_backend_unavailable(unsupported_result))
-    {
-        std::cerr << "SKIP: automatic text renderer routing did not reach usable QRhi render state\n";
-        return k_unsupported_backend_skip_return_code;
+    const int supported_status = verified_atlas_fixture_render_state_status(
+        supported_result,
+        "automatic text renderer routing",
+        supported.name);
+    if (supported_status != 0) {
+        return supported_status;
+    }
+    const int unsupported_status = verified_atlas_fixture_render_state_status(
+        unsupported_result,
+        "automatic text renderer routing",
+        unsupported.name);
+    if (unsupported_status != 0) {
+        return unsupported_status;
     }
 
     const term::Qsg_atlas_render_summary& supported_render =
@@ -6912,9 +7068,12 @@ int test_layout_contract(QGuiApplication& app, const char* backend)
                 term::vnm_terminal_default_monospace_font_family(),
                 VNM_TerminalSurface::Text_renderer_mode::GLYPH,
                 VNM_TerminalSurface::Lcd_subpixel_order::NONE);
-        if (atlas_fixture_backend_unavailable(atlas)) {
-            std::cerr << "SKIP: atlas layout contract did not reach usable QRhi render state\n";
-            return k_unsupported_backend_skip_return_code;
+        const int fixture_status = verified_atlas_fixture_render_state_status(
+            atlas,
+            "atlas layout contract",
+            fixture.name);
+        if (fixture_status != 0) {
+            return fixture_status;
         }
 
         ok &= validate_frame_build_report(fixture, atlas.atlas_report);
@@ -11671,7 +11830,9 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
                 report.render.msdf_text_renderer_active &&
                 report.render.msdf_text_resources_ready &&
                 report.render.msdf_text_texture_ready &&
-                report.render.msdf_text_glyph_instances == expected_glyphs;
+                report.render.msdf_text_glyph_instances == expected_glyphs &&
+                report.render.msdf_text_atlas_build_attempts_total >= 1U &&
+                report.render.msdf_text_atlas_texture_uploads_total >= 1U;
         });
     baseline_report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
@@ -11749,12 +11910,6 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         msdf_text_baked_identity(baseline_report.render);
     const Msdf_text_draw_identity draw_identity =
         msdf_text_draw_identity(baseline_report.render);
-    int texture_uploads = 0;
-    for (const term::Qsg_atlas_frame_report& report : reports) {
-        if (report.render.msdf_text_texture_uploaded) {
-            ++texture_uploads;
-        }
-    }
 
     bool ok = true;
     ok &= check(
@@ -11777,13 +11932,11 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         ok &= check(
             msdf_text_draw_identity_matches(draw_identity, report.render),
             "atlas MSDF resource stability keeps draw layout identity stable at one size");
+        ok &= check(
+            report.render.msdf_text_atlas_build_attempts_total == 1U &&
+                report.render.msdf_text_atlas_texture_uploads_total == 1U,
+            "atlas MSDF resource stability keeps durable build and upload totals stable");
     }
-    ok &= check(
-        baseline_report.render.msdf_text_texture_uploaded,
-        "atlas MSDF resource stability uploads the MSDF texture on initial generation");
-    ok &= check(
-        texture_uploads == 1,
-        "atlas MSDF resource stability does not reupload the MSDF texture after seeding");
     ok &= atlas_msdf_resource_stability_steady_buffer_ok(
         "unchanged",
         unchanged_report,
@@ -11793,13 +11946,10 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         color_report,
         Atlas_msdf_steady_buffer_expectation::PARTIAL);
 
-    // The baseline frame builds and uploads exactly one MSDF atlas; steady
-    // same-size frames reuse it without another build or upload.
-    ok &= check(
-        baseline_report.render.msdf_text_cache_miss &&
-            baseline_report.render.msdf_text_atlas_build_attempted &&
-            baseline_report.render.msdf_text_atlas_build_succeeded,
-        "atlas MSDF resource stability records the initial baked-atlas build");
+    // Build and upload flags describe one frame and can be superseded before
+    // the GUI thread samples the render-thread recorder. The cumulative
+    // counters are the durable event contract: baseline readiness waits for
+    // both events, and every later sample must keep them at exactly one.
     ok &= check(
         baseline_report.render.msdf_text_atlas_build_attempts_total == 1U &&
             baseline_report.render.msdf_text_atlas_texture_uploads_total == 1U,
@@ -13725,7 +13875,7 @@ bool test_atlas_auto_msdf_buffer_failure_falls_back(
     return ok;
 }
 
-bool atlas_report_backend_usable(
+int atlas_report_backend_status_after_verification(
     QGuiApplication& app,
     qreal            device_pixel_ratio)
 {
@@ -13741,18 +13891,10 @@ bool atlas_report_backend_usable(
         make_pixel_cell(0, 0, QStringLiteral("A"), 1, term::k_default_terminal_style_id));
     const Pixel_render_result atlas =
         render_pixel_atlas_fixture(app, probe);
-    const bool rendered =
-        atlas.ready &&
-        atlas_report_render_state_ready(atlas.atlas_report);
-    if (!rendered) {
-        std::cerr << "SKIP: atlas report backend check did not reach usable QRhi "
-            << "render state"
-            << " prepare_count=" << atlas.atlas_report.prepare_count
-            << " render_count=" << atlas.atlas_report.render_count
-            << " rhi_non_null=" << atlas.atlas_report.rhi_non_null
-            << '\n';
-    }
-    return rendered;
+    return verified_atlas_fixture_render_state_status(
+        atlas,
+        "atlas report backend check",
+        probe.name);
 }
 
 term::Terminal_render_snapshot make_warm_lazy_seed_snapshot(
@@ -13859,8 +14001,11 @@ int test_atlas_warm_lazy_smoke(QGuiApplication& app, const char* backend)
 
     const qreal device_pixel_ratio =
         pixel_probe_render_window_device_pixel_ratio(app);
-    if (!atlas_report_backend_usable(app, device_pixel_ratio)) {
-        return k_unsupported_backend_skip_return_code;
+    const int atlas_status = atlas_report_backend_status_after_verification(
+        app,
+        device_pixel_ratio);
+    if (atlas_status != 0) {
+        return atlas_status;
     }
 
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
@@ -14256,7 +14401,6 @@ Pixel_parity_fixture make_lcd_capability_probe_fixture(qreal device_pixel_ratio)
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_capability_probe",
-        false,
         {10, 104},
         980U,
         metrics,
@@ -14448,7 +14592,6 @@ Pixel_parity_fixture make_lcd_single_w_probe_fixture(qreal device_pixel_ratio)
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_single_w_probe",
-        false,
         {3, 3},
         986U,
         metrics,
@@ -14472,7 +14615,6 @@ Pixel_parity_fixture make_lcd_repeated_w_probe_fixture(qreal device_pixel_ratio)
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_repeated_w_probe",
-        false,
         {3, 18},
         988U,
         metrics,
@@ -14506,7 +14648,6 @@ Pixel_parity_fixture make_lcd_contiguous_x_probe_fixture(
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_contiguous_x_probe",
-        false,
         {3, k_lcd_contiguous_x_first_column +
             k_lcd_contiguous_x_cell_count + 1},
         992U,
@@ -14540,7 +14681,6 @@ Pixel_parity_fixture make_lcd_intensity_x_probe_fixture(
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_intensity_x_probe",
-        false,
         {k_lcd_intensity_x_first_row + k_lcd_intensity_x_rows + 1,
             k_lcd_intensity_x_first_column + k_lcd_intensity_x_columns + 1},
         994U,
@@ -14580,7 +14720,6 @@ Pixel_parity_fixture make_lcd_fragmented_x_probe_fixture(
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_fragmented_x_probe",
-        false,
         {3, k_lcd_fragmented_x_first_column +
             k_lcd_fragmented_x_columns + 1},
         995U,
@@ -14644,7 +14783,6 @@ Pixel_parity_fixture make_lcd_repeated_on_probe_fixture(
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_repeated_on_probe",
-        false,
         {3, k_lcd_repeated_on_second_column + 4},
         990U,
         metrics,
@@ -14680,7 +14818,6 @@ Pixel_parity_fixture make_lcd_ascii_panel_probe_fixture(qreal device_pixel_ratio
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_ascii_panel_probe",
-        false,
         {6, 42},
         989U,
         metrics,
@@ -19878,8 +20015,11 @@ int test_atlas_arc_row_provenance(QGuiApplication& app, const char* backend)
 
     const qreal device_pixel_ratio =
         pixel_probe_render_window_device_pixel_ratio(app);
-    if (!atlas_report_backend_usable(app, device_pixel_ratio)) {
-        return k_unsupported_backend_skip_return_code;
+    const int atlas_status = atlas_report_backend_status_after_verification(
+        app,
+        device_pixel_ratio);
+    if (atlas_status != 0) {
+        return atlas_status;
     }
 
     return test_atlas_rect_row_stable_graphic_arc_update(app, true) ? 0 : 1;
@@ -19895,8 +20035,11 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
 
     const qreal device_pixel_ratio =
         pixel_probe_render_window_device_pixel_ratio(app);
-    if (!atlas_report_backend_usable(app, device_pixel_ratio)) {
-        return k_unsupported_backend_skip_return_code;
+    const int atlas_status = atlas_report_backend_status_after_verification(
+        app,
+        device_pixel_ratio);
+    if (atlas_status != 0) {
+        return atlas_status;
     }
 
     bool ok = true;
@@ -20084,8 +20227,11 @@ int test_text_renderer_fallback_contract(
 
     const qreal device_pixel_ratio =
         pixel_probe_render_window_device_pixel_ratio(app);
-    if (!atlas_report_backend_usable(app, device_pixel_ratio)) {
-        return k_unsupported_backend_skip_return_code;
+    const int atlas_status = atlas_report_backend_status_after_verification(
+        app,
+        device_pixel_ratio);
+    if (atlas_status != 0) {
+        return atlas_status;
     }
 
     bool ok = true;
@@ -20269,6 +20415,8 @@ bool run_unit_tests()
 
 int main(int argc, char** argv)
 {
+    const bool post_verification_failure_contract =
+        has_argument(argc, argv, "--post-verification-failure-contract");
     const bool render_smoke = has_argument(argc, argv, "--render-smoke");
     const bool dense_grid_smoke = has_argument(argc, argv, "--dense-grid-smoke");
     const bool primitive_parity =
@@ -20311,6 +20459,9 @@ int main(int argc, char** argv)
     }
 
     QGuiApplication app(argc, argv);
+    if (post_verification_failure_contract) {
+        return test_post_verification_failure_exit_contract();
+    }
     if (dense_grid_smoke) {
         return test_dense_grid_smoke(app, backend);
     }
