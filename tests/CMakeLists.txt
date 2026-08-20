@@ -1640,6 +1640,26 @@ add_test(
         "$<TARGET_FILE:vnm_terminal_screen_basic>"
 )
 
+add_executable(vnm_terminal_search_index
+    search_index/search_index_tests.cpp
+)
+
+target_link_libraries(vnm_terminal_search_index PRIVATE
+    vnm_terminal_surface::vnm_terminal_surface
+)
+
+set_target_properties(vnm_terminal_search_index PROPERTIES
+    AUTOMOC OFF
+)
+
+add_test(
+    NAME vnm_terminal_search_index
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_search_index>"
+)
+
 add_executable(vnm_terminal_screen_sgr
     screen_sgr/sgr_model_tests.cpp
 )
@@ -1912,6 +1932,7 @@ set(vnm_terminal_test_process_targets
     vnm_terminal_resource_lifecycle
     vnm_terminal_qt_posture
     vnm_terminal_screen_basic
+    vnm_terminal_search_index
     vnm_terminal_screen_sgr
     vnm_terminal_screen_operations
     vnm_terminal_screen_alternate

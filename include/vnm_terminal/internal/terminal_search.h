@@ -34,7 +34,6 @@ struct terminal_search_match_t
 {
     terminal_search_match_identity_t identity;
     std::int64_t                     public_row = 0;
-    int                              visual_fragment_index = 0;
     int                              first_column = 0;
     int                              column_count = 0;
 };
@@ -63,7 +62,6 @@ public:
 
     const QString& query() const { return m_query; }
     terminal_search_result_state_t result_state() const;
-    const std::vector<terminal_search_match_t>& matches() const { return m_matches; }
     const terminal_search_match_t* current_match() const;
 
     bool select_next();
