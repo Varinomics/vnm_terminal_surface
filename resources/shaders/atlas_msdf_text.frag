@@ -7,6 +7,8 @@ layout(std140, binding = 0) uniform msdf_text_block
     float target_width;
     float target_height;
     float lcd_subpixel_order;
+    float framebuffer_y_up;
+    float ndc_y_up;
 };
 
 layout(binding = 1) uniform sampler2D msdf_atlas;
@@ -95,7 +97,11 @@ void main()
 {
     vec2 frame_origin = fragment_frame_rect.xy;
     vec2 frame_size = max(vec2(1.0), fragment_frame_rect.zw);
-    vec2 glyph_pixel = gl_FragCoord.xy - frame_origin;
+    vec2 fragment_pixel = gl_FragCoord.xy;
+    if (framebuffer_y_up > 0.5) {
+        fragment_pixel.y = target_height - fragment_pixel.y;
+    }
+    vec2 glyph_pixel = fragment_pixel - frame_origin;
     vec2 glyph_ratio = vec2(
         glyph_pixel.x / frame_size.x,
         1.0 - glyph_pixel.y / frame_size.y);

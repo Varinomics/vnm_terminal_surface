@@ -2,6 +2,7 @@
 #include "vnm_terminal/internal/qsg_atlas_font_bytes.h"
 #include "vnm_terminal/internal/qt_grid_metrics_provider.h"
 #include "vnm_terminal/internal/qsg_atlas_warm_set.h"
+#include "vnm_terminal/internal/terminal_color_scheme.h"
 #include "vnm_terminal/internal/terminal_graphic_geometry.h"
 #include "vnm_terminal/internal/vnm_terminal_font.h"
 #include "vnm_terminal/internal/vnm_terminal_surface_render_bridge.h"
@@ -44,6 +45,7 @@
 #include <QSGTextNode>
 #include <QThread>
 #include <private/qquickitem_p.h>
+#include <private/qquickwindow_p.h>
 #include <rhi/qrhi.h>
 
 #if !defined(VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED)
@@ -474,7 +476,8 @@ QString driver_device_type_name(QRhiDriverInfo::DeviceType type)
 int verify_requested_backend(
     QGuiApplication& app,
     const char*      backend,
-    const char*      test_name)
+    const char*      test_name,
+    bool             requires_msdf_ownership = false)
 {
     const QSGRendererInterface::GraphicsApi expected =
         expected_graphics_api_for_backend(backend);
@@ -484,8 +487,34 @@ int verify_requested_backend(
         return 1;
     }
 
+    std::atomic_bool msdf_rhi_observed{false};
+    std::atomic_bool known_software_adapter{false};
     QQuickWindow probe;
     probe.resize(64, 64);
+    const auto capture_msdf_rhi_capability = [&]() {
+        QRhi* const rhi = QQuickWindowPrivate::get(&probe)->rhi;
+        if (rhi != nullptr) {
+            known_software_adapter.store(
+                term::qsg_atlas_driver_info_is_known_software_renderer(
+                    rhi->driverInfo()),
+                std::memory_order_relaxed);
+            msdf_rhi_observed.store(true, std::memory_order_release);
+        }
+    };
+    if (requires_msdf_ownership) {
+        QObject::connect(
+            &probe,
+            &QQuickWindow::sceneGraphInitialized,
+            &probe,
+            capture_msdf_rhi_capability,
+            Qt::DirectConnection);
+        QObject::connect(
+            &probe,
+            &QQuickWindow::beforeRendering,
+            &probe,
+            capture_msdf_rhi_capability,
+            Qt::DirectConnection);
+    }
     probe.show();
     app.processEvents(QEventLoop::AllEvents, 50);
     QThread::msleep(20);
@@ -495,17 +524,46 @@ int verify_requested_backend(
         probe.rendererInterface() != nullptr
             ? probe.rendererInterface()->graphicsApi()
             : QSGRendererInterface::Unknown;
+    if (requires_msdf_ownership && active == expected &&
+        probe.rendererInterface() != nullptr)
+    {
+        for (int attempt = 0;
+            attempt < 80 &&
+                !msdf_rhi_observed.load(std::memory_order_acquire);
+            ++attempt)
+        {
+            probe.requestUpdate();
+            app.processEvents(QEventLoop::AllEvents, 50);
+            QThread::msleep(10);
+            if (attempt == 0) {
+                (void)probe.grabWindow();
+            }
+        }
+    }
     probe.hide();
     app.processEvents(QEventLoop::AllEvents, 50);
 
-    if (active == expected) {
-        return 0;
+    if (active != expected) {
+        std::cerr << "SKIP: " << test_name << " requested backend " << backend
+            << " but Qt activated "
+            << graphics_api_name(active).toUtf8().constData() << '\n';
+        return k_unsupported_backend_skip_return_code;
     }
 
-    std::cerr << "SKIP: " << test_name << " requested backend " << backend
-        << " but Qt activated " << graphics_api_name(active).toUtf8().constData()
-        << '\n';
-    return k_unsupported_backend_skip_return_code;
+    if (requires_msdf_ownership &&
+        !msdf_rhi_observed.load(std::memory_order_acquire))
+    {
+        std::cerr << "FAIL: " << test_name << " activated backend " << backend
+            << " without exposing its QRhi capability state\n";
+        return 1;
+    }
+    if (known_software_adapter.load(std::memory_order_relaxed)) {
+        std::cerr << "SKIP: " << test_name
+            << " requires MSDF ownership unavailable on this known software adapter\n";
+        return k_unsupported_backend_skip_return_code;
+    }
+
+    return 0;
 }
 
 term::Terminal_render_snapshot make_text_snapshot(std::uint64_t sequence, QString text)
@@ -898,12 +956,12 @@ struct Pixel_decorative_primitive
     std::string name;
     QRectF      rect;
     QColor      color;
+    QColor      background;
 };
 
 struct Pixel_parity_fixture
 {
     std::string                         name;
-    bool                                layout_parity = false;
     term::Terminal_render_snapshot      snapshot;
     term::terminal_cell_metrics_t       cell_metrics;
     QSizeF                              logical_size;
@@ -1103,7 +1161,19 @@ QRectF inset_rect(QRectF rect, qreal dx, qreal dy)
 
 term::Terminal_render_options pixel_render_options()
 {
-    return term::Terminal_render_options{};
+    const term::Terminal_color_scheme& scheme = term::default_color_scheme();
+    term::Terminal_render_options options;
+    options.default_background = QColor::fromRgba(scheme.background_rgba);
+    options.default_foreground = QColor::fromRgba(scheme.foreground_rgba);
+    options.cursor_color = QColor::fromRgba(scheme.cursor_rgba);
+    options.selection_background = QColor::fromRgba(scheme.selection_rgba);
+    options.selection_foreground =
+        term::terminal_selection_foreground_for_background(
+            options.selection_background);
+    options.cursor_shape_override = term::Terminal_cursor_shape::BLOCK;
+    options.cursor_blink_enabled_override = false;
+    options.underline_hyperlinks = true;
+    return options;
 }
 
 term::Terminal_render_frame pixel_expected_frame(
@@ -1452,8 +1522,8 @@ void paint_pixel_reference_qsg_decoration_rect(
     for (int y = pixels.top(); y <= pixels.bottom(); ++y) {
         for (int x = pixels.left(); x <= pixels.right(); ++x) {
             const QPointF sample(
-                (static_cast<qreal>(x) - 0.5) / dpr,
-                (static_cast<qreal>(y) - 0.5) / dpr);
+                (static_cast<qreal>(x) + 0.5) / dpr,
+                (static_cast<qreal>(y) + 0.5) / dpr);
             if (sample.x() < rect.left()  ||
                 sample.x() >= rect.right() ||
                 sample.y() < rect.top()   ||
@@ -1603,126 +1673,6 @@ void paint_pixel_reference_arcs(
     }
 }
 
-QImage pixel_tinted_glyph_image(
-    const term::Glyph_coverage_tile& tile,
-    QColor                           color)
-{
-    QImage glyph(tile.size, QImage::Format_ARGB32_Premultiplied);
-    glyph.fill(Qt::transparent);
-    for (int y = 0; y < tile.size.height(); ++y) {
-        const uchar* const row =
-            reinterpret_cast<const uchar*>(tile.bytes.constData()) +
-            static_cast<std::ptrdiff_t>(y * tile.bytes_per_line);
-        for (int x = 0; x < tile.size.width(); ++x) {
-            const int coverage = row[x];
-            if (coverage == 0) {
-                continue;
-            }
-            QColor pixel = color;
-            pixel.setAlpha(std::clamp(
-                static_cast<int>(
-                    std::lround(
-                        static_cast<qreal>(color.alpha()) *
-                            static_cast<qreal>(coverage) / 255.0)),
-                0,
-                255));
-            glyph.setPixelColor(x, y, pixel);
-        }
-    }
-    return glyph;
-}
-
-void paint_pixel_reference_glyph(
-    QPainter&                              painter,
-    quint32                                glyph_index,
-    QPointF                                glyph_origin,
-    QRawFont&                              raster_font,
-    const term::Terminal_render_text_run&  run,
-    qreal                                  device_pixel_ratio)
-{
-    if (glyph_index == 0U) {
-        return;
-    }
-
-    const QImage alpha_map = raster_font.alphaMapForGlyph(
-        glyph_index,
-        QRawFont::PixelAntialiasing);
-    const term::Glyph_coverage_tile tile =
-        term::qsg_atlas_coverage_tile_from_image(alpha_map);
-    if (!tile.is_valid()) {
-        return;
-    }
-
-    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
-    const QPoint physical_offset =
-        term::qsg_atlas_glyph_physical_offset_for_raster_font(
-            raster_font,
-            glyph_index,
-            term::Glyph_image_presentation::UNKNOWN);
-    const QRectF glyph_rect =
-        term::qsg_atlas_snapped_glyph_draw_rect(
-            glyph_origin,
-            physical_offset,
-            tile.size,
-            dpr);
-    if (run.clip_rect.isValid() && !glyph_rect.intersects(run.clip_rect)) {
-        return;
-    }
-
-    painter.save();
-    if (run.clip_rect.isValid()) {
-        painter.setClipRect(run.clip_rect);
-    }
-    painter.drawImage(glyph_rect, pixel_tinted_glyph_image(tile, run.foreground));
-    painter.restore();
-}
-
-void paint_pixel_reference_layout_text_run(
-    QPainter&                              painter,
-    const term::Terminal_render_text_run&  run,
-    const QFont&                           font,
-    term::terminal_cell_metrics_t          cell_metrics,
-    qreal                                  device_pixel_ratio)
-{
-    const term::Qsg_atlas_shaped_text_run_result shaped =
-        term::qsg_atlas_shape_text_run(
-            run,
-            font,
-            cell_metrics,
-            device_pixel_ratio);
-    for (const term::Qsg_atlas_shaped_glyph_record& record : shaped.records) {
-        QRawFont raster_font = record.raw_font;
-        raster_font.setPixelSize(record.physical_pixel_size);
-        paint_pixel_reference_glyph(
-            painter,
-            record.glyph_index,
-            record.glyph_origin,
-            raster_font,
-            run,
-            device_pixel_ratio);
-    }
-}
-
-void paint_pixel_reference_text_runs(
-    QPainter&                                      painter,
-    const std::vector<term::Terminal_render_text_run>& runs,
-    const QFont&                                   font,
-    term::terminal_cell_metrics_t                  cell_metrics,
-    qreal                                          device_pixel_ratio)
-{
-    for (const term::Terminal_render_text_run& run : runs) {
-        if (run.text.isEmpty()) {
-            continue;
-        }
-        paint_pixel_reference_layout_text_run(
-            painter,
-            run,
-            font,
-            cell_metrics,
-            device_pixel_ratio);
-    }
-}
-
 void append_exact_class(
     Pixel_parity_fixture& fixture,
     std::string            name,
@@ -1780,10 +1730,18 @@ void append_decorative_primitives(
             continue;
         }
 
+        QColor background = pixel_render_options().default_background;
+        for (const term::Terminal_render_rect& rect : frame.background_rects) {
+            if (rect.rect.contains(decoration.rect.center())) {
+                background = rect.color;
+            }
+        }
+
         fixture.decorative_primitives.push_back({
             name,
             decoration.rect,
             decoration.color,
+            background,
         });
     }
 }
@@ -1968,7 +1926,6 @@ term::Terminal_render_snapshot make_pixel_base_snapshot(
 
 Pixel_parity_fixture make_pixel_parity_base_fixture(
     std::string                   name,
-    bool                          layout_parity,
     term::terminal_grid_size_t    grid_size,
     std::uint64_t                 sequence,
     term::terminal_cell_metrics_t metrics,
@@ -1976,7 +1933,6 @@ Pixel_parity_fixture make_pixel_parity_base_fixture(
 {
     Pixel_parity_fixture fixture;
     fixture.name               = std::move(name);
-    fixture.layout_parity      = layout_parity;
     fixture.snapshot           = make_pixel_base_snapshot(grid_size, sequence);
     fixture.cell_metrics       = metrics;
     fixture.logical_size       = pixel_logical_size(grid_size, metrics);
@@ -1992,7 +1948,6 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
 
     Pixel_parity_fixture fills = make_pixel_parity_base_fixture(
         "fills_decorations_cursor",
-        false,
         {4, 12},
         710U,
         metrics,
@@ -2057,7 +2012,6 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
 
     Pixel_parity_fixture glyphs = make_pixel_parity_base_fixture(
         "ascii_bmp_attributes",
-        false,
         {3, 14},
         711U,
         metrics,
@@ -2098,7 +2052,6 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
 
     Pixel_parity_fixture cursor = make_pixel_parity_base_fixture(
         "block_cursor_text",
-        false,
         {1, 10},
         712U,
         metrics,
@@ -2122,7 +2075,6 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
 
     Pixel_parity_fixture empty_cursor = make_pixel_parity_base_fixture(
         "block_cursor_empty_fill",
-        false,
         {1, 8},
         713U,
         metrics,
@@ -2138,7 +2090,6 @@ std::vector<Pixel_parity_fixture> make_pixel_parity_fixtures(qreal device_pixel_
 
     Pixel_parity_fixture graphic_cursor = make_pixel_parity_base_fixture(
         "block_cursor_block_element_text",
-        false,
         {1, 8},
         714U,
         metrics,
@@ -2179,7 +2130,6 @@ Pixel_parity_fixture make_layout_parity_base_fixture(
 {
     return make_pixel_parity_base_fixture(
         std::move(name),
-        true,
         grid_size,
         sequence,
         metrics,
@@ -2403,90 +2353,6 @@ std::vector<Pixel_parity_fixture> make_layout_parity_fixtures(qreal device_pixel
         std::move(fallback),
         std::move(emoji),
     };
-}
-
-Pixel_aa_budget pixel_budget_for_backend(
-    const char*         backend,
-    const std::string&  fixture_name)
-{
-    if (fixture_name == "graphics_supported_unsupported_blocks") {
-        if (std::strcmp(backend, "opengl") == 0) {
-            return {300, 216, 276, 0.90};
-        }
-        return {300, 215, 276, 0.90};
-    }
-
-    if (fixture_name == "box_arcs") {
-        return {1152, 255, 260, 0.0};
-    }
-
-    if (fixture_name == "block_cursor_antialiased_box") {
-        if (std::strcmp(backend, "opengl") == 0) {
-            return {288, 130, 60, 0.0};
-        }
-        return {288, 120, 60, 0.0};
-    }
-
-    if (fixture_name == "block_cursor_antialiased_vertical_box") {
-        return {288, 200, 75, 0.0};
-    }
-
-    if (fixture_name == "block_cursor_block_element_text") {
-        return {288, 200, 75, 0.0};
-    }
-
-    if (fixture_name == "viewport_scrollback_selection") {
-        return {816, 210, 300, 0.35};
-    }
-
-    if (fixture_name == "alternate_viewport") {
-        return {288, 220, 260, 0.0};
-    }
-
-    if (fixture_name == "fallback_fonts") {
-        return {1140, 235, 650, 0.40};
-    }
-
-    if (fixture_name == "emoji_policy") {
-        return {840, 245, 560, 0.75};
-    }
-
-    if (fixture_name == "ascii_bmp_attributes") {
-        if (std::strcmp(backend, "d3d11") == 0) {
-            return {3132, 230, 1350, 0.45};
-        }
-        if (std::strcmp(backend, "d3d12") == 0) {
-            return {3132, 230, 1350, 0.45};
-        }
-        if (std::strcmp(backend, "vulkan") == 0) {
-            return {3132, 230, 1350, 0.45};
-        }
-        if (std::strcmp(backend, "opengl") == 0) {
-            return {3132, 230, 1350, 0.45};
-        }
-        return {3132, 230, 1350, 0.45};
-    }
-
-    if (fixture_name == "block_cursor_text") {
-        // MSDF cursor text clips the glyph through the cursor cell. QRhi
-        // backends differ from the CPU reference by a few edge pixels while
-        // preserving shape and placement.
-        if (std::strcmp(backend, "d3d11") == 0) {
-            return {288, 230, 120, 0.08};
-        }
-        if (std::strcmp(backend, "d3d12") == 0) {
-            return {288, 230, 120, 0.08};
-        }
-        if (std::strcmp(backend, "vulkan") == 0) {
-            return {288, 230, 120, 0.08};
-        }
-        if (std::strcmp(backend, "opengl") == 0) {
-            return {288, 230, 120, 0.08};
-        }
-        return {288, 230, 120, 0.08};
-    }
-
-    return {};
 }
 
 Pixel_aa_budget rgba_reference_budget_for_coverage(
@@ -4378,8 +4244,6 @@ Pixel_decorative_ink_stats measure_decorative_ink(
     const Pixel_decorative_primitive&  primitive,
     qreal                               device_pixel_ratio)
 {
-    constexpr int k_color_delta_tolerance = 2;
-
     Pixel_decorative_ink_stats stats;
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
     const qreal inflate = 2.0 / dpr;
@@ -4395,8 +4259,12 @@ Pixel_decorative_ink_stats measure_decorative_ink(
     double y_sum = 0.0;
     for (int y = region.top(); y <= region.bottom(); ++y) {
         for (int x = region.left(); x <= region.right(); ++x) {
-            if (pixel_delta(image.pixelColor(x, y), primitive.color) >
-                k_color_delta_tolerance)
+            const QColor pixel = image.pixelColor(x, y);
+            const int target_delta = pixel_delta(pixel, primitive.color);
+            const int background_delta = pixel_delta(
+                pixel,
+                primitive.background);
+            if (target_delta >= background_delta)
             {
                 continue;
             }
@@ -4434,9 +4302,10 @@ double decorative_expected_centerline(
     qreal                              device_pixel_ratio)
 {
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
-    return decorative_primitive_is_horizontal(primitive)
+    const qreal physical_center = decorative_primitive_is_horizontal(primitive)
         ? primitive.rect.center().y() * dpr
         : primitive.rect.center().x() * dpr;
+    return std::floor(physical_center) + 0.5;
 }
 
 double decorative_measured_centerline(
@@ -4463,9 +4332,15 @@ bool compare_decorative_primitives(
         fixture.decorative_primitives)
     {
         const Pixel_decorative_ink_stats reference_ink =
-            measure_decorative_ink(reference, primitive, device_pixel_ratio);
+            measure_decorative_ink(
+                reference,
+                primitive,
+                device_pixel_ratio);
         const Pixel_decorative_ink_stats atlas_ink =
-            measure_decorative_ink(atlas, primitive, device_pixel_ratio);
+            measure_decorative_ink(
+                atlas,
+                primitive,
+                device_pixel_ratio);
         if (!reference_ink.has_ink() || !atlas_ink.has_ink()) {
             std::cerr << "FAIL: " << parity_mode << " fixture "
                 << fixture.name
@@ -4484,22 +4359,37 @@ bool compare_decorative_primitives(
             decorative_measured_centerline(primitive, atlas_ink);
         const double expected_centerline =
             decorative_expected_centerline(primitive, device_pixel_ratio);
-        const bool bbox_matches =
-            std::abs(reference_ink.bbox.left() - atlas_ink.bbox.left()) <=
-                k_bbox_tolerance_pixels &&
-            std::abs(reference_ink.bbox.right() - atlas_ink.bbox.right()) <=
-                k_bbox_tolerance_pixels &&
-            std::abs(reference_ink.bbox.top() - atlas_ink.bbox.top()) <=
-                k_bbox_tolerance_pixels &&
-            std::abs(reference_ink.bbox.bottom() - atlas_ink.bbox.bottom()) <=
-                k_bbox_tolerance_pixels;
-        const bool centerline_matches =
-            std::abs(reference_centerline - atlas_centerline) <=
-                k_center_tolerance_pixels &&
-            std::abs(reference_centerline - expected_centerline) <=
-                k_center_tolerance_pixels &&
-            std::abs(atlas_centerline - expected_centerline) <=
-                k_center_tolerance_pixels;
+        const bool is_arc = primitive.name.starts_with("graphic_arc_");
+        const bool is_horizontal = decorative_primitive_is_horizontal(primitive);
+        const bool bbox_matches = is_arc
+            ? std::abs(reference_ink.bbox.left() - atlas_ink.bbox.left()) <=
+                    k_bbox_tolerance_pixels &&
+                std::abs(reference_ink.bbox.right() - atlas_ink.bbox.right()) <=
+                    k_bbox_tolerance_pixels &&
+                std::abs(reference_ink.bbox.top() - atlas_ink.bbox.top()) <=
+                    k_bbox_tolerance_pixels &&
+                std::abs(reference_ink.bbox.bottom() - atlas_ink.bbox.bottom()) <=
+                    k_bbox_tolerance_pixels
+            : is_horizontal
+                ? std::abs(reference_ink.bbox.left() - atlas_ink.bbox.left()) <=
+                        k_bbox_tolerance_pixels &&
+                    std::abs(reference_ink.bbox.right() - atlas_ink.bbox.right()) <=
+                        k_bbox_tolerance_pixels
+                : std::abs(reference_ink.bbox.top() - atlas_ink.bbox.top()) <=
+                        k_bbox_tolerance_pixels &&
+                    std::abs(reference_ink.bbox.bottom() - atlas_ink.bbox.bottom()) <=
+                        k_bbox_tolerance_pixels;
+        const bool centerline_matches = is_arc
+            ? std::abs(reference_ink.center_x - atlas_ink.center_x) <=
+                    k_center_tolerance_pixels &&
+                std::abs(reference_ink.center_y - atlas_ink.center_y) <=
+                    k_center_tolerance_pixels
+            : std::abs(reference_centerline - atlas_centerline) <=
+                    k_center_tolerance_pixels &&
+                std::abs(reference_centerline - expected_centerline) <=
+                    k_center_tolerance_pixels &&
+                std::abs(atlas_centerline - expected_centerline) <=
+                    k_center_tolerance_pixels;
         if (!bbox_matches || !centerline_matches) {
             std::cerr << "FAIL: " << parity_mode << " fixture "
                 << fixture.name
@@ -4894,85 +4784,6 @@ bool check_dense_grid_spacing(
             << ", " << y_stats.max_delta << "]\n";
     }
     return ok;
-}
-
-Pixel_render_result render_pixel_reference_fixture(
-    const Pixel_parity_fixture& fixture,
-    std::optional<QSize>         physical_image_size = std::nullopt)
-{
-    Pixel_render_result result;
-    result.device_pixel_ratio =
-        pixel_normalized_device_pixel_ratio(fixture.device_pixel_ratio);
-    result.image_device_pixel_ratio = result.device_pixel_ratio;
-    result.image = QImage(
-        physical_image_size.value_or(
-            pixel_window_physical_pixel_size(
-                fixture.logical_size,
-                result.device_pixel_ratio)),
-        QImage::Format_ARGB32_Premultiplied);
-    result.image.setDevicePixelRatio(result.device_pixel_ratio);
-    result.image.fill(QColor(1, 2, 3));
-
-    const term::Terminal_render_frame frame = pixel_expected_frame(fixture);
-    const QFont font = term::vnm_terminal_font(QString(), 18.0);
-
-    paint_pixel_reference_rects(
-        result.image,
-        frame.background_rects,
-        result.device_pixel_ratio);
-    paint_pixel_reference_rects(
-        result.image,
-        frame.selection_rects,
-        result.device_pixel_ratio);
-    paint_pixel_reference_rects(
-        result.image,
-        frame.graphic_rects,
-        result.device_pixel_ratio);
-    paint_pixel_reference_arcs(
-        result.image,
-        frame.graphic_arcs,
-        result.device_pixel_ratio);
-
-    {
-        QPainter painter(&result.image);
-        painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        painter.setRenderHint(QPainter::Antialiasing, false);
-        painter.setRenderHint(QPainter::TextAntialiasing, false);
-    paint_pixel_reference_text_runs(
-        painter,
-        frame.text_runs,
-        font,
-        fixture.cell_metrics,
-        result.device_pixel_ratio);
-    }
-
-    paint_pixel_reference_decorations(
-        result.image,
-        frame.decorations,
-        result.device_pixel_ratio);
-    paint_pixel_reference_cursors(
-        result.image,
-        frame.cursors,
-        result.device_pixel_ratio);
-    {
-        QPainter painter(&result.image);
-        painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        painter.setRenderHint(QPainter::Antialiasing, false);
-        painter.setRenderHint(QPainter::TextAntialiasing, false);
-    paint_pixel_reference_text_runs(
-        painter,
-        frame.cursor_text_runs,
-        font,
-        fixture.cell_metrics,
-        result.device_pixel_ratio);
-    }
-    paint_pixel_reference_rects(
-        result.image,
-        frame.overlay_rects,
-        result.device_pixel_ratio);
-
-    result.ready = !result.image.isNull();
-    return result;
 }
 
 int atlas_reference_coverage_with_alpha(int coverage, int alpha)
@@ -5811,7 +5622,11 @@ Pixel_render_result render_pixel_atlas_fixture(
     const Pixel_parity_fixture&  fixture,
     QPointF                      surface_position = QPointF(),
     qreal                        font_size = 18.0,
-    QString                      font_family = QString())
+    QString                      font_family = QString(),
+    VNM_TerminalSurface::Text_renderer_mode text_renderer_mode =
+        VNM_TerminalSurface::Text_renderer_mode::AUTO,
+    VNM_TerminalSurface::Lcd_subpixel_order lcd_subpixel_order =
+        VNM_TerminalSurface::Lcd_subpixel_order::AUTO)
 {
     QQuickWindow window;
     window.setColor(QColor(1, 2, 3));
@@ -5832,6 +5647,10 @@ Pixel_render_result render_pixel_atlas_fixture(
     surface.setSize(fixture.logical_size);
     surface.set_font_family(std::move(font_family));
     surface.set_font_size(font_size);
+    surface.set_color_scheme(QStringLiteral("Classic"));
+    surface.set_cursor_blink_enabled(false);
+    surface.set_text_renderer_mode(text_renderer_mode);
+    surface.set_lcd_subpixel_order(lcd_subpixel_order);
     term::VNM_TerminalSurface_render_bridge::set_cursor_blink_visible(surface, true);
     term::VNM_TerminalSurface_render_bridge::set_render_snapshot(
         surface,
@@ -5939,13 +5758,10 @@ bool compare_pixel_fixture(
     const Pixel_render_result&     reference,
     const Pixel_render_result&     atlas,
     const char*                    backend,
-    std::optional<Pixel_aa_budget> budget_override = std::nullopt,
-    const char*                    parity_mode_override = nullptr,
+    std::optional<Pixel_aa_budget> budget_override,
+    const char*                    parity_mode,
     bool                           compare_glyph_regions_enabled = true)
 {
-    const char* const parity_mode = parity_mode_override != nullptr
-        ? parity_mode_override
-        : (fixture.layout_parity ? "atlas layout parity" : "atlas pixel parity");
     if (!reference.ready || !atlas.ready) {
         std::cerr << "FAIL: " << parity_mode << " fixture "
             << fixture.name
@@ -6093,8 +5909,7 @@ bool compare_pixel_fixture(
         render_dpr,
         parity_mode);
 
-    const Pixel_aa_budget budget =
-        budget_override.value_or(pixel_budget_for_backend(backend, fixture.name));
+    const Pixel_aa_budget budget = budget_override.value_or(Pixel_aa_budget{});
     Pixel_glyph_stats glyphs;
     int budget_diff_pixels = 0;
     if (compare_glyph_regions_enabled) {
@@ -6265,10 +6080,477 @@ bool compare_pixel_fixture(
     return ok;
 }
 
-int test_pixel_parity(QGuiApplication& app, const char* backend)
+struct Renderer_glyph_ink
+{
+    QRect bbox;
+    int   pixels = 0;
+
+    bool has_ink() const { return pixels > 0; }
+};
+
+Renderer_glyph_ink measure_renderer_glyph_ink(
+    const QImage&            image,
+    const Pixel_glyph_mask&  mask,
+    qreal                    device_pixel_ratio)
+{
+    constexpr int k_ink_delta_threshold = 8;
+
+    Renderer_glyph_ink ink;
+    const QRect region = logical_rect_to_pixels(
+        mask.rect,
+        pixel_normalized_device_pixel_ratio(device_pixel_ratio))
+        .intersected(image.rect());
+    int left   = std::numeric_limits<int>::max();
+    int top    = std::numeric_limits<int>::max();
+    int right  = std::numeric_limits<int>::min();
+    int bottom = std::numeric_limits<int>::min();
+    for (int y = region.top(); y <= region.bottom(); ++y) {
+        for (int x = region.left(); x <= region.right(); ++x) {
+            if (pixel_delta(image.pixelColor(x, y), mask.background) <=
+                k_ink_delta_threshold)
+            {
+                continue;
+            }
+
+            left   = std::min(left, x);
+            top    = std::min(top, y);
+            right  = std::max(right, x);
+            bottom = std::max(bottom, y);
+            ++ink.pixels;
+        }
+    }
+    if (ink.has_ink()) {
+        ink.bbox = QRect(QPoint(left, top), QPoint(right, bottom));
+    }
+    return ink;
+}
+
+bool compare_renderer_glyph_placement(
+    const Pixel_parity_fixture&  fixture,
+    const Pixel_render_result&   reference,
+    const Pixel_render_result&   candidate,
+    const char*                  backend,
+    const char*                  parity_mode)
+{
+    constexpr int k_bbox_tolerance_pixels = 2;
+
+    bool ok = true;
+    ok &= check(!fixture.glyph_masks.empty(),
+        std::string(parity_mode) + " owns explicit glyph masks for " +
+            fixture.name);
+    for (std::size_t index = 0U; index < fixture.glyph_masks.size(); ++index) {
+        const Pixel_glyph_mask& mask = fixture.glyph_masks[index];
+        const Renderer_glyph_ink reference_ink = measure_renderer_glyph_ink(
+            reference.image,
+            mask,
+            fixture.device_pixel_ratio);
+        const Renderer_glyph_ink candidate_ink = measure_renderer_glyph_ink(
+            candidate.image,
+            mask,
+            fixture.device_pixel_ratio);
+        const QPoint physical_origin = logical_rect_to_pixels(
+            mask.rect,
+            fixture.device_pixel_ratio).topLeft();
+        const QRect reference_relative =
+            reference_ink.bbox.translated(-physical_origin);
+        const QRect candidate_relative =
+            candidate_ink.bbox.translated(-physical_origin);
+        const bool placement_matches =
+            reference_ink.has_ink() && candidate_ink.has_ink() &&
+            std::abs(reference_relative.left() - candidate_relative.left()) <=
+                k_bbox_tolerance_pixels &&
+            std::abs(reference_relative.right() - candidate_relative.right()) <=
+                k_bbox_tolerance_pixels &&
+            std::abs(reference_relative.top() - candidate_relative.top()) <=
+                k_bbox_tolerance_pixels &&
+            std::abs(reference_relative.bottom() - candidate_relative.bottom()) <=
+                k_bbox_tolerance_pixels;
+        if (!placement_matches) {
+            Pixel_glyph_mask full_frame_mask = mask;
+            full_frame_mask.rect = QRectF(QPointF(), fixture.logical_size);
+            const Renderer_glyph_ink candidate_full_ink =
+                measure_renderer_glyph_ink(
+                    candidate.image,
+                    full_frame_mask,
+                    fixture.device_pixel_ratio);
+            std::cerr << "FAIL: " << parity_mode << " glyph placement "
+                << fixture.name << " mask=" << index
+                << " backend=" << backend
+                << " reference_ink=" << reference_ink.pixels
+                << " candidate_ink=" << candidate_ink.pixels
+                << " reference_bbox=" << reference_relative.x() << ','
+                << reference_relative.y() << ' '
+                << reference_relative.width() << 'x'
+                << reference_relative.height()
+                << " candidate_bbox=" << candidate_relative.x() << ','
+                << candidate_relative.y() << ' '
+                << candidate_relative.width() << 'x'
+                << candidate_relative.height()
+                << " candidate_full_ink=" << candidate_full_ink.pixels
+                << " candidate_full_bbox=" << candidate_full_ink.bbox.x() << ','
+                << candidate_full_ink.bbox.y() << ' '
+                << candidate_full_ink.bbox.width() << 'x'
+                << candidate_full_ink.bbox.height()
+                << " dpr=" << fixture.device_pixel_ratio << '\n';
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool atlas_fixture_render_state_ready_after_backend_verification(
+    const Pixel_render_result& result)
+{
+    return
+        result.ready                                  &&
+        !result.image.isNull()                        &&
+        result.atlas_report.prepare_count > 0U        &&
+        result.atlas_report.render_count > 0U         &&
+        result.atlas_report.drew                      &&
+        result.atlas_report.command_buffer_non_null   &&
+        result.atlas_report.render_target_non_null    &&
+        result.atlas_report.rhi_non_null;
+}
+
+int verified_atlas_fixture_render_state_status(
+    const Pixel_render_result& result,
+    const char*                test_name,
+    const std::string&         fixture_name,
+    bool                       report_failure = true)
+{
+    if (atlas_fixture_render_state_ready_after_backend_verification(result)) {
+        return 0;
+    }
+
+    if (report_failure) {
+        std::cerr << "FAIL: " << test_name << " fixture " << fixture_name
+            << " lost usable atlas render state after backend verification"
+            << " ready=" << result.ready
+            << " capture_null=" << result.image.isNull()
+            << " prepare_count=" << result.atlas_report.prepare_count
+            << " render_count=" << result.atlas_report.render_count
+            << " drew=" << result.atlas_report.drew
+            << " command_buffer_non_null="
+            << result.atlas_report.command_buffer_non_null
+            << " render_target_non_null="
+            << result.atlas_report.render_target_non_null
+            << " rhi_non_null=" << result.atlas_report.rhi_non_null
+            << '\n';
+    }
+    return 1;
+}
+
+Pixel_parity_fixture make_msdf_orientation_discriminator_fixture(
+    qreal device_pixel_ratio)
+{
+    constexpr qreal k_font_size = 18.0;
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const QString family = term::vnm_terminal_default_monospace_font_family();
+    const term::terminal_cell_metrics_t metrics =
+        pixel_metrics(dpr, k_font_size, family);
+    Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
+        "msdf_orientation_top_bottom",
+        {6, 8},
+        730U,
+        metrics,
+        dpr);
+    fixture.snapshot.cells.push_back(make_pixel_cell(
+        0, 2, QStringLiteral("W"), 1, term::k_default_terminal_style_id));
+    fixture.snapshot.cells.push_back(make_pixel_cell(
+        5, 2, QStringLiteral("W"), 1, term::k_default_terminal_style_id));
+    const term::Terminal_render_frame frame = pixel_expected_frame(fixture);
+    append_text_glyph_masks(fixture, frame.text_runs);
+    return fixture;
+}
+
+int test_msdf_orientation_discriminator(
+    QGuiApplication& app,
+    const char*      backend)
+{
+#if !VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED || \
+    !VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED
+    std::cerr << "FAIL: MSDF orientation discriminator requires the production "
+        << "renderer and vnm_msdf_text diagnostic dependency\n";
+    (void)app;
+    (void)backend;
+    return 1;
+#else
+    const int backend_status = verify_requested_backend(
+        app,
+        backend,
+        "forced MSDF orientation discriminator",
+        true);
+    if (backend_status != 0) {
+        return backend_status;
+    }
+
+    constexpr qreal k_font_size = 18.0;
+    const qreal device_pixel_ratio =
+        pixel_probe_render_window_device_pixel_ratio(app);
+    const Pixel_parity_fixture fixture =
+        make_msdf_orientation_discriminator_fixture(device_pixel_ratio);
+    const QString family = term::vnm_terminal_default_monospace_font_family();
+    const Pixel_render_result candidate = render_pixel_atlas_fixture(
+        app,
+        fixture,
+        QPointF(),
+        k_font_size,
+        family,
+        VNM_TerminalSurface::Text_renderer_mode::MSDF,
+        VNM_TerminalSurface::Lcd_subpixel_order::NONE);
+    const int fixture_status = verified_atlas_fixture_render_state_status(
+        candidate,
+        "forced MSDF orientation discriminator",
+        fixture.name);
+    if (fixture_status != 0) {
+        return fixture_status;
+    }
+
+    const Msdf_single_w_probe_result reference =
+        render_msdf_single_w_probe_fixture(fixture, candidate.image.size());
+    const term::Qsg_atlas_render_summary& render = candidate.atlas_report.render;
+    bool ok = true;
+    ok &= check(candidate.ready && !candidate.image.isNull(),
+        "forced MSDF orientation candidate captured a non-empty frame");
+    ok &= check(reference.render.ready && !reference.render.image.isNull(),
+        "forced MSDF orientation diagnostic captured MSDF-owned reference ink");
+    ok &= check(reference.render.image.size() == candidate.image.size(),
+        "forced MSDF orientation candidate and diagnostic use one physical frame");
+    ok &= check(
+        render.text_renderer_policy == term::Terminal_text_renderer_policy::MSDF &&
+            render.effective_text_renderer == term::Terminal_text_renderer_kind::MSDF &&
+            !render.text_renderer_fallback_allowed &&
+            !render.text_renderer_fallback_used,
+        "forced MSDF orientation fixture has explicit MSDF ownership without fallback");
+    ok &= check(
+        render.msdf_text_renderer_active &&
+            render.msdf_text_shader_package_available &&
+            render.msdf_text_atlas_built &&
+            render.msdf_text_atlas_ready &&
+            render.msdf_text_texture_ready &&
+            render.msdf_text_resources_ready,
+        "forced MSDF orientation fixture has ready MSDF production resources");
+    ok &= check(
+        render.msdf_text_supported_runs == 2 &&
+            render.msdf_text_runs == 2 &&
+            render.msdf_text_glyph_instances == 2 &&
+            render.msdf_text_draw_calls > 0 &&
+            render.msdf_text_missed_supported_runs == 0 &&
+            render.msdf_text_missed_supported_glyphs == 0 &&
+            render.glyph_draw_calls == 0 &&
+            render.glyph_buffer_instances == 0,
+        "forced MSDF orientation fixture draws both rows only through MSDF");
+    ok &= check(fixture.glyph_masks.size() == 2U,
+        "forced MSDF orientation fixture owns top and bottom glyph masks");
+
+    constexpr int k_bbox_tolerance_pixels = 2;
+    for (std::size_t index = 0U; index < fixture.glyph_masks.size(); ++index) {
+        const Pixel_glyph_mask& mask = fixture.glyph_masks[index];
+        const Renderer_glyph_ink reference_ink =
+            measure_renderer_glyph_ink(
+                reference.render.image,
+                mask,
+                fixture.device_pixel_ratio);
+        const Renderer_glyph_ink candidate_ink =
+            measure_renderer_glyph_ink(
+                candidate.image,
+                mask,
+                fixture.device_pixel_ratio);
+        const QRect physical_region = logical_rect_to_pixels(
+            mask.rect,
+            fixture.device_pixel_ratio);
+        const QRect reference_relative = reference_ink.bbox.translated(
+            -physical_region.topLeft());
+        const QRect candidate_relative = candidate_ink.bbox.translated(
+            -physical_region.topLeft());
+        const bool placement_matches =
+            reference_ink.has_ink() && candidate_ink.has_ink() &&
+            std::abs(reference_relative.left() - candidate_relative.left()) <=
+                k_bbox_tolerance_pixels &&
+            std::abs(reference_relative.right() - candidate_relative.right()) <=
+                k_bbox_tolerance_pixels &&
+            std::abs(reference_relative.top() - candidate_relative.top()) <=
+                k_bbox_tolerance_pixels &&
+            std::abs(reference_relative.bottom() - candidate_relative.bottom()) <=
+                k_bbox_tolerance_pixels;
+        if (!placement_matches) {
+            std::cerr << "FAIL: forced MSDF orientation row " << index
+                << " reference_ink=" << reference_ink.pixels
+                << " candidate_ink=" << candidate_ink.pixels
+                << " reference_bbox=" << reference_relative.x() << ','
+                << reference_relative.y() << ' '
+                << reference_relative.width() << 'x'
+                << reference_relative.height()
+                << " candidate_bbox=" << candidate_relative.x() << ','
+                << candidate_relative.y() << ' '
+                << candidate_relative.width() << 'x'
+                << candidate_relative.height()
+                << " dpr=" << fixture.device_pixel_ratio << '\n';
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        std::cout << "PASS: forced MSDF orientation discriminator backend="
+            << backend << " dpr=" << candidate.device_pixel_ratio
+            << " top_and_bottom_rows=2 msdf_instances="
+            << render.msdf_text_glyph_instances << '\n';
+    }
+    return ok ? 0 : 1;
+#endif
+}
+
+int test_post_verification_failure_exit_contract()
+{
+    struct Failure_case
+    {
+        const char*         name;
+        Pixel_render_result result;
+    };
+
+    Pixel_render_result ready_state;
+    ready_state.image = QImage(1, 1, QImage::Format_RGBA8888);
+    ready_state.ready = true;
+    ready_state.atlas_report.prepare_count = 1U;
+    ready_state.atlas_report.render_count  = 1U;
+    ready_state.atlas_report.drew = true;
+    ready_state.atlas_report.command_buffer_non_null = true;
+    ready_state.atlas_report.render_target_non_null = true;
+    ready_state.atlas_report.rhi_non_null = true;
+
+    Pixel_render_result no_ready = ready_state;
+    no_ready.ready = false;
+
+    Pixel_render_result no_prepare = no_ready;
+    no_prepare.atlas_report.prepare_count = 0U;
+
+    Pixel_render_result no_render = no_ready;
+    no_render.atlas_report.render_count = 0U;
+
+    Pixel_render_result no_draw = no_ready;
+    no_draw.atlas_report.drew = false;
+
+    Pixel_render_result no_rhi = no_ready;
+    no_rhi.atlas_report.rhi_non_null = false;
+
+    Pixel_render_result no_capture = ready_state;
+    no_capture.image = {};
+
+    const std::array<Failure_case, 7> cases = {{
+        {"no fixture state", {}},
+        {"no ready state", no_ready},
+        {"no prepare", no_prepare},
+        {"no render", no_render},
+        {"no draw", no_draw},
+        {"no RHI", no_rhi},
+        {"no capture", no_capture},
+    }};
+
+    bool ok = true;
+    for (const Failure_case& failure : cases) {
+        const int simulated_exit_code =
+            verified_atlas_fixture_render_state_status(
+                failure.result,
+                "post-verification failure contract",
+                failure.name,
+                false);
+        ok &= check(
+            simulated_exit_code != 0 &&
+                simulated_exit_code != k_unsupported_backend_skip_return_code,
+            std::string("post-verification ") + failure.name +
+                " failure exits nonzero without becoming a skip");
+    }
+    return ok ? 0 : 1;
+}
+
+int test_primitive_parity(QGuiApplication& app, const char* backend)
 {
     const int backend_status =
-        verify_requested_backend(app, backend, "atlas pixel parity");
+        verify_requested_backend(app, backend, "atlas primitive parity");
+    if (backend_status != 0) {
+        return backend_status;
+    }
+
+    bool ok = true;
+    const qreal device_pixel_ratio =
+        pixel_probe_render_window_device_pixel_ratio(app);
+    std::vector<Pixel_parity_fixture> text_fixtures =
+        make_pixel_parity_fixtures(device_pixel_ratio);
+    std::vector<Pixel_parity_fixture> layout_fixtures =
+        make_layout_parity_fixtures(device_pixel_ratio);
+    std::vector<Pixel_parity_fixture> fixtures;
+    fixtures.push_back(std::move(text_fixtures[0]));
+    fixtures.push_back(std::move(text_fixtures[3]));
+    fixtures.push_back(std::move(layout_fixtures[0]));
+    fixtures.push_back(std::move(layout_fixtures[1]));
+
+    const qreal physical_pixel = 1.0 /
+        pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const term::Terminal_render_frame block_frame =
+        pixel_expected_frame(fixtures[2]);
+    for (const term::Terminal_render_rect& rect : block_frame.graphic_rects) {
+        const QRectF interior = rect.rect.adjusted(
+            physical_pixel,
+            physical_pixel,
+            -physical_pixel,
+            -physical_pixel);
+        if (interior.isValid()) {
+            append_exact_class(
+                fixtures[2],
+                "graphic_rect_pixel_center",
+                {interior});
+        }
+    }
+    const term::Terminal_render_frame arc_frame =
+        pixel_expected_frame(fixtures[3]);
+    int arc_index = 0;
+    for (const term::Terminal_render_arc& arc : arc_frame.graphic_arcs) {
+        fixtures[3].decorative_primitives.push_back({
+            "graphic_arc_" + std::to_string(arc_index++),
+            arc.rect,
+            arc.color,
+            pixel_render_options().default_background,
+        });
+    }
+
+    for (const Pixel_parity_fixture& fixture : fixtures) {
+        const Pixel_render_result atlas =
+            render_pixel_atlas_fixture(
+                app,
+                fixture,
+                QPointF(),
+                18.0,
+                term::vnm_terminal_default_monospace_font_family(),
+                VNM_TerminalSurface::Text_renderer_mode::GLYPH,
+                VNM_TerminalSurface::Lcd_subpixel_order::NONE);
+        const int fixture_status = verified_atlas_fixture_render_state_status(
+            atlas,
+            "atlas primitive parity",
+            fixture.name);
+        if (fixture_status != 0) {
+            return fixture_status;
+        }
+
+        const Pixel_render_result reference =
+            render_atlas_rgba_reference_fixture(fixture, atlas.image.size());
+        ok &= compare_pixel_fixture(
+            fixture,
+            reference,
+            atlas,
+            backend,
+            std::nullopt,
+            "atlas primitive parity",
+            false);
+    }
+    return ok ? 0 : 1;
+}
+
+int test_forced_glyph_parity(QGuiApplication& app, const char* backend)
+{
+    const int backend_status = verify_requested_backend(
+        app,
+        backend,
+        "forced glyph renderer parity");
     if (backend_status != 0) {
         return backend_status;
     }
@@ -6279,21 +6561,319 @@ int test_pixel_parity(QGuiApplication& app, const char* backend)
     const std::vector<Pixel_parity_fixture> fixtures =
         make_pixel_parity_fixtures(device_pixel_ratio);
     for (const Pixel_parity_fixture& fixture : fixtures) {
-        const Pixel_render_result atlas =
-            render_pixel_atlas_fixture(app, fixture);
-        if (!atlas.ready &&
-            (atlas.atlas_report.prepare_count == 0U ||
-                atlas.atlas_report.render_count == 0U ||
-                (atlas.atlas_report.prepare_count > 0U && !atlas.atlas_report.rhi_non_null)))
-        {
-            std::cerr << "SKIP: atlas pixel parity did not reach usable QRhi render state\n";
-            return k_unsupported_backend_skip_return_code;
+        if (fixture.glyph_masks.empty()) {
+            continue;
         }
 
+        const Pixel_render_result atlas = render_pixel_atlas_fixture(
+            app,
+            fixture,
+            QPointF(),
+            18.0,
+            term::vnm_terminal_default_monospace_font_family(),
+            VNM_TerminalSurface::Text_renderer_mode::GLYPH,
+            VNM_TerminalSurface::Lcd_subpixel_order::NONE);
+        const int fixture_status = verified_atlas_fixture_render_state_status(
+            atlas,
+            "forced glyph renderer parity",
+            fixture.name);
+        if (fixture_status != 0) {
+            return fixture_status;
+        }
+
+        const term::Qsg_atlas_render_summary& render = atlas.atlas_report.render;
+        ok &= check(
+            render.text_renderer_policy == term::Terminal_text_renderer_policy::GLYPH &&
+                render.effective_text_renderer == term::Terminal_text_renderer_kind::GLYPH &&
+                !render.text_renderer_fallback_allowed &&
+                !render.text_renderer_fallback_used &&
+                render.glyph_draw_calls > 0 &&
+                render.glyph_buffer_instances > 0 &&
+                render.msdf_text_draw_calls == 0 &&
+                render.msdf_text_glyph_instances == 0,
+            std::string("forced glyph renderer owns fixture ") + fixture.name);
         const Pixel_render_result reference =
             render_atlas_rgba_reference_fixture(fixture, atlas.image.size());
-        ok &= compare_pixel_fixture(fixture, reference, atlas, backend);
+        ok &= compare_pixel_fixture(
+            fixture,
+            reference,
+            atlas,
+            backend,
+            std::nullopt,
+            "forced glyph renderer parity",
+            false);
+        ok &= compare_renderer_glyph_placement(
+            fixture,
+            reference,
+            atlas,
+            backend,
+            "forced glyph renderer parity");
     }
+    return ok ? 0 : 1;
+}
+
+std::vector<Pixel_parity_fixture> make_forced_msdf_parity_fixtures(
+    qreal device_pixel_ratio)
+{
+    constexpr qreal k_font_size = 18.0;
+    const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
+    const term::terminal_cell_metrics_t metrics = pixel_metrics(
+        dpr,
+        k_font_size,
+        term::vnm_terminal_default_monospace_font_family());
+    Pixel_parity_fixture orientation =
+        make_msdf_orientation_discriminator_fixture(dpr);
+
+    Pixel_parity_fixture cursor = make_pixel_parity_base_fixture(
+        "msdf_cursor_text",
+        {3, 8},
+        731U,
+        metrics,
+        dpr);
+    cursor.snapshot.cursor.position      = {1, 2};
+    cursor.snapshot.cursor.visible       = true;
+    cursor.snapshot.cursor.shape         = term::Terminal_cursor_shape::BLOCK;
+    cursor.snapshot.cursor.blink_enabled = false;
+    cursor.snapshot.cells.push_back(make_pixel_cell(
+        1, 2, QStringLiteral("W"), 1, term::k_default_terminal_style_id));
+    const term::Terminal_render_frame cursor_frame = pixel_expected_frame(cursor);
+    append_text_glyph_masks(
+        cursor,
+        cursor_frame.cursor_text_runs,
+        pixel_render_options().cursor_color);
+
+    Pixel_parity_fixture preedit = make_pixel_parity_base_fixture(
+        "msdf_preedit_text",
+        {3, 8},
+        732U,
+        metrics,
+        dpr);
+    preedit.snapshot.cursor.position = {1, 3};
+    preedit.snapshot.ime_preedit.active = true;
+    preedit.snapshot.ime_preedit.text = QStringLiteral("W");
+    preedit.snapshot.ime_preedit.cursor_position = 1;
+    const term::Terminal_render_frame preedit_frame =
+        pixel_expected_frame(preedit);
+    append_text_glyph_masks(preedit, preedit_frame.text_runs);
+    append_text_glyph_masks(preedit, preedit_frame.cursor_text_runs);
+    append_decorative_primitives(
+        preedit,
+        "msdf_preedit_caret",
+        preedit_frame,
+        term::Terminal_render_decoration_kind::PREEDIT_CARET);
+
+    return {
+        std::move(orientation),
+        std::move(cursor),
+        std::move(preedit),
+    };
+}
+
+bool compare_msdf_owned_fixture(
+    const Pixel_parity_fixture&       fixture,
+    const Msdf_single_w_probe_result& reference,
+    const Pixel_render_result&        candidate,
+    const char*                       backend)
+{
+    const term::Qsg_atlas_render_summary& render = candidate.atlas_report.render;
+    bool ok = true;
+    ok &= check(
+        candidate.ready && reference.render.ready &&
+            !candidate.image.isNull() && !reference.render.image.isNull(),
+        std::string("forced MSDF candidate and diagnostic render ") + fixture.name);
+    ok &= check(
+        candidate.image.size() == reference.render.image.size() &&
+            pixel_device_pixel_ratios_match(
+                fixture.device_pixel_ratio,
+                candidate.device_pixel_ratio) &&
+            pixel_device_pixel_ratios_match(
+                fixture.device_pixel_ratio,
+                candidate.image_device_pixel_ratio) &&
+            pixel_device_pixel_ratios_match(
+                fixture.device_pixel_ratio,
+                reference.render.device_pixel_ratio) &&
+            pixel_device_pixel_ratios_match(
+                fixture.device_pixel_ratio,
+                reference.render.image_device_pixel_ratio),
+        std::string("forced MSDF uses one physical frame and DPR for ") +
+            fixture.name);
+    ok &= check(
+        render.text_renderer_policy == term::Terminal_text_renderer_policy::MSDF &&
+            render.effective_text_renderer == term::Terminal_text_renderer_kind::MSDF &&
+            !render.text_renderer_fallback_allowed &&
+            !render.text_renderer_fallback_used &&
+            render.msdf_text_renderer_active &&
+            render.msdf_text_shader_package_available &&
+            render.msdf_text_atlas_built &&
+            render.msdf_text_atlas_ready &&
+            render.msdf_text_texture_ready &&
+            render.msdf_text_resources_ready &&
+            render.msdf_text_supported_runs > 0 &&
+            render.msdf_text_runs == render.msdf_text_supported_runs &&
+            render.msdf_text_glyph_instances > 0 &&
+            render.msdf_text_draw_calls > 0 &&
+            render.msdf_text_missed_supported_runs == 0 &&
+            render.msdf_text_missed_supported_glyphs == 0 &&
+            render.glyph_draw_calls == 0 &&
+            render.glyph_buffer_instances == 0,
+        std::string("forced MSDF exclusively owns supported text in ") +
+            fixture.name);
+    ok &= compare_pixel_fixture(
+        fixture,
+        reference.render,
+        candidate,
+        backend,
+        std::nullopt,
+        "forced MSDF structural parity",
+        false);
+
+    ok &= compare_renderer_glyph_placement(
+        fixture,
+        reference.render,
+        candidate,
+        backend,
+        "forced MSDF diagnostic");
+    return ok;
+}
+
+int test_forced_msdf_parity(QGuiApplication& app, const char* backend)
+{
+#if !VNM_TERMINAL_MSDF_TEXT_RENDERER_ENABLED || \
+    !VNM_TERMINAL_QSG_ATLAS_MSDF_TEXT_ENABLED
+    std::cerr << "FAIL: forced MSDF parity requires production and diagnostic MSDF support\n";
+    (void)app;
+    (void)backend;
+    return 1;
+#else
+    const int backend_status = verify_requested_backend(
+        app,
+        backend,
+        "forced MSDF renderer parity",
+        true);
+    if (backend_status != 0) {
+        return backend_status;
+    }
+
+    bool ok = true;
+    const qreal device_pixel_ratio =
+        pixel_probe_render_window_device_pixel_ratio(app);
+    const std::vector<Pixel_parity_fixture> fixtures =
+        make_forced_msdf_parity_fixtures(device_pixel_ratio);
+    for (const Pixel_parity_fixture& fixture : fixtures) {
+        const Pixel_render_result candidate = render_pixel_atlas_fixture(
+            app,
+            fixture,
+            QPointF(),
+            18.0,
+            term::vnm_terminal_default_monospace_font_family(),
+            VNM_TerminalSurface::Text_renderer_mode::MSDF,
+            VNM_TerminalSurface::Lcd_subpixel_order::NONE);
+        const int fixture_status = verified_atlas_fixture_render_state_status(
+            candidate,
+            "forced MSDF renderer parity",
+            fixture.name);
+        if (fixture_status != 0) {
+            return fixture_status;
+        }
+        const Msdf_single_w_probe_result reference =
+            render_msdf_single_w_probe_fixture(fixture, candidate.image.size());
+        ok &= compare_msdf_owned_fixture(
+            fixture,
+            reference,
+            candidate,
+            backend);
+    }
+    return ok ? 0 : 1;
+#endif
+}
+
+int test_auto_text_renderer_routing(QGuiApplication& app, const char* backend)
+{
+    const int backend_status = verify_requested_backend(
+        app,
+        backend,
+        "automatic text renderer routing",
+        true);
+    if (backend_status != 0) {
+        return backend_status;
+    }
+
+    const qreal device_pixel_ratio =
+        pixel_probe_render_window_device_pixel_ratio(app);
+    const Pixel_parity_fixture supported =
+        make_msdf_orientation_discriminator_fixture(device_pixel_ratio);
+    std::vector<Pixel_parity_fixture> layout =
+        make_layout_parity_fixtures(device_pixel_ratio);
+    const Pixel_parity_fixture& unsupported = layout.back();
+    const auto render_auto = [&](const Pixel_parity_fixture& fixture) {
+        return render_pixel_atlas_fixture(
+            app,
+            fixture,
+            QPointF(),
+            18.0,
+            term::vnm_terminal_default_monospace_font_family(),
+            VNM_TerminalSurface::Text_renderer_mode::AUTO,
+            VNM_TerminalSurface::Lcd_subpixel_order::NONE);
+    };
+    const Pixel_render_result supported_result = render_auto(supported);
+    const Pixel_render_result unsupported_result = render_auto(unsupported);
+    const int supported_status = verified_atlas_fixture_render_state_status(
+        supported_result,
+        "automatic text renderer routing",
+        supported.name);
+    if (supported_status != 0) {
+        return supported_status;
+    }
+    const int unsupported_status = verified_atlas_fixture_render_state_status(
+        unsupported_result,
+        "automatic text renderer routing",
+        unsupported.name);
+    if (unsupported_status != 0) {
+        return unsupported_status;
+    }
+
+    const term::Qsg_atlas_render_summary& supported_render =
+        supported_result.atlas_report.render;
+    const term::Qsg_atlas_render_summary& unsupported_render =
+        unsupported_result.atlas_report.render;
+    const bool supported_msdf =
+        supported_render.msdf_text_draw_calls > 0 &&
+        supported_render.msdf_text_resources_ready;
+    const bool unsupported_msdf =
+        unsupported_render.msdf_text_draw_calls > 0 &&
+        unsupported_render.msdf_text_resources_ready;
+    const bool unsupported_glyph = unsupported_render.glyph_draw_calls > 0;
+    const term::Terminal_text_renderer_kind unsupported_expected =
+        unsupported_msdf && unsupported_glyph
+            ? term::Terminal_text_renderer_kind::MIXED
+            : (unsupported_msdf
+                ? term::Terminal_text_renderer_kind::MSDF
+                : (unsupported_glyph
+                    ? term::Terminal_text_renderer_kind::GLYPH
+                    : term::Terminal_text_renderer_kind::NONE));
+
+    bool ok = true;
+    ok &= check(
+        supported_result.ready &&
+            supported_render.text_renderer_policy ==
+                term::Terminal_text_renderer_policy::AUTO &&
+            supported_render.text_renderer_fallback_allowed &&
+            supported_msdf &&
+            supported_render.effective_text_renderer ==
+                term::Terminal_text_renderer_kind::MSDF &&
+            !supported_render.text_renderer_fallback_used,
+        "AUTO routes bundled supported ASCII exclusively through MSDF");
+    ok &= check(
+        unsupported_result.ready &&
+            unsupported_render.text_renderer_policy ==
+                term::Terminal_text_renderer_policy::AUTO &&
+            unsupported_render.text_renderer_fallback_allowed &&
+            unsupported_glyph &&
+            unsupported_render.effective_text_renderer == unsupported_expected &&
+            unsupported_render.text_renderer_fallback_used &&
+            unsupported_render.msdf_text_missed_supported_runs == 0 &&
+            unsupported_render.msdf_text_missed_supported_glyphs == 0,
+        "AUTO reports effective renderer and glyph fallback for unsupported text");
     return ok ? 0 : 1;
 }
 
@@ -6465,10 +7045,10 @@ bool validate_frame_build_report(
     return ok;
 }
 
-int test_layout_parity(QGuiApplication& app, const char* backend)
+int test_layout_contract(QGuiApplication& app, const char* backend)
 {
     const int backend_status =
-        verify_requested_backend(app, backend, "atlas layout parity");
+        verify_requested_backend(app, backend, "atlas layout contract");
     if (backend_status != 0) {
         return backend_status;
     }
@@ -6480,20 +7060,29 @@ int test_layout_parity(QGuiApplication& app, const char* backend)
         make_layout_parity_fixtures(device_pixel_ratio);
     for (const Pixel_parity_fixture& fixture : fixtures) {
         const Pixel_render_result atlas =
-            render_pixel_atlas_fixture(app, fixture);
-        if (!atlas.ready &&
-            (atlas.atlas_report.prepare_count == 0U ||
-                atlas.atlas_report.render_count == 0U ||
-                (atlas.atlas_report.prepare_count > 0U && !atlas.atlas_report.rhi_non_null)))
-        {
-            std::cerr << "SKIP: atlas layout parity did not reach usable QRhi render state\n";
-            return k_unsupported_backend_skip_return_code;
+            render_pixel_atlas_fixture(
+                app,
+                fixture,
+                QPointF(),
+                18.0,
+                term::vnm_terminal_default_monospace_font_family(),
+                VNM_TerminalSurface::Text_renderer_mode::GLYPH,
+                VNM_TerminalSurface::Lcd_subpixel_order::NONE);
+        const int fixture_status = verified_atlas_fixture_render_state_status(
+            atlas,
+            "atlas layout contract",
+            fixture.name);
+        if (fixture_status != 0) {
+            return fixture_status;
         }
 
-        const Pixel_render_result reference =
-            render_atlas_rgba_reference_fixture(fixture, atlas.image.size());
-        ok &= compare_pixel_fixture(fixture, reference, atlas, backend);
         ok &= validate_frame_build_report(fixture, atlas.atlas_report);
+        ok &= check(
+            atlas.atlas_report.render.text_renderer_policy ==
+                    term::Terminal_text_renderer_policy::GLYPH &&
+                atlas.atlas_report.render.msdf_text_draw_calls == 0,
+            std::string("layout contract has one explicit glyph renderer for ") +
+                fixture.name);
     }
     return ok ? 0 : 1;
 }
@@ -11241,7 +11830,9 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
                 report.render.msdf_text_renderer_active &&
                 report.render.msdf_text_resources_ready &&
                 report.render.msdf_text_texture_ready &&
-                report.render.msdf_text_glyph_instances == expected_glyphs;
+                report.render.msdf_text_glyph_instances == expected_glyphs &&
+                report.render.msdf_text_atlas_build_attempts_total >= 1U &&
+                report.render.msdf_text_atlas_texture_uploads_total >= 1U;
         });
     baseline_report =
         term::VNM_TerminalSurface_render_bridge::qsg_atlas_frame(surface);
@@ -11319,12 +11910,6 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         msdf_text_baked_identity(baseline_report.render);
     const Msdf_text_draw_identity draw_identity =
         msdf_text_draw_identity(baseline_report.render);
-    int texture_uploads = 0;
-    for (const term::Qsg_atlas_frame_report& report : reports) {
-        if (report.render.msdf_text_texture_uploaded) {
-            ++texture_uploads;
-        }
-    }
 
     bool ok = true;
     ok &= check(
@@ -11347,13 +11932,11 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         ok &= check(
             msdf_text_draw_identity_matches(draw_identity, report.render),
             "atlas MSDF resource stability keeps draw layout identity stable at one size");
+        ok &= check(
+            report.render.msdf_text_atlas_build_attempts_total == 1U &&
+                report.render.msdf_text_atlas_texture_uploads_total == 1U,
+            "atlas MSDF resource stability keeps durable build and upload totals stable");
     }
-    ok &= check(
-        baseline_report.render.msdf_text_texture_uploaded,
-        "atlas MSDF resource stability uploads the MSDF texture on initial generation");
-    ok &= check(
-        texture_uploads == 1,
-        "atlas MSDF resource stability does not reupload the MSDF texture after seeding");
     ok &= atlas_msdf_resource_stability_steady_buffer_ok(
         "unchanged",
         unchanged_report,
@@ -11363,13 +11946,10 @@ bool test_atlas_msdf_resource_stability(QGuiApplication& app)
         color_report,
         Atlas_msdf_steady_buffer_expectation::PARTIAL);
 
-    // The baseline frame builds and uploads exactly one MSDF atlas; steady
-    // same-size frames reuse it without another build or upload.
-    ok &= check(
-        baseline_report.render.msdf_text_cache_miss &&
-            baseline_report.render.msdf_text_atlas_build_attempted &&
-            baseline_report.render.msdf_text_atlas_build_succeeded,
-        "atlas MSDF resource stability records the initial baked-atlas build");
+    // Build and upload flags describe one frame and can be superseded before
+    // the GUI thread samples the render-thread recorder. The cumulative
+    // counters are the durable event contract: baseline readiness waits for
+    // both events, and every later sample must keep them at exactly one.
     ok &= check(
         baseline_report.render.msdf_text_atlas_build_attempts_total == 1U &&
             baseline_report.render.msdf_text_atlas_texture_uploads_total == 1U,
@@ -13295,7 +13875,7 @@ bool test_atlas_auto_msdf_buffer_failure_falls_back(
     return ok;
 }
 
-bool atlas_report_backend_usable(
+int atlas_report_backend_status_after_verification(
     QGuiApplication& app,
     qreal            device_pixel_ratio)
 {
@@ -13311,18 +13891,10 @@ bool atlas_report_backend_usable(
         make_pixel_cell(0, 0, QStringLiteral("A"), 1, term::k_default_terminal_style_id));
     const Pixel_render_result atlas =
         render_pixel_atlas_fixture(app, probe);
-    const bool rendered =
-        atlas.ready &&
-        atlas_report_render_state_ready(atlas.atlas_report);
-    if (!rendered) {
-        std::cerr << "SKIP: atlas report backend check did not reach usable QRhi "
-            << "render state"
-            << " prepare_count=" << atlas.atlas_report.prepare_count
-            << " render_count=" << atlas.atlas_report.render_count
-            << " rhi_non_null=" << atlas.atlas_report.rhi_non_null
-            << '\n';
-    }
-    return rendered;
+    return verified_atlas_fixture_render_state_status(
+        atlas,
+        "atlas report backend check",
+        probe.name);
 }
 
 term::Terminal_render_snapshot make_warm_lazy_seed_snapshot(
@@ -13429,8 +14001,11 @@ int test_atlas_warm_lazy_smoke(QGuiApplication& app, const char* backend)
 
     const qreal device_pixel_ratio =
         pixel_probe_render_window_device_pixel_ratio(app);
-    if (!atlas_report_backend_usable(app, device_pixel_ratio)) {
-        return k_unsupported_backend_skip_return_code;
+    const int atlas_status = atlas_report_backend_status_after_verification(
+        app,
+        device_pixel_ratio);
+    if (atlas_status != 0) {
+        return atlas_status;
     }
 
     const qreal dpr = pixel_normalized_device_pixel_ratio(device_pixel_ratio);
@@ -13826,7 +14401,6 @@ Pixel_parity_fixture make_lcd_capability_probe_fixture(qreal device_pixel_ratio)
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_capability_probe",
-        false,
         {10, 104},
         980U,
         metrics,
@@ -14018,7 +14592,6 @@ Pixel_parity_fixture make_lcd_single_w_probe_fixture(qreal device_pixel_ratio)
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_single_w_probe",
-        false,
         {3, 3},
         986U,
         metrics,
@@ -14042,7 +14615,6 @@ Pixel_parity_fixture make_lcd_repeated_w_probe_fixture(qreal device_pixel_ratio)
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_repeated_w_probe",
-        false,
         {3, 18},
         988U,
         metrics,
@@ -14076,7 +14648,6 @@ Pixel_parity_fixture make_lcd_contiguous_x_probe_fixture(
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_contiguous_x_probe",
-        false,
         {3, k_lcd_contiguous_x_first_column +
             k_lcd_contiguous_x_cell_count + 1},
         992U,
@@ -14110,7 +14681,6 @@ Pixel_parity_fixture make_lcd_intensity_x_probe_fixture(
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_intensity_x_probe",
-        false,
         {k_lcd_intensity_x_first_row + k_lcd_intensity_x_rows + 1,
             k_lcd_intensity_x_first_column + k_lcd_intensity_x_columns + 1},
         994U,
@@ -14150,7 +14720,6 @@ Pixel_parity_fixture make_lcd_fragmented_x_probe_fixture(
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_fragmented_x_probe",
-        false,
         {3, k_lcd_fragmented_x_first_column +
             k_lcd_fragmented_x_columns + 1},
         995U,
@@ -14214,7 +14783,6 @@ Pixel_parity_fixture make_lcd_repeated_on_probe_fixture(
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_repeated_on_probe",
-        false,
         {3, k_lcd_repeated_on_second_column + 4},
         990U,
         metrics,
@@ -14250,7 +14818,6 @@ Pixel_parity_fixture make_lcd_ascii_panel_probe_fixture(qreal device_pixel_ratio
 
     Pixel_parity_fixture fixture = make_pixel_parity_base_fixture(
         "lcd_ascii_panel_probe",
-        false,
         {6, 42},
         989U,
         metrics,
@@ -19448,8 +20015,11 @@ int test_atlas_arc_row_provenance(QGuiApplication& app, const char* backend)
 
     const qreal device_pixel_ratio =
         pixel_probe_render_window_device_pixel_ratio(app);
-    if (!atlas_report_backend_usable(app, device_pixel_ratio)) {
-        return k_unsupported_backend_skip_return_code;
+    const int atlas_status = atlas_report_backend_status_after_verification(
+        app,
+        device_pixel_ratio);
+    if (atlas_status != 0) {
+        return atlas_status;
     }
 
     return test_atlas_rect_row_stable_graphic_arc_update(app, true) ? 0 : 1;
@@ -19465,8 +20035,11 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
 
     const qreal device_pixel_ratio =
         pixel_probe_render_window_device_pixel_ratio(app);
-    if (!atlas_report_backend_usable(app, device_pixel_ratio)) {
-        return k_unsupported_backend_skip_return_code;
+    const int atlas_status = atlas_report_backend_status_after_verification(
+        app,
+        device_pixel_ratio);
+    if (atlas_status != 0) {
+        return atlas_status;
     }
 
     bool ok = true;
@@ -19633,6 +20206,37 @@ int test_atlas_report(QGuiApplication& app, const char* backend)
             atlas.atlas_report.frame_build.glyph_coverage_failures == 0 &&
             atlas.atlas_report.frame_build.glyph_atlas_insert_failures == 0,
         "atlas report records no silent glyph misses");
+    ok &= test_atlas_auto_msdf_prepare_resource_failure_falls_back(app);
+    ok &= test_atlas_auto_msdf_buffer_failure_falls_back(app);
+    ok &= test_atlas_forced_msdf_prepare_resource_failure_does_not_commit(app);
+    ok &= test_atlas_forced_msdf_buffer_failure_does_not_commit(app);
+    return ok ? 0 : 1;
+}
+
+int test_text_renderer_fallback_contract(
+    QGuiApplication& app,
+    const char*      backend)
+{
+    const int backend_status = verify_requested_backend(
+        app,
+        backend,
+        "text renderer fallback contract");
+    if (backend_status != 0) {
+        return backend_status;
+    }
+
+    const qreal device_pixel_ratio =
+        pixel_probe_render_window_device_pixel_ratio(app);
+    const int atlas_status = atlas_report_backend_status_after_verification(
+        app,
+        device_pixel_ratio);
+    if (atlas_status != 0) {
+        return atlas_status;
+    }
+
+    bool ok = true;
+    ok &= test_msdf_text_buffer_fallback_retry_decision();
+    ok &= test_msdf_text_prepare_fallback_retry_decision();
     ok &= test_atlas_auto_msdf_prepare_resource_failure_falls_back(app);
     ok &= test_atlas_auto_msdf_buffer_failure_falls_back(app);
     ok &= test_atlas_forced_msdf_prepare_resource_failure_does_not_commit(app);
@@ -19811,10 +20415,22 @@ bool run_unit_tests()
 
 int main(int argc, char** argv)
 {
+    const bool post_verification_failure_contract =
+        has_argument(argc, argv, "--post-verification-failure-contract");
     const bool render_smoke = has_argument(argc, argv, "--render-smoke");
     const bool dense_grid_smoke = has_argument(argc, argv, "--dense-grid-smoke");
-    const bool pixel_parity = has_argument(argc, argv, "--pixel-parity");
-    const bool layout_parity = has_argument(argc, argv, "--layout-parity");
+    const bool primitive_parity =
+        has_argument(argc, argv, "--primitive-parity");
+    const bool forced_glyph_parity =
+        has_argument(argc, argv, "--forced-glyph-parity");
+    const bool forced_msdf_parity =
+        has_argument(argc, argv, "--forced-msdf-parity");
+    const bool auto_text_renderer =
+        has_argument(argc, argv, "--auto-text-renderer");
+    const bool layout_contract =
+        has_argument(argc, argv, "--layout-contract");
+    const bool text_renderer_fallback =
+        has_argument(argc, argv, "--text-renderer-fallback");
     const bool atlas_report = has_argument(argc, argv, "--atlas-report");
     const bool arc_row_provenance =
         has_argument(argc, argv, "--arc-row-provenance");
@@ -19824,11 +20440,16 @@ int main(int argc, char** argv)
     const bool host_state_smoke = has_argument(argc, argv, "--host-state-smoke");
     const bool cursor_descender_smoke =
         has_argument(argc, argv, "--cursor-descender-smoke");
+    const bool msdf_orientation_discriminator =
+        has_argument(argc, argv, "--msdf-orientation-discriminator");
     const char* backend = argument_value(argc, argv, "--backend", "d3d11");
     const bool graphics_mode =
-        render_smoke || dense_grid_smoke || pixel_parity || layout_parity ||
+        render_smoke || dense_grid_smoke || primitive_parity ||
+        forced_glyph_parity || forced_msdf_parity || auto_text_renderer ||
+        layout_contract || text_renderer_fallback ||
         atlas_report || arc_row_provenance || warm_lazy_smoke ||
-        lcd_capability_probe || host_state_smoke || cursor_descender_smoke;
+        lcd_capability_probe || host_state_smoke || cursor_descender_smoke ||
+        msdf_orientation_discriminator;
     if (graphics_mode) {
         configure_graphics_api(backend);
     }
@@ -19838,11 +20459,17 @@ int main(int argc, char** argv)
     }
 
     QGuiApplication app(argc, argv);
+    if (post_verification_failure_contract) {
+        return test_post_verification_failure_exit_contract();
+    }
     if (dense_grid_smoke) {
         return test_dense_grid_smoke(app, backend);
     }
     if (cursor_descender_smoke) {
         return test_cursor_descender_clip(app, backend);
+    }
+    if (msdf_orientation_discriminator) {
+        return test_msdf_orientation_discriminator(app, backend);
     }
     if (atlas_report) {
         return test_atlas_report(app, backend);
@@ -19859,11 +20486,23 @@ int main(int argc, char** argv)
     if (host_state_smoke) {
         return test_atlas_host_state_smoke(app, backend);
     }
-    if (layout_parity) {
-        return test_layout_parity(app, backend);
+    if (primitive_parity) {
+        return test_primitive_parity(app, backend);
     }
-    if (pixel_parity) {
-        return test_pixel_parity(app, backend);
+    if (forced_glyph_parity) {
+        return test_forced_glyph_parity(app, backend);
+    }
+    if (forced_msdf_parity) {
+        return test_forced_msdf_parity(app, backend);
+    }
+    if (auto_text_renderer) {
+        return test_auto_text_renderer_routing(app, backend);
+    }
+    if (layout_contract) {
+        return test_layout_contract(app, backend);
+    }
+    if (text_renderer_fallback) {
+        return test_text_renderer_fallback_contract(app, backend);
     }
     if (render_smoke) {
         return test_render_smoke(app, backend);

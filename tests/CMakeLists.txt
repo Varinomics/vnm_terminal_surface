@@ -122,10 +122,8 @@ set(VNM_TERMINAL_EXTERNAL_CONFORMANCE_TIMEOUT "300" CACHE STRING
     "CTest timeout, in seconds, for external conformance commands.")
 set(VNM_TERMINAL_ENABLE_GPU_ATLAS_SMOKE OFF CACHE BOOL
     "Add the canonical atlas QRhi render-node hardware smoke CTests.")
-set(VNM_TERMINAL_ENABLE_GPU_ATLAS_PIXEL_PARITY OFF CACHE BOOL
-    "Add the canonical atlas pixel-parity hardware CTests.")
-set(VNM_TERMINAL_ENABLE_GPU_ATLAS_LAYOUT_PARITY OFF CACHE BOOL
-    "Add the canonical atlas layout-parity hardware CTests.")
+set(VNM_TERMINAL_ENABLE_GPU_ATLAS_PARITY OFF CACHE BOOL
+    "Add renderer-specific atlas parity and routing hardware CTests.")
 set(VNM_TERMINAL_ENABLE_GPU_ATLAS_REPORT OFF CACHE BOOL
     "Add the canonical atlas hardware report CTests.")
 option(VNM_TERMINAL_QSG_ATLAS_ENABLE_MSDF_TEXT
@@ -766,6 +764,24 @@ set_tests_properties(vnm_terminal_qsg_atlas PROPERTIES
     TIMEOUT 60
 )
 
+add_test(
+    NAME vnm_terminal_qsg_atlas_post_verification_failure_contract
+    COMMAND
+        "${CMAKE_COMMAND}" -E env
+        ${vnm_terminal_qt_offscreen_environment}
+        ${vnm_terminal_qt_unscaled_environment}
+        "${vnm_terminal_qt_runtime_path}"
+        "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+        "--post-verification-failure-contract"
+)
+
+set_tests_properties(
+    vnm_terminal_qsg_atlas_post_verification_failure_contract
+    PROPERTIES
+        LABELS "qsg;atlas;failure-contract"
+        TIMEOUT 60
+)
+
 if(WIN32)
     set(vnm_terminal_qsg_atlas_dense_grid_environment
         ${vnm_terminal_qt_windows_qpa_environment}
@@ -947,6 +963,30 @@ if(WIN32)
             SKIP_RETURN_CODE 77
             TIMEOUT 120
     )
+
+    foreach(atlas_msdf_orientation_backend IN ITEMS d3d11 opengl)
+        add_test(
+            NAME vnm_terminal_qsg_atlas_msdf_orientation_${atlas_msdf_orientation_backend}
+            COMMAND
+                "${CMAKE_COMMAND}" -E env
+                ${vnm_terminal_qt_windows_qpa_environment}
+                "QSG_RENDER_LOOP=threaded"
+                ${vnm_terminal_qt_unscaled_environment}
+                "${vnm_terminal_qt_runtime_path}"
+                "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
+                "--msdf-orientation-discriminator"
+                "--backend"
+                "${atlas_msdf_orientation_backend}"
+        )
+
+        set_tests_properties(
+            vnm_terminal_qsg_atlas_msdf_orientation_${atlas_msdf_orientation_backend}
+            PROPERTIES
+                LABELS "qsg;hardware;atlas;msdf;orientation"
+                SKIP_RETURN_CODE 77
+                TIMEOUT 120
+        )
+    endforeach()
 endif()
 
 if(VNM_TERMINAL_ENABLE_GPU_ATLAS_SMOKE)
@@ -997,29 +1037,29 @@ if(VNM_TERMINAL_ENABLE_GPU_ATLAS_SMOKE)
 
 endif()
 
-if(VNM_TERMINAL_ENABLE_GPU_ATLAS_PIXEL_PARITY)
-    set(vnm_terminal_qsg_atlas_pixel_parity_backends)
+if(VNM_TERMINAL_ENABLE_GPU_ATLAS_PARITY)
+    set(vnm_terminal_qsg_atlas_parity_backends)
     if(WIN32)
-        list(APPEND vnm_terminal_qsg_atlas_pixel_parity_backends
+        list(APPEND vnm_terminal_qsg_atlas_parity_backends
             d3d11
             d3d12
             vulkan
             opengl
         )
     elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD)$")
-        list(APPEND vnm_terminal_qsg_atlas_pixel_parity_backends
+        list(APPEND vnm_terminal_qsg_atlas_parity_backends
             vulkan
             opengl
         )
     elseif(APPLE)
-        list(APPEND vnm_terminal_qsg_atlas_pixel_parity_backends
+        list(APPEND vnm_terminal_qsg_atlas_parity_backends
             opengl
         )
     endif()
 
-    foreach(atlas_pixel_backend IN LISTS vnm_terminal_qsg_atlas_pixel_parity_backends)
+    function(vnm_terminal_add_atlas_parity_test backend mode argument timeout)
         add_test(
-            NAME vnm_terminal_qsg_atlas_pixel_parity_${atlas_pixel_backend}
+            NAME vnm_terminal_qsg_atlas_${mode}_${backend}
             COMMAND
                 "${CMAKE_COMMAND}" -E env
                 ${vnm_terminal_qt_windows_qpa_environment}
@@ -1027,63 +1067,33 @@ if(VNM_TERMINAL_ENABLE_GPU_ATLAS_PIXEL_PARITY)
                 ${vnm_terminal_qt_unscaled_environment}
                 "${vnm_terminal_qt_runtime_path}"
                 "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
-                "--pixel-parity"
+                "${argument}"
                 "--backend"
-                "${atlas_pixel_backend}"
+                "${backend}"
         )
 
         set_tests_properties(
-            vnm_terminal_qsg_atlas_pixel_parity_${atlas_pixel_backend}
+            vnm_terminal_qsg_atlas_${mode}_${backend}
             PROPERTIES
-                LABELS "qsg;hardware;atlas;pixel-parity"
+                LABELS "qsg;hardware;atlas;renderer-parity;${mode}"
                 SKIP_RETURN_CODE 77
-                TIMEOUT 90
+                TIMEOUT ${timeout}
         )
-    endforeach()
-endif()
+    endfunction()
 
-if(VNM_TERMINAL_ENABLE_GPU_ATLAS_LAYOUT_PARITY)
-    set(vnm_terminal_qsg_atlas_layout_parity_backends)
-    if(WIN32)
-        list(APPEND vnm_terminal_qsg_atlas_layout_parity_backends
-            d3d11
-            d3d12
-            vulkan
-            opengl
-        )
-    elseif(CMAKE_SYSTEM_NAME MATCHES "^(Linux|FreeBSD)$")
-        list(APPEND vnm_terminal_qsg_atlas_layout_parity_backends
-            vulkan
-            opengl
-        )
-    elseif(APPLE)
-        list(APPEND vnm_terminal_qsg_atlas_layout_parity_backends
-            opengl
-        )
-    endif()
-
-    foreach(atlas_layout_backend IN LISTS vnm_terminal_qsg_atlas_layout_parity_backends)
-        add_test(
-            NAME vnm_terminal_qsg_atlas_layout_parity_${atlas_layout_backend}
-            COMMAND
-                "${CMAKE_COMMAND}" -E env
-                ${vnm_terminal_qt_windows_qpa_environment}
-                "QSG_RENDER_LOOP=threaded"
-                ${vnm_terminal_qt_unscaled_environment}
-                "${vnm_terminal_qt_runtime_path}"
-                "$<TARGET_FILE:vnm_terminal_qsg_atlas>"
-                "--layout-parity"
-                "--backend"
-                "${atlas_layout_backend}"
-        )
-
-        set_tests_properties(
-            vnm_terminal_qsg_atlas_layout_parity_${atlas_layout_backend}
-            PROPERTIES
-                LABELS "qsg;hardware;atlas;layout-parity"
-                SKIP_RETURN_CODE 77
-                TIMEOUT 120
-        )
+    foreach(atlas_parity_backend IN LISTS vnm_terminal_qsg_atlas_parity_backends)
+        vnm_terminal_add_atlas_parity_test(
+            "${atlas_parity_backend}" primitive_parity --primitive-parity 120)
+        vnm_terminal_add_atlas_parity_test(
+            "${atlas_parity_backend}" forced_glyph_parity --forced-glyph-parity 180)
+        vnm_terminal_add_atlas_parity_test(
+            "${atlas_parity_backend}" forced_msdf_parity --forced-msdf-parity 180)
+        vnm_terminal_add_atlas_parity_test(
+            "${atlas_parity_backend}" auto_text_renderer --auto-text-renderer 120)
+        vnm_terminal_add_atlas_parity_test(
+            "${atlas_parity_backend}" layout_contract --layout-contract 180)
+        vnm_terminal_add_atlas_parity_test(
+            "${atlas_parity_backend}" text_renderer_fallback --text-renderer-fallback 240)
     endforeach()
 endif()
 
