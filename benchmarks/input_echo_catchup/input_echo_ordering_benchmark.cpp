@@ -292,10 +292,10 @@ bool start_surface(
 {
     auto backend = std::make_unique<Scripted_backend>(recorder);
     Scripted_backend* backend_ptr = backend.get();
-    const bool started = term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
+    const bool started = term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
         surface,
         std::move(backend),
-        {QStringLiteral("scripted-terminal")}).accepted;
+        {QStringLiteral("scripted-terminal")});
     if (!started) {
         *out_error = QStringLiteral("failed to start scripted terminal surface");
         return false;

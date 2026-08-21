@@ -22,7 +22,6 @@ DECLARE_HANDLE(HPCON);
 #endif
 
 #include <QDir>
-#include <QFileInfo>
 #include <QProcessEnvironment>
 #include <QStringList>
 #include <algorithm>
@@ -365,99 +364,6 @@ std::wstring command_line_from_argv(const QStringList& argv)
     return command_line;
 }
 
-bool windows_executable_file_exists(const QString& path)
-{
-    const std::wstring native_path = wide_from_qstring(QDir::toNativeSeparators(path));
-    const DWORD attributes = GetFileAttributesW(native_path.c_str());
-    return
-        attributes != INVALID_FILE_ATTRIBUTES &&
-        (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
-}
-
-std::optional<QString> windows_executable_candidate(QString path)
-{
-    path = QDir::cleanPath(path);
-    if (windows_executable_file_exists(path)) {
-        return path;
-    }
-    if (QFileInfo(path).suffix().isEmpty()) {
-        path += QStringLiteral(".exe");
-        if (windows_executable_file_exists(path)) {
-            return path;
-        }
-    }
-    return std::nullopt;
-}
-
-std::optional<QString> resolve_windows_executable(
-    const QString&             executable,
-    const QString&             working_directory,
-    const QProcessEnvironment& environment)
-{
-    const bool names_path =
-        executable.contains(QLatin1Char('/')) ||
-        executable.contains(QLatin1Char('\\')) ||
-        executable.contains(QLatin1Char(':'));
-    if (names_path) {
-        const QString candidate = QDir::isAbsolutePath(executable)
-            ? executable
-            : QDir(working_directory).absoluteFilePath(executable);
-        return windows_executable_candidate(candidate);
-    }
-
-    QStringList search_directories;
-    std::vector<wchar_t> module_path(32768U, L'\0');
-    const DWORD module_length = GetModuleFileNameW(
-        nullptr,
-        module_path.data(),
-        static_cast<DWORD>(module_path.size()));
-    if (module_length > 0U && module_length < module_path.size()) {
-        search_directories.push_back(
-            QFileInfo(QString::fromWCharArray(
-                module_path.data(),
-                static_cast<int>(module_length))).absolutePath());
-    }
-    search_directories.push_back(working_directory);
-
-    std::vector<wchar_t> system_directory(MAX_PATH + 1U, L'\0');
-    const UINT system_length = GetSystemDirectoryW(
-        system_directory.data(),
-        static_cast<UINT>(system_directory.size()));
-    if (system_length > 0U && system_length < system_directory.size()) {
-        search_directories.push_back(QString::fromWCharArray(
-            system_directory.data(),
-            static_cast<int>(system_length)));
-    }
-    std::vector<wchar_t> windows_directory(MAX_PATH + 1U, L'\0');
-    const UINT windows_length = GetWindowsDirectoryW(
-        windows_directory.data(),
-        static_cast<UINT>(windows_directory.size()));
-    if (windows_length > 0U && windows_length < windows_directory.size()) {
-        search_directories.push_back(QString::fromWCharArray(
-            windows_directory.data(),
-            static_cast<int>(windows_length)));
-    }
-    if (environment.contains(QStringLiteral("PATH"))) {
-        search_directories.append(
-            environment.value(QStringLiteral("PATH")).split(
-                QLatin1Char(';'),
-                Qt::KeepEmptyParts));
-    }
-
-    for (QString directory : search_directories) {
-        if (directory.isEmpty()) {
-            directory = working_directory;
-        }
-        if (std::optional<QString> candidate = windows_executable_candidate(
-                QDir(directory).absoluteFilePath(executable));
-            candidate.has_value())
-        {
-            return candidate;
-        }
-    }
-    return std::nullopt;
-}
-
 std::wstring environment_block_from_process_environment(
     const QProcessEnvironment& environment)
 {
@@ -559,28 +465,13 @@ public:
         Terminal_effective_launch_config effective_config =
             std::move(*precheck.effective_config);
 
-        const auto reject_start = [&] (
-            Terminal_backend_error_code code,
-            QString                     message,
-            bool                        native_dispatch_occurred = false) {
+        const auto reject_start = [&](Terminal_backend_error_code code, QString message) {
             return reject_native_backend_start_attempt(
                 callbacks,
                 start_gate,
                 code,
-                std::move(message),
-                native_dispatch_occurred);
+                std::move(message));
         };
-
-        const std::optional<QString> resolved_executable =
-            resolve_windows_executable(
-                effective_config.argv.front(),
-                effective_config.working_directory,
-                effective_config.environment);
-        if (!resolved_executable.has_value()) {
-            return reject_start(
-                Terminal_backend_error_code::START_FAILED,
-                QStringLiteral("executable lookup failed in the final environment"));
-        }
 
         const std::optional<Conpty_api> conpty_api = load_conpty_api();
         if (!conpty_api.has_value()) {
@@ -692,10 +583,8 @@ public:
             creation_flags |= CREATE_NEW_PROCESS_GROUP;
         }
 
-        const std::wstring application_name =
-            wide_from_qstring(QDir::toNativeSeparators(*resolved_executable));
         const BOOL process_created = CreateProcessW(
-            application_name.c_str(),
+            nullptr,
             command_line.data(),
             nullptr,
             nullptr,
@@ -715,8 +604,7 @@ public:
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
-                    windows_error_message(QStringLiteral("CreateProcessW"), create_process_error),
-                    true);
+                    windows_error_message(QStringLiteral("CreateProcessW"), create_process_error));
         }
 
         Unique_handle process_handle(process_information.hProcess);
@@ -733,8 +621,7 @@ public:
                     Terminal_backend_error_code::START_FAILED,
                     windows_error_message(
                         QStringLiteral("AssignProcessToJobObject"),
-                        assign_job_error),
-                    true);
+                        assign_job_error));
         }
 
         if (ResumeThread(thread_handle.get()) == static_cast<DWORD>(-1)) {
@@ -744,8 +631,7 @@ public:
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
-                    windows_error_message(QStringLiteral("ResumeThread"), resume_error),
-                    true);
+                    windows_error_message(QStringLiteral("ResumeThread"), resume_error));
         }
 
         {
@@ -788,7 +674,7 @@ public:
             m_write_queue.clear();
         }
 
-        Terminal_backend_result worker_result = start_native_backend_workers(
+        return start_native_backend_workers(
             call_state(),
             m_reader_thread,
             m_writer_thread,
@@ -814,8 +700,6 @@ public:
                 shutdown();
                 return backend_reject(Terminal_backend_error_code::START_FAILED, message);
             });
-        worker_result.native_dispatch_occurred = true;
-        return worker_result;
     }
 
     Terminal_backend_result write(QByteArray bytes)

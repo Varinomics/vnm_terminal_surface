@@ -3739,10 +3739,10 @@ Scenario_result run_surface_session_scroll_scenario(
         numbered_scroll_lines(output_line_count),
     };
     Scripted_backend* backend_ptr = backend.get();
-    const bool started = term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
+    const bool started = term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
         context.surface,
         std::move(backend),
-        {QStringLiteral("scripted-terminal")}).accepted;
+        {QStringLiteral("scripted-terminal")});
     if (!started) {
         result.structural_checks.backend_errors_zero       = backend_error_count == 0;
         result.structural_checks.scrollback_rows_available = false;
@@ -4297,10 +4297,10 @@ Scenario_result run_surface_session_action_scenario(
         };
     }
     Scripted_backend* backend_ptr = backend.get();
-    const bool started = term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
+    const bool started = term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
         context.surface,
         std::move(backend),
-        {QStringLiteral("scripted-terminal")}).accepted;
+        {QStringLiteral("scripted-terminal")});
     if (!started) {
         result.structural_checks.backend_errors_zero = backend_error_count == 0;
         result.status = QStringLiteral("failed");

@@ -140,16 +140,10 @@ Terminal_backend_result reject_native_backend_start_attempt(
     const Terminal_backend_callbacks&  callbacks,
     Native_backend_start_gate          start_gate,
     Terminal_backend_error_code        code,
-    QString                            message,
-    bool                               native_dispatch_occurred,
-    bool                               determinate)
+    QString                            message)
 {
     clear_native_backend_start_in_progress(start_gate);
-    Terminal_backend_result result =
-        reject_native_backend_start_with_report(callbacks, code, std::move(message));
-    result.native_dispatch_occurred = native_dispatch_occurred;
-    result.start_outcome_determinate = determinate;
-    return result;
+    return reject_native_backend_start_with_report(callbacks, code, std::move(message));
 }
 
 Terminal_backend_result reject_native_backend_start_with_report(

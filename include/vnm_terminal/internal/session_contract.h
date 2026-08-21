@@ -207,8 +207,6 @@ struct Terminal_session_result
     std::uint64_t                            sequence = 0U;
     bool                                     high_water_reached = false;
     std::optional<Terminal_backend_error>    error;
-    bool                                     native_dispatch_occurred = false;
-    bool                                     start_outcome_determinate = true;
 };
 
 struct Terminal_queue_result

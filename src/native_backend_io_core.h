@@ -320,9 +320,7 @@ Terminal_backend_result reject_native_backend_start_attempt(
     const Terminal_backend_callbacks&  callbacks,
     Native_backend_start_gate          start_gate,
     Terminal_backend_error_code        code,
-    QString                            message,
-    bool                               native_dispatch_occurred = false,
-    bool                               determinate = true);
+    QString                            message);
 
 Terminal_backend_result reject_native_backend_start_with_report(
     const Terminal_backend_callbacks&  callbacks,

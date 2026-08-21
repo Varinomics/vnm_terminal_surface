@@ -7,7 +7,7 @@
 Hosts use the surface as a C++ `QQuickItem`: create it under a
 `QQuickWindow` content item or expose it to QML, size it, configure the Qt
 properties, connect the signals that matter to the host, then call
-`start_terminal()`. The terminal pipeline itself is C++ code, not a tree of QML
+`start_process()`. The terminal pipeline itself is C++ code, not a tree of QML
 controls.
 
 ## Host Contract
@@ -165,36 +165,49 @@ resize synchronization changes emit `geometry_sync_changed()`.
 
 ## Process Launch
 
-`start_terminal(Terminal_process_start_request)` is the sole public launch
-boundary and starts one native terminal backend:
+`start_process(QStringList argv, QString working_directory = {})` starts one
+native terminal backend:
 
 - Windows uses ConPTY.
 - Linux and macOS use POSIX PTY APIs.
 - Platforms without a native backend fail with `backend_error()`.
 
-The request carries ordered argv, a caller-chosen absolute working directory,
-a policy-sanitized explicit base environment, and a separate optional
-capability contribution. `argv[0]` names the executable; the surface never
-parses a shell command string. The surface reads no ambient environment. It
-validates platform name identity and collisions, composes the final child
-environment, resolves a bare executable from that environment, revalidates the
-working directory immediately at the native boundary, and makes at most one
-native dispatch.
+The launch contract is an argument vector. `argv[0]` must name the executable;
+the surface does not parse shell command strings. An empty vector, an empty
+program name, an unavailable working directory, an invalid initial grid, backend
+startup failure, or a second start while a process is live returns `false` and
+reports a typed backend error. Starting again after a process has exited resets
+the old session before launching the new one.
 
-The base is trusted to contain Windows drive pseudo-variables such as `=C:` and
-preserves them through the native environment block. Capability contributions
-cannot contain pseudo-variables, collide with the base, or alter terminal-owned
-`TERM`, `COLORTERM`, and `NO_COLOR` names or executable-lookup names. The
-surface replaces terminal-owned base entries with its own identity. Embedded
-NULs, invalid names, and platform-equivalent duplicates are rejected before
-native dispatch.
+The invokable two-argument `start_process()` inherits the host process
+environment at backend start and remains the QML launch entry point.
+`start_process_with_exact_environment(QStringList argv, const
+QProcessEnvironment& environment_snapshot, QString working_directory = {})` is
+the C++ entry point for a per-launch snapshot. It copies every key and value,
+including present empty values, during the call and does not inherit variables
+from the host environment afterward. Passing
+`QProcessEnvironment::InheritFromParent` therefore supplies no keys; the method
+does not enable Qt's inheritance sentinel.
 
-`Terminal_process_start_result` reports acceptance, whether native dispatch
-occurred, and whether the outcome is determinate. A rejected determinate result
-with no dispatch can be corrected and submitted as a new request. A dispatched
-indeterminate result must never be retried because a child may already exist.
-Starting again after a determinately exited process resets the old session
-before launching the new one.
+Terminal identity is still part of the backend contract: the backend supplies
+its default `TERM` and `COLORTERM` values before applying the copied snapshot,
+so snapshot entries with those names replace the defaults. A missing `TERM`
+uses the backend default, while an explicitly empty `TERM` is rejected by the
+launch validation. On Windows this invariant covers every casing variant of
+`TERM`; on POSIX it covers the exact uppercase name. Environment `SET` values
+containing an embedded NUL are also rejected before native process launch.
+These rejected launches create no child process, report
+`INVALID_LAUNCH_CONFIG`, and leave the surface available for a corrected retry.
+
+Environment-name identity follows `QProcessEnvironment`. Names are
+case-sensitive on POSIX. On Windows they are case-insensitive and
+case-preserving, so casing variants occupy one key and the most recently
+inserted value replaces the previous value before the surface copies the
+snapshot. This prevents a launch snapshot from carrying ambiguous Windows
+case-colliding entries. Windows snapshots may also contain the magic
+environment entries whose names begin with `=` (for example, per-drive current
+directories); exact launch preserves them. Environment names containing `=` in
+any other position are rejected.
 
 Initial rows and columns come from the item size, font metrics, and device pixel
 ratio. Hosts should size the item before launch. Later geometry, font, screen,
