@@ -13,19 +13,15 @@ name: Downstream Windows
 # vnm_terminal master until the matching app commit is pushed. This workflow is
 # therefore kept out of the required status checks. That does not make a red
 # result benign. Red means the canonical pair does not configure, build or test
-# clean, and there are three distinct causes: vnm_terminal has not adopted this
-# surface change yet, this surface commit genuinely broke the pair, or this
-# surface's project version moved ahead of the one vnm_terminal expects (that
-# last one fails at the configure step with the version-mismatch FATAL_ERROR in
-# vnm_terminal_surface_dependency.cmake). Read the log to tell them apart. This
+# clean. The selected surface must provide the narrow embedded-surface target
+# and API used by vnm_terminal; its release version is independent of the app's.
+# A red result therefore means the app has not adopted a semantic API change,
+# the required surface capability is absent, or the pair genuinely fails to
+# configure, build, or test. Read the log to distinguish those causes. This
 # workflow deliberately does not use continue-on-error: an unadopted or a
 # genuinely broken pair must both fail loudly and visibly, and the advisory
 # status is expressed by branch protection not requiring this workflow, not by
 # swallowing the exit code.
-#
-# The version equality guard in vnm_terminal_surface_dependency.cmake does not
-# cover this: the failure it has to catch is same-version API drift, which that
-# guard passes straight through.
 
 on:
   push:

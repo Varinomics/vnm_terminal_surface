@@ -90,15 +90,12 @@ for local runs.
   status check, because a surface commit that changes the surface API
   legitimately breaks the application's `master` until the matching application
   commit is pushed. A red result means the canonical pair does not configure,
-  build, or test clean. That can be because the application has not adopted this
-  surface change yet, because this surface change genuinely broke the pair, or
-  because this surface's project version moved ahead of the version the
-  application expects. Read the job log to tell them apart; a red is never
-  benign by default. The version case is recognizable without reading far: it
-  fails at the configure step with the version-mismatch `FATAL_ERROR` from the
-  application's surface dependency logic. That same version equality check does
-  not cover the other two cases, since it passes same-version API drift straight
-  through.
+  build, or test clean. The application requires the narrow embedded-surface
+  target and API, while the two projects version their releases independently.
+  A red result can therefore mean the application has not adopted a semantic API
+  change, the required capability target is absent, or the selected pair
+  genuinely fails to configure, build, or test. Read the job log to distinguish
+  those causes; a red is never benign by default.
 - All tests run offscreen with `QT_QPA_PLATFORM=offscreen`.
 - `ctest` works without the Visual Studio developer shell; the developer shell is
   needed only to configure and build native MSVC targets.
