@@ -811,6 +811,10 @@ public:
             return config_result;
         }
 
+        if (term::is_backend_rejection(start_result)) {
+            return start_result;
+        }
+
         m_callbacks = std::move(callbacks);
         start_configs.push_back(config);
         if (start_config_observer != nullptr) {
@@ -823,7 +827,7 @@ public:
         for (const QByteArray& output : outputs_during_start) {
             m_callbacks.output_received(output);
         }
-        return term::backend_accept();
+        return start_result;
     }
 
     term::Terminal_backend_result write(QByteArray bytes) override
@@ -957,6 +961,8 @@ public:
     std::shared_ptr<Scripted_backend_lifecycle_state>
                                lifecycle_state;
     int*                       start_attempt_observer = nullptr;
+    term::Terminal_backend_result
+                               start_result = term::backend_accept();
     std::thread                worker;
 
 private:
@@ -986,10 +992,10 @@ Scripted_backend* start_surface_with_backend(
     bool*                              out_started)
 {
     Scripted_backend* backend_ptr = backend.get();
-    *out_started = term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
+    *out_started = term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
         surface,
         std::move(backend),
-        std::move(argv));
+        std::move(argv)).accepted;
     return backend_ptr;
 }
 
@@ -17963,8 +17969,20 @@ bool test_invalid_argv_reports_backend_error(QGuiApplication& app)
                     error_code = code;
                 });
 
-            ok &= check(!fixture.surface.start_process(argv),
+            const vnm_terminal::Terminal_process_start_result start_result =
+                fixture.surface.start_terminal({
+                    argv,
+                    QDir::currentPath(),
+                    {},
+                    std::nullopt,
+                });
+            ok &= check(!start_result.accepted,
                 "public invalid argv start returns false");
+            ok &= check(
+                !start_result.native_dispatch_occurred &&
+                    start_result.determinacy ==
+                        vnm_terminal::Terminal_process_start_determinacy::DETERMINATE,
+                "public validation rejection is determinate and undispatched");
             ok &= check(error_count == 1 &&
                 error_code ==
                     VNM_TerminalSurface::Backend_error_code::INVALID_LAUNCH_CONFIG,
@@ -18014,6 +18032,40 @@ bool test_invalid_argv_reports_backend_error(QGuiApplication& app)
             "invalid argv marks surface process state failed");
     }
 
+    return ok;
+}
+
+bool test_indeterminate_dispatched_start_is_reported_once(QGuiApplication& app)
+{
+    Surface_fixture fixture;
+    pump_events(app);
+
+    int observed_start_attempts = 0;
+    auto backend = std::make_unique<Scripted_backend>();
+    backend->start_attempt_observer = &observed_start_attempts;
+    backend->start_result = term::backend_start_reject(
+        term::Terminal_backend_error_code::START_FAILED,
+        QStringLiteral("scripted indeterminate dispatch"),
+        true,
+        false);
+
+    const vnm_terminal::Terminal_process_start_result result =
+        term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
+            fixture.surface,
+            std::move(backend),
+            {QStringLiteral("scripted-fixture")},
+            QDir::currentPath());
+
+    bool ok = true;
+    ok &= check(
+        !result.accepted &&
+            result.native_dispatch_occurred &&
+            result.determinacy ==
+                vnm_terminal::Terminal_process_start_determinacy::INDETERMINATE,
+        "structured start preserves dispatched indeterminate outcome");
+    ok &= check(
+        observed_start_attempts == 1,
+        "indeterminate dispatch invokes the backend exactly once");
     return ok;
 }
 
@@ -18163,5 +18215,6 @@ int main(int argc, char** argv)
     ok &= test_surface_overflow_reports_error_and_exit(app);
     ok &= test_public_search_api_persists_query_and_navigates(app);
     ok &= test_invalid_argv_reports_backend_error(app);
+    ok &= test_indeterminate_dispatched_start_is_reported_once(app);
     return ok ? 0 : 1;
 }

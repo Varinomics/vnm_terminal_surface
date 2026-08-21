@@ -24,6 +24,7 @@
 #include <QClipboard>
 #include <QCursor>
 #include <QDateTime>
+#include <QDir>
 #include <QFont>
 #include <QGuiApplication>
 #include <QHoverEvent>
@@ -80,6 +81,189 @@ extern "C" __declspec(dllimport) int __stdcall MessageBeep(unsigned int type);
 #endif
 
 namespace {
+
+using vnm_terminal::Terminal_environment_entry;
+using vnm_terminal::Terminal_process_start_determinacy;
+using vnm_terminal::Terminal_process_start_request;
+using vnm_terminal::Terminal_process_start_result;
+
+bool launch_environment_names_equal(const QString& left, const QString& right)
+{
+#if defined(_WIN32)
+    return left.compare(right, Qt::CaseInsensitive) == 0;
+#else
+    return left == right;
+#endif
+}
+
+bool is_windows_drive_pseudo_variable(const QString& name)
+{
+#if defined(_WIN32)
+    return
+        name.size() == 3 &&
+        name.at(0) == QLatin1Char('=') &&
+        name.at(1).isLetter() &&
+        name.at(2) == QLatin1Char(':');
+#else
+    Q_UNUSED(name);
+    return false;
+#endif
+}
+
+bool is_valid_explicit_base_name(const QString& name)
+{
+    if (name.startsWith(QLatin1Char('='))) {
+        return is_windows_drive_pseudo_variable(name);
+    }
+    return !name.isEmpty() &&
+        !name.contains(QLatin1Char('=')) &&
+        !name.contains(QChar(u'\0'));
+}
+
+bool is_terminal_owned_environment_name(const QString& name)
+{
+    return
+        launch_environment_names_equal(name, QStringLiteral("TERM")) ||
+        launch_environment_names_equal(name, QStringLiteral("COLORTERM")) ||
+        launch_environment_names_equal(name, QStringLiteral("NO_COLOR"));
+}
+
+bool is_lookup_sensitive_environment_name(const QString& name)
+{
+    if (launch_environment_names_equal(name, QStringLiteral("PATH"))) {
+        return true;
+    }
+#if defined(_WIN32)
+    return
+        launch_environment_names_equal(name, QStringLiteral("PATHEXT")) ||
+        launch_environment_names_equal(name, QStringLiteral("SystemRoot")) ||
+        launch_environment_names_equal(name, QStringLiteral("WINDIR"));
+#else
+    return false;
+#endif
+}
+
+bool contains_equivalent_environment_name(
+    const std::vector<Terminal_environment_entry>& entries,
+    const QString&                                  name)
+{
+    return std::any_of(
+        entries.begin(),
+        entries.end(),
+        [&name](const Terminal_environment_entry& entry) {
+            return launch_environment_names_equal(entry.name, name);
+        });
+}
+
+std::optional<QString> validate_structured_terminal_start(
+    const Terminal_process_start_request& request)
+{
+    if (request.argv.isEmpty() || request.argv.front().trimmed().isEmpty()) {
+        return QStringLiteral("argv must name an executable");
+    }
+    for (const QString& argument : request.argv) {
+        if (argument.contains(QChar(u'\0'))) {
+            return QStringLiteral("argv values must not contain NUL");
+        }
+    }
+    if (request.working_directory.contains(QChar(u'\0')) ||
+        request.working_directory.isEmpty() ||
+        !QDir::isAbsolutePath(request.working_directory))
+    {
+        return QStringLiteral("working directory must be an absolute path without NUL");
+    }
+
+    for (std::size_t index = 0U; index < request.base_environment.size(); ++index) {
+        const Terminal_environment_entry& entry = request.base_environment[index];
+        if (!is_valid_explicit_base_name(entry.name) ||
+            entry.value.contains(QChar(u'\0')))
+        {
+            return QStringLiteral("base environment contains an invalid entry");
+        }
+        for (std::size_t previous = 0U; previous < index; ++previous) {
+            if (launch_environment_names_equal(
+                    entry.name,
+                    request.base_environment[previous].name))
+            {
+                return QStringLiteral("base environment contains equivalent names");
+            }
+        }
+    }
+
+    if (!request.capability_environment.has_value()) {
+        return std::nullopt;
+    }
+    const auto& contribution = *request.capability_environment;
+    for (std::size_t index = 0U; index < contribution.size(); ++index) {
+        const Terminal_environment_entry& entry = contribution[index];
+        if (entry.name.startsWith(QLatin1Char('=')) ||
+            !is_valid_explicit_base_name(entry.name) ||
+            entry.value.contains(QChar(u'\0')))
+        {
+            return QStringLiteral("capability environment contains an invalid entry");
+        }
+        if (is_terminal_owned_environment_name(entry.name) ||
+            is_lookup_sensitive_environment_name(entry.name))
+        {
+            return QStringLiteral(
+                "capability environment cannot alter terminal-owned or lookup names");
+        }
+        if (contains_equivalent_environment_name(
+                request.base_environment,
+                entry.name))
+        {
+            return QStringLiteral("capability environment collides with the base environment");
+        }
+        for (std::size_t previous = 0U; previous < index; ++previous) {
+            if (launch_environment_names_equal(
+                    entry.name,
+                    contribution[previous].name))
+            {
+                return QStringLiteral("capability environment contains equivalent names");
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+term::Terminal_launch_config terminal_launch_config(
+    Terminal_process_start_request request)
+{
+    term::Terminal_launch_config launch_config;
+    launch_config.argv                = std::move(request.argv);
+    launch_config.working_directory   = std::move(request.working_directory);
+    launch_config.inherit_environment = false;
+    launch_config.environment_edits.reserve(
+        request.base_environment.size() +
+        (request.capability_environment.has_value()
+            ? request.capability_environment->size()
+            : 0U));
+
+    const auto append_entry = [&launch_config](Terminal_environment_entry entry) {
+        if (is_terminal_owned_environment_name(entry.name)) {
+            return;
+        }
+        launch_config.environment_edits.push_back({
+            term::Terminal_environment_operation::SET,
+            std::move(entry.name),
+            std::move(entry.value),
+        });
+    };
+    for (Terminal_environment_entry& entry : request.base_environment) {
+        append_entry(std::move(entry));
+    }
+    if (request.capability_environment.has_value()) {
+        for (Terminal_environment_entry& entry : *request.capability_environment) {
+            append_entry(std::move(entry));
+        }
+    }
+    return launch_config;
+}
+
+Terminal_process_start_result rejected_terminal_start()
+{
+    return {};
+}
 
 // The trace remains diagnostic; public signal delivery drains the session's
 // durable notification channel during GUI-thread sync.
@@ -4767,45 +4951,11 @@ bool VNM_TerminalSurface::scroll_to_offset_from_tail_from_source(
         std::move(source)).event_accepted;
 }
 
-bool VNM_TerminalSurface::start_process(QStringList argv, QString working_directory)
+Terminal_process_start_result VNM_TerminalSurface::start_terminal(
+    Terminal_process_start_request request)
 {
     Q_ASSERT(thread() == QThread::currentThread());
 
-    term::Terminal_launch_config launch_config;
-    launch_config.argv              = std::move(argv);
-    launch_config.working_directory = std::move(working_directory);
-    return start_process_with_native_backend(std::move(launch_config));
-}
-
-bool VNM_TerminalSurface::start_process_with_exact_environment(
-    QStringList                argv,
-    const QProcessEnvironment& environment_snapshot,
-    QString                    working_directory)
-{
-    Q_ASSERT(thread() == QThread::currentThread());
-
-    term::Terminal_launch_config launch_config;
-    launch_config.argv                = std::move(argv);
-    launch_config.working_directory   = std::move(working_directory);
-    launch_config.inherit_environment = false;
-
-    const QStringList environment_names = environment_snapshot.keys();
-    launch_config.environment_edits.reserve(
-        static_cast<std::size_t>(environment_names.size()));
-    for (const QString& name : environment_names) {
-        launch_config.environment_edits.push_back({
-            term::Terminal_environment_operation::SET,
-            name,
-            environment_snapshot.value(name),
-        });
-    }
-
-    return start_process_with_native_backend(std::move(launch_config));
-}
-
-bool VNM_TerminalSurface::start_process_with_native_backend(
-    term::Terminal_launch_config launch_config)
-{
     if (m_private->session != nullptr) {
         drain_backend_callback_events();
         if (is_live_process_state(m_private->session->process_state())) {
@@ -4813,10 +4963,27 @@ bool VNM_TerminalSurface::start_process_with_native_backend(
                 term::Terminal_backend_error_code::START_FAILED,
                 QStringLiteral("start requires no active terminal process"),
             });
-            return false;
+            return rejected_terminal_start();
         }
     }
 
+    if (const std::optional<QString> error =
+            validate_structured_terminal_start(request);
+        error.has_value())
+    {
+        report_backend_error({
+            term::Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
+            *error,
+        });
+        set_process_state(Process_state::FAILED);
+        return rejected_terminal_start();
+    }
+    return start_native_terminal(terminal_launch_config(std::move(request)));
+}
+
+Terminal_process_start_result VNM_TerminalSurface::start_native_terminal(
+    term::Terminal_launch_config launch_config)
+{
     if (launch_config.argv.isEmpty() ||
         launch_config.argv.front().trimmed().isEmpty())
     {
@@ -4825,7 +4992,7 @@ bool VNM_TerminalSurface::start_process_with_native_backend(
             QStringLiteral("argv must name an executable"),
         });
         set_process_state(Process_state::FAILED);
-        return false;
+        return rejected_terminal_start();
     }
 
     std::unique_ptr<term::Terminal_backend> backend = make_native_backend();
@@ -4835,10 +5002,10 @@ bool VNM_TerminalSurface::start_process_with_native_backend(
             QStringLiteral("no native terminal backend is available on this platform"),
         });
         set_process_state(Process_state::FAILED);
-        return false;
+        return rejected_terminal_start();
     }
 
-    return start_process_with_backend(
+    return start_backend_terminal(
         std::move(backend),
         std::move(launch_config));
 }
@@ -7285,7 +7452,7 @@ void VNM_TerminalSurface::bind_screen_signals(QScreen* screen)
         });
 }
 
-bool VNM_TerminalSurface::start_process_with_backend(
+Terminal_process_start_result VNM_TerminalSurface::start_backend_terminal(
     std::unique_ptr<term::Terminal_backend>    backend,
     term::Terminal_launch_config               launch_config)
 {
@@ -7298,7 +7465,7 @@ bool VNM_TerminalSurface::start_process_with_backend(
                 term::Terminal_backend_error_code::START_FAILED,
                 QStringLiteral("start requires no active terminal process"),
             });
-            return false;
+            return rejected_terminal_start();
         }
 
         reset_session();
@@ -7310,7 +7477,7 @@ bool VNM_TerminalSurface::start_process_with_backend(
             QStringLiteral("terminal backend is not available"),
         });
         set_process_state(Process_state::FAILED);
-        return false;
+        return rejected_terminal_start();
     }
 
     if (!m_terminal_title.isEmpty()) {
@@ -7348,7 +7515,7 @@ bool VNM_TerminalSurface::start_process_with_backend(
                 transcript_error,
             });
             set_process_state(Process_state::FAILED);
-            return false;
+            return rejected_terminal_start();
         }
     }
 #else
@@ -7358,7 +7525,7 @@ bool VNM_TerminalSurface::start_process_with_backend(
             QStringLiteral("transcript capture/replay is disabled in this build"),
         });
         set_process_state(Process_state::FAILED);
-        return false;
+        return rejected_terminal_start();
     }
 #endif
 
@@ -7420,10 +7587,22 @@ bool VNM_TerminalSurface::start_process_with_backend(
         }
         report_result_failure(result);
         reset_session();
-        return false;
+        return {
+            false,
+            result.native_dispatch_occurred,
+            result.start_outcome_determinate
+                ? Terminal_process_start_determinacy::DETERMINATE
+                : Terminal_process_start_determinacy::INDETERMINATE,
+        };
     }
 
-    return true;
+    return {
+        true,
+        result.native_dispatch_occurred,
+        result.start_outcome_determinate
+            ? Terminal_process_start_determinacy::DETERMINATE
+            : Terminal_process_start_determinacy::INDETERMINATE,
+    };
 }
 
 void VNM_TerminalSurface::queue_backend_callback_pressure_drain()
@@ -8587,7 +8766,8 @@ void term::VNM_TerminalSurface_render_bridge::set_ime_preedit_state(
     surface.m_private->set_ime_preedit_state(surface, std::move(state));
 }
 
-bool term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
+Terminal_process_start_result
+term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
     VNM_TerminalSurface&               surface,
     std::unique_ptr<Terminal_backend>  backend,
     QStringList                        argv,
@@ -8598,7 +8778,7 @@ bool term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
     Terminal_launch_config launch_config;
     launch_config.argv              = std::move(argv);
     launch_config.working_directory = std::move(working_directory);
-    return surface.start_process_with_backend(
+    return surface.start_backend_terminal(
         std::move(backend),
         std::move(launch_config));
 }

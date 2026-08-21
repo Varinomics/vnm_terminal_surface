@@ -18,6 +18,10 @@
 
 class VNM_TerminalSurface;
 
+namespace vnm_terminal {
+struct Terminal_process_start_result;
+}
+
 namespace vnm_terminal::internal {
 
 struct Terminal_surface_render_invalidation_stats_t
@@ -124,7 +128,7 @@ public:
         VNM_TerminalSurface&       surface,
         Ime_preedit_state          state);
 
-    static bool start_process_with_backend(
+    static vnm_terminal::Terminal_process_start_result start_backend_terminal(
         VNM_TerminalSurface&                   surface,
         std::unique_ptr<Terminal_backend>      backend,
         QStringList                            argv,

@@ -7,6 +7,7 @@
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QEventLoop>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QProcess>
 #include <QProcessEnvironment>
@@ -1187,10 +1188,10 @@ bool test_surface_retained_history_capacity()
         "surface accepts retained-history capacity before session start");
 
     auto backend = std::make_unique<Surface_smoke_backend>();
-    const bool started = term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
+    const bool started = term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
         fixture.surface,
         std::move(backend),
-        {QStringLiteral("surface-retained-history-capacity")});
+        {QStringLiteral("surface-retained-history-capacity")}).accepted;
     const term::terminal_retained_history_diagnostics_t diagnostics =
         term::VNM_TerminalSurface_render_bridge::retained_history_diagnostics(
             fixture.surface);
@@ -1229,10 +1230,10 @@ bool run_surface_behavior_smokes(QGuiApplication& app)
         backend->outputs_during_start = {expected_payload(smoke_case)};
         Surface_smoke_backend* backend_ptr = backend.get();
 
-        const bool started = term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
+        const bool started = term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
             fixture.surface,
             std::move(backend),
-            {QStringLiteral("surface-behavior-smoke")});
+            {QStringLiteral("surface-behavior-smoke")}).accepted;
         pump_events(app);
         const std::shared_ptr<const term::Terminal_render_snapshot> snapshot =
             term::VNM_TerminalSurface_render_bridge::render_snapshot(fixture.surface);
@@ -1303,11 +1304,18 @@ bool run_native_surface_behavior_smokes(QGuiApplication& app, const QString& fix
         const QString smoke_name = QString::fromLatin1(
             smoke_case.name.data(),
             static_cast<qsizetype>(smoke_case.name.size()));
-        const bool started = fixture.surface.start_process({
-            fixture_path,
-            QStringLiteral("--behavior-smoke"),
-            smoke_name,
-        });
+        const vnm_terminal::Terminal_process_start_result start_result =
+            fixture.surface.start_terminal({
+                {
+                    fixture_path,
+                    QStringLiteral("--behavior-smoke"),
+                    smoke_name,
+                },
+                QFileInfo(fixture_path).absolutePath(),
+                {},
+                std::nullopt,
+            });
+        const bool started = start_result.accepted;
         ok &= check(started,
             "native surface behavior smoke starts: " + std::string(smoke_case.name));
         if (!started) {

@@ -768,10 +768,10 @@ bool test_diagnostics_metrics_json(QGuiApplication& app)
 
     auto               backend     = std::make_unique<Recording_backend>();
     Recording_backend* backend_ptr = backend.get();
-    const bool started = term::VNM_TerminalSurface_render_bridge::start_process_with_backend(
+    const bool started = term::VNM_TerminalSurface_render_bridge::start_backend_terminal(
         surface,
         std::move(backend),
-        {QStringLiteral("metrics-fixture")});
+        {QStringLiteral("metrics-fixture")}).accepted;
     ok &= check(started, "retained-history metrics surface starts a session");
     if (!started) {
         return false;
