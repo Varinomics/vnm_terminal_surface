@@ -902,11 +902,15 @@ private:
         Terminal_backend_error                 error) const;
 
     Terminal_session_result make_accepted_result(
-        std::uint64_t                          sequence) const;
+        std::uint64_t                          sequence,
+        bool                                   native_dispatch_occurred = false,
+        bool                                   start_outcome_determinate = true) const;
 
     Terminal_session_result make_backend_rejected_result(
         std::uint64_t                          sequence,
-        std::optional<Terminal_backend_error>  error) const;
+        std::optional<Terminal_backend_error>  error,
+        bool                                   native_dispatch_occurred = false,
+        bool                                   start_outcome_determinate = true) const;
 
     std::uint64_t next_sequence();
     std::uint64_t next_resize_id();

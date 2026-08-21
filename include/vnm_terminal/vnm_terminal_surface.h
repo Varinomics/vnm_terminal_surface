@@ -6,7 +6,6 @@
 #include <QQuickItem>
 #include <QByteArray>
 #include <QDateTime>
-#include <QProcessEnvironment>
 #include <QString>
 #include <QStringList>
 #include <QVariant>
@@ -16,6 +15,40 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <vector>
+
+namespace vnm_terminal {
+
+struct Terminal_environment_entry
+{
+    QString name;
+    QString value;
+};
+
+struct Terminal_process_start_request
+{
+    QStringList argv;
+    QString working_directory;
+    std::vector<Terminal_environment_entry> base_environment;
+    std::optional<std::vector<Terminal_environment_entry>>
+        capability_environment;
+};
+
+enum class Terminal_process_start_determinacy
+{
+    DETERMINATE,
+    INDETERMINATE,
+};
+
+struct Terminal_process_start_result
+{
+    bool accepted = false;
+    bool native_dispatch_occurred = false;
+    Terminal_process_start_determinacy determinacy =
+        Terminal_process_start_determinacy::DETERMINATE;
+};
+
+} // namespace vnm_terminal
 
 class QQuickWindow;
 class QScreen;
@@ -663,19 +696,19 @@ public:
     bool scroll_to_offset_from_tail_from_source(
         int                    offset_from_tail,
         QString                source);
-    Q_INVOKABLE bool start_process(QStringList argv, QString working_directory = {});
     /**
-     * Starts a child without inheriting the process environment.
+     * Starts one terminal child from explicit semantic inputs.
      *
-     * The environment snapshot is copied during this call. On Windows,
-     * QProcessEnvironment has one case-insensitive, case-preserving key space,
-     * so case-colliding inserts are resolved before the snapshot reaches this
-     * boundary.
+     * `base_environment` is a caller-captured, policy-sanitized snapshot. The
+     * optional capability contribution remains separate until this call and
+     * cannot alter terminal-owned or executable-lookup names. The surface
+     * composes the final environment without ambient inheritance, revalidates
+     * the absolute working directory at native admission, and performs at most
+     * one native dispatch. An indeterminate dispatched result must not be
+     * retried.
      */
-    bool start_process_with_exact_environment(
-        QStringList                argv,
-        const QProcessEnvironment& environment_snapshot,
-        QString                    working_directory = {});
+    vnm_terminal::Terminal_process_start_result start_terminal(
+        vnm_terminal::Terminal_process_start_request request);
     Q_INVOKABLE bool interrupt_process();
     Q_INVOKABLE bool terminate_process();
 
@@ -814,11 +847,11 @@ private:
     void handle_scene_graph_invalidated(
         std::uint64_t          window_binding_generation);
 
-    bool start_process_with_native_backend(
+    vnm_terminal::Terminal_process_start_result start_native_terminal(
         vnm_terminal::internal::Terminal_launch_config
                                launch_config);
 
-    bool start_process_with_backend(
+    vnm_terminal::Terminal_process_start_result start_backend_terminal(
         std::unique_ptr<vnm_terminal::internal::Terminal_backend>
                                backend,
         vnm_terminal::internal::Terminal_launch_config

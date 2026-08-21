@@ -6,6 +6,7 @@
 
 #include <QByteArray>
 #include <QEventLoop>
+#include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QProcessEnvironment>
@@ -363,6 +364,34 @@ QString missing_environment_probe_line(const QString& name)
     return QStringLiteral("%1=missing").arg(name);
 }
 
+std::vector<vnm_terminal::Terminal_environment_entry> explicit_environment_entries(
+    const QProcessEnvironment& environment)
+{
+    std::vector<vnm_terminal::Terminal_environment_entry> entries;
+    const QStringList names = environment.keys();
+    entries.reserve(static_cast<std::size_t>(names.size()));
+    for (const QString& name : names) {
+        entries.push_back({name, environment.value(name)});
+    }
+    return entries;
+}
+
+vnm_terminal::Terminal_process_start_result start_terminal_fixture(
+    VNM_TerminalSurface& surface,
+    QStringList argv,
+    QString working_directory,
+    std::vector<vnm_terminal::Terminal_environment_entry> base_environment,
+    std::optional<std::vector<vnm_terminal::Terminal_environment_entry>>
+        capability_environment = std::nullopt)
+{
+    return surface.start_terminal({
+        std::move(argv),
+        std::move(working_directory),
+        std::move(base_environment),
+        std::move(capability_environment),
+    });
+}
+
 term::Terminal_launch_config environment_validation_config()
 {
     term::Terminal_launch_config config;
@@ -542,7 +571,8 @@ bool test_launch_environment_validation_contract()
 bool test_exact_environment_rejection_allows_retry(
     QGuiApplication&            app,
     const QString&              fixture_path,
-    const QProcessEnvironment&  invalid_environment,
+    std::vector<vnm_terminal::Terminal_environment_entry>
+                                  invalid_environment,
     std::string_view            label)
 {
     QTemporaryDir marker_dir;
@@ -592,10 +622,13 @@ bool test_exact_environment_rejection_allows_retry(
     };
 
     bool ok = true;
-    const bool invalid_started = fixture.surface.start_process_with_exact_environment(
-        argv,
-        invalid_environment,
-        QFileInfo(fixture_path).absolutePath());
+    const vnm_terminal::Terminal_process_start_result invalid_result =
+        start_terminal_fixture(
+            fixture.surface,
+            argv,
+            QFileInfo(fixture_path).absolutePath(),
+            std::move(invalid_environment));
+    const bool invalid_started = invalid_result.accepted;
     pump_events(app);
     ok &= case_check(!invalid_started, " rejects the invalid exact environment");
     ok &= case_check(
@@ -614,13 +647,13 @@ bool test_exact_environment_rejection_allows_retry(
         return false;
     }
 
-    QProcessEnvironment retry_environment;
-    retry_environment.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
-    retry_environment.insert(QStringLiteral("COLORTERM"), QStringLiteral("truecolor"));
-    const bool retry_started = fixture.surface.start_process_with_exact_environment(
-        argv,
-        retry_environment,
-        QFileInfo(fixture_path).absolutePath());
+    const vnm_terminal::Terminal_process_start_result retry_result =
+        start_terminal_fixture(
+            fixture.surface,
+            argv,
+            QFileInfo(fixture_path).absolutePath(),
+            {});
+    const bool retry_started = retry_result.accepted;
     ok &= case_check(retry_started, " allows a same-surface valid retry");
     if (!retry_started) {
         print_backend_errors(label, backend_errors);
@@ -648,31 +681,112 @@ bool test_exact_environment_rejection_allows_retry(
 
 bool test_exact_environment_rejections(QGuiApplication& app, const QString& fixture_path)
 {
-    QProcessEnvironment empty_term_environment;
-#if defined(_WIN32)
-    empty_term_environment.insert(QStringLiteral("tErM"), QString());
-#else
-    empty_term_environment.insert(QStringLiteral("TERM"), QString());
-#endif
+    std::vector<vnm_terminal::Terminal_environment_entry>
+        invalid_pseudo_environment{{
+            QStringLiteral("=VNM_INVALID_PSEUDO"),
+            QStringLiteral("value"),
+        }};
 
     QString nul_value = QStringLiteral("before");
     nul_value += QChar(u'\0');
     nul_value += QStringLiteral("after");
-    QProcessEnvironment nul_value_environment;
-    nul_value_environment.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
-    nul_value_environment.insert(QStringLiteral("VNM_NUL_VALUE_PROBE"), nul_value);
+    std::vector<vnm_terminal::Terminal_environment_entry>
+        nul_value_environment{{
+            QStringLiteral("VNM_NUL_VALUE_PROBE"),
+            nul_value,
+        }};
 
     bool ok = true;
     ok &= test_exact_environment_rejection_allows_retry(
         app,
         fixture_path,
-        empty_term_environment,
-        "empty TERM exact environment");
+        std::move(invalid_pseudo_environment),
+        "invalid pseudo-variable base environment");
     ok &= test_exact_environment_rejection_allows_retry(
         app,
         fixture_path,
-        nul_value_environment,
+        std::move(nul_value_environment),
         "NUL-value exact environment");
+    return ok;
+}
+
+bool test_capability_environment_rejections(
+    QGuiApplication& app,
+    const QString&   fixture_path)
+{
+    struct Rejection_case
+    {
+        const char* label;
+        std::vector<vnm_terminal::Terminal_environment_entry> base;
+        std::vector<vnm_terminal::Terminal_environment_entry> contribution;
+    };
+    const std::vector<Rejection_case> cases{
+        {
+            "base collision",
+            {{QStringLiteral("VNM_SHARED"), QStringLiteral("base")}},
+            {{QStringLiteral("VNM_SHARED"), QStringLiteral("capability")}},
+        },
+        {
+            "terminal-owned name",
+            {},
+            {{QStringLiteral("TERM"), QStringLiteral("capability")}},
+        },
+        {
+            "lookup-sensitive name",
+            {},
+            {{QStringLiteral("PATH"), QStringLiteral("capability")}},
+        },
+        {
+            "pseudo-variable edit",
+            {},
+            {{QStringLiteral("=C:"), QStringLiteral("capability")}},
+        },
+        {
+            "equivalent duplicate",
+            {},
+            {
+                {QStringLiteral("VNM_DUPLICATE"), QStringLiteral("first")},
+#if defined(_WIN32)
+                {QStringLiteral("vnm_duplicate"), QStringLiteral("second")},
+#else
+                {QStringLiteral("VNM_DUPLICATE"), QStringLiteral("second")},
+#endif
+            },
+        },
+    };
+
+    bool ok = true;
+    for (const Rejection_case& rejection_case : cases) {
+        Surface_fixture fixture;
+        pump_events(app);
+        int backend_error_count = 0;
+        QObject::connect(
+            &fixture.surface,
+            &VNM_TerminalSurface::backend_error,
+            &fixture.surface,
+            [&](VNM_TerminalSurface::Backend_error_code, const QString&) {
+                ++backend_error_count;
+            });
+
+        const vnm_terminal::Terminal_process_start_result result =
+            start_terminal_fixture(
+                fixture.surface,
+                {fixture_path},
+                QFileInfo(fixture_path).absolutePath(),
+                rejection_case.base,
+                rejection_case.contribution);
+        ok &= check(
+            !result.accepted &&
+                !result.native_dispatch_occurred &&
+                result.determinacy ==
+                    vnm_terminal::Terminal_process_start_determinacy::DETERMINATE,
+            std::string(rejection_case.label) +
+                " contribution rejects before native dispatch");
+        ok &= check(
+            backend_error_count == 1,
+            std::string(rejection_case.label) +
+                " contribution publishes one typed error");
+    }
     return ok;
 }
 
@@ -682,12 +796,13 @@ bool test_exact_process_environment(QGuiApplication& app, const QString& fixture
     const QString exact_name     = QStringLiteral("VNM_EXACT_PROBE");
     const QString empty_name     = QStringLiteral("VNM_EMPTY_PROBE");
     const QString unicode_name   = QStringLiteral("VNM_UNICODE_PROBE");
+    const QString capability_name = QStringLiteral("VNM_CAPABILITY_PROBE");
     const QString unicode_value  = QString::fromUtf8(
         QByteArray::fromHex("4772c3bcc39f6520e69db1e4baac"));
 
     QProcessEnvironment environment;
-    environment.insert(QStringLiteral("TERM"), QStringLiteral("xterm-256color"));
-    environment.insert(QStringLiteral("COLORTERM"), QStringLiteral("truecolor"));
+    environment.insert(QStringLiteral("TERM"), QStringLiteral("caller-term"));
+    environment.insert(QStringLiteral("COLORTERM"), QStringLiteral("caller-colorterm"));
     environment.insert(exact_name, QStringLiteral("snapshot-value"));
     environment.insert(empty_name, QString());
     environment.insert(unicode_name, unicode_value);
@@ -697,13 +812,16 @@ bool test_exact_process_environment(QGuiApplication& app, const QString& fixture
         exact_name,
         empty_name,
         unicode_name,
+        capability_name,
+        QStringLiteral("TERM"),
+        QStringLiteral("COLORTERM"),
     };
     bool ok = true;
 
 #if defined(_WIN32)
     const QString uppercase_case_name = QStringLiteral("VNM_CASE_PROBE");
     const QString lowercase_case_name = QStringLiteral("vnm_case_probe");
-    const QString magic_name          = QStringLiteral("=VNM_MAGIC_PROBE");
+    const QString magic_name          = QStringLiteral("=C:");
     environment.insert(uppercase_case_name, QStringLiteral("first-value"));
     environment.insert(lowercase_case_name, QStringLiteral("replacement-value"));
     environment.insert(magic_name, QStringLiteral("magic-value"));
@@ -765,11 +883,18 @@ bool test_exact_process_environment(QGuiApplication& app, const QString& fixture
         QStringLiteral("--echo-environment"),
     };
     argv.append(probe_names);
-    const bool started = fixture.surface.start_process_with_exact_environment(
-        argv,
-        environment,
-        QFileInfo(fixture_path).absolutePath());
-    ok &= check(started, "exact-environment public surface launch starts fixture");
+    const vnm_terminal::Terminal_process_start_result start_result =
+        start_terminal_fixture(
+            fixture.surface,
+            argv,
+            QFileInfo(fixture_path).absolutePath(),
+            explicit_environment_entries(environment),
+            std::vector<vnm_terminal::Terminal_environment_entry>{{
+                capability_name,
+                QStringLiteral("capability-value"),
+            }});
+    const bool started = start_result.accepted;
+    ok &= check(started, "explicit-environment structured surface launch starts fixture");
     if (!started) {
         print_backend_errors("exact-environment public surface", backend_errors);
         return false;
@@ -803,6 +928,25 @@ bool test_exact_process_environment(QGuiApplication& app, const QString& fixture
                 *snapshot,
                 present_environment_probe_line(unicode_name, unicode_value)),
             "exact environment preserves a Unicode value");
+        ok &= check(
+            snapshot_contains_text(
+                *snapshot,
+                present_environment_probe_line(
+                    capability_name,
+                    QStringLiteral("capability-value"))),
+            "separate capability contribution reaches the child");
+        ok &= check(
+            snapshot_contains_text(
+                *snapshot,
+                present_environment_probe_line(
+                    QStringLiteral("TERM"),
+                    QStringLiteral("xterm-256color"))) &&
+            snapshot_contains_text(
+                *snapshot,
+                present_environment_probe_line(
+                    QStringLiteral("COLORTERM"),
+                    QStringLiteral("truecolor"))),
+            "surface owns final TERM and COLORTERM values");
 
 #if defined(_WIN32)
         ok &= check(
@@ -839,7 +983,7 @@ bool test_exact_process_environment(QGuiApplication& app, const QString& fixture
     return ok;
 }
 
-bool test_default_process_environment_inheritance(
+bool test_caller_captured_process_environment(
     QGuiApplication& app,
     const QString&   fixture_path)
 {
@@ -877,15 +1021,20 @@ bool test_default_process_environment_inheritance(
             process_exit_code = exit_code;
         });
 
-    const bool started = fixture.surface.start_process(
-        {
-            fixture_path,
-            QStringLiteral("--echo-environment"),
-            inherited_name,
-        },
-        QFileInfo(fixture_path).absolutePath());
+    const vnm_terminal::Terminal_process_start_result start_result =
+        start_terminal_fixture(
+            fixture.surface,
+            {
+                fixture_path,
+                QStringLiteral("--echo-environment"),
+                inherited_name,
+            },
+            QFileInfo(fixture_path).absolutePath(),
+            explicit_environment_entries(
+                QProcessEnvironment::systemEnvironment()));
+    const bool started = start_result.accepted;
     bool ok = true;
-    ok &= check(started, "default public surface launch starts environment fixture");
+    ok &= check(started, "caller-captured environment starts the fixture");
     if (!started) {
         print_backend_errors("default public surface environment", backend_errors);
         return false;
@@ -905,7 +1054,7 @@ bool test_default_process_environment_inheritance(
             snapshot_contains_text(
                 *snapshot,
                 present_environment_probe_line(inherited_name, inherited_value)),
-            "default two-argument start_process inherits the host environment");
+            "caller-captured environment reaches the child explicitly");
     }
 
     print_backend_errors("default public surface environment", backend_errors);
@@ -915,6 +1064,235 @@ bool test_default_process_environment_inheritance(
         "default-environment fixture exits cleanly");
     ok &= check(backend_error_count == 0,
         "default public surface environment launch has no backend errors");
+    return ok;
+}
+
+bool test_final_path_and_executable_token_semantics(
+    QGuiApplication& app,
+    const QString&   fixture_path)
+{
+    QTemporaryDir directory;
+    bool ok = true;
+    ok &= check(directory.isValid(), "PATH lookup fixture directory is valid");
+    const QString binary_directory = directory.filePath(QStringLiteral("bin"));
+    const QString working_directory = directory.filePath(QStringLiteral("working"));
+    ok &= check(
+        QDir().mkpath(binary_directory) && QDir().mkpath(working_directory),
+        "PATH lookup fixture directories are created");
+#if defined(_WIN32)
+    const QString bare_name = QStringLiteral("vnm-phase2b-path-fixture.exe");
+    const QChar path_separator = QLatin1Char(';');
+#else
+    const QString bare_name = QStringLiteral("vnm-phase2b-path-fixture");
+    const QChar path_separator = QLatin1Char(':');
+#endif
+    const QString copied_fixture = QDir(binary_directory).filePath(bare_name);
+    ok &= check(
+        QFile::copy(fixture_path, copied_fixture),
+        "PATH lookup fixture executable is copied");
+    if (!ok) {
+        return false;
+    }
+    QFile::setPermissions(copied_fixture, QFile::permissions(fixture_path));
+
+    const auto run_fixture = [&] (
+        QString executable,
+        std::vector<vnm_terminal::Terminal_environment_entry> base_environment,
+        bool* out_exited) {
+        auto fixture = std::make_unique<Surface_fixture>();
+        pump_events(app);
+        QObject::connect(
+            &fixture->surface,
+            &VNM_TerminalSurface::process_exited,
+            &fixture->surface,
+            [out_exited](VNM_TerminalSurface::Exit_reason, int) {
+                *out_exited = true;
+            });
+        const vnm_terminal::Terminal_process_start_result result =
+            start_terminal_fixture(
+                fixture->surface,
+                {std::move(executable)},
+                working_directory,
+                std::move(base_environment));
+        return std::pair{std::move(fixture), result};
+    };
+
+    const QString host_path =
+        QProcessEnvironment::systemEnvironment().value(QStringLiteral("PATH"));
+    bool explicit_exited = false;
+    auto [explicit_fixture, explicit_result] = run_fixture(
+        bare_name,
+        {{
+            QStringLiteral("PATH"),
+            binary_directory + path_separator + host_path,
+        }},
+        &explicit_exited);
+    ok &= check(
+        explicit_result.accepted &&
+            explicit_result.native_dispatch_occurred &&
+            explicit_result.determinacy ==
+                vnm_terminal::Terminal_process_start_determinacy::DETERMINATE,
+        "bare executable resolves from the explicit final PATH");
+    ok &= check(
+        wait_for_process_exit(app, explicit_exited),
+        "explicit-PATH fixture exits");
+
+    bool absent_exited = false;
+    auto [absent_fixture, absent_result] = run_fixture(
+        bare_name,
+        {},
+        &absent_exited);
+    ok &= check(
+        !absent_result.accepted &&
+            !absent_result.native_dispatch_occurred &&
+            absent_result.determinacy ==
+                vnm_terminal::Terminal_process_start_determinacy::DETERMINATE &&
+            !absent_exited,
+        "absent PATH does not borrow the host PATH");
+
+    bool empty_exited = false;
+    auto [empty_fixture, empty_result] = run_fixture(
+        bare_name,
+        {{QStringLiteral("PATH"), QString()}},
+        &empty_exited);
+    ok &= check(
+        !empty_result.accepted &&
+            !empty_result.native_dispatch_occurred &&
+            empty_result.determinacy ==
+                vnm_terminal::Terminal_process_start_determinacy::DETERMINATE &&
+            !empty_exited,
+        "present-empty PATH remains distinct and does not borrow the host PATH");
+
+    bool absolute_exited = false;
+    auto [absolute_fixture, absolute_result] = run_fixture(
+        copied_fixture,
+        explicit_environment_entries(QProcessEnvironment::systemEnvironment()),
+        &absolute_exited);
+    ok &= check(
+        absolute_result.accepted && absolute_result.native_dispatch_occurred,
+        "absolute executable token bypasses PATH lookup");
+    ok &= check(
+        wait_for_process_exit(app, absolute_exited),
+        "absolute-token fixture exits");
+    return ok;
+}
+
+bool test_invalid_second_start_preserves_live_session(
+    QGuiApplication& app,
+    const QString&   fixture_path)
+{
+    const term::terminal_canvas_fixture_shell_like_smoke_contract_t contract =
+        term::terminal_canvas_fixture_shell_like_smoke_contract();
+
+    Surface_fixture fixture;
+    pump_events(app);
+
+    std::vector<VNM_TerminalSurface::Backend_error_code> backend_error_codes;
+    bool process_exited = false;
+    VNM_TerminalSurface::Exit_reason exit_reason =
+        VNM_TerminalSurface::Exit_reason::FAILED_TO_START;
+    int process_exit_code = -1;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::backend_error,
+        &fixture.surface,
+        [&](VNM_TerminalSurface::Backend_error_code code, const QString&) {
+            backend_error_codes.push_back(code);
+        });
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::process_exited,
+        &fixture.surface,
+        [&](VNM_TerminalSurface::Exit_reason reason, int exit_code) {
+            process_exited    = true;
+            exit_reason       = reason;
+            process_exit_code = exit_code;
+        });
+
+    bool ok = true;
+    const vnm_terminal::Terminal_process_start_result initial_start =
+        start_terminal_fixture(
+            fixture.surface,
+            {
+                fixture_path,
+                QStringLiteral("--shell-like-smoke"),
+            },
+            QFileInfo(fixture_path).absolutePath(),
+            explicit_environment_entries(
+                QProcessEnvironment::systemEnvironment()));
+    ok &= check(
+        initial_start.accepted && initial_start.native_dispatch_occurred,
+        "live-session admission fixture starts");
+    if (!ok) {
+        return false;
+    }
+
+    QString prompt = QString::fromLatin1(
+        contract.prompt.data(),
+        static_cast<qsizetype>(contract.prompt.size()));
+    while (!prompt.isEmpty() && prompt.back() == QChar(u' ')) {
+        prompt.chop(1);
+    }
+    if (!check(
+            wait_for_snapshot_row(app, fixture.surface, prompt),
+            "live-session admission fixture reaches its prompt"))
+    {
+        (void)cleanup_surface_process(
+            app,
+            fixture.surface,
+            process_exited,
+            "live-session admission fixture");
+        return false;
+    }
+
+    bool failed_state_published = false;
+    QObject::connect(
+        &fixture.surface,
+        &VNM_TerminalSurface::process_state_changed,
+        &fixture.surface,
+        [&]() {
+            failed_state_published = failed_state_published ||
+                fixture.surface.process_state() ==
+                    VNM_TerminalSurface::Process_state::FAILED;
+        });
+    const vnm_terminal::Terminal_process_start_result rejected_start =
+        start_terminal_fixture(
+            fixture.surface,
+            {},
+            QFileInfo(fixture_path).absolutePath(),
+            {});
+    pump_events(app);
+
+    ok &= check(
+        !rejected_start.accepted &&
+            !rejected_start.native_dispatch_occurred &&
+            rejected_start.determinacy ==
+                vnm_terminal::Terminal_process_start_determinacy::DETERMINATE,
+        "invalid second start is rejected before native dispatch");
+    ok &= check(
+        backend_error_codes.size() == 1U &&
+            backend_error_codes.front() ==
+                VNM_TerminalSurface::Backend_error_code::START_FAILED,
+        "live-session admission rejection publishes START_FAILED");
+    ok &= check(
+        !failed_state_published &&
+            fixture.surface.process_state() ==
+                VNM_TerminalSurface::Process_state::RUNNING,
+        "invalid second start does not publish FAILED or replace live state");
+    ok &= check(
+        !process_exited,
+        "invalid second start does not terminate the live backend");
+    ok &= check(
+        fixture.surface.paste_text(QStringLiteral("exit\n")),
+        "original backend still accepts input after invalid second start");
+    ok &= check(
+        wait_for_process_exit(app, process_exited),
+        "original backend exits normally after invalid second start");
+    pump_events(app);
+    ok &= check(
+        exit_reason == VNM_TerminalSurface::Exit_reason::EXITED &&
+            process_exit_code == 0,
+        "original backend retains its normal exit path");
     return ok;
 }
 
@@ -962,12 +1340,15 @@ bool test_shell_like_surface_native_smoke(QGuiApplication& app, const QString& f
             process_exit_code = exit_code;
         });
 
-    const bool started = fixture.surface.start_process(
+    const bool started = start_terminal_fixture(
+        fixture.surface,
         {
             fixture_path,
             QStringLiteral("--shell-like-smoke"),
         },
-        QFileInfo(fixture_path).absolutePath());
+        QFileInfo(fixture_path).absolutePath(),
+        explicit_environment_entries(
+            QProcessEnvironment::systemEnvironment())).accepted;
     ok &= check(started, "shell-like native surface smoke starts fixture");
     if (!started) {
         return false;
@@ -1173,12 +1554,15 @@ bool test_shell_like_surface_interrupt_smoke(QGuiApplication& app, const QString
             process_exit_code = exit_code;
         });
 
-    const bool started = fixture.surface.start_process(
+    const bool started = start_terminal_fixture(
+        fixture.surface,
         {
             fixture_path,
             QStringLiteral("--shell-like-smoke"),
         },
-        QFileInfo(fixture_path).absolutePath());
+        QFileInfo(fixture_path).absolutePath(),
+        explicit_environment_entries(
+            QProcessEnvironment::systemEnvironment())).accepted;
     ok &= check(started, "shell-like interrupt surface smoke starts fixture");
     if (!started) {
         return false;
@@ -1280,8 +1664,11 @@ int main(int argc, char** argv)
     bool ok = true;
     ok &= test_launch_environment_validation_contract();
     ok &= test_exact_environment_rejections(app, fixture_path);
+    ok &= test_capability_environment_rejections(app, fixture_path);
     ok &= test_exact_process_environment(app, fixture_path);
-    ok &= test_default_process_environment_inheritance(app, fixture_path);
+    ok &= test_caller_captured_process_environment(app, fixture_path);
+    ok &= test_final_path_and_executable_token_semantics(app, fixture_path);
+    ok &= test_invalid_second_start_preserves_live_session(app, fixture_path);
     ok &= test_shell_like_surface_native_smoke(app, fixture_path);
     ok &= test_shell_like_surface_interrupt_smoke(app, fixture_path);
     return ok ? 0 : 1;

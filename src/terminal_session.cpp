@@ -4487,7 +4487,11 @@ Terminal_session_result Terminal_session::process_start_command(
         if (!m_backend_error_queued_during_command) {
             record_backend_error(command.sequence, *backend_result.error);
         }
-        return make_backend_rejected_result(command.sequence, backend_result.error);
+        return make_backend_rejected_result(
+            command.sequence,
+            backend_result.error,
+            backend_result.native_dispatch_occurred,
+            backend_result.start_outcome_determinate);
     }
 
     if (m_stop_requested) {
@@ -4498,7 +4502,9 @@ Terminal_session_result Terminal_session::process_start_command(
             command.sequence,
             make_backend_error(
                 Terminal_backend_error_code::OUTPUT_OVERFLOW,
-                QStringLiteral("backend output overflowed during start")));
+                QStringLiteral("backend output overflowed during start")),
+            backend_result.native_dispatch_occurred,
+            backend_result.start_outcome_determinate);
     }
 
     m_process_state            = Terminal_process_state::RUNNING;
@@ -4510,7 +4516,10 @@ Terminal_session_result Terminal_session::process_start_command(
         QStringLiteral("process started"),
     });
 
-    return make_accepted_result(command.sequence);
+    return make_accepted_result(
+        command.sequence,
+        backend_result.native_dispatch_occurred,
+        backend_result.start_outcome_determinate);
 }
 
 Terminal_session_result Terminal_session::process_write_command(
@@ -9888,25 +9897,33 @@ Terminal_session_result Terminal_session::make_rejected_result(
 }
 
 Terminal_session_result Terminal_session::make_accepted_result(
-    std::uint64_t                  sequence) const
+    std::uint64_t                  sequence,
+    bool                           native_dispatch_occurred,
+    bool                           start_outcome_determinate) const
 {
     return {
         Terminal_session_result_code::ACCEPTED,
         sequence,
         false,
         std::nullopt,
+        native_dispatch_occurred,
+        start_outcome_determinate,
     };
 }
 
 Terminal_session_result Terminal_session::make_backend_rejected_result(
     std::uint64_t                          sequence,
-    std::optional<Terminal_backend_error>  error) const
+    std::optional<Terminal_backend_error>  error,
+    bool                                   native_dispatch_occurred,
+    bool                                   start_outcome_determinate) const
 {
     return {
         Terminal_session_result_code::BACKEND_REJECTED,
         sequence,
         false,
         std::move(error),
+        native_dispatch_occurred,
+        start_outcome_determinate,
     };
 }
 

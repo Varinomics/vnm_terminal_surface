@@ -138,6 +138,8 @@ struct Terminal_backend_result
 {
     Terminal_backend_result_code           code = Terminal_backend_result_code::ACCEPTED;
     std::optional<Terminal_backend_error>  error;
+    bool                                   native_dispatch_occurred = false;
+    bool                                   start_outcome_determinate = true;
 };
 
 struct Terminal_backend_resize_request
@@ -164,6 +166,16 @@ inline Terminal_backend_result backend_accept()
     return {};
 }
 
+inline Terminal_backend_result backend_start_accept()
+{
+    return {
+        Terminal_backend_result_code::ACCEPTED,
+        std::nullopt,
+        true,
+        true,
+    };
+}
+
 inline Terminal_backend_result backend_reject(
     Terminal_backend_error_code    code,
     QString                        message)
@@ -174,10 +186,24 @@ inline Terminal_backend_result backend_reject(
     };
 }
 
+inline Terminal_backend_result backend_start_reject(
+    Terminal_backend_error_code    code,
+    QString                        message,
+    bool                           native_dispatch_occurred,
+    bool                           determinate = true)
+{
+    return {
+        Terminal_backend_result_code::REJECTED,
+        Terminal_backend_error{code, std::move(message)},
+        native_dispatch_occurred,
+        determinate,
+    };
+}
+
 inline bool is_valid_backend_result(const Terminal_backend_result& result)
 {
     if (result.code == Terminal_backend_result_code::ACCEPTED) {
-        return !result.error.has_value();
+        return !result.error.has_value() && result.start_outcome_determinate;
     }
 
     return result.error.has_value();

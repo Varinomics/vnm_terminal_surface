@@ -3,6 +3,7 @@
 #if defined(__linux__) || defined(__APPLE__)
 
 #include "native_backend_io_core.h"
+#include <QDir>
 #include <QFile>
 #include <QProcessEnvironment>
 #include <QStringList>
@@ -156,7 +157,7 @@ struct Native_launch_data
     std::vector<char*>         argv_ptrs;
     std::vector<QByteArray>    env_bytes;
     std::vector<char*>         env_ptrs;
-    std::vector<QByteArray>    executable_candidates;
+    QByteArray                 executable;
     QByteArray                 working_directory;
 };
 
@@ -182,12 +183,26 @@ std::optional<QByteArray> environment_value(
     return environment.value(name).toLocal8Bit();
 }
 
-std::vector<QByteArray> executable_candidates(
+std::optional<QByteArray> resolved_executable(
     const QByteArray&          executable,
-    const QProcessEnvironment& environment)
+    const QProcessEnvironment& environment,
+    const QString&             working_directory)
 {
+    const auto usable_candidate = [&working_directory](QByteArray candidate)
+        -> std::optional<QByteArray> {
+        QString candidate_text = QFile::decodeName(candidate);
+        if (!QDir::isAbsolutePath(candidate_text)) {
+            candidate_text = QDir(working_directory).absoluteFilePath(candidate_text);
+        }
+        candidate = QFile::encodeName(QDir::cleanPath(candidate_text));
+        if (::access(candidate.constData(), X_OK) == 0) {
+            return candidate;
+        }
+        return std::nullopt;
+    };
+
     if (executable.contains('/')) {
-        return {executable};
+        return usable_candidate(executable);
     }
 
     QByteArray path = environment_value(environment, QStringLiteral("PATH"))
@@ -196,7 +211,6 @@ std::vector<QByteArray> executable_candidates(
         path = QByteArrayLiteral(".");
     }
 
-    std::vector<QByteArray> candidates;
     int start = 0;
     for (;;) {
         const int separator = path.indexOf(':', start);
@@ -211,7 +225,12 @@ std::vector<QByteArray> executable_candidates(
             candidate.append('/');
         }
         candidate.append(executable);
-        candidates.push_back(std::move(candidate));
+        if (std::optional<QByteArray> resolved =
+                usable_candidate(std::move(candidate));
+            resolved.has_value())
+        {
+            return resolved;
+        }
 
         if (separator < 0) {
             break;
@@ -220,7 +239,7 @@ std::vector<QByteArray> executable_candidates(
         start = separator + 1;
     }
 
-    return candidates;
+    return std::nullopt;
 }
 
 std::optional<Native_launch_data> make_native_launch_data(
@@ -258,8 +277,14 @@ std::optional<Native_launch_data> make_native_launch_data(
     }
     data.env_ptrs.push_back(nullptr);
 
-    data.executable_candidates =
-        executable_candidates(data.argv_bytes.front(), config.environment);
+    const std::optional<QByteArray> executable = resolved_executable(
+        data.argv_bytes.front(),
+        config.environment,
+        config.working_directory);
+    if (!executable.has_value()) {
+        return std::nullopt;
+    }
+    data.executable = *executable;
     data.working_directory = QFile::encodeName(config.working_directory);
     return data;
 }
@@ -383,26 +408,8 @@ bool pipe_read_exact(int fd, int& value)
         pipe_write_errno_and_exit(startup_error_write, errno);
     }
 
-    int  last_error        = ENOENT;
-    bool saw_access_denied = false;
-    for (const QByteArray& candidate : data.executable_candidates) {
-        ::execve(candidate.constData(), data.argv_ptrs.data(), data.env_ptrs.data());
-
-        if (errno == EACCES) {
-            saw_access_denied = true;
-        }
-
-        if (errno != ENOENT && errno != ENOTDIR && errno != EACCES) {
-            last_error = errno;
-            break;
-        }
-
-        last_error = errno;
-    }
-
-    pipe_write_errno_and_exit(
-        startup_error_write,
-        saw_access_denied ? EACCES : last_error);
+    ::execve(data.executable.constData(), data.argv_ptrs.data(), data.env_ptrs.data());
+    pipe_write_errno_and_exit(startup_error_write, errno);
 }
 
 Terminal_exit_reason exit_reason_from_wait_status(
@@ -662,12 +669,16 @@ public:
         Terminal_effective_launch_config effective_config =
             std::move(*precheck.effective_config);
 
-        const auto reject_start = [&](Terminal_backend_error_code code, QString message) {
+        const auto reject_start = [&] (
+            Terminal_backend_error_code code,
+            QString                     message,
+            bool                        native_dispatch_occurred = false) {
             return reject_native_backend_start_attempt(
                 callbacks,
                 start_gate,
                 code,
-                std::move(message));
+                std::move(message),
+                native_dispatch_occurred);
         };
 
         if (!size_fits_pty(effective_config.initial_grid_size)) {
@@ -683,7 +694,8 @@ public:
             return
                 reject_start(
                     Terminal_backend_error_code::INVALID_LAUNCH_CONFIG,
-                    QStringLiteral("launch argv and environment must not contain NUL bytes"));
+                    QStringLiteral(
+                        "launch argv/environment is invalid or executable lookup failed"));
         }
 
         Unique_fd startup_error_read;
@@ -753,7 +765,8 @@ public:
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
-                    posix_error_message(QStringLiteral("fcntl PTY close-on-exec"), cloexec_result));
+                    posix_error_message(QStringLiteral("fcntl PTY close-on-exec"), cloexec_result),
+                    true);
         }
 
         int child_errno = 0;
@@ -762,7 +775,8 @@ public:
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
-                    posix_error_message(QStringLiteral("execve"), child_errno));
+                    posix_error_message(QStringLiteral("execve"), child_errno),
+                    true);
         }
         startup_error_read.reset();
 
@@ -774,7 +788,8 @@ public:
             return
                 reject_start(
                     Terminal_backend_error_code::START_FAILED,
-                    posix_error_message(QStringLiteral("fcntl PTY nonblocking"), nonblocking_result));
+                    posix_error_message(QStringLiteral("fcntl PTY nonblocking"), nonblocking_result),
+                    true);
         }
 
         {
@@ -813,7 +828,7 @@ public:
             m_write_queue.clear();
         }
 
-        return start_native_backend_workers(
+        Terminal_backend_result worker_result = start_native_backend_workers(
             call_state(),
             m_reader_thread,
             m_writer_thread,
@@ -839,6 +854,8 @@ public:
                 shutdown();
                 return backend_reject(Terminal_backend_error_code::START_FAILED, message);
             });
+        worker_result.native_dispatch_occurred = true;
+        return worker_result;
     }
 
     Terminal_backend_result write(QByteArray bytes)
