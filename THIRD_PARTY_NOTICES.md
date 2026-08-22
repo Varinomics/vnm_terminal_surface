@@ -18,18 +18,30 @@ and the Qt Company distribution materials:
 - https://www.qt.io/licensing/
 - https://doc.qt.io/qt-6/licenses-used-in-qt.html
 
-## Ubuntu Mono - Bront Embedded Font
+## Ubuntu Mono derivative Bront Embedded Font
 
-`resources/fonts/vnm_framework_monospace.ttf` is a bundled monospace font. Its
-embedded metadata identifies it as Ubuntu Mono - Bront under the Ubuntu Font
-Licence 1.0.
+`resources/fonts/UbuntuMonoDerivativeBront-Regular.ttf` retains the Bront glyph
+outlines and metrics. It is licensed under the Ubuntu Font Licence 1.0.
 
-This font is not GPL-licensed. The font may be bundled under the Ubuntu Font
-Licence terms; derivative naming obligations must be reviewed before replacing
-or modifying the embedded font file.
+Copyright notice retained from the font:
 
-License reference:
+- Copyright 2011 Canonical Ltd. Licensed under the Ubuntu Font Licence 1.0.
 
+Upstream contributor:
+
+- Chris Wendt (`chrismwendt`), the author of the pinned upstream commit. The
+  pinned upstream files contain no separate contributor copyright statement.
+
+Varinomics changed only the name table so this non-substantially changed Ubuntu
+Mono derivative follows the UFL 1.0 section 2(c) form `Ubuntu Mono derivative
+Bront`. The immutable input and output hashes, exact metadata diff, fontTools
+version, deterministic recipe, PostScript spelling, and table-preservation
+invariant are recorded in
+`THIRD_PARTY/ubuntu_mono_derivative_bront_font.toml`.
+
+Source and license:
+
+- https://github.com/chrismwendt/bront/tree/aef23d9a11416655a8351230edb3c2377061c077
 - https://ubuntu.com/legal/font-licence
 
 ## Unicode 16.0 Data Files

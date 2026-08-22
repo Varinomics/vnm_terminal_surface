@@ -25,7 +25,7 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr const char* k_bundled_monospace_font_resource =
-    ":/vnm_terminal_surface/fonts/vnm_framework_monospace.ttf";
+    ":/vnm_terminal_surface/fonts/UbuntuMonoDerivativeBront-Regular.ttf";
 
 std::optional<QByteArray> bundled_font_bytes()
 {

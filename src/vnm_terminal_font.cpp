@@ -16,7 +16,7 @@ namespace vnm_terminal::internal {
 namespace {
 
 constexpr const char* k_vnm_framework_monospace_resource =
-    ":/vnm_terminal_surface/fonts/vnm_framework_monospace.ttf";
+    ":/vnm_terminal_surface/fonts/UbuntuMonoDerivativeBront-Regular.ttf";
 
 struct Default_monospace_font
 {

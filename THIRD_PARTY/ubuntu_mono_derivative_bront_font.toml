@@ -1,0 +1,69 @@
+name = "Ubuntu Mono derivative Bront Regular"
+spdx_license_expression = "Ubuntu-font-1.0"
+compliance_status = "resolved"
+modification_classification = "non_substantially_changed"
+naming_basis = "Ubuntu Font Licence 1.0 section 2(c)"
+copyright = "Copyright 2011 Canonical Ltd.  Licensed under the Ubuntu Font Licence 1.0"
+upstream_contributor = "Chris Wendt (GitHub chrismwendt; author of the pinned upstream commit)"
+contributor_notice = "The pinned upstream files contain no separate contributor copyright statement."
+
+upstream_url = "https://github.com/chrismwendt/bront"
+commit_or_version = "aef23d9a11416655a8351230edb3c2377061c077"
+source_path = "UbuntuMono-Bront.ttf"
+source_url = "https://raw.githubusercontent.com/chrismwendt/bront/aef23d9a11416655a8351230edb3c2377061c077/UbuntuMono-Bront.ttf"
+input_sha256 = "09ea86e719381a9b1aecf7590338b625edd00e9ad74ec2484b94bd35a029010d"
+input_size = 195252
+
+artifact_sha256 = "2448ba77c08b20151cdfd11da8bc72abc8b84fc46e85785c9a40f1a2a8c0655f"
+artifact_size = 195232
+imported_path = "resources/fonts/UbuntuMonoDerivativeBront-Regular.ttf"
+
+recipe = "THIRD_PARTY/recipes/prepare_ubuntu_mono_derivative_bront.py"
+recipe_tool = "fontTools 4.56.0"
+recipe_command = "python THIRD_PARTY/recipes/prepare_ubuntu_mono_derivative_bront.py <UbuntuMono-Bront.ttf> <UbuntuMonoDerivativeBront-Regular.ttf>"
+table_invariant = "Every table except name is byte-identical after normalizing head.checkSumAdjustment; undeclared name records and the name-record key set are unchanged."
+
+family_name = "Ubuntu Mono derivative Bront"
+full_name = "Ubuntu Mono derivative Bront"
+postscript_name = "UbuntuMonoDerivativeBront-Regular"
+postscript_name_note = "Spaces are removed and the Regular style is appended to form a valid PostScript name."
+
+[[metadata_change]]
+name_id = 1
+record_scope = "Macintosh Roman and Windows Unicode English (United States)"
+before = "Ubuntu Mono - Bront"
+after = "Ubuntu Mono derivative Bront"
+
+[[metadata_change]]
+name_id = 3
+record_scope = "Macintosh Roman and Windows Unicode English (United States)"
+before = "FontForge 2.0 : Ubuntu Mono - Bront : 28-6-2015"
+after = "Ubuntu Mono derivative Bront Regular 0.1"
+
+[[metadata_change]]
+name_id = 4
+record_scope = "Macintosh Roman and Windows Unicode English (United States)"
+before = "Ubuntu Mono - Bront"
+after = "Ubuntu Mono derivative Bront"
+
+[[metadata_change]]
+name_id = 6
+record_scope = "Macintosh Roman and Windows Unicode English (United States)"
+before = "UbuntuMono-Bront"
+after = "UbuntuMonoDerivativeBront-Regular"
+
+upstream_license_path = "UbuntuMono-LICENSE.txt"
+upstream_license_url = "https://raw.githubusercontent.com/chrismwendt/bront/aef23d9a11416655a8351230edb3c2377061c077/UbuntuMono-LICENSE.txt"
+upstream_license_sha256 = "2f0015108d68627bd788d313f529c21ff4da2c2c42a5e1f3883acc83480f9002"
+license_text = "LICENSES/Ubuntu-Font-Licence-1.0.txt"
+license_text_sha256 = "2f0015108d68627bd788d313f529c21ff4da2c2c42a5e1f3883acc83480f9002"
+notice = "THIRD_PARTY_NOTICES.md#ubuntu-mono-derivative-bront-embedded-font"
+
+dependency_kind = "bundled_font"
+rationale = "Bundled monospace fallback used by the terminal surface."
+reviewer = "Pinned source, deterministic metadata recipe, and table-diff review"
+license_posture = "resolved_non_substantially_changed_ubuntu_font_derivative"
+gpl_only = false
+direct_dependencies = []
+transitive_dependencies = []
+cmake_targets = []
